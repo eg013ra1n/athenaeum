@@ -195,7 +195,10 @@ pub struct Agent {
     seen: Arc<SeenStore>,
     engine: Arc<SyncEngineHandle>,
     origin_device: String,
-    watcher: Option<WatcherHandle>,
+    /// One watcher per configured capture directory (empty when `watch` is
+    /// false). All watchers feed the single enqueue pipeline; graceful shutdown
+    /// drops ALL of them before draining the consumer.
+    watchers: Vec<WatcherHandle>,
     enqueue_task: Option<JoinHandle<()>>,
     retention_task: Option<JoinHandle<()>>,
 }
@@ -302,15 +305,24 @@ impl Agent {
             "retention active"
         );
 
-        let (watcher, enqueue_task, retention_task) = if watch {
+        let (watchers, enqueue_task, retention_task) = if watch {
             let (stable_tx, stable_rx) = mpsc::channel::<PathBuf>(64);
-            let watcher = watcher::spawn_watcher(
-                config.capture_dir.clone(),
-                config.stability(),
-                config.poll_interval(),
-                stable_tx,
-                Arc::clone(&seen),
-            )?;
+            // One watcher per configured capture directory; each gets its own
+            // clone of the shared stable-file sender, all feeding the single
+            // enqueue consumer below.
+            let mut watchers = Vec::new();
+            for dir in config.capture_dirs_resolved() {
+                watchers.push(watcher::spawn_watcher(
+                    dir,
+                    config.stability(),
+                    config.poll_interval(),
+                    stable_tx.clone(),
+                    Arc::clone(&seen),
+                )?);
+            }
+            // Drop our own sender: the consumer's channel now closes precisely
+            // when the LAST watcher drops its clone (i.e. all have shut down).
+            drop(stable_tx);
             let enqueue_task = spawn_enqueue_consumer(
                 stable_rx,
                 Arc::clone(&engine),
@@ -323,9 +335,9 @@ impl Agent {
                 Arc::clone(&seen),
                 config.clone(),
             );
-            (Some(watcher), Some(enqueue_task), Some(retention_task))
+            (watchers, Some(enqueue_task), Some(retention_task))
         } else {
-            (None, None, None)
+            (Vec::new(), None, None)
         };
 
         Ok(Self {
@@ -334,7 +346,7 @@ impl Agent {
             seen,
             engine,
             origin_device,
-            watcher,
+            watchers,
             enqueue_task,
             retention_task,
         })
@@ -376,11 +388,13 @@ impl Agent {
         if let Some(t) = self.retention_task {
             t.abort();
         }
-        if let Some(w) = self.watcher {
+        // Shut down EVERY watcher before draining: each holds a clone of the
+        // stable-file sender, so the consumer's channel only closes once the
+        // last of them is gone.
+        for w in self.watchers {
             w.shutdown().await;
         }
-        // The watcher owned the stable-file sender; with it dropped the consumer
-        // sees its channel close and exits.
+        // With all watchers dropped, the consumer sees its channel close and exits.
         if let Some(t) = self.enqueue_task {
             let _ = t.await;
         }
@@ -401,7 +415,7 @@ impl Agent {
     /// wrong reason instead of proving the *new* agent's crash-resume works.
     #[doc(hidden)]
     pub fn kill_for_test(self) {
-        if let Some(w) = self.watcher {
+        for w in self.watchers {
             w.abort_for_test();
         }
         if let Some(t) = self.enqueue_task {
@@ -709,8 +723,10 @@ fn spawn_retention_task(
             let seen = Arc::clone(&seen);
             let config = config.clone();
             let res = tokio::task::spawn_blocking(move || {
-                let capture_dir = config.capture_dir.clone();
-                let disk_probe = move || disk_usage_pct(&capture_dir);
+                // Probe every capture volume and take the MAX usage: disk
+                // pressure on any one watched directory should trigger the gate.
+                let dirs = config.capture_dirs_resolved();
+                let disk_probe = move || dirs.iter().map(|d| disk_usage_pct(d)).max().unwrap_or(0);
                 run_retention_once(&config, &store, &seen, Utc::now(), &disk_probe)
             })
             .await;
@@ -996,9 +1012,9 @@ mod retention_tests {
         // real deletion path (production still refuses dry_run = false).
         config.retention.dry_run = false;
 
-        let s1 = config.capture_dir.join("light-0001.fits");
-        let s2 = config.capture_dir.join("light-0002.fits");
-        let su = config.capture_dir.join("light-0003.fits");
+        let s1 = config.capture_dirs_resolved()[0].join("light-0001.fits");
+        let s2 = config.capture_dirs_resolved()[0].join("light-0002.fits");
+        let su = config.capture_dirs_resolved()[0].join("light-0003.fits");
         std::fs::write(&s1, b"aaaa").unwrap();
         std::fs::write(&s2, b"bbbb").unwrap();
         std::fs::write(&su, b"cccc").unwrap();
@@ -1035,7 +1051,7 @@ mod retention_tests {
     fn run_retention_once_dry_run_reports_but_deletes_nothing() {
         let (_tmp, config, store, seen) = setup(); // dry_run = true from TOML
 
-        let s1 = config.capture_dir.join("light-0001.fits");
+        let s1 = config.capture_dirs_resolved()[0].join("light-0001.fits");
         std::fs::write(&s1, b"aaaa").unwrap();
         let (pkg1, id1) = register(&config, &store, &seen, &s1);
         store.confirm(id1, &[]).unwrap();
@@ -1064,7 +1080,7 @@ mod retention_tests {
         config.retention.disk_max_pct = 50;
         config.retention.dry_run = false; // real mode — still must not delete
 
-        let s1 = config.capture_dir.join("light-0001.fits");
+        let s1 = config.capture_dirs_resolved()[0].join("light-0001.fits");
         std::fs::write(&s1, b"aaaa").unwrap();
         // Enqueued + linked but NEVER confirmed.
         let (pkg1, _id1) = register(&config, &store, &seen, &s1);
@@ -1093,7 +1109,7 @@ mod retention_tests {
         let (_tmp, mut config, store, seen) = setup();
         config.retention.dry_run = false;
 
-        let s1 = config.capture_dir.join("light-0001.fits");
+        let s1 = config.capture_dirs_resolved()[0].join("light-0001.fits");
         std::fs::write(&s1, b"aaaa").unwrap();
         let (pkg1, id1) = register(&config, &store, &seen, &s1);
         store.confirm(id1, &[]).unwrap();
@@ -1120,7 +1136,7 @@ mod retention_tests {
     fn fallback_audit_insert_failure_prevents_delete() {
         let (_tmp, config, store, seen) = setup();
 
-        let s1 = config.capture_dir.join("light-0001.fits");
+        let s1 = config.capture_dirs_resolved()[0].join("light-0001.fits");
         std::fs::write(&s1, b"aaaa").unwrap();
         let (pkg1, id1) = register(&config, &store, &seen, &s1);
         store.confirm(id1, &[]).unwrap();
@@ -1146,7 +1162,7 @@ mod retention_tests {
         let (_tmp, mut config, store, seen) = setup();
         config.retention.dry_run = false;
 
-        let s1 = config.capture_dir.join("light-0001.fits");
+        let s1 = config.capture_dirs_resolved()[0].join("light-0001.fits");
         std::fs::write(&s1, b"aaaa").unwrap();
         let (_pkg1, id1) = register(&config, &store, &seen, &s1);
         store.confirm(id1, &[]).unwrap();
@@ -1170,7 +1186,7 @@ mod retention_tests {
         let (_tmp, mut config, store, seen) = setup();
         config.retention.dry_run = false;
 
-        let s1 = config.capture_dir.join("light-0001.fits");
+        let s1 = config.capture_dirs_resolved()[0].join("light-0001.fits");
         std::fs::write(&s1, b"aaaa").unwrap();
         let (_pkg1, id1) = register(&config, &store, &seen, &s1);
         store.confirm(id1, &[]).unwrap();
@@ -1196,7 +1212,7 @@ mod retention_tests {
         let (_tmp, mut config, store, seen) = setup();
         config.retention.dry_run = false;
 
-        let s1 = config.capture_dir.join("light-0001.fits");
+        let s1 = config.capture_dirs_resolved()[0].join("light-0001.fits");
         std::fs::write(&s1, b"aaaa").unwrap();
         let (pkg1, id1) = register(&config, &store, &seen, &s1);
         store.confirm(id1, &[]).unwrap();

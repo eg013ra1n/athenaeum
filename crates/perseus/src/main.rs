@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
 /// `run`: arm the watcher + engine and block until Ctrl-C, then shut down cleanly.
 async fn cmd_run(config: Config) -> Result<()> {
     tracing::info!(
-        capture_dir = %config.capture_dir.display(),
+        capture_dirs = ?config.capture_dirs_resolved(),
         data_dir = %config.data_dir.display(),
         "perseus starting (auto mode)"
     );
@@ -87,7 +87,15 @@ async fn cmd_status(config: Config) -> Result<()> {
 
     // Human-facing CLI output on stdout (documented exemption from zero-print).
     println!("Perseus status");
-    println!("  capture_dir       : {}", config.capture_dir.display());
+    println!(
+        "  capture_dirs      : {}",
+        config
+            .capture_dirs_resolved()
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     println!("  data_dir          : {}", config.data_dir.display());
     let pairing_route = match &config.account {
         Some(a) => format!("account (hub {})", a.hub_url),

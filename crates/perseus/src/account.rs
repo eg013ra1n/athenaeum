@@ -457,7 +457,8 @@ mod tests {
         allow_default_relays: bool,
     ) -> Config {
         Config {
-            capture_dir: data_dir.join("capture"),
+            capture_dir: Some(data_dir.join("capture")),
+            capture_dirs: Vec::new(),
             data_dir: data_dir.to_path_buf(),
             pairing_ticket: None,
             account: Some(AccountConfig {

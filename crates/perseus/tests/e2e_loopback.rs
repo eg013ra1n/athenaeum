@@ -50,11 +50,32 @@ fn write_fixture_fits(path: &Path, object: &str) {
 /// A test config with short stability/poll windows so the e2e runs in seconds.
 fn test_config(capture_dir: &Path, data_dir: &Path) -> Config {
     Config {
-        capture_dir: capture_dir.to_path_buf(),
+        capture_dir: Some(capture_dir.to_path_buf()),
+        capture_dirs: Vec::new(),
         data_dir: data_dir.to_path_buf(),
         // Loopback path never parses this as an iroh ticket; any non-empty value
         // passes structural validation. No [account] table — the loopback e2e
         // exercises the dev-ticket path (task M1).
+        pairing_ticket: Some("loopback-test".to_string()),
+        account: None,
+        mode: Mode::Auto,
+        retention: RetentionConfig {
+            policy: RetentionPolicy::KeepEverything,
+            dry_run: true,
+            ..RetentionConfig::default()
+        },
+        stability_secs: 1,
+        poll_interval_secs: 1,
+    }
+}
+
+/// A multi-directory variant of [`test_config`]: `capture_dirs = [...]` with no
+/// singular `capture_dir`. Used by the task-7 smoke test to watch two dirs.
+fn test_config_multi(capture_dirs: &[&Path], data_dir: &Path) -> Config {
+    Config {
+        capture_dir: None,
+        capture_dirs: capture_dirs.iter().map(|p| p.to_path_buf()).collect(),
+        data_dir: data_dir.to_path_buf(),
         pairing_ticket: Some("loopback-test".to_string()),
         account: None,
         mode: Mode::Auto,
@@ -454,4 +475,67 @@ async fn modified_file_is_reenqueued_after_restart() {
     .await;
 
     agent_b.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: multiple capture directories. A config with `capture_dirs = [a, b]`
+// arms one watcher per directory, all feeding the single enqueue pipeline — a
+// file dropped in EACH directory is packaged and confirmed independently.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn multiple_capture_dirs_are_both_watched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cap_a = tmp.path().join("capture-a");
+    let cap_b = tmp.path().join("capture-b");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&cap_a).unwrap();
+    std::fs::create_dir_all(&cap_b).unwrap();
+
+    let net = LoopbackNetwork::new();
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let sender = net.endpoint();
+    let sender_id = sender.node_id();
+    let transport: Arc<dyn SharingTransport> = Arc::new(sender);
+
+    let cfg = test_config_multi(&[cap_a.as_path(), cap_b.as_path()], &data);
+    let agent = Agent::start_with_transport(cfg, transport, receiver_id, sender_id, true)
+        .await
+        .expect("start agent");
+
+    // Let both watchers finish their (empty) baseline scan before the files land,
+    // so each fixture is a NEW arrival rather than pre-existing baseline.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    write_fixture_fits(&cap_a.join("frame_a.fits"), "M42");
+    write_fixture_fits(&cap_b.join("frame_b.fits"), "M31");
+
+    // Both files — one from each watched directory — reach Confirmed.
+    wait_until(
+        || {
+            is_confirmed(&history_for(&agent, "frame_a.fits"))
+                && is_confirmed(&history_for(&agent, "frame_b.fits"))
+        },
+        WAIT,
+    )
+    .await;
+
+    // Each was enqueued exactly once → exactly one transfer-start row each.
+    assert_eq!(
+        sent_starts(&history_for(&agent, "frame_a.fits")),
+        1,
+        "the file in capture dir A must be enqueued exactly once"
+    );
+    assert_eq!(
+        sent_starts(&history_for(&agent, "frame_b.fits")),
+        1,
+        "the file in capture dir B must be enqueued exactly once"
+    );
+
+    // Everything terminalized: no rows left in flight across BOTH dirs.
+    wait_until(|| agent.status_snapshot().unwrap().is_empty(), WAIT).await;
+
+    agent.shutdown().await;
 }

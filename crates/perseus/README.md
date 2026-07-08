@@ -56,6 +56,7 @@ contract:
 ```toml
 # perseus.toml
 capture_dir = "/data/capture"            # directory your capture app writes to
+# capture_dirs = ["/data/cam1", "/data/cam2"]  # …or watch several (see note below)
 data_dir = "/var/lib/perseus"            # SQLite store + blob store + device key + logs
 pairing_ticket = "<paste from primary>"  # primary → Settings → Sync (dev)
 mode = "auto"                            # only value in the MVP
@@ -75,6 +76,12 @@ dry_run = true                           # safe default; see the go-live note be
 
 Notes:
 
+- **One or several capture directories.** Use `capture_dir = "…"` for a single
+  directory, or `capture_dirs = ["…", "…"]` to watch several at once (e.g. two
+  cameras writing to separate folders). Set **exactly one** of the two forms —
+  configuring both, or neither, is rejected at startup. Perseus arms one watcher
+  per directory; every new frame from any of them flows through the same
+  packaging, send, and retention pipeline.
 - **`pairing_ticket`** is the out-of-band pairing string from the primary. On
   first `run`, Perseus generates a device key at `<data_dir>/device_key` (mode
   `0600`) and derives its own node identity from it. Both keys persist, so the

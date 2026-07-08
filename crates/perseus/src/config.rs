@@ -226,7 +226,14 @@ impl Default for AccountConfig {
 /// Parsed + validated Perseus configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
-    pub capture_dir: PathBuf,
+    /// Single capture directory (legacy form). Exactly one of `capture_dir` /
+    /// `capture_dirs` must be set — [`validate`](Self::validate) enforces this.
+    #[serde(default)]
+    pub capture_dir: Option<PathBuf>,
+    /// One or more capture directories to watch. The multi-directory form: a
+    /// separate watcher is armed per entry, all feeding the one enqueue pipeline.
+    #[serde(default)]
+    pub capture_dirs: Vec<PathBuf>,
     pub data_dir: PathBuf,
     /// Dev-ticket pairing route (task M1: optional now that `[account]` exists).
     #[serde(default)]
@@ -267,19 +274,42 @@ impl Config {
         Ok(cfg)
     }
 
+    /// The effective watch list: the singular `capture_dir` as a one-item list,
+    /// or the `capture_dirs` array. [`validate`](Self::validate) guarantees
+    /// exactly one form is populated, so this is unambiguous. Every consumer of
+    /// a capture directory (the watcher spawn loop, the retention disk probe,
+    /// the status banner) goes through here — never the raw fields.
+    pub fn capture_dirs_resolved(&self) -> Vec<PathBuf> {
+        if let Some(d) = &self.capture_dir {
+            vec![d.clone()]
+        } else {
+            self.capture_dirs.clone()
+        }
+    }
+
     /// Structural validation of already-parsed fields. Iroh-ticket well-formedness
     /// is deliberately NOT checked here — that lives in the production transport
     /// wiring (`run`), so tests and the loopback path can supply a placeholder.
     pub fn validate(&self) -> Result<()> {
-        if self.capture_dir.as_os_str().is_empty() {
-            bail!("capture_dir must not be empty");
+        // Exactly one of the two capture-directory forms must be set.
+        match (&self.capture_dir, self.capture_dirs.is_empty()) {
+            (Some(_), false) => {
+                bail!("set either capture_dir or capture_dirs in perseus.toml, not both")
+            }
+            (None, true) => bail!("capture_dir (or capture_dirs) is required"),
+            _ => {}
         }
-        if !self.capture_dir.exists() {
-            bail!(
-                "capture_dir {} does not exist — create it (or point at the \
-                 right path) before starting Perseus",
-                self.capture_dir.display()
-            );
+        for dir in self.capture_dirs_resolved() {
+            if dir.as_os_str().is_empty() {
+                bail!("capture directory must not be empty");
+            }
+            if !dir.exists() {
+                bail!(
+                    "capture directory does not exist: {} — create it (or point \
+                     at the right path) before starting Perseus",
+                    dir.display()
+                );
+            }
         }
         if self.data_dir.as_os_str().is_empty() {
             bail!("data_dir must not be empty");
@@ -407,11 +437,85 @@ dry_run = true
         )
     }
 
+    /// Minimal valid-shape TOML with the caller's own capture line(s) spliced in
+    /// — used by the multiple-capture-directory tests so they supply
+    /// `capture_dir` / `capture_dirs` themselves (unlike [`good_toml`], which
+    /// hardcodes the singular form).
+    fn toml_with(capture_line: &str) -> String {
+        format!(
+            r#"
+{capture_line}
+data_dir = "/var/lib/perseus"
+pairing_ticket = "ticket-abc"
+mode = "auto"
+[retention]
+policy = "keep_everything"
+dry_run = true
+"#
+        )
+    }
+
+    /// Task 7: the array form parses and `capture_dirs_resolved()` returns every
+    /// listed directory in order.
+    #[test]
+    fn capture_dirs_array_parses() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let toml = toml_with(&format!(
+            "capture_dirs = [\"{}\", \"{}\"]",
+            a.path().display(),
+            b.path().display()
+        ));
+        let c = Config::from_toml_str(&toml).expect("array form is valid");
+        assert_eq!(
+            c.capture_dirs_resolved(),
+            vec![a.path().to_path_buf(), b.path().to_path_buf()]
+        );
+    }
+
+    /// Task 7: the legacy singular `capture_dir` still works and resolves to a
+    /// one-item watch list.
+    #[test]
+    fn capture_dir_singular_still_works() {
+        let a = tempfile::tempdir().unwrap();
+        let toml = toml_with(&format!("capture_dir = \"{}\"", a.path().display()));
+        let c = Config::from_toml_str(&toml).expect("singular form is valid");
+        assert_eq!(c.capture_dirs_resolved(), vec![a.path().to_path_buf()]);
+    }
+
+    /// Task 7: setting BOTH forms is a misconfiguration — rejected with an
+    /// actionable message naming both keys. (Uses real dirs so it is the
+    /// exactly-one guard that fires, not the existence check.)
+    #[test]
+    fn both_forms_rejected() {
+        let a = tempfile::tempdir().unwrap();
+        let toml = toml_with(&format!(
+            "capture_dir = \"{d}\"\ncapture_dirs = [\"{d}\"]",
+            d = a.path().display()
+        ));
+        let err = Config::from_toml_str(&toml).expect_err("both forms must be rejected");
+        assert!(
+            err.to_string().contains("either capture_dir or capture_dirs"),
+            "error should name both keys: {err:#}"
+        );
+    }
+
+    /// Task 7: neither form present → rejected (a capture directory is required).
+    #[test]
+    fn neither_form_rejected() {
+        let err = Config::from_toml_str(&toml_with("")).expect_err("neither form must be rejected");
+        assert!(
+            err.chain().any(|c| c.to_string().contains("capture_dir")),
+            "error should demand a capture dir: {err:#}"
+        );
+    }
+
     #[test]
     fn parses_the_contract_shape() {
         let capture = tempfile::tempdir().unwrap();
         let cfg = Config::from_toml_str(&good_toml(capture.path())).expect("valid config");
-        assert_eq!(cfg.capture_dir, capture.path());
+        assert_eq!(cfg.capture_dir.as_deref(), Some(capture.path()));
+        assert_eq!(cfg.capture_dirs_resolved(), vec![capture.path().to_path_buf()]);
         assert_eq!(cfg.data_dir, PathBuf::from("/var/lib/perseus"));
         assert_eq!(cfg.pairing_ticket.as_deref(), Some("ticket-abc"));
         assert!(cfg.account.is_none(), "no [account] table in the ticket-only contract shape");
@@ -675,8 +779,8 @@ mode = "auto"
         let text = good_toml(&missing);
         let err = Config::from_toml_str(&text).expect_err("missing capture_dir must fail");
         assert!(
-            err.chain().any(|c| c.to_string().contains("capture_dir")),
-            "error should mention capture_dir: {err:#}"
+            err.chain().any(|c| c.to_string().contains("does not exist")),
+            "error should say the capture directory does not exist: {err:#}"
         );
     }
 
