@@ -21,7 +21,7 @@ rotation: number | null, uuid: string | null, updated_at: string | null, };
 
 export type ScanRoot = { id: number | null, path: string, enabled: boolean, find_duplicates: boolean, unique_camera: boolean, last_scan: string | null, last_scan_errors: Array<string> | null, monitor_enabled: boolean, 
 /**
- * 'normal' | 'calibration_library'
+ * 'normal' | 'calibration_library' | 'sync_incoming' | 'collaboration'
  */
 kind: string, };
 

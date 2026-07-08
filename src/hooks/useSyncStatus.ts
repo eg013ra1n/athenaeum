@@ -10,7 +10,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { useNotifications, type NotifyLike } from '../contexts/NotificationContext';
-import type { OutboundSummary, SyncFinishedEvent, SyncStatus } from '../types/models';
+import type { OutboundSummary, ScanRoot, SyncFinishedEvent, SyncStatus } from '../types/models';
 
 /** Status re-poll cadence while the indicator is visible. */
 const POLL_MS = 10_000;
@@ -69,6 +69,33 @@ export function notifyFinished(p: SyncFinishedEvent, notify: NotifyLike): void {
       hasErrors: p.outcome === 'partial',
       dedupeKey: `sync-recv-${p.packageId}`,
     });
+
+    // Unconfigured-landing hint (Stage 1.5, Task 6): when no sync-incoming
+    // folder is designated, received files fall back to the app-data folder.
+    // Nudge ONCE (dedupeKey persists in localStorage) to designate one so they
+    // land with the image library. Fire-and-forget — `notify` is stable, the
+    // scan-root read is cheap, and a failure here must never derail the arrival
+    // notification above.
+    if (p.outcome === 'ingested' || p.outcome === 'partial') {
+      void (async () => {
+        try {
+          const roots = await api.invoke<ScanRoot[]>('get_scan_roots');
+          if (!roots.some((r) => r.kind === 'sync_incoming')) {
+            notify({
+              title: 'Received files are landing in the app data folder',
+              detail:
+                'Designate a Sync Incoming Folder in File Manager to keep them with your image library.',
+              kind: 'sync',
+              tone: 'warning',
+              link: '/files',
+              dedupeKey: 'sync-incoming-unconfigured',
+            });
+          }
+        } catch (err) {
+          console.error('[useSyncStatus] sync-incoming hint scan-root check failed:', err);
+        }
+      })();
+    }
   } else if (p.outcome === 'failed') {
     notify({
       title: `Frames rejected from ${shortPeer(p.peerDevice)}`,

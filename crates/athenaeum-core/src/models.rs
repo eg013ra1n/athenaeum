@@ -158,7 +158,7 @@ pub struct ScanRoot {
     pub last_scan: Option<DateTime<Utc>>,
     pub last_scan_errors: Option<Vec<String>>,
     pub monitor_enabled: bool,
-    /// 'normal' | 'calibration_library'
+    /// 'normal' | 'calibration_library' | 'sync_incoming' | 'collaboration'
     pub kind: String,
 }
 

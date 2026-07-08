@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
-import { FolderPlus, Play, Filter, Trash2, CheckCircle2, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, Info, AlertCircle, ChevronDown, ChevronRight } from 'lucide-react';
+import { FolderPlus, Play, Filter, Trash2, CheckCircle2, Loader2, Copy, FolderOpen, RefreshCw, AlertTriangle, Info, AlertCircle, ChevronDown, ChevronRight, Inbox, Users } from 'lucide-react';
 import { pickDirectory } from '../api/desktop';
 import { isTauri } from '../utils/platform';
 import { api } from '../api';
@@ -20,6 +20,7 @@ import { MissingMetadataView } from '../components/missing-metadata/MissingMetad
 import { DuplicatesView } from '../components/duplicates/DuplicatesView';
 import { ArchiveFoldersSection } from '../components/archive/ArchiveFoldersSection';
 import { CalibrationFolderSection } from '../components/CalibrationFolderSection';
+import { SpecialFolderSection } from '../components/SpecialFolderSection';
 
 type TabMode = 'directories' | 'browse' | 'duplicates' | 'missing-metadata';
 type DuplicatesViewMode = 'files' | 'folders';
@@ -689,6 +690,32 @@ export default function FileManager() {
           )}
 
           <CalibrationFolderSection scanRoots={scanRoots} onRootsChanged={() => void refreshScanRoots()} />
+
+          <SpecialFolderSection
+            title="Sync Incoming Folder"
+            description="Files received from your capture devices land here."
+            kind="sync_incoming"
+            icon={Inbox}
+            notifyKind="sync"
+            getCommand="get_sync_incoming_dir"
+            setCommand="set_sync_incoming_dir"
+            clearCommand="clear_sync_incoming_dir"
+            scanRoots={scanRoots}
+            onRootsChanged={() => void refreshScanRoots()}
+          />
+
+          <SpecialFolderSection
+            title="Collaboration Folder"
+            description="Reserved for collaboration projects (Stage II) — received project contributions will be stored here."
+            kind="collaboration"
+            icon={Users}
+            notifyKind="sync"
+            getCommand="get_collaboration_dir"
+            setCommand="set_collaboration_dir"
+            clearCommand="clear_collaboration_dir"
+            scanRoots={scanRoots}
+            onRootsChanged={() => void refreshScanRoots()}
+          />
 
           <ArchiveFoldersSection />
         </div>
