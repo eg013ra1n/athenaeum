@@ -45,7 +45,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::events::{emit_event, ProgressEmitter};
-use crate::package::{self, ManifestRecord};
+use crate::package::{self, ManifestRecord, MANIFEST_FILENAME};
 use crate::sharing::types::{
     FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
 };
@@ -292,6 +292,38 @@ impl Worker {
                 }
             }
             Err(e) => tracing::error!(error = %e, "crash-resume enumeration failed"),
+        }
+
+        // Startup heal: reclaim payload copies left behind by any confirmed
+        // package a prior engine cleaned up incompletely (crashed after confirm
+        // but before cleanup, or confirmed by a pre-cleanup build). `confirmed()`
+        // returns EVERY confirmed row ever, so an already-clean (manifest-only)
+        // dir frees 0 bytes and is not counted. Best-effort and non-fatal: a
+        // per-dir error warns and continues; startup is never blocked.
+        match self.store.confirmed() {
+            Ok(rows) => {
+                let mut count: u64 = 0;
+                let mut freed_bytes: u64 = 0;
+                for row in rows {
+                    let dir = PathBuf::from(&row.package_ref);
+                    match cleanup_package_payloads(&dir) {
+                        Ok(0) => {}
+                        Ok(bytes) => {
+                            count += 1;
+                            freed_bytes = freed_bytes.saturating_add(bytes);
+                        }
+                        Err(e) => tracing::warn!(
+                            package_id = row.id,
+                            error = %format!("{e:#}"),
+                            "package payload heal failed"
+                        ),
+                    }
+                }
+                if count > 0 {
+                    tracing::info!(count, freed_bytes, "package payload heal");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "confirmed enumeration for payload heal failed"),
         }
 
         loop {
@@ -629,6 +661,21 @@ impl Worker {
             .confirm(pending.id, &receipts)
             .context("confirm outbound")?;
         self.append_confirmed_history(&pending, &receipts)?;
+        // Terminal + confirmed: free the payload copies `write_package` made in
+        // the package dir. They are dead weight once confirmed (the package is
+        // never re-served), and without this an observatory keeps a full
+        // duplicate of every night it sends. MUST run AFTER
+        // `append_confirmed_history` (which reads the manifest); the manifest is
+        // deliberately kept so retention/audit can still read it. Cleanup failure
+        // never fails the confirm — log and continue.
+        match cleanup_package_payloads(&pending.dir) {
+            Ok(freed_bytes) => {
+                tracing::info!(package_id = pending.id, freed_bytes, "package payloads cleaned");
+            }
+            Err(e) => {
+                tracing::warn!(package_id = pending.id, error = %format!("{e:#}"), "package payload cleanup failed");
+            }
+        }
         // Terminal: the package is confirmed; drop its served blobs so they do
         // not outlive the transfer. `package_id` is the id the ack correlated
         // against (== pending.announce.package_id). Fire-and-forget, never fails
@@ -880,4 +927,76 @@ fn announce_for_dir(dir: &Path) -> Result<PackageAnnounce> {
         byte_size,
         frame_count,
     })
+}
+
+/// Free the payload copies a confirmed package's directory holds, keeping only
+/// `manifest.ndjson`, and return the number of bytes reclaimed.
+///
+/// [`write_package`](crate::package::write_package) *copies* every source file
+/// into the package dir; once a package is `Confirmed` it is terminal and never
+/// re-served, so those copies are pure dead weight — without this an observatory
+/// keeps a full duplicate of every night it sends. The manifest is deliberately
+/// preserved: Perseus's retention audit (`build_retention_history_rows`) and the
+/// Sent-row naming both read it long after confirmation.
+///
+/// Packages are flat, but a manifest `rel_path` *may* carry a subdirectory (the
+/// writer creates it), so this also walks subdirectories and removes the emptied
+/// dirs. Cleaning an already-clean (manifest-only) dir is a cheap no-op that
+/// frees 0 bytes. Errors are propagated so the caller can log-and-continue — a
+/// cleanup failure must never fail the confirm transition or block startup.
+fn cleanup_package_payloads(dir: &Path) -> Result<u64> {
+    let mut freed = 0u64;
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("read package dir {}", dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("read package dir entry in {}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat package entry {}", path.display()))?;
+        if file_type.is_dir() {
+            freed = freed.saturating_add(remove_tree_counting(&path)?);
+        } else if file_type.is_file() {
+            // The manifest is the one file that must survive cleanup.
+            if entry.file_name() == std::ffi::OsStr::new(MANIFEST_FILENAME) {
+                continue;
+            }
+            freed = freed.saturating_add(remove_file_counting(&path)?);
+        }
+        // Symlinks / other node types are never written into a package; skip.
+    }
+    Ok(freed)
+}
+
+/// Recursively remove every file and subdirectory under `dir`, then `dir`
+/// itself, summing the bytes of the files removed. Only reached for the unusual
+/// case of a package whose manifest `rel_path` carried a subdirectory.
+fn remove_tree_counting(dir: &Path) -> Result<u64> {
+    let mut freed = 0u64;
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("read package subdir {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("read subdir entry in {}", dir.display()))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("stat subdir entry {}", path.display()))?;
+        if file_type.is_dir() {
+            freed = freed.saturating_add(remove_tree_counting(&path)?);
+        } else {
+            freed = freed.saturating_add(remove_file_counting(&path)?);
+        }
+    }
+    std::fs::remove_dir(dir)
+        .with_context(|| format!("remove emptied package subdir {}", dir.display()))?;
+    Ok(freed)
+}
+
+/// Remove one file, returning its size in bytes (0 if it can't be stat'd).
+fn remove_file_counting(path: &Path) -> Result<u64> {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    std::fs::remove_file(path)
+        .with_context(|| format!("remove package payload {}", path.display()))?;
+    Ok(size)
 }

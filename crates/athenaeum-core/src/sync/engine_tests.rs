@@ -19,7 +19,9 @@ use std::time::Duration;
 use tempfile::tempdir;
 use tokio::time::Instant;
 
-use crate::package::{self, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
+use crate::package::{
+    self, write_package, ManifestRecord, PayloadKind, MANIFEST_FILENAME, MANIFEST_VERSION,
+};
 use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
 use crate::sharing::types::{FrameReceipt, PackageAnnounce, ReceiptOutcome, TransportEvent};
 use crate::sharing::SharingTransport;
@@ -137,6 +139,17 @@ fn state_of(store: &StandaloneSyncStore, id: i64) -> Option<OutboundState> {
 
 fn attempts_of(store: &StandaloneSyncStore, id: i64) -> u32 {
     store.get_outbound(id).unwrap().map(|r| r.attempts).unwrap_or(0)
+}
+
+/// Sorted file/dir names directly inside `dir` (for asserting a package dir's
+/// contents after cleanup).
+fn dir_entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
 }
 
 // ---------------------------------------------------------------------------
@@ -727,6 +740,152 @@ async fn cancel_moves_to_failed_cancelled() {
         history.iter().any(|h| h.outcome == "cancelled"),
         "a cancelled outcome must be recorded in history"
     );
+
+    engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1.5.1 Task 1: package payload cleanup on confirm + startup heal.
+//
+// `write_package` COPIES every source file into the package dir; nothing ever
+// removed those copies, so confirmed packages kept a full duplicate of every
+// frame forever. Cleanup on confirm (and a startup heal for crash-orphaned
+// confirmed dirs) reclaims that space while KEEPING `manifest.ndjson` — the
+// retention/audit trail reads it long after confirmation.
+// ---------------------------------------------------------------------------
+
+/// Test A: a package driven to `Confirmed` over loopback has its payload copies
+/// removed, leaving ONLY `manifest.ndjson` in the package dir.
+#[tokio::test]
+async fn confirm_cleans_payloads_to_manifest_only() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(&tmp.path().join("srcA"), "uuid-a", "frameA.fits", "M42", 4096);
+    // Pre-confirm the writer's payload copy exists inside the package dir.
+    assert!(
+        pkg.join("frameA.fits").exists(),
+        "the writer must have copied the payload into the package dir"
+    );
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+
+    // Cleanup runs in the confirm path (after append_confirmed_history); poll.
+    wait_until(|| dir_entries(&pkg) == vec![MANIFEST_FILENAME.to_string()], WAIT).await;
+
+    assert_eq!(
+        dir_entries(&pkg),
+        vec![MANIFEST_FILENAME.to_string()],
+        "confirm must leave ONLY the manifest in the package dir"
+    );
+    assert!(
+        pkg.join(MANIFEST_FILENAME).exists(),
+        "the manifest must survive cleanup for the retention/audit trail"
+    );
+
+    engine.shutdown().await;
+}
+
+/// Test B: startup heal. Seed the store with a `Confirmed` row whose package dir
+/// still holds a payload + manifest (as if a prior engine confirmed it but
+/// crashed before cleaning); spawning a fresh engine must clean the payload and
+/// keep the manifest, and re-cleaning an already-clean dir stays a no-op.
+#[tokio::test]
+async fn startup_heal_cleans_confirmed_payloads() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+
+    let pkg = build_package(&tmp.path().join("srcB"), "uuid-b", "frameB.fits", "M31", 8192);
+    assert!(pkg.join("frameB.fits").exists());
+
+    // Seed a confirmed outbound row pointing at the package dir.
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let id = store.enqueue(&pkg.to_string_lossy(), receiver_id).unwrap();
+    store.confirm(id, &[]).unwrap();
+
+    // Spawn the engine → its startup heal iterates confirmed() and cleans.
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+
+    wait_until(|| !pkg.join("frameB.fits").exists(), WAIT).await;
+    assert_eq!(
+        dir_entries(&pkg),
+        vec![MANIFEST_FILENAME.to_string()],
+        "startup heal must leave ONLY the manifest"
+    );
+    assert!(
+        pkg.join(MANIFEST_FILENAME).exists(),
+        "the manifest must survive the heal"
+    );
+
+    engine.shutdown().await;
+
+    // Idempotent: a second engine over an already-clean confirmed dir is a no-op
+    // that never errors and never touches the manifest.
+    let engine2 = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+    // Give the heal a moment to run.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(dir_entries(&pkg), vec![MANIFEST_FILENAME.to_string()]);
+    engine2.shutdown().await;
+}
+
+/// Test C: a package driven to terminal `Failed` KEEPS its payloads — Task 2's
+/// retry re-enqueues the same package dir and depends on them.
+#[tokio::test]
+async fn failed_package_keeps_payloads() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // Receiver is started (announce delivers) but never acks → every attempt
+    // times out and the package terminalizes Failed.
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+
+    let pkg = build_package(&tmp.path().join("srcC"), "uuid-c", "frameC.fits", "NGC7000", 1024);
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig {
+            ack_timeout: Duration::from_millis(40),
+            max_attempts: 5,
+        },
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Failed), WAIT).await;
+
+    // A brief settle so any (erroneous) cleanup would have a chance to run.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        pkg.join("frameC.fits").exists(),
+        "a failed package must KEEP its payloads (retry depends on them)"
+    );
+    assert!(pkg.join(MANIFEST_FILENAME).exists());
 
     engine.shutdown().await;
 }
