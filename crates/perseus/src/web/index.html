@@ -204,6 +204,11 @@
           rep.rejected.forEach((x) => parts.push(`#${x.id}: ${x.reason}`));
           const f = $('delflash'); f.textContent = parts.join(' · ') || 'nothing to do';
           f.className = 'flash ' + (rep.rejected.length ? 'err' : 'ok');
+          // Clear the selection before refreshing: refreshSent() skips its
+          // re-render while any .rowsel is checked, so a stale selection here
+          // would freeze the table showing already-deleted rows.
+          document.querySelectorAll('.rowsel:checked').forEach((c) => { c.checked = false; });
+          updateDelSelected();
           refreshSent();
         } catch (e) { const f = $('delflash'); f.textContent = 'delete failed: ' + e.message; f.className = 'flash err'; }
       }
