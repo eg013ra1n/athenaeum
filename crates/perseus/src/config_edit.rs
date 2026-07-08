@@ -92,8 +92,9 @@ pub fn apply_retention_edit(config_path: &Path, edit: &RetentionEdit) -> Result<
 
 /// The snake_case TOML string for a [`RetentionPolicy`] variant. Kept in lock-step
 /// with the enum's `#[serde(rename_all = "snake_case")]` so a round-trip through
-/// the file re-parses to the same variant.
-fn policy_str(p: &RetentionPolicy) -> &'static str {
+/// the file re-parses to the same variant. `pub(crate)` so the web status page
+/// ([`crate::web`]) renders the policy with the same canonical string.
+pub(crate) fn policy_str(p: &RetentionPolicy) -> &'static str {
     match p {
         RetentionPolicy::KeepEverything => "keep_everything",
         RetentionPolicy::OnConfirm => "on_confirm",

@@ -58,20 +58,20 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Login => perseus::account::login(&config).await,
-        Command::Run => cmd_run(config).await,
+        Command::Run => cmd_run(config, cli.config.clone()).await,
         Command::Status => cmd_status(config).await,
-        Command::EnqueueBacklog { dir } => cmd_enqueue_backlog(config, dir).await,
+        Command::EnqueueBacklog { dir } => cmd_enqueue_backlog(config, cli.config.clone(), dir).await,
     }
 }
 
 /// `run`: arm the watcher + engine and block until Ctrl-C, then shut down cleanly.
-async fn cmd_run(config: Config) -> Result<()> {
+async fn cmd_run(config: Config, config_path: PathBuf) -> Result<()> {
     tracing::info!(
         capture_dirs = ?config.capture_dirs_resolved(),
         data_dir = %config.data_dir.display(),
         "perseus starting (auto mode)"
     );
-    let agent = Agent::start(config, true).await?;
+    let agent = Agent::start(config, config_path, true).await?;
     tokio::signal::ctrl_c()
         .await
         .context("await Ctrl-C")?;
@@ -143,7 +143,7 @@ async fn cmd_status(config: Config) -> Result<()> {
 
 /// `enqueue-backlog`: enqueue every eligible file under `dir`, then wait until
 /// every package terminalizes (Confirmed/Failed) or Ctrl-C, then shut down.
-async fn cmd_enqueue_backlog(config: Config, dir: PathBuf) -> Result<()> {
+async fn cmd_enqueue_backlog(config: Config, config_path: PathBuf, dir: PathBuf) -> Result<()> {
     let files = backlog_files(&dir)?;
     tracing::info!(count = files.len(), dir = %dir.display(), "backlog scan complete");
     if files.is_empty() {
@@ -152,7 +152,9 @@ async fn cmd_enqueue_backlog(config: Config, dir: PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    let agent = Agent::start(config, false).await?;
+    // `watch = false` → no web server spawns, so `config_path` is unused here;
+    // passed for signature symmetry with the `run` path.
+    let agent = Agent::start(config, config_path, false).await?;
     let mut enqueued = 0usize;
     for path in &files {
         match agent.enqueue_file(path).await {

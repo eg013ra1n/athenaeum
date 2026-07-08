@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Perseus — capture node</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, sans-serif;
+        max-width: 40rem;
+        margin: 4rem auto;
+        padding: 0 1.5rem;
+        line-height: 1.5;
+        color: #1a1a1a;
+        background: #fafafa;
+      }
+      code { background: #eee; padding: 0.1rem 0.3rem; border-radius: 3px; }
+      .muted { color: #666; }
+    </style>
+  </head>
+  <body>
+    <h1>Perseus</h1>
+    <p>Headless capture-node agent — status page.</p>
+    <p class="muted">
+      The interactive dashboard arrives in Task 10. For now the read-only JSON
+      API is live:
+    </p>
+    <ul>
+      <li><code>GET /api/status</code> — capture dirs, in-flight transfers, retention, counts</li>
+      <li><code>GET /api/sent</code> — outbound packages (optional <code>?state=</code>)</li>
+      <li><code>GET /api/history</code> — transfer history (optional <code>?query=</code>, <code>?direction=</code>)</li>
+    </ul>
+  </body>
+</html>

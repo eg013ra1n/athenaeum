@@ -302,6 +302,37 @@ pub fn confirmed_outbound_rows(conn: &Connection) -> Result<Vec<OutboundRow>> {
     raws.into_iter().map(to_outbound).collect()
 }
 
+/// Every `sync_outbound` row, newest-first, capped at `limit`. Unlike
+/// [`confirmed_outbound_rows`] there is no state filter — this is the Perseus web
+/// status page's "sent" list, which shows queued/announced/transferring/confirmed/
+/// failed packages alike. `ORDER BY id DESC` puts the most recently enqueued
+/// packages first; `LIMIT` bounds the response for a long-running node whose
+/// confirmed rows accumulate (retention deletes source files, never these rows).
+pub fn all_outbound_rows(conn: &Connection, limit: u32) -> Result<Vec<OutboundRow>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {OUTBOUND_COLS} FROM sync_outbound
+             ORDER BY id DESC LIMIT ?1"
+        ))
+        .context("prepare all_outbound_rows")?;
+    let raws = stmt
+        .query_map(params![limit], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })
+        .context("query all_outbound_rows")?
+        .collect::<rusqlite::Result<Vec<OutboundRaw>>>()
+        .context("collect all_outbound_rows")?;
+    raws.into_iter().map(to_outbound).collect()
+}
+
 /// One `sync_sources` row: a live (or historic) linkage from an app package back
 /// to one catalog source file it was built from. See [`DDL_SYNC_SOURCES`].
 ///
@@ -543,6 +574,15 @@ impl StandaloneSyncStore {
             .context("query sync_outbound by id")?;
         raw.map(to_outbound).transpose()
     }
+
+    /// Every outbound row, newest-first, capped at `limit` — the Perseus web
+    /// status page's "sent" list. Delegates to [`all_outbound_rows`]. Inherent
+    /// (not part of [`SyncStore`]) because only the web layer needs an unfiltered
+    /// listing; the engine drives itself off the state-filtered trait methods.
+    pub fn all_outbound(&self, limit: u32) -> Result<Vec<OutboundRow>> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        all_outbound_rows(&conn, limit)
+    }
 }
 
 impl SyncStore for StandaloneSyncStore {
@@ -725,6 +765,14 @@ impl CatalogSyncStore {
         let conn = self.lock_conn();
         load_receipts(&conn, &package_id.0)
     }
+
+    /// Every outbound row, newest-first, capped at `limit`. Twin of
+    /// [`StandaloneSyncStore::all_outbound`] for symmetry — see
+    /// [`all_outbound_rows`].
+    pub fn all_outbound(&self, limit: u32) -> Result<Vec<OutboundRow>> {
+        let conn = self.lock_conn();
+        all_outbound_rows(&conn, limit)
+    }
 }
 
 impl SyncStore for CatalogSyncStore {
@@ -824,5 +872,51 @@ impl SyncStore for CatalogSyncStore {
     fn search_history(&self, q: HistoryQuery) -> Result<Vec<HistoryRow>> {
         let conn = self.lock_conn();
         search_history_rows(&conn, &q)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PEER: NodeId = [7u8; 32];
+
+    /// `all_outbound` returns EVERY state (unlike `confirmed`), newest-id-first,
+    /// and honours the `limit` cap.
+    #[test]
+    fn all_outbound_returns_every_state_newest_first_capped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
+
+        // Three packages in distinct states.
+        let queued = store.enqueue("pkg-queued", PEER).unwrap();
+        let transferring = store.enqueue("pkg-transferring", PEER).unwrap();
+        let confirmed = store.enqueue("pkg-confirmed", PEER).unwrap();
+        store.set_state(transferring, OutboundState::Transferring).unwrap();
+        store.confirm(confirmed, &[]).unwrap();
+
+        let rows = store.all_outbound(100).unwrap();
+        assert_eq!(rows.len(), 3, "every row is returned regardless of state");
+        // Newest id first.
+        assert_eq!(rows[0].id, confirmed);
+        assert_eq!(rows[1].id, transferring);
+        assert_eq!(rows[2].id, queued);
+        // States are preserved, including the non-confirmed ones `confirmed()` hides.
+        assert_eq!(rows[0].state, OutboundState::Confirmed);
+        assert_eq!(rows[1].state, OutboundState::Transferring);
+        assert_eq!(rows[2].state, OutboundState::Queued);
+
+        // The limit caps the result and keeps the newest rows.
+        let capped = store.all_outbound(1).unwrap();
+        assert_eq!(capped.len(), 1);
+        assert_eq!(capped[0].id, confirmed, "the cap keeps the newest rows");
+    }
+
+    /// An empty store yields an empty list, never an error.
+    #[test]
+    fn all_outbound_empty_store_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
+        assert!(store.all_outbound(50).unwrap().is_empty());
     }
 }

@@ -5269,6 +5269,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "athenaeum-core",
+ "axum",
  "chrono",
  "clap",
  "iroh",
@@ -5282,6 +5283,7 @@ dependencies = [
  "tokio",
  "toml 0.8.2",
  "toml_edit 0.23.7",
+ "tower",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

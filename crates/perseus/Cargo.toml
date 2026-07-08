@@ -37,8 +37,16 @@ toml_edit = "0.23"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 notify = "6"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "sync"] }
+# "net" is required for the embedded web status page's `tokio::net::TcpListener`
+# (task 9). It is already enabled transitively by iroh, but Perseus uses the API
+# directly, so it declares the feature explicitly rather than relying on
+# workspace feature-unification.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "fs", "sync", "net"] }
 tracing = "0.1"
+# Embedded web status page (task 9): axum 0.8 router + bearer-auth middleware +
+# read-only status/sent/history endpoints. Pinned to the same major the web
+# crate uses so cargo unifies the dependency.
+axum = "0.8"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 # perseus_seen: Perseus's own store-aware dedup table, opened as a second
@@ -65,3 +73,7 @@ libc = "0.2"
 tempfile = "3"
 # Mock HTTP hub for the account login / pairing-resolution tests (task M1).
 wiremock = "0.6"
+# `ServiceExt::oneshot` to drive the web router in-process (no bound socket) in
+# the web.rs handler tests. `util` is the only feature needed. Version matches
+# the web crate so cargo unifies the dependency.
+tower = { version = "0.5", features = ["util"] }

@@ -471,6 +471,8 @@ mod tests {
             retention: RetentionConfig::default(),
             stability_secs: 1,
             poll_interval_secs: 1,
+            web_bind: String::new(),
+            web_token: None,
         }
     }
 

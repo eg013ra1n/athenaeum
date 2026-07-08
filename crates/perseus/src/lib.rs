@@ -24,6 +24,9 @@
 //! - [`seen`] — durable, stat-aware "already enqueued this exact file" dedup
 //!   (`perseus_seen` table), so a restart never re-baselines an un-synced
 //!   frame into oblivion.
+//! - [`web`] — the embedded status-page server: an axum router with bearer auth
+//!   and read-only status/sent/history endpoints (task 9); Task 10 adds write
+//!   handlers onto the same router.
 
 pub mod account;
 pub mod config;
@@ -31,6 +34,7 @@ pub mod config_edit;
 pub mod run;
 pub mod seen;
 pub mod watcher;
+pub mod web;
 
 pub use config::Config;
 pub use run::Agent;

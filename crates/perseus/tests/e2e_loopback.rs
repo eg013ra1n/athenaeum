@@ -66,6 +66,11 @@ fn test_config(capture_dir: &Path, data_dir: &Path) -> Config {
         },
         stability_secs: 1,
         poll_interval_secs: 1,
+        // The web status page is disabled in the loopback e2e (and would never
+        // bind anyway — these agents use `start_with_transport`, which never
+        // spawns the server).
+        web_bind: String::new(),
+        web_token: None,
     }
 }
 
@@ -86,6 +91,11 @@ fn test_config_multi(capture_dirs: &[&Path], data_dir: &Path) -> Config {
         },
         stability_secs: 1,
         poll_interval_secs: 1,
+        // The web status page is disabled in the loopback e2e (and would never
+        // bind anyway — these agents use `start_with_transport`, which never
+        // spawns the server).
+        web_bind: String::new(),
+        web_token: None,
     }
 }
 

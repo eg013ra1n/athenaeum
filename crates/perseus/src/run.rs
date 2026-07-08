@@ -201,6 +201,10 @@ pub struct Agent {
     watchers: Vec<WatcherHandle>,
     enqueue_task: Option<JoinHandle<()>>,
     retention_task: Option<JoinHandle<()>>,
+    /// The embedded web status-page server task (task 9), when armed. `None` on
+    /// the transport-injection path (tests) and when `web_bind` is empty. Aborted
+    /// on shutdown — it holds only `Arc` clones + a bound listener.
+    web_task: Option<JoinHandle<()>>,
     /// Live-edit channel for the retention config (task 8). The retention loop
     /// holds the matching receiver and re-borrows it every pass, so a `send`
     /// here takes effect on the next tick without an agent restart. The web
@@ -216,7 +220,15 @@ impl Agent {
     /// peer + relays resolved via the shared resolver (task M1) — account pairing
     /// (primary from the hub device list) → dev ticket → error. `watch` arms the
     /// capture watcher (true for `run`, false for `enqueue-backlog`).
-    pub async fn start(config: Config, watch: bool) -> Result<Self> {
+    ///
+    /// `config_path` is the on-disk `perseus.toml` this config was loaded from —
+    /// carried into the web status page's [`WebState`](crate::web::WebState) so
+    /// Task 10's retention edit can write it back. The embedded web server (task
+    /// 9) is spawned here (the production entry point), only when `watch` is set
+    /// and `web_bind` is non-empty; the transport-injection path
+    /// ([`start_with_transport`](Self::start_with_transport)) never binds it, so
+    /// the loopback e2e tests run many agents without contending for the port.
+    pub async fn start(config: Config, config_path: PathBuf, watch: bool) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
 
@@ -262,7 +274,48 @@ impl Agent {
         );
 
         let transport: Arc<dyn SharingTransport> = Arc::new(transport);
-        Self::start_with_transport(config, transport, peer, node_id, watch).await
+        let mut agent = Self::start_with_transport(config, transport, peer, node_id, watch).await?;
+        // Web status page: production run path only, and only when armed +
+        // enabled. Bound here (after the agent's store/engine/retention_tx
+        // exist) rather than inside `start_with_transport`, so the loopback e2e
+        // tests — which inject a transport and never call `start` — do not each
+        // try to bind the same port.
+        if watch {
+            agent.spawn_web_server(config_path).await?;
+        }
+        Ok(agent)
+    }
+
+    /// Bind and spawn the embedded web status page (task 9) if `web_bind` is
+    /// non-empty. The auth token is snapshotted here (an auth change needs a
+    /// restart). A non-loopback bind without a token was already refused by
+    /// [`Config::validate`], so binding wide-open is unreachable.
+    async fn spawn_web_server(&mut self, config_path: PathBuf) -> Result<()> {
+        if self.config.web_bind.is_empty() {
+            tracing::info!("web status page disabled (web_bind empty)");
+            return Ok(());
+        }
+        let token = self.config.web_token.clone();
+        let web_state = Arc::new(crate::web::WebState {
+            store: Arc::clone(&self.store),
+            engine: Arc::clone(&self.engine),
+            config_path,
+            config: tokio::sync::RwLock::new(self.config.clone()),
+            retention_tx: self.retention_tx.clone(),
+            device_names: std::collections::HashMap::new(),
+            capture_dirs: self.config.capture_dirs_resolved(),
+        });
+        let listener = tokio::net::TcpListener::bind(&self.config.web_bind)
+            .await
+            .with_context(|| format!("bind web status page {}", self.config.web_bind))?;
+        tracing::info!(bind = %self.config.web_bind, "web status page online");
+        let router = crate::web::build_router(web_state, token);
+        self.web_task = Some(tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router).await {
+                tracing::error!(error = %e, "web status page server exited");
+            }
+        }));
+        Ok(())
     }
 
     /// Start an agent over a caller-supplied transport + peer. This is the
@@ -368,6 +421,9 @@ impl Agent {
             watchers,
             enqueue_task,
             retention_task,
+            // The web server is bound only by `start` (production run path), never
+            // on the transport-injection path this constructor serves.
+            web_task: None,
             retention_tx,
         })
     }
@@ -413,10 +469,12 @@ impl Agent {
     /// Gracefully stop the watcher, drain the enqueue consumer, and shut the
     /// engine down (awaiting its worker).
     pub async fn shutdown(self) {
-        // The retention loop is an independent timer task; abort it directly (it
-        // holds only Arc clones + a watch receiver, nothing to drain). Dropping
-        // `self.retention_tx` at end of scope would also break it via
-        // `rx.changed()` erroring, but the explicit abort is immediate.
+        // The web status page + retention loop are independent tasks holding only
+        // Arc clones (and, for the web task, a bound listener); abort them
+        // directly — there is nothing to drain.
+        if let Some(t) = self.web_task {
+            t.abort();
+        }
         if let Some(t) = self.retention_task {
             t.abort();
         }
@@ -454,6 +512,9 @@ impl Agent {
             t.abort();
         }
         if let Some(t) = self.retention_task {
+            t.abort();
+        }
+        if let Some(t) = self.web_task {
             t.abort();
         }
         // `self.engine` (and `self.store`/`self.seen`) drop here, at end of scope.

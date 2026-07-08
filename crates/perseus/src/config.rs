@@ -82,6 +82,14 @@ fn default_retention_interval_secs() -> u64 {
     DEFAULT_RETENTION_INTERVAL_SECS
 }
 
+/// Default local status-page bind address (loopback only). Overridable in TOML;
+/// an empty string disables the embedded web server entirely.
+pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:8686";
+
+fn default_web_bind() -> String {
+    DEFAULT_WEB_BIND.to_string()
+}
+
 /// Agent operating mode. MVP has a single value; the enum exists so an unknown
 /// mode is a clear parse error rather than a silently ignored string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +256,17 @@ pub struct Config {
     pub stability_secs: u64,
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,
+    /// Local web status page bind address (task 9). Defaults to loopback
+    /// (`127.0.0.1:8686`). An empty string disables the embedded server. A
+    /// non-loopback bind requires [`web_token`](Self::web_token) —
+    /// [`validate`](Self::validate) refuses to start otherwise.
+    #[serde(default = "default_web_bind")]
+    pub web_bind: String,
+    /// Bearer token required for a non-loopback [`web_bind`](Self::web_bind).
+    /// Absent by default; only meaningful when the status page is exposed off
+    /// loopback, where it becomes mandatory (validation-enforced).
+    #[serde(default)]
+    pub web_token: Option<String>,
 }
 
 impl Config {
@@ -379,6 +398,22 @@ impl Config {
         if self.retention.interval_secs == 0 {
             bail!("retention.interval_secs must be >= 1");
         }
+        // Web status page (task 9). Empty disables it. A non-loopback bind MUST
+        // carry a bearer token — otherwise anyone who can reach the port could
+        // read transfer history and (task 10) edit retention. Refuse to START
+        // rather than silently binding wide-open; this is a hard startup gate,
+        // not a runtime 401.
+        if !self.web_bind.is_empty() {
+            let addr: std::net::SocketAddr = self.web_bind.parse().map_err(|e| {
+                anyhow::anyhow!("web_bind is not a valid socket address ({}): {e}", self.web_bind)
+            })?;
+            if !addr.ip().is_loopback() && self.web_token.as_deref().unwrap_or("").is_empty() {
+                bail!(
+                    "web_bind {} is not loopback — set web_token to protect the status page",
+                    self.web_bind
+                );
+            }
+        }
         Ok(())
     }
 
@@ -433,6 +468,17 @@ mode = "auto"
 policy = "keep_everything"
 dry_run = true
 "#,
+            capture_dir.display()
+        )
+    }
+
+    /// The top-level keys of a valid config (no `[retention]` table, which
+    /// defaults when omitted). Callers append further **top-level** keys — e.g.
+    /// `web_bind` — which must precede any table, then optionally their own
+    /// table. Used by the task-9 web-bind tests.
+    fn good_toml_top(capture_dir: &Path) -> String {
+        format!(
+            "capture_dir = \"{}\"\ndata_dir = \"/var/lib/perseus\"\npairing_ticket = \"ticket-abc\"\nmode = \"auto\"\n",
             capture_dir.display()
         )
     }
@@ -857,6 +903,69 @@ interval_secs = 600
         );
         let err = Config::from_toml_str(&text).expect_err("disk_max_pct=150 must fail");
         assert!(err.chain().any(|c| c.to_string().contains("disk_max_pct")));
+    }
+
+    /// Task 9: `web_bind` defaults to the loopback status-page address when the
+    /// key is absent, and needs no token there.
+    #[test]
+    fn web_bind_defaults_to_loopback() {
+        let capture = tempfile::tempdir().unwrap();
+        let cfg = Config::from_toml_str(&good_toml(capture.path())).unwrap();
+        assert_eq!(cfg.web_bind, DEFAULT_WEB_BIND);
+        assert_eq!(cfg.web_bind, "127.0.0.1:8686");
+        assert!(cfg.web_token.is_none(), "no token needed for a loopback bind");
+    }
+
+    /// Task 9: a non-loopback bind WITHOUT a token is refused at validation with
+    /// an actionable message — it must never silently bind wide-open.
+    #[test]
+    fn non_loopback_web_bind_without_token_is_rejected() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            "{}web_bind = \"0.0.0.0:8686\"\n",
+            good_toml_top(capture.path())
+        );
+        let err = Config::from_toml_str(&text).expect_err("wide-open bind without token must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("web_token") && msg.contains("loopback"),
+            "error must name web_token and loopback: {msg}"
+        );
+    }
+
+    /// Task 9: a non-loopback bind WITH a token validates.
+    #[test]
+    fn non_loopback_web_bind_with_token_is_accepted() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            "{}web_bind = \"0.0.0.0:8686\"\nweb_token = \"s3cret\"\n",
+            good_toml_top(capture.path())
+        );
+        let cfg = Config::from_toml_str(&text).expect("token-protected wide bind is valid");
+        assert_eq!(cfg.web_bind, "0.0.0.0:8686");
+        assert_eq!(cfg.web_token.as_deref(), Some("s3cret"));
+    }
+
+    /// Task 9: an empty `web_bind` disables the server and is always valid — no
+    /// token, no address parsing.
+    #[test]
+    fn empty_web_bind_disables_server_and_is_valid() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!("{}web_bind = \"\"\n", good_toml_top(capture.path()));
+        let cfg = Config::from_toml_str(&text).expect("empty web_bind is valid (disabled)");
+        assert!(cfg.web_bind.is_empty());
+    }
+
+    /// Task 9: a malformed `web_bind` is a parse error at validation.
+    #[test]
+    fn malformed_web_bind_is_rejected() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!("{}web_bind = \"not-an-address\"\n", good_toml_top(capture.path()));
+        let err = Config::from_toml_str(&text).expect_err("malformed web_bind must fail");
+        assert!(
+            format!("{err:#}").contains("web_bind"),
+            "error must name web_bind: {err:#}"
+        );
     }
 
     #[test]
