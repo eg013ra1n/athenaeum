@@ -65,6 +65,51 @@ pub async fn clear_calibration_library_dir(state: State<'_, AppState>) -> Result
     api::clear_calibration_library_dir(&state.ctx).map_err(|e| e.to_string())
 }
 
+/// The sync-incoming folder (personal-sync receiver write destination), if
+/// configured.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_sync_incoming_dir(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    api::get_sync_incoming_dir(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// Designate the sync-incoming folder. Returns the normalized effective path.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_sync_incoming_dir(path: String, state: State<'_, AppState>) -> Result<String, String> {
+    api::set_sync_incoming_dir(&state.ctx, path, &PathPolicy::AllowAll).map_err(|e| e.to_string())
+}
+
+/// Clear the sync-incoming folder (demotes the root to a normal monitored
+/// directory; never deletes it).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn clear_sync_incoming_dir(state: State<'_, AppState>) -> Result<(), String> {
+    api::clear_sync_incoming_dir(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// The collaboration folder, if configured.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_collaboration_dir(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    api::get_collaboration_dir(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// Designate the collaboration folder. Returns the normalized effective path.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_collaboration_dir(path: String, state: State<'_, AppState>) -> Result<String, String> {
+    api::set_collaboration_dir(&state.ctx, path, &PathPolicy::AllowAll).map_err(|e| e.to_string())
+}
+
+/// Clear the collaboration folder (demotes the root to a normal monitored
+/// directory; never deletes it).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn clear_collaboration_dir(state: State<'_, AppState>) -> Result<(), String> {
+    api::clear_collaboration_dir(&state.ctx).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn delete_scan_root(id: i64, state: State<'_, AppState>) -> Result<(), String> {

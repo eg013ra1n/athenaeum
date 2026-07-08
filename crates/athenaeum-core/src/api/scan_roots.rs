@@ -83,29 +83,49 @@ pub fn get_scan_roots(ctx: &ServiceContext) -> Result<Vec<ScanRoot>, ApiError> {
     Ok(crate::db::get_scan_roots(&conn)?)
 }
 
-/// Validate a scan-root `kind` value: `"normal"` | `"calibration_library"`,
-/// anything else is `ApiError::Invalid`. Runs at the top of `add_scan_root`,
-/// before any path/DB work.
+/// Scan-root kinds that are enforced unique across all roots and are managed
+/// through dedicated designate/clear commands rather than the plain
+/// add/delete flow. Each is guarded against plain deletion (see
+/// [`guard_against_special_root_deletion`]).
+pub(crate) const SPECIAL_ROOT_KINDS: &[&str] =
+    &["calibration_library", "sync_incoming", "collaboration"];
+
+/// Human-facing label for a special scan-root kind, used in the uniqueness /
+/// deletion-guard error messages. The `"Calibration Library"` wording is
+/// load-bearing: `set_calibration_library_dir` string-matches on it — do not
+/// change it.
+fn special_root_label(kind: &str) -> &'static str {
+    match kind {
+        "calibration_library" => "Calibration Library",
+        "sync_incoming" => "Sync incoming folder",
+        "collaboration" => "Collaboration folder",
+        _ => "special",
+    }
+}
+
+/// Validate a scan-root `kind` value: `"normal"` or one of
+/// [`SPECIAL_ROOT_KINDS`]; anything else is `ApiError::Invalid`. Runs at the
+/// top of `add_scan_root`, before any path/DB work.
 pub(crate) fn validate_scan_root_kind(kind: &str) -> Result<(), ApiError> {
-    if kind != "normal" && kind != "calibration_library" {
+    if kind != "normal" && !SPECIAL_ROOT_KINDS.contains(&kind) {
         return Err(ApiError::Invalid(format!("unknown scan root kind: {kind}")));
     }
     Ok(())
 }
 
-/// Single-library-root enforcement: adding a `"calibration_library"` root
-/// when one already exists is `ApiError::Conflict`. A no-op for `"normal"`.
-/// Runs in `add_scan_root` after overlap validation, before the DB write.
-pub(crate) fn check_library_root_uniqueness(
+/// Single-special-root enforcement: adding a root whose `kind` is one of
+/// [`SPECIAL_ROOT_KINDS`] when one already exists is `ApiError::Conflict`.
+/// A no-op for `"normal"`. Runs in `add_scan_root` after overlap validation,
+/// before the DB write.
+pub(crate) fn check_special_root_uniqueness(
     conn: &rusqlite::Connection,
     kind: &str,
 ) -> Result<(), ApiError> {
-    if kind == "calibration_library"
-        && crate::db::count_scan_roots_of_kind(conn, "calibration_library")? > 0
-    {
-        return Err(ApiError::Conflict(
-            "A Calibration Library root already exists — only one is allowed".to_string(),
-        ));
+    if SPECIAL_ROOT_KINDS.contains(&kind) && crate::db::count_scan_roots_of_kind(conn, kind)? > 0 {
+        return Err(ApiError::Conflict(format!(
+            "A {} root already exists — only one is allowed",
+            special_root_label(kind)
+        )));
     }
     Ok(())
 }
@@ -119,17 +139,18 @@ pub(crate) fn check_library_root_uniqueness(
 /// Overlap/duplicate cases return `ApiError::Conflict` — matching the web
 /// route's pre-conversion `StatusCode::CONFLICT` mapping.
 ///
-/// `kind` defaults to `"normal"` when `None`. `"calibration_library"` is
-/// enforced unique across all scan roots (`ApiError::Conflict` if another
-/// library root already exists); any other value is `ApiError::Invalid`.
+/// `kind` defaults to `"normal"` when `None`. Each of [`SPECIAL_ROOT_KINDS`]
+/// (`"calibration_library"`, `"sync_incoming"`, `"collaboration"`) is enforced
+/// unique across all scan roots (`ApiError::Conflict` if a root of that kind
+/// already exists); any other value is `ApiError::Invalid`.
 /// Note: the overlap checks below reject a new root that is a subdirectory
-/// of an existing one — so a calibration_library root nested inside an
-/// existing scan root is rejected too. That's intentional: the library is
-/// itself just a normal scanned root, so it must live outside every other
-/// registered root rather than inside one.
+/// of an existing one — so a special-kind root nested inside an existing scan
+/// root is rejected too. That's intentional: a special root is itself just a
+/// normal scanned root, so it must live outside every other registered root
+/// rather than inside one.
 ///
 /// The kind checks themselves live in `validate_scan_root_kind` /
-/// `check_library_root_uniqueness` (extracted so they're testable at the
+/// `check_special_root_uniqueness` (extracted so they're testable at the
 /// `Connection` level without a full `ServiceContext`).
 pub fn add_scan_root(
     ctx: &ServiceContext,
@@ -197,10 +218,10 @@ pub fn add_scan_root(
         }
     }
 
-    // 5. Single-library-root enforcement — checked after overlap validation
+    // 5. Single-special-root enforcement — checked after overlap validation
     //    so a doomed-anyway overlapping add doesn't get misreported as a
-    //    library-uniqueness conflict.
-    check_library_root_uniqueness(&conn, &kind)?;
+    //    uniqueness conflict.
+    check_special_root_uniqueness(&conn, &kind)?;
 
     // 6. Store the canonicalized path
     let path_str = new_path.to_string_lossy().to_string();
@@ -340,7 +361,7 @@ pub fn set_calibration_library_dir(
         add_scan_root(ctx, path_str.clone(), policy, Some("calibration_library".to_string()))
             .map_err(|e| match e {
                 // Minor-4/5: switching from one standalone calibration
-                // folder to another hits `check_library_root_uniqueness`'s
+                // folder to another hits `check_special_root_uniqueness`'s
                 // bare "only one is allowed" — a dead end unless the
                 // operator already knows the fix. Spell it out here rather
                 // than leaving them to reverse-engineer it. Overlap
@@ -383,6 +404,106 @@ pub fn clear_calibration_library_dir(ctx: &ServiceContext) -> Result<(), ApiErro
     Ok(())
 }
 
+// ── Sync-incoming / collaboration special roots (Task 4) ────────────────────
+//
+// Same designate/get/clear shape as the calibration library, but a simpler
+// storage model: the folder IS its own dedicated scan root (there is no
+// settings-key precedence layer). One root per kind, enforced by
+// `check_special_root_uniqueness` inside `add_scan_root`; guarded against
+// plain deletion by `guard_against_special_root_deletion`.
+
+/// Path of the (single) scan root of `kind`, if configured. Shared by the
+/// `sync_incoming` / `collaboration` getters and the deletion guard.
+fn resolve_special_root_dir(
+    conn: &rusqlite::Connection,
+    kind: &str,
+) -> Result<Option<String>, ApiError> {
+    Ok(crate::db::get_scan_roots(conn)?
+        .into_iter()
+        .find(|r| r.kind == kind)
+        .map(|r| r.path))
+}
+
+fn get_special_root_dir(ctx: &ServiceContext, kind: &str) -> Result<Option<String>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    resolve_special_root_dir(&conn, kind)
+}
+
+/// Designate `path` as the (single) root of `kind`. Routes through
+/// `add_scan_root` — which validates existence/dir, canonicalizes, sandboxes
+/// against `policy`, rejects overlap with existing roots, and enforces
+/// single-`kind` uniqueness (`ApiError::Conflict`) — exactly like the
+/// calibration setter's standalone-folder branch. Returns the normalized path.
+fn set_special_root_dir(
+    ctx: &ServiceContext,
+    path: String,
+    policy: &PathPolicy,
+    kind: &str,
+) -> Result<String, ApiError> {
+    let root = add_scan_root(ctx, path, policy, Some(kind.to_string()))?;
+    tracing::info!(path = %root.path, kind, "special scan root designated");
+    Ok(root.path)
+}
+
+/// Clear the (single) root of `kind` by DEMOTING it back to a `"normal"`
+/// monitored directory — never deletes the row. Mirrors
+/// `clear_calibration_library_dir`'s "never deletes any scan root": the folder
+/// stays monitored and is removable through the regular scan-root list, while
+/// the getter now returns `None` (no root of that kind resolves) and the
+/// deletion guard no longer blocks it.
+fn clear_special_root_dir(ctx: &ServiceContext, kind: &str) -> Result<(), ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    conn.execute(
+        "UPDATE scan_roots SET kind = 'normal' WHERE kind = ?1",
+        rusqlite::params![kind],
+    )?;
+    tracing::info!(kind, "special scan root cleared");
+    Ok(())
+}
+
+/// Sync-incoming folder — where the personal-sync receiver writes files
+/// pulled from a paired capture device (consumed by Task 5). `None` when
+/// unconfigured.
+pub fn get_sync_incoming_dir(ctx: &ServiceContext) -> Result<Option<String>, ApiError> {
+    get_special_root_dir(ctx, "sync_incoming")
+}
+
+/// Designate the sync-incoming folder. See [`set_special_root_dir`].
+pub fn set_sync_incoming_dir(
+    ctx: &ServiceContext,
+    path: String,
+    policy: &PathPolicy,
+) -> Result<String, ApiError> {
+    set_special_root_dir(ctx, path, policy, "sync_incoming")
+}
+
+/// Clear the sync-incoming folder (demotes to a normal monitored directory).
+pub fn clear_sync_incoming_dir(ctx: &ServiceContext) -> Result<(), ApiError> {
+    clear_special_root_dir(ctx, "sync_incoming")
+}
+
+/// Collaboration folder — the shared drop location for a collaboration
+/// workflow. `None` when unconfigured.
+pub fn get_collaboration_dir(ctx: &ServiceContext) -> Result<Option<String>, ApiError> {
+    get_special_root_dir(ctx, "collaboration")
+}
+
+/// Designate the collaboration folder. See [`set_special_root_dir`].
+pub fn set_collaboration_dir(
+    ctx: &ServiceContext,
+    path: String,
+    policy: &PathPolicy,
+) -> Result<String, ApiError> {
+    set_special_root_dir(ctx, path, policy, "collaboration")
+}
+
+/// Clear the collaboration folder (demotes to a normal monitored directory).
+pub fn clear_collaboration_dir(ctx: &ServiceContext) -> Result<(), ApiError> {
+    clear_special_root_dir(ctx, "collaboration")
+}
+
 /// Best-effort canonicalize for path comparison: falls back to the raw path
 /// when the target no longer exists on disk (a stale registered path, or a
 /// calibration folder the operator already deleted outside the app — see
@@ -396,34 +517,56 @@ fn canonical_or_raw(path: &str) -> std::path::PathBuf {
 }
 
 /// Guard behind `delete_scan_root`'s Critical-1 fix: refuses to delete a
-/// root whose subtree contains (or IS) the currently active
-/// calibration-library directory. `db::delete_scan_root` purges files,
-/// frames, etc. by path PREFIX with no awareness of the calibration library,
-/// so an unguarded delete would silently wipe a nested calibration folder's
-/// registered masters (or a dedicated library root's own masters) with no
-/// way back. A *vestigial* `calibration_library`-kind root — one the
-/// `calibration.library_dir` setting no longer points at, e.g. superseded by
-/// a folder configured elsewhere — is intentionally NOT blocked: deleting it
-/// is the documented cleanup path (Minor-5).
+/// root whose subtree contains (or IS) a currently active special-kind
+/// directory ([`SPECIAL_ROOT_KINDS`]). `db::delete_scan_root` purges files,
+/// frames, etc. by path PREFIX with no awareness of these special roots, so an
+/// unguarded delete would silently wipe a nested calibration folder's
+/// registered masters (or a dedicated special root's own contents) with no
+/// way back.
+///
+/// - **Calibration library**: resolved via the settings-key-aware
+///   [`resolve_calibration_library_dir`] (covers the nested-folder case AND
+///   the dedicated-root case). A *vestigial* `calibration_library`-kind root —
+///   one the `calibration.library_dir` setting no longer points at — is
+///   intentionally NOT blocked: deleting it is the documented cleanup path
+///   (Minor-5).
+/// - **Sync-incoming / collaboration**: dedicated roots resolved directly by
+///   kind. Blocked so they can only be removed through their own `clear_*`
+///   command, which demotes them back to a normal monitored directory (after
+///   which this guard no longer blocks them).
 ///
 /// Extracted to `Connection` level (no `ServiceContext`) so it's directly
 /// testable with an in-memory DB + real temp dirs — same pattern as
-/// `check_library_root_uniqueness` / `resolve_calibration_library_dir` above.
-pub(crate) fn guard_against_calibration_library_deletion(
+/// `check_special_root_uniqueness` / `resolve_calibration_library_dir` above.
+pub(crate) fn guard_against_special_root_deletion(
     conn: &rusqlite::Connection,
     root_path: &str,
 ) -> Result<(), ApiError> {
-    let Some(lib_dir) = resolve_calibration_library_dir(conn)? else {
-        return Ok(());
-    };
     let root_canon = canonical_or_raw(root_path);
-    let lib_canon = canonical_or_raw(&lib_dir);
-    // `starts_with` covers both the nested-folder case and the
-    // dedicated-root case (a path starts_with itself).
-    if lib_canon.starts_with(&root_canon) {
-        return Err(ApiError::Conflict(format!(
-            "This directory contains your Calibration Folder ({lib_dir}). Clear or move the Calibration Folder in File Manager first, then remove the directory."
-        )));
+
+    // Calibration library — settings-key-aware resolver. `starts_with` covers
+    // both the nested-folder case and the dedicated-root case (a path
+    // starts_with itself).
+    if let Some(lib_dir) = resolve_calibration_library_dir(conn)? {
+        if canonical_or_raw(&lib_dir).starts_with(&root_canon) {
+            return Err(ApiError::Conflict(format!(
+                "This directory contains your Calibration Folder ({lib_dir}). Clear or move the Calibration Folder in File Manager first, then remove the directory."
+            )));
+        }
+    }
+
+    // Sync-incoming / collaboration — dedicated roots resolved directly by
+    // kind. (Calibration is handled above via its settings-key resolver, so it
+    // is not repeated here.)
+    for kind in ["sync_incoming", "collaboration"] {
+        if let Some(dir) = resolve_special_root_dir(conn, kind)? {
+            if canonical_or_raw(&dir).starts_with(&root_canon) {
+                let label = special_root_label(kind);
+                return Err(ApiError::Conflict(format!(
+                    "This directory is your {label} ({dir}). Clear the {label} in File Manager first, then remove the directory."
+                )));
+            }
+        }
     }
     Ok(())
 }
@@ -445,7 +588,7 @@ pub fn delete_scan_root(ctx: &ServiceContext, id: i64) -> Result<(), ApiError> {
                 ApiError::Internal(format!("Failed to get scan root: {}", e))
             }
         })?;
-    guard_against_calibration_library_deletion(&conn, &root_path)?;
+    guard_against_special_root_deletion(&conn, &root_path)?;
 
     Ok(crate::db::delete_scan_root(&conn, id)?)
 }
@@ -1032,6 +1175,8 @@ mod kind_check_tests {
     fn known_kinds_pass_validation() {
         assert!(validate_scan_root_kind("normal").is_ok());
         assert!(validate_scan_root_kind("calibration_library").is_ok());
+        assert!(validate_scan_root_kind("sync_incoming").is_ok());
+        assert!(validate_scan_root_kind("collaboration").is_ok());
     }
 
     // ── resolve_calibration_library_dir precedence ───────────────────────
@@ -1085,7 +1230,7 @@ mod kind_check_tests {
         let conn = test_conn();
         crate::db::upsert_scan_root(&conn, "/lib/a", "calibration_library").unwrap();
         assert!(matches!(
-            check_library_root_uniqueness(&conn, "calibration_library"),
+            check_special_root_uniqueness(&conn, "calibration_library"),
             Err(ApiError::Conflict(_))
         ));
     }
@@ -1094,17 +1239,17 @@ mod kind_check_tests {
     fn normal_kind_is_ok_despite_existing_library_root() {
         let conn = test_conn();
         crate::db::upsert_scan_root(&conn, "/lib/a", "calibration_library").unwrap();
-        assert!(check_library_root_uniqueness(&conn, "normal").is_ok());
+        assert!(check_special_root_uniqueness(&conn, "normal").is_ok());
     }
 
     #[test]
     fn first_library_root_is_ok() {
         let conn = test_conn();
-        assert!(check_library_root_uniqueness(&conn, "calibration_library").is_ok());
+        assert!(check_special_root_uniqueness(&conn, "calibration_library").is_ok());
     }
 }
 
-/// Critical-1 fix round — `guard_against_calibration_library_deletion`
+/// Critical-1 fix round — `guard_against_special_root_deletion`
 /// exercised at `Connection` level with real temp dirs (canonicalize needs
 /// real paths on disk), matching the "test the extracted real logic"
 /// convention established in `kind_check_tests` above. Covers the five
@@ -1139,7 +1284,7 @@ mod delete_guard_tests {
         .unwrap();
 
         assert!(matches!(
-            guard_against_calibration_library_deletion(&conn, &root_path),
+            guard_against_special_root_deletion(&conn, &root_path),
             Err(ApiError::Conflict(_))
         ));
     }
@@ -1159,7 +1304,7 @@ mod delete_guard_tests {
         )
         .unwrap();
 
-        assert!(guard_against_calibration_library_deletion(&conn, &root_a_path).is_ok());
+        assert!(guard_against_special_root_deletion(&conn, &root_a_path).is_ok());
     }
 
     #[test]
@@ -1174,7 +1319,7 @@ mod delete_guard_tests {
         crate::db::upsert_scan_root(&conn, &lib_root_path, "calibration_library").unwrap();
 
         assert!(matches!(
-            guard_against_calibration_library_deletion(&conn, &lib_root_path),
+            guard_against_special_root_deletion(&conn, &lib_root_path),
             Err(ApiError::Conflict(_))
         ));
     }
@@ -1196,7 +1341,7 @@ mod delete_guard_tests {
         )
         .unwrap();
 
-        assert!(guard_against_calibration_library_deletion(&conn, &old_lib_root_path).is_ok());
+        assert!(guard_against_special_root_deletion(&conn, &old_lib_root_path).is_ok());
     }
 
     #[test]
@@ -1216,14 +1361,14 @@ mod delete_guard_tests {
         .unwrap();
 
         // Blocked before clearing...
-        assert!(guard_against_calibration_library_deletion(&conn, &root_path).is_err());
+        assert!(guard_against_special_root_deletion(&conn, &root_path).is_err());
 
         // clear_calibration_library_dir writes an empty value (not a
         // delete) — mirror that here rather than re-implementing via ctx.
         crate::db::set_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR, "").unwrap();
 
         // ...and allowed after.
-        assert!(guard_against_calibration_library_deletion(&conn, &root_path).is_ok());
+        assert!(guard_against_special_root_deletion(&conn, &root_path).is_ok());
     }
 }
 
@@ -1267,5 +1412,138 @@ mod set_library_dir_validation_tests {
             validate_library_dir_candidate(&missing),
             Err(ApiError::Invalid(_))
         ));
+    }
+}
+
+/// Task 4 (Stage 1.5 sync-hardening) — the `sync_incoming` / `collaboration`
+/// special scan-root kinds. Cloned from the calibration-library semantics:
+/// one root per kind, designated/cleared through dedicated commands, guarded
+/// against plain deletion. Exercised at the `ServiceContext` level (real temp
+/// catalog + real temp folders) because the setters route through
+/// `add_scan_root`, which stat-checks and canonicalizes the folder on disk.
+#[cfg(test)]
+mod special_root_tests {
+    use super::*;
+    use crate::services::ServiceContext;
+    use tempfile::TempDir;
+
+    fn test_ctx(db_dir: &TempDir) -> ServiceContext {
+        ServiceContext::new_for_tests(db_dir.path().join("catalog.db"))
+    }
+
+    fn kind_of(ctx: &ServiceContext, path: &str) -> Option<String> {
+        let db = db(ctx).unwrap();
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT kind FROM scan_roots WHERE path = ?1",
+            rusqlite::params![path],
+            |r| r.get(0),
+        )
+        .ok()
+    }
+
+    #[test]
+    fn sync_incoming_root_set_get_clear_roundtrip() {
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let folder = TempDir::new().unwrap();
+        let folder2 = TempDir::new().unwrap();
+
+        // set → get returns the (canonicalized) path, row is kind='sync_incoming'
+        let stored = set_sync_incoming_dir(
+            &ctx,
+            folder.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .unwrap();
+        assert_eq!(get_sync_incoming_dir(&ctx).unwrap(), Some(stored.clone()));
+        assert_eq!(kind_of(&ctx, &stored).as_deref(), Some("sync_incoming"));
+
+        // second set of a DIFFERENT path → Conflict (per-kind uniqueness)
+        assert!(matches!(
+            set_sync_incoming_dir(
+                &ctx,
+                folder2.path().to_string_lossy().to_string(),
+                &PathPolicy::AllowAll,
+            ),
+            Err(ApiError::Conflict(_))
+        ));
+
+        // clear → get returns None; row demoted to 'normal' (never deleted),
+        // mirroring clear_calibration_library_dir's "never deletes any root".
+        clear_sync_incoming_dir(&ctx).unwrap();
+        assert_eq!(get_sync_incoming_dir(&ctx).unwrap(), None);
+        assert_eq!(kind_of(&ctx, &stored).as_deref(), Some("normal"));
+    }
+
+    #[test]
+    fn collaboration_root_uniqueness_independent_of_sync_incoming() {
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let sync_dir = TempDir::new().unwrap();
+        let collab_dir = TempDir::new().unwrap();
+        let collab_dir2 = TempDir::new().unwrap();
+
+        // one sync_incoming AND one collaboration root coexist
+        set_sync_incoming_dir(
+            &ctx,
+            sync_dir.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .unwrap();
+        set_collaboration_dir(
+            &ctx,
+            collab_dir.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .unwrap();
+        assert!(get_sync_incoming_dir(&ctx).unwrap().is_some());
+        assert!(get_collaboration_dir(&ctx).unwrap().is_some());
+
+        // a SECOND collaboration root conflicts (uniqueness is per-kind)
+        assert!(matches!(
+            set_collaboration_dir(
+                &ctx,
+                collab_dir2.path().to_string_lossy().to_string(),
+                &PathPolicy::AllowAll,
+            ),
+            Err(ApiError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn special_roots_reject_plain_delete() {
+        let db_dir = TempDir::new().unwrap();
+        let ctx = test_ctx(&db_dir);
+        let sync_dir = TempDir::new().unwrap();
+
+        let stored = set_sync_incoming_dir(
+            &ctx,
+            sync_dir.path().to_string_lossy().to_string(),
+            &PathPolicy::AllowAll,
+        )
+        .unwrap();
+
+        let id = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::get_scan_roots(&conn)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.path == stored)
+                .unwrap()
+                .id
+                .unwrap()
+        };
+
+        // plain delete is refused by the guard (same as calibration library)
+        assert!(matches!(
+            delete_scan_root(&ctx, id),
+            Err(ApiError::Conflict(_))
+        ));
+
+        // after clear demotes it to 'normal', plain delete is allowed
+        clear_sync_incoming_dir(&ctx).unwrap();
+        assert!(delete_scan_root(&ctx, id).is_ok());
     }
 }

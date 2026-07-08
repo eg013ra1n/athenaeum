@@ -45,6 +45,12 @@ pub struct SetCalibrationLibraryDirArgs {
     pub path: String,
 }
 
+/// Shared body for the sync-incoming / collaboration setters.
+#[derive(serde::Deserialize)]
+pub struct SetSpecialRootDirArgs {
+    pub path: String,
+}
+
 #[derive(serde::Deserialize)]
 pub struct StartScanArgs {
     #[serde(rename = "rootId")]
@@ -141,6 +147,75 @@ pub async fn clear_calibration_library_dir(
     _body: Json<serde_json::Value>,
 ) -> Result<Json<()>, (StatusCode, String)> {
     api::clear_calibration_library_dir(&state.ctx).map(Json).map_err(api_err)
+}
+
+/// POST /api/get_sync_incoming_dir
+///
+/// The sync-incoming folder (personal-sync receiver write destination), if
+/// configured.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_sync_incoming_dir(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<Option<String>>, (StatusCode, String)> {
+    api::get_sync_incoming_dir(&state.ctx).map(Json).map_err(api_err)
+}
+
+/// POST /api/set_sync_incoming_dir
+///
+/// Designate the sync-incoming folder. Returns the normalized effective path.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_sync_incoming_dir(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetSpecialRootDirArgs>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    api::set_sync_incoming_dir(&state.ctx, args.path, &policy)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/clear_sync_incoming_dir
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn clear_sync_incoming_dir(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    api::clear_sync_incoming_dir(&state.ctx).map(Json).map_err(api_err)
+}
+
+/// POST /api/get_collaboration_dir
+///
+/// The collaboration folder, if configured.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_collaboration_dir(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<Option<String>>, (StatusCode, String)> {
+    api::get_collaboration_dir(&state.ctx).map(Json).map_err(api_err)
+}
+
+/// POST /api/set_collaboration_dir
+///
+/// Designate the collaboration folder. Returns the normalized effective path.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_collaboration_dir(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetSpecialRootDirArgs>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    api::set_collaboration_dir(&state.ctx, args.path, &policy)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/clear_collaboration_dir
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn clear_collaboration_dir(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    api::clear_collaboration_dir(&state.ctx).map(Json).map_err(api_err)
 }
 
 /// POST /api/delete_scan_root
