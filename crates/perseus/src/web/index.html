@@ -79,6 +79,7 @@
         <div class="row" style="margin-bottom:0.5rem;">
           <button id="delSelected" class="danger" disabled>Delete selected</button>
           <span class="muted">deletes source capture files of confirmed packages only</span>
+          <span class="muted" id="pausedNote" style="display:none;">auto-refresh paused while rows are selected</span>
         </div>
         <div class="tablewrap"><table>
           <thead><tr><th></th><th>package</th><th>state</th><th>created</th><th>confirmed</th><th></th></tr></thead>
@@ -167,9 +168,15 @@
       function updateDelSelected() {
         const any = document.querySelectorAll('.rowsel:checked').length > 0;
         $('delSelected').disabled = !any;
+        $('pausedNote').style.display = any ? '' : 'none';
       }
 
       async function refreshSent() {
+        // While any row is selected the operator is mid-batch-delete: skip this
+        // tick's re-render so we don't wipe their checkboxes and re-disable the
+        // Delete-selected button. Refresh resumes as soon as the selection is
+        // empty (after Delete selected completes or the user unchecks).
+        if (document.querySelector('.rowsel:checked')) return;
         try {
           const rows = await getJson('/api/sent');
           $('senttbody').innerHTML = rows.length
