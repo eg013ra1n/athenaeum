@@ -316,7 +316,11 @@ impl Agent {
             config_path,
             config: tokio::sync::RwLock::new(self.config.clone()),
             retention_tx: self.retention_tx.clone(),
-            device_names: std::collections::HashMap::new(),
+            // Load the display-only node_id_hex → device-name map cached at the
+            // last `perseus login` / peer resolution (task 11), so `/api/history`
+            // and the page can show friendly peer names. Empty until a login has
+            // populated it; history rows always keep the hex as the stable key.
+            device_names: crate::account::PairingCache::load(&self.config.data_dir).device_names,
             capture_dirs: self.config.capture_dirs_resolved(),
             seen: Arc::clone(&self.seen),
             retention_log: Arc::clone(&self.retention_log),

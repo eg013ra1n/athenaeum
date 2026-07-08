@@ -554,6 +554,29 @@ pub fn list_history(ctx: &ServiceContext, query: SyncHistoryQuery) -> Result<Vec
     search_history_rows(&conn, &q).map_err(|e| ApiError::Internal(format!("{e:#}")))
 }
 
+/// Map of node-id-hex → hub device name, for enriching history rows (the rows
+/// store the peer node id hex as the stable key; the name is display-only).
+/// Best-effort: a hub that is unreachable or a signed-out device yields an empty
+/// map (logged at `debug`, never an error) — the UI falls back to short hex.
+pub async fn get_sync_device_names(
+    ctx: &ServiceContext,
+) -> Result<HashMap<String, String>, ApiError> {
+    let devices = match crate::api::account::list_devices(ctx).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:?}"), "device names unavailable; falling back to hex");
+            return Ok(HashMap::new());
+        }
+    };
+    let mut map = HashMap::new();
+    for d in devices {
+        if let Ok(id) = pairing::node_id_from_pubkey_b64(&d.pubkey) {
+            map.insert(node_id_hex(&id), d.name.clone());
+        }
+    }
+    Ok(map)
+}
+
 // ── App sender engine + manual/auto send (task M2) ───────────────────────────
 //
 // A capture-role app enqueues its own frames to the paired primary through a
@@ -1109,6 +1132,23 @@ mod tests {
         let urls = vec!["https://relay1.example.org".to_string(), "https://relay2.example.org".to_string()];
         store_cached_relays(&ctx, &urls);
         assert_eq!(cached_relays(&ctx).unwrap(), urls);
+    }
+
+    /// Task 11: `get_sync_device_names` is best-effort — a signed-out device
+    /// (no stored token → `list_devices` errors before any network call) must
+    /// resolve to an EMPTY map, never surface an error. The hub URL is pointed
+    /// at a bogus host so the keychain/file token lookup finds nothing and the
+    /// path is fully hermetic (no network).
+    #[tokio::test]
+    async fn device_names_empty_when_signed_out() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(&conn, keys::ACCOUNT_HUB_URL, "http://sync-test.invalid").unwrap();
+        }
+        let names = get_sync_device_names(&ctx).await.unwrap();
+        assert!(names.is_empty(), "a signed-out device resolves to an empty map, not an error");
     }
 
     // ── Manual/auto send (task M2) ───────────────────────────────────────────

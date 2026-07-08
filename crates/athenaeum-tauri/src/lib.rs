@@ -459,6 +459,7 @@ pub fn run() {
             commands::enqueue_sync_selection,
             commands::get_sync_auto_mode,
             commands::set_sync_auto_mode,
+            commands::get_sync_device_names,
             commands::account_sign_in_start,
             commands::account_sign_in_verify,
             commands::account_status,

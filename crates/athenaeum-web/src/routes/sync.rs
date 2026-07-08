@@ -111,6 +111,18 @@ pub async fn set_sync_auto_mode(
     api::set_sync_auto_mode(&state.ctx, args.enabled).map(Json).map_err(api_err)
 }
 
+/// POST /api/get_sync_device_names
+///
+/// Map of peer node-id-hex → hub device name for the transfer history. Best-
+/// effort: hub unreachable / signed out → empty map (UI falls back to short hex).
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_sync_device_names(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
+    api::get_sync_device_names(&state.ctx).await.map(Json).map_err(api_err)
+}
+
 /// The web-side [`ScanCompletionHook`] (task M2 review finding): mirrors
 /// `athenaeum-tauri::commands::sync::DesktopScanCompletionHook`. The
 /// background `MonitorService` lives in `athenaeum-core` with only a

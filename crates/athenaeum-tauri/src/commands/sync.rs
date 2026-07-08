@@ -81,6 +81,16 @@ pub async fn set_sync_auto_mode(state: State<'_, AppState>, enabled: bool) -> Re
     api::set_sync_auto_mode(&state.ctx, enabled).map_err(|e| e.to_string())
 }
 
+/// Map of peer node-id-hex → hub device name, for showing friendly names in the
+/// transfer history. Best-effort: hub unreachable / signed out → empty map.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_sync_device_names(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    api::get_sync_device_names(&state.ctx).await.map_err(|e| e.to_string())
+}
+
 /// The desktop-side [`ScanCompletionHook`] (task M2 review finding): the
 /// background `MonitorService` lives in `athenaeum-core` with only a
 /// `ServiceContext`, but the personal-sync sender runtime (`AppState.sync_sender`)

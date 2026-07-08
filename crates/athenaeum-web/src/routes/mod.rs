@@ -252,6 +252,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/enqueue_sync_selection", post(sync::enqueue_sync_selection))
         .route("/api/get_sync_auto_mode", post(sync::get_sync_auto_mode))
         .route("/api/set_sync_auto_mode", post(sync::set_sync_auto_mode))
+        .route("/api/get_sync_device_names", post(sync::get_sync_device_names))
         // Account (Stage II, task B4)
         .route("/api/account_sign_in_start", post(account::account_sign_in_start))
         .route("/api/account_sign_in_verify", post(account::account_sign_in_verify))

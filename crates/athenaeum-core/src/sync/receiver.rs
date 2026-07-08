@@ -160,7 +160,7 @@ async fn handle_announce(
     from: NodeId,
     announce: PackageAnnounce,
 ) -> Result<()> {
-    let peer_device = hex32(&from);
+    let peer_device = super::node_id_hex(&from);
     let package_id = announce.package_id.0.clone();
     emit_event(emitter, "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
@@ -281,15 +281,6 @@ async fn handle_announce(
         failed,
     });
     Ok(())
-}
-
-/// Lowercase-hex rendering of a 32-byte node id (64 chars).
-fn hex32(id: &NodeId) -> String {
-    let mut s = String::with_capacity(64);
-    for b in id {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 // ── App-lifecycle runtime holder ────────────────────────────────────────────

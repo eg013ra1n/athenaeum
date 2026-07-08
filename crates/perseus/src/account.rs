@@ -21,6 +21,7 @@
 //!   resolutions (`data_dir/pairing_cache.json`), so an offline restart still
 //!   resolves. The token is NOT in it (that is the 0600 [`TokenStore`] file).
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -53,6 +54,10 @@ pub struct PairingCache {
     /// Last successfully resolved relay URLs.
     #[serde(default)]
     pub relay_urls: Vec<String>,
+    /// node_id_hex → hub device name, refreshed whenever the device list is
+    /// fetched. Display-only (history rows keep the hex as the stable key).
+    #[serde(default)]
+    pub device_names: HashMap<String, String>,
 }
 
 impl PairingCache {
@@ -194,6 +199,7 @@ async fn verify_and_register(
     let mut cache = PairingCache::load(&config.data_dir);
     cache.device_id = Some(resp.device_id.clone());
     cache.primary_device_id = primary_id.clone();
+    cache.device_names = device_names_from(&devices);
     cache.save(&config.data_dir);
 
     tracing::info!(device_id = %resp.device_id, "perseus signed in");
@@ -314,6 +320,7 @@ async fn build_account_pairing(
                      or run once while the hub is reachable): {e}"
                 )
             })?;
+            cache.device_names = device_names_from(&devices);
             let id = auto_pick_primary(&devices)?
                 .ok_or_else(|| anyhow!("no primary device in the account — set the primary role on your main machine first"))?;
             cache.primary_device_id = Some(id.clone());
@@ -345,6 +352,20 @@ fn auto_pick_primary(
              to choose which one this capture node pairs with"
         ),
     }
+}
+
+/// Build the node_id_hex → device-name map from a hub device list, for the
+/// pairing cache's display-only [`PairingCache::device_names`]. A device whose
+/// pubkey can't be decoded is skipped (the UI just falls back to short hex for
+/// it) — never fatal to the caller.
+fn device_names_from(devices: &[athenaeum_core::account::AccountDevice]) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for d in devices {
+        if let Ok(id) = pairing::node_id_from_pubkey_b64(&d.pubkey) {
+            map.insert(node_id_hex(&id), d.name.clone());
+        }
+    }
+    map
 }
 
 /// The 0600 file-backed token store for this hub (headless: no OS keychain). The
@@ -429,6 +450,28 @@ mod tests {
         let reloaded = PairingCache::load(dir.path());
         assert_eq!(reloaded, cache, "the cache round-trips through disk");
         assert_eq!(reloaded.relay_urls, vec!["https://relay1.example.org".to_string()]);
+    }
+
+    /// Task 11: the new `device_names` map is `#[serde(default)]`, so (a) an
+    /// old cache file written before this field existed still parses (→ empty
+    /// map, never an error), and (b) a saved map round-trips through disk.
+    #[test]
+    fn pairing_cache_device_names_roundtrip_and_backcompat() {
+        // (a) Old-format JSON without `device_names` parses to an empty map.
+        let old = r#"{"device_id":"d","primary_device_id":"p","peer_node_id_hex":"ab","relay_urls":[]}"#;
+        let c: PairingCache = serde_json::from_str(old).unwrap();
+        assert!(c.device_names.is_empty(), "a pre-field cache file loads an empty map");
+
+        // (b) Save with names → load returns them.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = PairingCache::default();
+        cache.device_names.insert("aa".repeat(32), "Studio".into());
+        cache.device_names.insert("bb".repeat(32), "Laptop".into());
+        cache.save(dir.path());
+
+        let reloaded = PairingCache::load(dir.path());
+        assert_eq!(reloaded.device_names.get(&"aa".repeat(32)).map(String::as_str), Some("Studio"));
+        assert_eq!(reloaded.device_names.get(&"bb".repeat(32)).map(String::as_str), Some("Laptop"));
     }
 
     use crate::config::{Config, Mode, RetentionConfig};
