@@ -1,10 +1,11 @@
 # Perseus — headless capture-node agent
 
 Perseus is a small, headless companion to Athenaeum. It runs on the machine at
-the telescope (a mini-PC, NUC, or Raspberry-class ARM board), watches your
-capture directory, and streams every new sub-exposure to a paired primary
-Athenaeum instance over an encrypted peer-to-peer link. No UI, no catalog — one
-binary and a TOML file, meant to run as a `systemd` / `launchd` service.
+the telescope (a mini-PC, NUC, or Raspberry-class ARM board), watches one or
+more capture directories, and streams every new sub-exposure to a paired primary
+Athenaeum instance over an encrypted peer-to-peer link. No catalog and no desktop
+UI — one binary, a TOML file, and an optional read-only [status page](#web-status-page),
+meant to run as a `systemd` / `launchd` service.
 
 It is deliberately lightweight: Perseus depends on `athenaeum-core` with
 `default-features = false`, so it pulls **none** of the image-rendering
@@ -13,8 +14,8 @@ the package format, the sync engine, and the iroh transport come along.
 
 ## What it does
 
-1. **Watch** the capture directory for new `.fits` / `.fit` / `.fts` / `.xisf`
-   files.
+1. **Watch** one or more capture directories for new `.fits` / `.fit` / `.fts` /
+   `.xisf` files.
 2. **Wait** until each file has finished being written — capture software writes
    FITS progressively, so a file is only picked up once its size and mtime hold
    steady for `stability_secs` (default 10 s).
@@ -60,6 +61,10 @@ capture_dir = "/data/capture"            # directory your capture app writes to
 data_dir = "/var/lib/perseus"            # SQLite store + blob store + device key + logs
 pairing_ticket = "<paste from primary>"  # primary → Settings → Sync (dev)
 mode = "auto"                            # only value in the MVP
+
+# Local status page (optional; top-level keys — must precede any table):
+# web_bind  = "127.0.0.1:8686"           # bind address (default); "" disables the page
+# web_token = "<random secret>"          # REQUIRED when web_bind is NOT loopback
 
 [retention]
 policy = "keep_everything"               # keep_everything | on_confirm | keep_days | disk_pct
@@ -124,6 +129,49 @@ already present when it launches are treated as a baseline and skipped, so a
 restart never re-sends your whole capture directory. Use `enqueue-backlog` to
 send pre-existing files on purpose.
 
+## Web status page
+
+`run` serves a small, read-only status page for eyeballing a headless node
+without SSH. It is **on by default on loopback** — open `http://127.0.0.1:8686/`
+on the capture machine.
+
+- **`web_bind`** (default `127.0.0.1:8686`) — the bind address. Set it to `""`
+  to disable the page entirely.
+- **`web_token`** — a bearer token. It is **required** for any non-loopback bind
+  (e.g. `0.0.0.0:8686` or a LAN address): Perseus **refuses to start** if you
+  expose the page off loopback without one, so the page is never silently
+  wide-open. On loopback a token is optional. When a token is set, the page asks
+  for it on first load (a `401` triggers a browser prompt) and remembers it in
+  the browser's `localStorage`.
+- A **runtime bind conflict is non-fatal** — if the port is already in use, the
+  agent logs a warning and keeps running (watch/send/retention are unaffected);
+  only the page is unavailable.
+
+The page has four sections:
+
+| Section       | Shows                                                                                             |
+| ------------- | ------------------------------------------------------------------------------------------------- |
+| **Status**    | The watched capture directories, live in-flight transfers, current retention policy, and counts.  |
+| **Sent**      | Outbound packages, newest first, with per-row **Delete** on confirmed packages only.              |
+| **History**   | The transfer audit log — filename, OBJECT, peer **device name** (from the hub, when known), size, duration, outcome, and a **✓ safe to delete** marker on peer-accepted frames. Filterable by filename. |
+| **Retention** | The live retention policy (editable) plus a rolling log of recent retention passes.               |
+
+**Delete semantics.** Manual delete removes the *source capture file* of a
+package, and only ever for a **confirmed** package (one the primary has fully
+received) — the button is absent on any other row. It goes through the exact same
+confirmed-only, audit-before-delete path that retention uses; the web page cannot
+delete anything retention couldn't.
+
+**Retention edits are safe by construction.** You can change `policy`,
+`keep_days`, `disk_max_pct`, `interval_secs`, and `dry_run` from the page. But the
+**two live-deletion keys stay TOML-only by design**: `i_have_verified_the_soak` is
+never web-writable, and flipping `dry_run = false` from the page is rejected
+(422) unless the on-disk soak opt-in is already `true`. Going live therefore
+remains the deliberate two-key hand edit described above — the UI can never enable
+irreversible deletion.
+
+Full design: [`docs/superpowers/specs/2026-07-08-stage15-sync-hardening-design.md`](../../docs/superpowers/specs/2026-07-08-stage15-sync-hardening-design.md).
+
 ## Service setup
 
 Sample unit files live in [`dist/`](dist/). Adjust the binary/config paths, the
@@ -187,3 +235,8 @@ tracing event — there is no ad-hoc `println!` in the service path.
   packages/           staged package directories (one per frame)
   logs/               rolling JSONL logs
 ```
+
+`sync_blobs/` does not grow without bound: each package's blob data is released
+once the transfer is confirmed/acked, and a startup sweep retires any tags left
+stale by an earlier crash — so steady-state disk use tracks in-flight frames, not
+lifetime volume.
