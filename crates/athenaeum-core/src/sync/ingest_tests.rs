@@ -29,7 +29,7 @@ use crate::sharing::SharingTransport;
 
 use super::ingest::ingest_package;
 use super::store::{count_satisfied_receipts, insert_receipt, CatalogSyncStore, SyncStore};
-use super::receiver::SyncReceiver;
+use super::receiver::{IncomingResolver, SyncReceiver};
 use super::{SyncConfig, SyncEngine, StandaloneSyncStore};
 
 const ORIGIN_DEVICE: &str = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
@@ -369,7 +369,8 @@ async fn ack_replay_from_receipt_log() {
     // Spawn the real receiver over its endpoint.
     let (_info, _handle) = SyncReceiver::spawn(
         Arc::clone(&store),
-        incoming.clone(),
+        sync_dir.clone(),
+        fixed_resolver(incoming.clone()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -545,7 +546,8 @@ async fn transit_corruption_repaired_then_redelivery_confirms() {
     let receiver_node = receiver_ep.node_id();
     let (_info, _handle) = SyncReceiver::spawn(
         Arc::clone(&store),
-        incoming,
+        tmp.path().join("staging_root"),
+        fixed_resolver(incoming),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -652,6 +654,124 @@ fn state_of(store: &StandaloneSyncStore, id: i64) -> Option<super::OutboundState
 
 fn attempts_of(store: &StandaloneSyncStore, id: i64) -> u32 {
     store.get_outbound(id).unwrap().map(|r| r.attempts).unwrap_or(0)
+}
+
+/// A resolver that always lands under a single fixed `root` — the pre-task-5
+/// behaviour, for the receiver tests that only assert catalog rows/receipts.
+fn fixed_resolver(root: PathBuf) -> IncomingResolver {
+    Arc::new(move || root.clone())
+}
+
+/// Build a one-frame fixture package with a distinct pixel `val` — like
+/// [`build_fixture_package`] but with genuinely different content per call so two
+/// packages both ingest (all-zero payloads would collide on the full-content
+/// secondary dedup and the second would land nothing). Returns `(pkg_dir, announce)`.
+fn build_fixture_package_val(
+    root: &Path,
+    frame_uuid: &str,
+    filename: &str,
+    object: &str,
+    val: f32,
+) -> (PathBuf, PackageAnnounce) {
+    let src_dir = root.join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = src_dir.join(filename);
+    write_fits_val(&src, val);
+
+    let byte_size = std::fs::metadata(&src).unwrap().len();
+    let xxh3 = package::xxh3_full_file(&src).unwrap();
+    let frame = fixture_frame(frame_uuid, object, "2026-01-16T10:00:00.000Z");
+    let record = ManifestRecord {
+        v: MANIFEST_VERSION,
+        frame_uuid: frame_uuid.to_string(),
+        origin_catalog_uuid: "catalog-uuid".to_string(),
+        origin_device: ORIGIN_DEVICE.to_string(),
+        payload_kind: PayloadKind::RawFrame,
+        rel_path: filename.to_string(),
+        byte_size,
+        xxh3,
+        frame_meta: serde_json::to_value(&frame).unwrap(),
+        analysis: None,
+        app_version: "test".to_string(),
+    };
+    let pkg_dir = root.join(format!("pkg-{frame_uuid}"));
+    let announce = package::write_package(&pkg_dir, vec![(src, record)]).unwrap();
+    (pkg_dir, announce)
+}
+
+/// Count regular files anywhere under `dir` (recursive). Used to prove a package
+/// landed under one resolver target and not the other.
+fn count_files(dir: &Path) -> usize {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .count()
+}
+
+/// The landing root is resolved LIVE, once per package — swapping the resolver's
+/// target between two announces makes the second package land under the new root
+/// with no receiver restart. Pins the "per-package resolution" contract (task 5).
+#[tokio::test]
+async fn landing_root_is_resolved_live_per_package() {
+    let tmp = TempDir::new().unwrap();
+    let catalog_path = tmp.path().join("catalog.db");
+    // Initialise the catalog schema (idempotent) so the receiver can ingest.
+    let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+    let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+    let dir_a = tmp.path().join("root_a");
+    let dir_b = tmp.path().join("root_b");
+    let staging_root = tmp.path().join("staging_root");
+
+    // A resolver whose target is a swappable `Arc<Mutex<PathBuf>>` (the exact
+    // mechanic the host uses via a live DB lookup — here the swap is explicit).
+    let target = Arc::new(std::sync::Mutex::new(dir_a.clone()));
+    let resolver: IncomingResolver = {
+        let t = Arc::clone(&target);
+        Arc::new(move || t.lock().unwrap().clone())
+    };
+
+    let net = LoopbackNetwork::new();
+    let sender: Arc<LoopbackTransport> = Arc::new(net.endpoint());
+    let receiver_ep: Arc<LoopbackTransport> = Arc::new(net.endpoint());
+    let receiver_node: NodeId = receiver_ep.node_id();
+
+    sender.start().await.unwrap();
+    let mut sender_events = sender.events().await;
+
+    let (_info, _handle) = SyncReceiver::spawn(
+        Arc::clone(&store),
+        staging_root.clone(),
+        Arc::clone(&resolver),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .unwrap();
+
+    // Package 1 → resolver returns dir_a → lands under dir_a. Distinct pixel
+    // content per package so both genuinely ingest (never a content dup).
+    let (pkg1, announce1) =
+        build_fixture_package_val(tmp.path(), "frame-live-a", "L_live_a.fits", "M42", 0.0);
+    sender.serve(&announce1, &pkg1).await.unwrap();
+    sender.announce(receiver_node, &announce1).await.unwrap();
+    let r1 = wait_for_ack(&mut sender_events, &announce1.package_id.0, Duration::from_secs(5)).await;
+    assert!(matches!(r1[0].outcome, ReceiptOutcome::Ingested));
+    assert_eq!(count_files(&dir_a), 1, "package 1 landed under the first resolver target");
+    assert_eq!(count_files(&dir_b), 0, "package 1 did not land under the second target");
+
+    // Swap the resolver's target: package 2 must land under dir_b, no restart.
+    *target.lock().unwrap() = dir_b.clone();
+
+    let (pkg2, announce2) =
+        build_fixture_package_val(tmp.path(), "frame-live-b", "L_live_b.fits", "NGC7000", 1.0);
+    sender.serve(&announce2, &pkg2).await.unwrap();
+    sender.announce(receiver_node, &announce2).await.unwrap();
+    let r2 = wait_for_ack(&mut sender_events, &announce2.package_id.0, Duration::from_secs(5)).await;
+    assert!(matches!(r2[0].outcome, ReceiptOutcome::Ingested));
+    assert_eq!(count_files(&dir_b), 1, "package 2 landed under the NEW resolver target (live per-package)");
+    assert_eq!(count_files(&dir_a), 1, "package 2 did not re-land under the first target");
 }
 
 /// Poll a sync predicate every 10ms until true, panicking after `timeout`.

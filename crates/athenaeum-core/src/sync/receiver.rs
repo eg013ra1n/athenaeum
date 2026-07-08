@@ -33,6 +33,13 @@ use crate::sharing::SharingTransport;
 use super::ingest::{self, IngestOutcome};
 use super::store::CatalogSyncStore;
 
+/// Resolves the landing root for the next received package, live. Called once per
+/// package (immediately before ingest), so designating or clearing the
+/// `sync_incoming` scan root takes effect on the very next package without
+/// restarting the transport. The host builds one that re-reads the designated
+/// root from the catalog (see [`crate::api::sync`]); tests inject their own.
+pub type IncomingResolver = Arc<dyn Fn() -> PathBuf + Send + Sync>;
+
 /// `sync-progress` payload: a per-package stage tick (never per-frame — discrete
 /// stages only, per the plan's "notify on outcomes, don't spam progress" rule).
 ///
@@ -94,31 +101,36 @@ impl SyncReceiverHandle {
 pub struct SyncReceiver;
 
 impl SyncReceiver {
-    /// Start the receiver over `transport`, landing files under `incoming_root`
-    /// and ingesting into `store`. Returns the transport's [`StartInfo`] (its
-    /// node id + pairing ticket) plus a handle to the spawned loop.
+    /// Start the receiver over `transport`, staging fetched packages under
+    /// `staging_root` and landing accepted files under the root the `incoming`
+    /// resolver returns (resolved live, per package — so a `sync_incoming`
+    /// designation change is honored on the next package without a restart).
+    /// Ingests into `store`. Returns the transport's [`StartInfo`] (its node id +
+    /// pairing ticket) plus a handle to the spawned loop.
     ///
     /// `transport.start()` is awaited here (so the ticket is available to the
     /// caller); the loop then takes the event stream exactly once.
     pub async fn spawn(
         store: Arc<CatalogSyncStore>,
-        incoming_root: PathBuf,
+        staging_root: PathBuf,
+        incoming: IncomingResolver,
         transport: Arc<dyn SharingTransport>,
         emitter: Arc<dyn ProgressEmitter>,
     ) -> Result<(StartInfo, SyncReceiverHandle)> {
         let info = transport.start().await.context("start receiver transport")?;
-        std::fs::create_dir_all(&incoming_root)
-            .with_context(|| format!("create incoming root {}", incoming_root.display()))?;
+        std::fs::create_dir_all(&staging_root)
+            .with_context(|| format!("create staging root {}", staging_root.display()))?;
 
         let mut events = transport.events().await;
         let loop_transport = Arc::clone(&transport);
         let join = tokio::spawn(async move {
-            tracing::info!(incoming_root = %incoming_root.display(), "sync receiver online");
+            tracing::info!(staging_root = %staging_root.display(), "sync receiver online");
             while let Some(ev) = events.recv().await {
                 if let TransportEvent::AnnounceReceived { from, announce } = ev {
                     if let Err(e) = handle_announce(
                         &store,
-                        &incoming_root,
+                        &staging_root,
+                        &incoming,
                         loop_transport.as_ref(),
                         emitter.as_ref(),
                         from,
@@ -141,7 +153,8 @@ impl SyncReceiver {
 /// emitting stage progress and a single finished event.
 async fn handle_announce(
     store: &Arc<CatalogSyncStore>,
-    incoming_root: &Path,
+    staging_root: &Path,
+    incoming: &IncomingResolver,
     transport: &dyn SharingTransport,
     emitter: &dyn ProgressEmitter,
     from: NodeId,
@@ -187,8 +200,10 @@ async fn handle_announce(
         return Ok(());
     }
 
-    // Fetch the package into a per-package staging dir under incoming_root.
-    let staging = incoming_root.join(".staging").join(&package_id);
+    // Fetch the package into a per-package staging dir under the staging root
+    // (out of the user-visible landing tree, so a half-fetched package never
+    // shows up in the designated sync_incoming folder).
+    let staging = staging_root.join("staging").join(&package_id);
     emit_event(emitter, "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
         direction: super::Direction::Received,
@@ -201,6 +216,11 @@ async fn handle_announce(
         .await
         .with_context(|| format!("fetch package {package_id}"))?;
 
+    // Resolve the landing root LIVE, per package: a `sync_incoming` designation
+    // (or clear) since the last package is honored here — not frozen at transport
+    // start. Falls back to the caller's app-data default when none is designated.
+    let incoming_root = incoming();
+
     // Ingest on a blocking thread (file I/O + SQLite); never block the runtime.
     emit_event(emitter, "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
@@ -211,7 +231,6 @@ async fn handle_announce(
     });
     let outcome = {
         let store = Arc::clone(store);
-        let incoming_root = incoming_root.to_path_buf();
         let staging_for_ingest = staging.clone();
         let announce = announce.clone();
         let peer_device = peer_device.clone();
@@ -322,6 +341,7 @@ impl SyncRuntime {
         sync_dir: PathBuf,
         db_path: PathBuf,
         relay_mode: iroh::RelayMode,
+        incoming: IncomingResolver,
         emitter: Arc<dyn ProgressEmitter>,
     ) -> Result<String> {
         let mut guard = self.inner.lock().await;
@@ -351,9 +371,11 @@ impl SyncRuntime {
             CatalogSyncStore::open(&db_path)
                 .with_context(|| format!("open catalog sync store {}", db_path.display()))?,
         );
-        let incoming_root = sync_dir.join("incoming");
+        // Staging lives under the sync dir; the landing root is resolved live per
+        // package by the caller-supplied resolver (task 5).
         let (info, receiver) =
-            SyncReceiver::spawn(store, incoming_root, Arc::clone(&transport), emitter).await?;
+            SyncReceiver::spawn(store, sync_dir.clone(), incoming, Arc::clone(&transport), emitter)
+                .await?;
 
         tracing::info!(ticket_len = info.pairing_ticket.len(), "sync runtime started (dev pairing)");
         *guard = Some(Started {

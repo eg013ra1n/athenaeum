@@ -80,6 +80,12 @@ impl ManageConnection for SqliteConnectionManager {
 ///
 /// Hands out pooled connections that each have PRAGMAs and SIN/COS already set up.
 /// The pool is `Send + Sync`, so `ServiceContext` no longer needs a `Mutex` around it.
+///
+/// `Clone` yields an independent handle onto the **same** underlying pool (r2d2
+/// `Pool` is internally `Arc`-backed) — a cheap, shared, `'static` DB handle the
+/// sync receiver's per-package landing resolver captures without borrowing
+/// `ServiceContext`.
+#[derive(Clone)]
 pub struct Database {
     pool: Pool<SqliteConnectionManager>,
     path: PathBuf,

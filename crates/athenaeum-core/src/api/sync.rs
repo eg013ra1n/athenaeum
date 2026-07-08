@@ -104,6 +104,34 @@ fn sync_paths(ctx: &ServiceContext) -> Result<(PathBuf, PathBuf), ApiError> {
     Ok((sync_dir, db_path))
 }
 
+/// Build the receiver's live per-package landing resolver. It re-reads the
+/// designated `sync_incoming` scan root from the catalog on **every** package —
+/// so designating or clearing that root (task 4) takes effect on the next
+/// received package with no transport restart — falling back to `fallback`
+/// (`<sync_dir>/incoming`) when no root is designated. A lookup error is logged,
+/// never swallowed, and also falls back (never strands an inbound package).
+///
+/// The closure is `'static`: it captures a cheap cloned [`crate::db::Database`]
+/// handle (shared pool) rather than borrowing `ctx`, so it can outlive this call
+/// and run inside the receiver's spawned loop.
+fn incoming_resolver(
+    ctx: &ServiceContext,
+    fallback: PathBuf,
+) -> Result<crate::sync::receiver::IncomingResolver, ApiError> {
+    let db = db(ctx)?.clone();
+    Ok(Arc::new(move || {
+        let conn = db.conn();
+        match crate::db::scan_root_path_of_kind(&conn, "sync_incoming") {
+            Ok(Some(p)) => PathBuf::from(p),
+            Ok(None) => fallback.clone(),
+            Err(e) => {
+                tracing::warn!(error = %e, "sync_incoming root lookup failed; landing in app-data fallback");
+                fallback.clone()
+            }
+        }
+    }))
+}
+
 // ── pairing cache (task M1) ──────────────────────────────────────────────────
 
 /// Read the cached relay map (newline-separated URLs) from settings.
@@ -278,10 +306,11 @@ pub async fn autostart_if_enabled(
     }
     tracing::debug!(dev, account_primary, "sync autostart condition met");
     let (sync_dir, db_path) = sync_paths(ctx)?;
+    let incoming = incoming_resolver(ctx, sync_dir.join("incoming"))?;
     // The receiver only listens; it never dials a peer for announce, so the raw
     // relay URLs (needed only to construct a dial hint) are irrelevant here.
     let (relay_mode, _relay_urls) = resolve_relay_mode(ctx).await?;
-    sync.ensure_started(sync_dir, db_path, relay_mode, emitter)
+    sync.ensure_started(sync_dir, db_path, relay_mode, incoming, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     Ok(true)
@@ -310,12 +339,13 @@ pub async fn get_pairing_ticket(
         ));
     }
     let (sync_dir, db_path) = sync_paths(ctx)?;
+    let incoming = incoming_resolver(ctx, sync_dir.join("incoming"))?;
     // Same reasoning as `autostart_if_enabled`: the receiver never dials out
     // for announce, so the raw relay URLs are not needed here.
     let (relay_mode, _relay_urls) = resolve_relay_mode(ctx).await?;
 
     let ticket = sync
-        .ensure_started(sync_dir, db_path, relay_mode, emitter)
+        .ensure_started(sync_dir, db_path, relay_mode, incoming, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     Ok(ticket)

@@ -3,7 +3,7 @@
 use crate::models::*;
 use crate::fingerprint::compute_header_fingerprint;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection, OptionalExtension, Result};
 
 /// Upper bound of the byte range that matches exactly the strings with
 /// `prefix` as a literal prefix: `[prefix, upper)`. Returns `None` when no
@@ -320,6 +320,18 @@ pub fn count_scan_roots_of_kind(conn: &Connection, kind: &str) -> Result<i64> {
         params![kind],
         |row| row.get(0),
     )
+}
+
+/// The path of the (unique) scan root of a given special `kind`, if one is
+/// designated. Drives the sync receiver's live per-package landing resolver:
+/// `sync_incoming` designated → land there; `None` → caller's app-data fallback.
+pub fn scan_root_path_of_kind(conn: &Connection, kind: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT path FROM scan_roots WHERE kind = ?1 LIMIT 1",
+        params![kind],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// Update scan root find_duplicates flag

@@ -184,9 +184,36 @@ async fn two_instance_sync_e2e() {
     let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
     let receiver_ep = Arc::new(net.endpoint());
     let receiver_node = receiver_ep.node_id();
+
+    // Designate a `sync_incoming` scan root on the primary — received files must
+    // land under it, not under the internal `<sync_dir>/incoming` staging default.
+    let designated = tmp.path().join("designated_incoming");
+    std::fs::create_dir_all(&designated).unwrap();
+    athenaeum_core::api::scan_roots::add_scan_root(
+        &primary_ctx,
+        designated.to_string_lossy().into_owned(),
+        &athenaeum_core::api::PathPolicy::AllowAll,
+        Some("sync_incoming".to_string()),
+    )
+    .expect("designate sync_incoming root");
+
+    // The live per-package landing resolver, built exactly as the host builds it:
+    // it re-reads the designated `sync_incoming` root from the primary catalog on
+    // every package (falling back to `<sync_dir>/incoming` when none is set).
+    let resolver_db = primary_ctx.db.get().unwrap().clone();
+    let fallback_incoming = primary_dir.join("incoming");
+    let incoming: athenaeum_core::sync::receiver::IncomingResolver = Arc::new(move || {
+        let conn = resolver_db.conn();
+        match athenaeum_core::db::scan_root_path_of_kind(&conn, "sync_incoming") {
+            Ok(Some(p)) => std::path::PathBuf::from(p),
+            _ => fallback_incoming.clone(),
+        }
+    });
+
     let (_info, receiver) = SyncReceiver::spawn(
         Arc::clone(&primary_store),
-        primary_dir.join("incoming"),
+        primary_dir.clone(),
+        incoming,
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -272,6 +299,15 @@ async fn two_instance_sync_e2e() {
         N as i64,
         "sender logged 50 confirmed sends"
     );
+
+    // All 50 landed files live under the designated `sync_incoming` root (the
+    // live resolver, not the `<sync_dir>/incoming` fallback).
+    let landed: Vec<_> = walkdir::WalkDir::new(&designated)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .collect();
+    assert_eq!(landed.len(), N, "all frames land under the designated sync_incoming root");
 
     // ── (2) Re-run the identical enqueue → dedupe-safe ───────────────────────
     let r2 = enqueue_sync_selection(&capture_ctx, &sender, frame_ids.clone(), None)
