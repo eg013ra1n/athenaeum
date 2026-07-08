@@ -37,12 +37,13 @@ interface SpecialFolderSectionProps {
  *
  * - the per-kind uniqueness Conflict ("…already exists — only one is allowed"):
  *   the folder is already designated, so tell the user to remove it first;
- * - the scan-root overlap Conflict (message contains "overlap"): the picked
- *   folder is inside/contains a monitored directory, so tell them to pick one
- *   outside their monitored directories.
+ * - the scan-root overlap Conflict ("…is a subdirectory of…" in either
+ *   direction, or "…already being monitored"): the picked folder is
+ *   inside/contains a monitored directory, so tell them to pick one outside
+ *   their monitored directories.
  */
 function friendlyConflict(msg: string): string {
-  if (msg.includes('overlap')) {
+  if (msg.includes('subdirectory') || msg.includes('already being monitored')) {
     return 'This folder is inside (or contains) a monitored directory — pick a folder outside your monitored directories.';
   }
   if (msg.includes('already exists') || msg.includes('only one is allowed')) {
