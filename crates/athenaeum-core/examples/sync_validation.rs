@@ -117,7 +117,7 @@ async fn serve(dir: &Path) -> Result<()> {
     router.endpoint().online().await;
 
     println!("Importing {} as a collection (hashing all files)...", dir.display());
-    let hash = blobs::import_package_collection(&store, dir)
+    let hash = blobs::import_package_collection(&store, dir, "pkg/validation")
         .await
         .context("import collection")?;
 
@@ -175,7 +175,7 @@ async fn fetch(ticket: &str, dest: &Path) -> Result<()> {
         dest.display()
     );
     let started = std::time::Instant::now();
-    blobs::fetch_collection_to_dir(&store, &endpoint, provider, ticket.hash(), dest)
+    blobs::fetch_collection_to_dir(&store, &endpoint, provider, ticket.hash(), "pkg/validation", dest)
         .await
         .context("fetch collection")?;
     println!("Download complete in {:.1}s.", started.elapsed().as_secs_f64());

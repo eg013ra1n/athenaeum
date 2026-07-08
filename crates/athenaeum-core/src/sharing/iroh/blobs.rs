@@ -57,9 +57,10 @@ fn collect_files(root: &Path) -> Result<Vec<PkgFile>> {
 
 /// Import every file under `pkg_dir` into `store` and assemble them into a
 /// collection. Returns the collection [`Hash`] (the package `root_hash`) after
-/// pinning it with a permanent tag so it survives garbage collection and is
-/// serveable to peers.
-pub async fn import_package_collection(store: &Store, pkg_dir: &Path) -> Result<Hash> {
+/// pinning it under the deterministic `tag` name so it survives garbage
+/// collection and is serveable to peers — and so `release` can later delete it
+/// by that exact name.
+pub async fn import_package_collection(store: &Store, pkg_dir: &Path, tag: &str) -> Result<Hash> {
     let files = collect_files(pkg_dir)?;
 
     // Hold each child's temp tag alive until the collection is stored + tagged,
@@ -78,18 +79,20 @@ pub async fn import_package_collection(store: &Store, pkg_dir: &Path) -> Result<
     }
 
     let collection = Collection::from_iter(items);
-    let tag = collection
+    let tag_tt = collection
         .store(store)
         .await
         .context("store package collection")?;
-    // A permanent tag over the hash-seq keeps the whole collection (meta + every
-    // child blob) reachable across GC once the temp tags drop.
+    // A permanent, deterministically-named tag over the hash-seq keeps the whole
+    // collection (meta + every child blob) reachable across GC once the temp
+    // tags drop. `tags().set` overwrites an existing same-name tag, so a re-serve
+    // of the same package id re-points the tag rather than leaking a second one.
     store
         .tags()
-        .create(tag.hash_and_format())
+        .set(tag, tag_tt.hash_and_format())
         .await
         .context("tag package collection")?;
-    let hash = tag.hash();
+    let hash = tag_tt.hash();
     drop(child_tags);
 
     tracing::debug!(
@@ -121,6 +124,7 @@ pub async fn fetch_collection_to_dir(
     endpoint: &Endpoint,
     provider: EndpointId,
     root_hash: Hash,
+    tag: &str,
     dest_dir: &Path,
 ) -> Result<()> {
     // Pull the whole hash-sequence (collection meta + every child blob).
@@ -129,6 +133,15 @@ pub async fn fetch_collection_to_dir(
         .download(HashAndFormat::hash_seq(root_hash), Shuffled::new(vec![provider]))
         .await
         .with_context(|| format!("download collection {root_hash}"))?;
+
+    // Pin the downloaded collection until the caller releases it (post-ack).
+    // Between download-complete and this set the data is untagged — the 900 s
+    // GC interval makes that window irrelevant in practice.
+    store
+        .tags()
+        .set(tag, HashAndFormat::hash_seq(root_hash))
+        .await
+        .context("tag fetched collection")?;
 
     // Reconstruct the package directory from the downloaded collection.
     let collection = Collection::load(root_hash, store)

@@ -48,8 +48,10 @@ use iroh::endpoint::{presets, Connection};
 use iroh::protocol::{ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use iroh_blobs::api::Store;
+use iroh_blobs::store::fs::options::Options as FsOptions;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::mem::MemStore;
+use iroh_blobs::store::GcConfig;
 use iroh_blobs::{BlobsProtocol, Hash};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::mpsc;
@@ -68,6 +70,19 @@ use proto::Msg;
 /// Custom ALPN for the announce/ack control channel. Distinct from
 /// [`iroh_blobs::ALPN`] so the two protocols coexist on one endpoint.
 pub const SYNC_ALPN: &[u8] = b"athenaeum/sync/1";
+
+/// Deterministic blob-store tag for a package collection. `release` deletes by
+/// this exact name, so both the import (serve) and download (fetch) sides pin
+/// with it — never with an auto-named tag.
+pub(crate) fn package_tag(package_id: &PackageId) -> String {
+    format!("pkg/{}", package_id.0)
+}
+
+/// How often the fs blob store's GC loop runs. A partial download older than one
+/// interval may be collected before a resume — that degrades resume to a
+/// re-download, never loses data (every byte is re-verified). 900 s is a
+/// deliberately slack interval so a normal transfer never races collection.
+const GC_INTERVAL: Duration = Duration::from_secs(900);
 
 /// Depth of an endpoint's inbound event channel. Control events are low volume;
 /// this comfortably holds bursts of announces/acks.
@@ -148,7 +163,19 @@ impl IrohTransport {
             BlobStore::Memory => MemStore::new().into(),
             BlobStore::Fs(dir) => {
                 let blob_dir = dir.join("sync_blobs");
-                FsStore::load(&blob_dir)
+                // Mirror FsStore::load's internals but with GC on: load() hardcodes
+                // gc: None, so no GC loop would ever run and released blobs would
+                // leak forever. The interval is slack (see GC_INTERVAL) so an
+                // in-flight transfer never races collection.
+                std::fs::create_dir_all(&blob_dir)
+                    .with_context(|| format!("create blob dir {}", blob_dir.display()))?;
+                let db_path = blob_dir.join("blobs.db");
+                let mut options = FsOptions::new(&blob_dir);
+                options.gc = Some(GcConfig {
+                    interval: GC_INTERVAL,
+                    add_protected: None,
+                });
+                FsStore::load_with_opts(db_path, options)
                     .await
                     .with_context(|| format!("open blob store {}", blob_dir.display()))?
                     .into()
@@ -325,8 +352,20 @@ impl SharingTransport for IrohTransport {
         let provider =
             EndpointId::from_bytes(&from).map_err(|e| anyhow!("invalid provider node id: {e}"))?;
 
-        blobs::fetch_collection_to_dir(&self.store, &self.endpoint, provider, root_hash, dest_dir)
-            .await?;
+        // Pin the downloaded collection under the same deterministic name the
+        // provider used, so it survives GC until this receiver releases it
+        // (post-ack). Task 3 wires that release; until then GC reclaims it after
+        // the slack interval if nothing pins it.
+        let tag = package_tag(&pkg.package_id);
+        blobs::fetch_collection_to_dir(
+            &self.store,
+            &self.endpoint,
+            provider,
+            root_hash,
+            &tag,
+            dest_dir,
+        )
+        .await?;
 
         // Best-effort completion progress (UI data; never blocks).
         let _ = self.event_tx.try_send(TransportEvent::FetchProgress {
@@ -339,7 +378,8 @@ impl SharingTransport for IrohTransport {
     }
 
     async fn serve(&self, pkg: &PackageAnnounce, src_dir: &Path) -> Result<()> {
-        let hash = blobs::import_package_collection(&self.store, src_dir).await?;
+        let tag = package_tag(&pkg.package_id);
+        let hash = blobs::import_package_collection(&self.store, src_dir, &tag).await?;
         self.served
             .lock()
             .expect("served mutex poisoned")
@@ -350,6 +390,23 @@ impl SharingTransport for IrohTransport {
             path = %src_dir.display(),
             "iroh serving package"
         );
+        Ok(())
+    }
+
+    async fn release(&self, package_id: &PackageId) -> Result<()> {
+        self.served
+            .lock()
+            .expect("served mutex poisoned")
+            .remove(&package_id.0);
+        // `tags().delete` returns the removed count and does NOT error on a
+        // missing tag — idempotency comes free.
+        let removed = self
+            .store
+            .tags()
+            .delete(package_tag(package_id))
+            .await
+            .map_err(|e| anyhow!("delete package tag: {e}"))?;
+        tracing::debug!(package_id = %package_id.0, tags_removed = removed, "iroh released package");
         Ok(())
     }
 

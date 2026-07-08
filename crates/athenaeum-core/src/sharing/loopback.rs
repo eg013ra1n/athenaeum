@@ -259,6 +259,15 @@ impl SharingTransport for LoopbackTransport {
         Ok(())
     }
 
+    async fn release(&self, package_id: &PackageId) -> anyhow::Result<()> {
+        let mut reg = self.registry.lock().expect("registry mutex poisoned");
+        if let Some(inbox) = reg.get_mut(&self.node_id) {
+            let removed = inbox.served.remove(&package_id.0).is_some();
+            tracing::debug!(package_id = %package_id.0, removed, "loopback released package");
+        }
+        Ok(())
+    }
+
     async fn ack(
         &self,
         to: NodeId,

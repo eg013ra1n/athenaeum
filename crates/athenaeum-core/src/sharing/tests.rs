@@ -115,6 +115,43 @@ async fn loopback_announce_fetch_ack_roundtrip() {
     }
 }
 
+/// After `release`, the provider stops serving the package: a subsequent fetch
+/// of the same package fails with a "not served" error. Releasing again (or an
+/// unknown id) is idempotent and Ok.
+#[tokio::test]
+async fn loopback_release_makes_package_unfetchable() {
+    let net = LoopbackNetwork::new();
+    let provider = net.endpoint();
+    let receiver = net.endpoint();
+
+    let provider_info = provider.start().await.unwrap();
+    receiver.start().await.unwrap();
+
+    let src = tempdir().unwrap();
+    write_blob(src.path(), "frame_0001.fits", 64 * 1024);
+    let pkg = sample_announce();
+    provider.serve(&pkg, src.path()).await.unwrap();
+
+    // Served → fetch succeeds.
+    let dest1 = tempdir().unwrap();
+    receiver
+        .fetch(provider_info.node_id, &pkg, dest1.path())
+        .await
+        .unwrap();
+
+    // Released → the same fetch now fails with "not served".
+    provider.release(&pkg.package_id).await.unwrap();
+    let dest2 = tempdir().unwrap();
+    let err = receiver
+        .fetch(provider_info.node_id, &pkg, dest2.path())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not served"), "got: {err}");
+
+    // Idempotent: releasing again (or an unknown id) is Ok.
+    provider.release(&pkg.package_id).await.unwrap();
+}
+
 /// With `abort_after_bytes` armed the first fetch fails mid-copy; the second
 /// (fault consumed) completes and the copied file hash-verifies against source.
 #[tokio::test]

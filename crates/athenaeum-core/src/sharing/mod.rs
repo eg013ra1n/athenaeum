@@ -62,6 +62,13 @@ pub trait SharingTransport: Send + Sync {
         receipts: Vec<FrameReceipt>,
     ) -> anyhow::Result<()>;
 
+    /// Drop the local payload data for `package_id` — the package reached a
+    /// terminal state (confirmed / failed / cancelled on the sender; acked on
+    /// the receiver) and its blobs must not outlive it. Idempotent: releasing
+    /// an unknown or already-released package is Ok(()). Never fails the
+    /// caller's state transition — callers log-and-continue on Err.
+    async fn release(&self, package_id: &PackageId) -> anyhow::Result<()>;
+
     /// Hand out the receiving half of this endpoint's [`TransportEvent`] stream.
     ///
     /// Single-consumer: the receiver is returned on the first call; subsequent

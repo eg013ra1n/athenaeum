@@ -205,6 +205,83 @@ async fn iroh_roundtrip_two_endpoints_localhost() {
 }
 
 // ---------------------------------------------------------------------------
+// 1b. Deterministic package tags: serve + fetch pin under `pkg/<id>`; release
+//     deletes on both sides; a second release is idempotent.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn release_deletes_package_tags_on_both_sides() {
+    use super::package_tag;
+
+    let provider = mem_transport().await;
+    let receiver = mem_transport().await;
+    let (ip, ir) = start_and_pair(&provider, &receiver).await;
+    let mut receiver_events = receiver.events().await;
+
+    let tmp = tempdir().unwrap();
+    let (dir, announce) =
+        build_package(&tmp.path().join("src"), "uuid-gc-1", "gc.fits", "M1", 4096);
+    provider.serve(&announce, &dir).await.unwrap();
+
+    let tag = package_tag(&announce.package_id);
+    // Provider pinned under the deterministic name.
+    assert!(provider
+        .store
+        .tags()
+        .get(tag.as_bytes())
+        .await
+        .unwrap()
+        .is_some());
+
+    // Announce so the receiver learns the iroh collection hash: the original
+    // announce still carries only the xxh3 placeholder root_hash, and fetch
+    // needs the wire announce. `package_id` is preserved, so the deterministic
+    // tag name is unchanged on both sides.
+    provider.announce(ir.node_id, &announce).await.unwrap();
+    let wire = match recv_next(&mut receiver_events).await {
+        TransportEvent::AnnounceReceived { announce, .. } => announce,
+        other => panic!("expected AnnounceReceived, got {other:?}"),
+    };
+
+    let dest = tempdir().unwrap();
+    receiver
+        .fetch(ip.node_id, &wire, dest.path())
+        .await
+        .unwrap();
+    // Receiver pinned the downloaded collection under the same name.
+    assert!(receiver
+        .store
+        .tags()
+        .get(tag.as_bytes())
+        .await
+        .unwrap()
+        .is_some());
+
+    provider.release(&announce.package_id).await.unwrap();
+    receiver.release(&announce.package_id).await.unwrap();
+    assert!(provider
+        .store
+        .tags()
+        .get(tag.as_bytes())
+        .await
+        .unwrap()
+        .is_none());
+    assert!(receiver
+        .store
+        .tags()
+        .get(tag.as_bytes())
+        .await
+        .unwrap()
+        .is_none());
+
+    // Idempotent second release.
+    provider.release(&announce.package_id).await.unwrap();
+
+    provider.shutdown().await;
+    receiver.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // 2. Resume after endpoint restart over a persistent blob store.
 // ---------------------------------------------------------------------------
 
@@ -534,6 +611,7 @@ async fn fetch_rejects_traversal_entry_names() {
         &receiver.endpoint,
         provider_id,
         root_hash,
+        "pkg/traversal-probe",
         &dest,
     )
     .await
