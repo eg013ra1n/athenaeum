@@ -281,7 +281,7 @@ impl Agent {
         // tests — which inject a transport and never call `start` — do not each
         // try to bind the same port.
         if watch {
-            agent.spawn_web_server(config_path).await?;
+            agent.spawn_web_server(config_path).await;
         }
         Ok(agent)
     }
@@ -290,10 +290,16 @@ impl Agent {
     /// non-empty. The auth token is snapshotted here (an auth change needs a
     /// restart). A non-loopback bind without a token was already refused by
     /// [`Config::validate`], so binding wide-open is unreachable.
-    async fn spawn_web_server(&mut self, config_path: PathBuf) -> Result<()> {
+    ///
+    /// A *runtime* bind failure is **non-fatal**: the status page is an optional
+    /// convenience, not the capture node's primary function (watch + sync), so a
+    /// port conflict on the default `127.0.0.1:8686` must never halt startup.
+    /// The actual bind lives in [`bind_and_spawn_web`], which logs-and-continues
+    /// on failure (returning `None`); this method can no longer fail.
+    async fn spawn_web_server(&mut self, config_path: PathBuf) {
         if self.config.web_bind.is_empty() {
             tracing::info!("web status page disabled (web_bind empty)");
-            return Ok(());
+            return;
         }
         let token = self.config.web_token.clone();
         let web_state = Arc::new(crate::web::WebState {
@@ -305,17 +311,8 @@ impl Agent {
             device_names: std::collections::HashMap::new(),
             capture_dirs: self.config.capture_dirs_resolved(),
         });
-        let listener = tokio::net::TcpListener::bind(&self.config.web_bind)
-            .await
-            .with_context(|| format!("bind web status page {}", self.config.web_bind))?;
-        tracing::info!(bind = %self.config.web_bind, "web status page online");
         let router = crate::web::build_router(web_state, token);
-        self.web_task = Some(tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, router).await {
-                tracing::error!(error = %e, "web status page server exited");
-            }
-        }));
-        Ok(())
+        self.web_task = bind_and_spawn_web(&self.config.web_bind, router).await;
     }
 
     /// Start an agent over a caller-supplied transport + peer. This is the
@@ -518,6 +515,39 @@ impl Agent {
             t.abort();
         }
         // `self.engine` (and `self.store`/`self.seen`) drop here, at end of scope.
+    }
+}
+
+/// Bind `web_bind` and spawn the axum status-page server, returning its task
+/// handle — or `None` if the bind fails.
+///
+/// **Runtime bind failure is non-fatal.** The status page is an optional
+/// convenience; the capture node's primary function is watching + syncing. A
+/// port conflict on the default `127.0.0.1:8686` (a second agent, a stale
+/// process, an unrelated service) must not take the whole agent down, so a bind
+/// error is logged at `error!` and swallowed here — the agent runs on without a
+/// web page. This is deliberately distinct from the `Config::validate` security
+/// gate, which still *hard-refuses* startup for a non-loopback `web_bind`
+/// without a `web_token`: that is a misconfiguration to fix, not a transient
+/// runtime condition to ride through.
+async fn bind_and_spawn_web(web_bind: &str, router: axum::Router) -> Option<JoinHandle<()>> {
+    match tokio::net::TcpListener::bind(web_bind).await {
+        Ok(listener) => {
+            tracing::info!(bind = %web_bind, "web status page online");
+            Some(tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, router).await {
+                    tracing::error!(error = %e, "web status page server exited");
+                }
+            }))
+        }
+        Err(e) => {
+            tracing::error!(
+                bind = %web_bind,
+                error = %e,
+                "web status page failed to bind; continuing without it"
+            );
+            None
+        }
     }
 }
 
@@ -991,6 +1021,37 @@ mod tests {
         load_or_create_device_key(&path).expect("create key");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// Review finding (non-fatal web bind): a port conflict on the OPTIONAL
+    /// status page must NOT halt the agent's primary function (watch + sync).
+    /// `bind_and_spawn_web` therefore logs-and-continues rather than propagating
+    /// — proven here by occupying an ephemeral port first, then handing the same
+    /// address to the binder and asserting it yields no task handle (agent
+    /// startup would sail past this) instead of erroring out.
+    #[tokio::test]
+    async fn web_bind_conflict_is_non_fatal() {
+        // Hold a real listener on an OS-assigned free port for the whole test so
+        // the address is genuinely occupied when the binder tries it.
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy ephemeral port");
+        let addr = occupied.local_addr().expect("read occupied addr").to_string();
+
+        let handle = bind_and_spawn_web(&addr, axum::Router::new()).await;
+        assert!(
+            handle.is_none(),
+            "a runtime bind failure must be swallowed (no web task), not propagated"
+        );
+    }
+
+    /// Positive control: a free port binds and yields a live task handle, so the
+    /// success path is exercised alongside the failure path (guards against a
+    /// binder that returns `None` unconditionally). The task is aborted so the
+    /// bound port is released promptly.
+    #[tokio::test]
+    async fn web_bind_success_yields_task() {
+        let handle = bind_and_spawn_web("127.0.0.1:0", axum::Router::new()).await;
+        let task = handle.expect("binding a free ephemeral port must spawn the server task");
+        task.abort();
     }
 }
 
