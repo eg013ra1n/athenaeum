@@ -207,12 +207,6 @@ pub struct Agent {
     watchers: Vec<WatcherHandle>,
     enqueue_task: Option<JoinHandle<()>>,
     retention_task: Option<JoinHandle<()>>,
-    /// The embedded web status-page server task (task 9), when armed. `None` on
-    /// the transport-injection path (tests), when `web_bind` is empty, and when
-    /// the runtime bind fails (a port conflict is non-fatal — see
-    /// [`bind_and_spawn_web`], which logs-and-continues). Aborted on shutdown —
-    /// it holds only `Arc` clones + a bound listener.
-    web_task: Option<JoinHandle<()>>,
     /// Live-edit channel for the retention config (task 8). The retention loop
     /// holds the matching receiver and re-borrows it every pass, so a `send`
     /// here takes effect on the next tick without an agent restart. The web
@@ -235,14 +229,14 @@ impl Agent {
     /// (primary from the hub device list) → dev ticket → error. `watch` arms the
     /// capture watcher (true for `run`, false for `enqueue-backlog`).
     ///
-    /// `config_path` is the on-disk `perseus.toml` this config was loaded from —
-    /// carried into the web status page's [`WebState`](crate::web::WebState) so
-    /// Task 10's retention edit can write it back. The embedded web server (task
-    /// 9) is spawned here (the production entry point), only when `watch` is set
-    /// and `web_bind` is non-empty; the transport-injection path
-    /// ([`start_with_transport`](Self::start_with_transport)) never binds it, so
-    /// the loopback e2e tests run many agents without contending for the port.
-    pub async fn start(config: Config, config_path: PathBuf, watch: bool) -> Result<Self> {
+    /// `_config_path` is the on-disk `perseus.toml` this config was loaded from.
+    /// It is retained in the signature for the supervisor's production launcher
+    /// ([`crate::supervisor::production_launcher`]); web-status-page ownership has
+    /// moved OFF the agent onto the supervisor, which attaches
+    /// [`WebState`](crate::web::WebState) to the running engine through its
+    /// `on_agent` seam (Task 4 restores that wiring on this branch). Until then
+    /// `start` no longer binds the status page itself.
+    pub async fn start(config: Config, _config_path: PathBuf, watch: bool) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
 
@@ -290,52 +284,12 @@ impl Agent {
         );
 
         let transport: Arc<dyn SharingTransport> = Arc::new(transport);
-        let mut agent = Self::start_with_transport(config, transport, peer, node_id, watch).await?;
-        // Web status page: production run path only, and only when armed +
-        // enabled. Bound here (after the agent's store/engine/retention_tx
-        // exist) rather than inside `start_with_transport`, so the loopback e2e
-        // tests — which inject a transport and never call `start` — do not each
-        // try to bind the same port.
-        if watch {
-            agent.spawn_web_server(config_path).await;
-        }
+        let agent = Self::start_with_transport(config, transport, peer, node_id, watch).await?;
+        // The embedded web status page is no longer bound here: its ownership
+        // moved to the supervisor (Task 4), which attaches `WebState` to the
+        // running engine via its `on_agent` seam. `bind_and_spawn_web` stays
+        // `pub(crate)` for that caller.
         Ok(agent)
-    }
-
-    /// Bind and spawn the embedded web status page (task 9) if `web_bind` is
-    /// non-empty. The auth token is snapshotted here (an auth change needs a
-    /// restart). A non-loopback bind without a token was already refused by
-    /// [`Config::validate`], so binding wide-open is unreachable.
-    ///
-    /// A *runtime* bind failure is **non-fatal**: the status page is an optional
-    /// convenience, not the capture node's primary function (watch + sync), so a
-    /// port conflict on the default `127.0.0.1:8686` must never halt startup.
-    /// The actual bind lives in [`bind_and_spawn_web`], which logs-and-continues
-    /// on failure (returning `None`); this method can no longer fail.
-    async fn spawn_web_server(&mut self, config_path: PathBuf) {
-        if self.config.web_bind.is_empty() {
-            tracing::info!("web status page disabled (web_bind empty)");
-            return;
-        }
-        let token = self.config.web_token.clone();
-        let web_state = Arc::new(crate::web::WebState {
-            store: Arc::clone(&self.store),
-            engine: Arc::clone(&self.engine),
-            config_path,
-            config: tokio::sync::RwLock::new(self.config.clone()),
-            retention_tx: self.retention_tx.clone(),
-            // Load the display-only node_id_hex → device-name map cached at the
-            // last `perseus login` / peer resolution (task 11), so `/api/history`
-            // and the page can show friendly peer names. Empty until a login has
-            // populated it; history rows always keep the hex as the stable key.
-            device_names: crate::account::PairingCache::load(&self.config.data_dir).device_names,
-            capture_dirs: self.config.capture_dirs_resolved(),
-            peer_device: self.peer_device.clone(),
-            seen: Arc::clone(&self.seen),
-            retention_log: Arc::clone(&self.retention_log),
-        });
-        let router = crate::web::build_router(web_state, token);
-        self.web_task = bind_and_spawn_web(&self.config.web_bind, router).await;
     }
 
     /// Start an agent over a caller-supplied transport + peer. This is the
@@ -453,9 +407,6 @@ impl Agent {
             watchers,
             enqueue_task,
             retention_task,
-            // The web server is bound only by `start` (production run path), never
-            // on the transport-injection path this constructor serves.
-            web_task: None,
             retention_tx,
             retention_log,
         })
@@ -489,6 +440,25 @@ impl Agent {
         &self.origin_device
     }
 
+    /// A cheap clone of the running sync engine handle. The supervisor's
+    /// [`ManagedAgent`](crate::supervisor::ManagedAgent) impl hands this to Task
+    /// 4's web state so the status page reads live engine status.
+    pub fn engine_handle(&self) -> Arc<SyncEngineHandle> {
+        Arc::clone(&self.engine)
+    }
+
+    /// The configured sync peer id (hex) — the same value delete/audit history
+    /// rows carry. Cloned into the supervisor's [`ManagedAgent`] view.
+    pub fn peer_device(&self) -> String {
+        self.peer_device.clone()
+    }
+
+    /// A shared handle to the rolling retention-pass log the web status page
+    /// serves read-only. Cloned into the supervisor's [`ManagedAgent`] view.
+    pub fn retention_log(&self) -> Arc<Mutex<VecDeque<RetentionRunRecord>>> {
+        Arc::clone(&self.retention_log)
+    }
+
     /// A clone of the retention live-edit sender (task 8). The web settings page
     /// sends the re-validated [`RetentionConfig`] returned by
     /// [`crate::config_edit::apply_retention_edit`] here to have the running
@@ -503,12 +473,8 @@ impl Agent {
     /// Gracefully stop the watcher, drain the enqueue consumer, and shut the
     /// engine down (awaiting its worker).
     pub async fn shutdown(self) {
-        // The web status page + retention loop are independent tasks holding only
-        // Arc clones (and, for the web task, a bound listener); abort them
-        // directly — there is nothing to drain.
-        if let Some(t) = self.web_task {
-            t.abort();
-        }
+        // The retention loop is an independent task holding only Arc clones;
+        // abort it directly — there is nothing to drain.
         if let Some(t) = self.retention_task {
             t.abort();
         }
@@ -548,9 +514,6 @@ impl Agent {
         if let Some(t) = self.retention_task {
             t.abort();
         }
-        if let Some(t) = self.web_task {
-            t.abort();
-        }
         // `self.engine` (and `self.store`/`self.seen`) drop here, at end of scope.
     }
 }
@@ -567,7 +530,16 @@ impl Agent {
 /// gate, which still *hard-refuses* startup for a non-loopback `web_bind`
 /// without a `web_token`: that is a misconfiguration to fix, not a transient
 /// runtime condition to ride through.
-async fn bind_and_spawn_web(web_bind: &str, router: axum::Router) -> Option<JoinHandle<()>> {
+///
+/// Currently called only by the `#[cfg(all(test, unix))]` tests below: its
+/// production caller (`spawn_web_server`) moved to the supervisor's web wiring in
+/// Task 4, which will call this from the `on_agent` seam. `allow(dead_code)`
+/// bridges that interim on non-test builds.
+#[allow(dead_code)]
+pub(crate) async fn bind_and_spawn_web(
+    web_bind: &str,
+    router: axum::Router,
+) -> Option<JoinHandle<()>> {
     match tokio::net::TcpListener::bind(web_bind).await {
         Ok(listener) => {
             tracing::info!(bind = %web_bind, "web status page online");

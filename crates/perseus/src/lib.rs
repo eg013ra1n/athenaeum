@@ -21,6 +21,9 @@
 //!   [`watcher::StabilityTracker`].
 //! - [`run`] — the [`run::Agent`]: store + transport + engine + watcher, plus
 //!   package building, the device key, and logging setup.
+//! - [`supervisor`] — the readiness-driven engine lifecycle: a state machine
+//!   that launches/stops the [`run::Agent`] as the config gains or loses
+//!   readiness (signed in + ≥1 capture dir), with a launcher seam for tests.
 //! - [`seen`] — durable, stat-aware "already enqueued this exact file" dedup
 //!   (`perseus_seen` table), so a restart never re-baselines an un-synced
 //!   frame into oblivion.
@@ -33,6 +36,7 @@ pub mod config;
 pub mod config_edit;
 pub mod run;
 pub mod seen;
+pub mod supervisor;
 pub mod watcher;
 pub mod web;
 
