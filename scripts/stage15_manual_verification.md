@@ -152,7 +152,30 @@ Walk the four sections:
    from the web while the soak key is false must be REJECTED (422) with the
    file unchanged — try it once; this pins the safety gate.
 
-5. **Manual delete** — pick ONE confirmed test package, Delete → confirm:
+5. **Capture directories (Stage 1.5.1)** — the Status section has a Capture
+   Directories editor: add/remove a directory → Save. The page shows an amber
+   `saved — restart Perseus to apply` banner until you restart the agent
+   (watchers spawn at startup; the banner derives from saved-config ≠ runtime
+   and clears itself after the restart). Check `perseus.toml` afterwards: the
+   `capture_dirs` array is written and a legacy singular `capture_dir` key is
+   removed.
+
+6. **Retry (Stage 1.5.1)** — failed rows in Sent carry an amber **Retry**
+   button: it re-enqueues the same package as a NEW row (the old row stays
+   `failed` — that's the honest model; the receiver dedups by frame uuid, so
+   a double-click cannot create duplicate catalog rows). Confirmed rows can't
+   be retried ("not failed").
+
+7. **Package copies are freed (Stage 1.5.1)** — after a package confirms,
+   its `data_dir/packages/<uuid>/` shrinks to `manifest.ndjson` only (the
+   payload copies are deleted; the tiny manifest stays for history/audit).
+   The first restart on this build also heals everything accumulated before:
+   look for `package payload heal` with `count`/`freed_bytes` in the log, and
+   `du -sh <data_dir>/packages` drops accordingly. Sent rows now show the
+   frame FILENAMES (the dir path is the muted sub-line) — Delete removes the
+   capture source files, exactly as the button's hint says.
+
+8. **Manual delete** — pick ONE confirmed test package, Delete → confirm:
 
    ```bash
    # source file is gone from the capture dir, and the audit row exists:
