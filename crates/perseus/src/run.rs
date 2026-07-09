@@ -60,8 +60,8 @@ pub fn peer_node_id_from_ticket(ticket: &str) -> Result<NodeId> {
 pub fn load_or_create_device_key(path: &Path) -> Result<[u8; 32]> {
     if path.exists() {
         tighten_permissions_if_needed(path)?;
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("read device key {}", path.display()))?;
+        let bytes =
+            std::fs::read(path).with_context(|| format!("read device key {}", path.display()))?;
         let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
             anyhow::anyhow!(
                 "device key {} is {} bytes, expected 32 — delete it to regenerate",
@@ -83,8 +83,8 @@ pub fn load_or_create_device_key(path: &Path) -> Result<[u8; 32]> {
 #[cfg(unix)]
 fn tighten_permissions_if_needed(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("stat device key {}", path.display()))?;
+    let meta =
+        std::fs::metadata(path).with_context(|| format!("stat device key {}", path.display()))?;
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
@@ -121,8 +121,7 @@ fn write_secret_0600(path: &Path, secret: &[u8; 32]) -> Result<()> {
 
 #[cfg(not(unix))]
 fn write_secret_0600(path: &Path, secret: &[u8; 32]) -> Result<()> {
-    std::fs::write(path, secret)
-        .with_context(|| format!("write device key {}", path.display()))?;
+    std::fs::write(path, secret).with_context(|| format!("write device key {}", path.display()))?;
     Ok(())
 }
 
@@ -197,6 +196,11 @@ pub struct Agent {
     seen: Arc<SeenStore>,
     engine: Arc<SyncEngineHandle>,
     origin_device: String,
+    /// The configured sync peer id (hex) — the same value transfer history rows
+    /// carry. Threaded into retention/manual-delete audit rows so a deleted
+    /// source shows the peer it was sent to, not this node's own id. Carried into
+    /// [`WebState`](crate::web::WebState) so `POST /api/delete` stamps it too.
+    peer_device: String,
     /// One watcher per configured capture directory (empty when `watch` is
     /// false). All watchers feed the single enqueue pipeline; graceful shutdown
     /// drops ALL of them before draining the consumer.
@@ -270,9 +274,11 @@ impl Agent {
                 .add_peer_ticket(ticket)
                 .context("register peer address from pairing ticket")?;
         } else {
-            let peer_addr =
-                athenaeum_core::sync::pairing::peer_addr_with_relays(resolved.peer, &resolved.relay_urls)
-                    .context("construct account-resolved peer address")?;
+            let peer_addr = athenaeum_core::sync::pairing::peer_addr_with_relays(
+                resolved.peer,
+                &resolved.relay_urls,
+            )
+            .context("construct account-resolved peer address")?;
             transport.add_peer(peer_addr);
         }
         let peer = resolved.peer;
@@ -324,6 +330,7 @@ impl Agent {
             // populated it; history rows always keep the hex as the stable key.
             device_names: crate::account::PairingCache::load(&self.config.data_dir).device_names,
             capture_dirs: self.config.capture_dirs_resolved(),
+            peer_device: self.peer_device.clone(),
             seen: Arc::clone(&self.seen),
             retention_log: Arc::clone(&self.retention_log),
         });
@@ -361,6 +368,9 @@ impl Agent {
             peer,
         ));
         let origin_device = node_id_hex(&node_id);
+        // The sync peer id (hex) — the same value the sender stamps on transfer
+        // history rows. Threaded into retention + manual-delete audit rows.
+        let peer_device = node_id_hex(&peer);
 
         // Retention is ACTIVE (task A8). Live deletion is GATED behind the
         // two-key soak opt-in (task M4): `dry_run = false` is only accepted when
@@ -423,6 +433,7 @@ impl Agent {
                 config.clone(),
                 retention_rx,
                 Arc::clone(&retention_log),
+                peer_device.clone(),
             );
             (watchers, Some(enqueue_task), Some(retention_task))
         } else {
@@ -438,6 +449,7 @@ impl Agent {
             seen,
             engine,
             origin_device,
+            peer_device,
             watchers,
             enqueue_task,
             retention_task,
@@ -684,11 +696,18 @@ fn source_stat_unchanged(link: &SourceLink, current_size: u64, current_mtime_ms:
 /// automatic retention pass, `deleted_manual` for the web "Delete selected"
 /// action ([`delete_confirmed_packages`]). Both take the exact same deletion
 /// path; only this tag distinguishes them in the history log.
+///
+/// `peer_device` is the CONFIGURED SYNC PEER id (hex) — the same value transfer
+/// history rows carry ([`SyncEngine`]'s sender stamps `node_id_hex(&peer)`).
+/// Stamping it here (rather than the manifest's `origin_device`, which is *this*
+/// node's own id) makes a deleted-source audit row show the peer the confirmed
+/// package was sent to, consistent with its matching transfer row.
 fn build_retention_history_rows(
     pkg_ref: &Path,
     source: &Path,
     byte_size: u64,
     outcome: &str,
+    peer_device: &str,
 ) -> Vec<HistoryRow> {
     let records = match read_manifest(pkg_ref) {
         Ok(records) => records,
@@ -712,7 +731,7 @@ fn build_retention_history_rows(
             frame_uuid: String::new(),
             filename,
             object: None,
-            peer_device: String::new(),
+            peer_device: peer_device.to_string(),
             direction: Direction::Sent,
             bytes: byte_size,
             started_at: now_iso(),
@@ -733,7 +752,9 @@ fn build_retention_history_rows(
                 frame_uuid: r.frame_uuid.clone(),
                 filename: r.rel_path.clone(),
                 object,
-                peer_device: r.origin_device.clone(),
+                // The sync peer (whom the package was sent to), NOT the
+                // manifest's `origin_device` (this node itself) — see fn docs.
+                peer_device: peer_device.to_string(),
                 direction: Direction::Sent,
                 bytes: r.byte_size,
                 started_at: now_iso(),
@@ -771,12 +792,14 @@ fn build_retention_history_rows(
 /// `outcome` is the audit tag (`retention_deleted` for a retention pass,
 /// `deleted_manual` for a web delete) — the deletion path is byte-for-byte
 /// identical either way, so the two share this one function and the same
-/// safety contract.
+/// safety contract. `peer_device` is the configured sync peer id (hex) stamped
+/// onto the audit row(s) (see [`build_retention_history_rows`]).
 fn retention_delete_source(
     store: &dyn SyncStore,
     seen: &SeenStore,
     pkg_ref: &Path,
     outcome: &str,
+    peer_device: &str,
 ) -> Result<DeleteOutcome> {
     let pkg_ref_str = pkg_ref.to_string_lossy();
 
@@ -824,7 +847,8 @@ fn retention_delete_source(
     // ── Audit BEFORE the destructive action ─────────────────────────────────
     // If even the fallback row can't be persisted, the `?` propagates and the
     // delete is refused entirely this tick — `source` is never touched.
-    let history_rows = build_retention_history_rows(pkg_ref, &source, current_meta.len(), outcome);
+    let history_rows =
+        build_retention_history_rows(pkg_ref, &source, current_meta.len(), outcome, peer_device);
     for h in &history_rows {
         store
             .append_history(h.clone())
@@ -863,11 +887,13 @@ pub fn run_retention_once(
     seen: &SeenStore,
     now: DateTime<Utc>,
     disk_probe: &dyn Fn() -> u8,
+    peer_device: &str,
 ) -> Result<RetentionOutcome> {
     let policy = config.retention.to_core_policy();
     let dry_run = config.retention.dry_run;
-    let mut deleter =
-        |pkg_ref: &Path| retention_delete_source(store, seen, pkg_ref, "retention_deleted");
+    let mut deleter = |pkg_ref: &Path| {
+        retention_delete_source(store, seen, pkg_ref, "retention_deleted", peer_device)
+    };
     evaluate_and_apply(store, &policy, dry_run, now, disk_probe, &mut deleter)
 }
 
@@ -909,6 +935,7 @@ pub fn delete_confirmed_packages(
     store: &StandaloneSyncStore,
     seen: &SeenStore,
     ids: &[i64],
+    peer_device: &str,
 ) -> Result<DeleteReport> {
     let mut report = DeleteReport::default();
     for &id in ids {
@@ -927,7 +954,7 @@ pub fn delete_confirmed_packages(
             continue;
         }
         let pkg_ref = PathBuf::from(&row.package_ref);
-        match retention_delete_source(store, seen, &pkg_ref, "deleted_manual") {
+        match retention_delete_source(store, seen, &pkg_ref, "deleted_manual", peer_device) {
             Ok(DeleteOutcome::Removed) => {
                 tracing::info!(id, package_ref = %row.package_ref, "manual delete removed confirmed source");
                 report.deleted.push(id);
@@ -973,6 +1000,7 @@ fn spawn_retention_task(
     config: Config,
     mut retention_rx: watch::Receiver<RetentionConfig>,
     retention_log: Arc<Mutex<VecDeque<RetentionRunRecord>>>,
+    peer_device: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Capture volumes are static across retention edits; resolve once.
@@ -1005,11 +1033,19 @@ fn spawn_retention_task(
             let mut pass_config = config.clone();
             pass_config.retention = retention;
             let dirs = capture_dirs.clone();
+            let peer_device = peer_device.clone();
             let res = tokio::task::spawn_blocking(move || {
                 // Probe every capture volume and take the MAX usage: disk
                 // pressure on any one watched directory should trigger the gate.
                 let disk_probe = move || dirs.iter().map(|d| disk_usage_pct(d)).max().unwrap_or(0);
-                run_retention_once(&pass_config, &store, &seen, Utc::now(), &disk_probe)
+                run_retention_once(
+                    &pass_config,
+                    &store,
+                    &seen,
+                    Utc::now(),
+                    &disk_probe,
+                    &peer_device,
+                )
             })
             .await;
             // Log AND record the pass for the web status page (task 10). The
@@ -1213,7 +1249,10 @@ mod tests {
         // Hold a real listener on an OS-assigned free port for the whole test so
         // the address is genuinely occupied when the binder tries it.
         let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy ephemeral port");
-        let addr = occupied.local_addr().expect("read occupied addr").to_string();
+        let addr = occupied
+            .local_addr()
+            .expect("read occupied addr")
+            .to_string();
 
         let handle = bind_and_spawn_web(&addr, axum::Router::new()).await;
         assert!(
@@ -1249,6 +1288,12 @@ mod retention_tests {
     use crate::config::RetentionPolicy as CfgPolicy;
 
     const PEER: NodeId = [3u8; 32];
+
+    /// The sync-peer hex these tests stamp on audit rows — the same value a
+    /// transfer row would carry (`node_id_hex(&peer)`), NOT this node's own id.
+    fn peer_hex() -> String {
+        node_id_hex(&PEER)
+    }
 
     /// Test-only store wrapper that fails every `append_history` call,
     /// delegating everything else to the wrapped real store. Proves the
@@ -1342,7 +1387,8 @@ mod retention_tests {
         let id = store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
         let meta = std::fs::metadata(src).unwrap();
         let mtime_ms = crate::seen::mtime_millis(meta.modified().ok());
-        seen.mark_enqueued(src, meta.len(), mtime_ms, &pkg.to_string_lossy()).unwrap();
+        seen.mark_enqueued(src, meta.len(), mtime_ms, &pkg.to_string_lossy())
+            .unwrap();
         (pkg, id)
     }
 
@@ -1390,22 +1436,72 @@ mod retention_tests {
         store.confirm(id2, &[]).unwrap();
 
         let probe = || 0u8;
-        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &probe).unwrap();
+        let outcome =
+            run_retention_once(&config, &store, &seen, Utc::now(), &probe, &peer_hex()).unwrap();
 
         assert_eq!(outcome.deleted.len(), 2, "both confirmed sources deleted");
-        assert!(!s1.exists() && !s2.exists(), "confirmed source files removed");
+        assert!(
+            !s1.exists() && !s2.exists(),
+            "confirmed source files removed"
+        );
         assert!(su.exists(), "the unconfirmed source is never touched");
-        assert_eq!(history_deleted_count(&store), 2, "one audit row per deletion");
+        assert_eq!(
+            history_deleted_count(&store),
+            2,
+            "one audit row per deletion"
+        );
         assert_eq!(
             seen.source_for_package(&pkg1.to_string_lossy()).unwrap(),
             None,
             "a deleted source no longer resolves"
         );
         assert_eq!(
-            seen.source_for_package(&pku.to_string_lossy()).unwrap().map(|l| l.path),
+            seen.source_for_package(&pku.to_string_lossy())
+                .unwrap()
+                .map(|l| l.path),
             Some(su.clone()),
             "the unconfirmed package's source stays live and resolvable"
         );
+    }
+
+    /// Regression: the `retention_deleted` audit row is stamped with the SYNC
+    /// PEER (the same hex a transfer row carries), NOT the manifest's
+    /// `origin_device` — which is this node's OWN id (the owner's screenshot bug
+    /// showed self in this column).
+    #[test]
+    fn audit_row_stamps_sync_peer_not_self() {
+        let (_tmp, mut config, store, seen) = setup();
+        config.retention.dry_run = false;
+
+        let s1 = config.capture_dirs_resolved()[0].join("light-0001.fits");
+        std::fs::write(&s1, b"aaaa").unwrap();
+        let (_pkg1, id1) = register(&config, &store, &seen, &s1);
+        store.confirm(id1, &[]).unwrap();
+
+        run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8, &peer_hex()).unwrap();
+
+        let rows = store
+            .search_history(HistoryQuery {
+                filename: None,
+                object: None,
+                direction: None,
+                peer: None,
+                limit: 1000,
+            })
+            .unwrap();
+        let audit: Vec<_> = rows
+            .iter()
+            .filter(|h| h.outcome == "retention_deleted")
+            .collect();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(
+            audit[0].peer_device,
+            peer_hex(),
+            "the audit row stamps the sync peer, not self"
+        );
+        // `make_package` stamps `origin_device = \"test-device\"` (this node's own
+        // id in production) — asserting we did NOT fall back to the manifest value.
+        assert_ne!(audit[0].peer_device, "test-device");
     }
 
     /// Dry-run mode (the default): nothing is deleted, no audit rows, files and
@@ -1419,7 +1515,8 @@ mod retention_tests {
         let (pkg1, id1) = register(&config, &store, &seen, &s1);
         store.confirm(id1, &[]).unwrap();
 
-        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8).unwrap();
+        let outcome =
+            run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8, &peer_hex()).unwrap();
 
         assert!(outcome.dry_run);
         assert_eq!(outcome.eligible.len(), 1, "reports the confirmed candidate");
@@ -1427,7 +1524,9 @@ mod retention_tests {
         assert!(s1.exists(), "the file remains on disk");
         assert_eq!(history_deleted_count(&store), 0, "no audit rows in dry-run");
         assert_eq!(
-            seen.source_for_package(&pkg1.to_string_lossy()).unwrap().map(|l| l.path),
+            seen.source_for_package(&pkg1.to_string_lossy())
+                .unwrap()
+                .map(|l| l.path),
             Some(s1),
             "the seen linkage is untouched"
         );
@@ -1448,15 +1547,21 @@ mod retention_tests {
         // Enqueued + linked but NEVER confirmed.
         let (pkg1, _id1) = register(&config, &store, &seen, &s1);
 
-        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &|| 99u8).unwrap();
+        let outcome =
+            run_retention_once(&config, &store, &seen, Utc::now(), &|| 99u8, &peer_hex()).unwrap();
 
         assert!(outcome.eligible.is_empty(), "unconfirmed never eligible");
         assert!(outcome.deleted.is_empty());
-        assert!(outcome.would_warn_disk_pressure, "full disk + nothing to free warns");
+        assert!(
+            outcome.would_warn_disk_pressure,
+            "full disk + nothing to free warns"
+        );
         assert!(s1.exists(), "the unconfirmed source survives a full disk");
         assert_eq!(history_deleted_count(&store), 0);
         assert_eq!(
-            seen.source_for_package(&pkg1.to_string_lossy()).unwrap().map(|l| l.path),
+            seen.source_for_package(&pkg1.to_string_lossy())
+                .unwrap()
+                .map(|l| l.path),
             Some(s1),
             "the source is still live (never deleted)"
         );
@@ -1480,9 +1585,14 @@ mod retention_tests {
         // Corrupt the package: remove its manifest so `read_manifest` fails.
         std::fs::remove_file(pkg1.join(MANIFEST_FILENAME)).unwrap();
 
-        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8).unwrap();
+        let outcome =
+            run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8, &peer_hex()).unwrap();
 
-        assert_eq!(outcome.deleted.len(), 1, "the delete still proceeds via a fallback audit row");
+        assert_eq!(
+            outcome.deleted.len(),
+            1,
+            "the delete still proceeds via a fallback audit row"
+        );
         assert!(!s1.exists());
         assert_eq!(
             history_deleted_count(&store),
@@ -1505,12 +1615,21 @@ mod retention_tests {
         store.confirm(id1, &[]).unwrap();
 
         let failing = FailingAppendHistoryStore(&store);
-        let result = retention_delete_source(&failing, &seen, &pkg1, "retention_deleted");
+        let result =
+            retention_delete_source(&failing, &seen, &pkg1, "retention_deleted", &peer_hex());
 
-        assert!(result.is_err(), "an unpersistable audit must refuse the delete");
-        assert!(s1.exists(), "the source survives when the audit can't be written");
+        assert!(
+            result.is_err(),
+            "an unpersistable audit must refuse the delete"
+        );
+        assert!(
+            s1.exists(),
+            "the source survives when the audit can't be written"
+        );
         assert_eq!(
-            seen.source_for_package(&pkg1.to_string_lossy()).unwrap().map(|l| l.path),
+            seen.source_for_package(&pkg1.to_string_lossy())
+                .unwrap()
+                .map(|l| l.path),
             Some(s1),
             "the seen linkage stays live — nothing was actually removed"
         );
@@ -1534,11 +1653,19 @@ mod retention_tests {
         // file lands here after confirmation but before retention runs.
         std::fs::write(&s1, b"brand-new-unconfirmed-content").unwrap();
 
-        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8).unwrap();
+        let outcome =
+            run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8, &peer_hex()).unwrap();
 
-        assert!(outcome.deleted.is_empty(), "a stat-mismatched source must not be deleted");
+        assert!(
+            outcome.deleted.is_empty(),
+            "a stat-mismatched source must not be deleted"
+        );
         assert!(s1.exists(), "the rewritten (unconfirmed) content survives");
-        assert_eq!(history_deleted_count(&store), 0, "no audit row for a guard-skipped delete");
+        assert_eq!(
+            history_deleted_count(&store),
+            0,
+            "no audit row for a guard-skipped delete"
+        );
     }
 
     /// Minor #3: a package whose linkage was already handled by an earlier
@@ -1557,14 +1684,22 @@ mod retention_tests {
         // Simulate this package's linkage already handled by an earlier pass.
         seen.mark_deleted(&s1).unwrap();
 
-        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8).unwrap();
+        let outcome =
+            run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8, &peer_hex()).unwrap();
 
         assert!(
             outcome.deleted.is_empty(),
             "an already-handled package must never be recounted as deleted"
         );
-        assert_eq!(history_deleted_count(&store), 0, "no duplicate audit row is written");
-        assert!(s1.exists(), "the file — already logically gone — is left untouched again");
+        assert_eq!(
+            history_deleted_count(&store),
+            0,
+            "no duplicate audit row is written"
+        );
+        assert!(
+            s1.exists(),
+            "the file — already logically gone — is left untouched again"
+        );
     }
 
     /// Minor #4: a source removed out-of-band (not by retention) must be
@@ -1583,7 +1718,8 @@ mod retention_tests {
         // Out-of-band removal: something other than retention deleted the file.
         std::fs::remove_file(&s1).unwrap();
 
-        let outcome = run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8).unwrap();
+        let outcome =
+            run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8, &peer_hex()).unwrap();
 
         assert!(
             outcome.deleted.is_empty(),

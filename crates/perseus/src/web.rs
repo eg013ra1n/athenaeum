@@ -50,7 +50,7 @@ use axum::{
 };
 use tokio::sync::watch;
 
-use athenaeum_core::package::MANIFEST_FILENAME;
+use athenaeum_core::package::{read_manifest, MANIFEST_FILENAME};
 use athenaeum_core::sync::store::StandaloneSyncStore;
 use athenaeum_core::sync::{
     Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState, SyncEngineHandle, SyncStore,
@@ -65,6 +65,11 @@ use crate::seen::SeenStore;
 const DEFAULT_SENT_LIMIT: u32 = 500;
 /// Default cap for `GET /api/history` when the caller supplies no `?limit=`.
 const DEFAULT_HISTORY_LIMIT: u32 = 500;
+/// Max filenames `GET /api/sent` returns per row (read from the package
+/// manifest). The client renders the first 5; a present 6th is the "there is at
+/// least one more" signal, shown as a "+ more" marker. Perseus packages are
+/// one-file-per-frame today, so the cap is defensive.
+const SENT_FILES_CAP: usize = 6;
 /// Row window `GET /api/status` tallies its terminal counts over. The status
 /// page is a summary, not a lifetime ledger — confirmed rows accrue forever
 /// (retention deletes source files, never outbound rows), so counts over the
@@ -96,6 +101,12 @@ pub struct WebState {
     pub device_names: HashMap<String, String>,
     /// The capture directories this node watches (for the status banner).
     pub capture_dirs: Vec<PathBuf>,
+    /// This node's configured sync peer id (hex) — the same value transfer
+    /// history rows carry. Stamped onto the `deleted_manual` audit rows written
+    /// by `POST /api/delete` so the history shows the peer a confirmed package
+    /// was sent to, not this agent's own node id (the manifest's `origin_device`
+    /// is self — the earlier bug). Threaded from the resolved peer at spawn.
+    pub peer_device: String,
     /// Perseus's stat-aware seen store (source-file linkage). The manual-delete
     /// endpoint (`POST /api/delete`) resolves a confirmed package back to its
     /// source capture file through this, via the exact same deleter retention
@@ -179,6 +190,12 @@ struct SentDto {
     /// The single safe-to-delete predicate surfaced to the UI: only a
     /// `confirmed` (fully received by the peer) package may be deleted.
     deletable: bool,
+    /// Filenames inside the package, read from its manifest — the human-facing
+    /// row content (the raw `package_ref` is a `data/packages/<uuid>` dir that
+    /// misled operators into thinking a delete had failed). Capped at
+    /// [`SENT_FILES_CAP`]; empty when the manifest can't be read. See
+    /// [`sent_files`].
+    files: Vec<String>,
 }
 
 /// One transfer-history row, for `GET /api/history`.
@@ -565,11 +582,12 @@ async fn api_delete(
     State(state): State<Arc<WebState>>,
     Json(req): Json<DeleteRequest>,
 ) -> Result<Json<DeleteReport>, (StatusCode, String)> {
-    let report = delete_confirmed_packages(&state.store, &state.seen, &req.ids).map_err(|e| {
-        let msg = format!("{e:#}");
-        tracing::error!(error = %msg, "web manual delete failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, msg)
-    })?;
+    let report = delete_confirmed_packages(&state.store, &state.seen, &req.ids, &state.peer_device)
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            tracing::error!(error = %msg, "web manual delete failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg)
+        })?;
     Ok(Json(report))
 }
 
@@ -686,10 +704,7 @@ async fn api_retry(
         match state.engine.enqueue_package(dir).await {
             Ok(new_id) => {
                 tracing::info!(old_id = id, new_id, "failed package re-enqueued via web");
-                report.retried.push(RetryPair {
-                    old_id: id,
-                    new_id,
-                });
+                report.retried.push(RetryPair { old_id: id, new_id });
             }
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -715,6 +730,33 @@ fn to_sent_dto(r: &OutboundRow) -> SentDto {
         created_at: r.created_at.clone(),
         confirmed_at: r.confirmed_at.clone(),
         deletable: r.state == OutboundState::Confirmed,
+        files: sent_files(&r.package_ref),
+    }
+}
+
+/// The filenames inside a package (from its manifest), for the operator-facing
+/// `Sent` row content. Capped at [`SENT_FILES_CAP`]; each entry is the file-name
+/// component of a manifest record's `rel_path`. An unreadable or missing
+/// manifest yields an empty vec — never an error, so `/api/sent` still lists the
+/// row and the UI falls back to the dir basename. T1 keeps the manifest alive
+/// through payload cleanup, so a confirmed row still resolves its names.
+fn sent_files(package_ref: &str) -> Vec<String> {
+    match read_manifest(Path::new(package_ref)) {
+        Ok(records) => records
+            .iter()
+            .take(SENT_FILES_CAP)
+            .map(|r| {
+                Path::new(&r.rel_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(r.rel_path.as_str())
+                    .to_string()
+            })
+            .collect(),
+        Err(error) => {
+            tracing::debug!(package_ref, %error, "sent: manifest unreadable; no filenames");
+            Vec::new()
+        }
     }
 }
 
@@ -748,9 +790,10 @@ fn duration_secs(started: &str, finished: Option<&str>) -> Option<f64> {
 mod tests {
     use super::*;
 
+    use athenaeum_core::package::{ManifestRecord, PayloadKind, MANIFEST_VERSION};
     use athenaeum_core::sharing::loopback::LoopbackNetwork;
     use athenaeum_core::sharing::SharingTransport;
-    use athenaeum_core::sync::SyncEngine; // Direction/HistoryRow come via `super::*`
+    use athenaeum_core::sync::{node_id_hex, SyncEngine}; // Direction/HistoryRow come via `super::*`
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt; // for `oneshot`
@@ -780,7 +823,9 @@ mod tests {
         let confirmed = store.enqueue("pkg-confirmed", PEER).unwrap();
         store.confirm(confirmed, &[]).unwrap();
         let transferring = store.enqueue("pkg-transferring", PEER).unwrap();
-        store.set_state(transferring, OutboundState::Transferring).unwrap();
+        store
+            .set_state(transferring, OutboundState::Transferring)
+            .unwrap();
 
         store
             .append_history(HistoryRow {
@@ -823,6 +868,7 @@ mod tests {
             retention_tx: watch::channel(config.retention.clone()).0,
             device_names: HashMap::new(),
             capture_dirs: config.capture_dirs_resolved(),
+            peer_device: node_id_hex(&PEER),
             seen,
             retention_log: Arc::new(Mutex::new(VecDeque::new())),
         });
@@ -839,7 +885,9 @@ mod tests {
     }
 
     async fn body_json(res: Response) -> serde_json::Value {
-        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
@@ -848,7 +896,12 @@ mod tests {
         let (state, _tmp) = test_state().await;
         let app = build_router(state, None);
         let res = app
-            .oneshot(HttpRequest::builder().uri("/api/status").body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -871,7 +924,12 @@ mod tests {
         let app = build_router(state, Some("s3cret".to_string()));
         let unauth = app
             .clone()
-            .oneshot(HttpRequest::builder().uri("/api/status").body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
@@ -920,10 +978,19 @@ mod tests {
         let (state, _tmp) = test_state().await;
         let app = build_router(state, None);
         let res = app
-            .oneshot(HttpRequest::builder().uri("/api/status").body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK, "loopback (no token) needs no auth");
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "loopback (no token) needs no auth"
+        );
     }
 
     #[tokio::test]
@@ -934,7 +1001,12 @@ mod tests {
         // Unfiltered → both rows, with their state strings + deletable flag.
         let res = app
             .clone()
-            .oneshot(HttpRequest::builder().uri("/api/sent").body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -967,6 +1039,94 @@ mod tests {
         assert_eq!(rows[0]["deletable"], true);
     }
 
+    /// Write a real package dir: a `manifest.ndjson` with one record per
+    /// `rel_path`, no payload files (we only read the manifest). Returns the dir.
+    fn write_manifest_package(dir: &std::path::Path, rel_paths: &[&str]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut ndjson = String::new();
+        for (i, rp) in rel_paths.iter().enumerate() {
+            let rec = ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: format!("uuid-{i}"),
+                origin_catalog_uuid: format!("uuid-{i}"),
+                origin_device: "self-node".to_string(),
+                payload_kind: PayloadKind::RawFrame,
+                rel_path: rp.to_string(),
+                byte_size: 0,
+                xxh3: "0".repeat(16),
+                frame_meta: serde_json::json!({}),
+                analysis: None,
+                app_version: "test".to_string(),
+            };
+            ndjson.push_str(&serde_json::to_string(&rec).unwrap());
+            ndjson.push('\n');
+        }
+        std::fs::write(dir.join(MANIFEST_FILENAME), ndjson).unwrap();
+        dir.to_path_buf()
+    }
+
+    /// `/api/sent` surfaces the package's filenames (the file-name component of
+    /// each manifest `rel_path`), capped at `SENT_FILES_CAP`; a row whose
+    /// package dir has no readable manifest reports an empty `files` (never an
+    /// error — the row still lists).
+    #[tokio::test]
+    async fn sent_reports_manifest_filenames_capped_and_empty_when_unreadable() {
+        let (state, tmp) = test_state().await;
+
+        // A real one-file package → its filename surfaces (dir stripped).
+        let pkg = write_manifest_package(&tmp.path().join("pkg-real"), &["frames/light-0009.fits"]);
+        state.store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
+
+        // Seven files → capped at SENT_FILES_CAP (6).
+        let many: Vec<String> = (0..7).map(|i| format!("f-{i}.fits")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let big = write_manifest_package(&tmp.path().join("pkg-many"), &refs);
+        state.store.enqueue(&big.to_string_lossy(), PEER).unwrap();
+
+        let app = build_router(state, None);
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/sent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(res).await;
+        let rows = v.as_array().unwrap();
+
+        let real = rows
+            .iter()
+            .find(|r| r["packageRef"].as_str().unwrap().ends_with("pkg-real"))
+            .unwrap();
+        assert_eq!(real["files"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            real["files"][0], "light-0009.fits",
+            "file-name component only"
+        );
+
+        let big_row = rows
+            .iter()
+            .find(|r| r["packageRef"].as_str().unwrap().ends_with("pkg-many"))
+            .unwrap();
+        assert_eq!(
+            big_row["files"].as_array().unwrap().len(),
+            SENT_FILES_CAP,
+            "the server caps filenames at SENT_FILES_CAP"
+        );
+
+        // The seeded bogus-ref rows have no manifest on disk → empty files.
+        let bogus = rows
+            .iter()
+            .find(|r| r["packageRef"] == "pkg-confirmed")
+            .unwrap();
+        assert!(
+            bogus["files"].as_array().unwrap().is_empty(),
+            "an unreadable manifest yields empty files, not an error row"
+        );
+    }
+
     #[tokio::test]
     async fn history_filters_and_computes_duration_and_peer_name() {
         let (state, _tmp) = test_state().await;
@@ -975,7 +1135,12 @@ mod tests {
         // Unfiltered → both rows.
         let res = app
             .clone()
-            .oneshot(HttpRequest::builder().uri("/api/history").body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/history")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let v = body_json(res).await;
@@ -1077,8 +1242,16 @@ mod tests {
 
         // Resolve the two seeded outbound ids by state.
         let rows = state.store.all_outbound(100).unwrap();
-        let a = rows.iter().find(|r| r.state == OutboundState::Confirmed).unwrap().id;
-        let b = rows.iter().find(|r| r.state == OutboundState::Transferring).unwrap().id;
+        let a = rows
+            .iter()
+            .find(|r| r.state == OutboundState::Confirmed)
+            .unwrap()
+            .id;
+        let b = rows
+            .iter()
+            .find(|r| r.state == OutboundState::Transferring)
+            .unwrap()
+            .id;
 
         let store = Arc::clone(&state.store);
         let app = build_router(state, None);
@@ -1099,14 +1272,21 @@ mod tests {
 
         let deleted = v["deleted"].as_array().unwrap();
         assert_eq!(deleted.len(), 1);
-        assert_eq!(deleted[0].as_i64().unwrap(), a, "only the confirmed package is deleted");
+        assert_eq!(
+            deleted[0].as_i64().unwrap(),
+            a,
+            "only the confirmed package is deleted"
+        );
 
         let rejected = v["rejected"].as_array().unwrap();
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0]["id"].as_i64().unwrap(), b);
         assert_eq!(rejected[0]["reason"], "not confirmed");
 
-        assert!(!source.exists(), "the confirmed package's source is removed from disk");
+        assert!(
+            !source.exists(),
+            "the confirmed package's source is removed from disk"
+        );
 
         let hist = store
             .search_history(HistoryQuery {
@@ -1117,10 +1297,22 @@ mod tests {
                 limit: 1000,
             })
             .unwrap();
+        let audit: Vec<_> = hist
+            .iter()
+            .filter(|h| h.outcome == "deleted_manual")
+            .collect();
         assert_eq!(
-            hist.iter().filter(|h| h.outcome == "deleted_manual").count(),
+            audit.len(),
             1,
             "exactly one deleted_manual audit row for the confirmed package"
+        );
+        // The audit row stamps the CONFIGURED SYNC PEER (the same hex transfer
+        // rows carry), not this agent's own node id — the earlier bug stamped
+        // the manifest's `origin_device` (self).
+        assert_eq!(
+            audit[0].peer_device,
+            node_id_hex(&PEER),
+            "the deleted_manual row is stamped with the sync peer, not self"
         );
     }
 
@@ -1183,7 +1375,10 @@ mod tests {
             "the running retention loop's watch receiver adopts the edit"
         );
         let text = std::fs::read_to_string(&config_path).unwrap();
-        assert!(text.contains("keep_days = 14"), "the config file was rewritten: {text}");
+        assert!(
+            text.contains("keep_days = 14"),
+            "the config file was rewritten: {text}"
+        );
 
         // PUT dry_run = false with no soak opt-in in the file → 422, file untouched.
         let before = std::fs::read_to_string(&config_path).unwrap();
@@ -1211,7 +1406,10 @@ mod tests {
             "the web can never enable live deletion"
         );
         let after = std::fs::read_to_string(&config_path).unwrap();
-        assert_eq!(after, before, "a rejected edit leaves the file byte-identical");
+        assert_eq!(
+            after, before,
+            "a rejected edit leaves the file byte-identical"
+        );
     }
 
     /// The retention-run log endpoint serializes the ring buffer newest-first.
@@ -1311,7 +1509,10 @@ mod tests {
         assert!(v["configured"].is_array());
         assert!(v["runtime"].is_array());
         assert_eq!(v["restartPending"], false, "no edit yet → not pending");
-        assert_eq!(v["configured"], v["runtime"], "configured mirrors the runtime snapshot");
+        assert_eq!(
+            v["configured"], v["runtime"],
+            "configured mirrors the runtime snapshot"
+        );
 
         // PUT a new, existing directory.
         let newdir = tempfile::tempdir().unwrap();
@@ -1329,19 +1530,28 @@ mod tests {
         // The file was rewritten to the array form with the singular key removed.
         let text = std::fs::read_to_string(&config_path).unwrap();
         assert!(text.contains("capture_dirs"), "array form written: {text}");
-        assert!(!text.contains("capture_dir ="), "singular key removed: {text}");
+        assert!(
+            !text.contains("capture_dir ="),
+            "singular key removed: {text}"
+        );
 
         // A later GET still reports pending (server-derived), and `runtime` is
         // unchanged from the spawn snapshot.
         let v = get_capture_dirs(&app).await;
-        assert_eq!(v["restartPending"], true, "pending survives across requests");
+        assert_eq!(
+            v["restartPending"], true,
+            "pending survives across requests"
+        );
         let runtime_now: Vec<String> = v["runtime"]
             .as_array()
             .unwrap()
             .iter()
             .map(|s| s.as_str().unwrap().to_string())
             .collect();
-        assert_eq!(runtime_now, runtime_snapshot, "runtime stays the spawn-time snapshot");
+        assert_eq!(
+            runtime_now, runtime_snapshot,
+            "runtime stays the spawn-time snapshot"
+        );
     }
 
     /// A PUT naming a directory that does not exist is refused `422` and leaves
@@ -1361,7 +1571,10 @@ mod tests {
             "a non-existent directory is rejected"
         );
         let after = std::fs::read_to_string(&config_path).unwrap();
-        assert_eq!(after, before, "a rejected edit leaves the file byte-identical");
+        assert_eq!(
+            after, before,
+            "a rejected edit leaves the file byte-identical"
+        );
     }
 
     // ── Task 2 (S1.5.1): retry failed packages ───────────────────────────────
@@ -1406,7 +1619,10 @@ mod tests {
         let (state, tmp) = test_state().await;
         let pkg = make_package_dir(tmp.path(), "pkg-failed-intact", false);
         let old_id = state.store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
-        state.store.set_state(old_id, OutboundState::Failed).unwrap();
+        state
+            .store
+            .set_state(old_id, OutboundState::Failed)
+            .unwrap();
 
         let store = Arc::clone(&state.store);
         let app = build_router(state, None);

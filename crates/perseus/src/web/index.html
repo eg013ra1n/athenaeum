@@ -168,6 +168,26 @@
       const fmtSize = (b) => { if (b == null) return '–'; const u = ['B','KB','MB','GB','TB']; let i = 0, n = b; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; };
       const fmtDur = (s) => (s == null ? '–' : s.toFixed(1) + 's');
 
+      // A Sent-row "package" cell: filenames (from the manifest) as the primary
+      // content — the raw package dir (`data/packages/<uuid>`) misled operators
+      // into thinking a delete had failed — with the full dir path as a muted
+      // sub-line + hover title. The server caps `files` at 6; a 6th present is
+      // its "at least one more" signal, rendered as "+ more". No filenames
+      // (unreadable manifest) → fall back to the dir basename.
+      function pkgCell(r) {
+        const path = r.packageRef || '';
+        const files = r.files || [];
+        let primary;
+        if (files.length) {
+          const shown = files.slice(0, 5).map(esc).join(', ');
+          primary = files.length > 5 ? shown + ' <span class="muted">+ more</span>' : shown;
+        } else {
+          primary = esc(path.split('/').pop() || path);
+        }
+        return `<div title="${esc(path)}">${primary}</div>`
+          + `<div class="muted mono" style="font-size:0.8em;" title="${esc(path)}">${esc(path)}</div>`;
+      }
+
       async function refreshStatus() {
         try {
           const s = await getJson('/api/status');
@@ -204,7 +224,7 @@
                 // A failed package can be re-sent: retry re-enqueues its still-on-disk
                 // payload as a fresh package (the old failed row is left as-is).
                 const retry = r.state === 'failed' ? `<button class="warn" data-retry="${r.id}">Retry</button>` : '';
-                return `<tr><td>${sel}</td><td class="mono">${esc(r.packageRef)}</td><td><span class="chip ${esc(r.state)}">${esc(r.state)}</span></td><td class="mono">${esc(r.createdAt)}</td><td class="mono">${esc(r.confirmedAt || '–')}</td><td>${del}${retry}</td></tr>`;
+                return `<tr><td>${sel}</td><td>${pkgCell(r)}</td><td><span class="chip ${esc(r.state)}">${esc(r.state)}</span></td><td class="mono">${esc(r.createdAt)}</td><td class="mono">${esc(r.confirmedAt || '–')}</td><td>${del}${retry}</td></tr>`;
               }).join('')
             : '<tr><td colspan="6" class="empty">nothing sent yet</td></tr>';
           document.querySelectorAll('.rowsel').forEach((c) => c.addEventListener('change', updateDelSelected));
