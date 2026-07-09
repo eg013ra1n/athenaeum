@@ -531,11 +531,10 @@ impl Agent {
 /// without a `web_token`: that is a misconfiguration to fix, not a transient
 /// runtime condition to ride through.
 ///
-/// Currently called only by the `#[cfg(all(test, unix))]` tests below: its
-/// production caller (`spawn_web_server`) moved to the supervisor's web wiring in
-/// Task 4, which will call this from the `on_agent` seam. `allow(dead_code)`
-/// bridges that interim on non-test builds.
-#[allow(dead_code)]
+/// Called by [`supervisor::start_supervised`](crate::supervisor::start_supervised),
+/// which binds the always-on status page once at startup (the web page's
+/// ownership moved off the agent onto the supervisor in Task 4), and by the
+/// `#[cfg(all(test, unix))]` tests below.
 pub(crate) async fn bind_and_spawn_web(
     web_bind: &str,
     router: axum::Router,

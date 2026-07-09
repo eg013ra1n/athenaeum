@@ -48,7 +48,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify, RwLock};
 
 use athenaeum_core::package::{read_manifest, MANIFEST_FILENAME};
 use athenaeum_core::sync::store::StandaloneSyncStore;
@@ -60,6 +60,7 @@ use crate::config::{Config, RetentionConfig};
 use crate::config_edit::{apply_capture_dirs_edit, apply_retention_edit, RetentionEdit};
 use crate::run::{delete_confirmed_packages, DeleteReport};
 use crate::seen::SeenStore;
+use crate::supervisor::AgentState;
 
 /// Default cap for `GET /api/sent` when the caller supplies no `?limit=`.
 const DEFAULT_SENT_LIMIT: u32 = 500;
@@ -76,46 +77,126 @@ const SENT_FILES_CAP: usize = 6;
 /// most recent N packages keep the endpoint bounded in time and memory.
 const STATUS_SCAN_LIMIT: u32 = 5000;
 
-/// Shared state for the status-page router. Task 10 extends the router with
-/// write handlers over this same struct — hence fields (`config_path`,
-/// `config`, `retention_tx`) this read-only task constructs but does not yet
-/// read. See the module docs.
+/// Shared state for the always-on status-page router.
+///
+/// The page is owned by the [`supervisor`](crate::supervisor), not the agent:
+/// it stays up for the whole process lifetime, in setup mode or running. The
+/// **engine-dependent** bits (`engine`, `peer_device`, `retention_tx`,
+/// `retention_log`, `device_names`, `running_dirs`) are behind their own locks
+/// and swapped in by [`attach`](Self::attach) when the engine launches and
+/// cleared by [`detach`](Self::detach) when it stops — so a request that arrives
+/// while the node is mid-setup sees `engine = None` and degrades honestly
+/// (empty in-flight list, `503` on retry) rather than reading a stale handle.
 pub struct WebState {
-    /// The durable sync store — source of the sent/history/counts reads.
+    /// The durable sync store — source of the sent/history/counts reads. Opened
+    /// once at supervisor start (a second WAL connection beside the agent's own)
+    /// so the page reads even while the engine is detached.
     pub store: Arc<StandaloneSyncStore>,
-    /// The running engine (its `status_snapshot` is the live in-flight list;
-    /// Task 10 uses it to cancel/delete packages).
-    pub engine: Arc<SyncEngineHandle>,
-    /// Path to `perseus.toml` — Task 10's retention edit writes it via
-    /// [`config_edit`](crate::config_edit). Unused by the read endpoints.
-    pub config_path: PathBuf,
-    /// The live config, behind an async lock so Task 10 can swap in an edited
-    /// copy. The read endpoints only ever `read().await` the retention table.
-    pub config: tokio::sync::RwLock<Config>,
-    /// Retention live-edit channel (task 8). Task 10 pushes an edited
-    /// [`RetentionConfig`] here so the running retention loop adopts it without
-    /// a restart. Held now (cheap; agent-available at spawn), used by Task 10.
-    pub retention_tx: watch::Sender<RetentionConfig>,
-    /// Peer node id (hex) → friendly device name, for enriching history rows.
-    /// Empty until Task 11 wires the hub device-name cache.
-    pub device_names: HashMap<String, String>,
-    /// The capture directories this node watches (for the status banner).
-    pub capture_dirs: Vec<PathBuf>,
-    /// This node's configured sync peer id (hex) — the same value transfer
-    /// history rows carry. Stamped onto the `deleted_manual` audit rows written
-    /// by `POST /api/delete` so the history shows the peer a confirmed package
-    /// was sent to, not this agent's own node id (the manifest's `origin_device`
-    /// is self — the earlier bug). Threaded from the resolved peer at spawn.
-    pub peer_device: String,
     /// Perseus's stat-aware seen store (source-file linkage). The manual-delete
     /// endpoint (`POST /api/delete`) resolves a confirmed package back to its
     /// source capture file through this, via the exact same deleter retention
     /// uses ([`delete_confirmed_packages`](crate::run::delete_confirmed_packages)).
     pub seen: Arc<SeenStore>,
+    /// Path to `perseus.toml` — the retention / capture-dirs edits write it via
+    /// [`config_edit`](crate::config_edit).
+    pub config_path: PathBuf,
+    /// The live config. The supervisor refreshes it every pass (so DTOs track
+    /// on-disk edits); the PUT handlers swap in an edited copy after re-validation.
+    pub config: RwLock<Config>,
+    /// The supervisor's live lifecycle state — `agentState`/`agentDetail` and the
+    /// `restartPending` gate come from here (`GET /api/status`).
+    pub agent_state: watch::Receiver<AgentState>,
+    /// Prod the supervisor into an immediate config re-read (Task 5's account
+    /// page rings this after a sign-in so readiness is picked up at once).
+    pub supervisor_wake: Arc<Notify>,
+    // ── swapped by attach()/detach() as the engine starts/stops ──────────────
+    /// The running engine (its `status_snapshot` is the live in-flight list;
+    /// `POST /api/retry` re-enqueues through it). `None` while detached (setup).
+    pub engine: RwLock<Option<Arc<SyncEngineHandle>>>,
+    /// This node's configured sync peer id (hex) — the same value transfer
+    /// history rows carry. Stamped onto the `deleted_manual` audit rows written
+    /// by `POST /api/delete` so the history shows the peer a confirmed package
+    /// was sent to, not this agent's own node id (the manifest's `origin_device`
+    /// is self — the earlier bug). Empty while detached.
+    pub peer_device: RwLock<String>,
+    /// Retention live-edit channel: the PUT-policy handler pushes an edited
+    /// [`RetentionConfig`] here so the running retention loop adopts it without a
+    /// restart. A placeholder (no receivers) while detached — sends are no-ops.
+    pub retention_tx: RwLock<watch::Sender<RetentionConfig>>,
     /// Rolling record (cap 50, newest-first) of the retention loop's recent
-    /// passes, surfaced read-only at `GET /api/retention/log`. The retention loop
-    /// in [`crate::run`] push-fronts each pass; this task is read-only.
-    pub retention_log: Arc<Mutex<VecDeque<RetentionRunRecord>>>,
+    /// passes, surfaced read-only at `GET /api/retention/log`. An empty buffer
+    /// while detached (no retention loop yet).
+    pub retention_log: RwLock<Arc<Mutex<VecDeque<RetentionRunRecord>>>>,
+    /// Peer node id (hex) → friendly device name, for enriching history rows.
+    /// Loaded from the pairing cache on attach.
+    pub device_names: RwLock<HashMap<String, String>>,
+    /// The capture directories the running engine was launched over. Set on
+    /// attach, cleared on detach; `restartPending` is this differing from the
+    /// configured set while the engine is running.
+    pub running_dirs: RwLock<Vec<PathBuf>>,
+}
+
+impl WebState {
+    /// Build a **detached** (setup-mode) state: store + seen open, engine absent.
+    /// The supervisor upgrades it to running via [`attach`](Self::attach) once
+    /// the node is ready and the engine launches.
+    pub fn detached(
+        store: Arc<StandaloneSyncStore>,
+        seen: Arc<SeenStore>,
+        config: Config,
+        config_path: PathBuf,
+        agent_state: watch::Receiver<AgentState>,
+        supervisor_wake: Arc<Notify>,
+    ) -> Self {
+        Self {
+            store,
+            seen,
+            config_path,
+            config: RwLock::new(config),
+            agent_state,
+            supervisor_wake,
+            engine: RwLock::new(None),
+            peer_device: RwLock::new(String::new()),
+            // A placeholder sender with no receivers: `send` is a harmless no-op
+            // until `attach` swaps in the running agent's real retention channel.
+            retention_tx: RwLock::new(watch::channel(RetentionConfig::default()).0),
+            retention_log: RwLock::new(Arc::new(Mutex::new(VecDeque::new()))),
+            device_names: RwLock::new(HashMap::new()),
+            running_dirs: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Swap the engine-dependent bits in as the engine comes up. Called (via a
+    /// `tokio::spawn`) from the supervisor's `on_agent` seam, which clones these
+    /// out of the `&dyn ManagedAgent` synchronously first (the callback is sync;
+    /// this is `async` and takes the write locks).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn attach(
+        &self,
+        engine: Option<Arc<SyncEngineHandle>>,
+        peer_device: String,
+        retention_tx: watch::Sender<RetentionConfig>,
+        retention_log: Arc<Mutex<VecDeque<RetentionRunRecord>>>,
+        device_names: HashMap<String, String>,
+        running_dirs: Vec<PathBuf>,
+    ) {
+        *self.engine.write().await = engine;
+        *self.peer_device.write().await = peer_device;
+        *self.retention_tx.write().await = retention_tx;
+        *self.retention_log.write().await = retention_log;
+        *self.device_names.write().await = device_names;
+        *self.running_dirs.write().await = running_dirs;
+    }
+
+    /// Drop the engine-dependent bits as the engine stops (setup lost, restart,
+    /// or shutdown): the page falls back to its detached behaviour. `retention_tx`
+    /// / `retention_log` / `device_names` are left as-is — harmlessly stale reads
+    /// until the next attach — while the load-bearing safety bits are cleared.
+    pub async fn detach(&self) {
+        *self.engine.write().await = None;
+        *self.peer_device.write().await = String::new();
+        *self.running_dirs.write().await = Vec::new();
+    }
 }
 
 /// One recorded retention pass, for `GET /api/retention/log`. Built by the
@@ -142,9 +223,19 @@ pub struct RetentionRunRecord {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StatusDto {
+    /// The supervisor's lifecycle label: `needs_setup` | `starting` | `running`
+    /// | `failed` (from [`AgentState::label`]).
+    agent_state: String,
+    /// Human-readable detail for the state (joined setup needs, or the error
+    /// text); `None` for `starting` / `running` (from [`AgentState::detail`]).
+    agent_detail: Option<String>,
+    /// The engine is running but over a stale capture-dir set (a saved edit not
+    /// yet applied): the page shows an "applying…" banner and awaits the restart.
+    restart_pending: bool,
     /// Watched capture directories (as display strings).
     capture_dirs: Vec<String>,
-    /// Live non-terminal packages (queued/announced/transferring).
+    /// Live non-terminal packages (queued/announced/transferring). Empty while
+    /// the engine is detached (setup mode).
     in_flight: Vec<SentDto>,
     /// The current retention policy + tuning.
     retention: RetentionDto,
@@ -282,20 +373,39 @@ async fn index_html() -> Html<&'static str> {
 async fn api_status(
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<StatusDto>, (StatusCode, String)> {
-    let retention = state.config.read().await.retention.clone();
+    // Snapshot the config once (clone, drop the guard) so no lock is held across
+    // the store/engine reads below.
+    let config = state.config.read().await.clone();
+    let retention = config.retention.clone();
+    let configured = config.capture_dirs_resolved();
 
-    // Live, complete in-flight picture (non-terminal rows, no cap).
-    let in_flight_rows = state.engine.status_snapshot().map_err(|e| {
-        tracing::error!(error = %e, "web status: read in-flight failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-    let queued = in_flight_rows
-        .iter()
-        .filter(|r| r.state == OutboundState::Queued)
-        .count() as u64;
-    let in_flight = in_flight_rows.iter().map(to_sent_dto).collect();
+    // Lifecycle state (cloned out of the watch borrow immediately, never held
+    // across an await).
+    let agent = state.agent_state.borrow().clone();
+    let running = state.running_dirs.read().await.clone();
+    let restart_pending = matches!(agent, AgentState::Running { .. }) && running != configured;
 
-    // Terminal counts over a bounded recent window (see STATUS_SCAN_LIMIT).
+    // Live in-flight picture — only when the engine is attached. Detached
+    // (setup mode) reports an empty list, never an error.
+    let engine = state.engine.read().await.clone();
+    let (in_flight, queued) = match &engine {
+        Some(engine) => {
+            let rows = engine.status_snapshot().map_err(|e| {
+                tracing::error!(error = %e, "web status: read in-flight failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            })?;
+            let queued = rows
+                .iter()
+                .filter(|r| r.state == OutboundState::Queued)
+                .count() as u64;
+            let in_flight: Vec<SentDto> = rows.iter().map(to_sent_dto).collect();
+            (in_flight, queued)
+        }
+        None => (Vec::new(), 0),
+    };
+
+    // Terminal counts over a bounded recent window (see STATUS_SCAN_LIMIT). The
+    // store is always open, engine or not.
     let recent = state.store.all_outbound(STATUS_SCAN_LIMIT).map_err(|e| {
         tracing::error!(error = %e, "web status: read outbound window failed");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -310,8 +420,10 @@ async fn api_status(
         .count() as u64;
 
     Ok(Json(StatusDto {
-        capture_dirs: state
-            .capture_dirs
+        agent_state: agent.label().to_string(),
+        agent_detail: agent.detail(),
+        restart_pending,
+        capture_dirs: configured
             .iter()
             .map(|p| p.display().to_string())
             .collect(),
@@ -399,9 +511,10 @@ async fn api_history(
         tracing::error!(error = %e, "web history: search failed");
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
+    let device_names = state.device_names.read().await;
     let dtos = rows
         .iter()
-        .map(|r| to_history_dto(r, &state.device_names))
+        .map(|r| to_history_dto(r, &device_names))
         .collect();
     Ok(Json(dtos))
 }
@@ -483,16 +596,14 @@ async fn api_put_retention_policy(
     // agent started without `watch`) is a harmless no-op — discard the SendError.
     let retention = new_cfg.retention.clone();
     *state.config.write().await = new_cfg;
-    let _ = state.retention_tx.send(retention.clone());
+    let _ = state.retention_tx.read().await.send(retention.clone());
     Ok(Json(PolicyDto::from_retention(&retention)))
 }
 
 /// `GET /api/retention/log` — the retention-run ring buffer, newest-first.
 async fn api_retention_log(State(state): State<Arc<WebState>>) -> Json<Vec<RetentionRunRecord>> {
-    let log = state
-        .retention_log
-        .lock()
-        .expect("retention_log mutex poisoned");
+    let log_handle = state.retention_log.read().await;
+    let log = log_handle.lock().expect("retention_log mutex poisoned");
     Json(log.iter().cloned().collect())
 }
 
@@ -531,7 +642,9 @@ async fn capture_dirs_dto(state: &WebState) -> CaptureDirsDto {
         .map(|p| p.display().to_string())
         .collect();
     let runtime: Vec<String> = state
-        .capture_dirs
+        .running_dirs
+        .read()
+        .await
         .iter()
         .map(|p| p.display().to_string())
         .collect();
@@ -582,7 +695,8 @@ async fn api_delete(
     State(state): State<Arc<WebState>>,
     Json(req): Json<DeleteRequest>,
 ) -> Result<Json<DeleteReport>, (StatusCode, String)> {
-    let report = delete_confirmed_packages(&state.store, &state.seen, &req.ids, &state.peer_device)
+    let peer_device = state.peer_device.read().await.clone();
+    let report = delete_confirmed_packages(&state.store, &state.seen, &req.ids, &peer_device)
         .map_err(|e| {
             let msg = format!("{e:#}");
             tracing::error!(error = %msg, "web manual delete failed");
@@ -664,6 +778,15 @@ async fn api_retry(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RetryRequest>,
 ) -> Result<Json<RetryReport>, (StatusCode, String)> {
+    // Retry re-enqueues through the live engine; there is nothing to retry into
+    // while the node is still in setup (engine detached). Honest 503, not a crash.
+    let Some(engine) = state.engine.read().await.clone() else {
+        tracing::warn!("web retry: sync engine is not running");
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sync engine is not running — finish setup first".to_string(),
+        ));
+    };
     let mut report = RetryReport::default();
     for &id in &req.ids {
         // A genuine store read failure is a 500 (the request failed), not a
@@ -701,7 +824,7 @@ async fn api_retry(
             });
             continue;
         }
-        match state.engine.enqueue_package(dir).await {
+        match engine.enqueue_package(dir).await {
             Ok(new_id) => {
                 tracing::info!(old_id = id, new_id, "failed package re-enqueued via web");
                 report.retried.push(RetryPair { old_id: id, new_id });
@@ -790,6 +913,7 @@ fn duration_secs(started: &str, finished: Option<&str>) -> Option<f64> {
 mod tests {
     use super::*;
 
+    use crate::supervisor::AgentState;
     use athenaeum_core::package::{ManifestRecord, PayloadKind, MANIFEST_VERSION};
     use athenaeum_core::sharing::loopback::LoopbackNetwork;
     use athenaeum_core::sharing::SharingTransport;
@@ -860,17 +984,23 @@ mod tests {
         let config_path = tmp.path().join("perseus.toml");
         std::fs::write(&config_path, &toml_str).unwrap();
         let config = Config::from_toml_str(&toml_str).unwrap();
+        // The attached (running) shape the handler tests exercise: a live engine,
+        // the peer + capture dirs the engine was launched over, and a Running
+        // lifecycle state. (The two detached-mode tests use `detached_test_state`.)
+        let (_state_tx, state_rx) = watch::channel(AgentState::Running { in_flight: 0 });
         let state = Arc::new(WebState {
             store,
-            engine,
-            config_path,
-            config: tokio::sync::RwLock::new(config.clone()),
-            retention_tx: watch::channel(config.retention.clone()).0,
-            device_names: HashMap::new(),
-            capture_dirs: config.capture_dirs_resolved(),
-            peer_device: node_id_hex(&PEER),
             seen,
-            retention_log: Arc::new(Mutex::new(VecDeque::new())),
+            config_path,
+            config: RwLock::new(config.clone()),
+            agent_state: state_rx,
+            supervisor_wake: Arc::new(Notify::new()),
+            engine: RwLock::new(Some(engine)),
+            peer_device: RwLock::new(node_id_hex(&PEER)),
+            retention_tx: RwLock::new(watch::channel(config.retention.clone()).0),
+            retention_log: RwLock::new(Arc::new(Mutex::new(VecDeque::new()))),
+            device_names: RwLock::new(HashMap::new()),
+            running_dirs: RwLock::new(config.capture_dirs_resolved()),
         });
         (state, tmp)
     }
@@ -884,11 +1014,94 @@ mod tests {
         )
     }
 
+    /// A **detached** (setup-mode) `WebState`: store + seen open, engine absent,
+    /// with the supervisor's live [`AgentState`] plumbed through. Built via
+    /// [`WebState::detached`] — the exact shape the always-on status page runs in
+    /// before the node is signed in and the engine launches.
+    async fn detached_test_state(agent: AgentState) -> (Arc<WebState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+        let seen = Arc::new(crate::seen::SeenStore::open(tmp.path().join("sync.db")).unwrap());
+        let toml_str = sample_toml(tmp.path());
+        let config_path = tmp.path().join("perseus.toml");
+        std::fs::write(&config_path, &toml_str).unwrap();
+        let config = Config::from_toml_str(&toml_str).unwrap();
+        // A live watch channel for the lifecycle state; the sender is dropped
+        // (borrow() still returns the seeded value after the last sender goes).
+        let (_state_tx, state_rx) = watch::channel(agent);
+        let state = Arc::new(WebState::detached(
+            store,
+            seen,
+            config,
+            config_path,
+            state_rx,
+            Arc::new(Notify::new()),
+        ));
+        (state, tmp)
+    }
+
     async fn body_json(res: Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// A detached node (engine absent, mid-setup) still serves `/api/status`: it
+    /// reports the lifecycle `agentState`/`agentDetail` from the supervisor's
+    /// watch channel and an empty in-flight list (no engine to snapshot).
+    #[tokio::test]
+    async fn status_reports_agent_state_and_empty_in_flight_when_detached() {
+        let (state, _tmp) = detached_test_state(AgentState::NeedsSetup {
+            needs: vec!["not signed in".to_string()],
+        })
+        .await;
+        let app = build_router(state, None);
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["agentState"], "needs_setup");
+        assert!(
+            v["agentDetail"].as_str().unwrap().contains("not signed in"),
+            "agentDetail carries the setup need: {}",
+            v["agentDetail"]
+        );
+        assert!(
+            v["inFlight"].as_array().unwrap().is_empty(),
+            "no engine → empty in-flight list, never an error"
+        );
+    }
+
+    /// `POST /api/retry` on a detached node (engine absent) is a `503`, not a
+    /// crash — the operator is told to finish setup first.
+    #[tokio::test]
+    async fn retry_returns_503_when_engine_absent() {
+        let (state, _tmp) = detached_test_state(AgentState::NeedsSetup {
+            needs: vec!["not signed in".to_string()],
+        })
+        .await;
+        let app = build_router(state, None);
+        let body = serde_json::json!({ "ids": [1] });
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/retry")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -1324,7 +1537,7 @@ mod tests {
     async fn retention_policy_roundtrip() {
         let (state, _tmp) = test_state().await;
         // A live receiver so the PUT's watch send is both observable and succeeds.
-        let mut rx = state.retention_tx.subscribe();
+        let mut rx = state.retention_tx.read().await.subscribe();
         let config_path = state.config_path.clone();
         let app = build_router(state, None);
 
@@ -1417,7 +1630,8 @@ mod tests {
     async fn retention_log_returns_ring_buffer() {
         let (state, _tmp) = test_state().await;
         {
-            let mut log = state.retention_log.lock().unwrap();
+            let log_handle = state.retention_log.read().await;
+            let mut log = log_handle.lock().unwrap();
             // Push oldest first; each push_front puts the newest at the head.
             log.push_front(RetentionRunRecord {
                 at: "2026-07-08T10:00:00.000Z".into(),
@@ -1498,7 +1712,9 @@ mod tests {
         let config_path = state.config_path.clone();
         // The spawn-time runtime snapshot — never mutated by a web edit.
         let runtime_snapshot: Vec<String> = state
-            .capture_dirs
+            .running_dirs
+            .read()
+            .await
             .iter()
             .map(|p| p.display().to_string())
             .collect();

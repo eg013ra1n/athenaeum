@@ -54,6 +54,9 @@
       ul.log { list-style: none; margin: 0; padding: 0; max-height: 14rem; overflow-y: auto; }
       .banner { border-radius: 6px; padding: 0.45rem 0.7rem; margin-bottom: 0.7rem; font-size: 0.82rem; border: 1px solid transparent; }
       .banner.warn { background: #3a2d10; color: var(--warn); border-color: var(--warn); }
+      .banner.err { background: #3d1417; color: var(--err); border-color: var(--err); }
+      .banner.info { background: #10233a; color: var(--accent); border-color: var(--accent); }
+      #agent-banner { font-weight: 600; }
     </style>
   </head>
   <body>
@@ -63,6 +66,9 @@
       <span class="sub" id="conn"></span>
     </header>
     <main>
+      <!-- Lifecycle banner, rendered from /api/status: hidden while running
+           normally; shown for setup / starting / failed / restart-pending. -->
+      <div class="banner" id="agent-banner" style="display:none;"></div>
       <section id="status">
         <h2>Status</h2>
         <div class="mono muted" id="captureDirs"></div>
@@ -188,11 +194,48 @@
           + `<div class="muted mono" style="font-size:0.8em;" title="${esc(path)}">${esc(path)}</div>`;
       }
 
+      // The lifecycle banner above the status card. Hidden while the engine is
+      // running normally; otherwise it surfaces the supervisor's agentState:
+      // yellow for setup, blue for starting, red for a failed launch, and a
+      // yellow "applying…" note while a saved capture-dir edit awaits its restart.
+      function renderAgentBanner(s) {
+        const b = $('agent-banner');
+        if (s.restartPending) {
+          b.className = 'banner warn';
+          b.textContent = 'Applying capture folder changes… restarting the sync engine';
+          b.style.display = '';
+          return;
+        }
+        switch (s.agentState) {
+          case 'running':
+            b.style.display = 'none';
+            break;
+          case 'needs_setup':
+            b.className = 'banner warn';
+            b.textContent = 'Setup required: ' + (s.agentDetail || 'finish setup to start syncing');
+            b.style.display = '';
+            break;
+          case 'starting':
+            b.className = 'banner info';
+            b.textContent = 'Starting…';
+            b.style.display = '';
+            break;
+          case 'failed':
+            b.className = 'banner err';
+            b.textContent = 'Sync engine failed: ' + (s.agentDetail || 'see the logs');
+            b.style.display = '';
+            break;
+          default:
+            b.style.display = 'none';
+        }
+      }
+
       async function refreshStatus() {
         try {
           const s = await getJson('/api/status');
           $('conn').textContent = 'connected';
           $('conn').className = 'sub';
+          renderAgentBanner(s);
           $('captureDirs').innerHTML = s.captureDirs.map(esc).join('<br>') || '<i>no capture dirs</i>';
           $('cQueued').textContent = s.counts.queued;
           $('cConfirmed').textContent = s.counts.confirmedTotal;

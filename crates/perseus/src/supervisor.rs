@@ -21,6 +21,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
 use athenaeum_core::sync::SyncEngineHandle;
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
@@ -163,14 +164,45 @@ impl SupervisorHandle {
 /// `Some(&dyn ManagedAgent)` right after every successful launch (before the
 /// `Running` state is published) and with `None` right **before** every stop —
 /// Task 4 attaches / detaches the web `WebState` here.
+///
+/// This is the test-facing entry point: it owns the lifecycle channel + wake and
+/// runs with a no-op config hook. Production goes through [`start_supervised`],
+/// which builds the always-on web page first and then calls [`spawn_with`] with
+/// the web-owned wake + state channel and a config-refresh hook.
 pub fn spawn(
     config_path: PathBuf,
     launcher: Launcher,
     opts: SupervisorOptions,
     on_agent: Box<dyn Fn(Option<&dyn ManagedAgent>) + Send>,
 ) -> SupervisorHandle {
-    let (state_tx, state_rx) = watch::channel(AgentState::NeedsSetup { needs: vec![] });
     let wake = Arc::new(Notify::new());
+    let (state_tx, _state_rx) = watch::channel(AgentState::NeedsSetup { needs: vec![] });
+    spawn_with(
+        config_path,
+        launcher,
+        opts,
+        on_agent,
+        Box::new(|_| {}),
+        wake,
+        state_tx,
+    )
+}
+
+/// The full supervisor engine. Unlike [`spawn`], the lifecycle `state_tx` and
+/// `wake` are supplied by the caller ([`start_supervised`]) so the always-on web
+/// [`WebState`](crate::web::WebState) can hold the matching receiver and ring the
+/// wake **before** the loop starts. `on_config` fires once per pass with the
+/// freshly-loaded config so the web DTOs track on-disk edits even in setup mode.
+fn spawn_with(
+    config_path: PathBuf,
+    launcher: Launcher,
+    opts: SupervisorOptions,
+    on_agent: Box<dyn Fn(Option<&dyn ManagedAgent>) + Send>,
+    on_config: Box<dyn Fn(&Config) + Send>,
+    wake: Arc<Notify>,
+    state_tx: watch::Sender<AgentState>,
+) -> SupervisorHandle {
+    let state_rx = state_tx.subscribe();
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let wake2 = Arc::clone(&wake);
     let task = tokio::spawn(async move {
@@ -197,6 +229,9 @@ pub fn spawn(
                     continue;
                 }
             };
+            // Refresh the web's view of the config every pass (retention /
+            // capture-dirs DTOs track on-disk edits, setup mode included).
+            on_config(&config);
             let needs = config.setup_needs(crate::account::token_present(&config));
             let configured = config.capture_dirs_resolved();
 
@@ -315,6 +350,125 @@ pub fn production_launcher() -> Launcher {
             Ok(Box::new(agent) as Box<dyn ManagedAgent>)
         })
     })
+}
+
+/// Production entry point: bring up the **always-on** web status page, then run
+/// the readiness supervisor with that page's [`WebState`](crate::web::WebState)
+/// attached / detached as the engine comes and goes.
+///
+/// The page is bound **once** here (loopback by default) and lives for the whole
+/// process, independent of the engine — in setup mode it renders the outstanding
+/// `agentState`; once the node is ready and the launcher builds the engine, the
+/// `on_agent` seam swaps the live engine bits into the shared `WebState`. The
+/// store + seen are opened here (a second WAL connection beside the agent's own)
+/// so sent/history read even while detached. An empty `web_bind` skips the bind;
+/// a runtime bind failure is non-fatal (logged, swallowed).
+pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> {
+    use athenaeum_core::sync::store::StandaloneSyncStore;
+
+    use crate::account::PairingCache;
+    use crate::seen::SeenStore;
+    use crate::web::{build_router, WebState};
+
+    let config = Config::load_lenient(&config_path)
+        .with_context(|| format!("load perseus config {}", config_path.display()))?;
+    std::fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
+
+    // Web store + seen: a second connection to the same perseus.db beside the
+    // agent's own (safe under WAL — the established pattern in this crate), so
+    // the page serves sent/history even while the engine is detached (setup).
+    let store = Arc::new(
+        StandaloneSyncStore::open(config.db_path())
+            .with_context(|| format!("open sync store {}", config.db_path().display()))?,
+    );
+    let seen = Arc::new(
+        SeenStore::open(config.db_path())
+            .with_context(|| format!("open seen store {}", config.db_path().display()))?,
+    );
+
+    // The lifecycle channel + wake are created HERE so the always-on page can
+    // hold the receiver (and ring the wake — Task 5's account page prods a
+    // re-check after sign-in) before the supervisor loop starts.
+    let wake = Arc::new(Notify::new());
+    let (state_tx, state_rx) = watch::channel(AgentState::NeedsSetup { needs: vec![] });
+
+    let web_state = Arc::new(WebState::detached(
+        Arc::clone(&store),
+        Arc::clone(&seen),
+        config.clone(),
+        config_path.clone(),
+        state_rx,
+        Arc::clone(&wake),
+    ));
+
+    // Bind the always-on status page (loopback default).
+    if config.web_bind.is_empty() {
+        tracing::info!("web status page disabled (web_bind empty)");
+    } else {
+        let router = build_router(Arc::clone(&web_state), config.web_token.clone());
+        let _ = crate::run::bind_and_spawn_web(&config.web_bind, router).await;
+    }
+
+    // ── Engine attach / detach seam ──────────────────────────────────────────
+    // `on_agent` is sync; `attach`/`detach` take the write locks (async). So the
+    // callback clones the engine-dependent bits out of `&dyn ManagedAgent`
+    // synchronously, then `tokio::spawn`s the async swap onto the shared state.
+    let data_dir = config.data_dir.clone();
+    let attach_config_path = config_path.clone();
+    let ws_agent = Arc::clone(&web_state);
+    let on_agent: Box<dyn Fn(Option<&dyn ManagedAgent>) + Send> =
+        Box::new(move |agent: Option<&dyn ManagedAgent>| {
+            let ws = Arc::clone(&ws_agent);
+            match agent {
+                Some(agent) => {
+                    let engine = agent.engine();
+                    let peer_device = agent.peer_device();
+                    let retention_tx = agent.retention_tx();
+                    let retention_log = agent.retention_log();
+                    let device_names = PairingCache::load(&data_dir).device_names;
+                    // The dirs the engine was launched over — read from the same
+                    // config file the launcher just used (authoritative, sync).
+                    let running_dirs = Config::load_lenient(&attach_config_path)
+                        .map(|c| c.capture_dirs_resolved())
+                        .unwrap_or_default();
+                    tokio::spawn(async move {
+                        ws.attach(
+                            engine,
+                            peer_device,
+                            retention_tx,
+                            retention_log,
+                            device_names,
+                            running_dirs,
+                        )
+                        .await;
+                    });
+                }
+                None => {
+                    tokio::spawn(async move { ws.detach().await });
+                }
+            }
+        });
+
+    // `on_config` refreshes the web view of the config each pass. `try_write`
+    // never blocks: a concurrent handler write simply wins this tick and the
+    // next pass reconciles.
+    let ws_config = Arc::clone(&web_state);
+    let on_config: Box<dyn Fn(&Config) + Send> = Box::new(move |config: &Config| {
+        if let Ok(mut guard) = ws_config.config.try_write() {
+            *guard = config.clone();
+        }
+    });
+
+    Ok(spawn_with(
+        config_path,
+        production_launcher(),
+        SupervisorOptions::default(),
+        on_agent,
+        on_config,
+        wake,
+        state_tx,
+    ))
 }
 
 #[cfg(test)]
