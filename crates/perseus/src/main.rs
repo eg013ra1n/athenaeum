@@ -3,7 +3,9 @@
 //! Subcommands:
 //! - `login` — interactive account sign-in (email → OTP); stores the device
 //!   token and registers this node as a capture device (task M1).
-//! - `run` — watch the capture dir and auto-send new frames (the service mode).
+//! - `run` — supervisor mode: host the local web status page and drive the
+//!   watcher/engine lifecycle until Ctrl-C (the service mode). First run on the
+//!   platform config path bootstraps a commented default config.
 //! - `status` — print a one-shot human summary of config + in-flight transfers.
 //! - `enqueue-backlog <dir>` — enqueue FITS/XISF already on disk before the
 //!   watcher was running, then drain and exit.
@@ -23,9 +25,10 @@ use perseus::run::{backlog_files, init_logging, Agent};
 #[derive(Parser, Debug)]
 #[command(name = "perseus", version, about, long_about = None)]
 struct Cli {
-    /// Path to the TOML config file.
-    #[arg(short, long, default_value = "perseus.toml", global = true)]
-    config: PathBuf,
+    /// Path to the TOML config file. When omitted, a legacy `./perseus.toml` is
+    /// honored if present, otherwise the platform config path is used.
+    #[arg(short, long, global = true)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Command,
@@ -36,7 +39,8 @@ enum Command {
     /// Sign in to the account (interactive email + one-time code) and register
     /// this node as a capture device paired to the account's primary.
     Login,
-    /// Watch the capture directory and auto-send new frames (runs until Ctrl-C).
+    /// Supervisor mode: host the local web page and drive the watcher/engine
+    /// lifecycle (runs until Ctrl-C). Bootstraps a default config on first run.
     Run,
     /// Print a one-shot status summary (config + in-flight transfers).
     Status,
@@ -50,7 +54,19 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::load(&cli.config)?;
+    let config_path = perseus::config::resolve_config_path(cli.config.clone());
+
+    // First-run bootstrap is for `run` only (Task 8's tray adds itself here).
+    // `login`/`status`/`enqueue-backlog` on a missing file fail with the friendly
+    // "read perseus config" error below rather than auto-creating.
+    if matches!(cli.command, Command::Run) {
+        perseus::config::ensure_config_exists(&config_path)?;
+    }
+
+    // A lenient load is enough to bring up the data dir + logging + startup banner
+    // for every command; `enqueue-backlog` re-loads strictly below (it genuinely
+    // needs dirs + a usable pairing route). `login`/`status` run pre-setup too.
+    let config = Config::load_lenient(&config_path)?;
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
     // Keep the log guard alive for the whole process (flushes on drop).
@@ -58,25 +74,32 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Login => perseus::account::login(&config).await,
-        Command::Run => cmd_run(config, cli.config.clone()).await,
+        Command::Run => cmd_run(config, config_path).await,
         Command::Status => cmd_status(config).await,
-        Command::EnqueueBacklog { dir } => cmd_enqueue_backlog(config, cli.config.clone(), dir).await,
+        Command::EnqueueBacklog { dir } => {
+            // Strict re-load: enqueue-backlog needs a fully valid config.
+            let config = Config::load(&config_path)?;
+            cmd_enqueue_backlog(config, config_path, dir).await
+        }
     }
 }
 
-/// `run`: arm the watcher + engine and block until Ctrl-C, then shut down cleanly.
+/// `run`: hand off to the supervisor (which binds the web page and drives the
+/// watcher/engine lifecycle) and block until Ctrl-C, then shut it down cleanly.
+/// The passed `config` is used only for the startup banner — the supervisor
+/// reloads from disk itself.
 async fn cmd_run(config: Config, config_path: PathBuf) -> Result<()> {
     tracing::info!(
         capture_dirs = ?config.capture_dirs_resolved(),
         data_dir = %config.data_dir.display(),
-        "perseus starting (auto mode)"
+        "perseus starting (supervisor mode)"
     );
-    let agent = Agent::start(config, config_path, true).await?;
+    let handle = perseus::supervisor::start_supervised(config_path).await?;
     tokio::signal::ctrl_c()
         .await
         .context("await Ctrl-C")?;
     tracing::info!("shutdown signal received; stopping");
-    agent.shutdown().await;
+    handle.shutdown().await;
     Ok(())
 }
 
@@ -109,6 +132,19 @@ async fn cmd_status(config: Config) -> Result<()> {
         None => "(none configured)".to_string(),
     };
     println!("  pairing_route     : {pairing_route}");
+    // Setup readiness derived from capture folders + a usable pairing route.
+    let needs = config.setup_needs(perseus::account::token_present(&config));
+    let readiness = if needs.is_empty() {
+        "ready".to_string()
+    } else {
+        let joined = needs
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("needs — {joined}")
+    };
+    println!("  agent readiness   : {readiness}");
     println!("  mode              : {:?}", config.mode);
     println!("  retention.policy  : {:?}", config.retention.policy);
     println!(
