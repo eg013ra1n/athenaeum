@@ -5272,6 +5272,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "dirs",
  "iroh",
  "iroh-tickets",
  "libc",

@@ -231,6 +231,27 @@ impl Default for AccountConfig {
     }
 }
 
+/// A gap that still blocks the sync engine from starting. An empty
+/// `Vec<SetupNeed>` (see [`Config::setup_needs`]) means the agent is ready; a
+/// non-empty one is what the tray/web UI renders as "finish setup" prompts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupNeed {
+    /// No capture folders configured — nothing to watch yet.
+    CaptureDirs,
+    /// No usable pairing route — neither a signed-in account (with a stored
+    /// device token) nor a dev pairing ticket.
+    Pairing,
+}
+
+impl std::fmt::Display for SetupNeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SetupNeed::CaptureDirs => write!(f, "no capture folders configured"),
+            SetupNeed::Pairing => write!(f, "not signed in"),
+        }
+    }
+}
+
 /// Parsed + validated Perseus configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -270,7 +291,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// Parse + validate a config from a TOML file on disk.
+    /// Parse + strictly validate a config from a TOML file on disk.
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read perseus config {}", path.display()))?;
@@ -278,19 +299,48 @@ impl Config {
             .with_context(|| format!("invalid perseus config {}", path.display()))
     }
 
-    /// Parse + validate a config from a TOML string. Split out so validation is
-    /// unit-testable without touching the filesystem.
+    /// Parse + structurally validate a config from a TOML file on disk — the
+    /// setup-state counterpart to [`load`](Self::load). A file with no capture
+    /// folders and no pairing route loads successfully; the supervisor turns the
+    /// remaining gaps into [`SetupNeed`]s (see [`setup_needs`](Self::setup_needs))
+    /// rather than refusing to start.
+    pub fn load_lenient(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read perseus config {}", path.display()))?;
+        Self::from_toml_str_lenient(&text)
+            .with_context(|| format!("invalid perseus config {}", path.display()))
+    }
+
+    /// Parse + strictly validate a config from a TOML string. Split out so
+    /// validation is unit-testable without touching the filesystem.
     pub fn from_toml_str(text: &str) -> Result<Self> {
-        let cfg: Config = toml::from_str(text).map_err(|e| {
+        let cfg = Self::parse_toml(text)?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Lenient counterpart to [`from_toml_str`](Self::from_toml_str): parse +
+    /// [`validate_structure`](Self::validate_structure) only. A structurally sound
+    /// but incomplete config (empty capture list, no pairing route) is accepted;
+    /// use [`setup_needs`](Self::setup_needs) to learn what is still missing.
+    pub fn from_toml_str_lenient(text: &str) -> Result<Self> {
+        let cfg = Self::parse_toml(text)?;
+        cfg.validate_structure()?;
+        Ok(cfg)
+    }
+
+    /// Deserialize the TOML with the shared friendly parse-error message. Both the
+    /// strict and lenient constructors go through here so the "expected keys" hint
+    /// stays in one place.
+    fn parse_toml(text: &str) -> Result<Self> {
+        toml::from_str(text).map_err(|e| {
             anyhow::anyhow!(
                 "could not parse config TOML: {e}. Expected keys: capture_dir, \
                  data_dir, mode = \"auto\", a pairing route (either an [account] \
                  table or pairing_ticket), and a [retention] table with policy = \
                  keep_everything|on_confirm|keep_days|disk_pct and dry_run = true"
             )
-        })?;
-        cfg.validate()?;
-        Ok(cfg)
+        })
     }
 
     /// The effective watch list: the singular `capture_dir` as a one-item list,
@@ -306,17 +356,33 @@ impl Config {
         }
     }
 
-    /// Structural validation of already-parsed fields. Iroh-ticket well-formedness
-    /// is deliberately NOT checked here — that lives in the production transport
-    /// wiring (`run`), so tests and the loopback path can supply a placeholder.
+    /// Strict validation (unchanged external behavior): structure + readiness.
+    ///
+    /// A config that passes this is both well-formed AND complete enough to start
+    /// the sync engine. The two halves are separable: [`validate_structure`] is
+    /// the "is this file broken?" check, `validate_ready` (private) adds the "is
+    /// setup finished?" demands that lenient callers skip (see [`setup_needs`]).
+    ///
+    /// [`validate_structure`]: Self::validate_structure
+    /// [`setup_needs`]: Self::setup_needs
     pub fn validate(&self) -> Result<()> {
-        // Exactly one of the two capture-directory forms must be set.
-        match (&self.capture_dir, self.capture_dirs.is_empty()) {
-            (Some(_), false) => {
-                bail!("set either capture_dir or capture_dirs in perseus.toml, not both")
-            }
-            (None, true) => bail!("capture_dir (or capture_dirs) is required"),
-            _ => {}
+        self.validate_structure()?;
+        self.validate_ready()
+    }
+
+    /// Structural checks only — a config that fails here is BROKEN. A config that
+    /// passes may still be incomplete (see [`setup_needs`](Self::setup_needs)):
+    /// empty capture list and missing pairing route are legal setup states.
+    ///
+    /// Iroh-ticket well-formedness is deliberately NOT checked here — that lives
+    /// in the production transport wiring (`run`), so tests and the loopback path
+    /// can supply a placeholder.
+    pub fn validate_structure(&self) -> Result<()> {
+        // Setting BOTH capture-directory forms is a structural misconfiguration
+        // (an empty list, by contrast, is a legal setup state — see
+        // `validate_ready`). Keep the wording actionable; tests pin the substring.
+        if self.capture_dir.is_some() && !self.capture_dirs.is_empty() {
+            bail!("set either capture_dir or capture_dirs in perseus.toml, not both");
         }
         for dir in self.capture_dirs_resolved() {
             if dir.as_os_str().is_empty() {
@@ -332,19 +398,6 @@ impl Config {
         }
         if self.data_dir.as_os_str().is_empty() {
             bail!("data_dir must not be empty");
-        }
-        // Pairing route (task M1): at least one of [account] or pairing_ticket.
-        let has_account = self.account.is_some();
-        let ticket_present = self
-            .pairing_ticket
-            .as_ref()
-            .is_some_and(|t| !t.trim().is_empty());
-        if !has_account && !ticket_present {
-            bail!(
-                "no pairing route configured — add an [account] table (then run \
-                 `perseus login`) or set pairing_ticket to the ticket from the \
-                 primary's Settings → Sync (dev)"
-            );
         }
         // A present-but-blank pairing_ticket is a misconfiguration, not "absent".
         if self.pairing_ticket.as_ref().is_some_and(|t| t.trim().is_empty()) {
@@ -417,6 +470,51 @@ impl Config {
         Ok(())
     }
 
+    /// The two readiness demands strict mode adds on top of structure: at least
+    /// one capture directory, and a pairing route. A config that fails only here
+    /// is not broken — it is a valid "freshly installed, not yet set up" state
+    /// (surfaced as [`SetupNeed`]s rather than an error by the lenient path).
+    fn validate_ready(&self) -> Result<()> {
+        if self.capture_dirs_resolved().is_empty() {
+            bail!("capture_dir (or capture_dirs) is required");
+        }
+        // Pairing route (task M1): at least one of [account] or pairing_ticket.
+        let ticket_present = self
+            .pairing_ticket
+            .as_ref()
+            .is_some_and(|t| !t.trim().is_empty());
+        if self.account.is_none() && !ticket_present {
+            bail!(
+                "no pairing route configured — add an [account] table (then run \
+                 `perseus login`) or set pairing_ticket to the ticket from the \
+                 primary's Settings → Sync (dev)"
+            );
+        }
+        Ok(())
+    }
+
+    /// What still blocks the sync engine from starting for this config. An empty
+    /// result means "ready" — the same bar the private `validate_ready` enforces,
+    /// expressed as a list the tray/web UI can render instead of a hard error.
+    /// `token_present` is the caller's answer to "is there a stored hub
+    /// device token" (see `account::token_present`); config alone cannot know,
+    /// because the token lives in a 0600 file in `data_dir`, never in the TOML.
+    pub fn setup_needs(&self, token_present: bool) -> Vec<SetupNeed> {
+        let mut needs = Vec::new();
+        if self.capture_dirs_resolved().is_empty() {
+            needs.push(SetupNeed::CaptureDirs);
+        }
+        let ticket = self
+            .pairing_ticket
+            .as_ref()
+            .is_some_and(|t| !t.trim().is_empty());
+        let account_ok = self.account.is_some() && token_present;
+        if !ticket && !account_ok {
+            needs.push(SetupNeed::Pairing);
+        }
+        needs
+    }
+
     /// Write-stability quiet window as a [`Duration`].
     pub fn stability(&self) -> Duration {
         Duration::from_secs(self.stability_secs)
@@ -446,6 +544,83 @@ impl Config {
     pub fn packages_dir(&self) -> PathBuf {
         self.data_dir.join("packages")
     }
+}
+
+/// Per-platform application subdirectory name. Linux XDG convention is
+/// lowercase (`~/.config/perseus`); macOS/Windows use the capitalized product
+/// name to match their Application Support / AppData conventions.
+fn app_dir_name() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "perseus"
+    } else {
+        "Perseus"
+    }
+}
+
+/// Default on-disk config file location:
+/// `~/Library/Application Support/Perseus/perseus.toml` (macOS),
+/// `%APPDATA%\Perseus\perseus.toml` (Windows),
+/// `~/.config/perseus/perseus.toml` (Linux). Falls back to the current
+/// directory if the platform config dir cannot be determined.
+pub fn platform_config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(app_dir_name())
+        .join("perseus.toml")
+}
+
+/// Default `data_dir` for a first-run config: the platform data directory plus
+/// `<app>/data`. Falls back to the current directory if it cannot be determined.
+pub fn platform_data_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(app_dir_name())
+        .join("data")
+}
+
+/// Resolve which config file to use: explicit `--config` flag wins; otherwise a
+/// legacy `./perseus.toml` in the current directory is honored if present; else
+/// the platform path.
+pub fn resolve_config_path(explicit: Option<PathBuf>) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    resolve_config_path_in(&cwd, explicit)
+}
+
+/// Testable core of [`resolve_config_path`]: precedence is
+/// `explicit > <cwd>/perseus.toml (if it exists) > platform path`.
+pub fn resolve_config_path_in(cwd: &Path, explicit: Option<PathBuf>) -> PathBuf {
+    if let Some(p) = explicit {
+        return p;
+    }
+    let legacy = cwd.join("perseus.toml");
+    if legacy.exists() {
+        legacy
+    } else {
+        platform_config_path()
+    }
+}
+
+/// First-run bootstrap: write the commented default template (with `data_dir`
+/// substituted to the platform default) when `path` does not yet exist, creating
+/// parent directories as needed. Returns `true` when this call created the file,
+/// `false` when it already existed (a no-op).
+pub fn ensure_config_exists(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create config dir {}", parent.display()))?;
+    }
+    // TOML literal string (single quotes): Windows backslashes need no escaping.
+    // Strip any stray single-quote from the path so it can't break out of the
+    // literal string it is spliced into.
+    let data_dir = platform_data_dir().display().to_string().replace('\'', "");
+    let text = include_str!("config_template.toml").replace("{data_dir}", &data_dir);
+    std::fs::write(path, text)
+        .with_context(|| format!("write default config {}", path.display()))?;
+    tracing::info!(path = %path.display(), "default config created");
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -978,5 +1153,79 @@ interval_secs = 600
             PathBuf::from("/var/lib/perseus/device_key")
         );
         assert_eq!(cfg.log_dir(), PathBuf::from("/var/lib/perseus/logs"));
+    }
+
+    #[test]
+    fn lenient_allows_empty_dirs_and_no_pairing() {
+        let text = "data_dir = \"/d\"\nmode = \"auto\"\ncapture_dirs = []\n";
+        let cfg = Config::from_toml_str_lenient(text).expect("lenient must accept setup-state config");
+        assert!(cfg.capture_dirs_resolved().is_empty());
+        // strict still refuses the same text
+        Config::from_toml_str(text).expect_err("strict must still demand dirs + pairing");
+    }
+
+    #[test]
+    fn lenient_still_rejects_structural_errors() {
+        // both capture forms set is a structural misconfiguration, not a setup gap
+        let a = tempfile::tempdir().unwrap();
+        let text = format!(
+            "data_dir = \"/d\"\nmode = \"auto\"\ncapture_dir = \"{d}\"\ncapture_dirs = [\"{d}\"]\n",
+            d = a.path().display()
+        );
+        Config::from_toml_str_lenient(&text).expect_err("both forms rejected even leniently");
+    }
+
+    #[test]
+    fn setup_needs_matrix() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = |dirs: &str, pairing: &str| {
+            Config::from_toml_str_lenient(&format!(
+                "data_dir = \"/d\"\nmode = \"auto\"\n{dirs}\n{pairing}\n"
+            ))
+            .unwrap()
+        };
+        let both = base("capture_dirs = []", "");
+        assert_eq!(both.setup_needs(false), vec![SetupNeed::CaptureDirs, SetupNeed::Pairing]);
+
+        let dirs_ok = base(&format!("capture_dirs = [\"{}\"]", dir.path().display()), "");
+        assert_eq!(dirs_ok.setup_needs(false), vec![SetupNeed::Pairing]);
+
+        // account table WITHOUT a stored token is still "not signed in"
+        let acct = base(&format!("capture_dirs = [\"{}\"]", dir.path().display()), "[account]");
+        assert_eq!(acct.setup_needs(false), vec![SetupNeed::Pairing]);
+        assert_eq!(acct.setup_needs(true), vec![]);
+
+        let ticket = base(
+            &format!("capture_dirs = [\"{}\"]", dir.path().display()),
+            "pairing_ticket = \"t\"",
+        );
+        assert_eq!(ticket.setup_needs(false), vec![]);
+    }
+
+    #[test]
+    fn default_template_parses_lenient_and_substitutes_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("perseus.toml");
+        assert!(ensure_config_exists(&path).unwrap(), "first call creates");
+        assert!(!ensure_config_exists(&path).unwrap(), "second call is a no-op");
+        let cfg = Config::load_lenient(&path).expect("template must be lenient-valid");
+        assert!(cfg.capture_dirs_resolved().is_empty());
+        assert!(cfg.account.is_some(), "template ships an [account] table for web sign-in");
+        assert_eq!(cfg.data_dir, platform_data_dir());
+    }
+
+    #[test]
+    fn resolve_config_path_precedence() {
+        let cwd = tempfile::tempdir().unwrap();
+        // explicit flag always wins
+        assert_eq!(
+            resolve_config_path_in(cwd.path(), Some(PathBuf::from("/x/p.toml"))),
+            PathBuf::from("/x/p.toml")
+        );
+        // no cwd file → platform path
+        assert_eq!(resolve_config_path_in(cwd.path(), None), platform_config_path());
+        // cwd perseus.toml wins over platform path (legacy compatibility)
+        std::fs::write(cwd.path().join("perseus.toml"), "x").unwrap();
+        assert_eq!(resolve_config_path_in(cwd.path(), None), cwd.path().join("perseus.toml"));
     }
 }

@@ -1,0 +1,18 @@
+# Perseus configuration — created automatically on first run.
+# The web page (tray icon → Open Web UI) can edit capture folders and
+# retention; this file can also be edited by hand (restart to apply).
+
+# Where Perseus keeps its database, logs, staged packages, and credentials.
+data_dir = '{data_dir}'
+mode = "auto"
+
+# Folders watched for new FITS/XISF captures. Add them from the web page,
+# or here: capture_dirs = ["/path/to/captures"]
+capture_dirs = []
+
+# Hub account pairing. Sign in from the web page, or run `perseus login`.
+[account]
+
+[retention]
+policy = "keep_everything"
+dry_run = true
