@@ -22,8 +22,10 @@
 //!   ([`RetentionRunRecord`], newest-first).
 //! - `GET`/`PUT /api/capture-dirs` — the configured vs. running capture
 //!   directories + a `restartPending` flag ([`CaptureDirsDto`]); a PUT rewrites
-//!   `perseus.toml`'s capture selection and adopts it into the live config, but
-//!   the watchers keep their spawn-time dirs until restart (restart-to-apply).
+//!   `perseus.toml`'s capture selection, adopts it into the live config, and
+//!   rings the supervisor so it applies the edit live (engine restart only, no
+//!   process restart). The watchers keep their spawn-time dirs until that
+//!   engine relaunch, which is the window `restartPending` reports.
 //! - `POST /api/delete` — delete the source capture files of CONFIRMED packages
 //!   through the same confirmed-only deleter retention uses ([`DeleteReport`]).
 //!
@@ -619,11 +621,12 @@ async fn api_retention_log(State(state): State<Arc<WebState>>) -> Json<Vec<Reten
 
 /// `GET`/`PUT /api/capture-dirs` payload. `configured` is the directory list in
 /// the live config (`perseus.toml`, freshly rewritten by a PUT); `runtime` is
-/// the list the watchers were actually spawned over. They diverge exactly when
-/// an edit has been saved but Perseus has not restarted yet — `restartPending`
-/// is that difference, ordered-list compared, so the page can show an honest
-/// "restart to apply" banner that survives reloads and clears itself once a
-/// restarted agent reports `runtime == configured` again.
+/// the list the watchers were actually spawned over. They diverge exactly in
+/// the window after an edit is saved and before the supervisor has relaunched
+/// the engine over the new dirs — `restartPending` is that difference,
+/// ordered-list compared, so the page can show an honest "applying…" banner
+/// that survives reloads and clears itself once the relaunched engine reports
+/// `runtime == configured` again.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CaptureDirsDto {
@@ -674,9 +677,13 @@ async fn api_get_capture_dirs(State(state): State<Arc<WebState>>) -> Json<Captur
 
 /// `PUT /api/capture-dirs` — rewrite `perseus.toml`'s capture-directory
 /// selection to the array form (comment-preserving, re-validated, atomic), then
-/// adopt it into the live config. Restart-to-apply: the running watchers keep
-/// their spawn-time directories, so [`WebState::capture_dirs`] is intentionally
-/// **not** touched — that gap is what makes the returned `restartPending` true.
+/// adopt it into the live config and ring the supervisor. The running watchers
+/// keep their spawn-time directories, so [`WebState::running_dirs`] is
+/// intentionally **not** touched here — that gap is what makes the returned
+/// `restartPending` true. The wake lets the supervisor apply the edit live: it
+/// reloads config each pass and restarts the engine when
+/// `running_dirs != configured`, so no operator-driven process restart is
+/// needed and the pending state clears itself once the engine relaunches.
 ///
 /// [`apply_capture_dirs_edit`] writes on an in-memory copy and only swaps it in
 /// after re-validation, so a rejected edit (an empty list, or a directory that
@@ -694,6 +701,11 @@ async fn api_put_capture_dirs(
     // so `configured` reflects the edit; the runtime snapshot stays as-is, which
     // is exactly what surfaces the restart-pending state.
     *state.config.write().await = new_cfg;
+    // Ring the supervisor: it reloads config each pass and restarts the engine
+    // when `running_dirs != configured`, so the edit applies live (engine
+    // restart only) with no operator-driven process restart. The banner clears
+    // itself once the restarted engine reports `running_dirs == configured`.
+    state.supervisor_wake.notify_one();
     Ok(Json(capture_dirs_dto(&state).await))
 }
 
@@ -1800,6 +1812,50 @@ mod tests {
         assert_eq!(
             after, before,
             "a rejected edit leaves the file byte-identical"
+        );
+    }
+
+    /// A valid capture-dirs PUT rings the supervisor's wake so the edit is
+    /// adopted live — the supervisor reloads config each pass and restarts the
+    /// engine when `running_dirs != configured`, no process restart. The wake
+    /// future is armed BEFORE the PUT so a `notify_one` fired inside the handler
+    /// cannot race ahead of the assertion.
+    #[tokio::test]
+    async fn capture_dirs_put_wakes_supervisor() {
+        use std::time::Duration;
+
+        let (state, _tmp) = test_state().await;
+        let wake = state.supervisor_wake.clone();
+        let state_ref = Arc::clone(&state);
+        let app = build_router(state, None);
+
+        // Arm the wake future BEFORE issuing the PUT (per the brief) so the
+        // handler's `notify_one` cannot be missed.
+        let woken = wake.notified();
+        tokio::pin!(woken);
+
+        let newdir = tempfile::tempdir().unwrap();
+        let new = newdir.path().display().to_string();
+        let res = put_capture_dirs(&app, &[new.clone()]).await;
+        assert_eq!(res.status(), StatusCode::OK, "a valid edit is accepted");
+
+        tokio::time::timeout(Duration::from_secs(1), woken)
+            .await
+            .expect("a capture-dirs edit must wake the supervisor");
+
+        // The live config lock adopted the new selection.
+        let configured: Vec<String> = state_ref
+            .config
+            .read()
+            .await
+            .capture_dirs_resolved()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(
+            configured,
+            vec![new],
+            "the config lock shows the new dirs"
         );
     }
 
