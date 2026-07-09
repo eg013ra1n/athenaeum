@@ -532,8 +532,21 @@
         try {
           const r = await api('/api/account/logout', { method: 'POST' });
           if (!r.ok) throw new Error(await r.text());
+          // Render the signed-out state directly (mirrors acctVerify()) instead of
+          // relying on refreshAccount(): its focus-guard skips the re-render while
+          // focus is inside #account, and "Confirm sign-out" still holds focus at
+          // this point — without this the card would keep showing the signed-in
+          // email until focus moved elsewhere.
+          $('acctSignOutConfirm').blur();
           acctFlash('signed out', true);
-          refreshStatus(); refreshAccount();
+          // The logout call already succeeded — a hiccup on this follow-up GET is
+          // not a sign-out failure, so it is swallowed here (same as
+          // refreshAccount()'s own error handling) rather than overwriting the
+          // flash above with a false "failed" message.
+          try { renderAccount(await getJson('/api/account')); } catch (e) { /* offline surfaced by refreshStatus() */ }
+          // Readiness changed — re-fetch status so the banner/engine state catch
+          // up at once (the server also woke the supervisor).
+          refreshStatus();
         } catch (e) { acctFlash('sign-out failed: ' + e.message, false); }
       }
 
