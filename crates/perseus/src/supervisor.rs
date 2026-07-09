@@ -204,7 +204,7 @@ pub fn spawn(
                 // Setup is (no longer) complete: stop any running engine and
                 // surface the outstanding needs.
                 if let Some(a) = agent.take() {
-                    tracing::info!("stopping engine; setup no longer complete");
+                    tracing::info!("stopping engine (setup no longer complete)");
                     on_agent(None);
                     let _ = a.stop().await;
                     running_dirs.clear();
