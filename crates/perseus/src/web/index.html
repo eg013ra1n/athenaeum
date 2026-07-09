@@ -52,6 +52,8 @@
       .ind { font-size: 0.82rem; } .ind b { color: var(--text); }
       .logline { border-bottom: 1px solid var(--border); padding: 0.35rem 0; font-size: 0.8rem; }
       ul.log { list-style: none; margin: 0; padding: 0; max-height: 14rem; overflow-y: auto; }
+      .banner { border-radius: 6px; padding: 0.45rem 0.7rem; margin-bottom: 0.7rem; font-size: 0.82rem; border: 1px solid transparent; }
+      .banner.warn { background: #3a2d10; color: var(--warn); border-color: var(--warn); }
     </style>
   </head>
   <body>
@@ -73,6 +75,21 @@
           <thead><tr><th>in-flight package</th><th>state</th><th>created</th></tr></thead>
           <tbody id="inflight"></tbody>
         </table></div>
+      </section>
+
+      <section id="capture-dirs">
+        <h2>Capture Directories</h2>
+        <div class="banner warn" id="cdBanner" style="display:none;">saved — restart Perseus to apply</div>
+        <div class="tablewrap"><table>
+          <thead><tr><th>directory</th><th></th></tr></thead>
+          <tbody id="cdList"></tbody>
+        </table></div>
+        <div class="row" style="margin-top:0.5rem;">
+          <input id="cdAddInput" placeholder="/path/to/capture" size="36" />
+          <button id="cdAdd" class="ghost">Add</button>
+          <button id="cdSave">Save</button>
+        </div>
+        <div class="flash" id="cdFlash"></div>
       </section>
 
       <section id="sent">
@@ -295,6 +312,68 @@
         } catch (e) { $('retlog').innerHTML = `<li class="empty">error: ${esc(e.message)}</li>`; }
       }
 
+      // ── Capture directories (restart-to-apply) ──────────────────────────────
+      // `cdWorking` is the local editable list. It is loaded from the server on
+      // page load and re-synced after each Save, and is mutated in place by the
+      // Add/Remove buttons — the 2 s tick only refreshes the amber banner (never
+      // the list), so an in-progress add/remove is never clobbered mid-edit.
+      let cdWorking = [];
+
+      function renderCaptureDirs() {
+        const tb = $('cdList');
+        tb.innerHTML = cdWorking.length
+          ? cdWorking.map((d, i) => `<tr><td class="mono">${esc(d)}</td><td><button class="ghost" data-cdrm="${i}">Remove</button></td></tr>`).join('')
+          : '<tr><td colspan="2" class="empty">no capture directories — add at least one before saving</td></tr>';
+        document.querySelectorAll('[data-cdrm]').forEach((b) => b.addEventListener('click', () => {
+          cdWorking.splice(Number(b.dataset.cdrm), 1);
+          renderCaptureDirs();
+        }));
+      }
+
+      function setCdBanner(pending) { $('cdBanner').style.display = pending ? '' : 'none'; }
+
+      async function loadCaptureDirs() {
+        try {
+          const c = await getJson('/api/capture-dirs');
+          cdWorking = c.configured.slice();
+          renderCaptureDirs();
+          setCdBanner(c.restartPending);
+        } catch (e) { const f = $('cdFlash'); f.textContent = 'load failed: ' + e.message; f.className = 'flash err'; }
+      }
+
+      async function refreshCdBanner() {
+        // Banner only — server-derived, so it survives reloads and clears itself
+        // once a restarted Perseus reports runtime == configured again. Never
+        // touches `cdWorking`, so it cannot wipe an in-progress edit.
+        try { const c = await getJson('/api/capture-dirs'); setCdBanner(c.restartPending); } catch (e) { /* offline surfaced by refreshStatus */ }
+      }
+
+      function addCaptureDir() {
+        const v = $('cdAddInput').value.trim();
+        if (!v) return;
+        cdWorking.push(v);
+        $('cdAddInput').value = '';
+        renderCaptureDirs();
+      }
+
+      async function saveCaptureDirs() {
+        const f = $('cdFlash');
+        try {
+          const r = await api('/api/capture-dirs', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ dirs: cdWorking }) });
+          if (r.status === 422) { f.textContent = 'rejected: ' + (await r.text()); f.className = 'flash err'; return; }
+          if (!r.ok) throw new Error(await r.text());
+          const c = await r.json();
+          cdWorking = c.configured.slice();
+          renderCaptureDirs();
+          setCdBanner(c.restartPending);
+          f.textContent = 'saved'; f.className = 'flash ok';
+        } catch (e) { f.textContent = 'save failed: ' + e.message; f.className = 'flash err'; }
+      }
+
+      $('cdAdd').addEventListener('click', addCaptureDir);
+      $('cdAddInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addCaptureDir(); });
+      $('cdSave').addEventListener('click', saveCaptureDirs);
+
       $('delSelected').addEventListener('click', () => doDelete([...document.querySelectorAll('.rowsel:checked')].map((c) => Number(c.dataset.id))));
       $('search').addEventListener('click', searchHistory);
       $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchHistory(); });
@@ -302,8 +381,8 @@
 
       // Initial load; poll status + sent + retention log every 2 s. History and
       // the policy form are on demand (the form is not clobbered while editing).
-      loadPolicy(); searchHistory();
-      function tick() { refreshStatus(); refreshSent(); refreshLog(); }
+      loadPolicy(); searchHistory(); loadCaptureDirs();
+      function tick() { refreshStatus(); refreshSent(); refreshLog(); refreshCdBanner(); }
       tick(); setInterval(tick, 2000);
     </script>
   </body>

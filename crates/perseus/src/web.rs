@@ -20,6 +20,10 @@
 //!   enabled here (the edit carries no soak field).
 //! - `GET /api/retention/log` — the recent retention-pass ring buffer
 //!   ([`RetentionRunRecord`], newest-first).
+//! - `GET`/`PUT /api/capture-dirs` — the configured vs. running capture
+//!   directories + a `restartPending` flag ([`CaptureDirsDto`]); a PUT rewrites
+//!   `perseus.toml`'s capture selection and adopts it into the live config, but
+//!   the watchers keep their spawn-time dirs until restart (restart-to-apply).
 //! - `POST /api/delete` — delete the source capture files of CONFIRMED packages
 //!   through the same confirmed-only deleter retention uses ([`DeleteReport`]).
 //!
@@ -53,7 +57,7 @@ use athenaeum_core::sync::{
 };
 
 use crate::config::{Config, RetentionConfig};
-use crate::config_edit::{apply_retention_edit, RetentionEdit};
+use crate::config_edit::{apply_capture_dirs_edit, apply_retention_edit, RetentionEdit};
 use crate::run::{delete_confirmed_packages, DeleteReport};
 use crate::seen::SeenStore;
 
@@ -216,6 +220,10 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
             get(api_get_retention_policy).put(api_put_retention_policy),
         )
         .route("/api/retention/log", get(api_retention_log))
+        .route(
+            "/api/capture-dirs",
+            get(api_get_capture_dirs).put(api_put_capture_dirs),
+        )
         .route("/api/delete", post(api_delete))
         .route("/api/retry", post(api_retry))
         .layer(axum::middleware::from_fn(move |req, next| {
@@ -469,6 +477,84 @@ async fn api_retention_log(State(state): State<Arc<WebState>>) -> Json<Vec<Reten
         .lock()
         .expect("retention_log mutex poisoned");
     Json(log.iter().cloned().collect())
+}
+
+/// `GET`/`PUT /api/capture-dirs` payload. `configured` is the directory list in
+/// the live config (`perseus.toml`, freshly rewritten by a PUT); `runtime` is
+/// the list the watchers were actually spawned over. They diverge exactly when
+/// an edit has been saved but Perseus has not restarted yet — `restartPending`
+/// is that difference, ordered-list compared, so the page can show an honest
+/// "restart to apply" banner that survives reloads and clears itself once a
+/// restarted agent reports `runtime == configured` again.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureDirsDto {
+    configured: Vec<String>,
+    runtime: Vec<String>,
+    restart_pending: bool,
+}
+
+/// `PUT /api/capture-dirs` request body: the new capture-directory selection.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CaptureDirsEdit {
+    dirs: Vec<String>,
+}
+
+/// Build the current [`CaptureDirsDto`] from live state: `configured` from the
+/// (possibly just-edited) config, `runtime` from the spawn-time snapshot, and
+/// `restartPending` = the two differ as ordered lists.
+async fn capture_dirs_dto(state: &WebState) -> CaptureDirsDto {
+    let configured: Vec<String> = state
+        .config
+        .read()
+        .await
+        .capture_dirs_resolved()
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let runtime: Vec<String> = state
+        .capture_dirs
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let restart_pending = configured != runtime;
+    CaptureDirsDto {
+        configured,
+        runtime,
+        restart_pending,
+    }
+}
+
+/// `GET /api/capture-dirs` — the configured vs. running capture directories and
+/// whether a restart is pending. Read-only; never touches disk.
+async fn api_get_capture_dirs(State(state): State<Arc<WebState>>) -> Json<CaptureDirsDto> {
+    Json(capture_dirs_dto(&state).await)
+}
+
+/// `PUT /api/capture-dirs` — rewrite `perseus.toml`'s capture-directory
+/// selection to the array form (comment-preserving, re-validated, atomic), then
+/// adopt it into the live config. Restart-to-apply: the running watchers keep
+/// their spawn-time directories, so [`WebState::capture_dirs`] is intentionally
+/// **not** touched — that gap is what makes the returned `restartPending` true.
+///
+/// [`apply_capture_dirs_edit`] writes on an in-memory copy and only swaps it in
+/// after re-validation, so a rejected edit (an empty list, or a directory that
+/// does not exist on the box) leaves the file byte-identical and returns `422`.
+async fn api_put_capture_dirs(
+    State(state): State<Arc<WebState>>,
+    Json(edit): Json<CaptureDirsEdit>,
+) -> Result<Json<CaptureDirsDto>, (StatusCode, String)> {
+    let new_cfg = apply_capture_dirs_edit(&state.config_path, &edit.dirs).map_err(|e| {
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web capture-dirs edit rejected");
+        (StatusCode::UNPROCESSABLE_ENTITY, msg)
+    })?;
+    // The file was already rewritten. Adopt the new config in the live web state
+    // so `configured` reflects the edit; the runtime snapshot stays as-is, which
+    // is exactly what surfaces the restart-pending state.
+    *state.config.write().await = new_cfg;
+    Ok(Json(capture_dirs_dto(&state).await))
 }
 
 /// `POST /api/delete` — delete the source capture files of the given CONFIRMED
@@ -1169,6 +1255,113 @@ mod tests {
         assert_eq!(rows[0]["at"], "2026-07-08T11:00:00.000Z", "newest first");
         assert_eq!(rows[0]["deleted"][0], "/cap/b.fits");
         assert_eq!(rows[1]["wouldDelete"][0], "/cap/a.fits");
+    }
+
+    // ── Task 3 (S1.5.1): capture-dirs editor (restart-to-apply) ───────────────
+
+    async fn get_capture_dirs(app: &Router) -> serde_json::Value {
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/capture-dirs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        body_json(res).await
+    }
+
+    async fn put_capture_dirs(app: &Router, dirs: &[String]) -> Response {
+        let body = serde_json::json!({ "dirs": dirs });
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/capture-dirs")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// GET reports `configured`/`runtime`/`restartPending`. A valid PUT rewrites
+    /// `perseus.toml` to the array form and adopts it into the live config, so
+    /// `configured` reflects the edit while `runtime` stays the spawn-time
+    /// snapshot — making `restartPending` true. The pending flag is server-
+    /// derived, so a subsequent GET still reports it (survives reloads).
+    #[tokio::test]
+    async fn capture_dirs_get_and_put_roundtrip() {
+        let (state, _tmp) = test_state().await;
+        let config_path = state.config_path.clone();
+        // The spawn-time runtime snapshot — never mutated by a web edit.
+        let runtime_snapshot: Vec<String> = state
+            .capture_dirs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let app = build_router(state, None);
+
+        // GET before any edit: configured == runtime, nothing pending.
+        let v = get_capture_dirs(&app).await;
+        assert!(v["configured"].is_array());
+        assert!(v["runtime"].is_array());
+        assert_eq!(v["restartPending"], false, "no edit yet → not pending");
+        assert_eq!(v["configured"], v["runtime"], "configured mirrors the runtime snapshot");
+
+        // PUT a new, existing directory.
+        let newdir = tempfile::tempdir().unwrap();
+        let new = newdir.path().display().to_string();
+        let res = put_capture_dirs(&app, &[new.clone()]).await;
+        assert_eq!(res.status(), StatusCode::OK, "a valid edit is accepted");
+        let v = body_json(res).await;
+        assert_eq!(
+            v["restartPending"], true,
+            "config changed but runtime is still the spawn snapshot → pending"
+        );
+        assert_eq!(v["configured"].as_array().unwrap().len(), 1);
+        assert_eq!(v["configured"][0], new, "the live config adopts the edit");
+
+        // The file was rewritten to the array form with the singular key removed.
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(text.contains("capture_dirs"), "array form written: {text}");
+        assert!(!text.contains("capture_dir ="), "singular key removed: {text}");
+
+        // A later GET still reports pending (server-derived), and `runtime` is
+        // unchanged from the spawn snapshot.
+        let v = get_capture_dirs(&app).await;
+        assert_eq!(v["restartPending"], true, "pending survives across requests");
+        let runtime_now: Vec<String> = v["runtime"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(runtime_now, runtime_snapshot, "runtime stays the spawn-time snapshot");
+    }
+
+    /// A PUT naming a directory that does not exist is refused `422` and leaves
+    /// the config file byte-identical (edit-on-copy, write-after-validate).
+    #[tokio::test]
+    async fn capture_dirs_put_nonexistent_rejected_byte_identical() {
+        let (state, tmp) = test_state().await;
+        let config_path = state.config_path.clone();
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let app = build_router(state, None);
+
+        let missing = tmp.path().join("does-not-exist");
+        let res = put_capture_dirs(&app, &[missing.display().to_string()]).await;
+        assert_eq!(
+            res.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a non-existent directory is rejected"
+        );
+        let after = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(after, before, "a rejected edit leaves the file byte-identical");
     }
 
     // ── Task 2 (S1.5.1): retry failed packages ───────────────────────────────
