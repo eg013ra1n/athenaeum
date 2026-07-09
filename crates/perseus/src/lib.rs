@@ -37,6 +37,8 @@ pub mod config_edit;
 pub mod run;
 pub mod seen;
 pub mod supervisor;
+#[cfg(feature = "tray")]
+pub mod tray;
 pub mod watcher;
 pub mod web;
 

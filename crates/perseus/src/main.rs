@@ -9,6 +9,9 @@
 //! - `status` — print a one-shot human summary of config + in-flight transfers.
 //! - `enqueue-backlog <dir>` — enqueue FITS/XISF already on disk before the
 //!   watcher was running, then drain and exit.
+//! - `tray` (feature `tray` only) — menu-bar status icon backed by the same
+//!   supervisor + web page as `run`; also the default action when no subcommand
+//!   is given. It owns its own tokio runtime, so `main` is a sync `fn`.
 //!
 //! stdout is reserved for `status` human output and clap's `--help`/errors (CLI
 //! UX). Everything else is `tracing` — rolling JSONL under `<data_dir>/logs`
@@ -31,7 +34,7 @@ struct Cli {
     config: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -49,17 +52,43 @@ enum Command {
         /// Directory to scan for pre-existing capture files.
         dir: PathBuf,
     },
+    /// Menu-bar tray mode: a status icon backed by the same supervisor + web page
+    /// as `run` (also the default when no subcommand is given). Bootstraps a
+    /// default config on first run.
+    #[cfg(feature = "tray")]
+    Tray,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = perseus::config::resolve_config_path(cli.config.clone());
 
-    // First-run bootstrap is for `run` only (Task 8's tray adds itself here).
-    // `login`/`status`/`enqueue-backlog` on a missing file fail with the friendly
-    // "read perseus config" error below rather than auto-creating.
-    if matches!(cli.command, Command::Run) {
+    // No subcommand → tray mode when built with `--features tray`; a headless
+    // build has no default action, so it prints help and exits with clap's
+    // usage-error code (2), matching a missing-subcommand error.
+    let command = match cli.command {
+        Some(command) => command,
+        None => {
+            #[cfg(feature = "tray")]
+            {
+                Command::Tray
+            }
+            #[cfg(not(feature = "tray"))]
+            {
+                use clap::CommandFactory;
+                let _ = Cli::command().print_help();
+                std::process::exit(2);
+            }
+        }
+    };
+
+    // First-run bootstrap is for the supervisor-hosting modes (`run`, and `tray`
+    // when enabled). `login`/`status`/`enqueue-backlog` on a missing file fail
+    // with the friendly "read perseus config" error below rather than auto-creating.
+    let bootstrap = matches!(command, Command::Run);
+    #[cfg(feature = "tray")]
+    let bootstrap = bootstrap || matches!(command, Command::Tray);
+    if bootstrap {
         perseus::config::ensure_config_exists(&config_path)?;
     }
 
@@ -72,7 +101,22 @@ async fn main() -> Result<()> {
     // Keep the log guard alive for the whole process (flushes on drop).
     let _log_guard = init_logging(&config.log_dir())?;
 
-    match cli.command {
+    // The tray owns its own tokio runtime — the tao event loop must run on the
+    // main thread, so `main` cannot be `#[tokio::main]`. Every other path enters a
+    // fresh multi-thread runtime below.
+    #[cfg(feature = "tray")]
+    if matches!(command, Command::Tray) {
+        return perseus::tray::run_tray(config_path);
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async_main(command, config, config_path))
+}
+
+/// Runtime dispatch for every non-tray subcommand. `config` is the lenient load
+/// used for the startup banner; `enqueue-backlog` re-loads strictly.
+async fn async_main(command: Command, config: Config, config_path: PathBuf) -> Result<()> {
+    match command {
         Command::Login => perseus::account::login(&config).await,
         Command::Run => cmd_run(config, config_path).await,
         Command::Status => cmd_status(config).await,
@@ -81,6 +125,8 @@ async fn main() -> Result<()> {
             let config = Config::load(&config_path)?;
             cmd_enqueue_backlog(config, config_path, dir).await
         }
+        #[cfg(feature = "tray")]
+        Command::Tray => unreachable!("tray mode runs before the tokio runtime is created"),
     }
 }
 

@@ -17,6 +17,11 @@ path = "src/lib.rs"
 name = "perseus"
 path = "src/main.rs"
 
+[features]
+# GUI tray mode. Off by default so headless builds (RPi, check:headless-core)
+# pull zero GUI deps. Desktop packages build with `--features tray`.
+tray = ["dep:tray-icon", "dep:tao", "dep:open", "dep:auto-launch"]
+
 [dependencies]
 # Headless dependency on the shared library: default-features = false omits the
 # `render` (rustafits) and `solver` (solvemyastro) native-heavy features. Perseus
@@ -67,6 +72,13 @@ chrono = "0.4"
 # ticket. Pinned to the exact versions athenaeum-core uses so cargo unifies them.
 iroh = "=1.0.2"
 iroh-tickets = "=1.0.0"
+# Tray mode (feature `tray`, off by default). Versions pinned to the workspace
+# lock — tray-icon/tao/open already resolve there transitively via Tauri, so
+# cargo unifies them; auto-launch is new to the lock (start-at-login toggle).
+tray-icon = { version = "0.21", optional = true }
+tao = { version = "0.34", optional = true }
+open = { version = "5.3", optional = true }
+auto-launch = { version = "0.5", optional = true }
 # Unix `statvfs` for the retention disk-usage probe (disk_pct policy). Already in
 # the workspace lock as a transitive dep; named here so run.rs can call it
 # directly. On non-unix the probe is a safe stub (0% → never triggers deletion).
