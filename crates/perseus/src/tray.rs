@@ -7,7 +7,7 @@
 //! process: `run_tray` blocks until Quit, which shuts the supervisor down
 //! gracefully and exits.
 
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 
@@ -166,6 +166,10 @@ pub fn run_tray(config_path: std::path::PathBuf) -> anyhow::Result<()> {
 
     let mut tray = None; // created on Init (tao's Linux gtk backend requires it there)
     let mut handle = Some(handle);
+    // Guards a start-at-login toggle in flight (see `spawn_toggle_autolaunch`):
+    // a click while `true` is ignored so a slow osascript round-trip can't be
+    // raced by a second click.
+    let mut autolaunch_pending = false;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
@@ -202,7 +206,11 @@ pub fn run_tray(config_path: std::path::PathBuf) -> anyhow::Result<()> {
                 }
             }
             tao::event::Event::UserEvent(UserEvent::AutoLaunch(enabled)) => {
+                // Covers both the startup probe and a completed toggle: either
+                // way nothing is in flight anymore, so re-enable the item.
+                autolaunch_pending = false;
                 start_login.set_checked(enabled);
+                start_login.set_enabled(true);
             }
             tao::event::Event::UserEvent(UserEvent::Menu(e)) => {
                 if e.id() == open_item.id() {
@@ -210,7 +218,16 @@ pub fn run_tray(config_path: std::path::PathBuf) -> anyhow::Result<()> {
                         tracing::error!(%error, url = %web_url, "open web ui failed");
                     }
                 } else if e.id() == start_login.id() {
-                    toggle_autolaunch(&autolaunch, &start_login);
+                    if autolaunch_pending {
+                        // A toggle is already in flight; ignore the double-click
+                        // rather than racing a second osascript call.
+                    } else if let Some(al) = autolaunch.clone() {
+                        autolaunch_pending = true;
+                        start_login.set_enabled(false);
+                        spawn_toggle_autolaunch(al, proxy.clone());
+                    } else {
+                        start_login.set_checked(false);
+                    }
                 } else if e.id() == quit_item.id() {
                     tracing::info!("quit requested; shutting down supervisor");
                     if let Some(h) = handle.take() {
@@ -237,20 +254,26 @@ fn build_autolaunch() -> Option<auto_launch::AutoLaunch> {
         .ok()
 }
 
-/// Flip the start-at-login state, keeping the check item in sync with the real
-/// outcome (never optimistically checked on failure).
-fn toggle_autolaunch(al: &Option<auto_launch::AutoLaunch>, item: &CheckMenuItem) {
-    let Some(al) = al else {
-        item.set_checked(false);
-        return;
-    };
-    let enabled = al.is_enabled().unwrap_or(false);
-    let result = if enabled { al.disable() } else { al.enable() };
-    match result {
-        Ok(()) => item.set_checked(!enabled),
-        Err(error) => {
-            tracing::error!(%error, "toggle start-at-login failed");
-            item.set_checked(enabled);
-        }
-    }
+/// Flip the start-at-login state OFF the UI thread. Like the startup probe,
+/// `is_enabled`/`enable`/`disable` can shell out to `osascript` (System Events)
+/// on macOS and block for the AppleEvent timeout (~120s, measured) — never on
+/// the event-loop thread, or a single click would freeze the whole tray. The
+/// caller has already disabled the menu item and set the in-flight guard;
+/// delivers the resulting checked state back via `UserEvent::AutoLaunch`, which
+/// clears the guard and re-enables the item.
+fn spawn_toggle_autolaunch(al: auto_launch::AutoLaunch, proxy: EventLoopProxy<UserEvent>) {
+    std::thread::spawn(move || {
+        let was_enabled = al.is_enabled().unwrap_or(false);
+        let result = if was_enabled { al.disable() } else { al.enable() };
+        let new_state = match result {
+            Ok(()) => !was_enabled,
+            Err(error) => {
+                tracing::error!(%error, "toggle start-at-login failed");
+                // Best-effort: report the real current state; fall back to the
+                // pre-click value if even that probe fails.
+                al.is_enabled().unwrap_or(was_enabled)
+            }
+        };
+        let _ = proxy.send_event(UserEvent::AutoLaunch(new_state));
+    });
 }
