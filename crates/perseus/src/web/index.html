@@ -66,6 +66,36 @@
       <span class="sub" id="conn"></span>
     </header>
     <main>
+      <!-- Account sign-in (email → OTP via the hub). The primary setup action:
+           a signed-out node shows the email/code flow; signed-in shows who it is
+           paired to + a two-click Sign out (the page uses no blocking dialogs). -->
+      <section id="account">
+        <h2>Account</h2>
+        <div id="acctSignedOut" style="display:none;">
+          <div class="row">
+            <input id="acctEmail" type="email" placeholder="you@example.com" size="28" autocomplete="email" />
+            <button id="acctSendCode">Send code</button>
+          </div>
+          <div class="row" id="acctCodeRow" style="display:none; margin-top:0.5rem;">
+            <input id="acctCode" placeholder="6-digit code" size="14" inputmode="numeric" autocomplete="one-time-code" />
+            <button id="acctVerify">Sign in</button>
+            <button id="acctResend" class="ghost">Send again</button>
+          </div>
+        </div>
+        <div id="acctSignedIn" style="display:none;">
+          <div class="row">
+            <div>
+              <div><b id="acctSignedInEmail"></b></div>
+              <div class="muted" id="acctPrimary"></div>
+            </div>
+            <span style="flex:1;"></span>
+            <button id="acctSignOut" class="ghost">Sign out</button>
+            <button id="acctSignOutConfirm" class="danger" style="display:none;">Confirm sign-out</button>
+          </div>
+        </div>
+        <div class="flash" id="acctFlash"></div>
+      </section>
+
       <!-- Lifecycle banner, rendered from /api/status: hidden while running
            normally; shown for setup / starting / failed / restart-pending. -->
       <div class="banner" id="agent-banner" style="display:none;"></div>
@@ -437,6 +467,90 @@
       $('cdAddInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addCaptureDir(); });
       $('cdSave').addEventListener('click', saveCaptureDirs);
 
+      // ── Account (email → OTP sign-in) ───────────────────────────────────────
+      // Two visual states from /api/account. Errors surface inline in the shared
+      // #acctFlash (the page's .flash.err helper), never a blocking dialog. The
+      // 2 s tick refreshes the card, but skips the render while the operator is
+      // interacting with it (focus inside the card) so typing / the two-click
+      // sign-out are never clobbered mid-action.
+      function acctFlash(msg, ok) { const f = $('acctFlash'); f.textContent = msg; f.className = 'flash ' + (ok ? 'ok' : 'err'); }
+
+      function renderAccount(a) {
+        const inGate = !!a.signedIn;
+        $('acctSignedIn').style.display = inGate ? '' : 'none';
+        $('acctSignedOut').style.display = inGate ? 'none' : '';
+        if (inGate) {
+          $('acctSignedInEmail').textContent = a.email || '(signed in)';
+          $('acctPrimary').textContent = a.primaryName
+            ? 'paired to ' + a.primaryName
+            : (a.primaryDeviceId ? 'paired to ' + shortHex(a.primaryDeviceId) : 'no primary device paired yet');
+          // Reset the two-click sign-out to its resting state.
+          $('acctSignOut').style.display = '';
+          $('acctSignOutConfirm').style.display = 'none';
+        }
+      }
+
+      async function refreshAccount() {
+        // Never re-render while the operator is mid-entry in the card — it would
+        // wipe the email/code inputs (or revert the two-click sign-out).
+        if ($('account').contains(document.activeElement)) return;
+        try { renderAccount(await getJson('/api/account')); }
+        catch (e) { /* offline is surfaced by refreshStatus() */ }
+      }
+
+      async function acctSendCode() {
+        const email = $('acctEmail').value.trim();
+        if (!email) { acctFlash('enter your account email', false); return; }
+        try {
+          const r = await api('/api/account/request-code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email }) });
+          if (!r.ok) throw new Error(await r.text());
+          $('acctCodeRow').style.display = '';
+          $('acctCode').focus();
+          acctFlash('code sent to ' + email + ' — check your inbox', true);
+        } catch (e) { acctFlash('could not send code: ' + e.message, false); }
+      }
+
+      async function acctVerify() {
+        const email = $('acctEmail').value.trim();
+        const code = $('acctCode').value.trim();
+        if (!code) { acctFlash('enter the code from your email', false); return; }
+        try {
+          const r = await api('/api/account/verify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, code }) });
+          if (!r.ok) throw new Error(await r.text());
+          const a = await r.json();
+          $('acctCode').value = '';
+          $('acctCodeRow').style.display = 'none';
+          renderAccount(a);
+          acctFlash('signed in', true);
+          // Readiness changed — re-fetch status + account so the banner + engine
+          // state catch up at once (the server also woke the supervisor).
+          refreshStatus(); refreshAccount();
+        } catch (e) { acctFlash('sign-in failed: ' + e.message, false); }
+      }
+
+      async function acctSignOut() {
+        try {
+          const r = await api('/api/account/logout', { method: 'POST' });
+          if (!r.ok) throw new Error(await r.text());
+          acctFlash('signed out', true);
+          refreshStatus(); refreshAccount();
+        } catch (e) { acctFlash('sign-out failed: ' + e.message, false); }
+      }
+
+      $('acctSendCode').addEventListener('click', acctSendCode);
+      $('acctResend').addEventListener('click', acctSendCode);
+      $('acctVerify').addEventListener('click', acctVerify);
+      $('acctEmail').addEventListener('keydown', (e) => { if (e.key === 'Enter') acctSendCode(); });
+      $('acctCode').addEventListener('keydown', (e) => { if (e.key === 'Enter') acctVerify(); });
+      // Two-click sign-out — no blocking confirm() dialog. The confirm button is
+      // focused so the tick's focus-guard holds it until the operator acts.
+      $('acctSignOut').addEventListener('click', () => {
+        $('acctSignOut').style.display = 'none';
+        $('acctSignOutConfirm').style.display = '';
+        $('acctSignOutConfirm').focus();
+      });
+      $('acctSignOutConfirm').addEventListener('click', acctSignOut);
+
       $('delSelected').addEventListener('click', () => doDelete([...document.querySelectorAll('.rowsel:checked')].map((c) => Number(c.dataset.id))));
       $('search').addEventListener('click', searchHistory);
       $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchHistory(); });
@@ -444,8 +558,8 @@
 
       // Initial load; poll status + sent + retention log every 2 s. History and
       // the policy form are on demand (the form is not clobbered while editing).
-      loadPolicy(); searchHistory(); loadCaptureDirs();
-      function tick() { refreshStatus(); refreshSent(); refreshLog(); refreshCdBanner(); }
+      loadPolicy(); searchHistory(); loadCaptureDirs(); refreshAccount();
+      function tick() { refreshStatus(); refreshSent(); refreshLog(); refreshCdBanner(); refreshAccount(); }
       tick(); setInterval(tick, 2000);
     </script>
   </body>

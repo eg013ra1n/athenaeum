@@ -62,6 +62,9 @@ use crate::run::{delete_confirmed_packages, DeleteReport};
 use crate::seen::SeenStore;
 use crate::supervisor::AgentState;
 
+mod account_api;
+use account_api::*;
+
 /// Default cap for `GET /api/sent` when the caller supplies no `?limit=`.
 const DEFAULT_SENT_LIMIT: u32 = 500;
 /// Default cap for `GET /api/history` when the caller supplies no `?limit=`.
@@ -334,6 +337,13 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         )
         .route("/api/delete", post(api_delete))
         .route("/api/retry", post(api_retry))
+        // Account sign-in (Task 5) — email→OTP through the hub. These are
+        // deliberately part of the bearer-gated `api` router, NOT exempt: they
+        // read/mutate account state and must never be reachable without the token.
+        .route("/api/account", get(api_account_get))
+        .route("/api/account/request-code", post(api_account_request_code))
+        .route("/api/account/verify", post(api_account_verify))
+        .route("/api/account/logout", post(api_account_logout))
         .layer(axum::middleware::from_fn(move |req, next| {
             auth_layer(token.clone(), req, next)
         }));
@@ -1915,5 +1925,223 @@ mod tests {
             before,
             "no new row created for a data-missing reject"
         );
+    }
+
+    // ── Task 5: account sign-in (/api/account/*) ──────────────────────────────
+
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A **detached** `WebState` whose config carries an `[account]` table
+    /// pointing at `hub_url`, over a real (temp) data dir the sign-in core writes
+    /// the token + pairing cache into. Engine absent (setup mode) — the exact
+    /// shape the always-on page runs in before the node is signed in.
+    async fn account_test_state(hub_url: &str) -> (Arc<WebState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+        let seen = Arc::new(crate::seen::SeenStore::open(tmp.path().join("sync.db")).unwrap());
+        let config = Config {
+            capture_dir: Some(tmp.path().to_path_buf()),
+            capture_dirs: Vec::new(),
+            data_dir: tmp.path().to_path_buf(),
+            pairing_ticket: None,
+            account: Some(crate::config::AccountConfig {
+                hub_url: hub_url.to_string(),
+                // No email in the file — the sign-in form supplies it and it is
+                // cached; account_status must surface it via the cache fallback.
+                email: None,
+                primary_device_id: None,
+                allow_default_relays: false,
+            }),
+            mode: crate::config::Mode::Auto,
+            retention: RetentionConfig::default(),
+            stability_secs: 1,
+            poll_interval_secs: 1,
+            web_bind: String::new(),
+            web_token: None,
+        };
+        let config_path = tmp.path().join("perseus.toml");
+        let (_tx, rx) = watch::channel(AgentState::NeedsSetup {
+            needs: vec!["not signed in".to_string()],
+        });
+        let state = Arc::new(WebState::detached(
+            store,
+            seen,
+            config,
+            config_path,
+            rx,
+            Arc::new(Notify::new()),
+        ));
+        (state, tmp)
+    }
+
+    /// Mount the three hub endpoints a successful web sign-in touches: verify →
+    /// token + device id, the device list (one primary → auto-pick), and the
+    /// role registration for the returned device id.
+    async fn mount_successful_signin(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/verify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deviceToken": "tok-secret-xyz",
+                "deviceId": "capture-dev",
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": "primary-1", "name": "Studio", "pubkey": "cHVia2V5",
+                    "role": "primary", "peerDeviceId": null,
+                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
+                }
+            ])))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/devices/capture-dev/role"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+
+    async fn post_json(app: &Router, uri: &str, body: serde_json::Value) -> Response {
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn get(app: &Router, uri: &str) -> Response {
+        app.clone()
+            .oneshot(HttpRequest::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// The happy path: request a code, verify it (→ signed in, and the supervisor
+    /// is woken so the engine can start), read the account snapshot, then log out
+    /// (→ signed out again). The wake future is armed BEFORE the verify request so
+    /// there is no race between `notify_one` and the assertion.
+    #[tokio::test]
+    async fn account_flow_signs_in_and_wakes_supervisor() {
+        use std::time::Duration;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/otp"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        mount_successful_signin(&server).await;
+
+        let (state, _tmp) = account_test_state(&server.uri()).await;
+        let wake = state.supervisor_wake.clone();
+        let app = build_router(state, None);
+
+        // request-code → 200.
+        let res = post_json(&app, "/api/account/request-code", serde_json::json!({ "email": "u@e.com" })).await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Arm the wake future BEFORE the verify request (per the brief) so a
+        // `notify_one` during the handler cannot be missed.
+        let woken = wake.notified();
+        tokio::pin!(woken);
+
+        let res = post_json(
+            &app,
+            "/api/account/verify",
+            serde_json::json!({ "email": "u@e.com", "code": "123456" }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["signedIn"], true, "verify returns the signed-in snapshot");
+        assert_eq!(v["email"], "u@e.com");
+
+        tokio::time::timeout(Duration::from_secs(1), woken)
+            .await
+            .expect("verify must wake the supervisor");
+
+        // GET /api/account reflects the signed-in state.
+        let v = body_json(get(&app, "/api/account").await).await;
+        assert_eq!(v["signedIn"], true);
+        assert_eq!(v["email"], "u@e.com");
+        assert_eq!(v["primaryName"], "Studio", "the paired primary name is surfaced");
+
+        // Logout → signed out again.
+        let res = post_json(&app, "/api/account/logout", serde_json::json!({})).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(get(&app, "/api/account").await).await;
+        assert_eq!(v["signedIn"], false, "logout clears the signed-in state");
+    }
+
+    /// A hub failure on verify passes through honestly as `502` carrying the
+    /// error text (never swallowed), and stores nothing — `signedIn` stays false.
+    #[tokio::test]
+    async fn account_endpoints_pass_hub_errors_through() {
+        let server = MockServer::start().await;
+        // The hub rejects the code. (401 → the client maps to its Unauthorized
+        // rendering; the point is the failure surfaces, not the literal body.)
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/verify"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_json(serde_json::json!({ "error": "bad code" })),
+            )
+            .mount(&server)
+            .await;
+
+        let (state, _tmp) = account_test_state(&server.uri()).await;
+        let app = build_router(state, None);
+
+        let res = post_json(
+            &app,
+            "/api/account/verify",
+            serde_json::json!({ "email": "u@e.com", "code": "000000" }),
+        )
+        .await;
+        assert_eq!(
+            res.status(),
+            StatusCode::BAD_GATEWAY,
+            "a hub failure is a 502, not a swallowed error"
+        );
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            body.contains("verify code"),
+            "the hub error chain passes through to the body: {body}"
+        );
+
+        // Nothing was stored: the account is still signed out.
+        let v = body_json(get(&app, "/api/account").await).await;
+        assert_eq!(v["signedIn"], false, "a failed verify stores nothing");
+    }
+
+    /// The account endpoints live behind the bearer gate: with a token configured,
+    /// an unauthenticated request is refused `401` before the handler runs (no hub
+    /// is even contacted).
+    #[tokio::test]
+    async fn account_endpoints_are_behind_bearer_gate() {
+        // Hub URL is never dialed — the auth layer rejects first.
+        let (state, _tmp) = account_test_state("http://127.0.0.1:1").await;
+        let app = build_router(state, Some("s3cret".to_string()));
+
+        let res = post_json(&app, "/api/account/request-code", serde_json::json!({ "email": "u@e.com" })).await;
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "no bearer token → 401 before the handler"
+        );
+
+        // GET /api/account is gated too.
+        let res = get(&app, "/api/account").await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }
