@@ -58,6 +58,14 @@ pub struct PairingCache {
     /// fetched. Display-only (history rows keep the hex as the stable key).
     #[serde(default)]
     pub device_names: HashMap<String, String>,
+    /// The email this device signed in with (display-only; surfaced by
+    /// [`account_status`] when the config file carries no `[account].email`).
+    #[serde(default)]
+    pub email: Option<String>,
+    /// The paired primary's hub device name (display-only companion to
+    /// [`Self::primary_device_id`], for the Account UI).
+    #[serde(default)]
+    pub primary_name: Option<String>,
 }
 
 impl PairingCache {
@@ -200,10 +208,110 @@ async fn verify_and_register(
     cache.device_id = Some(resp.device_id.clone());
     cache.primary_device_id = primary_id.clone();
     cache.device_names = device_names_from(&devices);
+    cache.email = Some(email.to_string());
+    cache.primary_name = primary_id.as_ref().and_then(|pid| {
+        devices.iter().find(|d| &d.id == pid).map(|d| d.name.clone())
+    });
     cache.save(&config.data_dir);
 
     tracing::info!(device_id = %resp.device_id, "perseus signed in");
     Ok(primary_id)
+}
+
+/// Is a hub device token stored for this config's account? (`false` when there
+/// is no `[account]` table at all.) The supervisor (Task 3) gates the sync
+/// engine on this.
+pub fn token_present(config: &Config) -> bool {
+    match &config.account {
+        Some(a) => matches!(token_store(config, a).load(), Ok(Some(_))),
+        None => false,
+    }
+}
+
+/// Ask the hub to email a one-time code. Requires an `[account]` table (hub_url).
+/// The non-interactive counterpart of the OTP request inside [`login`], for the
+/// web page's email→OTP sign-in.
+pub async fn request_code(config: &Config, email: &str) -> Result<()> {
+    let account = config.account.clone().ok_or_else(|| {
+        anyhow!("sign-in requires an [account] table in the config (hub_url)")
+    })?;
+    let email = email.trim();
+    if email.is_empty() {
+        bail!("email is required");
+    }
+    let client = HubClient::new(&account.hub_url).map_err(|e| anyhow!("{e}"))?;
+    client
+        .request_otp(email)
+        .await
+        .map_err(|e| anyhow!("request one-time code: {e}"))?;
+    tracing::info!("one-time code requested");
+    Ok(())
+}
+
+/// Non-interactive sign-in (the web page's path): verify the OTP, store the
+/// token, register as a capture device. Same core as `perseus login`, without
+/// the stdin prompts. Returns the resolved primary id (`None` when the account
+/// has no primary yet), like [`verify_and_register`].
+pub async fn web_sign_in(config: &Config, email: &str, code: &str) -> Result<Option<String>> {
+    let account = config.account.clone().ok_or_else(|| {
+        anyhow!("sign-in requires an [account] table in the config (hub_url)")
+    })?;
+    std::fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
+    let email = email.trim();
+    let code = code.trim();
+    if email.is_empty() {
+        bail!("email is required");
+    }
+    if code.is_empty() {
+        bail!("code is required");
+    }
+    let client = HubClient::new(&account.hub_url).map_err(|e| anyhow!("{e}"))?;
+    verify_and_register(config, &account, &client, email, code).await
+}
+
+/// Delete the stored token and reset the pairing cache. Idempotent; the engine
+/// is stopped by the supervisor (which the caller wakes), not here.
+pub fn sign_out(config: &Config) -> Result<()> {
+    if let Some(account) = &config.account {
+        token_store(config, account).delete().context("delete device token")?;
+    }
+    PairingCache::default().save(&config.data_dir);
+    tracing::info!("signed out");
+    Ok(())
+}
+
+/// A snapshot of the signed-in state for the Account UI (Task 5). All identity
+/// fields are display-only; `signed_in` is the authoritative gate (a stored
+/// token), everything else is best-effort from the config + pairing cache.
+#[derive(Debug, Clone)]
+pub struct AccountStatus {
+    /// A hub device token is stored (the sync engine may run).
+    pub signed_in: bool,
+    /// The signed-in email: config `[account].email` first, else the cache.
+    pub email: Option<String>,
+    /// The account hub base URL (`None` when there is no `[account]` table).
+    pub hub_url: Option<String>,
+    /// This device's hub device id (from the last sign-in).
+    pub device_id: Option<String>,
+    /// The paired primary's hub device id.
+    pub primary_device_id: Option<String>,
+    /// The paired primary's hub device name (display-only).
+    pub primary_name: Option<String>,
+}
+
+/// Build the [`AccountStatus`] snapshot from the config + pairing cache. Pure
+/// (no hub calls) so the web page can poll it cheaply.
+pub fn account_status(config: &Config) -> AccountStatus {
+    let cache = PairingCache::load(&config.data_dir);
+    AccountStatus {
+        signed_in: token_present(config),
+        email: config.account.as_ref().and_then(|a| a.email.clone()).or(cache.email),
+        hub_url: config.account.as_ref().map(|a| a.hub_url.clone()),
+        device_id: cache.device_id,
+        primary_device_id: cache.primary_device_id,
+        primary_name: cache.primary_name,
+    }
 }
 
 /// Resolve the peer + relays for an agent start, via the shared resolver.
@@ -583,6 +691,139 @@ mod tests {
         let cache = PairingCache::load(tmp.path());
         assert_eq!(cache.device_id.as_deref(), Some("capture-dev"));
         assert_eq!(cache.primary_device_id.as_deref(), Some("primary-1"));
+    }
+
+    /// Task 2: the non-interactive web sign-in core stores the token, registers
+    /// the capture device, and caches the signed-in identity (email + primary
+    /// name) so the Account UI can show who is signed in. Same hub interactions
+    /// as the CLI `login` core (verify → token+device_id → device list →
+    /// set_role), driven without a stdin prompt.
+    #[tokio::test]
+    async fn web_sign_in_stores_token_registers_and_caches_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/verify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deviceToken": "tok-secret-xyz",
+                "deviceId": "capture-dev",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": "primary-1", "name": "Studio", "pubkey": "cHVia2V5",
+                    "role": "primary", "peerDeviceId": null,
+                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
+                }
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/devices/capture-dev/role"))
+            .and(body_partial_json(serde_json::json!({
+                "role": "capture", "peerDeviceId": "primary-1"
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        // The web sign-in path carries no email in the config file — the email
+        // comes from the sign-in form and is cached; account_status must surface
+        // it via the cache fallback.
+        let mut config = account_config(tmp.path(), &server.uri(), None);
+        config.account.as_mut().unwrap().email = None;
+
+        let primary = web_sign_in(&config, "user@example.com", "123456")
+            .await
+            .expect("web sign-in succeeds");
+        assert_eq!(primary.as_deref(), Some("primary-1"), "auto-picked the single primary");
+
+        assert!(token_present(&config), "the device token must be stored");
+        let cache = PairingCache::load(&config.data_dir);
+        assert_eq!(cache.device_id.as_deref(), Some("capture-dev"));
+        assert_eq!(cache.primary_device_id, primary);
+        assert_eq!(cache.email.as_deref(), Some("user@example.com"));
+        assert!(cache.primary_name.is_some(), "primary name cached from the device list");
+        assert_eq!(cache.primary_name.as_deref(), Some("Studio"));
+
+        let status = account_status(&config);
+        assert!(status.signed_in);
+        assert_eq!(status.email.as_deref(), Some("user@example.com"));
+        assert_eq!(status.primary_device_id.as_deref(), Some("primary-1"));
+        assert_eq!(status.primary_name.as_deref(), Some("Studio"));
+    }
+
+    /// Task 2: request_code asks the hub to email a one-time code — exactly one
+    /// POST to the OTP endpoint `HubClient::request_otp` uses.
+    #[tokio::test]
+    async fn request_code_hits_hub_otp_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/otp"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = account_config(tmp.path(), &server.uri(), None);
+        request_code(&config, "user@example.com").await.unwrap();
+        // MockServer verifies the `.expect(1)` on drop.
+    }
+
+    /// Task 2: sign_out deletes the stored token and resets the pairing cache,
+    /// and a second call is a no-op (idempotent — the engine is stopped by the
+    /// supervisor, not here).
+    #[tokio::test]
+    async fn sign_out_clears_token_and_cache_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/verify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deviceToken": "tok-secret-xyz",
+                "deviceId": "capture-dev",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": "primary-1", "name": "Studio", "pubkey": "cHVia2V5",
+                    "role": "primary", "peerDeviceId": null,
+                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
+                }
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/devices/capture-dev/role"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let config = account_config(tmp.path(), &server.uri(), None);
+        web_sign_in(&config, "user@example.com", "123456")
+            .await
+            .expect("web sign-in succeeds");
+        assert!(token_present(&config), "signed in before sign-out");
+
+        sign_out(&config).unwrap();
+        assert!(!token_present(&config), "the token is gone after sign-out");
+        assert_eq!(
+            PairingCache::load(&config.data_dir),
+            PairingCache::default(),
+            "the pairing cache is reset to default"
+        );
+        sign_out(&config).unwrap(); // second call must not error
     }
 
     /// Task M1: run-time resolution picks the primary from the hub device list,
