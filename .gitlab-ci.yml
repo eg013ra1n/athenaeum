@@ -534,11 +534,13 @@ notify:telegram:
 #   linux (amd64 + manifest jobs, one-time, requires sudo):
 #     sudo apt-get install -y docker.io docker-buildx
 #     sudo usermod -aG docker gitlab-runner && sudo systemctl restart gitlab-runner
-#   macOS (arm64 job): Docker Desktop must be installed AND RUNNING — this is
-#     a GUI-session runner (see MEMORY.md project_macos_signing for the
-#     LaunchAgent setup it shares with the notarization runner); buildx ships
-#     with Docker Desktop, no separate install. If Docker Desktop is closed,
-#     the job's preflight fails loudly (allow_failure keeps it a soft/yellow
+#   macOS (arm64 job): OrbStack provides the Docker engine and must be RUNNING
+#     (start-at-login is enabled on the runner host: `orb config set
+#     app.start_at_login true`) — this is a GUI-session runner (see MEMORY.md
+#     project_macos_signing for the LaunchAgent setup it shares with the
+#     notarization runner). docker CLI comes from Homebrew; buildx resolves via
+#     ~/.docker/cli-plugins to OrbStack's plugin. If the engine is down, the
+#     job's preflight fails loudly (allow_failure keeps it a soft/yellow
 #     failure, but it must never silently no-op).
 #   qemu-user-static / tonistiigi/binfmt is NOT needed by any of the three
 #     jobs above — each builds natively for its own runner's architecture.
@@ -612,9 +614,9 @@ publish:dockerhub:arm64:
   variables:
     IMAGE: "docker.io/vsharifov/athenaeum"
   before_script:
-    # Native arm64 build on Apple Silicon Docker Desktop. Unlike the linux
-    # job, absence of docker/buildx OR a stopped daemon (Docker Desktop
-    # closed on this GUI-session runner) must surface as a visible failed
+    # Native arm64 build on Apple Silicon (OrbStack engine). Unlike the linux
+    # job, absence of docker/buildx OR a stopped daemon (OrbStack not
+    # running on this GUI-session runner) must surface as a visible failed
     # (yellow, allow_failure) job — NEVER exit 0 here, or a missing arm64
     # build silently degrades every release to amd64-only with no signal.
     - |
@@ -623,7 +625,7 @@ publish:dockerhub:arm64:
         exit 1
       fi
       if ! docker info >/dev/null 2>&1; then
-        echo "ERROR: Docker daemon not reachable — is Docker Desktop running on this runner host?"
+        echo "ERROR: Docker daemon not reachable — is OrbStack running on this runner host?"
         exit 1
       fi
       if ! docker buildx version >/dev/null 2>&1; then

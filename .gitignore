@@ -31,3 +31,4 @@ dist-ssr
 *.db-shm
 *.db-wal
 builds/
+scripts/__pycache__/*
