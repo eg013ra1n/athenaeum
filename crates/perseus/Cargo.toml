@@ -1,6 +1,6 @@
 [package]
 name = "perseus"
-version = "0.4.0"
+version = "0.4.0-beta.1"
 description = "Perseus — headless capture-node agent that watches a capture directory and syncs new frames to a paired primary over iroh"
 authors = ["you"]
 edition = "2021"

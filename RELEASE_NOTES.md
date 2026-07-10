@@ -1,33 +1,26 @@
-_The calibration release: build master darks, flats and bias in-app, calibrate your lights with Athenaeum's own rigorously tested math, and export stacker-ready data — plus a major star-measurement accuracy overhaul._
+_The sync beta — the machine at your telescope sends each finished frame home by itself._
 
 ## What's New
 
-- **Master Calibration Library.** Athenaeum now builds master calibration files itself — no external stacker needed. Select any matched calibration set and create a master dark, flat, bias or dark-flat with configurable integration recipes: Average / Median / Winsorized combination crossed with sigma-clip, percentile-clip or linear-fit rejection — or leave it on Auto. Masters are written into a dedicated Calibration Library folder, registered in the catalog exactly as if the scanner had found them, and every light frame and sub-calibration that used the raw set is relinked to the new master automatically. The raw set is marked as superseded — and can be archived to ZIP in one step, right from the build dialog.
-- **Batch master building.** "Create all masters" builds an entire equipment profile's worth of masters in dependency order (bias and dark-flats first, then darks, then flats — each flat pre-calibrated with the best available master), with a build-order preview, live per-set status, and in-batch dependency awareness.
-- **Master provenance and rebuild.** Every in-app master records exactly which frames and which recipe produced it. Rebuild a master in place after its source frames change — or restore its archived originals first if they were zipped.
-- **In-app light calibration.** A new **Calibrate Lights** action applies your master dark/bias and flat to a frame set's light frames, producing 32-bit float FITS ready for your stacking software with its own calibration steps disabled. The math follows the raw-master-dark convention (one subtraction removes bias and dark together), preserves negatives, keeps OSC frames un-debayered, and labels every output honestly (`CALSTAT`, full master provenance in the header). Flat normalization is selectable between two statistics; a side-by-side comparison with PixInsight-calibrated output of the same data agreed to 0.3% rms — Athenaeum keeps its own math, the comparison is a cross-check, not a target. Advanced parameters (trim fraction, output pedestal, bias-fallback policy) are there when you need them.
-- **Calibration coverage, visualized.** The Coverage tab shows per-set calibration lights with recipe badges, per-frame calibration details, and one-click master creation for anything missing.
-- **Export modes.** Export now offers three modes: calibrated lights only (with a strict readiness gate), raw lights + master calibration, or raw lights + full calibration sets.
-- **Compute queue.** Heavy jobs — analysis, master builds, light calibration — now run through a global admission queue with a sidebar indicator, so parallel work cannot oversubscribe the machine. Concurrency is configurable.
-- **Calibration Library folder management.** Designate the library folder in Settings → Calibration or the File Manager; the folder is scanned like any other root, so masters built elsewhere are picked up too.
+- **Personal sync (beta).** Sign in on your main computer and on the machines at your telescopes with a single account — just your email and a one-time code — pair them together, and send frames directly between them over an encrypted peer-to-peer connection. There is no cloud storage: your data travels machine-to-machine through a lightweight relay and lands only where you send it. A new Transfers panel shows live progress, and the transfer history lists each package with device names, durations, transfer speeds, filenames, and a badge that tells you when a local copy is safe to delete. This is the first beta of the sync feature set — expect rough edges, and keep your originals until a transfer is confirmed.
+- **Perseus — the capture-node agent (first release).** A small companion app for the computer sitting at the telescope. It watches your capture folders and automatically sends every finished frame to your primary Athenaeum machine, so your catalog fills in while you sleep. Perseus lives in the system tray with a live status icon and a one-click web dashboard where you can watch transfers, review history, tune how long it keeps local copies, and edit which folders it watches — and you sign in right from the browser. It can start automatically at login. Installers are provided for macOS (Apple Silicon and Intel, signed and notarized), Windows, and Debian/Ubuntu — including a headless build for Raspberry Pi (arm64) with an example systemd service.
+- **Sync landing folders.** Incoming frames land in a dedicated folder you designate (or a sensible default), so received data stays apart from the rest of your library and is ready to be scanned into your catalog. A separate folder for collaboration data is available too.
 
 ## Changes
 
-- **Star measurement accuracy overhaul.** The analysis engine was compared star-by-star with PixInsight's measurements on three datasets — not to chase its numbers, but to hunt down real defects. Several long-standing problems were found and fixed:
-  - Defocused frames now measure correctly. Previously a strongly defocused frame could report absurd sub-pixel FWHM values (stars "1 px wide"); such frames now land within a few percent of the cross-check values.
-  - Eccentricity and orientation are now measured reliably. The PSF fit could settle on a too-round solution for elongated stars when a neighbouring star or stamp corner skewed its starting point; per-star eccentricity now agrees closely in the cross-check, and elongation direction overlays align with what you see in the image.
-  - Close star pairs (blends) are excluded from measurement instead of being reported as single elongated pseudo-stars.
-  - Star overlay ellipses are drawn at 1.2× FWHM (was 2.5×) and the scale is now a setting — annotations hug the stars they belong to.
-- **Plate-solving star detection covers the whole frame.** On dense star fields the fast detector could fill its star budget from the top of the image and ignore the rest; it now selects the brightest stars frame-wide. Verified against the full solver corpus.
-- **Cleaner builds.** Type-generation warnings about serde attributes are gone.
+- Retention on a capture node is dry-run by default and only ever considers packages your primary machine has confirmed receiving. Nothing is deleted until you explicitly opt in, and never before it has safely arrived.
+- The transfer history now shows durations, transfer speeds, original filenames, and friendly device names in place of raw identifiers.
+- Perseus can watch several capture directories at once, and the list of watched folders is editable from its web page (applied on the next restart).
+- Failed transfers can be retried directly from the Perseus web page.
 
 ## Bug Fixes
 
-- Defocused-frame star analysis no longer collapses to sub-pixel FWHM values (the "1 px stars" bug).
-- Elongated stars near neighbours no longer measure as nearly round; orientation overlays no longer disagree with the visible elongation.
-- Analysis of 3-channel (RGB) XISF files no longer crashes the diagnostic pipeline.
-- Export mode is passed explicitly to the backend — a stale persisted setting can no longer silently change what gets exported.
-- Master build failures always release their queue slot and report completion, even on internal errors.
-- Restoring archived originals detects missing archive ZIPs and offers to forget the archive reference.
-- Calibration-set refresh is supersede-aware and prunes emptied sets; scan-root deletion is guarded against removing an active calibration folder.
-- Numerous smaller fixes across the master-build preview, batch dialog notes, FITS writer hardening, and the compute queue's admission race.
+- Completed transfers no longer accumulate disk space on either side. Local payload copies are freed once the primary confirms receipt, and a sweep at startup reclaims anything left behind by an interrupted transfer.
+- Frames are no longer lost or duplicated when a capture agent restarts in the middle of a transfer.
+- Auto-sync now also picks up frames discovered by folder monitoring, not only manual scans.
+- Signing in as your primary machine reliably starts listening for incoming frames.
+- First-run sign-in no longer occasionally fails because of a device-key race.
+- Retention refuses to remove a file unless it exactly matches what was transferred, and it audits every candidate before deleting anything.
+- Perseus keeps syncing even if its web dashboard cannot claim its network port at startup.
+- The Perseus transfer table no longer refreshes out from under a selection you are working with.
+- Folder configuration now reports the actual conflict when a chosen folder overlaps another one.
