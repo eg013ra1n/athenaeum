@@ -598,8 +598,11 @@ export type HistoryRow = { frameUuid: string, filename: string, object: string |
  */
 peerDevice: string, direction: Direction, bytes: number, startedAt: string, finishedAt: string | null, 
 /**
- * Short outcome tag: `sent`, `ingested`, `duplicate`, `rejected`, `failed`,
- * or `cancelled`.
+ * Short outcome tag: `sent`, `ingested`, `duplicate`, `rejected`, `failed`
+ * (or the composite `failed: rejected frame(s) <uuids>`), or `cancelled`.
+ * Retention / manual-deletion audit rows reuse this column too:
+ * `retention_deleted` (an automatic retention pass) and `deleted_manual`
+ * (the web "Delete selected" action).
  */
 outcome: string, };
 
