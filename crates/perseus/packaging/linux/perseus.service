@@ -1,0 +1,13 @@
+# Example systemd user unit for headless nodes.
+# Install: cp to ~/.config/systemd/user/ && systemctl --user enable --now perseus
+[Unit]
+Description=Perseus capture-node sync agent
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/perseus run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

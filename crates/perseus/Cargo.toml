@@ -93,3 +93,31 @@ wiremock = "0.6"
 # the web.rs handler tests. `util` is the only feature needed. Version matches
 # the web crate so cargo unifies the dependency.
 tower = { version = "0.5", features = ["util"] }
+
+# Debian packaging (cargo-deb). The parent table is the desktop package (tray UI +
+# GUI runtime deps); `variants.headless` overrides it for RPi/servers with no GUI.
+# Build desktop: `cargo deb -- -p perseus` from crates/perseus.
+# Build headless: `cargo deb --variant headless --no-default-features -- -p perseus`.
+[package.metadata.deb]
+maintainer = "Vilen Sharifov <vilen.sharifov@gmail.com>"
+copyright = "2026, Vilen Sharifov"
+extended-description = "Headless capture-node agent for Athenaeum: watches capture folders and syncs new FITS/XISF frames to your primary machine. Tray UI + embedded web page."
+section = "science"
+priority = "optional"
+features = ["tray"]
+depends = "$auto, libgtk-3-0, libayatana-appindicator3-1 | libappindicator3-1"
+assets = [
+  ["target/release/perseus", "usr/bin/", "755"],
+  ["packaging/linux/perseus.desktop", "usr/share/applications/", "644"],
+  ["packaging/linux/perseus.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+  ["packaging/linux/perseus.service", "usr/share/doc/perseus/examples/", "644"],
+]
+
+# Headless variant (RPi/servers): no tray feature, no GUI deps.
+[package.metadata.deb.variants.headless]
+features = []
+depends = "$auto"
+assets = [
+  ["target/release/perseus", "usr/bin/", "755"],
+  ["packaging/linux/perseus.service", "usr/share/doc/perseus/examples/", "644"],
+]

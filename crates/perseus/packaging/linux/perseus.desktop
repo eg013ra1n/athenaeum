@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Perseus
+Comment=Athenaeum capture-node sync agent
+Exec=perseus tray
+Icon=perseus
+Terminal=false
+Categories=Utility;Science;
