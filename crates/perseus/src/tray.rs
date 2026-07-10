@@ -132,11 +132,15 @@ pub fn run_tray(config_path: std::path::PathBuf) -> anyhow::Result<()> {
     });
 
     let web_url = {
-        let cfg = crate::config::Config::load_lenient(&config_path)?;
-        let bind: std::net::SocketAddr = cfg
-            .web_bind
-            .parse()
-            .unwrap_or_else(|_| "127.0.0.1:8686".parse().unwrap());
+        // A broken config must not kill the tray — the supervisor already
+        // surfaces the parse error (red icon + web banner). Fall back to the
+        // default loopback bind so "Open Web UI" still points somewhere useful.
+        let bind: std::net::SocketAddr = crate::config::Config::load_lenient(&config_path)
+            .ok()
+            .map(|c| c.web_bind)
+            .filter(|b| !b.is_empty())
+            .and_then(|b| b.parse().ok())
+            .unwrap_or_else(|| crate::config::DEFAULT_WEB_BIND.parse().unwrap());
         let host = if bind.ip().is_unspecified() {
             "127.0.0.1".to_string()
         } else {

@@ -544,6 +544,30 @@ impl Config {
     pub fn packages_dir(&self) -> PathBuf {
         self.data_dir.join("packages")
     }
+
+    /// A minimal, valid fallback the supervisor uses when the on-disk config
+    /// cannot be parsed at startup: platform data dir, loopback status page, no
+    /// token, empty capture list, no pairing. It exists only so the always-on
+    /// web page can still bind (and then surface the parse error) and logging has
+    /// a home; the supervisor loop reloads the real file each pass and publishes
+    /// `Failed { error }` until the typo is fixed. Because `web_bind` is loopback
+    /// and `web_token` is `None`, the non-loopback-needs-a-token rule is not
+    /// weakened — this is used only when the file genuinely cannot be parsed.
+    pub fn fallback() -> Self {
+        Self {
+            capture_dir: None,
+            capture_dirs: Vec::new(),
+            data_dir: platform_data_dir(),
+            pairing_ticket: None,
+            account: None,
+            mode: Mode::Auto,
+            retention: RetentionConfig::default(),
+            stability_secs: DEFAULT_STABILITY_SECS,
+            poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
+            web_bind: default_web_bind(),
+            web_token: None,
+        }
+    }
 }
 
 /// Per-platform application subdirectory name. Linux XDG convention is

@@ -218,10 +218,11 @@ fn spawn_with(
             let config = match Config::load_lenient(&config_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::error!(error = %e, path = %config_path.display(), "config load failed");
-                    let _ = state_tx.send(AgentState::Failed {
-                        error: e.to_string(),
-                    });
+                    // Surface the full error chain (parse detail included) so the
+                    // tray status line and web banner name the actual problem.
+                    let error = format!("{e:#}");
+                    tracing::error!(%error, path = %config_path.display(), "config load failed");
+                    let _ = state_tx.send(AgentState::Failed { error });
                     wait_tick(&wake2, &mut shutdown_rx, opts.retry_backoff).await;
                     if *shutdown_rx.borrow() {
                         break;
@@ -363,6 +364,13 @@ pub fn production_launcher() -> Launcher {
 /// store + seen are opened here (a second WAL connection beside the agent's own)
 /// so sent/history read even while detached. An empty `web_bind` skips the bind;
 /// a runtime bind failure is non-fatal (logged, swallowed).
+///
+/// A config that cannot be parsed at startup does NOT abort here: it falls back
+/// to [`Config::fallback`] (platform data dir, loopback web page, no token) so
+/// the always-on page still binds and shows the error, while the supervisor loop
+/// reloads the real file each pass and publishes `Failed { error }` (red tray
+/// icon + web banner) until the typo is fixed. The fallback is loopback-only, so
+/// the non-loopback-needs-a-token rule is never weakened.
 pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> {
     use athenaeum_core::sync::store::StandaloneSyncStore;
 
@@ -370,8 +378,14 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
     use crate::seen::SeenStore;
     use crate::web::{build_router, WebState};
 
-    let config = Config::load_lenient(&config_path)
-        .with_context(|| format!("load perseus config {}", config_path.display()))?;
+    let config = Config::load_lenient(&config_path).unwrap_or_else(|e| {
+        tracing::error!(
+            error = %format!("{e:#}"),
+            path = %config_path.display(),
+            "config load failed at startup; serving platform-default web page until the file is fixed"
+        );
+        Config::fallback()
+    });
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
 
@@ -861,6 +875,64 @@ mod tests {
             2,
             "one failed attempt then one successful retry"
         );
+        handle.shutdown().await;
+    }
+
+    /// A broken (unparseable) config on disk must publish `Failed { error }`
+    /// naming the config problem — never launch — and then recover to a normal
+    /// state once the file is fixed and the wake is rung. This is the supervisor
+    /// half of the "typo'd TOML must not die silently" fix: the loop owns the
+    /// recovery, so `start_supervised` can hand it a config path even when the
+    /// initial load failed.
+    #[tokio::test]
+    async fn invalid_config_publishes_failed_and_recovers_after_fix() {
+        let data = tempfile::tempdir().unwrap();
+        let cap = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("perseus.toml");
+        // Unterminated table header — a definite TOML syntax error.
+        write_config_atomic(&cfg_path, "[unclosed table\n");
+
+        let (launcher, lstate) = fake_launcher(vec![], 0);
+        let (on_agent, _seen) = recording_on_agent();
+        let handle = spawn(cfg_path.clone(), launcher, fast_opts(), on_agent);
+        let mut state = handle.state.clone();
+
+        // The loop surfaces the parse failure as Failed{error} mentioning config.
+        tokio::time::timeout(
+            T,
+            state.wait_for(|s| {
+                matches!(s, AgentState::Failed { error } if error.contains("config"))
+            }),
+        )
+        .await
+        .expect("never published Failed for the broken config")
+        .unwrap();
+        assert_eq!(
+            lstate.calls.load(Ordering::SeqCst),
+            0,
+            "must never launch while the config cannot be parsed"
+        );
+
+        // Fix the file and prod the loop → it reloads and leaves the Failed state.
+        write_ready_config(&cfg_path, data.path(), &[cap.path()]);
+        handle.wake.notify_one();
+
+        tokio::time::timeout(
+            T,
+            state.wait_for(|s| {
+                matches!(
+                    s,
+                    AgentState::Starting
+                        | AgentState::Running { .. }
+                        | AgentState::NeedsSetup { .. }
+                )
+            }),
+        )
+        .await
+        .expect("never recovered after the config was fixed")
+        .unwrap();
+
         handle.shutdown().await;
     }
 }

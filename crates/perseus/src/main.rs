@@ -92,14 +92,44 @@ fn main() -> Result<()> {
         perseus::config::ensure_config_exists(&config_path)?;
     }
 
-    // A lenient load is enough to bring up the data dir + logging + startup banner
-    // for every command; `enqueue-backlog` re-loads strictly below (it genuinely
-    // needs dirs + a usable pairing route). `login`/`status` run pre-setup too.
-    let config = Config::load_lenient(&config_path)?;
-    std::fs::create_dir_all(&config.data_dir)
-        .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
-    // Keep the log guard alive for the whole process (flushes on drop).
-    let _log_guard = init_logging(&config.log_dir())?;
+    // `run`/`tray` host the supervisor; a broken config there must be recoverable
+    // rather than fatal (see the lenient load below). This is the same command
+    // set as `bootstrap`.
+    let supervisor_mode = bootstrap;
+
+    // A lenient load brings up the data dir + logging + startup banner. For the
+    // supervisor-hosting modes (`run`, `tray`) a parse failure is NON-fatal: an
+    // installed tray app with a typo'd TOML would otherwise die on an unseen
+    // stderr line — no log file, no icon. Instead we log under the platform data
+    // dir and hand the path to the supervisor, whose loop reloads from disk and
+    // publishes `Failed { error }` (red icon + web banner), recovering once the
+    // file is fixed. `login`/`status`/`enqueue-backlog` still fail fast.
+    let (config, initial_load_error): (Option<Config>, Option<anyhow::Error>) =
+        match Config::load_lenient(&config_path) {
+            Ok(c) => (Some(c), None),
+            Err(e) if supervisor_mode => (None, Some(e)),
+            Err(e) => return Err(e),
+        };
+
+    if let Some(c) = &config {
+        std::fs::create_dir_all(&c.data_dir)
+            .with_context(|| format!("create data dir {}", c.data_dir.display()))?;
+    }
+    // Keep the log guard alive for the whole process (flushes on drop). Logging
+    // goes under the config's own data dir when it loaded, else the platform
+    // default (only reached in supervisor mode on a load failure).
+    let log_dir = config
+        .as_ref()
+        .map(Config::log_dir)
+        .unwrap_or_else(|| perseus::config::platform_data_dir().join("logs"));
+    let _log_guard = init_logging(&log_dir)?;
+    if let Some(e) = &initial_load_error {
+        tracing::error!(
+            error = %format!("{e:#}"),
+            path = %config_path.display(),
+            "initial config load failed; supervisor will surface and retry"
+        );
+    }
 
     // The tray owns its own tokio runtime — the tao event loop must run on the
     // main thread, so `main` cannot be `#[tokio::main]`. Every other path enters a
@@ -114,12 +144,20 @@ fn main() -> Result<()> {
 }
 
 /// Runtime dispatch for every non-tray subcommand. `config` is the lenient load
-/// used for the startup banner; `enqueue-backlog` re-loads strictly.
-async fn async_main(command: Command, config: Config, config_path: PathBuf) -> Result<()> {
+/// used for the startup banner — `None` only for `run` when the file could not
+/// be parsed (the supervisor owns recovery). `enqueue-backlog` re-loads strictly;
+/// `login`/`status` failed fast in `main` so they always receive `Some`.
+async fn async_main(command: Command, config: Option<Config>, config_path: PathBuf) -> Result<()> {
     match command {
-        Command::Login => perseus::account::login(&config).await,
+        Command::Login => {
+            let config = config.context("login requires a readable config")?;
+            perseus::account::login(&config).await
+        }
         Command::Run => cmd_run(config, config_path).await,
-        Command::Status => cmd_status(config).await,
+        Command::Status => {
+            let config = config.context("status requires a readable config")?;
+            cmd_status(config).await
+        }
         Command::EnqueueBacklog { dir } => {
             // Strict re-load: enqueue-backlog needs a fully valid config.
             let config = Config::load(&config_path)?;
@@ -133,13 +171,19 @@ async fn async_main(command: Command, config: Config, config_path: PathBuf) -> R
 /// `run`: hand off to the supervisor (which binds the web page and drives the
 /// watcher/engine lifecycle) and block until Ctrl-C, then shut it down cleanly.
 /// The passed `config` is used only for the startup banner — the supervisor
-/// reloads from disk itself.
-async fn cmd_run(config: Config, config_path: PathBuf) -> Result<()> {
-    tracing::info!(
-        capture_dirs = ?config.capture_dirs_resolved(),
-        data_dir = %config.data_dir.display(),
-        "perseus starting (supervisor mode)"
-    );
+/// reloads from disk itself. `None` means the config could not be parsed at
+/// startup; the supervisor still comes up (fallback page) and surfaces the error.
+async fn cmd_run(config: Option<Config>, config_path: PathBuf) -> Result<()> {
+    match &config {
+        Some(config) => tracing::info!(
+            capture_dirs = ?config.capture_dirs_resolved(),
+            data_dir = %config.data_dir.display(),
+            "perseus starting (supervisor mode)"
+        ),
+        None => tracing::warn!(
+            "perseus starting (supervisor mode) with an unreadable config; the supervisor will surface the error"
+        ),
+    }
     let handle = perseus::supervisor::start_supervised(config_path).await?;
     tokio::signal::ctrl_c()
         .await
