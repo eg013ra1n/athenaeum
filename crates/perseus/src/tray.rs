@@ -81,6 +81,9 @@ fn state_line(state: &AgentState, dirs: usize) -> String {
 /// own runtime — `main` must NOT be `#[tokio::main]` on this path. Blocks (never
 /// returns on macOS; the process exits on Quit).
 pub fn run_tray(config_path: std::path::PathBuf) -> anyhow::Result<()> {
+    // `mut` is only exercised by the macOS activation-policy call below;
+    // Windows/Linux builds would otherwise warn `unused_mut`.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     #[cfg(target_os = "macos")]
     {

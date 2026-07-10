@@ -375,12 +375,18 @@ build:perseus:windows:
     - job: build:windows
       artifacts: false
   script:
-    # Install NSIS (makensis) if the runner doesn't already have it, then refresh PATH.
+    # Resolve makensis by FULL PATH: the chocolatey nsis package installs to
+    # "C:\Program Files (x86)\NSIS" but adds NO PATH entry and NO shim, so
+    # Get-Command/PATH-refresh never find it (v0.4.0-beta.1 pipeline 220 proof).
     - |
-      if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+      $makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+      if (-not $makensis) { $makensis = Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe" }
+      if (-not (Test-Path $makensis)) {
         choco install -y --no-progress nsis
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+        $makensis = Join-Path ${env:ProgramFiles(x86)} "NSIS\makensis.exe"
       }
+      if (-not (Test-Path $makensis)) { throw "makensis not found at $makensis after install" }
+      $env:PERSEUS_MAKENSIS = $makensis
     - cargo build --release -p perseus --features tray
     # Build the installer from the .nsi's OWN directory so its relative File/icon
     # paths (and the OutFile) resolve against it; EXE is 4 levels up at target/release.
@@ -388,7 +394,7 @@ build:perseus:windows:
       $VERSION = "$env:CI_COMMIT_TAG".TrimStart("v")
       Push-Location crates\perseus\packaging\windows
       try {
-        makensis /DVERSION=$VERSION /DEXE=..\..\..\..\target\release\perseus.exe perseus.nsi
+        & $env:PERSEUS_MAKENSIS /DVERSION=$VERSION /DEXE=..\..\..\..\target\release\perseus.exe perseus.nsi
         if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
       } finally {
         Pop-Location
