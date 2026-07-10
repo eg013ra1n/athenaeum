@@ -126,23 +126,14 @@ check:headless-core:
   script:
     - cargo check -p athenaeum-core --no-default-features
 
-# --- macOS Build (Apple Silicon + Intel) — signed + notarized (Developer ID) ---
-# Secrets come from Protected CI/CD variables; the .p12/.p8 are decoded at
-# runtime into a throwaway per-job keychain and removed in after_script.
-build:macos:
-  stage: build
-  tags:
-    - macos
-  only:
-    - tags
-  cache:
-    key: "main-macos"
-    policy: pull
-    paths:
-      - .cargo/registry/
-      - .cargo/git/
-      - target/
-      - .npm/
+# --- Shared macOS signing/notarization setup (hidden template job) ---
+# Single source of truth for the Developer ID signing dance: before_script
+# materializes the .p12 cert + .p8 notary key into a throwaway per-job keychain
+# and makes it the default; after_script tears it all down. Reused via
+# `extends:` by BOTH build:macos (Tauri self-signs via APPLE_SIGNING_IDENTITY)
+# and build:perseus:macos (hand-codesigns via build_app.sh). It only carries the
+# scripts — each consumer keeps its own stage/tags/only/cache/script/artifacts.
+.macos_signing_setup:
   before_script:
     # Fail loudly if a signing variable is missing (e.g. the tag is not a
     # Protected tag) instead of silently producing an UNSIGNED dmg.
@@ -191,6 +182,32 @@ build:macos:
     - security find-identity -v -p codesigning "$KEYCHAIN_PATH"
     - security find-identity -v -p codesigning
     - rm -f "$CERT_PATH"
+  after_script:
+    # Fresh shell: recompute the same paths and clean up unconditionally.
+    # Restore the login keychain as default FIRST, then delete ours.
+    - security default-keychain -d user -s "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
+    - KEYCHAIN_PATH="$HOME/athenaeum-signing-${CI_JOB_ID}.keychain-db"
+    - security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+    - rm -f "$KEYCHAIN_PATH" "$HOME/athenaeum-cert-${CI_JOB_ID}.p12" "$HOME/athenaeum-api-key-${CI_JOB_ID}.p8"
+
+# --- macOS Build (Apple Silicon + Intel) — signed + notarized (Developer ID) ---
+# Secrets come from Protected CI/CD variables; the .p12/.p8 are decoded at
+# runtime into a throwaway per-job keychain and removed in after_script.
+build:macos:
+  stage: build
+  extends: .macos_signing_setup
+  tags:
+    - macos
+  only:
+    - tags
+  cache:
+    key: "main-macos"
+    policy: pull
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+      - target/
+      - .npm/
   script:
     # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
     # cmake and nasm are needed because turbojpeg-sys builds libjpeg-turbo
@@ -221,13 +238,6 @@ build:macos:
         xcrun notarytool submit "$DMG" --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
         xcrun stapler staple "$DMG" && xcrun stapler validate "$DMG"
       done
-  after_script:
-    # Fresh shell: recompute the same paths and clean up unconditionally.
-    # Restore the login keychain as default FIRST, then delete ours.
-    - security default-keychain -d user -s "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
-    - KEYCHAIN_PATH="$HOME/athenaeum-signing-${CI_JOB_ID}.keychain-db"
-    - security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
-    - rm -f "$KEYCHAIN_PATH" "$HOME/athenaeum-cert-${CI_JOB_ID}.p12" "$HOME/athenaeum-api-key-${CI_JOB_ID}.p8"
   artifacts:
     name: "athenaeum-macos-${CI_COMMIT_SHORT_SHA}"
     paths:
@@ -318,6 +328,140 @@ update-cache:macos:
     - npm run tauri build -- --target aarch64-apple-darwin
     - npm run tauri build -- --target x86_64-apple-darwin
 
+# --- Perseus (headless sync agent) — desktop installers (tags only) ---
+# Perseus ships as its own set of installers alongside Athenaeum. Each job builds
+# `perseus --features tray` (headless core; no rustafits/turbojpeg, so no
+# cmake/nasm). Signed/notarized on macOS via the shared .macos_signing_setup; the
+# deploy job renames + uploads the artifacts and creates stable-named aliases.
+
+build:perseus:macos:
+  stage: build
+  extends: .macos_signing_setup
+  tags:
+    - macos
+  only:
+    - tags
+  script:
+    - export PATH="$HOME/.cargo/bin:$PATH"
+    - rustup target add x86_64-apple-darwin
+    - VERSION="${CI_COMMIT_TAG#v}"
+    # build_app.sh builds+assembles+codesigns Perseus.app (uses APPLE_SIGNING_IDENTITY
+    # against the keychain set up by the shared before_script) and produces the dmg.
+    - bash crates/perseus/packaging/macos/build_app.sh aarch64-apple-darwin "$VERSION"
+    - bash crates/perseus/packaging/macos/build_app.sh x86_64-apple-darwin "$VERSION"
+    # Notarize + staple each dmg (APPLE_API_KEY_PATH exported by before_script).
+    - |
+      for DMG in target/aarch64-apple-darwin/release/bundle/perseus-*.dmg \
+                 target/x86_64-apple-darwin/release/bundle/perseus-*.dmg; do
+        echo "Notarizing $DMG ..."
+        xcrun notarytool submit "$DMG" --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+        xcrun stapler staple "$DMG" && xcrun stapler validate "$DMG"
+      done
+  artifacts:
+    name: "perseus-macos-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - target/aarch64-apple-darwin/release/bundle/perseus-*.dmg
+      - target/x86_64-apple-darwin/release/bundle/perseus-*.dmg
+    expire_in: 30 days
+
+build:perseus:windows:
+  stage: build
+  tags:
+    - windows
+  only:
+    - tags
+  needs:
+    # Serialize on the shared windows runner (warm target/, no concurrent cargo).
+    - job: build:windows
+      artifacts: false
+  script:
+    # Install NSIS (makensis) if the runner doesn't already have it, then refresh PATH.
+    - |
+      if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+        choco install -y --no-progress nsis
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+      }
+    - cargo build --release -p perseus --features tray
+    # Build the installer from the .nsi's OWN directory so its relative File/icon
+    # paths (and the OutFile) resolve against it; EXE is 4 levels up at target/release.
+    - |
+      $VERSION = "$env:CI_COMMIT_TAG".TrimStart("v")
+      Push-Location crates\perseus\packaging\windows
+      try {
+        makensis /DVERSION=$VERSION /DEXE=..\..\..\..\target\release\perseus.exe perseus.nsi
+        if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
+      } finally {
+        Pop-Location
+      }
+  artifacts:
+    name: "perseus-windows-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - crates/perseus/packaging/windows/perseus-*-setup.exe
+    expire_in: 30 days
+
+build:perseus:linux:
+  stage: build
+  tags:
+    - linux
+  only:
+    - tags
+  before_script:
+    - source "$HOME/.cargo/env"
+    # The desktop (tray) variant links against gtk/appindicator AND libxdo (-lxdo).
+    # These dev headers must be pre-installed on the runner host (the gitlab-runner
+    # user cannot sudo non-interactively). One-time setup on the runner host:
+    #   sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+    - |
+      missing=()
+      for p in libgtk-3-dev libayatana-appindicator3-dev libxdo-dev; do
+        dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")
+      done
+      if [ ${#missing[@]} -gt 0 ]; then
+        echo "ERROR: missing dev headers on runner: ${missing[*]}"
+        echo "Run on the runner host: sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev"
+        exit 1
+      fi
+    - command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
+  script:
+    - VERSION="${CI_COMMIT_TAG#v}"
+    # Drop any stale perseus artifacts from a prior run on this persistent runner
+    # so the deploy globs never match a leftover from an older version.
+    - rm -f target/debian/perseus*.deb target/debian/perseus*.tar.gz
+    - (cd crates/perseus && cargo deb -- -p perseus)   # desktop variant (tray)
+    # The .deb embeds the CRATE version; the tag drives the tar.gz + release links.
+    # At tag time they must match (the version bump is a separate release step) —
+    # warn, never block, on a mismatch.
+    - |
+      DEB=$(ls target/debian/perseus_*_amd64.deb 2>/dev/null | head -n1)
+      case "$DEB" in
+        */perseus_${VERSION}-1_amd64.deb) echo "perseus .deb version OK: $DEB" ;;
+        *) echo "WARNING: perseus .deb '$DEB' does not embed tag version '${VERSION}' — is the crate version bumped to match the tag?" ;;
+      esac
+    - tar czf "target/debian/perseus-${VERSION}-linux-amd64.tar.gz" -C target/release perseus
+  artifacts:
+    name: "perseus-linux-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - target/debian/*.deb
+      - target/debian/*.tar.gz
+    expire_in: 30 days
+
+build:perseus:linux-arm64:
+  stage: build
+  tags:
+    - macos          # OrbStack docker, native arm64 container build
+  only:
+    - tags
+  script:
+    # Drop stale perseus artifacts from a prior run (persistent runner host).
+    - rm -f target/debian/perseus*.deb target/debian/perseus*.tar.gz
+    - bash crates/perseus/packaging/linux/build_arm64.sh "${CI_COMMIT_TAG#v}"
+  artifacts:
+    name: "perseus-linux-arm64-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - target/debian/*.deb
+      - target/debian/*.tar.gz
+    expire_in: 30 days
+
 # --- Deploy to Web Server (tags only) ---
 deploy:
   stage: deploy
@@ -337,6 +481,14 @@ deploy:
       artifacts: true
     - job: build:macos
       artifacts: true
+    - job: build:perseus:macos
+      artifacts: true
+    - job: build:perseus:windows
+      artifacts: true
+    - job: build:perseus:linux
+      artifacts: true
+    - job: build:perseus:linux-arm64
+      artifacts: true
   before_script:
     - eval $(ssh-agent -s)
     - chmod 400 "$DEPLOY_SSH_KEY"
@@ -352,7 +504,7 @@ deploy:
     - mv target/aarch64-apple-darwin/release/bundle/dmg/*.dmg "target/aarch64-apple-darwin/release/bundle/dmg/Athenaeum_${CI_COMMIT_TAG}_aarch64.dmg"
     - mv target/x86_64-apple-darwin/release/bundle/dmg/*.dmg "target/x86_64-apple-darwin/release/bundle/dmg/Athenaeum_${CI_COMMIT_TAG}_x64.dmg"
     # Create directories on remote
-    - ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "mkdir -p ${BUILDS_PATH}/${CI_COMMIT_TAG}/linux ${BUILDS_PATH}/${CI_COMMIT_TAG}/windows ${BUILDS_PATH}/${CI_COMMIT_TAG}/macos"
+    - ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "mkdir -p ${BUILDS_PATH}/${CI_COMMIT_TAG}/linux ${BUILDS_PATH}/${CI_COMMIT_TAG}/windows ${BUILDS_PATH}/${CI_COMMIT_TAG}/macos ${BUILDS_PATH}/${CI_COMMIT_TAG}/perseus"
     # Upload Linux artifacts
     - ${SCP_CMD} target/release/bundle/appimage/*.AppImage target/release/bundle/deb/*.deb ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/linux/
     # Upload Windows artifacts
@@ -373,6 +525,33 @@ deploy:
         cd ${BUILDS_PATH}/${CI_COMMIT_TAG}/macos
         ln -sfn Athenaeum_${CI_COMMIT_TAG}_aarch64.dmg Athenaeum-macos-aarch64.dmg
         ln -sfn Athenaeum_${CI_COMMIT_TAG}_x64.dmg Athenaeum-macos-x64.dmg"
+    # --- Perseus artifacts ---
+    # dmg/exe names already embed the version (no `v`); the debs get renamed to
+    # carry the tag. Headless arm64 deb PREFIXES the package name (perseus-headless_*).
+    # VERSION (tag without the leading v) is interpolated locally into the alias
+    # block below because ${CI_COMMIT_TAG#v} does not expand inside the remote
+    # double-quoted ssh payload.
+    - VERSION="${CI_COMMIT_TAG#v}"
+    - mv target/debian/perseus_*_amd64.deb "target/debian/perseus_${CI_COMMIT_TAG}_amd64.deb"
+    - mv target/debian/perseus-headless_*_arm64.deb "target/debian/perseus_${CI_COMMIT_TAG}_arm64.deb"
+    - ${SCP_CMD}
+        target/aarch64-apple-darwin/release/bundle/perseus-*-macos-arm64.dmg
+        target/x86_64-apple-darwin/release/bundle/perseus-*-macos-x64.dmg
+        crates/perseus/packaging/windows/perseus-*-setup.exe
+        target/debian/perseus_${CI_COMMIT_TAG}_amd64.deb
+        target/debian/perseus_${CI_COMMIT_TAG}_arm64.deb
+        target/debian/perseus-*-linux-amd64.tar.gz
+        target/debian/perseus-*-linux-arm64.tar.gz
+        ${DEPLOY_USER}@${DEPLOY_HOST}:${BUILDS_PATH}/${CI_COMMIT_TAG}/perseus/
+    # Stable-named aliases (download page carries permanent beta links)
+    - |
+      ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "set -e
+        cd ${BUILDS_PATH}/${CI_COMMIT_TAG}/perseus
+        ln -sfn perseus-${VERSION}-macos-arm64.dmg perseus-macos-arm64.dmg
+        ln -sfn perseus-${VERSION}-macos-x64.dmg perseus-macos-x64.dmg
+        ln -sfn perseus-${VERSION}-windows-x64-setup.exe perseus-windows-x64-setup.exe
+        ln -sfn perseus_${CI_COMMIT_TAG}_amd64.deb perseus-linux-amd64.deb
+        ln -sfn perseus_${CI_COMMIT_TAG}_arm64.deb perseus-linux-arm64.deb"
     # Update symlink: beta tags → builds/beta, stable tags → builds/latest
     - |
       if echo "${CI_COMMIT_TAG}" | grep -q '\-beta'; then
@@ -410,7 +589,12 @@ release:
               {\"name\": \"Linux AppImage\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/linux/athenaeum_${CI_COMMIT_TAG}_amd64.AppImage\"},
               {\"name\": \"Linux Debian Package\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/linux/athenaeum_${CI_COMMIT_TAG}_amd64.deb\"},
               {\"name\": \"macOS Disk Image (Apple Silicon)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/macos/Athenaeum_${CI_COMMIT_TAG}_aarch64.dmg\"},
-              {\"name\": \"macOS Disk Image (Intel)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/macos/Athenaeum_${CI_COMMIT_TAG}_x64.dmg\"}
+              {\"name\": \"macOS Disk Image (Intel)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/macos/Athenaeum_${CI_COMMIT_TAG}_x64.dmg\"},
+              {\"name\": \"Perseus for macOS (Apple Silicon)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/perseus/perseus-macos-arm64.dmg\"},
+              {\"name\": \"Perseus for macOS (Intel)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/perseus/perseus-macos-x64.dmg\"},
+              {\"name\": \"Perseus for Windows\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/perseus/perseus-windows-x64-setup.exe\"},
+              {\"name\": \"Perseus for Linux (amd64 deb)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/perseus/perseus-linux-amd64.deb\"},
+              {\"name\": \"Perseus for Linux (arm64 deb, headless)\", \"url\": \"https://artfrom.space/builds/${CI_COMMIT_TAG}/perseus/perseus-linux-arm64.deb\"}
             ]
           }
         }" \
