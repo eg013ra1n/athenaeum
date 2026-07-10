@@ -27,11 +27,17 @@ pub const KEYRING_SERVICE: &str = "com.vsharifov.athenaeum";
 
 /// Stores/loads the hub device token for one account (hub host).
 pub struct TokenStore {
-    /// Keychain account / file discriminator — the hub host.
+    /// Keychain account / file discriminator — the hub host. Read only by the
+    /// keychain backend, which is compiled out on non-mac/win targets — hence
+    /// the target-scoped `dead_code` allowance (Linux/headless builds warn
+    /// otherwise; the field must still exist so constructors are portable).
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     account: String,
     /// 0600 file used as the fallback (or the sole backend under `file_only`).
     fallback_path: PathBuf,
-    /// When true, never touch the OS keychain — file backend only.
+    /// When true, never touch the OS keychain — file backend only. Same
+    /// target-scoped allowance as `account`: only the keychain backend reads it.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     file_only: bool,
 }
 
