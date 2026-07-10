@@ -438,6 +438,10 @@ build:perseus:linux:
     # overwrites target/release/perseus, which is useless on a headless x64 server
     # — so the amd64 tar.gz must capture the --no-default-features build beforehand.
     - cargo build --release -p perseus --no-default-features   # headless (no tray)
+    # cargo deb used to create target/debian/ as a side effect; with the tar now
+    # running first (headless ordering above), the dir must exist explicitly
+    # (pipeline 222 failure: "Cannot open: No such file or directory").
+    - mkdir -p target/debian
     - tar czf "target/debian/perseus-${VERSION}-linux-amd64.tar.gz" -C target/release perseus
     - (cd crates/perseus && cargo deb -- -p perseus)   # desktop variant (tray); overwrites target/release/perseus
     # The .deb embeds the CRATE version; the tag drives the tar.gz + release links.
