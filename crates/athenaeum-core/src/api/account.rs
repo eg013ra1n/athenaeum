@@ -39,8 +39,21 @@ struct AccountConfig {
 impl AccountConfig {
     /// Build the [`TokenStore`] for this hub (keychain account = hub host; the
     /// 0600 file fallback lives beside the catalog under `account/`).
+    ///
+    /// **Dev builds are file-only.** A debug binary's code signature is ad-hoc
+    /// and changes on every rebuild, so macOS can never persist an "Always
+    /// Allow" keychain grant for it — the keychain prompt re-fires after every
+    /// `cargo build`, and a stored grant is unreachable anyway. The 0600 file
+    /// (the exact fallback production uses when the keychain is unavailable)
+    /// is strictly better for development: no prompts, token still never in
+    /// the DB or logs. Release builds keep the keychain-first behavior; a
+    /// keychain-stored token from a prior release run is simply not seen by a
+    /// dev build (one re-login when switching), never migrated or deleted.
     fn token_store(&self) -> TokenStore {
         let file = self.account_dir.join(format!("token_{}", sanitize(&self.hub_host)));
+        if cfg!(debug_assertions) {
+            return TokenStore::file_only(self.hub_host.clone(), file);
+        }
         TokenStore::new(self.hub_host.clone(), file)
     }
 }
@@ -466,6 +479,34 @@ pub fn account_pairing(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dev builds must NEVER touch the OS keychain: an ad-hoc-signed debug
+    /// binary can't hold a keychain ACL grant, so the prompt re-fires on every
+    /// rebuild (owner pain, 2026-07-10). This pins the `debug_assertions`
+    /// branch of [`AccountConfig::token_store`]: the token round-trips through
+    /// the 0600 file. (No classic RED run for this test — against the old code
+    /// it would have written a credential into the developer's real login
+    /// keychain as a side effect; test compiles with `debug_assertions` on, so
+    /// it exercises exactly the dev branch.)
+    #[test]
+    fn dev_token_store_is_file_only_never_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AccountConfig {
+            hub_url: "https://projects.artfrom.space/api/v1".into(),
+            hub_host: "projects.artfrom.space".into(),
+            sync_dir: dir.path().join("sync"),
+            account_dir: dir.path().to_path_buf(),
+        };
+        let store = cfg.token_store();
+        store.store("dev-token-xyz").unwrap();
+        let file = dir.path().join("token_projects.artfrom.space");
+        let on_disk = std::fs::read_to_string(&file)
+            .expect("debug builds must store the token in the 0600 file, not the keychain");
+        assert_eq!(on_disk.trim(), "dev-token-xyz");
+        assert_eq!(store.load().unwrap().as_deref(), Some("dev-token-xyz"));
+        store.delete().unwrap();
+        assert!(!file.exists(), "delete removes the file");
+    }
 
     /// Fix (B4 review, minor #1): a wrong/expired OTP code must read as a
     /// code problem, not "you're signed out" — the user is mid sign-in, there
