@@ -209,15 +209,15 @@ fn account_peer_hexes(devices: &[crate::account::AccountDevice]) -> Vec<String> 
 }
 
 /// Build the receiver's live peer-authorization gate (finding H1). A signed-in
-/// `primary` enforces the cached allow-list (`SYNC_AUTHORIZED_PEERS`), re-read
-/// from settings on **every** announce so a hub refresh takes effect on the next
+/// node enforces the cached allow-list (`SYNC_AUTHORIZED_PEERS`), re-read from
+/// settings on **every** announce so a hub refresh takes effect on the next
 /// package. A pure dev-ticket node (no account) has no hub to build a list from,
 /// so it accepts any peer — the dev flag is a developer-only escape hatch.
 ///
-/// Fail closed: an account-primary whose cache is empty (never refreshed)
+/// Fail closed: a signed-in node whose cache is empty (never refreshed)
 /// authorizes nobody until [`refresh_authorized_peers`] populates it.
 fn peer_authorizer(ctx: &ServiceContext) -> Result<crate::sync::PeerAuthorizer, ApiError> {
-    if !account_primary_ready(ctx)? {
+    if !account_signed_in(ctx)? {
         tracing::warn!(
             "sync receiver has no account allow-list (dev-ticket mode); accepting any peer"
         );
@@ -236,12 +236,12 @@ fn peer_authorizer(ctx: &ServiceContext) -> Result<crate::sync::PeerAuthorizer, 
 
 /// Refresh the cached authorized-peer allow-list from the hub device list
 /// (finding H1). Best-effort: on any credential/hub failure the existing cache
-/// is left untouched (a primary that synced before keeps working offline; a
+/// is left untouched (a node that synced before keeps working offline; a
 /// brand-new one authorizes nobody until it can reach the hub — fail closed).
 /// Every device in the account is admitted (mesh model, finding H1 as updated
 /// for sync Phase 1).
 pub async fn refresh_authorized_peers(ctx: &ServiceContext) {
-    if !matches!(account_primary_ready(ctx), Ok(true)) {
+    if !matches!(account_signed_in(ctx), Ok(true)) {
         return;
     }
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx).ok().flatten() else {
@@ -345,28 +345,28 @@ fn persist_peer_resolution(ctx: &ServiceContext, resolution: &PeerResolution) {
     }
 }
 
-/// Local-state-only "signed-in primary" check for [`autostart_if_enabled`]:
-/// the persisted `account.*` settings the app writes on sign-in / role-set
-/// (`ACCOUNT_DEVICE_ID` presence as the signed-in proxy, cleared on sign-out by
-/// `clear_local_session` — the same network-free pattern [`auto_mode_ready`]
-/// already uses for the capture side). Deliberately settings-only: never
-/// touches the hub or the OS keychain, so the boot path can decide "should the
-/// receiver even try to start" without a network round-trip or a keychain call.
-fn account_primary_ready(ctx: &ServiceContext) -> Result<bool, ApiError> {
+/// Local-state-only "is this node signed in" check for [`autostart_if_enabled`]:
+/// the persisted `ACCOUNT_DEVICE_ID` the app writes on sign-in / clears on
+/// sign-out by `clear_local_session` (the same network-free pattern
+/// [`auto_mode_ready`] already uses for the capture side). Every signed-in
+/// Athenaeum node is a full peer (capability `athenaeum`) and runs a receiver —
+/// there is no role gate (sync Phase 1 mesh model). Deliberately settings-only:
+/// never touches the hub or the OS keychain, so the boot path can decide
+/// "should the receiver even try to start" without a network round-trip or a
+/// keychain call.
+fn account_signed_in(ctx: &ServiceContext) -> Result<bool, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    let has_identity = crate::db::get_setting(&conn, keys::ACCOUNT_DEVICE_ID)?
+    Ok(crate::db::get_setting(&conn, keys::ACCOUNT_DEVICE_ID)?
         .filter(|s| !s.is_empty())
-        .is_some();
-    let role = crate::db::get_setting(&conn, keys::ACCOUNT_ROLE)?
-        .and_then(|s| crate::account::DeviceRole::parse(&s));
-    Ok(has_identity && role == Some(crate::account::DeviceRole::Primary))
+        .is_some())
 }
 
 /// Boot-time autostart: start the receiver + transport when EITHER the dev
-/// pairing flag is enabled OR this device is a signed-in `primary`
-/// ([`account_primary_ready`], task A7 fix-review — a production account-mode
-/// primary must listen without anyone opening the dev-ticket disclosure).
+/// pairing flag is enabled OR this device is signed in
+/// ([`account_signed_in`], task A7 fix-review + sync Phase 2A — every signed-in
+/// mesh node must listen without anyone opening the dev-ticket disclosure, and
+/// with no `role == Primary` gate).
 /// Returns `true` iff it (re)confirmed the receiver is running, `false` when
 /// neither condition holds. The condition check is local-state-only (no hub
 /// call to decide *whether* to start); `resolve_relay_mode` may still reach the
@@ -385,11 +385,11 @@ pub async fn autostart_if_enabled(
     emitter: Arc<dyn ProgressEmitter>,
 ) -> Result<bool, ApiError> {
     let dev = dev_pairing_enabled(ctx)?;
-    let account_primary = account_primary_ready(ctx)?;
-    if !autostart_gate(dev, account_primary) {
+    let signed_in = account_signed_in(ctx)?;
+    if !autostart_gate(dev, signed_in) {
         return Ok(false);
     }
-    tracing::debug!(dev, account_primary, "sync autostart condition met");
+    tracing::debug!(dev, signed_in, "sync autostart condition met");
     let (sync_dir, db_path) = sync_paths(ctx)?;
     let incoming = incoming_resolver(ctx, sync_dir.join("incoming"))?;
     // The receiver only listens; it never dials a peer for announce, so the raw
@@ -406,10 +406,11 @@ pub async fn autostart_if_enabled(
 }
 
 /// The pure condition [`autostart_if_enabled`] gates on: the dev pairing flag,
-/// OR this device being a signed-in `primary`. Factored out for a fast,
-/// network-free unit test of the exact matrix (task A7 fix-review).
-fn autostart_gate(dev: bool, account_primary: bool) -> bool {
-    dev || account_primary
+/// OR this device being signed in (any Athenaeum node — no role gate). Factored
+/// out for a fast, network-free unit test of the exact matrix (task A7
+/// fix-review, broadened in sync Phase 2A).
+fn autostart_gate(dev: bool, signed_in: bool) -> bool {
+    dev || signed_in
 }
 
 /// Dev-flagged: lazily start the transport + receiver and return this device's
@@ -1697,37 +1698,50 @@ mod tests {
         assert_eq!(combined[0].frame_uuid, "s2");
     }
 
-    // ── Production account-mode autostart (task A7 fix-review) ──────────────
+    // ── Production account-mode autostart (task A7 fix-review; sync 2A) ─────
     //
-    // Bug: a signed-in PRIMARY without the dev flag never started the receiver
+    // Bug: a signed-in node without the dev flag never started the receiver
     // (Perseus in production account mode resolved its peer + relay map fine,
     // enqueued, then `serve/announce failed` forever because the app-side node
-    // wasn't listening). `autostart_gate` + `account_primary_ready` are the
-    // exact local-state-only condition the fix broadens to; `allow_default_relays`
-    // is the companion fix for the addendum (dev flag must never put a
-    // signed-in node on iroh's public relays, mixing relay networks with an
-    // account-mode peer).
+    // wasn't listening). `autostart_gate` + `account_signed_in` are the exact
+    // local-state-only condition; sync Phase 2A drops the old `role == Primary`
+    // gate so any signed-in mesh node autostarts. `allow_default_relays` is the
+    // companion fix for the addendum (dev flag must never put a signed-in node
+    // on iroh's public relays, mixing relay networks with an account-mode peer).
 
     /// The condition matrix `autostart_if_enabled` gates on: dev flag alone
-    /// starts it, signed-in-primary alone starts it, both starts it, neither
-    /// does not.
+    /// starts it, signed-in alone starts it, both starts it, neither does not.
     #[test]
     fn autostart_gate_matrix() {
         assert!(autostart_gate(true, false), "dev flag alone must start");
-        assert!(autostart_gate(false, true), "signed-in primary alone must start");
+        assert!(autostart_gate(false, true), "signed-in alone must start");
         assert!(autostart_gate(true, true), "both true still starts");
         assert!(!autostart_gate(false, false), "neither condition: must not start");
     }
 
-    /// `account_primary_ready` derives "signed-in primary" purely from
-    /// persisted settings (never the hub, never the keychain): no identity yet
-    /// → false; signed-in but role=capture → false; signed-in role=primary →
-    /// true; clearing the identity (sign-out) revokes readiness even if a role
-    /// setting is somehow left behind.
+    /// Sync Phase 2A, task 2: the gate opens for ANY signed-in node — no
+    /// `role == Primary` required. (The pure `dev || signed_in` shape is
+    /// unchanged; the behavioral broadening lives in the caller, exercised by
+    /// `autostart_starts_when_signed_in_without_primary_role`.)
     #[test]
-    fn account_primary_ready_matrix() {
+    fn autostart_gate_starts_for_any_signed_in_node() {
+        // dev flag alone starts (unchanged).
+        assert!(autostart_gate(true, false));
+        // signed in (any Athenaeum node) starts — no role required.
+        assert!(autostart_gate(false, true));
+        // neither → no autostart.
+        assert!(!autostart_gate(false, false));
+    }
+
+    /// `account_signed_in` derives "is this node signed in" purely from
+    /// persisted settings (never the hub, never the keychain): no identity yet
+    /// → false; signed in → true regardless of role (capture, primary, or no
+    /// role set at all — sync Phase 2A drops the role gate); clearing the
+    /// identity (sign-out) revokes it.
+    #[test]
+    fn account_signed_in_matrix() {
         let (_tmp, ctx) = test_ctx();
-        assert!(!account_primary_ready(&ctx).unwrap(), "no identity/role yet -> not ready");
+        assert!(!account_signed_in(&ctx).unwrap(), "no identity yet -> not signed in");
 
         {
             let db = db(&ctx).unwrap();
@@ -1735,14 +1749,21 @@ mod tests {
             crate::db::set_setting(&conn, keys::ACCOUNT_DEVICE_ID, "device-1").unwrap();
             crate::db::set_setting(&conn, keys::ACCOUNT_ROLE, "capture").unwrap();
         }
-        assert!(!account_primary_ready(&ctx).unwrap(), "signed-in capture -> not ready");
+        assert!(account_signed_in(&ctx).unwrap(), "signed-in capture -> signed in (no role gate)");
+
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::delete_setting(&conn, keys::ACCOUNT_ROLE).unwrap();
+        }
+        assert!(account_signed_in(&ctx).unwrap(), "signed in with no role set -> signed in");
 
         {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             crate::db::set_setting(&conn, keys::ACCOUNT_ROLE, "primary").unwrap();
         }
-        assert!(account_primary_ready(&ctx).unwrap(), "signed-in primary -> ready");
+        assert!(account_signed_in(&ctx).unwrap(), "signed-in primary -> signed in");
 
         {
             let db = db(&ctx).unwrap();
@@ -1750,17 +1771,19 @@ mod tests {
             crate::db::delete_setting(&conn, keys::ACCOUNT_DEVICE_ID).unwrap();
         }
         assert!(
-            !account_primary_ready(&ctx).unwrap(),
-            "no identity -> not ready even with role=primary lingering"
+            !account_signed_in(&ctx).unwrap(),
+            "no identity -> not signed in even with a role setting lingering"
         );
     }
 
-    /// `autostart_if_enabled`'s two negative paths never touch relay
-    /// resolution or the transport: signed-out + dev off, and signed-in
-    /// capture + dev off, both return `Ok(false)` with the receiver never
-    /// started (fast — no hub, no iroh).
+    /// `autostart_if_enabled`'s one remaining negative path never touches relay
+    /// resolution or the transport: signed-out + dev off returns `Ok(false)`
+    /// with the receiver never started (fast — no hub, no iroh). (A signed-in
+    /// node — of any role — is no longer a negative path as of sync Phase 2A;
+    /// it now passes the gate, covered by
+    /// `autostart_starts_when_signed_in_without_primary_role`.)
     #[tokio::test]
-    async fn autostart_negative_paths_never_start_the_receiver() {
+    async fn autostart_signed_out_dev_off_never_starts_the_receiver() {
         use crate::sync::SyncRuntime;
 
         let (_tmp, ctx) = test_ctx();
@@ -1771,18 +1794,41 @@ mod tests {
             .unwrap();
         assert!(!started, "signed-out + dev off must not start");
         assert!(!sync.is_started().await);
+    }
 
+    /// Sync Phase 2A, task 2: a signed-in node with NO role set must pass the
+    /// autostart gate — in the mesh model every signed-in Athenaeum node is a
+    /// full peer and runs a receiver, with no `role == Primary` gate.
+    ///
+    /// We assert at the gate boundary (the receiver never short-circuits at the
+    /// early `Ok(false)`) rather than on a fully-`Ok(true)` transport: this ctx
+    /// has no hub creds and no cached relay map, so once the gate admits, the
+    /// call deterministically proceeds into `resolve_relay_mode` and fails there
+    /// (`relay_mode_for(&[], allow_default = false)`), never reaching the real
+    /// iroh transport that `ensure_started` would bind. The whole autostart test
+    /// suite is hermetic-by-design (no sockets); the behavioral change under
+    /// test is purely "the gate is no longer role-gated". Old code returned the
+    /// early `Ok(false)` here (its gate was `dev || role==Primary`, both false),
+    /// so this genuinely fails RED before the fix.
+    #[tokio::test]
+    async fn autostart_starts_when_signed_in_without_primary_role() {
+        use crate::sync::SyncRuntime;
+
+        let (_tmp, ctx) = test_ctx();
         {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
+            // Signed in (identity present); ACCOUNT_ROLE left unset on purpose.
             crate::db::set_setting(&conn, keys::ACCOUNT_DEVICE_ID, "device-1").unwrap();
-            crate::db::set_setting(&conn, keys::ACCOUNT_ROLE, "capture").unwrap();
         }
-        let started = autostart_if_enabled(&ctx, &sync, Arc::new(crate::events::NullEmitter))
-            .await
-            .unwrap();
-        assert!(!started, "a signed-in capture device must not autostart the receiver");
-        assert!(!sync.is_started().await);
+        let sync = SyncRuntime::new();
+        let started =
+            autostart_if_enabled(&ctx, &sync, Arc::new(crate::events::NullEmitter)).await;
+        assert!(
+            !matches!(started, Ok(false)),
+            "a signed-in node must pass the autostart gate regardless of role \
+             (must not short-circuit at Ok(false)); got {started:?}"
+        );
     }
 
     /// Fix-review addendum: a signed-in device must never get the dev-only
