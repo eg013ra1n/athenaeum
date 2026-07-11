@@ -24,24 +24,15 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 /// Host-installed hook invoked after a *registered* scan (interactive OR
-/// monitor-triggered) completes with newly-ingested files (task M2 review
-/// finding: personal-sync auto mode must fire on unattended monitor scans, not
-/// just human-clicked ones — the monitor cycle IS the unattended-capture path).
+/// monitor-triggered) completes with newly-ingested files.
 ///
-/// Kept as a trait — rather than a concrete host type — so core never depends
-/// on `AppState`/Tauri/Axum: both hosts implement it once at startup, closing
-/// over their own `ServiceContext` + personal-sync sender runtime, and install
-/// it via [`MonitorService::set_scan_completion_hook`]. The monitor
-/// orchestrator (this module's `orchestrator::run_cycle`) calls it with the
-/// scan's `new_file_ids`; the interactive `start_scan_with_progress` command
-/// wrappers call the equivalent `auto_enqueue_scanned_files` directly (they
-/// already have host-specific state in scope) — this hook exists purely to
-/// give the *monitor* path, which runs deep in host-agnostic core, the same
-/// capability without a dependency inversion.
-///
-/// Personal-sync auto-mode guards (role / signed-in / toggle) are NOT decided
-/// here or cached at registration time — they are read fresh on every fire,
-/// inside the implementation, exactly like the interactive path.
+/// Kept as a trait — rather than a concrete host type — so core never depends on
+/// `AppState`/Tauri/Axum: a host can implement it once at startup, closing over
+/// its own state, and install it via [`MonitorService::set_scan_completion_hook`].
+/// The monitor orchestrator (this module's `orchestrator::run_cycle`) calls it
+/// with the scan's `new_file_ids`. In the mesh model (Sync 2C) no host installs
+/// a hook — the app no longer auto-sends on scan — so this is a dormant seam; a
+/// `None` hook is the common case and must never block or panic a cycle.
 ///
 /// Fire-and-forget by contract: `on_scan_completed` runs synchronously on the
 /// monitor's blocking-pool thread ([`MonitorService::tick`]) and must not

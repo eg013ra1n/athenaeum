@@ -20,14 +20,12 @@
 //! from any authed call additionally clears the local session automatically.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::account::{
     AccountClientError, AccountDevice, AccountStatus, DeviceCapability, DeviceKey, DeviceRole,
     HubClient, TokenStore,
 };
 use crate::api::{db, ApiError};
-use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
 use crate::settings::{defaults, keys};
 
@@ -260,31 +258,14 @@ pub async fn sign_in_verify(
 
     write_state(ctx, keys::ACCOUNT_EMAIL, &email)?;
     write_state(ctx, keys::ACCOUNT_DEVICE_ID, &resp.device_id)?;
-    // A freshly registered device has no role until `set_machine_role`. But on a
-    // plain *re-sign-in* the hub still holds this device's role + peer from before
-    // (the token/pubkey are unchanged) — clearing them locally here would drop the
-    // capture pairing until the next manual role set. Refresh from the hub
-    // (best-effort, one extra call) so the persisted role/peer match the hub
-    // again; a fresh device simply gets nothing back and stays unassigned.
+    // The mesh model (Sync 2C) has no per-device role/peer: every app install is
+    // a full peer ([`DeviceCapability::Athenaeum`]). These clears keep any legacy
+    // role/peer settings from a pre-2C build from lingering after a re-sign-in.
     clear_state(ctx, keys::ACCOUNT_ROLE)?;
     clear_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID)?;
-    refresh_persisted_role(ctx, &cfg, &resp.device_id, &resp.device_token).await;
 
     tracing::info!(hub = %cfg.hub_host, device_id = %resp.device_id, "device signed in");
     build_status(ctx, &cfg)
-}
-
-/// No-op since Sync 2C: the mesh model has no per-device role/peer to refresh —
-/// every app install is a full peer ([`DeviceCapability::Athenaeum`]), so there
-/// is nothing hub-held to restore after a re-sign-in. Kept as a compiling stub
-/// with its call site intact; Task 2 removes it and the two `clear_state` calls
-/// above wholesale.
-async fn refresh_persisted_role(
-    _ctx: &ServiceContext,
-    _cfg: &AccountConfig,
-    _device_id: &str,
-    _token: &str,
-) {
 }
 
 /// This device's account state — resolvable offline from the keychain + settings.
@@ -354,57 +335,6 @@ pub async fn revoke_device(ctx: &ServiceContext, device_id: String) -> Result<()
     Ok(())
 }
 
-/// Set THIS machine's role. `peer_device_id = None` clears any peer link (the
-/// hub rejects a `primary` with a peer, and a missing / cross-account / revoked
-/// peer, with a 400 whose message is surfaced).
-///
-/// **Role-change reactivity (task A7 fix-review):** a successful switch to
-/// `primary` best-effort autostarts the receive-side transport right here
-/// (mirroring `api::sync::autostart_if_enabled`'s boot-time gate — same
-/// pattern the M2a sender wiring established: the runtime handle + host
-/// emitter are passed in explicitly, not pulled from `ServiceContext`) so the
-/// device starts listening immediately instead of only on the next app
-/// restart or the dev-ticket disclosure. Never fails the role-set call: a
-/// transport hiccup here is logged and surfaced via the normal Sync status
-/// UI, not thrown back at the Account settings screen the user is looking at.
-pub async fn set_machine_role(
-    ctx: &ServiceContext,
-    role: DeviceRole,
-    peer_device_id: Option<String>,
-    sync: &crate::sync::SyncRuntime,
-    emitter: Arc<dyn ProgressEmitter>,
-) -> Result<AccountStatus, ApiError> {
-    let cfg = resolve_config(ctx)?;
-    let token = require_token(&cfg)?;
-    let device_id = read_state(ctx, keys::ACCOUNT_DEVICE_ID)?
-        .ok_or_else(|| ApiError::SignedOut("Not signed in.".into()))?;
-
-    let client = HubClient::new(&cfg.hub_url).map_err(map_client_err)?;
-    client
-        .set_role(&token, &device_id, role, peer_device_id.as_deref())
-        .await
-        .map_err(|e| map_authed_err(ctx, &cfg, e))?;
-
-    write_state(ctx, keys::ACCOUNT_ROLE, role.as_str())?;
-    // Persist the paired peer so the sync peer-resolver (task M1) can look up the
-    // primary's pubkey; a `primary`/unassigned role or a cleared peer wipes it.
-    match (role, peer_device_id.as_deref()) {
-        (DeviceRole::Capture, Some(peer)) => write_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID, peer)?,
-        _ => clear_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID)?,
-    }
-    tracing::info!(hub = %cfg.hub_host, device_id = %device_id, role = %role.as_str(), "machine role set");
-
-    if role == DeviceRole::Primary {
-        match crate::api::sync::autostart_if_enabled(ctx, sync, emitter).await {
-            Ok(true) => tracing::info!("sync receiver autostarted after role change to primary"),
-            Ok(false) => tracing::debug!("sync receiver autostart gate not met right after role change"),
-            Err(e) => tracing::warn!(error = %e, "sync receiver autostart after role change failed"),
-        }
-    }
-
-    build_status(ctx, &cfg)
-}
-
 // ── sync peer/relay resolution seam (task M1) ───────────────────────────────
 //
 // The app's capture-role sender resolves its peer + relays through
@@ -450,6 +380,19 @@ pub fn account_pairing(
         token,
         peer_device_id,
     }))
+}
+
+/// Test-only: write a device token through the SAME [`resolve_config`] +
+/// [`AccountConfig::token_store`] path the account commands use, so
+/// [`hub_credentials`] (and thus `retention_ready`) see this node as signed in.
+/// Lives here rather than in a sibling test module so it reuses the private
+/// path-resolution logic instead of duplicating the sanitize/file-name derivation.
+#[cfg(test)]
+pub(crate) fn store_token_for_test(ctx: &ServiceContext, token: &str) -> Result<(), ApiError> {
+    let cfg = resolve_config(ctx)?;
+    cfg.token_store()
+        .store(token)
+        .map_err(|e| ApiError::Internal(format!("store test token: {e:#}")))
 }
 
 #[cfg(test)]

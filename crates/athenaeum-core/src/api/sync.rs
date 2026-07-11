@@ -32,8 +32,7 @@ use crate::sync::store::search_history_rows;
 use crate::sync::{
     node_id_hex, pairing, CatalogSyncStore, Direction, HistoryQuery, HistoryRow, OutboundRow,
     OutboundState, OutboundSummary, PeerResolution, StartedSender, SyncEngine, SyncEngineHandle,
-    SyncPairingSummary, SyncReceiverStatus, SyncRuntime, SyncSenderRuntime, SyncSenderStatus,
-    SyncStatus, SyncStore,
+    SyncReceiverStatus, SyncRuntime, SyncSenderRuntime, SyncSenderStatus, SyncStatus, SyncStore,
 };
 
 /// Request filter for [`list_history`] (mirrors [`HistoryQuery`] over the
@@ -65,9 +64,8 @@ pub struct IneligibleFrame {
     pub reason: String,
 }
 
-/// Result of an [`enqueue_sync_selection`] / auto-mode enqueue: what was sent,
-/// the `(N of M)` counts for the owner's mixed-selection convention, and the
-/// ineligible remainder.
+/// Result of an [`enqueue_sync_selection`]: what was sent, the `(N of M)` counts
+/// for the owner's mixed-selection convention, and the ineligible remainder.
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct EnqueueSelectionResult {
@@ -347,10 +345,9 @@ fn persist_peer_resolution(ctx: &ServiceContext, resolution: &PeerResolution) {
 
 /// Local-state-only "is this node signed in" check for [`autostart_if_enabled`]:
 /// the persisted `ACCOUNT_DEVICE_ID` the app writes on sign-in / clears on
-/// sign-out by `clear_local_session` (the same network-free pattern
-/// [`auto_mode_ready`] already uses for the capture side). Every signed-in
-/// Athenaeum node is a full peer (capability `athenaeum`) and runs a receiver —
-/// there is no role gate (sync Phase 1 mesh model). Deliberately settings-only:
+/// sign-out by `clear_local_session`. Every signed-in Athenaeum node is a full
+/// peer (capability `athenaeum`) and runs a receiver — there is no role gate
+/// (sync Phase 1 mesh model). Deliberately settings-only:
 /// never touches the hub or the OS keychain, so the boot path can decide
 /// "should the receiver even try to start" without a network round-trip or a
 /// keychain call.
@@ -484,80 +481,6 @@ fn received_total(ctx: &ServiceContext) -> Result<u32, ApiError> {
     Ok(n.max(0) as u32)
 }
 
-/// This machine's persisted account role (network-free).
-fn machine_role(ctx: &ServiceContext) -> Result<Option<crate::account::DeviceRole>, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    Ok(crate::db::get_setting(&conn, keys::ACCOUNT_ROLE)?
-        .and_then(|s| crate::account::DeviceRole::parse(&s)))
-}
-
-/// The persisted paired-primary hub device id, if any (network-free).
-fn peer_device_id(ctx: &ServiceContext) -> Result<Option<String>, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    Ok(crate::db::get_setting(&conn, keys::ACCOUNT_PEER_DEVICE_ID)?.filter(|s| !s.is_empty()))
-}
-
-/// Whether a device token is present locally (signed in). Reads the keychain,
-/// never the network — same source the `account_status` command uses.
-fn is_signed_in(ctx: &ServiceContext) -> bool {
-    crate::api::account::hub_credentials(ctx).ok().flatten().is_some()
-}
-
-/// Derive the network-free pairing summary (see [`crate::sync::status`] for the
-/// honesty limit — this never contacts the hub). `Paired` wins for a signed-in
-/// capture node with a persisted primary; a signed-in device that can't send
-/// (primary / unassigned / no peer) is `Disabled` with an actionable reason;
-/// the dev-ticket flag maps to `DevTicket`; otherwise `SignedOut`.
-fn derive_pairing_summary(ctx: &ServiceContext) -> Result<SyncPairingSummary, ApiError> {
-    let signed = is_signed_in(ctx);
-    let dev = dev_pairing_enabled(ctx)?;
-    let role = machine_role(ctx)?;
-    let peer_id = peer_device_id(ctx)?;
-    // Prefer the last resolved peer node id (what the history rows show) for the
-    // display short id; fall back to the hub device id when nothing has resolved.
-    let cached_short = cached_peer(ctx)?.map(|p| short_id(&node_id_hex(&p)));
-    Ok(pairing_summary_from(signed, dev, role, peer_id, cached_short))
-}
-
-/// The pure pairing-summary decision, extracted from [`derive_pairing_summary`]
-/// so it is unit-testable without the keychain / settings plumbing. `Paired`
-/// wins for a signed-in capture node with a persisted primary; the dev-ticket
-/// flag maps to `DevTicket`; a signed-in device that cannot send is `Disabled`
-/// with an actionable reason; otherwise `SignedOut`.
-fn pairing_summary_from(
-    signed: bool,
-    dev: bool,
-    role: Option<crate::account::DeviceRole>,
-    peer_id: Option<String>,
-    cached_short: Option<String>,
-) -> SyncPairingSummary {
-    use crate::account::DeviceRole;
-    if signed && role == Some(DeviceRole::Capture) {
-        if let Some(peer_id) = peer_id {
-            let short = cached_short.unwrap_or_else(|| short_id(&peer_id));
-            return SyncPairingSummary::paired(short);
-        }
-        return SyncPairingSummary::disabled(
-            "capture role set but no paired primary — pair one in Settings",
-        );
-    }
-    if dev {
-        return SyncPairingSummary::dev_ticket();
-    }
-    if signed {
-        let reason = match role {
-            Some(DeviceRole::Primary) => {
-                "this machine is a primary (it receives); sending is not configured"
-            }
-            _ => "role not set — choose this machine's role in Settings",
-        };
-        return SyncPairingSummary::disabled(reason);
-    }
-    SyncPairingSummary::signed_out()
-}
-
 /// The send-side rollup: live in-flight counts + rows from the engine's
 /// non-terminal snapshot, plus terminal totals counted from `sync_outbound`.
 async fn build_sender_status(
@@ -618,8 +541,6 @@ pub async fn get_status(
     let received_total = received_total(ctx)?;
     let transport_started = sync.is_started().await;
     let pairing_ticket = sync.ticket().await;
-    let machine_role = machine_role(ctx)?;
-    let pairing = derive_pairing_summary(ctx)?;
     let sender_status = build_sender_status(ctx, sender).await?;
 
     Ok(SyncStatus {
@@ -627,8 +548,6 @@ pub async fn get_status(
         transport_started,
         pairing_ticket,
         received_total,
-        machine_role,
-        pairing,
         sender: sender_status,
         receiver: SyncReceiverStatus { active: transport_started, received_total },
     })
@@ -1054,71 +973,6 @@ pub fn set_sync_auto_mode(ctx: &ServiceContext, enabled: bool) -> Result<(), Api
     Ok(())
 }
 
-/// The auto-mode entry guard: auto mode on AND this device is a signed-in
-/// `capture` node with a paired primary. Read purely from settings — a signed-out
-/// device has its role + peer cleared (`clear_local_session`), so this is a
-/// reliable, network-free proxy for "capture + signed in + paired". The
-/// authoritative signed-in check still runs downstream at peer resolution in
-/// [`ensure_sender_engine`]; this only decides whether to attempt at all, so a
-/// primary or signed-out device never even builds a package.
-fn auto_mode_ready(ctx: &ServiceContext) -> Result<bool, ApiError> {
-    if !get_sync_auto_mode(ctx)? {
-        return Ok(false);
-    }
-    let db = db(ctx)?;
-    let conn = db.conn();
-    let role = crate::db::get_setting(&conn, keys::ACCOUNT_ROLE)?
-        .and_then(|s| crate::account::DeviceRole::parse(&s));
-    let has_peer = crate::db::get_setting(&conn, keys::ACCOUNT_PEER_DEVICE_ID)?
-        .filter(|s| !s.is_empty())
-        .is_some();
-    Ok(role == Some(crate::account::DeviceRole::Capture) && has_peer)
-}
-
-/// Auto mode (task M2, step 3): the scanner "scan finished" hook. When auto mode
-/// is on for a signed-in capture node, the files newly ingested by that scan are
-/// enqueued to the primary as ONE per-scan-batch package (the same builder the
-/// manual command uses). A per-batch package keeps one scan → one confirm/retry
-/// unit; per-file would multiply the announce/ack traffic for no gain.
-///
-/// Guards live INSIDE the hook, not just the UI: a primary, signed-out, or
-/// auto-off device returns `Ok(None)` and enqueues nothing. A sync failure
-/// (unreachable peer, etc.) is logged and swallowed — it must never fail the scan
-/// that triggered it.
-pub async fn auto_enqueue_scanned_files(
-    ctx: &ServiceContext,
-    sender: &SyncSenderRuntime,
-    file_ids: Vec<i64>,
-    emitter: Option<Arc<dyn ProgressEmitter>>,
-) -> Result<Option<EnqueueSelectionResult>, ApiError> {
-    if !auto_mode_ready(ctx)? {
-        return Ok(None);
-    }
-    if file_ids.is_empty() {
-        return Ok(None);
-    }
-    // The scanner reports FILE ids; the package is keyed on FRAME ids.
-    let frame_ids = {
-        let db = db(ctx)?;
-        let conn = db.conn();
-        crate::db::get_frame_ids_for_file_ids(&conn, &file_ids)
-            .map_err(|e| ApiError::Internal(format!("resolve frame ids for scanned files: {e:#}")))?
-    };
-    if frame_ids.is_empty() {
-        return Ok(None);
-    }
-    match enqueue_sync_selection(ctx, sender, frame_ids, emitter).await {
-        Ok(result) => {
-            tracing::info!(enqueued = result.enqueued_count, "auto-mode sync enqueued scanned files");
-            Ok(Some(result))
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "auto-mode sync enqueue failed; scan unaffected");
-            Ok(None)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1350,34 +1204,6 @@ mod tests {
         frame_id
     }
 
-    /// Inject a loopback-backed engine into `sender` as though
-    /// [`ensure_sender_engine`] had already built it — no hub, no iroh. Writes
-    /// into `ctx`'s own catalog sync tables so the test can inspect the outbound
-    /// rows it produces.
-    async fn inject_loopback_sender(ctx: &ServiceContext, sender: &SyncSenderRuntime) {
-        use crate::sharing::loopback::LoopbackNetwork;
-        let db_path = db(ctx).unwrap().path().to_path_buf();
-        let store = Arc::new(CatalogSyncStore::open(&db_path).unwrap());
-        let net = LoopbackNetwork::new();
-        let transport: Arc<dyn SharingTransport> = Arc::new(net.endpoint());
-        let peer: NodeId = [9u8; 32];
-        let engine = Arc::new(SyncEngine::spawn(store as Arc<dyn SyncStore>, transport, peer));
-        let mut guard = sender.lock_inner().await;
-        *guard = Some(StartedSender { engine, origin_device: "aa".repeat(32), peer });
-    }
-
-    fn outbound_package_refs(ctx: &ServiceContext) -> Vec<String> {
-        let db = db(ctx).unwrap();
-        let conn = db.conn();
-        let mut stmt = conn.prepare("SELECT package_ref FROM sync_outbound").unwrap();
-        let refs = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .unwrap()
-            .collect::<rusqlite::Result<Vec<String>>>()
-            .unwrap();
-        refs
-    }
-
     /// Step 1: a selection builds ONE package from exactly the eligible frames,
     /// carrying each frame's serialized `Frame` as `frame_meta` and its analysis
     /// summary when present — never the unselected frame.
@@ -1471,61 +1297,6 @@ mod tests {
         assert_eq!(records.len(), 1, "the eligible frame still enqueues");
     }
 
-    /// Step 3: the auto-mode hook. With auto on for a signed-in capture node, N
-    /// newly-scanned files become ONE batch package of N records; auto off →
-    /// nothing; a non-capture role → nothing (and no engine is started in either
-    /// negative case).
-    #[tokio::test]
-    async fn auto_mode_scan_enqueues_new_files() {
-        let (tmp, ctx) = test_ctx();
-        let dir = tmp.path();
-        let f1 = insert_fixture_frame(&ctx, dir, "light-0001.fits", "M42", false);
-        let f2 = insert_fixture_frame(&ctx, dir, "light-0002.fits", "M42", false);
-        let file_ids: Vec<i64> = {
-            let db = db(&ctx).unwrap();
-            let conn = db.conn();
-            let mut stmt = conn.prepare("SELECT file_id FROM frames WHERE id IN (?1, ?2)").unwrap();
-            stmt.query_map([f1, f2], |r| r.get(0))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<i64>>>()
-                .unwrap()
-        };
-
-        let sender = SyncSenderRuntime::new();
-
-        // auto OFF → nothing enqueued, no engine built.
-        set_sync_auto_mode(&ctx, false).unwrap();
-        let none = auto_enqueue_scanned_files(&ctx, &sender, file_ids.clone(), None).await.unwrap();
-        assert!(none.is_none(), "auto off → nothing");
-        assert!(!sender.is_started().await, "no engine when auto off");
-
-        // auto ON but role != capture (unset) → nothing, still no engine.
-        set_sync_auto_mode(&ctx, true).unwrap();
-        let none = auto_enqueue_scanned_files(&ctx, &sender, file_ids.clone(), None).await.unwrap();
-        assert!(none.is_none(), "non-capture role → nothing");
-        assert!(!sender.is_started().await, "no engine for a non-capture device");
-
-        // auto ON + signed-in capture + paired → enqueue one batch package.
-        {
-            let db = db(&ctx).unwrap();
-            let conn = db.conn();
-            crate::db::set_setting(&conn, keys::ACCOUNT_ROLE, "capture").unwrap();
-            crate::db::set_setting(&conn, keys::ACCOUNT_PEER_DEVICE_ID, "primary-1").unwrap();
-        }
-        inject_loopback_sender(&ctx, &sender).await; // stand in for ensure_sender_engine
-        let result = auto_enqueue_scanned_files(&ctx, &sender, file_ids.clone(), None)
-            .await
-            .unwrap()
-            .expect("capture + auto on enqueues");
-        assert_eq!(result.enqueued_count, 2, "both new files enqueued");
-        assert_eq!(result.total_count, 2);
-
-        let refs = outbound_package_refs(&ctx);
-        assert_eq!(refs.len(), 1, "one per-scan-batch package (not per-file)");
-        let records = crate::package::read_manifest(std::path::Path::new(&refs[0])).unwrap();
-        assert_eq!(records.len(), 2, "N records in the single batch package");
-    }
-
     /// Engine-start guard: the resolution → peer mapping turns a
     /// Disabled/Invalidated pairing into a typed error (so the send path never
     /// starts an engine), and an Account/Ticket into the concrete peer.
@@ -1600,54 +1371,6 @@ mod tests {
     }
 
     // ── Status enrichment (task M3) ──────────────────────────────────────────
-
-    /// The pure pairing-summary decision covers every branch and its precedence
-    /// (paired capture wins over the dev flag; a signed-in non-sender is
-    /// `disabled`; signed out with no dev flag is `signedOut`).
-    #[test]
-    fn pairing_summary_branches_and_precedence() {
-        use crate::account::DeviceRole;
-
-        assert_eq!(pairing_summary_from(false, false, None, None, None).kind, "signedOut");
-        assert_eq!(pairing_summary_from(false, true, None, None, None).kind, "devTicket");
-
-        // Signed-in capture with a peer → paired; the cached short id wins.
-        let paired = pairing_summary_from(
-            true,
-            false,
-            Some(DeviceRole::Capture),
-            Some("primary-1".into()),
-            Some("abcdef0123".into()),
-        );
-        assert_eq!(paired.kind, "paired");
-        assert_eq!(paired.peer_short.as_deref(), Some("abcdef0123"));
-
-        // No cached peer → falls back to the (shortened) hub device id.
-        let fallback = pairing_summary_from(
-            true,
-            false,
-            Some(DeviceRole::Capture),
-            Some("primary-device-long-id".into()),
-            None,
-        );
-        assert_eq!(fallback.peer_short.as_deref(), Some("primary-de"));
-
-        // Capture with no paired primary, and a signed-in primary, are disabled.
-        assert_eq!(
-            pairing_summary_from(true, false, Some(DeviceRole::Capture), None, None).kind,
-            "disabled"
-        );
-        assert_eq!(
-            pairing_summary_from(true, false, Some(DeviceRole::Primary), None, None).kind,
-            "disabled"
-        );
-
-        // Paired capture wins even when the dev flag is also on.
-        assert_eq!(
-            pairing_summary_from(true, true, Some(DeviceRole::Capture), Some("p".into()), None).kind,
-            "paired"
-        );
-    }
 
     /// `list_history` applies the new `direction` / `peer` filters SQL-side,
     /// including the two combined.

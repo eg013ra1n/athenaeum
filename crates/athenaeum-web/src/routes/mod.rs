@@ -260,7 +260,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/account_sign_out", post(account::account_sign_out))
         .route("/api/list_account_devices", post(account::list_account_devices))
         .route("/api/revoke_account_device", post(account::revoke_account_device))
-        .route("/api/set_machine_role", post(account::set_machine_role))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_log_path", post(get_log_path))

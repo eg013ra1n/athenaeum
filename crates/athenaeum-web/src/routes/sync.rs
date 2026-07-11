@@ -9,9 +9,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{EnqueueSelectionResult, SyncHistoryQuery};
 use athenaeum_core::events::ProgressEmitter;
-use athenaeum_core::monitor::ScanCompletionHook;
-use athenaeum_core::services::ServiceContext;
-use athenaeum_core::sync::{HistoryRow, SyncSenderRuntime, SyncStatus};
+use athenaeum_core::sync::{HistoryRow, SyncStatus};
 use serde::Deserialize;
 
 use crate::events::SseProgressEmitter;
@@ -121,37 +119,4 @@ pub async fn get_sync_device_names(
     _body: Json<serde_json::Value>,
 ) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
     api::get_sync_device_names(&state.ctx).await.map(Json).map_err(api_err)
-}
-
-/// The web-side [`ScanCompletionHook`] (task M2 review finding): mirrors
-/// `athenaeum-tauri::commands::sync::DesktopScanCompletionHook`. The
-/// background `MonitorService` lives in `athenaeum-core` with only a
-/// `ServiceContext`, but the personal-sync sender runtime
-/// (`WebAppState.sync_sender`) is host state — this closes over both and is
-/// installed once at startup via `state.monitor.set_scan_completion_hook(...)`
-/// (see `main.rs`), so a monitor-triggered (unattended) scan auto-enqueues
-/// exactly like an interactive one. Auto-mode guards (role/signed-in/toggle)
-/// are NOT decided here — they live inside `auto_enqueue_scanned_files`, read
-/// fresh every fire.
-pub struct WebScanCompletionHook {
-    pub ctx: Arc<ServiceContext>,
-    pub sender: Arc<SyncSenderRuntime>,
-    /// Host emitter captured into the sender engine on its first spawn so an
-    /// unattended (monitor-triggered) auto-enqueue also emits transfer events.
-    pub emitter: Arc<dyn ProgressEmitter>,
-}
-
-impl ScanCompletionHook for WebScanCompletionHook {
-    fn on_scan_completed(&self, new_file_ids: Vec<i64>) {
-        let ctx = Arc::clone(&self.ctx);
-        let sender = Arc::clone(&self.sender);
-        let emitter = Arc::clone(&self.emitter);
-        tokio::spawn(async move {
-            if let Err(e) =
-                api::auto_enqueue_scanned_files(&ctx, &sender, new_file_ids, Some(emitter)).await
-            {
-                tracing::warn!(error = %e, "auto-mode sync enqueue after monitor scan failed");
-            }
-        });
-    }
 }

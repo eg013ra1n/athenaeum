@@ -2,14 +2,11 @@
 // Business logic lives in `athenaeum_core::api::account`; mirrors the Axum
 // routes in `crates/athenaeum-web/src/routes/account.rs`.
 
-use std::sync::Arc;
+use tauri::State;
 
-use tauri::{AppHandle, State};
-
-use athenaeum_core::account::{AccountDevice, AccountStatus, DeviceRole};
+use athenaeum_core::account::{AccountDevice, AccountStatus};
 use athenaeum_core::api::account as api;
 
-use crate::tauri_events::TauriProgressEmitter;
 use super::AppState;
 
 /// Request an email OTP for `email`.
@@ -61,24 +58,6 @@ pub async fn revoke_account_device(
     device_id: String,
 ) -> Result<(), String> {
     api::revoke_device(&state.ctx, device_id)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Set this machine's role (`primary` / `capture`), optionally with a peer.
-/// A successful switch to `primary` best-effort autostarts the receiver (task
-/// A7 fix-review) — `state.sync` + a Tauri event emitter are passed through so
-/// `api::set_machine_role` can call the same autostart gate boot uses.
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn set_machine_role(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    role: DeviceRole,
-    peer_device_id: Option<String>,
-) -> Result<AccountStatus, String> {
-    let emitter = Arc::new(TauriProgressEmitter(app));
-    api::set_machine_role(&state.ctx, role, peer_device_id, &state.sync, emitter)
         .await
         .map_err(|e| e.to_string())
 }

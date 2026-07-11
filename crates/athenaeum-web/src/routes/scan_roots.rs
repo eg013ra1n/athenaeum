@@ -239,29 +239,6 @@ pub async fn start_scan_with_progress(
 ) -> Result<Json<ScanResultDto>, (StatusCode, String)> {
     let emitter = SseProgressEmitter::new(state.event_tx.clone());
     let dto = api::start_scan_with_progress(&state.ctx, args.root_id, &emitter).map_err(api_err)?;
-
-    // Personal-sync auto mode (task M2): enqueue newly-scanned files to the
-    // paired primary in the background — never blocks the scan return. The hook
-    // self-guards (auto mode + signed-in capture) and never fails the scan.
-    if !dto.new_file_ids.is_empty() {
-        let ctx = state.ctx.clone();
-        let sender = state.sync_sender.clone();
-        let file_ids = dto.new_file_ids.clone();
-        let sync_emitter: std::sync::Arc<dyn athenaeum_core::events::ProgressEmitter> =
-            std::sync::Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
-        tokio::spawn(async move {
-            if let Err(e) = athenaeum_core::api::sync::auto_enqueue_scanned_files(
-                &ctx,
-                &sender,
-                file_ids,
-                Some(sync_emitter),
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "auto-mode sync enqueue after scan failed");
-            }
-        });
-    }
     Ok(Json(dto))
 }
 

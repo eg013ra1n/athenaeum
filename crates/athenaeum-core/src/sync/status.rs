@@ -1,23 +1,11 @@
 //! Aggregated status snapshot for the Transfers UI (task M3).
 //!
 //! [`SyncStatus`] is the single payload the `get_sync_status` command returns —
-//! it rolls up this device's pairing, the send-side engine's live picture, and
-//! the receive-side runtime into one poll. It is built by
-//! [`crate::api::sync::get_status`], which is the only place that reads the
-//! sender/receiver runtimes and the catalog together.
-//!
-//! **Honesty limit (documented, deliberate):** the [`pairing`](SyncStatus::pairing)
-//! summary is derived from cached settings + the persisted role/peer only — a
-//! status poll never contacts the hub (that would make a 10-second UI poll do
-//! network I/O). So `Paired` means "this device is a signed-in capture node with
-//! a persisted primary", NOT "the hub still agrees right now". A pairing the hub
-//! has since invalidated keeps reading `Paired` here until the next real send /
-//! peer-resolve refreshes it (that path *does* hit the hub and clears a stale
-//! cache — see [`crate::api::sync::resolve_capture_peer`]).
+//! it rolls up the send-side engine's live picture and the receive-side runtime
+//! into one poll. It is built by [`crate::api::sync::get_status`], which is the
+//! only place that reads the sender/receiver runtimes and the catalog together.
 
 use serde::Serialize;
-
-use crate::account::DeviceRole;
 
 use super::models::OutboundState;
 
@@ -105,8 +93,8 @@ pub struct SyncReceiverStatus {
 /// The full snapshot the Transfers UI polls. Enriched in task M3 from the
 /// original receive-only shape (`devPairingEnabled` / `transportStarted` /
 /// `pairingTicket` / `receivedTotal` retained for back-compat) with the
-/// [`pairing`](Self::pairing) summary, the [`sender`](Self::sender) rollup, and
-/// a symmetric [`receiver`](Self::receiver) rollup.
+/// [`sender`](Self::sender) rollup and a symmetric [`receiver`](Self::receiver)
+/// rollup.
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
@@ -118,13 +106,6 @@ pub struct SyncStatus {
     pub pairing_ticket: Option<String>,
     /// Total frames received (history rows with `direction = received`).
     pub received_total: u32,
-    /// This machine's account role, when signed in and assigned. Excluded from
-    /// the generated TS (`#[ts(skip)]`) because the mesh model (Sync 2C) drops
-    /// `DeviceRole` from the frontend; Task 2 removes this field entirely.
-    #[ts(skip)]
-    pub machine_role: Option<DeviceRole>,
-    /// Network-free pairing summary (see the module honesty note).
-    pub pairing: SyncPairingSummary,
     /// Send-side rollup.
     pub sender: SyncSenderStatus,
     /// Receive-side rollup.

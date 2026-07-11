@@ -191,20 +191,14 @@ impl AppRetentionConfig {
     }
 }
 
-/// Whether the retention tick should run at all: this device is a signed-in
-/// `capture` node. Network-free — role from settings, sign-in from the keychain
-/// (never the hub). A primary, signed-out, or unassigned device is never ready,
-/// so it never opens a store, resolves confirmed rows, or considers a delete.
+/// Whether the retention tick should run at all: this device is signed in.
+/// Network-free — sign-in from the local token store (never the hub). In the
+/// mesh model (Sync 2C) every signed-in node is a full peer that can send, so
+/// sender-copy retention applies to any of them; the old `role == capture` gate
+/// is gone. A signed-out device is never ready, so it never opens a store,
+/// resolves confirmed rows, or considers a delete.
 pub fn retention_ready(ctx: &ServiceContext) -> Result<bool, ApiError> {
-    let signed = crate::api::account::hub_credentials(ctx).ok().flatten().is_some();
-    if !signed {
-        return Ok(false);
-    }
-    let db = db(ctx)?;
-    let conn = db.conn();
-    let role = crate::db::get_setting(&conn, keys::ACCOUNT_ROLE)?
-        .and_then(|s| crate::account::DeviceRole::parse(&s));
-    Ok(role == Some(crate::account::DeviceRole::Capture))
+    Ok(crate::api::account::hub_credentials(ctx)?.is_some())
 }
 
 /// The volume retention measures for the `disk_pct` policy: the first enabled
@@ -448,10 +442,10 @@ pub fn evaluate(
     evaluate_and_apply(store, &cfg.policy, dry_run, now, disk_probe, &mut deleter)
 }
 
-/// One retention pass for a full-app capture node. `Ok(None)` when the device is
-/// not ready (not a signed-in capture node) or the policy is `keep_everything`
-/// (nothing to do) — neither opens a store nor touches disk. Otherwise opens the
-/// catalog-backed store and runs [`evaluate`].
+/// One retention pass for a full-app node. `Ok(None)` when the device is not
+/// ready (not signed in) or the policy is `keep_everything` (nothing to do) —
+/// neither opens a store nor touches disk. Otherwise opens the catalog-backed
+/// store and runs [`evaluate`].
 ///
 /// `now` + `disk_probe` are injected so the hourly loop can pass the live clock /
 /// statvfs probe while tests pass deterministic ones.
@@ -500,11 +494,11 @@ pub fn run_app_retention_once(
     Ok(Some(outcome))
 }
 
-/// The hourly (config-cadence) retention loop for a full-app capture node. Each
-/// tick runs a full pass on a blocking thread (SQLite + fs). Gated inside
-/// [`run_app_retention_once`], so it is a cheap no-op on any non-capture /
-/// signed-out / keep-everything device — safe to spawn unconditionally at host
-/// start. Never fails the host; every error is logged and the loop continues.
+/// The hourly (config-cadence) retention loop for a full-app node. Each tick
+/// runs a full pass on a blocking thread (SQLite + fs). Gated inside
+/// [`run_app_retention_once`], so it is a cheap no-op on any signed-out /
+/// keep-everything device — safe to spawn unconditionally at host start. Never
+/// fails the host; every error is logged and the loop continues.
 pub async fn run_app_retention_loop(ctx: Arc<ServiceContext>, interval: Duration) {
     tracing::info!(interval_secs = interval.as_secs(), "app retention loop armed");
     loop {
@@ -518,7 +512,7 @@ pub async fn run_app_retention_loop(ctx: Arc<ServiceContext>, interval: Duration
         .await;
         match res {
             Ok(Ok(Some(_outcome))) => {}
-            Ok(Ok(None)) => tracing::debug!("retention tick skipped (not a capture node or keep_everything)"),
+            Ok(Ok(None)) => tracing::debug!("retention tick skipped (signed out or keep_everything)"),
             Ok(Err(error)) => tracing::error!(error = %error, "retention tick failed"),
             Err(error) => tracing::error!(%error, "retention tick task panicked"),
         }
@@ -535,6 +529,72 @@ mod tests {
     use std::cell::Cell;
 
     const PEER: NodeId = [5u8; 32];
+
+    /// A minimal real-`Database` [`ServiceContext`] (tempdir SQLite), mirroring
+    /// the construction pattern in `api::sync`/`api::account` tests. Used by the
+    /// `retention_ready` gate test, which needs the full context (settings +
+    /// token store) rather than a bare `Connection`.
+    fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
+        use crate::cache::MemoryImageCache;
+        use crate::services::compute_queue::ComputeQueue;
+        use crate::services::operation_queue::OperationQueue;
+        use crate::settings::SettingsManager;
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        #[cfg(all(feature = "render", feature = "solver"))]
+        use std::sync::RwLock;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(database);
+        let ctx = ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "render", feature = "solver"))]
+            dso_catalog: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "solver")]
+            star_cache: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "solver")]
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            operation_queue: OperationQueue::start(),
+            compute_queue: ComputeQueue::new(),
+        };
+        (tmp, ctx)
+    }
+
+    /// Sign this node in by writing a device token through the real account path
+    /// (so `hub_credentials` resolves it). No role/peer is set — the mesh model
+    /// (Sync 2C) has no role, and `retention_ready` must key on signed-in alone.
+    fn set_hub_credentials(ctx: &ServiceContext) {
+        crate::api::account::store_token_for_test(ctx, "test-device-token").unwrap();
+    }
+
+    /// Sync 2C: sender-copy retention runs on ANY signed-in node — the old
+    /// `role == Capture` gate is gone (the mesh model has no role). Signed out →
+    /// not ready; signed in (no role) → ready. RED against the pre-2C gate, which
+    /// required a persisted `capture` role that this test never sets.
+    #[test]
+    fn retention_ready_is_signed_in_not_role() {
+        let (_tmp, ctx) = test_ctx();
+        // signed out → not ready
+        assert!(!retention_ready(&ctx).unwrap());
+        set_hub_credentials(&ctx);
+        assert!(
+            retention_ready(&ctx).unwrap(),
+            "any signed-in node runs sender-copy retention"
+        );
+    }
 
     /// A confirmed app package with one linked source on disk. Returns the temp
     /// dir (kept alive), the catalog db path, the frame's source path, its

@@ -2,15 +2,12 @@
 // Business logic lives in `athenaeum_core::api::account`; mirrors the Tauri
 // commands in `crates/athenaeum-tauri/src/commands/account.rs`.
 
-use std::sync::Arc;
-
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
 
-use athenaeum_core::account::{AccountDevice, AccountStatus, DeviceRole};
+use athenaeum_core::account::{AccountDevice, AccountStatus};
 use athenaeum_core::api::account as api;
 
-use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
 use crate::WebAppState;
 
@@ -31,14 +28,6 @@ pub struct SignInVerifyReq {
 #[serde(rename_all = "camelCase")]
 pub struct RevokeDeviceReq {
     device_id: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetRoleReq {
-    role: DeviceRole,
-    #[serde(default)]
-    peer_device_id: Option<String>,
 }
 
 /// POST /api/account_sign_in_start
@@ -99,23 +88,6 @@ pub async fn revoke_account_device(
     Json(req): Json<RevokeDeviceReq>,
 ) -> Result<Json<()>, (StatusCode, String)> {
     api::revoke_device(&state.ctx, req.device_id)
-        .await
-        .map(Json)
-        .map_err(api_err)
-}
-
-/// POST /api/set_machine_role
-///
-/// A successful switch to `primary` best-effort autostarts the receiver (task
-/// A7 fix-review) — `state.sync` + an SSE emitter are passed through so
-/// `api::set_machine_role` can call the same autostart gate boot uses.
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn set_machine_role(
-    State(state): State<WebAppState>,
-    Json(req): Json<SetRoleReq>,
-) -> Result<Json<AccountStatus>, (StatusCode, String)> {
-    let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
-    api::set_machine_role(&state.ctx, req.role, req.peer_device_id, &state.sync, emitter)
         .await
         .map(Json)
         .map_err(api_err)

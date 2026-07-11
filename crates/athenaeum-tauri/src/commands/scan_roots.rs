@@ -198,30 +198,6 @@ pub async fn start_scan_with_progress(
     let scan_emitter = TauriProgressEmitter(app_handle.clone());
     let dto = api::start_scan_with_progress(&state.ctx, root_id, &scan_emitter)
         .map_err(|e| e.to_string())?;
-
-    // Personal-sync auto mode (task M2): enqueue newly-scanned files to the
-    // paired primary. Fired in the background so it never blocks the scan
-    // return; the hook self-guards (auto mode + signed-in capture) and never
-    // fails the scan.
-    if !dto.new_file_ids.is_empty() {
-        let ctx = state.ctx.clone();
-        let sender = state.sync_sender.clone();
-        let file_ids = dto.new_file_ids.clone();
-        let sync_emitter: std::sync::Arc<dyn athenaeum_core::events::ProgressEmitter> =
-            std::sync::Arc::new(TauriProgressEmitter(app_handle.clone()));
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = athenaeum_core::api::sync::auto_enqueue_scanned_files(
-                &ctx,
-                &sender,
-                file_ids,
-                Some(sync_emitter),
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "auto-mode sync enqueue after scan failed");
-            }
-        });
-    }
     Ok(dto)
 }
 

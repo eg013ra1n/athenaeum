@@ -395,7 +395,6 @@ mod tests {
         serde_json::json!([
             {
                 "id": "some-other-device", "name": "Laptop", "pubkey": "b3RoZXI=",
-                "role": null, "peerDeviceId": null,
                 "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
             }
         ])

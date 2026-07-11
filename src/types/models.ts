@@ -690,10 +690,6 @@ pairingTicket: string | null,
  */
 receivedTotal: number, 
 /**
- * Network-free pairing summary (see the module honesty note).
- */
-pairing: SyncPairingSummary, 
-/**
  * Send-side rollup.
  */
 sender: SyncSenderStatus, 
