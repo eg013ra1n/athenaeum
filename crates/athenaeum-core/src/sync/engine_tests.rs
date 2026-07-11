@@ -889,3 +889,97 @@ async fn failed_package_keeps_payloads() {
 
     engine.shutdown().await;
 }
+
+// ── M3: confirmation must be bound to the peer AND complete ───────────────────
+
+/// M3 (peer-binding): an ack from a node other than the paired peer must not
+/// confirm the package. The real peer receives the announce but never acks; a
+/// *different* node forges an all-`Ingested` ack with the correct package_id.
+/// The sender must ignore it — else a rogue node could drive a package to
+/// `Confirmed` and let retention delete the capture originals.
+#[tokio::test]
+async fn ack_from_unexpected_peer_does_not_confirm() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let attacker = Arc::new(net.endpoint());
+    attacker.start().await.unwrap();
+
+    let sender_ep = Arc::new(net.endpoint());
+    let sender_node = sender_ep.node_id();
+
+    let pkg = build_package(&tmp.path().join("src"), "uuid-1", "f.fits", "M42", 1024);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(store.clone() as Arc<dyn SyncStore>, sender_ep, receiver_id);
+
+    let attacker_for_task = attacker.clone();
+    tokio::spawn(async move {
+        let mut events = receiver.events().await;
+        while let Some(ev) = events.recv().await {
+            if let TransportEvent::AnnounceReceived { announce, .. } = ev {
+                let receipts = vec![FrameReceipt {
+                    frame_uuid: "uuid-1".to_string(),
+                    xxh3: "0".repeat(16),
+                    outcome: ReceiptOutcome::Ingested,
+                }];
+                let _ = attacker_for_task
+                    .ack(sender_node, &announce.package_id, receipts)
+                    .await;
+            }
+        }
+    });
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_ne!(
+        state_of(&store, id),
+        Some(OutboundState::Confirmed),
+        "an ack from a node other than the paired peer must not confirm the package"
+    );
+
+    engine.shutdown().await;
+}
+
+/// M3 (completeness): an ack that does not cover every announced frame must not
+/// confirm. The paired peer acks with ZERO receipts (it stored nothing); the
+/// sender must not treat that as a full delivery, else retention would delete an
+/// un-transferred original.
+#[tokio::test]
+async fn empty_ack_does_not_confirm() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+
+    let sender_ep = Arc::new(net.endpoint());
+    let sender_node = sender_ep.node_id();
+
+    let pkg = build_package(&tmp.path().join("src"), "uuid-1", "f.fits", "M42", 1024);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(store.clone() as Arc<dyn SyncStore>, sender_ep, receiver_id);
+
+    let receiver_for_task = receiver.clone();
+    tokio::spawn(async move {
+        let mut events = receiver_for_task.events().await;
+        while let Some(ev) = events.recv().await {
+            if let TransportEvent::AnnounceReceived { announce, .. } = ev {
+                let _ = receiver_for_task
+                    .ack(sender_node, &announce.package_id, vec![])
+                    .await;
+            }
+        }
+    });
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_ne!(
+        state_of(&store, id),
+        Some(OutboundState::Confirmed),
+        "an ack that does not cover every announced frame must not confirm"
+    );
+
+    engine.shutdown().await;
+}

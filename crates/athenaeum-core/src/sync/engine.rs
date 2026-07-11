@@ -590,10 +590,10 @@ impl Worker {
     fn handle_event(&mut self, ev: TransportEvent) -> Result<()> {
         match ev {
             TransportEvent::AckReceived {
+                from,
                 package_id,
                 receipts,
-                ..
-            } => self.on_ack(package_id, receipts),
+            } => self.on_ack(from, package_id, receipts),
             TransportEvent::FetchProgress {
                 package_id,
                 bytes_done,
@@ -627,7 +627,23 @@ impl Worker {
     ///
     /// Idempotent for a fully-accepted ack: one for a package no longer in the
     /// in-flight map (already confirmed, or unknown) is dropped at debug.
-    fn on_ack(&mut self, package_id: PackageId, receipts: Vec<FrameReceipt>) -> Result<()> {
+    fn on_ack(&mut self, from: NodeId, package_id: PackageId, receipts: Vec<FrameReceipt>) -> Result<()> {
+        // Peer-binding (finding M3): an ack is only trustworthy from the
+        // package's intended destination. The remote node id is cryptographically
+        // authenticated by the transport (iroh QUIC / loopback), so a `from` that
+        // is not `self.peer` is a forged or misdirected ack — drop it with no
+        // state change, so it can never drive a package to `Confirmed` (which
+        // would make retention eligible to delete the capture originals).
+        if from != self.peer {
+            tracing::warn!(
+                package_id = %package_id.0,
+                from = %node_id_hex(&from),
+                expected = %node_id_hex(&self.peer),
+                "ignoring sync ack from a node other than the paired peer"
+            );
+            return Ok(());
+        }
+
         // The map is keyed by row id, so locate the slot whose minted announce
         // carries this `package_id`.
         let key = self.pending.iter().find_map(|(k, p)| match &p.announce {
@@ -652,6 +668,48 @@ impl Worker {
             );
             if let Some(p) = self.pending.get_mut(&key) {
                 p.last_rejected = rejected.into_iter().map(str::to_string).collect();
+            }
+            return Ok(());
+        }
+
+        // Completeness (finding M3): confirm ONLY when every announced frame is
+        // acked with a non-`Rejected` receipt. An empty or partial ack (fewer
+        // frames than the manifest describes) must NOT confirm — otherwise
+        // retention could delete a source whose frame the peer never actually
+        // stored. The package manifest is the source of truth for the announced
+        // frame set; all receipts here are already non-`Rejected` (guarded
+        // above), so `acked` is exactly the set of accepted frame uuids.
+        let dir = self
+            .pending
+            .get(&key)
+            .map(|p| p.dir.clone())
+            .expect("key from live find");
+        let expected: Vec<String> = match crate::package::read_manifest(&dir) {
+            Ok(records) => records.into_iter().map(|r| r.frame_uuid).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    package_id = key,
+                    error = %format!("{e:#}"),
+                    "cannot read manifest to verify ack completeness; not confirming"
+                );
+                return Ok(());
+            }
+        };
+        let acked: std::collections::HashSet<&str> =
+            receipts.iter().map(|r| r.frame_uuid.as_str()).collect();
+        let missing: Vec<&str> = expected
+            .iter()
+            .map(String::as_str)
+            .filter(|u| !acked.contains(u))
+            .collect();
+        if !missing.is_empty() {
+            tracing::warn!(
+                package_id = key,
+                missing = %missing.join(","),
+                "sync ack does not cover every announced frame; package stays in flight for retry"
+            );
+            if let Some(p) = self.pending.get_mut(&key) {
+                p.last_rejected = missing.into_iter().map(str::to_string).collect();
             }
             return Ok(());
         }
