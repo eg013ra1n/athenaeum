@@ -38,7 +38,7 @@
 //! **snapshotted at spawn** — changing it needs an agent restart, which keeps
 //! the middleware trivial (no shared mutable auth state).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -369,11 +369,125 @@ async fn auth_layer(token: Option<String>, req: Request, next: Next) -> Response
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    if presented == Some(expected) {
+    // Constant-time comparison (finding M1): a plain `==` on the token short-
+    // circuits at the first differing byte, leaking a per-byte timing oracle a
+    // LAN attacker could use to recover the token. `constant_time_eq` compares
+    // in time independent of the contents (only the length is observable, which
+    // is not secret).
+    let ok = presented.is_some_and(|p| constant_time_eq(p.as_bytes(), expected.as_bytes()));
+    if ok {
         next.run(req).await
     } else {
         (StatusCode::UNAUTHORIZED, "invalid or missing bearer token").into_response()
     }
+}
+
+/// Compare two byte slices in constant time (no data-dependent early exit).
+/// Returns `false` immediately on a length mismatch — the length of a bearer
+/// token is not sensitive, its contents are.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ── DNS-rebinding Host guard (finding M2) ────────────────────────────────────
+
+/// Which `Host` header values this server will answer, derived from its bind
+/// address. Defends against DNS rebinding: a malicious page the operator visits
+/// cannot rebind its own hostname to the loopback agent and drive the API,
+/// because such requests carry the attacker's `Host`, not an allowed one.
+#[derive(Clone)]
+pub(crate) enum HostPolicy {
+    /// The bind is a wildcard (`0.0.0.0` / `::`) so the legitimate host is not
+    /// enumerable — the bearer token (mandatory for a non-loopback bind) is the
+    /// defense; the Host check is a no-op.
+    AllowAll,
+    /// Answer only these host values (loopback names + the specific bind IP).
+    Allowed(HashSet<String>),
+}
+
+impl HostPolicy {
+    /// Build the policy for a bind address. A loopback or specific-IP bind gets a
+    /// concrete allow-list (loopback names + that IP); a wildcard bind can't be
+    /// enumerated, so it allows all (token-protected).
+    pub(crate) fn for_bind(addr: std::net::SocketAddr) -> Self {
+        let ip = addr.ip();
+        if ip.is_unspecified() {
+            return HostPolicy::AllowAll;
+        }
+        let mut set = HashSet::from([
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+            "[::1]".to_string(),
+        ]);
+        set.insert(ip.to_string());
+        if ip.is_ipv6() {
+            set.insert(format!("[{ip}]"));
+        }
+        HostPolicy::Allowed(set)
+    }
+
+    /// Whether a request carrying this `Host` header is permitted. A *missing*
+    /// Host is allowed — a DNS-rebinding attack always presents the attacker's
+    /// hostname, so absence cannot be that attack, and rejecting it would only
+    /// break odd non-browser clients.
+    fn permits(&self, host_header: Option<&str>) -> bool {
+        match self {
+            HostPolicy::AllowAll => true,
+            HostPolicy::Allowed(set) => match host_header {
+                None => true,
+                Some(h) => {
+                    let raw = h.trim().to_ascii_lowercase();
+                    set.contains(&raw) || set.contains(&host_only(&raw))
+                }
+            },
+        }
+    }
+}
+
+/// The host component of a `Host` header value, with any `:port` stripped.
+/// Handles bracketed IPv6 (`[::1]:8686` → `[::1]`) and `host:port`.
+fn host_only(h: &str) -> String {
+    let h = h.trim();
+    if let Some(rest) = h.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return format!("[{}]", &rest[..end]);
+        }
+    }
+    match h.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            host.to_string()
+        }
+        _ => h.to_string(),
+    }
+}
+
+/// Wrap `router` with the [`HostPolicy`] guard (finding M2). Applied at the
+/// single production serving choke point (`run::bind_and_spawn_web`), so it
+/// covers every route including the auth-exempt `GET /`.
+pub(crate) fn apply_host_guard(router: Router, policy: HostPolicy) -> Router {
+    router.layer(axum::middleware::from_fn(move |req: Request, next: Next| {
+        let policy = policy.clone();
+        async move {
+            let host = req
+                .headers()
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            if policy.permits(host.as_deref()) {
+                next.run(req).await
+            } else {
+                (StatusCode::FORBIDDEN, "host not allowed").into_response()
+            }
+        }
+    }))
 }
 
 /// `GET /` — placeholder status page. The interactive dashboard is Task 10.
@@ -1226,6 +1340,67 @@ mod tests {
             StatusCode::OK,
             "loopback (no token) needs no auth"
         );
+    }
+
+    // ── M2: DNS-rebinding Host guard ─────────────────────────────────────────
+
+    #[test]
+    fn host_policy_loopback_allows_localhost_and_rejects_foreign() {
+        let policy = HostPolicy::for_bind("127.0.0.1:8686".parse().unwrap());
+        assert!(policy.permits(Some("localhost:8686")));
+        assert!(policy.permits(Some("127.0.0.1:8686")));
+        assert!(policy.permits(Some("127.0.0.1")));
+        assert!(policy.permits(None), "a missing Host is not a rebinding attack");
+        assert!(!policy.permits(Some("evil.com")), "a foreign host is rejected");
+        assert!(
+            !policy.permits(Some("attacker.example:8686")),
+            "a rebinding host with the right port is still rejected"
+        );
+    }
+
+    #[test]
+    fn host_policy_wildcard_allows_all() {
+        let policy = HostPolicy::for_bind("0.0.0.0:8686".parse().unwrap());
+        assert!(policy.permits(Some("anything.example")));
+        assert!(policy.permits(None));
+    }
+
+    /// Integration: the guard layer wrapping a real router 403s a foreign Host
+    /// and passes a loopback Host through to the handler.
+    #[tokio::test]
+    async fn host_guard_layer_blocks_rebinding_host() {
+        let (state, _tmp) = test_state().await;
+        let policy = HostPolicy::for_bind("127.0.0.1:8686".parse().unwrap());
+        let app = apply_host_guard(build_router(state, None), policy);
+
+        let evil = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/status")
+                    .header("host", "evil.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            evil.status(),
+            StatusCode::FORBIDDEN,
+            "a foreign Host must be refused before reaching the handler"
+        );
+
+        let ok = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/status")
+                    .header("host", "127.0.0.1:8686")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK, "a loopback Host passes through");
     }
 
     #[tokio::test]

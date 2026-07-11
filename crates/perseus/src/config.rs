@@ -86,6 +86,12 @@ fn default_retention_interval_secs() -> u64 {
 /// an empty string disables the embedded web server entirely.
 pub const DEFAULT_WEB_BIND: &str = "127.0.0.1:8686";
 
+/// Minimum length of a `web_token` protecting a non-loopback bind (finding M1).
+/// A LAN-exposed admin page must not be guarded by an operator-invented short
+/// string; require enough entropy that guessing is infeasible. Generate one
+/// with e.g. `openssl rand -base64 24`.
+pub const MIN_WEB_TOKEN_LEN: usize = 16;
+
 fn default_web_bind() -> String {
     DEFAULT_WEB_BIND.to_string()
 }
@@ -460,11 +466,24 @@ impl Config {
             let addr: std::net::SocketAddr = self.web_bind.parse().map_err(|e| {
                 anyhow::anyhow!("web_bind is not a valid socket address ({}): {e}", self.web_bind)
             })?;
-            if !addr.ip().is_loopback() && self.web_token.as_deref().unwrap_or("").is_empty() {
-                bail!(
-                    "web_bind {} is not loopback — set web_token to protect the status page",
-                    self.web_bind
-                );
+            if !addr.ip().is_loopback() {
+                let token = self.web_token.as_deref().unwrap_or("");
+                if token.is_empty() {
+                    bail!(
+                        "web_bind {} is not loopback — set web_token to protect the status page",
+                        self.web_bind
+                    );
+                }
+                // Finding M1: reject an operator-invented weak token on a
+                // LAN-exposed bind — it must carry real entropy.
+                if token.chars().count() < MIN_WEB_TOKEN_LEN {
+                    bail!(
+                        "web_token is too weak ({} chars) for the non-loopback bind {} — use at least {} random characters (e.g. `openssl rand -base64 24`)",
+                        token.chars().count(),
+                        self.web_bind,
+                        MIN_WEB_TOKEN_LEN
+                    );
+                }
             }
         }
         Ok(())
@@ -1132,17 +1151,36 @@ interval_secs = 600
         );
     }
 
-    /// Task 9: a non-loopback bind WITH a token validates.
+    /// Task 9: a non-loopback bind WITH a strong token validates.
     #[test]
     fn non_loopback_web_bind_with_token_is_accepted() {
         let capture = tempfile::tempdir().unwrap();
+        let strong = "s3cret-9f2b7c1a4e8d6053"; // >= MIN_WEB_TOKEN_LEN
         let text = format!(
-            "{}web_bind = \"0.0.0.0:8686\"\nweb_token = \"s3cret\"\n",
+            "{}web_bind = \"0.0.0.0:8686\"\nweb_token = \"{strong}\"\n",
             good_toml_top(capture.path())
         );
         let cfg = Config::from_toml_str(&text).expect("token-protected wide bind is valid");
         assert_eq!(cfg.web_bind, "0.0.0.0:8686");
-        assert_eq!(cfg.web_token.as_deref(), Some("s3cret"));
+        assert_eq!(cfg.web_token.as_deref(), Some(strong));
+    }
+
+    /// Finding M1: a non-loopback bind with a WEAK (too-short) token is refused —
+    /// an operator-invented `web_token = "obs"` must not protect a LAN-exposed
+    /// admin page.
+    #[test]
+    fn non_loopback_web_bind_with_weak_token_is_rejected() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            "{}web_bind = \"0.0.0.0:8686\"\nweb_token = \"obs2026\"\n",
+            good_toml_top(capture.path())
+        );
+        let err = Config::from_toml_str(&text).expect_err("a weak token must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("web_token") && msg.to_lowercase().contains("weak"),
+            "error must flag the weak web_token: {msg}"
+        );
     }
 
     /// Task 9: an empty `web_bind` disables the server and is always valid — no

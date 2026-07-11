@@ -539,6 +539,14 @@ pub(crate) async fn bind_and_spawn_web(
     web_bind: &str,
     router: axum::Router,
 ) -> Option<JoinHandle<()>> {
+    // Wrap the router with the DNS-rebinding Host guard (finding M2), derived
+    // from the bind address. `web_bind` is already validated as a SocketAddr by
+    // `Config::validate`; if it somehow does not parse, serve without the guard
+    // rather than dropping the page (a loopback bind is the default anyway).
+    let router = match web_bind.parse::<std::net::SocketAddr>() {
+        Ok(addr) => crate::web::apply_host_guard(router, crate::web::HostPolicy::for_bind(addr)),
+        Err(_) => router,
+    };
     match tokio::net::TcpListener::bind(web_bind).await {
         Ok(listener) => {
             tracing::info!(bind = %web_bind, "web status page online");
