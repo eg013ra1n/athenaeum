@@ -190,13 +190,6 @@ fn clear_cached_peer(ctx: &ServiceContext) {
 
 // ── authorized inbound peers (finding H1) ────────────────────────────────────
 
-/// This device's hub-assigned id from settings (network-free); `None` signed out.
-fn self_device_id(ctx: &ServiceContext) -> Result<Option<String>, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    Ok(crate::db::get_setting(&conn, keys::ACCOUNT_DEVICE_ID)?.filter(|s| !s.is_empty()))
-}
-
 /// Decode a base64 device pubkey (`AccountDevice::pubkey`) into its 64-char
 /// lowercase hex node id — the form the allow-list and the transport compare.
 fn pubkey_b64_to_hex(pubkey_b64: &str) -> Option<String> {
@@ -206,6 +199,13 @@ fn pubkey_b64_to_hex(pubkey_b64: &str) -> Option<String> {
         .ok()?;
     let arr: crate::sharing::types::NodeId = bytes.as_slice().try_into().ok()?;
     Some(crate::sync::node_id_hex(&arr))
+}
+
+/// The hex node ids of every device in the account — the receiver's allow-list
+/// in the mesh model (finding H1, updated for sync Phase 1): any device in my
+/// account is trusted. Order is preserved; undecodable pubkeys are skipped.
+fn account_peer_hexes(devices: &[crate::account::AccountDevice]) -> Vec<String> {
+    devices.iter().filter_map(|d| pubkey_b64_to_hex(&d.pubkey)).collect()
 }
 
 /// Build the receiver's live peer-authorization gate (finding H1). A signed-in
@@ -238,14 +238,12 @@ fn peer_authorizer(ctx: &ServiceContext) -> Result<crate::sync::PeerAuthorizer, 
 /// (finding H1). Best-effort: on any credential/hub failure the existing cache
 /// is left untouched (a primary that synced before keeps working offline; a
 /// brand-new one authorizes nobody until it can reach the hub — fail closed).
-/// Only capture devices whose `peerDeviceId` is THIS primary are admitted.
+/// Every device in the account is admitted (mesh model, finding H1 as updated
+/// for sync Phase 1).
 pub async fn refresh_authorized_peers(ctx: &ServiceContext) {
     if !matches!(account_primary_ready(ctx), Ok(true)) {
         return;
     }
-    let Some(self_id) = self_device_id(ctx).ok().flatten() else {
-        return;
-    };
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx).ok().flatten() else {
         return;
     };
@@ -263,21 +261,14 @@ pub async fn refresh_authorized_peers(ctx: &ServiceContext) {
             return;
         }
     };
-    let hexes: Vec<String> = devices
-        .iter()
-        .filter(|d| {
-            d.role == Some(crate::account::DeviceRole::Capture)
-                && d.peer_device_id.as_deref() == Some(self_id.as_str())
-        })
-        .filter_map(|d| pubkey_b64_to_hex(&d.pubkey))
-        .collect();
+    let hexes = account_peer_hexes(&devices);
     if let Ok(db) = db(ctx) {
         let conn = db.conn();
         if let Err(e) = crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &hexes.join("\n"))
         {
             tracing::warn!(error = %e, "failed to cache authorized peers");
         } else {
-            tracing::info!(count = hexes.len(), "refreshed authorized capture peers");
+            tracing::info!(count = hexes.len(), "refreshed authorized account peers");
         }
     }
 }
@@ -1171,6 +1162,38 @@ mod tests {
             compute_queue: ComputeQueue::new(),
         };
         (tmp, ctx)
+    }
+
+    /// The receiver's allow-list is now every device in the account (mesh model,
+    /// finding H1 as updated for sync Phase 1) — not just capture devices paired
+    /// to this primary. A device with no role (a fresh hub) and an unpaired
+    /// capture are both authorized.
+    #[test]
+    fn account_peer_hexes_includes_every_device_regardless_of_role() {
+        use base64::Engine;
+        use crate::account::AccountDevice;
+        let b64 = |bytes: [u8; 32]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let dev = |seed: u8, role: Option<crate::account::DeviceRole>, peer: Option<&str>| {
+            AccountDevice {
+                id: format!("dev-{seed}"),
+                name: format!("n{seed}"),
+                pubkey: b64([seed; 32]),
+                role,
+                peer_device_id: peer.map(str::to_string),
+                created_at: "2026-07-11T00:00:00Z".into(),
+                last_seen_at: None,
+            }
+        };
+        let devices = vec![
+            dev(1, None, None),                                              // no role (new hub)
+            dev(2, Some(crate::account::DeviceRole::Capture), Some("dev-9")), // unpaired-to-me capture
+            dev(3, Some(crate::account::DeviceRole::Primary), None),
+        ];
+        let hexes = account_peer_hexes(&devices);
+        assert_eq!(hexes.len(), 3, "every account device is authorized, not just paired captures");
+        assert!(hexes.contains(&"01".repeat(32)));
+        assert!(hexes.contains(&"02".repeat(32)));
+        assert!(hexes.contains(&"03".repeat(32)));
     }
 
     /// The peer cache round-trips: store → read back → clear → gone. Proves the
