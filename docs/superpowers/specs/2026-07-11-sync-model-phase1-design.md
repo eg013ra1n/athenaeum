@@ -172,3 +172,21 @@ TDD throughout, project gates as usual (workspace build, core tests, `tsc`, hub 
 
 - **Hub:** capability set on verify; `GET /devices` filters destinations; duplicate name → 409; `PATCH` renames; migration backfill.
 - **Core:** mirror landing preserves the tree under `<slug>/<rel_path>`; slug sanitizer rejects path-unsafe resolved names; offer/want skips a true duplicate and transfers a sampling-collision false-positive; allow-list = account (accept account peer, drop non-account); multi-root Perseus collision handled.
+
+---
+
+## 13. Client design decisions (confirmed with owner 2026-07-11)
+
+Resolving the client half of §3–§6, which the model sections left open. The hub half (Plan 1) is already merged (`athenaeum-hub` main, not yet deployed).
+
+1. **Receiver autostart = signed-in, no role gate.** Every signed-in Athenaeum node runs a `SyncReceiver` (it is always an `athenaeum` capability = full peer). The old `account_primary_ready` / `role == Primary` gate on `autostart_if_enabled` is replaced by a plain "signed in (account identity present)" check. Perseus never receives.
+2. **The app no longer auto-sends; sending is explicit.** In the mesh model the app has no fixed primary to push to, so the capture-on-scan auto-enqueue and the whole `resolve_capture_peer` / paired-primary / `ACCOUNT_PEER_DEVICE_ID` send machinery is **removed from the app**. The app sends only via an explicit user action (pick files/folder + pick destination node) — that UI is Phase 3. Auto-send survives **only in Perseus**, to its configured target node(s) (Plan 2C / Phase 2). The scan-completion auto-enqueue hook and `SyncSenderRuntime`'s single-peer resolution are re-pointed to the explicit-target model, not role/pairing.
+3. **Account UI drops the role selector.** `AccountSection.tsx` no longer offers a primary/capture toggle or `set_role`. It shows the device's **capability** (fixed, informational — `athenaeum`), an **editable name** (→ hub `PATCH /devices/{id}`), and the account device list (with capability + name). `RoleBadge`/`applyRole`/`handleSelectRole`/the role radios are removed; `useAccount.setRole` is removed; `DeviceRole` in `models.ts` → `DeviceCapability`.
+4. **Old local state is inert.** `ACCOUNT_ROLE` and `ACCOUNT_PEER_DEVICE_ID` settings are no longer read or written; on upgrade they are simply ignored (a best-effort clear is optional, not required — nothing reads them).
+
+**Implementation slices (each its own plan → SDD cycle):**
+- **Plan 2A — core: capability model + account-wide allow-list.** `DeviceRole` → `DeviceCapability` (core `account` + `api::account` + `api::sync` + `sync::status`/`pairing`); the hub client sends `deviceCapability` on verify and reads `capability` from `/devices`; `refresh_authorized_peers` caches **every** account device; the receiver autostart gate becomes signed-in (decision 1); remove `set_role` from the client + its tauri/web command/route + `ACCOUNT_ROLE`/`ACCOUNT_PEER_DEVICE_ID` reads.
+- **Plan 2B — core: mirror landing** (§6): `rel_path` relative to a sync-root, `land_payload` → `incoming_root/<sender-slug>/<rel_path>`, receiver-resolved sanitized slug.
+- **Plan 2C — explicit-target send path + client UI/naming**: `enqueue`/`SyncSenderRuntime` take an explicit destination; remove app auto-send (decision 2); cross-OS hostname default + name-editing UI (Perseus web + `AccountSection.tsx`, decision 3) + `PATCH` wiring; Perseus `targets` config + `rel_path` from `capture_dir`.
+
+Plan 2 (all three slices) ships **together with the hub deploy** so the removed role/pairing contract never breaks a live client.
