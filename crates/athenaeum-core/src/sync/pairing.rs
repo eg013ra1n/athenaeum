@@ -49,7 +49,7 @@ use base64::Engine;
 use iroh::{RelayMap, RelayMode};
 use iroh_tickets::endpoint::EndpointTicket;
 
-use crate::account::{DeviceRole, HubClient};
+use crate::account::HubClient;
 use crate::sharing::types::NodeId;
 
 /// Account-pairing inputs for a signed-in `capture` device with a paired primary.
@@ -205,13 +205,9 @@ async fn fetch_primary_node_id(acc: &AccountPairing) -> FetchOutcome {
             acc.peer_device_id
         ));
     };
-    if primary.role != Some(DeviceRole::Primary) {
-        return FetchOutcome::GoneOrDemoted(format!(
-            "the paired device ({}) is no longer a primary (current role: {:?}) — re-pair in \
-             Settings",
-            acc.peer_device_id, primary.role
-        ));
-    }
+    // Sync 2C: the mesh model has no per-device role, so the peer is resolved
+    // purely by its pubkey → node id. (The old "demoted from primary" gate read
+    // `AccountDevice.role`, which no longer exists.)
     match node_id_from_pubkey_b64(&primary.pubkey) {
         Ok(node) => FetchOutcome::Found(node),
         Err(e) => FetchOutcome::HubUnreachable(format!("invalid primary pubkey: {e}")),
@@ -405,18 +401,6 @@ mod tests {
         ])
     }
 
-    /// A device list where `device_id` is present but demoted to `capture`
-    /// (no longer `primary`).
-    fn devices_body_demoted(device_id: &str, pubkey_b64: &str) -> serde_json::Value {
-        serde_json::json!([
-            {
-                "id": device_id, "name": "Former Primary", "pubkey": pubkey_b64,
-                "role": "capture", "peerDeviceId": null,
-                "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
-            }
-        ])
-    }
-
     /// A valid iroh pairing ticket string + the node id it encodes, built from a
     /// real (relay-disabled, in-memory) transport so the parse is exercised.
     async fn sample_ticket() -> (String, NodeId) {
@@ -517,32 +501,6 @@ mod tests {
         assert!(
             matches!(res, PeerResolution::Invalidated { .. }),
             "hub-confirmed-gone must invalidate, not fall back to the cache, got {res:?}"
-        );
-    }
-
-    /// Review finding #2: hub REACHABLE, the pinned device is present but its
-    /// role is no longer `primary` (demoted/reassigned) — same Invalidated
-    /// treatment as fully absent, and again must NOT use the cache.
-    #[tokio::test]
-    async fn peer_demoted_invalidates_even_with_cache() {
-        let (_raw, pubkey_b64) = sample_primary_pubkey();
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/devices"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(devices_body_demoted("primary-1", &pubkey_b64)))
-            .mount(&server)
-            .await;
-
-        let cached = [9u8; 32];
-        let account = AccountPairing {
-            hub_url: server.uri(),
-            token: "tok".into(),
-            peer_device_id: "primary-1".into(),
-        };
-        let res = resolve_peer(Some(&account), None, Some(cached)).await;
-        assert!(
-            matches!(res, PeerResolution::Invalidated { .. }),
-            "a demoted (non-primary) peer must invalidate, not fall back to the cache, got {res:?}"
         );
     }
 

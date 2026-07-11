@@ -118,7 +118,10 @@ pub struct SyncStatus {
     pub pairing_ticket: Option<String>,
     /// Total frames received (history rows with `direction = received`).
     pub received_total: u32,
-    /// This machine's account role, when signed in and assigned.
+    /// This machine's account role, when signed in and assigned. Excluded from
+    /// the generated TS (`#[ts(skip)]`) because the mesh model (Sync 2C) drops
+    /// `DeviceRole` from the frontend; Task 2 removes this field entirely.
+    #[ts(skip)]
     pub machine_role: Option<DeviceRole>,
     /// Network-free pairing summary (see the module honesty note).
     pub pairing: SyncPairingSummary,

@@ -1166,29 +1166,25 @@ mod tests {
     }
 
     /// The receiver's allow-list is now every device in the account (mesh model,
-    /// finding H1 as updated for sync Phase 1) — not just capture devices paired
-    /// to this primary. A device with no role (a fresh hub) and an unpaired
-    /// capture are both authorized.
+    /// finding H1 as updated for sync Phase 1) — regardless of a device's
+    /// capability (full Athenaeum peer or send-only Perseus agent).
     #[test]
     fn account_peer_hexes_includes_every_device_regardless_of_role() {
         use base64::Engine;
-        use crate::account::AccountDevice;
+        use crate::account::{AccountDevice, DeviceCapability};
         let b64 = |bytes: [u8; 32]| base64::engine::general_purpose::STANDARD.encode(bytes);
-        let dev = |seed: u8, role: Option<crate::account::DeviceRole>, peer: Option<&str>| {
-            AccountDevice {
-                id: format!("dev-{seed}"),
-                name: format!("n{seed}"),
-                pubkey: b64([seed; 32]),
-                role,
-                peer_device_id: peer.map(str::to_string),
-                created_at: "2026-07-11T00:00:00Z".into(),
-                last_seen_at: None,
-            }
+        let dev = |seed: u8, capability: DeviceCapability| AccountDevice {
+            id: format!("dev-{seed}"),
+            name: format!("n{seed}"),
+            pubkey: b64([seed; 32]),
+            capability,
+            created_at: "2026-07-11T00:00:00Z".into(),
+            last_seen_at: None,
         };
         let devices = vec![
-            dev(1, None, None),                                              // no role (new hub)
-            dev(2, Some(crate::account::DeviceRole::Capture), Some("dev-9")), // unpaired-to-me capture
-            dev(3, Some(crate::account::DeviceRole::Primary), None),
+            dev(1, DeviceCapability::Athenaeum),
+            dev(2, DeviceCapability::Perseus),
+            dev(3, DeviceCapability::Athenaeum),
         ];
         let hexes = account_peer_hexes(&devices);
         assert_eq!(hexes.len(), 3, "every account device is authorized, not just paired captures");

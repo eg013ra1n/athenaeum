@@ -7,7 +7,7 @@
 //!
 //! Endpoint contract (base = `account.hub_url`):
 //! - `POST /api/v1/auth/otp {email}` → 204 (429 rate-limited)
-//! - `POST /api/v1/auth/verify {email, code, devicePubkey, deviceName}`
+//! - `POST /api/v1/auth/verify {email, code, devicePubkey, deviceName, deviceCapability}`
 //!   → 200 `{deviceToken, deviceId}` | 400 (malformed pubkey) | 401 (wrong/
 //!   expired code) | 409 (pubkey already owned by a DIFFERENT account —
 //!   same-account re-verify/re-sign-in is a 200 on the hub, not a conflict)
@@ -21,7 +21,7 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use serde::Deserialize;
 
-use super::{AccountDevice, DeviceRole};
+use super::{AccountDevice, DeviceCapability, DeviceRole};
 
 /// Typed outcome of a failed hub call. Carries no secrets.
 #[derive(Debug)]
@@ -134,6 +134,7 @@ impl HubClient {
         code: &str,
         device_pubkey_b64: &str,
         device_name: &str,
+        capability: DeviceCapability,
     ) -> Result<VerifyResponse, AccountClientError> {
         let resp = self
             .http
@@ -143,6 +144,7 @@ impl HubClient {
                 "code": code,
                 "devicePubkey": device_pubkey_b64,
                 "deviceName": device_name,
+                "deviceCapability": capability.as_str(),
             }))
             .send()
             .await
@@ -319,7 +321,7 @@ mod tests {
         let client = HubClient::new(server.uri()).unwrap();
         client.request_otp("a@b.com").await.unwrap();
         let resp = client
-            .verify("a@b.com", "123456", "cHVia2V5", "test-device")
+            .verify("a@b.com", "123456", "cHVia2V5", "test-device", DeviceCapability::Athenaeum)
             .await
             .unwrap();
         assert_eq!(resp.device_token, "tok-secret-123");
@@ -433,7 +435,7 @@ mod tests {
 
         let client = HubClient::new(server.uri()).unwrap();
         let err = client
-            .verify("a@b.com", "123456", "cHVia2V5", "test-device")
+            .verify("a@b.com", "123456", "cHVia2V5", "test-device", DeviceCapability::Athenaeum)
             .await
             .unwrap_err();
         match err {
@@ -458,25 +460,27 @@ mod tests {
         assert!(debug.contains("dev-1"), "device_id should still be visible: {debug}");
     }
 
+    /// `GET /devices` decodes the mesh `capability` field, and a payload missing
+    /// it (older hub) defaults to `athenaeum` (see `AccountDevice::capability`'s
+    /// `#[serde(default)]`).
     #[tokio::test]
-    async fn list_devices_parses_roles_and_nulls() {
+    async fn list_devices_parses_capability_and_defaults() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/devices"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {
                     "id": "dev-1", "name": "Studio Mac", "pubkey": "cHVia2V5",
-                    "role": "primary", "peerDeviceId": null,
+                    "capability": "athenaeum",
                     "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": "2026-07-06T00:00:00Z"
                 },
                 {
                     "id": "dev-2", "name": "Mini PC", "pubkey": "cHVia2V5Mg",
-                    "role": "capture", "peerDeviceId": "dev-1",
+                    "capability": "perseus",
                     "createdAt": "2026-07-02T00:00:00Z", "lastSeenAt": null
                 },
                 {
                     "id": "dev-3", "name": "New", "pubkey": "cHVia2V5Mw",
-                    "role": null, "peerDeviceId": null,
                     "createdAt": "2026-07-03T00:00:00Z", "lastSeenAt": null
                 }
             ])))
@@ -486,10 +490,9 @@ mod tests {
         let client = HubClient::new(server.uri()).unwrap();
         let devices = client.list_devices("tok").await.unwrap();
         assert_eq!(devices.len(), 3);
-        assert_eq!(devices[0].role, Some(DeviceRole::Primary));
-        assert_eq!(devices[1].role, Some(DeviceRole::Capture));
-        assert_eq!(devices[1].peer_device_id.as_deref(), Some("dev-1"));
-        assert_eq!(devices[2].role, None);
+        assert_eq!(devices[0].capability, DeviceCapability::Athenaeum);
+        assert_eq!(devices[1].capability, DeviceCapability::Perseus);
+        assert_eq!(devices[2].capability, DeviceCapability::Athenaeum); // missing → default
         assert_eq!(devices[2].last_seen_at, None);
     }
 }

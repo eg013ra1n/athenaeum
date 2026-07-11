@@ -22,7 +22,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::account::{AccountClientError, AccountDevice, AccountStatus, DeviceKey, DeviceRole, HubClient, TokenStore};
+use crate::account::{
+    AccountClientError, AccountDevice, AccountStatus, DeviceCapability, DeviceKey, DeviceRole,
+    HubClient, TokenStore,
+};
 use crate::api::{db, ApiError};
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
@@ -241,7 +244,13 @@ pub async fn sign_in_verify(
 
     let client = HubClient::new(&cfg.hub_url).map_err(map_client_err)?;
     let resp = client
-        .verify(&email, &code, &key.pubkey_base64(), &device_name())
+        .verify(
+            &email,
+            &code,
+            &key.pubkey_base64(),
+            &device_name(),
+            DeviceCapability::Athenaeum,
+        )
         .await
         .map_err(map_verify_err)?;
 
@@ -265,50 +274,17 @@ pub async fn sign_in_verify(
     build_status(ctx, &cfg)
 }
 
-/// Best-effort: re-read this device's hub row and persist its current `role` +
-/// `peer_device_id` locally. Called after a successful sign-in/verify so a
-/// re-sign-in restores the role the hub already holds (the known B4 gap). Never
-/// fails sign-in — a hub hiccup just leaves the role unassigned until the next
-/// [`list_devices`] / [`set_machine_role`].
+/// No-op since Sync 2C: the mesh model has no per-device role/peer to refresh —
+/// every app install is a full peer ([`DeviceCapability::Athenaeum`]), so there
+/// is nothing hub-held to restore after a re-sign-in. Kept as a compiling stub
+/// with its call site intact; Task 2 removes it and the two `clear_state` calls
+/// above wholesale.
 async fn refresh_persisted_role(
-    ctx: &ServiceContext,
-    cfg: &AccountConfig,
-    device_id: &str,
-    token: &str,
+    _ctx: &ServiceContext,
+    _cfg: &AccountConfig,
+    _device_id: &str,
+    _token: &str,
 ) {
-    let client = match HubClient::new(&cfg.hub_url) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, "role refresh: could not build hub client");
-            return;
-        }
-    };
-    let devices = match client.list_devices(token).await {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::warn!(error = %e, "role refresh: list_devices failed; role left unassigned");
-            return;
-        }
-    };
-    let Some(me) = devices.iter().find(|d| d.id == device_id) else {
-        return;
-    };
-    if let Some(role) = me.role {
-        if let Err(e) = write_state(ctx, keys::ACCOUNT_ROLE, role.as_str()) {
-            tracing::warn!(error = %e, "role refresh: persist role failed");
-        }
-    }
-    match me.peer_device_id.as_deref() {
-        Some(peer) => {
-            if let Err(e) = write_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID, peer) {
-                tracing::warn!(error = %e, "role refresh: persist peer failed");
-            }
-        }
-        None => {
-            let _ = clear_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID);
-        }
-    }
-    tracing::info!(device_id = %device_id, "persisted role/peer refreshed from hub after sign-in");
 }
 
 /// This device's account state — resolvable offline from the keychain + settings.
@@ -324,20 +300,20 @@ fn build_status(ctx: &ServiceContext, cfg: &AccountConfig) -> Result<AccountStat
         .load()
         .map_err(|e| ApiError::Internal(format!("load token: {e:#}")))?
         .is_some();
-    let (email, device_id, role) = if signed_in {
+    let (email, device_id) = if signed_in {
         (
             read_state(ctx, keys::ACCOUNT_EMAIL)?,
             read_state(ctx, keys::ACCOUNT_DEVICE_ID)?,
-            read_state(ctx, keys::ACCOUNT_ROLE)?.and_then(|s| DeviceRole::parse(&s)),
         )
     } else {
-        (None, None, None)
+        (None, None)
     };
     Ok(AccountStatus {
         signed_in,
         email,
         device_id,
-        role,
+        // The app is always a full mesh peer.
+        capability: DeviceCapability::Athenaeum,
         hub_url: cfg.hub_url.clone(),
     })
 }

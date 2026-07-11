@@ -159,7 +159,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::sync::SyncHistoryQuery,
             crate::api::sync::IneligibleFrame,
             crate::api::sync::EnqueueSelectionResult,
-            crate::account::DeviceRole,
+            crate::account::DeviceCapability,
             crate::account::AccountDevice,
             crate::account::AccountStatus,
         ]))),

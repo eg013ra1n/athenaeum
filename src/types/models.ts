@@ -690,10 +690,6 @@ pairingTicket: string | null,
  */
 receivedTotal: number, 
 /**
- * This machine's account role, when signed in and assigned.
- */
-machineRole: DeviceRole | null, 
-/**
  * Network-free pairing summary (see the module honesty note).
  */
 pairing: SyncPairingSummary, 
@@ -785,17 +781,18 @@ totalCount: number,
  */
 ineligible: Array<IneligibleFrame>, };
 
-export type DeviceRole = "primary" | "capture";
+export type DeviceCapability = "athenaeum" | "perseus";
 
 export type AccountDevice = { id: string, name: string, 
 /**
  * Base64 of the device's 32-byte ed25519 public key (== its node id).
  */
-pubkey: string, role: DeviceRole | null, 
+pubkey: string, 
 /**
- * The paired primary for a `capture` device (else `None`).
+ * What this device is in the mesh (full peer vs send-only agent). Absent on
+ * older hub payloads → defaults to [`DeviceCapability::Athenaeum`].
  */
-peerDeviceId: string | null, createdAt: string, lastSeenAt: string | null, };
+capability: DeviceCapability, createdAt: string, lastSeenAt: string | null, };
 
 export type AccountStatus = { 
 /**
@@ -811,9 +808,10 @@ email: string | null,
  */
 deviceId: string | null, 
 /**
- * This device's role; `None` when unassigned or signed out.
+ * This device's capability. The app is always a full peer
+ * ([`DeviceCapability::Athenaeum`]).
  */
-role: DeviceRole | null, 
+capability: DeviceCapability, 
 /**
  * The hub this device authenticates against.
  */
