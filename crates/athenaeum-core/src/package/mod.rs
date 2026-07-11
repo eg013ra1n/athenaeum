@@ -39,6 +39,8 @@ mod tests;
 
 pub use manifest::{ManifestRecord, PayloadKind, MANIFEST_VERSION};
 pub use reader::{read_manifest, validate_package};
+// `validate_rel_path` / `validate_package_id` are defined below and re-exported
+// implicitly (same module); listed here for discoverability alongside the reader.
 pub use writer::{write_package, write_package_with_root_hash, RootHashProvider};
 
 /// Name of the manifest file inside a package directory.
@@ -62,6 +64,20 @@ pub const MANIFEST_FILENAME: &str = "manifest.ndjson";
 /// `dest.join("/etc/x")` == `/etc/x`), and does nothing to stop `../../x`
 /// climbing out of `dest` — both must be rejected before the join, not after.
 pub fn validate_rel_path(rel_path: &str) -> Result<()> {
+    // Reject Windows separators / prefixes independent of host platform. On a
+    // Unix build `Path::components` parses `..\..\x` and `C:\x` as a *single*
+    // `Component::Normal`, so they would slip past the component check below and
+    // then traverse if the file ever landed on a Windows receiver. A wire
+    // `rel_path` is always forward-slash by contract, so a backslash, a
+    // drive-letter, or a UNC prefix is never legitimate (finding L1).
+    if rel_path.contains('\\') {
+        bail!("rel_path must not contain a backslash separator: {}", rel_path);
+    }
+    let bytes = rel_path.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        bail!("rel_path must not carry a drive-letter prefix: {}", rel_path);
+    }
+
     let rel = Path::new(rel_path);
     if rel
         .components()
@@ -70,6 +86,37 @@ pub fn validate_rel_path(rel_path: &str) -> Result<()> {
         bail!(
             "rel_path must be relative with no '..'/root components: {}",
             rel_path
+        );
+    }
+    Ok(())
+}
+
+/// Validate that a peer-supplied `package_id` is safe to use as a single path
+/// segment (the receiver builds its per-package staging directory by joining the
+/// wire `package_id` onto the staging root).
+///
+/// Unlike [`validate_rel_path`] (which permits nested forward-slash paths), a
+/// `package_id` must be exactly **one** filesystem-safe component. `Path::join`
+/// on an absolute or `..`-laden component escapes the base — so an unvalidated
+/// `package_id` of `"/Users/victim/Library/LaunchAgents"` or `"../../x"` would
+/// place the entire fetched package at an attacker-chosen path (arbitrary file
+/// write / RCE, finding C1). The producer always mints a v4 UUID, so the safe
+/// alphabet is `[A-Za-z0-9._-]` with `.`/`..` and the empty string excluded;
+/// anything carrying a separator, root, drive letter, NUL, or other character
+/// is rejected before it is ever used as a path.
+pub fn validate_package_id(package_id: &str) -> Result<()> {
+    if package_id.is_empty() {
+        bail!("package_id must not be empty");
+    }
+    if package_id == "." || package_id == ".." {
+        bail!("package_id must not be a relative-directory component: {package_id}");
+    }
+    if !package_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        bail!(
+            "package_id must be a single safe path segment ([A-Za-z0-9._-]): {package_id}"
         );
     }
     Ok(())

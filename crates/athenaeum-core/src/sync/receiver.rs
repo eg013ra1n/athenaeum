@@ -162,6 +162,31 @@ async fn handle_announce(
 ) -> Result<()> {
     let peer_device = super::node_id_hex(&from);
     let package_id = announce.package_id.0.clone();
+
+    // The wire `package_id` is peer-controlled and is used below to build the
+    // per-package staging directory. Reject anything that is not a single safe
+    // path segment BEFORE it is ever joined onto a path — an absolute or
+    // `..`-laden id would place the fetched package at an attacker-chosen
+    // location (arbitrary file write / RCE, finding C1). Fail closed: refuse the
+    // announce, emit a failed outcome, ingest nothing.
+    if let Err(e) = crate::package::validate_package_id(&package_id) {
+        tracing::warn!(
+            from = %peer_device,
+            package_id = %package_id,
+            error = %e,
+            "sync receiver rejected announce with unsafe package_id"
+        );
+        emit_event(emitter, "sync-finished", &SyncFinishedEvent {
+            package_id,
+            direction: super::Direction::Received,
+            outcome: "failed".to_string(),
+            peer_device,
+            ok_count: 0,
+            failed: Vec::new(),
+        });
+        return Ok(());
+    }
+
     emit_event(emitter, "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
         direction: super::Direction::Received,
@@ -385,5 +410,77 @@ impl SyncRuntime {
 impl Default for SyncRuntime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sharing::loopback::LoopbackNetwork;
+    use crate::sharing::types::{PackageAnnounce, PackageId};
+    use std::sync::Mutex;
+
+    /// Captures the events the receiver emits so a test can assert the rejection
+    /// path fired.
+    #[derive(Default)]
+    struct RecordingEmitter {
+        events: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+    impl ProgressEmitter for RecordingEmitter {
+        fn emit_json(&self, name: &str, payload: serde_json::Value) {
+            self.events.lock().unwrap().push((name.to_string(), payload));
+        }
+    }
+
+    /// C1 regression: an announce carrying a path-shaped `package_id` must be
+    /// refused before any fetch, and must never create the attacker-chosen path.
+    /// Unfixed, `staging_root.join("staging").join(&package_id)` resolves to the
+    /// absolute `evil` path (Path::join replaces the base on an absolute
+    /// component) and the fetched package lands there.
+    #[tokio::test]
+    async fn handle_announce_rejects_unsafe_package_id_without_escaping_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging_root = tmp.path().join("stage");
+        std::fs::create_dir_all(&staging_root).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap());
+        let transport = LoopbackNetwork::new().endpoint();
+        let incoming_root = tmp.path().join("incoming");
+        let incoming: IncomingResolver = Arc::new(move || incoming_root.clone());
+        let emitter = RecordingEmitter::default();
+
+        let evil = tmp.path().join("evil_escape");
+        let announce = PackageAnnounce {
+            package_id: PackageId(evil.to_string_lossy().into_owned()),
+            root_hash: "0".repeat(64),
+            byte_size: 0,
+            frame_count: 1,
+        };
+
+        handle_announce(
+            &store,
+            &staging_root,
+            &incoming,
+            &transport,
+            &emitter,
+            [7u8; 32],
+            announce,
+        )
+        .await
+        .expect("an unsafe announce is rejected as a clean Ok, not an error");
+
+        assert!(
+            !evil.exists(),
+            "receiver must not create the attacker-chosen path"
+        );
+        let events = emitter.events.lock().unwrap();
+        let finished = events
+            .iter()
+            .find(|(n, _)| n == "sync-finished")
+            .expect("a finished event is emitted for the rejected package");
+        assert_eq!(finished.1["outcome"], "failed");
+        assert!(
+            !events.iter().any(|(n, _)| n == "sync-progress"),
+            "rejection happens before any fetch/ingest progress tick"
+        );
     }
 }

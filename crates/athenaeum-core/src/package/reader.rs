@@ -41,6 +41,11 @@ pub fn validate_package(dir: &Path) -> Result<()> {
     let records = read_manifest(dir)?;
 
     for record in &records {
+        // Guard the untrusted rel_path before joining it onto `dir` — this
+        // "verify a received package" helper must refuse a traversal/absolute
+        // rel_path rather than stat/hash an arbitrary file on disk (finding L1).
+        super::validate_rel_path(&record.rel_path)
+            .with_context(|| format!("reject unsafe rel_path {}", record.rel_path))?;
         let path = dir.join(&record.rel_path);
 
         let meta = fs::metadata(&path)

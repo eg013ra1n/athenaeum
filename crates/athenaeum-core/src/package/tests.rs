@@ -13,8 +13,8 @@ use crate::models::Frame;
 
 use super::manifest::MANIFEST_VERSION;
 use super::{
-    read_manifest, validate_package, write_package, write_package_with_root_hash, xxh3_full_file,
-    ManifestRecord, PayloadKind, MANIFEST_FILENAME,
+    read_manifest, validate_package, validate_package_id, validate_rel_path, write_package,
+    write_package_with_root_hash, xxh3_full_file, ManifestRecord, PayloadKind, MANIFEST_FILENAME,
 };
 
 /// Fabricate a tiny valid FITS (4x4 float image) at `path`.
@@ -130,6 +130,87 @@ fn root_hash_provider_overrides_placeholder() {
     assert_eq!(announce.root_hash, "collection-hash-stub");
     // The package still validates — the provider only changes the announce field.
     validate_package(dest.path()).unwrap();
+}
+
+// ── path-safety guards (C1 / L1) ─────────────────────────────────────────────
+
+#[test]
+fn validate_package_id_accepts_uuids_and_simple_ids() {
+    // The sender always mints a v4 UUID; that (and plain alphanumeric/`-`/`_`
+    // ids) must pass.
+    validate_package_id("550e8400-e29b-41d4-a716-446655440000").unwrap();
+    validate_package_id("pkg_42").unwrap();
+    validate_package_id("ABCdef0123").unwrap();
+}
+
+#[test]
+fn validate_package_id_rejects_path_components_and_traversal() {
+    // A peer-supplied package_id is used to build the receiver's staging dir
+    // (receiver.rs). It must never be allowed to carry a path separator, a
+    // parent-dir escape, an absolute root, or a Windows drive/UNC prefix — any
+    // of which would let a malicious announce place the fetched package outside
+    // the staging root (arbitrary file write / RCE, finding C1).
+    for bad in [
+        "",
+        ".",
+        "..",
+        "a/b",
+        "../../etc/cron.d",
+        "/Users/victim/Library/LaunchAgents",
+        "..\\..\\windows",
+        "C:\\windows\\system32",
+        "\\\\host\\share",
+        "pkg\0null",
+    ] {
+        assert!(
+            validate_package_id(bad).is_err(),
+            "package_id must be rejected as unsafe: {bad:?}"
+        );
+    }
+}
+
+#[test]
+fn validate_rel_path_rejects_backslash_and_drive_letters_cross_platform() {
+    // The guard runs on the receiver's own platform, but a Unix receiver parses
+    // `..\..\x` and `C:\x` as a single Normal component, so a Windows-style
+    // traversal would slip through if we only relied on `Path::components`.
+    // Reject backslashes, drive-letter, and UNC prefixes independent of host
+    // (finding L1).
+    for bad in [
+        "..\\..\\secret",
+        "C:\\Windows\\System32\\x",
+        "\\\\host\\share\\x",
+        "a\\b",
+    ] {
+        assert!(
+            validate_rel_path(bad).is_err(),
+            "rel_path with a Windows separator/prefix must be rejected: {bad:?}"
+        );
+    }
+    // Forward-slash relative paths (the wire format) still pass.
+    validate_rel_path("frames/light_0001.fits").unwrap();
+}
+
+#[test]
+fn validate_package_rejects_traversal_rel_path() {
+    // `validate_package` is the "verify an untrusted package" helper; it must
+    // refuse a manifest record whose rel_path escapes the package dir rather
+    // than stat/hash an arbitrary file on disk (finding L1, latent hardening).
+    let dir = tempdir().unwrap();
+    let placeholder = dir.path().join("placeholder.fits");
+    write_fixture_fits(&placeholder);
+    let record = ManifestRecord {
+        rel_path: "../../../../etc/hosts".to_string(),
+        ..sample_record(&placeholder, "unused")
+    };
+    let line = serde_json::to_string(&record).unwrap();
+    std::fs::write(dir.path().join(MANIFEST_FILENAME), format!("{line}\n")).unwrap();
+
+    let err = validate_package(dir.path()).expect_err("traversal rel_path must be rejected");
+    assert!(
+        format!("{err:#}").contains("rel_path"),
+        "error should name the rel_path guard: {err:#}"
+    );
 }
 
 #[test]
