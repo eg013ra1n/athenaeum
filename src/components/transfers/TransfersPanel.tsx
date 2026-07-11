@@ -231,15 +231,6 @@ export function TransfersPanel() {
               <ArrowDown size={12} />
               {status.receiver.receivedTotal} received
             </span>
-            <span className="ml-auto truncate" title="Pairing status">
-              {status.pairing.kind === 'paired'
-                ? `→ ${status.pairing.peerShort ?? ''}`
-                : status.pairing.kind === 'disabled'
-                  ? 'not sending'
-                  : status.pairing.kind === 'devTicket'
-                    ? 'dev pairing'
-                    : 'signed out'}
-            </span>
           </div>
         )}
 

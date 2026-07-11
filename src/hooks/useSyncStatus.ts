@@ -3,8 +3,8 @@
 //
 // Mounted ONCE via `TransfersProvider` so it is the sole place discrete-outcome
 // notifications fire (no double toasts) and the sole poller. Polling is gated on
-// `visible` — a hidden indicator (signed out, no role, no dev flag) does no
-// periodic work; an inbound/outbound event can still flip visibility via the
+// `visible` — a hidden indicator (no sender/receiver activity, no dev flag) does
+// no periodic work; an inbound/outbound event can still flip visibility via the
 // push listener, which starts the interval.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -113,7 +113,7 @@ export interface UseSyncStatus {
   status: SyncStatus | null;
   /** In-flight outbound rows for the Active tab (`status.sender.active`). */
   active: OutboundSummary[];
-  /** Whether the sidebar indicator should render (role set OR dev flag). */
+  /** Whether the sidebar indicator should render (sender/receiver present OR dev flag). */
   visible: boolean;
   /** Re-poll `get_sync_status` now. */
   refresh: () => void;
@@ -173,7 +173,9 @@ export function useSyncStatus(): UseSyncStatus {
     };
   }, [refresh, notify]);
 
-  const visible = !!status && (status.machineRole != null || status.devPairingEnabled);
+  const visible =
+    !!status &&
+    (status.sender != null || status.receiver != null || status.devPairingEnabled);
 
   // Periodic re-poll ONLY while visible — a hidden indicator does no polling.
   useEffect(() => {

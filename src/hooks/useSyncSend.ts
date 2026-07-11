@@ -1,17 +1,20 @@
 // "Send to primary" capability + action for the frame-selection toolbar (task M2b).
 //
-// A2 NOTE — account state proper (sign-in flow, device list, role selector) still
+// A2 NOTE — account state proper (sign-in flow, device list, name editor) still
 // lives ONLY in `useAccount` + `AccountSection` (see useAccount.ts header). This
-// hook does NOT import either symbol; it reads the offline-resolvable
-// `account_status` command directly to answer a single yes/no question — "is this
-// a signed-in capture node?" — so the guard grep for `useAccount|AccountSection`
-// stays clean. A signed-out (or primary / unassigned) user gets `canSend = false`,
-// the toolbar button never renders, and no sync code runs on the normal path.
+// hook does NOT import either symbol, so the guard grep for
+// `useAccount|AccountSection` stays clean.
+//
+// PHASE 1 — the app has no send UI yet (explicit app→app send is Phase 3, after
+// the capability model lands). `canSend` is hard `false`, so the toolbar button
+// never renders and no sync code runs on the normal path. The full hook shape
+// (`canSend` / `sending` / `sendToPrimary`) is retained so Phase 3 can restore
+// per-target gating without touching call sites.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { useNotifications } from '../contexts/NotificationContext';
-import type { AccountStatus, EnqueueSelectionResult, IneligibleFrame } from '../types/models';
+import type { EnqueueSelectionResult, IneligibleFrame } from '../types/models';
 
 /** Tauri and Axum both reject with a plain string, not an `Error`. */
 function errMsg(err: unknown): string {
@@ -55,16 +58,10 @@ export function useSyncSend(): UseSyncSend {
 
   useEffect(() => {
     mounted.current = true;
-    (async () => {
-      try {
-        const s = await api.invoke<AccountStatus>('account_status');
-        // A null/partial status must never crash the host toolbar — default off.
-        if (mounted.current) setCanSend(!!s?.signedIn && s?.role === 'capture');
-      } catch (err) {
-        console.error('[sync] account status poll failed:', err);
-        if (mounted.current) setCanSend(false);
-      }
-    })();
+    // Phase 1: the app has no send UI. Explicit app→app send arrives in Phase 3;
+    // until then the toolbar button never renders. The hook shape is kept so
+    // Phase 3 can restore per-target gating without touching call sites.
+    setCanSend(false);
     return () => {
       mounted.current = false;
     };

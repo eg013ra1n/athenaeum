@@ -8,6 +8,8 @@ import {
   ShieldCheck,
   Server,
   Monitor,
+  Network,
+  Pencil,
   Trash2,
   Loader2,
   AlertTriangle,
@@ -17,7 +19,7 @@ import { api } from '../../api';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import { useNotifications } from '../../contexts/NotificationContext';
 import { useAccount, accountErrMsg, SIGNED_OUT_HEALED } from '../../hooks/useAccount';
-import type { AccountDevice, DeviceRole } from '../../types/models';
+import type { AccountDevice, DeviceCapability } from '../../types/models';
 
 /** Default hub the app points sign-in at when `account.hub_url` is unset. */
 const DEFAULT_HUB_URL = 'https://projects.artfrom.space';
@@ -27,26 +29,134 @@ function shortId(id: string): string {
   return id.length > 12 ? `${id.slice(0, 8)}…` : id;
 }
 
-/** Small coloured pill for a device's role. */
-function RoleBadge({ role }: { role: DeviceRole | null }) {
-  if (role === 'primary') {
-    return (
-      <span className="inline-flex items-center rounded-full bg-accent/20 px-2 py-0.5 text-xs font-medium text-accent">
-        Primary
-      </span>
-    );
-  }
-  if (role === 'capture') {
-    return (
-      <span className="inline-flex items-center rounded-full bg-purple/20 px-2 py-0.5 text-xs font-medium text-purple">
-        Capture
-      </span>
-    );
-  }
+/** Human label for a device capability. The app is always a full peer. */
+function capabilityLabel(capability: DeviceCapability): string {
+  return capability === 'perseus' ? 'Send-only' : 'Full peer';
+}
+
+/** Small coloured pill for a device's capability (full peer vs send-only agent). */
+function CapabilityPill({ capability }: { capability: DeviceCapability }) {
+  const isPeer = capability !== 'perseus';
   return (
-    <span className="inline-flex items-center rounded-full bg-surface-hover px-2 py-0.5 text-xs font-medium text-content-muted">
-      Unassigned
+    <span
+      className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
+        isPeer ? 'bg-accent/20 text-accent' : 'bg-purple/20 text-purple'
+      }`}
+    >
+      {capabilityLabel(capability)}
     </span>
+  );
+}
+
+/**
+ * Inline editor for this device's display name → `rename_device`. Mirrors
+ * `HubUrlDevEditor`'s load/edit/save shape: local `value`/`saving`/`error`
+ * state, an explicit Save button (never per-keystroke), a duplicate-name error
+ * surfaced inline (the hub maps a clash to `name already in use`). Re-seeds from
+ * `initialName` when the resolved device name changes (e.g. after a rename
+ * refresh) but never clobbers text the user has started editing.
+ */
+function DeviceNameEditor({
+  deviceId,
+  initialName,
+  onRename,
+  onRenamed,
+  onSignedOut,
+}: {
+  deviceId: string;
+  initialName: string;
+  onRename: (deviceId: string, name: string) => Promise<typeof SIGNED_OUT_HEALED | void>;
+  onRenamed: (name: string) => void;
+  onSignedOut: () => void;
+}) {
+  const [value, setValue] = useState(initialName);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
+  const prevInitial = useRef(initialName);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  // Re-seed on an external name change, but only if the user hasn't diverged the
+  // field from the last-known value (never stomp an in-progress edit).
+  useEffect(() => {
+    setValue((cur) => (cur === prevInitial.current ? initialName : cur));
+    prevInitial.current = initialName;
+  }, [initialName]);
+
+  const trimmed = value.trim();
+  const dirty = trimmed !== initialName.trim();
+
+  const handleSave = async () => {
+    if (saving) return;
+    if (trimmed === '') {
+      setError('Device name cannot be empty.');
+      return;
+    }
+    if (!dirty) return; // no-op — nothing changed
+    setSaving(true);
+    setError(null);
+    try {
+      const res = await onRename(deviceId, trimmed);
+      if (res === SIGNED_OUT_HEALED) {
+        onSignedOut();
+        return;
+      }
+      onRenamed(trimmed);
+    } catch (err) {
+      // Duplicate name → `name already in use`; other hub errors surface too.
+      if (mounted.current) setError(accountErrMsg(err));
+    } finally {
+      if (mounted.current) setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-1.5">
+      <label className="flex items-center gap-1.5 text-sm font-medium text-content-secondary">
+        <Pencil size={13} className="flex-shrink-0" />
+        Device name
+      </label>
+      <div className="flex items-center gap-2 max-w-md">
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => {
+            setValue(e.target.value);
+            setError(null);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              void handleSave();
+            }
+          }}
+          placeholder="This machine's name"
+          spellCheck={false}
+          autoComplete="off"
+          className="flex-1 min-w-0 bg-surface-hover border border-border rounded-lg px-3 py-1.5 text-sm text-content focus:outline-none focus:border-accent"
+        />
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={saving || !dirty || trimmed === ''}
+          className="flex-shrink-0 inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs text-content-secondary hover:bg-surface-hover disabled:opacity-50 transition-colors"
+        >
+          {saving ? <Loader2 size={13} className="animate-spin" /> : null}
+          Save
+        </button>
+      </div>
+      {error && <p className="text-xs text-error">{error}</p>}
+      <p className="text-xs text-content-muted">
+        Shown to your other devices in sync history and transfers. Must be unique across your
+        account.
+      </p>
+    </div>
   );
 }
 
@@ -142,7 +252,7 @@ function HubUrlDevEditor({ onSaved }: { onSaved: () => Promise<unknown> }) {
  * by the host in `Settings.tsx`, matching the `LoggingSettings` pattern).
  *
  * Three states: loading, signed-out (email → code sign-in), signed-in (account
- * card + machine-role selector + device list). All account state is owned by
+ * card + device-name editor + device list). All account state is owned by
  * `useAccount`; see that hook's header for the A2 isolation guard.
  */
 export default function AccountSection() {
@@ -158,7 +268,7 @@ export default function AccountSection() {
     sendCode,
     verifyCode,
     signOut,
-    setRole,
+    renameDevice,
     revokeDevice,
   } = useAccount();
 
@@ -171,10 +281,6 @@ export default function AccountSection() {
   const [signInError, setSignInError] = useState<string | null>(null);
 
   // ── signed-in controls ─────────────────────────────────────────────────────
-  const [roleDraft, setRoleDraft] = useState<DeviceRole | null>(null);
-  const [peerDraft, setPeerDraft] = useState('');
-  const [roleError, setRoleError] = useState<string | null>(null);
-  const [roleSaving, setRoleSaving] = useState(false);
   const [revokingId, setRevokingId] = useState<string | null>(null);
   const [signingOut, setSigningOut] = useState(false);
   const [retryingStatus, setRetryingStatus] = useState(false);
@@ -189,10 +295,8 @@ export default function AccountSection() {
 
   const signedIn = status?.signedIn ?? false;
   const deviceId = status?.deviceId ?? null;
-  const currentRole = status?.role ?? null;
+  const capability = status?.capability ?? 'athenaeum';
   const thisDevice = devices.find((d) => d.id === deviceId);
-  const currentPeer = thisDevice?.peerDeviceId ?? '';
-  const peerCandidates = devices.filter((d) => d.id !== deviceId);
 
   // Reset the sign-in form each time we (re-)enter the signed-out state so a
   // stale code/step never wedges a fresh sign-in.
@@ -203,15 +307,6 @@ export default function AccountSection() {
       setSignInError(null);
     }
   }, [signedIn]);
-
-  // Keep the role/peer drafts in step with the resolved status.
-  useEffect(() => {
-    setRoleDraft(currentRole);
-    setRoleError(null);
-  }, [currentRole, deviceId]);
-  useEffect(() => {
-    setPeerDraft(currentPeer);
-  }, [currentPeer]);
 
   // ── handlers ────────────────────────────────────────────────────────────────
 
@@ -259,43 +354,24 @@ export default function AccountSection() {
     setSignInError(null);
   };
 
-  const applyRole = async (role: DeviceRole, peer: string | null) => {
-    setRoleSaving(true);
-    setRoleError(null);
-    try {
-      const res = await setRole(role, peer);
-      if (res === SIGNED_OUT_HEALED) {
-        notify({
-          title: 'Signed out',
-          detail: 'This device was signed out. Please sign in again.',
-          kind: 'generic',
-          tone: 'warning',
-        });
-        return;
-      }
-      notify({
-        title: 'Machine role updated',
-        detail: role === 'capture' ? 'This machine is now a Capture device.' : 'This machine is now the Primary device.',
-        kind: 'generic',
-        tone: 'success',
-      });
-    } catch (err) {
-      // 409 (second primary) / 400 (peer validation) → actionable, inline.
-      setRoleError(accountErrMsg(err));
-      setRoleDraft(currentRole); // revert the radio to the true state
-    } finally {
-      setRoleSaving(false);
-    }
+  // Success path for the inline device-name editor — the editor owns its own
+  // input/saving/error state; the parent just raises the outcome notification.
+  const handleRenamed = (name: string) => {
+    notify({
+      title: 'Device renamed',
+      detail: `This device is now named "${name}".`,
+      kind: 'generic',
+      tone: 'success',
+    });
   };
 
-  const handleSelectRole = (next: DeviceRole) => {
-    setRoleError(null);
-    setRoleDraft(next);
-    // Primary applies immediately (and clears any peer link). Capture waits for
-    // a peer to be picked below, then applies via the Apply button.
-    if (next === 'primary') {
-      void applyRole('primary', null);
-    }
+  const handleRenameSignedOut = () => {
+    notify({
+      title: 'Signed out',
+      detail: 'This device was signed out. Please sign in again.',
+      kind: 'generic',
+      tone: 'warning',
+    });
   };
 
   const handleRevoke = async (device: AccountDevice) => {
@@ -517,7 +593,7 @@ export default function AccountSection() {
     );
   }
 
-  // SIGNED IN — account card, role selector, device list.
+  // SIGNED IN — account card, device-name editor, device list.
   return (
     <div className="space-y-6">
       {/* Account card */}
@@ -534,7 +610,11 @@ export default function AccountSection() {
               <span className="font-mono text-content-secondary">
                 {status.deviceId ? shortId(status.deviceId) : '—'}
               </span>
-              <RoleBadge role={currentRole} />
+            </div>
+            <div className="flex items-center gap-2 text-sm text-content-muted">
+              <Network size={14} className="flex-shrink-0" />
+              Capability:
+              <CapabilityPill capability={capability} />
             </div>
             <div className="flex items-center gap-2 text-xs text-content-muted">
               <Server size={14} className="flex-shrink-0" />
@@ -552,87 +632,17 @@ export default function AccountSection() {
         </div>
       </div>
 
-      {/* Machine role */}
-      <div>
-        <h4 className="text-sm font-medium text-content-secondary mb-1">Machine role</h4>
-        <p className="text-xs text-content-muted mb-3">
-          How this machine participates in sync. A <strong>Capture</strong> device sends its frames
-          to a paired <strong>Primary</strong>.
-        </p>
-
-        <div className="space-y-2">
-          <label className="flex items-center gap-2 text-sm text-content-muted cursor-not-allowed opacity-70">
-            <input type="radio" name="machine-role" checked={roleDraft === null} disabled readOnly />
-            None <span className="text-xs">(not assigned)</span>
-          </label>
-          <label className="flex items-center gap-2 text-sm text-content cursor-pointer">
-            <input
-              type="radio"
-              name="machine-role"
-              checked={roleDraft === 'primary'}
-              disabled={roleSaving}
-              onChange={() => handleSelectRole('primary')}
-            />
-            Primary <span className="text-xs text-content-muted">— receives frames</span>
-          </label>
-          <label className="flex items-center gap-2 text-sm text-content cursor-pointer">
-            <input
-              type="radio"
-              name="machine-role"
-              checked={roleDraft === 'capture'}
-              disabled={roleSaving}
-              onChange={() => handleSelectRole('capture')}
-            />
-            Capture <span className="text-xs text-content-muted">— sends frames to a Primary</span>
-          </label>
-        </div>
-
-        {/* Peer picker for Capture role */}
-        {roleDraft === 'capture' && (
-          <div className="mt-3 pl-6 space-y-2">
-            {peerCandidates.length === 0 ? (
-              <p className="text-sm text-content-muted">
-                No other devices on this account yet. Sign in on your Primary machine first, then
-                come back to pair this one.
-              </p>
-            ) : (
-              <>
-                <label className="block text-xs text-content-muted">Paired Primary device</label>
-                <div className="flex items-center gap-2 flex-wrap">
-                  <select
-                    value={peerDraft}
-                    onChange={(e) => setPeerDraft(e.target.value)}
-                    disabled={roleSaving}
-                    className="bg-surface-hover border border-border rounded-lg px-3 py-2 text-sm text-content focus:outline-none focus:border-accent"
-                  >
-                    <option value="">Select a device…</option>
-                    {peerCandidates.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        {d.name} ({shortId(d.id)})
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    onClick={() => applyRole('capture', peerDraft)}
-                    disabled={roleSaving || !peerDraft}
-                    className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:cursor-not-allowed text-surface rounded-lg text-sm transition-colors"
-                  >
-                    {roleSaving ? <Loader2 size={16} className="animate-spin" /> : null}
-                    Apply
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-        )}
-
-        {roleError && (
-          <div className="mt-3 flex items-start gap-2 rounded-lg border border-error/50 bg-error-muted p-2.5">
-            <AlertTriangle size={16} className="text-error flex-shrink-0 mt-0.5" />
-            <p className="text-sm text-error">{roleError}</p>
-          </div>
-        )}
-      </div>
+      {/* Device name */}
+      {deviceId && (
+        <DeviceNameEditor
+          key={deviceId}
+          deviceId={deviceId}
+          initialName={thisDevice?.name ?? ''}
+          onRename={renameDevice}
+          onRenamed={handleRenamed}
+          onSignedOut={handleRenameSignedOut}
+        />
+      )}
 
       {/* Device list */}
       <div>
@@ -654,7 +664,7 @@ export default function AccountSection() {
               <thead>
                 <tr className="border-b border-border text-left text-xs text-content-muted">
                   <th className="px-3 py-2 font-medium">Device</th>
-                  <th className="px-3 py-2 font-medium">Role</th>
+                  <th className="px-3 py-2 font-medium">Capability</th>
                   <th className="px-3 py-2 font-medium">Created</th>
                   <th className="px-3 py-2 font-medium">Last seen</th>
                   <th className="px-3 py-2 font-medium sr-only">Actions</th>
@@ -677,7 +687,7 @@ export default function AccountSection() {
                         <span className="font-mono text-xs text-content-muted">{shortId(d.id)}</span>
                       </td>
                       <td className="px-3 py-2">
-                        <RoleBadge role={d.role} />
+                        <CapabilityPill capability={d.capability} />
                       </td>
                       <td className="px-3 py-2 text-content-muted whitespace-nowrap">
                         {formatTimestamp(d.createdAt)}

@@ -18,7 +18,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '../api';
-import type { AccountDevice, AccountStatus, DeviceRole } from '../types/models';
+import type { AccountDevice, AccountStatus } from '../types/models';
 
 /** Tauri and Axum both reject with a plain string, not an `Error`. */
 export function accountErrMsg(err: unknown): string {
@@ -56,10 +56,11 @@ export interface UseAccount {
   /** Local-only sign-out. */
   signOut: () => Promise<void>;
   /**
-   * Set this machine's role. Resolves `SIGNED_OUT_HEALED` if the call 401'd and
-   * self-healed to signed-out; throws the hub's actionable message otherwise.
+   * Rename a device by id (this device or a peer). Resolves `SIGNED_OUT_HEALED`
+   * if the call 401'd and self-healed to signed-out; throws the hub's actionable
+   * message otherwise (a duplicate name surfaces as `name already in use`).
    */
-  setRole: (role: DeviceRole, peerDeviceId?: string | null) => Promise<Healed | void>;
+  renameDevice: (deviceId: string, name: string) => Promise<Healed | void>;
   /** Revoke a device. Revoking THIS device signs out locally (status re-polls). */
   revokeDevice: (deviceId: string) => Promise<Healed | void>;
 }
@@ -175,22 +176,21 @@ export function useAccount(): UseAccount {
     }
   }, [refreshStatus]);
 
-  const setRole = useCallback(
-    async (role: DeviceRole, peerDeviceId?: string | null): Promise<Healed | void> => {
+  const renameDevice = useCallback(
+    async (deviceId: string, name: string): Promise<Healed | void> => {
       try {
-        const s = await api.invoke<AccountStatus>('set_machine_role', {
-          role,
-          peerDeviceId: peerDeviceId ?? null,
-        });
-        if (mounted.current) setStatus(s);
-        // Peer link may have changed — refresh the device list.
-        void refreshDevices();
+        await api.invoke('rename_device', { deviceId, name });
       } catch (err) {
-        console.error('[account] set role failed:', err);
+        console.error('[account] rename device failed:', err);
         const fresh = await refreshStatus();
         if (fresh && !fresh.signedIn) return SIGNED_OUT_HEALED;
+        // A duplicate name maps to `name already in use` — surfaced verbatim.
         throw new Error(accountErrMsg(err));
       }
+      // Name changed — refresh both the device list and status (status.deviceId
+      // carries no name, but a self-rename should still re-poll for consistency).
+      await refreshDevices();
+      await refreshStatus();
     },
     [refreshStatus, refreshDevices],
   );
@@ -229,7 +229,7 @@ export function useAccount(): UseAccount {
     sendCode,
     verifyCode,
     signOut,
-    setRole,
+    renameDevice,
     revokeDevice,
   };
 }
