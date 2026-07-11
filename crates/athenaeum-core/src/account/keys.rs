@@ -234,7 +234,58 @@ fn write_new_key_file(path: &Path, secret: &[u8; 32]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn write_new_key_file(path: &Path, secret: &[u8; 32]) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create device key tmp {}", path.display()))?;
+    f.write_all(secret)
+        .with_context(|| format!("write device key tmp {}", path.display()))?;
+    f.sync_all()
+        .with_context(|| format!("sync device key tmp {}", path.display()))?;
+    drop(f);
+    // Windows has no chmod; restrict the private identity key to the current
+    // user so it is not readable by other accounts on a shared host (finding
+    // L2). Best-effort — the key already exists and the account still works if
+    // this fails; only the hardening is skipped.
+    restrict_windows_acl(path);
+    Ok(())
+}
+
+/// Best-effort owner-only ACL on the device key (finding L2, Windows). Uses
+/// `icacls` (always present on Windows) to disable ACL inheritance and grant
+/// only the current user full control, dropping any inherited group/Everyone
+/// access. Never fails key creation — logs and continues on any error.
+#[cfg(windows)]
+fn restrict_windows_acl(path: &Path) {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    if user.is_empty() {
+        tracing::warn!(path = %path.display(), "cannot resolve USERNAME to restrict device key ACL");
+        return;
+    }
+    match std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:F"))
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            tracing::debug!(path = %path.display(), "device key ACL restricted to current user");
+        }
+        Ok(out) => {
+            tracing::warn!(path = %path.display(), code = ?out.status.code(), "icacls did not restrict device key ACL");
+        }
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "failed to run icacls to restrict device key ACL");
+        }
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn write_new_key_file(path: &Path, secret: &[u8; 32]) -> Result<()> {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
