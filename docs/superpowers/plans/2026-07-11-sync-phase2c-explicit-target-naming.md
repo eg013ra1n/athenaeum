@@ -111,21 +111,22 @@ git commit -m "feat(account): DeviceCapability model — capability on verify + 
 
 ### Task 2: Remove role/pairing/auto-send machinery (core + tauri + web)
 
-Delete every role-gated send path and the app's auto-send. After this task the app **receives** (Plan 2A autostart) but has **no send path wired to the UI** (explicit-target send lands in Task 3; the Phase-3 UI is out of scope). This is a compiler-guided deletion pass — remove the symbols, fix callers until green.
+Delete the app's **auto-send** and the role-**write** machinery (role selector, `set_role`, role readers). After this task the app **receives** (Plan 2A autostart) but never auto-sends. This is a compiler-guided deletion pass — remove the symbols, fix callers until green.
 
-**Remove (symbol @ file:line — verify current line by symbol name):**
-- `api/account.rs`: `set_machine_role` (~L394), `account_pairing` (~L454), `refresh_persisted_role` (~L273); the `ACCOUNT_ROLE`/`ACCOUNT_PEER_DEVICE_ID` writes/clears in `clear_local_session` (~L144-145), `sign_in_verify` (~L260-262).
+**Task-boundary rule (why the send primitive stays):** the manual send chain `enqueue_sync_selection → ensure_sender_engine → resolve_capture_peer → account_pairing` compiles today only because of the role/pairing readers. Task 3 replaces that whole chain with the explicit-target primitive. So **Task 2 leaves the send-primitive chain compiling and untouched** (`account_pairing`, `resolve_capture_peer`, `persist_peer_resolution`, `peer_from_resolution`, `ensure_sender_engine`, `enqueue_sync_selection`, `sync/pairing.rs` resolution, the `DeviceRole` enum, and the `ACCOUNT_ROLE`/`ACCOUNT_PEER_DEVICE_ID` **consts**). With `set_machine_role` gone, `ACCOUNT_ROLE` is never written → `account_pairing` returns `None` → the manual send is transitionally inert until Task 3 rebuilds it. **Task 3 deletes** `resolve_capture_peer`/`account_pairing`/`peer_from_resolution`/`DeviceRole`/the two consts/`sync/pairing.rs` primary-resolution when it installs the explicit-target replacement.
+
+**Remove in THIS task (symbol @ file:line — verify current line by symbol name):**
+- `api/account.rs`: `set_machine_role` (~L394), `refresh_persisted_role` (already a no-op stub after Task 1 — delete it + its call site in `sign_in_verify` ~L262). Leave the `ACCOUNT_ROLE`/`ACCOUNT_PEER_DEVICE_ID` clears in `clear_local_session`/`sign_in_verify` in place (they reference the consts Task 3 removes; harmless).
 - `account/client.rs`: `set_role` method (~L209) + its tests (~L366, L407, L489).
-- `api/sync.rs`: `resolve_capture_peer` (~L324), `persist_peer_resolution` (~L340), `peer_from_resolution` (~L687, folds into Task 3), `machine_role` (~L488), `peer_device_id` (~L496), `auto_mode_ready` (~L1064), `auto_enqueue_scanned_files` (~L1088), `derive_pairing_summary` (~L513), `pairing_summary_from` (~L529) + their tests (~L1613-1651, L1502-1520).
+- `api/sync.rs`: `machine_role` (~L488), `peer_device_id` (~L496), `auto_mode_ready` (~L1064), `auto_enqueue_scanned_files` (~L1088), `derive_pairing_summary` (~L513), `pairing_summary_from` (~L529) + their tests (~L1613-1651, L1502-1520). **Keep** `resolve_capture_peer`, `persist_peer_resolution`, `peer_from_resolution`, `ensure_sender_engine`, `enqueue_sync_selection` (Task 3 owns them).
 - `api/retention.rs`: the `ACCOUNT_ROLE`/`DeviceRole::Capture` gate in `retention_ready` (~L205-207) → replace with signed-in gate: `Ok(hub_credentials(ctx)?.is_some())`.
-- `settings/mod.rs`: `ACCOUNT_ROLE` (~L146) and `ACCOUNT_PEER_DEVICE_ID` (~L151) consts.
-- `sync/pairing.rs`: `fetch_primary_node_id` (~L192) + the `role == Primary` filter; keep `peer_addr_with_relays` and relay helpers (Task 3 dials with them). `resolve_peer`/`PeerResolution`/`AccountPairing` — remove the variants/paths only reachable from `resolve_capture_peer`; keep what Perseus/Task 3 reuse (if nothing reuses them, remove; Perseus is rewritten in Task 6 to not use them).
-- `sync/status.rs`: `SyncStatus.machine_role` field; update `get_status` (`api/sync.rs` ~L612) to stop populating it.
+- `sync/status.rs`: `SyncStatus.machine_role` field (already `#[ts(skip)]` after Task 1) — remove the field; update `get_status` (`api/sync.rs` ~L612/L630) to stop populating it. Also remove `SyncStatus.pairing_summary` (fed by `derive_pairing_summary`) and its `get_status` population.
 - `api/account.rs` tauri/web: `set_machine_role` command (`athenaeum-tauri/src/commands/account.rs` ~L74; registered `lib.rs` ~L469) and route (`athenaeum-web/src/routes/account.rs` ~L113; registered `routes/mod.rs` ~L263), plus their request DTOs (`role: DeviceRole`).
 - `auto_enqueue_scanned_files` call sites: `athenaeum-tauri/src/commands/scan_roots.rs:213`, `athenaeum-tauri/src/commands/sync.rs:117`, `athenaeum-web/src/routes/scan_roots.rs:253`, `athenaeum-web/src/routes/sync.rs:151`. Remove the auto-enqueue block (the scan-completion hook no longer sends). Keep the scan itself.
 - `monitor/orchestrator.rs`: test `TestHook` role writes (~L361-362) + the `auto_enqueue_scanned_files` test call (~L399-415) — delete or retarget those tests.
+- `sync/pairing.rs`: clean up the stale `"role": null, "peerDeviceId": null` keys in the `devices_body_without_pinned_peer` fixture (Task 1 Minor).
 
-**Files:** the above; Test: adjust/remove the now-invalid inline tests; keep `enqueue_sync_selection`'s own tests (Task 3 re-points them).
+**Files:** the above; Test: adjust/remove the now-invalid inline tests; keep `enqueue_sync_selection`/`ensure_sender_engine`'s own tests (Task 3 re-points them). After removing `SyncStatus` fields, regenerate TS (`TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract`) and commit `models.ts`.
 
 - [ ] **Step 1: Write failing test** — assert the auto-send hook is gone at the type level (a compile check) and retention gate flipped:
 
@@ -160,6 +161,8 @@ git commit -m "refactor(sync): remove role/pairing send-gating + app auto-send (
 ### Task 3: Explicit-target send — per-peer sender runtime (core + tauri + web)
 
 Replace the single-peer `SyncSenderRuntime` with a per-peer engine map, and make `ensure_sender_engine` / `enqueue_sync_selection` take an explicit destination node. The destination is a device **id** resolved to a `NodeId` via the cached account device list (same resolver the receiver allow-list uses). This is the send primitive Perseus (Task 7) and the Phase-3 app UI consume.
+
+**Deferred deletions this task also performs (kept compiling through Task 2):** delete `resolve_capture_peer`, `persist_peer_resolution`, `peer_from_resolution`, `account_pairing` (`api/account.rs`), the `DeviceRole` enum + `AccountPairing`/`PeerResolution` and `sync/pairing.rs::fetch_primary_node_id`/`resolve_peer` primary-resolution (keep `peer_addr_with_relays` + relay helpers — the new `ensure_sender_engine` dials with them), and the `ACCOUNT_ROLE`/`ACCOUNT_PEER_DEVICE_ID` consts (`settings/mod.rs`) plus their now-orphaned clears in `clear_local_session`/`sign_in_verify`. After this task, zero `DeviceRole`/role/pairing symbols remain in core. Regenerate TS if any exported type changed.
 
 **Files:**
 - Modify: `crates/athenaeum-core/src/sync/sender.rs` (map keyed by `NodeId`)
