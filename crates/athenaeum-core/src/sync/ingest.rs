@@ -28,7 +28,8 @@
 //!    so it is not a secondary-dedupe candidate — `frames.uuid` (step 2)
 //!    remains the primary key for those; acceptable v1.
 //! 4. **Ingest** — otherwise land the payload (tmp/rename into
-//!    `<incoming_root>/<origin_device_short>/<date>/`) and insert `files` +
+//!    `<incoming_root>/<sender_slug>/<rel_path>`, mirroring the sender's tree
+//!    under a slug derived from the *authenticated* peer node id) and insert `files` +
 //!    `frames` + `fits_header` rows (reusing the scanner primitives), carrying
 //!    the manifest's `frame_uuid` onto `frames.uuid` so a later redelivery
 //!    dedups. Receipt [`Ingested`](ReceiptOutcome::Ingested). If the catalog
@@ -136,6 +137,12 @@ pub fn ingest_package(
 
     let package_id = &announce.package_id.0;
 
+    // Per-sender landing prefix, computed once (the whole package is from one
+    // authenticated peer). Derived from `peer_device` — the AUTHENTICATED node id
+    // (hex) the receiver verified — NOT the manifest's wire-supplied
+    // `origin_device`, which a peer could set to anything.
+    let sender_slug = sanitize_slug(peer_device);
+
     // Redelivery optimization: load whatever this package already has on
     // record and reuse any non-Rejected receipt verbatim instead of
     // reprocessing. This avoids needless re-hash I/O AND avoids a subtle
@@ -167,7 +174,7 @@ pub fn ingest_package(
             // — the source may have been repaired since the last attempt.
         }
 
-        let verdict = match process_frame(conn, incoming_root, package_dir, record, package_id, peer_device, &started_at) {
+        let verdict = match process_frame(conn, incoming_root, package_dir, record, package_id, peer_device, &sender_slug, &started_at) {
             Ok(v) => v,
             Err(e) => {
                 // A processing error (I/O, DB) is surfaced as a Rejected receipt
@@ -222,6 +229,7 @@ fn process_frame(
     record: &ManifestRecord,
     package_id: &str,
     peer_device: &str,
+    sender_slug: &str,
     started_at: &str,
 ) -> Result<FrameVerdict> {
     // Guard the record's rel_path (untrusted, wire-supplied) before joining.
@@ -294,7 +302,7 @@ fn process_frame(
     }
 
     // 4. Ingest: land the payload, then insert catalog rows in one transaction.
-    let landed = land_payload(incoming_root, &payload, record, &snapshot)
+    let landed = land_payload(incoming_root, &payload, record, sender_slug)
         .with_context(|| format!("land payload {}", record.rel_path))?;
     // The sampling hash is computed here purely to populate `files.content_hash`
     // (the unrelated scanner-side Duplicates view) — it never decides a skip.
@@ -379,27 +387,24 @@ fn primary_wins_outcome(existing: Option<&str>, snapshot: Option<&str>) -> &'sta
     }
 }
 
-/// Land an accepted payload under `<incoming_root>/<device_short>/<date>/<name>`,
-/// tmp-copy + atomic rename, collision-suffixed. Returns the final path.
+/// Land an accepted payload mirroring the sender's tree under
+/// `<incoming_root>/<sender_slug>/<rel_path>`, tmp-copy + atomic rename,
+/// collision-suffixed. `sender_slug` is derived from the AUTHENTICATED peer node
+/// id (Plan 2B); `rel_path` is `validate_rel_path`-guarded in `process_frame`, so
+/// the join cannot escape `<incoming_root>/<sender_slug>/`. Returns the final path.
 fn land_payload(
     incoming_root: &Path,
     payload: &Path,
     record: &ManifestRecord,
-    snapshot: &Frame,
+    sender_slug: &str,
 ) -> Result<PathBuf> {
-    let device_short = short_device(&record.origin_device);
-    let date = snapshot
-        .date_obs
-        .map(|d| d.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
-    let dest_dir = incoming_root.join(&device_short).join(&date);
-    std::fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("create landing dir {}", dest_dir.display()))?;
+    let dest = unique_path(&incoming_root.join(sender_slug).join(Path::new(&record.rel_path)));
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create landing dir {}", parent.display()))?;
+    }
 
-    let filename = filename_of(&record.rel_path);
-    let dest = unique_path(&dest_dir.join(&filename));
-
-    // tmp + atomic rename: copy to a sibling temp, fsync, then rename into place.
+    // tmp + atomic rename: copy to a sibling temp, then rename into place.
     // The staging payload lives under the same incoming_root, so this is normally
     // an intra-filesystem move; the copy handles the cross-device case too.
     let tmp = dest.with_extension(format!(
@@ -552,14 +557,34 @@ fn filename_of(rel_path: &str) -> String {
     rel_path.rsplit('/').next().unwrap_or(rel_path).to_string()
 }
 
-/// Short, filesystem-safe rendering of an origin device id for the landing path
-/// (hex node id → first 12 chars).
-fn short_device(origin_device: &str) -> String {
-    let s: String = origin_device.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    if s.is_empty() {
-        "unknown".to_string()
+/// A filesystem-safe single path segment derived from a display string (the
+/// per-sender landing-folder prefix). Lowercase; any char outside
+/// `[a-z0-9._-]` → `-`; runs of `-` collapse; leading/trailing `-`/`.` trimmed;
+/// capped at 24 chars; empty → `"node"`. Applied to the authenticated peer node
+/// id here (Plan 2C applies it to a resolved device name instead).
+pub(crate) fn sanitize_slug(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(24));
+    let mut prev_dash = false;
+    for ch in raw.chars() {
+        let c = ch.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+            out.push(c);
+            prev_dash = false;
+        } else {
+            if !prev_dash {
+                out.push('-');
+            }
+            prev_dash = true;
+        }
+        if out.len() >= 24 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches(|c| c == '-' || c == '.');
+    if trimmed.is_empty() {
+        "node".to_string()
     } else {
-        s.chars().take(12).collect()
+        trimmed.to_string()
     }
 }
 

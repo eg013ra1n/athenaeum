@@ -28,6 +28,7 @@ use crate::sharing::types::{FrameReceipt, NodeId, PackageAnnounce, PackageId, Re
 use crate::sharing::SharingTransport;
 
 use super::ingest::ingest_package;
+use super::node_id_hex;
 use super::store::{count_satisfied_receipts, insert_receipt, CatalogSyncStore, SyncStore};
 use super::receiver::{IncomingResolver, SyncReceiver};
 use super::{SyncConfig, SyncEngine, StandaloneSyncStore};
@@ -106,6 +107,115 @@ fn build_fixture_package(
     let pkg_dir = root.join(format!("pkg-{frame_uuid}"));
     let announce = package::write_package(&pkg_dir, vec![(src, record)]).unwrap();
     (pkg_dir, announce)
+}
+
+/// Builds a one-file package with an explicit nested `rel_path` and a decoy
+/// `origin_device`, so a test can prove landing mirrors `rel_path` under the
+/// AUTHENTICATED peer (not the manifest's origin_device). Returns (pkg_dir, announce).
+fn build_nested_package(
+    root: &Path,
+    frame_uuid: &str,
+    rel_path: &str,
+    decoy_origin_device: &str,
+) -> (PathBuf, PackageAnnounce) {
+    let src_dir = root.join("src-nested");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = src_dir.join("payload.fits");
+    write_fits(&src);
+    let byte_size = std::fs::metadata(&src).unwrap().len();
+    let xxh3 = package::xxh3_full_file(&src).unwrap();
+    let record = ManifestRecord {
+        v: MANIFEST_VERSION,
+        frame_uuid: frame_uuid.to_string(),
+        origin_catalog_uuid: frame_uuid.to_string(),
+        origin_device: decoy_origin_device.to_string(),
+        payload_kind: PayloadKind::RawFrame,
+        rel_path: rel_path.to_string(),
+        byte_size,
+        xxh3,
+        // A full, valid Frame snapshot (the receiver deserializes frame_meta into
+        // `models::Frame`, which requires more than a bare `object`); object is
+        // "M31" for readability but the landing path is driven by `rel_path`.
+        frame_meta: serde_json::to_value(fixture_frame(frame_uuid, "M31", "2026-01-16T10:00:00.000Z")).unwrap(),
+        analysis: None,
+        app_version: "test".to_string(),
+    };
+    let pkg_dir = root.join(format!("pkg-{frame_uuid}"));
+    let announce = package::write_package(&pkg_dir, vec![(src, record)]).unwrap();
+    (pkg_dir, announce)
+}
+
+#[tokio::test]
+async fn ingest_mirrors_rel_path_under_authenticated_peer_slug() {
+    let tmp = TempDir::new().unwrap();
+    let catalog_path = tmp.path().join("catalog.db");
+    let assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+    let sync_dir = tmp.path().join("sync");
+    let incoming = sync_dir.join("incoming");
+    let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+    let net = LoopbackNetwork::new();
+    let sender: Arc<LoopbackTransport> = Arc::new(net.endpoint());
+    let receiver_ep: Arc<LoopbackTransport> = Arc::new(net.endpoint());
+    let receiver_node: NodeId = receiver_ep.node_id();
+    let sender_node: NodeId = sender.node_id();
+    sender.start().await.unwrap();
+    let mut sender_events = sender.events().await;
+
+    let (_info, _handle) = SyncReceiver::spawn(
+        Arc::clone(&store),
+        sync_dir.clone(),
+        fixed_resolver(incoming.clone()),
+        super::allow_all_peers(),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .unwrap();
+
+    // Nested rel_path + a decoy origin_device that must NOT appear in the path.
+    let (pkg_dir, announce) = build_nested_package(
+        tmp.path(),
+        "frame-nested-1",
+        "M31/2026-07-10/lights/L_0001.fits",
+        "deadbeefdeadbeefdeadbeefdeadbeef", // decoy origin_device
+    );
+    sender.serve(&announce, &pkg_dir).await.unwrap();
+    sender.announce(receiver_node, &announce).await.unwrap();
+    let receipts =
+        wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
+    assert!(matches!(receipts[0].outcome, ReceiptOutcome::Ingested));
+
+    // The slug is the authenticated sender node id, sanitized (NOT the decoy).
+    let slug = super::ingest::sanitize_slug(&node_id_hex(&sender_node));
+    let expected = incoming.join(&slug).join("M31/2026-07-10/lights/L_0001.fits");
+    assert!(expected.exists(), "file must mirror rel_path under the peer slug: {}", expected.display());
+
+    // The decoy origin_device must NOT be a folder anywhere under incoming.
+    let decoy_slug = super::ingest::sanitize_slug("deadbeefdeadbeefdeadbeefdeadbeef");
+    assert!(
+        !incoming.join(&decoy_slug).exists(),
+        "manifest-declared origin_device must NOT drive the landing path"
+    );
+
+    // The catalog row points at the mirrored path.
+    let c = assert_db.conn();
+    let path: String = c
+        .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert!(path.ends_with("M31/2026-07-10/lights/L_0001.fits"), "catalog path mirrors rel_path: {path}");
+}
+
+#[test]
+fn sanitize_slug_is_path_safe() {
+    assert_eq!(super::ingest::sanitize_slug("Studio Mac"), "studio-mac");
+    assert_eq!(super::ingest::sanitize_slug("../../etc"), "etc");   // separators/dots → safe
+    assert_eq!(super::ingest::sanitize_slug("a/b\\c:d"), "a-b-c-d");
+    assert_eq!(super::ingest::sanitize_slug(""), "node");
+    assert_eq!(super::ingest::sanitize_slug("!!!"), "node");
+    // hex node id stays hex, capped.
+    let s = super::ingest::sanitize_slug(&"ab".repeat(32));
+    assert!(s.len() <= 24 && s.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
 /// Build a two-frame fixture package (one `pkg_dir`, one announce/`package_id`
@@ -222,13 +332,20 @@ fn ingest_lands_files_and_rows() {
         .unwrap();
     assert_eq!(object.as_deref(), Some("M31"));
 
-    // File landed under <incoming>/<device_short>/<date>/.
+    // File landed under <incoming>/<sender_slug>/<rel_path>. The slug is derived
+    // from the AUTHENTICATED peer node id (PEER_HEX), sanitized — never the
+    // manifest's origin_device — and the sender's tree (here a flat rel_path) is
+    // mirrored verbatim beneath it.
     let landed_path: String = conn
         .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
         .unwrap();
     assert!(Path::new(&landed_path).exists(), "landed file exists on disk");
     assert!(landed_path.contains("incoming"), "under incoming root: {landed_path}");
-    assert!(landed_path.contains("2026-01-15"), "date-bucketed by DATE-OBS: {landed_path}");
+    let slug = super::ingest::sanitize_slug(PEER_HEX);
+    assert!(
+        landed_path.ends_with(&format!("{slug}/L_0001.fits")),
+        "mirrors rel_path under the peer slug: {landed_path}"
+    );
 
     // History + receipt written.
     assert_eq!(
