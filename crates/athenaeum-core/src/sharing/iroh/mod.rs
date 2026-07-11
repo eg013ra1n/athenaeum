@@ -184,6 +184,18 @@ impl IrohTransport {
 
         // Both protocols on one router: blobs for content, our control ALPN for
         // announce/ack. `spawn` registers both ALPNs on the endpoint.
+        //
+        // Finding F5 (accepted residual, LOW): the blobs provider serves any
+        // stored blob to any node that requests it BY HASH. This is not the
+        // exploitable boundary — the real attack (unauthorized *ingestion*) is
+        // blocked receiver-side by the H1 peer-authorization gate in
+        // `sync::receiver`. Pulling a blob additionally requires the collection
+        // `root_hash`, an unguessable BLAKE3 digest transmitted only to the
+        // authorized peer over encrypted QUIC, and served content is released
+        // promptly after ack. iroh-blobs 0.103 does expose a connect-time
+        // `ConnectMode::Intercept` reject hook; wiring a dynamic allow-list into
+        // it is a possible future hardening, deliberately not taken here to keep
+        // the transport free of authorization state (which lives in the host).
         let blobs = BlobsProtocol::new(&store, None);
         let control = SyncControlProtocol {
             event_tx: event_tx.clone(),

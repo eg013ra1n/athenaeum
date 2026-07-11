@@ -371,6 +371,7 @@ async fn ack_replay_from_receipt_log() {
         Arc::clone(&store),
         sync_dir.clone(),
         fixed_resolver(incoming.clone()),
+        super::allow_all_peers(),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -548,6 +549,7 @@ async fn transit_corruption_repaired_then_redelivery_confirms() {
         Arc::clone(&store),
         tmp.path().join("staging_root"),
         fixed_resolver(incoming),
+        super::allow_all_peers(),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -744,6 +746,7 @@ async fn landing_root_is_resolved_live_per_package() {
         Arc::clone(&store),
         staging_root.clone(),
         Arc::clone(&resolver),
+        super::allow_all_peers(),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -788,4 +791,119 @@ async fn wait_until<F: FnMut() -> bool>(mut pred: F, timeout: Duration) {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+// ── H1: receiver-side peer authorization ─────────────────────────────────────
+
+/// H1 (deny): an announce from a peer NOT on the receiver's allow-list is
+/// silently dropped — nothing is fetched, ingested, or landed. Without the gate
+/// the fixture package would ingest one file + one history row.
+#[tokio::test]
+async fn receiver_drops_announce_from_unauthorized_peer() {
+    let tmp = TempDir::new().unwrap();
+    let catalog_path = tmp.path().join("catalog.db");
+    let assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+    let sync_dir = tmp.path().join("sync");
+    let incoming = sync_dir.join("incoming");
+    let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+    let net = LoopbackNetwork::new();
+    let sender: Arc<LoopbackTransport> = Arc::new(net.endpoint());
+    let receiver_ep: Arc<LoopbackTransport> = Arc::new(net.endpoint());
+    let receiver_node: NodeId = receiver_ep.node_id();
+    sender.start().await.unwrap();
+
+    // Allow-list contains a DIFFERENT node, never the actual sender.
+    let allowed_other: NodeId = [9u8; 32];
+    let authorizer: super::PeerAuthorizer = Arc::new(move |id| *id == allowed_other);
+
+    let (_info, _handle) = SyncReceiver::spawn(
+        Arc::clone(&store),
+        sync_dir.clone(),
+        fixed_resolver(incoming.clone()),
+        authorizer,
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .unwrap();
+
+    let (pkg_dir, announce) = build_fixture_package(
+        tmp.path(),
+        "frame-uuid-deny",
+        "L_deny.fits",
+        "M42",
+        "2026-01-16T10:00:00.000Z",
+    );
+    sender.serve(&announce, &pkg_dir).await.unwrap();
+    sender.announce(receiver_node, &announce).await.unwrap();
+
+    // Give the receiver ample time to (wrongly) ingest, then assert it did not.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let c = assert_db.conn();
+    assert_eq!(
+        count(&c, "SELECT COUNT(*) FROM files"),
+        0,
+        "an unauthorized peer's announce must ingest nothing"
+    );
+    assert_eq!(
+        count(&c, "SELECT COUNT(*) FROM sync_history"),
+        0,
+        "a dropped announce writes no history"
+    );
+}
+
+/// H1 (allow): an announce from a peer ON the allow-list ingests normally — the
+/// gate rejects only unauthorized senders, never authorized ones.
+#[tokio::test]
+async fn receiver_ingests_from_authorized_peer() {
+    let tmp = TempDir::new().unwrap();
+    let catalog_path = tmp.path().join("catalog.db");
+    let assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+    let sync_dir = tmp.path().join("sync");
+    let incoming = sync_dir.join("incoming");
+    let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+    let net = LoopbackNetwork::new();
+    let sender: Arc<LoopbackTransport> = Arc::new(net.endpoint());
+    let receiver_ep: Arc<LoopbackTransport> = Arc::new(net.endpoint());
+    let receiver_node: NodeId = receiver_ep.node_id();
+    sender.start().await.unwrap();
+    let mut sender_events = sender.events().await;
+
+    // Allow-list is exactly the real sender.
+    let sender_node: NodeId = sender.node_id();
+    let authorizer: super::PeerAuthorizer = Arc::new(move |id| *id == sender_node);
+
+    let (_info, _handle) = SyncReceiver::spawn(
+        Arc::clone(&store),
+        sync_dir.clone(),
+        fixed_resolver(incoming.clone()),
+        authorizer,
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .unwrap();
+
+    let (pkg_dir, announce) = build_fixture_package(
+        tmp.path(),
+        "frame-uuid-allow",
+        "L_allow.fits",
+        "M42",
+        "2026-01-16T10:00:00.000Z",
+    );
+    sender.serve(&announce, &pkg_dir).await.unwrap();
+    sender.announce(receiver_node, &announce).await.unwrap();
+
+    let receipts =
+        wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
+    assert_eq!(receipts.len(), 1);
+    assert!(matches!(receipts[0].outcome, ReceiptOutcome::Ingested));
+    let c = assert_db.conn();
+    assert_eq!(
+        count(&c, "SELECT COUNT(*) FROM files"),
+        1,
+        "an authorized peer's announce ingests normally"
+    );
 }

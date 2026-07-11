@@ -188,6 +188,100 @@ fn clear_cached_peer(ctx: &ServiceContext) {
     }
 }
 
+// ── authorized inbound peers (finding H1) ────────────────────────────────────
+
+/// This device's hub-assigned id from settings (network-free); `None` signed out.
+fn self_device_id(ctx: &ServiceContext) -> Result<Option<String>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    Ok(crate::db::get_setting(&conn, keys::ACCOUNT_DEVICE_ID)?.filter(|s| !s.is_empty()))
+}
+
+/// Decode a base64 device pubkey (`AccountDevice::pubkey`) into its 64-char
+/// lowercase hex node id — the form the allow-list and the transport compare.
+fn pubkey_b64_to_hex(pubkey_b64: &str) -> Option<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(pubkey_b64)
+        .ok()?;
+    let arr: crate::sharing::types::NodeId = bytes.as_slice().try_into().ok()?;
+    Some(crate::sync::node_id_hex(&arr))
+}
+
+/// Build the receiver's live peer-authorization gate (finding H1). A signed-in
+/// `primary` enforces the cached allow-list (`SYNC_AUTHORIZED_PEERS`), re-read
+/// from settings on **every** announce so a hub refresh takes effect on the next
+/// package. A pure dev-ticket node (no account) has no hub to build a list from,
+/// so it accepts any peer — the dev flag is a developer-only escape hatch.
+///
+/// Fail closed: an account-primary whose cache is empty (never refreshed)
+/// authorizes nobody until [`refresh_authorized_peers`] populates it.
+fn peer_authorizer(ctx: &ServiceContext) -> Result<crate::sync::PeerAuthorizer, ApiError> {
+    if !account_primary_ready(ctx)? {
+        tracing::warn!(
+            "sync receiver has no account allow-list (dev-ticket mode); accepting any peer"
+        );
+        return Ok(crate::sync::allow_all_peers());
+    }
+    let db = db(ctx)?.clone();
+    Ok(Arc::new(move |from: &crate::sharing::types::NodeId| {
+        let hex = crate::sync::node_id_hex(from);
+        let conn = db.conn();
+        match crate::db::get_setting(&conn, keys::SYNC_AUTHORIZED_PEERS) {
+            Ok(Some(raw)) => raw.lines().map(str::trim).any(|line| line == hex),
+            _ => false, // fail closed: no list yet ⇒ authorize nobody
+        }
+    }))
+}
+
+/// Refresh the cached authorized-peer allow-list from the hub device list
+/// (finding H1). Best-effort: on any credential/hub failure the existing cache
+/// is left untouched (a primary that synced before keeps working offline; a
+/// brand-new one authorizes nobody until it can reach the hub — fail closed).
+/// Only capture devices whose `peerDeviceId` is THIS primary are admitted.
+pub async fn refresh_authorized_peers(ctx: &ServiceContext) {
+    if !matches!(account_primary_ready(ctx), Ok(true)) {
+        return;
+    }
+    let Some(self_id) = self_device_id(ctx).ok().flatten() else {
+        return;
+    };
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx).ok().flatten() else {
+        return;
+    };
+    let client = match crate::account::HubClient::new(hub_url) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "authorized-peer refresh: hub client build failed");
+            return;
+        }
+    };
+    let devices = match client.list_devices(&token).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(error = %e, "authorized-peer refresh: device list unavailable; keeping cached set");
+            return;
+        }
+    };
+    let hexes: Vec<String> = devices
+        .iter()
+        .filter(|d| {
+            d.role == Some(crate::account::DeviceRole::Capture)
+                && d.peer_device_id.as_deref() == Some(self_id.as_str())
+        })
+        .filter_map(|d| pubkey_b64_to_hex(&d.pubkey))
+        .collect();
+    if let Ok(db) = db(ctx) {
+        let conn = db.conn();
+        if let Err(e) = crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &hexes.join("\n"))
+        {
+            tracing::warn!(error = %e, "failed to cache authorized peers");
+        } else {
+            tracing::info!(count = hexes.len(), "refreshed authorized capture peers");
+        }
+    }
+}
+
 /// Whether the dev-only default-relay fallback ([`pairing::relay_mode_for`]'s
 /// `allow_default`) is permitted, given whether this device has hub credentials
 /// (`signed_in`) and whether the dev pairing flag is on (`dev_flag`).
@@ -310,7 +404,11 @@ pub async fn autostart_if_enabled(
     // The receiver only listens; it never dials a peer for announce, so the raw
     // relay URLs (needed only to construct a dial hint) are irrelevant here.
     let (relay_mode, _relay_urls) = resolve_relay_mode(ctx).await?;
-    sync.ensure_started(sync_dir, db_path, relay_mode, incoming, emitter)
+    // Populate the authorized-peer allow-list (best-effort) before the receiver
+    // starts accepting, then enforce it live per-package (finding H1).
+    refresh_authorized_peers(ctx).await;
+    let authorized = peer_authorizer(ctx)?;
+    sync.ensure_started(sync_dir, db_path, relay_mode, incoming, authorized, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     Ok(true)
@@ -343,9 +441,14 @@ pub async fn get_pairing_ticket(
     // Same reasoning as `autostart_if_enabled`: the receiver never dials out
     // for announce, so the raw relay URLs are not needed here.
     let (relay_mode, _relay_urls) = resolve_relay_mode(ctx).await?;
+    // Enforce the authorized-peer allow-list here too (finding H1). In pure
+    // dev-ticket mode (no account) this resolves to accept-any; a signed-in
+    // primary that also flips the dev flag still enforces its account list.
+    refresh_authorized_peers(ctx).await;
+    let authorized = peer_authorizer(ctx)?;
 
     let ticket = sync
-        .ensure_started(sync_dir, db_path, relay_mode, incoming, emitter)
+        .ensure_started(sync_dir, db_path, relay_mode, incoming, authorized, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     Ok(ticket)

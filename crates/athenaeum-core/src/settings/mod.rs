@@ -159,6 +159,12 @@ pub mod keys {
     pub const SYNC_CACHED_PEER: &str = "sync.cached_peer_node_id";
     /// Last successfully fetched relay map (newline-separated relay URLs).
     pub const SYNC_CACHED_RELAYS: &str = "sync.cached_relay_map";
+    /// Authorized inbound-sync peers for a primary receiver (finding H1):
+    /// newline-separated 64-char lowercase hex node ids of the capture devices
+    /// paired to THIS primary, refreshed from the hub device list. The receiver
+    /// only ingests announces from a peer on this list. Empty = accept nobody
+    /// (fail closed) until the first successful hub refresh.
+    pub const SYNC_AUTHORIZED_PEERS: &str = "sync.authorized_peer_ids";
 }
 
 /// Runtime overrides for settings (session-specific)

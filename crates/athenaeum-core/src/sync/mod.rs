@@ -73,7 +73,8 @@ pub use pairing::{
 pub use models::{Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState};
 pub use retention::{evaluate_and_apply, DeleteOutcome, RetentionOutcome, RetentionPolicy};
 pub use receiver::{
-    SyncFinishedEvent, SyncProgressEvent, SyncReceiver, SyncReceiverHandle, SyncRuntime,
+    allow_all_peers, IncomingResolver, PeerAuthorizer, SyncFinishedEvent, SyncProgressEvent,
+    SyncReceiver, SyncReceiverHandle, SyncRuntime,
 };
 pub use sender::{StartedSender, SyncSenderRuntime};
 pub use status::{

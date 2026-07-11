@@ -40,6 +40,28 @@ use super::store::CatalogSyncStore;
 /// root from the catalog (see [`crate::api::sync`]); tests inject their own.
 pub type IncomingResolver = Arc<dyn Fn() -> PathBuf + Send + Sync>;
 
+/// Decides whether the peer that sent an announce is authorized to deliver
+/// packages to this receiver (finding H1). Evaluated **live, once per package**
+/// (like [`IncomingResolver`]), so an allow-list / pairing change takes effect on
+/// the next package without a transport restart. Returns `true` to accept the
+/// announce, `false` to silently drop it (no fetch, no ingest, no ack).
+///
+/// The remote node id is already cryptographically authenticated by the
+/// transport (iroh binds it to the peer's ed25519 key); this closure adds the
+/// missing *authorization* — for the app primary, membership in the set of
+/// capture-device pubkeys paired to this device (built by the host from the
+/// account device list, cached for offline starts). Without it, any node that
+/// can dial the endpoint could push files into the catalog and landing folder.
+pub type PeerAuthorizer = Arc<dyn Fn(&NodeId) -> bool + Send + Sync>;
+
+/// A [`PeerAuthorizer`] that accepts every peer. Used by tests and by the
+/// dev-ticket escape hatch (which has no hub to build an allow-list from — it is
+/// a developer-only flag). Production account-mode primaries always build a real
+/// allow-list instead.
+pub fn allow_all_peers() -> PeerAuthorizer {
+    Arc::new(|_| true)
+}
+
 /// `sync-progress` payload: a per-package stage tick (never per-frame — discrete
 /// stages only, per the plan's "notify on outcomes, don't spam progress" rule).
 ///
@@ -114,6 +136,7 @@ impl SyncReceiver {
         store: Arc<CatalogSyncStore>,
         staging_root: PathBuf,
         incoming: IncomingResolver,
+        authorized: PeerAuthorizer,
         transport: Arc<dyn SharingTransport>,
         emitter: Arc<dyn ProgressEmitter>,
     ) -> Result<(StartInfo, SyncReceiverHandle)> {
@@ -127,6 +150,19 @@ impl SyncReceiver {
             tracing::info!(staging_root = %staging_root.display(), "sync receiver online");
             while let Some(ev) = events.recv().await {
                 if let TransportEvent::AnnounceReceived { from, announce } = ev {
+                    // Authorization gate (finding H1): only ingest from a peer on
+                    // this receiver's allow-list. An unauthorized (or revoked)
+                    // node is silently dropped BEFORE any fetch/ingest/ack — it
+                    // never touches the catalog or the landing folder, and gets
+                    // no signal it was even heard.
+                    if !authorized(&from) {
+                        tracing::warn!(
+                            from = %super::node_id_hex(&from),
+                            package_id = %announce.package_id.0,
+                            "sync receiver dropped announce from an unauthorized peer"
+                        );
+                        continue;
+                    }
                     if let Err(e) = handle_announce(
                         &store,
                         &staging_root,
@@ -358,6 +394,7 @@ impl SyncRuntime {
         db_path: PathBuf,
         relay_mode: iroh::RelayMode,
         incoming: IncomingResolver,
+        authorized: PeerAuthorizer,
         emitter: Arc<dyn ProgressEmitter>,
     ) -> Result<String> {
         let mut guard = self.inner.lock().await;
@@ -393,9 +430,15 @@ impl SyncRuntime {
         );
         // Staging lives under the sync dir; the landing root is resolved live per
         // package by the caller-supplied resolver (task 5).
-        let (info, receiver) =
-            SyncReceiver::spawn(store, sync_dir.clone(), incoming, Arc::clone(&transport), emitter)
-                .await?;
+        let (info, receiver) = SyncReceiver::spawn(
+            store,
+            sync_dir.clone(),
+            incoming,
+            authorized,
+            Arc::clone(&transport),
+            emitter,
+        )
+        .await?;
 
         tracing::info!(ticket_len = info.pairing_ticket.len(), "sync runtime started (dev pairing)");
         *guard = Some(Started {

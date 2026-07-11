@@ -48,8 +48,8 @@ use athenaeum_core::services::ServiceContext;
 use athenaeum_core::sharing::loopback::LoopbackNetwork;
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::{
-    node_id_hex, CatalogSyncStore, RetentionPolicy, StartedSender, SyncEngine, SyncReceiver,
-    SyncSenderRuntime, SyncStore,
+    allow_all_peers, node_id_hex, CatalogSyncStore, RetentionPolicy, StartedSender, SyncEngine,
+    SyncReceiver, SyncSenderRuntime, SyncStore,
 };
 use chrono::Utc;
 
@@ -214,6 +214,7 @@ async fn two_instance_sync_e2e() {
         Arc::clone(&primary_store),
         primary_dir.clone(),
         incoming,
+        allow_all_peers(),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
