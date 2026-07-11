@@ -20,6 +20,7 @@
 - **Path/name safety unchanged.** Node names become directory slugs on the receiver via the 2B `sync::ingest::sanitize_slug` (receiver-resolved, never from the package). This plan does not touch that; it only feeds better names in.
 - **Author every commit as `eg013ra1n <vilen.sharifov@gmail.com>`; no Claude co-author/footer.** GitLab `origin` only.
 - **Gates per task:** `cargo build -p <crate>` + the crate's `cargo test` green and warning-free; frontend tasks also `npx tsc --noEmit`. The hub suite is not run here (separate repo, Plan 1).
+- **Perseus is knowingly non-compiling from Task 1 until Task 6.** Task 1's `HubClient::verify` signature change + `AccountDevice.role`/`peer_device_id` removal broke `crates/perseus` (which is migrated in Task 6). Therefore **Tasks 2–5 gate on `cargo build -p athenaeum-core -p athenaeum-tauri -p athenaeum-web` (NOT `--workspace`)** plus the relevant tests/tsc. **Task 6 restores the full `cargo build --workspace`** (it fixes Perseus and deletes the cross-crate role symbols). Do not attempt Perseus fixes before Task 6.
 - **Branch `0.4.0`.** No feature branch; commit directly as the prior 2A/2B tasks did.
 
 ---
