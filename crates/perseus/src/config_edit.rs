@@ -152,6 +152,96 @@ pub fn apply_capture_dirs_edit(config_path: &Path, dirs: &[String]) -> Result<Co
     Ok(cfg)
 }
 
+/// Rewrite the `targets` send list in `config_path` to the array form (the
+/// account devices this node sends captures to, by name or id), preserving all
+/// comments/layout ([`toml_edit`]), then re-parse + validate the whole file and
+/// atomically replace it. Returns the freshly re-validated [`Config`] so the
+/// caller can adopt it into the live web state. Like [`apply_capture_dirs_edit`],
+/// this is **restart-to-apply**: the running engines are bound to their peers at
+/// spawn, so a targets change is picked up by the supervisor's engine relaunch
+/// (which is the window the web page's `restartPending` reports).
+///
+/// Unlike capture dirs, an **empty** list is NOT refused up front: a config with
+/// a dev `pairing_ticket` is a valid send route with zero `targets`. Emptiness is
+/// left to the whole-config re-validate step — an account-only config (no ticket)
+/// with zero targets fails [`Config::validate`]'s "no send target" check and the
+/// edit is rejected with the file left byte-identical (edit-on-copy,
+/// write-after-validate), so a rejected edit never leaves a partial or orphaned
+/// tmp file behind.
+pub fn apply_targets_edit(config_path: &Path, targets: &[String]) -> Result<Config> {
+    let original = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    let mut doc: toml_edit::DocumentMut = original
+        .parse()
+        .with_context(|| format!("parse {}", config_path.display()))?;
+
+    // Write the array form at the document root. `targets` is a top-level key
+    // (not under `[account]`), matching the config contract.
+    let array: toml_edit::Array = targets.iter().map(|t| t.as_str()).collect();
+    doc["targets"] = toml_edit::value(array);
+
+    // Re-parse + validate the ENTIRE edited document before it ever hits disk, so
+    // a selection that leaves no usable send route is rejected with the file
+    // still untouched.
+    let candidate = doc.to_string();
+    let cfg = Config::from_toml_str(&candidate).context("re-parse edited config")?;
+    cfg.validate().context("edited config failed validation")?;
+
+    // Atomic replace: write the validated candidate to a sibling tmp, then rename
+    // over the original. Only reached once validation has passed.
+    let tmp = config_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &candidate)
+        .with_context(|| format!("write tmp config {}", tmp.display()))?;
+    std::fs::rename(&tmp, config_path)
+        .with_context(|| format!("replace config {}", config_path.display()))?;
+
+    tracing::info!(count = targets.len(), "targets edited via web");
+    Ok(cfg)
+}
+
+/// Rewrite this node's `device_name` (its friendly name in the account device
+/// list) in `config_path`, preserving all comments/layout ([`toml_edit`]), then
+/// re-parse + validate the whole file and atomically replace it. Returns the
+/// freshly re-validated [`Config`].
+///
+/// A blank name **removes** the `device_name` key entirely so registration falls
+/// back to the machine-hostname default
+/// ([`athenaeum_core::account::default_device_name`]) — clearing the field in the
+/// UI means "use the hostname", never "register as the empty string". A non-blank
+/// name is written trimmed. Applied live (no engine restart needed — the name
+/// only affects hub registration); the web route additionally best-effort renames
+/// the live hub device. Edit-on-copy, write-after-validate: a rejected edit
+/// leaves the file byte-identical with no orphan tmp.
+pub fn apply_device_name_edit(config_path: &Path, name: &str) -> Result<Config> {
+    let original = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    let mut doc: toml_edit::DocumentMut = original
+        .parse()
+        .with_context(|| format!("parse {}", config_path.display()))?;
+
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        // Clearing the field reverts to the hostname default rather than
+        // registering the device as an empty string.
+        doc.remove("device_name");
+    } else {
+        doc["device_name"] = toml_edit::value(trimmed);
+    }
+
+    let candidate = doc.to_string();
+    let cfg = Config::from_toml_str(&candidate).context("re-parse edited config")?;
+    cfg.validate().context("edited config failed validation")?;
+
+    let tmp = config_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &candidate)
+        .with_context(|| format!("write tmp config {}", tmp.display()))?;
+    std::fs::rename(&tmp, config_path)
+        .with_context(|| format!("replace config {}", config_path.display()))?;
+
+    tracing::info!(device_name = trimmed, "device name edited via web");
+    Ok(cfg)
+}
+
 /// The snake_case TOML string for a [`RetentionPolicy`] variant. Kept in lock-step
 /// with the enum's `#[serde(rename_all = "snake_case")]` so a round-trip through
 /// the file re-parses to the same variant. `pub(crate)` so the web status page
@@ -325,6 +415,94 @@ i_have_verified_the_soak = false
 
         let after = std::fs::read_to_string(&p).unwrap();
         assert_eq!(after, original, "an empty-list reject touches nothing on disk");
+    }
+
+    // ── Task 7 (Sync 2C): targets + device-name editors ──────────────────────
+
+    /// A minimal, ready account-based config over `dir` (used as the capture dir
+    /// so `validate()`'s existence check passes) with one pre-existing target, so
+    /// the config is strictly valid before any edit.
+    fn write_min_config(dir: &Path) -> std::path::PathBuf {
+        let p = dir.join("perseus.toml");
+        let text = format!(
+            "# top comment\ncapture_dirs = [\"{d}\"]\ndata_dir = \"{d}\"\nmode = \"auto\"\ntargets = [\"studio-mac\"]\ndevice_name = \"old-name\"\n[account]\nemail = \"me@example.com\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            d = dir.display()
+        );
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    /// The brief's RED test: a targets edit writes the new list, re-parses, and
+    /// persists to disk so a fresh load returns it.
+    #[test]
+    fn apply_targets_edit_writes_and_reparses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+        let cfg = apply_targets_edit(&path, &["studio-mac".into(), "nas-01".into()]).unwrap();
+        assert_eq!(cfg.targets, vec!["studio-mac".to_string(), "nas-01".to_string()]);
+        // Re-load from disk to prove the write-back persisted + re-parses.
+        let reloaded = Config::load_lenient(&path).unwrap();
+        assert_eq!(reloaded.targets.len(), 2);
+        assert_eq!(reloaded.targets, vec!["studio-mac".to_string(), "nas-01".to_string()]);
+    }
+
+    /// A targets edit preserves unrelated comments/layout (comment-preserving
+    /// write-back), touching only the `targets` array.
+    #[test]
+    fn apply_targets_edit_preserves_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+        apply_targets_edit(&path, &["a".into(), "b".into(), "c".into()]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# top comment"), "top comment preserved: {text}");
+        assert!(text.contains("device_name = \"old-name\""), "unrelated key preserved");
+        assert!(text.contains("\"c\""), "the new array is written");
+    }
+
+    /// Clearing every target on an account-only config (no dev ticket) leaves no
+    /// send route, so the whole-config re-validate rejects the edit and the file
+    /// is left byte-identical (no orphan tmp).
+    #[test]
+    fn apply_targets_edit_empty_on_account_rejected_and_file_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+        let original = std::fs::read_to_string(&path).unwrap();
+        let err = apply_targets_edit(&path, &[]).expect_err("no send route must be rejected");
+        assert!(
+            format!("{err:#}").contains("send target"),
+            "error should name the missing send target: {err:#}"
+        );
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, original, "a rejected edit leaves the file byte-identical");
+        assert!(
+            !path.with_extension("toml.tmp").exists(),
+            "no orphan tmp file after a rejected edit"
+        );
+    }
+
+    /// A device-name edit writes the trimmed name, re-parses, and persists.
+    #[test]
+    fn apply_device_name_edit_writes_and_reparses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+        let cfg = apply_device_name_edit(&path, "  Observatory Pi  ").unwrap();
+        assert_eq!(cfg.device_name.as_deref(), Some("Observatory Pi"), "name is trimmed");
+        let reloaded = Config::load_lenient(&path).unwrap();
+        assert_eq!(reloaded.device_name.as_deref(), Some("Observatory Pi"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# top comment"), "unrelated comment preserved");
+    }
+
+    /// Clearing the device name removes the key entirely so registration falls
+    /// back to the hostname default (never the empty string).
+    #[test]
+    fn apply_device_name_edit_empty_clears_to_hostname_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+        let cfg = apply_device_name_edit(&path, "   ").unwrap();
+        assert!(cfg.device_name.is_none(), "a blank name clears the override");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("device_name"), "the device_name key is removed: {text}");
     }
 
     /// A web edit can never enable live deletion: `dry_run = false` while the

@@ -59,7 +59,10 @@ use athenaeum_core::sync::{
 };
 
 use crate::config::{Config, RetentionConfig};
-use crate::config_edit::{apply_capture_dirs_edit, apply_retention_edit, RetentionEdit};
+use crate::config_edit::{
+    apply_capture_dirs_edit, apply_device_name_edit, apply_retention_edit, apply_targets_edit,
+    RetentionEdit,
+};
 use crate::run::{delete_confirmed_packages, DeleteReport};
 use crate::seen::SeenStore;
 use crate::supervisor::AgentState;
@@ -139,6 +142,10 @@ pub struct WebState {
     /// attach, cleared on detach; `restartPending` is this differing from the
     /// configured set while the engine is running.
     pub running_dirs: RwLock<Vec<PathBuf>>,
+    /// The send-target list the running engines were launched over (Sync 2C).
+    /// Set on attach, cleared on detach; the targets editor's `restartPending`
+    /// is this differing from the configured `targets` while the engine runs.
+    pub running_targets: RwLock<Vec<String>>,
 }
 
 impl WebState {
@@ -168,6 +175,7 @@ impl WebState {
             retention_log: RwLock::new(Arc::new(Mutex::new(VecDeque::new()))),
             device_names: RwLock::new(HashMap::new()),
             running_dirs: RwLock::new(Vec::new()),
+            running_targets: RwLock::new(Vec::new()),
         }
     }
 
@@ -184,6 +192,7 @@ impl WebState {
         retention_log: Arc<Mutex<VecDeque<RetentionRunRecord>>>,
         device_names: HashMap<String, String>,
         running_dirs: Vec<PathBuf>,
+        running_targets: Vec<String>,
     ) {
         *self.engine.write().await = engine;
         *self.peer_device.write().await = peer_device;
@@ -191,6 +200,7 @@ impl WebState {
         *self.retention_log.write().await = retention_log;
         *self.device_names.write().await = device_names;
         *self.running_dirs.write().await = running_dirs;
+        *self.running_targets.write().await = running_targets;
     }
 
     /// Drop the engine-dependent bits as the engine stops (setup lost, restart,
@@ -201,6 +211,7 @@ impl WebState {
         *self.engine.write().await = None;
         *self.peer_device.write().await = String::new();
         *self.running_dirs.write().await = Vec::new();
+        *self.running_targets.write().await = Vec::new();
     }
 }
 
@@ -336,6 +347,11 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         .route(
             "/api/capture-dirs",
             get(api_get_capture_dirs).put(api_put_capture_dirs),
+        )
+        .route("/api/targets", get(api_get_targets).put(api_put_targets))
+        .route(
+            "/api/device-name",
+            get(api_get_device_name).put(api_put_device_name),
         )
         .route("/api/delete", post(api_delete))
         .route("/api/retry", post(api_retry))
@@ -823,6 +839,152 @@ async fn api_put_capture_dirs(
     Ok(Json(capture_dirs_dto(&state).await))
 }
 
+/// `GET`/`PUT /api/targets` payload. `configured` is the send-target list in the
+/// live config (`perseus.toml`, freshly rewritten by a PUT); `runtime` is the
+/// list the running engines were actually spawned over. They diverge exactly in
+/// the window after an edit is saved and before the supervisor has relaunched the
+/// engines over the new targets — `restartPending` is that difference (ordered
+/// compare), so the page shows an honest "applying…" note that clears itself once
+/// the relaunched engines report `runtime == configured` again. Mirrors
+/// [`CaptureDirsDto`] (targets are likewise restart-to-apply — bound at spawn).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetsDto {
+    configured: Vec<String>,
+    runtime: Vec<String>,
+    restart_pending: bool,
+}
+
+/// `PUT /api/targets` request body: the new send-target selection.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetsEdit {
+    targets: Vec<String>,
+}
+
+/// Build the current [`TargetsDto`] from live state: `configured` from the
+/// (possibly just-edited) config, `runtime` from the spawn-time snapshot, and
+/// `restartPending` = the two differ as ordered lists.
+async fn targets_dto(state: &WebState) -> TargetsDto {
+    let configured = state.config.read().await.targets.clone();
+    let runtime = state.running_targets.read().await.clone();
+    let restart_pending = configured != runtime;
+    TargetsDto {
+        configured,
+        runtime,
+        restart_pending,
+    }
+}
+
+/// `GET /api/targets` — the configured vs. running send targets and whether a
+/// restart is pending. Read-only; never touches disk.
+async fn api_get_targets(State(state): State<Arc<WebState>>) -> Json<TargetsDto> {
+    Json(targets_dto(&state).await)
+}
+
+/// `PUT /api/targets` — rewrite `perseus.toml`'s `targets` list (comment-preserving,
+/// re-validated, atomic), then adopt it into the live config and ring the
+/// supervisor. The running engines keep their spawn-time targets, so
+/// [`WebState::running_targets`] is intentionally **not** touched here — that gap
+/// is what makes the returned `restartPending` true. The wake lets the supervisor
+/// apply the edit live: it reloads config each pass and restarts the engines when
+/// `running_targets != configured`, so no operator-driven process restart is
+/// needed and the pending state clears itself once the engines relaunch.
+///
+/// [`apply_targets_edit`] writes on an in-memory copy and only swaps it in after
+/// re-validation, so a rejected edit (a selection that leaves no usable send
+/// route) leaves the file byte-identical and returns `422`.
+async fn api_put_targets(
+    State(state): State<Arc<WebState>>,
+    Json(edit): Json<TargetsEdit>,
+) -> Result<Json<TargetsDto>, (StatusCode, String)> {
+    let new_cfg = apply_targets_edit(&state.config_path, &edit.targets).map_err(|e| {
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web targets edit rejected");
+        (StatusCode::UNPROCESSABLE_ENTITY, msg)
+    })?;
+    // The file was already rewritten. Adopt the new config so `configured`
+    // reflects the edit; the runtime snapshot stays as-is, surfacing the
+    // restart-pending state.
+    *state.config.write().await = new_cfg;
+    state.supervisor_wake.notify_one();
+    Ok(Json(targets_dto(&state).await))
+}
+
+/// `GET`/`PUT /api/device-name` payload. `deviceName` is the explicit
+/// `perseus.toml` override (`None` → the hostname default is used). On a PUT,
+/// `hubError` carries a best-effort live-hub-rename problem (a duplicate name, or
+/// an unreachable hub) — the LOCAL edit always succeeds regardless, so the UI
+/// surfaces `hubError` as a warning rather than a failure.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceNameDto {
+    device_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hub_error: Option<String>,
+}
+
+/// `PUT /api/device-name` request body: the new friendly name (blank clears the
+/// override back to the hostname default).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceNameEdit {
+    name: String,
+}
+
+/// `GET /api/device-name` — the current `device_name` override (never the
+/// hostname default; `None` means "use the hostname"). Read-only.
+async fn api_get_device_name(State(state): State<Arc<WebState>>) -> Json<DeviceNameDto> {
+    let device_name = state.config.read().await.device_name.clone();
+    Json(DeviceNameDto {
+        device_name,
+        hub_error: None,
+    })
+}
+
+/// `PUT /api/device-name` — rewrite `perseus.toml`'s `device_name`
+/// (comment-preserving, re-validated, atomic) and adopt it live, then
+/// **best-effort** rename the live hub device so the account device list updates
+/// without waiting for the next sign-in.
+///
+/// The local config edit is authoritative: a `409` duplicate name from the hub or
+/// an unreachable hub does NOT fail the request — the name is already saved
+/// locally and re-syncs on the next registration. The hub problem is surfaced in
+/// `hubError` (a `409` message, or the transport error) so the UI can warn. A
+/// rejected local edit (no send route, etc.) still returns `422` with the file
+/// left byte-identical. `device_name` is not engine-bound, so no restart is
+/// needed; the supervisor is woken so re-registration picks up the new name.
+async fn api_put_device_name(
+    State(state): State<Arc<WebState>>,
+    Json(edit): Json<DeviceNameEdit>,
+) -> Result<Json<DeviceNameDto>, (StatusCode, String)> {
+    let new_cfg = apply_device_name_edit(&state.config_path, &edit.name).map_err(|e| {
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web device-name edit rejected");
+        (StatusCode::UNPROCESSABLE_ENTITY, msg)
+    })?;
+    let device_name = new_cfg.device_name.clone();
+    *state.config.write().await = new_cfg.clone();
+
+    // Best-effort live hub rename (no-op when not signed in). A duplicate name or
+    // an unreachable hub is surfaced, not fatal — the local edit stands.
+    let hub_error = match crate::account::rename_hub_device(&new_cfg).await {
+        crate::account::HubRenameOutcome::Renamed(_) | crate::account::HubRenameOutcome::Skipped => {
+            None
+        }
+        crate::account::HubRenameOutcome::Duplicate(msg) => Some(msg),
+        crate::account::HubRenameOutcome::Unreachable(msg) => {
+            Some(format!("saved locally, but the hub could not be updated: {msg}"))
+        }
+    };
+    // Re-registration (next sign-in / supervisor pass) picks up the local name.
+    state.supervisor_wake.notify_one();
+    Ok(Json(DeviceNameDto {
+        device_name,
+        hub_error,
+    }))
+}
+
 /// `POST /api/delete` — delete the source capture files of the given CONFIRMED
 /// packages. Verifies each id is `confirmed` before touching disk; non-confirmed
 /// / unknown ids come back in `rejected` with a reason. Shares the same
@@ -1137,6 +1299,7 @@ mod tests {
             retention_log: RwLock::new(Arc::new(Mutex::new(VecDeque::new()))),
             device_names: RwLock::new(HashMap::new()),
             running_dirs: RwLock::new(config.capture_dirs_resolved()),
+            running_targets: RwLock::new(config.targets.clone()),
         });
         (state, tmp)
     }
@@ -1340,6 +1503,149 @@ mod tests {
             StatusCode::OK,
             "loopback (no token) needs no auth"
         );
+    }
+
+    // ── Task 7 (Sync 2C): targets + device-name editors ──────────────────────
+
+    /// `PUT /api/targets` rewrites `perseus.toml`, adopts the new list live, and
+    /// reports `restartPending` (the running engines still hold their spawn-time
+    /// targets). A fresh `GET` reflects the edit and the file on disk carries it.
+    #[tokio::test]
+    async fn targets_put_writes_adopts_and_flags_restart_pending() {
+        let (state, tmp) = test_state().await;
+        let app = build_router(state, None);
+
+        let body = serde_json::json!({ "targets": ["studio", "nas"] });
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/targets")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["configured"], serde_json::json!(["studio", "nas"]));
+        assert_eq!(
+            v["restartPending"], true,
+            "the engines still run over the old (empty) targets until relaunch"
+        );
+
+        // The on-disk config carries the new targets.
+        let text = std::fs::read_to_string(tmp.path().join("perseus.toml")).unwrap();
+        assert!(text.contains("targets"), "targets written to disk: {text}");
+        assert!(text.contains("\"nas\""));
+
+        // A follow-up GET reflects the adopted config.
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/targets")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(res).await;
+        assert_eq!(v["configured"], serde_json::json!(["studio", "nas"]));
+    }
+
+    /// `PUT /api/targets` with an empty list is ALLOWED when a dev pairing ticket
+    /// is the send route (unlike capture dirs, targets are not always required) —
+    /// it validates and returns `200`.
+    #[tokio::test]
+    async fn targets_put_empty_allowed_with_ticket_route() {
+        let (state, _tmp) = test_state().await; // sample config has a pairing_ticket
+        let app = build_router(state, None);
+        let body = serde_json::json!({ "targets": [] });
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/targets")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "empty targets is valid when a pairing ticket provides the send route"
+        );
+    }
+
+    /// `PUT /api/device-name` writes the trimmed name, adopts it live, and — when
+    /// not signed in — makes no hub call, so `hubError` is absent. `GET` then
+    /// reflects it.
+    #[tokio::test]
+    async fn device_name_put_writes_and_no_hub_error_when_signed_out() {
+        let (state, tmp) = test_state().await; // sample config has no [account]
+        let app = build_router(state, None);
+
+        let body = serde_json::json!({ "name": "  Observatory Pi  " });
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/device-name")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["deviceName"], "Observatory Pi", "name trimmed + saved");
+        assert!(v.get("hubError").is_none(), "no hub call when signed out: {v}");
+
+        let text = std::fs::read_to_string(tmp.path().join("perseus.toml")).unwrap();
+        assert!(text.contains("device_name = \"Observatory Pi\""), "written to disk: {text}");
+
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/device-name")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let v = body_json(res).await;
+        assert_eq!(v["deviceName"], "Observatory Pi");
+    }
+
+    /// Clearing the device name via `PUT` removes the override (blank → hostname
+    /// default): `deviceName` comes back `null` and the key is gone from disk.
+    #[tokio::test]
+    async fn device_name_put_blank_clears_override() {
+        let (state, tmp) = test_state().await;
+        let app = build_router(state, None);
+        let body = serde_json::json!({ "name": "   " });
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/device-name")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert!(v["deviceName"].is_null(), "a blank name clears the override: {v}");
+        let text = std::fs::read_to_string(tmp.path().join("perseus.toml")).unwrap();
+        assert!(!text.contains("device_name"), "the key is removed from disk: {text}");
     }
 
     // ── M2: DNS-rebinding Host guard ─────────────────────────────────────────

@@ -10,14 +10,16 @@
 //!   0600 file in `data_dir` (never the TOML), and this device registers itself
 //!   with the [`DeviceCapability::Perseus`] capability. There is no per-account
 //!   "primary" to pair to — that one-primary model is gone.
-//! - [`resolve_pairing`] — the run-time resolution the [`crate::run::Agent`]
-//!   uses: it resolves the first configured target to a [`NodeId`] (from the hub
+//! - [`resolve_targets`] — the run-time resolution the [`crate::run::Agent`]
+//!   uses: it resolves **every** configured target to a [`NodeId`] (from the hub
 //!   device list, matched by id then name, pubkey → node id) and pairs the hub
-//!   relay map (with an offline cache fallback). Task 6 resolves `targets[0]`;
-//!   the full multi-target send is task 7. Falling back to iroh's public default
-//!   relays requires the dev-only `[account].allow_default_relays` opt-in
-//!   (default `false`) — otherwise an empty/unreachable relay map with no cache
-//!   is a loud, actionable error.
+//!   relay map (with an offline cache fallback). Targets are independent — a bad
+//!   or send-only target is skipped with a `warn!`, and only a resolution that
+//!   yields zero peers errors. The [`crate::run::Agent`] spawns one sync engine
+//!   per resolved target and fans each built package out to all of them. Falling
+//!   back to iroh's public default relays requires the dev-only
+//!   `[account].allow_default_relays` opt-in (default `false`) — otherwise an
+//!   empty/unreachable relay map with no cache is a loud, actionable error.
 //! - [`PairingCache`] — the persisted `perseus login` result + last successful
 //!   resolutions (`data_dir/pairing_cache.json`), so an offline restart still
 //!   resolves. The token is NOT in it (that is the 0600 [`TokenStore`] file).
@@ -49,9 +51,17 @@ pub struct PairingCache {
     #[serde(default)]
     pub device_id: Option<String>,
     /// Last successfully resolved target peer node id (64-char lowercase hex).
-    /// Task 6 tracks the single `targets[0]` peer here for offline restarts.
+    /// Legacy single-target field (Task 6); superseded by [`target_peers`] for
+    /// the multi-target send (Task 7). Retained `#[serde(default)]` so an old
+    /// cache file still parses; no longer written.
     #[serde(default)]
     pub peer_node_id_hex: Option<String>,
+    /// target string (device name or id, as written in `config.targets`) → last
+    /// successfully resolved peer node id (64-char lowercase hex). Refreshed on
+    /// every live resolution and consulted as the per-target offline fallback
+    /// when the hub is unreachable (Task 7 multi-target send).
+    #[serde(default)]
+    pub target_peers: HashMap<String, String>,
     /// Last successfully resolved relay URLs.
     #[serde(default)]
     pub relay_urls: Vec<String>,
@@ -95,24 +105,39 @@ impl PairingCache {
     }
 }
 
-/// The resolved sync peer + relays for one agent start.
-#[derive(Debug)]
-pub struct ResolvedPairing {
+/// One resolved send target: the peer to send to plus how to attach its dial
+/// hint. In the Sync 2C mesh model Perseus fans each built package out to every
+/// configured target, one [`SyncEngine`](athenaeum_core::sync::SyncEngine) per
+/// target ([`ResolvedTargets`]).
+#[derive(Debug, Clone)]
+pub struct ResolvedTarget {
     /// The peer to send to.
     pub peer: NodeId,
-    /// The relay mode the transport should bind with.
-    pub relay_mode: RelayMode,
     /// `Some` only on the dev-ticket path — the caller registers the peer's
-    /// dialable address from this ticket (the account path resolves by node id).
+    /// dialable address from this ticket. `None` on the account path (a bare node
+    /// id: the caller attaches the shared relay map as the dial hint instead).
     pub ticket: Option<String>,
-    /// The raw relay URLs `relay_mode` was built from (fix-review, production
-    /// bug: account-mode dial failure). On the account path (`ticket = None`)
-    /// the caller must attach these to the peer's `EndpointAddr`
-    /// ([`pairing::peer_addr_with_relays`]) before `add_peer` — a bare node id
-    /// is undialable with `IrohTransport`'s discovery-free preset. Whatever
-    /// `resolve_relays` resolved (fresh from the hub, or the offline cache
-    /// fallback) ends up here, so the cached-relay offline start dials
-    /// correctly too, with no extra plumbing.
+}
+
+/// All resolved send targets + the shared relay map for one agent start.
+///
+/// The relay map is shared across targets (account devices on one hub publish the
+/// same relay set), so it is resolved once; the per-target peer is what differs.
+#[derive(Debug)]
+pub struct ResolvedTargets {
+    /// Every configured target that resolved to a peer. Guaranteed non-empty
+    /// (resolution errors if ZERO targets resolve). A target that is a Perseus
+    /// capture agent or fails to resolve is skipped with a `warn!`, never
+    /// aborting the whole set.
+    pub targets: Vec<ResolvedTarget>,
+    /// The relay mode every target's transport should bind with.
+    pub relay_mode: RelayMode,
+    /// The raw relay URLs `relay_mode` was built from. On the account path each
+    /// target is a bare node id: the caller attaches these to the peer's
+    /// `EndpointAddr` ([`pairing::peer_addr_with_relays`]) before `add_peer` — a
+    /// bare node id is undialable with `IrohTransport`'s discovery-free preset.
+    /// Whatever `resolve_relays` resolved (fresh from the hub, or the offline
+    /// cache fallback) ends up here, so the cached-relay offline start dials too.
     pub relay_urls: Vec<String>,
 }
 
@@ -288,18 +313,18 @@ pub fn account_status(config: &Config) -> AccountStatus {
     }
 }
 
-/// Resolve the peer + relays for an agent start.
+/// Resolve **every** configured send target + the shared relay map for an agent
+/// start (Sync 2C multi-target send).
 ///
-/// Order (Sync 2C): account send target (signed in → resolve `targets[0]` from
-/// the hub device list, with the cached peer as the offline fallback) → dev
-/// ticket → error. Task 6 resolves the FIRST configured target only; the full
-/// multi-target send is task 7. A successful account resolution refreshes the
-/// offline cache (`peer_node_id_hex` + relay map).
+/// Order: account send targets (signed in → resolve each entry in `config.targets`
+/// from the hub device list, with the cached per-target peer as the offline
+/// fallback) → dev ticket (a single target) → error. A successful account
+/// resolution refreshes the offline cache (`target_peers` + relay map).
 ///
-/// The peer is resolved FIRST and a failure bails immediately, before the relay
-/// map is resolved — there is no point spending a second hub round trip on
-/// relays when there is nothing to sync to yet.
-pub async fn resolve_pairing(config: &Config) -> Result<ResolvedPairing> {
+/// The targets are resolved FIRST and a total failure bails immediately, before
+/// the relay map is resolved — there is no point spending a second hub round trip
+/// on relays when there is nothing to sync to yet.
+pub async fn resolve_targets(config: &Config) -> Result<ResolvedTargets> {
     let mut cache = PairingCache::load(&config.data_dir);
 
     // Signed in? (an [account] table AND a stored device token.)
@@ -316,16 +341,27 @@ pub async fn resolve_pairing(config: &Config) -> Result<ResolvedPairing> {
         .map(str::trim)
         .filter(|t| !t.is_empty());
 
-    // Resolve the peer: account target[0] when signed in, else the dev ticket.
-    // `relay_account` carries the (hub_url, token) the relay map is fetched with
-    // — `None` on the ticket path (an account-less ticket run is dev/test).
-    let (peer, ticket, relay_account) = if let Some((account, token)) = &account_token {
-        let peer = resolve_target_peer(config, account, token, &mut cache).await?;
-        (peer, None, Some((account.hub_url.clone(), token.clone())))
+    // Resolve the targets: every account target when signed in, else the dev
+    // ticket (a single target). `relay_account` carries the (hub_url, token) the
+    // relay map is fetched with — `None` on the ticket path (an account-less
+    // ticket run is dev/test).
+    let (targets, relay_account) = if let Some((account, token)) = &account_token {
+        let peers = resolve_all_target_peers(config, account, token, &mut cache).await?;
+        let targets = peers
+            .into_iter()
+            .map(|peer| ResolvedTarget { peer, ticket: None })
+            .collect();
+        (targets, Some((account.hub_url.clone(), token.clone())))
     } else if let Some(t) = dev_ticket {
         let peer = crate::run::peer_node_id_from_ticket(t)
             .context("derive the sync peer from the dev pairing ticket")?;
-        (peer, Some(t.to_string()), None)
+        (
+            vec![ResolvedTarget {
+                peer,
+                ticket: Some(t.to_string()),
+            }],
+            None,
+        )
     } else {
         bail!(
             "cannot resolve a send target — sign in and add at least one entry to \
@@ -356,85 +392,116 @@ pub async fn resolve_pairing(config: &Config) -> Result<ResolvedPairing> {
     };
 
     cache.save(&config.data_dir);
-    Ok(ResolvedPairing {
-        peer,
+    Ok(ResolvedTargets {
+        targets,
         relay_mode,
-        ticket,
         relay_urls: relays.urls.clone(),
     })
 }
 
-/// Resolve the first configured send target to its peer [`NodeId`].
+/// Resolve every configured send target to its peer [`NodeId`], in order.
 ///
-/// The target string is matched against the account device list by **id first,
-/// then name**, and the matched device's pubkey is decoded to a node id. A
-/// Perseus capability device is refused as a target (capture agents are
-/// send-only and cannot receive). When the hub is unreachable, the last cached
-/// peer is used as an offline fallback; with no cache this is an actionable
+/// Each target string is matched against the account device list by **id first,
+/// then name**, and the matched device's pubkey is decoded to a node id. Per
+/// spec §8 the targets are **independent**: a target that is a Perseus capture
+/// agent (send-only, cannot receive), that is not in the device list, or whose
+/// pubkey cannot be decoded is **skipped with a `warn!`** — it never aborts the
+/// whole set. Only a resolution that yields ZERO peers is a hard error.
+///
+/// When the hub is unreachable, each target falls back to its last cached peer
+/// (`target_peers`); with no cached peer for any target this is an actionable
 /// error rather than a silent no-peer start. On a live resolution the cache's
-/// `peer_node_id_hex` + friendly-name map are refreshed.
-///
-/// Task 6 resolves only `targets[0]`; the multi-target send loop is task 7.
-async fn resolve_target_peer(
+/// `target_peers` + friendly-name map are refreshed.
+async fn resolve_all_target_peers(
     config: &Config,
     account: &AccountConfig,
     token: &str,
     cache: &mut PairingCache,
-) -> Result<NodeId> {
-    let target = config
+) -> Result<Vec<NodeId>> {
+    let target_strings: Vec<String> = config
         .targets
         .iter()
-        .map(|t| t.trim())
-        .find(|t| !t.is_empty())
-        .ok_or_else(|| {
-            anyhow!("no send target configured — add at least one device to `targets`")
-        })?;
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if target_strings.is_empty() {
+        bail!("no send target configured — add at least one device to `targets`");
+    }
 
     let client = HubClient::new(&account.hub_url).map_err(|e| anyhow!("{e}"))?;
     match client.list_devices(token).await {
         Ok(devices) => {
             cache.device_names = device_names_from(&devices);
-            // Match by id first, then by name (either spelling is a valid target).
-            let device = devices
-                .iter()
-                .find(|d| d.id == target)
-                .or_else(|| devices.iter().find(|d| d.name == target))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "send target '{target}' was not found in your account device list — \
-                         check the device name or id"
-                    )
-                })?;
-            if device.capability == DeviceCapability::Perseus {
+            let mut peers = Vec::new();
+            let mut resolved_target_peers = HashMap::new();
+            for target in &target_strings {
+                // Match by id first, then by name (either spelling is valid).
+                let Some(device) = devices
+                    .iter()
+                    .find(|d| &d.id == target)
+                    .or_else(|| devices.iter().find(|d| &d.name == target))
+                else {
+                    tracing::warn!(
+                        target = %target,
+                        "send target not found in the account device list; skipping"
+                    );
+                    continue;
+                };
+                if device.capability == DeviceCapability::Perseus {
+                    tracing::warn!(
+                        target = %target,
+                        "send target is a Perseus capture agent (send-only, cannot receive); skipping"
+                    );
+                    continue;
+                }
+                match pairing::node_id_from_pubkey_b64(&device.pubkey) {
+                    Ok(peer) => {
+                        resolved_target_peers.insert(target.clone(), node_id_hex(&peer));
+                        peers.push(peer);
+                        tracing::info!(target = %target, "resolved send target from account device list");
+                    }
+                    Err(error) => tracing::warn!(
+                        target = %target,
+                        %error,
+                        "could not decode the send target's pubkey; skipping"
+                    ),
+                }
+            }
+            // Refresh the offline per-target cache with exactly what resolved.
+            cache.target_peers = resolved_target_peers;
+            if peers.is_empty() {
                 bail!(
-                    "send target '{target}' is a Perseus capture agent — capture agents are \
-                     send-only and cannot receive frames; choose a full Athenaeum device"
+                    "none of the configured send targets could be resolved — check the \
+                     device names/ids in `targets` (each must be a full Athenaeum device \
+                     in your account, not a Perseus capture agent)"
                 );
             }
-            let peer = pairing::node_id_from_pubkey_b64(&device.pubkey)
-                .with_context(|| format!("decode pubkey for send target '{target}'"))?;
-            cache.peer_node_id_hex = Some(node_id_hex(&peer));
-            tracing::info!(target = %target, "resolved send target from account device list");
-            Ok(peer)
+            Ok(peers)
         }
         Err(error) => {
-            // Hub unreachable: fall back to the last cached target peer, if any.
-            if let Some(peer) = cache
-                .peer_node_id_hex
-                .as_deref()
-                .and_then(|s| node_id_from_hex(s).ok())
-            {
-                tracing::warn!(
-                    target = %target,
-                    %error,
-                    "could not reach the hub to resolve the send target; using last cached peer"
-                );
-                return Ok(peer);
+            // Hub unreachable: fall back to each target's last cached peer.
+            let mut peers = Vec::new();
+            for target in &target_strings {
+                if let Some(peer) = cache
+                    .target_peers
+                    .get(target)
+                    .and_then(|s| node_id_from_hex(s).ok())
+                {
+                    peers.push(peer);
+                }
             }
-            bail!(
-                "could not reach the hub to resolve send target '{target}', and there is no \
-                 cached peer yet: {error}"
+            if peers.is_empty() {
+                bail!(
+                    "could not reach the hub to resolve the send targets, and there is no \
+                     cached peer for any of them yet: {error}"
+                );
+            }
+            tracing::warn!(
+                resolved = peers.len(),
+                %error,
+                "could not reach the hub to resolve send targets; using cached target peers"
             );
+            Ok(peers)
         }
     }
 }
@@ -483,6 +550,77 @@ fn device_name(config: &Config, key: &DeviceKey) -> String {
         .device_name
         .clone()
         .unwrap_or_else(|| default_device_name("perseus", &key.node_id_hex()))
+}
+
+/// The outcome of a best-effort live hub device rename after a local
+/// `device_name` edit (Task 7 web editor).
+#[derive(Debug)]
+pub enum HubRenameOutcome {
+    /// No hub call was made — not signed in, or no hub device id recorded yet.
+    /// The local config edit is the whole story.
+    Skipped,
+    /// The hub accepted the rename to this effective name.
+    Renamed(String),
+    /// The hub rejected the name as a duplicate of another active device in the
+    /// account. The local edit still stands; the message is surfaced to the UI so
+    /// the operator can pick another name.
+    Duplicate(String),
+    /// The hub was unreachable or errored. Logged (`warn!`), non-fatal — the
+    /// local edit stands and the next sign-in/registration re-syncs the name.
+    Unreachable(String),
+}
+
+/// Best-effort push of this node's (post-edit) effective device name to the hub,
+/// so a rename from the web page takes effect on the live account device list
+/// without waiting for the next sign-in. The effective name is the explicit
+/// `config.device_name` override or, when it was cleared, the hostname default
+/// ([`device_name`]).
+///
+/// A no-op ([`HubRenameOutcome::Skipped`]) when not signed in or no hub device id
+/// is known yet. A `409` from the hub maps to [`HubRenameOutcome::Duplicate`]
+/// (surfaced to the UI); any other hub/transport error maps to
+/// [`HubRenameOutcome::Unreachable`] and is `warn!`-logged but never fatal — the
+/// local config edit is authoritative and re-syncs on the next registration.
+pub async fn rename_hub_device(config: &Config) -> HubRenameOutcome {
+    use athenaeum_core::account::AccountClientError;
+
+    let Some(account) = &config.account else {
+        return HubRenameOutcome::Skipped;
+    };
+    let token = match token_store(config, account).load() {
+        Ok(Some(t)) => t,
+        _ => return HubRenameOutcome::Skipped,
+    };
+    let Some(device_id) = PairingCache::load(&config.data_dir).device_id else {
+        return HubRenameOutcome::Skipped;
+    };
+
+    // The effective name to register: the explicit override, or the hostname
+    // default when the field was cleared. Reuses the exact key the run-time
+    // transport binds, so the name matches what a fresh sign-in would send.
+    let key = match DeviceKey::load_or_create(&config.device_key_path()) {
+        Ok(k) => k,
+        Err(error) => return HubRenameOutcome::Unreachable(format!("device key: {error:#}")),
+    };
+    let name = device_name(config, &key);
+
+    let client = match HubClient::new(&account.hub_url) {
+        Ok(c) => c,
+        Err(error) => return HubRenameOutcome::Unreachable(error.to_string()),
+    };
+    match client.rename_device(&token, &device_id, &name).await {
+        Ok(()) => {
+            tracing::info!(device_id = %device_id, "hub device renamed");
+            HubRenameOutcome::Renamed(name)
+        }
+        Err(AccountClientError::DuplicateName) => HubRenameOutcome::Duplicate(format!(
+            "the name \"{name}\" is already used by another device in your account — choose another"
+        )),
+        Err(error) => {
+            tracing::warn!(%error, "could not reach the hub to rename this device; the local name still applies");
+            HubRenameOutcome::Unreachable(error.to_string())
+        }
+    }
 }
 
 /// Read one trimmed line from stdin after printing `label` (login prompts).
@@ -768,11 +906,11 @@ mod tests {
         sign_out(&config).unwrap(); // second call must not error
     }
 
-    /// Sync 2C: run-time resolution matches `targets[0]` against the hub device
+    /// Sync 2C: run-time resolution matches each target against the hub device
     /// list (by name here), decodes the device pubkey to the peer node id,
     /// resolves the relay map, and caches both for the next offline start.
     #[tokio::test]
-    async fn resolve_pairing_resolves_target_peer_and_relays() {
+    async fn resolve_targets_resolves_target_peer_and_relays() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         // A real device key gives us a pubkey the resolver must decode back to a
@@ -803,23 +941,106 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let resolved = resolve_pairing(&config).await.expect("resolution succeeds");
-        assert_eq!(resolved.peer, target_node, "peer decodes from the target's pubkey");
-        assert!(resolved.ticket.is_none(), "account path resolves by node id, not a ticket");
+        let resolved = resolve_targets(&config).await.expect("resolution succeeds");
+        assert_eq!(resolved.targets.len(), 1, "one configured target resolves to one peer");
+        assert_eq!(resolved.targets[0].peer, target_node, "peer decodes from the target's pubkey");
+        assert!(resolved.targets[0].ticket.is_none(), "account path resolves by node id, not a ticket");
         assert!(
             matches!(resolved.relay_mode, RelayMode::Custom(_)),
             "the hub relay map yields a custom relay mode"
         );
 
-        // Offline cache was refreshed with both the peer and the relay map.
+        // Offline cache was refreshed with the per-target peer and the relay map.
         let cache = PairingCache::load(tmp.path());
-        assert_eq!(cache.peer_node_id_hex, Some(node_id_hex(&target_node)));
+        assert_eq!(cache.target_peers.get("Studio").map(String::as_str), Some(node_id_hex(&target_node).as_str()));
         assert_eq!(cache.relay_urls, vec!["https://relay1.example.org".to_string()]);
+    }
+
+    /// Sync 2C: every configured target resolves to its own peer, in order — the
+    /// multi-target send fans a built package out to all of them (Task 7).
+    #[tokio::test]
+    async fn resolve_targets_resolves_every_configured_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let key_a = DeviceKey::load_or_create_in(&tmp.path().join("a")).unwrap();
+        let key_b = DeviceKey::load_or_create_in(&tmp.path().join("b")).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                device_json("studio-1", "Studio", &key_a.pubkey_base64(), "athenaeum"),
+                device_json("nas-1", "NAS", &key_b.pubkey_base64(), "athenaeum"),
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/relay-map"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "relays": ["https://relay1.example.org"]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = account_config(tmp.path(), &server.uri(), &["Studio", "NAS"]);
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+
+        let resolved = resolve_targets(&config).await.expect("both targets resolve");
+        assert_eq!(resolved.targets.len(), 2, "both configured targets resolve");
+        assert_eq!(resolved.targets[0].peer, key_a.node_id(), "first target order preserved");
+        assert_eq!(resolved.targets[1].peer, key_b.node_id(), "second target order preserved");
+
+        // Both peers cached per target for the next offline start.
+        let cache = PairingCache::load(tmp.path());
+        assert_eq!(cache.target_peers.len(), 2);
+        assert_eq!(cache.target_peers.get("Studio").map(String::as_str), Some(node_id_hex(&key_a.node_id()).as_str()));
+        assert_eq!(cache.target_peers.get("NAS").map(String::as_str), Some(node_id_hex(&key_b.node_id()).as_str()));
+    }
+
+    /// Sync 2C: targets are independent (spec §8) — a send-only Perseus target is
+    /// skipped, but a good target alongside it still resolves. A skipped bad
+    /// target must never drop the whole set.
+    #[tokio::test]
+    async fn resolve_targets_skips_bad_target_but_keeps_good() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let good = DeviceKey::load_or_create_in(&tmp.path().join("good")).unwrap();
+        let bad = DeviceKey::load_or_create_in(&tmp.path().join("bad")).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                device_json("studio-1", "Studio", &good.pubkey_base64(), "athenaeum"),
+                device_json("cam-1", "CaptureCam", &bad.pubkey_base64(), "perseus"),
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/relay-map"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "relays": ["https://relay1.example.org"]
+            })))
+            .mount(&server)
+            .await;
+
+        // Also include a target that is not in the device list at all — likewise
+        // skipped without aborting the set.
+        let config = account_config(tmp.path(), &server.uri(), &["Studio", "CaptureCam", "Ghost"]);
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+
+        let resolved = resolve_targets(&config).await.expect("the good target still resolves");
+        assert_eq!(resolved.targets.len(), 1, "only the good target resolves; the rest are skipped");
+        assert_eq!(resolved.targets[0].peer, good.node_id());
     }
 
     /// Sync 2C: a target given by device **id** (not name) also resolves.
     #[tokio::test]
-    async fn resolve_pairing_matches_target_by_id() {
+    async fn resolve_targets_matches_target_by_id() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let target_key = DeviceKey::load_or_create_in(&tmp.path().join("target")).unwrap();
@@ -846,14 +1067,15 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let resolved = resolve_pairing(&config).await.expect("resolution by id succeeds");
-        assert_eq!(resolved.peer, target_node, "matched the target by its device id");
+        let resolved = resolve_targets(&config).await.expect("resolution by id succeeds");
+        assert_eq!(resolved.targets.len(), 1);
+        assert_eq!(resolved.targets[0].peer, target_node, "matched the target by its device id");
     }
 
-    /// Sync 2C: a `perseus` capability device is refused as a target — capture
-    /// agents are send-only and cannot receive frames.
+    /// Sync 2C: a lone `perseus` capability target is skipped (send-only, cannot
+    /// receive), leaving ZERO resolved targets → an actionable error.
     #[tokio::test]
-    async fn resolve_pairing_rejects_perseus_target() {
+    async fn resolve_targets_only_perseus_target_errors() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let other_key = DeviceKey::load_or_create_in(&tmp.path().join("other")).unwrap();
@@ -872,19 +1094,19 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let err = resolve_pairing(&config)
+        let err = resolve_targets(&config)
             .await
-            .expect_err("a perseus target must be refused");
+            .expect_err("a lone perseus target leaves zero resolved");
         assert!(
-            format!("{err:#}").contains("send-only"),
-            "error should explain a capture agent cannot receive: {err:#}"
+            format!("{err:#}").contains("could be resolved"),
+            "error should explain none of the targets resolved: {err:#}"
         );
     }
 
-    /// Sync 2C: a target that is not in the account device list is an actionable
-    /// error (no silent no-peer start).
+    /// Sync 2C: a lone target not in the account device list is skipped, leaving
+    /// zero resolved → an actionable error (no silent no-peer start).
     #[tokio::test]
-    async fn resolve_pairing_unknown_target_errors() {
+    async fn resolve_targets_only_unknown_target_errors() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let server = MockServer::start().await;
@@ -901,19 +1123,19 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let err = resolve_pairing(&config)
+        let err = resolve_targets(&config)
             .await
-            .expect_err("an unknown target must error");
+            .expect_err("a lone unknown target leaves zero resolved");
         assert!(
-            format!("{err:#}").contains("was not found"),
-            "error should say the target was not found: {err:#}"
+            format!("{err:#}").contains("could be resolved"),
+            "error should say none of the targets resolved: {err:#}"
         );
     }
 
     /// Sync 2C: with the hub unreachable, resolution falls back to the cached
-    /// target peer + relay map (offline start) rather than failing.
+    /// per-target peer + relay map (offline start) rather than failing.
     #[tokio::test]
-    async fn resolve_pairing_offline_uses_cache() {
+    async fn resolve_targets_offline_uses_cache() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         // A hub that errors every call (no mounts → 404).
@@ -924,15 +1146,17 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        // Seed the cache as a prior successful resolution.
+        // Seed the cache as a prior successful resolution — the target string
+        // "Studio" maps to a cached peer for the offline fallback.
         let cached_node = [11u8; 32];
         let mut cache = PairingCache::default();
-        cache.peer_node_id_hex = Some(node_id_hex(&cached_node));
+        cache.target_peers.insert("Studio".to_string(), node_id_hex(&cached_node));
         cache.relay_urls = vec!["https://relay-cached.example.org".into()];
         cache.save(tmp.path());
 
-        let resolved = resolve_pairing(&config).await.expect("offline resolution uses cache");
-        assert_eq!(resolved.peer, cached_node, "an unreachable hub falls back to the cached peer");
+        let resolved = resolve_targets(&config).await.expect("offline resolution uses cache");
+        assert_eq!(resolved.targets.len(), 1);
+        assert_eq!(resolved.targets[0].peer, cached_node, "an unreachable hub falls back to the cached peer");
         assert!(
             matches!(resolved.relay_mode, RelayMode::Custom(_)),
             "the cached relay map is used offline"
@@ -943,7 +1167,7 @@ mod tests {
     /// and there is no cached relay map — without the dev-only opt-in this must
     /// be an actionable error, NOT a silent fallback to iroh's public relays.
     #[tokio::test]
-    async fn resolve_pairing_empty_relay_map_no_optin_errors() {
+    async fn resolve_targets_empty_relay_map_no_optin_errors() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let target_key = DeviceKey::load_or_create_in(&tmp.path().join("target")).unwrap();
@@ -966,7 +1190,7 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let err = resolve_pairing(&config)
+        let err = resolve_targets(&config)
             .await
             .expect_err("an empty hub relay map with no cache and no opt-in must be refused");
         assert!(
@@ -979,7 +1203,7 @@ mod tests {
     /// `[account].allow_default_relays = true` — the dev-only opt-in allows
     /// falling back to iroh's public default relays.
     #[tokio::test]
-    async fn resolve_pairing_empty_relay_map_with_optin_uses_default() {
+    async fn resolve_targets_empty_relay_map_with_optin_uses_default() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let target_key = DeviceKey::load_or_create_in(&tmp.path().join("target")).unwrap();
@@ -1002,16 +1226,16 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let resolved = resolve_pairing(&config)
+        let resolved = resolve_targets(&config)
             .await
             .expect("the dev-only opt-in must allow the default-relay fallback");
         assert!(matches!(resolved.relay_mode, RelayMode::Default));
     }
 
-    /// Sync 2C: the dev-ticket route still resolves a peer with no account — the
-    /// offline dev/test path is unchanged by the targets migration.
+    /// Sync 2C: the dev-ticket route still resolves a single peer with no account
+    /// — the offline dev/test path is unchanged by the targets migration.
     #[tokio::test]
-    async fn resolve_pairing_dev_ticket_without_account() {
+    async fn resolve_targets_dev_ticket_without_account() {
         use athenaeum_core::sharing::iroh::{random_secret, BlobStore, IrohTransport};
         use athenaeum_core::sharing::SharingTransport;
 
@@ -1030,8 +1254,12 @@ mod tests {
         config.account = None;
         config.pairing_ticket = Some(info.pairing_ticket);
 
-        let resolved = resolve_pairing(&config).await.expect("dev ticket resolves a peer");
-        assert_eq!(resolved.peer, ticket_node, "peer comes from the pairing ticket");
-        assert!(resolved.ticket.is_some(), "the ticket is carried through for add_peer_ticket");
+        let resolved = resolve_targets(&config).await.expect("dev ticket resolves a peer");
+        assert_eq!(resolved.targets.len(), 1, "the dev ticket is a single target");
+        assert_eq!(resolved.targets[0].peer, ticket_node, "peer comes from the pairing ticket");
+        assert!(
+            resolved.targets[0].ticket.is_some(),
+            "the ticket is carried through for add_peer_ticket"
+        );
     }
 }

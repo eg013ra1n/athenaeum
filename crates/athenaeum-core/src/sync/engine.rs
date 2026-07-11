@@ -281,10 +281,21 @@ impl Worker {
             .context("start sync transport")?;
         let mut events = self.transport.events().await;
 
-        // Crash-resume: re-drive every non-terminal row left by a prior engine.
+        // Crash-resume: re-drive the non-terminal rows left by a prior engine —
+        // but ONLY the ones bound to THIS engine's peer. The store is shared
+        // (Perseus fans one package out to N per-target engines over one
+        // `perseus.db`; the app holds one engine per peer over one catalog store),
+        // so `non_terminal()` returns rows for every peer. An engine re-driving
+        // another peer's row would announce that package to the WRONG peer and let
+        // its own ack confirm a row destined elsewhere — cross-delivery + a
+        // corrupted per-peer confirmation. Scoping the resume to `row.peer ==
+        // self.peer` keeps each engine's recovery to its own outbound rows.
         match self.store.non_terminal() {
             Ok(rows) => {
                 for row in rows {
+                    if row.peer != self.peer {
+                        continue;
+                    }
                     let dir = PathBuf::from(&row.package_ref);
                     if let Err(e) = self.start_package(row.id, dir, row.state).await {
                         tracing::error!(package_id = row.id, error = %e, "resume re-announce failed");

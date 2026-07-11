@@ -983,3 +983,59 @@ async fn empty_ack_does_not_confirm() {
 
     engine.shutdown().await;
 }
+
+// ── Sync 2C (Task 7): shared store, per-target engines ────────────────────────
+
+/// Crash-resume must be **peer-scoped**. Perseus fans one package out to N
+/// per-target engines over a single shared `perseus.db`, so `non_terminal()`
+/// returns rows for every peer. An engine bound to peer A that re-drove peer B's
+/// row on startup would announce B's package to A (wrong peer) and let A's ack
+/// confirm a row destined for B. This seeds two Queued rows (one per peer) into
+/// one store, spawns ONE engine bound to peer A, and asserts only A's row is
+/// re-driven to Confirmed while B's row is left untouched.
+#[tokio::test]
+async fn crash_resume_only_redrives_its_own_peers_rows() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // Two receivers on one network: peer A acks everything; peer B is present
+    // (so its id is dialable) but its row must never be driven by A's engine.
+    let receiver_a = Arc::new(net.endpoint());
+    let receiver_a_id = receiver_a.start().await.unwrap().node_id;
+    let _stats_a = spawn_receiver(receiver_a.clone(), tmp.path().join("recv_a"));
+    let receiver_b = Arc::new(net.endpoint());
+    let receiver_b_id = receiver_b.start().await.unwrap().node_id;
+    let _stats_b = spawn_receiver(receiver_b.clone(), tmp.path().join("recv_b"));
+
+    let pkg_a = build_package(&tmp.path().join("src_a"), "uuid-a", "a.fits", "M42", 2048);
+    let pkg_b = build_package(&tmp.path().join("src_b"), "uuid-b", "b.fits", "M31", 2048);
+
+    // Seed both rows directly (as a prior multi-engine run would have left them),
+    // each bound to its own peer.
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let id_a = store.enqueue(&pkg_a.to_string_lossy(), receiver_a_id).unwrap();
+    let id_b = store.enqueue(&pkg_b.to_string_lossy(), receiver_b_id).unwrap();
+
+    // ONE engine, bound to peer A only.
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_a_id,
+    );
+
+    wait_until(
+        || state_of(&store, id_a) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+
+    // B's row was never A's to drive: it stays exactly as seeded (Queued),
+    // never announced to A, never confirmed.
+    assert_eq!(
+        state_of(&store, id_b),
+        Some(OutboundState::Queued),
+        "an engine must not re-drive another peer's outbound row"
+    );
+
+    engine.shutdown().await;
+}

@@ -94,6 +94,16 @@
           </div>
         </div>
         <div class="flash" id="acctFlash"></div>
+        <!-- Device name (Sync 2C): this node's friendly name in the account
+             device list. Blank = the hostname default. Saving best-effort renames
+             the live hub device; a duplicate name is surfaced but the local name
+             is still saved. -->
+        <div class="row" style="margin-top:0.75rem; border-top:1px solid var(--border); padding-top:0.75rem;">
+          <input id="devName" placeholder="(hostname default)" size="24" autocomplete="off" />
+          <button id="devNameSave" class="ghost">Save name</button>
+          <span class="muted">this node's name in your account</span>
+        </div>
+        <div class="flash" id="devNameFlash"></div>
       </section>
 
       <!-- Lifecycle banner, rendered from /api/status: hidden while running
@@ -125,6 +135,25 @@
           <button id="cdSave">Save</button>
         </div>
         <div class="flash" id="cdFlash"></div>
+      </section>
+
+      <!-- Send targets (Sync 2C): the account devices this node sends captures
+           to, by device name or id. Mirrors the capture-dirs editor; a save is
+           restart-to-apply (the engines are bound to their peers at spawn), so a
+           saved edit shows an inline "applying…" note until the engines relaunch. -->
+      <section id="targets-sec">
+        <h2>Send Targets</h2>
+        <div class="muted" style="margin:-0.25rem 0 0.5rem;">Account devices this node sends captures to, by device name or id. Perseus is send-only.</div>
+        <div class="tablewrap"><table>
+          <thead><tr><th>target</th><th></th></tr></thead>
+          <tbody id="tgList"></tbody>
+        </table></div>
+        <div class="row" style="margin-top:0.5rem;">
+          <input id="tgAddInput" placeholder="device name or id" size="30" />
+          <button id="tgAdd" class="ghost">Add</button>
+          <button id="tgSave">Save</button>
+        </div>
+        <div class="flash" id="tgFlash"></div>
       </section>
 
       <section id="sent">
@@ -461,6 +490,83 @@
       $('cdAddInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addCaptureDir(); });
       $('cdSave').addEventListener('click', saveCaptureDirs);
 
+      // ── Send targets (restart-to-apply, mirrors capture dirs) ───────────────
+      // `tgWorking` is the local editable list, loaded on page load and re-synced
+      // after each Save; the Add/Remove buttons mutate it in place. Targets are
+      // bound at engine spawn, so a save is restart-to-apply — the flash reports
+      // "restarting…" while the server's restartPending holds.
+      let tgWorking = [];
+
+      function renderTargets() {
+        const tb = $('tgList');
+        tb.innerHTML = tgWorking.length
+          ? tgWorking.map((t, i) => `<tr><td class="mono">${esc(t)}</td><td><button class="ghost" data-tgrm="${i}">Remove</button></td></tr>`).join('')
+          : '<tr><td colspan="2" class="empty">no send targets — add at least one (or use a dev pairing ticket)</td></tr>';
+        document.querySelectorAll('[data-tgrm]').forEach((b) => b.addEventListener('click', () => {
+          tgWorking.splice(Number(b.dataset.tgrm), 1);
+          renderTargets();
+        }));
+      }
+
+      async function loadTargets() {
+        try {
+          const c = await getJson('/api/targets');
+          tgWorking = c.configured.slice();
+          renderTargets();
+        } catch (e) { const f = $('tgFlash'); f.textContent = 'load failed: ' + e.message; f.className = 'flash err'; }
+      }
+
+      function addTarget() {
+        const v = $('tgAddInput').value.trim();
+        if (!v) return;
+        tgWorking.push(v);
+        $('tgAddInput').value = '';
+        renderTargets();
+      }
+
+      async function saveTargets() {
+        const f = $('tgFlash');
+        try {
+          const r = await api('/api/targets', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ targets: tgWorking }) });
+          if (r.status === 422) { f.textContent = 'rejected: ' + (await r.text()); f.className = 'flash err'; return; }
+          if (!r.ok) throw new Error(await r.text());
+          const c = await r.json();
+          tgWorking = c.configured.slice();
+          renderTargets();
+          f.textContent = c.restartPending ? 'saved — restarting the sync engine to apply' : 'saved';
+          f.className = 'flash ok';
+        } catch (e) { f.textContent = 'save failed: ' + e.message; f.className = 'flash err'; }
+      }
+
+      $('tgAdd').addEventListener('click', addTarget);
+      $('tgAddInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addTarget(); });
+      $('tgSave').addEventListener('click', saveTargets);
+
+      // ── Device name (this node's name in the account) ───────────────────────
+      async function loadDeviceName() {
+        try {
+          const d = await getJson('/api/device-name');
+          // Never clobber the field while the operator is typing in it.
+          if (document.activeElement !== $('devName')) $('devName').value = d.deviceName || '';
+        } catch (e) { /* offline surfaced by refreshStatus() */ }
+      }
+
+      async function saveDeviceName() {
+        const f = $('devNameFlash');
+        try {
+          const r = await api('/api/device-name', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: $('devName').value }) });
+          if (r.status === 422) { f.textContent = 'rejected: ' + (await r.text()); f.className = 'flash err'; return; }
+          if (!r.ok) throw new Error(await r.text());
+          const d = await r.json();
+          $('devName').value = d.deviceName || '';
+          if (d.hubError) { f.textContent = d.hubError; f.className = 'flash err'; }
+          else { f.textContent = d.deviceName ? 'saved' : 'saved — using the hostname default'; f.className = 'flash ok'; }
+        } catch (e) { f.textContent = 'save failed: ' + e.message; f.className = 'flash err'; }
+      }
+
+      $('devNameSave').addEventListener('click', saveDeviceName);
+      $('devName').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveDeviceName(); });
+
       // ── Account (email → OTP sign-in) ───────────────────────────────────────
       // Two visual states from /api/account. Errors surface inline in the shared
       // #acctFlash (the page's .flash.err helper), never a blocking dialog. The
@@ -475,9 +581,9 @@
         $('acctSignedOut').style.display = inGate ? 'none' : '';
         if (inGate) {
           $('acctSignedInEmail').textContent = a.email || '(signed in)';
-          $('acctPrimary').textContent = a.primaryName
-            ? 'paired to ' + a.primaryName
-            : (a.primaryDeviceId ? 'paired to ' + shortHex(a.primaryDeviceId) : 'no primary device paired yet');
+          // Sync 2C mesh model: no per-account "primary" — show this node's own
+          // hub device id instead (send targets live in their own editor).
+          $('acctPrimary').textContent = a.deviceId ? 'device id ' + shortHex(a.deviceId) : '';
           // Reset the two-click sign-out to its resting state.
           $('acctSignOut').style.display = '';
           $('acctSignOutConfirm').style.display = 'none';
@@ -563,10 +669,11 @@
       $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchHistory(); });
       $('saveRet').addEventListener('click', savePolicy);
 
-      // Initial load; poll status + sent + retention log every 2 s. History and
-      // the policy form are on demand (the form is not clobbered while editing).
-      loadPolicy(); searchHistory(); loadCaptureDirs(); refreshAccount();
-      function tick() { refreshStatus(); refreshSent(); refreshLog(); refreshAccount(); }
+      // Initial load; poll status + sent + retention log every 2 s. History, the
+      // policy form, the targets list and the device-name field are on demand /
+      // load-once (not clobbered while editing).
+      loadPolicy(); searchHistory(); loadCaptureDirs(); loadTargets(); loadDeviceName(); refreshAccount();
+      function tick() { refreshStatus(); refreshSent(); refreshLog(); refreshAccount(); loadDeviceName(); }
       tick(); setInterval(tick, 2000);
     </script>
   </body>

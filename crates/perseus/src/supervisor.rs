@@ -207,9 +207,13 @@ fn spawn_with(
     let wake2 = Arc::clone(&wake);
     let task = tokio::spawn(async move {
         let mut agent: Option<Box<dyn ManagedAgent>> = None;
-        // The capture-dir set the running agent was launched for; a divergence
-        // from the freshly-read config triggers a restart.
+        // The capture-dir set AND the send-target list the running agent was
+        // launched for; a divergence from the freshly-read config in EITHER
+        // triggers a restart. Targets are bound to their peers when the engines
+        // are spawned, so a targets edit is restart-to-apply just like a
+        // capture-dir edit.
         let mut running_dirs: Vec<PathBuf> = vec![];
+        let mut running_targets: Vec<String> = vec![];
         // When set and still in the future, the loop stays in `Failed` (no
         // relaunch) until this instant elapses.
         let mut backoff_until: Option<Instant> = None;
@@ -244,19 +248,25 @@ fn spawn_with(
                     on_agent(None);
                     let _ = a.stop().await;
                     running_dirs.clear();
+                    running_targets.clear();
                 }
                 let _ = state_tx.send(AgentState::NeedsSetup {
                     needs: needs.iter().map(|n| n.to_string()).collect(),
                 });
-            } else if agent.is_some() && running_dirs != configured {
-                // Ready, but the capture-dir set changed under a running engine:
-                // stop it and relaunch on the very next pass (bounded fast path —
-                // no wait between the stop and the relaunch).
-                tracing::info!("capture dirs changed; restarting engine");
+            } else if agent.is_some()
+                && (running_dirs != configured || running_targets != config.targets)
+            {
+                // Ready, but the capture-dir set OR the send-target list changed
+                // under a running engine: stop it and relaunch on the very next
+                // pass (bounded fast path — no wait between the stop and the
+                // relaunch). Both are bound at engine-spawn time, so either change
+                // is restart-to-apply.
+                tracing::info!("capture dirs or targets changed; restarting engine");
                 let a = agent.take().unwrap();
                 on_agent(None);
                 let _ = a.stop().await;
                 running_dirs.clear();
+                running_targets.clear();
                 continue;
             } else if agent.is_none() {
                 // Ready and nothing running: launch, unless we're still inside a
@@ -269,6 +279,7 @@ fn spawn_with(
                         Ok(a) => {
                             on_agent(Some(a.as_ref()));
                             running_dirs = configured.clone();
+                            running_targets = config.targets.clone();
                             let n = a.in_flight().unwrap_or(0) as u32;
                             agent = Some(a);
                             backoff_until = None;
@@ -441,10 +452,17 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
                     let retention_tx = agent.retention_tx();
                     let retention_log = agent.retention_log();
                     let device_names = PairingCache::load(&data_dir).device_names;
-                    // The dirs the engine was launched over — read from the same
-                    // config file the launcher just used (authoritative, sync).
-                    let running_dirs = Config::load_lenient(&attach_config_path)
+                    // The dirs + targets the engine was launched over — read from
+                    // the same config file the launcher just used (authoritative,
+                    // sync). Both back the web editors' `restartPending`.
+                    let launched = Config::load_lenient(&attach_config_path);
+                    let running_dirs = launched
+                        .as_ref()
                         .map(|c| c.capture_dirs_resolved())
+                        .unwrap_or_default();
+                    let running_targets = launched
+                        .as_ref()
+                        .map(|c| c.targets.clone())
                         .unwrap_or_default();
                     tokio::spawn(async move {
                         ws.attach(
@@ -454,6 +472,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
                             retention_log,
                             device_names,
                             running_dirs,
+                            running_targets,
                         )
                         .await;
                     });
@@ -786,6 +805,74 @@ mod tests {
             "on_agent: attach, detach (restart), attach"
         );
         drop(created);
+        handle.shutdown().await;
+    }
+
+    /// Sync 2C (Task 7): a change to the send-target list under a running engine
+    /// restarts it — targets are bound to their peers at engine-spawn, so a
+    /// targets edit is restart-to-apply, exactly like a capture-dir edit.
+    #[tokio::test]
+    async fn config_edit_restarts_on_targets_change() {
+        let data = tempfile::tempdir().unwrap();
+        let cap = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("perseus.toml");
+        // Ready via the dev ticket (so readiness is independent of an account
+        // token), plus an explicit target list we then change.
+        let write = |targets: &str| {
+            write_config_atomic(
+                &cfg_path,
+                &format!(
+                    "data_dir = \"{}\"\nmode = \"auto\"\ncapture_dirs = [\"{}\"]\npairing_ticket = \"t\"\ntargets = [{}]\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+                    data.path().display(),
+                    cap.path().display(),
+                    targets
+                ),
+            );
+        };
+        write("\"studio\"");
+
+        let (launcher, lstate) = fake_launcher(vec![Behavior::Launch(0), Behavior::Launch(0)], 0);
+        let (on_agent, _seen) = recording_on_agent();
+        let handle = spawn(cfg_path.clone(), launcher, fast_opts(), on_agent);
+        let mut state = handle.state.clone();
+
+        tokio::time::timeout(T, state.wait_for(|s| s.label() == "running"))
+            .await
+            .expect("first launch never reached Running")
+            .unwrap();
+        assert_eq!(lstate.calls.load(Ordering::SeqCst), 1);
+
+        // Add a second target, then prod the supervisor to re-read.
+        write("\"studio\", \"nas\"");
+        handle.wake.notify_one();
+
+        tokio::time::timeout(T, async {
+            loop {
+                if state.changed().await.is_err() {
+                    break;
+                }
+                if lstate.calls.load(Ordering::SeqCst) >= 2
+                    && matches!(&*state.borrow(), AgentState::Running { .. })
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("targets change never restarted the engine");
+
+        assert_eq!(
+            lstate.calls.load(Ordering::SeqCst),
+            2,
+            "the targets change must trigger a second launch"
+        );
+        assert!(
+            lstate.created.lock().unwrap()[0]
+                .stopped
+                .load(Ordering::SeqCst),
+            "the old agent must be stopped on a targets change"
+        );
         handle.shutdown().await;
     }
 

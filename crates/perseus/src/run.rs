@@ -1,11 +1,17 @@
-//! The running agent: durable sync store, iroh transport, sync engine, and the
-//! capture watcher wired together.
+//! The running agent: durable sync store, one iroh transport + sync engine **per
+//! configured send target**, and the capture watcher wired together (Sync 2C
+//! multi-target send).
 //!
-//! [`Agent`] is transport-injectable. Production ([`Agent::start`]) builds an
-//! [`IrohTransport`] from a persisted device key and derives the peer node id
-//! from the pairing ticket. Tests ([`Agent::start_with_transport`]) inject an
-//! in-process loopback transport and a known peer, exercising the exact same
-//! enqueue/package/engine path without a network.
+//! [`Agent`] is transport-injectable. Production ([`Agent::start`]) resolves every
+//! target ([`crate::account::resolve_targets`]) and builds one [`IrohTransport`]
+//! (each with its own `blobs_out_<peer>` store dir) + one [`SyncEngine`] per
+//! target, all sharing the one durable store. The enqueue pipeline builds each
+//! package ONCE and fans it out to every engine — a per-target failure is
+//! `warn!`-logged and never drops the others (spec §8). Tests
+//! ([`Agent::start_with_transport`] for a single target,
+//! [`Agent::start_with_transports`] for N) inject in-process loopback transports
+//! and known peers, exercising the exact same enqueue/package/engine path without
+//! a network.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -273,14 +279,29 @@ fn parse_frame(path: &Path) -> Result<athenaeum_core::models::Frame> {
     }
 }
 
-/// A running capture agent. Owns the sync engine, the durable store, the
-/// stat-aware seen store, and (optionally) the capture watcher + its enqueue
-/// consumer.
+/// One resolved send target's running engine: the peer it sends to plus the
+/// [`SyncEngine`] bound to it. Perseus fans each built package out to every
+/// [`TargetEngine`] (Sync 2C multi-target send), one engine + transport per
+/// target, all sharing the one durable [`StandaloneSyncStore`].
+struct TargetEngine {
+    /// The peer this engine sends to. Retained for diagnostics + to derive the
+    /// audit `peer_device` (the engine itself already owns it).
+    peer: NodeId,
+    engine: Arc<SyncEngineHandle>,
+}
+
+/// A running capture agent. Owns one sync engine **per configured target**, the
+/// durable store, the stat-aware seen store, and (optionally) the capture watcher
+/// + its enqueue consumer.
 pub struct Agent {
     config: Config,
     store: Arc<StandaloneSyncStore>,
     seen: Arc<SeenStore>,
-    engine: Arc<SyncEngineHandle>,
+    /// One engine per resolved send target (Sync 2C). Always non-empty: target
+    /// resolution errors before an agent is built if zero targets resolve, and
+    /// the injection seams require at least one transport. The enqueue pipeline
+    /// builds each package once and fans it out to every engine here.
+    engines: Vec<TargetEngine>,
     origin_device: String,
     /// The configured sync peer id (hex) — the same value transfer history rows
     /// carry. Threaded into retention/manual-delete audit rows so a deleted
@@ -326,51 +347,60 @@ impl Agent {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
 
-        // Resolve the peer + relay map before binding the transport: account
-        // pairing when signed in (offline cache fallback), else the dev ticket.
-        let resolved = crate::account::resolve_pairing(&config).await?;
+        // Resolve EVERY send target + the shared relay map before binding any
+        // transport: account resolution when signed in (offline per-target cache
+        // fallback), else the dev ticket (a single target).
+        let resolved = crate::account::resolve_targets(&config).await?;
 
         let secret = load_or_create_device_key(&config.device_key_path())?;
 
-        let transport = IrohTransport::new(
-            secret,
-            resolved.relay_mode,
-            BlobStore::Fs(config.data_dir.clone()),
-        )
-        .await
-        .context("build iroh transport")?;
-        // On the ticket path, register the peer's full dialable address from the
-        // ticket (it embeds relay + direct addresses). On the account path the
-        // peer is a bare node id: `IrohTransport` has NO discovery services
-        // (`presets::Minimal`, task A5), so without a dial hint `announce`
-        // fails instantly with "No addressing information available"
-        // (fix-review, production bug). Attach our own resolved relay URL(s) —
-        // the same ones this endpoint itself binds with — as the peer's dial
-        // hint; account devices on the same hub share the same published relay
-        // set, so this is the correct minimal hint, no separate address
-        // exchange needed.
-        if let Some(ticket) = &resolved.ticket {
-            transport
-                .add_peer_ticket(ticket)
-                .context("register peer address from pairing ticket")?;
-        } else {
-            let peer_addr = athenaeum_core::sync::pairing::peer_addr_with_relays(
-                resolved.peer,
-                &resolved.relay_urls,
-            )
-            .context("construct account-resolved peer address")?;
-            transport.add_peer(peer_addr);
+        // One transport + engine per resolved target. Each transport gets its OWN
+        // blob store directory, keyed by the target's node id, so the per-target
+        // `redb` blob stores never collide on their exclusive directory lock.
+        let mut node_id: Option<NodeId> = None;
+        let mut transports: Vec<(NodeId, Arc<dyn SharingTransport>)> = Vec::new();
+        for target in &resolved.targets {
+            let blob_dir = config
+                .data_dir
+                .join(format!("blobs_out_{}", node_id_hex(&target.peer)));
+            let transport =
+                IrohTransport::new(secret, resolved.relay_mode.clone(), BlobStore::Fs(blob_dir))
+                    .await
+                    .context("build iroh transport")?;
+            // On the ticket path, register the peer's full dialable address from
+            // the ticket (it embeds relay + direct addresses). On the account
+            // path the peer is a bare node id: `IrohTransport` has NO discovery
+            // services (`presets::Minimal`, task A5), so without a dial hint
+            // `announce` fails instantly with "No addressing information
+            // available" (fix-review, production bug). Attach our own resolved
+            // relay URL(s) — the same ones this endpoint itself binds with — as
+            // the peer's dial hint; account devices on the same hub share the
+            // same published relay set, so this is the correct minimal hint.
+            if let Some(ticket) = &target.ticket {
+                transport
+                    .add_peer_ticket(ticket)
+                    .context("register peer address from pairing ticket")?;
+            } else {
+                let peer_addr = athenaeum_core::sync::pairing::peer_addr_with_relays(
+                    target.peer,
+                    &resolved.relay_urls,
+                )
+                .context("construct account-resolved peer address")?;
+                transport.add_peer(peer_addr);
+            }
+            node_id.get_or_insert_with(|| transport.node_id());
+            tracing::info!(
+                node_id = %node_id_hex(&transport.node_id()),
+                peer = %node_id_hex(&target.peer),
+                "iroh transport ready"
+            );
+            transports.push((target.peer, Arc::new(transport)));
         }
-        let peer = resolved.peer;
-        let node_id = transport.node_id();
-        tracing::info!(
-            node_id = %node_id_hex(&node_id),
-            peer = %node_id_hex(&peer),
-            "iroh transport ready"
-        );
+        // `resolve_targets` guarantees at least one target resolved, so `node_id`
+        // is always set here.
+        let node_id = node_id.expect("resolve_targets yields at least one transport");
 
-        let transport: Arc<dyn SharingTransport> = Arc::new(transport);
-        let agent = Self::start_with_transport(config, transport, peer, node_id, watch).await?;
+        let agent = Self::start_with_transports(config, transports, node_id, watch).await?;
         // The embedded web status page is no longer bound here: its ownership
         // moved to the supervisor (Task 4), which attaches `WebState` to the
         // running engine via its `on_agent` seam. `bind_and_spawn_web` stays
@@ -378,9 +408,9 @@ impl Agent {
         Ok(agent)
     }
 
-    /// Start an agent over a caller-supplied transport + peer. This is the
+    /// Start an agent over a SINGLE caller-supplied transport + peer. This is the
     /// injection seam the e2e test uses to run against a loopback transport; the
-    /// production path routes through here after building the iroh transport.
+    /// single-target case delegates to [`start_with_transports`].
     #[doc(hidden)]
     pub async fn start_with_transport(
         config: Config,
@@ -389,8 +419,31 @@ impl Agent {
         node_id: NodeId,
         watch: bool,
     ) -> Result<Self> {
+        Self::start_with_transports(config, vec![(peer, transport)], node_id, watch).await
+    }
+
+    /// Start an agent over N caller-supplied `(peer, transport)` pairs — one sync
+    /// engine per target, all sharing the one durable store, and the enqueue
+    /// pipeline fanning each built package out to all of them (Sync 2C
+    /// multi-target send). The production path ([`start`](Self::start)) routes
+    /// through here after building one iroh transport per resolved target; tests
+    /// inject loopback transports.
+    ///
+    /// `transports` must be non-empty (there is always at least one target); the
+    /// first pair's peer is used to derive the audit `peer_device`.
+    #[doc(hidden)]
+    pub async fn start_with_transports(
+        config: Config,
+        transports: Vec<(NodeId, Arc<dyn SharingTransport>)>,
+        node_id: NodeId,
+        watch: bool,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
+        anyhow::ensure!(
+            !transports.is_empty(),
+            "an agent needs at least one send target"
+        );
 
         let store = Arc::new(
             StandaloneSyncStore::open(config.db_path())
@@ -402,15 +455,29 @@ impl Agent {
             SeenStore::open(config.db_path())
                 .with_context(|| format!("open seen store {}", config.db_path().display()))?,
         );
-        let engine = Arc::new(SyncEngine::spawn(
-            Arc::clone(&store) as Arc<dyn SyncStore>,
-            transport,
-            peer,
-        ));
+        // One engine per target, all over the single shared store. The engine's
+        // crash-resume is peer-scoped (core `sync::engine`), so N engines on one
+        // store re-drive only their own outbound rows.
+        let engines: Vec<TargetEngine> = transports
+            .into_iter()
+            .map(|(peer, transport)| TargetEngine {
+                peer,
+                engine: Arc::new(SyncEngine::spawn(
+                    Arc::clone(&store) as Arc<dyn SyncStore>,
+                    transport,
+                    peer,
+                )),
+            })
+            .collect();
         let origin_device = node_id_hex(&node_id);
-        // The sync peer id (hex) — the same value the sender stamps on transfer
-        // history rows. Threaded into retention + manual-delete audit rows.
-        let peer_device = node_id_hex(&peer);
+        // The audit `peer_device` (hex) stamped on retention / manual-delete
+        // history rows. With multiple targets a confirmed package was sent to
+        // several peers; the FIRST target's id is used as the representative peer
+        // for the audit column (the confirmed-gate itself is per-outbound-row).
+        let peer_device = node_id_hex(&engines[0].peer);
+        // Handles cloned out for the watcher/enqueue consumer fan-out below.
+        let engine_handles: Vec<Arc<SyncEngineHandle>> =
+            engines.iter().map(|t| Arc::clone(&t.engine)).collect();
 
         // Retention is ACTIVE (task A8). Live deletion is GATED behind the
         // two-key soak opt-in (task M4): `dry_run = false` is only accepted when
@@ -465,7 +532,7 @@ impl Agent {
             drop(stable_tx);
             let enqueue_task = spawn_enqueue_consumer(
                 stable_rx,
-                Arc::clone(&engine),
+                engine_handles.clone(),
                 Arc::clone(&seen),
                 config.clone(),
                 origin_device.clone(),
@@ -490,7 +557,7 @@ impl Agent {
             config,
             store,
             seen,
-            engine,
+            engines,
             origin_device,
             peer_device,
             watchers,
@@ -501,24 +568,54 @@ impl Agent {
         })
     }
 
-    /// Build a package for `file_path` and enqueue it for sending; returns the
-    /// durable outbound row id. Used by `enqueue-backlog` and reused by the
-    /// watcher consumer. Records the file's current `(size, mtime)` in the seen
-    /// store once the durable `Queued` row exists, so a later restart never
-    /// re-packages this exact, unchanged file.
+    /// Build a package for `file_path` **once** and enqueue it to EVERY target
+    /// engine (Sync 2C multi-target send). Used by `enqueue-backlog` and reused by
+    /// the watcher consumer. Records the file's current `(size, mtime)` in the
+    /// seen store once at least one durable `Queued` row exists, so a later
+    /// restart never re-packages this exact, unchanged file.
+    ///
+    /// Per spec §8 the targets are independent: a per-target enqueue failure is
+    /// `warn!`-logged and never aborts the others. Errors only if the package
+    /// could not be built at all, or if it reached ZERO targets.
     pub async fn enqueue_file(&self, file_path: &Path) -> Result<i64> {
         let capture_dir = owning_capture_dir(&self.config, file_path);
         let pkg_dir =
             build_package_for_file(&self.config, &capture_dir, file_path, &self.origin_device)?;
-        let id = self.engine.enqueue_package(&pkg_dir).await?;
-        tracing::info!(id, path = %file_path.display(), "enqueued capture file");
+        let engines = self.engine_handles();
+        let (first_id, delivered) = enqueue_package_to_all(&engines, &pkg_dir).await;
+        let Some(first_id) = first_id else {
+            anyhow::bail!(
+                "package for {} reached none of the {} configured targets",
+                file_path.display(),
+                engines.len()
+            );
+        };
+        tracing::info!(
+            id = first_id,
+            delivered,
+            targets = engines.len(),
+            path = %file_path.display(),
+            "enqueued capture file"
+        );
         record_seen(&self.seen, file_path, &pkg_dir.to_string_lossy());
-        Ok(id)
+        Ok(first_id)
     }
 
-    /// Live in-flight (non-terminal) outbound rows.
+    /// Cheap clones of every target engine handle (fan-out call sites).
+    fn engine_handles(&self) -> Vec<Arc<SyncEngineHandle>> {
+        self.engines.iter().map(|t| Arc::clone(&t.engine)).collect()
+    }
+
+    /// The number of configured send targets (one engine each). Test/introspection.
+    pub fn engine_count(&self) -> usize {
+        self.engines.len()
+    }
+
+    /// Live in-flight (non-terminal) outbound rows across ALL targets. Every
+    /// engine shares the one store, so any engine's snapshot is the same
+    /// node-wide picture — read the first engine's.
     pub fn status_snapshot(&self) -> Result<Vec<OutboundRow>> {
-        self.engine.status_snapshot()
+        self.engines[0].engine.status_snapshot()
     }
 
     /// The durable store (test/introspection).
@@ -531,11 +628,14 @@ impl Agent {
         &self.origin_device
     }
 
-    /// A cheap clone of the running sync engine handle. The supervisor's
+    /// A cheap clone of the FIRST target's sync engine handle. The supervisor's
     /// [`ManagedAgent`](crate::supervisor::ManagedAgent) impl hands this to Task
-    /// 4's web state so the status page reads live engine status.
+    /// 4's web state so the status page reads live engine status (`status_snapshot`
+    /// reads the shared store, so any engine gives the node-wide picture) and the
+    /// web `retry` re-enqueues through it. Multi-target web-retry fan-out is not
+    /// wired in v1 — a retried package goes to the first target only.
     pub fn engine_handle(&self) -> Arc<SyncEngineHandle> {
-        Arc::clone(&self.engine)
+        Arc::clone(&self.engines[0].engine)
     }
 
     /// The configured sync peer id (hex) — the same value delete/audit history
@@ -579,7 +679,10 @@ impl Agent {
         if let Some(t) = self.enqueue_task {
             let _ = t.await;
         }
-        self.engine.shutdown().await;
+        // Shut every target engine down (awaiting each worker).
+        for t in self.engines {
+            t.engine.shutdown().await;
+        }
     }
 
     /// Hard-kill: abort the watcher and enqueue-consumer tasks immediately (no
@@ -605,7 +708,10 @@ impl Agent {
         if let Some(t) = self.retention_task {
             t.abort();
         }
-        // `self.engine` (and `self.store`/`self.seen`) drop here, at end of scope.
+        // `self.engines` (and `self.store`/`self.seen`) drop here, at end of
+        // scope: each dropped engine handle closes its worker's command channel,
+        // so every worker notices and exits on its own (the same mechanism
+        // `shutdown` relies on, minus the cooperative await).
     }
 }
 
@@ -677,12 +783,46 @@ fn record_seen(seen: &SeenStore, path: &Path, package_ref: &str) {
     }
 }
 
+/// Build one package and enqueue it to EVERY target engine (Sync 2C multi-target
+/// send). The package is built once by the caller; this fans that one package dir
+/// out to all engines. Per spec §8 the targets are independent — a per-engine
+/// `enqueue_package` failure (e.g. a stopped worker) is `warn!`-logged and never
+/// stops the others. Returns `(first_id, delivered_count)`: the durable row id of
+/// the first successful enqueue (for the seen-store linkage / caller reporting)
+/// and how many targets accepted it. `first_id` is `None` iff ZERO targets did.
+async fn enqueue_package_to_all(
+    engines: &[Arc<SyncEngineHandle>],
+    pkg_dir: &Path,
+) -> (Option<i64>, usize) {
+    let mut first_id: Option<i64> = None;
+    let mut delivered = 0usize;
+    for (idx, engine) in engines.iter().enumerate() {
+        match engine.enqueue_package(pkg_dir).await {
+            Ok(id) => {
+                first_id.get_or_insert(id);
+                delivered += 1;
+            }
+            Err(error) => {
+                // One target failing must not drop the rest.
+                tracing::warn!(
+                    target_index = idx,
+                    %error,
+                    package = %pkg_dir.display(),
+                    "enqueue to target failed; other targets are unaffected"
+                );
+            }
+        }
+    }
+    (first_id, delivered)
+}
+
 /// Spawn the task that turns stable capture files into enqueued packages. Each
 /// item is `(owning_capture_dir, file_path)` from a watcher, so the package's
-/// `rel_path` is computed relative to the dir the file was captured under.
+/// `rel_path` is computed relative to the dir the file was captured under. Each
+/// package is built ONCE and fanned out to every target engine.
 fn spawn_enqueue_consumer(
     mut stable_rx: mpsc::Receiver<(PathBuf, PathBuf)>,
-    engine: Arc<SyncEngineHandle>,
+    engines: Vec<Arc<SyncEngineHandle>>,
     seen: Arc<SeenStore>,
     config: Config,
     origin_device: String,
@@ -690,15 +830,26 @@ fn spawn_enqueue_consumer(
     tokio::spawn(async move {
         while let Some((capture_dir, path)) = stable_rx.recv().await {
             match build_package_for_file(&config, &capture_dir, &path, &origin_device) {
-                Ok(pkg_dir) => match engine.enqueue_package(&pkg_dir).await {
-                    Ok(id) => {
-                        tracing::info!(id, path = %path.display(), "enqueued capture file");
-                        record_seen(&seen, &path, &pkg_dir.to_string_lossy());
+                Ok(pkg_dir) => {
+                    let (first_id, delivered) = enqueue_package_to_all(&engines, &pkg_dir).await;
+                    match first_id {
+                        Some(id) => {
+                            tracing::info!(
+                                id,
+                                delivered,
+                                targets = engines.len(),
+                                path = %path.display(),
+                                "enqueued capture file"
+                            );
+                            record_seen(&seen, &path, &pkg_dir.to_string_lossy());
+                        }
+                        None => tracing::error!(
+                            targets = engines.len(),
+                            path = %path.display(),
+                            "enqueue failed for every target"
+                        ),
                     }
-                    Err(error) => {
-                        tracing::error!(%error, path = %path.display(), "enqueue failed")
-                    }
-                },
+                }
                 Err(error) => {
                     tracing::error!(%error, path = %path.display(), "build package failed")
                 }
@@ -1895,5 +2046,215 @@ mod retention_tests {
             None,
             "the dead linkage is stamped so it stops being offered"
         );
+    }
+}
+
+/// Sync 2C (Task 7): the multi-target send — one engine per target, each built
+/// package fanned out to every engine, with per-target failure isolation.
+#[cfg(test)]
+mod multi_target_tests {
+    use super::*;
+
+    use athenaeum_core::sharing::loopback::{LoopbackNetwork, LoopbackTransport};
+    use athenaeum_core::sharing::types::{FrameReceipt, ReceiptOutcome, TransportEvent};
+    use athenaeum_core::sharing::SharingTransport;
+    use athenaeum_core::sync::store::SyncStore;
+    use athenaeum_core::sync::{OutboundState, SyncEngine};
+
+    /// Hand-build a one-file package (real payload + hash so a receiver can fetch
+    /// it) and return its directory.
+    fn make_pkg(dir: &Path, uuid: &str, name: &str) -> PathBuf {
+        let src = dir.join(name);
+        std::fs::write(&src, b"payload-bytes-0123456789").unwrap();
+        let byte_size = std::fs::metadata(&src).unwrap().len();
+        let xxh3 = package::xxh3_full_file(&src).unwrap();
+        let record = ManifestRecord {
+            v: MANIFEST_VERSION,
+            frame_uuid: uuid.to_string(),
+            origin_catalog_uuid: uuid.to_string(),
+            origin_device: "test-device".to_string(),
+            payload_kind: PayloadKind::RawFrame,
+            rel_path: name.to_string(),
+            byte_size,
+            xxh3,
+            frame_meta: serde_json::json!({ "object": "M42" }),
+            analysis: None,
+            app_version: "test".to_string(),
+        };
+        let pkg_dir = dir.join(format!("pkg-{uuid}"));
+        write_package(&pkg_dir, vec![(src, record)]).unwrap();
+        pkg_dir
+    }
+
+    /// Spawn a reactive receiver on `endpoint`: fetch every announced package and
+    /// ack every frame as `Ingested`, so the sender's row reaches `Confirmed`.
+    fn spawn_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf) {
+        tokio::spawn(async move {
+            let mut events = endpoint.events().await;
+            let mut n = 0usize;
+            while let Some(event) = events.recv().await {
+                let TransportEvent::AnnounceReceived { from, announce } = event else {
+                    continue;
+                };
+                n += 1;
+                let dest = dest_root.join(format!("fetch-{n}"));
+                if endpoint.fetch(from, &announce, &dest).await.is_ok() {
+                    if let Ok(records) = read_manifest(&dest) {
+                        let receipts: Vec<FrameReceipt> = records
+                            .iter()
+                            .map(|r| FrameReceipt {
+                                frame_uuid: r.frame_uuid.clone(),
+                                xxh3: r.xxh3.clone(),
+                                outcome: ReceiptOutcome::Ingested,
+                            })
+                            .collect();
+                        let _ = endpoint.ack(from, &announce.package_id, receipts).await;
+                    }
+                }
+            }
+        });
+    }
+
+    async fn wait_until<F: FnMut() -> bool>(mut pred: F) {
+        for _ in 0..500 {
+            if pred() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition never became true");
+    }
+
+    /// One built package fans out to EVERY target engine: both peers receive and
+    /// confirm it, so the shared store ends with one confirmed outbound row per
+    /// target (proving per-target delivery).
+    #[tokio::test]
+    async fn fan_out_delivers_to_every_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let net = LoopbackNetwork::new();
+
+        let recv_a = Arc::new(net.endpoint());
+        let a_id = recv_a.start().await.unwrap().node_id;
+        spawn_receiver(recv_a.clone(), tmp.path().join("ra"));
+        let recv_b = Arc::new(net.endpoint());
+        let b_id = recv_b.start().await.unwrap().node_id;
+        spawn_receiver(recv_b.clone(), tmp.path().join("rb"));
+
+        let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+        let engine_a = Arc::new(SyncEngine::spawn(
+            Arc::clone(&store) as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()),
+            a_id,
+        ));
+        let engine_b = Arc::new(SyncEngine::spawn(
+            Arc::clone(&store) as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()),
+            b_id,
+        ));
+
+        let pkg = make_pkg(tmp.path(), "uuid-1", "frame.fits");
+        let (first_id, delivered) =
+            enqueue_package_to_all(&[Arc::clone(&engine_a), Arc::clone(&engine_b)], &pkg).await;
+        assert!(first_id.is_some(), "at least one target accepted the package");
+        assert_eq!(delivered, 2, "the package reached both targets");
+
+        // Both per-target rows reach Confirmed (one per peer).
+        wait_until(|| {
+            store
+                .all_outbound(100)
+                .unwrap()
+                .iter()
+                .filter(|r| r.state == OutboundState::Confirmed)
+                .count()
+                == 2
+        })
+        .await;
+        let confirmed: Vec<NodeId> = store
+            .all_outbound(100)
+            .unwrap()
+            .iter()
+            .filter(|r| r.state == OutboundState::Confirmed)
+            .map(|r| r.peer)
+            .collect();
+        assert!(confirmed.contains(&a_id) && confirmed.contains(&b_id), "one confirmed row per target peer");
+
+        engine_a.shutdown().await;
+        engine_b.shutdown().await;
+    }
+
+    /// A per-target enqueue failure never drops the others (spec §8): engine B is
+    /// shut down before the fan-out, so its `enqueue_package` fails, but engine A
+    /// still gets the package — the store ends with exactly one outbound row, for
+    /// peer A.
+    #[tokio::test]
+    async fn fan_out_isolates_a_failing_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let net = LoopbackNetwork::new();
+
+        let recv_a = Arc::new(net.endpoint());
+        let a_id = recv_a.start().await.unwrap().node_id;
+        // A live receiver so A's row can even confirm; not required for the
+        // isolation assertion, which only needs the row to exist.
+        spawn_receiver(recv_a.clone(), tmp.path().join("ra"));
+        let b_id = [0xBBu8; 32];
+
+        let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+        let engine_a = Arc::new(SyncEngine::spawn(
+            Arc::clone(&store) as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()),
+            a_id,
+        ));
+        let engine_b = Arc::new(SyncEngine::spawn(
+            Arc::clone(&store) as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()),
+            b_id,
+        ));
+        // Kill B's worker: its `enqueue_package` will now error.
+        engine_b.shutdown().await;
+
+        let pkg = make_pkg(tmp.path(), "uuid-1", "frame.fits");
+        let (first_id, delivered) =
+            enqueue_package_to_all(&[Arc::clone(&engine_a), Arc::clone(&engine_b)], &pkg).await;
+        assert!(first_id.is_some(), "the live target still accepted the package");
+        assert_eq!(delivered, 1, "only the live target accepted it — the dead one is skipped, not fatal");
+
+        // Exactly one outbound row exists, and it belongs to peer A.
+        let rows = store.all_outbound(100).unwrap();
+        assert_eq!(rows.len(), 1, "the failed target enqueued nothing");
+        assert_eq!(rows[0].peer, a_id, "the surviving row is for the live target");
+
+        engine_a.shutdown().await;
+    }
+
+    /// `start_with_transports` spawns exactly one engine per injected target.
+    #[tokio::test]
+    async fn start_with_transports_spawns_one_engine_per_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cap = tmp.path().join("cap");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&cap).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let toml = format!(
+            "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            cap.display(),
+            data.display()
+        );
+        let config = Config::from_toml_str(&toml).unwrap();
+
+        let net = LoopbackNetwork::new();
+        let a_id = [1u8; 32];
+        let b_id = [2u8; 32];
+        let sender = Arc::new(net.endpoint());
+        let sender_id = sender.node_id();
+        let transports: Vec<(NodeId, Arc<dyn SharingTransport>)> = vec![
+            (a_id, Arc::new(net.endpoint())),
+            (b_id, Arc::new(net.endpoint())),
+        ];
+
+        let agent = Agent::start_with_transports(config, transports, sender_id, false)
+            .await
+            .expect("agent starts with two targets");
+        assert_eq!(agent.engine_count(), 2, "one engine per injected target");
+        agent.shutdown().await;
     }
 }
