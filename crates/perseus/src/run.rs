@@ -694,6 +694,18 @@ impl Agent {
         self.peer_device.clone()
     }
 
+    /// The shared-payload cleanup coordinator, `Some` only for a true fan-out
+    /// (≥2 targets). Cloned into the supervisor's [`ManagedAgent`] view so the
+    /// web retry (`POST /api/retry`) can [`bump`](SharedPackageCleanup::bump) it
+    /// when it re-enqueues a failed package: the retry adds a new outbound row to
+    /// the sinked engine, and without the bump that row's terminal would
+    /// over-count against the coordinator's stale `expected` and free the shared
+    /// payload while a still-offline target has yet to receive it. `None` for a
+    /// single-target agent (no shared dir, no coordinator).
+    pub fn cleanup(&self) -> Option<Arc<SharedPackageCleanup>> {
+        self.cleanup.clone()
+    }
+
     /// A shared handle to the rolling retention-pass log the web status page
     /// serves read-only. Cloned into the supervisor's [`ManagedAgent`] view.
     pub fn retention_log(&self) -> Arc<Mutex<VecDeque<RetentionRunRecord>>> {

@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use athenaeum_core::sync::SyncEngineHandle;
+use athenaeum_core::sync::{SharedPackageCleanup, SyncEngineHandle};
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 
@@ -77,6 +77,10 @@ pub trait ManagedAgent: Send + 'static {
     fn engine(&self) -> Option<Arc<SyncEngineHandle>>;
     /// The configured sync peer id (hex).
     fn peer_device(&self) -> String;
+    /// The shared-payload cleanup coordinator (`Some` only for a ≥2-target
+    /// fan-out). The web retry bumps it so a re-enqueued row can't prematurely
+    /// free an offline target's payload.
+    fn cleanup(&self) -> Option<Arc<SharedPackageCleanup>>;
     /// The retention live-edit sender (Task 8's web settings page writes here).
     fn retention_tx(&self) -> watch::Sender<RetentionConfig>;
     /// The rolling retention-pass log the status page serves read-only.
@@ -93,6 +97,9 @@ impl ManagedAgent for Agent {
     }
     fn peer_device(&self) -> String {
         self.peer_device()
+    }
+    fn cleanup(&self) -> Option<Arc<SharedPackageCleanup>> {
+        Agent::cleanup(self)
     }
     fn retention_tx(&self) -> watch::Sender<RetentionConfig> {
         Agent::retention_tx(self)
@@ -448,6 +455,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
             match agent {
                 Some(agent) => {
                     let engine = agent.engine();
+                    let cleanup = agent.cleanup();
                     let peer_device = agent.peer_device();
                     let retention_tx = agent.retention_tx();
                     let retention_log = agent.retention_log();
@@ -467,6 +475,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
                     tokio::spawn(async move {
                         ws.attach(
                             engine,
+                            cleanup,
                             peer_device,
                             retention_tx,
                             retention_log,
@@ -534,6 +543,9 @@ mod tests {
         }
         fn peer_device(&self) -> String {
             self.peer.clone()
+        }
+        fn cleanup(&self) -> Option<Arc<SharedPackageCleanup>> {
+            None
         }
         fn retention_tx(&self) -> watch::Sender<RetentionConfig> {
             watch::channel(RetentionConfig::default()).0

@@ -88,6 +88,37 @@ impl SharedPackageCleanup {
         state.expected = Some(state.expected.map_or(expected, |e| e.max(expected)));
         maybe_clean(dir, state);
     }
+
+    /// Raise `dir`'s `expected` target count by `delta` — for extra outbound rows
+    /// added to an ALREADY-registered fan-out dir after its initial [`register`]
+    /// (the Perseus web retry: re-enqueueing a failed package mints a new row on
+    /// the sinked engine, whose eventual terminal would otherwise over-count
+    /// against the stale `expected` and free the payload while a still-offline
+    /// target has yet to receive it — the exact data loss `register` fixed,
+    /// reopened via retry).
+    ///
+    /// Distinct from [`register`](Self::register), which raises-to-max: a retry
+    /// genuinely ADDS a terminal signal, so its count must be added, not maxed.
+    /// If the dir is absent it is created with `expected = delta` (a retry can
+    /// only follow the original enqueue+register in practice, so this is
+    /// defensive); if already **cleaned** it is a no-op — the payload is gone and
+    /// the web layer guards retries on payload presence, so a post-cleanup bump
+    /// must neither resurrect state nor re-run the once-only cleanup.
+    pub fn bump(&self, dir: &Path, delta: usize) {
+        let mut map = self
+            .inner
+            .lock()
+            .expect("cleanup coordinator mutex poisoned");
+        let state = map.entry(dir.to_path_buf()).or_default();
+        if state.cleaned {
+            return;
+        }
+        // Add `delta` to the known target count. `expected` is `Some` whenever a
+        // register preceded this bump (the production path); an unregistered dir's
+        // unknown count is treated as 0 so the added row still raises the gate.
+        state.expected = Some(state.expected.unwrap_or(0) + delta);
+        maybe_clean(dir, state);
+    }
 }
 
 impl PackageCleanupSink for SharedPackageCleanup {
@@ -250,6 +281,67 @@ mod tests {
             entries(&dir),
             vec![MANIFEST_FILENAME.to_string()],
             "a zero-target orphan is cleaned right away"
+        );
+    }
+
+    /// A `bump` before a retry's terminal raises `expected` so the retried row's
+    /// own terminal cannot prematurely free a still-offline target's payload.
+    /// Scenario (the web-retry data-loss hole this closes): 2 targets, target A
+    /// fails, the operator retries A onto the sinked engine (one extra row), and
+    /// target B is still offline — the retry's confirm must NOT trip cleanup.
+    #[test]
+    fn bump_before_retry_terminal_prevents_premature_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_pkg_dir(tmp.path(), "pkg-f");
+
+        let coord = SharedPackageCleanup::new();
+        coord.register(&dir, 2);
+
+        // Target A failed (terminal=1); B still offline, payload must be retained.
+        coord.on_terminal(&dir);
+        assert!(
+            dir.join("frame.fits").exists(),
+            "one terminal (A failed) is short of two targets"
+        );
+
+        // Operator retries A → one extra row on the sinked engine. Bump raises
+        // expected 2 → 3 so the retry's own terminal cannot close the gate.
+        coord.bump(&dir, 1);
+
+        // A's retry (A2) confirms: terminal=2, still < 3 → payload retained for B.
+        coord.on_terminal(&dir);
+        assert!(
+            dir.join("frame.fits").exists(),
+            "the retried row's terminal must not free the payload while B is offline"
+        );
+
+        // B finally confirms: terminal=3 == expected → cleaned, manifest kept.
+        coord.on_terminal(&dir);
+        assert_eq!(
+            entries(&dir),
+            vec![MANIFEST_FILENAME.to_string()],
+            "only once every original target AND the retry are terminal is the payload freed"
+        );
+    }
+
+    /// `bump` on an already-cleaned dir is a no-op: the payload is gone and the
+    /// web layer guards retries on payload presence, so a post-cleanup bump must
+    /// neither resurrect state nor re-run cleanup (proven by a post-clean sentinel).
+    #[test]
+    fn bump_after_clean_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_pkg_dir(tmp.path(), "pkg-g");
+
+        let coord = SharedPackageCleanup::new();
+        coord.register(&dir, 1);
+        coord.on_terminal(&dir); // gate met (1/1) → cleaned
+        assert_eq!(entries(&dir), vec![MANIFEST_FILENAME.to_string()]);
+
+        std::fs::write(dir.join("late-sentinel.fits"), b"still here").unwrap();
+        coord.bump(&dir, 1);
+        assert!(
+            dir.join("late-sentinel.fits").exists(),
+            "a bump after the once-only cleanup must be a no-op"
         );
     }
 

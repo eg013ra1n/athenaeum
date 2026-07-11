@@ -55,7 +55,8 @@ use tokio::sync::{watch, Notify, RwLock};
 use athenaeum_core::package::{read_manifest, MANIFEST_FILENAME};
 use athenaeum_core::sync::store::StandaloneSyncStore;
 use athenaeum_core::sync::{
-    Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState, SyncEngineHandle, SyncStore,
+    Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState, SharedPackageCleanup,
+    SyncEngineHandle, SyncStore,
 };
 
 use crate::config::{Config, RetentionConfig};
@@ -121,6 +122,13 @@ pub struct WebState {
     /// The running engine (its `status_snapshot` is the live in-flight list;
     /// `POST /api/retry` re-enqueues through it). `None` while detached (setup).
     pub engine: RwLock<Option<Arc<SyncEngineHandle>>>,
+    /// The shared-payload cleanup coordinator, `Some` only for a ≥2-target
+    /// fan-out (the same instance the fanned-out engines were spawned with).
+    /// `POST /api/retry` bumps it after a successful re-enqueue so the retried
+    /// row's terminal cannot prematurely free a still-offline target's payload.
+    /// `None` while detached, and `None` for a single-target agent (no shared
+    /// dir → the engine's own in-line cleanup, no coordinator).
+    pub cleanup: RwLock<Option<Arc<SharedPackageCleanup>>>,
     /// This node's configured sync peer id (hex) — the same value transfer
     /// history rows carry. Stamped onto the `deleted_manual` audit rows written
     /// by `POST /api/delete` so the history shows the peer a confirmed package
@@ -168,6 +176,7 @@ impl WebState {
             agent_state,
             supervisor_wake,
             engine: RwLock::new(None),
+            cleanup: RwLock::new(None),
             peer_device: RwLock::new(String::new()),
             // A placeholder sender with no receivers: `send` is a harmless no-op
             // until `attach` swaps in the running agent's real retention channel.
@@ -187,6 +196,7 @@ impl WebState {
     pub async fn attach(
         &self,
         engine: Option<Arc<SyncEngineHandle>>,
+        cleanup: Option<Arc<SharedPackageCleanup>>,
         peer_device: String,
         retention_tx: watch::Sender<RetentionConfig>,
         retention_log: Arc<Mutex<VecDeque<RetentionRunRecord>>>,
@@ -195,6 +205,7 @@ impl WebState {
         running_targets: Vec<String>,
     ) {
         *self.engine.write().await = engine;
+        *self.cleanup.write().await = cleanup;
         *self.peer_device.write().await = peer_device;
         *self.retention_tx.write().await = retention_tx;
         *self.retention_log.write().await = retention_log;
@@ -209,6 +220,7 @@ impl WebState {
     /// until the next attach — while the load-bearing safety bits are cleared.
     pub async fn detach(&self) {
         *self.engine.write().await = None;
+        *self.cleanup.write().await = None;
         *self.peer_device.write().await = String::new();
         *self.running_dirs.write().await = Vec::new();
         *self.running_targets.write().await = Vec::new();
@@ -1085,6 +1097,15 @@ async fn api_retry(
             "sync engine is not running — finish setup first".to_string(),
         ));
     };
+    // The shared-payload cleanup coordinator — present only for a ≥2-target
+    // fan-out. A re-enqueue mints a NEW outbound row against the SAME shared
+    // package dir, so its eventual terminal must raise the coordinator's
+    // `expected` (via `bump`); without that, the retried row's terminal
+    // over-counts against the stale `expected` and frees the payload while a
+    // still-offline target has yet to receive it (the data-loss hole). `None`
+    // for a single-target agent (no shared dir; the engine's in-line cleanup
+    // is unchanged).
+    let cleanup = state.cleanup.read().await.clone();
     let mut report = RetryReport::default();
     for &id in &req.ids {
         // A genuine store read failure is a 500 (the request failed), not a
@@ -1125,6 +1146,16 @@ async fn api_retry(
         match engine.enqueue_package(dir).await {
             Ok(new_id) => {
                 tracing::info!(old_id = id, new_id, "failed package re-enqueued via web");
+                // The retry always routes to the sinked engine (`engines[0]`),
+                // regardless of which target failed — per-target retry routing is
+                // a separate follow-up (mis-delivery is a *reported* failure with
+                // a history row, and each target's own engine auto-retries its
+                // non-terminal packages on reconnect, so it is not data loss).
+                // Bump the coordinator so this extra row's terminal cannot
+                // prematurely free the shared payload of a still-offline target.
+                if let Some(coord) = &cleanup {
+                    coord.bump(dir, 1);
+                }
                 report.retried.push(RetryPair { old_id: id, new_id });
             }
             Err(e) => {
@@ -1294,6 +1325,9 @@ mod tests {
             agent_state: state_rx,
             supervisor_wake: Arc::new(Notify::new()),
             engine: RwLock::new(Some(engine)),
+            // Single-target test agent: no fan-out coordinator (the retry-bump
+            // path is exercised by the coordinator's own unit tests).
+            cleanup: RwLock::new(None),
             peer_device: RwLock::new(node_id_hex(&PEER)),
             retention_tx: RwLock::new(watch::channel(config.retention.clone()).0),
             retention_log: RwLock::new(Arc::new(Mutex::new(VecDeque::new()))),
