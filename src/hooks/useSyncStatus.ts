@@ -175,7 +175,7 @@ export function useSyncStatus(): UseSyncStatus {
 
   const visible =
     !!status &&
-    (status.sender != null || status.receiver != null || status.devPairingEnabled);
+    (status.transportStarted || status.sender.started || status.devPairingEnabled);
 
   // Periodic re-poll ONLY while visible — a hidden indicator does no polling.
   useEffect(() => {
