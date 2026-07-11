@@ -183,7 +183,11 @@
     </main>
 
     <script>
-      let token = localStorage.getItem('perseusToken') || '';
+      // Bearer token kept in sessionStorage, not localStorage (finding L4): it is
+      // scoped to the tab/session and not persisted to disk in the browser
+      // profile, shrinking the window in which a shared machine or a future XSS
+      // could lift the LAN token. The operator re-enters it per browser session.
+      let token = sessionStorage.getItem('perseusToken') || '';
       const $ = (id) => document.getElementById(id);
       const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
 
@@ -193,7 +197,7 @@
         let res = await fetch(path, Object.assign({}, opts, { headers }));
         if (res.status === 401) {
           const t = window.prompt('Bearer token required for this Perseus node:');
-          if (t) { token = t; localStorage.setItem('perseusToken', t); return api(path, opts); }
+          if (t) { token = t; sessionStorage.setItem('perseusToken', t); return api(path, opts); }
         }
         return res;
       }
