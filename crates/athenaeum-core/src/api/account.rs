@@ -22,8 +22,8 @@
 use std::path::PathBuf;
 
 use crate::account::{
-    AccountClientError, AccountDevice, AccountStatus, DeviceCapability, DeviceKey, DeviceRole,
-    HubClient, TokenStore,
+    AccountClientError, AccountDevice, AccountStatus, DeviceCapability, DeviceKey, HubClient,
+    TokenStore,
 };
 use crate::api::{db, ApiError};
 use crate::services::ServiceContext;
@@ -134,16 +134,14 @@ fn clear_state(ctx: &ServiceContext, key: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Drop the local token + clear persisted account identity (email / device id /
-/// role). Used by [`sign_out`] and on any `401` from the hub.
+/// Drop the local token + clear persisted account identity (email / device id).
+/// Used by [`sign_out`] and on any `401` from the hub.
 fn clear_local_session(ctx: &ServiceContext, cfg: &AccountConfig) -> Result<(), ApiError> {
     cfg.token_store()
         .delete()
         .map_err(|e| ApiError::Internal(format!("clear token: {e:#}")))?;
     clear_state(ctx, keys::ACCOUNT_EMAIL)?;
     clear_state(ctx, keys::ACCOUNT_DEVICE_ID)?;
-    clear_state(ctx, keys::ACCOUNT_ROLE)?;
-    clear_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID)?;
     clear_sync_caches(ctx)?;
     Ok(())
 }
@@ -258,11 +256,6 @@ pub async fn sign_in_verify(
 
     write_state(ctx, keys::ACCOUNT_EMAIL, &email)?;
     write_state(ctx, keys::ACCOUNT_DEVICE_ID, &resp.device_id)?;
-    // The mesh model (Sync 2C) has no per-device role/peer: every app install is
-    // a full peer ([`DeviceCapability::Athenaeum`]). These clears keep any legacy
-    // role/peer settings from a pre-2C build from lingering after a re-sign-in.
-    clear_state(ctx, keys::ACCOUNT_ROLE)?;
-    clear_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID)?;
 
     tracing::info!(hub = %cfg.hub_host, device_id = %resp.device_id, "device signed in");
     build_status(ctx, &cfg)
@@ -335,13 +328,12 @@ pub async fn revoke_device(ctx: &ServiceContext, device_id: String) -> Result<()
     Ok(())
 }
 
-// ── sync peer/relay resolution seam (task M1) ───────────────────────────────
+// ── sync relay resolution seam (task M1) ────────────────────────────────────
 //
-// The app's capture-role sender resolves its peer + relays through
-// `crate::sync::pairing`, exactly like Perseus. These helpers gather the
-// settings/keychain inputs that resolver needs; they live here (not in
-// `api::sync`) because they read the same `AccountConfig` + `TokenStore` the
-// account commands use.
+// The app's sender resolves its relays through `crate::sync::pairing`, exactly
+// like Perseus. This helper gathers the settings/keychain credentials that
+// resolver needs; it lives here (not in `api::sync`) because it reads the same
+// `AccountConfig` + `TokenStore` the account commands use.
 
 /// The signed-in hub credentials `(hub_url, token)`, or `None` when signed out.
 /// Used to fetch the relay map for the sync transport.
@@ -352,34 +344,6 @@ pub fn hub_credentials(ctx: &ServiceContext) -> Result<Option<(String, String)>,
         .load()
         .map_err(|e| ApiError::Internal(format!("load token: {e:#}")))?;
     Ok(token.map(|t| (cfg.hub_url.clone(), t)))
-}
-
-/// The account-pairing inputs for the sync peer resolver: `Some` only when this
-/// device is signed in, has role `capture`, and has a persisted paired primary.
-/// `None` otherwise (the resolver then falls through to the dev-ticket path).
-pub fn account_pairing(
-    ctx: &ServiceContext,
-) -> Result<Option<crate::sync::AccountPairing>, ApiError> {
-    let cfg = resolve_config(ctx)?;
-    let Some(token) = cfg
-        .token_store()
-        .load()
-        .map_err(|e| ApiError::Internal(format!("load token: {e:#}")))?
-    else {
-        return Ok(None);
-    };
-    let role = read_state(ctx, keys::ACCOUNT_ROLE)?.and_then(|s| DeviceRole::parse(&s));
-    if role != Some(DeviceRole::Capture) {
-        return Ok(None);
-    }
-    let Some(peer_device_id) = read_state(ctx, keys::ACCOUNT_PEER_DEVICE_ID)? else {
-        return Ok(None);
-    };
-    Ok(Some(crate::sync::AccountPairing {
-        hub_url: cfg.hub_url,
-        token,
-        peer_device_id,
-    }))
 }
 
 /// Test-only: write a device token through the SAME [`resolve_config`] +

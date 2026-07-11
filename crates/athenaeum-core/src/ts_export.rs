@@ -149,7 +149,6 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::sync::models::Direction,
             crate::sync::models::OutboundState,
             crate::sync::models::HistoryRow,
-            crate::sync::status::SyncPairingSummary,
             crate::sync::status::OutboundSummary,
             crate::sync::status::SyncSenderStatus,
             crate::sync::status::SyncReceiverStatus,

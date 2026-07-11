@@ -68,6 +68,8 @@ pub async fn list_sync_history(
 #[serde(rename_all = "camelCase")]
 pub struct EnqueueSelectionArgs {
     pub frame_ids: Vec<i64>,
+    /// The chosen destination — an account device id resolved to its node id.
+    pub destination_device_id: String,
 }
 
 /// POST /api/enqueue_sync_selection
@@ -79,7 +81,10 @@ pub async fn enqueue_sync_selection(
     // The host emitter, captured into the sender engine on its first spawn, so
     // send-side state transitions surface as `sync-progress`/`sync-finished`.
     let emitter: Arc<dyn ProgressEmitter> = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
-    api::enqueue_sync_selection(&state.ctx, &state.sync_sender, args.frame_ids, Some(emitter))
+    let dest = api::resolve_dest_node(&state.ctx, &args.destination_device_id)
+        .await
+        .map_err(api_err)?;
+    api::enqueue_sync_selection(&state.ctx, &state.sync_sender, dest, args.frame_ids, Some(emitter))
         .await
         .map(Json)
         .map_err(api_err)

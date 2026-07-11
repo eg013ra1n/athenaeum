@@ -77,9 +77,7 @@ pub use receiver::{
     SyncReceiver, SyncReceiverHandle, SyncRuntime,
 };
 pub use sender::{StartedSender, SyncSenderRuntime};
-pub use status::{
-    OutboundSummary, SyncPairingSummary, SyncReceiverStatus, SyncSenderStatus, SyncStatus,
-};
+pub use status::{OutboundSummary, SyncReceiverStatus, SyncSenderStatus, SyncStatus};
 pub use store::{
     insert_sync_source, live_sources_for_package, mark_sync_source_deleted, CatalogSyncStore,
     StandaloneSyncStore, SyncSourceRow, SyncStore,

@@ -8,15 +8,24 @@
 //!
 //! It is a **dumb holder** on purpose — the orchestration that resolves the peer
 //! + relays and builds the iroh transport lives in [`crate::api::sync`] (which
-//! owns the account/pairing plumbing), exactly like [`SyncRuntime`] is driven by
-//! `api::sync::get_pairing_ticket`. The engine is constructed lazily on the first
-//! enqueue ([`ensure_sender_engine`](crate::api::sync::ensure_sender_engine)) and
-//! cached here for the process lifetime.
+//! owns the account/device plumbing), exactly like [`SyncRuntime`] is driven by
+//! `api::sync::get_pairing_ticket`. Each engine is constructed lazily on the
+//! first enqueue to a given destination
+//! ([`ensure_sender_engine`](crate::api::sync::ensure_sender_engine)) and cached
+//! here for the process lifetime.
 //!
-//! Holding the [`tokio::sync::Mutex`] across the (async) transport build in the
-//! ensure path is what guarantees exactly one engine is ever spawned — a second
-//! concurrent enqueue blocks on the lock and then sees the populated slot.
+//! # Per-peer map (sync 2C)
+//!
+//! Explicit-target send addresses each destination device by its [`NodeId`], so
+//! the runtime holds **one engine per peer** (`HashMap<NodeId, StartedSender>`)
+//! rather than a single slot. A device can therefore send to several peers
+//! concurrently, each over its own engine/transport. Holding the
+//! [`tokio::sync::Mutex`] across the (async) transport build in the ensure path
+//! is what guarantees exactly one engine per peer is ever spawned — a second
+//! concurrent enqueue to the same peer blocks on the lock and then sees the
+//! populated entry.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::sharing::types::NodeId;
@@ -35,40 +44,47 @@ pub struct StartedSender {
     pub peer: NodeId,
 }
 
-/// App-lifecycle holder for the send side. Cheap to construct; the engine +
-/// transport are built lazily on the first enqueue.
+/// App-lifecycle holder for the send side. Cheap to construct; each peer's
+/// engine + transport are built lazily on the first enqueue to that peer, keyed
+/// by the destination [`NodeId`].
 pub struct SyncSenderRuntime {
-    inner: tokio::sync::Mutex<Option<StartedSender>>,
+    inner: tokio::sync::Mutex<HashMap<NodeId, StartedSender>>,
 }
 
 impl SyncSenderRuntime {
-    /// A fresh, unstarted runtime.
+    /// A fresh runtime with no started engines.
     pub fn new() -> Self {
         Self {
-            inner: tokio::sync::Mutex::new(None),
+            inner: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// Whether the engine has been started.
+    /// Whether at least one peer engine has been started.
     pub async fn is_started(&self) -> bool {
-        self.inner.lock().await.is_some()
+        !self.inner.lock().await.is_empty()
     }
 
-    /// The running engine handle + this device's origin id, if started.
-    pub async fn current(&self) -> Option<(Arc<SyncEngineHandle>, String)> {
+    /// The running engine handle + this device's origin id for `peer`, if an
+    /// engine to that peer has been started.
+    pub async fn current_for(&self, peer: &NodeId) -> Option<(Arc<SyncEngineHandle>, String)> {
         self.inner
             .lock()
             .await
-            .as_ref()
+            .get(peer)
             .map(|s| (Arc::clone(&s.engine), s.origin_device.clone()))
     }
 
-    /// Lock the inner slot for the ensure critical section. The orchestration in
-    /// [`crate::api::sync::ensure_sender_engine`] holds this guard across the
-    /// transport build so a second concurrent enqueue can never spawn a second
-    /// engine. Tests inject a loopback-backed engine by setting this slot
-    /// directly.
-    pub async fn lock_inner(&self) -> tokio::sync::MutexGuard<'_, Option<StartedSender>> {
+    /// The destination peers with a started engine (order unspecified).
+    pub async fn started_peers(&self) -> Vec<NodeId> {
+        self.inner.lock().await.keys().copied().collect()
+    }
+
+    /// Lock the per-peer map for the ensure critical section. The orchestration
+    /// in [`crate::api::sync::ensure_sender_engine`] holds this guard across the
+    /// transport build so a second concurrent enqueue to the SAME peer can never
+    /// spawn a second engine for it. Tests inject loopback-backed engines by
+    /// inserting into this map directly.
+    pub async fn lock_inner(&self) -> tokio::sync::MutexGuard<'_, HashMap<NodeId, StartedSender>> {
         self.inner.lock().await
     }
 }

@@ -235,11 +235,14 @@ async fn two_instance_sync_e2e() {
     let sender = SyncSenderRuntime::new();
     {
         let mut guard = sender.lock_inner().await;
-        *guard = Some(StartedSender {
-            engine: Arc::clone(&engine),
-            origin_device: node_id_hex(&sender_node),
-            peer: receiver_node,
-        });
+        guard.insert(
+            receiver_node,
+            StartedSender {
+                engine: Arc::clone(&engine),
+                origin_device: node_id_hex(&sender_node),
+                peer: receiver_node,
+            },
+        );
     }
 
     // ── Seed 50 fixture frames into the capture catalog + one never-synced
@@ -256,7 +259,7 @@ async fn two_instance_sync_e2e() {
     assert!(keeper_path.exists(), "keeper file written");
 
     // ── (1) First enqueue → primary ingests ALL 50 with metadata ─────────────
-    let r1 = enqueue_sync_selection(&capture_ctx, &sender, frame_ids.clone(), None)
+    let r1 = enqueue_sync_selection(&capture_ctx, &sender, receiver_node, frame_ids.clone(), None)
         .await
         .expect("first enqueue");
     assert_eq!(r1.enqueued_count, N as u32);
@@ -311,7 +314,7 @@ async fn two_instance_sync_e2e() {
     assert_eq!(landed.len(), N, "all frames land under the designated sync_incoming root");
 
     // ── (2) Re-run the identical enqueue → dedupe-safe ───────────────────────
-    let r2 = enqueue_sync_selection(&capture_ctx, &sender, frame_ids.clone(), None)
+    let r2 = enqueue_sync_selection(&capture_ctx, &sender, receiver_node, frame_ids.clone(), None)
         .await
         .expect("second enqueue");
     assert_eq!(r2.enqueued_count, N as u32, "the same 50 frames re-enqueue");

@@ -606,20 +606,6 @@ peerDevice: string, direction: Direction, bytes: number, startedAt: string, fini
  */
 outcome: string, };
 
-export type SyncPairingSummary = { 
-/**
- * One of: `paired`, `disabled`, `devTicket`, `signedOut`.
- */
-kind: string, 
-/**
- * Short peer id (for display) when `kind == "paired"`.
- */
-peerShort: string | null, 
-/**
- * Actionable reason when `kind == "disabled"`.
- */
-reason: string | null, };
-
 export type OutboundSummary = { 
 /**
  * Durable `sync_outbound` row id (stable across the package's lifecycle;

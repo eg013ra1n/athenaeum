@@ -31,7 +31,7 @@ use crate::sharing::SharingTransport;
 use crate::sync::store::search_history_rows;
 use crate::sync::{
     node_id_hex, pairing, CatalogSyncStore, Direction, HistoryQuery, HistoryRow, OutboundRow,
-    OutboundState, OutboundSummary, PeerResolution, StartedSender, SyncEngine, SyncEngineHandle,
+    OutboundState, OutboundSummary, StartedSender, SyncEngine, SyncEngineHandle,
     SyncReceiverStatus, SyncRuntime, SyncSenderRuntime, SyncSenderStatus, SyncStatus, SyncStore,
 };
 
@@ -147,41 +147,6 @@ fn store_cached_relays(ctx: &ServiceContext, urls: &[String]) {
         let conn = db.conn();
         if let Err(e) = crate::db::set_setting(&conn, keys::SYNC_CACHED_RELAYS, &urls.join("\n")) {
             tracing::warn!(error = %e, "failed to cache relay map");
-        }
-    }
-}
-
-/// The last cached peer node id, decoded from its 64-char hex form.
-fn cached_peer(ctx: &ServiceContext) -> Result<Option<crate::sharing::types::NodeId>, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-    let Some(hex) = crate::db::get_setting(&conn, keys::SYNC_CACHED_PEER)?.filter(|s| !s.is_empty())
-    else {
-        return Ok(None);
-    };
-    Ok(crate::sync::node_id_from_hex(&hex).ok())
-}
-
-/// Persist a freshly-resolved peer node id (best-effort).
-fn store_cached_peer(ctx: &ServiceContext, peer: &crate::sharing::types::NodeId) {
-    if let Ok(db) = db(ctx) {
-        let conn = db.conn();
-        let hex = crate::sync::node_id_hex(peer);
-        if let Err(e) = crate::db::set_setting(&conn, keys::SYNC_CACHED_PEER, &hex) {
-            tracing::warn!(error = %e, "failed to cache sync peer");
-        }
-    }
-}
-
-/// Clear the cached peer (task M1 review finding #2): the hub authoritatively
-/// said the paired primary is gone or demoted, so a stale cached peer must not
-/// keep being served on a later hub outage. Best-effort — a failure here just
-/// means a possible one-time stale resolution on the next offline start.
-fn clear_cached_peer(ctx: &ServiceContext) {
-    if let Ok(db) = db(ctx) {
-        let conn = db.conn();
-        if let Err(e) = crate::db::delete_setting(&conn, keys::SYNC_CACHED_PEER) {
-            tracing::warn!(error = %e, "failed to clear invalidated cached peer");
         }
     }
 }
@@ -310,37 +275,6 @@ async fn resolve_relay_mode(ctx: &ServiceContext) -> Result<(iroh::RelayMode, Ve
     let allow_default = allow_default_relays(creds.is_some(), dev_pairing_enabled(ctx)?);
     let mode = pairing::relay_mode_for(&res.urls, allow_default).map_err(ApiError::Internal)?;
     Ok((mode, res.urls))
-}
-
-/// Resolve this device's sync peer following the documented order (task M1):
-/// account pairing (capture role + paired primary, resolved from the hub, with
-/// the last cached peer as an offline fallback) → dev-flag ticket → disabled.
-/// The single seam shared by the app's capture-role sender and Perseus. A fresh
-/// account resolution is cached for the next offline start; a hub-confirmed
-/// gone/demoted peer ([`PeerResolution::Invalidated`]) clears that cache instead
-/// (review finding #2) so a later hub outage can't resurrect a dead pairing.
-pub async fn resolve_capture_peer(ctx: &ServiceContext) -> Result<PeerResolution, ApiError> {
-    let account = crate::api::account::account_pairing(ctx)?;
-    // The app has no *peer* ticket to dial: the dev flag only makes the app's own
-    // receiver mint a ticket for Perseus to dial, so account pairing is the app's
-    // sole capture-send route. Perseus keeps the ticket path (it holds one).
-    let cached = cached_peer(ctx)?;
-    let resolution = pairing::resolve_peer(account.as_ref(), None, cached).await;
-    persist_peer_resolution(ctx, &resolution);
-    Ok(resolution)
-}
-
-/// The cache side effects of a peer resolution (task M1 review finding #2): a
-/// fresh account resolution refreshes the cache; a hub-confirmed
-/// gone/demoted peer clears it instead, so a later hub outage can't resurrect a
-/// pairing the hub already invalidated. Extracted from [`resolve_capture_peer`]
-/// so it is unit-testable without exercising the account/keychain plumbing.
-fn persist_peer_resolution(ctx: &ServiceContext, resolution: &PeerResolution) {
-    match resolution {
-        PeerResolution::Account { peer, fresh: true } => store_cached_peer(ctx, peer),
-        PeerResolution::Invalidated { .. } => clear_cached_peer(ctx),
-        _ => {}
-    }
 }
 
 /// Local-state-only "is this node signed in" check for [`autostart_if_enabled`]:
@@ -487,12 +421,20 @@ async fn build_sender_status(
     ctx: &ServiceContext,
     sender: &SyncSenderRuntime,
 ) -> Result<SyncSenderStatus, ApiError> {
-    let started = sender.is_started().await;
-    let active_rows: Vec<OutboundRow> = match sender.current().await {
-        Some((engine, _)) => engine
-            .status_snapshot()
-            .map_err(|e| ApiError::Internal(format!("sender status snapshot: {e:#}")))?,
-        None => Vec::new(),
+    // Roll up the live snapshot of EVERY started peer engine (per-peer map,
+    // sync 2C) under one lock so the in-flight view spans all destinations.
+    let (started, active_rows) = {
+        let guard = sender.lock_inner().await;
+        let started = !guard.is_empty();
+        let mut active_rows: Vec<OutboundRow> = Vec::new();
+        for s in guard.values() {
+            active_rows.extend(
+                s.engine
+                    .status_snapshot()
+                    .map_err(|e| ApiError::Internal(format!("sender status snapshot: {e:#}")))?,
+            );
+        }
+        (started, active_rows)
     };
 
     let mut queued = 0u32;
@@ -591,28 +533,37 @@ pub async fn get_sync_device_names(
     Ok(map)
 }
 
-// ── App sender engine + manual/auto send (task M2) ───────────────────────────
+// ── App sender engine + explicit-target send (sync 2C) ───────────────────────
 //
-// A capture-role app enqueues its own frames to the paired primary through a
-// running sender-side [`SyncEngine`], the counterpart of the receiver's
-// [`SyncRuntime`]. The engine is built lazily on the first enqueue and cached in
-// the host `AppState`'s [`SyncSenderRuntime`]; the orchestration lives here (not
-// in `sync::sender`) because it owns the account/pairing + iroh plumbing.
+// An app enqueues its own frames to an explicitly chosen destination device
+// through a running sender-side [`SyncEngine`], the counterpart of the
+// receiver's [`SyncRuntime`]. The engine for a given peer is built lazily on the
+// first enqueue to it and cached in the host `AppState`'s [`SyncSenderRuntime`]
+// per-peer map; the orchestration lives here (not in `sync::sender`) because it
+// owns the account/device + iroh plumbing.
 
-/// Map a resolved [`PeerResolution`] to a concrete peer id, or a typed error the
-/// UI surfaces. A `Disabled` / `Invalidated` pairing returns an error HERE —
-/// before any transport is built — so the send path never starts an engine on a
-/// pairing the hub says is gone (task M2 self-review invariant).
-fn peer_from_resolution(res: PeerResolution) -> Result<NodeId, ApiError> {
-    match res {
-        PeerResolution::Account { peer, .. } | PeerResolution::Ticket { peer } => Ok(peer),
-        PeerResolution::Invalidated { reason } => Err(ApiError::Invalid(format!(
-            "the paired primary was invalidated by the hub (re-pair in Settings): {reason}"
-        ))),
-        PeerResolution::Disabled { reason } => {
-            Err(ApiError::Invalid(format!("personal sync is not configured: {reason}")))
-        }
+/// Resolve an account device id → its [`NodeId`] via the account device list —
+/// the send-side counterpart of the receiver's allow-list resolver. Fetches the
+/// hub's device list, finds the device with `id == device_id`, and decodes its
+/// base64 `pubkey` into a node id. Errors (all [`ApiError::Invalid`], surfaced
+/// to the UI) when the device is absent, its pubkey is undecodable, or — per
+/// spec §10 — it is a send-only Perseus agent (never a valid destination: a
+/// Perseus node has no receiver, so a package sent to it would never land).
+pub async fn resolve_dest_node(ctx: &ServiceContext, device_id: &str) -> Result<NodeId, ApiError> {
+    let devices = crate::api::account::list_devices(ctx).await?;
+    let Some(device) = devices.iter().find(|d| d.id == device_id) else {
+        return Err(ApiError::Invalid(format!(
+            "destination device {device_id} is not in the account's device list"
+        )));
+    };
+    if device.capability == crate::account::DeviceCapability::Perseus {
+        return Err(ApiError::Invalid(format!(
+            "device {device_id} is a send-only Perseus agent and cannot receive frames"
+        )));
     }
+    pairing::node_id_from_pubkey_b64(&device.pubkey).map_err(|e| {
+        ApiError::Invalid(format!("destination device {device_id} has an invalid pubkey: {e:#}"))
+    })
 }
 
 /// The directory the app writes outgoing packages into (`<sync_dir>/packages`).
@@ -621,35 +572,36 @@ fn sender_packages_dir(ctx: &ServiceContext) -> Result<PathBuf, ApiError> {
     Ok(sync_dir.join("packages"))
 }
 
-/// Ensure the sender engine is running and return its handle + this device's
-/// origin id. Idempotent: a started runtime short-circuits without resolving the
-/// peer or building a transport. The very first call resolves the peer (guarded
-/// — see [`peer_from_resolution`]), resolves the relay map, binds the shared
-/// device identity's iroh transport, opens the catalog-backed store, and spawns
-/// the engine.
+/// Ensure the sender engine for `dest` is running and return its handle + this
+/// device's origin id. Idempotent per destination: a peer that already has a
+/// started engine short-circuits without building a transport. The first call
+/// for a given `dest` resolves the relay map, binds the shared device identity's
+/// iroh transport (attaching `dest`'s dial hint), opens the catalog-backed
+/// store, and spawns the engine — then inserts it under `dest` in the per-peer
+/// map (sync 2C).
 ///
 /// The runtime mutex is held across the whole build so two concurrent enqueues
-/// can never spawn two engines (the second blocks, then sees the populated slot).
+/// to the SAME peer can never spawn two engines for it (the second blocks, then
+/// sees the populated entry).
 ///
 /// `emitter` is the host's progress sink (Tauri/SSE); it is captured at spawn so
 /// the engine's per-package state transitions surface as `sync-progress` /
 /// `sync-finished` events for the Transfers UI (task M3). It is only used on the
-/// very first (spawning) call — subsequent enqueues reuse the cached engine and
-/// its captured emitter (a process-global sink, identical regardless of caller).
+/// very first (spawning) call for `dest` — subsequent enqueues reuse the cached
+/// engine and its captured emitter (a process-global sink, identical regardless
+/// of caller).
 pub async fn ensure_sender_engine(
     ctx: &ServiceContext,
     sender: &SyncSenderRuntime,
+    dest: NodeId,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<(Arc<SyncEngineHandle>, String), ApiError> {
     let mut guard = sender.lock_inner().await;
-    if let Some(started) = guard.as_ref() {
+    if let Some(started) = guard.get(&dest) {
         return Ok((Arc::clone(&started.engine), started.origin_device.clone()));
     }
 
-    // Resolve the peer FIRST: a Disabled/Invalidated pairing errors out with NO
-    // engine started, no transport bound, no package built.
-    let resolution = resolve_capture_peer(ctx).await?;
-    let peer = peer_from_resolution(resolution)?;
+    let peer = dest;
     let (relay_mode, relay_urls) = resolve_relay_mode(ctx).await?;
     let (sync_dir, db_path) = sync_paths(ctx)?;
 
@@ -681,13 +633,12 @@ pub async fn ensure_sender_engine(
     .map_err(|e| ApiError::Internal(format!("build iroh transport for sender: {e:#}")))?;
     let origin_device = node_id_hex(&transport.node_id());
 
-    // Fix-review: the app's capture-role sender ALWAYS resolves its peer via
-    // account pairing (`resolve_capture_peer` never returns a ticket — that
-    // path is Perseus-only), which yields a bare node id. `IrohTransport` has
-    // no discovery services, so without a dial hint `announce` fails instantly
-    // with "No addressing information available". Attach our own resolved
-    // relay URL(s) — the same ones this endpoint itself binds with — as the
-    // peer's dial hint before the first announce ever goes out.
+    // The destination is an account-resolved bare node id (from
+    // `resolve_dest_node`). `IrohTransport` has no discovery services, so without
+    // a dial hint `announce` fails instantly with "No addressing information
+    // available". Attach our own resolved relay URL(s) — the same ones this
+    // endpoint itself binds with — as the peer's dial hint before the first
+    // announce ever goes out (devices on one account share the hub's relay set).
     let peer_addr = pairing::peer_addr_with_relays(peer, &relay_urls)
         .map_err(|e| ApiError::Internal(format!("construct peer address: {e:#}")))?;
     transport.add_peer(peer_addr);
@@ -706,11 +657,14 @@ pub async fn ensure_sender_engine(
     ));
 
     tracing::info!(peer = %node_id_hex(&peer), origin = %origin_device, "sync sender engine started");
-    *guard = Some(StartedSender {
-        engine: Arc::clone(&engine),
-        origin_device: origin_device.clone(),
-        peer,
-    });
+    guard.insert(
+        dest,
+        StartedSender {
+            engine: Arc::clone(&engine),
+            origin_device: origin_device.clone(),
+            peer,
+        },
+    );
     Ok((engine, origin_device))
 }
 
@@ -918,18 +872,19 @@ async fn build_and_enqueue_selection(
     })
 }
 
-/// Manual send (task M2, step 2): enqueue exactly the eligible frames in the
-/// selection to the paired primary as ONE package. Ineligible frames come back in
-/// the result. Starting the engine is the send path's hard pairing guard — a
-/// Disabled/Invalidated peer errors here before anything is built.
+/// Explicit-target send (sync 2C): enqueue exactly the eligible frames in the
+/// selection to the destination peer `dest` as ONE package. Ineligible frames
+/// come back in the result. The destination is resolved by the caller (via
+/// [`resolve_dest_node`]) and passed in explicitly — this function no longer
+/// resolves any implicit "paired primary".
 ///
 /// An empty selection is a benign no-op checked FIRST (task M2 review minor):
-/// there is nothing to resolve or send, so it must never surface a pairing
-/// error on an otherwise-unconfigured device just because the caller happened
-/// to pass zero ids.
+/// there is nothing to send, so it must never start an engine for `dest` just
+/// because the caller happened to pass zero ids.
 pub async fn enqueue_sync_selection(
     ctx: &ServiceContext,
     sender: &SyncSenderRuntime,
+    dest: NodeId,
     frame_ids: Vec<i64>,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<EnqueueSelectionResult, ApiError> {
@@ -941,7 +896,7 @@ pub async fn enqueue_sync_selection(
             ineligible: Vec::new(),
         });
     }
-    let (engine, origin_device) = ensure_sender_engine(ctx, sender, emitter).await?;
+    let (engine, origin_device) = ensure_sender_engine(ctx, sender, dest, emitter).await?;
     let packages_dir = sender_packages_dir(ctx)?;
     let result =
         build_and_enqueue_selection(ctx, &engine, &origin_device, &packages_dir, &frame_ids).await?;
@@ -1019,6 +974,47 @@ mod tests {
         (tmp, ctx)
     }
 
+    /// Sync 2C, task 3: the sender runtime holds ONE engine per destination
+    /// peer, addressed by that peer's [`NodeId`]. `current_for` resolves a
+    /// present peer to its engine and `None` for an unknown one; `started_peers`
+    /// enumerates exactly the addressed peers. Proves the single-`Option` slot
+    /// was replaced by a per-peer map.
+    #[tokio::test]
+    async fn sender_runtime_holds_one_engine_per_peer() {
+        use crate::sharing::loopback::LoopbackNetwork;
+        use crate::sharing::SharingTransport;
+        use crate::sync::StandaloneSyncStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let node_id_from_hex = |h: &str| crate::sync::node_id_from_hex(h).unwrap();
+        // A loopback-backed `StartedSender` (the same shape `ensure_sender_engine`
+        // builds), keyed to `peer`. The engine idles with nothing enqueued.
+        let fake_started = |peer: NodeId, db_name: &str| {
+            let net = LoopbackNetwork::new();
+            let store = Arc::new(StandaloneSyncStore::open(tmp.path().join(db_name)).unwrap());
+            let engine = Arc::new(SyncEngine::spawn(
+                store as Arc<dyn SyncStore>,
+                Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
+                peer,
+            ));
+            StartedSender { engine, origin_device: node_id_hex(&peer), peer }
+        };
+
+        let sender = SyncSenderRuntime::new();
+        let a: NodeId = node_id_from_hex(&"aa".repeat(32));
+        let b: NodeId = node_id_from_hex(&"bb".repeat(32));
+        {
+            let mut g = sender.lock_inner().await;
+            g.insert(a, fake_started(a, "a.db"));
+            g.insert(b, fake_started(b, "b.db"));
+        }
+        assert!(sender.current_for(&a).await.is_some());
+        assert!(sender.current_for(&b).await.is_some());
+        let c: NodeId = node_id_from_hex(&"cc".repeat(32));
+        assert!(sender.current_for(&c).await.is_none(), "unknown peer has no engine");
+        assert_eq!(sender.started_peers().await.len(), 2);
+    }
+
     /// The receiver's allow-list is now every device in the account (mesh model,
     /// finding H1 as updated for sync Phase 1) — regardless of a device's
     /// capability (full Athenaeum peer or send-only Perseus agent).
@@ -1045,67 +1041,6 @@ mod tests {
         assert!(hexes.contains(&"01".repeat(32)));
         assert!(hexes.contains(&"02".repeat(32)));
         assert!(hexes.contains(&"03".repeat(32)));
-    }
-
-    /// The peer cache round-trips: store → read back → clear → gone. Proves the
-    /// exact mechanic [`persist_peer_resolution`] relies on for the
-    /// `Invalidated` case (review finding #2's "assert the setting is gone").
-    #[test]
-    fn cached_peer_store_then_clear_removes_the_setting() {
-        let (_tmp, ctx) = test_ctx();
-        let peer = [7u8; 32];
-        assert_eq!(cached_peer(&ctx).unwrap(), None, "nothing cached yet");
-
-        store_cached_peer(&ctx, &peer);
-        assert_eq!(cached_peer(&ctx).unwrap(), Some(peer));
-
-        clear_cached_peer(&ctx);
-        assert_eq!(cached_peer(&ctx).unwrap(), None, "the cached peer setting must be gone");
-    }
-
-    /// Review finding #2: `PeerResolution::Invalidated` clears an existing
-    /// cached peer (not "leave it, next resolve wins") — a subsequent hub
-    /// outage must not resurrect a pairing the hub already said is dead.
-    #[test]
-    fn invalidated_resolution_clears_an_existing_cache() {
-        let (_tmp, ctx) = test_ctx();
-        store_cached_peer(&ctx, &[1u8; 32]);
-        assert!(cached_peer(&ctx).unwrap().is_some(), "precondition: a cache exists");
-
-        persist_peer_resolution(
-            &ctx,
-            &PeerResolution::Invalidated { reason: "gone".to_string() },
-        );
-        assert_eq!(cached_peer(&ctx).unwrap(), None, "Invalidated must clear the cache");
-    }
-
-    /// A fresh account resolution stores the new peer as the cache.
-    #[test]
-    fn fresh_account_resolution_stores_the_cache() {
-        let (_tmp, ctx) = test_ctx();
-        let peer = [2u8; 32];
-        persist_peer_resolution(&ctx, &PeerResolution::Account { peer, fresh: true });
-        assert_eq!(cached_peer(&ctx).unwrap(), Some(peer));
-    }
-
-    /// A non-fresh (cached-fallback) resolution must NOT rewrite the cache —
-    /// it already came FROM the cache, re-storing it is a harmless no-op at
-    /// best and a footgun if the semantics ever drift.
-    #[test]
-    fn stale_account_resolution_does_not_touch_the_cache() {
-        let (_tmp, ctx) = test_ctx();
-        let original = [3u8; 32];
-        store_cached_peer(&ctx, &original);
-
-        persist_peer_resolution(
-            &ctx,
-            &PeerResolution::Account { peer: [9u8; 32], fresh: false },
-        );
-        assert_eq!(
-            cached_peer(&ctx).unwrap(),
-            Some(original),
-            "a non-fresh resolution must not overwrite the existing cache"
-        );
     }
 
     /// The relay-map cache round-trips through settings the same way.
@@ -1297,77 +1232,25 @@ mod tests {
         assert_eq!(records.len(), 1, "the eligible frame still enqueues");
     }
 
-    /// Engine-start guard: the resolution → peer mapping turns a
-    /// Disabled/Invalidated pairing into a typed error (so the send path never
-    /// starts an engine), and an Account/Ticket into the concrete peer.
-    #[test]
-    fn peer_from_resolution_gates_disabled_and_invalidated() {
-        assert!(matches!(
-            peer_from_resolution(PeerResolution::Account { peer: [1u8; 32], fresh: true }),
-            Ok(p) if p == [1u8; 32]
-        ));
-        assert!(matches!(
-            peer_from_resolution(PeerResolution::Ticket { peer: [2u8; 32] }),
-            Ok(p) if p == [2u8; 32]
-        ));
-        assert!(matches!(
-            peer_from_resolution(PeerResolution::Disabled { reason: "x".into() }),
-            Err(ApiError::Invalid(_))
-        ));
-        assert!(matches!(
-            peer_from_resolution(PeerResolution::Invalidated { reason: "y".into() }),
-            Err(ApiError::Invalid(_))
-        ));
-    }
-
-    /// Engine-start guard, end to end: a signed-out device resolves to a
-    /// Disabled pairing, so `enqueue_sync_selection` returns a typed error and
-    /// NO engine is started. The bogus hub host makes the token load a clean
-    /// keychain miss (no prompt) and no network call is ever made (account = None
-    /// short-circuits the resolver before any hub request).
-    #[tokio::test]
-    async fn enqueue_on_unconfigured_pairing_errors_without_starting_engine() {
-        let (_tmp, ctx) = test_ctx();
-        {
-            let db = db(&ctx).unwrap();
-            let conn = db.conn();
-            crate::db::set_setting(&conn, keys::ACCOUNT_HUB_URL, "http://m2-guard-unconfigured.invalid")
-                .unwrap();
-        }
-        let sender = SyncSenderRuntime::new();
-        let err = enqueue_sync_selection(&ctx, &sender, vec![1, 2, 3], None).await.unwrap_err();
-        assert!(matches!(err, ApiError::Invalid(_)), "unconfigured pairing → typed error, got {err:?}");
-        assert!(!sender.is_started().await, "no engine started on a Disabled pairing");
-    }
-
-    /// Task M2 review minor: an empty selection is a benign no-op checked
-    /// BEFORE `ensure_sender_engine` — it must return the zero result rather
-    /// than surfacing a pairing error, and it must never even attempt to
-    /// resolve the peer. Proven two ways: (1) the call succeeds with a
-    /// zero-valued result and no engine is started, where the OLD ordering
-    /// (empty check after `ensure_sender_engine`) would have returned
-    /// `Err(ApiError::Invalid)` for this same signed-out device; (2) a
-    /// wiremock hub records zero requests.
+    /// Sync 2C: an empty selection is a benign no-op checked BEFORE
+    /// `ensure_sender_engine` — it returns the zero result and never builds an
+    /// engine for `dest`, even though a valid destination node id is supplied.
+    /// (The destination is now resolved by the caller and passed in explicitly,
+    /// so the send path itself no longer touches the hub; this pins that an
+    /// empty selection still short-circuits before any transport build.)
     #[tokio::test]
     async fn enqueue_with_empty_selection_returns_zero_result_without_starting_engine() {
         let (_tmp, ctx) = test_ctx();
-        let server = wiremock::MockServer::start().await;
-        {
-            let db = db(&ctx).unwrap();
-            let conn = db.conn();
-            crate::db::set_setting(&conn, keys::ACCOUNT_HUB_URL, &server.uri()).unwrap();
-        }
         let sender = SyncSenderRuntime::new();
+        let dest: NodeId = [7u8; 32];
 
-        let result = enqueue_sync_selection(&ctx, &sender, Vec::new(), None).await.unwrap();
+        let result = enqueue_sync_selection(&ctx, &sender, dest, Vec::new(), None).await.unwrap();
         assert_eq!(result.enqueued_count, 0);
         assert_eq!(result.eligible_count, 0);
         assert_eq!(result.total_count, 0);
         assert!(result.ineligible.is_empty());
         assert!(!sender.is_started().await, "no engine started for an empty selection");
-
-        let requests = server.received_requests().await.unwrap();
-        assert!(requests.is_empty(), "empty selection must never resolve the peer against the hub");
+        assert!(sender.started_peers().await.is_empty(), "no peer engine for an empty selection");
     }
 
     // ── Status enrichment (task M3) ──────────────────────────────────────────
@@ -1452,11 +1335,11 @@ mod tests {
         assert!(!autostart_gate(false, false));
     }
 
-    /// `account_signed_in` derives "is this node signed in" purely from
-    /// persisted settings (never the hub, never the keychain): no identity yet
-    /// → false; signed in → true regardless of role (capture, primary, or no
-    /// role set at all — sync Phase 2A drops the role gate); clearing the
-    /// identity (sign-out) revokes it.
+    /// `account_signed_in` derives "is this node signed in" purely from the
+    /// persisted `ACCOUNT_DEVICE_ID` (never the hub, never the keychain): no
+    /// identity yet → false; identity present → true (the mesh model has no
+    /// per-device role — sync 2C removed it entirely); clearing the identity
+    /// (sign-out) revokes it.
     #[test]
     fn account_signed_in_matrix() {
         let (_tmp, ctx) = test_ctx();
@@ -1466,33 +1349,15 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             crate::db::set_setting(&conn, keys::ACCOUNT_DEVICE_ID, "device-1").unwrap();
-            crate::db::set_setting(&conn, keys::ACCOUNT_ROLE, "capture").unwrap();
         }
-        assert!(account_signed_in(&ctx).unwrap(), "signed-in capture -> signed in (no role gate)");
-
-        {
-            let db = db(&ctx).unwrap();
-            let conn = db.conn();
-            crate::db::delete_setting(&conn, keys::ACCOUNT_ROLE).unwrap();
-        }
-        assert!(account_signed_in(&ctx).unwrap(), "signed in with no role set -> signed in");
-
-        {
-            let db = db(&ctx).unwrap();
-            let conn = db.conn();
-            crate::db::set_setting(&conn, keys::ACCOUNT_ROLE, "primary").unwrap();
-        }
-        assert!(account_signed_in(&ctx).unwrap(), "signed-in primary -> signed in");
+        assert!(account_signed_in(&ctx).unwrap(), "identity present -> signed in");
 
         {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             crate::db::delete_setting(&conn, keys::ACCOUNT_DEVICE_ID).unwrap();
         }
-        assert!(
-            !account_signed_in(&ctx).unwrap(),
-            "no identity -> not signed in even with a role setting lingering"
-        );
+        assert!(!account_signed_in(&ctx).unwrap(), "identity cleared (sign-out) -> not signed in");
     }
 
     /// `autostart_if_enabled`'s one remaining negative path never touches relay
@@ -1537,7 +1402,7 @@ mod tests {
         {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            // Signed in (identity present); ACCOUNT_ROLE left unset on purpose.
+            // Signed in (identity present) — the mesh model has no role gate.
             crate::db::set_setting(&conn, keys::ACCOUNT_DEVICE_ID, "device-1").unwrap();
         }
         let sync = SyncRuntime::new();

@@ -142,13 +142,6 @@ pub mod keys {
     pub const ACCOUNT_EMAIL: &str = "account.email";
     /// This device's hub-assigned device id.
     pub const ACCOUNT_DEVICE_ID: &str = "account.device_id";
-    /// This device's role: `"primary"` | `"capture"` | empty (unassigned).
-    pub const ACCOUNT_ROLE: &str = "account.role";
-    /// For a `capture` device, the hub device id of its paired primary. Persisted
-    /// (task M1) so the peer resolver can look up the primary's current pubkey
-    /// without re-reading this device's own hub row every time. Cleared on
-    /// sign-out and whenever the role becomes `primary`/unassigned.
-    pub const ACCOUNT_PEER_DEVICE_ID: &str = "account.peer_device_id";
 
     // Personal sync pairing caches (task M1). Best-effort offline fallbacks that
     // let the capture-role sender / Perseus start when the hub is briefly

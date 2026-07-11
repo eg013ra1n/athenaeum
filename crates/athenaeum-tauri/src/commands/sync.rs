@@ -48,19 +48,25 @@ pub async fn list_sync_history(
     api::list_history(&state.ctx, query).map_err(|e| e.to_string())
 }
 
-/// Manual send (task M2): enqueue the eligible frames of a selection to the
-/// paired primary as one package. Ineligible frames come back in the result.
+/// Explicit-target send (sync 2C): enqueue the eligible frames of a selection to
+/// the chosen destination device as one package. `destination_device_id` is an
+/// account device id, resolved to its node id via [`api::resolve_dest_node`].
+/// Ineligible frames come back in the result.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn enqueue_sync_selection(
     state: State<'_, AppState>,
     app: AppHandle,
     frame_ids: Vec<i64>,
+    destination_device_id: String,
 ) -> Result<EnqueueSelectionResult, String> {
     // The host emitter, captured into the sender engine on its first spawn, so
     // send-side state transitions surface as `sync-progress`/`sync-finished`.
     let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
-    api::enqueue_sync_selection(&state.ctx, &state.sync_sender, frame_ids, Some(emitter))
+    let dest = api::resolve_dest_node(&state.ctx, &destination_device_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    api::enqueue_sync_selection(&state.ctx, &state.sync_sender, dest, frame_ids, Some(emitter))
         .await
         .map_err(|e| e.to_string())
 }

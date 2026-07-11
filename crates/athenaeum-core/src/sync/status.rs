@@ -9,40 +9,6 @@ use serde::Serialize;
 
 use super::models::OutboundState;
 
-/// A network-free summary of this device's send-side sync pairing (see the
-/// module honesty note). Modeled as a `kind`-tagged struct rather than a Rust
-/// enum so the generated TS is a flat, unambiguous shape the frontend switches
-/// on — every field stays plain camelCase.
-#[derive(Debug, Clone, Serialize, ts_rs::TS)]
-#[serde(rename_all = "camelCase")]
-pub struct SyncPairingSummary {
-    /// One of: `paired`, `disabled`, `devTicket`, `signedOut`.
-    pub kind: String,
-    /// Short peer id (for display) when `kind == "paired"`.
-    pub peer_short: Option<String>,
-    /// Actionable reason when `kind == "disabled"`.
-    pub reason: Option<String>,
-}
-
-impl SyncPairingSummary {
-    /// Signed in as a capture device with a paired primary.
-    pub fn paired(peer_short: impl Into<String>) -> Self {
-        Self { kind: "paired".into(), peer_short: Some(peer_short.into()), reason: None }
-    }
-    /// Signed in, but sending is not configured (wrong role, or no peer).
-    pub fn disabled(reason: impl Into<String>) -> Self {
-        Self { kind: "disabled".into(), peer_short: None, reason: Some(reason.into()) }
-    }
-    /// Dev ticket pairing is enabled (the receiver mints a ticket for a peer).
-    pub fn dev_ticket() -> Self {
-        Self { kind: "devTicket".into(), peer_short: None, reason: None }
-    }
-    /// Not signed in and no dev pairing.
-    pub fn signed_out() -> Self {
-        Self { kind: "signedOut".into(), peer_short: None, reason: None }
-    }
-}
-
 /// One in-flight outbound package for the Active tab (never a terminal row —
 /// those are summarized by the counts and live in history).
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
