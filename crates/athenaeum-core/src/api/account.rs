@@ -22,8 +22,8 @@
 use std::path::PathBuf;
 
 use crate::account::{
-    AccountClientError, AccountDevice, AccountStatus, DeviceCapability, DeviceKey, HubClient,
-    TokenStore,
+    default_device_name, AccountClientError, AccountDevice, AccountStatus, DeviceCapability,
+    DeviceKey, HubClient, TokenStore,
 };
 use crate::api::{db, ApiError};
 use crate::services::ServiceContext;
@@ -96,21 +96,6 @@ fn sanitize(host: &str) -> String {
         .collect()
 }
 
-/// Best-effort device name for the hub device list. GUI apps on macOS often do
-/// not inherit `HOSTNAME`, so this degrades to a generic label rather than
-/// failing sign-in — the name is cosmetic and can be renamed later.
-fn device_name() -> String {
-    for var in ["ATHENAEUM_DEVICE_NAME", "HOSTNAME", "COMPUTERNAME"] {
-        if let Ok(v) = std::env::var(var) {
-            let v = v.trim();
-            if !v.is_empty() {
-                return v.to_string();
-            }
-        }
-    }
-    "Athenaeum".to_string()
-}
-
 // ── settings-backed account state ───────────────────────────────────────────
 
 fn read_state(ctx: &ServiceContext, key: &str) -> Result<Option<String>, ApiError> {
@@ -168,6 +153,8 @@ fn map_client_err(e: AccountClientError) -> ApiError {
         AccountClientError::SecondPrimary(m) => ApiError::Conflict(m),
         AccountClientError::DeviceConflict(m) => ApiError::Conflict(m),
         AccountClientError::PeerValidation(m) => ApiError::Invalid(m),
+        // Fixed, actionable message so the rename UI can suggest a suffix.
+        AccountClientError::DuplicateName => ApiError::Invalid("name already in use".into()),
         AccountClientError::BadRequest(m) => ApiError::Invalid(m),
         AccountClientError::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
     }
@@ -244,7 +231,7 @@ pub async fn sign_in_verify(
             &email,
             &code,
             &key.pubkey_base64(),
-            &device_name(),
+            &default_device_name("athenaeum", &key.node_id_hex()),
             DeviceCapability::Athenaeum,
         )
         .await
@@ -326,6 +313,30 @@ pub async fn revoke_device(ctx: &ServiceContext, device_id: String) -> Result<()
     }
     tracing::info!(hub = %cfg.hub_host, device_id = %device_id, "device revoked");
     Ok(())
+}
+
+/// Rename a device by id (this device or a peer). A hub 409 (the name collides
+/// with another active device in the account) surfaces as
+/// [`ApiError::Invalid`]`("name already in use")` so the UI can suggest a
+/// suffix. Returns a refreshed [`AccountStatus`].
+pub async fn rename_device(
+    ctx: &ServiceContext,
+    device_id: String,
+    name: String,
+) -> Result<AccountStatus, ApiError> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(ApiError::Invalid("Name is required.".into()));
+    }
+    let cfg = resolve_config(ctx)?;
+    let token = require_token(&cfg)?;
+    let client = HubClient::new(&cfg.hub_url).map_err(map_client_err)?;
+    client
+        .rename_device(&token, &device_id, &name)
+        .await
+        .map_err(|e| map_authed_err(ctx, &cfg, e))?;
+    tracing::info!(hub = %cfg.hub_host, device_id = %device_id, "device renamed");
+    build_status(ctx, &cfg)
 }
 
 // ── sync relay resolution seam (task M1) ────────────────────────────────────

@@ -30,6 +30,13 @@ pub struct RevokeDeviceReq {
     device_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameDeviceReq {
+    device_id: String,
+    name: String,
+}
+
 /// POST /api/account_sign_in_start
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn account_sign_in_start(
@@ -88,6 +95,18 @@ pub async fn revoke_account_device(
     Json(req): Json<RevokeDeviceReq>,
 ) -> Result<Json<()>, (StatusCode, String)> {
     api::revoke_device(&state.ctx, req.device_id)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/rename_device
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn rename_device(
+    State(state): State<WebAppState>,
+    Json(req): Json<RenameDeviceReq>,
+) -> Result<Json<AccountStatus>, (StatusCode, String)> {
+    api::rename_device(&state.ctx, req.device_id, req.name)
         .await
         .map(Json)
         .map_err(api_err)

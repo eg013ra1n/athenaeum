@@ -15,10 +15,12 @@ use serde::{Deserialize, Serialize};
 
 pub mod client;
 pub mod keys;
+pub mod naming;
 pub mod token_store;
 
 pub use client::{AccountClientError, HubClient, VerifyResponse};
 pub use keys::DeviceKey;
+pub use naming::default_device_name;
 pub use token_store::TokenStore;
 
 /// A device's role in the account. `primary` receives; `capture` sends to its

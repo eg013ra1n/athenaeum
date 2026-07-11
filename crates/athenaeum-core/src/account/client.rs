@@ -38,6 +38,10 @@ pub enum AccountClientError {
     DeviceConflict(String),
     /// 400 on the role endpoint — peer validation failed (message from the hub).
     PeerValidation(String),
+    /// 409 on `PATCH /devices/{id}` — the requested name collides with another
+    /// active device in the account (`UNIQUE(account_id, lower(name))`). Carries
+    /// no message: the api layer maps it to a fixed, actionable string.
+    DuplicateName,
     /// 400 elsewhere — malformed request (e.g. bad pubkey, bad code shape).
     BadRequest(String),
     /// Transport / unexpected-status / decode failure.
@@ -52,6 +56,9 @@ impl std::fmt::Display for AccountClientError {
             }
             AccountClientError::Unauthorized => {
                 f.write_str("signed out or device revoked; sign in again")
+            }
+            AccountClientError::DuplicateName => {
+                f.write_str("name already in use by another device")
             }
             AccountClientError::SecondPrimary(m)
             | AccountClientError::DeviceConflict(m)
@@ -202,6 +209,33 @@ impl HubClient {
             StatusCode::NOT_FOUND => {
                 Err(AccountClientError::BadRequest("no such device".into()))
             }
+            s => Err(unexpected(s, resp).await),
+        }
+    }
+
+    /// `PATCH /devices/{id}` — rename a device. Body `{ "name": name }`. 409 →
+    /// [`AccountClientError::DuplicateName`] (the name collides with another
+    /// active device in the account); 401 → [`AccountClientError::Unauthorized`].
+    pub async fn rename_device(
+        &self,
+        token: &str,
+        device_id: &str,
+        name: &str,
+    ) -> Result<(), AccountClientError> {
+        let resp = self
+            .http
+            .patch(self.url(&format!("/devices/{device_id}")))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .map_err(net)?;
+        match resp.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::CONFLICT => Err(AccountClientError::DuplicateName),
+            StatusCode::UNAUTHORIZED => Err(AccountClientError::Unauthorized),
+            StatusCode::BAD_REQUEST => Err(AccountClientError::BadRequest(body_message(resp).await)),
+            StatusCode::NOT_FOUND => Err(AccountClientError::BadRequest("no such device".into())),
             s => Err(unexpected(s, resp).await),
         }
     }
@@ -444,6 +478,62 @@ mod tests {
             }
             other => panic!("expected DeviceConflict, got {other:?}"),
         }
+    }
+
+    /// `PATCH /devices/{id}` renames a device: a 204 (or 200) is success.
+    #[tokio::test]
+    async fn rename_device_succeeds_on_204() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/devices/dev-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+
+        let client = HubClient::new(server.uri()).unwrap();
+        client.rename_device("tok", "dev-1", "Observatory Mac").await.unwrap();
+    }
+
+    /// Sync 2C: a name that collides with another active device in the account
+    /// (hub `UNIQUE(account_id, lower(name))`) returns 409, which the client
+    /// must surface as the typed [`AccountClientError::DuplicateName`] — not the
+    /// generic `Network` bucket — so the api layer can suggest a suffix.
+    #[tokio::test]
+    async fn rename_device_409_maps_to_duplicate_name() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/devices/dev-1"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "a device named \"Observatory Mac\" already exists",
+            })))
+            .mount(&server)
+            .await;
+
+        let client = HubClient::new(server.uri()).unwrap();
+        let err = client.rename_device("tok", "dev-1", "Observatory Mac").await.unwrap_err();
+        assert!(
+            matches!(err, AccountClientError::DuplicateName),
+            "409 on rename must map to DuplicateName, got {err:?}"
+        );
+    }
+
+    /// A 401 on rename maps to `Unauthorized` (→ SignedOut at the api boundary,
+    /// which also clears the local session), like every other authed call.
+    #[tokio::test]
+    async fn rename_device_401_maps_to_unauthorized() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/devices/dev-1"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = HubClient::new(server.uri()).unwrap();
+        let err = client.rename_device("stale", "dev-1", "New Name").await.unwrap_err();
+        assert!(
+            matches!(err, AccountClientError::Unauthorized),
+            "401 on rename must map to Unauthorized, got {err:?}"
+        );
     }
 
     /// Fix (B4 review, minor #4): `VerifyResponse`'s `Debug` must never print

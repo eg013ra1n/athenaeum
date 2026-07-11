@@ -61,3 +61,16 @@ pub async fn revoke_account_device(
         .await
         .map_err(|e| e.to_string())
 }
+
+/// Rename a device by id (this device or a peer). Returns the refreshed status.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn rename_device(
+    state: State<'_, AppState>,
+    device_id: String,
+    name: String,
+) -> Result<AccountStatus, String> {
+    api::rename_device(&state.ctx, device_id, name)
+        .await
+        .map_err(|e| e.to_string())
+}

@@ -454,6 +454,7 @@ pub fn run() {
             commands::account_sign_out,
             commands::list_account_devices,
             commands::revoke_account_device,
+            commands::rename_device,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -67,6 +67,10 @@ tracing-appender = "0.2"
 # the generated-output diff in tests/ts_contract.rs is the real guard.
 ts-rs = { version = "10", features = ["chrono-impl", "no-serde-warnings"] }
 base64 = "0.22"
+# Cross-platform OS hostname for the default device name (Sync 2C). Small,
+# dependency-light; the name is cosmetic (renamable via the hub) so this only
+# needs a best-effort read, with a synthetic `<prefix>-<short6>` fallback.
+hostname = "0.4"
 # Unix statvfs for the retention disk-usage probe (task M4). Already in the build
 # graph transitively (rusqlite/tokio); named directly, single 0.2 version, so the
 # `disk_pct` retention policy can measure free space without a new dependency tree.
