@@ -129,6 +129,38 @@ struct Pending {
     last_rejected: Vec<String>,
 }
 
+/// Optional host sink notified when a package reaches a **terminal** state
+/// (confirmed, failed, or cancelled) on this engine.
+///
+/// # Why this exists
+///
+/// Perseus's multi-target send builds ONE package directory and fans it out to N
+/// independent [`SyncEngine`]s (one per target, each its own peer-scoped store).
+/// The payload copies live in that **one shared** dir. Without coordination the
+/// first engine to reach `Confirmed` would delete the shared payload out from
+/// under every other target still mid-transfer — so a target that was offline
+/// when the first confirmed would silently never receive the frame (its retry
+/// re-serves a manifest-only collection). Gating the shared-payload cleanup
+/// behind this sink lets a single coordinator
+/// ([`SharedPackageCleanup`](super::cleanup_coord::SharedPackageCleanup)) clean
+/// the dir exactly once, only after **every** target that received the package is
+/// terminal (confirmed OR failed OR cancelled — a dead/offline target must not
+/// block cleanup forever).
+///
+/// When the sink is `None` (the app and single-target Perseus — no fan-out, no
+/// sharing) the engine keeps its original in-line cleanup behavior byte-for-byte.
+///
+/// The coordinator keys on `dir` (the shared fan-out identity): each engine mints
+/// its own per-session announce `PackageId`, so those are **not** shared across
+/// targets and cannot be the key. `dir` is also the only identity available at
+/// every terminal site (a pre-announce failure has no `PackageId`).
+pub trait PackageCleanupSink: Send + Sync {
+    /// One target's engine has reached a terminal state for the package served
+    /// from `dir`. Implementations MUST be idempotent and cheap; this is called
+    /// on the synchronous engine worker (confirm/fail/cancel path).
+    fn on_terminal(&self, dir: &Path);
+}
+
 /// Factory + namespace for the sync engine. Holds no state itself — [`spawn`]
 /// moves everything into the worker task and returns a [`SyncEngineHandle`].
 ///
@@ -171,14 +203,52 @@ impl SyncEngine {
         Self::spawn_with_config_and_emitter(store, transport, peer, SyncConfig::default(), emitter)
     }
 
-    /// The full constructor both convenience spawners delegate to. Starts a
-    /// tokio task running the worker loop and returns a handle to it.
+    /// The public constructor the config/emitter convenience spawners delegate
+    /// to. Passes no [`PackageCleanupSink`], so payload cleanup stays exactly as
+    /// it was before the sink existed (app + single-target Perseus path).
     pub fn spawn_with_config_and_emitter(
         store: Arc<dyn SyncStore>,
         transport: Arc<dyn SharingTransport>,
         peer: NodeId,
         config: SyncConfig,
         emitter: Option<Arc<dyn ProgressEmitter>>,
+    ) -> SyncEngineHandle {
+        Self::spawn_inner(store, transport, peer, config, emitter, None)
+    }
+
+    /// Spawn with a shared [`PackageCleanupSink`] and default [`SyncConfig`] /
+    /// no emitter — Perseus's multi-target fan-out path. Every engine sharing one
+    /// package dir is given the SAME coordinator so the shared payload is cleaned
+    /// exactly once, only after all targets are terminal. The app and
+    /// single-target Perseus never take this path (they spawn without a sink and
+    /// keep the original in-line cleanup).
+    pub fn spawn_with_sink(
+        store: Arc<dyn SyncStore>,
+        transport: Arc<dyn SharingTransport>,
+        peer: NodeId,
+        cleanup_sink: Arc<dyn PackageCleanupSink>,
+    ) -> SyncEngineHandle {
+        Self::spawn_inner(
+            store,
+            transport,
+            peer,
+            SyncConfig::default(),
+            None,
+            Some(cleanup_sink),
+        )
+    }
+
+    /// The single full constructor every spawner delegates to. Starts a tokio
+    /// task running the worker loop and returns a handle to it. `cleanup_sink`
+    /// is `None` for the app and single-target Perseus (unchanged in-line
+    /// cleanup) and `Some(coordinator)` for the multi-target fan-out.
+    fn spawn_inner(
+        store: Arc<dyn SyncStore>,
+        transport: Arc<dyn SharingTransport>,
+        peer: NodeId,
+        config: SyncConfig,
+        emitter: Option<Arc<dyn ProgressEmitter>>,
+        cleanup_sink: Option<Arc<dyn PackageCleanupSink>>,
     ) -> SyncEngineHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let worker = Worker {
@@ -188,6 +258,7 @@ impl SyncEngine {
             config,
             pending: HashMap::new(),
             emitter,
+            cleanup_sink,
         };
         let join = tokio::spawn(async move {
             if let Err(e) = worker.run(cmd_rx).await {
@@ -269,6 +340,13 @@ struct Worker {
     /// Optional host sink for the send-side `sync-progress` / `sync-finished`
     /// events (task M3). `None` for Perseus + tests → the engine is log-only.
     emitter: Option<Arc<dyn ProgressEmitter>>,
+    /// Optional coordinator for shared-payload cleanup on the multi-target
+    /// fan-out (Sync 2C). `Some` only when Perseus fans one package dir out to
+    /// N engines; the confirmed/failed/cancelled terminal paths route through it
+    /// so the shared dir is cleaned exactly once, after every target is
+    /// terminal. `None` for the app + single-target Perseus → the original
+    /// in-line cleanup runs unchanged.
+    cleanup_sink: Option<Arc<dyn PackageCleanupSink>>,
 }
 
 impl Worker {
@@ -311,30 +389,44 @@ impl Worker {
         // returns EVERY confirmed row ever, so an already-clean (manifest-only)
         // dir frees 0 bytes and is not counted. Best-effort and non-fatal: a
         // per-dir error warns and continues; startup is never blocked.
-        match self.store.confirmed() {
-            Ok(rows) => {
-                let mut count: u64 = 0;
-                let mut freed_bytes: u64 = 0;
-                for row in rows {
-                    let dir = PathBuf::from(&row.package_ref);
-                    match cleanup_package_payloads(&dir) {
-                        Ok(0) => {}
-                        Ok(bytes) => {
-                            count += 1;
-                            freed_bytes = freed_bytes.saturating_add(bytes);
+        //
+        // With a `cleanup_sink` (multi-target fan-out) the package dirs are
+        // SHARED across N engines: a per-engine heal here would let one engine
+        // delete a dir another target still needs (that target's row may be
+        // non-terminal and about to resume). The shared restart reconciliation is
+        // done ONCE, centrally, by Perseus (`reconcile_shared_cleanup`) which has
+        // the full per-dir picture across every target, so a sinked engine skips
+        // its own heal entirely. The no-sink heal below is unchanged.
+        if self.cleanup_sink.is_some() {
+            tracing::debug!("startup payload heal delegated to the shared cleanup coordinator");
+        } else {
+            match self.store.confirmed() {
+                Ok(rows) => {
+                    let mut count: u64 = 0;
+                    let mut freed_bytes: u64 = 0;
+                    for row in rows {
+                        let dir = PathBuf::from(&row.package_ref);
+                        match cleanup_package_payloads(&dir) {
+                            Ok(0) => {}
+                            Ok(bytes) => {
+                                count += 1;
+                                freed_bytes = freed_bytes.saturating_add(bytes);
+                            }
+                            Err(e) => tracing::warn!(
+                                package_id = row.id,
+                                error = %format!("{e:#}"),
+                                "package payload heal failed"
+                            ),
                         }
-                        Err(e) => tracing::warn!(
-                            package_id = row.id,
-                            error = %format!("{e:#}"),
-                            "package payload heal failed"
-                        ),
+                    }
+                    if count > 0 {
+                        tracing::info!(count, freed_bytes, "package payload heal");
                     }
                 }
-                if count > 0 {
-                    tracing::info!(count, freed_bytes, "package payload heal");
+                Err(e) => {
+                    tracing::warn!(error = %e, "confirmed enumeration for payload heal failed")
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "confirmed enumeration for payload heal failed"),
         }
 
         loop {
@@ -737,13 +829,24 @@ impl Worker {
         // `append_confirmed_history` (which reads the manifest); the manifest is
         // deliberately kept so retention/audit can still read it. Cleanup failure
         // never fails the confirm — log and continue.
-        match cleanup_package_payloads(&pending.dir) {
-            Ok(freed_bytes) => {
-                tracing::info!(package_id = pending.id, freed_bytes, "package payloads cleaned");
-            }
-            Err(e) => {
-                tracing::warn!(package_id = pending.id, error = %format!("{e:#}"), "package payload cleanup failed");
-            }
+        //
+        // On the multi-target fan-out (`cleanup_sink` set) the payload dir is
+        // SHARED across N engines, so this engine must NOT delete it on its own
+        // confirm — that would strip a still-offline target's retry to a
+        // manifest-only collection (silent data loss). Route the terminal signal
+        // to the coordinator, which cleans exactly once after every target is
+        // terminal. Without a sink (app / single-target) the original in-line
+        // cleanup runs unchanged.
+        match &self.cleanup_sink {
+            Some(sink) => sink.on_terminal(&pending.dir),
+            None => match cleanup_package_payloads(&pending.dir) {
+                Ok(freed_bytes) => {
+                    tracing::info!(package_id = pending.id, freed_bytes, "package payloads cleaned");
+                }
+                Err(e) => {
+                    tracing::warn!(package_id = pending.id, error = %format!("{e:#}"), "package payload cleanup failed");
+                }
+            },
         }
         // Terminal: the package is confirmed; drop its served blobs so they do
         // not outlive the transfer. `package_id` is the id the ack correlated
@@ -813,6 +916,14 @@ impl Worker {
         };
         if let Some(dir) = dir {
             self.append_terminal_history(id, &dir, &outcome)?;
+            // Multi-target fan-out: a `Failed` target is terminal too. Notify the
+            // coordinator so a permanently-unreachable peer does not block the
+            // shared payload's cleanup forever (spec: terminal = confirmed OR
+            // failed OR cancelled). No-op without a sink — a failed package keeps
+            // its payloads there (Task 2: retry depends on them), unchanged.
+            if let Some(sink) = &self.cleanup_sink {
+                sink.on_terminal(&dir);
+            }
         }
         self.emit_finished(id, &outcome, 0, last_rejected);
         Ok(())
@@ -856,6 +967,12 @@ impl Worker {
             "sync state"
         );
         self.append_terminal_history(id, &dir, "cancelled")?;
+        // Multi-target fan-out: a cancelled target is terminal — notify the
+        // coordinator so it counts toward the all-targets-terminal cleanup gate.
+        // No-op without a sink (unchanged single-target behavior).
+        if let Some(sink) = &self.cleanup_sink {
+            sink.on_terminal(&dir);
+        }
         self.emit_finished(id, "cancelled", 0, Vec::new());
         Ok(())
     }
@@ -1013,7 +1130,11 @@ fn announce_for_dir(dir: &Path) -> Result<PackageAnnounce> {
 /// dirs. Cleaning an already-clean (manifest-only) dir is a cheap no-op that
 /// frees 0 bytes. Errors are propagated so the caller can log-and-continue — a
 /// cleanup failure must never fail the confirm transition or block startup.
-fn cleanup_package_payloads(dir: &Path) -> Result<u64> {
+///
+/// `pub(super)` so the shared-payload coordinator
+/// ([`SharedPackageCleanup`](super::cleanup_coord::SharedPackageCleanup)) reuses
+/// this exact routine when it fires the once-only cleanup for a fanned-out dir.
+pub(super) fn cleanup_package_payloads(dir: &Path) -> Result<u64> {
     let mut freed = 0u64;
     for entry in
         std::fs::read_dir(dir).with_context(|| format!("read package dir {}", dir.display()))?

@@ -28,7 +28,8 @@ use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::store::{StandaloneSyncStore, SyncStore};
 use athenaeum_core::sync::{
     evaluate_and_apply, node_id_hex, DeleteOutcome, Direction, HistoryRow, OutboundRow,
-    OutboundState, RetentionOutcome, SyncEngine, SyncEngineHandle,
+    OutboundState, PackageCleanupSink, RetentionOutcome, SharedPackageCleanup, SyncEngine,
+    SyncEngineHandle,
 };
 use chrono::{DateTime, Utc};
 use iroh_tickets::endpoint::EndpointTicket;
@@ -302,6 +303,14 @@ pub struct Agent {
     /// the injection seams require at least one transport. The enqueue pipeline
     /// builds each package once and fans it out to every engine here.
     engines: Vec<TargetEngine>,
+    /// Shared-payload cleanup coordinator, `Some` ONLY for a true fan-out (≥2
+    /// targets). One built package dir is served by every engine, so no single
+    /// engine may delete it on its own confirm — that would starve a still-offline
+    /// target's retry to a manifest-only collection (silent data loss). The
+    /// coordinator frees the dir exactly once, after every target that received
+    /// it is terminal. A single-target agent leaves this `None` and keeps the
+    /// engine's original in-line cleanup, byte-for-byte.
+    cleanup: Option<Arc<SharedPackageCleanup>>,
     origin_device: String,
     /// The configured sync peer id (hex) — the same value transfer history rows
     /// carry. Threaded into retention/manual-delete audit rows so a deleted
@@ -455,18 +464,48 @@ impl Agent {
             SeenStore::open(config.db_path())
                 .with_context(|| format!("open seen store {}", config.db_path().display()))?,
         );
+        // Shared-payload cleanup coordinator — ONLY for a true fan-out (≥2
+        // targets). With one target there is no shared dir, so the engine's
+        // original in-line cleanup is correct and left byte-for-byte unchanged
+        // (`cleanup = None`, plain `SyncEngine::spawn`). With ≥2 targets every
+        // engine is given the SAME coordinator so the one built package dir is
+        // freed exactly once, after every target is terminal.
+        //
+        // Reconcile FIRST, before any engine spawns: in-memory coordinator state
+        // is lost on restart, so re-derive it from the durable rows (grouped by
+        // package dir) — a dir terminal on all targets is cleaned now, one still
+        // pending keeps its payload. Running before spawn means no engine's
+        // resume can confirm/clean ahead of the seeded expected counts.
+        let cleanup: Option<Arc<SharedPackageCleanup>> = if transports.len() > 1 {
+            let coord = Arc::new(SharedPackageCleanup::new());
+            if let Err(error) = reconcile_shared_cleanup(&store, &coord) {
+                tracing::warn!(%error, "shared-cleanup restart reconciliation failed; continuing");
+            }
+            Some(coord)
+        } else {
+            None
+        };
         // One engine per target, all over the single shared store. The engine's
         // crash-resume is peer-scoped (core `sync::engine`), so N engines on one
         // store re-drive only their own outbound rows.
         let engines: Vec<TargetEngine> = transports
             .into_iter()
-            .map(|(peer, transport)| TargetEngine {
-                peer,
-                engine: Arc::new(SyncEngine::spawn(
-                    Arc::clone(&store) as Arc<dyn SyncStore>,
-                    transport,
+            .map(|(peer, transport)| {
+                let engine = match &cleanup {
+                    Some(coord) => SyncEngine::spawn_with_sink(
+                        Arc::clone(&store) as Arc<dyn SyncStore>,
+                        transport,
+                        peer,
+                        Arc::clone(coord) as Arc<dyn PackageCleanupSink>,
+                    ),
+                    None => {
+                        SyncEngine::spawn(Arc::clone(&store) as Arc<dyn SyncStore>, transport, peer)
+                    }
+                };
+                TargetEngine {
                     peer,
-                )),
+                    engine: Arc::new(engine),
+                }
             })
             .collect();
         let origin_device = node_id_hex(&node_id);
@@ -536,6 +575,7 @@ impl Agent {
                 Arc::clone(&seen),
                 config.clone(),
                 origin_device.clone(),
+                cleanup.clone(),
             );
             let retention_task = spawn_retention_task(
                 Arc::clone(&store),
@@ -558,6 +598,7 @@ impl Agent {
             store,
             seen,
             engines,
+            cleanup,
             origin_device,
             peer_device,
             watchers,
@@ -583,6 +624,15 @@ impl Agent {
             build_package_for_file(&self.config, &capture_dir, file_path, &self.origin_device)?;
         let engines = self.engine_handles();
         let (first_id, delivered) = enqueue_package_to_all(&engines, &pkg_dir).await;
+        // Fan-out only: tell the coordinator how many targets actually received
+        // this dir, so it frees the shared payload exactly once — after every one
+        // of them is terminal. `delivered == 0` (reached no target) registers an
+        // expected of 0, which cleans the orphaned copy immediately (no target's
+        // retry can ever need it). Single-target agents skip this entirely
+        // (`cleanup` is `None`) and keep the engine's in-line cleanup.
+        if let Some(coord) = &self.cleanup {
+            coord.register(&pkg_dir, delivered);
+        }
         let Some(first_id) = first_id else {
             anyhow::bail!(
                 "package for {} reached none of the {} configured targets",
@@ -816,6 +866,52 @@ async fn enqueue_package_to_all(
     (first_id, delivered)
 }
 
+/// Restart reconciliation for the shared-payload cleanup coordinator (fan-out
+/// only). In-memory coordinator state is lost on restart, so re-derive it from
+/// the durable `sync_outbound` rows BEFORE any engine spawns.
+///
+/// Each fanned-out package dir has one row per target it reached. Group by
+/// `package_ref` and, per dir:
+///   - `expected` = number of rows (the targets that received it), and
+///   - already-terminal = rows in `Confirmed` or `Failed` (a cancel is stored as
+///     `Failed`), replayed as `on_terminal` calls.
+///
+/// A dir terminal on every target is cleaned exactly once here; a dir with any
+/// still-pending target keeps its payload — that target's engine resume re-drives
+/// it, and its later confirm/fail notifies the coordinator to complete the gate.
+///
+/// Honest resume scope: this recovers precisely the all-terminal-vs-pending
+/// decision, which is what both prevents the silent-loss bug (a premature delete
+/// under a still-pending target) and bounds the payload leak. It does not
+/// distinguish confirmed from failed targets — irrelevant to the cleanup gate,
+/// where both are terminal.
+fn reconcile_shared_cleanup(
+    store: &StandaloneSyncStore,
+    cleanup: &SharedPackageCleanup,
+) -> Result<()> {
+    use std::collections::HashMap;
+    // Every row regardless of state; `u32::MAX` so a long-lived node's history is
+    // never truncated (confirmed rows accumulate — retention deletes sources, not
+    // rows).
+    let rows = store.all_outbound(u32::MAX)?;
+    let mut by_dir: HashMap<String, (usize, usize)> = HashMap::new();
+    for row in &rows {
+        let entry = by_dir.entry(row.package_ref.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        if matches!(row.state, OutboundState::Confirmed | OutboundState::Failed) {
+            entry.1 += 1;
+        }
+    }
+    for (dir, (expected, terminal)) in by_dir {
+        let path = PathBuf::from(&dir);
+        cleanup.register(&path, expected);
+        for _ in 0..terminal {
+            cleanup.on_terminal(&path);
+        }
+    }
+    Ok(())
+}
+
 /// Spawn the task that turns stable capture files into enqueued packages. Each
 /// item is `(owning_capture_dir, file_path)` from a watcher, so the package's
 /// `rel_path` is computed relative to the dir the file was captured under. Each
@@ -826,12 +922,20 @@ fn spawn_enqueue_consumer(
     seen: Arc<SeenStore>,
     config: Config,
     origin_device: String,
+    cleanup: Option<Arc<SharedPackageCleanup>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while let Some((capture_dir, path)) = stable_rx.recv().await {
             match build_package_for_file(&config, &capture_dir, &path, &origin_device) {
                 Ok(pkg_dir) => {
                     let (first_id, delivered) = enqueue_package_to_all(&engines, &pkg_dir).await;
+                    // Fan-out only: register the delivered target count so the
+                    // shared payload is freed exactly once, after all are terminal
+                    // (see `Agent::enqueue_file`). Single-target keeps in-line
+                    // cleanup (`cleanup` is `None`).
+                    if let Some(coord) = &cleanup {
+                        coord.register(&pkg_dir, delivered);
+                    }
                     match first_id {
                         Some(id) => {
                             tracing::info!(
@@ -2059,7 +2163,9 @@ mod multi_target_tests {
     use athenaeum_core::sharing::types::{FrameReceipt, ReceiptOutcome, TransportEvent};
     use athenaeum_core::sharing::SharingTransport;
     use athenaeum_core::sync::store::SyncStore;
-    use athenaeum_core::sync::{OutboundState, SyncEngine};
+    use athenaeum_core::sync::{
+        OutboundState, PackageCleanupSink, SharedPackageCleanup, SyncEngine,
+    };
 
     /// Hand-build a one-file package (real payload + hash so a receiver can fetch
     /// it) and return its directory.
@@ -2224,6 +2330,75 @@ mod multi_target_tests {
         assert_eq!(rows[0].peer, a_id, "the surviving row is for the live target");
 
         engine_a.shutdown().await;
+    }
+
+    /// The regression this whole change exists for: when target B is offline as
+    /// target A confirms, the SHARED payload must NOT be deleted — otherwise B's
+    /// retry re-serves a manifest-only collection and B silently never gets the
+    /// frame. Two engines share one coordinator + one package dir; B's peer has
+    /// no receiver (never acks → its row stays non-terminal), so after A confirms
+    /// the payload must survive. Cancelling B (terminal) then lets the
+    /// coordinator clean exactly once.
+    #[tokio::test]
+    async fn offline_target_keeps_shared_payload_until_it_terminalizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let net = LoopbackNetwork::new();
+
+        // Target A: a live receiver that acks → its row confirms.
+        let recv_a = Arc::new(net.endpoint());
+        let a_id = recv_a.start().await.unwrap().node_id;
+        spawn_receiver(recv_a.clone(), tmp.path().join("ra"));
+        // Target B: a peer with NO endpoint → announce never reaches it, so B's
+        // row never confirms (stays non-terminal, retrying) — "offline".
+        let b_id = [0xBBu8; 32];
+
+        let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+        let coord = Arc::new(SharedPackageCleanup::new());
+        let engine_a = Arc::new(SyncEngine::spawn_with_sink(
+            Arc::clone(&store) as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()),
+            a_id,
+            Arc::clone(&coord) as Arc<dyn PackageCleanupSink>,
+        ));
+        let engine_b = Arc::new(SyncEngine::spawn_with_sink(
+            Arc::clone(&store) as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()),
+            b_id,
+            Arc::clone(&coord) as Arc<dyn PackageCleanupSink>,
+        ));
+
+        let pkg = make_pkg(tmp.path(), "uuid-off", "frame.fits");
+        // The fan-out reached both targets → expected = 2.
+        coord.register(&pkg, 2);
+        let _id_a = engine_a.enqueue_package(&pkg).await.unwrap();
+        let id_b = engine_b.enqueue_package(&pkg).await.unwrap();
+
+        // A confirms. Under the OLD code this deleted the shared payload.
+        wait_until(|| {
+            store
+                .all_outbound(100)
+                .unwrap()
+                .iter()
+                .any(|r| r.peer == a_id && r.state == OutboundState::Confirmed)
+        })
+        .await;
+        // Give any (erroneous) cleanup a chance to run.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            pkg.join("frame.fits").exists(),
+            "the shared payload MUST survive A's confirm while B is still offline"
+        );
+
+        // B terminalizes (cancel) → both targets terminal → clean exactly once.
+        engine_b.cancel(id_b).await.unwrap();
+        wait_until(|| !pkg.join("frame.fits").exists()).await;
+        assert!(
+            !pkg.join("frame.fits").exists(),
+            "once B is terminal too the coordinator frees the shared payload"
+        );
+
+        engine_a.shutdown().await;
+        engine_b.shutdown().await;
     }
 
     /// `start_with_transports` spawns exactly one engine per injected target.

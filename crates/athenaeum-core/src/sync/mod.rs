@@ -47,6 +47,7 @@ use chrono::Utc;
 
 use crate::sharing::types::NodeId;
 
+pub mod cleanup_coord;
 pub mod engine;
 pub mod ingest;
 pub mod models;
@@ -64,7 +65,10 @@ mod ingest_tests;
 #[cfg(test)]
 mod retention_tests;
 
-pub use engine::{SyncConfig, SyncEngine, SyncEngineHandle, DEFAULT_ACK_TIMEOUT, MAX_ATTEMPTS};
+pub use cleanup_coord::SharedPackageCleanup;
+pub use engine::{
+    PackageCleanupSink, SyncConfig, SyncEngine, SyncEngineHandle, DEFAULT_ACK_TIMEOUT, MAX_ATTEMPTS,
+};
 pub use ingest::{ingest_package, IngestOutcome};
 pub use pairing::{node_id_from_ticket, relay_mode_for, resolve_relays, RelayResolution};
 pub use models::{Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState};

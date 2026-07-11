@@ -26,6 +26,8 @@ use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
 use crate::sharing::types::{FrameReceipt, PackageAnnounce, ReceiptOutcome, TransportEvent};
 use crate::sharing::SharingTransport;
 
+use super::cleanup_coord::SharedPackageCleanup;
+use super::engine::PackageCleanupSink;
 use super::store::{StandaloneSyncStore, SyncStore};
 use super::{HistoryQuery, OutboundState, SyncConfig, SyncEngine};
 
@@ -886,6 +888,60 @@ async fn failed_package_keeps_payloads() {
         "a failed package must KEEP its payloads (retry depends on them)"
     );
     assert!(pkg.join(MANIFEST_FILENAME).exists());
+
+    engine.shutdown().await;
+}
+
+/// Test D (Sync 2C): with a shared cleanup sink the confirming engine must NOT
+/// delete the SHARED payload on its own confirm — it defers to the coordinator,
+/// which cleans only once EVERY target is terminal. This is the fan-out
+/// data-loss fix at the engine boundary (`spawn_with_sink` routes the confirmed
+/// terminal through `on_terminal` instead of the in-line cleanup). A single
+/// engine is driven to `Confirmed`; the coordinator is told two targets share
+/// the dir, so the payload must survive until the second (simulated) target
+/// terminalizes.
+#[tokio::test]
+async fn sink_defers_shared_payload_cleanup_until_all_targets_terminal() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(&tmp.path().join("srcD"), "uuid-d", "frameD.fits", "M42", 4096);
+    assert!(pkg.join("frameD.fits").exists());
+
+    // Two targets share this dir; only one is driven here.
+    let coord = Arc::new(SharedPackageCleanup::new());
+    coord.register(&pkg, 2);
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_with_sink(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        coord.clone() as Arc<dyn PackageCleanupSink>,
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+
+    // Confirmed, but the shared payload MUST still be here — the second target
+    // has not terminalized, so an in-line cleanup would have starved its retry.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        pkg.join("frameD.fits").exists(),
+        "a sinked engine must NOT delete the shared payload on its own confirm"
+    );
+
+    // The second target reaches terminal → the coordinator cleans exactly once.
+    coord.on_terminal(&pkg);
+    assert_eq!(
+        dir_entries(&pkg),
+        vec![MANIFEST_FILENAME.to_string()],
+        "once every target is terminal the coordinator leaves only the manifest"
+    );
 
     engine.shutdown().await;
 }
