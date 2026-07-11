@@ -208,8 +208,14 @@ impl WatcherHandle {
 }
 
 /// Start watching `capture_dir` (recursively). Stable capture files are sent on
-/// `stable_tx`; the consumer builds a package and enqueues it. Returns once the
-/// `notify` watcher is armed.
+/// `stable_tx` as `(owning_capture_dir, file_path)`; the consumer builds a
+/// package (with a `rel_path` relative to that capture dir) and enqueues it.
+/// Returns once the `notify` watcher is armed.
+///
+/// The owning capture dir is the *canonicalized* root this watcher watches (see
+/// the canonicalize note below): pairing it with each stable path lets the
+/// enqueue consumer compute the capture-dir-relative `rel_path` without guessing
+/// which of several configured roots the file came from.
 ///
 /// `seen_store` is the durable, stat-aware "already enqueued this exact file"
 /// record (see [`crate::seen`]) — it, not an in-process baseline, decides
@@ -220,7 +226,7 @@ pub fn spawn_watcher(
     capture_dir: PathBuf,
     stability: Duration,
     poll_interval: Duration,
-    stable_tx: mpsc::Sender<PathBuf>,
+    stable_tx: mpsc::Sender<(PathBuf, PathBuf)>,
     seen_store: Arc<SeenStore>,
 ) -> Result<WatcherHandle> {
     // Canonicalize the watched root so both discovery sources — `notify` events
@@ -369,7 +375,10 @@ pub fn spawn_watcher(
                     for path in tracker.collect_stable(now) {
                         candidates.remove(&path);
                         tracing::info!(path = %path.display(), "capture file stable; enqueuing");
-                        if stable_tx.send(path).await.is_err() {
+                        // Pair the file with the (canonicalized) capture dir it
+                        // came from, so the consumer can compute a rel_path
+                        // relative to it.
+                        if stable_tx.send((capture_dir.clone(), path)).await.is_err() {
                             tracing::warn!("stable-file consumer gone; watcher stopping");
                             return;
                         }

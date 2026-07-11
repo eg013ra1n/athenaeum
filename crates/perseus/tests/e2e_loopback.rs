@@ -58,6 +58,8 @@ fn test_config(capture_dir: &Path, data_dir: &Path) -> Config {
         // exercises the dev-ticket path (task M1).
         pairing_ticket: Some("loopback-test".to_string()),
         account: None,
+        targets: Vec::new(),
+        device_name: None,
         mode: Mode::Auto,
         retention: RetentionConfig {
             policy: RetentionPolicy::KeepEverything,
@@ -83,6 +85,8 @@ fn test_config_multi(capture_dirs: &[&Path], data_dir: &Path) -> Config {
         data_dir: data_dir.to_path_buf(),
         pairing_ticket: Some("loopback-test".to_string()),
         account: None,
+        targets: Vec::new(),
+        device_name: None,
         mode: Mode::Auto,
         retention: RetentionConfig {
             policy: RetentionPolicy::KeepEverything,

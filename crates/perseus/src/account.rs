@@ -1,22 +1,23 @@
-//! Perseus account pairing (task M1).
+//! Perseus account sign-in + send-target resolution (Sync 2C mesh model).
 //!
-//! Perseus pairs with a primary either through a hub **account** (a `perseus
-//! login` device token) or a raw **pairing ticket**. This module owns:
+//! Perseus is a **send-only** capability: it signs into a hub **account** (a
+//! `perseus login` device token) and sends captures to explicit **targets**
+//! (account devices named by id or name), or — for offline dev/tests — derives a
+//! single peer from a raw **pairing ticket**. This module owns:
 //!
 //! - [`login`] — the interactive CLI OTP flow (email → code) using the shared
 //!   [`athenaeum_core::account`] hub client. The device token is written to a
 //!   0600 file in `data_dir` (never the TOML), and this device registers itself
-//!   as a `capture` device paired to the account's primary.
+//!   with the [`DeviceCapability::Perseus`] capability. There is no per-account
+//!   "primary" to pair to — that one-primary model is gone.
 //! - [`resolve_pairing`] — the run-time resolution the [`crate::run::Agent`]
-//!   uses: it feeds the account/ticket inputs into the **single** shared resolver
-//!   ([`athenaeum_core::sync::pairing`]) so Perseus and the app agree on the
-//!   order (account → ticket → error) and both get the hub relay map with an
-//!   offline cache fallback. Falling back further, to iroh's public default
-//!   relays, requires the dev-only `[account].allow_default_relays` opt-in
+//!   uses: it resolves the first configured target to a [`NodeId`] (from the hub
+//!   device list, matched by id then name, pubkey → node id) and pairs the hub
+//!   relay map (with an offline cache fallback). Task 6 resolves `targets[0]`;
+//!   the full multi-target send is task 7. Falling back to iroh's public default
+//!   relays requires the dev-only `[account].allow_default_relays` opt-in
 //!   (default `false`) — otherwise an empty/unreachable relay map with no cache
-//!   is a loud, actionable error (review finding #1). A hub that
-//!   *authoritatively* says the paired primary is gone or demoted is likewise
-//!   never served from the cache — it invalidates it (review finding #2).
+//!   is a loud, actionable error.
 //! - [`PairingCache`] — the persisted `perseus login` result + last successful
 //!   resolutions (`data_dir/pairing_cache.json`), so an offline restart still
 //!   resolves. The token is NOT in it (that is the 0600 [`TokenStore`] file).
@@ -26,10 +27,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
-use athenaeum_core::account::{DeviceKey, DeviceRole, HubClient, TokenStore};
+use athenaeum_core::account::{
+    default_device_name, DeviceCapability, DeviceKey, HubClient, TokenStore,
+};
 use athenaeum_core::sharing::types::NodeId;
-use athenaeum_core::sync::pairing::{self, AccountPairing};
-use athenaeum_core::sync::{node_id_from_hex, node_id_hex, PeerResolution};
+use athenaeum_core::sync::pairing;
+use athenaeum_core::sync::{node_id_from_hex, node_id_hex};
 use iroh::RelayMode;
 use serde::{Deserialize, Serialize};
 
@@ -45,10 +48,8 @@ pub struct PairingCache {
     /// This device's hub device id (from login).
     #[serde(default)]
     pub device_id: Option<String>,
-    /// The paired primary's hub device id (config override, or auto-picked).
-    #[serde(default)]
-    pub primary_device_id: Option<String>,
-    /// Last successfully resolved peer node id (64-char lowercase hex).
+    /// Last successfully resolved target peer node id (64-char lowercase hex).
+    /// Task 6 tracks the single `targets[0]` peer here for offline restarts.
     #[serde(default)]
     pub peer_node_id_hex: Option<String>,
     /// Last successfully resolved relay URLs.
@@ -62,10 +63,6 @@ pub struct PairingCache {
     /// [`account_status`] when the config file carries no `[account].email`).
     #[serde(default)]
     pub email: Option<String>,
-    /// The paired primary's hub device name (display-only companion to
-    /// [`Self::primary_device_id`], for the Account UI).
-    #[serde(default)]
-    pub primary_name: Option<String>,
 }
 
 impl PairingCache {
@@ -120,8 +117,8 @@ pub struct ResolvedPairing {
 }
 
 /// Interactive `perseus login`: request an OTP for the account email, verify it,
-/// store the device token (0600 file), and register this device as a `capture`
-/// device paired to the account's primary. Requires an `[account]` config table.
+/// store the device token (0600 file), and register this device with the
+/// [`DeviceCapability::Perseus`] capability. Requires an `[account]` config table.
 pub async fn login(config: &Config) -> Result<()> {
     let account = config.account.clone().ok_or_else(|| {
         anyhow!("`perseus login` requires an [account] table in the config (hub_url/email)")
@@ -149,21 +146,16 @@ pub async fn login(config: &Config) -> Result<()> {
         bail!("code is required");
     }
 
-    let primary_id = verify_and_register(config, &account, &client, &email, &code).await?;
-    match &primary_id {
-        Some(p) => println!("Signed in. Registered as a capture device paired to primary {p}."),
-        None => println!(
-            "Signed in, but no primary device was found. Set the primary role on your \
-             main Athenaeum machine (Settings → Account), then re-run `perseus login` \
-             or set [account].primary_device_id."
-        ),
-    }
+    verify_and_register(config, &account, &client, &email, &code).await?;
+    println!(
+        "Signed in as a Perseus capture device. Add the devices to send to in the \
+         config `targets` list (by device name or id)."
+    );
     Ok(())
 }
 
 /// The non-interactive core of [`login`]: verify the OTP, store the token, and
-/// register this device as a `capture` device paired to the account's primary.
-/// Returns the resolved primary id (`None` when the account has no primary yet).
+/// register this device with the [`DeviceCapability::Perseus`] capability.
 /// Split out so the hub interactions are testable without prompting for stdin.
 async fn verify_and_register(
     config: &Config,
@@ -171,12 +163,18 @@ async fn verify_and_register(
     client: &HubClient,
     email: &str,
     code: &str,
-) -> Result<Option<String>> {
+) -> Result<()> {
     // The ONE device identity: the same key file the run-time transport binds.
     let key = DeviceKey::load_or_create(&config.device_key_path())
         .context("load or create device key")?;
     let resp = client
-        .verify(email, code, &key.pubkey_base64(), &device_name())
+        .verify(
+            email,
+            code,
+            &key.pubkey_base64(),
+            &device_name(config, &key),
+            DeviceCapability::Perseus,
+        )
         .await
         .map_err(|e| anyhow!("verify code: {e}"))?;
 
@@ -185,37 +183,20 @@ async fn verify_and_register(
         .store(&resp.device_token)
         .context("store device token")?;
 
-    // Resolve the primary to pair with: config override, else auto-pick the
-    // account's single primary.
-    let devices = client
-        .list_devices(&resp.device_token)
-        .await
-        .map_err(|e| anyhow!("list account devices: {e}"))?;
-    let primary_id = match account.primary_device_id.clone() {
-        Some(id) => Some(id),
-        None => auto_pick_primary(&devices)?,
-    };
-
-    // Register this device as capture, paired to the primary when one is known.
-    if let Some(primary) = &primary_id {
-        client
-            .set_role(&resp.device_token, &resp.device_id, DeviceRole::Capture, Some(primary))
-            .await
-            .map_err(|e| anyhow!("register as capture device: {e}"))?;
-    }
-
     let mut cache = PairingCache::load(&config.data_dir);
     cache.device_id = Some(resp.device_id.clone());
-    cache.primary_device_id = primary_id.clone();
-    cache.device_names = device_names_from(&devices);
     cache.email = Some(email.to_string());
-    cache.primary_name = primary_id.as_ref().and_then(|pid| {
-        devices.iter().find(|d| &d.id == pid).map(|d| d.name.clone())
-    });
+    // Best-effort: refresh the friendly-name cache history rows resolve peer hex
+    // against. There is no primary to pick, so a device-list failure here must
+    // NOT fail sign-in — the token is already stored.
+    match client.list_devices(&resp.device_token).await {
+        Ok(devices) => cache.device_names = device_names_from(&devices),
+        Err(error) => tracing::warn!(%error, "could not refresh device names after sign-in"),
+    }
     cache.save(&config.data_dir);
 
     tracing::info!(device_id = %resp.device_id, "perseus signed in");
-    Ok(primary_id)
+    Ok(())
 }
 
 /// Is a hub device token stored for this config's account? (`false` when there
@@ -249,10 +230,9 @@ pub async fn request_code(config: &Config, email: &str) -> Result<()> {
 }
 
 /// Non-interactive sign-in (the web page's path): verify the OTP, store the
-/// token, register as a capture device. Same core as `perseus login`, without
-/// the stdin prompts. Returns the resolved primary id (`None` when the account
-/// has no primary yet), like [`verify_and_register`].
-pub async fn web_sign_in(config: &Config, email: &str, code: &str) -> Result<Option<String>> {
+/// token, register with the Perseus capability. Same core as `perseus login`,
+/// without the stdin prompts.
+pub async fn web_sign_in(config: &Config, email: &str, code: &str) -> Result<()> {
     let account = config.account.clone().ok_or_else(|| {
         anyhow!("sign-in requires an [account] table in the config (hub_url)")
     })?;
@@ -294,10 +274,6 @@ pub struct AccountStatus {
     pub hub_url: Option<String>,
     /// This device's hub device id (from the last sign-in).
     pub device_id: Option<String>,
-    /// The paired primary's hub device id.
-    pub primary_device_id: Option<String>,
-    /// The paired primary's hub device name (display-only).
-    pub primary_name: Option<String>,
 }
 
 /// Build the [`AccountStatus`] snapshot from the config + pairing cache. Pure
@@ -309,70 +285,64 @@ pub fn account_status(config: &Config) -> AccountStatus {
         email: config.account.as_ref().and_then(|a| a.email.clone()).or(cache.email),
         hub_url: config.account.as_ref().map(|a| a.hub_url.clone()),
         device_id: cache.device_id,
-        primary_device_id: cache.primary_device_id,
-        primary_name: cache.primary_name,
     }
 }
 
-/// Resolve the peer + relays for an agent start, via the shared resolver.
+/// Resolve the peer + relays for an agent start.
 ///
-/// Order (task M1): account pairing (signed-in capture device → primary from the
-/// hub device list, with the cached peer as the offline fallback) → dev ticket →
-/// error. Successful resolutions refresh the offline cache; a hub-confirmed
-/// gone/demoted peer clears the cached peer instead (review finding #2).
+/// Order (Sync 2C): account send target (signed in → resolve `targets[0]` from
+/// the hub device list, with the cached peer as the offline fallback) → dev
+/// ticket → error. Task 6 resolves the FIRST configured target only; the full
+/// multi-target send is task 7. A successful account resolution refreshes the
+/// offline cache (`peer_node_id_hex` + relay map).
 ///
-/// Peer resolution happens FIRST and a `Disabled`/`Invalidated` outcome bails
-/// immediately, before the relay map is resolved (review minor (b)) — there is
-/// no point spending a second hub round trip on relays when there is nothing to
-/// sync to yet.
+/// The peer is resolved FIRST and a failure bails immediately, before the relay
+/// map is resolved — there is no point spending a second hub round trip on
+/// relays when there is nothing to sync to yet.
 pub async fn resolve_pairing(config: &Config) -> Result<ResolvedPairing> {
     let mut cache = PairingCache::load(&config.data_dir);
 
-    let account_inputs = build_account_pairing(config, &mut cache).await?;
+    // Signed in? (an [account] table AND a stored device token.)
+    let account_token = match &config.account {
+        Some(account) => token_store(config, account)
+            .load()
+            .context("load device token")?
+            .map(|token| (account, token)),
+        None => None,
+    };
     let dev_ticket = config
         .pairing_ticket
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty());
-    let cached_peer = cache
-        .peer_node_id_hex
-        .as_deref()
-        .and_then(|s| node_id_from_hex(s).ok());
 
-    let resolution = pairing::resolve_peer(account_inputs.as_ref(), dev_ticket, cached_peer).await;
-    let (peer, ticket) = match resolution {
-        PeerResolution::Account { peer, fresh } => {
-            if fresh {
-                cache.peer_node_id_hex = Some(node_id_hex(&peer));
-            }
-            (peer, None)
-        }
-        PeerResolution::Ticket { peer } => (peer, dev_ticket.map(str::to_string)),
-        PeerResolution::Invalidated { reason } => {
-            cache.peer_node_id_hex = None;
-            cache.save(&config.data_dir);
-            bail!(
-                "cannot resolve a sync peer — the hub says the pairing is no longer valid: {reason}"
-            );
-        }
-        PeerResolution::Disabled { reason } => {
-            cache.save(&config.data_dir);
-            bail!("cannot resolve a sync peer — {reason}");
-        }
+    // Resolve the peer: account target[0] when signed in, else the dev ticket.
+    // `relay_account` carries the (hub_url, token) the relay map is fetched with
+    // — `None` on the ticket path (an account-less ticket run is dev/test).
+    let (peer, ticket, relay_account) = if let Some((account, token)) = &account_token {
+        let peer = resolve_target_peer(config, account, token, &mut cache).await?;
+        (peer, None, Some((account.hub_url.clone(), token.clone())))
+    } else if let Some(t) = dev_ticket {
+        let peer = crate::run::peer_node_id_from_ticket(t)
+            .context("derive the sync peer from the dev pairing ticket")?;
+        (peer, Some(t.to_string()), None)
+    } else {
+        bail!(
+            "cannot resolve a send target — sign in and add at least one entry to \
+             `targets`, or set a dev pairing_ticket"
+        );
     };
 
     // Relays: hub map when signed in, cached map otherwise. Falling back to
     // iroh's public default relays beyond that requires the dev-only opt-in
     // (review finding #1) — only relevant when actually signed in (an
     // account-less ticket run is inherently dev/test already).
-    let relay_account = account_inputs
-        .as_ref()
-        .map(|a| (a.hub_url.as_str(), a.token.as_str()));
-    let relays = pairing::resolve_relays(relay_account, &cache.relay_urls).await;
+    let relay_account_ref = relay_account.as_ref().map(|(u, t)| (u.as_str(), t.as_str()));
+    let relays = pairing::resolve_relays(relay_account_ref, &cache.relay_urls).await;
     if relays.fresh {
         cache.relay_urls = relays.urls.clone();
     }
-    let allow_default_relays = if account_inputs.is_some() {
+    let allow_default_relays = if relay_account.is_some() {
         config.account.as_ref().is_some_and(|a| a.allow_default_relays)
     } else {
         true
@@ -394,71 +364,78 @@ pub async fn resolve_pairing(config: &Config) -> Result<ResolvedPairing> {
     })
 }
 
-/// Build the account-pairing inputs, or `None` when Perseus is not signed in
-/// (no `[account]` table or no stored token). Resolves the paired primary id
-/// from config → cache → auto-pick (a hub call, cached on success).
-async fn build_account_pairing(
+/// Resolve the first configured send target to its peer [`NodeId`].
+///
+/// The target string is matched against the account device list by **id first,
+/// then name**, and the matched device's pubkey is decoded to a node id. A
+/// Perseus capability device is refused as a target (capture agents are
+/// send-only and cannot receive). When the hub is unreachable, the last cached
+/// peer is used as an offline fallback; with no cache this is an actionable
+/// error rather than a silent no-peer start. On a live resolution the cache's
+/// `peer_node_id_hex` + friendly-name map are refreshed.
+///
+/// Task 6 resolves only `targets[0]`; the multi-target send loop is task 7.
+async fn resolve_target_peer(
     config: &Config,
+    account: &AccountConfig,
+    token: &str,
     cache: &mut PairingCache,
-) -> Result<Option<AccountPairing>> {
-    let Some(account) = &config.account else {
-        return Ok(None);
-    };
-    let Some(token) = token_store(config, account)
-        .load()
-        .context("load device token")?
-    else {
-        return Ok(None);
-    };
-
-    let peer_device_id = match account
-        .primary_device_id
-        .clone()
-        .or_else(|| cache.primary_device_id.clone())
-    {
-        Some(id) => id,
-        None => {
-            // No configured/cached primary: auto-pick from the hub. If the hub is
-            // unreachable here we can't proceed — an actionable error is better
-            // than a silent no-peer start.
-            let client = HubClient::new(&account.hub_url).map_err(|e| anyhow!("{e}"))?;
-            let devices = client.list_devices(&token).await.map_err(|e| {
-                anyhow!(
-                    "could not auto-pick the primary device (set [account].primary_device_id, \
-                     or run once while the hub is reachable): {e}"
-                )
-            })?;
-            cache.device_names = device_names_from(&devices);
-            let id = auto_pick_primary(&devices)?
-                .ok_or_else(|| anyhow!("no primary device in the account — set the primary role on your main machine first"))?;
-            cache.primary_device_id = Some(id.clone());
-            id
-        }
-    };
-
-    Ok(Some(AccountPairing {
-        hub_url: account.hub_url.clone(),
-        token,
-        peer_device_id,
-    }))
-}
-
-/// Pick the account's single `primary` device id: `Some(id)` for exactly one,
-/// `Ok(None)` for none, an error for more than one (ambiguous — must be pinned).
-fn auto_pick_primary(
-    devices: &[athenaeum_core::account::AccountDevice],
-) -> Result<Option<String>> {
-    let primaries: Vec<&athenaeum_core::account::AccountDevice> = devices
+) -> Result<NodeId> {
+    let target = config
+        .targets
         .iter()
-        .filter(|d| d.role == Some(DeviceRole::Primary))
-        .collect();
-    match primaries.as_slice() {
-        [only] => Ok(Some(only.id.clone())),
-        [] => Ok(None),
-        _ => bail!(
-            "the account has more than one primary device — set [account].primary_device_id \
-             to choose which one this capture node pairs with"
-        ),
+        .map(|t| t.trim())
+        .find(|t| !t.is_empty())
+        .ok_or_else(|| {
+            anyhow!("no send target configured — add at least one device to `targets`")
+        })?;
+
+    let client = HubClient::new(&account.hub_url).map_err(|e| anyhow!("{e}"))?;
+    match client.list_devices(token).await {
+        Ok(devices) => {
+            cache.device_names = device_names_from(&devices);
+            // Match by id first, then by name (either spelling is a valid target).
+            let device = devices
+                .iter()
+                .find(|d| d.id == target)
+                .or_else(|| devices.iter().find(|d| d.name == target))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "send target '{target}' was not found in your account device list — \
+                         check the device name or id"
+                    )
+                })?;
+            if device.capability == DeviceCapability::Perseus {
+                bail!(
+                    "send target '{target}' is a Perseus capture agent — capture agents are \
+                     send-only and cannot receive frames; choose a full Athenaeum device"
+                );
+            }
+            let peer = pairing::node_id_from_pubkey_b64(&device.pubkey)
+                .with_context(|| format!("decode pubkey for send target '{target}'"))?;
+            cache.peer_node_id_hex = Some(node_id_hex(&peer));
+            tracing::info!(target = %target, "resolved send target from account device list");
+            Ok(peer)
+        }
+        Err(error) => {
+            // Hub unreachable: fall back to the last cached target peer, if any.
+            if let Some(peer) = cache
+                .peer_node_id_hex
+                .as_deref()
+                .and_then(|s| node_id_from_hex(s).ok())
+            {
+                tracing::warn!(
+                    target = %target,
+                    %error,
+                    "could not reach the hub to resolve the send target; using last cached peer"
+                );
+                return Ok(peer);
+            }
+            bail!(
+                "could not reach the hub to resolve send target '{target}', and there is no \
+                 cached peer yet: {error}"
+            );
+        }
     }
 }
 
@@ -497,17 +474,15 @@ fn hub_host(url: &str) -> String {
     host.split(':').next().unwrap_or(host).to_string()
 }
 
-/// Best-effort device name for the hub device list.
-fn device_name() -> String {
-    for var in ["ATHENAEUM_DEVICE_NAME", "HOSTNAME", "COMPUTERNAME"] {
-        if let Ok(v) = std::env::var(var) {
-            let v = v.trim();
-            if !v.is_empty() {
-                return v.to_string();
-            }
-        }
-    }
-    "Perseus".to_string()
+/// The device name registered with the hub: the explicit `config.device_name`
+/// override, else the machine hostname (falling back to a `perseus-<short-id>`
+/// label from the device node id when the hostname is unavailable — see
+/// [`default_device_name`]).
+fn device_name(config: &Config, key: &DeviceKey) -> String {
+    config
+        .device_name
+        .clone()
+        .unwrap_or_else(|| default_device_name("perseus", &key.node_id_hex()))
 }
 
 /// Read one trimmed line from stdin after printing `label` (login prompts).
@@ -550,7 +525,6 @@ mod tests {
         assert_eq!(cache, PairingCache::default(), "missing file loads an empty cache");
 
         cache.device_id = Some("dev-1".into());
-        cache.primary_device_id = Some("primary-1".into());
         cache.peer_node_id_hex = Some(node_id_hex(&[3u8; 32]));
         cache.relay_urls = vec!["https://relay1.example.org".into()];
         cache.save(dir.path());
@@ -586,25 +560,25 @@ mod tests {
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// A minimal `[account]`-based Config over a fresh data dir. `capture_dir`
-    /// need not exist here — these tests never call `validate()`, only the
-    /// account helpers. `allow_default_relays` defaults to `false` (production
-    /// default); callers that need the dev-only opt-in use
+    /// A minimal `[account]`-based Config over a fresh data dir with the given
+    /// send `targets`. `capture_dir` need not exist here — these tests never call
+    /// `validate()`, only the account helpers. `allow_default_relays` defaults to
+    /// `false` (production default); callers that need the dev-only opt-in use
     /// [`account_config_allowing_default_relays`].
-    fn account_config(data_dir: &Path, hub_url: &str, primary: Option<&str>) -> Config {
-        account_config_with(data_dir, hub_url, primary, false)
+    fn account_config(data_dir: &Path, hub_url: &str, targets: &[&str]) -> Config {
+        account_config_with(data_dir, hub_url, targets, false)
     }
 
     /// As [`account_config`], but with the dev-only relay opt-in set — for the
     /// gating-matrix tests (review finding #1).
-    fn account_config_allowing_default_relays(data_dir: &Path, hub_url: &str, primary: Option<&str>) -> Config {
-        account_config_with(data_dir, hub_url, primary, true)
+    fn account_config_allowing_default_relays(data_dir: &Path, hub_url: &str, targets: &[&str]) -> Config {
+        account_config_with(data_dir, hub_url, targets, true)
     }
 
     fn account_config_with(
         data_dir: &Path,
         hub_url: &str,
-        primary: Option<&str>,
+        targets: &[&str],
         allow_default_relays: bool,
     ) -> Config {
         Config {
@@ -615,9 +589,10 @@ mod tests {
             account: Some(AccountConfig {
                 hub_url: hub_url.to_string(),
                 email: Some("me@example.com".into()),
-                primary_device_id: primary.map(str::to_string),
                 allow_default_relays,
             }),
+            targets: targets.iter().map(|s| s.to_string()).collect(),
+            device_name: None,
             mode: Mode::Auto,
             retention: RetentionConfig::default(),
             stability_secs: 1,
@@ -627,59 +602,54 @@ mod tests {
         }
     }
 
-    /// Task M1: the non-interactive login core verifies the code, stores the
-    /// token (0600 file), auto-picks the account's single primary, and registers
-    /// this device as a `capture` device paired to it.
+    /// One account device with the given fields (mesh `capability`; a real pubkey
+    /// so `resolve_target_peer` can decode it to a node id).
+    fn device_json(id: &str, name: &str, pubkey: &str, capability: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "name": name, "pubkey": pubkey, "capability": capability,
+            "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
+        })
+    }
+
+    /// Sync 2C: the non-interactive login core verifies the code — sending the
+    /// `perseus` capability (body matcher) — stores the token (0600 file), and
+    /// caches the signed-in identity. No role/primary pairing happens.
     #[tokio::test]
-    async fn login_verify_and_register_stores_token_and_registers_capture() {
+    async fn verify_and_register_registers_as_perseus_and_stores_token() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let server = MockServer::start().await;
 
+        // The verify body MUST carry deviceCapability = "perseus"; a mismatch
+        // 404s and the flow errors, proving Perseus registers send-only.
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/verify"))
+            .and(body_partial_json(serde_json::json!({ "deviceCapability": "perseus" })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "deviceToken": "tok-secret-xyz",
-                "deviceId": "capture-dev",
+                "deviceId": "perseus-dev",
             })))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v1/devices"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {
-                    "id": "primary-1", "name": "Studio", "pubkey": "cHVia2V5",
-                    "role": "primary", "peerDeviceId": null,
-                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
-                }
+                device_json("studio-1", "Studio", "cHVia2V5", "athenaeum")
             ])))
-            .mount(&server)
-            .await;
-        // The role call MUST arrive as capture paired to primary-1 (body matcher);
-        // if it doesn't match, the mock 404s and the flow errors — proving the
-        // capture registration happened with the right arguments.
-        Mock::given(method("POST"))
-            .and(path("/api/v1/devices/capture-dev/role"))
-            .and(body_partial_json(serde_json::json!({
-                "role": "capture", "peerDeviceId": "primary-1"
-            })))
-            .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
 
         let account = AccountConfig {
             hub_url: server.uri(),
             email: Some("me@example.com".into()),
-            primary_device_id: None, // exercise auto-pick
             allow_default_relays: false,
         };
-        let config = account_config(tmp.path(), &server.uri(), None);
+        let config = account_config(tmp.path(), &server.uri(), &["Studio"]);
         let client = HubClient::new(&account.hub_url).unwrap();
 
-        let primary = verify_and_register(&config, &account, &client, "me@example.com", "123456")
+        verify_and_register(&config, &account, &client, "me@example.com", "123456")
             .await
             .expect("login core succeeds");
-        assert_eq!(primary.as_deref(), Some("primary-1"), "auto-picked the single primary");
 
         // Token landed in the 0600 file store.
         assert_eq!(
@@ -687,19 +657,17 @@ mod tests {
             Some("tok-secret-xyz"),
             "the device token must be stored"
         );
-        // Cache recorded the login result.
+        // Cache recorded the sign-in identity + friendly-name map.
         let cache = PairingCache::load(tmp.path());
-        assert_eq!(cache.device_id.as_deref(), Some("capture-dev"));
-        assert_eq!(cache.primary_device_id.as_deref(), Some("primary-1"));
+        assert_eq!(cache.device_id.as_deref(), Some("perseus-dev"));
+        assert_eq!(cache.email.as_deref(), Some("me@example.com"));
     }
 
-    /// Task 2: the non-interactive web sign-in core stores the token, registers
-    /// the capture device, and caches the signed-in identity (email + primary
-    /// name) so the Account UI can show who is signed in. Same hub interactions
-    /// as the CLI `login` core (verify → token+device_id → device list →
-    /// set_role), driven without a stdin prompt.
+    /// Sync 2C: the non-interactive web sign-in core stores the token and caches
+    /// the signed-in identity (email) so the Account UI can show who is signed
+    /// in, driven without a stdin prompt.
     #[tokio::test]
-    async fn web_sign_in_stores_token_registers_and_caches_identity() {
+    async fn web_sign_in_stores_token_and_caches_identity() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let server = MockServer::start().await;
@@ -708,58 +676,41 @@ mod tests {
             .and(path("/api/v1/auth/verify"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "deviceToken": "tok-secret-xyz",
-                "deviceId": "capture-dev",
+                "deviceId": "perseus-dev",
             })))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v1/devices"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {
-                    "id": "primary-1", "name": "Studio", "pubkey": "cHVia2V5",
-                    "role": "primary", "peerDeviceId": null,
-                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
-                }
+                device_json("studio-1", "Studio", "cHVia2V5", "athenaeum")
             ])))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/v1/devices/capture-dev/role"))
-            .and(body_partial_json(serde_json::json!({
-                "role": "capture", "peerDeviceId": "primary-1"
-            })))
-            .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
 
         // The web sign-in path carries no email in the config file — the email
         // comes from the sign-in form and is cached; account_status must surface
         // it via the cache fallback.
-        let mut config = account_config(tmp.path(), &server.uri(), None);
+        let mut config = account_config(tmp.path(), &server.uri(), &["Studio"]);
         config.account.as_mut().unwrap().email = None;
 
-        let primary = web_sign_in(&config, "user@example.com", "123456")
+        web_sign_in(&config, "user@example.com", "123456")
             .await
             .expect("web sign-in succeeds");
-        assert_eq!(primary.as_deref(), Some("primary-1"), "auto-picked the single primary");
 
         assert!(token_present(&config), "the device token must be stored");
         let cache = PairingCache::load(&config.data_dir);
-        assert_eq!(cache.device_id.as_deref(), Some("capture-dev"));
-        assert_eq!(cache.primary_device_id, primary);
+        assert_eq!(cache.device_id.as_deref(), Some("perseus-dev"));
         assert_eq!(cache.email.as_deref(), Some("user@example.com"));
-        assert!(cache.primary_name.is_some(), "primary name cached from the device list");
-        assert_eq!(cache.primary_name.as_deref(), Some("Studio"));
 
         let status = account_status(&config);
         assert!(status.signed_in);
         assert_eq!(status.email.as_deref(), Some("user@example.com"));
-        assert_eq!(status.primary_device_id.as_deref(), Some("primary-1"));
-        assert_eq!(status.primary_name.as_deref(), Some("Studio"));
+        assert_eq!(status.device_id.as_deref(), Some("perseus-dev"));
     }
 
-    /// Task 2: request_code asks the hub to email a one-time code — exactly one
-    /// POST to the OTP endpoint `HubClient::request_otp` uses.
+    /// request_code asks the hub to email a one-time code — exactly one POST to
+    /// the OTP endpoint `HubClient::request_otp` uses.
     #[tokio::test]
     async fn request_code_hits_hub_otp_endpoint() {
         let tmp = tempfile::tempdir().unwrap();
@@ -772,13 +723,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = account_config(tmp.path(), &server.uri(), None);
+        let config = account_config(tmp.path(), &server.uri(), &["Studio"]);
         request_code(&config, "user@example.com").await.unwrap();
         // MockServer verifies the `.expect(1)` on drop.
     }
 
-    /// Task 2: sign_out deletes the stored token and resets the pairing cache,
-    /// and a second call is a no-op (idempotent — the engine is stopped by the
+    /// sign_out deletes the stored token and resets the pairing cache, and a
+    /// second call is a no-op (idempotent — the engine is stopped by the
     /// supervisor, not here).
     #[tokio::test]
     async fn sign_out_clears_token_and_cache_idempotently() {
@@ -789,28 +740,19 @@ mod tests {
             .and(path("/api/v1/auth/verify"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "deviceToken": "tok-secret-xyz",
-                "deviceId": "capture-dev",
+                "deviceId": "perseus-dev",
             })))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/api/v1/devices"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {
-                    "id": "primary-1", "name": "Studio", "pubkey": "cHVia2V5",
-                    "role": "primary", "peerDeviceId": null,
-                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
-                }
+                device_json("studio-1", "Studio", "cHVia2V5", "athenaeum")
             ])))
             .mount(&server)
             .await;
-        Mock::given(method("POST"))
-            .and(path("/api/v1/devices/capture-dev/role"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
 
-        let config = account_config(tmp.path(), &server.uri(), None);
+        let config = account_config(tmp.path(), &server.uri(), &["Studio"]);
         web_sign_in(&config, "user@example.com", "123456")
             .await
             .expect("web sign-in succeeds");
@@ -826,28 +768,24 @@ mod tests {
         sign_out(&config).unwrap(); // second call must not error
     }
 
-    /// Task M1: run-time resolution picks the primary from the hub device list,
-    /// decodes its pubkey to the peer node id, resolves the relay map, and caches
-    /// both for the next offline start.
+    /// Sync 2C: run-time resolution matches `targets[0]` against the hub device
+    /// list (by name here), decodes the device pubkey to the peer node id,
+    /// resolves the relay map, and caches both for the next offline start.
     #[tokio::test]
-    async fn resolve_pairing_resolves_peer_and_relays_from_account() {
+    async fn resolve_pairing_resolves_target_peer_and_relays() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         // A real device key gives us a pubkey the resolver must decode back to a
         // node id — no hand-rolled base64.
-        let primary_key = DeviceKey::load_or_create_in(&tmp.path().join("primary")).unwrap();
-        let primary_pubkey = primary_key.pubkey_base64();
-        let primary_node = primary_key.node_id();
+        let target_key = DeviceKey::load_or_create_in(&tmp.path().join("target")).unwrap();
+        let target_pubkey = target_key.pubkey_base64();
+        let target_node = target_key.node_id();
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/devices"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {
-                    "id": "primary-1", "name": "Studio", "pubkey": primary_pubkey,
-                    "role": "primary", "peerDeviceId": null,
-                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
-                }
+                device_json("studio-1", "Studio", &target_pubkey, "athenaeum")
             ])))
             .mount(&server)
             .await;
@@ -859,14 +797,14 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = account_config(tmp.path(), &server.uri(), Some("primary-1"));
-        // Pre-store a token → the resolver treats this as signed in.
+        // Match by name.
+        let config = account_config(tmp.path(), &server.uri(), &["Studio"]);
         token_store(&config, config.account.as_ref().unwrap())
             .store("tok-signed-in")
             .unwrap();
 
         let resolved = resolve_pairing(&config).await.expect("resolution succeeds");
-        assert_eq!(resolved.peer, primary_node, "peer decodes from the primary's pubkey");
+        assert_eq!(resolved.peer, target_node, "peer decodes from the target's pubkey");
         assert!(resolved.ticket.is_none(), "account path resolves by node id, not a ticket");
         assert!(
             matches!(resolved.relay_mode, RelayMode::Custom(_)),
@@ -875,12 +813,105 @@ mod tests {
 
         // Offline cache was refreshed with both the peer and the relay map.
         let cache = PairingCache::load(tmp.path());
-        assert_eq!(cache.peer_node_id_hex, Some(node_id_hex(&primary_node)));
+        assert_eq!(cache.peer_node_id_hex, Some(node_id_hex(&target_node)));
         assert_eq!(cache.relay_urls, vec!["https://relay1.example.org".to_string()]);
     }
 
-    /// Task M1: with the hub unreachable, resolution falls back to the cached
-    /// peer + relay map (offline start) rather than failing.
+    /// Sync 2C: a target given by device **id** (not name) also resolves.
+    #[tokio::test]
+    async fn resolve_pairing_matches_target_by_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let target_key = DeviceKey::load_or_create_in(&tmp.path().join("target")).unwrap();
+        let target_node = target_key.node_id();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                device_json("studio-1", "Studio", &target_key.pubkey_base64(), "athenaeum")
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/relay-map"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "relays": ["https://relay1.example.org"]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = account_config(tmp.path(), &server.uri(), &["studio-1"]); // by id
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+
+        let resolved = resolve_pairing(&config).await.expect("resolution by id succeeds");
+        assert_eq!(resolved.peer, target_node, "matched the target by its device id");
+    }
+
+    /// Sync 2C: a `perseus` capability device is refused as a target — capture
+    /// agents are send-only and cannot receive frames.
+    #[tokio::test]
+    async fn resolve_pairing_rejects_perseus_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let other_key = DeviceKey::load_or_create_in(&tmp.path().join("other")).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                device_json("cam-1", "CaptureCam", &other_key.pubkey_base64(), "perseus")
+            ])))
+            .mount(&server)
+            .await;
+
+        let config = account_config(tmp.path(), &server.uri(), &["CaptureCam"]);
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+
+        let err = resolve_pairing(&config)
+            .await
+            .expect_err("a perseus target must be refused");
+        assert!(
+            format!("{err:#}").contains("send-only"),
+            "error should explain a capture agent cannot receive: {err:#}"
+        );
+    }
+
+    /// Sync 2C: a target that is not in the account device list is an actionable
+    /// error (no silent no-peer start).
+    #[tokio::test]
+    async fn resolve_pairing_unknown_target_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                device_json("studio-1", "Studio", "cHVia2V5", "athenaeum")
+            ])))
+            .mount(&server)
+            .await;
+
+        let config = account_config(tmp.path(), &server.uri(), &["Nonexistent"]);
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+
+        let err = resolve_pairing(&config)
+            .await
+            .expect_err("an unknown target must error");
+        assert!(
+            format!("{err:#}").contains("was not found"),
+            "error should say the target was not found: {err:#}"
+        );
+    }
+
+    /// Sync 2C: with the hub unreachable, resolution falls back to the cached
+    /// target peer + relay map (offline start) rather than failing.
     #[tokio::test]
     async fn resolve_pairing_offline_uses_cache() {
         let tmp = tempfile::tempdir().unwrap();
@@ -888,7 +919,7 @@ mod tests {
         // A hub that errors every call (no mounts → 404).
         let down = MockServer::start().await;
 
-        let config = account_config(tmp.path(), &down.uri(), Some("primary-1"));
+        let config = account_config(tmp.path(), &down.uri(), &["Studio"]);
         token_store(&config, config.account.as_ref().unwrap())
             .store("tok-signed-in")
             .unwrap();
@@ -896,7 +927,6 @@ mod tests {
         // Seed the cache as a prior successful resolution.
         let cached_node = [11u8; 32];
         let mut cache = PairingCache::default();
-        cache.primary_device_id = Some("primary-1".into());
         cache.peer_node_id_hex = Some(node_id_hex(&cached_node));
         cache.relay_urls = vec!["https://relay-cached.example.org".into()];
         cache.save(tmp.path());
@@ -909,89 +939,6 @@ mod tests {
         );
     }
 
-    /// Review finding #2: the hub is reachable and answers successfully, but
-    /// the pinned primary is simply not in the device list anymore (unpaired on
-    /// the hub side). `resolve_pairing` must error (not silently resolve to a
-    /// stale cached peer) AND must clear the cached peer so a later hub outage
-    /// can't resurrect the dead pairing.
-    #[tokio::test]
-    async fn resolve_pairing_peer_gone_from_hub_invalidates_and_clears_cache() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path()).unwrap();
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/devices"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {
-                    "id": "some-other-device", "name": "Laptop", "pubkey": "b3RoZXI=",
-                    "role": null, "peerDeviceId": null,
-                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
-                }
-            ])))
-            .mount(&server)
-            .await;
-
-        let config = account_config(tmp.path(), &server.uri(), Some("primary-1"));
-        token_store(&config, config.account.as_ref().unwrap())
-            .store("tok-signed-in")
-            .unwrap();
-
-        // A prior cache exists — it must NOT be used or left behind.
-        let mut cache = PairingCache::default();
-        cache.primary_device_id = Some("primary-1".into());
-        cache.peer_node_id_hex = Some(node_id_hex(&[11u8; 32]));
-        cache.save(tmp.path());
-
-        let err = resolve_pairing(&config)
-            .await
-            .expect_err("a hub-confirmed-gone peer must not resolve");
-        assert!(
-            format!("{err:#}").to_lowercase().contains("no longer valid"),
-            "error should explain the pairing is invalid: {err:#}"
-        );
-
-        let reloaded = PairingCache::load(tmp.path());
-        assert_eq!(reloaded.peer_node_id_hex, None, "the cached peer must be cleared");
-    }
-
-    /// Review finding #2: the pinned device is present but demoted (role is no
-    /// longer `primary`) — same Invalidated treatment and cache-clear as fully
-    /// absent.
-    #[tokio::test]
-    async fn resolve_pairing_peer_demoted_invalidates_and_clears_cache() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path()).unwrap();
-        let primary_key = DeviceKey::load_or_create_in(&tmp.path().join("primary")).unwrap();
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/devices"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {
-                    "id": "primary-1", "name": "Demoted", "pubkey": primary_key.pubkey_base64(),
-                    "role": "capture", "peerDeviceId": null,
-                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
-                }
-            ])))
-            .mount(&server)
-            .await;
-
-        let config = account_config(tmp.path(), &server.uri(), Some("primary-1"));
-        token_store(&config, config.account.as_ref().unwrap())
-            .store("tok-signed-in")
-            .unwrap();
-
-        let mut cache = PairingCache::default();
-        cache.primary_device_id = Some("primary-1".into());
-        cache.peer_node_id_hex = Some(node_id_hex(&[11u8; 32]));
-        cache.save(tmp.path());
-
-        let err = resolve_pairing(&config).await.expect_err("a demoted peer must not resolve");
-        assert!(format!("{err:#}").to_lowercase().contains("no longer valid"));
-
-        let reloaded = PairingCache::load(tmp.path());
-        assert_eq!(reloaded.peer_node_id_hex, None, "the cached peer must be cleared");
-    }
-
     /// Review finding #1: signed in, the hub's relay map is explicitly empty,
     /// and there is no cached relay map — without the dev-only opt-in this must
     /// be an actionable error, NOT a silent fallback to iroh's public relays.
@@ -999,16 +946,12 @@ mod tests {
     async fn resolve_pairing_empty_relay_map_no_optin_errors() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
-        let primary_key = DeviceKey::load_or_create_in(&tmp.path().join("primary")).unwrap();
+        let target_key = DeviceKey::load_or_create_in(&tmp.path().join("target")).unwrap();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/devices"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {
-                    "id": "primary-1", "name": "Studio", "pubkey": primary_key.pubkey_base64(),
-                    "role": "primary", "peerDeviceId": null,
-                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
-                }
+                device_json("studio-1", "Studio", &target_key.pubkey_base64(), "athenaeum")
             ])))
             .mount(&server)
             .await;
@@ -1018,7 +961,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = account_config(tmp.path(), &server.uri(), Some("primary-1")); // allow_default_relays: false
+        let config = account_config(tmp.path(), &server.uri(), &["Studio"]); // allow_default_relays: false
         token_store(&config, config.account.as_ref().unwrap())
             .store("tok-signed-in")
             .unwrap();
@@ -1039,16 +982,12 @@ mod tests {
     async fn resolve_pairing_empty_relay_map_with_optin_uses_default() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
-        let primary_key = DeviceKey::load_or_create_in(&tmp.path().join("primary")).unwrap();
+        let target_key = DeviceKey::load_or_create_in(&tmp.path().join("target")).unwrap();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/devices"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                {
-                    "id": "primary-1", "name": "Studio", "pubkey": primary_key.pubkey_base64(),
-                    "role": "primary", "peerDeviceId": null,
-                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
-                }
+                device_json("studio-1", "Studio", &target_key.pubkey_base64(), "athenaeum")
             ])))
             .mount(&server)
             .await;
@@ -1058,7 +997,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = account_config_allowing_default_relays(tmp.path(), &server.uri(), Some("primary-1"));
+        let config = account_config_allowing_default_relays(tmp.path(), &server.uri(), &["Studio"]);
         token_store(&config, config.account.as_ref().unwrap())
             .store("tok-signed-in")
             .unwrap();
@@ -1069,31 +1008,30 @@ mod tests {
         assert!(matches!(resolved.relay_mode, RelayMode::Default));
     }
 
-    #[test]
-    fn auto_pick_primary_handles_zero_one_many() {
-        use athenaeum_core::account::AccountDevice;
-        let dev = |id: &str, role: Option<DeviceRole>| AccountDevice {
-            id: id.into(),
-            name: id.into(),
-            pubkey: "cHVia2V5".into(),
-            role,
-            peer_device_id: None,
-            created_at: "2026-07-01T00:00:00Z".into(),
-            last_seen_at: None,
-        };
-        assert_eq!(auto_pick_primary(&[]).unwrap(), None);
-        assert_eq!(
-            auto_pick_primary(&[dev("p", Some(DeviceRole::Primary)), dev("c", Some(DeviceRole::Capture))])
-                .unwrap(),
-            Some("p".to_string())
-        );
-        assert!(
-            auto_pick_primary(&[
-                dev("p1", Some(DeviceRole::Primary)),
-                dev("p2", Some(DeviceRole::Primary))
-            ])
-            .is_err(),
-            "two primaries is ambiguous and must error"
-        );
+    /// Sync 2C: the dev-ticket route still resolves a peer with no account — the
+    /// offline dev/test path is unchanged by the targets migration.
+    #[tokio::test]
+    async fn resolve_pairing_dev_ticket_without_account() {
+        use athenaeum_core::sharing::iroh::{random_secret, BlobStore, IrohTransport};
+        use athenaeum_core::sharing::SharingTransport;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+
+        // A real endpoint ticket (relay-disabled, in-memory) the resolver parses.
+        let transport = IrohTransport::new(random_secret(), RelayMode::Disabled, BlobStore::Memory)
+            .await
+            .unwrap();
+        let info = transport.start().await.unwrap();
+        let ticket_node = transport.node_id();
+        transport.shutdown().await;
+
+        let mut config = account_config(tmp.path(), "http://127.0.0.1:1", &[]);
+        config.account = None;
+        config.pairing_ticket = Some(info.pairing_ticket);
+
+        let resolved = resolve_pairing(&config).await.expect("dev ticket resolves a peer");
+        assert_eq!(resolved.peer, ticket_node, "peer comes from the pairing ticket");
+        assert!(resolved.ticket.is_some(), "the ticket is carried through for add_peer_ticket");
     }
 }

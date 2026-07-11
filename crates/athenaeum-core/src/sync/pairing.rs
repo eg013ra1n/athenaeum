@@ -1,32 +1,13 @@
-//! Peer + relay resolution for personal sync (task M1).
+//! Relay + node-id resolution helpers for personal sync (Sync 2C mesh model).
 //!
-//! This module is the **single documented resolver** the plan calls for: both the
-//! app's capture-role sender and the headless Perseus agent decide *who to sync
-//! to* (and *over which relays*) through the functions here, so the resolution
-//! order lives in exactly one place.
-//!
-//! # Peer resolution order ([`resolve_peer`])
-//!
-//! 1. **Account pairing.** When signed in as a `capture` device with a paired
-//!    primary ([`AccountPairing`]), the primary's current pubkey is fetched from
-//!    the account device list on the hub and decoded to a [`NodeId`]. The hub's
-//!    answer is split into three distinct outcomes ([`FetchOutcome`], review
-//!    finding #2) rather than collapsed into one "it failed" bucket:
-//!    - **Found** — the peer is present and still `primary`: resolves live.
-//!    - **Gone or demoted** — the hub was reached and *authoritatively* answered
-//!      that the pinned device is no longer in the list, or is no longer
-//!      `primary`. This is NOT a transient failure — a stale cached peer must
-//!      not keep being served, so this returns
-//!      [`PeerResolution::Invalidated`] and the caller clears its cache.
-//!    - **Hub unreachable** — a transport/HTTP failure. This alone falls back to
-//!      the **last cached resolution** (the caller persists it on every
-//!      successful resolve — see the `fresh` flag). A role/peer change on the
-//!      hub therefore takes effect on the *next successful refresh*, not
-//!      instantly on a cached start.
-//! 2. **Dev ticket.** Behind the `sync.dev_ticket_pairing` flag, the peer is
-//!    derived from a pasted iroh pairing ticket. Kept for tests / offline dev.
-//! 3. **Neither** → [`PeerResolution::Disabled`] with an actionable reason the
-//!    host surfaces as "sync not configured".
+//! In the mesh model there is no single "primary" a device pairs to: every
+//! Athenaeum install is a full peer, a Perseus agent is send-only, and a sender
+//! chooses **explicit targets** (device names/ids resolved against the account
+//! device list). Target → [`NodeId`] resolution therefore lives with each host
+//! (the app's sender, Perseus's `account` module), decoding a device's pubkey
+//! via [`node_id_from_pubkey_b64`]. What remains shared here is the relay-map
+//! resolution both hosts still go through, plus the small node-id/address
+//! helpers ([`node_id_from_ticket`], [`peer_addr_with_relays`]).
 //!
 //! # Relay resolution ([`resolve_relays`] + [`relay_mode_for`])
 //!
@@ -52,50 +33,6 @@ use iroh_tickets::endpoint::EndpointTicket;
 use crate::account::HubClient;
 use crate::sharing::types::NodeId;
 
-/// Account-pairing inputs for a signed-in `capture` device with a paired primary.
-/// The token is a bearer credential — never logged (only the `peer_device_id` is).
-#[derive(Clone)]
-pub struct AccountPairing {
-    /// Base URL of the hub this device authenticates against.
-    pub hub_url: String,
-    /// This device's hub bearer token.
-    pub token: String,
-    /// The hub device id of this capture device's paired primary.
-    pub peer_device_id: String,
-}
-
-impl std::fmt::Debug for AccountPairing {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Redact the token; a `{:?}` must never leak the bearer credential.
-        f.debug_struct("AccountPairing")
-            .field("hub_url", &self.hub_url)
-            .field("token", &"<redacted>")
-            .field("peer_device_id", &self.peer_device_id)
-            .finish()
-    }
-}
-
-/// The resolved sync peer and how it was resolved.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PeerResolution {
-    /// Resolved from the account. `fresh = true` means it came live from the hub
-    /// (the caller should persist it as the new cache); `fresh = false` means the
-    /// hub was unreachable and the last cached resolution was used.
-    Account { peer: NodeId, fresh: bool },
-    /// Resolved from a dev-flag pairing ticket.
-    Ticket { peer: NodeId },
-    /// The hub was reached and **authoritatively** said the pinned peer is gone
-    /// (no longer in the account device list) or demoted (no longer `primary`).
-    /// Distinct from [`Disabled`](Self::Disabled): this is not "try again with
-    /// the cache" — the caller MUST clear any cached peer, since serving it
-    /// again would resolve to a pairing the hub just said is invalid (review
-    /// finding #2).
-    Invalidated { reason: String },
-    /// No pairing is configured (or the hub is unreachable and no cache
-    /// exists). `reason` is an actionable, user-facing status string.
-    Disabled { reason: String },
-}
-
 /// The resolved relay URLs to build the transport with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayResolution {
@@ -104,114 +41,6 @@ pub struct RelayResolution {
     /// True when freshly fetched from the hub — the caller should persist these
     /// as the new relay-map cache.
     pub fresh: bool,
-}
-
-/// The three distinct outcomes of asking the hub for the paired primary's
-/// current node id (review finding #2). Kept separate from a bare
-/// `Result<NodeId>` deliberately: "the hub said no" and "the hub could not be
-/// reached" must never be handled the same way — only the latter is a
-/// legitimate reason to fall back to a cached peer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FetchOutcome {
-    /// The pinned peer is present in the device list and still `primary`.
-    Found(NodeId),
-    /// The hub was reached and authoritatively answered: the pinned device id
-    /// is no longer in the account's device list, or it is present but its
-    /// role is no longer `primary` (demoted / reassigned). A stale cached peer
-    /// must be invalidated, not served again.
-    GoneOrDemoted(String),
-    /// A transport/HTTP failure (or an undecodable pubkey, treated the same —
-    /// a data hiccup, not the hub saying no) — the hub's answer, if any, cannot
-    /// be trusted this attempt. The last cached peer is a legitimate fallback.
-    HubUnreachable(String),
-}
-
-/// Resolve the sync peer following the documented order. `dev_ticket` is the
-/// pasted ticket when the `sync.dev_ticket_pairing` flag is on; `cached_peer` is
-/// the last successfully resolved peer (used only when the hub is unreachable).
-pub async fn resolve_peer(
-    account: Option<&AccountPairing>,
-    dev_ticket: Option<&str>,
-    cached_peer: Option<NodeId>,
-) -> PeerResolution {
-    if let Some(acc) = account {
-        match fetch_primary_node_id(acc).await {
-            FetchOutcome::Found(peer) => {
-                tracing::info!(
-                    peer_device_id = %acc.peer_device_id,
-                    "resolved sync peer from account device list"
-                );
-                return PeerResolution::Account { peer, fresh: true };
-            }
-            FetchOutcome::GoneOrDemoted(reason) => {
-                tracing::warn!(
-                    peer_device_id = %acc.peer_device_id,
-                    %reason,
-                    "hub says the paired primary is gone or no longer primary; invalidating any cached peer"
-                );
-                return PeerResolution::Invalidated { reason };
-            }
-            FetchOutcome::HubUnreachable(error) => {
-                if let Some(peer) = cached_peer {
-                    tracing::warn!(
-                        %error,
-                        peer_device_id = %acc.peer_device_id,
-                        "could not reach the hub to resolve the sync peer; using last cached resolution"
-                    );
-                    return PeerResolution::Account { peer, fresh: false };
-                }
-                return PeerResolution::Disabled {
-                    reason: format!(
-                        "signed in as a capture device but the hub is unreachable and there is \
-                         no cached peer yet: {error}"
-                    ),
-                };
-            }
-        }
-    }
-
-    if let Some(ticket) = dev_ticket {
-        return match node_id_from_ticket(ticket) {
-            Ok(peer) => PeerResolution::Ticket { peer },
-            Err(error) => PeerResolution::Disabled {
-                reason: format!("dev pairing ticket is not a valid iroh ticket: {error:#}"),
-            },
-        };
-    }
-
-    PeerResolution::Disabled {
-        reason: "sync is not configured: sign in and set this machine's role to capture \
-                 with a paired primary, or enable dev ticket pairing"
-            .to_string(),
-    }
-}
-
-/// Fetch the paired primary's node id from the account device list, typed into
-/// [`FetchOutcome`] so "the hub said no" and "the hub could not be reached" are
-/// never conflated by the caller.
-async fn fetch_primary_node_id(acc: &AccountPairing) -> FetchOutcome {
-    let client = match HubClient::new(&acc.hub_url) {
-        Ok(c) => c,
-        Err(e) => return FetchOutcome::HubUnreachable(e.to_string()),
-    };
-    let devices = match client.list_devices(&acc.token).await {
-        Ok(d) => d,
-        Err(e) => return FetchOutcome::HubUnreachable(e.to_string()),
-    };
-    let Some(primary) = devices.iter().find(|d| d.id == acc.peer_device_id) else {
-        return FetchOutcome::GoneOrDemoted(format!(
-            "the paired primary device ({}) is no longer in the account's device list — \
-             re-pair in Settings",
-            acc.peer_device_id
-        ));
-    };
-    // Sync 2C: the mesh model has no per-device role, so the peer is resolved
-    // purely by its pubkey → node id. (The old "demoted from primary" gate read
-    // `AccountDevice.role`, which no longer exists.)
-    match node_id_from_pubkey_b64(&primary.pubkey) {
-        Ok(node) => FetchOutcome::Found(node),
-        Err(e) => FetchOutcome::HubUnreachable(format!("invalid primary pubkey: {e}")),
-    }
 }
 
 /// Resolve the relay URLs for the transport. When `account` is `Some`
@@ -374,181 +203,6 @@ mod tests {
         (raw, STANDARD.encode(raw))
     }
 
-    fn devices_body(primary_id: &str, primary_pubkey_b64: &str) -> serde_json::Value {
-        serde_json::json!([
-            {
-                "id": "capture-1", "name": "Mini PC", "pubkey": "b3RoZXI=",
-                "role": "capture", "peerDeviceId": primary_id,
-                "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
-            },
-            {
-                "id": primary_id, "name": "Studio Mac", "pubkey": primary_pubkey_b64,
-                "role": "primary", "peerDeviceId": null,
-                "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
-            }
-        ])
-    }
-
-    /// A device list that does not contain the pinned peer device id at all
-    /// (unpaired/deleted on the hub) — only some unrelated device is listed.
-    fn devices_body_without_pinned_peer() -> serde_json::Value {
-        serde_json::json!([
-            {
-                "id": "some-other-device", "name": "Laptop", "pubkey": "b3RoZXI=",
-                "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
-            }
-        ])
-    }
-
-    /// A valid iroh pairing ticket string + the node id it encodes, built from a
-    /// real (relay-disabled, in-memory) transport so the parse is exercised.
-    async fn sample_ticket() -> (String, NodeId) {
-        use crate::sharing::iroh::{random_secret, BlobStore, IrohTransport};
-        use crate::sharing::SharingTransport;
-
-        let transport = IrohTransport::new(random_secret(), RelayMode::Disabled, BlobStore::Memory)
-            .await
-            .unwrap();
-        let info = transport.start().await.unwrap();
-        let node = transport.node_id();
-        transport.shutdown().await;
-        (info.pairing_ticket, node)
-    }
-
-    #[tokio::test]
-    async fn account_path_wins_over_dev_ticket() {
-        let (raw, pubkey_b64) = sample_primary_pubkey();
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/devices"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(devices_body("primary-1", &pubkey_b64)))
-            .mount(&server)
-            .await;
-
-        let (ticket, _ticket_node) = sample_ticket().await;
-        let account = AccountPairing {
-            hub_url: server.uri(),
-            token: "tok".into(),
-            peer_device_id: "primary-1".into(),
-        };
-
-        // Both account AND a dev ticket present: the account path must win, live.
-        let res = resolve_peer(Some(&account), Some(&ticket), None).await;
-        assert_eq!(
-            res,
-            PeerResolution::Account { peer: raw, fresh: true },
-            "account resolution must win over the dev ticket and decode the primary pubkey"
-        );
-    }
-
-    #[tokio::test]
-    async fn hub_down_uses_cached_peer() {
-        // A server with no /devices mock returns 404 → the client errors → the
-        // resolver must fall back to the cached peer rather than fail.
-        let server = MockServer::start().await;
-        let cached = [42u8; 32];
-        let account = AccountPairing {
-            hub_url: server.uri(),
-            token: "tok".into(),
-            peer_device_id: "primary-1".into(),
-        };
-
-        let res = resolve_peer(Some(&account), None, Some(cached)).await;
-        assert_eq!(
-            res,
-            PeerResolution::Account { peer: cached, fresh: false },
-            "an unreachable hub must fall back to the last cached resolution (not fresh)"
-        );
-    }
-
-    #[tokio::test]
-    async fn hub_down_no_cache_is_disabled() {
-        let server = MockServer::start().await;
-        let account = AccountPairing {
-            hub_url: server.uri(),
-            token: "tok".into(),
-            peer_device_id: "primary-1".into(),
-        };
-        let res = resolve_peer(Some(&account), None, None).await;
-        assert!(
-            matches!(res, PeerResolution::Disabled { .. }),
-            "no fresh resolution and no cache must disable sync, got {res:?}"
-        );
-    }
-
-    /// Review finding #2: hub REACHABLE, device list returned successfully, but
-    /// the pinned peer id is simply not in it (unpaired/deleted on the hub side).
-    /// This must NOT fall back to any cached peer — the hub authoritatively said
-    /// the pairing is gone, so `Invalidated` (not `Account{fresh:false}`) is the
-    /// only correct result, even with a cache present.
-    #[tokio::test]
-    async fn peer_missing_from_device_list_invalidates_even_with_cache() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/devices"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(devices_body_without_pinned_peer()))
-            .mount(&server)
-            .await;
-
-        let cached = [9u8; 32];
-        let account = AccountPairing {
-            hub_url: server.uri(),
-            token: "tok".into(),
-            peer_device_id: "primary-1".into(),
-        };
-        let res = resolve_peer(Some(&account), None, Some(cached)).await;
-        assert!(
-            matches!(res, PeerResolution::Invalidated { .. }),
-            "hub-confirmed-gone must invalidate, not fall back to the cache, got {res:?}"
-        );
-    }
-
-    /// Review finding #2 (pinned regression): a genuine hub outage (HTTP 500)
-    /// is the ONE case that legitimately falls back to the cached peer,
-    /// `fresh: false` — distinct from the "hub said no" cases above.
-    #[tokio::test]
-    async fn hub_500_uses_cached_peer_fresh_false() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/api/v1/devices"))
-            .respond_with(ResponseTemplate::new(500))
-            .mount(&server)
-            .await;
-
-        let cached = [5u8; 32];
-        let account = AccountPairing {
-            hub_url: server.uri(),
-            token: "tok".into(),
-            peer_device_id: "primary-1".into(),
-        };
-        let res = resolve_peer(Some(&account), None, Some(cached)).await;
-        assert_eq!(
-            res,
-            PeerResolution::Account { peer: cached, fresh: false },
-            "a transport/HTTP failure (not a hub answer) must use the cache, not invalidate"
-        );
-    }
-
-    #[tokio::test]
-    async fn dev_ticket_fallback_when_no_account() {
-        let (ticket, ticket_node) = sample_ticket().await;
-        let res = resolve_peer(None, Some(&ticket), None).await;
-        assert_eq!(
-            res,
-            PeerResolution::Ticket { peer: ticket_node },
-            "with no account the dev ticket path resolves the ticket's node id"
-        );
-    }
-
-    #[tokio::test]
-    async fn nothing_configured_is_disabled() {
-        let res = resolve_peer(None, None, None).await;
-        assert!(
-            matches!(res, PeerResolution::Disabled { .. }),
-            "no account and no ticket must disable sync, got {res:?}"
-        );
-    }
-
     #[tokio::test]
     async fn relay_map_fetched_from_hub_then_cached_round_trips_offline() {
         let server = MockServer::start().await;
@@ -664,17 +318,6 @@ mod tests {
         let (raw, b64) = sample_primary_pubkey();
         assert_eq!(node_id_from_pubkey_b64(&b64).unwrap(), raw);
         assert!(node_id_from_pubkey_b64("short").is_err(), "wrong length must error");
-    }
-
-    #[test]
-    fn account_pairing_debug_redacts_token() {
-        let acc = AccountPairing {
-            hub_url: "https://h".into(),
-            token: "super-secret-token".into(),
-            peer_device_id: "p".into(),
-        };
-        let dbg = format!("{acc:?}");
-        assert!(!dbg.contains("super-secret-token"), "token leaked into Debug: {dbg}");
     }
 
     // ── peer_addr_with_relays (fix-review: account-mode dial failure) ───────

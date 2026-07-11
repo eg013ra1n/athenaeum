@@ -222,7 +222,13 @@ async fn cmd_status(config: Config) -> Result<()> {
         None => "(none configured)".to_string(),
     };
     println!("  pairing_route     : {pairing_route}");
-    // Setup readiness derived from capture folders + a usable pairing route.
+    let targets = if config.targets.is_empty() {
+        "(none configured)".to_string()
+    } else {
+        config.targets.join(", ")
+    };
+    println!("  targets           : {targets}");
+    // Setup readiness derived from capture folders + a usable send target.
     let needs = config.setup_needs(perseus::account::token_present(&config));
     let readiness = if needs.is_empty() {
         "ready".to_string()

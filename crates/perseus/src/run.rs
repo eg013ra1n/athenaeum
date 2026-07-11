@@ -133,18 +133,21 @@ fn write_secret_0600(path: &Path, secret: &[u8; 32]) -> Result<()> {
 /// trivially one-to-one with a frame. The manifest's `frame_meta` is the full
 /// header-derived [`athenaeum_core::models::Frame`]; `frame_uuid` is minted here
 /// (Perseus is headless — there is no catalog uuid to inherit).
+///
+/// `capture_dir` is the watched root `file_path` came from: the manifest
+/// `rel_path` is computed **relative to it** ([`compute_rel_path`]) so the
+/// receiver can replicate the capture directory tree, and — when more than one
+/// capture dir is configured — prefixed with a sanitized per-dir label so files
+/// from different roots don't collide.
 pub fn build_package_for_file(
     config: &Config,
+    capture_dir: &Path,
     file_path: &Path,
     origin_device: &str,
 ) -> Result<PathBuf> {
     let frame = parse_frame(file_path)?;
     let frame_uuid = Uuid::new_v4().to_string();
-    let filename = file_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("capture file has no valid name: {}", file_path.display()))?
-        .to_string();
+    let rel_path = compute_rel_path(config, capture_dir, file_path);
     let byte_size = std::fs::metadata(file_path)
         .with_context(|| format!("stat capture file {}", file_path.display()))?
         .len();
@@ -157,7 +160,7 @@ pub fn build_package_for_file(
         origin_catalog_uuid: frame_uuid.clone(),
         origin_device: origin_device.to_string(),
         payload_kind: PayloadKind::RawFrame,
-        rel_path: filename,
+        rel_path,
         byte_size,
         xxh3,
         frame_meta: serde_json::to_value(&frame).context("serialize frame_meta")?,
@@ -169,6 +172,89 @@ pub fn build_package_for_file(
     write_package(&pkg_dir, vec![(file_path.to_path_buf(), record)])
         .with_context(|| format!("write package for {}", file_path.display()))?;
     Ok(pkg_dir)
+}
+
+/// The manifest `rel_path` for `file_path`: its path **relative to
+/// `capture_dir`**, forward-slash separated (so it is `validate_rel_path`-clean
+/// on every platform). When more than one capture dir is configured, a sanitized
+/// label — the capture dir's basename, lowercased to `[a-z0-9._-]` — is prefixed
+/// as the first segment so identically-named files from different roots do not
+/// collide on the receiver.
+///
+/// Pure (no filesystem access) so the path math is unit-testable without writing
+/// a package. If `file_path` is somehow not under `capture_dir` the basename is
+/// used as a safe fallback (a `rel_path` is never allowed to escape the root).
+pub fn compute_rel_path(config: &Config, capture_dir: &Path, file_path: &Path) -> String {
+    let rel = file_path
+        .strip_prefix(capture_dir)
+        .ok()
+        .map(to_slash)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            file_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+
+    if config.capture_dirs_resolved().len() > 1 {
+        let label = sanitize_label(capture_dir);
+        if !label.is_empty() {
+            return format!("{label}/{rel}");
+        }
+    }
+    rel
+}
+
+/// Join a path's `Normal` components with `/` — forward-slash on every platform,
+/// and any root / prefix / `..` component is dropped, guaranteeing the result is
+/// [`athenaeum_core::package::validate_rel_path`]-clean.
+fn to_slash(rel: &Path) -> String {
+    rel.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// A capture dir's basename as a single safe path segment: lowercased, with any
+/// character outside `[a-z0-9._-]` replaced by `-`. Empty if the dir has no
+/// usable basename (e.g. the filesystem root).
+fn sanitize_label(capture_dir: &Path) -> String {
+    let base = capture_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    base.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// The configured capture dir that owns `file_path`: the longest configured root
+/// that is an ancestor of the file, else the file's parent directory (so a file
+/// outside every configured root still yields a bare-filename `rel_path`). Used
+/// by [`Agent::enqueue_file`] (the `enqueue-backlog` path), where the owning
+/// root is not carried by a watcher.
+fn owning_capture_dir(config: &Config, file_path: &Path) -> PathBuf {
+    config
+        .capture_dirs_resolved()
+        .into_iter()
+        .filter(|d| file_path.starts_with(d))
+        .max_by_key(|d| d.components().count())
+        .unwrap_or_else(|| {
+            file_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default()
+        })
 }
 
 /// Parse a capture file's header into a [`Frame`](athenaeum_core::models::Frame)
@@ -357,7 +443,10 @@ impl Agent {
             Arc::new(Mutex::new(VecDeque::new()));
 
         let (watchers, enqueue_task, retention_task) = if watch {
-            let (stable_tx, stable_rx) = mpsc::channel::<PathBuf>(64);
+            // Each stable file is paired with the (canonicalized) capture dir it
+            // came from, so the consumer can compute a capture-dir-relative
+            // rel_path (with a per-dir label when watching more than one root).
+            let (stable_tx, stable_rx) = mpsc::channel::<(PathBuf, PathBuf)>(64);
             // One watcher per configured capture directory; each gets its own
             // clone of the shared stable-file sender, all feeding the single
             // enqueue consumer below.
@@ -418,7 +507,9 @@ impl Agent {
     /// store once the durable `Queued` row exists, so a later restart never
     /// re-packages this exact, unchanged file.
     pub async fn enqueue_file(&self, file_path: &Path) -> Result<i64> {
-        let pkg_dir = build_package_for_file(&self.config, file_path, &self.origin_device)?;
+        let capture_dir = owning_capture_dir(&self.config, file_path);
+        let pkg_dir =
+            build_package_for_file(&self.config, &capture_dir, file_path, &self.origin_device)?;
         let id = self.engine.enqueue_package(&pkg_dir).await?;
         tracing::info!(id, path = %file_path.display(), "enqueued capture file");
         record_seen(&self.seen, file_path, &pkg_dir.to_string_lossy());
@@ -586,17 +677,19 @@ fn record_seen(seen: &SeenStore, path: &Path, package_ref: &str) {
     }
 }
 
-/// Spawn the task that turns stable capture files into enqueued packages.
+/// Spawn the task that turns stable capture files into enqueued packages. Each
+/// item is `(owning_capture_dir, file_path)` from a watcher, so the package's
+/// `rel_path` is computed relative to the dir the file was captured under.
 fn spawn_enqueue_consumer(
-    mut stable_rx: mpsc::Receiver<PathBuf>,
+    mut stable_rx: mpsc::Receiver<(PathBuf, PathBuf)>,
     engine: Arc<SyncEngineHandle>,
     seen: Arc<SeenStore>,
     config: Config,
     origin_device: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        while let Some(path) = stable_rx.recv().await {
-            match build_package_for_file(&config, &path, &origin_device) {
+        while let Some((capture_dir, path)) = stable_rx.recv().await {
+            match build_package_for_file(&config, &capture_dir, &path, &origin_device) {
                 Ok(pkg_dir) => match engine.enqueue_package(&pkg_dir).await {
                     Ok(id) => {
                         tracing::info!(id, path = %path.display(), "enqueued capture file");
@@ -1166,6 +1259,89 @@ pub fn init_logging(log_dir: &Path) -> Result<LogGuard> {
         .context("install tracing subscriber")?;
 
     Ok(LogGuard(guard))
+}
+
+#[cfg(test)]
+mod rel_path_tests {
+    use super::*;
+
+    /// A config whose single capture dir is `dir` (no per-dir label).
+    fn single_root_config(dir: &str) -> Config {
+        let mut c = Config::fallback();
+        c.capture_dir = Some(PathBuf::from(dir));
+        c.capture_dirs = Vec::new();
+        c
+    }
+
+    /// A config with several capture dirs (each stable file gets a per-dir label).
+    fn multi_root_config(dirs: &[&str]) -> Config {
+        let mut c = Config::fallback();
+        c.capture_dir = None;
+        c.capture_dirs = dirs.iter().map(PathBuf::from).collect();
+        c
+    }
+
+    /// Task 6: with a single capture dir, `rel_path` is the file's path relative
+    /// to that dir — forward-slash, no label.
+    #[test]
+    fn rel_path_is_relative_to_capture_dir() {
+        let cfg = single_root_config("/data/astro");
+        let rel = compute_rel_path(
+            &cfg,
+            Path::new("/data/astro"),
+            Path::new("/data/astro/M31/2026-07-10/L_0001.fits"),
+        );
+        assert_eq!(rel, "M31/2026-07-10/L_0001.fits");
+    }
+
+    /// Task 6: with more than one capture dir, `rel_path` is prefixed with a
+    /// sanitized per-dir label (the capture dir basename) so identically-named
+    /// files from different roots don't collide on the receiver.
+    #[test]
+    fn rel_path_gets_root_label_when_multi_root() {
+        let cfg = multi_root_config(&["/data/astro", "/mnt/backup"]);
+        let rel = compute_rel_path(
+            &cfg,
+            Path::new("/mnt/backup"),
+            Path::new("/mnt/backup/M31/L_0001.fits"),
+        );
+        assert_eq!(rel, "backup/M31/L_0001.fits");
+    }
+
+    /// A file directly under the (single) capture dir yields a bare filename —
+    /// the pre-Task-6 behavior, unchanged for the flat-directory case.
+    #[test]
+    fn rel_path_of_top_level_file_is_the_filename() {
+        let cfg = single_root_config("/data/astro");
+        let rel = compute_rel_path(&cfg, Path::new("/data/astro"), Path::new("/data/astro/L_0001.fits"));
+        assert_eq!(rel, "L_0001.fits");
+    }
+
+    /// A capture-dir basename with characters outside `[a-z0-9._-]` is sanitized
+    /// to a single safe segment (spaces → `-`, uppercase → lowercase).
+    #[test]
+    fn multi_root_label_is_sanitized() {
+        let cfg = multi_root_config(&["/data/astro", "/mnt/My Backup"]);
+        let rel = compute_rel_path(
+            &cfg,
+            Path::new("/mnt/My Backup"),
+            Path::new("/mnt/My Backup/sub/x.fits"),
+        );
+        assert_eq!(rel, "my-backup/sub/x.fits");
+    }
+
+    /// The computed `rel_path` is always `validate_rel_path`-clean (forward-slash,
+    /// no `..`/root), even in the multi-root labelled case.
+    #[test]
+    fn computed_rel_path_is_validate_clean() {
+        let cfg = multi_root_config(&["/data/astro", "/mnt/backup"]);
+        let rel = compute_rel_path(
+            &cfg,
+            Path::new("/mnt/backup"),
+            Path::new("/mnt/backup/M31/L_0001.fits"),
+        );
+        athenaeum_core::package::validate_rel_path(&rel).expect("rel_path must be wire-clean");
+    }
 }
 
 #[cfg(all(test, unix))]

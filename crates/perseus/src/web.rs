@@ -2181,9 +2181,10 @@ mod tests {
                 // No email in the file — the sign-in form supplies it and it is
                 // cached; account_status must surface it via the cache fallback.
                 email: None,
-                primary_device_id: None,
                 allow_default_relays: false,
             }),
+            targets: Vec::new(),
+            device_name: None,
             mode: crate::config::Mode::Auto,
             retention: RetentionConfig::default(),
             stability_secs: 1,
@@ -2206,15 +2207,16 @@ mod tests {
         (state, tmp)
     }
 
-    /// Mount the three hub endpoints a successful web sign-in touches: verify →
-    /// token + device id, the device list (one primary → auto-pick), and the
-    /// role registration for the returned device id.
+    /// Mount the two hub endpoints a successful web sign-in touches: verify →
+    /// token + device id, and the device list (to refresh the friendly-name
+    /// cache). Sync 2C registers the Perseus capability at verify; there is no
+    /// role/primary-pairing call.
     async fn mount_successful_signin(server: &MockServer) {
         Mock::given(method("POST"))
             .and(path("/api/v1/auth/verify"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "deviceToken": "tok-secret-xyz",
-                "deviceId": "capture-dev",
+                "deviceId": "perseus-dev",
             })))
             .mount(server)
             .await;
@@ -2222,16 +2224,11 @@ mod tests {
             .and(path("/api/v1/devices"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
                 {
-                    "id": "primary-1", "name": "Studio", "pubkey": "cHVia2V5",
-                    "role": "primary", "peerDeviceId": null,
+                    "id": "studio-1", "name": "Studio", "pubkey": "cHVia2V5",
+                    "capability": "athenaeum",
                     "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null
                 }
             ])))
-            .mount(server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api/v1/devices/capture-dev/role"))
-            .respond_with(ResponseTemplate::new(200))
             .mount(server)
             .await;
     }
@@ -2305,7 +2302,7 @@ mod tests {
         let v = body_json(get(&app, "/api/account").await).await;
         assert_eq!(v["signedIn"], true);
         assert_eq!(v["email"], "u@e.com");
-        assert_eq!(v["primaryName"], "Studio", "the paired primary name is surfaced");
+        assert_eq!(v["deviceId"], "perseus-dev", "the signed-in device id is surfaced");
 
         // Logout → signed out again.
         let res = post_json(&app, "/api/account/logout", serde_json::json!({})).await;

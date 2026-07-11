@@ -23,40 +23,9 @@ pub use keys::DeviceKey;
 pub use naming::default_device_name;
 pub use token_store::TokenStore;
 
-/// A device's role in the account. `primary` receives; `capture` sends to its
-/// paired primary. Absent (`None`) means "registered but unassigned".
-///
-/// Serialized lowercase on the wire — matches both the hub JSON
-/// (`"primary"`/`"capture"`) and the frontend string union.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
-#[serde(rename_all = "lowercase")]
-pub enum DeviceRole {
-    Primary,
-    Capture,
-}
-
-impl DeviceRole {
-    /// The lowercase wire string (`"primary"` / `"capture"`).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DeviceRole::Primary => "primary",
-            DeviceRole::Capture => "capture",
-        }
-    }
-
-    /// Parse the lowercase wire string; unknown / empty → `None`.
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "primary" => Some(DeviceRole::Primary),
-            "capture" => Some(DeviceRole::Capture),
-            _ => None,
-        }
-    }
-}
-
 /// What a device *is* in the mesh sync model (Sync 2C). Every Athenaeum install
 /// is a full peer (receives + sends); a Perseus capture agent is send-only. This
-/// replaces the old primary/capture [`DeviceRole`] one-primary topology.
+/// replaces the old primary/capture role one-primary topology.
 ///
 /// Serialized lowercase on the wire — matches the hub JSON
 /// (`"athenaeum"`/`"perseus"`) and the frontend string union.

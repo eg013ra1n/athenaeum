@@ -1,25 +1,27 @@
 //! Perseus TOML configuration: parse + validate.
 //!
-//! The binding contract is the `perseus.toml` shape from the task brief. As of
-//! task M1 there are two pairing routes — an **account** (the primary is resolved
-//! from the hub device list) or a **dev ticket** — and at least one must be
-//! present:
+//! The binding contract is the `perseus.toml` shape from the task brief. Perseus
+//! is a **send-only** capability (Sync 2C): it signs into an account and sends
+//! captures to explicit **targets**. There are two routes — an **account** (with
+//! ≥1 target) or a **dev ticket** — and at least one must be present:
 //!
 //! ```toml
 //! capture_dir = "/data/capture"
 //! data_dir = "/var/lib/perseus"
 //! mode = "auto"                             # only value in MVP
+//! device_name = "Observatory Pi"            # optional; defaults to the hostname
 //!
-//! # Route A — account pairing (recommended). Sign in with `perseus login`; the
-//! # device token lands in a 0600 file in data_dir (NEVER in this TOML).
+//! # Route A — account (recommended). Sign in with `perseus login`; the device
+//! # token lands in a 0600 file in data_dir (NEVER in this TOML). `targets` names
+//! # the account devices to send to (by device name or id).
+//! targets = ["Studio Mac"]
 //! [account]
 //! hub_url = "https://projects.artfrom.space"
 //! email = "me@example.com"                  # optional; prompted at login if absent
-//! primary_device_id = "dev-abc"             # optional; auto-picks the single primary
 //! allow_default_relays = false              # dev only; see AccountConfig docs
 //!
 //! # Route B — dev ticket (offline dev / tests). Optional now that [account] exists.
-//! pairing_ticket = "<paste from primary Settings → Sync (dev)>"
+//! pairing_ticket = "<paste from a receiver's Settings → Sync (dev)>"
 //!
 //! [retention]
 //! policy = "keep_everything"                # keep_everything | on_confirm | keep_days | disk_pct
@@ -200,9 +202,11 @@ fn default_hub_url() -> String {
     DEFAULT_HUB_URL.to_string()
 }
 
-/// The `[account]` table (task M1). Present when Perseus pairs via the hub account
-/// (a `perseus login` device token) rather than a raw pairing ticket. The token
-/// itself is NEVER in TOML — it lives in a 0600 file in `data_dir`.
+/// The `[account]` table. Present when Perseus signs into the hub account
+/// (a `perseus login` device token) rather than pairing via a raw dev ticket.
+/// The token itself is NEVER in TOML — it lives in a 0600 file in `data_dir`.
+/// In the Sync 2C mesh model Perseus is a send-only capability that sends to the
+/// explicit [`Config::targets`]; there is no per-account "primary" to pair to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountConfig {
     /// Hub base URL (defaults to the production hub).
@@ -211,10 +215,6 @@ pub struct AccountConfig {
     /// Account email. Optional in the file — `perseus login` prompts when absent.
     #[serde(default)]
     pub email: Option<String>,
-    /// The paired primary's hub device id. Optional — when absent, Perseus
-    /// auto-picks the account's single `primary` device.
-    #[serde(default)]
-    pub primary_device_id: Option<String>,
     /// **Dev only.** When the hub's relay map is empty/unreachable and there is
     /// no cached relay map yet, allow falling back to iroh's public default
     /// relays (task M1 review finding #1). Defaults to `false` — a signed-in
@@ -231,7 +231,6 @@ impl Default for AccountConfig {
         Self {
             hub_url: default_hub_url(),
             email: None,
-            primary_device_id: None,
             allow_default_relays: false,
         }
     }
@@ -244,16 +243,16 @@ impl Default for AccountConfig {
 pub enum SetupNeed {
     /// No capture folders configured — nothing to watch yet.
     CaptureDirs,
-    /// No usable pairing route — neither a signed-in account (with a stored
-    /// device token) nor a dev pairing ticket.
-    Pairing,
+    /// No usable send target — neither a signed-in account with at least one
+    /// entry in [`Config::targets`], nor a dev pairing ticket.
+    Targets,
 }
 
 impl std::fmt::Display for SetupNeed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SetupNeed::CaptureDirs => write!(f, "no capture folders configured"),
-            SetupNeed::Pairing => write!(f, "not signed in"),
+            SetupNeed::Targets => write!(f, "no send target configured (sign in and add a target)"),
         }
     }
 }
@@ -273,9 +272,20 @@ pub struct Config {
     /// Dev-ticket pairing route (task M1: optional now that `[account]` exists).
     #[serde(default)]
     pub pairing_ticket: Option<String>,
-    /// Account-pairing route (task M1).
+    /// Account sign-in route.
     #[serde(default)]
     pub account: Option<AccountConfig>,
+    /// The devices in the account to send captures to, by device name or id
+    /// (Sync 2C mesh model). Perseus is send-only, so at least one target is
+    /// required for the account route (the dev ticket is the alternative). Task 6
+    /// resolves `targets[0]`; the full multi-target send is task 7.
+    #[serde(default)]
+    pub targets: Vec<String>,
+    /// Optional friendly name for this node in the account device list. When
+    /// absent, sign-in defaults to the machine hostname
+    /// ([`athenaeum_core::account::default_device_name`]).
+    #[serde(default)]
+    pub device_name: Option<String>,
     pub mode: Mode,
     #[serde(default)]
     pub retention: RetentionConfig,
@@ -342,9 +352,10 @@ impl Config {
         toml::from_str(text).map_err(|e| {
             anyhow::anyhow!(
                 "could not parse config TOML: {e}. Expected keys: capture_dir, \
-                 data_dir, mode = \"auto\", a pairing route (either an [account] \
-                 table or pairing_ticket), and a [retention] table with policy = \
-                 keep_everything|on_confirm|keep_days|disk_pct and dry_run = true"
+                 data_dir, mode = \"auto\", a send route (either an [account] table \
+                 with targets = [..], or pairing_ticket), and a [retention] table \
+                 with policy = keep_everything|on_confirm|keep_days|disk_pct and \
+                 dry_run = true"
             )
         })
     }
@@ -490,26 +501,38 @@ impl Config {
     }
 
     /// The two readiness demands strict mode adds on top of structure: at least
-    /// one capture directory, and a pairing route. A config that fails only here
+    /// one capture directory, and a send target. A config that fails only here
     /// is not broken — it is a valid "freshly installed, not yet set up" state
     /// (surfaced as [`SetupNeed`]s rather than an error by the lenient path).
     fn validate_ready(&self) -> Result<()> {
         if self.capture_dirs_resolved().is_empty() {
             bail!("capture_dir (or capture_dirs) is required");
         }
-        // Pairing route (task M1): at least one of [account] or pairing_ticket.
+        // Send target (Sync 2C): at least one entry in `targets` (account route),
+        // or a dev pairing ticket. The old single-primary pairing requirement is
+        // replaced by explicit targets.
+        if !self.has_configured_send_target() {
+            bail!(
+                "no send target configured — add at least one device to `targets` \
+                 (a device name or id from your account, then run `perseus login`) \
+                 or set pairing_ticket to the ticket from a receiver's Settings → \
+                 Sync (dev)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether the config, on its own, names a send target: a non-empty
+    /// `targets` list, or a dev pairing ticket. This is the config-only half of
+    /// readiness (it cannot know whether a device token is stored — that is the
+    /// `token_present` argument to [`setup_needs`](Self::setup_needs)).
+    fn has_configured_send_target(&self) -> bool {
         let ticket_present = self
             .pairing_ticket
             .as_ref()
             .is_some_and(|t| !t.trim().is_empty());
-        if self.account.is_none() && !ticket_present {
-            bail!(
-                "no pairing route configured — add an [account] table (then run \
-                 `perseus login`) or set pairing_ticket to the ticket from the \
-                 primary's Settings → Sync (dev)"
-            );
-        }
-        Ok(())
+        let has_target = self.targets.iter().any(|t| !t.trim().is_empty());
+        ticket_present || has_target
     }
 
     /// What still blocks the sync engine from starting for this config. An empty
@@ -523,13 +546,19 @@ impl Config {
         if self.capture_dirs_resolved().is_empty() {
             needs.push(SetupNeed::CaptureDirs);
         }
+        // A dev ticket is a self-contained send target (no account/token needed).
         let ticket = self
             .pairing_ticket
             .as_ref()
             .is_some_and(|t| !t.trim().is_empty());
-        let account_ok = self.account.is_some() && token_present;
-        if !ticket && !account_ok {
-            needs.push(SetupNeed::Pairing);
+        // The account route is usable only when signed in (a stored token) AND at
+        // least one target is named — Perseus is send-only, so with no target
+        // there is nowhere to send.
+        let account_targets = self.account.is_some()
+            && token_present
+            && self.targets.iter().any(|t| !t.trim().is_empty());
+        if !ticket && !account_targets {
+            needs.push(SetupNeed::Targets);
         }
         needs
     }
@@ -579,6 +608,8 @@ impl Config {
             data_dir: platform_data_dir(),
             pairing_ticket: None,
             account: None,
+            targets: Vec::new(),
+            device_name: None,
             mode: Mode::Auto,
             retention: RetentionConfig::default(),
             stability_secs: DEFAULT_STABILITY_SECS,
@@ -926,16 +957,17 @@ mode = "auto"
         );
     }
 
-    /// Task M1: an `[account]` table alone is a valid pairing route — no
+    /// Sync 2C: an `[account]` table with `targets` is a valid send route — no
     /// `pairing_ticket` required. `hub_url` defaults to the production hub.
     #[test]
-    fn account_only_config_parses_without_ticket() {
+    fn account_with_targets_config_parses_without_ticket() {
         let capture = tempfile::tempdir().unwrap();
         let text = format!(
             r#"
 capture_dir = "{}"
 data_dir = "/d"
 mode = "auto"
+targets = ["Studio Mac"]
 [account]
 email = "me@example.com"
 [retention]
@@ -944,19 +976,19 @@ dry_run = true
 "#,
             capture.path().display()
         );
-        let cfg = Config::from_toml_str(&text).expect("account-only config is valid");
-        assert!(cfg.pairing_ticket.is_none(), "no ticket needed with [account]");
+        let cfg = Config::from_toml_str(&text).expect("account+targets config is valid");
+        assert!(cfg.pairing_ticket.is_none(), "no ticket needed with [account] + targets");
+        assert_eq!(cfg.targets, vec!["Studio Mac".to_string()]);
         let account = cfg.account.expect("account table present");
         assert_eq!(account.hub_url, DEFAULT_HUB_URL, "hub_url defaults to the production hub");
         assert_eq!(account.email.as_deref(), Some("me@example.com"));
-        assert!(account.primary_device_id.is_none(), "primary auto-picked when omitted");
         assert!(
             !account.allow_default_relays,
             "allow_default_relays must default to false (task M1 review finding #1)"
         );
     }
 
-    /// Task M1: account + explicit hub_url + primary_device_id all parse.
+    /// Sync 2C: account + explicit hub_url + targets + device_name all parse.
     #[test]
     fn account_config_with_all_fields_parses() {
         let capture = tempfile::tempdir().unwrap();
@@ -965,10 +997,11 @@ dry_run = true
 capture_dir = "{}"
 data_dir = "/d"
 mode = "auto"
+device_name = "Observatory Pi"
+targets = ["dev-primary-1", "Laptop"]
 [account]
 hub_url = "https://staging.example.org"
 email = "me@example.com"
-primary_device_id = "dev-primary-1"
 allow_default_relays = true
 [retention]
 policy = "keep_everything"
@@ -976,27 +1009,51 @@ dry_run = true
 "#,
             capture.path().display()
         );
-        let account = Config::from_toml_str(&text).unwrap().account.unwrap();
+        let cfg = Config::from_toml_str(&text).unwrap();
+        assert_eq!(cfg.device_name.as_deref(), Some("Observatory Pi"));
+        assert_eq!(cfg.targets, vec!["dev-primary-1".to_string(), "Laptop".to_string()]);
+        let account = cfg.account.unwrap();
         assert_eq!(account.hub_url, "https://staging.example.org");
-        assert_eq!(account.primary_device_id.as_deref(), Some("dev-primary-1"));
         assert!(account.allow_default_relays, "explicit true must parse through");
     }
 
-    /// Task M1: neither a pairing route present → rejected with an actionable
-    /// message naming both routes.
+    /// Sync 2C: no send route present (no targets, no ticket) → rejected with an
+    /// actionable message naming both routes.
     #[test]
-    fn no_pairing_route_is_rejected() {
+    fn no_send_route_is_rejected() {
         let capture = tempfile::tempdir().unwrap();
         let text = format!(
-            "capture_dir=\"{}\"\ndata_dir=\"/d\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            "capture_dir=\"{}\"\ndata_dir=\"/d\"\nmode=\"auto\"\n[account]\nemail=\"me@example.com\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
             capture.path().display()
         );
-        let err = Config::from_toml_str(&text).expect_err("no pairing route must fail");
+        let err = Config::from_toml_str(&text).expect_err("no send route must fail");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("pairing") && (msg.contains("account") || msg.contains("pairing_ticket")),
-            "error should name the pairing routes: {msg}"
+            msg.contains("send target") && (msg.contains("targets") || msg.contains("pairing_ticket")),
+            "error should name the send routes: {msg}"
         );
+    }
+
+    /// Sync 2C: `targets` parses as a string list preserving order.
+    #[test]
+    fn targets_parse_as_ordered_list() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            "capture_dir=\"{}\"\ndata_dir=\"/d\"\nmode=\"auto\"\ntargets=[\"a\", \"b\", \"c\"]\n[account]\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            capture.path().display()
+        );
+        let cfg = Config::from_toml_str(&text).expect("targets list is valid");
+        assert_eq!(cfg.targets, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    /// Sync 2C: `targets` defaults to an empty list when omitted, and
+    /// `device_name` defaults to `None`.
+    #[test]
+    fn targets_and_device_name_default_when_omitted() {
+        let capture = tempfile::tempdir().unwrap();
+        let cfg = Config::from_toml_str(&good_toml(capture.path())).unwrap();
+        assert!(cfg.targets.is_empty(), "targets defaults to []");
+        assert!(cfg.device_name.is_none(), "device_name defaults to None");
     }
 
     #[test]
@@ -1240,27 +1297,33 @@ interval_secs = 600
     #[test]
     fn setup_needs_matrix() {
         let dir = tempfile::tempdir().unwrap();
-        let base = |dirs: &str, pairing: &str| {
-            Config::from_toml_str_lenient(&format!(
-                "data_dir = \"/d\"\nmode = \"auto\"\n{dirs}\n{pairing}\n"
-            ))
-            .unwrap()
+        let dirs_line = format!("capture_dirs = [\"{}\"]", dir.path().display());
+        let parse = |body: &str| {
+            Config::from_toml_str_lenient(&format!("data_dir = \"/d\"\nmode = \"auto\"\n{body}\n"))
+                .unwrap()
         };
-        let both = base("capture_dirs = []", "");
-        assert_eq!(both.setup_needs(false), vec![SetupNeed::CaptureDirs, SetupNeed::Pairing]);
 
-        let dirs_ok = base(&format!("capture_dirs = [\"{}\"]", dir.path().display()), "");
-        assert_eq!(dirs_ok.setup_needs(false), vec![SetupNeed::Pairing]);
+        // Nothing configured → both needs.
+        let both = parse("capture_dirs = []");
+        assert_eq!(both.setup_needs(false), vec![SetupNeed::CaptureDirs, SetupNeed::Targets]);
 
-        // account table WITHOUT a stored token is still "not signed in"
-        let acct = base(&format!("capture_dirs = [\"{}\"]", dir.path().display()), "[account]");
-        assert_eq!(acct.setup_needs(false), vec![SetupNeed::Pairing]);
+        // Dirs ok, no send target → just the target need.
+        let dirs_ok = parse(&dirs_line);
+        assert_eq!(dirs_ok.setup_needs(false), vec![SetupNeed::Targets]);
+
+        // Account + a target but NOT signed in → still needs a target (a target
+        // is unresolvable without a stored token).
+        let acct = parse(&format!("{dirs_line}\ntargets = [\"Studio\"]\n[account]"));
+        assert_eq!(acct.setup_needs(false), vec![SetupNeed::Targets]);
+        // Signed in AND a target → ready.
         assert_eq!(acct.setup_needs(true), vec![]);
 
-        let ticket = base(
-            &format!("capture_dirs = [\"{}\"]", dir.path().display()),
-            "pairing_ticket = \"t\"",
-        );
+        // Signed in but NO target → still needs a target (send-only: nowhere to send).
+        let acct_no_target = parse(&format!("{dirs_line}\n[account]"));
+        assert_eq!(acct_no_target.setup_needs(true), vec![SetupNeed::Targets]);
+
+        // A dev ticket is a self-contained send target (no account/token needed).
+        let ticket = parse(&format!("{dirs_line}\npairing_ticket = \"t\""));
         assert_eq!(ticket.setup_needs(false), vec![]);
     }
 

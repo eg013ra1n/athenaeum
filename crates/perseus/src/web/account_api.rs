@@ -37,8 +37,6 @@ pub struct AccountDto {
     email: Option<String>,
     hub_url: Option<String>,
     device_id: Option<String>,
-    primary_device_id: Option<String>,
-    primary_name: Option<String>,
 }
 
 impl From<crate::account::AccountStatus> for AccountDto {
@@ -48,8 +46,6 @@ impl From<crate::account::AccountStatus> for AccountDto {
             email: s.email,
             hub_url: s.hub_url,
             device_id: s.device_id,
-            primary_device_id: s.primary_device_id,
-            primary_name: s.primary_name,
         }
     }
 }

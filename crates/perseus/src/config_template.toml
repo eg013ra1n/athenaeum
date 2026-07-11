@@ -6,11 +6,18 @@
 data_dir = '{data_dir}'
 mode = "auto"
 
+# Optional friendly name for this node in your account (defaults to the hostname).
+# device_name = "Observatory Pi"
+
 # Folders watched for new FITS/XISF captures. Add them from the web page,
 # or here: capture_dirs = ["/path/to/captures"]
 capture_dirs = []
 
-# Hub account pairing. Sign in from the web page, or run `perseus login`.
+# Devices in your account to send captures to, by device name or id. Perseus is
+# send-only; add at least one. Set from the web page, or here: targets = ["Studio Mac"]
+targets = []
+
+# Hub account sign-in. Sign in from the web page, or run `perseus login`.
 [account]
 
 [retention]

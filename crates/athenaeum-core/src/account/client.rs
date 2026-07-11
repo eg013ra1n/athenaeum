@@ -13,7 +13,7 @@
 //!   same-account re-verify/re-sign-in is a 200 on the hub, not a conflict)
 //! - `GET  /api/v1/devices` → `[AccountDevice]`
 //! - `POST /api/v1/devices/{id}/revoke` → 204
-//! - `POST /api/v1/devices/{id}/role {role, peerDeviceId?}` → 200 | 400 | 409
+//! - `PATCH /api/v1/devices/{id} {name}` → 200 | 400 | 409
 //! - `GET  /api/v1/relay-map` → `{relays: [url,...]}`
 
 use std::time::Duration;
@@ -21,7 +21,7 @@ use std::time::Duration;
 use reqwest::StatusCode;
 use serde::Deserialize;
 
-use super::{AccountDevice, DeviceCapability, DeviceRole};
+use super::{AccountDevice, DeviceCapability};
 
 /// Typed outcome of a failed hub call. Carries no secrets.
 #[derive(Debug)]
@@ -240,39 +240,6 @@ impl HubClient {
         }
     }
 
-    /// `POST /devices/{id}/role` — set a device's role. `peer_device_id = None`
-    /// clears any peer link. 409 → SecondPrimary, 400 → PeerValidation.
-    pub async fn set_role(
-        &self,
-        token: &str,
-        device_id: &str,
-        role: DeviceRole,
-        peer_device_id: Option<&str>,
-    ) -> Result<(), AccountClientError> {
-        let mut body = serde_json::Map::new();
-        body.insert("role".into(), serde_json::Value::String(role.as_str().to_string()));
-        if let Some(peer) = peer_device_id {
-            body.insert("peerDeviceId".into(), serde_json::Value::String(peer.to_string()));
-        }
-        let resp = self
-            .http
-            .post(self.url(&format!("/devices/{device_id}/role")))
-            .bearer_auth(token)
-            .json(&serde_json::Value::Object(body))
-            .send()
-            .await
-            .map_err(net)?;
-        match resp.status() {
-            StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
-            StatusCode::CONFLICT => Err(AccountClientError::SecondPrimary(body_message(resp).await)),
-            StatusCode::BAD_REQUEST => {
-                Err(AccountClientError::PeerValidation(body_message(resp).await))
-            }
-            StatusCode::UNAUTHORIZED => Err(AccountClientError::Unauthorized),
-            s => Err(unexpected(s, resp).await),
-        }
-    }
-
     /// `GET /relay-map` — the hub's advertised relay URLs.
     pub async fn relay_map(&self, token: &str) -> Result<Vec<String>, AccountClientError> {
         let resp = self
@@ -387,30 +354,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_primary_conflict_surfaces_message() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/v1/devices/dev-1/role"))
-            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
-                "error": "This account already has a primary device.",
-            })))
-            .mount(&server)
-            .await;
-
-        let client = HubClient::new(server.uri()).unwrap();
-        let err = client
-            .set_role("tok", "dev-1", DeviceRole::Primary, None)
-            .await
-            .unwrap_err();
-        match err {
-            AccountClientError::SecondPrimary(msg) => {
-                assert!(msg.contains("already has a primary"), "message surfaced: {msg}");
-            }
-            other => panic!("expected SecondPrimary, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn rate_limit_maps_to_typed_error() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -425,30 +368,6 @@ mod tests {
             matches!(err, AccountClientError::RateLimited),
             "429 must map to RateLimited, got {err:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn peer_validation_400_on_role() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/api/v1/devices/dev-2/role"))
-            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
-                "error": "peer device must belong to the same account",
-            })))
-            .mount(&server)
-            .await;
-
-        let client = HubClient::new(server.uri()).unwrap();
-        let err = client
-            .set_role("tok", "dev-2", DeviceRole::Capture, Some("missing"))
-            .await
-            .unwrap_err();
-        match err {
-            AccountClientError::PeerValidation(msg) => {
-                assert!(msg.contains("same account"), "message surfaced: {msg}");
-            }
-            other => panic!("expected PeerValidation, got {other:?}"),
-        }
     }
 
     /// Fix (B4 review): the hub still 409s `/auth/verify` when the pubkey

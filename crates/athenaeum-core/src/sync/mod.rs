@@ -66,10 +66,7 @@ mod retention_tests;
 
 pub use engine::{SyncConfig, SyncEngine, SyncEngineHandle, DEFAULT_ACK_TIMEOUT, MAX_ATTEMPTS};
 pub use ingest::{ingest_package, IngestOutcome};
-pub use pairing::{
-    node_id_from_ticket, relay_mode_for, resolve_peer, resolve_relays, AccountPairing,
-    PeerResolution, RelayResolution,
-};
+pub use pairing::{node_id_from_ticket, relay_mode_for, resolve_relays, RelayResolution};
 pub use models::{Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState};
 pub use retention::{evaluate_and_apply, DeleteOutcome, RetentionOutcome, RetentionPolicy};
 pub use receiver::{

@@ -680,8 +680,8 @@ mod tests {
                     "must list the capture-dirs need: {needs:?}"
                 );
                 assert!(
-                    needs.iter().any(|n| n.contains("not signed in")),
-                    "must list the pairing need: {needs:?}"
+                    needs.iter().any(|n| n.contains("send target")),
+                    "must list the send-target need: {needs:?}"
                 );
             }
             other => panic!("expected NeedsSetup, got {other:?}"),
@@ -807,7 +807,7 @@ mod tests {
             .expect("first launch never reached Running")
             .unwrap();
 
-        // Remove the pairing route entirely → "not signed in".
+        // Remove the send route entirely (no ticket, no targets) → not ready.
         write_config_atomic(
             &cfg_path,
             &format!(
@@ -822,7 +822,7 @@ mod tests {
             T,
             state.wait_for(|s| {
                 matches!(s, AgentState::NeedsSetup { needs }
-                    if needs.len() == 1 && needs[0].contains("not signed in"))
+                    if needs.len() == 1 && needs[0].contains("send target"))
             }),
         )
         .await
