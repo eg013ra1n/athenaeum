@@ -48,6 +48,7 @@ use chrono::Utc;
 use crate::sharing::types::NodeId;
 
 pub mod cleanup_coord;
+pub mod dedup;
 pub mod engine;
 pub mod ingest;
 pub mod models;
@@ -66,6 +67,7 @@ mod ingest_tests;
 mod retention_tests;
 
 pub use cleanup_coord::SharedPackageCleanup;
+pub use dedup::{confirm_candidates, partition_offer, WantSplit};
 pub use engine::{
     PackageCleanupSink, SyncConfig, SyncEngine, SyncEngineHandle, DEFAULT_ACK_TIMEOUT, MAX_ATTEMPTS,
 };
