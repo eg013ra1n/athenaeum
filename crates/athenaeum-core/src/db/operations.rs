@@ -2991,6 +2991,43 @@ pub fn get_frame_ids_for_file_ids(conn: &Connection, file_ids: &[i64]) -> Result
     Ok(ids)
 }
 
+/// Map a set of selected paths (files and/or folders) to the catalog frame
+/// ids they cover. For each `path`, a frame qualifies when its file is either
+/// an exact `files.path` match (the path names a file) or lives under
+/// `"<path>/"` (the path names a folder — matched recursively at any depth).
+///
+/// Results are DISTINCT and returned in ascending, stable order: a
+/// `BTreeSet` dedupes across paths, so an overlapping file + parent-folder
+/// selection yields each frame once. Empty input or non-cataloged paths yield
+/// an empty vec.
+///
+/// Path form: matches the STORED `files.path` verbatim — same contract as
+/// `get_file_by_path`. No macOS `/Volumes` ↔ `/private/Volumes` normalization
+/// is applied here; the dual-pane browser selects the same path form the
+/// scanner recorded, so an exact/prefix compare against the stored string is
+/// correct. Real paths carry no SQL `%`/`_` wildcards, so the `LIKE` prefix
+/// needs no `ESCAPE`; the trailing `/` in the prefix stops a sibling that
+/// merely shares a name prefix (e.g. `/M31extra`) from matching `/M31`.
+pub fn frame_ids_under_paths(conn: &Connection, paths: &[String]) -> Result<Vec<i64>> {
+    use std::collections::BTreeSet;
+
+    let mut ids: BTreeSet<i64> = BTreeSet::new();
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT fr.id
+           FROM files f
+           JOIN frames fr ON fr.file_id = f.id
+          WHERE f.path = ?1 OR f.path LIKE ?2",
+    )?;
+    for path in paths {
+        let prefix = format!("{}/%", path.trim_end_matches('/'));
+        let rows = stmt.query_map(params![path, prefix], |row| row.get::<_, i64>(0))?;
+        for r in rows {
+            ids.insert(r?);
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
 /// Delete excluded frames by file IDs
 pub fn delete_excluded_frames_by_file_ids(conn: &Connection, file_ids: &[i64]) -> Result<usize> {
     if file_ids.is_empty() {
@@ -3732,6 +3769,58 @@ mod bulk_metadata_tests {
         ).unwrap();
         conn.query_row("SELECT id FROM sessions ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn frame_ids_under_paths_matches_file_and_folder() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Build a temp catalog with files+frames at known paths (reusing the
+        // module's `insert_frame` helper, which returns the generated frame_id).
+        let l1 = insert_frame(&conn, "/data/astro/M31/2026-07-12/L_0001.fits", Some("Light"));
+        let l2 = insert_frame(&conn, "/data/astro/M31/2026-07-12/L_0002.fits", Some("Light"));
+        let f1 = insert_frame(&conn, "/data/astro/M31/flats/F_0001.fits", Some("Flat"));
+        let _other = insert_frame(&conn, "/data/other/x.fits", Some("Light"));
+
+        // exact file → its frame
+        assert_eq!(
+            frame_ids_under_paths(&conn, &["/data/astro/M31/2026-07-12/L_0001.fits".into()]).unwrap(),
+            vec![l1]
+        );
+
+        // folder → all frames under it (recursive), sorted/deduped
+        let mut got = frame_ids_under_paths(&conn, &["/data/astro/M31".into()]).unwrap();
+        got.sort();
+        let mut expect = vec![l1, l2, f1];
+        expect.sort();
+        assert_eq!(got, expect);
+
+        // a file + an overlapping folder → deduped
+        let mut both = frame_ids_under_paths(
+            &conn,
+            &[
+                "/data/astro/M31/2026-07-12/L_0001.fits".into(),
+                "/data/astro/M31".into(),
+            ],
+        )
+        .unwrap();
+        both.sort();
+        assert_eq!(both, expect);
+
+        // a sibling folder sharing a name prefix must NOT be swept in by the
+        // LIKE (the trailing `/` in the prefix guards against `/M31extra/…`).
+        let m31_extra = insert_frame(&conn, "/data/astro/M31extra/z.fits", Some("Light"));
+        let mut only_m31 = frame_ids_under_paths(&conn, &["/data/astro/M31".into()]).unwrap();
+        only_m31.sort();
+        assert_eq!(only_m31, expect, "M31extra sibling must not match /data/astro/M31");
+        assert!(!only_m31.contains(&m31_extra));
+
+        // non-cataloged path → empty
+        assert!(frame_ids_under_paths(&conn, &["/nope".into()]).unwrap().is_empty());
+
+        // empty input → empty
+        assert!(frame_ids_under_paths(&conn, &[]).unwrap().is_empty());
     }
 
     #[test]

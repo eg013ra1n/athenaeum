@@ -310,6 +310,11 @@ pub struct SearchCatalogArgs {
 }
 
 #[derive(serde::Deserialize)]
+pub struct ResolveFrameIdsForPathsArgs {
+    pub paths: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
 pub struct MkdirArgs {
     pub path: String,
 }
@@ -361,6 +366,17 @@ pub async fn search_catalog(
     Json(args): Json<SearchCatalogArgs>,
 ) -> Result<Json<Vec<CatalogSearchHit>>, (StatusCode, String)> {
     api::search_catalog(&state.ctx, args.query, args.limit, args.instrume_filter)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/resolve_frame_ids_for_paths
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn resolve_frame_ids_for_paths(
+    State(state): State<WebAppState>,
+    Json(args): Json<ResolveFrameIdsForPathsArgs>,
+) -> Result<Json<Vec<i64>>, (StatusCode, String)> {
+    api::resolve_frame_ids_for_paths(&state.ctx, args.paths)
         .map(Json)
         .map_err(api_err)
 }

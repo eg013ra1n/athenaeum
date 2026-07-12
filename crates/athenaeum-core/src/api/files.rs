@@ -549,6 +549,22 @@ pub fn search_catalog(
     Ok(rows)
 }
 
+/// Map a set of selected browser paths (files and/or folders) to the catalog
+/// frame ids they cover, so the dual-pane file browser (which selects by
+/// path) can feed the Send dialog (which addresses frames by id). Folders
+/// match recursively; overlapping file + parent-folder selections are
+/// deduped; non-cataloged paths contribute nothing. Returns an ascending,
+/// stable, DISTINCT list.
+pub fn resolve_frame_ids_for_paths(
+    ctx: &ServiceContext,
+    paths: Vec<String>,
+) -> Result<Vec<i64>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let ids = crate::db::frame_ids_under_paths(&conn, &paths)?;
+    Ok(ids)
+}
+
 /// Row -> CatalogSearchHit mapper shared between the two SQL branches above.
 fn map_search_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CatalogSearchHit> {
     Ok(CatalogSearchHit {

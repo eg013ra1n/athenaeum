@@ -90,6 +90,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         // Dual-pane file browser
         .route("/api/enqueue_move_operation", post(files::enqueue_move_operation))
         .route("/api/search_catalog", post(files::search_catalog))
+        .route("/api/resolve_frame_ids_for_paths", post(files::resolve_frame_ids_for_paths))
         .route("/api/mkdir_in_scan_root", post(files::mkdir_in_scan_root))
         .route("/api/rename_path", post(files::rename_path))
         // Settings

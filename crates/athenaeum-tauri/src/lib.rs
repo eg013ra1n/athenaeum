@@ -277,6 +277,7 @@ pub fn run() {
             commands::get_distinct_instrumes,
             commands::enqueue_move_operation,
             commands::search_catalog,
+            commands::resolve_frame_ids_for_paths,
             commands::mkdir_in_scan_root,
             commands::rename_path,
             commands::get_duplicates,

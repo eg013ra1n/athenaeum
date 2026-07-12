@@ -254,6 +254,20 @@ pub async fn search_catalog(
     api::search_catalog(&state.ctx, query, limit, instrume_filter).map_err(|e| e.to_string())
 }
 
+/// Map a set of selected paths (files and/or folders) to catalog frame ids,
+/// so the dual-pane file browser (which selects by path) can feed the Send
+/// dialog (which addresses frames by id). Folders resolve recursively;
+/// overlapping file + folder selections are deduped; non-cataloged paths
+/// contribute nothing.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn resolve_frame_ids_for_paths(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<Vec<i64>, String> {
+    api::resolve_frame_ids_for_paths(&state.ctx, paths).map_err(|e| e.to_string())
+}
+
 /// Create a directory inside a scan root. Validated to refuse paths that
 /// would land outside any configured scan root.
 #[tauri::command]
