@@ -32,6 +32,7 @@
 //!   handlers onto the same router.
 
 pub mod account;
+pub mod batch_store;
 pub mod config;
 pub mod config_edit;
 pub mod run;
