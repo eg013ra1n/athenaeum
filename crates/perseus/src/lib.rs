@@ -21,6 +21,9 @@
 //!   [`watcher::StabilityTracker`].
 //! - [`run`] — the [`run::Agent`]: store + transport + engine + watcher, plus
 //!   package building, the device key, and logging setup.
+//! - [`batcher`] — the send batcher ([`batcher::spawn_batcher`]): accumulates the
+//!   watcher's stable files and flushes them as one package on the auto
+//!   quiet-timer or a manual signal, replacing the old per-file consumer.
 //! - [`supervisor`] — the readiness-driven engine lifecycle: a state machine
 //!   that launches/stops the [`run::Agent`] as the config gains or loses
 //!   readiness (signed in + ≥1 capture dir), with a launcher seam for tests.
@@ -33,6 +36,7 @@
 
 pub mod account;
 pub mod batch_store;
+pub mod batcher;
 pub mod config;
 pub mod config_edit;
 pub mod run;

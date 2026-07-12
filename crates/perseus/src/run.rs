@@ -37,7 +37,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::config::{Config, RetentionConfig};
+use crate::batch_store::BatchStore;
+use crate::batcher::{spawn_batcher, BatcherHandle};
+use crate::config::{Config, RetentionConfig, SendCfg};
 use crate::seen::{SeenStore, SourceLink};
 use crate::watcher::{self, WatcherHandle};
 use crate::web::RetentionRunRecord;
@@ -373,7 +375,23 @@ pub struct Agent {
     /// false). All watchers feed the single enqueue pipeline; graceful shutdown
     /// drops ALL of them before draining the consumer.
     watchers: Vec<WatcherHandle>,
-    enqueue_task: Option<JoinHandle<()>>,
+    /// The batcher loop's task (Sync Phase 2): accumulates the watcher's stable
+    /// files and flushes them as one package per batch. `Some` only on the
+    /// `watch` path (there is no batcher in enqueue-backlog mode). Replaces the
+    /// old per-file `spawn_enqueue_consumer`.
+    batcher_task: Option<JoinHandle<()>>,
+    /// The batcher's control handle: the shared pending set + the manual-flush
+    /// signal. `Some` only on the `watch` path. Cloned into the web layer (Task 6)
+    /// so the status page can show "N pending" and trigger "Send N pending".
+    batcher: Option<BatcherHandle>,
+    /// Live-edit channel for the send config (mode + auto quiet window). Seeded
+    /// with the startup [`Config::send_cfg`]; the batcher holds the matching
+    /// receiver and adopts a new value on the next select! turn (no restart). The
+    /// web settings page (Task 6) obtains a clone via [`Agent::send_cfg_tx`] and
+    /// pushes re-validated edits. Created unconditionally (like `retention_tx`) so
+    /// the accessor is always available; on the non-`watch` path there is no
+    /// receiver, so a send is a harmless no-op.
+    send_cfg_tx: watch::Sender<SendCfg>,
     retention_task: Option<JoinHandle<()>>,
     /// Live-edit channel for the retention config (task 8). The retention loop
     /// holds the matching receiver and re-borrows it every pass, so a `send`
@@ -605,7 +623,14 @@ impl Agent {
         let retention_log: Arc<Mutex<VecDeque<RetentionRunRecord>>> =
             Arc::new(Mutex::new(VecDeque::new()));
 
-        let (watchers, enqueue_task, retention_task) = if watch {
+        // Live-edit channel for the send config (Sync Phase 2). Seeded with the
+        // startup mode + quiet window; the batcher re-borrows it on every select!
+        // turn. Created unconditionally so `send_cfg_tx()` is always available —
+        // when `watch` is false there is no batcher receiving it (a send is a
+        // harmless no-op), matching the retention_tx pattern above.
+        let (send_cfg_tx, send_cfg_rx) = watch::channel(config.send_cfg());
+
+        let (watchers, batcher_task, batcher, retention_task) = if watch {
             // Each stable file is paired with the (canonicalized) capture dir it
             // came from, so the consumer can compute a capture-dir-relative
             // rel_path (with a per-dir label when watching more than one root).
@@ -623,16 +648,29 @@ impl Agent {
                     Arc::clone(&seen),
                 )?);
             }
-            // Drop our own sender: the consumer's channel now closes precisely
+            // Drop our own sender: the batcher's channel now closes precisely
             // when the LAST watcher drops its clone (i.e. all have shut down).
             drop(stable_tx);
-            let enqueue_task = spawn_enqueue_consumer(
+            // Per-batch send bookkeeping (Task 2), opened as another connection
+            // into the same `perseus.db` (WAL-safe, like `seen`). The batcher
+            // writes one row per flushed package; the web history page (Task 6)
+            // lists them.
+            let batches = Arc::new(
+                BatchStore::open(config.db_path())
+                    .with_context(|| format!("open batch store {}", config.db_path().display()))?,
+            );
+            // Sync Phase 2: the batcher replaces the per-file consumer —
+            // accumulate stable files, flush the whole set as ONE package on the
+            // auto quiet-timer or a manual signal, fan it to every target.
+            let (batcher, batcher_task) = spawn_batcher(
                 stable_rx,
                 engine_handles.clone(),
                 Arc::clone(&seen),
+                batches,
                 config.clone(),
                 origin_device.clone(),
                 cleanup.clone(),
+                send_cfg_rx,
             );
             let retention_task = spawn_retention_task(
                 Arc::clone(&store),
@@ -642,12 +680,19 @@ impl Agent {
                 Arc::clone(&retention_log),
                 peer_device.clone(),
             );
-            (watchers, Some(enqueue_task), Some(retention_task))
+            (
+                watchers,
+                Some(batcher_task),
+                Some(batcher),
+                Some(retention_task),
+            )
         } else {
-            // No retention loop in enqueue-backlog mode: drop the receiver so the
-            // channel has none (the sender is still held for API symmetry).
+            // No batcher / retention loop in enqueue-backlog mode: drop the
+            // receivers so those channels have none (the senders are still held
+            // for API symmetry).
             drop(retention_rx);
-            (Vec::new(), None, None)
+            drop(send_cfg_rx);
+            (Vec::new(), None, None, None)
         };
 
         Ok(Self {
@@ -659,7 +704,9 @@ impl Agent {
             origin_device,
             peer_device,
             watchers,
-            enqueue_task,
+            batcher_task,
+            batcher,
+            send_cfg_tx,
             retention_task,
             retention_tx,
             retention_log,
@@ -780,8 +827,25 @@ impl Agent {
         self.retention_tx.clone()
     }
 
-    /// Gracefully stop the watcher, drain the enqueue consumer, and shut the
-    /// engine down (awaiting its worker).
+    /// The batcher's control handle (Sync Phase 2), `Some` only on the `watch`
+    /// path (enqueue-backlog has no batcher). The web layer (Task 6) clones this
+    /// to render "N pending" ([`BatcherHandle::pending_snapshot`]) and to trigger
+    /// "Send N pending" ([`BatcherHandle::flush_now`]).
+    pub fn batcher(&self) -> Option<BatcherHandle> {
+        self.batcher.clone()
+    }
+
+    /// A clone of the send-config live-edit sender. The web settings page (Task 6)
+    /// pushes a re-validated [`SendCfg`] (mode + auto quiet window) here for the
+    /// running batcher to adopt on its next select! turn — no agent restart. When
+    /// the agent was started without `watch` there is no batcher receiving it, so
+    /// a `send` is a harmless no-op.
+    pub fn send_cfg_tx(&self) -> watch::Sender<SendCfg> {
+        self.send_cfg_tx.clone()
+    }
+
+    /// Gracefully stop the watcher, drain the batcher, and shut the engine down
+    /// (awaiting its worker).
     pub async fn shutdown(self) {
         // The retention loop is an independent task holding only Arc clones;
         // abort it directly — there is nothing to drain.
@@ -794,8 +858,10 @@ impl Agent {
         for w in self.watchers {
             w.shutdown().await;
         }
-        // With all watchers dropped, the consumer sees its channel close and exits.
-        if let Some(t) = self.enqueue_task {
+        // With all watchers dropped, the batcher sees its channel close and exits
+        // (any still-pending files are re-detected on the next run via the seen
+        // store, so nothing is lost by not force-flushing here).
+        if let Some(t) = self.batcher_task {
             let _ = t.await;
         }
         // Shut every target engine down (awaiting each worker).
@@ -804,9 +870,9 @@ impl Agent {
         }
     }
 
-    /// Hard-kill: abort the watcher and enqueue-consumer tasks immediately (no
+    /// Hard-kill: abort the watcher and batcher tasks immediately (no
     /// graceful handshake), then drop this agent's engine handle. Once the
-    /// aborted enqueue task's own handle clone is also gone, the engine's
+    /// aborted batcher task's own handle clone is also gone, the engine's
     /// command channel closes and its worker notices and exits on its own —
     /// the same mechanism [`shutdown`](Self::shutdown) relies on, just without
     /// the cooperative command-and-await round trip.
@@ -821,7 +887,7 @@ impl Agent {
         for w in self.watchers {
             w.abort_for_test();
         }
-        if let Some(t) = self.enqueue_task {
+        if let Some(t) = self.batcher_task {
             t.abort();
         }
         if let Some(t) = self.retention_task {
@@ -888,7 +954,10 @@ pub(crate) async fn bind_and_spawn_web(
 /// future restart — it must never fail the enqueue itself (the file is already
 /// durably queued). The `package_ref` linkage is what retention later joins on to
 /// map a confirmed package back to this source capture file.
-fn record_seen(seen: &SeenStore, path: &Path, package_ref: &str) {
+///
+/// `pub(crate)` so the [`crate::batcher`] flush path records each file in a
+/// flushed batch, exactly as the old per-file consumer did.
+pub(crate) fn record_seen(seen: &SeenStore, path: &Path, package_ref: &str) {
     match std::fs::metadata(path) {
         Ok(m) => {
             let mtime_ms = crate::seen::mtime_millis(m.modified().ok());
@@ -909,7 +978,11 @@ fn record_seen(seen: &SeenStore, path: &Path, package_ref: &str) {
 /// stops the others. Returns `(first_id, delivered_count)`: the durable row id of
 /// the first successful enqueue (for the seen-store linkage / caller reporting)
 /// and how many targets accepted it. `first_id` is `None` iff ZERO targets did.
-async fn enqueue_package_to_all(
+///
+/// `pub(crate)` so the [`crate::batcher`] flush path fans one batch package out
+/// to every target, sharing the exact per-target failure isolation the per-file
+/// path uses.
+pub(crate) async fn enqueue_package_to_all(
     engines: &[Arc<SyncEngineHandle>],
     pkg_dir: &Path,
 ) -> (Option<i64>, usize) {
@@ -979,57 +1052,6 @@ fn reconcile_shared_cleanup(
         }
     }
     Ok(())
-}
-
-/// Spawn the task that turns stable capture files into enqueued packages. Each
-/// item is `(owning_capture_dir, file_path)` from a watcher, so the package's
-/// `rel_path` is computed relative to the dir the file was captured under. Each
-/// package is built ONCE and fanned out to every target engine.
-fn spawn_enqueue_consumer(
-    mut stable_rx: mpsc::Receiver<(PathBuf, PathBuf)>,
-    engines: Vec<Arc<SyncEngineHandle>>,
-    seen: Arc<SeenStore>,
-    config: Config,
-    origin_device: String,
-    cleanup: Option<Arc<SharedPackageCleanup>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some((capture_dir, path)) = stable_rx.recv().await {
-            match build_package_for_file(&config, &capture_dir, &path, &origin_device) {
-                Ok(pkg_dir) => {
-                    let (first_id, delivered) = enqueue_package_to_all(&engines, &pkg_dir).await;
-                    // Fan-out only: register the delivered target count so the
-                    // shared payload is freed exactly once, after all are terminal
-                    // (see `Agent::enqueue_file`). Single-target keeps in-line
-                    // cleanup (`cleanup` is `None`).
-                    if let Some(coord) = &cleanup {
-                        coord.register(&pkg_dir, delivered);
-                    }
-                    match first_id {
-                        Some(id) => {
-                            tracing::info!(
-                                id,
-                                delivered,
-                                targets = engines.len(),
-                                path = %path.display(),
-                                "enqueued capture file"
-                            );
-                            record_seen(&seen, &path, &pkg_dir.to_string_lossy());
-                        }
-                        None => tracing::error!(
-                            targets = engines.len(),
-                            path = %path.display(),
-                            "enqueue failed for every target"
-                        ),
-                    }
-                }
-                Err(error) => {
-                    tracing::error!(%error, path = %path.display(), "build package failed")
-                }
-            }
-        }
-        tracing::debug!("enqueue consumer stopped");
-    })
 }
 
 /// RFC3339 UTC millisecond timestamp — the sync tables' canonical rendering.

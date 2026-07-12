@@ -29,7 +29,7 @@ use athenaeum_core::sharing::types::{FrameReceipt, ReceiptOutcome, TransportEven
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::{HistoryQuery, HistoryRow, OutboundState, SyncStore};
 
-use perseus::config::{Config, Mode, RetentionConfig, RetentionPolicy, DEFAULT_AUTO_QUIET_SECS};
+use perseus::config::{Config, Mode, RetentionConfig, RetentionPolicy};
 use perseus::run::Agent;
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -61,7 +61,10 @@ fn test_config(capture_dir: &Path, data_dir: &Path) -> Config {
         targets: Vec::new(),
         device_name: None,
         mode: Mode::Auto,
-        auto_quiet_secs: DEFAULT_AUTO_QUIET_SECS,
+        // A 1s quiet window (matching stability/poll) so the batcher flushes each
+        // stabilized frame within seconds — the e2e asserts confirmation inside
+        // `WAIT`, and the production 60s default would blow that budget.
+        auto_quiet_secs: 1,
         retention: RetentionConfig {
             policy: RetentionPolicy::KeepEverything,
             dry_run: true,
@@ -89,7 +92,8 @@ fn test_config_multi(capture_dirs: &[&Path], data_dir: &Path) -> Config {
         targets: Vec::new(),
         device_name: None,
         mode: Mode::Auto,
-        auto_quiet_secs: DEFAULT_AUTO_QUIET_SECS,
+        // Short quiet window so the batcher flushes promptly (see `test_config`).
+        auto_quiet_secs: 1,
         retention: RetentionConfig {
             policy: RetentionPolicy::KeepEverything,
             dry_run: true,
