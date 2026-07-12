@@ -68,8 +68,9 @@ export function SendToNodeDialog({ frameIds, open, onClose }: SendToNodeDialogPr
         if (cancelled) return;
         setSignedIn(status.signedIn);
         // Candidates = other full-peer Athenaeum nodes on this account (never
-        // Perseus send-only agents, never self). The backend re-validates + rejects
-        // Perseus/self too, so this is a UX filter, not the security boundary.
+        // Perseus send-only agents, never self). The backend re-validates +
+        // rejects Perseus and unknown devices too; self is excluded only by
+        // this UI filter, so this is a UX filter, not the security boundary.
         const cands = status.signedIn
           ? devices.filter((d) => d.capability === 'athenaeum' && d.id !== status.deviceId)
           : [];

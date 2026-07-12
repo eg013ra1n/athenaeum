@@ -3005,9 +3005,16 @@ pub fn get_frame_ids_for_file_ids(conn: &Connection, file_ids: &[i64]) -> Result
 /// `get_file_by_path`. No macOS `/Volumes` ↔ `/private/Volumes` normalization
 /// is applied here; the dual-pane browser selects the same path form the
 /// scanner recorded, so an exact/prefix compare against the stored string is
-/// correct. Real paths carry no SQL `%`/`_` wildcards, so the `LIKE` prefix
-/// needs no `ESCAPE`; the trailing `/` in the prefix stops a sibling that
-/// merely shares a name prefix (e.g. `/M31extra`) from matching `/M31`.
+/// correct. The folder branch uses an exact-case, wildcard-safe byte-range
+/// prefix (`path >= "<path>/" AND path < upper`, via `path_prefix_upper`) —
+/// the same compare `rename_files_path_prefix` uses. Unlike the
+/// ASCII-case-insensitive `LIKE` it replaced, `>=`/`<` on TEXT are
+/// case-SENSITIVE (so a `/M31` select never sweeps a `/m31` sibling on a
+/// case-sensitive FS — Linux desktop + Docker/web) and treat `_`/`%` in the
+/// folder's own name literally (so `/M31_L` never sweeps a `/M31xL` sibling).
+/// The trailing `/` still stops a name-prefix sibling like `/M31extra` from
+/// matching `/M31`, and this now agrees with the case-sensitive exact-file
+/// branch.
 pub fn frame_ids_under_paths(conn: &Connection, paths: &[String]) -> Result<Vec<i64>> {
     use std::collections::BTreeSet;
 
@@ -3016,11 +3023,17 @@ pub fn frame_ids_under_paths(conn: &Connection, paths: &[String]) -> Result<Vec<
         "SELECT DISTINCT fr.id
            FROM files f
            JOIN frames fr ON fr.file_id = f.id
-          WHERE f.path = ?1 OR f.path LIKE ?2",
+          WHERE f.path = ?1
+             OR (f.path >= ?2 AND (?3 IS NULL OR f.path < ?3))",
     )?;
     for path in paths {
-        let prefix = format!("{}/%", path.trim_end_matches('/'));
-        let rows = stmt.query_map(params![path, prefix], |row| row.get::<_, i64>(0))?;
+        // Descendants of a selected FOLDER: `[prefix, upper)` byte-range where
+        // `prefix` carries the trailing separator and `upper` is its exclusive
+        // upper bound (NULL only when the prefix is all `char::MAX` — then the
+        // guard falls back to a lower-bound-only match).
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let upper = path_prefix_upper(&prefix);
+        let rows = stmt.query_map(params![path, prefix, upper], |row| row.get::<_, i64>(0))?;
         for r in rows {
             ids.insert(r?);
         }
@@ -3781,6 +3794,9 @@ mod bulk_metadata_tests {
         let l1 = insert_frame(&conn, "/data/astro/M31/2026-07-12/L_0001.fits", Some("Light"));
         let l2 = insert_frame(&conn, "/data/astro/M31/2026-07-12/L_0002.fits", Some("Light"));
         let f1 = insert_frame(&conn, "/data/astro/M31/flats/F_0001.fits", Some("Flat"));
+        // A real subfolder directly under M31 — a folder select must still
+        // sweep descendants at any depth after the LIKE→range-compare fix.
+        let c1 = insert_frame(&conn, "/data/astro/M31/2026/c.fits", Some("Light"));
         let _other = insert_frame(&conn, "/data/other/x.fits", Some("Light"));
 
         // exact file → its frame
@@ -3792,7 +3808,7 @@ mod bulk_metadata_tests {
         // folder → all frames under it (recursive), sorted/deduped
         let mut got = frame_ids_under_paths(&conn, &["/data/astro/M31".into()]).unwrap();
         got.sort();
-        let mut expect = vec![l1, l2, f1];
+        let mut expect = vec![l1, l2, f1, c1];
         expect.sort();
         assert_eq!(got, expect);
 
@@ -3815,6 +3831,33 @@ mod bulk_metadata_tests {
         only_m31.sort();
         assert_eq!(only_m31, expect, "M31extra sibling must not match /data/astro/M31");
         assert!(!only_m31.contains(&m31_extra));
+
+        // OVER-MATCH GUARD 1 (wildcard chars): `_`/`%` in the selected folder's
+        // own name must be matched LITERALLY, not as SQL `LIKE` wildcards.
+        // Selecting `/data/astro/M31_L` must not sweep the sibling
+        // `/data/astro/M31xL` (underscores are pervasive in astro paths).
+        let wc_target = insert_frame(&conn, "/data/astro/M31_L/a.fits", Some("Light"));
+        let wc_sibling = insert_frame(&conn, "/data/astro/M31xL/b.fits", Some("Light"));
+        let got_wc = frame_ids_under_paths(&conn, &["/data/astro/M31_L".into()]).unwrap();
+        assert_eq!(
+            got_wc,
+            vec![wc_target],
+            "underscore in the folder name must be literal, not a LIKE wildcard"
+        );
+        assert!(!got_wc.contains(&wc_sibling));
+
+        // OVER-MATCH GUARD 2 (case): the folder branch must be case-SENSITIVE,
+        // agreeing with the exact-file branch. On a case-sensitive FS
+        // (Linux desktop + Docker/web) selecting `/data/astro/M31` must not
+        // sweep the sibling `/data/astro/m31`.
+        let case_sibling = insert_frame(&conn, "/data/astro/m31/b.fits", Some("Light"));
+        let mut got_case = frame_ids_under_paths(&conn, &["/data/astro/M31".into()]).unwrap();
+        got_case.sort();
+        assert_eq!(
+            got_case, expect,
+            "lowercase m31 sibling must not match /data/astro/M31 (case-sensitive)"
+        );
+        assert!(!got_case.contains(&case_sibling));
 
         // non-cataloged path → empty
         assert!(frame_ids_under_paths(&conn, &["/nope".into()]).unwrap().is_empty());
