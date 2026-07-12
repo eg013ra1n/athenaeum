@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Play, Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight, Crosshair, Send } from 'lucide-react';
+import { Play, Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight, Crosshair } from 'lucide-react';
 import { api } from '../api';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
@@ -18,7 +18,6 @@ import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
 import { PlateSolveBatchPanel, type PlateSolveBatchPanelHandle } from './plate-solve/PlateSolveBatchPanel';
 import { LightsAnalysisChartView } from './analysis/LightsAnalysisChartView';
 import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
-import { useSyncSend } from '../hooks/useSyncSend';
 
 interface LightsAnalysisViewProps {
   hierarchy: CalibrationHierarchyViewData;
@@ -514,16 +513,6 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
     onBlink?.([...selectedFrameIds]);
   }, [selectedFrameIds, onBlink]);
 
-  // "Send to primary" (task M2b) — only surfaced on a signed-in capture node.
-  // `canSend` gates button visibility; the hook enqueues the eligible subset and
-  // raises the outcome notification (N-of-M convention).
-  const { canSend: canSendToPrimary, sending: sendingToPrimary, sendToPrimary } = useSyncSend();
-
-  const handleSendToPrimary = useCallback(() => {
-    if (selectedFrameIds.size === 0) return;
-    void sendToPrimary([...selectedFrameIds]);
-  }, [selectedFrameIds, sendToPrimary]);
-
   const handleBlackholeSelected = useCallback(async () => {
     if (selectedFrameIds.size === 0) return;
 
@@ -822,27 +811,6 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               </button>
               <span className="text-[10px] text-content-muted leading-tight">Plate Solve</span>
             </div>
-
-            {/* Send to primary — only for a signed-in capture node (task M2b).
-                Runs on the eligible subset; the (N of M) outcome is reported via
-                the notification, not the button label. */}
-            {canSendToPrimary && (
-              <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
-                <button
-                  onClick={handleSendToPrimary}
-                  disabled={!hasSelection || sendingToPrimary}
-                  className="w-10 h-7 inline-flex items-center justify-center text-xs font-medium bg-purple hover:brightness-110 text-white rounded-lg transition-colors disabled:opacity-30 disabled:cursor-default"
-                  title={
-                    hasSelection
-                      ? `Send ${selectedFrameIds.size} selected frame${selectedFrameIds.size === 1 ? '' : 's'} to your paired primary device`
-                      : 'Select frames to send to your primary device'
-                  }
-                >
-                  <Send size={12} />
-                </button>
-                <span className="text-[10px] text-content-muted leading-tight">Send</span>
-              </div>
-            )}
 
             <span className="text-border h-7 flex items-center">|</span>
 
