@@ -54,6 +54,7 @@ pub mod ingest;
 pub mod models;
 pub mod pairing;
 pub mod receiver;
+pub mod responder;
 pub mod retention;
 pub mod sender;
 pub mod status;
@@ -79,6 +80,7 @@ pub use receiver::{
     allow_all_peers, IncomingResolver, PeerAuthorizer, SyncFinishedEvent, SyncProgressEvent,
     SyncReceiver, SyncReceiverHandle, SyncRuntime,
 };
+pub use responder::{CatalogDedupResponder, DedupResponder};
 pub use sender::{StartedSender, SyncSenderRuntime};
 pub use status::{OutboundSummary, SyncReceiverStatus, SyncSenderStatus, SyncStatus};
 pub use store::{

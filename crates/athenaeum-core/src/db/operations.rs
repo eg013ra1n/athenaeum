@@ -5212,6 +5212,45 @@ mod savepoint_migration_tests {
     }
 }
 
+/// Files whose `content_hash` (the SAMPLING xxh3 stored by the scanner) is one
+/// of `hashes`, returned as `(content_hash, path)` pairs. Backs the P2P dedup
+/// responder's membership probe: an offered sampling hash present here is a
+/// *candidate* duplicate that still needs full-hash confirmation.
+///
+/// The `IN (…)` list is chunked at 900 bind params (SQLite's default limit is
+/// 999) and the per-chunk results are unioned. An empty `hashes` slice runs no
+/// query and returns an empty vec. `content_hash` and `path` are both indexed
+/// (`idx_files_content_hash`, `idx_files_path`), so each chunk is an index scan.
+pub fn find_files_by_content_hashes(
+    conn: &Connection,
+    hashes: &[String],
+) -> Result<Vec<(String, String)>> {
+    // SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999; stay well under it.
+    const CHUNK: usize = 900;
+    let mut out = Vec::new();
+    if hashes.is_empty() {
+        return Ok(out);
+    }
+    for chunk in hashes.chunks(CHUNK) {
+        let placeholders = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT content_hash, path FROM files WHERE content_hash IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            rusqlite::params_from_iter(chunk.iter().map(|s| s.as_str())),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        for r in rows {
+            out.push(r?);
+        }
+    }
+    Ok(out)
+}
+
 /// Task 9 (calibration_library scan-root kind) — DB-level coverage for
 /// `upsert_scan_root`'s INSERT-only kind semantics and the
 /// `count_scan_roots_of_kind` uniqueness-guard helper. The code-level

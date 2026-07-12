@@ -766,6 +766,18 @@ impl CatalogSyncStore {
         load_receipts(&conn, &package_id.0)
     }
 
+    /// Catalog files whose SAMPLING hash (`files.content_hash`) is one of
+    /// `hashes`, as `(sampling_hash, path)` pairs — the membership probe the
+    /// P2P dedup responder ([`CatalogDedupResponder`](super::responder::CatalogDedupResponder))
+    /// uses to split an incoming offer into definite-wants vs. sampling-hash
+    /// candidates. Thin wrapper over
+    /// [`find_files_by_content_hashes`](crate::db::find_files_by_content_hashes).
+    pub fn files_by_sampling_hashes(&self, hashes: &[String]) -> Result<Vec<(String, String)>> {
+        let conn = self.lock_conn();
+        crate::db::find_files_by_content_hashes(&conn, hashes)
+            .map_err(|e| anyhow::anyhow!("look up files by sampling hash: {e}"))
+    }
+
     /// Every outbound row, newest-first, capped at `limit`. Twin of
     /// [`StandaloneSyncStore::all_outbound`] for symmetry — see
     /// [`all_outbound_rows`].
