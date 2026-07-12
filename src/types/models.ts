@@ -719,7 +719,14 @@ peerDevice: string, okCount: number,
 /**
  * Frame uuids the receiver rejected (integrity failure).
  */
-failed: Array<string>, };
+failed: Array<string>, 
+/**
+ * Sender-only dedup outcome (Sync Phase 3): frames actually sent (`new`) vs.
+ * dropped as the peer's duplicates by the pre-announce handshake. Always `0`
+ * on the receiver-side emits — the receiver reports ingest/duplicate per
+ * frame in [`ok_count`](Self::ok_count) / its receipts, not this split.
+ */
+newCount: number, duplicateCount: number, };
 
 export type SyncHistoryQuery = { 
 /**

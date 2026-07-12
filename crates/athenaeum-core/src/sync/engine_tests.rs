@@ -11,24 +11,30 @@
 //! (fresh transport endpoint) over the same store file; it re-enumerates
 //! `non_terminal()` and finishes.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tempfile::tempdir;
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::package::{
     self, write_package, ManifestRecord, PayloadKind, MANIFEST_FILENAME, MANIFEST_VERSION,
 };
+use crate::sharing::iroh::proto::{FullHashEntry, OfferEntry};
 use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
-use crate::sharing::types::{FrameReceipt, PackageAnnounce, ReceiptOutcome, TransportEvent};
+use crate::sharing::types::{
+    FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, StartInfo, TransportEvent,
+};
 use crate::sharing::SharingTransport;
 
 use super::cleanup_coord::SharedPackageCleanup;
 use super::engine::PackageCleanupSink;
 use super::store::{StandaloneSyncStore, SyncStore};
+use super::DedupResponder;
 use super::{HistoryQuery, OutboundState, SyncConfig, SyncEngine};
 
 /// Build a one-frame package under `src_root`'s parent and return its directory.
@@ -1092,6 +1098,343 @@ async fn crash_resume_only_redrives_its_own_peers_rows() {
         Some(OutboundState::Queued),
         "an engine must not re-drive another peer's outbound row"
     );
+
+    engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Sync Phase 3 (Task 6): pre-announce dedup handshake spliced into the sender.
+//
+// The engine now computes an Offer, `negotiate_want`s with the peer, and either
+// (a) empty want → terminalizes as all-duplicate WITHOUT announcing, (b)
+// non-empty want → serves only that subset + announces, or (c) any handshake
+// failure → falls back to announcing the FULL package (best-effort). The
+// sender's `sync-finished` event carries a `{newCount, duplicateCount}` outcome.
+// ---------------------------------------------------------------------------
+
+/// Build a package with N frames under `src_root` and return its dir. Each
+/// `(uuid, filename, object, size)` writes a real payload + a manifest record.
+fn build_package_multi(
+    src_root: &Path,
+    pkg_name: &str,
+    frames: &[(&str, &str, &str, usize)],
+) -> PathBuf {
+    std::fs::create_dir_all(src_root).unwrap();
+    let mut items = Vec::new();
+    for (frame_uuid, filename, object, size) in frames {
+        let payload = src_root.join(filename);
+        let bytes: Vec<u8> = (0..*size).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&payload, &bytes).unwrap();
+        let byte_size = std::fs::metadata(&payload).unwrap().len();
+        let xxh3 = package::xxh3_full_file(&payload).unwrap();
+        let record = ManifestRecord {
+            v: MANIFEST_VERSION,
+            frame_uuid: frame_uuid.to_string(),
+            origin_catalog_uuid: "catalog-uuid".to_string(),
+            origin_device: "origin-device".to_string(),
+            payload_kind: PayloadKind::RawFrame,
+            rel_path: filename.to_string(),
+            byte_size,
+            xxh3,
+            frame_meta: serde_json::json!({ "filename": filename, "object": object }),
+            analysis: None,
+            app_version: "test".to_string(),
+        };
+        items.push((payload, record));
+    }
+    let pkg_dir = src_root.parent().unwrap().join(format!("pkg-{pkg_name}"));
+    write_package(&pkg_dir, items).unwrap();
+    pkg_dir
+}
+
+/// A [`DedupResponder`] that reports EVERY offered frame as a true duplicate:
+/// nothing is a definite want, and every candidate's full hash "matches" (drop
+/// them all) → the negotiated want is empty.
+struct AllDuplicateResponder;
+impl DedupResponder for AllDuplicateResponder {
+    fn want_for_offer(&self, entries: &[OfferEntry]) -> (Vec<String>, Vec<String>) {
+        (
+            Vec::new(),
+            entries.iter().map(|e| e.rel_path.clone()).collect(),
+        )
+    }
+    fn confirm_full_hashes(&self, _entries: &[FullHashEntry]) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// A [`DedupResponder`] that wants exactly one `rel_path` and treats every other
+/// offered frame as a true duplicate (candidate whose full hash matches → drop).
+struct WantOnlyResponder {
+    wanted_rel: String,
+}
+impl DedupResponder for WantOnlyResponder {
+    fn want_for_offer(&self, entries: &[OfferEntry]) -> (Vec<String>, Vec<String>) {
+        let mut want = Vec::new();
+        let mut cands = Vec::new();
+        for e in entries {
+            if e.rel_path == self.wanted_rel {
+                want.push(e.rel_path.clone());
+            } else {
+                cands.push(e.rel_path.clone());
+            }
+        }
+        (want, cands)
+    }
+    fn confirm_full_hashes(&self, _entries: &[FullHashEntry]) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// A transport decorator that forces `negotiate_want` to error while delegating
+/// every other call to the wrapped loopback endpoint — so the engine's
+/// best-effort fallback (announce the FULL package on a handshake failure) can
+/// be exercised end to end with a working serve/announce/fetch/ack path.
+struct NegotiateErrTransport(Arc<LoopbackTransport>);
+
+#[async_trait::async_trait]
+impl SharingTransport for NegotiateErrTransport {
+    async fn start(&self) -> anyhow::Result<StartInfo> {
+        self.0.start().await
+    }
+    async fn announce(&self, to: NodeId, a: &PackageAnnounce) -> anyhow::Result<()> {
+        self.0.announce(to, a).await
+    }
+    async fn fetch(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest_dir: &Path,
+    ) -> anyhow::Result<()> {
+        self.0.fetch(from, pkg, dest_dir).await
+    }
+    async fn serve(
+        &self,
+        pkg: &PackageAnnounce,
+        src_dir: &Path,
+        want: Option<&HashSet<String>>,
+    ) -> anyhow::Result<()> {
+        self.0.serve(pkg, src_dir, want).await
+    }
+    async fn ack(
+        &self,
+        to: NodeId,
+        package_id: &PackageId,
+        receipts: Vec<FrameReceipt>,
+    ) -> anyhow::Result<()> {
+        self.0.ack(to, package_id, receipts).await
+    }
+    async fn negotiate_want(
+        &self,
+        _to: NodeId,
+        _package_id: PackageId,
+        _offer: Vec<OfferEntry>,
+        _full_by_rel: HashMap<String, String>,
+    ) -> anyhow::Result<HashSet<String>> {
+        anyhow::bail!("injected negotiate failure")
+    }
+    async fn release(&self, package_id: &PackageId) -> anyhow::Result<()> {
+        self.0.release(package_id).await
+    }
+    async fn events(&self) -> mpsc::Receiver<TransportEvent> {
+        self.0.events().await
+    }
+}
+
+/// All-duplicate: the peer reports every offered frame as a true duplicate, so
+/// the negotiated want is empty. The engine must terminalize the package to
+/// `Confirmed` WITHOUT announcing (the receiver never fetches), and the sender's
+/// finished event must report `{ newCount: 0, duplicateCount: 1 }`.
+#[tokio::test]
+async fn all_duplicate_package_terminalizes_without_announce() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint_with_responder(Arc::new(AllDuplicateResponder)));
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(&tmp.path().join("srcDup"), "uuid-dup", "dup.fits", "M42", 4096);
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
+    let engine = SyncEngine::spawn_with_emitter(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        Some(emitter),
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+
+    // Let any (erroneous) announce reach the receiver before asserting none did.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        stats.attempts.load(SeqCst),
+        0,
+        "an all-duplicate package must never be announced to the peer"
+    );
+
+    wait_until(
+        || {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, p)| n == "sync-finished" && p["outcome"] == "confirmed")
+        },
+        WAIT,
+    )
+    .await;
+    let evts = events.lock().unwrap();
+    let finished = evts
+        .iter()
+        .find(|(n, _)| n == "sync-finished")
+        .expect("a sync-finished event");
+    assert_eq!(finished.1["direction"].as_str(), Some("sent"));
+    assert_eq!(finished.1["newCount"].as_u64(), Some(0));
+    assert_eq!(finished.1["duplicateCount"].as_u64(), Some(1));
+    drop(evts);
+
+    engine.shutdown().await;
+}
+
+/// Best-effort fallback: when `negotiate_want` errors, the engine must announce
+/// the FULL package (pre-dedup behavior) and the receiver ingests every frame →
+/// `Confirmed`, finished `{ newCount: 1, duplicateCount: 0 }`.
+#[tokio::test]
+async fn negotiate_error_falls_back_to_full_announce() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(&tmp.path().join("srcErr"), "uuid-err", "err.fits", "M42", 4096);
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
+    // Wrap the sender endpoint so `negotiate_want` always errors → full send.
+    let sender = Arc::new(NegotiateErrTransport(Arc::new(net.endpoint())));
+    let engine = SyncEngine::spawn_with_emitter(
+        store.clone() as Arc<dyn SyncStore>,
+        sender,
+        receiver_id,
+        Some(emitter),
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+
+    assert!(
+        stats.attempts.load(SeqCst) >= 1,
+        "a handshake failure must still announce the full package"
+    );
+
+    wait_until(
+        || {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, p)| n == "sync-finished" && p["outcome"] == "confirmed")
+        },
+        WAIT,
+    )
+    .await;
+    let evts = events.lock().unwrap();
+    let finished = evts
+        .iter()
+        .find(|(n, _)| n == "sync-finished")
+        .expect("a sync-finished event");
+    assert_eq!(finished.1["newCount"].as_u64(), Some(1));
+    assert_eq!(finished.1["duplicateCount"].as_u64(), Some(0));
+    drop(evts);
+
+    engine.shutdown().await;
+}
+
+/// Mixed batch: the peer wants 1 of 2 offered frames. The engine must serve only
+/// that frame (the receiver fetches exactly it, never the duplicate), reach
+/// `Confirmed`, and report finished `{ newCount: 1, duplicateCount: 1 }`.
+#[tokio::test]
+async fn mixed_batch_serves_only_want_subset() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // The peer already has "a.fits"; it wants only the new "b.fits".
+    let responder = WantOnlyResponder {
+        wanted_rel: "b.fits".to_string(),
+    };
+    let receiver = Arc::new(net.endpoint_with_responder(Arc::new(responder)));
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let recv_root = tmp.path().join("recv");
+    let stats = spawn_receiver(receiver.clone(), recv_root.clone());
+
+    let pkg = build_package_multi(
+        &tmp.path().join("srcMix"),
+        "uuid-mix",
+        &[
+            ("uuid-a", "a.fits", "M42", 2048),
+            ("uuid-b", "b.fits", "M42", 4096),
+        ],
+    );
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
+    let engine = SyncEngine::spawn_with_emitter(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        Some(emitter),
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+
+    // Exactly one announce → exactly one fetch, of the wanted frame only.
+    assert_eq!(
+        stats.attempts.load(SeqCst),
+        1,
+        "a mixed batch must announce the subset exactly once"
+    );
+    let fetched = dir_entries(&recv_root.join("fetch-1"));
+    assert!(
+        fetched.contains(&"b.fits".to_string()),
+        "the wanted frame must be fetched, got {fetched:?}"
+    );
+    assert!(
+        !fetched.contains(&"a.fits".to_string()),
+        "the duplicate frame must NOT be fetched, got {fetched:?}"
+    );
+
+    wait_until(
+        || {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, p)| n == "sync-finished" && p["outcome"] == "confirmed")
+        },
+        WAIT,
+    )
+    .await;
+    let evts = events.lock().unwrap();
+    let finished = evts
+        .iter()
+        .find(|(n, _)| n == "sync-finished")
+        .expect("a sync-finished event");
+    assert_eq!(finished.1["newCount"].as_u64(), Some(1));
+    assert_eq!(finished.1["duplicateCount"].as_u64(), Some(1));
+    drop(evts);
 
     engine.shutdown().await;
 }

@@ -101,6 +101,12 @@ pub struct SyncFinishedEvent {
     pub ok_count: u32,
     /// Frame uuids the receiver rejected (integrity failure).
     pub failed: Vec<String>,
+    /// Sender-only dedup outcome (Sync Phase 3): frames actually sent (`new`) vs.
+    /// dropped as the peer's duplicates by the pre-announce handshake. Always `0`
+    /// on the receiver-side emits — the receiver reports ingest/duplicate per
+    /// frame in [`ok_count`](Self::ok_count) / its receipts, not this split.
+    pub new_count: u32,
+    pub duplicate_count: u32,
 }
 
 /// Handle to a running [`SyncReceiver`]. Dropping it (or calling
@@ -219,6 +225,8 @@ async fn handle_announce(
             peer_device,
             ok_count: 0,
             failed: Vec::new(),
+            new_count: 0,
+            duplicate_count: 0,
         });
         return Ok(());
     }
@@ -257,6 +265,8 @@ async fn handle_announce(
             peer_device: peer_device.clone(),
             ok_count: satisfied_count,
             failed: Vec::new(),
+            new_count: 0,
+            duplicate_count: 0,
         });
         return Ok(());
     }
@@ -340,6 +350,8 @@ async fn handle_announce(
         peer_device,
         ok_count: outcome.ok_count(),
         failed,
+        new_count: 0,
+        duplicate_count: 0,
     });
     Ok(())
 }

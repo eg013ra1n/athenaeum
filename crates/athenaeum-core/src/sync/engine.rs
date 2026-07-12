@@ -34,7 +34,7 @@
 //! - [`cancel`](SyncEngineHandle::cancel) → `Failed` with a `cancelled` history
 //!   outcome.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -46,6 +46,7 @@ use tokio::time::Instant;
 
 use crate::events::{emit_event, ProgressEmitter};
 use crate::package::{self, ManifestRecord, MANIFEST_FILENAME};
+use crate::sharing::iroh::proto::OfferEntry;
 use crate::sharing::types::{
     FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
 };
@@ -127,6 +128,36 @@ struct Pending {
     /// subsequent partial ack so it always reflects the latest verdict. Named
     /// in the terminal history outcome if the package is eventually `Failed`.
     last_rejected: Vec<String>,
+    /// The dedup-negotiated want subset (Sync Phase 3): `None` = full send (the
+    /// pre-dedup behavior + the best-effort fallback when the handshake is
+    /// unavailable or errors), `Some(rel_paths)` = only the frames the peer
+    /// still wants. Decided ONCE on the first build (announce `None`) and reused
+    /// across every retry so a retry re-serves the same subset instead of
+    /// re-negotiating. Also filters the started-history + the `on_ack`
+    /// completeness check to exactly the frames actually sent.
+    want: Option<HashSet<String>>,
+    /// Frames actually sent to the peer this batch (`new`) vs. dropped as the
+    /// peer's duplicates (`duplicate`), fixed at negotiate time and reported on
+    /// the sender's `sync-finished` `{new, duplicate}` outcome.
+    new_count: u32,
+    duplicate_count: u32,
+}
+
+/// Outcome of the first-build dedup handshake
+/// ([`negotiate_and_build`](Worker::negotiate_and_build)).
+enum Negotiated {
+    /// Serve + announce this (subset-or-full) announce; `want` is the negotiated
+    /// subset (`None` = full send / best-effort fallback).
+    Send {
+        announce: PackageAnnounce,
+        want: Option<HashSet<String>>,
+    },
+    /// The peer already has every frame — the package was terminalized in place
+    /// (confirmed) with no announce; the caller returns without serving.
+    AllDuplicate,
+    /// A manifest/announce build error already logged + armed a retry; the
+    /// caller returns and lets `handle_timeouts` re-drive the slot.
+    Deferred,
 }
 
 /// Optional host sink notified when a package reaches a **terminal** state
@@ -513,7 +544,17 @@ impl Worker {
     }
 
     /// Emit the single send-side `sync-finished` event for a package (task M3).
-    fn emit_finished(&self, id: i64, outcome: &str, ok_count: u32, failed: Vec<String>) {
+    /// `new_count` / `duplicate_count` are the Sync Phase 3 dedup outcome — how
+    /// many frames were actually sent vs. dropped as the peer's duplicates.
+    fn emit_finished(
+        &self,
+        id: i64,
+        outcome: &str,
+        ok_count: u32,
+        failed: Vec<String>,
+        new_count: u32,
+        duplicate_count: u32,
+    ) {
         if let Some(em) = &self.emitter {
             emit_event(em.as_ref(), "sync-finished", &SyncFinishedEvent {
                 package_id: id.to_string(),
@@ -522,6 +563,8 @@ impl Worker {
                 peer_device: node_id_hex(&self.peer),
                 ok_count,
                 failed,
+                new_count,
+                duplicate_count,
             });
         }
     }
@@ -553,6 +596,9 @@ impl Worker {
                 started_at: String::new(),
                 deadline: Instant::now(),
                 last_rejected: Vec::new(),
+                want: None,
+                new_count: 0,
+                duplicate_count: 0,
             },
         );
         self.attempt(id).await
@@ -571,40 +617,38 @@ impl Worker {
     /// failing re-announce cannot busy-spin (M1).
     async fn attempt(&mut self, id: i64) -> Result<()> {
         // Snapshot from the slot; drop the borrow before any await / mutation.
-        let Some((dir, existing, started)) = self
+        let Some((dir, existing, started, cached_want)) = self
             .pending
             .get(&id)
-            .map(|p| (p.dir.clone(), p.announce.clone(), p.started))
+            .map(|p| (p.dir.clone(), p.announce.clone(), p.started, p.want.clone()))
         else {
             // Slot gone (cancelled/confirmed concurrently) — nothing to do.
             return Ok(());
         };
 
-        // Reuse the minted announce across retries (stable `package_id` for ack
-        // correlation) or build a fresh one if we don't have one yet.
-        let announce = match existing {
-            Some(a) => a,
-            None => match announce_for_dir(&dir) {
-                Ok(a) => a,
-                Err(e) => {
-                    // `{e:#}` (alternate Display) — a bare `%e` prints only the
-                    // outermost `.context(...)` layer, hiding the actual cause
-                    // (fix-review: field diagnosis shouldn't need a debugger).
-                    tracing::error!(package_id = id, error = %format!("{e:#}"), "sync build announce failed; will retry");
-                    self.arm_retry(id);
-                    return Ok(());
-                }
+        // Reuse the minted announce + negotiated want across retries (stable
+        // `package_id` for ack correlation, no re-negotiation), or run the dedup
+        // handshake once and build a fresh subset/full announce on the first
+        // build. An empty want short-circuits to an all-duplicate terminal.
+        let (announce, want) = match existing {
+            Some(a) => (a, cached_want),
+            None => match self.negotiate_and_build(id, &dir).await? {
+                // The handshake found the peer already has every frame: no
+                // announce, no serve — terminalize as all-duplicate and return.
+                Negotiated::AllDuplicate => return Ok(()),
+                // A manifest/announce build error already logged + armed a retry.
+                Negotiated::Deferred => return Ok(()),
+                Negotiated::Send { announce, want } => (announce, want),
             },
         };
 
-        // Provider side: register the served dir, then advertise it to the peer.
-        // A failure here (e.g. the peer is offline) is retryable, not fatal:
-        // remember the announce and arm a retry deadline.
+        // Provider side: register the served dir (the negotiated want-subset when
+        // `Some`, the full package when `None`), then advertise it to the peer. A
+        // failure here (e.g. the peer is offline) is retryable, not fatal:
+        // remember the announce + want and arm a retry deadline.
         let serve_announce = async {
-            // Task 6 will pass the negotiated want-subset here; until then serve
-            // the full package (`None`).
             self.transport
-                .serve(&announce, &dir, None)
+                .serve(&announce, &dir, want.as_ref())
                 .await
                 .context("serve package")?;
             self.transport
@@ -620,6 +664,7 @@ impl Worker {
             tracing::error!(package_id = id, error = %format!("{e:#}"), "sync serve/announce failed; will retry");
             if let Some(p) = self.pending.get_mut(&id) {
                 p.announce = Some(announce);
+                p.want = want;
             }
             self.arm_retry(id);
             return Ok(());
@@ -646,7 +691,10 @@ impl Worker {
             tracing::info!(package_id = id, state = "announced", "sync state");
             self.store.set_state(id, OutboundState::Transferring)?;
             tracing::info!(package_id = id, state = "transferring", "sync state");
-            self.append_started_history(id, &dir, &started_at)?;
+            // Started history covers only the frames actually sent (the want
+            // subset), so a resend of the peer's duplicates leaves no orphan
+            // `sent` rows that never get a matching confirm.
+            self.append_started_history(id, &dir, &started_at, want.as_ref())?;
             // One coarse in-flight tick per package (the first successful
             // announce); retries re-announce but do NOT re-emit — bounded, never
             // per-byte.
@@ -655,13 +703,155 @@ impl Worker {
             tracing::info!(package_id = id, state = "transferring", "sync resume/retry re-announce");
         }
 
-        // Arm the ack-wait deadline and persist the announce/milestone on the slot.
+        // Arm the ack-wait deadline and persist the announce/want/milestone.
         if let Some(p) = self.pending.get_mut(&id) {
             p.announce = Some(announce);
+            p.want = want;
             p.started = true;
             p.started_at = started_at;
             p.deadline = Instant::now() + self.config.ack_timeout;
         }
+        Ok(())
+    }
+
+    /// First-build dedup handshake (Sync Phase 3), run once when a package has no
+    /// minted announce yet. Reads the manifest, mints the announce, offers the
+    /// peer the frames' sampling hashes, and `negotiate_want`s the subset it
+    /// still needs. Best-effort throughout: a `compute_xxhash` error or any
+    /// `negotiate_want` failure abandons the handshake and falls back to a full
+    /// send (`want = None`) rather than ever failing the send. An empty want is
+    /// terminalized here as all-duplicate (no announce). The served
+    /// `{new, duplicate}` counts are stashed on the pending slot for the eventual
+    /// finished event.
+    async fn negotiate_and_build(&mut self, id: i64, dir: &Path) -> Result<Negotiated> {
+        let records = match package::read_manifest(dir) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(package_id = id, error = %format!("{e:#}"), "sync build announce failed; will retry");
+                self.arm_retry(id);
+                return Ok(Negotiated::Deferred);
+            }
+        };
+        let full_announce = match announce_for_dir(dir) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(package_id = id, error = %format!("{e:#}"), "sync build announce failed; will retry");
+                self.arm_retry(id);
+                return Ok(Negotiated::Deferred);
+            }
+        };
+
+        // Build the offer (sampling hashes). ANY hashing error abandons the
+        // handshake for the whole package → full send (`want = None`).
+        let want: Option<HashSet<String>> = match build_offer(dir, &records) {
+            Err(e) => {
+                tracing::debug!(package_id = id, error = %format!("{e:#}"), "dedup offer hashing failed; full send");
+                None
+            }
+            Ok((offer, full_by_rel)) => {
+                match self
+                    .transport
+                    .negotiate_want(self.peer, full_announce.package_id.clone(), offer, full_by_rel)
+                    .await
+                {
+                    Ok(w) => Some(w),
+                    Err(e) => {
+                        tracing::debug!(error = %e, package_id = %full_announce.package_id.0, "dedup negotiate failed; full send");
+                        None
+                    }
+                }
+            }
+        };
+
+        // All-duplicate: the peer already has every frame — terminalize the
+        // package to a confirmed terminal WITHOUT announcing or serving.
+        if matches!(&want, Some(w) if w.is_empty()) {
+            self.terminalize_all_duplicate(id, &records)?;
+            return Ok(Negotiated::AllDuplicate);
+        }
+
+        // Compute the announce actually served + the outcome counts: the full
+        // announce for a fallback (`None`), or a subset announce (adjusted
+        // byte_size/frame_count, same package_id/root_hash) for a want-subset.
+        let total = records.len();
+        let (announce, new_count, duplicate_count) = match &want {
+            None => (full_announce, total as u32, 0u32),
+            Some(w) => {
+                let byte_size: u64 = records
+                    .iter()
+                    .filter(|r| w.contains(&r.rel_path))
+                    .map(|r| r.byte_size)
+                    .sum();
+                let subset = PackageAnnounce {
+                    package_id: full_announce.package_id.clone(),
+                    root_hash: full_announce.root_hash.clone(),
+                    byte_size,
+                    frame_count: w.len() as u32,
+                };
+                (subset, w.len() as u32, total.saturating_sub(w.len()) as u32)
+            }
+        };
+        if let Some(p) = self.pending.get_mut(&id) {
+            p.new_count = new_count;
+            p.duplicate_count = duplicate_count;
+            p.want = want.clone();
+        }
+        Ok(Negotiated::Send { announce, want })
+    }
+
+    /// Drive a package straight to a confirmed terminal because the dedup
+    /// handshake found the peer already holds every frame (empty want). Reuses
+    /// the exact confirmed-terminal mechanics of [`on_ack`](Self::on_ack) —
+    /// per-frame `Duplicate` receipts, confirmed history, payload cleanup routed
+    /// through the [`cleanup_sink`] (so a multi-target coordinator counts this
+    /// engine terminal), and the confirmed state stamp — but skips announce /
+    /// serve / blob release entirely (nothing was ever served).
+    fn terminalize_all_duplicate(&mut self, id: i64, records: &[ManifestRecord]) -> Result<()> {
+        let receipts: Vec<FrameReceipt> = records
+            .iter()
+            .map(|r| FrameReceipt {
+                frame_uuid: r.frame_uuid.clone(),
+                xxh3: r.xxh3.clone(),
+                outcome: ReceiptOutcome::Duplicate,
+            })
+            .collect();
+
+        let mut pending = self
+            .pending
+            .remove(&id)
+            .ok_or_else(|| anyhow!("all-duplicate terminal for a vanished slot {id}"))?;
+        // No transfer-start milestone was ever recorded (we never announced), so
+        // stamp a start time now for a coherent confirmed history row.
+        if pending.started_at.is_empty() {
+            pending.started_at = now_iso();
+        }
+
+        self.store
+            .confirm(pending.id, &receipts)
+            .context("confirm all-duplicate outbound")?;
+        self.append_confirmed_history(&pending, &receipts)?;
+        // Same shared-payload discipline as the ack path: defer to the
+        // coordinator when fanned out, else clean the payload copies in line.
+        match &self.cleanup_sink {
+            Some(sink) => sink.on_terminal(&pending.dir),
+            None => match cleanup_package_payloads(&pending.dir) {
+                Ok(freed_bytes) => {
+                    tracing::info!(package_id = pending.id, freed_bytes, "package payloads cleaned");
+                }
+                Err(e) => {
+                    tracing::warn!(package_id = pending.id, error = %format!("{e:#}"), "package payload cleanup failed");
+                }
+            },
+        }
+        tracing::info!(package_id = pending.id, state = "confirmed", reason = "all_duplicate", "sync state");
+        self.emit_finished(
+            pending.id,
+            "confirmed",
+            receipts.len() as u32,
+            Vec::new(),
+            0,
+            records.len() as u32,
+        );
         Ok(())
     }
 
@@ -777,20 +967,31 @@ impl Worker {
             return Ok(());
         }
 
-        // Completeness (finding M3): confirm ONLY when every announced frame is
-        // acked with a non-`Rejected` receipt. An empty or partial ack (fewer
-        // frames than the manifest describes) must NOT confirm — otherwise
-        // retention could delete a source whose frame the peer never actually
-        // stored. The package manifest is the source of truth for the announced
-        // frame set; all receipts here are already non-`Rejected` (guarded
-        // above), so `acked` is exactly the set of accepted frame uuids.
-        let dir = self
+        // Completeness (finding M3): confirm ONLY when every frame we actually
+        // SENT is acked with a non-`Rejected` receipt. An empty or partial ack
+        // (fewer frames than we sent) must NOT confirm — otherwise retention
+        // could delete a source whose frame the peer never actually stored.
+        //
+        // "Sent" is the negotiated want subset (Sync Phase 3), not the whole
+        // manifest: a want-subset send never transfers the peer's duplicates, so
+        // the ack legitimately covers only the subset. `want = None` (full send /
+        // fallback) expects the whole manifest, exactly as before dedup. All
+        // receipts here are already non-`Rejected` (guarded above), so `acked` is
+        // exactly the set of accepted frame uuids.
+        let (dir, want) = self
             .pending
             .get(&key)
-            .map(|p| p.dir.clone())
+            .map(|p| (p.dir.clone(), p.want.clone()))
             .expect("key from live find");
         let expected: Vec<String> = match crate::package::read_manifest(&dir) {
-            Ok(records) => records.into_iter().map(|r| r.frame_uuid).collect(),
+            Ok(records) => records
+                .into_iter()
+                .filter(|r| match &want {
+                    Some(w) => w.contains(&r.rel_path),
+                    None => true,
+                })
+                .map(|r| r.frame_uuid)
+                .collect(),
             Err(e) => {
                 tracing::warn!(
                     package_id = key,
@@ -856,7 +1057,14 @@ impl Worker {
         // the confirm.
         self.spawn_release(package_id);
         tracing::info!(package_id = pending.id, state = "confirmed", "sync state");
-        self.emit_finished(pending.id, "confirmed", receipts.len() as u32, Vec::new());
+        self.emit_finished(
+            pending.id,
+            "confirmed",
+            receipts.len() as u32,
+            Vec::new(),
+            pending.new_count,
+            pending.duplicate_count,
+        );
         Ok(())
     }
 
@@ -927,7 +1135,7 @@ impl Worker {
                 sink.on_terminal(&dir);
             }
         }
-        self.emit_finished(id, &outcome, 0, last_rejected);
+        self.emit_finished(id, &outcome, 0, last_rejected, 0, 0);
         Ok(())
     }
 
@@ -975,14 +1183,27 @@ impl Worker {
         if let Some(sink) = &self.cleanup_sink {
             sink.on_terminal(&dir);
         }
-        self.emit_finished(id, "cancelled", 0, Vec::new());
+        self.emit_finished(id, "cancelled", 0, Vec::new(), 0, 0);
         Ok(())
     }
 
-    /// Append one `sent` (transfer-started) history row per manifest frame.
-    fn append_started_history(&self, id: i64, dir: &Path, started_at: &str) -> Result<()> {
+    /// Append one `sent` (transfer-started) history row per frame actually sent.
+    /// `want` is the negotiated subset (Sync Phase 3): `Some(w)` records only the
+    /// frames in `w` (the peer's duplicates were never transferred), `None`
+    /// records every manifest frame (full send / fallback).
+    fn append_started_history(
+        &self,
+        id: i64,
+        dir: &Path,
+        started_at: &str,
+        want: Option<&HashSet<String>>,
+    ) -> Result<()> {
         let records = package::read_manifest(dir)
             .with_context(|| format!("read manifest for started history {}", dir.display()))?;
+        let records: Vec<&ManifestRecord> = records
+            .iter()
+            .filter(|r| want.map(|w| w.contains(&r.rel_path)).unwrap_or(true))
+            .collect();
         let peer_device = node_id_hex(&self.peer);
         for r in &records {
             self.store.append_history(HistoryRow {
@@ -1115,6 +1336,33 @@ fn announce_for_dir(dir: &Path) -> Result<PackageAnnounce> {
         byte_size,
         frame_count,
     })
+}
+
+/// Build the dedup [`Offer`](crate::sharing::iroh::proto::Msg::Offer) for a
+/// package: one [`OfferEntry`] per manifest record keyed by `rel_path` + the
+/// SAMPLING xxh3 (`duplicates::compute_xxhash`, matching `files.content_hash`),
+/// plus a `rel_path → full xxh3` map for the second (full-hash) handshake round.
+///
+/// Returns `Err` on the first unhashable payload; the caller treats ANY error as
+/// "abandon the handshake for the whole package" and falls back to a full send —
+/// the dedup path is a best-effort optimization, never a correctness gate.
+fn build_offer(
+    dir: &Path,
+    records: &[ManifestRecord],
+) -> Result<(Vec<OfferEntry>, HashMap<String, String>)> {
+    let mut offer = Vec::with_capacity(records.len());
+    let mut full_by_rel = HashMap::with_capacity(records.len());
+    for r in records {
+        let sampling_hash = crate::duplicates::compute_xxhash(&dir.join(&r.rel_path))
+            .with_context(|| format!("sampling-hash payload {}", r.rel_path))?;
+        offer.push(OfferEntry {
+            rel_path: r.rel_path.clone(),
+            sampling_hash,
+            byte_size: r.byte_size,
+        });
+        full_by_rel.insert(r.rel_path.clone(), r.xxh3.clone());
+    }
+    Ok((offer, full_by_rel))
 }
 
 /// Free the payload copies a confirmed package's directory holds, keeping only
