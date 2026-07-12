@@ -1243,9 +1243,10 @@ mod tests {
         std::fs::create_dir_all(tmp.path()).unwrap();
 
         // A real endpoint ticket (relay-disabled, in-memory) the resolver parses.
-        let transport = IrohTransport::new(random_secret(), RelayMode::Disabled, BlobStore::Memory)
-            .await
-            .unwrap();
+        let transport =
+            IrohTransport::new(random_secret(), RelayMode::Disabled, BlobStore::Memory, None)
+                .await
+                .unwrap();
         let info = transport.start().await.unwrap();
         let ticket_node = transport.node_id();
         transport.shutdown().await;

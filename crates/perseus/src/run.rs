@@ -372,10 +372,15 @@ impl Agent {
             let blob_dir = config
                 .data_dir
                 .join(format!("blobs_out_{}", node_id_hex(&target.peer)));
-            let transport =
-                IrohTransport::new(secret, resolved.relay_mode.clone(), BlobStore::Fs(blob_dir))
-                    .await
-                    .context("build iroh transport")?;
+            let transport = IrohTransport::new(
+                secret,
+                resolved.relay_mode.clone(),
+                BlobStore::Fs(blob_dir),
+                // Perseus is send-only: it never answers inbound dedup offers.
+                None,
+            )
+            .await
+            .context("build iroh transport")?;
             // On the ticket path, register the peer's full dialable address from
             // the ticket (it embeds relay + direct addresses). On the account
             // path the peer is a bare node id: `IrohTransport` has NO discovery

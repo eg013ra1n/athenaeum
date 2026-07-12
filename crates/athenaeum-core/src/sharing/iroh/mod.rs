@@ -37,9 +37,9 @@
 //! [iroh]: https://docs.rs/iroh
 //! [collection]: iroh_blobs::format::collection::Collection
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -58,6 +58,7 @@ use tokio::sync::mpsc;
 
 use super::types::{FrameReceipt, NodeId, PackageAnnounce, PackageId, StartInfo, TransportEvent};
 use super::SharingTransport;
+use crate::sync::DedupResponder;
 
 pub mod blobs;
 pub mod proto;
@@ -65,7 +66,7 @@ pub mod proto;
 #[cfg(test)]
 mod tests;
 
-use proto::Msg;
+use proto::{Msg, OfferEntry};
 
 /// Custom ALPN for the announce/ack control channel. Distinct from
 /// [`iroh_blobs::ALPN`] so the two protocols coexist on one endpoint.
@@ -145,7 +146,16 @@ impl IrohTransport {
     /// traversal) or [`RelayMode::Disabled`] for direct-only / in-process tests.
     /// The endpoint binds immediately; call [`start`](SharingTransport::start) to
     /// wait until it is online and obtain its pairing ticket.
-    pub async fn new(secret: [u8; 32], relay_mode: RelayMode, store: BlobStore) -> Result<Self> {
+    /// `responder` answers inbound dedup `Offer`/`FullHashes` requests on the
+    /// control channel (a running receiver passes `Some(CatalogDedupResponder)`;
+    /// a send-only endpoint passes `None`, in which case peers get a want-all
+    /// reply so nothing is silently withheld).
+    pub async fn new(
+        secret: [u8; 32],
+        relay_mode: RelayMode,
+        store: BlobStore,
+        responder: Option<Arc<dyn DedupResponder>>,
+    ) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let secret_key = SecretKey::from_bytes(&secret);
         let uses_relay = !matches!(relay_mode, RelayMode::Disabled);
@@ -199,6 +209,7 @@ impl IrohTransport {
         let blobs = BlobsProtocol::new(&store, None);
         let control = SyncControlProtocol {
             event_tx: event_tx.clone(),
+            responder,
         };
         let router = Router::builder(endpoint)
             .accept(iroh_blobs::ALPN, blobs)
@@ -311,6 +322,48 @@ impl IrohTransport {
             .await
             .map_err(|_| anyhow!("sync control send to {} timed out", hex32(&to)))??;
         Ok(())
+    }
+
+    /// Open a control connection to `to`, send one request [`Msg`], and read the
+    /// peer's **reply `Msg`** (decoded off the same bidi stream) — the
+    /// request/response counterpart of [`send_control`](Self::send_control),
+    /// whose reply is only the one-byte delivery ack. Used by the dedup
+    /// handshake, where the peer answers each request with a [`Msg::Want`]. The
+    /// responder is stateless, so each round drives its own connection/stream.
+    ///
+    /// Any connect/write/read/decode/timeout error propagates so the caller's
+    /// [`negotiate_want`](SharingTransport::negotiate_want) returns `Err` and the
+    /// engine falls back to a full announce.
+    async fn send_request(&self, to: NodeId, msg: Msg) -> Result<Msg> {
+        let target = self.dial_target(to)?;
+        let bytes = msg.encode()?;
+        let endpoint = &self.endpoint;
+
+        let exchange = async {
+            let conn = endpoint
+                .connect(target, SYNC_ALPN)
+                .await
+                .context("connect sync control channel")?;
+            let (mut tx, mut rx) = conn.open_bi().await.context("open control stream")?;
+            tx.write_all(&bytes).await.context("write control request")?;
+            tx.finish().context("finish control request")?;
+            // Read the peer's reply Msg (it finishes its send half after writing).
+            let reply = rx
+                .read_to_end(MAX_CONTROL_BYTES)
+                .await
+                .context("await control reply")?;
+            if reply.is_empty() {
+                anyhow::bail!("control request closed without a reply");
+            }
+            let reply = Msg::decode(&reply).context("decode control reply")?;
+            conn.close(0u32.into(), b"ok");
+            anyhow::Ok(reply)
+        };
+
+        match tokio::time::timeout(CONTROL_SEND_TIMEOUT, exchange).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow!("sync control request to {} timed out", hex32(&to))),
+        }
     }
 }
 
@@ -455,6 +508,59 @@ impl SharingTransport for IrohTransport {
         Ok(())
     }
 
+    async fn negotiate_want(
+        &self,
+        to: NodeId,
+        package_id: PackageId,
+        offer: Vec<OfferEntry>,
+        full_by_rel: HashMap<String, String>,
+    ) -> Result<HashSet<String>> {
+        // Round 1: Offer → Want. A non-Want reply (or any transport error) is a
+        // protocol failure → Err → the engine falls back to a full announce.
+        let reply = self
+            .send_request(
+                to,
+                Msg::Offer {
+                    package_id: package_id.clone(),
+                    entries: offer.clone(),
+                },
+            )
+            .await
+            .context("negotiate_want offer round")?;
+        let (want, candidates) = match reply {
+            Msg::Want { want, candidates, .. } => (want, candidates),
+            other => anyhow::bail!("expected Want reply to Offer, got {other:?}"),
+        };
+
+        let mut wanted: HashSet<String> = want.into_iter().collect();
+        if candidates.is_empty() {
+            tracing::debug!(to = %hex32(&to), package_id = %package_id.0, want = wanted.len(), "negotiate_want resolved (no candidates)");
+            return Ok(wanted);
+        }
+
+        // Round 2: FullHashes → Want (still-wanted after full-hash disambiguation).
+        let entries = proto::build_full_hash_entries(&offer, &candidates, &full_by_rel, &mut wanted);
+        if !entries.is_empty() {
+            let reply = self
+                .send_request(
+                    to,
+                    Msg::FullHashes {
+                        package_id: package_id.clone(),
+                        entries,
+                    },
+                )
+                .await
+                .context("negotiate_want full-hashes round")?;
+            let still = match reply {
+                Msg::Want { want, .. } => want,
+                other => anyhow::bail!("expected Want reply to FullHashes, got {other:?}"),
+            };
+            wanted.extend(still);
+        }
+        tracing::debug!(to = %hex32(&to), package_id = %package_id.0, want = wanted.len(), "negotiate_want resolved");
+        Ok(wanted)
+    }
+
     async fn events(&self) -> mpsc::Receiver<TransportEvent> {
         let mut guard = self.event_rx.lock().expect("event_rx mutex poisoned");
         match guard.take() {
@@ -469,11 +575,26 @@ impl SharingTransport for IrohTransport {
 }
 
 /// The `athenaeum/sync/1` protocol handler: reads postcard [`Msg`]s off inbound
-/// bidirectional streams, republishes them as in-process [`TransportEvent`]s,
-/// and acks each with a byte so the sender can close cleanly.
-#[derive(Debug, Clone)]
+/// bidirectional streams and either republishes them as in-process
+/// [`TransportEvent`]s (`Announce`/`Ack`, acked with a byte so the sender can
+/// close cleanly) or answers them directly via the injected [`DedupResponder`]
+/// (`Offer`/`FullHashes`, replied to with a real [`Msg::Want`]).
+#[derive(Clone)]
 struct SyncControlProtocol {
     event_tx: mpsc::Sender<TransportEvent>,
+    /// Answers the dedup handshake. `None` on a send-only endpoint or a peer
+    /// with no catalog wired — in which case offers are answered want-all.
+    responder: Option<Arc<dyn DedupResponder>>,
+}
+
+// `dyn DedupResponder` isn't `Debug`, so the derive can't apply; the iroh
+// `ProtocolHandler` bound requires `Debug`, so hand-roll a minimal one.
+impl std::fmt::Debug for SyncControlProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncControlProtocol")
+            .field("has_responder", &self.responder.is_some())
+            .finish()
+    }
 }
 
 impl ProtocolHandler for SyncControlProtocol {
@@ -510,17 +631,60 @@ impl ProtocolHandler for SyncControlProtocol {
                     package_id,
                     receipts,
                 },
-                // P2P dedup-handshake messages (Offer/Want/FullHashes) decode here
-                // but are not yet routed to a TransportEvent — the handshake is
-                // wired in a later task. Ack the stream and skip so an early or
-                // stray one can't wedge the accept loop.
-                Msg::Offer { .. } | Msg::Want { .. } | Msg::FullHashes { .. } => {
-                    tracing::debug!(
-                        from = %hex32(&from),
-                        "dedup-handshake control message not yet routed; skipping"
-                    );
-                    let _ = tx.write_all(b"1").await;
-                    let _ = tx.finish();
+                // Dedup handshake round 1: answer the offer with a real Want
+                // reply (not the b"1" delivery ack) driven by the responder. No
+                // responder → want-all, so a responder-less full peer still
+                // receives everything (nothing silently withheld).
+                Msg::Offer {
+                    package_id,
+                    entries,
+                } => {
+                    let (want, candidates) = match &self.responder {
+                        Some(r) => r.want_for_offer(&entries),
+                        None => (entries.iter().map(|e| e.rel_path.clone()).collect(), Vec::new()),
+                    };
+                    write_reply(
+                        &mut tx,
+                        &Msg::Want {
+                            package_id,
+                            want,
+                            candidates,
+                        },
+                        &from,
+                    )
+                    .await;
+                    continue;
+                }
+                // Dedup handshake round 2: confirm the candidates' full hashes
+                // and reply with the still-wanted subset. No responder → keep
+                // them all wanted (safe direction).
+                Msg::FullHashes {
+                    package_id,
+                    entries,
+                } => {
+                    let still = match &self.responder {
+                        Some(r) => r.confirm_full_hashes(&entries),
+                        None => entries.iter().map(|e| e.rel_path.clone()).collect(),
+                    };
+                    write_reply(
+                        &mut tx,
+                        &Msg::Want {
+                            package_id,
+                            want: still,
+                            candidates: Vec::new(),
+                        },
+                        &from,
+                    )
+                    .await;
+                    continue;
+                }
+                // A well-behaved peer never sends us a Want as a request — it is
+                // the reply to our own Offer/FullHashes on the sender side.
+                // Treat an inbound one as a protocol error: skip it (the stream
+                // closes with no reply, so a confused sender's read errors and it
+                // falls back to a full announce).
+                Msg::Want { .. } => {
+                    tracing::warn!(from = %hex32(&from), "unexpected inbound Want on control accept; ignoring");
                     continue;
                 }
             };
@@ -534,6 +698,20 @@ impl ProtocolHandler for SyncControlProtocol {
             let _ = tx.finish();
         }
         Ok(())
+    }
+}
+
+/// Encode a reply [`Msg`] and write it back on an accept-side bidi stream,
+/// finishing the send half. Best-effort: a write/finish failure only means the
+/// requester's read errors — which correctly drives its negotiation fallback —
+/// and an encode failure (never expected for a well-formed `Want`) is logged.
+async fn write_reply(tx: &mut iroh::endpoint::SendStream, reply: &Msg, from: &NodeId) {
+    match reply.encode() {
+        Ok(bytes) => {
+            let _ = tx.write_all(&bytes).await;
+            let _ = tx.finish();
+        }
+        Err(e) => tracing::warn!(from = %hex32(from), error = %e, "encode dedup reply failed"),
     }
 }
 

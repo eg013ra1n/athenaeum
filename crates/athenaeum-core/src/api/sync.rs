@@ -628,6 +628,8 @@ pub async fn ensure_sender_engine(
         secret,
         relay_mode,
         crate::sharing::iroh::BlobStore::Fs(sync_dir.join("blobs_out")),
+        // Send-only: no inbound offers to answer, so no dedup responder.
+        None,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("build iroh transport for sender: {e:#}")))?;

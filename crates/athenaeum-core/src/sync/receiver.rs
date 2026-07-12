@@ -411,6 +411,16 @@ impl SyncRuntime {
             &crate::account::keys::device_key_path(&sync_dir),
         )?
         .secret_bytes();
+        let store = Arc::new(
+            CatalogSyncStore::open(&db_path)
+                .with_context(|| format!("open catalog sync store {}", db_path.display()))?,
+        );
+        // A running receiver answers a peer's pre-Announce dedup handshake from
+        // its own catalog: the transport's control channel routes inbound
+        // Offer/FullHashes to this responder (spec §7, task 4).
+        let responder: Arc<dyn crate::sync::DedupResponder> =
+            Arc::new(crate::sync::CatalogDedupResponder::new(Arc::clone(&store)));
+
         // The receiver's blob store is `blobs`; the sender's is a SEPARATE
         // `blobs_out` (see `api::sync::ensure_sender_engine`). Both halves may
         // run in one process, and one `FsStore` per dir keeps the sender's
@@ -419,15 +429,12 @@ impl SyncRuntime {
             secret,
             relay_mode,
             crate::sharing::iroh::BlobStore::Fs(sync_dir.join("blobs")),
+            Some(responder),
         )
         .await
         .context("build iroh transport for receiver")?;
         let transport: Arc<dyn SharingTransport> = Arc::new(transport);
 
-        let store = Arc::new(
-            CatalogSyncStore::open(&db_path)
-                .with_context(|| format!("open catalog sync store {}", db_path.display()))?,
-        );
         // Staging lives under the sync dir; the landing root is resolved live per
         // package by the caller-supplied resolver (task 5).
         let (info, receiver) = SyncReceiver::spawn(

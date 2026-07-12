@@ -42,10 +42,26 @@ use super::{random_secret, BlobStore, IrohTransport};
 const IROH_WAIT: Duration = Duration::from_secs(60);
 
 /// Build a fresh in-memory transport with the relay disabled (direct localhost).
+/// No dedup responder — most tests don't exercise the handshake.
 async fn mem_transport() -> IrohTransport {
-    IrohTransport::new(random_secret(), RelayMode::Disabled, BlobStore::Memory)
+    IrohTransport::new(random_secret(), RelayMode::Disabled, BlobStore::Memory, None)
         .await
         .expect("build iroh transport")
+}
+
+/// Like [`mem_transport`] but wires a dedup responder into the control channel,
+/// so this endpoint answers a peer's `negotiate_want` from `responder`.
+async fn mem_transport_with_responder(
+    responder: Arc<dyn crate::sync::DedupResponder>,
+) -> IrohTransport {
+    IrohTransport::new(
+        random_secret(),
+        RelayMode::Disabled,
+        BlobStore::Memory,
+        Some(responder),
+    )
+    .await
+    .expect("build iroh transport with responder")
 }
 
 /// Bring two endpoints online and pair them (each learns the other's address).
@@ -293,7 +309,7 @@ async fn start_sweeps_stale_tags() {
     // Persistent store so tags survive the restart (pattern from
     // iroh_resume_after_endpoint_restart, tests.rs:211).
     let home = tempfile::tempdir().unwrap();
-    let t1 = IrohTransport::new(random_secret(), RelayMode::Disabled, BlobStore::Fs(home.path().to_path_buf()))
+    let t1 = IrohTransport::new(random_secret(), RelayMode::Disabled, BlobStore::Fs(home.path().to_path_buf()), None)
         .await
         .unwrap();
     t1.start().await.unwrap();
@@ -303,7 +319,7 @@ async fn start_sweeps_stale_tags() {
     t1.shutdown().await;
 
     // New process over the same store: the old tag must be gone after start().
-    let t2 = IrohTransport::new(random_secret(), RelayMode::Disabled, BlobStore::Fs(home.path().to_path_buf()))
+    let t2 = IrohTransport::new(random_secret(), RelayMode::Disabled, BlobStore::Fs(home.path().to_path_buf()), None)
         .await
         .unwrap();
     t2.start().await.unwrap();
@@ -330,6 +346,7 @@ async fn split_blob_dirs_prevent_startup_sweep_interference() {
         random_secret(),
         RelayMode::Disabled,
         BlobStore::Fs(parent.path().join("blobs")),
+        None,
     )
     .await
     .unwrap();
@@ -351,6 +368,7 @@ async fn split_blob_dirs_prevent_startup_sweep_interference() {
         random_secret(),
         RelayMode::Disabled,
         BlobStore::Fs(parent.path().join("blobs_out")),
+        None,
     )
     .await
     .unwrap();
@@ -384,6 +402,7 @@ async fn iroh_resume_after_endpoint_restart() {
         random_secret(),
         RelayMode::Disabled,
         BlobStore::Fs(recv_home.clone()),
+        None,
     )
     .await
     .unwrap();
@@ -433,6 +452,7 @@ async fn iroh_resume_after_endpoint_restart() {
         random_secret(),
         RelayMode::Disabled,
         BlobStore::Fs(recv_home.clone()),
+        None,
     )
     .await
     .unwrap();
@@ -780,5 +800,124 @@ async fn fetch_rejects_traversal_entry_names() {
     );
 
     provider.shutdown().await;
+    receiver.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Dedup handshake over iroh: negotiate_want drives Offer→Want→FullHashes→Want
+//    against a responder wired into the receiver's control channel.
+// ---------------------------------------------------------------------------
+
+use crate::sharing::iroh::proto::{FullHashEntry, OfferEntry};
+use crate::sync::DedupResponder;
+use std::collections::{HashMap, HashSet};
+
+/// Catalog-free responder mirroring the loopback test's stub: `present` are the
+/// sampling hashes it "has", `local_full` maps each to the full xxh3 of its
+/// local file so a true-duplicate full-hash match can be settled.
+struct StubResponder {
+    present: HashSet<String>,
+    local_full: HashMap<String, String>,
+}
+
+impl DedupResponder for StubResponder {
+    fn want_for_offer(&self, entries: &[OfferEntry]) -> (Vec<String>, Vec<String>) {
+        let mut want = Vec::new();
+        let mut cands = Vec::new();
+        for e in entries {
+            if self.present.contains(&e.sampling_hash) {
+                cands.push(e.rel_path.clone());
+            } else {
+                want.push(e.rel_path.clone());
+            }
+        }
+        (want, cands)
+    }
+
+    fn confirm_full_hashes(&self, entries: &[FullHashEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .filter(|e| match self.local_full.get(&e.sampling_hash) {
+                Some(local) => local != &e.xxh3_full,
+                None => true,
+            })
+            .map(|e| e.rel_path.clone())
+            .collect()
+    }
+}
+
+fn oe(rel: &str, sampling: &str) -> OfferEntry {
+    OfferEntry {
+        rel_path: rel.into(),
+        sampling_hash: sampling.into(),
+        byte_size: 1,
+    }
+}
+
+#[tokio::test]
+async fn iroh_negotiate_returns_only_absent_and_false_positive_wants() {
+    let responder = StubResponder {
+        present: ["have".to_string()].into_iter().collect(),
+        local_full: [("have".to_string(), "F_HAVE".to_string())]
+            .into_iter()
+            .collect(),
+    };
+    let receiver = mem_transport_with_responder(Arc::new(responder)).await;
+    let sender = mem_transport().await;
+    let (_sender_info, receiver_info) = start_and_pair(&sender, &receiver).await;
+
+    let offer = vec![
+        oe("new.fits", "absent"),   // absent sampling → want
+        oe("have.fits", "have"),    // candidate, full matches → drop
+        oe("collide.fits", "have"), // candidate, full differs → false positive → want
+    ];
+    let full: HashMap<String, String> = [
+        ("have.fits".to_string(), "F_HAVE".to_string()),
+        ("collide.fits".to_string(), "F_OTHER".to_string()),
+    ]
+    .into_iter()
+    .collect();
+
+    let want = sender
+        .negotiate_want(receiver_info.node_id, PackageId("p".into()), offer, full)
+        .await
+        .expect("negotiate_want over iroh must succeed");
+    assert_eq!(
+        want,
+        ["new.fits".to_string(), "collide.fits".to_string()]
+            .into_iter()
+            .collect::<HashSet<String>>()
+    );
+
+    sender.shutdown().await;
+    receiver.shutdown().await;
+}
+
+#[tokio::test]
+async fn iroh_negotiate_without_responder_wants_everything() {
+    // A responder-less receiver still answers Offer — with want-all, so a full
+    // peer that never wired a catalog receives every offered frame.
+    let receiver = mem_transport().await;
+    let sender = mem_transport().await;
+    let (_sender_info, receiver_info) = start_and_pair(&sender, &receiver).await;
+
+    let offer = vec![oe("a.fits", "h1"), oe("b.fits", "h2")];
+    let want = sender
+        .negotiate_want(
+            receiver_info.node_id,
+            PackageId("p".into()),
+            offer,
+            HashMap::new(),
+        )
+        .await
+        .expect("negotiate_want must succeed against a responder-less peer");
+    assert_eq!(
+        want,
+        ["a.fits".to_string(), "b.fits".to_string()]
+            .into_iter()
+            .collect::<HashSet<String>>()
+    );
+
+    sender.shutdown().await;
     receiver.shutdown().await;
 }

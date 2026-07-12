@@ -390,6 +390,7 @@ mod tests {
             key.secret_bytes(),
             iroh::RelayMode::Disabled,
             BlobStore::Memory,
+            None,
         )
         .await
         .unwrap();

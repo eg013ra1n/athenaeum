@@ -6,7 +6,7 @@
 //! `fetch` with a plain filesystem copy. A per-endpoint [`FaultPlan`] injects
 //! the failure modes the engine's resilience paths need to be tested against.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,8 +16,10 @@ use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use super::iroh::proto::OfferEntry;
 use super::types::{FrameReceipt, NodeId, PackageAnnounce, PackageId, StartInfo, TransportEvent};
 use super::SharingTransport;
+use crate::sync::DedupResponder;
 
 /// Per-endpoint fault injection knobs.
 ///
@@ -42,10 +44,14 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 const COPY_CHUNK_BYTES: usize = 8 * 1024;
 
 /// One peer's mailbox in the shared registry: where to deliver its inbound
-/// events, and which packages it is serving (`package_id` → source directory).
+/// events, which packages it is serving (`package_id` → source directory), and
+/// the optional dedup responder that answers inbound `negotiate_want` offers.
 struct PeerInbox {
     event_tx: mpsc::Sender<TransportEvent>,
     served: HashMap<String, PathBuf>,
+    /// Answers a peer's dedup handshake (`None` = want-all, no dedup). The
+    /// in-process counterpart of the iroh `SyncControlProtocol`'s responder.
+    responder: Option<Arc<dyn DedupResponder>>,
 }
 
 /// The in-process network shared by every endpoint minted from it.
@@ -75,7 +81,22 @@ impl LoopbackNetwork {
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
             fault: Mutex::new(FaultPlan::default()),
+            responder: None,
         }
+    }
+
+    /// Mint an endpoint that answers a peer's dedup handshake via `responder`
+    /// (registered into its inbox on [`start`](SharingTransport::start)) — the
+    /// in-process stand-in for a running receiver's `CatalogDedupResponder`. Its
+    /// send-only counterpart is [`endpoint`](Self::endpoint), whose peers get a
+    /// want-all (dedup-free) response.
+    pub fn endpoint_with_responder(
+        &self,
+        responder: Arc<dyn DedupResponder>,
+    ) -> LoopbackTransport {
+        let mut ep = self.endpoint();
+        ep.responder = Some(responder);
+        ep
     }
 }
 
@@ -95,6 +116,9 @@ pub struct LoopbackTransport {
     /// Handed out once by `events()`; `None` afterwards (single-consumer).
     event_rx: Mutex<Option<mpsc::Receiver<TransportEvent>>>,
     fault: Mutex<FaultPlan>,
+    /// Registered into this endpoint's [`PeerInbox`] on `start`; answers dedup
+    /// handshakes from peers. `None` for a plain (want-all) endpoint.
+    responder: Option<Arc<dyn DedupResponder>>,
 }
 
 impl LoopbackTransport {
@@ -127,6 +151,7 @@ impl SharingTransport for LoopbackTransport {
             reg.entry(self.node_id).or_insert_with(|| PeerInbox {
                 event_tx: self.event_tx.clone(),
                 served: HashMap::new(),
+                responder: self.responder.clone(),
             });
         }
         let pairing_ticket = pairing_ticket(&self.node_id);
@@ -304,6 +329,47 @@ impl SharingTransport for LoopbackTransport {
         Ok(())
     }
 
+    async fn negotiate_want(
+        &self,
+        to: NodeId,
+        _package_id: PackageId,
+        offer: Vec<OfferEntry>,
+        full_by_rel: HashMap<String, String>,
+    ) -> anyhow::Result<HashSet<String>> {
+        // Read the target peer's responder (clone the Arc, then drop the lock —
+        // the responder calls below must not hold the registry mutex).
+        let responder = {
+            let reg = self.registry.lock().expect("registry mutex poisoned");
+            let inbox = reg
+                .get(&to)
+                .ok_or_else(|| anyhow!("peer not started: {}", hex32(&to)))?;
+            inbox.responder.clone()
+        };
+
+        // No responder → want-all (dedup-free), mirroring the iroh accept side.
+        let responder = match responder {
+            None => return Ok(offer.into_iter().map(|e| e.rel_path).collect()),
+            Some(r) => r,
+        };
+
+        // Round 1: offer → (definite wants, ambiguous candidates).
+        let (want, candidates) = responder.want_for_offer(&offer);
+        let mut wanted: HashSet<String> = want.into_iter().collect();
+        if candidates.is_empty() {
+            return Ok(wanted);
+        }
+
+        // Round 2: answer each candidate with its full hash, confirm, union.
+        let entries = super::iroh::proto::build_full_hash_entries(
+            &offer,
+            &candidates,
+            &full_by_rel,
+            &mut wanted,
+        );
+        wanted.extend(responder.confirm_full_hashes(&entries));
+        Ok(wanted)
+    }
+
     async fn events(&self) -> mpsc::Receiver<TransportEvent> {
         let mut guard = self.event_rx.lock().expect("event_rx mutex poisoned");
         match guard.take() {
@@ -361,4 +427,124 @@ fn pairing_ticket(node_id: &NodeId) -> String {
 /// Short hex rendering of a node id for log fields.
 fn hex32(node_id: &NodeId) -> String {
     node_id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod negotiate_tests {
+    use super::*;
+    use crate::sharing::iroh::proto::{FullHashEntry, OfferEntry};
+    use crate::sync::DedupResponder;
+    use std::collections::{HashMap, HashSet};
+
+    /// A catalog-free [`DedupResponder`] for the loopback handshake test.
+    /// `present` are the sampling hashes it "has"; `local_full` maps each such
+    /// sampling hash to the full xxh3 of the local file carrying it, so a
+    /// full-hash match can be settled without touching disk.
+    struct StubResponder {
+        present: HashSet<String>,
+        local_full: HashMap<String, String>,
+    }
+
+    impl DedupResponder for StubResponder {
+        fn want_for_offer(&self, entries: &[OfferEntry]) -> (Vec<String>, Vec<String>) {
+            let mut want = Vec::new();
+            let mut cands = Vec::new();
+            for e in entries {
+                if self.present.contains(&e.sampling_hash) {
+                    cands.push(e.rel_path.clone());
+                } else {
+                    want.push(e.rel_path.clone());
+                }
+            }
+            (want, cands)
+        }
+
+        fn confirm_full_hashes(&self, entries: &[FullHashEntry]) -> Vec<String> {
+            entries
+                .iter()
+                .filter(|e| match self.local_full.get(&e.sampling_hash) {
+                    // Same full hash as our local file → true duplicate, drop it.
+                    Some(local) => local != &e.xxh3_full,
+                    // No local full hash for this sampling → keep wanted (safe).
+                    None => true,
+                })
+                .map(|e| e.rel_path.clone())
+                .collect()
+        }
+    }
+
+    fn oe(rel: &str, sampling: &str) -> OfferEntry {
+        OfferEntry {
+            rel_path: rel.into(),
+            sampling_hash: sampling.into(),
+            byte_size: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn negotiate_returns_only_absent_and_false_positive_wants() {
+        let net = LoopbackNetwork::new();
+
+        // The receiver "has" sampling "have" with full "F_HAVE".
+        let responder = StubResponder {
+            present: ["have".to_string()].into_iter().collect(),
+            local_full: [("have".to_string(), "F_HAVE".to_string())]
+                .into_iter()
+                .collect(),
+        };
+        let recv = net.endpoint_with_responder(Arc::new(responder));
+        recv.start().await.unwrap();
+        let node_b = recv.node_id();
+
+        let send = net.endpoint();
+        send.start().await.unwrap();
+
+        let offer = vec![
+            oe("new.fits", "absent"),   // sampling absent → want
+            oe("have.fits", "have"),    // candidate, full matches → drop
+            oe("collide.fits", "have"), // candidate, full differs → false positive → want
+        ];
+        let full: HashMap<String, String> = [
+            ("have.fits".to_string(), "F_HAVE".to_string()),
+            ("collide.fits".to_string(), "F_OTHER".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let want = send
+            .negotiate_want(node_b, PackageId("p".into()), offer, full)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            want,
+            ["new.fits".to_string(), "collide.fits".to_string()]
+                .into_iter()
+                .collect::<HashSet<String>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiate_without_responder_wants_everything() {
+        // A responder-less receiver (send-only-less full peer) must still be
+        // offered everything: no dedup, want-all.
+        let net = LoopbackNetwork::new();
+        let recv = net.endpoint();
+        recv.start().await.unwrap();
+        let node_b = recv.node_id();
+        let send = net.endpoint();
+        send.start().await.unwrap();
+
+        let offer = vec![oe("a.fits", "h1"), oe("b.fits", "h2")];
+        let want = send
+            .negotiate_want(node_b, PackageId("p".into()), offer, HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            want,
+            ["a.fits".to_string(), "b.fits".to_string()]
+                .into_iter()
+                .collect::<HashSet<String>>()
+        );
+    }
 }

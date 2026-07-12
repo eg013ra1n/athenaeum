@@ -22,6 +22,8 @@
 //!
 //! [postcard]: https://docs.rs/postcard
 
+use std::collections::{HashMap, HashSet};
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +100,45 @@ impl Msg {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         postcard::from_bytes(bytes).context("postcard-decode sync control message")
     }
+}
+
+/// Build the [`FullHashEntry`] list for the second dedup round, shared by both
+/// transports so their handshake logic can't drift.
+///
+/// For each candidate `rel_path`, pair its offered `sampling_hash` (looked up in
+/// `offer`) with the sender's own full-file xxh3 from `full_by_rel`. A candidate
+/// the sender can't supply a full hash for is inserted straight into `wanted`
+/// (the safe direction — never silently drop a frame) and omitted from the
+/// query. The returned entries are what the sender puts in its [`Msg::FullHashes`].
+pub(crate) fn build_full_hash_entries(
+    offer: &[OfferEntry],
+    candidates: &[String],
+    full_by_rel: &HashMap<String, String>,
+    wanted: &mut HashSet<String>,
+) -> Vec<FullHashEntry> {
+    let sampling_by_rel: HashMap<&str, &str> = offer
+        .iter()
+        .map(|e| (e.rel_path.as_str(), e.sampling_hash.as_str()))
+        .collect();
+    let mut entries = Vec::with_capacity(candidates.len());
+    for rel in candidates {
+        match full_by_rel.get(rel) {
+            Some(full) => entries.push(FullHashEntry {
+                rel_path: rel.clone(),
+                sampling_hash: sampling_by_rel
+                    .get(rel.as_str())
+                    .copied()
+                    .unwrap_or("")
+                    .to_string(),
+                xxh3_full: full.clone(),
+            }),
+            None => {
+                tracing::warn!(rel_path = %rel, "negotiate_want candidate missing full hash; keeping wanted");
+                wanted.insert(rel.clone());
+            }
+        }
+    }
+    entries
 }
 
 #[cfg(test)]

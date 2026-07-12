@@ -62,6 +62,27 @@ pub trait SharingTransport: Send + Sync {
         receipts: Vec<FrameReceipt>,
     ) -> anyhow::Result<()>;
 
+    /// Best-effort pre-Announce dedup negotiation: offer peer `to` the frames of
+    /// `package_id` (keyed `rel_path` + sampling hash), returning the `rel_path`s
+    /// the peer still wants after the offer/want[/full-hashes] handshake.
+    /// `full_by_rel` maps each offered `rel_path` to its full-file xxh3, used to
+    /// disambiguate sampling-hash collisions in the second round.
+    ///
+    /// `Err` is the contract for "fall back": any transport/decode/timeout error
+    /// (or an old peer that can't answer the handshake) propagates, and the
+    /// caller must announce the full package instead. The default bails, so a
+    /// transport that hasn't implemented the handshake degrades to that fallback.
+    async fn negotiate_want(
+        &self,
+        to: NodeId,
+        package_id: PackageId,
+        offer: Vec<crate::sharing::iroh::proto::OfferEntry>,
+        full_by_rel: std::collections::HashMap<String, String>,
+    ) -> anyhow::Result<std::collections::HashSet<String>> {
+        let _ = (to, package_id, offer, full_by_rel);
+        anyhow::bail!("negotiate_want unsupported by this transport")
+    }
+
     /// Drop the local payload data for `package_id` — the package reached a
     /// terminal state (confirmed / failed / cancelled on the sender; acked on
     /// the receiver) and its blobs must not outlive it. Idempotent: releasing
