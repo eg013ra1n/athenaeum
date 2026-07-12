@@ -152,6 +152,63 @@ pub fn build_package_for_file(
     file_path: &Path,
     origin_device: &str,
 ) -> Result<PathBuf> {
+    // One file is just a one-element batch; delegate so the manifest-record shape
+    // is defined in exactly one place (Task 3). A single missing/unparseable file
+    // means the batch is empty → `build_batch_package` errors, matching the old
+    // fail-fast contract `Agent::enqueue_file` relies on.
+    let input = [(capture_dir.to_path_buf(), file_path.to_path_buf())];
+    build_batch_package(config, &input, origin_device).map(|(pkg_dir, _)| pkg_dir)
+}
+
+/// Build ONE package containing a manifest record per `(capture_dir, file)` in
+/// `files`. A file that vanished, won't parse, or can't be hashed is dropped
+/// with a `warn!` and the batch continues — a single bad frame never fails the
+/// whole set. Returns `(pkg_dir, included_count)`; empty input OR every file
+/// dropped is an error (a package with zero records is never written).
+///
+/// Each record is byte-identical in shape to the single-file path (minted
+/// `frame_uuid`, `origin_catalog_uuid == frame_uuid`, capture-dir-relative
+/// `rel_path`, full-file `xxh3`, header-derived `frame_meta`). The package dir
+/// is keyed by a fresh uuid (not any one frame's uuid) since it now carries N
+/// frames.
+pub fn build_batch_package(
+    config: &Config,
+    files: &[(PathBuf /* capture_dir */, PathBuf /* file */)],
+    origin_device: &str,
+) -> Result<(PathBuf, usize)> {
+    let mut records: Vec<(PathBuf, ManifestRecord)> = Vec::with_capacity(files.len());
+    for (capture_dir, file_path) in files {
+        match build_manifest_record(config, capture_dir, file_path, origin_device) {
+            Ok(record) => records.push((file_path.clone(), record)),
+            Err(error) => {
+                // Never fatal: a vanished / unparseable / unhashable file is
+                // dropped and the rest of the batch proceeds (spec §8 style).
+                tracing::warn!(path = %file_path.display(), %error, "skipping file in batch");
+            }
+        }
+    }
+
+    if records.is_empty() {
+        anyhow::bail!("batch has no buildable files");
+    }
+
+    let count = records.len();
+    let pkg_dir = config.packages_dir().join(Uuid::new_v4().to_string());
+    write_package(&pkg_dir, records)
+        .with_context(|| format!("write batch package {}", pkg_dir.display()))?;
+    Ok((pkg_dir, count))
+}
+
+/// Build the single manifest record for one capture file — the per-file work
+/// shared by [`build_package_for_file`] and [`build_batch_package`]. Any of the
+/// three fallible steps (parse header, stat, hash) short-circuits with `?`, so a
+/// caller batching many files can treat one `Err` as "drop this file".
+fn build_manifest_record(
+    config: &Config,
+    capture_dir: &Path,
+    file_path: &Path,
+    origin_device: &str,
+) -> Result<ManifestRecord> {
     let frame = parse_frame(file_path)?;
     let frame_uuid = Uuid::new_v4().to_string();
     let rel_path = compute_rel_path(config, capture_dir, file_path);
@@ -160,11 +217,11 @@ pub fn build_package_for_file(
         .len();
     let xxh3 = package::xxh3_full_file(file_path)?;
 
-    let record = ManifestRecord {
+    Ok(ManifestRecord {
         v: MANIFEST_VERSION,
         frame_uuid: frame_uuid.clone(),
         // No producer catalog: anchor origin identity to the minted frame uuid.
-        origin_catalog_uuid: frame_uuid.clone(),
+        origin_catalog_uuid: frame_uuid,
         origin_device: origin_device.to_string(),
         payload_kind: PayloadKind::RawFrame,
         rel_path,
@@ -173,12 +230,7 @@ pub fn build_package_for_file(
         frame_meta: serde_json::to_value(&frame).context("serialize frame_meta")?,
         analysis: None,
         app_version: env!("CARGO_PKG_VERSION").to_string(),
-    };
-
-    let pkg_dir = config.packages_dir().join(&frame_uuid);
-    write_package(&pkg_dir, vec![(file_path.to_path_buf(), record)])
-        .with_context(|| format!("write package for {}", file_path.display()))?;
-    Ok(pkg_dir)
+    })
 }
 
 /// The manifest `rel_path` for `file_path`: its path **relative to
@@ -2448,5 +2500,81 @@ mod multi_target_tests {
             .expect("agent starts with two targets");
         assert_eq!(agent.engine_count(), 2, "one engine per injected target");
         agent.shutdown().await;
+    }
+}
+
+/// Task 3: [`build_batch_package`] bundles N capture files into ONE package with
+/// a record per surviving file, dropping any file that vanished / won't parse
+/// (never fatal) and erroring only when nothing is buildable.
+#[cfg(test)]
+mod batch_package_tests {
+    use super::*;
+
+    use athenaeum_core::fits_writer::keywords::{FrameKind, HeaderBuilder};
+    use athenaeum_core::fits_writer::write_fits_f32;
+
+    /// Write a minimal, parseable single-frame FITS at `path` via core's writer.
+    fn write_fixture_fits(path: &Path, object: &str) {
+        let cards = HeaderBuilder::new(FrameKind::Light)
+            .object(object)
+            .exptime(60.0)
+            .filter("Ha")
+            .instrume("TestCam")
+            .build()
+            .expect("build header");
+        let data = vec![0.0f32; 8 * 8];
+        write_fits_f32(path, 8, 8, 1, &data, &cards).expect("write fixture fits");
+    }
+
+    /// Three parseable FITS under one temp capture dir, plus a config whose
+    /// `data_dir` (and thus `packages_dir()`) is a sibling temp dir. The temp
+    /// tree is intentionally kept (`TempDir::keep`) so the written package
+    /// survives for the assertion instead of being reaped when the guard drops.
+    fn three_capture_files() -> (Config, PathBuf, Vec<PathBuf>) {
+        let tmp = tempfile::tempdir().unwrap().keep();
+        let capture = tmp.join("capture");
+        let data = tmp.join("data");
+        std::fs::create_dir_all(&capture).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+
+        let files: Vec<PathBuf> = ["a.fits", "b.fits", "c.fits"]
+            .iter()
+            .map(|name| {
+                let p = capture.join(name);
+                write_fixture_fits(&p, "M42");
+                p
+            })
+            .collect();
+
+        let toml = format!(
+            "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            capture.display(),
+            data.display()
+        );
+        let config = Config::from_toml_str(&toml).unwrap();
+        (config, capture, files)
+    }
+
+    #[test]
+    fn build_batch_package_bundles_all_present_files() {
+        let (config, cap, files) = three_capture_files();
+        let input: Vec<_> = files.iter().map(|f| (cap.clone(), f.clone())).collect();
+        let (pkg_dir, n) = build_batch_package(&config, &input, &"aa".repeat(32)).unwrap();
+        assert_eq!(n, 3);
+        let recs = athenaeum_core::package::read_manifest(&pkg_dir).unwrap();
+        assert_eq!(recs.len(), 3); // one manifest, 3 records
+    }
+
+    #[test]
+    fn build_batch_package_drops_vanished_file() {
+        let (config, cap, files) = three_capture_files();
+        std::fs::remove_file(&files[1]).unwrap(); // one gone before build
+        let input: Vec<_> = files.iter().map(|f| (cap.clone(), f.clone())).collect();
+        let (pkg_dir, n) = build_batch_package(&config, &input, &"aa".repeat(32)).unwrap();
+        assert_eq!(n, 2); // the survivor count
+        assert_eq!(
+            athenaeum_core::package::read_manifest(&pkg_dir).unwrap().len(),
+            2
+        );
     }
 }
