@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { Play, Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight, Crosshair } from 'lucide-react';
+import { Play, Trash2, BarChart3, Download, Check, LineChart, Table as TableIcon, X, Scissors, Plus, Calendar, Camera, ArrowLeftRight, Crosshair, Send } from 'lucide-react';
 import { api } from '../api';
 import type {
   CalibrationHierarchyView as CalibrationHierarchyViewData,
@@ -17,6 +17,7 @@ import { buildCameraFilterTree, buildMergedCameraFilterTree } from './calibratio
 import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
 import { PlateSolveBatchPanel, type PlateSolveBatchPanelHandle } from './plate-solve/PlateSolveBatchPanel';
 import { LightsAnalysisChartView } from './analysis/LightsAnalysisChartView';
+import { SendToNodeDialog } from './transfers/SendToNodeDialog';
 import { useAnalysisProgressContext } from '../contexts/AnalysisProgressContext';
 
 interface LightsAnalysisViewProps {
@@ -72,6 +73,9 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
   // Table row selection — which individual frames are selected (for mass actions)
   const [selectedFrameIds, setSelectedFrameIds] = useState<Set<number>>(new Set());
   const [blackholing, setBlackholing] = useState(false);
+  // Explicit app→app send (Phase 3) — the "Send to…" toolbar action opens the
+  // reusable SendToNodeDialog with the currently selected frames.
+  const [sendOpen, setSendOpen] = useState(false);
   const [thresholds, setThresholds] = useState<RejectionThresholds>(EMPTY_THRESHOLDS);
   const [defaultThresholds, setDefaultThresholds] = useState<RejectionThresholds | null>(null);
   const [rejectActive, setRejectActive] = useState(true);
@@ -811,6 +815,21 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
               </button>
               <span className="text-[10px] text-content-muted leading-tight">Plate Solve</span>
             </div>
+            <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
+              <button
+                onClick={() => setSendOpen(true)}
+                disabled={!hasSelection}
+                className="w-10 h-7 inline-flex items-center justify-center text-xs font-medium bg-accent hover:bg-accent-hover text-white rounded-lg transition-colors disabled:opacity-30 disabled:cursor-default"
+                title={
+                  hasSelection
+                    ? `Send ${selectedFrameIds.size} selected frame${selectedFrameIds.size === 1 ? '' : 's'} to another node`
+                    : 'Select frames to send'
+                }
+              >
+                <Send size={12} />
+              </button>
+              <span className="text-[10px] text-content-muted leading-tight">Send to…</span>
+            </div>
 
             <span className="text-border h-7 flex items-center">|</span>
 
@@ -919,6 +938,13 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
           <BlackholedFramesSection frames={blackholedFrames} analysisData={analysisData} onBlink={onBlink} />
         </div>
       </div>
+
+      {/* Explicit app→app send dialog (Phase 3) — overlay portal, self-hides when closed. */}
+      <SendToNodeDialog
+        frameIds={[...selectedFrameIds]}
+        open={sendOpen}
+        onClose={() => setSendOpen(false)}
+      />
     </div>
   );
 }
