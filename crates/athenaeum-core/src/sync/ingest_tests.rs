@@ -180,7 +180,7 @@ async fn ingest_mirrors_rel_path_under_authenticated_peer_slug() {
         "M31/2026-07-10/lights/L_0001.fits",
         "deadbeefdeadbeefdeadbeefdeadbeef", // decoy origin_device
     );
-    sender.serve(&announce, &pkg_dir).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None).await.unwrap();
     sender.announce(receiver_node, &announce).await.unwrap();
     let receipts =
         wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
@@ -498,7 +498,7 @@ async fn ack_replay_from_receipt_log() {
     // Build + serve a fixture package.
     let (pkg_dir, announce) =
         build_fixture_package(tmp.path(), "frame-uuid-4", "L_0004.fits", "NGC7000", "2026-01-16T10:00:00.000Z");
-    sender.serve(&announce, &pkg_dir).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None).await.unwrap();
 
     // First delivery: announce → receiver fetches, ingests, acks.
     sender.announce(receiver_node, &announce).await.unwrap();
@@ -874,7 +874,7 @@ async fn landing_root_is_resolved_live_per_package() {
     // content per package so both genuinely ingest (never a content dup).
     let (pkg1, announce1) =
         build_fixture_package_val(tmp.path(), "frame-live-a", "L_live_a.fits", "M42", 0.0);
-    sender.serve(&announce1, &pkg1).await.unwrap();
+    sender.serve(&announce1, &pkg1, None).await.unwrap();
     sender.announce(receiver_node, &announce1).await.unwrap();
     let r1 = wait_for_ack(&mut sender_events, &announce1.package_id.0, Duration::from_secs(5)).await;
     assert!(matches!(r1[0].outcome, ReceiptOutcome::Ingested));
@@ -886,7 +886,7 @@ async fn landing_root_is_resolved_live_per_package() {
 
     let (pkg2, announce2) =
         build_fixture_package_val(tmp.path(), "frame-live-b", "L_live_b.fits", "NGC7000", 1.0);
-    sender.serve(&announce2, &pkg2).await.unwrap();
+    sender.serve(&announce2, &pkg2, None).await.unwrap();
     sender.announce(receiver_node, &announce2).await.unwrap();
     let r2 = wait_for_ack(&mut sender_events, &announce2.package_id.0, Duration::from_secs(5)).await;
     assert!(matches!(r2[0].outcome, ReceiptOutcome::Ingested));
@@ -952,7 +952,7 @@ async fn receiver_drops_announce_from_unauthorized_peer() {
         "M42",
         "2026-01-16T10:00:00.000Z",
     );
-    sender.serve(&announce, &pkg_dir).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None).await.unwrap();
     sender.announce(receiver_node, &announce).await.unwrap();
 
     // Give the receiver ample time to (wrongly) ingest, then assert it did not.
@@ -1010,7 +1010,7 @@ async fn receiver_ingests_from_authorized_peer() {
         "M42",
         "2026-01-16T10:00:00.000Z",
     );
-    sender.serve(&announce, &pkg_dir).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None).await.unwrap();
     sender.announce(receiver_node, &announce).await.unwrap();
 
     let receipts =

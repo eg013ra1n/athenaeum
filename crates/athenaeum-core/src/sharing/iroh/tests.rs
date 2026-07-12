@@ -154,7 +154,7 @@ async fn iroh_roundtrip_two_endpoints_localhost() {
     let (pkg_dir, announce) =
         build_package(&tmp.path().join("src"), "uuid-1", "frame1.fits", "M42", 128 * 1024);
 
-    provider.serve(&announce, &pkg_dir).await.unwrap();
+    provider.serve(&announce, &pkg_dir, None).await.unwrap();
     provider
         .announce(receiver_info.node_id, &announce)
         .await
@@ -237,7 +237,7 @@ async fn release_deletes_package_tags_on_both_sides() {
     let tmp = tempdir().unwrap();
     let (dir, announce) =
         build_package(&tmp.path().join("src"), "uuid-gc-1", "gc.fits", "M1", 4096);
-    provider.serve(&announce, &dir).await.unwrap();
+    provider.serve(&announce, &dir, None).await.unwrap();
 
     let tag = package_tag(&announce.package_id);
     // Provider pinned under the deterministic name.
@@ -315,7 +315,7 @@ async fn start_sweeps_stale_tags() {
     t1.start().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let (dir, announce) = build_package(tmp.path(), "uuid-sweep-1", "s.fits", "M1", 2048);
-    t1.serve(&announce, &dir).await.unwrap();
+    t1.serve(&announce, &dir, None).await.unwrap();
     t1.shutdown().await;
 
     // New process over the same store: the old tag must be gone after start().
@@ -355,7 +355,7 @@ async fn split_blob_dirs_prevent_startup_sweep_interference() {
     // Serve a package on the receiver-half store so it pins a live `pkg/<id>`.
     let tmp = tempfile::tempdir().unwrap();
     let (dir, announce) = build_package(tmp.path(), "uuid-split-1", "split.fits", "M1", 2048);
-    receiver.serve(&announce, &dir).await.unwrap();
+    receiver.serve(&announce, &dir, None).await.unwrap();
     let tag = package_tag(&announce.package_id);
     assert!(
         receiver.store.tags().get(tag.as_bytes()).await.unwrap().is_some(),
@@ -420,7 +420,7 @@ async fn iroh_resume_after_endpoint_restart() {
     // mid-download; if it happens to finish, the re-fetch below is idempotent.
     let (pkg_dir, announce) =
         build_package(&tmp.path().join("src"), "uuid-r", "big.fits", "M31", 16 * 1024 * 1024);
-    provider.serve(&announce, &pkg_dir).await.unwrap();
+    provider.serve(&announce, &pkg_dir, None).await.unwrap();
     provider
         .announce(receiver_info.node_id, &announce)
         .await
@@ -706,7 +706,7 @@ async fn bare_node_id_without_a_peer_address_is_undialable() {
     let tmp = tempdir().unwrap();
     let (pkg_dir, announce) =
         build_package(&tmp.path().join("src"), "uuid-bare", "frame_bare.fits", "M1", 4096);
-    sender.serve(&announce, &pkg_dir).await.unwrap();
+    sender.serve(&announce, &pkg_dir, None).await.unwrap();
 
     let err = sender
         .announce(receiver_info.node_id, &announce)
@@ -920,4 +920,131 @@ async fn iroh_negotiate_without_responder_wants_everything() {
 
     sender.shutdown().await;
     receiver.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 6. Want-subset collection: a subset serve builds a collection from only the
+//    negotiated frames + a manifest filtered to them, so fetch lands exactly
+//    those frames.
+// ---------------------------------------------------------------------------
+
+/// Build a 3-frame package (`frame1/2/3.fits` + manifest) and return
+/// `(pkg_dir, announce, [rel_path…])`. Distinct per-frame content so a
+/// wrong-frame transfer would hash-mismatch.
+fn build_three_frame_package(src_root: &Path) -> (PathBuf, PackageAnnounce, Vec<String>) {
+    std::fs::create_dir_all(src_root).unwrap();
+    let mut records: Vec<(PathBuf, ManifestRecord)> = Vec::new();
+    let mut rels = Vec::new();
+    for i in 1..=3u8 {
+        let filename = format!("frame{i}.fits");
+        let payload = src_root.join(&filename);
+        let bytes: Vec<u8> = (0..(4096 + i as usize * 100))
+            .map(|j| ((j + i as usize) % 251) as u8)
+            .collect();
+        std::fs::write(&payload, &bytes).unwrap();
+        let byte_size = std::fs::metadata(&payload).unwrap().len();
+        let xxh3 = package::xxh3_full_file(&payload).unwrap();
+        records.push((
+            payload,
+            ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: format!("uuid-{i}"),
+                origin_catalog_uuid: "catalog-uuid".to_string(),
+                origin_device: "origin-device".to_string(),
+                payload_kind: PayloadKind::RawFrame,
+                rel_path: filename.clone(),
+                byte_size,
+                xxh3,
+                frame_meta: serde_json::json!({ "n": i }),
+                analysis: None,
+                app_version: "test".to_string(),
+            },
+        ));
+        rels.push(filename);
+    }
+    let pkg_dir = src_root.parent().unwrap().join("pkg-three");
+    let announce = write_package(&pkg_dir, records).unwrap();
+    (pkg_dir, announce, rels)
+}
+
+#[tokio::test]
+async fn subset_serve_transfers_only_want_frames() {
+    let provider = mem_transport().await;
+    let receiver = mem_transport().await;
+    let (provider_info, receiver_info) = start_and_pair(&provider, &receiver).await;
+    let mut receiver_events = receiver.events().await;
+
+    let tmp = tempdir().unwrap();
+    let (pkg_dir, announce, rels) = build_three_frame_package(&tmp.path().join("src"));
+
+    // Want only frame1 + frame3 (frame2 already held by the peer).
+    let want: HashSet<String> = [rels[0].clone(), rels[2].clone()].into_iter().collect();
+    provider
+        .serve(&announce, &pkg_dir, Some(&want))
+        .await
+        .unwrap();
+    provider
+        .announce(receiver_info.node_id, &announce)
+        .await
+        .unwrap();
+
+    // The wire announce carries the subset collection hash.
+    let wire = match recv_next(&mut receiver_events).await {
+        TransportEvent::AnnounceReceived { announce, .. } => announce,
+        other => panic!("expected AnnounceReceived, got {other:?}"),
+    };
+
+    let dest = tempdir().unwrap();
+    receiver
+        .fetch(provider_info.node_id, &wire, dest.path())
+        .await
+        .unwrap();
+
+    assert!(dest.path().join(&rels[0]).exists(), "frame1 (wanted) present");
+    assert!(
+        !dest.path().join(&rels[1]).exists(),
+        "frame2 (not wanted) must be absent from the subset collection"
+    );
+    assert!(dest.path().join(&rels[2]).exists(), "frame3 (wanted) present");
+
+    // The downloaded manifest holds exactly the two wanted records.
+    let fetched = package::read_manifest(dest.path()).unwrap();
+    assert_eq!(fetched.len(), 2, "filtered manifest must hold 2 records");
+    let got: HashSet<String> = fetched.iter().map(|r| r.rel_path.clone()).collect();
+    assert_eq!(got, want, "manifest records must be exactly the wanted rel_paths");
+
+    // The wanted payloads round-trip byte-for-byte.
+    assert_eq!(
+        xxh3_of(&pkg_dir.join(&rels[0])),
+        xxh3_of(&dest.path().join(&rels[0])),
+        "frame1 content mismatch"
+    );
+
+    provider.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// An empty want set is a caller error — Task 6 drops an all-duplicate package
+/// before serve, so `serve(Some(empty))` must fail loudly rather than build a
+/// zero-frame collection.
+#[tokio::test]
+async fn subset_serve_empty_want_is_error() {
+    let provider = mem_transport().await;
+    provider.start().await.unwrap();
+
+    let tmp = tempdir().unwrap();
+    let (pkg_dir, announce, _rels) = build_three_frame_package(&tmp.path().join("src"));
+
+    let empty: HashSet<String> = HashSet::new();
+    let err = provider
+        .serve(&announce, &pkg_dir, Some(&empty))
+        .await
+        .expect_err("an empty want set must be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("empty want"),
+        "error should name the empty-want guard, got: {msg}"
+    );
+
+    provider.shutdown().await;
 }

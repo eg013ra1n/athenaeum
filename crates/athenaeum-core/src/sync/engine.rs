@@ -601,8 +601,10 @@ impl Worker {
         // A failure here (e.g. the peer is offline) is retryable, not fatal:
         // remember the announce and arm a retry deadline.
         let serve_announce = async {
+            // Task 6 will pass the negotiated want-subset here; until then serve
+            // the full package (`None`).
             self.transport
-                .serve(&announce, &dir)
+                .serve(&announce, &dir, None)
                 .await
                 .context("serve package")?;
             self.transport

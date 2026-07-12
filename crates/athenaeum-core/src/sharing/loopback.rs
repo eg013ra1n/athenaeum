@@ -43,12 +43,22 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// partway through a single file.
 const COPY_CHUNK_BYTES: usize = 8 * 1024;
 
+/// A served package in the mock: its source directory plus the optional
+/// negotiated want subset. `want = None` mirrors a full serve; `Some(rel_paths)`
+/// mirrors the iroh subset collection — `fetch` transfers only those payloads
+/// plus a manifest filtered to them, so the loopback e2e is honest.
+#[derive(Clone)]
+struct ServedPackage {
+    src_dir: PathBuf,
+    want: Option<HashSet<String>>,
+}
+
 /// One peer's mailbox in the shared registry: where to deliver its inbound
-/// events, which packages it is serving (`package_id` → source directory), and
+/// events, which packages it is serving (`package_id` → [`ServedPackage`]), and
 /// the optional dedup responder that answers inbound `negotiate_want` offers.
 struct PeerInbox {
     event_tx: mpsc::Sender<TransportEvent>,
-    served: HashMap<String, PathBuf>,
+    served: HashMap<String, ServedPackage>,
     /// Answers a peer's dedup handshake (`None` = want-all, no dedup). The
     /// in-process counterpart of the iroh `SyncControlProtocol`'s responder.
     responder: Option<Arc<dyn DedupResponder>>,
@@ -184,8 +194,8 @@ impl SharingTransport for LoopbackTransport {
         pkg: &PackageAnnounce,
         dest_dir: &Path,
     ) -> anyhow::Result<()> {
-        // Resolve the provider's served source directory.
-        let src_dir = {
+        // Resolve the provider's served package (source dir + optional want subset).
+        let served = {
             let reg = self.registry.lock().expect("registry mutex poisoned");
             reg.get(&from)
                 .and_then(|inbox| inbox.served.get(&pkg.package_id.0).cloned())
@@ -197,8 +207,20 @@ impl SharingTransport for LoopbackTransport {
                 hex32(&from)
             )
         })?;
+        let ServedPackage { src_dir, want } = served;
 
-        let files = collect_files(&src_dir)?;
+        // Which files move: a full serve transfers every file under `src_dir`
+        // (manifest included); a want-subset serve transfers only the wanted
+        // payloads and re-synthesizes a manifest filtered to them, so the mock
+        // mirrors the iroh subset collection instead of copying the whole dir.
+        let files = match &want {
+            None => collect_files(&src_dir)?,
+            Some(w) => {
+                let kept = filter_manifest_records(&src_dir, w)?;
+                write_filtered_manifest(dest_dir, &kept).await?;
+                subset_src_files(&src_dir, &kept)?
+            }
+        };
         let bytes_total: u64 = files.iter().map(|f| f.size).sum();
         // Read the one-shot abort threshold once; disarm inside the loop if it fires.
         let abort_after = self.fault.lock().expect("fault mutex poisoned").abort_after_bytes;
@@ -268,17 +290,27 @@ impl SharingTransport for LoopbackTransport {
         Ok(())
     }
 
-    async fn serve(&self, pkg: &PackageAnnounce, src_dir: &Path) -> anyhow::Result<()> {
+    async fn serve(
+        &self,
+        pkg: &PackageAnnounce,
+        src_dir: &Path,
+        want: Option<&HashSet<String>>,
+    ) -> anyhow::Result<()> {
         let mut reg = self.registry.lock().expect("registry mutex poisoned");
         let inbox = reg
             .get_mut(&self.node_id)
             .ok_or_else(|| anyhow!("endpoint not started"))?;
-        inbox
-            .served
-            .insert(pkg.package_id.0.clone(), src_dir.to_path_buf());
+        inbox.served.insert(
+            pkg.package_id.0.clone(),
+            ServedPackage {
+                src_dir: src_dir.to_path_buf(),
+                want: want.cloned(),
+            },
+        );
         tracing::debug!(
             package_id = %pkg.package_id.0,
             path = %src_dir.display(),
+            subset = want.is_some(),
             "loopback serving package"
         );
         Ok(())
@@ -406,6 +438,62 @@ fn collect_files(src: &Path) -> anyhow::Result<Vec<SrcFile>> {
             .to_path_buf();
         let size = entry.metadata().context("stat file")?.len();
         out.push(SrcFile { abs, rel, size });
+    }
+    Ok(out)
+}
+
+/// Read the served package's manifest and keep only the wanted records (order
+/// preserved) — the mock's counterpart of `blobs::import_subset_collection`'s
+/// manifest filter.
+fn filter_manifest_records(
+    src_dir: &Path,
+    want: &HashSet<String>,
+) -> anyhow::Result<Vec<crate::package::ManifestRecord>> {
+    let records = crate::package::read_manifest(src_dir)?;
+    Ok(records
+        .into_iter()
+        .filter(|r| want.contains(&r.rel_path))
+        .collect())
+}
+
+/// Write a `manifest.ndjson` holding exactly `kept` into `dest_dir`, in the same
+/// compact one-record-per-line format `read_manifest` parses.
+async fn write_filtered_manifest(
+    dest_dir: &Path,
+    kept: &[crate::package::ManifestRecord],
+) -> anyhow::Result<()> {
+    tokio::fs::create_dir_all(dest_dir)
+        .await
+        .with_context(|| format!("create dest dir {}", dest_dir.display()))?;
+    let mut buf = String::new();
+    for r in kept {
+        buf.push_str(&serde_json::to_string(r).context("serialize filtered manifest record")?);
+        buf.push('\n');
+    }
+    let path = dest_dir.join(crate::package::MANIFEST_FILENAME);
+    tokio::fs::write(&path, buf.as_bytes())
+        .await
+        .with_context(|| format!("write filtered manifest {}", path.display()))?;
+    Ok(())
+}
+
+/// The [`SrcFile`] copy list for a want-subset fetch: each kept payload under
+/// `src_dir` at its `rel_path` (the manifest is written separately).
+fn subset_src_files(
+    src_dir: &Path,
+    kept: &[crate::package::ManifestRecord],
+) -> anyhow::Result<Vec<SrcFile>> {
+    let mut out = Vec::with_capacity(kept.len());
+    for r in kept {
+        let abs = src_dir.join(&r.rel_path);
+        let size = std::fs::metadata(&abs)
+            .with_context(|| format!("stat wanted payload {}", abs.display()))?
+            .len();
+        out.push(SrcFile {
+            abs,
+            rel: PathBuf::from(&r.rel_path),
+            size,
+        });
     }
     Ok(out)
 }

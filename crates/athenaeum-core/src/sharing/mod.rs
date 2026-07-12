@@ -52,7 +52,19 @@ pub trait SharingTransport: Send + Sync {
 
     /// Register the local package directory that peers may fetch from
     /// (provider side).
-    async fn serve(&self, pkg: &PackageAnnounce, src_dir: &Path) -> anyhow::Result<()>;
+    ///
+    /// `want` narrows what is served to the frames the peer still wants after
+    /// the dedup handshake: `None` serves the full package (the pre-dedup
+    /// behavior); `Some(rel_paths)` serves only those payloads plus a manifest
+    /// filtered to exactly them, so the receiver ingests the negotiated subset
+    /// and never sees the frames it already had. `want` must be non-empty — an
+    /// all-duplicate package is dropped before serve, not served empty.
+    async fn serve(
+        &self,
+        pkg: &PackageAnnounce,
+        src_dir: &Path,
+        want: Option<&std::collections::HashSet<String>>,
+    ) -> anyhow::Result<()>;
 
     /// Acknowledge a received package to peer `to`, returning per-frame receipts.
     async fn ack(

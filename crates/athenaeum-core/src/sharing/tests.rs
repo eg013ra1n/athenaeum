@@ -4,12 +4,14 @@
 //! [`SharingTransport`] surface end-to-end over the in-process
 //! [`LoopbackNetwork`] and exercise the fault knobs.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tempfile::tempdir;
 use tokio::sync::mpsc::Receiver;
 
+use crate::package::{self, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use super::loopback::{FaultPlan, LoopbackNetwork};
 use super::types::{
     FrameReceipt, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
@@ -65,7 +67,7 @@ async fn loopback_announce_fetch_ack_roundtrip() {
     let blob = write_blob(src.path(), "frame_0001.fits", 64 * 1024);
     let pkg = sample_announce();
 
-    provider.serve(&pkg, src.path()).await.unwrap();
+    provider.serve(&pkg, src.path(), None).await.unwrap();
     provider
         .announce(receiver_info.node_id, &pkg)
         .await
@@ -130,7 +132,7 @@ async fn loopback_release_makes_package_unfetchable() {
     let src = tempdir().unwrap();
     write_blob(src.path(), "frame_0001.fits", 64 * 1024);
     let pkg = sample_announce();
-    provider.serve(&pkg, src.path()).await.unwrap();
+    provider.serve(&pkg, src.path(), None).await.unwrap();
 
     // Served → fetch succeeds.
     let dest1 = tempdir().unwrap();
@@ -166,7 +168,7 @@ async fn loopback_fault_abort_mid_fetch_then_resume() {
     let src = tempdir().unwrap();
     let blob = write_blob(src.path(), "frame_0001.fits", 256 * 1024);
     let pkg = sample_announce();
-    provider.serve(&pkg, src.path()).await.unwrap();
+    provider.serve(&pkg, src.path(), None).await.unwrap();
 
     // Arm the one-shot fault: abort after 32 KiB copied.
     receiver.set_fault(FaultPlan {
@@ -238,4 +240,91 @@ async fn loopback_duplicate_ack_delivered_once_ok() {
             other => panic!("expected AckReceived, got {other:?}"),
         }
     }
+}
+
+/// Build a 3-frame package (`frame1/2/3.fits` + manifest) on disk and return
+/// `(pkg_dir, announce, [rel_path…])`. Each payload has distinct content so a
+/// wrong-frame copy would hash-mismatch.
+fn build_three_frame_package(src_root: &Path) -> (PathBuf, PackageAnnounce, Vec<String>) {
+    std::fs::create_dir_all(src_root).unwrap();
+    let mut records: Vec<(PathBuf, ManifestRecord)> = Vec::new();
+    let mut rels = Vec::new();
+    for i in 1..=3u8 {
+        let filename = format!("frame{i}.fits");
+        let payload = src_root.join(&filename);
+        let bytes: Vec<u8> = (0..(4096 + i as usize * 100))
+            .map(|j| ((j + i as usize) % 251) as u8)
+            .collect();
+        std::fs::write(&payload, &bytes).unwrap();
+        let byte_size = std::fs::metadata(&payload).unwrap().len();
+        let xxh3 = package::xxh3_full_file(&payload).unwrap();
+        records.push((
+            payload,
+            ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: format!("uuid-{i}"),
+                origin_catalog_uuid: "catalog-uuid".to_string(),
+                origin_device: "origin-device".to_string(),
+                payload_kind: PayloadKind::RawFrame,
+                rel_path: filename.clone(),
+                byte_size,
+                xxh3,
+                frame_meta: serde_json::json!({ "n": i }),
+                analysis: None,
+                app_version: "test".to_string(),
+            },
+        ));
+        rels.push(filename);
+    }
+    let pkg_dir = src_root.parent().unwrap().join("pkg-three");
+    let announce = write_package(&pkg_dir, records).unwrap();
+    (pkg_dir, announce, rels)
+}
+
+/// A want-subset serve must transfer ONLY the negotiated frames: fetch lands
+/// frame1 + frame3 (not frame2) and the fetched manifest holds exactly those
+/// two records. The mock's honest mirror of the iroh subset collection.
+#[tokio::test]
+async fn subset_serve_transfers_only_want_frames() {
+    let net = LoopbackNetwork::new();
+    let provider = net.endpoint();
+    let receiver = net.endpoint();
+    provider.start().await.unwrap();
+    receiver.start().await.unwrap();
+
+    let tmp = tempdir().unwrap();
+    let (pkg_dir, announce, rels) = build_three_frame_package(&tmp.path().join("src"));
+
+    // Want only frame1 + frame3 (drop frame2 as an already-had duplicate).
+    let want: HashSet<String> = [rels[0].clone(), rels[2].clone()].into_iter().collect();
+    provider
+        .serve(&announce, &pkg_dir, Some(&want))
+        .await
+        .unwrap();
+
+    let dest = tempdir().unwrap();
+    receiver
+        .fetch(provider.node_id(), &announce, dest.path())
+        .await
+        .unwrap();
+
+    assert!(dest.path().join(&rels[0]).exists(), "frame1 (wanted) present");
+    assert!(
+        !dest.path().join(&rels[1]).exists(),
+        "frame2 (not wanted) must be absent"
+    );
+    assert!(dest.path().join(&rels[2]).exists(), "frame3 (wanted) present");
+
+    // The fetched manifest holds exactly the two wanted records.
+    let fetched = package::read_manifest(dest.path()).unwrap();
+    assert_eq!(fetched.len(), 2, "filtered manifest must hold 2 records");
+    let got: HashSet<String> = fetched.iter().map(|r| r.rel_path.clone()).collect();
+    assert_eq!(got, want, "manifest records must be exactly the wanted rel_paths");
+
+    // The wanted payloads round-trip byte-for-byte.
+    assert_eq!(
+        xxh3_of(&pkg_dir.join(&rels[0])),
+        xxh3_of(&dest.path().join(&rels[0])),
+        "frame1 content mismatch"
+    );
 }

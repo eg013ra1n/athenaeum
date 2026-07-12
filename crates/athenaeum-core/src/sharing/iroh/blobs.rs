@@ -9,6 +9,7 @@
 //! package always yields the same hash, and iroh-blobs verifies every byte on
 //! download (BLAKE3 bao trees), which is what makes a killed transfer resumable.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -18,7 +19,7 @@ use iroh_blobs::api::{Store, TempTag};
 use iroh_blobs::format::collection::Collection;
 use iroh_blobs::{Hash, HashAndFormat};
 
-use crate::package::validate_rel_path;
+use crate::package::{read_manifest, validate_rel_path, ManifestRecord, MANIFEST_FILENAME};
 
 /// A payload file discovered under a package directory.
 struct PkgFile {
@@ -62,11 +63,12 @@ fn collect_files(root: &Path) -> Result<Vec<PkgFile>> {
 /// by that exact name.
 pub async fn import_package_collection(store: &Store, pkg_dir: &Path, tag: &str) -> Result<Hash> {
     let files = collect_files(pkg_dir)?;
+    let count = files.len();
 
     // Hold each child's temp tag alive until the collection is stored + tagged,
     // so nothing it references can be collected mid-assembly.
-    let mut child_tags: Vec<TempTag> = Vec::with_capacity(files.len());
-    let mut items: Vec<(String, Hash)> = Vec::with_capacity(files.len());
+    let mut child_tags: Vec<TempTag> = Vec::with_capacity(count);
+    let mut items: Vec<(String, Hash)> = Vec::with_capacity(count);
     for f in &files {
         let tt = store
             .blobs()
@@ -78,15 +80,34 @@ pub async fn import_package_collection(store: &Store, pkg_dir: &Path, tag: &str)
         child_tags.push(tt);
     }
 
+    let hash = store_and_tag_collection(store, items, child_tags, tag).await?;
+    tracing::debug!(
+        path = %pkg_dir.display(),
+        count,
+        root_hash = %hash,
+        "package imported as collection"
+    );
+    Ok(hash)
+}
+
+/// Assemble `items` (entry name → child blob hash) into a [`Collection`], store
+/// it, and pin it under the permanent `tag`. `child_tags` holds every child
+/// blob's temp tag alive until the collection AND its permanent tag exist —
+/// nothing the collection references can be GC'd mid-assembly — then drops.
+/// `tags().set` overwrites a same-name tag, so re-serving a package id re-points
+/// its tag rather than leaking a second one. Returns the collection [`Hash`]
+/// (the package `root_hash`). Shared by the full and want-subset import paths.
+async fn store_and_tag_collection(
+    store: &Store,
+    items: Vec<(String, Hash)>,
+    child_tags: Vec<TempTag>,
+    tag: &str,
+) -> Result<Hash> {
     let collection = Collection::from_iter(items);
     let tag_tt = collection
         .store(store)
         .await
         .context("store package collection")?;
-    // A permanent, deterministically-named tag over the hash-seq keeps the whole
-    // collection (meta + every child blob) reachable across GC once the temp
-    // tags drop. `tags().set` overwrites an existing same-name tag, so a re-serve
-    // of the same package id re-points the tag rather than leaking a second one.
     store
         .tags()
         .set(tag, tag_tt.hash_and_format())
@@ -94,12 +115,105 @@ pub async fn import_package_collection(store: &Store, pkg_dir: &Path, tag: &str)
         .context("tag package collection")?;
     let hash = tag_tt.hash();
     drop(child_tags);
+    Ok(hash)
+}
 
+/// Import ONLY the negotiated want frames under `pkg_dir` into `store` and
+/// assemble them into a collection — the dedup-aware counterpart of
+/// [`import_package_collection`], used when the pre-Announce handshake settled
+/// on a subset the peer still wants.
+///
+/// The collection carries a `manifest.ndjson` filtered to exactly the wanted
+/// records plus each wanted payload file, so the receiver rebuilds a package of
+/// precisely the negotiated frames and never sees the ones it already had. The
+/// full package directory on disk is untouched (Task 7 build-once): this reads
+/// it and imports only the wanted subset. Entries are sorted by name so an
+/// identical want set over an identical package always yields the same
+/// `root_hash`, matching `import_package_collection`'s sorted-walk determinism.
+///
+/// `want` must be non-empty — an all-duplicate package is dropped before serve,
+/// never served empty; an empty (or manifest-matching-nothing) want is a caller
+/// error and returns `Err`.
+pub async fn import_subset_collection(
+    store: &Store,
+    pkg_dir: &Path,
+    want: &HashSet<String>,
+    tag: &str,
+) -> Result<Hash> {
+    if want.is_empty() {
+        anyhow::bail!(
+            "import_subset_collection called with an empty want set (pkg {})",
+            pkg_dir.display()
+        );
+    }
+
+    // Keep only the manifest records the peer still wants, in manifest order.
+    let kept: Vec<ManifestRecord> = read_manifest(pkg_dir)?
+        .into_iter()
+        .filter(|r| want.contains(&r.rel_path))
+        .collect();
+    if kept.is_empty() {
+        anyhow::bail!(
+            "want set matched no manifest records (pkg {})",
+            pkg_dir.display()
+        );
+    }
+
+    // Re-serialize the kept records as the SAME ndjson `read_manifest` parses.
+    let mut manifest_ndjson = String::new();
+    for r in &kept {
+        let line = serde_json::to_string(r).context("serialize filtered manifest record")?;
+        manifest_ndjson.push_str(&line);
+        manifest_ndjson.push('\n');
+    }
+
+    // Collection entries: the filtered manifest (an in-memory blob — no temp
+    // file) plus each wanted payload under `pkg_dir`, sorted by entry name.
+    enum Src {
+        /// Filtered `manifest.ndjson`, added straight from memory.
+        ManifestBytes(Vec<u8>),
+        /// A wanted payload file at its absolute on-disk path.
+        Payload(PathBuf),
+    }
+    let mut entries: Vec<(String, Src)> = Vec::with_capacity(kept.len() + 1);
+    entries.push((
+        MANIFEST_FILENAME.to_string(),
+        Src::ManifestBytes(manifest_ndjson.into_bytes()),
+    ));
+    for r in &kept {
+        entries.push((r.rel_path.clone(), Src::Payload(pkg_dir.join(&r.rel_path))));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut child_tags: Vec<TempTag> = Vec::with_capacity(entries.len());
+    let mut items: Vec<(String, Hash)> = Vec::with_capacity(entries.len());
+    for (name, src) in entries {
+        let tt = match src {
+            Src::ManifestBytes(bytes) => store
+                .blobs()
+                .add_bytes(bytes)
+                .temp_tag()
+                .await
+                .context("import filtered manifest blob")?,
+            Src::Payload(abs) => store
+                .blobs()
+                .add_path(&abs)
+                .temp_tag()
+                .await
+                .with_context(|| format!("import blob {}", abs.display()))?,
+        };
+        items.push((name, tt.hash()));
+        child_tags.push(tt);
+    }
+
+    let count = items.len();
+    let hash = store_and_tag_collection(store, items, child_tags, tag).await?;
     tracing::debug!(
         path = %pkg_dir.display(),
-        count = files.len(),
+        count,
+        want = kept.len(),
         root_hash = %hash,
-        "package imported as collection"
+        "package subset imported as collection"
     );
     Ok(hash)
 }

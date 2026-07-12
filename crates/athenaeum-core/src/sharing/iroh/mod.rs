@@ -456,9 +456,19 @@ impl SharingTransport for IrohTransport {
         Ok(())
     }
 
-    async fn serve(&self, pkg: &PackageAnnounce, src_dir: &Path) -> Result<()> {
+    async fn serve(
+        &self,
+        pkg: &PackageAnnounce,
+        src_dir: &Path,
+        want: Option<&HashSet<String>>,
+    ) -> Result<()> {
         let tag = package_tag(&pkg.package_id);
-        let hash = blobs::import_package_collection(&self.store, src_dir, &tag).await?;
+        // `None` → full package (pre-dedup). `Some(w)` → the negotiated subset:
+        // only those payloads plus a manifest filtered to exactly them.
+        let hash = match want {
+            None => blobs::import_package_collection(&self.store, src_dir, &tag).await?,
+            Some(w) => blobs::import_subset_collection(&self.store, src_dir, w, &tag).await?,
+        };
         self.served
             .lock()
             .expect("served mutex poisoned")
@@ -467,6 +477,7 @@ impl SharingTransport for IrohTransport {
             package_id = %pkg.package_id.0,
             root_hash = %hash,
             path = %src_dir.display(),
+            subset = want.is_some(),
             "iroh serving package"
         );
         Ok(())
