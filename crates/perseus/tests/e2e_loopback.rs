@@ -29,7 +29,7 @@ use athenaeum_core::sharing::types::{FrameReceipt, ReceiptOutcome, TransportEven
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::{HistoryQuery, HistoryRow, OutboundState, SyncStore};
 
-use perseus::config::{Config, Mode, RetentionConfig, RetentionPolicy};
+use perseus::config::{Config, Mode, RetentionConfig, RetentionPolicy, DEFAULT_AUTO_QUIET_SECS};
 use perseus::run::Agent;
 
 const WAIT: Duration = Duration::from_secs(30);
@@ -61,6 +61,7 @@ fn test_config(capture_dir: &Path, data_dir: &Path) -> Config {
         targets: Vec::new(),
         device_name: None,
         mode: Mode::Auto,
+        auto_quiet_secs: DEFAULT_AUTO_QUIET_SECS,
         retention: RetentionConfig {
             policy: RetentionPolicy::KeepEverything,
             dry_run: true,
@@ -88,6 +89,7 @@ fn test_config_multi(capture_dirs: &[&Path], data_dir: &Path) -> Config {
         targets: Vec::new(),
         device_name: None,
         mode: Mode::Auto,
+        auto_quiet_secs: DEFAULT_AUTO_QUIET_SECS,
         retention: RetentionConfig {
             policy: RetentionPolicy::KeepEverything,
             dry_run: true,

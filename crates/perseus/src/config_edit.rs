@@ -19,7 +19,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{Config, RetentionPolicy};
+use crate::config::{Config, Mode, RetentionPolicy};
 
 /// The subset of `[retention]` a web edit may change. Deliberately omits
 /// `i_have_verified_the_soak`: the soak opt-in is never web-writable (see the
@@ -240,6 +240,63 @@ pub fn apply_device_name_edit(config_path: &Path, name: &str) -> Result<Config> 
 
     tracing::info!(device_name = trimmed, "device name edited via web");
     Ok(cfg)
+}
+
+/// Rewrite the top-level send `mode` + `auto_quiet_secs` keys in `config_path`,
+/// preserving all comments/layout ([`toml_edit`]), then re-parse + validate the
+/// whole file and atomically replace it. Returns the freshly re-validated
+/// [`Config`] so the caller can publish the new [`crate::config::SendCfg`] onto
+/// the batcher's live `watch` channel (Task 4) — this edit applies live, no
+/// engine restart.
+///
+/// Both keys are written at the document root. Edit-on-copy,
+/// write-after-validate: on **any** error the file is left byte-identical, with
+/// no partial or orphaned tmp file.
+pub fn apply_send_mode_edit(
+    config_path: &Path,
+    mode: Mode,
+    auto_quiet_secs: u64,
+) -> Result<Config> {
+    let original = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    let mut doc: toml_edit::DocumentMut = original
+        .parse()
+        .with_context(|| format!("parse {}", config_path.display()))?;
+
+    doc["mode"] = toml_edit::value(mode_str(mode));
+    doc["auto_quiet_secs"] = toml_edit::value(auto_quiet_secs as i64);
+
+    // Re-parse + validate the ENTIRE edited document before it ever hits disk, so
+    // a malformed result is rejected with the file still untouched.
+    let candidate = doc.to_string();
+    let cfg = Config::from_toml_str(&candidate).context("re-parse edited config")?;
+    cfg.validate().context("edited config failed validation")?;
+
+    // Atomic replace: write the validated candidate to a sibling tmp, then rename
+    // over the original. Only reached once validation has passed.
+    let tmp = config_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &candidate)
+        .with_context(|| format!("write tmp config {}", tmp.display()))?;
+    std::fs::rename(&tmp, config_path)
+        .with_context(|| format!("replace config {}", config_path.display()))?;
+
+    tracing::info!(
+        mode = mode_str(mode),
+        auto_quiet_secs,
+        "send mode edited via web"
+    );
+    Ok(cfg)
+}
+
+/// The snake_case TOML string for a [`Mode`] variant. Kept in lock-step with the
+/// enum's `#[serde(rename_all = "snake_case")]` so a round-trip through the file
+/// re-parses to the same variant. `pub(crate)` so the web status page renders the
+/// mode with the same canonical string.
+pub(crate) fn mode_str(m: Mode) -> &'static str {
+    match m {
+        Mode::Auto => "auto",
+        Mode::Manual => "manual",
+    }
 }
 
 /// The snake_case TOML string for a [`RetentionPolicy`] variant. Kept in lock-step
@@ -478,6 +535,35 @@ i_have_verified_the_soak = false
             !path.with_extension("toml.tmp").exists(),
             "no orphan tmp file after a rejected edit"
         );
+    }
+
+    /// The brief's RED test (Phase 2 Task 1): a send-mode edit writes
+    /// `Mode::Manual` + `auto_quiet_secs`, re-parses, and persists to disk so a
+    /// fresh load returns both.
+    #[test]
+    fn apply_send_mode_edit_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+        let cfg = apply_send_mode_edit(&path, Mode::Manual, 30).unwrap();
+        assert_eq!(cfg.mode, Mode::Manual);
+        assert_eq!(cfg.auto_quiet_secs, 30);
+        let reloaded = Config::load_lenient(&path).unwrap();
+        assert_eq!(reloaded.mode, Mode::Manual);
+        assert_eq!(reloaded.auto_quiet_secs, 30);
+    }
+
+    /// A send-mode edit preserves unrelated comments/layout, touching only the
+    /// `mode` and `auto_quiet_secs` keys.
+    #[test]
+    fn apply_send_mode_edit_preserves_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+        apply_send_mode_edit(&path, Mode::Manual, 45).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# top comment"), "top comment preserved: {text}");
+        assert!(text.contains("device_name = \"old-name\""), "unrelated key preserved");
+        assert!(text.contains("mode = \"manual\""), "mode is rewritten");
+        assert!(text.contains("auto_quiet_secs = 45"), "quiet window is written");
     }
 
     /// A device-name edit writes the trimmed name, re-parses, and persists.

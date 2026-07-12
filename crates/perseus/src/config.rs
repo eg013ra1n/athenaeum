@@ -8,7 +8,8 @@
 //! ```toml
 //! capture_dir = "/data/capture"
 //! data_dir = "/var/lib/perseus"
-//! mode = "auto"                             # only value in MVP
+//! mode = "auto"                             # "auto" or "manual" (Phase 2)
+//! auto_quiet_secs = 60                       # auto: flush after N idle seconds
 //! device_name = "Observatory Pi"            # optional; defaults to the hostname
 //!
 //! # Route A — account (recommended). Sign in with `perseus login`; the device
@@ -58,6 +59,10 @@ pub const DEFAULT_STABILITY_SECS: u64 = 10;
 /// Default re-stat cadence (seconds) for pending capture files.
 pub const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
 
+/// Default auto-mode quiet window (seconds): in `Mode::Auto` the batcher flushes
+/// a pending send after this many seconds elapse with no new capture arriving.
+pub const DEFAULT_AUTO_QUIET_SECS: u64 = 60;
+
 /// Default `keep_days` threshold (days) for the `keep_days` policy.
 pub const DEFAULT_KEEP_DAYS: u32 = 30;
 /// Default disk-usage cap (percent) for the `disk_pct` policy.
@@ -70,6 +75,9 @@ fn default_stability_secs() -> u64 {
 }
 fn default_poll_interval_secs() -> u64 {
     DEFAULT_POLL_INTERVAL_SECS
+}
+fn default_auto_quiet_secs() -> u64 {
+    DEFAULT_AUTO_QUIET_SECS
 }
 fn default_true() -> bool {
     true
@@ -98,13 +106,27 @@ fn default_web_bind() -> String {
     DEFAULT_WEB_BIND.to_string()
 }
 
-/// Agent operating mode. MVP has a single value; the enum exists so an unknown
-/// mode is a clear parse error rather than a silently ignored string.
+/// Agent send-behaviour mode. The enum exists so an unknown mode is a clear
+/// parse error rather than a silently ignored string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
-    /// Auto-send every new frame the watcher stabilizes.
+    /// Auto-send every new frame the watcher stabilizes (batched by the
+    /// `auto_quiet_secs` quiet window).
     Auto,
+    /// Queue stabilized frames; the operator triggers the send explicitly from
+    /// the web page (Phase 2).
+    Manual,
+}
+
+/// A snapshot of the send-behaviour knobs the batcher (Task 4) and web page
+/// (Task 6) read live: the current [`Mode`] plus the auto-mode quiet window.
+/// Cheap to copy so a `watch` channel can hand out the latest value without a
+/// lock on the whole [`Config`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendCfg {
+    pub mode: Mode,
+    pub auto_quiet_secs: u64,
 }
 
 /// Retention policy. Parsed and validated here; the evaluator that acts on it is
@@ -287,6 +309,11 @@ pub struct Config {
     #[serde(default)]
     pub device_name: Option<String>,
     pub mode: Mode,
+    /// Auto-mode quiet window in seconds: in [`Mode::Auto`] the batcher flushes a
+    /// pending send once this many seconds pass with no new capture. Additive/
+    /// defaulted (absent from the contract sample); ignored in [`Mode::Manual`].
+    #[serde(default = "default_auto_quiet_secs")]
+    pub auto_quiet_secs: u64,
     #[serde(default)]
     pub retention: RetentionConfig,
     #[serde(default = "default_stability_secs")]
@@ -563,6 +590,16 @@ impl Config {
         needs
     }
 
+    /// A cheap, copyable snapshot of the send-behaviour knobs (mode + auto quiet
+    /// window). The batcher (Task 4) and web page (Task 6) read this rather than
+    /// the whole [`Config`], so a live edit can be published on a `watch` channel.
+    pub fn send_cfg(&self) -> SendCfg {
+        SendCfg {
+            mode: self.mode,
+            auto_quiet_secs: self.auto_quiet_secs,
+        }
+    }
+
     /// Write-stability quiet window as a [`Duration`].
     pub fn stability(&self) -> Duration {
         Duration::from_secs(self.stability_secs)
@@ -611,6 +648,7 @@ impl Config {
             targets: Vec::new(),
             device_name: None,
             mode: Mode::Auto,
+            auto_quiet_secs: DEFAULT_AUTO_QUIET_SECS,
             retention: RetentionConfig::default(),
             stability_secs: DEFAULT_STABILITY_SECS,
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
@@ -929,14 +967,40 @@ mode = "auto"
         assert!(cfg.retention.dry_run, "dry-run wins — nothing is deleted");
     }
 
+    /// Phase 2: `mode = "manual"` is now a valid send mode; only a genuinely
+    /// unknown value is a parse error.
+    #[test]
+    fn manual_mode_parses() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = good_toml(capture.path()).replace("mode = \"auto\"", "mode = \"manual\"");
+        let cfg = Config::from_toml_str(&text).expect("manual is a valid send mode");
+        assert_eq!(cfg.mode, Mode::Manual);
+        // Additive quiet window defaults when the key is absent.
+        assert_eq!(cfg.auto_quiet_secs, DEFAULT_AUTO_QUIET_SECS);
+    }
+
     #[test]
     fn unknown_mode_is_rejected() {
         let capture = tempfile::tempdir().unwrap();
-        let text = good_toml(capture.path()).replace("mode = \"auto\"", "mode = \"manual\"");
+        let text = good_toml(capture.path()).replace("mode = \"auto\"", "mode = \"bogus\"");
         assert!(
             Config::from_toml_str(&text).is_err(),
-            "only mode = auto is accepted in the MVP"
+            "an unknown mode must be a parse error"
         );
+    }
+
+    /// The additive `auto_quiet_secs` key parses when present.
+    #[test]
+    fn auto_quiet_secs_parses_when_present() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = good_toml(capture.path()).replace(
+            "mode = \"auto\"",
+            "mode = \"auto\"\nauto_quiet_secs = 15",
+        );
+        let cfg = Config::from_toml_str(&text).expect("valid config");
+        assert_eq!(cfg.auto_quiet_secs, 15);
+        assert_eq!(cfg.send_cfg().auto_quiet_secs, 15);
+        assert_eq!(cfg.send_cfg().mode, Mode::Auto);
     }
 
     #[test]

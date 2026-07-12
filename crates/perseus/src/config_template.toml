@@ -4,7 +4,8 @@
 
 # Where Perseus keeps its database, logs, staged packages, and credentials.
 data_dir = '{data_dir}'
-mode = "auto"
+mode = "auto"            # "auto" (send each capture) or "manual" (queue; send from the web page)
+auto_quiet_secs = 60     # auto: flush after N seconds with no new file
 
 # Optional friendly name for this node in your account (defaults to the hostname).
 # device_name = "Observatory Pi"

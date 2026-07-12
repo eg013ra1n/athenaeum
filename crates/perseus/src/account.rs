@@ -732,6 +732,7 @@ mod tests {
             targets: targets.iter().map(|s| s.to_string()).collect(),
             device_name: None,
             mode: Mode::Auto,
+            auto_quiet_secs: crate::config::DEFAULT_AUTO_QUIET_SECS,
             retention: RetentionConfig::default(),
             stability_secs: 1,
             poll_interval_secs: 1,
