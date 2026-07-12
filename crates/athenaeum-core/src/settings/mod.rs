@@ -58,9 +58,17 @@ pub mod defaults {
     pub const SYNC_RETENTION_DRY_RUN: &str = "true";
     pub const SYNC_RETENTION_LIVE_CONFIRMED: &str = "false";
 
-    // Account layer (task B4). Base URL of the athenaeum-hub. Overridable so a
-    // dev build can point at a local/staging hub. The device token lives in the
-    // OS keychain (never here); only non-secret account state is persisted.
+    // Account layer (task B4). Base URL of the athenaeum-hub. The device token
+    // lives in the OS keychain (never here), keyed per hub host — so the prod
+    // and test sign-ins coexist and switching is safe.
+    //
+    // Debug (dev) builds default to the TEST hub so day-to-day development
+    // never touches the production account registry; release builds (prod +
+    // betas) default to the production hub. The `account.hub_url` setting
+    // overrides either way (Settings → Account hub selector).
+    #[cfg(debug_assertions)]
+    pub const ACCOUNT_HUB_URL: &str = "https://test-hub.artfrom.space";
+    #[cfg(not(debug_assertions))]
     pub const ACCOUNT_HUB_URL: &str = "https://projects.artfrom.space";
 }
 

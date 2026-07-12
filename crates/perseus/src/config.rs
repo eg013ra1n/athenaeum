@@ -216,8 +216,13 @@ impl RetentionConfig {
     }
 }
 
-/// Default hub base URL — matches the app's `account.hub_url` default so a
-/// bare `[account]` table (email only) points at the production hub.
+/// Default hub base URL — matches the app's `account.hub_url` default: debug
+/// (dev) builds point a bare `[account]` table (email only) at the TEST hub,
+/// release builds (installers/betas) at the production hub. An explicit
+/// `hub_url` in config.toml overrides either way.
+#[cfg(debug_assertions)]
+pub const DEFAULT_HUB_URL: &str = "https://test-hub.artfrom.space";
+#[cfg(not(debug_assertions))]
 pub const DEFAULT_HUB_URL: &str = "https://projects.artfrom.space";
 
 fn default_hub_url() -> String {
@@ -231,7 +236,7 @@ fn default_hub_url() -> String {
 /// explicit [`Config::targets`]; there is no per-account "primary" to pair to.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountConfig {
-    /// Hub base URL (defaults to the production hub).
+    /// Hub base URL (defaults per build profile: test hub in debug, production in release).
     #[serde(default = "default_hub_url")]
     pub hub_url: String,
     /// Account email. Optional in the file — `perseus login` prompts when absent.
@@ -1022,7 +1027,7 @@ mode = "auto"
     }
 
     /// Sync 2C: an `[account]` table with `targets` is a valid send route — no
-    /// `pairing_ticket` required. `hub_url` defaults to the production hub.
+    /// `pairing_ticket` required. `hub_url` defaults per build profile (DEFAULT_HUB_URL).
     #[test]
     fn account_with_targets_config_parses_without_ticket() {
         let capture = tempfile::tempdir().unwrap();
@@ -1044,7 +1049,7 @@ dry_run = true
         assert!(cfg.pairing_ticket.is_none(), "no ticket needed with [account] + targets");
         assert_eq!(cfg.targets, vec!["Studio Mac".to_string()]);
         let account = cfg.account.expect("account table present");
-        assert_eq!(account.hub_url, DEFAULT_HUB_URL, "hub_url defaults to the production hub");
+        assert_eq!(account.hub_url, DEFAULT_HUB_URL, "hub_url falls back to the build-profile default");
         assert_eq!(account.email.as_deref(), Some("me@example.com"));
         assert!(
             !account.allow_default_relays,

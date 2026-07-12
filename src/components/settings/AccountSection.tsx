@@ -21,8 +21,16 @@ import { useNotifications } from '../../contexts/NotificationContext';
 import { useAccount, accountErrMsg, SIGNED_OUT_HEALED } from '../../hooks/useAccount';
 import type { AccountDevice, DeviceCapability } from '../../types/models';
 
-/** Default hub the app points sign-in at when `account.hub_url` is unset. */
-const DEFAULT_HUB_URL = 'https://projects.artfrom.space';
+/** The two first-class hub registries surfaced by the selector. */
+const PROD_HUB_URL = 'https://projects.artfrom.space';
+const TEST_HUB_URL = 'https://test-hub.artfrom.space';
+
+/**
+ * Default hub when `account.hub_url` is unset — mirrors the backend's
+ * build-profile default (`settings::defaults::ACCOUNT_HUB_URL`): dev builds
+ * point at the test hub, release builds (prod + betas) at production.
+ */
+const DEFAULT_HUB_URL = import.meta.env.DEV ? TEST_HUB_URL : PROD_HUB_URL;
 
 /** Compact display for a hub-assigned device id (opaque, can be long). */
 function shortId(id: string): string {
@@ -155,6 +163,89 @@ function DeviceNameEditor({
       <p className="text-xs text-content-muted">
         Shown to your other devices in sync history and transfers. Must be unique across your
         account.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Hub selector — Production vs Test registry, shown in ALL builds (this is the
+ * beta's prod/dev toggle). Writes `account.hub_url` and re-polls status.
+ * Rendered only while signed out: the hub choice decides which account/device
+ * registry sign-in talks to, and device tokens are stored per hub host, so
+ * flipping back and forth never clobbers the other hub's sign-in.
+ */
+function HubSelector({ onSaved }: { onSaved: () => Promise<unknown> }) {
+  const [current, setCurrent] = useState<string>(DEFAULT_HUB_URL);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    (async () => {
+      try {
+        const raw = await api.invoke<string | null>('get_setting', { key: 'account.hub_url' });
+        if (mounted.current && raw != null && raw !== '') setCurrent(raw);
+      } catch (err) {
+        console.error('[account] load hub url failed:', err);
+      }
+    })();
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const choose = async (url: string) => {
+    if (busy || url === current) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.invoke('set_setting', { key: 'account.hub_url', value: url });
+      if (mounted.current) setCurrent(url);
+      await onSaved(); // re-poll account_status so the sign-in form shows the new hub
+    } catch (err) {
+      console.error('[account] switch hub failed:', err);
+      if (mounted.current) setError(accountErrMsg(err));
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  };
+
+  const isCustom = current !== PROD_HUB_URL && current !== TEST_HUB_URL;
+  const pill = (url: string, label: string) => (
+    <button
+      key={url}
+      type="button"
+      onClick={() => choose(url)}
+      disabled={busy}
+      className={`px-3 py-1.5 rounded-md text-xs border transition-colors disabled:opacity-50 ${
+        current === url
+          ? 'border-accent bg-accent-muted/20 text-content'
+          : 'border-border text-content-secondary hover:bg-surface-hover'
+      }`}
+    >
+      {label}
+    </button>
+  );
+
+  return (
+    <div className="space-y-1.5 border-t border-border/50 pt-4">
+      <label className="block text-xs text-content-muted">Hub</label>
+      <div className="flex items-center gap-2">
+        {pill(PROD_HUB_URL, 'Production')}
+        {pill(TEST_HUB_URL, 'Test')}
+        {busy && <Loader2 size={13} className="animate-spin text-content-muted" />}
+      </div>
+      {isCustom && (
+        <p className="text-xs text-content-muted">
+          Custom hub: <span className="font-mono text-content-secondary">{current}</span>
+        </p>
+      )}
+      {error && <p className="text-xs text-error">{error}</p>}
+      <p className="text-xs text-content-muted">
+        Production is where your real devices live; Test is a separate registry for trying
+        things out. Each hub keeps its own sign-in, so switching is safe.
       </p>
     </div>
   );
@@ -588,6 +679,7 @@ export default function AccountSection() {
           </form>
         )}
 
+        <HubSelector onSaved={refreshStatus} />
         {import.meta.env.DEV && <HubUrlDevEditor onSaved={refreshStatus} />}
       </div>
     );
