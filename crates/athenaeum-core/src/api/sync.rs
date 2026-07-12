@@ -415,6 +415,26 @@ fn received_total(ctx: &ServiceContext) -> Result<u32, ApiError> {
     Ok(n.max(0) as u32)
 }
 
+/// Dedup in-flight rows by durable `sync_outbound` id, keeping the first
+/// occurrence and ordering ascending by id.
+///
+/// Every per-peer engine ([`SyncSenderRuntime`], sync 2C) opens its OWN
+/// [`CatalogSyncStore`] over the SAME catalog DB, and
+/// [`SyncStore::non_terminal`](crate::sync::SyncStore::non_terminal) has no peer
+/// filter — so with N started engines the naive rollup returns N copies of every
+/// non-terminal row. Collapsing by id yields exactly the distinct in-flight
+/// packages, from which `queued`/`transferring` are then counted (never
+/// N-inflated). A [`std::collections::BTreeMap`] gives both first-occurrence
+/// (`or_insert`) and the stable ascending-by-id ordering the Active tab expects.
+fn dedup_active(rows: Vec<OutboundSummary>) -> Vec<OutboundSummary> {
+    let mut by_id: std::collections::BTreeMap<i64, OutboundSummary> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        by_id.entry(row.id).or_insert(row);
+    }
+    by_id.into_values().collect()
+}
+
 /// The send-side rollup: live in-flight counts + rows from the engine's
 /// non-terminal snapshot, plus terminal totals counted from `sync_outbound`.
 async fn build_sender_status(
@@ -437,22 +457,30 @@ async fn build_sender_status(
         (started, active_rows)
     };
 
+    // Every engine's `non_terminal()` reads the same peer-unfiltered store, so
+    // `active_rows` holds one copy per started engine — dedup by id before
+    // counting so `queued`/`transferring` reflect distinct packages, not N×.
+    let active = dedup_active(
+        active_rows
+            .iter()
+            .map(|row| OutboundSummary {
+                id: row.id,
+                package_short: short_pkg(&row.package_ref),
+                state: row.state,
+                attempts: row.attempts,
+                created_at: row.created_at.clone(),
+                peer_short: short_id(&node_id_hex(&row.peer)),
+            })
+            .collect(),
+    );
+
     let mut queued = 0u32;
     let mut transferring = 0u32;
-    let mut active = Vec::with_capacity(active_rows.len());
-    for row in &active_rows {
+    for row in &active {
         match row.state {
             OutboundState::Transferring | OutboundState::Delivered => transferring += 1,
             _ => queued += 1, // Queued / Announced
         }
-        active.push(OutboundSummary {
-            id: row.id,
-            package_short: short_pkg(&row.package_ref),
-            state: row.state,
-            attempts: row.attempts,
-            created_at: row.created_at.clone(),
-            peer_short: short_id(&node_id_hex(&row.peer)),
-        });
     }
 
     let (confirmed_total, failed_total) = {
@@ -1015,6 +1043,71 @@ mod tests {
         let c: NodeId = node_id_from_hex(&"cc".repeat(32));
         assert!(sender.current_for(&c).await.is_none(), "unknown peer has no engine");
         assert_eq!(sender.started_peers().await.len(), 2);
+    }
+
+    /// Multi-destination regression (sync 2C / Phase 3): with two started
+    /// per-peer engines, `build_sender_status` must NOT N-duplicate the in-flight
+    /// rows. Each engine opens its OWN `CatalogSyncStore` over the SAME catalog
+    /// DB — exactly how `ensure_sender_engine` builds them — and
+    /// `non_terminal()` has no peer filter, so every engine's snapshot returns
+    /// the full non-terminal set. Rolled up naively across 2 engines that would
+    /// be 4 rows for 2 real packages; the fix dedups by row id.
+    ///
+    /// The two non-terminal rows are addressed to a THIRD peer X, so neither
+    /// started engine (A, B) re-drives them on crash-resume (`row.peer !=
+    /// self.peer`) — keeping the rows stable through the read while still
+    /// reproducing the cross-peer duplication.
+    #[tokio::test]
+    async fn sender_status_dedupes_active_rows_across_peers() {
+        use crate::sharing::loopback::LoopbackNetwork;
+        use crate::sharing::SharingTransport;
+
+        let (_tmp, ctx) = test_ctx();
+        let db_path = db(&ctx).unwrap().path().to_path_buf();
+        let node = |b: u8| crate::sync::node_id_from_hex(&format!("{b:02x}").repeat(32)).unwrap();
+
+        // Two non-terminal rows (ids 1, 2) in the shared catalog sync store,
+        // addressed to a third peer X: one Queued, one Transferring.
+        let peer_x = node(0xcc);
+        {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            let id1 = store.enqueue("/pkgs/one", peer_x).unwrap();
+            let id2 = store.enqueue("/pkgs/two", peer_x).unwrap();
+            assert_eq!((id1, id2), (1, 2));
+            store.set_state(id2, OutboundState::Transferring).unwrap();
+        }
+
+        // Two started per-peer engines (A, B), each with its OWN store over the
+        // SAME catalog DB, idling with nothing of their own enqueued.
+        let started_for = |peer: NodeId| {
+            let net = LoopbackNetwork::new();
+            let store = Arc::new(CatalogSyncStore::open(&db_path).unwrap());
+            let engine = Arc::new(SyncEngine::spawn(
+                store as Arc<dyn SyncStore>,
+                Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
+                peer,
+            ));
+            StartedSender { engine, origin_device: node_id_hex(&peer), peer }
+        };
+        let peer_a = node(0xaa);
+        let peer_b = node(0xbb);
+        let sender = SyncSenderRuntime::new();
+        {
+            let mut g = sender.lock_inner().await;
+            g.insert(peer_a, started_for(peer_a));
+            g.insert(peer_b, started_for(peer_b));
+        }
+
+        let status = build_sender_status(&ctx, &sender).await.unwrap();
+        assert_eq!(status.active.len(), 2, "2 distinct rows, not 4 (deduped across the 2 peers)");
+        assert_eq!(
+            status.active.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "deduped rows stay ordered ascending by id"
+        );
+        assert_eq!(status.queued, 1, "one Queued row, counted once");
+        assert_eq!(status.transferring, 1, "one Transferring row, counted once");
+        assert_eq!(status.queued + status.transferring, 2);
     }
 
     /// The receiver's allow-list is now every device in the account (mesh model,
