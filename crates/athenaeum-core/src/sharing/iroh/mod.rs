@@ -510,6 +510,19 @@ impl ProtocolHandler for SyncControlProtocol {
                     package_id,
                     receipts,
                 },
+                // P2P dedup-handshake messages (Offer/Want/FullHashes) decode here
+                // but are not yet routed to a TransportEvent — the handshake is
+                // wired in a later task. Ack the stream and skip so an early or
+                // stray one can't wedge the accept loop.
+                Msg::Offer { .. } | Msg::Want { .. } | Msg::FullHashes { .. } => {
+                    tracing::debug!(
+                        from = %hex32(&from),
+                        "dedup-handshake control message not yet routed; skipping"
+                    );
+                    let _ = tx.write_all(b"1").await;
+                    let _ = tx.finish();
+                    continue;
+                }
             };
             // Deliver in-process, then ack. A closed consumer means the engine is
             // gone — stop accepting and leave the ack unsent so the sender retries.
