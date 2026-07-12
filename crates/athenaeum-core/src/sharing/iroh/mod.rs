@@ -650,9 +650,27 @@ impl ProtocolHandler for SyncControlProtocol {
                     package_id,
                     entries,
                 } => {
-                    let (want, candidates) = match &self.responder {
-                        Some(r) => r.want_for_offer(&entries),
-                        None => (entries.iter().map(|e| e.rel_path.clone()).collect(), Vec::new()),
+                    // `want_for_offer` does blocking catalog DB I/O — run it off
+                    // the async worker so it can't stall the accept loop / other
+                    // connections. A `spawn_blocking` join failure (the responder
+                    // never panics) falls back to the safe direction: want
+                    // everything, no candidates — matching the None branch.
+                    let (want, candidates) = match self.responder.clone() {
+                        Some(r) => {
+                            let entries2 = entries.clone();
+                            tokio::task::spawn_blocking(move || r.want_for_offer(&entries2))
+                                .await
+                                .unwrap_or_else(|_| {
+                                    (
+                                        entries.iter().map(|e| e.rel_path.clone()).collect(),
+                                        Vec::new(),
+                                    )
+                                })
+                        }
+                        None => (
+                            entries.iter().map(|e| e.rel_path.clone()).collect(),
+                            Vec::new(),
+                        ),
                     };
                     write_reply(
                         &mut tx,
@@ -673,8 +691,19 @@ impl ProtocolHandler for SyncControlProtocol {
                     package_id,
                     entries,
                 } => {
-                    let still = match &self.responder {
-                        Some(r) => r.confirm_full_hashes(&entries),
+                    // `confirm_full_hashes` streams and hashes every candidate
+                    // file from disk (potentially many GB on a re-send) — move it
+                    // off the async worker. A join failure resolves to the safe
+                    // direction: keep every candidate wanted (the None branch).
+                    let still = match self.responder.clone() {
+                        Some(r) => {
+                            let entries2 = entries.clone();
+                            tokio::task::spawn_blocking(move || r.confirm_full_hashes(&entries2))
+                                .await
+                                .unwrap_or_else(|_| {
+                                    entries.iter().map(|e| e.rel_path.clone()).collect()
+                                })
+                        }
                         None => entries.iter().map(|e| e.rel_path.clone()).collect(),
                     };
                     write_reply(
