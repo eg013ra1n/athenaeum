@@ -34,13 +34,13 @@
 //! catalog store — is the same public API the desktop/web hosts use.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use athenaeum_core::api::retention::{evaluate, AppRetentionConfig};
 use athenaeum_core::api::sync::enqueue_sync_selection;
 use athenaeum_core::db::{insert_file, insert_frame, Database};
-use athenaeum_core::events::NullEmitter;
+use athenaeum_core::events::{NullEmitter, ProgressEmitter};
 use athenaeum_core::fits_writer::keywords::{FrameKind, HeaderBuilder};
 use athenaeum_core::fits_writer::write_fits_f32;
 use athenaeum_core::models::{File, FileFormat, Frame, ImageType};
@@ -48,8 +48,8 @@ use athenaeum_core::services::ServiceContext;
 use athenaeum_core::sharing::loopback::LoopbackNetwork;
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::{
-    allow_all_peers, node_id_hex, CatalogSyncStore, RetentionPolicy, StartedSender, SyncEngine,
-    SyncReceiver, SyncSenderRuntime, SyncStore,
+    allow_all_peers, node_id_hex, CatalogDedupResponder, CatalogSyncStore, DedupResponder,
+    RetentionPolicy, StartedSender, SyncEngine, SyncReceiver, SyncSenderRuntime, SyncStore,
 };
 use chrono::Utc;
 
@@ -159,6 +159,42 @@ async fn wait_until<F: FnMut() -> bool>(mut pred: F, timeout: Duration) {
             panic!("wait_until timed out after {timeout:?}");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// Records the sender engine's emitted events so the dedup e2e can read the Sync
+/// Phase 3 `{new, duplicate}` outcome off each send-side `sync-finished`. Those
+/// counts are the *only* place the split surfaces — `enqueue_sync_selection`'s
+/// [`EnqueueSelectionResult`] reports the app-layer enqueue size, not what the
+/// negotiate handshake actually transferred vs. dropped — so the emitter is the
+/// observable oracle for "the re-send moved only the new frames".
+#[derive(Default)]
+struct RecordingEmitter {
+    events: Mutex<Vec<(String, serde_json::Value)>>,
+}
+
+impl ProgressEmitter for RecordingEmitter {
+    fn emit_json(&self, name: &str, payload: serde_json::Value) {
+        self.events.lock().unwrap().push((name.to_string(), payload));
+    }
+}
+
+impl RecordingEmitter {
+    /// The send-side `sync-finished` events seen so far, in emit order, as
+    /// `(new_count, duplicate_count)` pairs — one per confirmed package.
+    fn sent_finished(&self) -> Vec<(u64, u64)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, p)| name == "sync-finished" && p["direction"] == "sent")
+            .map(|(_, p)| {
+                (
+                    p["newCount"].as_u64().expect("newCount is a number"),
+                    p["duplicateCount"].as_u64().expect("duplicateCount is a number"),
+                )
+            })
+            .collect()
     }
 }
 
@@ -410,6 +446,194 @@ async fn two_instance_sync_e2e() {
             "retention_deleted event present for the same frame {uuid}"
         );
     }
+
+    // Clean shutdown of the background tasks (tidy; tempdir drop handles the rest).
+    engine.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// Sync Phase 3 (dedup handshake) end-to-end: a re-send of an OVERLAPPING batch
+/// transfers only the genuinely-new frames.
+///
+/// This pins the whole offer/want chain — proto (task 1), pure split (task 2),
+/// catalog responder (task 3), transport negotiate (task 4), want-subset serve
+/// (task 5), engine splice (task 6) — over two real instances on the loopback
+/// transport, the same observable oracle [`two_instance_sync_e2e`] uses.
+///
+/// The dedup only runs because instance B's loopback endpoint is given a real
+/// [`CatalogDedupResponder`] over B's catalog (`endpoint_with_responder`): B
+/// answers A's pre-announce `Offer` from `files.content_hash` (the sampling hash
+/// that B's ingest populates via `compute_xxhash(&landed)`), sampling-matches the
+/// frames it already holds, then full-hash-confirms them as true duplicates. A
+/// responder-less endpoint would answer want-all and the assertions below would
+/// see `{new:4, duplicate:0}` instead — so the responder wiring is exactly what
+/// this test drives out.
+///
+/// The `{new, duplicate}` split surfaces only on the send-side `sync-finished`
+/// event (not on `enqueue_sync_selection`'s result), so A's engine is spawned
+/// with a [`RecordingEmitter`] that captures each package's outcome.
+#[tokio::test]
+async fn resend_transfers_only_new_frames() {
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = ServiceContext::new_for_tests(capture_db.clone());
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let pdb = primary_ctx.db.get().unwrap();
+
+    // ── Primary receiver over loopback, WITH a catalog dedup responder ──────────
+    // The responder is the in-process stand-in for a running receiver's
+    // `CatalogDedupResponder`: it answers A's `negotiate_want` from B's real
+    // catalog, so a re-sent frame B already holds is recognized as a duplicate and
+    // never transferred. Built from B's catalog store BEFORE the endpoint is
+    // minted, then registered into the endpoint's inbox on `start`.
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let responder: Arc<dyn DedupResponder> =
+        Arc::new(CatalogDedupResponder::new(Arc::clone(&primary_store)));
+    let receiver_ep = Arc::new(net.endpoint_with_responder(responder));
+    let receiver_node = receiver_ep.node_id();
+
+    // Designate a `sync_incoming` scan root so received files land under it (same
+    // as the metadata-delivery e2e); its live resolver re-reads it per package.
+    let designated = tmp.path().join("designated_incoming");
+    std::fs::create_dir_all(&designated).unwrap();
+    athenaeum_core::api::scan_roots::add_scan_root(
+        &primary_ctx,
+        designated.to_string_lossy().into_owned(),
+        &athenaeum_core::api::PathPolicy::AllowAll,
+        Some("sync_incoming".to_string()),
+    )
+    .expect("designate sync_incoming root");
+    let resolver_db = primary_ctx.db.get().unwrap().clone();
+    let fallback_incoming = primary_dir.join("incoming");
+    let incoming: athenaeum_core::sync::receiver::IncomingResolver = Arc::new(move || {
+        let conn = resolver_db.conn();
+        match athenaeum_core::db::scan_root_path_of_kind(&conn, "sync_incoming") {
+            Ok(Some(p)) => std::path::PathBuf::from(p),
+            _ => fallback_incoming.clone(),
+        }
+    });
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    // ── Capture sender engine over loopback, WITH a recording emitter so the test
+    // can read each package's `{new, duplicate}` dedup outcome. ──
+    let sender_ep = net.endpoint();
+    let sender_node = sender_ep.node_id();
+    let engine_store = Arc::new(CatalogSyncStore::open(&capture_db).unwrap());
+    let emitter = Arc::new(RecordingEmitter::default());
+    let engine = Arc::new(SyncEngine::spawn_with_emitter(
+        engine_store as Arc<dyn SyncStore>,
+        Arc::new(sender_ep) as Arc<dyn SharingTransport>,
+        receiver_node,
+        Some(Arc::clone(&emitter) as Arc<dyn ProgressEmitter>),
+    ));
+    let sender = SyncSenderRuntime::new();
+    {
+        let mut guard = sender.lock_inner().await;
+        guard.insert(
+            receiver_node,
+            StartedSender {
+                engine: Arc::clone(&engine),
+                origin_device: node_id_hex(&sender_node),
+                peer: receiver_node,
+            },
+        );
+    }
+
+    // Seed 4 fixture frames on A: idx 0,1,2 are the first batch; idx 3 is the one
+    // new frame the overlapping re-send adds. Each idx writes a distinct pixel
+    // value → a distinct sampling + full xxh3. The 3 overlapping payloads are
+    // byte-identical across sends (same unchanged source files), so B's responder
+    // sampling-matches then full-confirms them as true duplicates; idx 3's bytes
+    // are genuinely different, so it stays wanted.
+    let mut frame_ids: Vec<i64> = Vec::with_capacity(4);
+    for idx in 0..4 {
+        let (fid, _uuid, _object, _exptime) = insert_capture_frame(&capture_ctx, &capture_files, idx);
+        frame_ids.push(fid);
+    }
+
+    // ── (1) First batch: 3 frames → B ingests all 3, all reported new ──────────
+    let batch1: Vec<i64> = frame_ids[0..3].to_vec();
+    let r1 = enqueue_sync_selection(&capture_ctx, &sender, receiver_node, batch1, None)
+        .await
+        .expect("first enqueue");
+    assert_eq!(r1.enqueued_count, 3, "the first 3 frames enqueue");
+
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 3, WAIT).await;
+    wait_until(|| emitter.sent_finished().len() == 1, WAIT).await;
+    assert_eq!(
+        emitter.sent_finished()[0],
+        (3, 0),
+        "the first batch is all new: {{new:3, duplicate:0}}"
+    );
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), 3, "B holds the 3 first-batch files");
+    // B's ingest populated `files.content_hash` for all 3 — the sampling hash the
+    // responder diffs the next offer against.
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL"),
+        3,
+        "every ingested file carries its sampling content_hash"
+    );
+
+    // ── (2) Overlapping batch: the same 3 + 1 new (4 total) ────────────────────
+    // Only the 1 new frame is transferred; the 3 B already holds are dropped by
+    // the negotiate handshake before any announce/serve of them.
+    let batch2: Vec<i64> = frame_ids[0..4].to_vec();
+    let r2 = enqueue_sync_selection(&capture_ctx, &sender, receiver_node, batch2, None)
+        .await
+        .expect("second enqueue");
+    assert_eq!(r2.enqueued_count, 4, "all 4 frames re-enqueue at the app layer");
+
+    wait_until(|| emitter.sent_finished().len() == 2, WAIT).await;
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 4, WAIT).await;
+
+    assert_eq!(
+        emitter.sent_finished()[1],
+        (1, 3),
+        "the overlapping re-send moves only the 1 new frame; the 3 dupes are dropped"
+    );
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), 4, "B holds exactly 4 files after the re-send");
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 4, "B holds exactly 4 frames after the re-send");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(DISTINCT uuid) FROM frames"),
+        4,
+        "B's 4 frames all carry distinct uuids — no frame was double-ingested"
+    );
+
+    // ── (3) Fully-overlapping re-send: all 4 again → all-duplicate terminal ─────
+    // Every offered frame is a known duplicate, so the handshake returns an empty
+    // want and the package terminalizes confirmed WITHOUT announcing or serving —
+    // B never even sees an announce, and its catalog is untouched.
+    let batch3: Vec<i64> = frame_ids[0..4].to_vec();
+    enqueue_sync_selection(&capture_ctx, &sender, receiver_node, batch3, None)
+        .await
+        .expect("third enqueue");
+
+    wait_until(|| emitter.sent_finished().len() == 3, WAIT).await;
+    assert_eq!(
+        emitter.sent_finished()[2],
+        (0, 4),
+        "a fully-overlapping re-send transfers nothing: {{new:0, duplicate:4}}"
+    );
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), 4, "B unchanged by the all-duplicate re-send");
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 4, "B unchanged by the all-duplicate re-send");
 
     // Clean shutdown of the background tasks (tidy; tempdir drop handles the rest).
     engine.shutdown().await;
