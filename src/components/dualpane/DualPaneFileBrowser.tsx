@@ -38,6 +38,7 @@ import {
   Pencil,
   Play,
   RefreshCw,
+  Send,
   Sliders,
   Trash2,
   X as XIcon,
@@ -52,6 +53,7 @@ import type { FileWithFrame, Frame } from '../../types/models';
 import type { ScanRootWithAvailability } from '../../types/helpers';
 import BlinkViewer from '../BlinkViewer';
 import { computeMissingFlags, type MissingFlags } from '../missing-metadata/MissingMetadataTable';
+import { SendToNodeDialog } from '../transfers/SendToNodeDialog';
 import CatalogSearch from './CatalogSearch';
 import MetadataPane from './MetadataPane';
 import {
@@ -352,6 +354,12 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   const [mkdirState, setMkdirState] = useState<{ destDir: string } | null>(null);
   const [renameState, setRenameState] = useState<{ oldPath: string; oldName: string } | null>(null);
   const [blinkFrames, setBlinkFrames] = useState<FileWithFrame[] | null>(null);
+  /** "Send to…" — resolves the active-pane selection (file/folder paths) to
+   *  catalog frame ids, then opens the reusable SendToNodeDialog. `sendResolving`
+   *  guards against a double-invoke while the async resolve is in flight. */
+  const [sendOpen, setSendOpen] = useState(false);
+  const [sendFrameIds, setSendFrameIds] = useState<number[]>([]);
+  const [sendResolving, setSendResolving] = useState(false);
   const refreshTokenRef = useRef(0);
   /** Per-pane generation counter for in-flight directory loads. Each call to
    *  loadListing increments its pane's counter and captures the value; only
@@ -854,6 +862,44 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
     setBlinkFrames(frames);
   }, [state.activePane, state.panes, visibleListing]);
 
+  /** "Send to…" — resolve the active-pane selection (file/folder paths) to
+   *  catalog frame ids, then open the SendToNodeDialog. Folders resolve to
+   *  every cataloged frame beneath them; a selection with nothing cataloged
+   *  resolves to `[]` and shows an inline notice instead of opening. The
+   *  `sendResolving` flag disables the action + guards a double-invoke while
+   *  the async resolve is in flight. */
+  const openSend = useCallback(async () => {
+    if (sendResolving) return;
+    const paths = [...state.panes[state.activePane].selection];
+    if (paths.length === 0) return;
+    setSendResolving(true);
+    try {
+      const frameIds = await api.invoke<number[]>('resolve_frame_ids_for_paths', { paths });
+      if (frameIds.length === 0) {
+        notify({
+          title: 'No cataloged frames in the selection',
+          detail: 'Select files or a folder that Athenaeum has cataloged to send them.',
+          kind: 'sync',
+          tone: 'info',
+        });
+        return;
+      }
+      setSendFrameIds(frameIds);
+      setSendOpen(true);
+    } catch (e) {
+      console.error('resolve_frame_ids_for_paths failed:', e);
+      notify({
+        title: 'Could not resolve frames to send',
+        detail: String(e),
+        kind: 'sync',
+        tone: 'warning',
+        hasErrors: true,
+      });
+    } finally {
+      setSendResolving(false);
+    }
+  }, [sendResolving, state.activePane, state.panes, notify]);
+
   /** Activate the row at `path` — folders/parent navigate, files no-op (Phase 2). */
   const activatePath = useCallback((path: string) => {
     const active = state.panes[state.activePane];
@@ -875,7 +921,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
   // True when ANY confirm/prompt dialog is open. Pane shortcuts (F-keys,
   // Tab, Cmd+I, Cmd+A, Space, Enter, arrows, Backspace) are suppressed in
   // that case so they can't accidentally fire underneath the dialog.
-  const isModalOpen = !!(confirmMove || confirmDelete || mkdirState || renameState || blinkFrames);
+  const isModalOpen = !!(confirmMove || confirmDelete || mkdirState || renameState || blinkFrames || sendOpen);
 
   // Modal-only key handler: ESC cancels any dialog; Y/Enter confirms simple
   // Move/Delete dialogs. Mkdir/Rename prompts handle their own Enter/Escape
@@ -1156,6 +1202,17 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
             })
           }
         />
+
+        <span className="text-border h-7 flex items-center">|</span>
+
+        <ShortcutButton
+          variant="accent"
+          icon={sendResolving ? <Loader2 size={12} className="animate-spin" /> : <Send size={12} />}
+          label="Send"
+          title="Send active selection to another Athenaeum node"
+          disabled={state.panes[state.activePane].selection.size === 0 || sendResolving}
+          onClick={() => void openSend()}
+        />
       </div>
 
       {/* Search */}
@@ -1383,6 +1440,15 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
           primaryLabel="Rename"
         />
       )}
+
+      {/* Send-to-node dialog — resolves the active-pane selection to frame ids
+          (see openSend) then fans the enqueue out to the chosen Athenaeum
+          nodes. Self-contained overlay; closing just unmounts its body. */}
+      <SendToNodeDialog
+        frameIds={sendFrameIds}
+        open={sendOpen}
+        onClose={() => setSendOpen(false)}
+      />
     </div>
   );
 }
