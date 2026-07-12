@@ -251,6 +251,17 @@ async fn flush_once(
             for item in files {
                 guard.insert(item);
             }
+            drop(guard);
+            // The staged package is now orphaned (its files are re-queued and the
+            // next flush mints a fresh dir). With a fan-out `cleanup` the zero
+            // `register` above already frees it; a single-target agent (`None`)
+            // must drop it here, or an Auto-mode dead-worker leaks one dir per
+            // quiet window. Best-effort — a failure just warns.
+            if cleanup.is_none() {
+                if let Err(error) = std::fs::remove_dir_all(&pkg_dir) {
+                    tracing::warn!(%error, package_ref = %package_ref, "failed to clean orphaned zero-target package dir");
+                }
+            }
             None
         }
     }
