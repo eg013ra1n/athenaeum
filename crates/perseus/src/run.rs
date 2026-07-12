@@ -165,8 +165,17 @@ pub fn build_package_for_file(
 /// Build ONE package containing a manifest record per `(capture_dir, file)` in
 /// `files`. A file that vanished, won't parse, or can't be hashed is dropped
 /// with a `warn!` and the batch continues — a single bad frame never fails the
-/// whole set. Returns `(pkg_dir, included_count)`; empty input OR every file
+/// whole set. Returns `(pkg_dir, included)` where `included` is the capture-file
+/// paths whose records actually made it into the package, in order
+/// (`included.len()` is the packaged record count); empty input OR every file
 /// dropped is an error (a package with zero records is never written).
+///
+/// Returning the *included* paths — not just a count — is what lets the batcher
+/// flush ([`crate::batcher`]) record as seen **only** the files it truly
+/// packaged. A present-but-unbuildable file dropped above must NOT be marked
+/// seen: the durable seen store is the dedup authority, so marking it would lose
+/// the frame forever; leaving it unseen makes it retried on the next detection /
+/// restart, matching the legacy per-file path (a failed build was never seen).
 ///
 /// Each record is byte-identical in shape to the single-file path (minted
 /// `frame_uuid`, `origin_catalog_uuid == frame_uuid`, capture-dir-relative
@@ -177,7 +186,7 @@ pub fn build_batch_package(
     config: &Config,
     files: &[(PathBuf /* capture_dir */, PathBuf /* file */)],
     origin_device: &str,
-) -> Result<(PathBuf, usize)> {
+) -> Result<(PathBuf, Vec<PathBuf>)> {
     let mut records: Vec<(PathBuf, ManifestRecord)> = Vec::with_capacity(files.len());
     for (capture_dir, file_path) in files {
         match build_manifest_record(config, capture_dir, file_path, origin_device) {
@@ -194,11 +203,14 @@ pub fn build_batch_package(
         anyhow::bail!("batch has no buildable files");
     }
 
-    let count = records.len();
+    // The capture-file paths that actually made it into the package, in order —
+    // captured BEFORE `records` is moved into `write_package`. The caller records
+    // exactly these as seen (see the fn docs).
+    let included: Vec<PathBuf> = records.iter().map(|(path, _)| path.clone()).collect();
     let pkg_dir = config.packages_dir().join(Uuid::new_v4().to_string());
     write_package(&pkg_dir, records)
         .with_context(|| format!("write batch package {}", pkg_dir.display()))?;
-    Ok((pkg_dir, count))
+    Ok((pkg_dir, included))
 }
 
 /// Build the single manifest record for one capture file — the per-file work
@@ -2581,8 +2593,8 @@ mod batch_package_tests {
     fn build_batch_package_bundles_all_present_files() {
         let (config, cap, files) = three_capture_files();
         let input: Vec<_> = files.iter().map(|f| (cap.clone(), f.clone())).collect();
-        let (pkg_dir, n) = build_batch_package(&config, &input, &"aa".repeat(32)).unwrap();
-        assert_eq!(n, 3);
+        let (pkg_dir, included) = build_batch_package(&config, &input, &"aa".repeat(32)).unwrap();
+        assert_eq!(included, files, "every present file is included, in order");
         let recs = athenaeum_core::package::read_manifest(&pkg_dir).unwrap();
         assert_eq!(recs.len(), 3); // one manifest, 3 records
     }
@@ -2592,8 +2604,10 @@ mod batch_package_tests {
         let (config, cap, files) = three_capture_files();
         std::fs::remove_file(&files[1]).unwrap(); // one gone before build
         let input: Vec<_> = files.iter().map(|f| (cap.clone(), f.clone())).collect();
-        let (pkg_dir, n) = build_batch_package(&config, &input, &"aa".repeat(32)).unwrap();
-        assert_eq!(n, 2); // the survivor count
+        let (pkg_dir, included) = build_batch_package(&config, &input, &"aa".repeat(32)).unwrap();
+        // Only the two survivors are included — the vanished file is NOT (so the
+        // batcher never marks it seen); order is preserved.
+        assert_eq!(included, vec![files[0].clone(), files[2].clone()]);
         assert_eq!(
             athenaeum_core::package::read_manifest(&pkg_dir).unwrap().len(),
             2

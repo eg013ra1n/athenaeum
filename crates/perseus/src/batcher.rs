@@ -27,8 +27,11 @@
 //! One flush builds one package from the drained files
 //! ([`build_batch_package`]), fans it to every target
 //! ([`enqueue_package_to_all`]), and — only when at least one target accepted it
-//! — marks every file in the batch [`record_seen`] and writes a
-//! [`BatchStore`] row. A flush that reaches **zero** targets re-queues its files
+//! — marks the files it **actually packaged** [`record_seen`] and writes a
+//! [`BatchStore`] row. A file that was present but unbuildable (won't parse /
+//! stat / hash) is dropped from the package at build time and is deliberately
+//! left unseen, so it is retried on the next detection / restart rather than
+//! silently lost. A flush that reaches **zero** targets re-queues its files
 //! (they were never recorded as seen) so the next flush retries them; a flush
 //! whose files all vanished is dropped with a `warn!` (there is nothing left to
 //! send). The batcher loop never fails on a bad batch — a single flush error is
@@ -171,7 +174,7 @@ async fn flush_once(
         std::mem::take(&mut *guard).into_iter().collect()
     };
 
-    let (pkg_dir, n) = match build_batch_package(config, &files, origin_device) {
+    let (pkg_dir, included) = match build_batch_package(config, &files, origin_device) {
         Ok(built) => built,
         Err(error) => {
             // Every file in the batch vanished / won't parse. There is nothing on
@@ -185,6 +188,10 @@ async fn flush_once(
             return None;
         }
     };
+    // The packaged record count == the number of files that actually shipped.
+    // Some drained files may have been dropped at build time (present but
+    // unbuildable); those are deliberately absent from `included`.
+    let n = included.len();
 
     let (first_id, delivered) = enqueue_package_to_all(engines, &pkg_dir).await;
     // Fan-out only: register the delivered target count so the shared payload is
@@ -199,9 +206,18 @@ async fn flush_once(
 
     match first_id {
         Some(_) => {
-            // At least one target durably queued the package. Mark every file
-            // seen (so a restart never re-baselines it) and record the batch.
-            for (_, file) in &files {
+            // At least one target durably queued the package. Mark seen ONLY the
+            // files that actually made it into the package (so a restart never
+            // re-baselines them) and record the batch. A drained file that was
+            // dropped at build time (present-but-unbuildable) is intentionally
+            // left unseen: it never shipped, so it must stay enqueue-eligible and
+            // get retried on the next detection / restart rather than be silently
+            // lost (the durable seen store is the dedup authority). This is not
+            // the zero-target re-queue path — we do NOT re-insert it into
+            // `pending` (that would spin a permanently-corrupt file forever
+            // in-session); simply not marking it seen matches the legacy per-file
+            // behavior exactly.
+            for file in &included {
                 record_seen(seen, file, &package_ref);
             }
             if let Err(error) = batches.record(&package_ref, mode_str(mode), &now_rfc3339(), n) {
@@ -427,6 +443,9 @@ mod tests {
         capture: PathBuf,
         files: Vec<PathBuf>,
         batches: Arc<BatchStore>,
+        /// A clone of the batcher's seen store, so a test can assert which files
+        /// were (or were not) recorded seen after a flush.
+        seen: Arc<SeenStore>,
         stable_tx: mpsc::Sender<(PathBuf, PathBuf)>,
         handle: BatcherHandle,
         _task: JoinHandle<()>,
@@ -486,7 +505,7 @@ mod tests {
             let (handle, task) = spawn_batcher(
                 stable_rx,
                 vec![Arc::clone(&engine)],
-                seen,
+                Arc::clone(&seen),
                 Arc::clone(&batches),
                 config,
                 "aa".repeat(32),
@@ -498,6 +517,7 @@ mod tests {
                 capture,
                 files,
                 batches,
+                seen,
                 stable_tx,
                 handle,
                 _task: task,
@@ -616,5 +636,58 @@ mod tests {
         h.handle.flush_now().await;
         settle().await;
         assert_eq!(h.batch_count(), 1, "an empty manual flush is a no-op");
+    }
+
+    /// The current `(size, mtime_ms)` of a file on disk, in the same shape the
+    /// seen store keys on — so a test can ask `should_enqueue` the exact question
+    /// the watcher would.
+    fn stat_size_mtime(path: &Path) -> (u64, i64) {
+        let m = std::fs::metadata(path).expect("stat test file");
+        (m.len(), crate::seen::mtime_millis(m.modified().ok()))
+    }
+
+    /// A present-but-unbuildable file (garbage, non-FITS) drained in a batch is
+    /// **not** marked seen when the batch delivers — only the files that actually
+    /// made it into the package are. So the good file is deduped (never re-sent)
+    /// while the corrupt-but-present file stays enqueue-eligible and is retried on
+    /// the next detection / restart, exactly as the legacy per-file path did.
+    /// Without this the corrupt file would be marked seen despite never shipping,
+    /// and the durable seen store would silently lose it forever.
+    #[tokio::test]
+    async fn dropped_but_present_file_is_not_marked_seen() {
+        let h = Harness::spawn(SendCfg {
+            mode: Mode::Manual,
+            auto_quiet_secs: 60,
+        });
+
+        let good = h.files[0].clone();
+        let bad = h.files[1].clone();
+        // Corrupt the second fixture in place: it still EXISTS on disk, but
+        // `build_batch_package` can no longer parse it, so it is dropped from the
+        // package (present-but-unbuildable) rather than vanishing.
+        std::fs::write(&bad, b"this is not a FITS file").expect("clobber fixture");
+
+        h.feed(&[0, 1]).await;
+        settle().await;
+        h.handle.flush_now().await;
+        wait_until(|| h.batch_count() == 1).await;
+
+        // Only the good file was packaged.
+        let rows = h.batches.list().unwrap();
+        assert_eq!(rows[0].file_count, 1, "only the buildable file was packaged");
+
+        // The good file is now seen (deduped — never re-sent).
+        let (gs, gm) = stat_size_mtime(&good);
+        assert!(
+            !h.seen.should_enqueue(&good, gs, gm).unwrap(),
+            "the packaged file is recorded seen"
+        );
+
+        // The corrupt-but-present file is NOT seen — it will be retried, not lost.
+        let (bs, bm) = stat_size_mtime(&bad);
+        assert!(
+            h.seen.should_enqueue(&bad, bs, bm).unwrap(),
+            "a dropped-but-present file is left enqueue-eligible for retry"
+        );
     }
 }
