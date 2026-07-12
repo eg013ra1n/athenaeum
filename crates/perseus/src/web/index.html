@@ -57,6 +57,28 @@
       .banner.err { background: #3d1417; color: var(--err); border-color: var(--err); }
       .banner.info { background: #10233a; color: var(--accent); border-color: var(--accent); }
       #agent-banner { font-weight: 600; }
+      /* Sync Phase 2: To-sync pending tree + batched history. Reuses the page's
+         tokens/chip idioms; adds only tree/collapsible-specific rules. */
+      .chip.sending { background: #1f3a5f; color: #79c0ff; }
+      .chip.auto { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
+      .chip.manual { background: #3a2d10; color: var(--warn); }
+      #pendingTree { max-height: 22rem; overflow-y: auto; margin-top: 0.25rem; font-size: 0.85rem; }
+      details.tree-node > summary { cursor: pointer; padding: 0.12rem 0.25rem; border-radius: 4px; }
+      details.tree-node > summary:hover { background: var(--surface2); }
+      .tree-body { margin-left: 0.9rem; border-left: 1px solid var(--border); padding-left: 0.6rem; }
+      ul.tree-files { list-style: none; margin: 0; padding: 0; }
+      ul.tree-files li { padding: 0.12rem 0 0.12rem 1.15rem; color: var(--muted); }
+      #batchList details { margin-bottom: 0.3rem; }
+      details.batch-day > summary { cursor: pointer; padding: 0.3rem 0.4rem; background: var(--surface2); border-radius: 6px; }
+      .batch-day-body { margin: 0.3rem 0 0.5rem 0.6rem; padding-left: 0.6rem; border-left: 1px solid var(--border); }
+      details.batch > summary { cursor: pointer; padding: 0.3rem 0.4rem; border-radius: 6px; }
+      details.batch > summary:hover { background: var(--surface2); }
+      details.batch > summary > span { margin-right: 0.55rem; }
+      .btargets { margin: 0.2rem 0 0.4rem 1.4rem; }
+      .btarget { padding: 0.15rem 0; }
+      .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+      .seg label { flex-direction: row; align-items: center; gap: 0.3rem; padding: 0.3rem 0.6rem; color: var(--text); cursor: pointer; }
+      .seg label:first-child { border-right: 1px solid var(--border); }
     </style>
   </head>
   <body>
@@ -123,6 +145,29 @@
         </table></div>
       </section>
 
+      <!-- To sync (Sync Phase 2): the pending accumulator as a rel_path tree, the
+           live Auto↔Manual send-mode toggle (PUT /api/send-mode, no restart), the
+           auto quiet-window input (only meaningful for Auto), and the manual
+           "Send N pending" button (Manual + count>0 → POST /api/send-now). Polled
+           on the 2 s tick; the toggle/quiet input are not clobbered while focused. -->
+      <section id="tosync">
+        <h2>To Sync</h2>
+        <div class="row" style="margin-bottom:0.5rem;">
+          <div class="seg" role="radiogroup" aria-label="Send mode">
+            <label><input type="radio" name="sendMode" id="modeAuto" value="auto" /> Auto</label>
+            <label><input type="radio" name="sendMode" id="modeManual" value="manual" /> Manual</label>
+          </div>
+          <label id="quietWrap" style="flex-direction:row; align-items:center; gap:0.4rem; color:var(--muted);">
+            quiet window (s)
+            <input id="quietSecs" type="number" min="1" style="width:6rem;" aria-label="Auto quiet window in seconds" />
+          </label>
+          <span style="flex:1;"></span>
+          <button id="sendNow" disabled>Send 0 pending</button>
+        </div>
+        <div class="flash" id="tosyncFlash"></div>
+        <div id="pendingTree"><div class="empty">nothing pending — all captures sent</div></div>
+      </section>
+
       <section id="capture-dirs">
         <h2>Capture Directories</h2>
         <div class="tablewrap"><table>
@@ -168,6 +213,16 @@
           <tbody id="senttbody"></tbody>
         </table></div>
         <div class="flash" id="delflash"></div>
+      </section>
+
+      <!-- Batched history (Sync Phase 2): recorded send-batches from
+           GET /api/batches, newest-first. Auto batches are grouped under a
+           collapsible calendar-day header; manual batches list individually.
+           Expand a batch row → its per-target {name, state}. `new`/`duplicate`
+           are not yet tracked post-flight, so both render as "—". -->
+      <section id="batches">
+        <h2>Batched History</h2>
+        <div id="batchList"><div class="empty">no batches sent yet</div></div>
       </section>
 
       <section id="history">
@@ -669,11 +724,172 @@
       $('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') searchHistory(); });
       $('saveRet').addEventListener('click', savePolicy);
 
+      // ── To sync: pending tree + Auto/Manual toggle + manual send ────────────
+      // `pendingCount` is the last-fetched total; the Send button label + enabled
+      // state derive from it plus the currently-selected mode. `lastPendingJson`
+      // guards the tree render so an unchanged pending set doesn't collapse the
+      // operator's expanded <details> every 2 s tick.
+      let pendingCount = 0;
+      let lastPendingJson = null;
+
+      const currentMode = () => ($('modeManual').checked ? 'manual' : 'auto');
+
+      function updateQuietVisibility() {
+        // The quiet window is inert in manual mode — only show it for Auto.
+        $('quietWrap').style.display = currentMode() === 'auto' ? '' : 'none';
+      }
+
+      function updateSendButton() {
+        const manual = currentMode() === 'manual';
+        const btn = $('sendNow');
+        btn.textContent = `Send ${pendingCount} pending`;
+        // Auto flushes on its own quiet timer → the manual button is hidden.
+        // In Manual it is enabled only when there is something to flush.
+        btn.style.display = manual ? '' : 'none';
+        btn.disabled = !(manual && pendingCount > 0);
+      }
+
+      function applyModeControls(mode, quietSecs) {
+        $('modeAuto').checked = mode !== 'manual';
+        $('modeManual').checked = mode === 'manual';
+        // Never clobber the quiet input while the operator is typing in it.
+        if (document.activeElement !== $('quietSecs')) $('quietSecs').value = quietSecs;
+        updateQuietVisibility();
+        updateSendButton();
+      }
+
+      function renderNode(node) {
+        const label = `${esc(node.name)} <span class="muted">(${node.count})</span>`;
+        const childHtml = node.children.map(renderNode).join('');
+        const fileHtml = node.files.length
+          ? `<ul class="tree-files">${node.files.map((f) => `<li class="mono">${esc(f)}</li>`).join('')}</ul>`
+          : '';
+        return `<details open class="tree-node"><summary>${label}</summary><div class="tree-body">${childHtml}${fileHtml}</div></details>`;
+      }
+
+      function renderPendingTree(root) {
+        // Skip the re-render (and preserve expand state) when nothing changed.
+        const json = JSON.stringify(root);
+        if (json === lastPendingJson) return;
+        lastPendingJson = json;
+        const container = $('pendingTree');
+        if (!root || root.count === 0) {
+          container.innerHTML = '<div class="empty">nothing pending — all captures sent</div>';
+          return;
+        }
+        // The root is the synthetic empty node — render its children/files at the
+        // top level rather than showing a blank summary for it.
+        const childHtml = root.children.map(renderNode).join('');
+        const fileHtml = root.files.length
+          ? `<ul class="tree-files">${root.files.map((f) => `<li class="mono">${esc(f)}</li>`).join('')}</ul>`
+          : '';
+        container.innerHTML = childHtml + fileHtml;
+      }
+
+      async function refreshPending() {
+        try {
+          const p = await getJson('/api/pending');
+          pendingCount = p.count;
+          // Don't clobber the toggle/quiet input while the operator is interacting
+          // with the card; the tree + button label always reflect the live count.
+          if (!$('tosync').contains(document.activeElement)) applyModeControls(p.mode, p.autoQuietSecs);
+          else updateSendButton();
+          renderPendingTree(p.tree);
+        } catch (e) {
+          $('pendingTree').innerHTML = `<div class="empty">error: ${esc(e.message)}</div>`;
+        }
+      }
+
+      async function saveSendMode() {
+        const edit = { mode: currentMode(), autoQuietSecs: Number($('quietSecs').value) || 0 };
+        const f = $('tosyncFlash');
+        try {
+          const r = await api('/api/send-mode', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(edit) });
+          if (r.status === 400 || r.status === 422) { f.textContent = 'rejected: ' + (await r.text()); f.className = 'flash err'; return; }
+          if (!r.ok) throw new Error(await r.text());
+          const m = await r.json();
+          applyModeControls(m.mode, m.autoQuietSecs);
+          f.textContent = 'saved'; f.className = 'flash ok';
+        } catch (e) { f.textContent = 'save failed: ' + e.message; f.className = 'flash err'; }
+      }
+
+      async function sendNow() {
+        const f = $('tosyncFlash');
+        try {
+          const r = await api('/api/send-now', { method: 'POST' });
+          if (!r.ok) throw new Error(await r.text());
+          const rep = await r.json();
+          f.textContent = rep.flushed > 0 ? `flushed ${rep.flushed} pending` : 'nothing pending to send';
+          f.className = 'flash' + (rep.flushed > 0 ? ' ok' : '');
+          // Reflect the flush at once: the tree empties and the batch appears.
+          refreshPending(); refreshBatches();
+        } catch (e) { f.textContent = 'send failed: ' + e.message; f.className = 'flash err'; }
+      }
+
+      document.querySelectorAll('input[name="sendMode"]').forEach((r) => r.addEventListener('change', () => {
+        updateQuietVisibility(); updateSendButton(); saveSendMode();
+      }));
+      $('quietSecs').addEventListener('change', saveSendMode);
+      $('quietSecs').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); saveSendMode(); } });
+      $('sendNow').addEventListener('click', sendNow);
+
+      // ── Batched history: grouped send-batches from /api/batches ──────────────
+      // Auto batches group under a collapsible calendar-day header (consecutive
+      // same-day runs → one header, chronological, newest-first); manual batches
+      // list individually. `lastBatchesJson` guards the render so an unchanged
+      // list doesn't collapse an expanded batch row on each tick.
+      let lastBatchesJson = null;
+
+      const batchDay = (createdAt) => (String(createdAt || '').match(/^\d{4}-\d{2}-\d{2}/) || [String(createdAt || '').slice(0, 10) || '—'])[0];
+      const batchTime = (createdAt) => { const m = String(createdAt || '').match(/T(\d{2}:\d{2}:\d{2})/); return m ? m[1] : String(createdAt || ''); };
+
+      function batchRow(b) {
+        const modeCls = b.mode === 'manual' ? 'manual' : 'auto';
+        const targets = b.targets.length
+          ? b.targets.map((t) => `<div class="btarget"><span class="mono">${esc(t.name)}</span> — <span class="chip ${esc(t.state)}">${esc(t.state)}</span></div>`).join('')
+          : '<div class="empty">no target rows visible yet</div>';
+        // `new`/`duplicate` are not tracked post-flight (deferred) → shown as "—".
+        return `<details class="batch"><summary>`
+          + `<span class="mono">${esc(batchTime(b.createdAt))}</span>`
+          + `<span class="chip ${modeCls}">${esc(b.mode)}</span>`
+          + `<span>${esc(b.fileCount)} file${b.fileCount === 1 ? '' : 's'}</span>`
+          + `<span class="muted">new — · dup —</span>`
+          + `<span class="chip ${esc(b.outcome)}">${esc(b.outcome)}</span>`
+          + `</summary><div class="btargets">${targets}</div></details>`;
+      }
+
+      async function refreshBatches() {
+        try {
+          const rows = await getJson('/api/batches');
+          const json = JSON.stringify(rows);
+          if (json === lastBatchesJson) return;
+          lastBatchesJson = json;
+          const container = $('batchList');
+          if (!rows.length) { container.innerHTML = '<div class="empty">no batches sent yet</div>'; return; }
+          let html = '';
+          let i = 0;
+          while (i < rows.length) {
+            if (rows[i].mode === 'auto') {
+              const day = batchDay(rows[i].createdAt);
+              const group = [];
+              while (i < rows.length && rows[i].mode === 'auto' && batchDay(rows[i].createdAt) === day) { group.push(rows[i]); i++; }
+              const files = group.reduce((s, x) => s + x.fileCount, 0);
+              html += `<details class="batch-day" open><summary><span class="mono">${esc(day)}</span> `
+                + `<span class="muted">— ${group.length} auto batch${group.length === 1 ? '' : 'es'}, ${files} file${files === 1 ? '' : 's'}</span></summary>`
+                + `<div class="batch-day-body">${group.map(batchRow).join('')}</div></details>`;
+            } else {
+              html += batchRow(rows[i]); i++;
+            }
+          }
+          container.innerHTML = html;
+        } catch (e) { $('batchList').innerHTML = `<div class="empty">error: ${esc(e.message)}</div>`; }
+      }
+
       // Initial load; poll status + sent + retention log every 2 s. History, the
       // policy form, the targets list and the device-name field are on demand /
       // load-once (not clobbered while editing).
       loadPolicy(); searchHistory(); loadCaptureDirs(); loadTargets(); loadDeviceName(); refreshAccount();
-      function tick() { refreshStatus(); refreshSent(); refreshLog(); refreshAccount(); loadDeviceName(); }
+      function tick() { refreshStatus(); refreshSent(); refreshLog(); refreshAccount(); loadDeviceName(); refreshPending(); refreshBatches(); }
       tick(); setInterval(tick, 2000);
     </script>
   </body>
