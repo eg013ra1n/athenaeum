@@ -26,7 +26,8 @@ use athenaeum_core::sync::{SharedPackageCleanup, SyncEngineHandle};
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 
-use crate::config::{Config, RetentionConfig};
+use crate::batcher::BatcherHandle;
+use crate::config::{Config, RetentionConfig, SendCfg};
 use crate::run::Agent;
 use crate::web::RetentionRunRecord;
 
@@ -85,6 +86,12 @@ pub trait ManagedAgent: Send + 'static {
     fn retention_tx(&self) -> watch::Sender<RetentionConfig>;
     /// The rolling retention-pass log the status page serves read-only.
     fn retention_log(&self) -> Arc<Mutex<VecDeque<RetentionRunRecord>>>;
+    /// The running batcher's control handle (Sync Phase 2), `Some` only on the
+    /// `watch` path. The web `GET /api/pending` / `POST /api/send-now` drive it.
+    fn batcher(&self) -> Option<BatcherHandle>;
+    /// The send-config live-edit sender (the web `PUT /api/send-mode` writes here
+    /// so the running batcher live-applies an Auto↔Manual / quiet-window change).
+    fn send_cfg_tx(&self) -> watch::Sender<SendCfg>;
     /// The live in-flight (non-terminal) outbound package count.
     fn in_flight(&self) -> anyhow::Result<usize>;
     /// Gracefully stop the agent, returning a handle that completes on shutdown.
@@ -106,6 +113,12 @@ impl ManagedAgent for Agent {
     }
     fn retention_log(&self) -> Arc<Mutex<VecDeque<RetentionRunRecord>>> {
         Agent::retention_log(self)
+    }
+    fn batcher(&self) -> Option<BatcherHandle> {
+        Agent::batcher(self)
+    }
+    fn send_cfg_tx(&self) -> watch::Sender<SendCfg> {
+        Agent::send_cfg_tx(self)
     }
     fn in_flight(&self) -> anyhow::Result<usize> {
         Ok(self.status_snapshot()?.len())
@@ -393,6 +406,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
     use athenaeum_core::sync::store::StandaloneSyncStore;
 
     use crate::account::PairingCache;
+    use crate::batch_store::BatchStore;
     use crate::seen::SeenStore;
     use crate::web::{build_router, WebState};
 
@@ -418,6 +432,12 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
         SeenStore::open(config.db_path())
             .with_context(|| format!("open seen store {}", config.db_path().display()))?,
     );
+    // The per-batch send record (`perseus_batch`), a third WAL connection to the
+    // same perseus.db, so `GET /api/batches` lists batches engine-attached or not.
+    let batches = Arc::new(
+        BatchStore::open(config.db_path())
+            .with_context(|| format!("open batch store {}", config.db_path().display()))?,
+    );
 
     // The lifecycle channel + wake are created HERE so the always-on page can
     // hold the receiver (and ring the wake — Task 5's account page prods a
@@ -428,6 +448,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
     let web_state = Arc::new(WebState::detached(
         Arc::clone(&store),
         Arc::clone(&seen),
+        Arc::clone(&batches),
         config.clone(),
         config_path.clone(),
         state_rx,
@@ -459,6 +480,8 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
                     let peer_device = agent.peer_device();
                     let retention_tx = agent.retention_tx();
                     let retention_log = agent.retention_log();
+                    let batcher = agent.batcher();
+                    let send_cfg_tx = agent.send_cfg_tx();
                     let device_names = PairingCache::load(&data_dir).device_names;
                     // The dirs + targets the engine was launched over — read from
                     // the same config file the launcher just used (authoritative,
@@ -482,6 +505,8 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
                             device_names,
                             running_dirs,
                             running_targets,
+                            batcher,
+                            send_cfg_tx,
                         )
                         .await;
                     });
@@ -552,6 +577,16 @@ mod tests {
         }
         fn retention_log(&self) -> Arc<Mutex<VecDeque<RetentionRunRecord>>> {
             Arc::new(Mutex::new(VecDeque::new()))
+        }
+        fn batcher(&self) -> Option<BatcherHandle> {
+            None
+        }
+        fn send_cfg_tx(&self) -> watch::Sender<SendCfg> {
+            watch::channel(SendCfg {
+                mode: crate::config::Mode::Auto,
+                auto_quiet_secs: 0,
+            })
+            .0
         }
         fn in_flight(&self) -> anyhow::Result<usize> {
             Ok(self.in_flight.load(Ordering::SeqCst))

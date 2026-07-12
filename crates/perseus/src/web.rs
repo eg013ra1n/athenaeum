@@ -55,15 +55,18 @@ use tokio::sync::{watch, Notify, RwLock};
 use athenaeum_core::package::{read_manifest, MANIFEST_FILENAME};
 use athenaeum_core::sync::store::StandaloneSyncStore;
 use athenaeum_core::sync::{
-    Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState, SharedPackageCleanup,
-    SyncEngineHandle, SyncStore,
+    node_id_hex, Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState,
+    SharedPackageCleanup, SyncEngineHandle, SyncStore,
 };
 
-use crate::config::{Config, RetentionConfig};
+use crate::batch_store::BatchStore;
+use crate::batcher::BatcherHandle;
+use crate::config::{Config, Mode, RetentionConfig, SendCfg};
 use crate::config_edit::{
-    apply_capture_dirs_edit, apply_device_name_edit, apply_retention_edit, apply_targets_edit,
-    RetentionEdit,
+    apply_capture_dirs_edit, apply_device_name_edit, apply_retention_edit, apply_send_mode_edit,
+    apply_targets_edit, RetentionEdit,
 };
+use crate::pending::{pending_tree, PendingNode};
 use crate::run::{delete_confirmed_packages, DeleteReport};
 use crate::seen::SeenStore;
 use crate::supervisor::AgentState;
@@ -154,6 +157,23 @@ pub struct WebState {
     /// Set on attach, cleared on detach; the targets editor's `restartPending`
     /// is this differing from the configured `targets` while the engine runs.
     pub running_targets: RwLock<Vec<String>>,
+    /// The running batcher's control handle (Sync Phase 2). `Some` only while the
+    /// engine is attached: `GET /api/pending` reads its pending snapshot for the
+    /// "To sync" tree and `POST /api/send-now` triggers a manual flush through it.
+    /// Set on attach, cleared on detach — mirror `engine` (a request mid-setup
+    /// sees `None` and degrades to an empty tree / a `0`-flush no-op).
+    pub batcher: RwLock<Option<BatcherHandle>>,
+    /// Durable per-batch send record (`perseus_batch`). Opened once at web start
+    /// beside `store`/`seen` (a second WAL connection to the same `perseus.db`),
+    /// so `GET /api/batches` lists recorded batches engine-attached or not.
+    pub batches: Arc<BatchStore>,
+    /// The running batcher's live send-config channel, threaded in from the agent
+    /// on attach (a clone of [`Agent::send_cfg_tx`](crate::run::Agent::send_cfg_tx)).
+    /// `PUT /api/send-mode` sends the re-validated [`SendCfg`] here so the running
+    /// batcher live-applies an Auto↔Manual / quiet-window change with no restart.
+    /// A placeholder (no receivers) while detached — sends are harmless no-ops —
+    /// and, like `retention_tx`, left as-is on detach rather than cleared.
+    pub send_cfg_tx: RwLock<watch::Sender<SendCfg>>,
 }
 
 impl WebState {
@@ -163,11 +183,15 @@ impl WebState {
     pub fn detached(
         store: Arc<StandaloneSyncStore>,
         seen: Arc<SeenStore>,
+        batches: Arc<BatchStore>,
         config: Config,
         config_path: PathBuf,
         agent_state: watch::Receiver<AgentState>,
         supervisor_wake: Arc<Notify>,
     ) -> Self {
+        // A placeholder send-config seed for the not-yet-attached channel; the
+        // real value arrives with the batcher's sender on `attach`.
+        let send_cfg = config.send_cfg();
         Self {
             store,
             seen,
@@ -185,6 +209,11 @@ impl WebState {
             device_names: RwLock::new(HashMap::new()),
             running_dirs: RwLock::new(Vec::new()),
             running_targets: RwLock::new(Vec::new()),
+            batcher: RwLock::new(None),
+            batches,
+            // Placeholder send-config channel (no receivers) until `attach` swaps
+            // in the running batcher's real sender — mirrors `retention_tx`.
+            send_cfg_tx: RwLock::new(watch::channel(send_cfg).0),
         }
     }
 
@@ -203,6 +232,8 @@ impl WebState {
         device_names: HashMap<String, String>,
         running_dirs: Vec<PathBuf>,
         running_targets: Vec<String>,
+        batcher: Option<BatcherHandle>,
+        send_cfg_tx: watch::Sender<SendCfg>,
     ) {
         *self.engine.write().await = engine;
         *self.cleanup.write().await = cleanup;
@@ -212,6 +243,8 @@ impl WebState {
         *self.device_names.write().await = device_names;
         *self.running_dirs.write().await = running_dirs;
         *self.running_targets.write().await = running_targets;
+        *self.batcher.write().await = batcher;
+        *self.send_cfg_tx.write().await = send_cfg_tx;
     }
 
     /// Drop the engine-dependent bits as the engine stops (setup lost, restart,
@@ -224,6 +257,10 @@ impl WebState {
         *self.peer_device.write().await = String::new();
         *self.running_dirs.write().await = Vec::new();
         *self.running_targets.write().await = Vec::new();
+        // The batcher is a load-bearing safety bit (it drives sends): clear it so
+        // a detached page's send-now is an honest no-op. `send_cfg_tx` is left
+        // as-is (a harmless stale sender) exactly like `retention_tx`.
+        *self.batcher.write().await = None;
     }
 }
 
@@ -365,6 +402,16 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
             "/api/device-name",
             get(api_get_device_name).put(api_put_device_name),
         )
+        // Sync Phase 2 (send workflow): the pending "To sync" tree, the live
+        // Auto↔Manual send-mode toggle, the manual "send now" trigger, and the
+        // batched send history. All bearer-gated like every other `/api/*` route.
+        .route("/api/pending", get(api_get_pending))
+        .route(
+            "/api/send-mode",
+            get(api_get_send_mode).put(api_put_send_mode),
+        )
+        .route("/api/send-now", post(api_send_now))
+        .route("/api/batches", get(api_batches))
         .route("/api/delete", post(api_delete))
         .route("/api/retry", post(api_retry))
         // Account sign-in (Task 5) — email→OTP through the hub. These are
@@ -997,6 +1044,267 @@ async fn api_put_device_name(
     }))
 }
 
+// ── Sync Phase 2: pending tree / send-mode / send-now / batched history ───────
+
+/// `GET /api/pending` payload: the "To sync" tree plus the live send-mode header
+/// the page renders above it (so a single fetch drives the whole panel).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingDto {
+    /// The pending accumulator grouped into a `rel_path` trie (see [`pending_tree`]).
+    tree: PendingNode,
+    /// The current send mode (`auto` | `manual`) — the same snake_case string the
+    /// TOML uses ([`crate::config_edit::mode_str`]).
+    mode: String,
+    /// The auto-mode quiet window in seconds (inert in manual mode).
+    auto_quiet_secs: u64,
+    /// Total pending files — the batcher's accumulator length, i.e. the "N
+    /// pending" the manual "send now" button acts on.
+    count: usize,
+}
+
+/// `GET /api/send-mode` payload, and the applied-values echo a successful `PUT`
+/// returns.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SendModeDto {
+    mode: String,
+    auto_quiet_secs: u64,
+}
+
+/// `PUT /api/send-mode` request body. `mode` is a free string (not the [`Mode`]
+/// enum) so an unknown value is a clean `400` from the handler rather than a
+/// `422` deserialization error from the extractor.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendModeEdit {
+    mode: String,
+    auto_quiet_secs: u64,
+}
+
+/// `POST /api/send-now` response: how many pending files the manual flush carried
+/// (`0` when nothing was pending — a no-op, never an error).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SendNowDto {
+    flushed: usize,
+}
+
+/// One `GET /api/batches` row: a recorded send-batch ([`crate::batch_store::BatchRow`])
+/// joined with the sync engine's per-target outbound state.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchDto {
+    package_ref: String,
+    /// `auto` (watcher quiet-timer) or `manual` (operator "send now").
+    mode: String,
+    created_at: String,
+    file_count: i64,
+    /// Frames actually transferred vs. dropped as the peer's duplicates. These
+    /// are the sender's ephemeral `sync-finished` dedup outcome — NOT persisted in
+    /// `sync_outbound` and not carried on [`OutboundRow`] — so they are reported as
+    /// `0` here (the honest "not tracked post-flight" value). Wired as named
+    /// fields so a future durable source can fill them without a shape change.
+    #[serde(rename = "new")]
+    new_count: u32,
+    #[serde(rename = "duplicate")]
+    duplicate_count: u32,
+    /// One entry per target the package was fanned to (friendly name + live
+    /// outbound state). Empty for a batch whose outbound rows aren't visible yet.
+    targets: Vec<BatchTargetDto>,
+    /// The batch-level outcome derived from its targets (see [`aggregate_outcome`]).
+    outcome: String,
+}
+
+/// One send target of a batch: the friendly device name (peer hex when unknown)
+/// and its current outbound state string.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchTargetDto {
+    name: String,
+    state: String,
+}
+
+/// Parse a wire `mode` string into a [`Mode`]. `None` for any unknown value — the
+/// handler maps that to a `400`.
+fn parse_mode(s: &str) -> Option<Mode> {
+    match s {
+        "auto" => Some(Mode::Auto),
+        "manual" => Some(Mode::Manual),
+        _ => None,
+    }
+}
+
+/// `GET /api/pending` — the "To sync" tree over the batcher's current pending
+/// accumulator, plus the live send-mode header. A detached page (engine in setup,
+/// batcher `None`) reports an empty tree and a `0` count — never an error.
+async fn api_get_pending(State(state): State<Arc<WebState>>) -> Json<PendingDto> {
+    // Clone the config once (drop the guard) so no lock is held across the read.
+    let config = state.config.read().await.clone();
+    let send = config.send_cfg();
+    let snapshot = match state.batcher.read().await.as_ref() {
+        Some(b) => b.pending_snapshot(),
+        None => Vec::new(),
+    };
+    let count = snapshot.len();
+    let tree = pending_tree(&snapshot, &config);
+    Json(PendingDto {
+        tree,
+        mode: crate::config_edit::mode_str(send.mode).to_string(),
+        auto_quiet_secs: send.auto_quiet_secs,
+        count,
+    })
+}
+
+/// `GET /api/send-mode` — the current send mode + auto quiet window. Read-only.
+async fn api_get_send_mode(State(state): State<Arc<WebState>>) -> Json<SendModeDto> {
+    let send = state.config.read().await.send_cfg();
+    Json(SendModeDto {
+        mode: crate::config_edit::mode_str(send.mode).to_string(),
+        auto_quiet_secs: send.auto_quiet_secs,
+    })
+}
+
+/// `PUT /api/send-mode` — flip Auto↔Manual (and/or change the quiet window),
+/// **live**. An unknown `mode` string is a `400` before anything is touched.
+/// Otherwise [`apply_send_mode_edit`] rewrites `perseus.toml` (comment-preserving,
+/// re-validated, atomic — a rejected edit leaves the file byte-identical and
+/// returns `422`), the live config is swapped, and the new [`SendCfg`] is pushed
+/// onto the batcher's `send_cfg_tx` so the running batcher adopts it on its next
+/// select! turn — no restart. The supervisor is woken so its config view refreshes
+/// at once. Returns the applied `{mode, autoQuietSecs}`.
+async fn api_put_send_mode(
+    State(state): State<Arc<WebState>>,
+    Json(edit): Json<SendModeEdit>,
+) -> Result<Json<SendModeDto>, (StatusCode, String)> {
+    let mode = parse_mode(&edit.mode).ok_or_else(|| {
+        tracing::error!(mode = %edit.mode, "web send-mode edit: unknown mode");
+        (
+            StatusCode::BAD_REQUEST,
+            format!("unknown send mode: {}", edit.mode),
+        )
+    })?;
+    let new_cfg =
+        apply_send_mode_edit(&state.config_path, mode, edit.auto_quiet_secs).map_err(|e| {
+            let msg = format!("{e:#}");
+            tracing::error!(error = %msg, "web send-mode edit rejected");
+            (StatusCode::UNPROCESSABLE_ENTITY, msg)
+        })?;
+    let send = new_cfg.send_cfg();
+    *state.config.write().await = new_cfg;
+    // Live-apply: push the new send config onto the running batcher's watch
+    // channel (a no-op send when detached — no receiver). This is what makes the
+    // Auto↔Manual / quiet-window change take effect with no engine restart.
+    let _ = state.send_cfg_tx.read().await.send(send);
+    // Wake the supervisor so its per-pass config view refreshes immediately.
+    state.supervisor_wake.notify_one();
+    Ok(Json(SendModeDto {
+        mode: crate::config_edit::mode_str(send.mode).to_string(),
+        auto_quiet_secs: send.auto_quiet_secs,
+    }))
+}
+
+/// `POST /api/send-now` — flush the whole pending set now as one manual batch.
+/// The pending count is read **at flush time** and returned as `flushed`; a flush
+/// with nothing pending (or a detached page with no batcher) is a `0`-flush no-op,
+/// records no batch row, and is never an error. The handle is cloned out of the
+/// lock so the guard is not held across the `flush_now().await`.
+async fn api_send_now(State(state): State<Arc<WebState>>) -> Json<SendNowDto> {
+    let batcher = state.batcher.read().await.clone();
+    let flushed = match batcher {
+        Some(b) => {
+            let count = b.pending_snapshot().len();
+            b.flush_now().await;
+            count
+        }
+        None => 0,
+    };
+    Json(SendNowDto { flushed })
+}
+
+/// The batch-level outcome derived from its per-target outbound states: `failed`
+/// if any target failed, `confirmed` once every target confirmed, else `sending`
+/// (some target still in flight). An empty set — a batch whose outbound rows are
+/// not visible yet (just recorded, or aged out of the scan window) — is reported
+/// as `sending` so a just-sent batch reads honestly rather than as an error.
+fn aggregate_outcome(rows: &[&OutboundRow]) -> String {
+    if rows.is_empty() {
+        return "sending".to_string();
+    }
+    if rows.iter().any(|r| r.state == OutboundState::Failed) {
+        "failed".to_string()
+    } else if rows.iter().all(|r| r.state == OutboundState::Confirmed) {
+        "confirmed".to_string()
+    } else {
+        "sending".to_string()
+    }
+}
+
+/// `GET /api/batches` — every recorded send-batch (newest-first), each joined by
+/// `package_ref` with the sync engine's outbound rows so the operator sees where
+/// a package went (per target) and how it fared. Read-only.
+///
+/// A fan-out writes one outbound row per target, so the join groups them by
+/// `package_ref`. [`all_outbound`](StandaloneSyncStore::all_outbound) (every
+/// state, unlike the non-terminal-only `status_snapshot`) is used so a `confirmed`
+/// batch still resolves its targets. `{new, duplicate}` are the sender's ephemeral
+/// dedup outcome and are not persisted, so they are reported as `0` (see
+/// [`BatchDto`]). A batch with no matching outbound row (just recorded, or aged
+/// past the scan window) degrades to `outcome: "sending"` with no targets.
+async fn api_batches(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<Vec<BatchDto>>, (StatusCode, String)> {
+    let rows = state.batches.list().map_err(|e| {
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web batches: list failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
+    let outbound = state.store.all_outbound(STATUS_SCAN_LIMIT).map_err(|e| {
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web batches: read outbound failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
+    // Group outbound rows by package_ref (one row per target on a fan-out).
+    let mut by_ref: HashMap<&str, Vec<&OutboundRow>> = HashMap::new();
+    for row in &outbound {
+        by_ref
+            .entry(row.package_ref.as_str())
+            .or_default()
+            .push(row);
+    }
+    let device_names = state.device_names.read().await;
+    let dtos = rows
+        .iter()
+        .map(|b| {
+            let matched: &[&OutboundRow] = by_ref
+                .get(b.package_ref.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let targets = matched
+                .iter()
+                .map(|r| {
+                    let hex = node_id_hex(&r.peer);
+                    BatchTargetDto {
+                        name: device_names.get(&hex).cloned().unwrap_or(hex),
+                        state: r.state.as_str().to_string(),
+                    }
+                })
+                .collect();
+            BatchDto {
+                package_ref: b.package_ref.clone(),
+                mode: b.mode.clone(),
+                created_at: b.created_at.clone(),
+                file_count: b.file_count,
+                new_count: 0,
+                duplicate_count: 0,
+                targets,
+                outcome: aggregate_outcome(matched),
+            }
+        })
+        .collect();
+    Ok(Json(dtos))
+}
+
 /// `POST /api/delete` — delete the source capture files of the given CONFIRMED
 /// packages. Verifies each id is `confirmed` before touching disk; non-confirmed
 /// / unknown ids come back in `rejected` with a reason. Shares the same
@@ -1316,6 +1624,8 @@ mod tests {
         // The attached (running) shape the handler tests exercise: a live engine,
         // the peer + capture dirs the engine was launched over, and a Running
         // lifecycle state. (The two detached-mode tests use `detached_test_state`.)
+        let batches =
+            Arc::new(crate::batch_store::BatchStore::open(tmp.path().join("sync.db")).unwrap());
         let (_state_tx, state_rx) = watch::channel(AgentState::Running { in_flight: 0 });
         let state = Arc::new(WebState {
             store,
@@ -1334,6 +1644,12 @@ mod tests {
             device_names: RwLock::new(HashMap::new()),
             running_dirs: RwLock::new(config.capture_dirs_resolved()),
             running_targets: RwLock::new(config.targets.clone()),
+            // No live batcher in this base harness (the send-workflow tests use
+            // `test_state_with_batcher`); the batch store + a placeholder
+            // send-config channel keep the new endpoints callable.
+            batcher: RwLock::new(None),
+            batches,
+            send_cfg_tx: RwLock::new(watch::channel(config.send_cfg()).0),
         });
         (state, tmp)
     }
@@ -1355,6 +1671,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
         let seen = Arc::new(crate::seen::SeenStore::open(tmp.path().join("sync.db")).unwrap());
+        let batches =
+            Arc::new(crate::batch_store::BatchStore::open(tmp.path().join("sync.db")).unwrap());
         let toml_str = sample_toml(tmp.path());
         let config_path = tmp.path().join("perseus.toml");
         std::fs::write(&config_path, &toml_str).unwrap();
@@ -1365,6 +1683,7 @@ mod tests {
         let state = Arc::new(WebState::detached(
             store,
             seen,
+            batches,
             config,
             config_path,
             state_rx,
@@ -2511,6 +2830,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
         let seen = Arc::new(crate::seen::SeenStore::open(tmp.path().join("sync.db")).unwrap());
+        let batches =
+            Arc::new(crate::batch_store::BatchStore::open(tmp.path().join("sync.db")).unwrap());
         let config = Config {
             capture_dir: Some(tmp.path().to_path_buf()),
             capture_dirs: Vec::new(),
@@ -2540,6 +2861,7 @@ mod tests {
         let state = Arc::new(WebState::detached(
             store,
             seen,
+            batches,
             config,
             config_path,
             rx,
@@ -2712,5 +3034,232 @@ mod tests {
         // GET /api/account is gated too.
         let res = get(&app, "/api/account").await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Task 6 (Sync Phase 2): pending / send-mode / send-now / batches ────────
+
+    /// `PUT /api/send-mode` rewrites `perseus.toml` (mode + auto_quiet_secs),
+    /// swaps the live config, live-applies the new [`SendCfg`] onto the batcher's
+    /// watch channel, and returns the applied values; a follow-up `GET` reflects
+    /// them and the on-disk file carries them.
+    #[tokio::test]
+    async fn put_send_mode_applies_and_get_reflects() {
+        let (state, _tmp) = test_state().await; // sample config: mode = "auto"
+        // Subscribe BEFORE the PUT so the live-apply send has a receiver and is
+        // observable — this proves the running batcher would adopt the change.
+        let mut rx = state.send_cfg_tx.read().await.subscribe();
+        let config_path = state.config_path.clone();
+        let app = build_router(state, None);
+
+        // GET reflects the seeded auto mode.
+        let v = body_json(get(&app, "/api/send-mode").await).await;
+        assert_eq!(v["mode"], "auto");
+
+        // PUT manual / 45.
+        let body = serde_json::json!({ "mode": "manual", "autoQuietSecs": 45 });
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/send-mode")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["mode"], "manual", "the PUT echoes the applied mode");
+        assert_eq!(v["autoQuietSecs"], 45);
+
+        // The live-apply reached the batcher's watch channel.
+        assert_eq!(
+            *rx.borrow_and_update(),
+            SendCfg {
+                mode: Mode::Manual,
+                auto_quiet_secs: 45,
+            },
+            "the running batcher's send-config channel adopts the edit"
+        );
+
+        // The on-disk config carries mode=manual + auto_quiet_secs=45.
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded = Config::from_toml_str(&text).unwrap();
+        assert_eq!(reloaded.mode, Mode::Manual, "written to disk: {text}");
+        assert_eq!(reloaded.auto_quiet_secs, 45);
+
+        // A follow-up GET reflects the adopted mode.
+        let v = body_json(get(&app, "/api/send-mode").await).await;
+        assert_eq!(v["mode"], "manual");
+        assert_eq!(v["autoQuietSecs"], 45);
+    }
+
+    /// An unknown `mode` string is a clean `400` (not a `422` extractor error nor
+    /// a silent no-op) and leaves the config byte-identical.
+    #[tokio::test]
+    async fn put_send_mode_unknown_mode_is_400() {
+        let (state, _tmp) = test_state().await;
+        let config_path = state.config_path.clone();
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let app = build_router(state, None);
+
+        let body = serde_json::json!({ "mode": "sideways", "autoQuietSecs": 30 });
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/send-mode")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            before,
+            "an unknown mode leaves the config untouched"
+        );
+    }
+
+    /// `POST /api/send-now` over a live batcher whose accumulator is empty is a
+    /// no-op: `{flushed: 0}` and no batch row recorded.
+    #[tokio::test]
+    async fn send_now_with_empty_pending_is_noop() {
+        // A WebState whose batcher is live but never fed a file → empty pending.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("sync.db");
+        let store = Arc::new(StandaloneSyncStore::open(&db).unwrap());
+        let seen = Arc::new(crate::seen::SeenStore::open(&db).unwrap());
+        let batches = Arc::new(crate::batch_store::BatchStore::open(&db).unwrap());
+
+        let toml_str = sample_toml(tmp.path());
+        let config_path = tmp.path().join("perseus.toml");
+        std::fs::write(&config_path, &toml_str).unwrap();
+        let config = Config::from_toml_str(&toml_str).unwrap();
+
+        // A loopback engine as the batcher's sole fan-out target.
+        let transport: Arc<dyn SharingTransport> = Arc::new(LoopbackNetwork::new().endpoint());
+        let engine = Arc::new(SyncEngine::spawn(
+            Arc::clone(&store) as Arc<dyn SyncStore>,
+            transport,
+            PEER,
+        ));
+
+        // A real batcher over an empty stable channel (never fed → nothing pending).
+        let (_stable_tx, stable_rx) = tokio::sync::mpsc::channel::<(PathBuf, PathBuf)>(8);
+        let (send_cfg_tx, send_cfg_rx) = watch::channel(config.send_cfg());
+        let (batcher, _task) = crate::batcher::spawn_batcher(
+            stable_rx,
+            vec![Arc::clone(&engine)],
+            Arc::clone(&seen),
+            Arc::clone(&batches),
+            config.clone(),
+            node_id_hex(&PEER),
+            None,
+            send_cfg_rx,
+        );
+
+        let (_state_tx, state_rx) = watch::channel(AgentState::Running { in_flight: 0 });
+        let state = Arc::new(WebState {
+            store,
+            seen,
+            config_path,
+            config: RwLock::new(config.clone()),
+            agent_state: state_rx,
+            supervisor_wake: Arc::new(Notify::new()),
+            engine: RwLock::new(Some(engine)),
+            cleanup: RwLock::new(None),
+            peer_device: RwLock::new(node_id_hex(&PEER)),
+            retention_tx: RwLock::new(watch::channel(config.retention.clone()).0),
+            retention_log: RwLock::new(Arc::new(Mutex::new(VecDeque::new()))),
+            device_names: RwLock::new(HashMap::new()),
+            running_dirs: RwLock::new(config.capture_dirs_resolved()),
+            running_targets: RwLock::new(config.targets.clone()),
+            batcher: RwLock::new(Some(batcher)),
+            batches: Arc::clone(&batches),
+            send_cfg_tx: RwLock::new(send_cfg_tx),
+        });
+
+        let app = build_router(state, None);
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/send-now")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["flushed"], 0, "an empty pending set flushes nothing");
+        assert!(
+            batches.list().unwrap().is_empty(),
+            "a no-op send-now records no batch row"
+        );
+        // `_stable_tx` / `_task` stay bound to keep the batcher alive to here.
+    }
+
+    /// `GET /api/pending` degrades honestly on a detached page (batcher `None`):
+    /// an empty tree, zero count, and the seeded send mode — never an error.
+    #[tokio::test]
+    async fn pending_empty_when_detached() {
+        let (state, _tmp) = detached_test_state(AgentState::NeedsSetup {
+            needs: vec!["not signed in".to_string()],
+        })
+        .await;
+        let app = build_router(state, None);
+        let v = body_json(get(&app, "/api/pending").await).await;
+        assert_eq!(v["count"], 0, "no batcher → nothing pending");
+        assert_eq!(v["tree"]["count"], 0);
+        assert!(v["tree"]["children"].as_array().unwrap().is_empty());
+        assert_eq!(v["mode"], "auto", "the send mode still surfaces");
+    }
+
+    /// `GET /api/batches` lists recorded batches (newest-first) joined with the
+    /// engine's outbound state: a batch whose package has a confirmed outbound row
+    /// reads `outcome: confirmed`; one with no outbound row degrades to `sending`.
+    #[tokio::test]
+    async fn batches_lists_and_joins_outbound_state() {
+        let (state, _tmp) = test_state().await;
+        // The seeded confirmed outbound row is `pkg-confirmed`; record a batch for
+        // it plus one for a package with no outbound row at all.
+        state
+            .batches
+            .record("pkg-confirmed", "manual", "2026-07-12T02:00:00Z", 3)
+            .unwrap();
+        state
+            .batches
+            .record("pkg-orphan", "auto", "2026-07-12T01:00:00Z", 1)
+            .unwrap();
+        let app = build_router(state, None);
+
+        let v = body_json(get(&app, "/api/batches").await).await;
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        // Newest-first: pkg-confirmed (02:00) before pkg-orphan (01:00).
+        assert_eq!(rows[0]["packageRef"], "pkg-confirmed");
+        assert_eq!(rows[0]["mode"], "manual");
+        assert_eq!(rows[0]["fileCount"], 3);
+        assert_eq!(rows[0]["new"], 0, "new/duplicate are not persisted → 0");
+        assert_eq!(rows[0]["duplicate"], 0);
+        assert_eq!(
+            rows[0]["outcome"], "confirmed",
+            "its outbound row is confirmed"
+        );
+        assert_eq!(rows[0]["targets"].as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["targets"][0]["state"], "confirmed");
+
+        assert_eq!(rows[1]["packageRef"], "pkg-orphan");
+        assert_eq!(
+            rows[1]["outcome"], "sending",
+            "no outbound row yet → sending, not an error"
+        );
+        assert!(rows[1]["targets"].as_array().unwrap().is_empty());
     }
 }
