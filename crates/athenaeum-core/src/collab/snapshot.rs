@@ -33,7 +33,6 @@ pub struct SnapshotMember {
 #[serde(rename_all = "camelCase")]
 struct SnapshotPayload {
     schema: u32,
-    #[allow(dead_code)]
     project_id: String,
     membership_version: i64,
     require_approval: bool,
@@ -44,6 +43,10 @@ struct SnapshotPayload {
 
 #[derive(Debug, Clone)]
 pub struct VerifiedSnapshot {
+    /// The project id the hub signed this snapshot for. The caller MUST check
+    /// it against the project the snapshot is being stored under — a correctly
+    /// signed snapshot for the wrong project is still a binding violation.
+    pub project_id: String,
     pub membership_version: i64,
     pub require_approval: bool,
     pub members: Vec<SnapshotMember>,
@@ -90,6 +93,7 @@ pub fn verify_and_parse(
     }
 
     Ok(VerifiedSnapshot {
+        project_id: parsed.project_id,
         membership_version: parsed.membership_version,
         require_approval: parsed.require_approval,
         members: parsed.members,
@@ -127,6 +131,7 @@ mod tests {
         let wire = signed_fixture(&key, &payload());
         let pinned = wire.pubkey.clone();
         let snap = verify_and_parse(&wire, &pinned).unwrap();
+        assert_eq!(snap.project_id, "p-1", "project_id round-trips for the binding check");
         assert_eq!(snap.membership_version, 4);
         assert!(snap.require_approval);
         assert_eq!(snap.members[0].display_name, "Vilen");

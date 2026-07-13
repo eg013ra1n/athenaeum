@@ -160,13 +160,22 @@ pub struct ProjectDetail {
 /// `objctra`/`objctdec` strings, or `None` when either is absent or fails to
 /// parse (warn-and-None — an unparseable center never fails a whole listing).
 fn set_center(conn: &Connection, frames_set_id: i64) -> Option<(f64, f64)> {
-    let coords: Option<(Option<String>, Option<String>)> = conn
+    let coords: Option<(Option<String>, Option<String>)> = match conn
         .query_row(
             "SELECT objctra, objctdec FROM frames_set WHERE id = ?1",
             [frames_set_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .ok();
+        .optional()
+    {
+        Ok(coords) => coords,
+        Err(e) => {
+            // Listing flows keep degrading gracefully (None), but a genuine DB
+            // error must never be silent.
+            tracing::warn!(frames_set_id, error = %e, "querying frame set center failed — treating as no center");
+            return None;
+        }
+    };
     let Some((Some(ra_str), Some(dec_str))) = coords else {
         return None;
     };
@@ -328,12 +337,18 @@ fn frame_gate_inputs(
         });
 
         // Center precedence: plate-solve crval → frames ra/dec → parsed
-        // objctra/objctdec strings.
+        // objctra/objctdec strings. A real solve's crval is authoritative and
+        // never sentinel-checked; but a header (0.0, 0.0) in frames.ra/dec is
+        // the FITS "not actually set" placeholder (see plate_solve/hints.rs
+        // is_sentinel_position) — treat it as unset and fall through to the
+        // objctra/objctdec parse.
         let center = solve
             .map(|(_, crval1, crval2)| (*crval1, *crval2))
             .or_else(|| {
                 frow.and_then(|f| match (f.ra, f.dec) {
-                    (Some(ra), Some(dec)) => Some((ra, dec)),
+                    (Some(ra), Some(dec)) if ra.abs() >= 1e-6 || dec.abs() >= 1e-6 => {
+                        Some((ra, dec))
+                    }
                     _ => None,
                 })
             })
@@ -780,10 +795,10 @@ enum FetchError {
 /// transported snapshot `payload`/`signature` (so slice-4's `PeerAuthorizer` can
 /// re-verify offline) AND the re-serialized verified member list.
 ///
-/// KNOWN, DELIBERATE GAP (slice-3 spec): [`VerifiedSnapshot`] does not surface
-/// the payload's `projectId`, so there is no cross-check that the snapshot the
-/// hub returned actually belongs to `p.id`. The hub is the trust anchor for that
-/// binding; do not synthesize a check here.
+/// The verified snapshot's `projectId` is cross-checked against `p.id`: a
+/// correctly-signed snapshot for a DIFFERENT project is a binding violation and
+/// is rejected via [`FetchError::Verify`] (the stale cache row is kept), so a
+/// snapshot can never be cached under the wrong project.
 async fn fetch_one_project(
     client: &crate::collab::hub_client::CollabClient,
     token: &str,
@@ -800,6 +815,13 @@ async fn fetch_one_project(
         .map_err(|e| FetchError::Transport(e.into()))?;
     let verified = crate::collab::snapshot::verify_and_parse(&snapshot_wire, pinned)
         .map_err(FetchError::Verify)?;
+    if verified.project_id != p.id {
+        return Err(FetchError::Verify(anyhow::anyhow!(
+            "snapshot is signed for project {} but was fetched for project {}",
+            verified.project_id,
+            p.id
+        )));
+    }
     let thresholds = client
         .thresholds(token, &p.id)
         .await
@@ -942,6 +964,13 @@ pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, 
         let db = db(ctx)?;
         let conn = db.conn();
         crate::db::collab::prune_projects_not_in(&conn, &keep).map_err(internal)?;
+        // Expire stale intents first: a "publish as project" intent that never
+        // matched a new project must not silently auto-link an unrelated project
+        // that appears weeks later.
+        let expired = crate::db::collab::delete_intents_older_than(&conn, 7).map_err(internal)?;
+        if expired > 0 {
+            tracing::info!(count = expired, "expired stale portal link intents");
+        }
         // Auto-link deep-link intents against projects that appeared this refresh.
         for (intent_id, set_id, ra, dec) in
             crate::db::collab::list_link_intents(&conn).map_err(internal)?
@@ -1160,6 +1189,114 @@ mod tests {
 
         unlink_frame_set(&ctx, "p-1", set_id).unwrap();
         assert_eq!(evaluate_project_gate(&ctx, "p-1").unwrap().total, 0);
+    }
+
+    /// Insert a fully-populated `plate_solves` row (every NOT NULL column) for
+    /// one frame, with an explicit pixel scale and crval center so the gate's
+    /// precedence branches are observable.
+    fn seed_plate_solve(
+        conn: &rusqlite::Connection,
+        frame_id: i64,
+        pixel_scale_arcsec: f64,
+        crval1: f64,
+        crval2: f64,
+    ) {
+        conn.execute(
+            "INSERT INTO plate_solves \
+             (frame_id, crpix1, crpix2, crval1, crval2, cd1_1, cd1_2, cd2_1, cd2_2, \
+              matched_stars, total_detected, rms_residual_px, rms_residual_arcsec, \
+              pixel_scale_arcsec, field_rotation_deg, solve_time_ms, catalog_used, \
+              algorithm_used, solved_at) \
+             VALUES (?1, 100.0, 100.0, ?2, ?3, 1.0, 0.0, 0.0, 1.0, \
+                     300, 400, 0.5, 0.4, ?4, 0.0, 1000, 'gaia', 'blind', '2026-07-13T00:00:00Z')",
+            rusqlite::params![frame_id, crval1, crval2, pixel_scale_arcsec],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn gate_prefers_plate_solve_scale_and_center_over_header() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            // frames.ra/dec are deliberately FAR off target (100, 10) so a
+            // center taken from the frame row would fail the radius check; the
+            // solve's crval sits on target.
+            let (set_id, frames) =
+                seed_set(&conn, "Off-header set", "06:40:00", "+10:00:00", 100.0, 10.0, 1);
+            // Solve: scale 1.5″/px (≠ the ~0.776″/px header fallback), center
+            // on target (210.8, +54.35).
+            seed_plate_solve(&conn, frames[0], 1.5, 210.8, 54.35);
+            (set_id, frames)
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert_eq!(report.total, 1);
+        let row = report.rows.iter().find(|r| r.frame_id == frames[0]).unwrap();
+
+        // Scale from the solve: 2.0 px × 1.5 ″/px = 3.0″ (NOT 2.0 × ~0.776).
+        assert!(
+            (row.fwhm_arcsec.unwrap() - 3.0).abs() < 1e-6,
+            "fwhm should use the solve pixel scale: {:?}",
+            row.fwhm_arcsec
+        );
+        // Center from crval (on target) → no radius failure, even though
+        // frames.ra/dec (100, 10) is far outside the 1.5° radius.
+        assert!(
+            !row.failures.iter().any(|f| f.contains("outside target radius")),
+            "center should come from crval, not frames.ra/dec: {:?}",
+            row.failures
+        );
+    }
+
+    #[test]
+    fn gate_dedups_a_frame_shared_by_two_linked_sets() {
+        let (_tmp, ctx) = test_ctx();
+        let (set_a, set_b, frame_id) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            let (set_a, frames) =
+                seed_set(&conn, "Set A", "14:03:12", "+54:21:00", 210.8, 54.35, 1);
+            let frame_id = frames[0];
+
+            // A second set (own imaging_night + session) that shares the SAME
+            // frame via an extra session_members row.
+            conn.execute(
+                "INSERT INTO frames_set (name, objctra, objctdec) VALUES ('Set B', '14:03:12', '+54:21:00')",
+                [],
+            )
+            .unwrap();
+            let set_b = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) \
+                 VALUES (?1, '2026-07-03T20:00:00Z', '2026-07-04T03:00:00Z')",
+                [set_b],
+            )
+            .unwrap();
+            let night_b = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'ASI2600MM')",
+                [night_b],
+            )
+            .unwrap();
+            let session_b = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![session_b, frame_id],
+            )
+            .unwrap();
+            (set_a, set_b, frame_id)
+        };
+
+        link_frame_set(&ctx, "p-1", set_a).unwrap();
+        link_frame_set(&ctx, "p-1", set_b).unwrap();
+
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert_eq!(report.total, 1, "the shared frame is counted once (union dedup)");
+        assert_eq!(report.rows.len(), 1);
+        assert_eq!(report.rows[0].frame_id, frame_id);
     }
 
     #[test]

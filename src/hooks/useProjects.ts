@@ -23,7 +23,10 @@ export function useProjects() {
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('Sign in')) {
+      // Core emits two SignedOut messages ("Sign in to use collaboration
+      // projects." and "Signed out or device revoked — sign in again.");
+      // a case-insensitive "sign in" test catches both.
+      if (msg.toLowerCase().includes('sign in')) {
         if (mounted.current) setSignedOut(true);
       } else {
         console.error('[projects] refresh failed:', err);

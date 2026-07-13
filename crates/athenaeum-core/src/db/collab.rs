@@ -238,6 +238,17 @@ pub fn delete_link_intent(conn: &Connection, intent_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Delete link intents older than `days` days (by `created_at`). A stale intent
+/// must not silently auto-link an unrelated "new" project that appears weeks
+/// later, so the refresh loop expires them first. Returns the number removed.
+pub fn delete_intents_older_than(conn: &Connection, days: i64) -> Result<usize> {
+    let removed = conn.execute(
+        "DELETE FROM project_link_intents WHERE created_at < datetime('now', ?1)",
+        params![format!("-{days} days")],
+    )?;
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +334,29 @@ mod tests {
         assert!(list_link_intents(&conn).unwrap().is_empty());
 
         assert_eq!(unlink_set(&conn, "p-1", set_id).unwrap(), 0, "already gone");
+    }
+
+    #[test]
+    fn expires_only_stale_link_intents() {
+        let conn = test_conn();
+        conn.execute("INSERT INTO frames_set (name) VALUES ('S1')", []).unwrap();
+        let set_id = conn.last_insert_rowid();
+
+        // One fresh intent (created_at = now via the column default).
+        let fresh = add_link_intent(&conn, set_id, 1.0, 2.0).unwrap();
+        // One stale intent, backdated 8 days past its default created_at.
+        let stale = add_link_intent(&conn, set_id, 3.0, 4.0).unwrap();
+        conn.execute(
+            "UPDATE project_link_intents SET created_at = datetime('now', '-8 days') WHERE id = ?1",
+            params![stale],
+        )
+        .unwrap();
+
+        let removed = delete_intents_older_than(&conn, 7).unwrap();
+        assert_eq!(removed, 1, "only the 8-day-old intent expires");
+
+        let remaining: Vec<i64> =
+            list_link_intents(&conn).unwrap().into_iter().map(|(id, ..)| id).collect();
+        assert_eq!(remaining, vec![fresh], "the fresh intent survives");
     }
 }
