@@ -28,6 +28,7 @@ use crate::collab::gate::{
 };
 use crate::coordinates::{angular_distance, parse_dec_sexagesimal, parse_ra_sexagesimal};
 use crate::db::analysis::get_frame_analyses_by_ids;
+use crate::db::collab::CollabProjectRow;
 use crate::models::FrameAnalysis;
 use crate::services::ServiceContext;
 
@@ -89,6 +90,57 @@ pub struct ProjectSetMatch {
 #[serde(rename_all = "camelCase")]
 pub struct PortalNewProjectLink {
     pub url: String,
+}
+
+/// A cached project rendered as a list card (`list_projects` / `refresh_projects`).
+/// The three trailing counts are live: `linked_sets` from `project_links`,
+/// `candidates`/`publishable` from the gate over the linked sets' LIGHT frames.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCard {
+    pub project_id: String,
+    pub slug: String,
+    pub title: String,
+    pub data_role: String,
+    pub coordinator: bool,
+    pub require_approval: bool,
+    pub pending_announcements: i64,
+    pub project_status: String,
+    pub target_name: String,
+    pub target_ra_deg: f64,
+    pub target_dec_deg: f64,
+    pub target_radius_deg: f64,
+    pub membership_version: i64,
+    pub linked_sets: i64,
+    pub candidates: i64,
+    pub publishable: i64,
+    pub fetched_at: String,
+}
+
+/// One verified snapshot member, projected for the project-detail view. Also
+/// `Deserialize`: it is parsed back out of the cache row's `members_json` (a
+/// serialized `Vec<SnapshotMember>`), whose extra `accountId`/`nodes` fields
+/// serde ignores.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectMemberView {
+    pub display_name: String,
+    pub data_role: String,
+    pub coordinator: bool,
+}
+
+/// The full project-detail payload: the card plus the verified member list,
+/// threshold registry, currently-linked sets, and the portal base URL (for the
+/// frontend to build project links).
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDetail {
+    pub card: ProjectCard,
+    pub members: Vec<ProjectMemberView>,
+    pub thresholds_version: Option<i32>,
+    pub thresholds: Vec<ThresholdRuleView>,
+    pub links: Vec<LinkedSetView>,
+    pub portal_base: String,
 }
 
 // ── Shared internal helpers (also used by Task 5) ────────────────────────────
@@ -545,10 +597,361 @@ pub fn find_matching_projects(
     Ok(out)
 }
 
+// ── Hub poll: cards, detail, refresh ─────────────────────────────────────────
+
+/// `AccountClientError → ApiError`, a local copy of the private
+/// `api::account::map_client_err` (keep the two in sync). A `401` surfaces as
+/// [`ApiError::SignedOut`] so the frontend re-shows the sign-in flow.
+fn client_err(e: crate::account::AccountClientError) -> ApiError {
+    use crate::account::AccountClientError as E;
+    match e {
+        E::RateLimited => {
+            ApiError::Invalid("Too many requests — wait a minute and try again.".into())
+        }
+        E::Unauthorized => {
+            ApiError::SignedOut("Signed out or device revoked — sign in again.".into())
+        }
+        E::SecondPrimary(m) | E::DeviceConflict(m) => ApiError::Conflict(m),
+        E::PeerValidation(m) | E::BadRequest(m) => ApiError::Invalid(m),
+        E::DuplicateName => ApiError::Invalid("name already in use".into()),
+        E::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
+    }
+}
+
+/// Host of a hub URL, for scoping the per-hub TOFU pin setting key. Mirrors the
+/// private `api::account::hub_host`; falls back to the raw string if it does not
+/// parse.
+fn hub_host_of(hub_url: &str) -> String {
+    reqwest::Url::parse(hub_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_else(|| hub_url.to_string())
+}
+
+/// Build a [`ProjectCard`] from a cached row, computing the live counts.
+/// `card_from_row` never holds a DB connection across the gate call.
+fn card_from_row(ctx: &ServiceContext, row: CollabProjectRow) -> Result<ProjectCard, ApiError> {
+    let linked_sets = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::db::collab::linked_set_ids(&conn, &row.project_id)
+            .map_err(internal)?
+            .len() as i64
+    };
+    let gate = evaluate_project_gate(ctx, &row.project_id)?;
+    Ok(ProjectCard {
+        project_id: row.project_id,
+        slug: row.slug,
+        title: row.title,
+        data_role: row.data_role,
+        coordinator: row.is_coordinator,
+        require_approval: row.require_approval,
+        pending_announcements: row.pending_announcements,
+        project_status: row.project_status,
+        target_name: row.target_name,
+        target_ra_deg: row.target_ra_deg,
+        target_dec_deg: row.target_dec_deg,
+        target_radius_deg: row.target_radius_deg,
+        membership_version: row.membership_version,
+        linked_sets,
+        candidates: gate.total,
+        publishable: gate.publishable,
+        fetched_at: row.fetched_at,
+    })
+}
+
+/// Every cached project as a card (instant — cache only, no hub I/O).
+pub fn list_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, ApiError> {
+    let rows = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::db::collab::list_projects(&conn).map_err(internal)?
+    };
+    rows.into_iter().map(|row| card_from_row(ctx, row)).collect()
+}
+
+/// A [`LinkedSetView`] per frame set currently linked to the project.
+fn linked_set_views(
+    conn: &Connection,
+    project_id: &str,
+    row: &CollabProjectRow,
+) -> Result<Vec<LinkedSetView>, ApiError> {
+    let mut out = Vec::new();
+    for set_id in crate::db::collab::linked_set_ids(conn, project_id).map_err(internal)? {
+        let name: Option<String> = conn
+            .query_row("SELECT name FROM frames_set WHERE id = ?1", [set_id], |r| {
+                r.get(0)
+            })
+            .optional()
+            .map_err(|e| internal(e.into()))?
+            .flatten();
+        let center = set_center(conn, set_id);
+        let distance_deg =
+            center.map(|(ra, dec)| angular_distance(ra, dec, row.target_ra_deg, row.target_dec_deg));
+        out.push(LinkedSetView {
+            frames_set_id: set_id,
+            name,
+            light_count: light_count(conn, set_id).map_err(internal)?,
+            distance_deg,
+            within_radius: distance_deg
+                .map(|d| d <= row.target_radius_deg)
+                .unwrap_or(false),
+        });
+    }
+    Ok(out)
+}
+
+/// The full detail view for one cached project. `NotFound` when the project
+/// isn't cached — the caller must [`refresh_projects`] first.
+pub fn get_project_detail(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<ProjectDetail, ApiError> {
+    let (row, links, portal_base) = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let row = crate::db::collab::get_project(&conn, project_id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("project {project_id} is not cached — refresh first"))
+            })?;
+        let links = linked_set_views(&conn, project_id, &row)?;
+        let portal_base = ctx.settings.get_with_precedence(
+            &conn,
+            crate::settings::keys::ACCOUNT_HUB_URL,
+            crate::settings::defaults::ACCOUNT_HUB_URL,
+        )?;
+        (row, links, portal_base)
+    };
+
+    let members: Vec<ProjectMemberView> = serde_json::from_str(&row.members_json)
+        .map_err(|e| {
+            tracing::warn!(project_id, error = %e, "cached members_json did not parse — showing an empty member list");
+            e
+        })
+        .unwrap_or_default();
+    let thresholds: Vec<ThresholdRuleView> = match &row.thresholds_rules_json {
+        Some(json) => serde_json::from_str(json)
+            .map_err(|e| {
+                tracing::warn!(project_id, error = %e, "cached threshold rules do not parse — showing no rules");
+                e
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let thresholds_version = row.thresholds_version;
+    let card = card_from_row(ctx, row)?;
+
+    Ok(ProjectDetail {
+        card,
+        members,
+        thresholds_version,
+        thresholds,
+        links,
+        portal_base,
+    })
+}
+
+/// A per-project fetch failure, split so the refresh loop can log a snapshot
+/// verification failure (a security-relevant event) at `error!` while every
+/// other transport/decode failure logs at `warn!`. Either way the stale cache
+/// row is kept (never swallowed — the caller always logs).
+enum FetchError {
+    /// The signed membership snapshot did not verify against the pinned hub key
+    /// (pin mismatch, bad signature, tampered/unparseable payload).
+    Verify(anyhow::Error),
+    /// Any other per-project failure (network, unexpected status, decode).
+    Transport(anyhow::Error),
+}
+
+/// Assemble one fresh cache row from `project_page` + `membership_snapshot`
+/// (verified against the pinned key) + `thresholds`. The row stores BOTH the raw
+/// transported snapshot `payload`/`signature` (so slice-4's `PeerAuthorizer` can
+/// re-verify offline) AND the re-serialized verified member list.
+///
+/// KNOWN, DELIBERATE GAP (slice-3 spec): [`VerifiedSnapshot`] does not surface
+/// the payload's `projectId`, so there is no cross-check that the snapshot the
+/// hub returned actually belongs to `p.id`. The hub is the trust anchor for that
+/// binding; do not synthesize a check here.
+async fn fetch_one_project(
+    client: &crate::collab::hub_client::CollabClient,
+    token: &str,
+    pinned: &str,
+    p: &crate::collab::hub_client::MyProjectWire,
+) -> Result<CollabProjectRow, FetchError> {
+    let page = client
+        .project_page(&p.id)
+        .await
+        .map_err(|e| FetchError::Transport(e.into()))?;
+    let snapshot_wire = client
+        .membership_snapshot(token, &p.id)
+        .await
+        .map_err(|e| FetchError::Transport(e.into()))?;
+    let verified = crate::collab::snapshot::verify_and_parse(&snapshot_wire, pinned)
+        .map_err(FetchError::Verify)?;
+    let thresholds = client
+        .thresholds(token, &p.id)
+        .await
+        .map_err(|e| FetchError::Transport(e.into()))?;
+
+    let members_json =
+        serde_json::to_string(&verified.members).map_err(|e| FetchError::Transport(e.into()))?;
+    let (thresholds_version, thresholds_rules_json) = match thresholds.current {
+        Some(set) => {
+            let rules = serde_json::to_string(&set.rules).map_err(|e| FetchError::Transport(e.into()))?;
+            (Some(set.version), Some(rules))
+        }
+        None => (None, None),
+    };
+
+    Ok(CollabProjectRow {
+        project_id: p.id.clone(),
+        slug: p.slug.clone(),
+        title: p.title.clone(),
+        data_role: p.data_role.clone(),
+        is_coordinator: p.coordinator,
+        // The signed snapshot is the single source of truth for both membership
+        // fields (they travel together in the signed payload; slice-4 enforces
+        // the signed `require_approval`).
+        require_approval: verified.require_approval,
+        pending_announcements: p.pending_announcements,
+        project_status: page.project.status,
+        target_name: page.project.target.name,
+        target_ra_deg: page.project.target.ra_deg,
+        target_dec_deg: page.project.target.dec_deg,
+        target_radius_deg: page.project.target.radius_deg,
+        membership_version: verified.membership_version,
+        snapshot_payload_b64: snapshot_wire.payload,
+        snapshot_signature_b64: snapshot_wire.signature,
+        members_json,
+        thresholds_version,
+        thresholds_rules_json,
+        fetched_at: String::new(), // filled by SQL
+    })
+}
+
+/// TOFU: return the pinned snapshot pubkey for this hub host. First call fetches
+/// the hub's key and stores it under `collab.snapshot_pubkey.<host>` (`info!`);
+/// later calls return the stored pin unchanged. A subsequent `verify_and_parse`
+/// mismatch against this pin is handled per-project by the refresh loop.
+async fn pinned_pubkey(
+    ctx: &ServiceContext,
+    hub_url: &str,
+    client: &crate::collab::hub_client::CollabClient,
+) -> Result<String, ApiError> {
+    let host = hub_host_of(hub_url);
+    let key = format!("collab.snapshot_pubkey.{host}");
+
+    let existing = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::db::get_setting(&conn, &key).map_err(|e| internal(e.into()))?
+    };
+    if let Some(pin) = existing.filter(|s| !s.is_empty()) {
+        return Ok(pin);
+    }
+
+    let fetched = client.collab_pubkey().await.map_err(client_err)?;
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::db::set_setting(&conn, &key, &fetched).map_err(|e| internal(e.into()))?;
+    }
+    tracing::info!(hub_host = %host, "pinned hub snapshot pubkey (TOFU)");
+    Ok(fetched)
+}
+
+/// Poll the hub for every project I'm a member of and refresh the local cache.
+///
+/// - Signed out → [`ApiError::SignedOut`].
+/// - TOFU-pins the hub's snapshot pubkey per host (see [`pinned_pubkey`]).
+/// - Per-project isolation: a failed fetch keeps the stale cache row and
+///   continues (`warn!`, or `error!` for a snapshot verification failure).
+/// - Prunes cache rows for projects no longer returned by the hub (a failed
+///   fetch still counts as "still mine" and is kept).
+/// - Auto-links any pending portal deep-link intent whose target matches a
+///   project that appeared for the FIRST time this refresh (≤ 0.1°).
+///
+/// Returns the refreshed cards (== [`list_projects`]).
+pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, ApiError> {
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        return Err(ApiError::SignedOut(
+            "Sign in to use collaboration projects.".into(),
+        ));
+    };
+    let client = crate::collab::hub_client::CollabClient::new(&hub_url).map_err(client_err)?;
+
+    let pinned = pinned_pubkey(ctx, &hub_url, &client).await?;
+    let mine = client.my_projects(&token).await.map_err(client_err)?;
+
+    let previous_ids: std::collections::HashSet<String> = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::db::collab::list_projects(&conn)
+            .map_err(internal)?
+            .into_iter()
+            .map(|p| p.project_id)
+            .collect()
+    };
+
+    // `keep` = every project the hub still lists (whether or not its fetch
+    // succeeded); `new_targets` = only those that appeared this refresh, for the
+    // intent auto-link below.
+    let mut keep: Vec<String> = Vec::with_capacity(mine.len());
+    let mut new_targets: Vec<(String, f64, f64)> = Vec::new();
+    for p in &mine {
+        keep.push(p.id.clone());
+        match fetch_one_project(&client, &token, &pinned, p).await {
+            Ok(row) => {
+                if !previous_ids.contains(&row.project_id) {
+                    new_targets.push((row.project_id.clone(), row.target_ra_deg, row.target_dec_deg));
+                }
+                let db = db(ctx)?;
+                let conn = db.conn();
+                crate::db::collab::upsert_project(&conn, &row).map_err(internal)?;
+            }
+            Err(FetchError::Verify(err)) => {
+                tracing::error!(
+                    project_id = %p.id,
+                    error = %format!("{err:#}"),
+                    "membership snapshot failed verification against the pinned hub key — keeping cached state"
+                );
+            }
+            Err(FetchError::Transport(err)) => {
+                tracing::warn!(
+                    project_id = %p.id,
+                    error = %format!("{err:#}"),
+                    "project refresh failed — keeping cached state"
+                );
+            }
+        }
+    }
+
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::db::collab::prune_projects_not_in(&conn, &keep).map_err(internal)?;
+        // Auto-link deep-link intents against projects that appeared this refresh.
+        for (intent_id, set_id, ra, dec) in
+            crate::db::collab::list_link_intents(&conn).map_err(internal)?
+        {
+            if let Some((project_id, ..)) = new_targets
+                .iter()
+                .find(|(_, tra, tdec)| angular_distance(ra, dec, *tra, *tdec) <= 0.1)
+            {
+                crate::db::collab::link_set(&conn, project_id, set_id).map_err(internal)?;
+                crate::db::collab::delete_link_intent(&conn, intent_id).map_err(internal)?;
+                tracing::info!(%project_id, frames_set_id = set_id, "auto-linked source set from portal deep-link intent");
+            }
+        }
+    }
+
+    list_projects(ctx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::collab::CollabProjectRow;
 
     /// A minimal real-`Database` [`ServiceContext`] (tempdir SQLite, no keychain
     /// involved anywhere). Copied verbatim from `api::sync` / `api::masters`
@@ -825,5 +1228,164 @@ mod tests {
         // Once linked, the project stops being suggested for that set.
         crate::db::collab::link_set(&conn, "p-1", set_id).unwrap();
         assert!(find_matching_projects(&conn, 210.8, 54.35, set_id).unwrap().is_empty());
+    }
+
+    /// End-to-end hub poll (wiremock): a fresh refresh fetches the page + a REAL
+    /// ed25519-signed membership snapshot + thresholds, TOFU-pins the hub key,
+    /// caches the verified row (raw payload/signature + parsed members), and
+    /// auto-links the pending portal deep-link intent. A second refresh whose
+    /// membership is signed by a DIFFERENT key fails verification against the
+    /// pin and keeps the stale row (refresh still Ok).
+    #[tokio::test]
+    async fn refresh_populates_cache_verifies_snapshot_and_auto_links_intent() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        use ed25519_dalek::{Signer, SigningKey};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Signing fixtures (same technique as the Task-1 snapshot tests).
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        let key_b64 = B64.encode(key.verifying_key().to_bytes());
+        let snapshot_payload = serde_json::json!({
+            "schema": 1, "projectId": "p-1", "membershipVersion": 7, "requireApproval": true,
+            "issuedAt": "2026-07-13T00:00:00Z",
+            "members": [{"accountId": "a-1", "displayName": "Vilen", "dataRole": "send_receive",
+                         "coordinator": true, "nodes": [B64.encode([9u8; 32])]}]
+        });
+        let signed = |k: &SigningKey, payload: &serde_json::Value| -> serde_json::Value {
+            let bytes = serde_json::to_vec(payload).unwrap();
+            serde_json::json!({
+                "payload": B64.encode(&bytes),
+                "signature": B64.encode(k.sign(&bytes).to_bytes()),
+                "pubkey": B64.encode(k.verifying_key().to_bytes()),
+            })
+        };
+
+        // Mock hub.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/collab/pubkey"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "pubkey": key_b64 })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/me/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "id": "p-1", "slug": "m101", "title": "M 101", "dataRole": "send_receive",
+                "coordinator": true, "requireApproval": false, "pendingAnnouncements": 0
+            }])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "project": {"id": "p-1", "slug": "m101", "title": "M 101", "status": "active",
+                            "requireApproval": false,
+                            "target": {"name": "M101", "raDeg": 210.8, "decDeg": 54.35, "radiusDeg": 1.5}},
+                "members": [{"displayName": "Vilen", "dataRole": "send_receive", "coordinator": true}],
+                "packages": [], "progress": {"totalFrames": 0, "integrationSecondsByFilter": {}, "perMember": []}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1/thresholds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "current": {"version": 2,
+                            "rules": [{"metricKey": "not_trailed", "op": "reject_if", "value": true}],
+                            "createdAt": "2026-07-13T00:00:00Z"},
+                "history": []
+            })))
+            .mount(&server)
+            .await;
+        // Membership: K-signed, served ONCE so the second refresh falls through
+        // to the K2-signed mock mounted later.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1/membership"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(signed(&key, &snapshot_payload)))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // ctx: point the account hub at the mock, sign in, seed a set + intent.
+        let (_tmp, ctx) = test_ctx();
+        let host = reqwest::Url::parse(&server.uri())
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            crate::db::set_setting(&conn, crate::settings::keys::ACCOUNT_HUB_URL, &server.uri())
+                .unwrap();
+        }
+        crate::api::account::store_token_for_test(&ctx, "tok").unwrap();
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            let (set_id, _) = seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 1);
+            set_id
+        };
+        // Record the "publish as project" intent from the set's own target.
+        record_project_link_intent(&ctx, set_id).unwrap();
+
+        // First refresh.
+        let cards = refresh_projects(&ctx).await.unwrap();
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].project_id, "p-1");
+        assert_eq!(cards[0].linked_sets, 1, "the intent auto-linked the source set");
+
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            let row = crate::db::collab::get_project(&conn, "p-1").unwrap().unwrap();
+            assert_eq!(row.membership_version, 7);
+            let members: Vec<ProjectMemberView> =
+                serde_json::from_str(&row.members_json).unwrap();
+            assert_eq!(members.len(), 1);
+            assert_eq!(members[0].display_name, "Vilen");
+            assert!(members[0].coordinator);
+
+            // The raw snapshot payload/signature are cached (slice-4 re-verify).
+            assert!(!row.snapshot_payload_b64.is_empty());
+            assert!(!row.snapshot_signature_b64.is_empty());
+
+            // The TOFU pin now stores K under the per-host key.
+            let pin = crate::db::get_setting(&conn, &format!("collab.snapshot_pubkey.{host}"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(pin, key_b64);
+
+            // The intent auto-linked and was consumed.
+            assert_eq!(
+                crate::db::collab::linked_set_ids(&conn, "p-1").unwrap(),
+                vec![set_id]
+            );
+            assert!(crate::db::collab::list_link_intents(&conn).unwrap().is_empty());
+        }
+
+        // Second refresh: membership now signed by a DIFFERENT key → the pinned
+        // key rejects it and the stale row is kept.
+        let other = SigningKey::from_bytes(&[2u8; 32]);
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1/membership"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(signed(&other, &snapshot_payload)),
+            )
+            .mount(&server)
+            .await;
+
+        let cards2 = refresh_projects(&ctx)
+            .await
+            .expect("pin mismatch keeps the stale row, refresh still Ok");
+        assert_eq!(cards2.len(), 1);
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            let row = crate::db::collab::get_project(&conn, "p-1").unwrap().unwrap();
+            assert_eq!(
+                row.membership_version, 7,
+                "stale row kept after pin mismatch"
+            );
+        }
     }
 }
