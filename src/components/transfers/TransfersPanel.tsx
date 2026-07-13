@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { X, Search, ArrowUp, ArrowDown, Inbox } from 'lucide-react';
+import { X, Search, ArrowUp, ArrowDown, Inbox, Users } from 'lucide-react';
 import { api } from '../../api';
 import { useTransfers } from '../../contexts/TransfersContext';
 import { formatTimestamp } from '../../utils/dateFormatting';
@@ -8,6 +8,7 @@ import type {
   HistoryRow,
   OutboundState,
   OutboundSummary,
+  ProjectCard,
   SyncHistoryQuery,
 } from '../../types/models';
 
@@ -42,6 +43,12 @@ function outcomeTone(outcome: string): string {
 function shortPeer(hex: string): string {
   const t = hex.trim();
   return t.length > 10 ? t.slice(0, 10) : t;
+}
+
+/** Fallback label for a project chip when the id → title map has no entry. */
+function shortProject(id: string): string {
+  const t = id.trim();
+  return t.length > 8 ? t.slice(0, 8) : t;
 }
 
 /**
@@ -85,6 +92,7 @@ export function TransfersPanel() {
   const [tab, setTab] = useState<Tab>('active');
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [deviceNames, setDeviceNames] = useState<Record<string, string>>({});
+  const [projectNames, setProjectNames] = useState<Record<string, string>>({});
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [search, setSearch] = useState('');
   const [dirFilter, setDirFilter] = useState<DirFilter>('all');
@@ -105,8 +113,8 @@ export function TransfersPanel() {
       object: null,
       direction: dirFilter === 'all' ? null : dirFilter,
       peer: null,
-      // Project-dimension filter is unused here for now; the Transfers project
-      // chip lands in Task 12.
+      // No dedicated project-scoped SQL filter here — the project dimension is
+      // shown as a per-row chip and matched by the free-text filter below.
       project: null,
       limit: HISTORY_LIMIT,
     };
@@ -139,6 +147,23 @@ export function TransfersPanel() {
         if (!cancelled && mounted.current) setDeviceNames(names ?? {});
       })
       .catch((err) => console.error('[TransfersPanel] get_sync_device_names failed:', err));
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  // Project id → title map (cache-only) so a collab history row's project chip
+  // renders a name instead of the raw id. Degrades to a short id on any failure.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    api
+      .invoke<ProjectCard[]>('list_collab_projects')
+      .then((cards) => {
+        if (cancelled || !mounted.current) return;
+        setProjectNames(Object.fromEntries(cards.map((c) => [c.projectId, c.title])));
+      })
+      .catch((err) => console.error('[TransfersPanel] list_collab_projects failed:', err));
     return () => {
       cancelled = true;
     };
@@ -194,9 +219,11 @@ export function TransfersPanel() {
         r.filename.toLowerCase().includes(q) ||
         (r.object ?? '').toLowerCase().includes(q) ||
         r.peerDevice.toLowerCase().includes(q) ||
-        (deviceNames[r.peerDevice] ?? '').toLowerCase().includes(q),
+        (deviceNames[r.peerDevice] ?? '').toLowerCase().includes(q) ||
+        (r.project ?? '').toLowerCase().includes(q) ||
+        (r.project ? (projectNames[r.project] ?? '').toLowerCase().includes(q) : false),
     );
-  }, [history, search, deviceNames]);
+  }, [history, search, deviceNames, projectNames]);
 
   return (
     <>
@@ -261,6 +288,7 @@ export function TransfersPanel() {
             <HistoryTab
               rows={filteredHistory}
               deviceNames={deviceNames}
+              projectNames={projectNames}
               loading={loadingHistory}
               search={search}
               onSearch={setSearch}
@@ -303,6 +331,7 @@ function ActiveTab({ active }: { active: OutboundSummary[] }) {
 interface HistoryTabProps {
   rows: HistoryRow[];
   deviceNames: Record<string, string>;
+  projectNames: Record<string, string>;
   loading: boolean;
   search: string;
   onSearch: (v: string) => void;
@@ -313,6 +342,7 @@ interface HistoryTabProps {
 function HistoryTab({
   rows,
   deviceNames,
+  projectNames,
   loading,
   search,
   onSearch,
@@ -381,6 +411,17 @@ function HistoryTab({
                 </div>
                 <p className="mt-0.5 flex items-center gap-2 pl-5 text-[10px] text-content-muted">
                   {r.object && <span className="truncate">{r.object}</span>}
+                  {r.project && (
+                    <span
+                      className="inline-flex shrink-0 items-center gap-0.5 rounded bg-accent/15 px-1 py-0.5 text-[9px] text-accent"
+                      title={r.project}
+                    >
+                      <Users size={9} />
+                      <span className="max-w-[8rem] truncate">
+                        {projectNames[r.project] ?? shortProject(r.project)}
+                      </span>
+                    </span>
+                  )}
                   <span title={r.peerDevice}>{peerLabel}</span>
                   <span className="ml-auto shrink-0">{formatTimestamp(r.startedAt)}</span>
                 </p>

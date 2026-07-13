@@ -1,12 +1,30 @@
 import { useCallback, useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
-import { ExternalLink, Plus, Target } from 'lucide-react';
+import { ExternalLink, Loader2, Plus, Send, Target } from 'lucide-react';
 import { api } from '../api';
 import { openUrl } from '../api/desktop';
 import { safeExternalUrl } from '../utils/externalUrl';
 import { useNotifications } from '../contexts/NotificationContext';
 import LinkObjectDialog from '../components/collab/LinkObjectDialog';
-import type { FrameGateRow, GateReport, ProjectDetail as Detail } from '../types/models';
+import ReceiveTab from '../components/collab/ReceiveTab';
+import ModerationQueue from '../components/collab/ModerationQueue';
+import { formatBytes } from '../components/collab/format';
+import { formatTimestamp } from '../utils/dateFormatting';
+import type {
+  FrameGateRow,
+  GateReport,
+  ProjectDetail as Detail,
+  ProjectPackageView,
+  PublishResult,
+} from '../types/models';
+
+type Tab = 'contribute' | 'receive' | 'moderation' | 'overview';
+
+// Rough per-frame size for the PRE-publish confirm estimate only (a calibrated
+// 32-bit-float light frame). The exact size is measured when the package is
+// built and reported back in `PublishResult.byteSize`; the dialog labels this
+// figure "estimated" so it never reads as an authoritative stored value (S6).
+const APPROX_FRAME_BYTES = 45 * 1024 * 1024;
 
 export default function ProjectDetail() {
   const { id } = useParams();
@@ -14,9 +32,14 @@ export default function ProjectDetail() {
   const [detail, setDetail] = useState<Detail | null>(null);
   const [gate, setGate] = useState<GateReport | null>(null);
   const [gateError, setGateError] = useState(false);
-  const [tab, setTab] = useState<'contribute' | 'overview'>('contribute');
+  const [tab, setTab] = useState<Tab>('contribute');
   const [linkOpen, setLinkOpen] = useState(false);
   const [missing, setMissing] = useState(false);
+  const [packages, setPackages] = useState<ProjectPackageView[] | null>(null);
+  const [packagesError, setPackagesError] = useState(false);
+  const [publishConfirm, setPublishConfirm] = useState(false);
+  const [publishBusy, setPublishBusy] = useState(false);
+  const [publishError, setPublishError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -46,9 +69,24 @@ export default function ProjectDetail() {
     }
   }, [id]);
 
+  const loadPackages = useCallback(async () => {
+    if (!id) return;
+    setPackagesError(false);
+    try {
+      setPackages(await api.invoke<ProjectPackageView[]>('list_collab_packages', { projectId: id }));
+    } catch (err) {
+      console.error('[projects] list packages failed:', err);
+      setPackagesError(true);
+    }
+  }, [id]);
+
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    void loadPackages();
+  }, [loadPackages]);
 
   const openPortal = async (path: string) => {
     if (!detail) return;
@@ -67,6 +105,44 @@ export default function ProjectDetail() {
     await openUrl(safe);
   };
 
+  const doPublish = async () => {
+    if (!id) return;
+    setPublishBusy(true);
+    setPublishError(null);
+    try {
+      const res = await api.invoke<PublishResult>('publish_collab_package', { projectId: id });
+      setPublishConfirm(false);
+      // Message reflects the hub-returned state + seed target, never optimistic (S6).
+      let title: string;
+      let tone: 'info' | 'success' | 'warning' = 'info';
+      if (res.seedTarget == null) {
+        title = 'Announced — waiting for a receive-capable member';
+      } else if (res.state === 'published') {
+        title = `Publication announced — seeding to ${res.seedTarget}`;
+        tone = 'success';
+      } else {
+        title = `Sent for approval to ${res.seedTarget}`;
+      }
+      notify({
+        title,
+        detail: `${res.frameCount} frames · ${formatBytes(res.byteSize)}`,
+        kind: 'project',
+        tone,
+        link: `/projects/${id}`,
+        dedupeKey: `publish-${res.packageId}`,
+      });
+      await loadPackages();
+      await load();
+    } catch (err) {
+      // S6 — a failed publish surfaces inline, never silently swallowed.
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[projects] publish failed:', err);
+      setPublishError(msg);
+    } finally {
+      setPublishBusy(false);
+    }
+  };
+
   if (missing)
     return (
       <p className="p-6 text-sm text-content-muted">
@@ -77,6 +153,19 @@ export default function ProjectDetail() {
 
   const c = detail.card;
   const portalPath = c.coordinator ? `/p/${c.slug}/admin` : `/p/${c.slug}`;
+  const canReceive = c.dataRole === 'send_receive' || c.coordinator;
+  const canModerate = c.coordinator && c.requireApproval;
+  const needsApproval = c.requireApproval && !c.coordinator;
+  const coordinatorName = detail.members.find((m) => m.coordinator)?.displayName ?? 'the coordinator';
+  const publishable = gate?.publishable ?? 0;
+
+  const tabs: Tab[] = [
+    'contribute',
+    ...(canReceive ? (['receive'] as const) : []),
+    ...(canModerate ? (['moderation'] as const) : []),
+    'overview',
+  ];
+  const activeTab = tabs.includes(tab) ? tab : 'contribute';
 
   return (
     <div className="space-y-4 p-6">
@@ -97,22 +186,27 @@ export default function ProjectDetail() {
       </div>
 
       <div className="flex gap-1 border-b border-border">
-        {(['contribute', 'overview'] as const).map((t) => (
+        {tabs.map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
-            className={`px-4 py-2 text-sm capitalize transition-colors ${
-              tab === t
+            className={`inline-flex items-center gap-1.5 px-4 py-2 text-sm capitalize transition-colors ${
+              activeTab === t
                 ? 'border-b-2 border-accent font-medium text-content'
                 : 'text-content-muted hover:text-content-secondary'
             }`}
           >
             {t}
+            {t === 'moderation' && c.pendingAnnouncements > 0 && (
+              <span className="rounded-full bg-warning/20 px-1.5 text-[10px] font-medium text-warning">
+                {c.pendingAnnouncements}
+              </span>
+            )}
           </button>
         ))}
       </div>
 
-      {tab === 'contribute' ? (
+      {activeTab === 'contribute' && (
         <div className="space-y-4">
           <div className="flex items-center gap-3">
             <span className="text-sm font-medium text-content">Linked objects</span>
@@ -147,15 +241,40 @@ export default function ProjectDetail() {
             <GateTable gate={gate} />
           )}
 
-          <button
-            disabled
-            title="Sending arrives with the exchange update"
-            className="cursor-not-allowed rounded bg-surface-hover px-4 py-2 text-sm text-content-muted"
-          >
-            Publish {gate?.publishable ?? 0} passing frames (coming soon)
-          </button>
+          <div className="space-y-1">
+            <button
+              onClick={() => {
+                setPublishError(null);
+                setPublishConfirm(true);
+              }}
+              disabled={publishable === 0}
+              className="inline-flex items-center gap-1.5 rounded bg-accent px-4 py-2 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+              title={publishable === 0 ? 'No passing frames to publish yet' : undefined}
+            >
+              <Send size={14} /> Publish {publishable} passing frames
+            </button>
+            {publishError && !publishConfirm && <p className="text-sm text-error">{publishError}</p>}
+          </div>
+
+          <PublicationHistory packages={packages} error={packagesError} />
         </div>
-      ) : (
+      )}
+
+      {activeTab === 'receive' && id && (
+        <ReceiveTab projectId={id} packages={packages} reload={loadPackages} />
+      )}
+
+      {activeTab === 'moderation' && id && (
+        <ModerationQueue
+          projectId={id}
+          onDecided={() => {
+            void load();
+            void loadPackages();
+          }}
+        />
+      )}
+
+      {activeTab === 'overview' && (
         <div className="space-y-4 text-sm">
           <section>
             <h2 className="mb-1 font-medium text-content">Members</h2>
@@ -201,7 +320,129 @@ export default function ProjectDetail() {
           onChanged={() => void load()}
         />
       )}
+
+      {publishConfirm && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+          onClick={() => !publishBusy && setPublishConfirm(false)}
+        >
+          <div
+            className="w-[30rem] max-w-[90vw] rounded-lg border border-border bg-surface p-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-2 flex items-center gap-2">
+              <Send size={16} className="text-accent" />
+              <h2 className="font-medium text-content">Publish to {c.title}</h2>
+            </div>
+            <p className="mb-2 text-sm text-content-secondary">
+              {publishable} passing {publishable === 1 ? 'frame' : 'frames'} will be packaged and
+              announced to the project.
+            </p>
+            <p className="mb-2 text-xs text-content-muted">
+              Estimated size ≈ {formatBytes(publishable * APPROX_FRAME_BYTES)} — the exact size is
+              measured when the package is built.
+            </p>
+            {needsApproval && (
+              <p className="mb-2 text-xs text-warning">
+                This project requires approval — your contribution goes to {coordinatorName} for
+                review.
+              </p>
+            )}
+            {publishError && <p className="mb-2 text-sm text-error">{publishError}</p>}
+            <div className="mt-3 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPublishConfirm(false)}
+                disabled={publishBusy}
+                className="rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void doPublish()}
+                disabled={publishBusy}
+                className="inline-flex items-center gap-1 rounded bg-accent px-3 py-1.5 text-sm text-surface transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {publishBusy && <Loader2 size={12} className="animate-spin" />} Publish
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+/** Own publications with their hub-mirrored state + replication line. */
+function PublicationHistory({
+  packages,
+  error,
+}: {
+  packages: ProjectPackageView[] | null;
+  error: boolean;
+}) {
+  if (error)
+    return (
+      <div className="space-y-1">
+        <h2 className="text-sm font-medium text-content">Your publications</h2>
+        <p className="text-sm text-error">Could not load your publications — see console.</p>
+      </div>
+    );
+  if (packages === null) return null;
+  const own = packages.filter((p) => p.own);
+  return (
+    <div className="space-y-2">
+      <h2 className="text-sm font-medium text-content">Your publications</h2>
+      {own.length === 0 ? (
+        <p className="text-sm text-content-muted">Nothing published yet.</p>
+      ) : (
+        <ul className="space-y-1.5">
+          {own.map((p) => (
+            <li
+              key={p.packageId}
+              className={`rounded border border-border px-3 py-2 text-sm ${
+                p.superseded ? 'opacity-50' : ''
+              }`}
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs text-content-muted">{formatTimestamp(p.createdAt)}</span>
+                <span className="text-xs text-content-secondary">
+                  {p.frameCount} frames · {formatBytes(p.byteSize)}
+                </span>
+                <StateChip state={p.state} rejectReason={p.rejectReason} />
+                {p.superseded && (
+                  <span className="rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-content-muted">
+                    superseded
+                  </span>
+                )}
+              </div>
+              <p className="mt-0.5 text-[11px] text-content-muted">
+                held by {p.holderCount} ({p.onlineCount} online)
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/** Hub-mirrored publication state chip. Rejected carries its reason on the title. */
+function StateChip({ state, rejectReason }: { state: string; rejectReason: string | null }) {
+  const map: Record<string, string> = {
+    pending: 'bg-warning/20 text-warning',
+    published: 'bg-success/20 text-success',
+    rejected: 'bg-error/20 text-error',
+  };
+  const cls = map[state] ?? 'bg-surface-hover text-content-muted';
+  return (
+    <span
+      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
+      title={state === 'rejected' && rejectReason ? rejectReason : undefined}
+    >
+      {state}
+    </span>
   );
 }
 
