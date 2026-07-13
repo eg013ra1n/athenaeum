@@ -141,6 +141,13 @@ struct Pending {
     /// the sender's `sync-finished` `{new, duplicate}` outcome.
     new_count: u32,
     duplicate_count: u32,
+    /// Collab exchange (slice 4): the project id / HUB package uuid read from the
+    /// manifest's [`ProjectStamp`](crate::package::ProjectStamp) on the first
+    /// build. `Some` marks this as a PROJECT package — the announce goes out via
+    /// [`announce_project`](SharingTransport::announce_project) and the Offer/Want
+    /// dedup negotiation is skipped (full send). Both `None` for personal sync.
+    project_id: Option<String>,
+    hub_package_id: Option<String>,
 }
 
 /// Outcome of the first-build dedup handshake
@@ -533,12 +540,17 @@ impl Worker {
     /// lifecycle) so the Transfers UI can correlate it to the Active-tab row.
     fn emit_progress(&self, id: i64, stage: &str, frame_count: u32) {
         if let Some(em) = &self.emitter {
+            // Collab exchange (slice 4): tag the tick with the project id if this
+            // package is a project exchange. Read from the live slot (present for
+            // every progress tick); `None` for personal sync.
+            let project_id = self.pending.get(&id).and_then(|p| p.project_id.clone());
             emit_event(em.as_ref(), "sync-progress", &SyncProgressEvent {
                 package_id: id.to_string(),
                 direction: Direction::Sent,
                 stage: stage.to_string(),
                 peer_device: node_id_hex(&self.peer),
                 frame_count,
+                project_id,
             });
         }
     }
@@ -554,6 +566,7 @@ impl Worker {
         failed: Vec<String>,
         new_count: u32,
         duplicate_count: u32,
+        project_id: Option<String>,
     ) {
         if let Some(em) = &self.emitter {
             emit_event(em.as_ref(), "sync-finished", &SyncFinishedEvent {
@@ -565,6 +578,7 @@ impl Worker {
                 failed,
                 new_count,
                 duplicate_count,
+                project_id,
             });
         }
     }
@@ -599,6 +613,8 @@ impl Worker {
                 want: None,
                 new_count: 0,
                 duplicate_count: 0,
+                project_id: None,
+                hub_package_id: None,
             },
         );
         self.attempt(id).await
@@ -642,6 +658,17 @@ impl Worker {
             },
         };
 
+        // Collab exchange (slice 4): read the project routing captured by
+        // `negotiate_and_build` (set on the first build, persisted across
+        // retries). `Some((project_id, hub_package_id))` ⇒ the announce goes out
+        // as a project advertisement; `None` ⇒ the personal-sync announce.
+        let project = self.pending.get(&id).and_then(|p| {
+            match (&p.project_id, &p.hub_package_id) {
+                (Some(pid), Some(hub)) => Some((pid.clone(), hub.clone())),
+                _ => None,
+            }
+        });
+
         // Provider side: register the served dir (the negotiated want-subset when
         // `Some`, the full package when `None`), then advertise it to the peer. A
         // failure here (e.g. the peer is offline) is retryable, not fatal:
@@ -651,10 +678,18 @@ impl Worker {
                 .serve(&announce, &dir, want.as_ref())
                 .await
                 .context("serve package")?;
-            self.transport
-                .announce(self.peer, &announce)
-                .await
-                .context("announce package")
+            match &project {
+                Some((pid, hub)) => self
+                    .transport
+                    .announce_project(self.peer, pid, hub, &announce)
+                    .await
+                    .context("announce project package"),
+                None => self
+                    .transport
+                    .announce(self.peer, &announce)
+                    .await
+                    .context("announce package"),
+            }
         }
         .await;
         if let Err(e) = serve_announce {
@@ -741,23 +776,42 @@ impl Worker {
             }
         };
 
-        // Build the offer (sampling hashes). ANY hashing error abandons the
-        // handshake for the whole package → full send (`want = None`).
-        let want: Option<HashSet<String>> = match build_offer(dir, &records) {
-            Err(e) => {
-                tracing::debug!(package_id = id, error = %format!("{e:#}"), "dedup offer hashing failed; full send");
-                None
+        // Collab exchange (slice 4): a manifest carrying a project stamp marks a
+        // PROJECT package. Record `(project_id, hub_package_id)` on the slot so
+        // the announce site routes through `announce_project`, and skip the
+        // Offer/Want dedup negotiation entirely (Д2/audit B2 — project packages
+        // always full-send). Persisted on the slot so retries keep the routing.
+        let stamp = records.iter().find_map(|r| r.project.clone());
+        if let Some(s) = &stamp {
+            if let Some(p) = self.pending.get_mut(&id) {
+                p.project_id = Some(s.project_id.clone());
+                p.hub_package_id = Some(s.package_id.clone());
             }
-            Ok((offer, full_by_rel)) => {
-                match self
-                    .transport
-                    .negotiate_want(self.peer, full_announce.package_id.clone(), offer, full_by_rel)
-                    .await
-                {
-                    Ok(w) => Some(w),
-                    Err(e) => {
-                        tracing::debug!(error = %e, package_id = %full_announce.package_id.0, "dedup negotiate failed; full send");
-                        None
+        }
+
+        // Build the offer (sampling hashes). ANY hashing error abandons the
+        // handshake for the whole package → full send (`want = None`). A project
+        // package skips the handshake entirely and full-sends.
+        let want: Option<HashSet<String>> = if stamp.is_some() {
+            tracing::debug!(package_id = id, "project package; skipping dedup negotiation (full send)");
+            None
+        } else {
+            match build_offer(dir, &records) {
+                Err(e) => {
+                    tracing::debug!(package_id = id, error = %format!("{e:#}"), "dedup offer hashing failed; full send");
+                    None
+                }
+                Ok((offer, full_by_rel)) => {
+                    match self
+                        .transport
+                        .negotiate_want(self.peer, full_announce.package_id.clone(), offer, full_by_rel)
+                        .await
+                    {
+                        Ok(w) => Some(w),
+                        Err(e) => {
+                            tracing::debug!(error = %e, package_id = %full_announce.package_id.0, "dedup negotiate failed; full send");
+                            None
+                        }
                     }
                 }
             }
@@ -851,6 +905,7 @@ impl Worker {
             Vec::new(),
             0,
             records.len() as u32,
+            pending.project_id.clone(),
         );
         Ok(())
     }
@@ -908,6 +963,10 @@ impl Worker {
             // Inbound announcements are the receiver's concern (task A7), not
             // this sender-side engine's.
             TransportEvent::AnnounceReceived { .. } => Ok(()),
+            // Inbound project advertisements / pull requests (collab exchange,
+            // slice 4) are handled by the receive side, not this sender engine.
+            TransportEvent::ProjectAnnounceReceived { .. }
+            | TransportEvent::ProjectRequestReceived { .. } => Ok(()),
         }
     }
 
@@ -1064,6 +1123,7 @@ impl Worker {
             Vec::new(),
             pending.new_count,
             pending.duplicate_count,
+            pending.project_id.clone(),
         );
         Ok(())
     }
@@ -1107,9 +1167,14 @@ impl Worker {
     /// receiver's rejection, not just an unreachable peer.
     fn fail_package(&mut self, id: i64) -> Result<()> {
         let removed = self.pending.remove(&id);
-        let (dir, last_rejected, pkg_id) = match removed {
-            Some(p) => (Some(p.dir), p.last_rejected, p.announce.map(|a| a.package_id)),
-            None => (None, Vec::new(), None),
+        let (dir, last_rejected, pkg_id, project_id) = match removed {
+            Some(p) => (
+                Some(p.dir),
+                p.last_rejected,
+                p.announce.map(|a| a.package_id),
+                p.project_id,
+            ),
+            None => (None, Vec::new(), None, None),
         };
         self.store.set_state(id, OutboundState::Failed)?;
         // Terminal: release any served blobs (fire-and-forget). `pkg_id` is
@@ -1135,7 +1200,7 @@ impl Worker {
                 sink.on_terminal(&dir);
             }
         }
-        self.emit_finished(id, &outcome, 0, last_rejected, 0, 0);
+        self.emit_finished(id, &outcome, 0, last_rejected, 0, 0, project_id);
         Ok(())
     }
 
@@ -1147,8 +1212,8 @@ impl Worker {
         // in-flight entry also carries the minted announce whose blobs need
         // releasing; a row resolved only from the store was never served this
         // session, so there is nothing to release (`pkg_id` stays `None`).
-        let (dir, pkg_id) = if let Some(p) = self.pending.remove(&id) {
-            (Some(p.dir), p.announce.map(|a| a.package_id))
+        let (dir, pkg_id, project_id) = if let Some(p) = self.pending.remove(&id) {
+            (Some(p.dir), p.announce.map(|a| a.package_id), p.project_id)
         } else {
             (
                 self.store
@@ -1156,6 +1221,7 @@ impl Worker {
                     .into_iter()
                     .find(|r| r.id == id)
                     .map(|r| PathBuf::from(r.package_ref)),
+                None,
                 None,
             )
         };
@@ -1183,7 +1249,7 @@ impl Worker {
         if let Some(sink) = &self.cleanup_sink {
             sink.on_terminal(&dir);
         }
-        self.emit_finished(id, "cancelled", 0, Vec::new(), 0, 0);
+        self.emit_finished(id, "cancelled", 0, Vec::new(), 0, 0, project_id);
         Ok(())
     }
 

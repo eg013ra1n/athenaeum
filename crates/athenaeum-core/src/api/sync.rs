@@ -830,6 +830,7 @@ fn build_selection_package(
                 frame_meta,
                 analysis,
                 app_version: env!("CARGO_PKG_VERSION").to_string(),
+                project: None,
             },
         ));
         eligible.push(frame_id);

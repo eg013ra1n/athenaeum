@@ -2126,6 +2126,7 @@ mod tests {
                 frame_meta: serde_json::json!({}),
                 analysis: None,
                 app_version: "test".to_string(),
+                project: None,
             };
             ndjson.push_str(&serde_json::to_string(&rec).unwrap());
             ndjson.push('\n');

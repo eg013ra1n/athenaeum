@@ -48,6 +48,7 @@ fn sample_record(src: &Path, rel_path: &str) -> ManifestRecord {
         frame_meta: serde_json::to_value(&frame).unwrap(),
         analysis: None,
         app_version: "0.4.0".to_string(),
+        project: None,
     }
 }
 

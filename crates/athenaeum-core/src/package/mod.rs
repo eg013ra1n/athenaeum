@@ -37,7 +37,7 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
-pub use manifest::{ManifestRecord, PayloadKind, MANIFEST_VERSION};
+pub use manifest::{ManifestRecord, PayloadKind, ProjectStamp, MANIFEST_VERSION};
 pub use reader::{read_manifest, validate_package};
 // `validate_rel_path` / `validate_package_id` are defined below and re-exported
 // implicitly (same module); listed here for discoverability alongside the reader.

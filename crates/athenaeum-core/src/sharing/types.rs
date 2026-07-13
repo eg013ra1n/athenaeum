@@ -80,4 +80,19 @@ pub enum TransportEvent {
         bytes_done: u64,
         bytes_total: u64,
     },
+    /// A peer advertised a PROJECT package (collab exchange, slice 4). Carries the
+    /// HUB package uuid (`package_id`) alongside the engine's wire `announce`
+    /// (whose own `package_id` is the ack-correlation id).
+    ProjectAnnounceReceived {
+        from: NodeId,
+        project_id: String,
+        package_id: String,
+        announce: PackageAnnounce,
+    },
+    /// A receive-role member asked us (a holder) to serve a project package.
+    ProjectRequestReceived {
+        from: NodeId,
+        project_id: String,
+        package_id: String,
+    },
 }

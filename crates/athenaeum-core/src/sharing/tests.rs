@@ -272,6 +272,7 @@ fn build_three_frame_package(src_root: &Path) -> (PathBuf, PackageAnnounce, Vec<
                 frame_meta: serde_json::json!({ "n": i }),
                 analysis: None,
                 app_version: "test".to_string(),
+                project: None,
             },
         ));
         rels.push(filename);

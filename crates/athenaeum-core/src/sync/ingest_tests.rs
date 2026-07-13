@@ -102,6 +102,7 @@ fn build_fixture_package(
         frame_meta: serde_json::to_value(&frame).unwrap(),
         analysis: None,
         app_version: "test".to_string(),
+        project: None,
     };
 
     let pkg_dir = root.join(format!("pkg-{frame_uuid}"));
@@ -139,6 +140,7 @@ fn build_nested_package(
         frame_meta: serde_json::to_value(fixture_frame(frame_uuid, "M31", "2026-01-16T10:00:00.000Z")).unwrap(),
         analysis: None,
         app_version: "test".to_string(),
+        project: None,
     };
     let pkg_dir = root.join(format!("pkg-{frame_uuid}"));
     let announce = package::write_package(&pkg_dir, vec![(src, record)]).unwrap();
@@ -246,6 +248,7 @@ fn build_two_frame_package(root: &Path) -> (PathBuf, [String; 2], PathBuf) {
         frame_meta: serde_json::to_value(&fixture_frame(uuid, object, "2026-01-16T10:00:00.000Z")).unwrap(),
         analysis: None,
         app_version: "test".to_string(),
+        project: None,
     };
     let record_a = record_of(&path_a, &uuid_a, "PAIR_A");
     let record_b = record_of(&path_b, &uuid_b, "PAIR_B");
@@ -290,6 +293,7 @@ fn build_raw_package(root: &Path, frame_uuid: &str, filename: &str, bytes: &[u8]
         frame_meta: serde_json::to_value(&frame).unwrap(),
         analysis: None,
         app_version: "test".to_string(),
+        project: None,
     };
     let pkg_dir = root.join(format!("pkg-{frame_uuid}"));
     let announce = package::write_package(&pkg_dir, vec![(src, record)]).unwrap();
@@ -812,6 +816,7 @@ fn build_fixture_package_val(
         frame_meta: serde_json::to_value(&frame).unwrap(),
         analysis: None,
         app_version: "test".to_string(),
+        project: None,
     };
     let pkg_dir = root.join(format!("pkg-{frame_uuid}"));
     let announce = package::write_package(&pkg_dir, vec![(src, record)]).unwrap();

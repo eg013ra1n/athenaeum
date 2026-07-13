@@ -244,6 +244,7 @@ fn build_manifest_record(
         frame_meta: serde_json::to_value(&frame).context("serialize frame_meta")?,
         analysis: None,
         app_version: env!("CARGO_PKG_VERSION").to_string(),
+        project: None,
     })
 }
 
@@ -1879,6 +1880,7 @@ mod retention_tests {
             frame_meta: serde_json::json!({ "object": object }),
             analysis: None,
             app_version: "test".to_string(),
+            project: None,
         };
         let pkg_dir = packages_dir.join(&uuid);
         write_package(&pkg_dir, vec![(src.to_path_buf(), record)]).unwrap();
@@ -2289,6 +2291,7 @@ mod multi_target_tests {
             frame_meta: serde_json::json!({ "object": "M42" }),
             analysis: None,
             app_version: "test".to_string(),
+            project: None,
         };
         let pkg_dir = dir.join(format!("pkg-{uuid}"));
         write_package(&pkg_dir, vec![(src, record)]).unwrap();

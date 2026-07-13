@@ -88,6 +88,20 @@ pub enum Msg {
         package_id: PackageId,
         entries: Vec<FullHashEntry>,
     },
+    // Slice-4 collab exchange — appended; postcard indices of the variants above are frozen.
+    /// Provider advertises a PROJECT package (collab exchange, slice 4).
+    /// `package_id` is the HUB package uuid (row key); `announce.package_id`
+    /// stays the engine-minted wire id (ack correlation).
+    ProjectAnnounce {
+        project_id: String,
+        package_id: String,
+        announce: PackageAnnounce,
+    },
+    /// A receive-role member asks a holder to serve a project package (hub id).
+    ProjectRequest {
+        project_id: String,
+        package_id: String,
+    },
 }
 
 impl Msg {
@@ -215,6 +229,24 @@ mod tests {
                     sampling_hash: "00ff".into(),
                     xxh3_full: "1122334455667788".into(),
                 }],
+            },
+        ] {
+            let back = Msg::decode(&msg.encode().unwrap()).unwrap();
+            assert_eq!(msg, back);
+        }
+    }
+
+    #[test]
+    fn project_announce_and_request_roundtrip() {
+        for msg in [
+            Msg::ProjectAnnounce {
+                project_id: "p-1".into(),
+                package_id: "hub-pkg-1".into(),
+                announce: sample_announce(),
+            },
+            Msg::ProjectRequest {
+                project_id: "p-1".into(),
+                package_id: "hub-pkg-1".into(),
             },
         ] {
             let back = Msg::decode(&msg.encode().unwrap()).unwrap();

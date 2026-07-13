@@ -68,6 +68,7 @@ fn build_package(
         frame_meta: serde_json::json!({ "filename": filename, "object": object }),
         analysis: None,
         app_version: "test".to_string(),
+        project: None,
     };
 
     let pkg_dir = src_root.parent().unwrap().join(format!("pkg-{frame_uuid}"));
@@ -1139,6 +1140,7 @@ fn build_package_multi(
             frame_meta: serde_json::json!({ "filename": filename, "object": object }),
             analysis: None,
             app_version: "test".to_string(),
+            project: None,
         };
         items.push((payload, record));
     }
@@ -1437,4 +1439,145 @@ async fn mixed_batch_serves_only_want_subset() {
     drop(evts);
 
     engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Slice-4 collab exchange: project-aware announce + the request_project wire.
+// ---------------------------------------------------------------------------
+
+/// Build a one-frame package whose manifest carries a [`ProjectStamp`], so the
+/// engine routes its announce through `announce_project` (slice 4).
+fn build_project_package(
+    src_root: &Path,
+    frame_uuid: &str,
+    filename: &str,
+    project_id: &str,
+    hub_package_id: &str,
+) -> PathBuf {
+    std::fs::create_dir_all(src_root).unwrap();
+    let payload = src_root.join(filename);
+    let bytes: Vec<u8> = (0..4096usize).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&payload, &bytes).unwrap();
+    let byte_size = std::fs::metadata(&payload).unwrap().len();
+    let xxh3 = package::xxh3_full_file(&payload).unwrap();
+    let record = ManifestRecord {
+        v: MANIFEST_VERSION,
+        frame_uuid: frame_uuid.to_string(),
+        origin_catalog_uuid: "catalog-uuid".to_string(),
+        origin_device: "origin-device".to_string(),
+        payload_kind: PayloadKind::RawFrame,
+        rel_path: filename.to_string(),
+        byte_size,
+        xxh3,
+        frame_meta: serde_json::json!({ "filename": filename, "object": "M42" }),
+        analysis: None,
+        app_version: "test".to_string(),
+        project: Some(crate::package::ProjectStamp {
+            project_id: project_id.to_string(),
+            package_id: hub_package_id.to_string(),
+            thresholds_version: None,
+            cal_engine_version: None,
+        }),
+    };
+    let pkg_dir = src_root
+        .parent()
+        .unwrap()
+        .join(format!("proj-pkg-{frame_uuid}"));
+    write_package(&pkg_dir, vec![(payload, record)]).unwrap();
+    pkg_dir
+}
+
+/// A project package (manifest carries a `ProjectStamp`) enqueued into the engine
+/// is advertised to the peer as `ProjectAnnounceReceived` — carrying the hub id
+/// and project id — NOT a plain `AnnounceReceived`.
+#[tokio::test]
+async fn project_package_announces_via_announce_project() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // Receiver endpoint records the first inbound project advertisement.
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let seen: Arc<std::sync::Mutex<Option<TransportEvent>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    {
+        let receiver = receiver.clone();
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            let mut events = receiver.events().await;
+            while let Some(ev) = events.recv().await {
+                // A project package must never arrive as a plain announce.
+                assert!(
+                    !matches!(ev, TransportEvent::AnnounceReceived { .. }),
+                    "project package must not arrive as a plain AnnounceReceived"
+                );
+                if matches!(ev, TransportEvent::ProjectAnnounceReceived { .. }) {
+                    *seen.lock().unwrap() = Some(ev);
+                    break;
+                }
+            }
+        });
+    }
+
+    let pkg = build_project_package(
+        &tmp.path().join("psrc"),
+        "puuid-1",
+        "p1.fits",
+        "p-1",
+        "hub-pkg-1",
+    );
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+    let _id = engine.enqueue_package(&pkg).await.unwrap();
+
+    wait_until(|| seen.lock().unwrap().is_some(), WAIT).await;
+    match seen.lock().unwrap().take().unwrap() {
+        TransportEvent::ProjectAnnounceReceived {
+            project_id,
+            package_id,
+            announce,
+            ..
+        } => {
+            assert_eq!(project_id, "p-1");
+            assert_eq!(package_id, "hub-pkg-1");
+            assert_eq!(announce.frame_count, 1);
+        }
+        other => panic!("expected ProjectAnnounceReceived, got {other:?}"),
+    }
+    engine.shutdown().await;
+}
+
+/// `request_project` delivers a `ProjectRequestReceived` (carrying the hub id) to
+/// the holder — the receive-role member's pull request over the loopback wire.
+#[tokio::test]
+async fn request_project_delivers_project_request_event() {
+    let net = LoopbackNetwork::new();
+    let holder = net.endpoint();
+    holder.start().await.unwrap();
+    let holder_id = holder.node_id();
+    let mut events = holder.events().await;
+
+    let member = net.endpoint();
+    member.start().await.unwrap();
+    member
+        .request_project(holder_id, "p-1", "hub-pkg-1")
+        .await
+        .unwrap();
+
+    match events.recv().await.unwrap() {
+        TransportEvent::ProjectRequestReceived {
+            project_id,
+            package_id,
+            ..
+        } => {
+            assert_eq!(project_id, "p-1");
+            assert_eq!(package_id, "hub-pkg-1");
+        }
+        other => panic!("expected ProjectRequestReceived, got {other:?}"),
+    }
 }

@@ -188,6 +188,55 @@ impl SharingTransport for LoopbackTransport {
         Ok(())
     }
 
+    async fn announce_project(
+        &self,
+        to: NodeId,
+        project_id: &str,
+        package_id: &str,
+        a: &PackageAnnounce,
+    ) -> anyhow::Result<()> {
+        let tx = self.peer_tx(to)?;
+        tx.send(TransportEvent::ProjectAnnounceReceived {
+            from: self.node_id,
+            project_id: project_id.to_string(),
+            package_id: package_id.to_string(),
+            announce: a.clone(),
+        })
+        .await
+        .map_err(|_| anyhow!("peer event channel closed: {}", hex32(&to)))?;
+        tracing::debug!(
+            to = %hex32(&to),
+            project_id,
+            package_id,
+            wire_package_id = %a.package_id.0,
+            "loopback project announce delivered"
+        );
+        Ok(())
+    }
+
+    async fn request_project(
+        &self,
+        to: NodeId,
+        project_id: &str,
+        package_id: &str,
+    ) -> anyhow::Result<()> {
+        let tx = self.peer_tx(to)?;
+        tx.send(TransportEvent::ProjectRequestReceived {
+            from: self.node_id,
+            project_id: project_id.to_string(),
+            package_id: package_id.to_string(),
+        })
+        .await
+        .map_err(|_| anyhow!("peer event channel closed: {}", hex32(&to)))?;
+        tracing::debug!(
+            to = %hex32(&to),
+            project_id,
+            package_id,
+            "loopback project request delivered"
+        );
+        Ok(())
+    }
+
     async fn fetch(
         &self,
         from: NodeId,

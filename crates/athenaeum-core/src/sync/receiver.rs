@@ -82,6 +82,11 @@ pub struct SyncProgressEvent {
     /// destination peer for a send tick.
     pub peer_device: String,
     pub frame_count: u32,
+    /// Collab exchange (slice 4): the project id when this package is a project
+    /// exchange, else `None` for personal sync. Additive — the Transfers UI reads
+    /// it in Task 11 to route project transfers to the project view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 /// `sync-finished` payload: emitted once per package at the end of processing.
@@ -107,6 +112,11 @@ pub struct SyncFinishedEvent {
     /// frame in [`ok_count`](Self::ok_count) / its receipts, not this split.
     pub new_count: u32,
     pub duplicate_count: u32,
+    /// Collab exchange (slice 4): the project id when this package is a project
+    /// exchange, else `None` for personal sync. Additive — Task 11 wires it to
+    /// the project-transfer UI/notification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
 }
 
 /// Handle to a running [`SyncReceiver`]. Dropping it (or calling
@@ -227,6 +237,7 @@ async fn handle_announce(
             failed: Vec::new(),
             new_count: 0,
             duplicate_count: 0,
+            project_id: None,
         });
         return Ok(());
     }
@@ -237,6 +248,7 @@ async fn handle_announce(
         stage: "received".to_string(),
         peer_device: peer_device.clone(),
         frame_count: announce.frame_count,
+        project_id: None,
     });
 
     // Ack-replay guard: a fully-receipted package is re-acked from the log,
@@ -267,6 +279,7 @@ async fn handle_announce(
             failed: Vec::new(),
             new_count: 0,
             duplicate_count: 0,
+            project_id: None,
         });
         return Ok(());
     }
@@ -281,6 +294,7 @@ async fn handle_announce(
         stage: "fetching".to_string(),
         peer_device: peer_device.clone(),
         frame_count: announce.frame_count,
+        project_id: None,
     });
     transport
         .fetch(from, &announce, &staging)
@@ -299,6 +313,7 @@ async fn handle_announce(
         stage: "ingesting".to_string(),
         peer_device: peer_device.clone(),
         frame_count: announce.frame_count,
+        project_id: None,
     });
     let outcome = {
         let store = Arc::clone(store);
@@ -352,6 +367,7 @@ async fn handle_announce(
         failed,
         new_count: 0,
         duplicate_count: 0,
+        project_id: None,
     });
     Ok(())
 }

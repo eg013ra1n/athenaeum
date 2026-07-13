@@ -95,6 +95,37 @@ pub trait SharingTransport: Send + Sync {
         anyhow::bail!("negotiate_want unsupported by this transport")
     }
 
+    /// Advertise a collaboration PROJECT package to peer `to` (slice 4). Mirrors
+    /// [`announce`](Self::announce) but carries the HUB package uuid + project id
+    /// on the wire so the receiver can correlate it to its hub project row; the
+    /// engine-minted `announce.package_id` still correlates the eventual ack. The
+    /// default bails, so a transport without project support fails loudly rather
+    /// than silently degrading to a personal-sync announce.
+    async fn announce_project(
+        &self,
+        to: NodeId,
+        project_id: &str,
+        package_id: &str,
+        announce: &PackageAnnounce,
+    ) -> anyhow::Result<()> {
+        let _ = (to, project_id, package_id, announce);
+        anyhow::bail!("transport does not support project exchange")
+    }
+
+    /// Ask holder `to` to serve a project package identified by its HUB uuid
+    /// (`package_id` — the holder's row key), a receive-role member's pull
+    /// request (slice 4). The default bails on a transport without project
+    /// support.
+    async fn request_project(
+        &self,
+        to: NodeId,
+        project_id: &str,
+        package_id: &str,
+    ) -> anyhow::Result<()> {
+        let _ = (to, project_id, package_id);
+        anyhow::bail!("transport does not support project exchange")
+    }
+
     /// Drop the local payload data for `package_id` — the package reached a
     /// terminal state (confirmed / failed / cancelled on the sender; acked on
     /// the receiver) and its blobs must not outlive it. Idempotent: releasing

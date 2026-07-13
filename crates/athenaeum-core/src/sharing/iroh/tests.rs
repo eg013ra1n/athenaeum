@@ -102,6 +102,7 @@ fn build_package(
         frame_meta: serde_json::json!({ "object": object }),
         analysis: None,
         app_version: "test".to_string(),
+        project: None,
     };
 
     let pkg_dir = src_root.parent().unwrap().join(format!("pkg-{frame_uuid}"));
@@ -958,6 +959,7 @@ fn build_three_frame_package(src_root: &Path) -> (PathBuf, PackageAnnounce, Vec<
                 frame_meta: serde_json::json!({ "n": i }),
                 analysis: None,
                 app_version: "test".to_string(),
+                project: None,
             },
         ));
         rels.push(filename);
