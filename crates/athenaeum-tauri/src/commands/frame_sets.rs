@@ -11,6 +11,7 @@ use super::AppState;
 pub async fn auto_generate_frame_sets(
     project_id: i64,
     threshold_deg: Option<f64>,
+    app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AutoGenerateResult, String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
@@ -78,6 +79,9 @@ pub async fn auto_generate_frame_sets(
         .get_session_gap_threshold_hours(&conn)
         .unwrap_or(6.0);
 
+    // Collaboration: emitter for the per-set project-match suggestions below.
+    let emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
+
     for cluster in clusters {
         // Calculate metadata from cluster frames
         let metadata = crate::frames_set_metadata::calculate_metadata_from_frame_ids(
@@ -99,6 +103,32 @@ pub async fn auto_generate_frame_sets(
             metadata.min_rotation,
             metadata.max_rotation,
         ).map_err(|e| e.to_string())?;
+
+        // Collaboration: suggest linking a new set whose center falls inside one
+        // of my projects' target radius (spec §7 join-first-shoot-later; never
+        // auto-link — the notification is a suggestion).
+        if let (Some(ra_str), Some(dec_str)) = (&metadata.objctra, &metadata.objctdec) {
+            if let (Ok(ra), Ok(dec)) = (
+                athenaeum_core::coordinates::parse_ra_sexagesimal(ra_str),
+                athenaeum_core::coordinates::parse_dec_sexagesimal(dec_str),
+            ) {
+                match athenaeum_core::api::collab::find_matching_projects(&conn, ra, dec, set_id) {
+                    Ok(matches) if !matches.is_empty() => {
+                        athenaeum_core::events::emit_event(
+                            &emitter,
+                            "project-set-match",
+                            &athenaeum_core::api::collab::ProjectSetMatchEvent {
+                                frames_set_id: set_id,
+                                set_name: cluster.name.clone(),
+                                matches,
+                            },
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(set_id, error = %format!("{err:#}"), "project match check failed"),
+                }
+            }
+        }
 
         // Get frames for session detection
         let frames = db::get_frames_with_files_by_ids(&conn, &cluster.member_frame_ids)

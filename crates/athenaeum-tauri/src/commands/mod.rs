@@ -56,6 +56,7 @@ pub mod masters;
 pub mod lights;
 pub mod sync;
 pub mod account;
+pub mod collab;
 
 // Re-export all commands for convenient access
 pub use core::*;
@@ -78,3 +79,4 @@ pub use masters::*;
 pub use lights::*;
 pub use sync::*;
 pub use account::*;
+pub use collab::*;

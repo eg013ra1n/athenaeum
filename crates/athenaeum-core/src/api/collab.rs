@@ -85,6 +85,17 @@ pub struct ProjectSetMatch {
     pub project_slug: String,
 }
 
+/// The `project-set-match` event payload: a newly-generated frame set whose
+/// center falls inside one or more of my cached projects' target radii (Task-6
+/// set-match hook; a suggestion only — never auto-links).
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSetMatchEvent {
+    pub frames_set_id: i64,
+    pub set_name: Option<String>,
+    pub matches: Vec<ProjectSetMatch>,
+}
+
 /// The portal `/new` deep link prefilled from a frame set's target.
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]

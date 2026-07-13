@@ -293,6 +293,9 @@ pub async fn auto_generate_frame_sets(
     let mut sets_created = 0;
     let mut frames_clustered = 0;
 
+    // Collaboration: emitter for the per-set project-match suggestions below.
+    let emitter = crate::events::SseProgressEmitter::new(state.event_tx.clone());
+
     for cluster in clusters {
         let metadata = athenaeum_core::frames_set_metadata::calculate_metadata_from_frame_ids(
             &cluster.member_frame_ids,
@@ -314,6 +317,32 @@ pub async fn auto_generate_frame_sets(
             metadata.max_rotation,
         )
         .map_err(db_err)?;
+
+        // Collaboration: suggest linking a new set whose center falls inside one
+        // of my projects' target radius (spec §7 join-first-shoot-later; never
+        // auto-link — the notification is a suggestion).
+        if let (Some(ra_str), Some(dec_str)) = (&metadata.objctra, &metadata.objctdec) {
+            if let (Ok(ra), Ok(dec)) = (
+                athenaeum_core::coordinates::parse_ra_sexagesimal(ra_str),
+                athenaeum_core::coordinates::parse_dec_sexagesimal(dec_str),
+            ) {
+                match athenaeum_core::api::collab::find_matching_projects(&conn, ra, dec, set_id) {
+                    Ok(matches) if !matches.is_empty() => {
+                        athenaeum_core::events::emit_event(
+                            &emitter,
+                            "project-set-match",
+                            &athenaeum_core::api::collab::ProjectSetMatchEvent {
+                                frames_set_id: set_id,
+                                set_name: cluster.name.clone(),
+                                matches,
+                            },
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(set_id, error = %format!("{err:#}"), "project match check failed"),
+                }
+            }
+        }
 
         let frame_data = db::get_frames_with_files_by_ids(&conn, &cluster.member_frame_ids)
             .map_err(db_err)?;

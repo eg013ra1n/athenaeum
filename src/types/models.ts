@@ -806,3 +806,42 @@ capability: DeviceCapability,
  */
 hubUrl: string, };
 
+export type ProjectCard = { projectId: string, slug: string, title: string, dataRole: string, coordinator: boolean, requireApproval: boolean, pendingAnnouncements: number, projectStatus: string, targetName: string, targetRaDeg: number, targetDecDeg: number, targetRadiusDeg: number, membershipVersion: number, linkedSets: number, candidates: number, publishable: number, fetchedAt: string, };
+
+export type ProjectDetail = { card: ProjectCard, members: Array<ProjectMemberView>, thresholdsVersion: number | null, thresholds: Array<ThresholdRuleView>, links: Array<LinkedSetView>, portalBase: string, };
+
+export type ProjectMemberView = { displayName: string, dataRole: string, coordinator: boolean, };
+
+export type LinkedSetView = { framesSetId: number, name: string | null, lightCount: number, distanceDeg: number | null, withinRadius: boolean, };
+
+export type LinkSuggestion = { framesSetId: number, name: string | null, lightCount: number, 
+/**
+ * Angular distance (deg) from the set center to the project target; `None`
+ * when the set has no parseable center.
+ */
+distanceDeg: number | null, withinRadius: boolean, alreadyLinked: boolean, };
+
+export type GateReport = { projectId: string, total: number, publishable: number, rows: Array<FrameGateRow>, };
+
+export type ProjectSetMatch = { projectId: string, projectTitle: string, projectSlug: string, };
+
+export type ProjectSetMatchEvent = { framesSetId: number, setName: string | null, matches: Array<ProjectSetMatch>, };
+
+export type PortalNewProjectLink = { url: string, };
+
+export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, trailed: boolean | null, publishable: boolean, 
+/**
+ * Human-readable failure reasons, empty when publishable
+ * (e.g. `FWHM 3.4″ > 3.0″`, `not calibrated (Stale)`, `no analysis`,
+ * `unknown pixel scale`, `outside target radius (2.1° > 1.5°)`).
+ */
+failures: Array<string>, };
+
+export type ThresholdRuleView = { metricKey: string, op: string, 
+/**
+ * The repo's ts-rs feature set has NO `serde-json-impl`, so
+ * `serde_json::Value` cannot derive `TS` — override the emitted TS type
+ * (the hub validates rule values to number|bool, so this is exact).
+ */
+value: number | boolean, };
+

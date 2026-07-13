@@ -456,6 +456,13 @@ pub fn run() {
             commands::list_account_devices,
             commands::revoke_account_device,
             commands::rename_device,
+            commands::list_collab_projects,
+            commands::refresh_collab_projects,
+            commands::get_collab_project_detail,
+            commands::evaluate_collab_gate,
+            commands::list_collab_link_suggestions,
+            commands::set_collab_link,
+            commands::create_collab_link_intent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -36,6 +36,7 @@ mod masters;
 mod lights;
 pub(crate) mod sync;
 mod account;
+mod collab;
 
 /// Build the complete Axum router.
 pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
@@ -262,6 +263,14 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/list_account_devices", post(account::list_account_devices))
         .route("/api/revoke_account_device", post(account::revoke_account_device))
         .route("/api/rename_device", post(account::rename_device))
+        // Collaboration projects (Stage II, slice 3)
+        .route("/api/list_collab_projects", post(collab::list_collab_projects))
+        .route("/api/refresh_collab_projects", post(collab::refresh_collab_projects))
+        .route("/api/get_collab_project_detail", post(collab::get_collab_project_detail))
+        .route("/api/evaluate_collab_gate", post(collab::evaluate_collab_gate))
+        .route("/api/list_collab_link_suggestions", post(collab::list_collab_link_suggestions))
+        .route("/api/set_collab_link", post(collab::set_collab_link))
+        .route("/api/create_collab_link_intent", post(collab::create_collab_link_intent))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_log_path", post(get_log_path))
