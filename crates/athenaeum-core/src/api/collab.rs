@@ -2607,7 +2607,18 @@ mod tests {
                 "p-1",
                 &serde_json::json!([member_json("Solo", "send", false, &[0x33; 32])]).to_string(),
             );
-            seed_publishable_set(&conn, &out_dir, "M101 Set", &["uuid-b-1", "uuid-b-2"])
+            // Full 36-char v4 uuids: the Д9 supersede substring-matches source
+            // frame uuids against retained manifests, and the F5 hardening ignores
+            // anything shorter than 32 chars.
+            seed_publishable_set(
+                &conn,
+                &out_dir,
+                "M101 Set",
+                &[
+                    "bbbbbbb1-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    "bbbbbbb2-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                ],
+            )
         };
         link_frame_set(&ctx, "p-1", set_id).unwrap();
 
@@ -2655,12 +2666,15 @@ mod tests {
         let out_dir = _tmp.path().join("cal_out");
         let set_id = {
             let conn = crate::api::db(&ctx).unwrap().conn();
+            // Bob (a non-coordinator send_receive member) is listed FIRST so a
+            // first-eligible-member-wins bug would seed Bob; the pending selector
+            // must skip him and still choose the coordinator (F4).
             seed_publish_project(
                 &conn,
                 "p-1",
                 &serde_json::json!([
-                    member_json("Coord", "send_receive", true, &COORD),
                     member_json("Bob", "send_receive", false, &BOB),
+                    member_json("Coord", "send_receive", true, &COORD),
                 ])
                 .to_string(),
             );

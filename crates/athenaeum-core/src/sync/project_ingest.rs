@@ -88,6 +88,15 @@ pub fn ingest_project_package(
         .ok_or_else(|| anyhow!("unknown collaboration project {project_id}"))?;
     let package = crate::db::collab_exchange::get_package(conn, package_id)?
         .ok_or_else(|| anyhow!("unknown collaboration package {package_id}"))?;
+
+    // A hub-rejected package must never re-land: a rejected contributor could
+    // otherwise re-push the rejected content onto the coordinator (the poll
+    // re-creates the row at state='rejected' because a coordinator sees every
+    // state). Hard-refuse before any frame lands (I2).
+    if package.state == "rejected" {
+        bail!("refusing to ingest package {package_id}: hub state is 'rejected'");
+    }
+
     let manifest_xxh3 = package
         .manifest_xxh3
         .clone()
@@ -228,9 +237,33 @@ fn process_project_frame(
     if let Err(e) = package::validate_rel_path(&record.rel_path) {
         return Ok(rejected_receipt(record, format!("unsafe rel_path: {e}")));
     }
-    let payload = staging_dir.join(&record.rel_path);
+    // Project stamp cross-check FIRST (no disk I/O): the record must be stamped
+    // with THIS project and THIS hub package id (audit B1). An unstamped or
+    // mis-stamped record — a personal-sync frame, or one lifted from another
+    // package — is rejected before we touch its payload or short-circuit as a
+    // duplicate.
+    let stamp_ok = record
+        .project
+        .as_ref()
+        .is_some_and(|p| p.project_id == project_id && p.package_id == package_id);
+    if !stamp_ok {
+        tracing::warn!(frame_uuid = %record.frame_uuid, "project ingest stamp mismatch; rejecting");
+        return Ok(rejected_receipt(record, "project stamp mismatch".to_string()));
+    }
+
+    // uuid-supersede (Д9), duplicate arm resolved BEFORE the payload-presence/hash
+    // checks (F1): a byte-identical re-delivery of the same (project, publisher,
+    // uuid) is a Duplicate — land nothing. Deciding it without reading the payload
+    // lets an already-holding requester complete even against an incomplete serve
+    // dir that is missing this overlap payload.
+    let existing = existing_contribution_xxh3(conn, project_id, publisher, &record.frame_uuid)?;
+    if existing.as_deref() == Some(record.xxh3.as_str()) {
+        tracing::debug!(frame_uuid = %record.frame_uuid, "project ingest duplicate (same uuid + xxh3)");
+        return Ok(duplicate_receipt(record));
+    }
 
     // Verify integrity: the payload must exist and its full-content xxh3 match.
+    let payload = staging_dir.join(&record.rel_path);
     let actual = match package::xxh3_full_file(&payload) {
         Ok(h) => h,
         Err(e) => return Ok(rejected_receipt(record, format!("payload unreadable: {e}"))),
@@ -243,27 +276,9 @@ fn process_project_frame(
         ));
     }
 
-    // Project stamp cross-check: the record must be stamped with THIS project and
-    // THIS hub package id (audit B1). An unstamped or mis-stamped record — a
-    // personal-sync frame, or one lifted from another package — is rejected.
-    let stamp_ok = record
-        .project
-        .as_ref()
-        .is_some_and(|p| p.project_id == project_id && p.package_id == package_id);
-    if !stamp_ok {
-        tracing::warn!(frame_uuid = %record.frame_uuid, "project ingest stamp mismatch; rejecting");
-        return Ok(rejected_receipt(record, "project stamp mismatch".to_string()));
-    }
-
-    // uuid-supersede (Д9): a byte-identical re-delivery of the same
-    // (project, publisher, uuid) is a Duplicate — land nothing. A different
-    // xxh3 for the same key supersedes the older contribution (its landed file
-    // removed best-effort) before the new one lands.
-    let existing = existing_contribution_xxh3(conn, project_id, publisher, &record.frame_uuid)?;
-    if existing.as_deref() == Some(record.xxh3.as_str()) {
-        tracing::debug!(frame_uuid = %record.frame_uuid, "project ingest duplicate (same uuid + xxh3)");
-        return Ok(duplicate_receipt(record));
-    }
+    // A different xxh3 for the same (project, publisher, uuid) supersedes the
+    // older contribution (its landed file removed best-effort) before the new one
+    // lands.
     if let Some(old_path) =
         crate::db::collab_exchange::replace_contribution_for_uuid(conn, project_id, publisher, &record.frame_uuid)?
     {
@@ -511,6 +526,40 @@ mod tests {
         .unwrap();
     }
 
+    /// Seed an additional hub-anchored package row with a custom id (same project
+    /// + publisher), modelling an incremental re-publish (F1).
+    fn seed_named_package(conn: &Connection, package_id: &str, manifest_xxh3: &str) {
+        crate::db::collab_exchange::upsert_package(
+            conn,
+            &PackageRow {
+                package_id: package_id.to_string(),
+                project_id: PROJECT_ID.to_string(),
+                announcement_id: format!("ann-{package_id}"),
+                publisher_display: PUBLISHER.to_string(),
+                own: false,
+                root_hash: "roothash".to_string(),
+                byte_size: 0,
+                frame_count: 0,
+                manifest_xxh3: Some(manifest_xxh3.to_string()),
+                aggregate_stats: "{}".to_string(),
+                supersedes: "[]".to_string(),
+                state: "published".to_string(),
+                reject_reason: None,
+                superseded: false,
+                origin: "remote".to_string(),
+                local_dir: None,
+                manifest_ndjson: None,
+                local_status: "none".to_string(),
+                holder_count: 0,
+                online_count: 0,
+                created_at: "2026-07-13 00:00:00".to_string(),
+                decided_at: None,
+                fetched_at: String::new(),
+            },
+        )
+        .unwrap();
+    }
+
     /// Designate a `collaboration` scan root at `path` so landing is deterministic.
     fn seed_collab_root(conn: &Connection, path: &Path) {
         conn.execute(
@@ -545,9 +594,15 @@ mod tests {
     }
 
     fn default_stamp() -> ProjectStamp {
+        stamp_for(HUB_PACKAGE_ID)
+    }
+
+    /// A project stamp for a specific hub package id (records for a second,
+    /// re-published package must be stamped with ITS package id).
+    fn stamp_for(package_id: &str) -> ProjectStamp {
         ProjectStamp {
             project_id: PROJECT_ID.to_string(),
-            package_id: HUB_PACKAGE_ID.to_string(),
+            package_id: package_id.to_string(),
             thresholds_version: None,
             cal_engine_version: None,
         }
@@ -645,6 +700,38 @@ mod tests {
         let err = ingest_project_package(&conn, &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER)
             .expect_err("null anchor must be a hard error");
         assert!(format!("{err:#}").contains("announcement carries no manifest anchor"));
+    }
+
+    // A hub-rejected package is refused wholesale before any frame lands (I2) — a
+    // rejected contributor must not be able to re-push the rejected content.
+    #[test]
+    fn rejected_state_is_hard_error() {
+        let tmp = TempDir::new().unwrap();
+        let conn = test_conn();
+        let landing = tmp.path().join("landing");
+        seed_project(&conn);
+        seed_collab_root(&conn, &landing);
+
+        let staging = tmp.path().join("staging");
+        let bytes = b"rejected-content";
+        let rec = record("u-1", "a.fits", &hash_bytes(bytes), Some(default_stamp()));
+        let anchor = stage(&staging, vec![rec], &[("a.fits", bytes)]);
+        seed_package(&conn, Some(&anchor));
+        // Flip the hub-mirrored state to rejected (as a coordinator's poll would).
+        let mut row = crate::db::collab_exchange::get_package(&conn, HUB_PACKAGE_ID)
+            .unwrap()
+            .unwrap();
+        row.state = "rejected".to_string();
+        crate::db::collab_exchange::upsert_package(&conn, &row).unwrap();
+
+        let err = ingest_project_package(&conn, &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER)
+            .expect_err("a rejected package must be refused");
+        assert!(
+            format!("{err:#}").contains("rejected"),
+            "the error names the state: {err:#}"
+        );
+        assert!(contributions_for_package(&conn, HUB_PACKAGE_ID).unwrap().is_empty());
+        assert!(landed_files(&landing).is_empty(), "nothing landed for a rejected package");
     }
 
     // 2. A bad per-frame xxh3 ⇒ Rejected, while good frames still land.
@@ -884,5 +971,77 @@ mod tests {
             "fallback lands under <sync_dir>/collaboration: {}",
             rows[0].landed_path
         );
+    }
+
+    // F1/C1: an incremental re-publish re-includes unchanged frames, which ingest
+    // as Duplicates and keep their contribution row keyed to the ORIGINAL package.
+    // `reconstruct_serve_dir` must still serve the COMPLETE re-published package by
+    // resolving payloads from the retained manifest BY CONTENT HASH, not the
+    // package key. ("collab" in the name so the focused `--lib collab` gate runs it.)
+    #[test]
+    fn collab_incremental_republish_reconstructs_complete_serve() {
+        let tmp = TempDir::new().unwrap();
+        let conn = test_conn();
+        let landing = tmp.path().join("landing");
+        seed_project(&conn);
+        seed_collab_root(&conn, &landing);
+
+        // ── pkg1 (HUB_PACKAGE_ID): frame A (shared) + B (v1). ─────────────────
+        let a = b"frame-A-shared-content";
+        let b1 = b"frame-B-content-v1";
+        let staging1 = tmp.path().join("staging1");
+        let anchor1 = stage(
+            &staging1,
+            vec![
+                record("u-A", "A.fits", &hash_bytes(a), Some(default_stamp())),
+                record("u-B", "B.fits", &hash_bytes(b1), Some(default_stamp())),
+            ],
+            &[("A.fits", a), ("B.fits", b1)],
+        );
+        seed_package(&conn, Some(&anchor1));
+        let out1 =
+            ingest_project_package(&conn, &staging1, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
+        assert_eq!(out1.ok_count, 2);
+
+        // ── pkg2: A re-included unchanged (Duplicate), B changed (v2), C new. ─
+        const PKG2: &str = "hub-pkg-2";
+        let b2 = b"frame-B-content-v2-different";
+        let c = b"frame-C-brand-new";
+        let staging2 = tmp.path().join("staging2");
+        let anchor2 = stage(
+            &staging2,
+            vec![
+                record("u-A", "A.fits", &hash_bytes(a), Some(stamp_for(PKG2))),
+                record("u-B", "B.fits", &hash_bytes(b2), Some(stamp_for(PKG2))),
+                record("u-C", "C.fits", &hash_bytes(c), Some(stamp_for(PKG2))),
+            ],
+            &[("A.fits", a), ("B.fits", b2), ("C.fits", c)],
+        );
+        seed_named_package(&conn, PKG2, &anchor2);
+        let out2 = ingest_project_package(&conn, &staging2, PROJECT_ID, PKG2, PEER).unwrap();
+
+        // A is a byte-identical re-delivery ⇒ Duplicate; B(v2) + C ingest.
+        let by_uuid = |u: &str| out2.receipts.iter().find(|r| r.frame_uuid == u).unwrap();
+        assert!(matches!(by_uuid("u-A").outcome, ReceiptOutcome::Duplicate));
+        assert!(matches!(by_uuid("u-B").outcome, ReceiptOutcome::Ingested));
+        assert!(matches!(by_uuid("u-C").outcome, ReceiptOutcome::Ingested));
+
+        // The overlap frame A's contribution row stayed keyed to the ORIGINAL
+        // package — a PKG2-keyed lookup misses it (the bug's root cause).
+        assert_eq!(
+            contributions_for_package(&conn, PKG2).unwrap().len(),
+            2,
+            "only B(v2) + C are keyed to PKG2; A stayed on pkg1"
+        );
+
+        // Reconstruct + validate the PKG2 serve dir: manifest-driven, hash-resolved,
+        // COMPLETE. `validate_package` re-hashes every manifest payload end to end.
+        let sync_dir = tmp.path().join("sync");
+        let serve_dir =
+            crate::api::collab_exchange::reconstruct_serve_dir(&conn, &sync_dir, PKG2).unwrap();
+        crate::package::validate_package(&serve_dir).unwrap();
+        for name in ["A.fits", "B.fits", "C.fits"] {
+            assert!(serve_dir.join(name).exists(), "{name} served in the reconstructed dir");
+        }
     }
 }

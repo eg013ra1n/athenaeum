@@ -487,6 +487,14 @@ pub fn own_active_announcement_ids_for_uuids(
     project_id: &str,
     uuids: &[String],
 ) -> Result<Vec<String>> {
+    // A v4 uuid is 36 chars: ignore anything shorter than 32 so an empty/short
+    // string can't substring-match every retained manifest and mass-supersede
+    // unrelated packages (F5).
+    let uuids: Vec<&str> = uuids
+        .iter()
+        .map(String::as_str)
+        .filter(|u| u.len() >= 32)
+        .collect();
     if uuids.is_empty() {
         return Ok(Vec::new());
     }
@@ -506,7 +514,7 @@ pub fn own_active_announcement_ids_for_uuids(
     for (announcement_id, manifest) in rows {
         let Some(bytes) = manifest else { continue };
         let text = String::from_utf8_lossy(&bytes);
-        if uuids.iter().any(|u| text.contains(u.as_str())) {
+        if uuids.iter().any(|u| text.contains(*u)) {
             out.push(announcement_id);
         }
     }
@@ -760,12 +768,19 @@ mod tests {
     fn own_active_announcement_ids_for_uuids_filters() {
         let conn = test_conn();
 
-        // own + active + manifest contains u-1  -> included
+        // Realistic v4 uuids (36 chars) — the substring match keys on full uuids,
+        // and the F5 length filter drops anything shorter than 32.
+        let u1 = "11111111-1111-4111-8111-111111111111";
+        let u9 = "99999999-9999-4999-8999-999999999999";
+        let u_none = "22222222-2222-4222-8222-222222222222";
+
+        // own + active + manifest contains u1  -> included
         let mut own_active = sample_package("p-own", "proj-1", "2026-07-10 00:00:00");
         own_active.own = true;
         own_active.origin = "mine".into();
         own_active.state = "published".into();
-        own_active.manifest_ndjson = Some(b"{\"uuid\":\"u-1\"}\n{\"uuid\":\"u-9\"}\n".to_vec());
+        own_active.manifest_ndjson =
+            Some(format!("{{\"uuid\":\"{u1}\"}}\n{{\"uuid\":\"{u9}\"}}\n").into_bytes());
         upsert_package(&conn, &own_active).unwrap();
 
         // own but rejected -> excluded
@@ -773,7 +788,7 @@ mod tests {
         own_rejected.own = true;
         own_rejected.origin = "mine".into();
         own_rejected.state = "rejected".into();
-        own_rejected.manifest_ndjson = Some(b"{\"uuid\":\"u-1\"}\n".to_vec());
+        own_rejected.manifest_ndjson = Some(format!("{{\"uuid\":\"{u1}\"}}\n").into_bytes());
         upsert_package(&conn, &own_rejected).unwrap();
 
         // foreign (not own) with the uuid -> excluded
@@ -781,28 +796,33 @@ mod tests {
         foreign.own = false;
         foreign.origin = "remote".into();
         foreign.state = "published".into();
-        foreign.manifest_ndjson = Some(b"{\"uuid\":\"u-1\"}\n".to_vec());
+        foreign.manifest_ndjson = Some(format!("{{\"uuid\":\"{u1}\"}}\n").into_bytes());
         upsert_package(&conn, &foreign).unwrap();
 
-        let ids = own_active_announcement_ids_for_uuids(
-            &conn,
-            "proj-1",
-            &["u-1".to_string()],
-        )
-        .unwrap();
+        let ids = own_active_announcement_ids_for_uuids(&conn, "proj-1", &[u1.to_string()]).unwrap();
         assert_eq!(ids, vec!["ann-p-own".to_string()]);
 
         // A uuid nobody carries yields nothing; an empty uuid list short-circuits.
-        assert!(own_active_announcement_ids_for_uuids(&conn, "proj-1", &["u-none".into()])
+        assert!(own_active_announcement_ids_for_uuids(&conn, "proj-1", &[u_none.to_string()])
             .unwrap()
             .is_empty());
         assert!(own_active_announcement_ids_for_uuids(&conn, "proj-1", &[])
             .unwrap()
             .is_empty());
 
+        // F5: an empty (or too-short) uuid must NOT substring-match every manifest
+        // — it is filtered out, so nothing is returned even though every manifest
+        // trivially "contains" the empty string.
+        assert!(own_active_announcement_ids_for_uuids(&conn, "proj-1", &["".to_string()])
+            .unwrap()
+            .is_empty());
+        assert!(own_active_announcement_ids_for_uuids(&conn, "proj-1", &["u-1".to_string()])
+            .unwrap()
+            .is_empty(), "a short non-uuid is ignored");
+
         // A superseded own+active package is excluded too.
         mark_superseded(&conn, &["ann-p-own".to_string()]).unwrap();
-        assert!(own_active_announcement_ids_for_uuids(&conn, "proj-1", &["u-1".into()])
+        assert!(own_active_announcement_ids_for_uuids(&conn, "proj-1", &[u1.to_string()])
             .unwrap()
             .is_empty());
     }

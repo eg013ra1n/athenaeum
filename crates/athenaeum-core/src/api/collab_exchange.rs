@@ -58,11 +58,17 @@ use crate::sync::{
 ///   it already holds a byte-identical manifest + payloads.
 /// - `origin='received'` (or any other locally-held origin) ⇒ materializes
 ///   `<sync_dir>/collab_serve/<package_id>/`: `manifest.ndjson` is written
-///   byte-exact from the retained `manifest_ndjson`, and each contribution's
-///   payload is hard-linked from its `landed_path` to its `rel_path` (a byte copy
-///   is the fallback when hard-linking is impossible, e.g. a cross-device landing
-///   root). Idempotent — a second call re-writes the manifest and skips payloads
-///   already present.
+///   byte-exact from the retained `manifest_ndjson`, and each MANIFEST RECORD's
+///   payload is resolved among locally-held contributions by content hash
+///   (`find_contribution_by_project_and_hash`, scoped to the package's project)
+///   and hard-linked to its `rel_path` (a byte copy is the fallback when
+///   hard-linking is impossible, e.g. a cross-device landing root). Resolving by
+///   hash — not by package key — is load-bearing (C1/F1): an incremental
+///   re-publish re-includes unchanged frames whose contribution rows stay keyed
+///   to the ORIGINAL package, so a package-keyed lookup would serve an INCOMPLETE
+///   dir. A manifest record with no locally-held payload is a HARD error (we
+///   refuse to serve a package we cannot fully reconstruct). Idempotent — a
+///   second call re-writes the manifest and skips payloads already present.
 pub fn reconstruct_serve_dir(
     conn: &rusqlite::Connection,
     sync_dir: &Path,
@@ -89,25 +95,81 @@ pub fn reconstruct_serve_dir(
     let manifest_bytes = pkg.manifest_ndjson.as_deref().ok_or_else(|| {
         anyhow!("collab package {package_id} has no retained manifest to re-serve")
     })?;
-    let contributions = crate::db::collab_exchange::contributions_for_package(conn, package_id)?;
+    let records = parse_manifest_bytes(manifest_bytes)
+        .with_context(|| format!("parse retained manifest for {package_id}"))?;
     let serve_dir = sync_dir.join("collab_serve").join(package_id);
-    materialize_serve_dir(&serve_dir, manifest_bytes, &contributions)
+    materialize_serve_dir(conn, &pkg.project_id, &serve_dir, manifest_bytes, &records)
         .with_context(|| format!("reconstruct collab serve dir for {package_id}"))?;
     tracing::info!(
         package_id,
-        count = contributions.len(),
+        count = records.len(),
         path = %serve_dir.display(),
         "collab serve dir reconstructed"
     );
     Ok(serve_dir)
 }
 
-/// Materialize `serve_dir`: `manifest.ndjson` byte-exact from `manifest_bytes`,
-/// then each contribution's payload at its `rel_path`. Idempotent.
+/// Parse retained NDJSON manifest bytes into records (blank lines skipped,
+/// unknown JSON keys ignored — mirrors [`crate::package::read_manifest`], but
+/// from bytes we already hold rather than re-reading a file).
+fn parse_manifest_bytes(bytes: &[u8]) -> Result<Vec<crate::package::ManifestRecord>> {
+    let text = std::str::from_utf8(bytes).context("retained manifest is not valid utf-8")?;
+    let mut records = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str(line)
+            .with_context(|| format!("parse retained manifest line {}", i + 1))?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+/// Every manifest record's payload resolves to a locally-held contribution by
+/// `(project_id, xxh3)` — the completeness predicate the have-report gate (F1)
+/// uses before advertising a package to the hub. The read-only twin of
+/// [`materialize_serve_dir`]'s per-record content-hash resolution.
+fn manifest_fully_local(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    records: &[crate::package::ManifestRecord],
+) -> Result<bool> {
+    for record in records {
+        if crate::db::collab_exchange::find_contribution_by_project_and_hash(
+            conn,
+            project_id,
+            &record.xxh3,
+        )?
+        .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Materialize `serve_dir` from the RETAINED MANIFEST (Д2): `manifest.ndjson`
+/// byte-exact from `manifest_bytes`, then for each manifest record resolve its
+/// payload among locally-held contributions by content hash
+/// (`find_contribution_by_project_and_hash`, scoped to `project_id`) and
+/// hard-link it at the record's `rel_path`.
+///
+/// Resolving by CONTENT HASH — not the package key — is the fix for C1/F1: an
+/// incremental re-publish re-includes unchanged frames, whose contribution rows
+/// stay keyed to the ORIGINAL package (the receiver returns `Duplicate` and
+/// writes no new row for them). A package-keyed lookup would miss every such
+/// overlap payload and serve an INCOMPLETE package; the hash lookup finds them
+/// wherever they landed. Any manifest record with NO locally-held payload is a
+/// HARD error — we refuse to serve a package we cannot fully reconstruct
+/// (the request handler's silent-drop discipline turns the error into a refusal).
+/// Idempotent — a second call re-writes the manifest and skips present payloads.
 fn materialize_serve_dir(
+    conn: &rusqlite::Connection,
+    project_id: &str,
     serve_dir: &Path,
     manifest_bytes: &[u8],
-    contributions: &[ContributionRow],
+    records: &[crate::package::ManifestRecord],
 ) -> Result<()> {
     std::fs::create_dir_all(serve_dir)
         .with_context(|| format!("create collab serve dir {}", serve_dir.display()))?;
@@ -117,20 +179,36 @@ fn materialize_serve_dir(
     std::fs::write(&manifest_path, manifest_bytes)
         .with_context(|| format!("write serve manifest {}", manifest_path.display()))?;
 
-    for c in contributions {
+    for record in records {
         // `rel_path` originated in a peer's manifest — guard before joining (L1).
-        crate::package::validate_rel_path(&c.rel_path)
-            .with_context(|| format!("reject unsafe contribution rel_path {}", c.rel_path))?;
-        let dest = serve_dir.join(&c.rel_path);
+        crate::package::validate_rel_path(&record.rel_path)
+            .with_context(|| format!("reject unsafe manifest rel_path {}", record.rel_path))?;
+        let dest = serve_dir.join(&record.rel_path);
         if dest.exists() {
             // Idempotent second call: the payload is already materialized.
             continue;
         }
+        // Resolve the payload by content hash among ALL of this project's
+        // contributions — an incremental re-publish's overlap frames keep their
+        // row keyed to the original package, so a package-keyed lookup would miss
+        // them (C1/F1). No local payload ⇒ refuse to serve an incomplete package.
+        let contribution = crate::db::collab_exchange::find_contribution_by_project_and_hash(
+            conn,
+            project_id,
+            &record.xxh3,
+        )?
+        .ok_or_else(|| {
+            anyhow!(
+                "cannot re-serve package: no local payload for rel_path {} (xxh3 {})",
+                record.rel_path,
+                record.xxh3
+            )
+        })?;
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create serve payload dir {}", parent.display()))?;
         }
-        let src = Path::new(&c.landed_path);
+        let src = Path::new(&contribution.landed_path);
         // Hard-link the landed copy into the serve dir — no second full copy of the
         // frame. Fall back to a byte copy when hard-linking is impossible (a
         // cross-device landing root, EXDEV, or any other link error).
@@ -598,6 +676,9 @@ pub async fn refresh_all_project_packages(
             }
         }
     }
+    // Surface any download failures a spawned pull task buffered (F3) — drained
+    // exactly once so the frontend raises one `downloadFailed` per failure.
+    all.extend(drain_download_failures());
     Ok(all)
 }
 
@@ -721,13 +802,41 @@ pub async fn report_have_after_ingest(
     let announcement_id = {
         let db = db(ctx)?;
         let conn = db.conn();
-        match get_package(&conn, package_id)? {
-            Some(row) => row.announcement_id,
-            None => {
-                tracing::warn!(package_id, "report_have: no local package row; skipping");
-                return Ok(());
-            }
+        let Some(row) = get_package(&conn, package_id)? else {
+            tracing::warn!(package_id, "report_have: no local package row; skipping");
+            return Ok(());
+        };
+        // Gate (F1): only advertise a package we can ACTUALLY fully serve. The
+        // post-ingest hook fires even after a partial/failed ingest, so without
+        // this the hub would list us as a holder that per-frame-fails every
+        // requester. Complete local status AND every manifest record's payload
+        // resolvable by content hash — the same predicate `reconstruct_serve_dir`
+        // enforces, checked cheaply here first.
+        if row.local_status != "complete" {
+            tracing::debug!(
+                package_id,
+                local_status = %row.local_status,
+                "report_have skipped: package not locally complete"
+            );
+            return Ok(());
         }
+        let manifest_ok = match row.manifest_ndjson.as_deref() {
+            Some(bytes) => {
+                let records = parse_manifest_bytes(bytes)
+                    .map_err(|e| ApiError::Internal(format!("parse retained manifest: {e:#}")))?;
+                manifest_fully_local(&conn, &row.project_id, &records)
+                    .map_err(|e| ApiError::Internal(format!("manifest coverage check: {e:#}")))?
+            }
+            None => false,
+        };
+        if !manifest_ok {
+            tracing::warn!(
+                package_id,
+                "report_have skipped: retained manifest not fully covered by local payloads"
+            );
+            return Ok(());
+        }
+        row.announcement_id
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
     client
@@ -780,6 +889,15 @@ pub async fn download_project_package(
             None => false,
         };
         if !allowed {
+            // M2/F6: a spawned download task's Err never reaches the UI, whose
+            // Receive-tab busy state clears only when local_status leaves "none".
+            // Flip an existing row to failed so the spinner doesn't hang. Status
+            // only (no `downloadFailed` notification) — a role rejection is a
+            // config issue, not an attempted transfer; the UPDATE no-ops when the
+            // row doesn't exist yet.
+            if let Err(e) = set_local_status(&conn, package_id, "failed") {
+                tracing::warn!(package_id, error = %format!("{e}"), "download: role-guard set failed status errored");
+            }
             return Err(ApiError::Invalid(format!(
                 "this device's role in project {project_id} does not permit downloading packages"
             )));
@@ -795,14 +913,14 @@ pub async fn download_project_package(
 
     // ── Fresh poll: upsert the row AND read the package's current holders. ────
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
-        set_download_failed(ctx, package_id);
+        set_download_failed(ctx, project_id, package_id);
         return Err(ApiError::SignedOut("Sign in to download a project package.".into()));
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
     let anns = match client.list_announcements(&token, project_id).await {
         Ok(a) => a,
         Err(e) => {
-            set_download_failed(ctx, package_id);
+            set_download_failed(ctx, project_id, package_id);
             return Err(client_err(e));
         }
     };
@@ -815,7 +933,7 @@ pub async fn download_project_package(
     // The freshly-polled announcement for this package (keyed by hub uuid).
     let Some(ann) = anns.into_iter().find(|a| a.package_id == package_id) else {
         tracing::warn!(project_id, package_id, "download: hub no longer lists this package");
-        set_download_failed(ctx, package_id);
+        set_download_failed(ctx, project_id, package_id);
         return Ok(());
     };
 
@@ -833,7 +951,7 @@ pub async fn download_project_package(
 
     if holders.is_empty() {
         tracing::warn!(project_id, package_id, "download: no other holder to pull from");
-        set_download_failed(ctx, package_id);
+        set_download_failed(ctx, project_id, package_id);
         return Ok(());
     }
 
@@ -886,19 +1004,54 @@ pub async fn download_project_package(
     }
 
     // Every holder exhausted.
-    set_download_failed(ctx, package_id);
+    set_download_failed(ctx, project_id, package_id);
     tracing::warn!(project_id, package_id, holders = holders.len(), "download failed: no holder delivered");
     Ok(())
 }
 
-/// Best-effort `set_local_status("failed")` — logged, never masks the caller's
-/// own error/return.
-fn set_download_failed(ctx: &ServiceContext, package_id: &str) {
+/// Best-effort `set_local_status("failed")` for a genuine download attempt, plus
+/// an enqueued `downloadFailed` change so the next `refresh_all_project_packages`
+/// surfaces it (F3 — the download runs on a spawned task that can't `notify()`
+/// itself). Logged, never masks the caller's own error/return.
+fn set_download_failed(ctx: &ServiceContext, project_id: &str, package_id: &str) {
     if let Ok(db) = db(ctx) {
         let conn = db.conn();
         if let Err(e) = set_local_status(&conn, package_id, "failed") {
             tracing::warn!(package_id, error = %format!("{e}"), "download: set failed status errored");
         }
+    }
+    push_download_failure(project_id, package_id);
+}
+
+/// Process-local buffer of `downloadFailed` state changes a spawned
+/// `download_project_package` task produced but could not surface itself (it
+/// returns into a spawned task, not the UI). [`refresh_all_project_packages`]
+/// drains it so the next poll reports each failure exactly once (F3).
+static PENDING_DOWNLOAD_FAILURES: std::sync::OnceLock<std::sync::Mutex<Vec<PackageStateChange>>> =
+    std::sync::OnceLock::new();
+
+fn pending_download_failures() -> &'static std::sync::Mutex<Vec<PackageStateChange>> {
+    PENDING_DOWNLOAD_FAILURES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Enqueue a `downloadFailed` change (F3). Poison-tolerant: a failed lock only
+/// means the change isn't surfaced this cycle, never a panic.
+fn push_download_failure(project_id: &str, package_id: &str) {
+    if let Ok(mut buf) = pending_download_failures().lock() {
+        buf.push(PackageStateChange {
+            project_id: project_id.to_string(),
+            package_id: package_id.to_string(),
+            kind: "downloadFailed".to_string(),
+            detail: None,
+        });
+    }
+}
+
+/// Drain the buffered `downloadFailed` changes exactly once (F3).
+fn drain_download_failures() -> Vec<PackageStateChange> {
+    match pending_download_failures().lock() {
+        Ok(mut buf) => std::mem::take(&mut *buf),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -1803,6 +1956,61 @@ mod tests {
         let sync = crate::sync::SyncRuntime::new();
         let err = download_project_package(&ctx, &sync, "p-1", "pkg-x").await.unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)), "send-only is fail-closed Invalid, got {err:?}");
+    }
+
+    /// F3: a download whose holders are exhausted lands `failed` AND buffers a
+    /// `downloadFailed` change that the next `refresh_all_project_packages` drains
+    /// exactly once — the spawned pull task can't `notify()` the UI itself.
+    #[tokio::test]
+    async fn exhausted_download_buffers_downloadfailed_drained_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (_tmp, ctx) = test_ctx();
+        let own = own_node_for(&ctx);
+        {
+            let conn = db(&ctx).unwrap().conn();
+            let members = serde_json::json!([
+                { "accountId": "acc-me", "displayName": "Me", "dataRole": "send_receive",
+                  "coordinator": false, "nodes": [B64.encode(own)] }
+            ])
+            .to_string();
+            seed_project(&conn, "p-1", &members);
+        }
+
+        // The hub lists the package with NO holders ⇒ the pull exhausts and fails.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1/announcements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                ann_json("ann-x", "pkg-x", false, "published", &[], None, serde_json::json!([]))
+            ])))
+            .mount(&server)
+            .await;
+        wire_hub(&ctx, &server.uri());
+
+        let sync = crate::sync::SyncRuntime::new();
+        // Role passes, poll finds the package, no other holder to pull from ⇒ failed.
+        download_project_package(&ctx, &sync, "p-1", "pkg-x").await.unwrap();
+        assert_eq!(
+            get_package(&db(&ctx).unwrap().conn(), "pkg-x").unwrap().unwrap().local_status,
+            "failed",
+            "an exhausted download lands failed"
+        );
+
+        // The next refresh drains exactly one downloadFailed for pkg-x.
+        let changes = refresh_all_project_packages(&ctx).await.unwrap();
+        let dl_failed: Vec<_> = changes.iter().filter(|c| c.kind == "downloadFailed").collect();
+        assert_eq!(dl_failed.len(), 1, "exactly one buffered downloadFailed drained");
+        assert_eq!(dl_failed[0].package_id, "pkg-x");
+        assert_eq!(dl_failed[0].project_id, "p-1");
+
+        // Drained exactly once — a second refresh surfaces no more.
+        let again = refresh_all_project_packages(&ctx).await.unwrap();
+        assert!(
+            again.iter().all(|c| c.kind != "downloadFailed"),
+            "the buffer is not re-drained"
+        );
     }
 
     /// Download happy path over loopback: D role-passes, polls the hub for the
