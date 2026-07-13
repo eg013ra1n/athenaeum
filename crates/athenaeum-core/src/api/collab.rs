@@ -38,8 +38,9 @@ use crate::coordinates::{angular_distance, parse_dec_sexagesimal, parse_ra_sexag
 use crate::db::analysis::get_frame_analyses_by_ids;
 use crate::db::collab::CollabProjectRow;
 use crate::db::collab_exchange::{
-    get_package_by_announcement, mark_superseded, own_active_announcement_ids_for_uuids,
-    set_local_status, upsert_package, PackageRow,
+    contributions_for_package, delete_package, get_package_by_announcement, list_packages,
+    mark_superseded, own_active_announcement_ids_for_uuids, set_local_status, upsert_package,
+    PackageRow,
 };
 use crate::db::light_calibrations::get_light_calibration_for_frame;
 use crate::events::ProgressEmitter;
@@ -1520,6 +1521,225 @@ pub async fn publish_collab_frames(
     })
 }
 
+// ── Moderation (Task 9): review queue + approve/reject (render-gated) ─────────
+
+/// One frame in a pending package's review copy, projected for the moderation
+/// UI. Metrics are parsed from the contribution's stored `analysis` JSON (the
+/// publisher's `serde_json::to_value(&FrameAnalysis)`, snake_case keys); an
+/// absent metric stays `None` — never invented.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ModerationFrame {
+    pub frame_uuid: String,
+    pub rel_path: String,
+    /// Absolute on-disk path of the landed review copy; `None` when the
+    /// contribution row carries no landed path.
+    pub landed_path: Option<String>,
+    pub byte_size: i64,
+    pub fwhm: Option<f64>,
+    pub eccentricity: Option<f64>,
+    pub stars: Option<i64>,
+    pub snr: Option<f64>,
+}
+
+/// One pending announcement awaiting a coordinator decision.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ModerationItem {
+    pub announcement_id: String,
+    pub package_id: String,
+    pub publisher: String,
+    pub frame_count: i64,
+    pub byte_size: i64,
+    pub created_at: String,
+    /// The push-seed review copy has fully landed (`local_status == "complete"`);
+    /// `false` while the coordinator is still receiving it.
+    pub review_copy_complete: bool,
+    pub frames: Vec<ModerationFrame>,
+}
+
+/// Parse the four review metrics out of a contribution's stored `analysis` JSON
+/// (`median_fwhm`, `median_eccentricity`, `stars_detected`, `median_snr`). A
+/// missing field or malformed JSON leaves that metric `None` — never invented.
+fn moderation_metrics(
+    analysis: Option<&str>,
+) -> (Option<f64>, Option<f64>, Option<i64>, Option<f64>) {
+    let Some(json) = analysis else {
+        return (None, None, None, None);
+    };
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "moderation: contribution analysis JSON did not parse — metrics omitted");
+            return (None, None, None, None);
+        }
+    };
+    (
+        v.get("median_fwhm").and_then(serde_json::Value::as_f64),
+        v.get("median_eccentricity")
+            .and_then(serde_json::Value::as_f64),
+        v.get("stars_detected").and_then(serde_json::Value::as_i64),
+        v.get("median_snr").and_then(serde_json::Value::as_f64),
+    )
+}
+
+/// The coordinator's review queue: every PENDING package for the project, each
+/// with its landed review frames + parsed metrics. Cache-only (no hub I/O) — the
+/// poll (Task 8) keeps the pending set current and lands the review copies.
+pub fn list_moderation_queue(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<Vec<ModerationItem>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+
+    let mut out = Vec::new();
+    for pkg in list_packages(&conn, project_id).map_err(internal)? {
+        if pkg.state != "pending" {
+            continue;
+        }
+        let frames = contributions_for_package(&conn, &pkg.package_id)
+            .map_err(internal)?
+            .into_iter()
+            .map(|c| {
+                let (fwhm, eccentricity, stars, snr) = moderation_metrics(c.analysis.as_deref());
+                ModerationFrame {
+                    frame_uuid: c.frame_uuid,
+                    rel_path: c.rel_path,
+                    landed_path: (!c.landed_path.is_empty()).then_some(c.landed_path),
+                    byte_size: c.byte_size,
+                    fwhm,
+                    eccentricity,
+                    stars,
+                    snr,
+                }
+            })
+            .collect();
+        out.push(ModerationItem {
+            review_copy_complete: pkg.local_status == "complete",
+            announcement_id: pkg.announcement_id,
+            package_id: pkg.package_id,
+            publisher: pkg.publisher_display,
+            frame_count: pkg.frame_count,
+            byte_size: pkg.byte_size,
+            created_at: pkg.created_at,
+            frames,
+        });
+    }
+    Ok(out)
+}
+
+/// Map a hub approve/reject error: a 409 (the announcement is no longer pending —
+/// already decided by another coordinator, or superseded) surfaces as
+/// [`ApiError::Conflict`] so the caller leaves the local row untouched (the next
+/// poll re-syncs it). Everything else goes through [`client_err`]. The collab
+/// client collapses a 409 into `Network("hub returned 409 Conflict…")`, so the
+/// status is detected there.
+fn decide_err(e: crate::account::AccountClientError) -> ApiError {
+    if let crate::account::AccountClientError::Network(ref msg) = e {
+        if msg.contains("409") {
+            return ApiError::Conflict(
+                "This announcement was already decided — refresh the queue.".into(),
+            );
+        }
+    }
+    client_err(e)
+}
+
+/// Decide a pending announcement (coordinator only — enforced by the hub).
+///
+/// - `approve` ⇒ hub approve, then flip the local package state to `published`
+///   (optimistic; the poll re-syncs the authoritative state).
+/// - reject ⇒ `reason` is required, trimmed, and must be 1..=500 BYTES —
+///   validated BEFORE any hub call. On a successful hub reject the local review
+///   copy is removed: every contribution's landed file is deleted best-effort
+///   (`warn!` per failure), then [`delete_package`] drops the row (its
+///   contributions CASCADE). Nothing else — the poll won't resurrect the files.
+///
+/// A hub 409 (no longer pending) is a [`ApiError::Conflict`] and leaves the local
+/// row untouched.
+pub async fn decide_announcement(
+    ctx: &ServiceContext,
+    announcement_id: &str,
+    approve: bool,
+    reason: Option<String>,
+) -> Result<(), ApiError> {
+    // Validate the rejection reason BEFORE touching the hub (the hub also enforces
+    // the 1..=500 BYTE bound, but bailing here avoids a wasted round trip).
+    let reason = if approve {
+        None
+    } else {
+        let trimmed = reason.unwrap_or_default().trim().to_string();
+        if !(1..=500).contains(&trimmed.len()) {
+            return Err(ApiError::Invalid(
+                "a rejection reason of 1 to 500 bytes is required".into(),
+            ));
+        }
+        Some(trimmed)
+    };
+
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        return Err(ApiError::SignedOut(
+            "Sign in to moderate announcements.".into(),
+        ));
+    };
+    let client = CollabClient::new(&hub_url).map_err(client_err)?;
+
+    if approve {
+        let resp = client
+            .approve_announcement(&token, announcement_id)
+            .await
+            .map_err(decide_err)?;
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let updated = conn
+            .execute(
+                "UPDATE project_packages SET state = 'published', decided_at = datetime('now') \
+                 WHERE announcement_id = ?1",
+                [announcement_id],
+            )
+            .map_err(|e| internal(e.into()))?;
+        tracing::info!(announcement_id, hub_state = %resp.state, updated, "approved announcement");
+    } else {
+        let reason = reason.expect("the reject path validates a reason above");
+        let resp = client
+            .reject_announcement(&token, announcement_id, &reason)
+            .await
+            .map_err(decide_err)?;
+        let db = db(ctx)?;
+        let conn = db.conn();
+        match get_package_by_announcement(&conn, announcement_id).map_err(internal)? {
+            Some(pkg) => {
+                let contributions =
+                    contributions_for_package(&conn, &pkg.package_id).map_err(internal)?;
+                for c in &contributions {
+                    if c.landed_path.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = std::fs::remove_file(&c.landed_path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            tracing::warn!(path = %c.landed_path, error = %e, "reject: removing review-copy file failed");
+                        }
+                    }
+                }
+                let removed = delete_package(&conn, &pkg.package_id).map_err(internal)?;
+                tracing::info!(
+                    announcement_id,
+                    package_id = %pkg.package_id,
+                    hub_state = %resp.state,
+                    files = contributions.len(),
+                    removed,
+                    "rejected announcement; review copy deleted"
+                );
+            }
+            None => {
+                tracing::info!(announcement_id, hub_state = %resp.state, "rejected announcement; no local review copy to delete");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2509,5 +2729,289 @@ mod tests {
             publish_collab_frames(&ctx, &sender, "p-1", None).await,
             Err(ApiError::Invalid(_))
         ));
+    }
+
+    // ── Moderation (Task 9) ──────────────────────────────────────────────────
+
+    /// Insert a package row with a given decision `state` + local fetch status
+    /// (fresh `package_id` ⇒ an INSERT, so `local_status` is honored).
+    fn seed_moderation_package(
+        conn: &rusqlite::Connection,
+        project_id: &str,
+        package_id: &str,
+        announcement_id: &str,
+        state: &str,
+        local_status: &str,
+        frame_count: i64,
+    ) {
+        upsert_package(
+            conn,
+            &PackageRow {
+                package_id: package_id.into(),
+                project_id: project_id.into(),
+                announcement_id: announcement_id.into(),
+                publisher_display: "Alice".into(),
+                own: false,
+                root_hash: "r".into(),
+                byte_size: 4096,
+                frame_count,
+                manifest_xxh3: None,
+                aggregate_stats: "{}".into(),
+                supersedes: "[]".into(),
+                state: state.into(),
+                reject_reason: None,
+                superseded: false,
+                origin: "remote".into(),
+                local_dir: None,
+                manifest_ndjson: None,
+                local_status: local_status.into(),
+                holder_count: 0,
+                online_count: 0,
+                created_at: "2026-07-13T00:00:00Z".into(),
+                decided_at: None,
+                fetched_at: String::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// Insert one landed contribution (received frame) for a package.
+    fn add_contribution(
+        conn: &rusqlite::Connection,
+        project_id: &str,
+        package_id: &str,
+        uuid: &str,
+        landed_path: &str,
+        analysis: Option<String>,
+    ) {
+        crate::db::collab_exchange::insert_contribution(
+            conn,
+            &crate::db::collab_exchange::ContributionRow {
+                id: 0,
+                project_id: project_id.into(),
+                package_id: package_id.into(),
+                frame_uuid: uuid.into(),
+                publisher_display: "Alice".into(),
+                rel_path: format!("Alice/{uuid}.fits"),
+                landed_path: landed_path.into(),
+                byte_size: 2048,
+                xxh3: "deadbeef".into(),
+                frame_meta: "{}".into(),
+                analysis,
+                superseded: false,
+                created_at: String::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// The queue lists PENDING packages only (scoped to the project), each frame's
+    /// metrics parsed from the stored `analysis` JSON (absent ⇒ None), and
+    /// `review_copy_complete` reflects `local_status == "complete"` both ways.
+    #[test]
+    fn moderation_queue_lists_pending_with_parsed_metrics() {
+        let (_tmp, ctx) = test_ctx();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+
+        // Pending + fully landed: one frame with analysis, one without.
+        seed_moderation_package(&conn, "p-1", "pkg-pend", "ann-pend", "pending", "complete", 2);
+        let analysis = serde_json::json!({
+            "stars_detected": 400, "median_fwhm": 2.0,
+            "median_eccentricity": 0.4, "median_snr": 10.0
+        })
+        .to_string();
+        add_contribution(&conn, "p-1", "pkg-pend", "u-1", "/land/u-1.fits", Some(analysis));
+        add_contribution(&conn, "p-1", "pkg-pend", "u-2", "/land/u-2.fits", None);
+
+        // Pending but still downloading (review copy incomplete).
+        seed_moderation_package(&conn, "p-1", "pkg-dl", "ann-dl", "pending", "downloading", 1);
+        add_contribution(&conn, "p-1", "pkg-dl", "u-3", "/land/u-3.fits", None);
+
+        // Published — never in the moderation queue.
+        seed_moderation_package(&conn, "p-1", "pkg-pub", "ann-pub", "published", "complete", 1);
+        // Pending, but a DIFFERENT project — excluded by scope.
+        seed_moderation_package(&conn, "p-2", "pkg-other", "ann-other", "pending", "complete", 1);
+
+        let queue = list_moderation_queue(&ctx, "p-1").unwrap();
+        assert_eq!(queue.len(), 2, "only p-1's pending packages");
+
+        let complete = queue.iter().find(|m| m.package_id == "pkg-pend").unwrap();
+        assert!(complete.review_copy_complete);
+        assert_eq!(complete.announcement_id, "ann-pend");
+        assert_eq!(complete.publisher, "Alice");
+        assert_eq!(complete.byte_size, 4096);
+        assert_eq!(complete.frames.len(), 2);
+
+        let f1 = complete.frames.iter().find(|f| f.frame_uuid == "u-1").unwrap();
+        assert_eq!(f1.fwhm, Some(2.0));
+        assert_eq!(f1.eccentricity, Some(0.4));
+        assert_eq!(f1.stars, Some(400));
+        assert_eq!(f1.snr, Some(10.0));
+        assert_eq!(f1.landed_path.as_deref(), Some("/land/u-1.fits"));
+        assert_eq!(f1.byte_size, 2048);
+
+        let f2 = complete.frames.iter().find(|f| f.frame_uuid == "u-2").unwrap();
+        assert_eq!(f2.fwhm, None, "absent analysis ⇒ metrics stay None");
+        assert_eq!(f2.eccentricity, None);
+        assert_eq!(f2.stars, None);
+        assert_eq!(f2.snr, None);
+
+        let incomplete = queue.iter().find(|m| m.package_id == "pkg-dl").unwrap();
+        assert!(!incomplete.review_copy_complete, "still downloading ⇒ not complete");
+    }
+
+    /// Approve → hub approve (200) then the local package flips to `published`.
+    #[tokio::test]
+    async fn approve_flips_local_state_to_published() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/api/v1/announcements/ann-a/approve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "ann-a", "state": "published"
+            })))
+            .mount(&server)
+            .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_moderation_package(&conn, "p-1", "pkg-a", "ann-a", "pending", "complete", 1);
+        }
+
+        decide_announcement(&ctx, "ann-a", true, None).await.unwrap();
+
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        let row = get_package_by_announcement(&conn, "ann-a").unwrap().unwrap();
+        assert_eq!(row.state, "published", "approve flips local state");
+        assert!(row.decided_at.is_some(), "decided_at stamped");
+    }
+
+    /// A reject with an empty / whitespace-only / over-long reason is `Invalid`
+    /// BEFORE any hub call (the mock server sees zero requests).
+    #[tokio::test]
+    async fn reject_bad_reason_is_invalid_before_any_hub_call() {
+        let server = MockServer::start().await;
+        // No reject mock mounted on purpose.
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_moderation_package(&conn, "p-1", "pkg-e", "ann-e", "pending", "complete", 1);
+        }
+
+        for reason in [
+            None,
+            Some(String::new()),
+            Some("   ".to_string()),
+            Some("x".repeat(501)),
+        ] {
+            assert!(
+                matches!(
+                    decide_announcement(&ctx, "ann-e", false, reason).await,
+                    Err(ApiError::Invalid(_))
+                ),
+                "empty/whitespace/over-long reason ⇒ Invalid"
+            );
+        }
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "no hub request was made for an invalid reason"
+        );
+    }
+
+    /// Reject happy path (hub 200): every landed file is removed and the package
+    /// row + its contributions are deleted (CASCADE).
+    #[tokio::test]
+    async fn reject_deletes_the_review_copy() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/api/v1/announcements/ann-r/reject"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "ann-r", "state": "rejected"
+            })))
+            .mount(&server)
+            .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+
+        // Land two real files the reject must delete.
+        let land = _tmp.path().join("land");
+        std::fs::create_dir_all(&land).unwrap();
+        let f1 = land.join("u-1.fits");
+        let f2 = land.join("u-2.fits");
+        std::fs::write(&f1, b"aaa").unwrap();
+        std::fs::write(&f2, b"bbb").unwrap();
+
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_moderation_package(&conn, "p-1", "pkg-r", "ann-r", "pending", "complete", 2);
+            add_contribution(&conn, "p-1", "pkg-r", "u-1", f1.to_str().unwrap(), None);
+            add_contribution(&conn, "p-1", "pkg-r", "u-2", f2.to_str().unwrap(), None);
+        }
+
+        decide_announcement(&ctx, "ann-r", false, Some("FWHM too high".into()))
+            .await
+            .unwrap();
+
+        assert!(!f1.exists(), "landed file removed");
+        assert!(!f2.exists(), "landed file removed");
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        assert!(
+            get_package_by_announcement(&conn, "ann-r").unwrap().is_none(),
+            "package row deleted"
+        );
+        assert!(
+            crate::db::collab_exchange::contributions_for_package(&conn, "pkg-r")
+                .unwrap()
+                .is_empty(),
+            "contributions cascaded away"
+        );
+    }
+
+    /// A hub 409 (already decided) is a `Conflict` and leaves the local review
+    /// copy entirely untouched — the next poll re-syncs it.
+    #[tokio::test]
+    async fn reject_hub_409_is_conflict_and_leaves_local_row() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/api/v1/announcements/ann-x/reject"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "announcement already decided"
+            })))
+            .mount(&server)
+            .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+
+        let land = _tmp.path().join("land");
+        std::fs::create_dir_all(&land).unwrap();
+        let f1 = land.join("u-1.fits");
+        std::fs::write(&f1, b"keep").unwrap();
+
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_moderation_package(&conn, "p-1", "pkg-x", "ann-x", "pending", "complete", 1);
+            add_contribution(&conn, "p-1", "pkg-x", "u-1", f1.to_str().unwrap(), None);
+        }
+
+        let err = decide_announcement(&ctx, "ann-x", false, Some("too soft".into()))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApiError::Conflict(_)), "409 ⇒ Conflict, got {err:?}");
+
+        // Local review copy untouched.
+        assert!(f1.exists(), "landed file NOT removed on 409");
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        let row = get_package_by_announcement(&conn, "ann-x").unwrap().unwrap();
+        assert_eq!(row.state, "pending", "local row untouched on 409");
+        assert_eq!(
+            crate::db::collab_exchange::contributions_for_package(&conn, "pkg-x")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }
