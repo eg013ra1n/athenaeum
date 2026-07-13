@@ -19,6 +19,15 @@
 //! Plus [`fetch_rejects_traversal_entry_names`] — a peer-supplied collection
 //! entry name must never escape `dest_dir` (the fetch-side counterpart of the
 //! A3 write-side `rel_path` guard).
+//!
+//! And the collab-exchange slice-4 connect gate:
+//! [`connect_gate_refuses_control_dispatch_and_blocks_announce`] /
+//! [`connect_gate_permits_when_predicate_allows`] /
+//! [`connect_gate_refuses_blob_fetch`] — `IrohTransport::set_connect_gate`
+//! actually gates BOTH protocol handlers over a real iroh connection: a
+//! refusing gate blocks the control-channel announce (zero events dispatched)
+//! and the blobs download (zero bytes land), while a permitting gate lets the
+//! very same announce through unchanged.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,7 +40,9 @@ use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
 
 use crate::package::{self, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
-use crate::sharing::types::{FrameReceipt, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent};
+use crate::sharing::types::{
+    FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
+};
 use crate::sharing::SharingTransport;
 use crate::sync::{HistoryQuery, OutboundState, StandaloneSyncStore, SyncEngine, SyncStore};
 
@@ -1049,4 +1060,148 @@ async fn subset_serve_empty_want_is_error() {
     );
 
     provider.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 7. Connect gate (collab exchange, slice 4): an ungated peer gets no control
+//    dispatch and no blob bytes. `authz.rs`'s unit tests and the receiver's
+//    loopback gate test cover the DECISION (authz.rs) and the WIRING
+//    (ReceiverHooks → ensure_started → project_gate); neither drives the
+//    loopback mock, so this file is the only coverage of the actual iroh
+//    `ProtocolHandler` refusal — `connect_gate_admits`, the
+//    `connection.close(..., b"unauthorized")` call, and both
+//    `SyncControlProtocol::accept` and `GatedBlobs::accept` refusing before
+//    delegating.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn connect_gate_refuses_control_dispatch_and_blocks_announce() {
+    let provider = mem_transport().await;
+    let receiver = mem_transport().await;
+    let (_provider_info, receiver_info) = start_and_pair(&provider, &receiver).await;
+
+    // Installed AFTER start/pair: `set_connect_gate` is late-bindable (a mutexed
+    // slot cloned into the handlers at construction), so an already-spawned
+    // router picks up this predicate on the very next connection.
+    receiver.set_connect_gate(Arc::new(|_from: &NodeId| false));
+
+    let mut receiver_events = receiver.events().await;
+
+    let tmp = tempdir().unwrap();
+    let (pkg_dir, announce) =
+        build_package(&tmp.path().join("src"), "uuid-gate-1", "gate1.fits", "M1", 4096);
+    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+
+    // The refusing gate closes the connection at the TOP of
+    // `SyncControlProtocol::accept` — before a single `Msg` is decoded — so the
+    // sender never receives its one-byte delivery ack and `announce` errors.
+    // Bounded well under `CONTROL_SEND_TIMEOUT` (30s): an actively closed
+    // connection fails the pending read almost immediately, never waits it out.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(15),
+        provider.announce(receiver_info.node_id, &announce),
+    )
+    .await;
+    match outcome {
+        Ok(Ok(())) => panic!("announce must not succeed against a refusing connect gate"),
+        Ok(Err(_)) | Err(_) => {} // expected: no delivery ack, ever
+    }
+
+    // And zero control dispatch: no `AnnounceReceived` was ever pushed onto the
+    // receiver's event stream, because the control loop never ran at all.
+    let never_arrived =
+        tokio::time::timeout(Duration::from_millis(300), receiver_events.recv()).await;
+    assert!(
+        never_arrived.is_err(),
+        "a gated peer must produce zero control dispatch, but an event arrived"
+    );
+
+    provider.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// Companion to the refusal test above — proves the refusal there is caused by
+/// the gate's verdict, not by broken test setup (e.g. an uncloned gate slot, an
+/// inverted boolean that always refuses): the SAME announce, over the SAME two
+/// endpoints, succeeds end to end when the installed predicate returns `true`.
+#[tokio::test]
+async fn connect_gate_permits_when_predicate_allows() {
+    let provider = mem_transport().await;
+    let receiver = mem_transport().await;
+    let (provider_info, receiver_info) = start_and_pair(&provider, &receiver).await;
+
+    receiver.set_connect_gate(Arc::new(|_from: &NodeId| true));
+
+    let mut receiver_events = receiver.events().await;
+    let tmp = tempdir().unwrap();
+    let (pkg_dir, announce) =
+        build_package(&tmp.path().join("src"), "uuid-gate-2", "gate2.fits", "M1", 4096);
+    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+
+    provider
+        .announce(receiver_info.node_id, &announce)
+        .await
+        .expect("a permitting connect gate must not block the announce");
+
+    match recv_next(&mut receiver_events).await {
+        TransportEvent::AnnounceReceived { from, .. } => assert_eq!(from, provider_info.node_id),
+        other => panic!("expected AnnounceReceived, got {other:?}"),
+    }
+
+    provider.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// The blob-content half of the same contract: `GatedBlobs::accept` must refuse
+/// a download connection exactly like `SyncControlProtocol::accept` refuses a
+/// control connection. The gate lives on whichever side SERVES blob content —
+/// here the provider, since the receiver dials IN to download — so the
+/// announce is delivered first (learning the real collection hash), and only
+/// then is the provider gated shut for the fetch.
+#[tokio::test]
+async fn connect_gate_refuses_blob_fetch() {
+    let provider = mem_transport().await;
+    let receiver = mem_transport().await;
+    let (provider_info, receiver_info) = start_and_pair(&provider, &receiver).await;
+    let mut receiver_events = receiver.events().await;
+
+    let tmp = tempdir().unwrap();
+    let (pkg_dir, announce) =
+        build_package(&tmp.path().join("src"), "uuid-gate-3", "gate3.fits", "M1", 4096);
+    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    // Deliver the announce BEFORE gating the provider, so the receiver learns
+    // the real iroh collection hash — this test's point is the BLOB path, not
+    // the control path (already covered above).
+    provider
+        .announce(receiver_info.node_id, &announce)
+        .await
+        .unwrap();
+    let wire = match recv_next(&mut receiver_events).await {
+        TransportEvent::AnnounceReceived { announce, .. } => announce,
+        other => panic!("expected AnnounceReceived, got {other:?}"),
+    };
+
+    // NOW gate the provider — the side whose `GatedBlobs` wrapper must refuse
+    // the receiver's incoming download connection before ever delegating to the
+    // inner `iroh_blobs` handler.
+    provider.set_connect_gate(Arc::new(|_from: &NodeId| false));
+
+    let dest_parent = tempdir().unwrap();
+    let dest = dest_parent.path().join("dest");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(15),
+        receiver.fetch(provider_info.node_id, &wire, &dest),
+    )
+    .await;
+    match outcome {
+        Ok(Ok(())) => panic!("fetch must not succeed against a refusing connect gate"),
+        Ok(Err(_)) | Err(_) => {} // expected: no blob bytes ever delivered
+    }
+    assert!(
+        !dest.exists(),
+        "no blob bytes land: dest_dir is only created after a successful download"
+    );
+
+    provider.shutdown().await;
+    receiver.shutdown().await;
 }
