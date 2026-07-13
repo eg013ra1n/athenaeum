@@ -834,7 +834,7 @@ struct BuiltSelection {
 /// A collision-free package `rel_path` for a payload. Uses the source filename;
 /// on a duplicate basename within one package it disambiguates with the frame id
 /// (and, in the pathological case, a uuid) so no two payloads overwrite.
-fn unique_rel_path(filename: &str, frame_id: i64, used: &mut HashSet<String>) -> String {
+pub(crate) fn unique_rel_path(filename: &str, frame_id: i64, used: &mut HashSet<String>) -> String {
     let base = if filename.trim().is_empty() {
         format!("frame_{frame_id}.fits")
     } else {

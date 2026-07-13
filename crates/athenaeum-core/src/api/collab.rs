@@ -17,20 +17,40 @@
 //! render-only `api::lights`; the `crate::collab` core module and `db::collab`
 //! stay ungated so the headless/perseus `--no-default-features` build compiles.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
 
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::account::keys::{device_key_path, DeviceKey};
+use crate::api::collab_exchange::ensure_collab_sender_engine;
 use crate::api::lights::frame_cal_status;
 use crate::api::{db, ApiError};
 use crate::collab::gate::{
     evaluate_frame, FrameGateRow, GateFrameInput, ProjectTarget, ThresholdRuleView,
 };
+use crate::collab::hub_client::{AnnounceRequest, CollabClient};
+use crate::collab::snapshot::SnapshotMember;
 use crate::coordinates::{angular_distance, parse_dec_sexagesimal, parse_ra_sexagesimal};
 use crate::db::analysis::get_frame_analyses_by_ids;
 use crate::db::collab::CollabProjectRow;
+use crate::db::collab_exchange::{
+    get_package_by_announcement, mark_superseded, own_active_announcement_ids_for_uuids,
+    set_local_status, upsert_package, PackageRow,
+};
+use crate::db::light_calibrations::get_light_calibration_for_frame;
+use crate::events::ProgressEmitter;
+use crate::fits_writer::{stamp_extra_card, Card, CardValue};
 use crate::models::FrameAnalysis;
+use crate::package::{
+    write_package, xxh3_full_file, ManifestRecord, PayloadKind, ProjectStamp, MANIFEST_FILENAME,
+    MANIFEST_VERSION,
+};
 use crate::services::ServiceContext;
+use crate::sharing::types::NodeId;
 
 /// Module-local `anyhow::Error → ApiError::Internal` mapper (house style —
 /// mirrors the blanket `From<anyhow::Error>` conversion so `.map_err(internal)`
@@ -989,6 +1009,517 @@ pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, 
     list_projects(ctx)
 }
 
+// ── Publish (Task 7): stamped build, hub announce, push-seed ─────────────────
+
+/// The outcome of publishing a project's gate-passing calibrated lights
+/// (BINDING for Tasks 11–12).
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishResult {
+    /// The HUB package uuid (minted first, stamped into every record, announced).
+    pub package_id: String,
+    /// The hub's announcement id (`{id}` from the announce reply).
+    pub announcement_id: String,
+    /// `pending` (require_approval) | `published`.
+    pub state: String,
+    pub frame_count: i64,
+    pub byte_size: i64,
+    /// Announcement ids this publish superseded (Д9); also flipped `superseded=1`
+    /// locally.
+    pub superseded_announcements: Vec<String>,
+    /// Display name of the chosen first-replica member; `None` when no
+    /// receive-capable member is available to seed (still announced).
+    pub seed_target: Option<String>,
+}
+
+/// One publishable frame carried through the stamping/manifest build.
+struct PublishFrame {
+    frame_id: i64,
+    /// The calibrated-light artifact on disk (`light_calibrations.output_path`).
+    output_path: String,
+    /// The light-calibration engine version stamped into the record's project stamp.
+    engine_version: i64,
+    frame: crate::models::Frame,
+    analysis: Option<serde_json::Value>,
+    fwhm_arcsec: Option<f64>,
+    eccentricity: Option<f64>,
+}
+
+/// Linear-interpolated percentile of a pre-sorted slice (`p` in 0..=100). Matches
+/// the median for `p == 50` (average of the two middle values on even n).
+fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    if sorted.len() == 1 {
+        return Some(sorted[0]);
+    }
+    let rank = (p / 100.0) * (sorted.len() as f64 - 1.0);
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    let frac = rank - lo as f64;
+    Some(sorted[lo] + (sorted[hi] - sorted[lo]) * frac)
+}
+
+/// Sort a value list ascending (NaN-safe: NaNs sink to the end but never panic).
+fn sorted_f64(mut v: Vec<f64>) -> Vec<f64> {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v
+}
+
+/// The base64 `nodes[]` of one snapshot member decoded to raw 32-byte node ids
+/// (malformed entries skipped). Mirrors [`crate::collab::authz`]'s decode.
+fn member_node_ids(member: &SnapshotMember) -> Vec<NodeId> {
+    member
+        .nodes
+        .iter()
+        .filter_map(|entry| {
+            let bytes = B64.decode(entry).ok()?;
+            <[u8; 32]>::try_from(bytes.as_slice()).ok()
+        })
+        .collect()
+}
+
+/// The publisher's own display name from the cached snapshot (the member owning
+/// `own_node`), or empty when it can't be resolved.
+fn own_display_name(members: &[SnapshotMember], own_node: &NodeId) -> String {
+    members
+        .iter()
+        .find(|m| member_node_ids(m).iter().any(|n| n == own_node))
+        .map(|m| m.display_name.clone())
+        .unwrap_or_default()
+}
+
+/// Push-seed target selection (Д8): the FIRST eligible member's first node,
+/// excluding our own. Candidate roles are the coordinator when the announcement
+/// is `pending` (only they can decide it), else every `send_receive` member.
+fn select_seed_target(
+    members: &[SnapshotMember],
+    state: &str,
+    own_node: &NodeId,
+) -> Option<(NodeId, String)> {
+    let pending = state == "pending";
+    for m in members {
+        let eligible = if pending {
+            m.coordinator
+        } else {
+            m.data_role == "send_receive"
+        };
+        if !eligible {
+            continue;
+        }
+        for node in member_node_ids(m) {
+            if &node != own_node {
+                return Some((node, m.display_name.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// Publish a project's gate-passing calibrated lights: build a stamped package,
+/// announce it to the hub (anchored on the pre-minted hub uuid), record it
+/// locally with Д9 supersedes, and push-seed the first receive-capable member.
+///
+/// Render-gated (it consumes [`evaluate_project_gate`] + `db::light_calibrations`),
+/// so the headless `--no-default-features` build never compiles it.
+pub async fn publish_collab_frames(
+    ctx: &ServiceContext,
+    collab_sender: &crate::sync::SyncSenderRuntime,
+    project_id: &str,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+) -> Result<PublishResult, ApiError> {
+    // ── 1. Gate → publishable frames, resolve each artifact on disk ──────────
+    let gate = evaluate_project_gate(ctx, project_id)?;
+    let publishable: Vec<&FrameGateRow> = gate.rows.iter().filter(|r| r.publishable).collect();
+    if publishable.is_empty() {
+        return Err(ApiError::Invalid("no publishable frames".into()));
+    }
+
+    let (mut frames, project, skipped_missing) = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+
+        let project = crate::db::collab::get_project(&conn, project_id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("project {project_id} is not cached — refresh first"))
+            })?;
+
+        let ids: Vec<i64> = publishable.iter().map(|r| r.frame_id).collect();
+        let rows = crate::db::get_frames_with_files_by_ids(&conn, &ids)
+            .map_err(|e| internal(e.into()))?;
+        let frame_by_id: HashMap<i64, crate::models::Frame> =
+            rows.into_iter().map(|(_, _, fr)| (fr.id.unwrap_or_default(), fr)).collect();
+        let analysis_by_id: HashMap<i64, FrameAnalysis> = get_frame_analyses_by_ids(&conn, &ids)
+            .map_err(|e| internal(e.into()))?
+            .into_iter()
+            .map(|a| (a.frame_id, a))
+            .collect();
+
+        let mut frames: Vec<PublishFrame> = Vec::with_capacity(publishable.len());
+        let mut skipped: Vec<i64> = Vec::new();
+        for row in &publishable {
+            let Some(cal) = get_light_calibration_for_frame(&conn, row.frame_id).map_err(internal)?
+            else {
+                tracing::warn!(frame_id = row.frame_id, "publish: no light-calibration row — skipping");
+                skipped.push(row.frame_id);
+                continue;
+            };
+            if !Path::new(&cal.output_path).exists() {
+                tracing::warn!(
+                    frame_id = row.frame_id,
+                    path = %cal.output_path,
+                    "publish: calibrated artifact missing on disk — skipping"
+                );
+                skipped.push(row.frame_id);
+                continue;
+            }
+            let Some(frame) = frame_by_id.get(&row.frame_id).cloned() else {
+                tracing::warn!(frame_id = row.frame_id, "publish: frame row vanished — skipping");
+                skipped.push(row.frame_id);
+                continue;
+            };
+            let analysis = analysis_by_id
+                .get(&row.frame_id)
+                .and_then(|a| serde_json::to_value(a).ok());
+            frames.push(PublishFrame {
+                frame_id: row.frame_id,
+                output_path: cal.output_path,
+                engine_version: cal.engine_version,
+                frame,
+                analysis,
+                fwhm_arcsec: row.fwhm_arcsec,
+                eccentricity: row.eccentricity,
+            });
+        }
+        (frames, project, skipped)
+    };
+
+    if frames.is_empty() {
+        return Err(ApiError::Invalid(
+            "no publishable frames — every calibrated artifact is missing on disk".into(),
+        ));
+    }
+    if !skipped_missing.is_empty() {
+        tracing::warn!(count = skipped_missing.len(), "publish: skipped frames with missing artifacts");
+    }
+
+    // ── 2. Mint the HUB package uuid FIRST; stamp each artifact into staging ──
+    let (sync_dir, _db_path) = crate::api::sync::sync_paths(ctx)?;
+    let own_node = DeviceKey::load_or_create(&device_key_path(&sync_dir))
+        .map_err(|e| ApiError::Internal(format!("device key: {e:#}")))?
+        .node_id();
+    let own_device = crate::sync::node_id_hex(&own_node);
+
+    let hub_package_id = uuid::Uuid::new_v4().to_string();
+    let pub_dir = sync_dir.join("collab_pub").join(&hub_package_id);
+    let staging = sync_dir.join("collab_pub").join(format!("{hub_package_id}.staging"));
+    std::fs::create_dir_all(&staging)
+        .map_err(|e| ApiError::Internal(format!("create publish staging {}: {e}", staging.display())))?;
+
+    let stamp_card = Card::new("ATH_PRJ", CardValue::Str(project_id.to_string()))
+        .map_err(|e| ApiError::Internal(format!("build ATH_PRJ card: {e}")))?;
+    let thresholds_version = project.thresholds_version.map(|v| v as i64);
+
+    let mut records: Vec<(std::path::PathBuf, ManifestRecord)> = Vec::with_capacity(frames.len());
+    let mut published_uuids: Vec<String> = Vec::with_capacity(frames.len());
+    let mut used_rel_paths: HashSet<String> = HashSet::new();
+    // Retain the surviving frames so the aggregate stats read the published subset.
+    let mut kept: Vec<PublishFrame> = Vec::with_capacity(frames.len());
+
+    for pf in frames.drain(..) {
+        let out = Path::new(&pf.output_path);
+        let base = out
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| format!("frame_{}.fits", pf.frame_id));
+        let rel_path = crate::api::sync::unique_rel_path(&base, pf.frame_id, &mut used_rel_paths);
+        let stamped = staging.join(&rel_path);
+
+        if let Err(e) = stamp_extra_card(out, &stamped, &stamp_card) {
+            tracing::warn!(frame_id = pf.frame_id, error = %e, "publish: stamping failed — skipping frame");
+            continue;
+        }
+        let byte_size = match std::fs::metadata(&stamped) {
+            Ok(m) => m.len(),
+            Err(e) => {
+                tracing::warn!(frame_id = pf.frame_id, error = %e, "publish: cannot stat stamped copy — skipping");
+                continue;
+            }
+        };
+        let xxh3 = match xxh3_full_file(&stamped) {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(frame_id = pf.frame_id, error = %format!("{e:#}"), "publish: cannot hash stamped copy — skipping");
+                continue;
+            }
+        };
+        let frame_uuid = pf
+            .frame
+            .uuid
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let frame_meta = match serde_json::to_value(&pf.frame) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(frame_id = pf.frame_id, error = %e, "publish: cannot serialize frame_meta — skipping");
+                continue;
+            }
+        };
+        published_uuids.push(frame_uuid.clone());
+        records.push((
+            stamped,
+            ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: frame_uuid.clone(),
+                origin_catalog_uuid: frame_uuid,
+                origin_device: own_device.clone(),
+                payload_kind: PayloadKind::CalibratedLight,
+                rel_path,
+                byte_size,
+                xxh3,
+                frame_meta,
+                analysis: pf.analysis.clone(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                project: Some(ProjectStamp {
+                    project_id: project_id.to_string(),
+                    package_id: hub_package_id.clone(),
+                    thresholds_version,
+                    cal_engine_version: Some(pf.engine_version),
+                }),
+            },
+        ));
+        kept.push(pf);
+    }
+
+    if records.is_empty() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(ApiError::Invalid(
+            "no publishable frames — every calibrated artifact failed to stamp".into(),
+        ));
+    }
+
+    // ── 3. write_package into the pub dir ────────────────────────────────────
+    let announce = match write_package(&pub_dir, records) {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            let _ = std::fs::remove_dir_all(&pub_dir);
+            return Err(ApiError::Internal(format!("write publish package: {e:#}")));
+        }
+    };
+    // Staging is only a copy source for `write_package`; the pub dir now holds
+    // the authoritative payloads + manifest.
+    let _ = std::fs::remove_dir_all(&staging);
+
+    let manifest_path = pub_dir.join(MANIFEST_FILENAME);
+    let manifest_bytes = std::fs::read(&manifest_path)
+        .map_err(|e| ApiError::Internal(format!("read written manifest: {e}")))?;
+    let manifest_xxh3 = xxh3_full_file(&manifest_path)
+        .map_err(|e| ApiError::Internal(format!("hash written manifest: {e:#}")))?;
+    // Hub rootHash: the hub REQUIRES exactly 64 hex chars. `write_package`'s own
+    // `root_hash` is a 16-hex xxh3 placeholder, so compute the BLAKE3 collection
+    // anchor over the manifest bytes (`iroh_blobs::Hash` — blake3 is not a direct
+    // dep). This is an IDENTIFIER only; the wire transfer substitutes the real
+    // iroh collection hash per serve.
+    let root_hash = iroh_blobs::Hash::new(&manifest_bytes).to_hex();
+
+    let frame_count = kept.len() as i64;
+    let byte_size = announce.byte_size as i64;
+
+    // ── 4. Aggregate stats from the published subset ─────────────────────────
+    let aggregate_stats = {
+        let mut stats = serde_json::Map::new();
+        stats.insert("manifestXxh3".into(), serde_json::json!(manifest_xxh3));
+        stats.insert("frameCount".into(), serde_json::json!(frame_count));
+
+        let fwhms = sorted_f64(kept.iter().filter_map(|f| f.fwhm_arcsec).collect());
+        if !fwhms.is_empty() {
+            let mut fwhm_obj = serde_json::Map::new();
+            if let Some(m) = percentile(&fwhms, 50.0) {
+                fwhm_obj.insert("median".into(), serde_json::json!(m));
+            }
+            if let Some(p) = percentile(&fwhms, 10.0) {
+                fwhm_obj.insert("p10".into(), serde_json::json!(p));
+            }
+            if let Some(p) = percentile(&fwhms, 90.0) {
+                fwhm_obj.insert("p90".into(), serde_json::json!(p));
+            }
+            stats.insert("fwhmArcsec".into(), serde_json::Value::Object(fwhm_obj));
+        }
+
+        let eccs = sorted_f64(kept.iter().filter_map(|f| f.eccentricity).collect());
+        if let Some(m) = percentile(&eccs, 50.0) {
+            stats.insert("eccentricityMedian".into(), serde_json::json!(m));
+        }
+
+        let mut integ: BTreeMap<String, f64> = BTreeMap::new();
+        for f in &kept {
+            if let (Some(filter), Some(exp)) = (f.frame.filter.clone(), f.frame.exptime) {
+                *integ.entry(filter).or_default() += exp;
+            }
+        }
+        if !integ.is_empty() {
+            stats.insert("integrationSecondsByFilter".into(), serde_json::json!(integ));
+        }
+        serde_json::Value::Object(stats)
+    };
+
+    // ── 5. Д9 supersedes: my still-active announcements touching these uuids ──
+    let supersedes = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        own_active_announcement_ids_for_uuids(&conn, project_id, &published_uuids).map_err(internal)?
+    };
+
+    // ── 6. Hub announce (anchored on the pre-minted hub uuid) ────────────────
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        let _ = std::fs::remove_dir_all(&pub_dir);
+        return Err(ApiError::SignedOut("Sign in to publish to a project.".into()));
+    };
+    let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    let req = AnnounceRequest {
+        package_id: hub_package_id.clone(),
+        root_hash: root_hash.clone(),
+        byte_size,
+        frame_count: frame_count as i32,
+        aggregate_stats: aggregate_stats.clone(),
+        supersedes: supersedes.clone(),
+    };
+    let resp = match client.announce(&token, project_id, &req).await {
+        Ok(r) => r,
+        Err(e) => {
+            // A closed/duplicate (409), 403, or network failure leaves nothing
+            // published — drop the retained dir so a retry starts clean.
+            let _ = std::fs::remove_dir_all(&pub_dir);
+            return Err(client_err(e));
+        }
+    };
+    tracing::info!(
+        project_id,
+        package_id = %hub_package_id,
+        announcement_id = %resp.id,
+        state = %resp.state,
+        frame_count,
+        superseded = supersedes.len(),
+        "collab package announced"
+    );
+
+    // ── 7. Local rows: upsert (origin=mine), mark supersedes, drop stale dirs ─
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let publisher_display = {
+            let members: Vec<SnapshotMember> =
+                serde_json::from_str(&project.members_json).unwrap_or_default();
+            own_display_name(&members, &own_node)
+        };
+        upsert_package(
+            &conn,
+            &PackageRow {
+                package_id: hub_package_id.clone(),
+                project_id: project_id.to_string(),
+                announcement_id: resp.id.clone(),
+                publisher_display,
+                own: true,
+                root_hash: root_hash.clone(),
+                byte_size,
+                frame_count,
+                manifest_xxh3: Some(manifest_xxh3.clone()),
+                aggregate_stats: aggregate_stats.to_string(),
+                supersedes: serde_json::to_string(&supersedes).unwrap_or_else(|_| "[]".into()),
+                state: resp.state.clone(),
+                reject_reason: None,
+                superseded: false,
+                origin: "mine".to_string(),
+                local_dir: Some(pub_dir.to_string_lossy().to_string()),
+                manifest_ndjson: Some(manifest_bytes.clone()),
+                local_status: "complete".to_string(),
+                holder_count: 0,
+                online_count: 0,
+                created_at: crate::sync::now_iso(),
+                decided_at: None,
+                fetched_at: String::new(),
+            },
+        )
+        .map_err(internal)?;
+        // T3 hazard: `upsert_package` ignores `local_status` on the UPDATE branch,
+        // so an earlier poll INSERT could strand it at 'none'. Set it explicitly.
+        set_local_status(&conn, &hub_package_id, "complete").map_err(internal)?;
+
+        if !supersedes.is_empty() {
+            mark_superseded(&conn, &supersedes).map_err(internal)?;
+            // Reclaim the retained publication dir of each superseded package I own
+            // (best-effort — a failure only leaves a stale dir on disk).
+            for ann_id in &supersedes {
+                if let Ok(Some(old)) = get_package_by_announcement(&conn, ann_id) {
+                    if old.origin == "mine" {
+                        if let Some(dir) = old.local_dir.as_deref() {
+                            if let Err(e) = std::fs::remove_dir_all(dir) {
+                                if e.kind() != std::io::ErrorKind::NotFound {
+                                    tracing::warn!(path = %dir, error = %e, "publish: superseded pub dir cleanup failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── 8. Push-seed the first receive-capable member (Д8) ───────────────────
+    let seed_target = {
+        let members: Vec<SnapshotMember> =
+            serde_json::from_str(&project.members_json).unwrap_or_else(|e| {
+                tracing::warn!(project_id, error = %e, "publish push-seed: members_json parse failed; no seed target");
+                Vec::new()
+            });
+        match select_seed_target(&members, &resp.state, &own_node) {
+            None => {
+                tracing::info!(project_id, package_id = %hub_package_id, "publish: no receive-capable member to seed");
+                None
+            }
+            Some((node, target_name)) => {
+                // Best-effort: the package is already announced + recorded, so a
+                // transient sender-build/enqueue failure must not undo the publish.
+                match ensure_collab_sender_engine(ctx, collab_sender, node, emitter.clone()).await {
+                    Ok((engine, _origin)) => match engine.enqueue_package(&pub_dir).await {
+                        Ok(_) => {
+                            tracing::info!(
+                                project_id,
+                                package_id = %hub_package_id,
+                                seed_target = %target_name,
+                                "publish: push-seed enqueued"
+                            );
+                            Some(target_name)
+                        }
+                        Err(e) => {
+                            tracing::warn!(project_id, error = %format!("{e:#}"), "publish: push-seed enqueue failed");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(project_id, error = %e, "publish: collab sender engine build failed; not seeded");
+                        None
+                    }
+                }
+            }
+        }
+    };
+
+    Ok(PublishResult {
+        package_id: hub_package_id,
+        announcement_id: resp.id,
+        state: resp.state,
+        frame_count,
+        byte_size,
+        superseded_announcements: supersedes,
+        seed_target,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1535,5 +2066,448 @@ mod tests {
                 "stale row kept after pin mismatch"
             );
         }
+    }
+
+    // ── Publish (Task 7) ─────────────────────────────────────────────────────
+
+    use crate::db::light_calibrations::{
+        upsert_light_calibration, FlatNormMode, LightCalRow, LIGHT_CAL_ENGINE_VERSION,
+    };
+    use wiremock::matchers::{method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Cache a project directly (no snapshot verification) with the given
+    /// `members_json`; target M101, no threshold rules (precondition-only gate),
+    /// thresholds_version 4.
+    fn seed_publish_project(conn: &rusqlite::Connection, project_id: &str, members_json: &str) {
+        crate::db::collab::upsert_project(
+            conn,
+            &CollabProjectRow {
+                project_id: project_id.into(),
+                slug: "m101".into(),
+                title: "M 101".into(),
+                data_role: "send_receive".into(),
+                is_coordinator: true,
+                require_approval: false,
+                pending_announcements: 0,
+                project_status: "active".into(),
+                target_name: "M101".into(),
+                target_ra_deg: 210.8,
+                target_dec_deg: 54.35,
+                target_radius_deg: 1.5,
+                membership_version: 1,
+                snapshot_payload_b64: "e30=".into(),
+                snapshot_signature_b64: "e30=".into(),
+                members_json: members_json.into(),
+                thresholds_version: Some(4),
+                thresholds_rules_json: None,
+                fetched_at: String::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    /// One member entry as slice-3 caches it (camelCase `SnapshotMember`).
+    fn member_json(display: &str, data_role: &str, coordinator: bool, node: &NodeId) -> serde_json::Value {
+        serde_json::json!({
+            "accountId": format!("acc-{display}"),
+            "displayName": display,
+            "dataRole": data_role,
+            "coordinator": coordinator,
+            "nodes": [B64.encode(node)],
+        })
+    }
+
+    /// A frame set of gate-passing, calibrated LIGHT frames: on-target, known
+    /// pixel scale, not trailed, each with a real tiny calibrated FITS artifact on
+    /// disk + a `Calibrated` `light_calibrations` row. Returns the set id.
+    fn seed_publishable_set(
+        conn: &rusqlite::Connection,
+        out_dir: &std::path::Path,
+        name: &str,
+        uuids: &[&str],
+    ) -> i64 {
+        std::fs::create_dir_all(out_dir).unwrap();
+        conn.execute(
+            "INSERT INTO frames_set (name, objctra, objctdec) VALUES (?1, '14:03:12', '+54:21:00')",
+            [name],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) \
+             VALUES (?1, '2026-07-01T20:00:00Z', '2026-07-02T03:00:00Z')",
+            [set_id],
+        )
+        .unwrap();
+        let night_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'ASI2600MM')",
+            [night_id],
+        )
+        .unwrap();
+        let session_id = conn.last_insert_rowid();
+
+        for (i, uuid) in uuids.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at) \
+                 VALUES (?1, ?2, 1000, '2026-07-01T21:00:00Z', 'FITS', '2026-07-01T21:00:00Z')",
+                rusqlite::params![
+                    format!("/data/{name}/L_{i:04}.fits"),
+                    format!("L_{i:04}.fits")
+                ],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, object, instrume, ra, dec, xpixsz, focallen, exptime, filter, uuid) \
+                 VALUES (?1, 'Light', 'M101', 'ASI2600MM', 210.8, 54.35, 3.76, 1000.0, 300.0, 'L', ?2)",
+                rusqlite::params![file_id, uuid],
+            )
+            .unwrap();
+            let frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![session_id, frame_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frame_analysis \
+                 (frame_id, file_id, stars_detected, median_fwhm, median_eccentricity, median_snr, \
+                  median_hfr, frame_snr, snr_weight, psf_signal, background, noise, \
+                  detection_threshold, width, height, source_channels, trail_r_squared, possibly_trailed) \
+                 VALUES (?1, ?2, 400, 2.0, 0.4, 10.0, 2.0, 10.0, 1.0, 100.0, 10.0, 1.0, 5.0, \
+                         6248, 4176, 1, 0.0, 0)",
+                rusqlite::params![frame_id, file_id],
+            )
+            .unwrap();
+
+            // A real single-HDU FITS the stamper can copy + a Calibrated tracking
+            // row (no set-ids, current engine, no calibration links ⇒ Calibrated).
+            let out_path = out_dir.join(format!("c_{uuid}.fits"));
+            crate::fits_writer::write_fits_f32(&out_path, 4, 4, 1, &vec![0.5f32; 16], &[]).unwrap();
+            upsert_light_calibration(
+                conn,
+                &LightCalRow {
+                    id: 0,
+                    frame_id: Some(frame_id),
+                    source_uuid: Some(uuid.to_string()),
+                    source_filename: Some(format!("L_{i:04}.fits")),
+                    output_path: out_path.to_string_lossy().to_string(),
+                    dark_set_id: None,
+                    flat_set_id: None,
+                    bias_set_id: None,
+                    calstat: "B".to_string(),
+                    flat_norm_applied: false,
+                    flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
+                    output_hash: "deadbeef".to_string(),
+                    engine_version: LIGHT_CAL_ENGINE_VERSION,
+                    created_at: "2026-07-10T00:00:00Z".to_string(),
+                    cal_params: "{}".to_string(),
+                },
+            )
+            .unwrap();
+        }
+        set_id
+    }
+
+    /// Point `ctx`'s account hub at `uri` and store a device token.
+    fn wire_hub(ctx: &ServiceContext, uri: &str) {
+        {
+            let conn = crate::api::db(ctx).unwrap().conn();
+            crate::db::set_setting(&conn, crate::settings::keys::ACCOUNT_HUB_URL, uri).unwrap();
+        }
+        crate::api::account::store_token_for_test(ctx, "tok").unwrap();
+    }
+
+    /// Mount a single announce responder returning `{id, state}`.
+    async fn mount_announce(server: &MockServer, project_id: &str, id: &str, state: &str) {
+        Mock::given(wm_method("POST"))
+            .and(wm_path(format!("/api/v1/projects/{project_id}/announcements")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": id, "state": state
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Insert a loopback-backed collab sender engine keyed by `peer` into `sender`
+    /// (so `ensure_collab_sender_engine` short-circuits to it instead of building a
+    /// real iroh transport). Returns the engine's outbound store.
+    async fn insert_loopback_engine(
+        sender: &crate::sync::SyncSenderRuntime,
+        db_dir: &std::path::Path,
+        tag: &str,
+        peer: NodeId,
+    ) -> std::sync::Arc<crate::sync::StandaloneSyncStore> {
+        use crate::sharing::SharingTransport;
+        use crate::sync::{
+            node_id_hex, StandaloneSyncStore, StartedSender, SyncEngine, SyncStore,
+        };
+
+        let net = crate::sharing::loopback::LoopbackNetwork::new();
+        let a_ep = net.endpoint();
+        let a_node = a_ep.node_id();
+        let store = std::sync::Arc::new(
+            StandaloneSyncStore::open(db_dir.join(format!("{tag}_a_sync.db"))).unwrap(),
+        );
+        let engine = std::sync::Arc::new(SyncEngine::spawn_with_sink_and_emitter(
+            std::sync::Arc::clone(&store) as std::sync::Arc<dyn SyncStore>,
+            std::sync::Arc::new(a_ep) as std::sync::Arc<dyn SharingTransport>,
+            peer,
+            std::sync::Arc::new(crate::api::collab_exchange::CollabCleanupSink),
+            None,
+        ));
+        sender.lock_inner().await.insert(
+            peer,
+            StartedSender {
+                engine,
+                origin_device: node_id_hex(&a_node),
+                peer,
+            },
+        );
+        store
+    }
+
+    /// Pull the announce request bodies (in order) the mock hub received.
+    async fn announce_bodies(server: &MockServer) -> Vec<serde_json::Value> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path().ends_with("/announcements"))
+            .map(|r| serde_json::from_slice(&r.body).unwrap())
+            .collect()
+    }
+
+    /// (a) Full publish over a wiremock hub + a loopback seed target: state
+    /// published, retained stamped pub dir (ATH_PRJ in the payload header), an
+    /// origin=mine row with manifest bytes, the hub saw the manifest anchor +
+    /// `supersedes: []`, and the send_receive member was seeded.
+    #[tokio::test]
+    async fn publish_announces_stamps_and_seeds_the_member() {
+        const BOB: NodeId = [0x11; 32];
+        let server = MockServer::start().await;
+        mount_announce(&server, "p-1", "ann-a", "published").await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        let out_dir = _tmp.path().join("cal_out");
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(
+                &conn,
+                "p-1",
+                &serde_json::json!([member_json("Bob", "send_receive", false, &BOB)]).to_string(),
+            );
+            seed_publishable_set(&conn, &out_dir, "M101 Set", &["uuid-a-1", "uuid-a-2"])
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        let sender = crate::sync::SyncSenderRuntime::new();
+        let store = insert_loopback_engine(&sender, _tmp.path(), "a", BOB).await;
+
+        let result = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+
+        assert_eq!(result.state, "published");
+        assert_eq!(result.announcement_id, "ann-a");
+        assert_eq!(result.frame_count, 2);
+        assert!(result.byte_size > 0);
+        assert!(result.superseded_announcements.is_empty());
+        assert_eq!(result.seed_target.as_deref(), Some("Bob"), "the send_receive member is seeded");
+
+        // Retained pub dir with a stamped payload (ATH_PRJ in the header).
+        let pub_dir = _tmp.path().join("sync").join("collab_pub").join(&result.package_id);
+        assert!(pub_dir.join(crate::package::MANIFEST_FILENAME).exists());
+        let payload = pub_dir.join("c_uuid-a-1.fits");
+        assert!(payload.exists(), "stamped payload retained under its rel_path");
+        let head = String::from_utf8_lossy(&std::fs::read(&payload).unwrap()).to_string();
+        assert!(head.contains("ATH_PRJ"), "payload header carries the project stamp card");
+        // Staging scratch dir cleaned.
+        assert!(!_tmp.path().join("sync").join("collab_pub").join(format!("{}.staging", result.package_id)).exists());
+
+        // Local package row: origin=mine, complete, retained manifest bytes.
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            let row = crate::db::collab_exchange::get_package(&conn, &result.package_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.origin, "mine");
+            assert!(row.own);
+            assert_eq!(row.state, "published");
+            assert_eq!(row.local_status, "complete");
+            assert_eq!(row.frame_count, 2);
+            assert!(row.manifest_ndjson.as_ref().is_some_and(|b| !b.is_empty()));
+            assert_eq!(row.root_hash.len(), 64, "rootHash rendered to 64 hex chars");
+        }
+
+        // Hub saw the manifest anchor + an empty supersedes.
+        let bodies = announce_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0]["aggregateStats"]["manifestXxh3"].as_str().unwrap().len(),
+            16
+        );
+        assert_eq!(bodies[0]["supersedes"], serde_json::json!([]));
+        assert_eq!(bodies[0]["rootHash"].as_str().unwrap().len(), 64);
+
+        // The seed reached the loopback engine (outbound row created on enqueue).
+        assert!(store.get_outbound(1).unwrap().is_some(), "push-seed enqueued to the member engine");
+    }
+
+    /// (b) Re-publishing the same source uuids supersedes the first announcement:
+    /// the second announce body carries the first announcement id, the first
+    /// package row flips `superseded=1`, and the result echoes it.
+    #[tokio::test]
+    async fn republish_supersedes_the_prior_announcement() {
+        let server = MockServer::start().await;
+        // First POST → ann-1 (once), later POSTs → ann-2.
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/api/v1/projects/p-1/announcements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "ann-1", "state": "published"
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_announce(&server, "p-1", "ann-2", "published").await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        let out_dir = _tmp.path().join("cal_out");
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            // Send-only member ⇒ no seed target (keeps this test focused on Д9).
+            seed_publish_project(
+                &conn,
+                "p-1",
+                &serde_json::json!([member_json("Solo", "send", false, &[0x33; 32])]).to_string(),
+            );
+            seed_publishable_set(&conn, &out_dir, "M101 Set", &["uuid-b-1", "uuid-b-2"])
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        let sender = crate::sync::SyncSenderRuntime::new();
+        let first = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        assert_eq!(first.announcement_id, "ann-1");
+        assert!(first.superseded_announcements.is_empty());
+        assert!(first.seed_target.is_none(), "a send-only member is not a seed target");
+
+        let second = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        assert_eq!(second.announcement_id, "ann-2");
+        assert_eq!(
+            second.superseded_announcements,
+            vec!["ann-1".to_string()],
+            "the re-publish supersedes the first announcement"
+        );
+
+        // The first package row is now flagged superseded.
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            let first_row = crate::db::collab_exchange::get_package(&conn, &first.package_id)
+                .unwrap()
+                .unwrap();
+            assert!(first_row.superseded, "first package row flipped superseded=1");
+        }
+
+        // The second announce body carried the first announcement id in supersedes.
+        let bodies = announce_bodies(&server).await;
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["supersedes"], serde_json::json!([]));
+        assert_eq!(bodies[1]["supersedes"], serde_json::json!(["ann-1"]));
+    }
+
+    /// (c) A `pending` announcement (require_approval) seeds the COORDINATOR, not
+    /// a non-coordinator send_receive member.
+    #[tokio::test]
+    async fn pending_publish_seeds_the_coordinator() {
+        const COORD: NodeId = [0x22; 32];
+        const BOB: NodeId = [0x11; 32];
+        let server = MockServer::start().await;
+        mount_announce(&server, "p-1", "ann-c", "pending").await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        let out_dir = _tmp.path().join("cal_out");
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(
+                &conn,
+                "p-1",
+                &serde_json::json!([
+                    member_json("Coord", "send_receive", true, &COORD),
+                    member_json("Bob", "send_receive", false, &BOB),
+                ])
+                .to_string(),
+            );
+            seed_publishable_set(&conn, &out_dir, "M101 Set", &["uuid-c-1"])
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        let sender = crate::sync::SyncSenderRuntime::new();
+        // Pre-insert engines for BOTH candidates so whichever is chosen enqueues
+        // cleanly (no real transport) — the seed_target string reveals the choice.
+        insert_loopback_engine(&sender, _tmp.path(), "c_coord", COORD).await;
+        insert_loopback_engine(&sender, _tmp.path(), "c_bob", BOB).await;
+
+        let result = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        assert_eq!(result.state, "pending");
+        assert_eq!(
+            result.seed_target.as_deref(),
+            Some("Coord"),
+            "a pending package seeds only the coordinator"
+        );
+    }
+
+    /// (d) No receive-capable member online ⇒ `seed_target` is None but the
+    /// package is still announced + recorded.
+    #[tokio::test]
+    async fn publish_with_no_eligible_target_still_announces() {
+        let server = MockServer::start().await;
+        mount_announce(&server, "p-1", "ann-d", "published").await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        let out_dir = _tmp.path().join("cal_out");
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            // Only a send-only contributor ⇒ no published-state seed candidate.
+            seed_publish_project(
+                &conn,
+                "p-1",
+                &serde_json::json!([member_json("Solo", "send", false, &[0x44; 32])]).to_string(),
+            );
+            seed_publishable_set(&conn, &out_dir, "M101 Set", &["uuid-d-1"])
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        let sender = crate::sync::SyncSenderRuntime::new();
+        let result = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+
+        assert_eq!(result.state, "published");
+        assert!(result.seed_target.is_none(), "no receive-capable member ⇒ no seed target");
+        assert!(!sender.is_started().await, "nothing was enqueued");
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            assert!(crate::db::collab_exchange::get_package(&conn, &result.package_id)
+                .unwrap()
+                .is_some());
+        }
+    }
+
+    /// An empty gate (no publishable frames) is an `Invalid`, never a panic.
+    #[tokio::test]
+    async fn publish_with_no_publishable_frames_is_invalid() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(&conn, "p-1", "[]");
+        }
+        let sender = crate::sync::SyncSenderRuntime::new();
+        assert!(matches!(
+            publish_collab_frames(&ctx, &sender, "p-1", None).await,
+            Err(ApiError::Invalid(_))
+        ));
     }
 }
