@@ -170,6 +170,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::collab::ProjectSetMatch,
             crate::api::collab::ProjectSetMatchEvent,
             crate::api::collab::PortalNewProjectLink,
+            crate::api::collab_exchange::PackageStateChange,
             crate::collab::gate::FrameGateRow,
             crate::collab::gate::ThresholdRuleView,
         ]))),

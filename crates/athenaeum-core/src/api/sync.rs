@@ -246,20 +246,57 @@ fn project_announce_gate(ctx: &ServiceContext) -> Result<crate::sync::ProjectAnn
 
 /// Assemble the slice-4 [`ReceiverHooks`](crate::sync::ReceiverHooks) that both
 /// `ensure_started` callers pass: the composite connect gate (installed only when
-/// signed in) plus the always-on project announce gate, plus the task-6
-/// holder-side serve handler that answers inbound project pull requests.
+/// signed in) plus the always-on project announce gate, the task-6 holder-side
+/// serve handler that answers inbound project pull requests, and the task-8
+/// announcements-refresh + post-ingest report-have hooks.
 fn receiver_hooks(
-    ctx: &ServiceContext,
+    ctx: &Arc<ServiceContext>,
     request_handler: Option<crate::sync::ProjectRequestHandler>,
 ) -> Result<crate::sync::ReceiverHooks, ApiError> {
     Ok(crate::sync::ReceiverHooks {
         connect_gate: connect_gate(ctx)?,
         project_gate: Some(project_announce_gate(ctx)?),
-        // Task 8 wires these to the hub poll (announcements refresh) and the
-        // report-have / notification path; None until then.
-        announcements_refresher: None,
-        on_project_ingested: None,
+        announcements_refresher: Some(announcements_refresher(Arc::clone(ctx))),
+        on_project_ingested: Some(on_project_ingested_hook(Arc::clone(ctx))),
         project_request_handler: request_handler,
+    })
+}
+
+/// Build the task-8 [`ProjectAnnouncementsRefresher`](crate::sync::ProjectAnnouncementsRefresher)
+/// the receiver invokes when an inbound project announce names a package whose hub
+/// row we don't yet know. The hook is synchronous by contract, so it
+/// `tokio::spawn`s the async hub poll (the house pattern — see
+/// [`project_request_handler`]) and returns immediately; the receive loop never
+/// blocks. The receiver's immediate re-check may miss the still-in-flight poll,
+/// but the sender's announce retry lands once the row appears.
+fn announcements_refresher(ctx: Arc<ServiceContext>) -> crate::sync::ProjectAnnouncementsRefresher {
+    Arc::new(move |project_id: &str| {
+        let ctx = Arc::clone(&ctx);
+        let project_id = project_id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::api::collab_exchange::refresh_project_packages(&ctx, &project_id).await
+            {
+                tracing::warn!(project_id = %project_id, error = %format!("{e}"), "announcements refresh failed");
+            }
+        });
+    })
+}
+
+/// Build the task-8 [`ProjectIngestedHook`](crate::sync::ProjectIngestedHook)
+/// fired after a project package ingests + acks: a best-effort report-have so the
+/// hub adds this device to the package's swarm. `tokio::spawn`ed off the receive
+/// loop; a failure only means the hub doesn't list us as a holder yet.
+fn on_project_ingested_hook(ctx: Arc<ServiceContext>) -> crate::sync::ProjectIngestedHook {
+    Arc::new(move |project_id: String, package_id: String| {
+        let ctx = Arc::clone(&ctx);
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::api::collab_exchange::report_have_after_ingest(&ctx, &package_id).await
+            {
+                tracing::warn!(project_id = %project_id, package_id = %package_id, error = %format!("{e}"), "post-ingest report_have failed");
+            }
+        });
     })
 }
 
@@ -443,7 +480,7 @@ pub async fn autostart_if_enabled(
     refresh_authorized_peers(ctx).await;
     let authorized = peer_authorizer(ctx)?;
     let hooks = receiver_hooks(
-        ctx,
+        &ctx_arc,
         Some(project_request_handler(Arc::clone(&ctx_arc), Arc::clone(&emitter))),
     )?;
     sync.ensure_started(sync_dir, db_path, relay_mode, incoming, authorized, hooks, emitter)
@@ -490,7 +527,7 @@ pub async fn get_pairing_ticket(
     refresh_authorized_peers(ctx).await;
     let authorized = peer_authorizer(ctx)?;
     let hooks = receiver_hooks(
-        ctx,
+        &ctx_arc,
         Some(project_request_handler(Arc::clone(&ctx_arc), Arc::clone(&emitter))),
     )?;
 

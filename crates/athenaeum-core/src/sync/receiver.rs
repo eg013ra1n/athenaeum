@@ -706,11 +706,13 @@ async fn handle_project_announce(
 
 // ── App-lifecycle runtime holder ────────────────────────────────────────────
 
-/// One started-transport bundle held by [`SyncRuntime`]. `_transport` /
-/// `_receiver` are lifetime anchors — kept so the endpoint and its event loop
-/// live for the runtime's lifetime, not read directly.
+/// One started-transport bundle held by [`SyncRuntime`]. `transport` is the
+/// live receive-side transport — read back by [`SyncRuntime::transport`] so the
+/// collab download loop can issue an outbound `request_project` over the SAME
+/// endpoint the receiver listens on. `_receiver` is a lifetime anchor — kept so
+/// the endpoint's event loop lives for the runtime's lifetime, not read directly.
 struct Started {
-    _transport: Arc<dyn SharingTransport>,
+    transport: Arc<dyn SharingTransport>,
     ticket: String,
     _receiver: SyncReceiverHandle,
 }
@@ -722,12 +724,28 @@ struct Started {
 /// the dev flag.
 pub struct SyncRuntime {
     inner: tokio::sync::Mutex<Option<Started>>,
+    /// The concrete iroh transport stored alongside the boxed trait object when
+    /// [`ensure_started`](Self::ensure_started) builds one (audit B4). A bare
+    /// account-resolved node id is undialable — the receiver runtime only holds
+    /// `Arc<dyn SharingTransport>`, and `request_project` over it would fall back
+    /// to a hint-less `EndpointAddr` and fail with "No addressing information
+    /// available". The collab download loop reaches for this handle to attach a
+    /// `pairing::peer_addr_with_relays` dial hint (via the inherent
+    /// [`add_peer`](crate::sharing::iroh::IrohTransport::add_peer), not on the
+    /// trait) BEFORE the request. `None` for a non-iroh (loopback test) runtime,
+    /// whose in-process mailbox routing needs no dial hint. Held in a plain
+    /// `std::sync::Mutex` so [`iroh_handle`](Self::iroh_handle) stays a cheap
+    /// synchronous getter, independent of the async `inner` lock.
+    iroh: std::sync::Mutex<Option<Arc<crate::sharing::iroh::IrohTransport>>>,
 }
 
 impl SyncRuntime {
     /// A fresh, unstarted runtime.
     pub fn new() -> Self {
-        Self { inner: tokio::sync::Mutex::new(None) }
+        Self {
+            inner: tokio::sync::Mutex::new(None),
+            iroh: std::sync::Mutex::new(None),
+        }
     }
 
     /// Whether the transport has been started (a ticket exists).
@@ -738,6 +756,40 @@ impl SyncRuntime {
     /// The current pairing ticket, if started.
     pub async fn ticket(&self) -> Option<String> {
         self.inner.lock().await.as_ref().map(|s| s.ticket.clone())
+    }
+
+    /// The live receive-side transport, if started — the collab download loop
+    /// issues `request_project` over it (the receiver listens on the same
+    /// endpoint, and `request_project` is an outbound send that never touches the
+    /// receiver's single-consumer event stream).
+    pub async fn transport(&self) -> Option<Arc<dyn SharingTransport>> {
+        self.inner.lock().await.as_ref().map(|s| Arc::clone(&s.transport))
+    }
+
+    /// The concrete iroh transport handle for outbound dial hints (audit B4).
+    /// `None` when the runtime was not started with an iroh transport (loopback
+    /// tests) — those bypass dialing entirely.
+    pub fn iroh_handle(&self) -> Option<Arc<crate::sharing::iroh::IrohTransport>> {
+        self.iroh.lock().expect("iroh handle mutex poisoned").clone()
+    }
+
+    /// Test-only: seed a started runtime around an already-online `transport`
+    /// (typically a loopback endpoint whose receiver was spawned separately), so
+    /// [`transport`](Self::transport) hands it back to the collab download loop.
+    /// Leaves [`iroh_handle`](Self::iroh_handle) `None` — loopback routing needs
+    /// no dial hint.
+    #[cfg(test)]
+    pub(crate) async fn set_started_for_test(
+        &self,
+        transport: Arc<dyn SharingTransport>,
+        receiver: SyncReceiverHandle,
+        ticket: String,
+    ) {
+        *self.inner.lock().await = Some(Started {
+            transport,
+            ticket,
+            _receiver: receiver,
+        });
     }
 
     /// Lazily build the iroh transport under `sync_dir`, spawn one receiver that
@@ -800,7 +852,12 @@ impl SyncRuntime {
         if let Some(gate) = hooks.connect_gate {
             transport.set_connect_gate(gate);
         }
-        let transport: Arc<dyn SharingTransport> = Arc::new(transport);
+        // Keep the CONCRETE handle alongside the boxed trait object (audit B4): the
+        // collab download loop needs `IrohTransport::add_peer` (an inherent method,
+        // not on `SharingTransport`) to attach a dial hint before `request_project`.
+        let iroh_arc: Arc<crate::sharing::iroh::IrohTransport> = Arc::new(transport);
+        *self.iroh.lock().expect("iroh handle mutex poisoned") = Some(Arc::clone(&iroh_arc));
+        let transport: Arc<dyn SharingTransport> = iroh_arc;
 
         // Staging lives under the sync dir; the landing root is resolved live per
         // package by the caller-supplied resolver (task 5).
@@ -822,7 +879,7 @@ impl SyncRuntime {
 
         tracing::info!(ticket_len = info.pairing_ticket.len(), "sync runtime started (dev pairing)");
         *guard = Some(Started {
-            _transport: transport,
+            transport,
             ticket: info.pairing_ticket.clone(),
             _receiver: receiver,
         });

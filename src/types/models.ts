@@ -841,6 +841,12 @@ export type ProjectSetMatchEvent = { framesSetId: number, setName: string | null
 
 export type PortalNewProjectLink = { url: string, };
 
+export type PackageStateChange = { projectId: string, packageId: string, 
+/**
+ * `newPackage` | `approved` | `rejected` | `downloadComplete` | `downloadFailed`.
+ */
+kind: string, detail: string | null, };
+
 export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, trailed: boolean | null, publishable: boolean, 
 /**
  * Human-readable failure reasons, empty when publishable

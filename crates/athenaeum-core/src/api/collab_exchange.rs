@@ -35,8 +35,12 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 
+use crate::account::keys::{device_key_path, DeviceKey};
 use crate::api::{db, ApiError};
-use crate::db::collab_exchange::ContributionRow;
+use crate::collab::hub_client::{AnnouncementWire, CollabClient, HolderWire};
+use crate::db::collab_exchange::{
+    get_package, mark_superseded, set_local_status, upsert_package, ContributionRow, PackageRow,
+};
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
 use crate::sharing::types::NodeId;
@@ -378,6 +382,438 @@ pub async fn ensure_collab_sender_engine(
         },
     );
     Ok((engine, origin_device))
+}
+
+// ── Announcements poll + download orchestration (slice 4, task 8) ────────────
+//
+// The receive/coordinate side of the exchange: `refresh_project_packages` polls
+// the hub's announcement list into `project_packages` (upsert + state diffs the
+// frontend turns into `notify()`), and `download_project_package` runs the Д6
+// explicit sequential-holder pull. Ungated, like the rest of this module.
+
+/// A holder counts as ONLINE when the hub last saw it within this many seconds.
+const HOLDER_ONLINE_WINDOW_SECS: i64 = 300;
+
+/// Download loop cadence: re-read the row this often, up to the timeout, waiting
+/// for a requested serve to ingest (the Task-5 receiver arm flips `local_status`).
+const DOWNLOAD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const DOWNLOAD_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// One state change a poll observed, which the frontend (Task 11) turns into a
+/// `notify()` call. [`refresh_project_packages`] NEVER notifies itself.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageStateChange {
+    pub project_id: String,
+    pub package_id: String,
+    /// `newPackage` | `approved` | `rejected` | `downloadComplete` | `downloadFailed`.
+    pub kind: String,
+    pub detail: Option<String>,
+}
+
+/// Map an [`AccountClientError`](crate::account::AccountClientError) onto the api
+/// boundary (mirrors `api::collab::client_err`).
+fn client_err(e: crate::account::AccountClientError) -> ApiError {
+    use crate::account::AccountClientError as E;
+    match e {
+        E::RateLimited => {
+            ApiError::Invalid("Too many requests — wait a minute and try again.".into())
+        }
+        E::Unauthorized => {
+            ApiError::SignedOut("Signed out or device revoked — sign in again.".into())
+        }
+        E::SecondPrimary(m) | E::DeviceConflict(m) => ApiError::Conflict(m),
+        E::PeerValidation(m) | E::BadRequest(m) => ApiError::Invalid(m),
+        E::DuplicateName => ApiError::Invalid("name already in use".into()),
+        E::Network(m) => ApiError::Internal(format!("Hub request failed: {m}")),
+    }
+}
+
+/// Is this holder online — did the hub see it within [`HOLDER_ONLINE_WINDOW_SECS`]
+/// of `now`? An absent or unparseable `last_seen_at` ⇒ offline.
+fn holder_online(h: &HolderWire, now: chrono::DateTime<chrono::Utc>) -> bool {
+    h.last_seen_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds().abs() <= HOLDER_ONLINE_WINDOW_SECS)
+        .unwrap_or(false)
+}
+
+/// Diff each announcement against the existing row, then upsert it. Returns the
+/// `PackageStateChange`s the poll observed. Pure (no network, no notify) so it is
+/// exercised hermetically and reused by [`download_project_package`]'s fresh poll.
+///
+/// Diff rules (brief): an unknown row that is `published` and not mine ⇒
+/// `newPackage`; a known OWN row moving `pending → published` ⇒ `approved`; any
+/// known row moving to `rejected` ⇒ `rejected` (carrying the hub reason). The
+/// upsert's forward-only origin + preserved local progress (T3) mean a poll can't
+/// downgrade a received/owned row or clobber its manifest / `local_status`.
+///
+/// T3 hazard: `superseded` is a hub-mirrored column overwritten on EVERY upsert,
+/// so this re-marks the complete union of the hub-listed `supersedes` arrays at
+/// the end of the cycle — otherwise an own-published supersede flag would clear.
+fn apply_announcements(
+    conn: &rusqlite::Connection,
+    project_id: &str,
+    anns: &[AnnouncementWire],
+) -> Result<Vec<PackageStateChange>, ApiError> {
+    let now = chrono::Utc::now();
+    let mut changes = Vec::new();
+    let mut supersedes_union: Vec<String> = Vec::new();
+
+    for ann in anns {
+        let existing = get_package(conn, &ann.package_id)?;
+
+        // Diff BEFORE the upsert overwrites the hub-mirrored state.
+        match &existing {
+            None => {
+                if ann.state == "published" && !ann.own {
+                    changes.push(PackageStateChange {
+                        project_id: project_id.to_string(),
+                        package_id: ann.package_id.clone(),
+                        kind: "newPackage".to_string(),
+                        detail: None,
+                    });
+                }
+            }
+            Some(row) => {
+                if ann.state == "rejected" && row.state != "rejected" {
+                    changes.push(PackageStateChange {
+                        project_id: project_id.to_string(),
+                        package_id: ann.package_id.clone(),
+                        kind: "rejected".to_string(),
+                        detail: ann.reject_reason.clone(),
+                    });
+                } else if ann.own && row.state == "pending" && ann.state == "published" {
+                    changes.push(PackageStateChange {
+                        project_id: project_id.to_string(),
+                        package_id: ann.package_id.clone(),
+                        kind: "approved".to_string(),
+                        detail: None,
+                    });
+                }
+            }
+        }
+
+        let manifest_xxh3 = ann
+            .aggregate_stats
+            .get("manifestXxh3")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let online_count = ann.holders.iter().filter(|h| holder_online(h, now)).count() as i64;
+
+        upsert_package(
+            conn,
+            &PackageRow {
+                package_id: ann.package_id.clone(),
+                project_id: project_id.to_string(),
+                announcement_id: ann.id.clone(),
+                publisher_display: ann.publisher_display_name.clone(),
+                own: ann.own,
+                root_hash: ann.root_hash.clone(),
+                byte_size: ann.byte_size,
+                frame_count: ann.frame_count as i64,
+                manifest_xxh3,
+                aggregate_stats: ann.aggregate_stats.to_string(),
+                supersedes: serde_json::to_string(&ann.supersedes).unwrap_or_else(|_| "[]".into()),
+                state: ann.state.clone(),
+                reject_reason: ann.reject_reason.clone(),
+                // Re-derived comprehensively below — never trust this per-row.
+                superseded: false,
+                origin: if ann.own { "mine" } else { "remote" }.to_string(),
+                // Local-only columns: the upsert preserves the existing values, so
+                // a poll never clobbers a retained dir / manifest / fetch progress.
+                local_dir: None,
+                manifest_ndjson: None,
+                local_status: "none".to_string(),
+                holder_count: ann.holders.len() as i64,
+                online_count,
+                created_at: ann.created_at.clone(),
+                decided_at: ann.decided_at.clone(),
+                fetched_at: String::new(),
+            },
+        )?;
+        supersedes_union.extend(ann.supersedes.iter().cloned());
+    }
+
+    // Comprehensive re-mark (T3 hazard) — mark_superseded no-ops on an empty slice.
+    mark_superseded(conn, &supersedes_union)?;
+    Ok(changes)
+}
+
+/// Fetch one project's announcements from the hub and apply them. Returns the raw
+/// wire announcements (holders included — the download loop needs them) plus the
+/// state diffs. Signed out ⇒ `Ok((vec![], vec![]))` so the poll cadence degrades
+/// quietly instead of erroring.
+async fn poll_project_announcements(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<(Vec<AnnouncementWire>, Vec<PackageStateChange>), ApiError> {
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    let anns = client
+        .list_announcements(&token, project_id)
+        .await
+        .map_err(client_err)?;
+    let changes = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        apply_announcements(&conn, project_id, &anns)?
+    };
+    Ok((anns, changes))
+}
+
+/// Poll one project's announcements into `project_packages`. Returns the diffs the
+/// frontend turns into `notify()` calls. NEVER notifies itself.
+pub async fn refresh_project_packages(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<Vec<PackageStateChange>, ApiError> {
+    let (_anns, changes) = poll_project_announcements(ctx, project_id).await?;
+    Ok(changes)
+}
+
+/// All cached projects (the poll-cadence entry point). A per-project failure is
+/// logged and skipped so one unreachable project never sinks the whole sweep.
+pub async fn refresh_all_project_packages(
+    ctx: &ServiceContext,
+) -> Result<Vec<PackageStateChange>, ApiError> {
+    let project_ids: Vec<String> = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        crate::db::collab::list_projects(&conn)?
+            .into_iter()
+            .map(|p| p.project_id)
+            .collect()
+    };
+    let mut all = Vec::new();
+    for pid in project_ids {
+        match refresh_project_packages(ctx, &pid).await {
+            Ok(mut c) => all.append(&mut c),
+            Err(e) => {
+                tracing::warn!(project_id = %pid, error = %format!("{e}"), "refresh project packages failed; continuing")
+            }
+        }
+    }
+    Ok(all)
+}
+
+/// Report to the hub that this device now holds `package_id`'s blobs — the
+/// task-8 post-ingest hook. Resolves the announcement id from the local row, then
+/// `POST /announcements/{id}/have` with the device bearer. Signed out or an
+/// unknown local row ⇒ a benign no-op (nothing to report against).
+pub async fn report_have_after_ingest(
+    ctx: &ServiceContext,
+    package_id: &str,
+) -> Result<(), ApiError> {
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        return Ok(());
+    };
+    let announcement_id = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        match get_package(&conn, package_id)? {
+            Some(row) => row.announcement_id,
+            None => {
+                tracing::warn!(package_id, "report_have: no local package row; skipping");
+                return Ok(());
+            }
+        }
+    };
+    let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    client
+        .report_have(&token, &announcement_id)
+        .await
+        .map_err(client_err)?;
+    tracing::info!(package_id, announcement_id = %announcement_id, "reported have to hub");
+    Ok(())
+}
+
+/// Д6 explicit download of a project package: role-gate, poll the hub for the
+/// package's current holders, then try each holder sequentially — attach a dial
+/// hint (audit B4), `request_project`, and wait for the served package to ingest
+/// (the Task-5 receiver arm flips `local_status` to `complete`). The first
+/// success reports-have to the hub and returns; all holders exhausted lands
+/// `failed`.
+///
+/// **Dial hints are mandatory on the real network (audit B4).** A bare
+/// account-resolved holder node id is undialable: without a
+/// [`pairing::peer_addr_with_relays`] hint attached via the inherent
+/// [`IrohTransport::add_peer`](crate::sharing::iroh::IrohTransport::add_peer),
+/// `request_project` falls back to a hint-less `EndpointAddr` and fails with "No
+/// addressing information available". Loopback tests bypass dialing (in-process
+/// mailbox routing), so [`SyncRuntime::iroh_handle`](crate::sync::SyncRuntime::iroh_handle)
+/// is `None` there and the hint step is skipped.
+///
+/// Runs on a command-spawned task (Task 11): the terminal `local_status` +
+/// `sync-finished` event carry the outcome, so returning `Ok` on an exhausted
+/// attempt is normal, not an error.
+pub async fn download_project_package(
+    ctx: &ServiceContext,
+    sync: &crate::sync::SyncRuntime,
+    project_id: &str,
+    package_id: &str,
+) -> Result<(), ApiError> {
+    let (sync_dir, _db_path) = crate::api::sync::sync_paths(ctx)?;
+
+    // ── Role guard (fail-closed) ─────────────────────────────────────────────
+    // Only a send_receive member or the coordinator may pull. Own membership is
+    // resolved by matching THIS device's node id in the cached snapshot (the
+    // account id is not part of the snapshot keying).
+    let own_node = DeviceKey::load_or_create(&device_key_path(&sync_dir))
+        .map_err(|e| ApiError::Internal(format!("device key: {e:#}")))?
+        .node_id();
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let allowed = match crate::collab::authz::member_for_node(&conn, project_id, &own_node) {
+            Some(m) => m.coordinator || m.data_role == "send_receive",
+            None => false,
+        };
+        if !allowed {
+            return Err(ApiError::Invalid(format!(
+                "this device's role in project {project_id} does not permit downloading packages"
+            )));
+        }
+    }
+
+    // ── Mark downloading (before any network I/O, so the UI reflects intent). ─
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        set_local_status(&conn, package_id, "downloading")?;
+    }
+
+    // ── Fresh poll: upsert the row AND read the package's current holders. ────
+    let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        set_download_failed(ctx, package_id);
+        return Err(ApiError::SignedOut("Sign in to download a project package.".into()));
+    };
+    let client = CollabClient::new(&hub_url).map_err(client_err)?;
+    let anns = match client.list_announcements(&token, project_id).await {
+        Ok(a) => a,
+        Err(e) => {
+            set_download_failed(ctx, package_id);
+            return Err(client_err(e));
+        }
+    };
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        apply_announcements(&conn, project_id, &anns)?;
+    }
+
+    // The freshly-polled announcement for this package (keyed by hub uuid).
+    let Some(ann) = anns.into_iter().find(|a| a.package_id == package_id) else {
+        tracing::warn!(project_id, package_id, "download: hub no longer lists this package");
+        set_download_failed(ctx, package_id);
+        return Ok(());
+    };
+
+    // Candidate holders (exclude MY own node — I can't serve myself).
+    let holders: Vec<(NodeId, String)> = ann
+        .holders
+        .iter()
+        .filter_map(|h| {
+            pairing::node_id_from_pubkey_b64(&h.pubkey)
+                .ok()
+                .map(|n| (n, h.display_name.clone()))
+        })
+        .filter(|(n, _)| *n != own_node)
+        .collect();
+
+    if holders.is_empty() {
+        tracing::warn!(project_id, package_id, "download: no other holder to pull from");
+        set_download_failed(ctx, package_id);
+        return Ok(());
+    }
+
+    // request_project rides the SAME endpoint the receiver listens on (an
+    // outbound send; it never touches the receiver's single-consumer stream).
+    let transport = sync.transport().await.ok_or_else(|| {
+        ApiError::Internal("sync transport not started; cannot request a project package".into())
+    })?;
+    let iroh = sync.iroh_handle();
+    // The relay map is only needed to build dial hints on the real-network path.
+    let relay_urls = if iroh.is_some() {
+        crate::api::sync::resolve_relay_mode(ctx).await?.1
+    } else {
+        Vec::new()
+    };
+
+    for (holder_node, holder_name) in &holders {
+        // Audit B4: attach OUR resolved relay URL(s) as this holder's dial hint
+        // before the request. A loopback runtime (no iroh handle) routes
+        // in-process and needs no hint.
+        if let Some(handle) = &iroh {
+            match pairing::peer_addr_with_relays(*holder_node, &relay_urls) {
+                Ok(addr) => handle.add_peer(addr),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), holder = %holder_name, "download: dial hint build failed; skipping holder");
+                    continue;
+                }
+            }
+        }
+
+        if let Err(e) = transport
+            .request_project(*holder_node, project_id, package_id)
+            .await
+        {
+            tracing::warn!(error = %format!("{e:#}"), holder = %holder_name, "download: request_project failed; next holder");
+            continue;
+        }
+        tracing::info!(project_id, package_id, holder = %holder_name, "download: requested serve; awaiting ingest");
+
+        // Wait for the receiver to flip local_status to complete (Task 5 ingest).
+        if wait_for_local_complete(ctx, package_id).await {
+            // Report-have (device bearer) so the hub adds us to the swarm.
+            if let Err(e) = client.report_have(&token, &ann.id).await {
+                tracing::warn!(announcement_id = %ann.id, error = %format!("{e}"), "download: report_have failed after ingest");
+            }
+            tracing::info!(project_id, package_id, holder = %holder_name, "download complete");
+            return Ok(());
+        }
+        tracing::warn!(project_id, package_id, holder = %holder_name, "download: holder did not deliver in time; next holder");
+    }
+
+    // Every holder exhausted.
+    set_download_failed(ctx, package_id);
+    tracing::warn!(project_id, package_id, holders = holders.len(), "download failed: no holder delivered");
+    Ok(())
+}
+
+/// Best-effort `set_local_status("failed")` — logged, never masks the caller's
+/// own error/return.
+fn set_download_failed(ctx: &ServiceContext, package_id: &str) {
+    if let Ok(db) = db(ctx) {
+        let conn = db.conn();
+        if let Err(e) = set_local_status(&conn, package_id, "failed") {
+            tracing::warn!(package_id, error = %format!("{e}"), "download: set failed status errored");
+        }
+    }
+}
+
+/// Poll `project_packages.local_status` every [`DOWNLOAD_POLL_INTERVAL`] up to
+/// [`DOWNLOAD_POLL_TIMEOUT`], returning `true` the moment it reads `complete` and
+/// `false` on `failed` or timeout.
+async fn wait_for_local_complete(ctx: &ServiceContext, package_id: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + DOWNLOAD_POLL_TIMEOUT;
+    loop {
+        if let Ok(db) = db(ctx) {
+            let conn = db.conn();
+            match get_package(&conn, package_id) {
+                Ok(Some(row)) if row.local_status == "complete" => return true,
+                Ok(Some(row)) if row.local_status == "failed" => return false,
+                _ => {}
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(DOWNLOAD_POLL_INTERVAL).await;
+    }
 }
 
 #[cfg(test)]
@@ -904,6 +1340,476 @@ mod tests {
             a_landing.join(HUB).join("L_0001.fits").exists(),
             "A's landed source is retained after the serve dir is cleaned"
         );
+
+        a_engine.shutdown().await;
+    }
+
+    // ── Task 8: announcements poll + download orchestration ───────────────────
+
+    /// A minimal file-backed-`Database` [`ServiceContext`] (no keychain), copied
+    /// from `api::sync` / `api::collab` tests. A tempdir-FILE-backed `Database`
+    /// (not `:memory:`) so the pool + the receiver's own `CatalogSyncStore` see
+    /// one catalog file.
+    fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
+        use crate::cache::MemoryImageCache;
+        use crate::services::compute_queue::ComputeQueue;
+        use crate::services::operation_queue::OperationQueue;
+        use crate::settings::SettingsManager;
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        #[cfg(all(feature = "render", feature = "solver"))]
+        use std::sync::RwLock;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(database);
+        let ctx = ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(all(feature = "render", feature = "solver"))]
+            dso_catalog: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "solver")]
+            star_cache: Arc::new(RwLock::new(None)),
+            #[cfg(feature = "solver")]
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            operation_queue: OperationQueue::start(),
+            compute_queue: ComputeQueue::new(),
+        };
+        (tmp, ctx)
+    }
+
+    /// Point `ctx`'s account hub at `uri` + store a device token (mirrors
+    /// `api::collab::wire_hub`).
+    fn wire_hub(ctx: &ServiceContext, uri: &str) {
+        {
+            let conn = db(ctx).unwrap().conn();
+            crate::db::set_setting(&conn, crate::settings::keys::ACCOUNT_HUB_URL, uri).unwrap();
+        }
+        crate::api::account::store_token_for_test(ctx, "tok").unwrap();
+    }
+
+    /// This device's node id for `ctx`'s sync dir — the identity the download
+    /// role guard resolves against the cached membership snapshot.
+    fn own_node_for(ctx: &ServiceContext) -> NodeId {
+        let (sync_dir, _) = crate::api::sync::sync_paths(ctx).unwrap();
+        DeviceKey::load_or_create(&device_key_path(&sync_dir))
+            .unwrap()
+            .node_id()
+    }
+
+    /// One announcement wire row (camelCase), as `GET /announcements` returns it.
+    #[allow(clippy::too_many_arguments)]
+    fn ann_json(
+        id: &str,
+        package_id: &str,
+        own: bool,
+        state: &str,
+        supersedes: &[&str],
+        reject_reason: Option<&str>,
+        holders: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "packageId": package_id,
+            "publisherDisplayName": "Pub",
+            "own": own,
+            "rootHash": "a".repeat(64),
+            "byteSize": 100,
+            "frameCount": 3,
+            "aggregateStats": { "manifestXxh3": "abcd1234" },
+            "supersedes": supersedes,
+            "state": state,
+            "rejectReason": reject_reason,
+            "createdAt": "2026-07-13T00:00:00Z",
+            "decidedAt": null,
+            "holders": holders,
+        })
+    }
+
+    /// A fresh unknown PUBLISHED foreign announcement polls in as a `newPackage`
+    /// diff (skipping an own one) and lands a `remote` row.
+    #[tokio::test]
+    async fn poll_new_published_foreign_is_new_package_skips_own() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1/announcements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                ann_json("ann-f", "pkg-foreign", false, "published", &[], None, serde_json::json!([])),
+                ann_json("ann-mine", "pkg-mine", true, "published", &[], None, serde_json::json!([])),
+            ])))
+            .mount(&server)
+            .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+
+        let changes = refresh_project_packages(&ctx, "p-1").await.unwrap();
+        assert_eq!(changes.len(), 1, "only the foreign published package is a newPackage");
+        assert_eq!(changes[0].kind, "newPackage");
+        assert_eq!(changes[0].package_id, "pkg-foreign");
+        assert_eq!(changes[0].project_id, "p-1");
+
+        let conn = db(&ctx).unwrap().conn();
+        let foreign = get_package(&conn, "pkg-foreign").unwrap().unwrap();
+        assert_eq!(foreign.origin, "remote");
+        assert_eq!(foreign.state, "published");
+        assert_eq!(foreign.manifest_xxh3.as_deref(), Some("abcd1234"));
+        let mine = get_package(&conn, "pkg-mine").unwrap().unwrap();
+        assert_eq!(mine.origin, "mine");
+        assert!(mine.own);
+    }
+
+    /// An own package moving `pending → published` across two polls diffs as
+    /// `approved` (and the first poll, still pending, raises nothing).
+    #[tokio::test]
+    async fn poll_own_pending_then_published_is_approved() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (_tmp, ctx) = test_ctx();
+
+        // Poll 1: own + pending → no diff (not published, and own is skipped).
+        let server1 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1/announcements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                ann_json("ann-1", "pkg-own", true, "pending", &[], None, serde_json::json!([]))
+            ])))
+            .mount(&server1)
+            .await;
+        wire_hub(&ctx, &server1.uri());
+        assert!(refresh_project_packages(&ctx, "p-1").await.unwrap().is_empty());
+        assert_eq!(get_package(&db(&ctx).unwrap().conn(), "pkg-own").unwrap().unwrap().state, "pending");
+
+        // Poll 2: the same package is now published → approved.
+        let server2 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1/announcements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                ann_json("ann-1", "pkg-own", true, "published", &[], None, serde_json::json!([]))
+            ])))
+            .mount(&server2)
+            .await;
+        wire_hub(&ctx, &server2.uri());
+        let changes = refresh_project_packages(&ctx, "p-1").await.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, "approved");
+        assert_eq!(changes[0].package_id, "pkg-own");
+
+        // Idempotent: a third identical poll raises nothing (already published).
+        let changes2 = refresh_project_packages(&ctx, "p-1").await.unwrap();
+        assert!(changes2.is_empty(), "re-polling a published row does not re-approve");
+    }
+
+    /// A known package moving to `rejected` diffs as `rejected` carrying the hub
+    /// reason as `detail`.
+    #[tokio::test]
+    async fn poll_rejected_carries_reason() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (_tmp, ctx) = test_ctx();
+        // Seed a known pending row directly.
+        {
+            let conn = db(&ctx).unwrap().conn();
+            let mut row = base_package("pkg-r", "p-1", "Pub");
+            row.own = true;
+            row.origin = "mine".into();
+            row.state = "pending".into();
+            upsert_package(&conn, &row).unwrap();
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1/announcements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                ann_json("ann-r", "pkg-r", true, "rejected", &[], Some("FWHM too high"), serde_json::json!([]))
+            ])))
+            .mount(&server)
+            .await;
+        wire_hub(&ctx, &server.uri());
+
+        let changes = refresh_project_packages(&ctx, "p-1").await.unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind, "rejected");
+        assert_eq!(changes[0].detail.as_deref(), Some("FWHM too high"));
+        let row = get_package(&db(&ctx).unwrap().conn(), "pkg-r").unwrap().unwrap();
+        assert_eq!(row.state, "rejected");
+        assert_eq!(row.reject_reason.as_deref(), Some("FWHM too high"));
+    }
+
+    /// The hub-listed `supersedes` array marks the older package superseded, and —
+    /// the T3 hazard — that flag SURVIVES a re-poll even though every upsert
+    /// rewrites `superseded=0`. Holder/online counts are captured per poll.
+    #[tokio::test]
+    async fn poll_marks_supersedes_and_survives_repoll() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (_tmp, ctx) = test_ctx();
+        // A holder seen "now" is online; one seen long ago is not.
+        let now = chrono::Utc::now().to_rfc3339();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1/announcements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                // The new package supersedes ann-old.
+                ann_json("ann-new", "pkg-new", true, "published", &["ann-old"], None, serde_json::json!([
+                    { "pubkey": "cHVia2V5", "displayName": "H1", "lastSeenAt": now },
+                    { "pubkey": "cHVia2V5Mg", "displayName": "H2", "lastSeenAt": "2020-01-01T00:00:00Z" },
+                ])),
+                // The older, still-own package whose announcement is superseded.
+                ann_json("ann-old", "pkg-old", true, "published", &[], None, serde_json::json!([])),
+            ])))
+            .mount(&server)
+            .await;
+        wire_hub(&ctx, &server.uri());
+
+        refresh_project_packages(&ctx, "p-1").await.unwrap();
+        {
+            let conn = db(&ctx).unwrap().conn();
+            let old = get_package(&conn, "pkg-old").unwrap().unwrap();
+            assert!(old.superseded, "pkg-old is superseded by ann-new's supersedes list");
+            let new = get_package(&conn, "pkg-new").unwrap().unwrap();
+            assert!(!new.superseded, "pkg-new is not superseded");
+            assert_eq!(new.holder_count, 2, "holder_count = holders.len()");
+            assert_eq!(new.online_count, 1, "only the recently-seen holder counts as online");
+        }
+
+        // Re-poll: every upsert rewrote superseded=0, but the comprehensive
+        // re-mark restores it (T3 hazard).
+        refresh_project_packages(&ctx, "p-1").await.unwrap();
+        assert!(
+            get_package(&db(&ctx).unwrap().conn(), "pkg-old").unwrap().unwrap().superseded,
+            "own supersede flag survives a re-poll"
+        );
+    }
+
+    /// Download role guard (fail-closed): a send-only own node is refused with
+    /// `Invalid` before any network I/O.
+    #[tokio::test]
+    async fn download_role_guard_send_only_is_invalid() {
+        let (_tmp, ctx) = test_ctx();
+        let own = own_node_for(&ctx);
+        {
+            let conn = db(&ctx).unwrap().conn();
+            let members = serde_json::json!([
+                { "accountId": "acc-me", "displayName": "Me", "dataRole": "send",
+                  "coordinator": false, "nodes": [B64.encode(own)] }
+            ])
+            .to_string();
+            seed_project(&conn, "p-1", &members);
+        }
+        let sync = crate::sync::SyncRuntime::new();
+        let err = download_project_package(&ctx, &sync, "p-1", "pkg-x").await.unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "send-only is fail-closed Invalid, got {err:?}");
+    }
+
+    /// Download happy path over loopback: D role-passes, polls the hub for the
+    /// package's holder (A), requests the serve, A completes the Task-6 serve
+    /// circuit, D's receiver ingests (flipping `local_status` to complete), the
+    /// poll-loop observes it, and `report_have` hits the hub.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn download_happy_path_over_loopback() {
+        use crate::sharing::loopback::LoopbackNetwork;
+        use crate::sync::{
+            allow_all_peers, ProjectAnnounceGate, ProjectReceiveHooks, StandaloneSyncStore,
+            SyncReceiver, SyncRuntime,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const PROJECT: &str = "proj-dl";
+        const HUB: &str = "hub-dl-1";
+
+        let (dtmp, ctx) = test_ctx();
+        let own_node = own_node_for(&ctx);
+        let (d_sync_dir, d_db_path) = crate::api::sync::sync_paths(&ctx).unwrap();
+
+        // ── A: a received-complete package + its reconstructed serve dir. ──────
+        let a_tmp = tempfile::tempdir().unwrap();
+        let payload = b"downloaded-frame-bytes-0001";
+        let a_db = crate::db::Database::new(a_tmp.path().join("a_catalog.db")).unwrap();
+        let manifest_bytes = {
+            let c = a_db.conn();
+            seed_received_package(&c, &a_tmp.path().join("a_land"), PROJECT, HUB, "Alice", "published", payload)
+        };
+        // The hub-anchored manifest hash the receiver verifies the served bytes
+        // against — must be the REAL anchor of A's manifest, not a placeholder.
+        let anchor = hash_bytes(&manifest_bytes);
+        let serve_dir = {
+            let c = a_db.conn();
+            reconstruct_serve_dir(&c, &a_tmp.path().join("a_sync"), HUB).unwrap()
+        };
+
+        // ── Loopback endpoints: D (receiver + request sender), A recv + A send. ─
+        let net = LoopbackNetwork::new();
+        let d_ep: Arc<crate::sharing::loopback::LoopbackTransport> = Arc::new(net.endpoint());
+        let d_node = d_ep.node_id();
+        let a_recv_ep = net.endpoint();
+        let a_recv_node = a_recv_ep.node_id();
+        let a_send_ep = net.endpoint();
+        let a_send_node = a_send_ep.node_id();
+
+        // A's collab engine serves back to D over a_send.
+        let a_store = Arc::new(StandaloneSyncStore::open(a_tmp.path().join("a_sync.db")).unwrap());
+        let a_engine = Arc::new(SyncEngine::spawn_with_sink_and_emitter(
+            Arc::clone(&a_store) as Arc<dyn SyncStore>,
+            Arc::new(a_send_ep) as Arc<dyn SharingTransport>,
+            d_node,
+            Arc::new(CollabCleanupSink),
+            None,
+        ));
+
+        // A's receiver: on an inbound request, enqueue the reconstructed serve dir.
+        let handler_engine = Arc::clone(&a_engine);
+        let handler_dir = serve_dir.clone();
+        let request_handler: crate::sync::ProjectRequestHandler =
+            Arc::new(move |from: NodeId, _project: String, _package: String| {
+                assert_eq!(from, d_node, "the serve request came from D");
+                let e = Arc::clone(&handler_engine);
+                let dir = handler_dir.clone();
+                tokio::spawn(async move {
+                    let _ = e.enqueue_package(&dir).await;
+                });
+            });
+        let a_recv_store = Arc::new(CatalogSyncStore::open(a_tmp.path().join("a_recv.db")).unwrap());
+        let a_incoming: crate::sync::receiver::IncomingResolver = {
+            let p = a_tmp.path().join("a_incoming");
+            Arc::new(move || p.clone())
+        };
+        let (_a_info, _a_handle) = SyncReceiver::spawn(
+            a_recv_store,
+            a_tmp.path().join("a_stage"),
+            a_incoming,
+            allow_all_peers(),
+            ProjectReceiveHooks { request_handler: Some(request_handler), ..Default::default() },
+            Arc::new(a_recv_ep) as Arc<dyn SharingTransport>,
+            Arc::new(crate::events::NullEmitter),
+        )
+        .await
+        .unwrap();
+
+        // ── D: seed the catalog, spawn the receiver, hold the runtime. ─────────
+        {
+            let conn = db(&ctx).unwrap().conn();
+            // Own node is a send_receive member → role guard passes.
+            let members = serde_json::json!([
+                { "accountId": "acc-me", "displayName": "Me", "dataRole": "send_receive",
+                  "coordinator": true, "nodes": [B64.encode(own_node)] }
+            ])
+            .to_string();
+            seed_project(&conn, PROJECT, &members);
+            // The hub package row (from a prior poll) — origin remote, not yet held.
+            let row = base_package(HUB, PROJECT, "Alice");
+            upsert_package(&conn, &row).unwrap();
+            // The collaboration landing root project_ingest fills.
+            conn.execute(
+                "INSERT INTO scan_roots (path, kind) VALUES (?1, 'collaboration')",
+                [dtmp.path().join("d_land").to_string_lossy().to_string()],
+            )
+            .unwrap();
+        }
+
+        let d_store = Arc::new(CatalogSyncStore::open(&d_db_path).unwrap());
+        // D's project gate authorizes the announce from A's SENDER node.
+        let gate: ProjectAnnounceGate =
+            Arc::new(move |from: &NodeId, pid: &str| *from == a_send_node && pid == PROJECT);
+        let d_incoming: crate::sync::receiver::IncomingResolver = {
+            let p = d_sync_dir.join("incoming");
+            Arc::new(move || p.clone())
+        };
+        let (_d_info, d_handle) = SyncReceiver::spawn(
+            d_store,
+            d_sync_dir.clone(),
+            d_incoming,
+            allow_all_peers(),
+            ProjectReceiveHooks { gate: Some(gate), ..Default::default() },
+            Arc::clone(&d_ep) as Arc<dyn SharingTransport>,
+            Arc::new(crate::events::NullEmitter),
+        )
+        .await
+        .unwrap();
+
+        let runtime = SyncRuntime::new();
+        runtime
+            .set_started_for_test(Arc::clone(&d_ep) as Arc<dyn SharingTransport>, d_handle, "ticket".into())
+            .await;
+
+        // ── Hub: list the package with A (recv node) as its holder + accept have. ─
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/projects/{PROJECT}/announcements")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                "id": "ann-hub",
+                "packageId": HUB,
+                "publisherDisplayName": "Alice",
+                "own": false,
+                "rootHash": "a".repeat(64),
+                "byteSize": payload.len(),
+                "frameCount": 1,
+                // The REAL manifest anchor — the receiver verifies against it.
+                "aggregateStats": { "manifestXxh3": anchor },
+                "supersedes": [],
+                "state": "published",
+                "rejectReason": null,
+                "createdAt": "2026-07-13T00:00:00Z",
+                "decidedAt": null,
+                "holders": [
+                    { "pubkey": B64.encode(a_recv_node), "displayName": "Alice",
+                      "lastSeenAt": chrono::Utc::now().to_rfc3339() }
+                ],
+            }])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/announcements/ann-hub/have"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        wire_hub(&ctx, &server.uri());
+
+        // ── Drive the download. ────────────────────────────────────────────────
+        download_project_package(&ctx, &runtime, PROJECT, HUB).await.unwrap();
+
+        // D holds the package: local_status complete, one landed contribution
+        // (never into files/frames), and the hub was told we now have it.
+        let conn = db(&ctx).unwrap().conn();
+        assert_eq!(
+            get_package(&conn, HUB).unwrap().unwrap().local_status,
+            "complete",
+            "the download loop observed the ingest"
+        );
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 0, "contributions never enter files");
+        let landed = contributions_for_package(&conn, HUB).unwrap();
+        assert_eq!(landed.len(), 1, "the served frame landed as a contribution");
+        assert_eq!(std::fs::read(&landed[0].landed_path).unwrap(), payload);
+
+        // report_have was asserted via `.expect(1)`; verify explicitly too.
+        let haves = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path() == "/api/v1/announcements/ann-hub/have")
+            .count();
+        assert_eq!(haves, 1, "report_have hit the hub once after ingest");
 
         a_engine.shutdown().await;
     }
