@@ -10,6 +10,7 @@ pub mod analysis;
 pub mod master_provenance;
 pub mod light_calibrations;
 pub mod collab;
+pub mod collab_exchange;
 
 pub use schema::*;
 pub use operations::*;

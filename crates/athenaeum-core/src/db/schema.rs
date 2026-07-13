@@ -1767,6 +1767,75 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // ---- Stage II collaboration (slice 4): known packages + received contributions ----
+    // Every collaboration package I know about — mine, received, or merely seen in
+    // the hub list. Mirrors the hub-anchored decision state (`state`) alongside
+    // local-only progress (`local_status`, `local_dir`, `manifest_ndjson`). The
+    // retained `manifest_ndjson` bytes (mine + fully-received) let me re-serve a
+    // package byte-identically (Д2) without re-deriving the manifest.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS project_packages (
+            package_id      TEXT PRIMARY KEY,
+            project_id      TEXT NOT NULL,
+            announcement_id TEXT NOT NULL UNIQUE,
+            publisher_display TEXT NOT NULL,
+            own             INTEGER NOT NULL DEFAULT 0,
+            root_hash       TEXT NOT NULL,
+            byte_size       INTEGER NOT NULL,
+            frame_count     INTEGER NOT NULL,
+            manifest_xxh3   TEXT,
+            aggregate_stats TEXT NOT NULL DEFAULT '{}',
+            supersedes      TEXT NOT NULL DEFAULT '[]',
+            state           TEXT NOT NULL,
+            reject_reason   TEXT,
+            superseded      INTEGER NOT NULL DEFAULT 0,
+            origin          TEXT NOT NULL,
+            local_dir       TEXT,
+            manifest_ndjson BLOB,
+            local_status    TEXT NOT NULL DEFAULT 'none',
+            holder_count    INTEGER NOT NULL DEFAULT 0,
+            online_count    INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL,
+            decided_at      TEXT,
+            fetched_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_packages_project ON project_packages(project_id)",
+        [],
+    )?;
+
+    // Received frames (contributions) — these NEVER enter `files`/`frames`; they
+    // land under a managed per-project root and are tracked here only. Cascades
+    // away with its parent package.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS project_contributions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id      TEXT NOT NULL,
+            package_id      TEXT NOT NULL REFERENCES project_packages(package_id) ON DELETE CASCADE,
+            frame_uuid      TEXT NOT NULL,
+            publisher_display TEXT NOT NULL,
+            rel_path        TEXT NOT NULL,
+            landed_path     TEXT NOT NULL UNIQUE,
+            byte_size       INTEGER NOT NULL,
+            xxh3            TEXT NOT NULL,
+            frame_meta      TEXT NOT NULL DEFAULT '{}',
+            analysis        TEXT,
+            superseded      INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_contributions_project ON project_contributions(project_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_contributions_uuid ON project_contributions(frame_uuid)",
+        [],
+    )?;
+
     Ok(())
 }
 
