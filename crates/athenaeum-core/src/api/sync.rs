@@ -247,6 +247,10 @@ fn receiver_hooks(ctx: &ServiceContext) -> Result<crate::sync::ReceiverHooks, Ap
     Ok(crate::sync::ReceiverHooks {
         connect_gate: connect_gate(ctx)?,
         project_gate: Some(project_announce_gate(ctx)?),
+        // Task 8 wires these to the hub poll (announcements refresh) and the
+        // report-have / notification path; None until then.
+        announcements_refresher: None,
+        on_project_ingested: None,
     })
 }
 

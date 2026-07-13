@@ -72,6 +72,34 @@ pub fn allow_all_peers() -> PeerAuthorizer {
 /// is only ever accepted when a real membership check passes.
 pub type ProjectAnnounceGate = Arc<dyn Fn(&NodeId, &str) -> bool + Send + Sync>;
 
+/// Refresh this device's cached announcements for a project (collab exchange,
+/// slice 4, task 5). Invoked with the `project_id` when an inbound project
+/// announce names a package whose `project_packages` row we do not yet know:
+/// Task 8 wires it to a hub poll so the row appears, and the receiver re-checks
+/// before deciding to drop fail-closed. Synchronous by contract (called on the
+/// receiver loop); an implementation doing async hub I/O bridges it internally.
+pub type ProjectAnnouncementsRefresher = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Post-ingest callback (collab exchange, slice 4, task 5): invoked with
+/// `(project_id, hub_package_id)` after a project package has been ingested and
+/// acked. Task 8 wires it to report-have + notification data; absent = no-op.
+pub type ProjectIngestedHook = Arc<dyn Fn(String, String) + Send + Sync>;
+
+/// The project-exchange receive hooks [`SyncReceiver::spawn`] threads into its
+/// loop (slice 4): the per-announce membership gate plus the Task-8 refresher /
+/// post-ingest callbacks. `Default` = "no project support installed" (every field
+/// `None`), so a personal-sync-only caller passes `Default::default()`.
+#[derive(Clone, Default)]
+pub struct ProjectReceiveHooks {
+    /// Per-announce project-membership gate. Absent or refusing ⇒ the announce is
+    /// dropped fail-closed.
+    pub gate: Option<ProjectAnnounceGate>,
+    /// Refresh announcements when a project package's row is unknown (task 8).
+    pub announcements_refresher: Option<ProjectAnnouncementsRefresher>,
+    /// Fired after a project package is ingested + acked (task 8).
+    pub on_project_ingested: Option<ProjectIngestedHook>,
+}
+
 /// Optional receive-side hooks the host threads into
 /// [`SyncRuntime::ensure_started`] (collab exchange, slice 4). Every field is
 /// optional and the whole struct is `Default` ("nothing installed"), so a caller
@@ -87,6 +115,13 @@ pub struct ReceiverHooks {
     /// Per-announce project-membership gate for inbound `ProjectAnnounceReceived`
     /// events. Absent or refusing ⇒ the announce is dropped fail-closed.
     pub project_gate: Option<ProjectAnnounceGate>,
+    /// Refresh cached announcements when a project package's hub row is unknown
+    /// (task 5 flow; Task 8 wires it to the hub poll). Absent ⇒ an unknown-row
+    /// announce is dropped fail-closed without a refresh attempt.
+    pub announcements_refresher: Option<ProjectAnnouncementsRefresher>,
+    /// Post-ingest callback (task 5 flow; Task 8 wires report-have + notification
+    /// data). Absent = no-op.
+    pub on_project_ingested: Option<ProjectIngestedHook>,
 }
 
 /// `sync-progress` payload: a per-package stage tick (never per-frame — discrete
@@ -180,13 +215,19 @@ impl SyncReceiver {
         staging_root: PathBuf,
         incoming: IncomingResolver,
         authorized: PeerAuthorizer,
-        project_gate: Option<ProjectAnnounceGate>,
+        project: ProjectReceiveHooks,
         transport: Arc<dyn SharingTransport>,
         emitter: Arc<dyn ProgressEmitter>,
     ) -> Result<(StartInfo, SyncReceiverHandle)> {
         let info = transport.start().await.context("start receiver transport")?;
         std::fs::create_dir_all(&staging_root)
             .with_context(|| format!("create staging root {}", staging_root.display()))?;
+
+        let ProjectReceiveHooks {
+            gate: project_gate,
+            announcements_refresher,
+            on_project_ingested,
+        } = project;
 
         let mut events = transport.events().await;
         let loop_transport = Arc::clone(&transport);
@@ -223,18 +264,17 @@ impl SyncReceiver {
                         }
                     }
                     // Collab exchange (slice 4): an inbound PROJECT package
-                    // advertisement. Fail-closed skeleton — Task 5 lands the
-                    // ingest; here we only validate and gate, then drop.
+                    // advertisement. The ROW KEY is the event's hub `package_id`
+                    // (audit B1) while fetch/ack use the wire `announce.package_id`.
                     TransportEvent::ProjectAnnounceReceived {
                         from,
                         project_id,
                         package_id,
-                        announce: _,
+                        announce,
                     } => {
-                        // The hub package id is peer-controlled and will build a
-                        // staging path in Task 5 — reject anything that is not a
-                        // single safe path segment now (same C1 guard as personal
-                        // sync), before it can be used.
+                        // The hub package id is peer-controlled — reject anything
+                        // that is not a single safe path segment BEFORE the gate
+                        // (same C1 guard as personal sync).
                         if let Err(e) = crate::package::validate_package_id(&package_id) {
                             tracing::warn!(
                                 from = %super::node_id_hex(&from),
@@ -261,11 +301,22 @@ impl SyncReceiver {
                             );
                             continue;
                         }
-                        tracing::info!(
+                        if let Err(e) = handle_project_announce(
+                            &store,
+                            &staging_root,
+                            loop_transport.as_ref(),
+                            emitter.as_ref(),
+                            announcements_refresher.as_ref(),
+                            on_project_ingested.as_ref(),
+                            from,
                             project_id,
                             package_id,
-                            "project package announced — ingest lands in Task 5"
-                        );
+                            announce,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %format!("{e:#}"), "sync receiver project announce handling failed");
+                        }
                     }
                     // Collab exchange (slice 4): a receive-role member asked us to
                     // serve a project package. Serving lands in Task 6; log + drop.
@@ -464,6 +515,159 @@ async fn handle_announce(
     Ok(())
 }
 
+/// Handle one authorized PROJECT announce (collab exchange, slice 4): resolve the
+/// hub package row (refreshing announcements once if unknown), fetch into staging,
+/// ingest the contributions, ack the receipts, and emit `sync-progress` /
+/// `sync-finished` carrying the `project_id`.
+///
+/// `hub_package_id` is the event's hub uuid (the `project_packages` row key);
+/// `announce.package_id` is the engine-minted wire id used for fetch/ack. The
+/// gate + hub-id `validate_package_id` already ran in the loop.
+#[allow(clippy::too_many_arguments)]
+async fn handle_project_announce(
+    store: &Arc<CatalogSyncStore>,
+    staging_root: &Path,
+    transport: &dyn SharingTransport,
+    emitter: &dyn ProgressEmitter,
+    announcements_refresher: Option<&super::ProjectAnnouncementsRefresher>,
+    on_project_ingested: Option<&super::ProjectIngestedHook>,
+    from: NodeId,
+    project_id: String,
+    hub_package_id: String,
+    announce: PackageAnnounce,
+) -> Result<()> {
+    let peer_device = super::node_id_hex(&from);
+    let wire_package_id = announce.package_id.0.clone();
+
+    // Row-key check on the HUB package id: unknown ⇒ ask the refresher to poll
+    // the hub once, then re-check. Still unknown ⇒ drop fail-closed (we never
+    // fetch a package we can't anchor).
+    let known = |store: &Arc<CatalogSyncStore>| -> Result<bool> {
+        let conn = store.lock_conn();
+        Ok(crate::db::collab_exchange::get_package(&conn, &hub_package_id)?.is_some())
+    };
+    if !known(store)? {
+        if let Some(refresh) = announcements_refresher {
+            refresh(&project_id);
+        }
+        if !known(store)? {
+            tracing::warn!(
+                from = %peer_device,
+                project_id,
+                package_id = %hub_package_id,
+                "project announce dropped: package row unknown after refresh"
+            );
+            return Ok(());
+        }
+    }
+
+    // The WIRE package id builds the staging path — guard it (C1) before the join.
+    if let Err(e) = crate::package::validate_package_id(&wire_package_id) {
+        tracing::warn!(
+            from = %peer_device,
+            project_id,
+            package_id = %wire_package_id,
+            error = %e,
+            "project announce rejected: unsafe wire package_id"
+        );
+        return Ok(());
+    }
+
+    emit_event(emitter, "sync-progress", &SyncProgressEvent {
+        package_id: hub_package_id.clone(),
+        direction: super::Direction::Received,
+        stage: "received".to_string(),
+        peer_device: peer_device.clone(),
+        frame_count: announce.frame_count,
+        project_id: Some(project_id.clone()),
+    });
+
+    // Fetch into a per-package staging dir keyed by the WIRE id (mirrors personal
+    // sync — out of the user-visible landing tree).
+    let staging = staging_root.join("staging").join(&wire_package_id);
+    emit_event(emitter, "sync-progress", &SyncProgressEvent {
+        package_id: hub_package_id.clone(),
+        direction: super::Direction::Received,
+        stage: "fetching".to_string(),
+        peer_device: peer_device.clone(),
+        frame_count: announce.frame_count,
+        project_id: Some(project_id.clone()),
+    });
+    transport
+        .fetch(from, &announce, &staging)
+        .await
+        .with_context(|| format!("fetch project package {wire_package_id}"))?;
+
+    // Ingest on a blocking thread (file I/O + SQLite).
+    emit_event(emitter, "sync-progress", &SyncProgressEvent {
+        package_id: hub_package_id.clone(),
+        direction: super::Direction::Received,
+        stage: "ingesting".to_string(),
+        peer_device: peer_device.clone(),
+        frame_count: announce.frame_count,
+        project_id: Some(project_id.clone()),
+    });
+    let outcome = {
+        let store = Arc::clone(store);
+        let staging_for_ingest = staging.clone();
+        let project_id = project_id.clone();
+        let hub_package_id = hub_package_id.clone();
+        let peer_device = peer_device.clone();
+        tokio::task::spawn_blocking(move || -> Result<super::ProjectIngestOutcome> {
+            let conn = store.lock_conn();
+            super::project_ingest::ingest_project_package(
+                &conn,
+                &staging_for_ingest,
+                &project_id,
+                &hub_package_id,
+                &peer_device,
+            )
+        })
+        .await
+        .context("project ingest join")??
+    };
+
+    // Ack the per-frame receipts to the serving peer, keyed by the WIRE id.
+    transport
+        .ack(from, &announce.package_id, outcome.receipts.clone())
+        .await
+        .with_context(|| format!("ack project package {wire_package_id}"))?;
+
+    // Terminal: drop the fetched blobs (best-effort, idempotent).
+    if let Err(e) = transport.release(&announce.package_id).await {
+        tracing::warn!(package_id = %wire_package_id, error = %format!("{e:#}"), "receiver blob release failed");
+    }
+    // Best-effort staging cleanup.
+    if let Err(e) = std::fs::remove_dir_all(&staging) {
+        tracing::debug!(error = %e, path = %staging.display(), "project ingest staging cleanup skipped");
+    }
+
+    let finished_outcome = if outcome.failed.is_empty() {
+        "ingested"
+    } else if outcome.ok_count == 0 {
+        "failed"
+    } else {
+        "partial"
+    };
+    emit_event(emitter, "sync-finished", &SyncFinishedEvent {
+        package_id: hub_package_id.clone(),
+        direction: super::Direction::Received,
+        outcome: finished_outcome.to_string(),
+        peer_device,
+        ok_count: outcome.ok_count as u32,
+        failed: outcome.failed,
+        new_count: 0,
+        duplicate_count: 0,
+        project_id: Some(project_id.clone()),
+    });
+
+    // Post-ingest hook (Task 8 wires report-have + notification data; None = no-op).
+    if let Some(hook) = on_project_ingested {
+        hook(project_id, hub_package_id);
+    }
+    Ok(())
+}
+
 // ── App-lifecycle runtime holder ────────────────────────────────────────────
 
 /// One started-transport bundle held by [`SyncRuntime`]. `_transport` /
@@ -569,7 +773,11 @@ impl SyncRuntime {
             sync_dir.clone(),
             incoming,
             authorized,
-            hooks.project_gate,
+            ProjectReceiveHooks {
+                gate: hooks.project_gate,
+                announcements_refresher: hooks.announcements_refresher,
+                on_project_ingested: hooks.on_project_ingested,
+            },
             Arc::clone(&transport),
             emitter,
         )
@@ -714,7 +922,7 @@ mod tests {
             staging,
             incoming,
             allow_all_peers(),
-            Some(project_gate),
+            ProjectReceiveHooks { gate: Some(project_gate), ..Default::default() },
             Arc::new(receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
         )

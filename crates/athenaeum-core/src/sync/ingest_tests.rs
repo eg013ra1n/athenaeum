@@ -1035,3 +1035,247 @@ async fn receiver_ingests_from_authorized_peer() {
         "an authorized peer's announce ingests normally"
     );
 }
+
+// ── Project exchange (slice 4, task 5): full receiver over LoopbackTransport ──
+
+/// Captures emitted events so the project e2e can assert `sync-finished` carried
+/// the project id.
+#[derive(Default)]
+struct EventRecorder {
+    events: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+}
+impl crate::events::ProgressEmitter for EventRecorder {
+    fn emit_json(&self, name: &str, payload: serde_json::Value) {
+        self.events.lock().unwrap().push((name.to_string(), payload));
+    }
+}
+
+/// A cached `collab_projects` row with the given slug (dummy target/snapshot).
+fn e2e_project_row(project_id: &str, slug: &str) -> crate::db::collab::CollabProjectRow {
+    crate::db::collab::CollabProjectRow {
+        project_id: project_id.to_string(),
+        slug: slug.to_string(),
+        title: "E2E".to_string(),
+        data_role: "contribute".to_string(),
+        is_coordinator: false,
+        require_approval: false,
+        pending_announcements: 0,
+        project_status: "active".to_string(),
+        target_name: "M42".to_string(),
+        target_ra_deg: 83.8,
+        target_dec_deg: -5.4,
+        target_radius_deg: 1.0,
+        membership_version: 1,
+        snapshot_payload_b64: "x".to_string(),
+        snapshot_signature_b64: "x".to_string(),
+        members_json: "[]".to_string(),
+        thresholds_version: None,
+        thresholds_rules_json: None,
+        fetched_at: String::new(),
+    }
+}
+
+/// A hub-anchored `project_packages` row for the given package + manifest anchor.
+fn e2e_package_row(
+    project_id: &str,
+    package_id: &str,
+    publisher: &str,
+    anchor: &str,
+) -> crate::db::collab_exchange::PackageRow {
+    crate::db::collab_exchange::PackageRow {
+        package_id: package_id.to_string(),
+        project_id: project_id.to_string(),
+        announcement_id: format!("ann-{package_id}"),
+        publisher_display: publisher.to_string(),
+        own: false,
+        root_hash: "rh".to_string(),
+        byte_size: 0,
+        frame_count: 1,
+        manifest_xxh3: Some(anchor.to_string()),
+        aggregate_stats: "{}".to_string(),
+        supersedes: "[]".to_string(),
+        state: "published".to_string(),
+        reject_reason: None,
+        superseded: false,
+        origin: "remote".to_string(),
+        local_dir: None,
+        manifest_ndjson: None,
+        local_status: "none".to_string(),
+        holder_count: 0,
+        online_count: 0,
+        created_at: "2026-07-13 00:00:00".to_string(),
+        decided_at: None,
+        fetched_at: String::new(),
+    }
+}
+
+/// Build a stamped one-frame PROJECT package under `root`; returns
+/// `(pkg_dir, announce, manifest_anchor)`. The record carries a `ProjectStamp`
+/// for `(project_id, hub_package_id)` (so the receiver's cross-check passes); the
+/// anchor is the full-content xxh3 of the written `manifest.ndjson` — exactly what
+/// the hub records as `manifest_xxh3`.
+fn build_stamped_project_package(
+    root: &Path,
+    frame_uuid: &str,
+    filename: &str,
+    project_id: &str,
+    hub_package_id: &str,
+) -> (PathBuf, PackageAnnounce, String) {
+    let src_dir = root.join("psrc");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let src = src_dir.join(filename);
+    write_fits_val(&src, 0.5);
+    let byte_size = std::fs::metadata(&src).unwrap().len();
+    let xxh3 = package::xxh3_full_file(&src).unwrap();
+    let frame = fixture_frame(frame_uuid, "M42", "2026-01-16T10:00:00.000Z");
+    let record = ManifestRecord {
+        v: MANIFEST_VERSION,
+        frame_uuid: frame_uuid.to_string(),
+        origin_catalog_uuid: "cat".to_string(),
+        origin_device: ORIGIN_DEVICE.to_string(),
+        payload_kind: PayloadKind::CalibratedLight,
+        rel_path: filename.to_string(),
+        byte_size,
+        xxh3,
+        frame_meta: serde_json::to_value(&frame).unwrap(),
+        analysis: None,
+        app_version: "test".to_string(),
+        project: Some(crate::package::ProjectStamp {
+            project_id: project_id.to_string(),
+            package_id: hub_package_id.to_string(),
+            thresholds_version: None,
+            cal_engine_version: None,
+        }),
+    };
+    let pkg_dir = root.join(format!("ppkg-{frame_uuid}"));
+    let announce = package::write_package(&pkg_dir, vec![(src, record)]).unwrap();
+    let anchor = package::xxh3_full_file(&pkg_dir.join(package::MANIFEST_FILENAME)).unwrap();
+    (pkg_dir, announce, anchor)
+}
+
+/// Poll the recorder until a `sync-finished` event appears (the finished emit
+/// races slightly behind the ack the sender awaits on).
+async fn wait_for_finished(recorder: &EventRecorder) -> serde_json::Value {
+    for _ in 0..300 {
+        if let Some(v) = recorder
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(n, _)| n == "sync-finished")
+            .map(|(_, v)| v.clone())
+        {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("no sync-finished emitted");
+}
+
+/// Loopback e2e (task 5 Step 3): node A push-seeds a stamped project package to
+/// node B (B's catalog pre-seeded with the project + hub-anchored package row). B
+/// lands the frame under `<collab-root>/<proj-slug>/<pub-slug>/`, writes a
+/// contribution row (never `files`/`frames`), and acks — A sees the Ingested
+/// receipts (receipts flowed), and B's `sync-finished` carries the project id.
+#[tokio::test]
+async fn project_package_lands_contributions_and_acks() {
+    const PROJECT_ID: &str = "proj-e2e";
+    const HUB_PACKAGE_ID: &str = "hub-pkg-e2e";
+    const PROJECT_SLUG: &str = "orion-e2e";
+    const PUBLISHER: &str = "Alice E2E";
+
+    let tmp = TempDir::new().unwrap();
+    let catalog_path = tmp.path().join("catalog.db");
+    let assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+
+    // Node A builds a stamped package; capture its manifest anchor.
+    let (pkg_dir, announce, anchor) =
+        build_stamped_project_package(tmp.path(), "pf-1", "L_0001.fits", PROJECT_ID, HUB_PACKAGE_ID);
+
+    // Seed B: project (slug) + hub-anchored package row + collaboration landing root.
+    let landing = tmp.path().join("collab_landing");
+    {
+        let c = assert_db.conn();
+        crate::db::collab::upsert_project(&c, &e2e_project_row(PROJECT_ID, PROJECT_SLUG)).unwrap();
+        crate::db::collab_exchange::upsert_package(
+            &c,
+            &e2e_package_row(PROJECT_ID, HUB_PACKAGE_ID, PUBLISHER, &anchor),
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO scan_roots (path, kind) VALUES (?1, 'collaboration')",
+            [landing.to_string_lossy().to_string()],
+        )
+        .unwrap();
+    }
+
+    let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+    let net = LoopbackNetwork::new();
+    let sender: Arc<LoopbackTransport> = Arc::new(net.endpoint());
+    let receiver_ep: Arc<LoopbackTransport> = Arc::new(net.endpoint());
+    let receiver_node: NodeId = receiver_ep.node_id();
+
+    sender.start().await.unwrap();
+    let mut sender_events = sender.events().await;
+
+    let recorder = Arc::new(EventRecorder::default());
+    let hooks = super::receiver::ProjectReceiveHooks {
+        gate: Some(Arc::new(|_from: &NodeId, pid: &str| pid == PROJECT_ID)),
+        ..Default::default()
+    };
+    let (_info, _handle) = SyncReceiver::spawn(
+        Arc::clone(&store),
+        tmp.path().join("stage"),
+        fixed_resolver(tmp.path().join("unused_incoming")),
+        super::allow_all_peers(),
+        hooks,
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::clone(&recorder) as Arc<dyn crate::events::ProgressEmitter>,
+    )
+    .await
+    .unwrap();
+
+    // A serves (full) + project-announces to B.
+    sender.serve(&announce, &pkg_dir, None).await.unwrap();
+    sender
+        .announce_project(receiver_node, PROJECT_ID, HUB_PACKAGE_ID, &announce)
+        .await
+        .unwrap();
+
+    // A receives the ack with an Ingested receipt ("receipts flowed", B confirmed).
+    let receipts =
+        wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
+    assert_eq!(receipts.len(), 1);
+    assert!(matches!(receipts[0].outcome, ReceiptOutcome::Ingested));
+
+    // B's finished event carries the project id.
+    let finished = wait_for_finished(&recorder).await;
+    assert_eq!(finished["projectId"], PROJECT_ID);
+    assert_eq!(finished["outcome"], "ingested");
+    assert_eq!(finished["okCount"], 1);
+
+    // Contribution landed under <collab-root>/<proj-slug>/<pub-slug>/<rel>, never
+    // in files/frames.
+    let rows = {
+        let c = assert_db.conn();
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM files"), 0, "contributions never enter files");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM frames"), 0, "contributions never enter frames");
+        crate::db::collab_exchange::contributions_for_package(&c, HUB_PACKAGE_ID).unwrap()
+    };
+    assert_eq!(rows.len(), 1, "one contribution landed");
+    let landed = PathBuf::from(&rows[0].landed_path);
+    let expected = landing
+        .join(super::ingest::sanitize_slug(PROJECT_SLUG))
+        .join(super::ingest::sanitize_slug(PUBLISHER))
+        .join("L_0001.fits");
+    assert_eq!(landed, expected, "hub-anchored landing layout");
+    assert!(landed.exists(), "the payload is on disk");
+
+    // The package is marked complete and its manifest retained (Д2 re-serve).
+    let pkg = {
+        let c = assert_db.conn();
+        crate::db::collab_exchange::get_package(&c, HUB_PACKAGE_ID).unwrap().unwrap()
+    };
+    assert_eq!(pkg.local_status, "complete");
+    assert!(pkg.manifest_ndjson.is_some(), "retained manifest bytes for re-serving");
+}

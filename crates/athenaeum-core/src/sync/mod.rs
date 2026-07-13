@@ -53,6 +53,7 @@ pub mod engine;
 pub mod ingest;
 pub mod models;
 pub mod pairing;
+pub mod project_ingest;
 pub mod receiver;
 pub mod responder;
 pub mod retention;
@@ -75,9 +76,11 @@ pub use engine::{
 pub use ingest::{ingest_package, IngestOutcome};
 pub use pairing::{node_id_from_ticket, relay_mode_for, resolve_relays, RelayResolution};
 pub use models::{Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState};
+pub use project_ingest::{ingest_project_package, ProjectIngestOutcome};
 pub use retention::{evaluate_and_apply, DeleteOutcome, RetentionOutcome, RetentionPolicy};
 pub use receiver::{
-    allow_all_peers, IncomingResolver, PeerAuthorizer, ProjectAnnounceGate, ReceiverHooks,
+    allow_all_peers, IncomingResolver, PeerAuthorizer, ProjectAnnounceGate,
+    ProjectAnnouncementsRefresher, ProjectIngestedHook, ProjectReceiveHooks, ReceiverHooks,
     SyncFinishedEvent, SyncProgressEvent, SyncReceiver, SyncReceiverHandle, SyncRuntime,
 };
 pub use responder::{CatalogDedupResponder, DedupResponder};

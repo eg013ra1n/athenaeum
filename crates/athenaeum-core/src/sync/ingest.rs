@@ -597,8 +597,10 @@ fn format_of(rel_path: &str) -> FileFormat {
 }
 
 /// Return `base` if free, else `base` with a `_2`, `_3`, … suffix inserted before
-/// the extension, until an unused path is found.
-fn unique_path(base: &Path) -> PathBuf {
+/// the extension, until an unused path is found. `pub(crate)` so the sibling
+/// [`project_ingest`](super::project_ingest) landing path reuses the exact
+/// collision-suffix logic.
+pub(crate) fn unique_path(base: &Path) -> PathBuf {
     if !base.exists() {
         return base.to_path_buf();
     }
