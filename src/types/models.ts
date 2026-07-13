@@ -698,7 +698,13 @@ stage: string,
  * The other peer's node id (hex): the sending peer for a receive tick, the
  * destination peer for a send tick.
  */
-peerDevice: string, frameCount: number, };
+peerDevice: string, frameCount: number, 
+/**
+ * Collab exchange (slice 4): the project id when this package is a project
+ * exchange, else `None` for personal sync. Additive — the Transfers UI reads
+ * it in Task 11 to route project transfers to the project view.
+ */
+projectId: string | null, };
 
 export type SyncFinishedEvent = { packageId: string, 
 /**
@@ -726,7 +732,13 @@ failed: Array<string>,
  * on the receiver-side emits — the receiver reports ingest/duplicate per
  * frame in [`ok_count`](Self::ok_count) / its receipts, not this split.
  */
-newCount: number, duplicateCount: number, };
+newCount: number, duplicateCount: number, 
+/**
+ * Collab exchange (slice 4): the project id when this package is a project
+ * exchange, else `None` for personal sync. Additive — Task 11 wires it to
+ * the project-transfer UI/notification.
+ */
+projectId: string | null, };
 
 export type SyncHistoryQuery = { 
 /**
