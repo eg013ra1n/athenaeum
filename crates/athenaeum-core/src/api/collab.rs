@@ -1637,7 +1637,10 @@ pub fn list_moderation_queue(
 /// status is detected there.
 fn decide_err(e: crate::account::AccountClientError) -> ApiError {
     if let crate::account::AccountClientError::Network(ref msg) = e {
-        if msg.contains("409") {
+        // Match the client's stable prefix, not a bare "409" — the message tail
+        // can echo hub-controlled text (e.g. the typed reject reason), and a
+        // literal "409" inside it must not relabel a non-conflict error.
+        if msg.contains("hub returned 409") {
             return ApiError::Conflict(
                 "This announcement was already decided — refresh the queue.".into(),
             );
