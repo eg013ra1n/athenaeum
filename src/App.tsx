@@ -10,6 +10,7 @@ import ShootCalendar from './pages/ShootCalendar';
 import Objects from './pages/Objects';
 import FrameSetDetail from './pages/FrameSetDetail';
 import Projects from './pages/Projects';
+import ProjectDetail from './pages/ProjectDetail';
 import Equipment from './pages/Equipment';
 import BlackHole from './pages/BlackHole';
 import SkyChart from './pages/SkyChart';
@@ -77,6 +78,7 @@ function AppContent() {
           <Route path="objects" element={<Objects />} />
           <Route path="objects/:id" element={<FrameSetDetail />} />
           <Route path="projects" element={<Projects />} />
+          <Route path="projects/:id" element={<ProjectDetail />} />
           <Route path="excluded" element={<ExcludedFrames />} />
           <Route path="skychart" element={<SkyChart />} />
           <Route path="equipment" element={<Equipment />} />

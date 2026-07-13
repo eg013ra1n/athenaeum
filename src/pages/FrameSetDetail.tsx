@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useParams, useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { api } from '../api';
-import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, AlignHorizontalJustifyCenter } from 'lucide-react';
-import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, LightFrameReadiness, LightCalReadiness, LightCalDetails } from '../types/models';
+import { ArrowLeft, MapPin, RotateCw, AlertCircle, Scissors, BarChart3, Crosshair, History, Search, Archive as ArchiveIcon, Layers, AlignHorizontalJustifyCenter, Users } from 'lucide-react';
+import type { FrameSetDetail, FileWithFrame, CalibrationHierarchyView, FrameAnalysis, FindNewFramesResult, MergeReport, FrameSetReference, LightFrameReadiness, LightCalReadiness, LightCalDetails, PortalNewProjectLink } from '../types/models';
 import BlinkViewer from '../components/BlinkViewer';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AlertDialog } from '../components/AlertDialog';
@@ -19,7 +19,9 @@ import { RestoreDialog } from '../components/archive/RestoreDialog';
 import { ExportTab } from '../components/export/ExportTab';
 import { getArchiveSettings, listArchiveRoots, startArchiveOperation, listArchivedFrameSets, listArchiveZips } from '../api/archive';
 import { StackingPrepTab } from '../components/StackingPrepTab';
-import { revealItemInDir } from '../api/desktop';
+import { revealItemInDir, openUrl } from '../api/desktop';
+import { safeExternalUrl } from '../utils/externalUrl';
+import { useNotifications } from '../contexts/NotificationContext';
 import { isTauri } from '../utils/platform';
 import { Upload, FolderOpen } from 'lucide-react';
 import type { ArchiveCompression, Dispositions, ConflictResolution } from '../types/archive';
@@ -38,6 +40,7 @@ export default function FrameSetDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const location = useLocation();
+  const { notify } = useNotifications();
   const [detail, setDetail] = useState<FrameSetDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -625,6 +628,38 @@ export default function FrameSetDetail() {
     }
   };
 
+  const publishAsProject = async () => {
+    if (!id) return;
+    try {
+      // Core mints the deep link (percent-encoded, Url-built) and records an
+      // intent so the next poll auto-links this set to the project the portal
+      // creates from it (spec §8).
+      const { url } = await api.invoke<PortalNewProjectLink>('create_collab_link_intent', {
+        framesSetId: parseInt(id),
+      });
+      const safe = safeExternalUrl(url);
+      if (!safe) {
+        console.error('[projects] refused non-http(s) intent url:', url);
+        notify({
+          title: 'Could not open the portal',
+          detail: 'The configured hub address is not a valid web address.',
+          kind: 'project',
+          tone: 'warning',
+        });
+        return;
+      }
+      await openUrl(safe);
+    } catch (err) {
+      console.error('[projects] publish-as-project failed:', err);
+      notify({
+        title: 'Could not start project creation',
+        detail: err instanceof Error ? err.message : String(err),
+        kind: 'project',
+        tone: 'warning',
+      });
+    }
+  };
+
   if (loading) {
     return (
       <div className="p-6">
@@ -819,6 +854,14 @@ export default function FrameSetDetail() {
                 </button>
               </>
             )}
+            <button
+              onClick={() => void publishAsProject()}
+              title="Publish this frame set as a collaboration project on the portal"
+              className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover"
+            >
+              <Users size={14} />
+              Publish as project
+            </button>
             <div className="flex items-center gap-1.5 text-sm text-content-muted">
               <span><span className="font-medium text-content">{calibrationHierarchy?.total_frames ?? '-'}</span> frames</span>
               <span>·</span>
