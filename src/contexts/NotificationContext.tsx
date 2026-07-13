@@ -47,6 +47,7 @@ export type NotificationKind =
   | 'masterbuild'
   | 'calibration'
   | 'sync'
+  | 'project'
   | 'generic';
 
 /** Short-lived toast shown bottom-right. */

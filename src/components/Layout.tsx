@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Outlet, NavLink } from 'react-router-dom';
-import { Files, Calendar, Target, Focus, Camera, Settings, Trash2, Info, ChevronsLeft, ChevronsRight } from 'lucide-react';
+import { Files, Calendar, Target, Focus, Camera, Settings, Trash2, Info, Users, ChevronsLeft, ChevronsRight } from 'lucide-react';
 import { ArchiveResumeBanner } from './archive/ArchiveResumeBanner';
 import { ScanProgressProvider } from '../contexts/ScanProgressContext';
 import { ScanProgressIndicator } from './ScanProgressIndicator';
@@ -24,7 +24,16 @@ import { TransfersProvider } from '../contexts/TransfersContext';
 import { TransferIndicator } from './transfers/TransferIndicator';
 import { TransfersPanel } from './transfers/TransfersPanel';
 import { AutoUpdateCheck } from './AutoUpdateCheck';
+import { useProjectMatches } from '../hooks/useProjectMatches';
 import Logo from '../assets/athenaeum.png';
+
+/** Mounts the global `project-set-match` listener. Rendered inside
+ * `NotificationProvider` (below) so `useProjectMatches` → `useNotifications`
+ * has its context; the Layout body itself runs above the provider. */
+function ProjectMatchesListener() {
+  useProjectMatches();
+  return null;
+}
 
 export default function Layout() {
   const [collapsed, setCollapsed] = useState(
@@ -38,6 +47,7 @@ export default function Layout() {
   const navItems = [
     { to: '/files', icon: Files, label: 'File Manager' },
     { to: '/objects', icon: Target, label: 'Objects' },
+    { to: '/projects', icon: Users, label: 'Projects' },
     { to: '/equipment', icon: Camera, label: 'Equipment' },
     { to: '/skychart', icon: Focus, label: 'Sky Chart' },
     { to: '/calendar', icon: Calendar, label: 'Shoot Calendar' },
@@ -127,6 +137,7 @@ export default function Layout() {
           <NotificationPanel />
           <TransfersPanel />
           <AutoUpdateCheck />
+          <ProjectMatchesListener />
         </div>
         </LightCalibrationProvider>
         </MasterBuildProvider>

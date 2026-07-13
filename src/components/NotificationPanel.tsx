@@ -19,6 +19,7 @@ import {
   Blend,
   Wand2,
   RefreshCw,
+  Users,
   type LucideIcon,
 } from 'lucide-react';
 import { useNotifications, type NotificationKind } from '../contexts/NotificationContext';
@@ -39,6 +40,7 @@ const KIND_ICON: Record<NotificationKind, LucideIcon> = {
   masterbuild: Blend,
   calibration: Wand2,
   sync: RefreshCw,
+  project: Users,
   generic: Bell,
 };
 
