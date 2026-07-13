@@ -9,6 +9,7 @@ pub mod db;
 pub mod fits_parser;
 pub mod fits_writer;
 pub mod clustering;
+pub mod collab;
 pub mod settings;
 pub mod sessions;
 pub mod duplicates;

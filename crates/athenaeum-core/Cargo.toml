@@ -57,6 +57,11 @@ iroh-blobs = "=0.103.0"
 # pinned to iroh's 1.x ticket crate. Transitive under iroh-blobs, named directly
 # so the transport can build/parse pairing tickets.
 iroh-tickets = "=1.0.0"
+# ed25519 verification of hub-signed membership snapshots. MUST match the
+# version iroh 1.0.2 already carries transitively (one crate version in the
+# tree — owner rule): check `grep -A1 'name = "ed25519-dalek"' Cargo.lock`
+# and pin exactly that (3.0.0-rc.0 at the time of writing).
+ed25519-dalek = "3.0.0-rc.0"
 # postcard wire encoding for the announce/ack control protocol (bidirectional QUIC stream).
 postcard = { version = "1", features = ["use-std"] }
 tracing = "0.1"

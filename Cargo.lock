@@ -433,6 +433,7 @@ dependencies = [
  "byteorder",
  "cdshealpix",
  "chrono",
+ "ed25519-dalek",
  "flate2",
  "hostname",
  "image",
