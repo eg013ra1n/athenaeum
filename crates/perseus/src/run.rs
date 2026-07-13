@@ -1168,6 +1168,8 @@ fn build_retention_history_rows(
             started_at: now_iso(),
             finished_at: Some(now_iso()),
             outcome: outcome.to_string(),
+            // Perseus is a personal-sync capture agent — no project dimension.
+            project: None,
         }];
     }
 
@@ -1191,6 +1193,8 @@ fn build_retention_history_rows(
                 started_at: now_iso(),
                 finished_at: Some(now_iso()),
                 outcome: outcome.to_string(),
+                // Perseus is a personal-sync capture agent — no project dimension.
+                project: None,
             }
         })
         .collect()
@@ -1914,6 +1918,7 @@ mod retention_tests {
                 object: None,
                 direction: None,
                 peer: None,
+                project: None,
                 limit: 1000,
             })
             .unwrap()
@@ -2001,6 +2006,7 @@ mod retention_tests {
                 object: None,
                 direction: None,
                 peer: None,
+                project: None,
                 limit: 1000,
             })
             .unwrap();

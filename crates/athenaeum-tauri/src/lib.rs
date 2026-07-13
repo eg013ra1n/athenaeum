@@ -97,6 +97,7 @@ pub fn run() {
                 monitor: athenaeum_core::monitor::MonitorService::new(),
                 sync: Arc::new(athenaeum_core::sync::SyncRuntime::new()),
                 sync_sender: Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
+                collab_sender: Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
             }
         })
         .setup(|app| {
@@ -463,6 +464,13 @@ pub fn run() {
             commands::list_collab_link_suggestions,
             commands::set_collab_link,
             commands::create_collab_link_intent,
+            commands::publish_collab_package,
+            commands::refresh_collab_packages,
+            commands::list_collab_packages,
+            commands::download_collab_package,
+            commands::list_collab_contributions,
+            commands::list_collab_moderation,
+            commands::decide_collab_announcement,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

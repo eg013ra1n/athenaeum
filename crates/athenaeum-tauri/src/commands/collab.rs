@@ -1,11 +1,19 @@
-//! Collaboration-project commands — thin wrappers over `athenaeum_core::api::collab`.
+//! Collaboration-project commands — thin wrappers over `athenaeum_core::api::collab`
+//! and `athenaeum_core::api::collab_exchange`.
+
+use std::sync::Arc;
 
 use athenaeum_core::api::collab as api;
 use athenaeum_core::api::collab::{
-    GateReport, LinkSuggestion, PortalNewProjectLink, ProjectCard, ProjectDetail,
+    GateReport, LinkSuggestion, ModerationItem, PortalNewProjectLink, ProjectCard, ProjectDetail,
+    PublishResult,
 };
-use tauri::State;
+use athenaeum_core::api::collab_exchange as exchange;
+use athenaeum_core::api::collab_exchange::{ContributionView, PackageStateChange, ProjectPackageView};
+use athenaeum_core::events::ProgressEmitter;
+use tauri::{AppHandle, State};
 
+use crate::tauri_events::TauriProgressEmitter;
 use super::AppState; // AppState lives in commands/mod.rs and is NOT re-exported at the crate root
 
 #[tauri::command]
@@ -71,4 +79,103 @@ pub async fn create_collab_link_intent(
     frames_set_id: i64,
 ) -> Result<PortalNewProjectLink, String> {
     api::record_project_link_intent(&state.ctx, frames_set_id).map_err(|e| e.to_string())
+}
+
+// ── Exchange (Task 11): publish, poll, list, download, moderate ──────────────
+
+/// Build + announce a stamped package of the project's gate-passing calibrated
+/// lights, record it locally (with Д9 supersedes), and push-seed the first
+/// receive-capable member. Rides the host-owned collab sender map.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn publish_collab_package(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_id: String,
+) -> Result<PublishResult, String> {
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
+    api::publish_collab_frames(&state.ctx, &state.collab_sender, &project_id, Some(emitter))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Poll every cached project's announcements into `project_packages`, returning
+/// the state changes the frontend turns into `notify()` calls.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn refresh_collab_packages(
+    state: State<'_, AppState>,
+) -> Result<Vec<PackageStateChange>, String> {
+    exchange::refresh_all_project_packages(&state.ctx)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Every known package for a project (cache-only — no hub call).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn list_collab_packages(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<ProjectPackageView>, String> {
+    exchange::list_project_packages(&state.ctx, &project_id).map_err(|e| e.to_string())
+}
+
+/// Start the Д6 explicit sequential-holder download of a project package. Spawns
+/// the pull and returns immediately — the terminal `local_status` + `sync-finished`
+/// event carry the outcome.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn download_collab_package(
+    state: State<'_, AppState>,
+    project_id: String,
+    package_id: String,
+) -> Result<(), String> {
+    let ctx = Arc::clone(&state.ctx);
+    let sync = Arc::clone(&state.sync);
+    tokio::spawn(async move {
+        if let Err(e) =
+            exchange::download_project_package(&ctx, &sync, &project_id, &package_id).await
+        {
+            tracing::error!(error = %format!("{e}"), "collab package download failed");
+        }
+    });
+    Ok(())
+}
+
+/// Every received contribution for a project (cache-only — no hub call).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn list_collab_contributions(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<ContributionView>, String> {
+    exchange::list_contributions(&state.ctx, &project_id).map_err(|e| e.to_string())
+}
+
+/// The coordinator's review queue: every PENDING package with its landed review
+/// frames + parsed metrics (cache-only).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn list_collab_moderation(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<Vec<ModerationItem>, String> {
+    api::list_moderation_queue(&state.ctx, &project_id).map_err(|e| e.to_string())
+}
+
+/// Decide a pending announcement (coordinator only — enforced by the hub).
+/// `approve` ⇒ hub approve + flip local state; reject ⇒ `reason` required, hub
+/// reject, then remove the local review copy.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn decide_collab_announcement(
+    state: State<'_, AppState>,
+    announcement_id: String,
+    approve: bool,
+    reason: Option<String>,
+) -> Result<(), String> {
+    api::decide_announcement(&state.ctx, &announcement_id, approve, reason)
+        .await
+        .map_err(|e| e.to_string())
 }

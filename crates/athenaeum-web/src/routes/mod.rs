@@ -271,6 +271,13 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/list_collab_link_suggestions", post(collab::list_collab_link_suggestions))
         .route("/api/set_collab_link", post(collab::set_collab_link))
         .route("/api/create_collab_link_intent", post(collab::create_collab_link_intent))
+        .route("/api/publish_collab_package", post(collab::publish_collab_package))
+        .route("/api/refresh_collab_packages", post(collab::refresh_collab_packages))
+        .route("/api/list_collab_packages", post(collab::list_collab_packages))
+        .route("/api/download_collab_package", post(collab::download_collab_package))
+        .route("/api/list_collab_contributions", post(collab::list_collab_contributions))
+        .route("/api/list_collab_moderation", post(collab::list_collab_moderation))
+        .route("/api/decide_collab_announcement", post(collab::decide_collab_announcement))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_log_path", post(get_log_path))
@@ -462,6 +469,7 @@ mod tests {
             monitor: athenaeum_core::monitor::MonitorService::new(),
             sync: std::sync::Arc::new(athenaeum_core::sync::SyncRuntime::new()),
             sync_sender: std::sync::Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
+            collab_sender: std::sync::Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
         }
     }
 

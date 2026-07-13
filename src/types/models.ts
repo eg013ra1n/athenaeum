@@ -604,7 +604,14 @@ peerDevice: string, direction: Direction, bytes: number, startedAt: string, fini
  * `retention_deleted` (an automatic retention pass) and `deleted_manual`
  * (the web "Delete selected" action).
  */
-outcome: string, };
+outcome: string, 
+/**
+ * Stage-II collab provenance: the `project_id` this frame moved for, taken
+ * from the manifest record's [`ProjectStamp`](crate::package::ProjectStamp).
+ * `None` for a personal-sync transfer (no project dimension) — the Transfers
+ * UI shows a project chip only for the collab rows.
+ */
+project: string | null, };
 
 export type OutboundSummary = { 
 /**
@@ -758,6 +765,11 @@ direction: Direction | null,
  */
 peer: string | null, 
 /**
+ * Exact `project_id` filter (Stage II collab); unfiltered when absent. The
+ * Transfers UI's project-dimension passthrough (Task 11).
+ */
+project: string | null, 
+/**
  * Newest-first cap. `0` is treated as the default cap.
  */
 limit: number, };
@@ -841,11 +853,85 @@ export type ProjectSetMatchEvent = { framesSetId: number, setName: string | null
 
 export type PortalNewProjectLink = { url: string, };
 
+export type PublishResult = { 
+/**
+ * The HUB package uuid (minted first, stamped into every record, announced).
+ */
+packageId: string, 
+/**
+ * The hub's announcement id (`{id}` from the announce reply).
+ */
+announcementId: string, 
+/**
+ * `pending` (require_approval) | `published`.
+ */
+state: string, frameCount: number, byteSize: number, 
+/**
+ * Announcement ids this publish superseded (Д9); also flipped `superseded=1`
+ * locally.
+ */
+supersededAnnouncements: Array<string>, 
+/**
+ * Display name of the chosen first-replica member; `None` when no
+ * receive-capable member is available to seed (still announced).
+ */
+seedTarget: string | null, };
+
+export type ModerationFrame = { frameUuid: string, relPath: string, 
+/**
+ * Absolute on-disk path of the landed review copy; `None` when the
+ * contribution row carries no landed path.
+ */
+landedPath: string | null, byteSize: number, fwhm: number | null, eccentricity: number | null, stars: number | null, snr: number | null, };
+
+export type ModerationItem = { announcementId: string, packageId: string, publisher: string, frameCount: number, byteSize: number, createdAt: string, 
+/**
+ * The push-seed review copy has fully landed (`local_status == "complete"`);
+ * `false` while the coordinator is still receiving it.
+ */
+reviewCopyComplete: boolean, frames: Array<ModerationFrame>, };
+
 export type PackageStateChange = { projectId: string, packageId: string, 
 /**
  * `newPackage` | `approved` | `rejected` | `downloadComplete` | `downloadFailed`.
  */
 kind: string, detail: string | null, };
+
+export type ProjectPackageView = { 
+/**
+ * HUB package uuid (the `project_packages` row key).
+ */
+packageId: string, 
+/**
+ * Hub-mirrored decision: `pending` | `published` | `rejected`.
+ */
+state: string, 
+/**
+ * Local fetch progress: `none` | `downloading` | `complete` | `failed`.
+ */
+localStatus: string, 
+/**
+ * I published this package.
+ */
+own: boolean, publisher: string, byteSize: number, frameCount: number, createdAt: string, rejectReason: string | null, 
+/**
+ * Another announcement supersedes this one.
+ */
+superseded: boolean, 
+/**
+ * Holders the hub listed at poll time.
+ */
+holderCount: number, 
+/**
+ * Of those holders, how many the hub last saw within the online window.
+ */
+onlineCount: number, };
+
+export type ContributionView = { packageId: string, frameUuid: string, publisher: string, relPath: string, byteSize: number, 
+/**
+ * A newer contribution for the same frame uuid supersedes this one.
+ */
+superseded: boolean, createdAt: string, };
 
 export type FrameGateRow = { frameId: number, filename: string, fwhmArcsec: number | null, eccentricity: number | null, starsDetected: number | null, trailed: boolean | null, publishable: boolean, 
 /**

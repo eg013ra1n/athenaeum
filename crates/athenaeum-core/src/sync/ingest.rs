@@ -539,6 +539,7 @@ fn received_history(
         started_at: started_at.to_string(),
         finished_at: Some(now_iso()),
         outcome: outcome.to_string(),
+        project: record.project.as_ref().map(|p| p.project_id.clone()),
     }
 }
 

@@ -1651,6 +1651,12 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         };
         conn.execute(DDL_OUTBOUND, [])?;
         conn.execute(DDL_HISTORY, [])?;
+        // AUDIT B3: `CREATE TABLE IF NOT EXISTS` never adds a column to an existing
+        // `sync_history` — migrate the Stage-II collab `project` column in place
+        // (rusqlite-native `column_exists`, the schema.rs idiom).
+        if !column_exists(conn, "sync_history", "project")? {
+            conn.execute("ALTER TABLE sync_history ADD COLUMN project TEXT", [])?;
+        }
         conn.execute(DDL_RECEIPTS, [])?;
         conn.execute(DDL_SYNC_SOURCES, [])?;
         for idx in DDL_INDEXES {

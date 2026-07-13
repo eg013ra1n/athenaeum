@@ -30,6 +30,10 @@ pub const DDL_OUTBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_outbound (
 )";
 
 /// `sync_history` — append-only per-frame transfer audit log.
+///
+/// The trailing `project` column (Stage II collab, Task 11) is created inline for
+/// a fresh DB; an existing project-less table is migrated in place by
+/// [`ensure_history_columns`] (a `CREATE TABLE IF NOT EXISTS` never adds a column).
 pub const DDL_HISTORY: &str = "CREATE TABLE IF NOT EXISTS sync_history (
     id INTEGER PRIMARY KEY,
     frame_uuid TEXT,
@@ -40,8 +44,32 @@ pub const DDL_HISTORY: &str = "CREATE TABLE IF NOT EXISTS sync_history (
     bytes INTEGER,
     started_at TEXT,
     finished_at TEXT,
-    outcome TEXT
+    outcome TEXT,
+    project TEXT
 )";
+
+/// Idempotently add the `project` column to an existing `sync_history` table.
+///
+/// `CREATE TABLE IF NOT EXISTS` never alters an already-materialised table, so a
+/// store opened over a pre-Stage-II catalog / Perseus DB is migrated in place
+/// here (Task 11, AUDIT B3). SQLite has no `ADD COLUMN IF NOT EXISTS`, so this
+/// reads `PRAGMA table_info` first — the same idiom as Perseus's `ensure_column`.
+/// Called by every `sync_history` materialisation site (both store `open`s and
+/// `db::schema::init_db`) right after the DDL.
+pub fn ensure_history_columns(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("PRAGMA table_info(sync_history)")
+        .context("prepare table_info(sync_history)")?
+        .query_map([], |r| r.get::<_, String>(1))
+        .context("query table_info(sync_history)")?
+        .filter_map(|c| c.ok())
+        .any(|c| c == "project");
+    if !present {
+        conn.execute("ALTER TABLE sync_history ADD COLUMN project TEXT", [])
+            .context("add sync_history.project column")?;
+    }
+    Ok(())
+}
 
 /// `sync_receipts` — the receiver's durable per-frame verdict log (task A7).
 ///
@@ -172,11 +200,22 @@ type HistoryRaw = (
     String,
     Option<String>,
     String,
+    Option<String>,
 );
 
 fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
-    let (frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome) =
-        raw;
+    let (
+        frame_uuid,
+        filename,
+        object,
+        peer_device,
+        direction,
+        bytes,
+        started_at,
+        finished_at,
+        outcome,
+        project,
+    ) = raw;
     Ok(HistoryRow {
         frame_uuid,
         filename,
@@ -187,13 +226,14 @@ fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
         started_at,
         finished_at,
         outcome,
+        project,
     })
 }
 
 const OUTBOUND_COLS: &str =
     "id, package_ref, peer, state, attempts, created_at, confirmed_at";
 const HISTORY_COLS: &str =
-    "frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome";
+    "frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project";
 
 // ── Free functions on a raw connection ──────────────────────────────────────
 //
@@ -208,8 +248,8 @@ const HISTORY_COLS: &str =
 pub fn insert_history_row(conn: &Connection, h: &HistoryRow) -> Result<()> {
     conn.execute(
         "INSERT INTO sync_history
-         (frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+         (frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             h.frame_uuid,
             h.filename,
@@ -220,6 +260,7 @@ pub fn insert_history_row(conn: &Connection, h: &HistoryRow) -> Result<()> {
             h.started_at,
             h.finished_at,
             h.outcome,
+            h.project,
         ],
     )
     .context("insert sync_history")?;
@@ -246,6 +287,10 @@ pub fn search_history_rows(conn: &Connection, q: &HistoryQuery) -> Result<Vec<Hi
         sql.push_str(" AND peer_device = ?");
         args.push(Box::new(peer.clone()));
     }
+    if let Some(project) = &q.project {
+        sql.push_str(" AND project = ?");
+        args.push(Box::new(project.clone()));
+    }
     sql.push_str(" ORDER BY started_at DESC, id DESC LIMIT ?");
     args.push(Box::new(q.limit as i64));
 
@@ -263,6 +308,7 @@ pub fn search_history_rows(conn: &Connection, q: &HistoryQuery) -> Result<Vec<Hi
                 r.get(6)?,
                 r.get(7)?,
                 r.get(8)?,
+                r.get(9)?,
             ))
         })
         .context("query search_history")?
@@ -542,6 +588,7 @@ impl StandaloneSyncStore {
         conn.execute(DDL_OUTBOUND, [])
             .context("create sync_outbound")?;
         conn.execute(DDL_HISTORY, []).context("create sync_history")?;
+        ensure_history_columns(&conn)?;
         for idx in DDL_INDEXES {
             conn.execute(idx, []).context("create sync_history index")?;
         }
@@ -726,6 +773,7 @@ impl CatalogSyncStore {
         .context("configure catalog sync store pragmas")?;
         conn.execute(DDL_OUTBOUND, []).context("create sync_outbound")?;
         conn.execute(DDL_HISTORY, []).context("create sync_history")?;
+        ensure_history_columns(&conn)?;
         conn.execute(DDL_RECEIPTS, []).context("create sync_receipts")?;
         conn.execute(DDL_SYNC_SOURCES, []).context("create sync_sources")?;
         for idx in DDL_INDEXES {
@@ -930,5 +978,76 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
         assert!(store.all_outbound(50).unwrap().is_empty());
+    }
+
+    /// Migration (AUDIT B3): opening a store over a PRE-EXISTING project-less
+    /// `sync_history` table adds the `project` column in place, and an insert
+    /// carrying a project value round-trips through search — proving both the
+    /// `ALTER TABLE` migration and the new column's insert/search SQL.
+    #[test]
+    fn opening_over_projectless_history_migrates_and_inserts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("legacy.db");
+
+        // Materialise the OLD (project-less) sync_history shape by hand — exactly
+        // what a store created before Stage II left on disk.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE sync_history (
+                    id INTEGER PRIMARY KEY,
+                    frame_uuid TEXT, filename TEXT, object TEXT, peer_device TEXT,
+                    direction TEXT, bytes INTEGER, started_at TEXT, finished_at TEXT, outcome TEXT
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sync_history
+                    (frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome)
+                 VALUES ('u-old', 'old.fits', 'M42', 'peerA', 'sent', 10, 't0', NULL, 'sent')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Opening the store migrates the table in place (no error) …
+        let store = StandaloneSyncStore::open(&db_path).unwrap();
+
+        // … a legacy row now reads back with project = NULL …
+        let legacy = store
+            .search_history(HistoryQuery { filename: Some("old.fits".into()), limit: 10, ..Default::default() })
+            .unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].project, None, "legacy row's project migrated to NULL");
+
+        // … and a fresh insert carrying a project value round-trips + filters.
+        store
+            .append_history(HistoryRow {
+                frame_uuid: "u-new".into(),
+                filename: "new.fits".into(),
+                object: Some("M31".into()),
+                peer_device: "peerB".into(),
+                direction: Direction::Received,
+                bytes: 20,
+                started_at: "t1".into(),
+                finished_at: Some("t2".into()),
+                outcome: "ingested".into(),
+                project: Some("proj-42".into()),
+            })
+            .unwrap();
+
+        let by_project = store
+            .search_history(HistoryQuery { project: Some("proj-42".into()), limit: 10, ..Default::default() })
+            .unwrap();
+        assert_eq!(by_project.len(), 1, "project filter matches exactly the collab row");
+        assert_eq!(by_project[0].frame_uuid, "u-new");
+        assert_eq!(by_project[0].project.as_deref(), Some("proj-42"));
+
+        // A project filter that matches nothing returns empty (never the legacy row).
+        assert!(store
+            .search_history(HistoryQuery { project: Some("proj-none".into()), limit: 10, ..Default::default() })
+            .unwrap()
+            .is_empty());
     }
 }

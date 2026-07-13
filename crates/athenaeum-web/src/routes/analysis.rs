@@ -218,6 +218,7 @@ mod analysis_config_tests {
             monitor: athenaeum_core::monitor::MonitorService::new(),
             sync: std::sync::Arc::new(athenaeum_core::sync::SyncRuntime::new()),
             sync_sender: std::sync::Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
+            collab_sender: std::sync::Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
         }
     }
 

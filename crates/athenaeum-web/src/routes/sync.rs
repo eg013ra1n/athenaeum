@@ -27,10 +27,15 @@ pub async fn get_sync_pairing_ticket(
     _body: Json<serde_json::Value>,
 ) -> Result<Json<String>, (StatusCode, String)> {
     let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
-    api::get_pairing_ticket(Arc::clone(&state.ctx), &state.sync, emitter)
-        .await
-        .map(Json)
-        .map_err(api_err)
+    api::get_pairing_ticket(
+        Arc::clone(&state.ctx),
+        &state.sync,
+        Arc::clone(&state.collab_sender),
+        emitter,
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
 }
 
 /// POST /api/get_sync_status

@@ -1307,6 +1307,7 @@ impl Worker {
                 started_at: started_at.to_string(),
                 finished_at: None,
                 outcome: "sent".to_string(),
+                project: project_of(r),
             })?;
         }
         tracing::debug!(package_id = id, count = records.len(), "sync history: transfer started");
@@ -1325,9 +1326,9 @@ impl Worker {
         let finished = now_iso();
 
         for rec in receipts {
-            let (filename, object, bytes) = match by_uuid.get(rec.frame_uuid.as_str()) {
-                Some(m) => (filename_of(&m.rel_path), object_of(m), m.byte_size),
-                None => (rec.frame_uuid.clone(), None, 0),
+            let (filename, object, bytes, project) = match by_uuid.get(rec.frame_uuid.as_str()) {
+                Some(m) => (filename_of(&m.rel_path), object_of(m), m.byte_size, project_of(m)),
+                None => (rec.frame_uuid.clone(), None, 0, None),
             };
             self.store.append_history(HistoryRow {
                 frame_uuid: rec.frame_uuid.clone(),
@@ -1339,6 +1340,7 @@ impl Worker {
                 started_at: pending.started_at.clone(),
                 finished_at: Some(finished.clone()),
                 outcome: receipt_outcome_str(&rec.outcome),
+                project,
             })?;
         }
         Ok(())
@@ -1367,6 +1369,7 @@ impl Worker {
                 started_at: ts.clone(),
                 finished_at: Some(ts.clone()),
                 outcome: outcome.to_string(),
+                project: project_of(r),
             })?;
         }
         Ok(())
@@ -1388,6 +1391,12 @@ fn object_of(r: &ManifestRecord) -> Option<String> {
         .get("object")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// The `project_id` this record moved for (Stage II collab stamp), or `None` for
+/// a personal-sync record. Populates `sync_history.project` (Task 11).
+fn project_of(r: &ManifestRecord) -> Option<String> {
+    r.project.as_ref().map(|p| p.project_id.clone())
 }
 
 /// Short outcome tag for a receipt verdict, stored in `sync_history.outcome`.

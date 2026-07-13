@@ -579,6 +579,7 @@ async fn engine_suite_over_iroh() {
             object: None,
             direction: None,
             peer: None,
+            project: None,
             limit: 100,
         })
         .unwrap();
@@ -679,6 +680,7 @@ async fn engine_dup_ack_confirms_once_over_iroh() {
             object: None,
             direction: None,
             peer: None,
+            project: None,
             limit: 100,
         })
         .unwrap();

@@ -105,6 +105,9 @@ export function TransfersPanel() {
       object: null,
       direction: dirFilter === 'all' ? null : dirFilter,
       peer: null,
+      // Project-dimension filter is unused here for now; the Transfers project
+      // chip lands in Task 12.
+      project: null,
       limit: HISTORY_LIMIT,
     };
     api

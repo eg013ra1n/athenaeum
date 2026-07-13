@@ -77,6 +77,10 @@ pub struct WebAppState {
     /// Personal-sync send-side runtime (task M2). Lazily builds the sender engine
     /// on the first enqueue (manual send / auto mode).
     pub sync_sender: Arc<athenaeum_core::sync::SyncSenderRuntime>,
+    /// Stage-II collab send-side runtime (Task 11): the DEDICATED collab sender
+    /// map (distinct from `sync_sender` — collab serves ride a `blobs_collab`
+    /// store, audit m7). Shared by the request-to-serve handler and the publish path.
+    pub collab_sender: Arc<athenaeum_core::sync::SyncSenderRuntime>,
 }
 
 #[tokio::main]
@@ -235,6 +239,7 @@ async fn main() {
         monitor: athenaeum_core::monitor::MonitorService::new(),
         sync: Arc::new(athenaeum_core::sync::SyncRuntime::new()),
         sync_sender: Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
+        collab_sender: Arc::new(athenaeum_core::sync::SyncSenderRuntime::new()),
     };
 
     // Personal sync (Stage I, task A7): start the receiver + iroh transport at
@@ -245,9 +250,10 @@ async fn main() {
     {
         let ctx_for_sync = Arc::clone(&state.ctx);
         let sync_for_sync = Arc::clone(&state.sync);
+        let collab_for_sync = Arc::clone(&state.collab_sender);
         let emitter = Arc::new(events::SseProgressEmitter::new(state.event_tx.clone()));
         tokio::spawn(async move {
-            match athenaeum_core::api::sync::autostart_if_enabled(ctx_for_sync, &sync_for_sync, emitter).await {
+            match athenaeum_core::api::sync::autostart_if_enabled(ctx_for_sync, &sync_for_sync, collab_for_sync, emitter).await {
                 Ok(true) => tracing::info!("personal sync receiver autostarted (dev pairing enabled)"),
                 Ok(false) => tracing::debug!("personal sync disabled; receiver not started"),
                 Err(e) => tracing::error!(error = %e, "personal sync autostart failed"),

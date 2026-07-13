@@ -32,6 +32,11 @@ pub struct AppState {
     /// on the first enqueue (manual send / auto mode). Held here alongside `sync`
     /// for the same reason — the transport is built with host-provided plumbing.
     pub sync_sender: Arc<athenaeum_core::sync::SyncSenderRuntime>,
+    /// Stage-II collab send-side runtime (Task 11): the DEDICATED collab sender
+    /// map (distinct from `sync_sender` — collab serves ride a `blobs_collab`
+    /// store, audit m7). Held here so the request-to-serve handler, the publish
+    /// path, and the Transfers UI all share the one instance.
+    pub collab_sender: Arc<athenaeum_core::sync::SyncSenderRuntime>,
 }
 
 pub mod core;

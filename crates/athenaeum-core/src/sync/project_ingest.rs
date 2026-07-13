@@ -380,7 +380,8 @@ fn land_project_payload(dest_base: &Path, payload: &Path) -> Result<PathBuf> {
 
 /// Build a `direction = received` history row for a landed contribution. The
 /// `object` field carries the manifest's `frame_meta.object` (like personal
-/// sync); the project dimension arrives with the Task-11 column.
+/// sync); `project` carries the record's collab [`ProjectStamp`] project id so
+/// the Transfers UI can chip the row by project (Task 11).
 fn received_history(record: &ManifestRecord, peer_device: &str, started_at: &str) -> HistoryRow {
     HistoryRow {
         frame_uuid: record.frame_uuid.clone(),
@@ -396,6 +397,7 @@ fn received_history(record: &ManifestRecord, peer_device: &str, started_at: &str
         started_at: started_at.to_string(),
         finished_at: Some(now_iso()),
         outcome: "ingested".to_string(),
+        project: record.project.as_ref().map(|p| p.project_id.clone()),
     }
 }
 

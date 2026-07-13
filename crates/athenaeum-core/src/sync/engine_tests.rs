@@ -200,6 +200,7 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
             object: None,
             direction: None,
             peer: None,
+            project: None,
             limit: 100,
         })
         .unwrap();
@@ -495,6 +496,7 @@ async fn ack_lost_then_duplicate_ack_confirms_once() {
             object: None,
             direction: None,
             peer: None,
+            project: None,
             limit: 100,
         })
         .unwrap();
@@ -547,6 +549,7 @@ async fn failed_after_max_attempts_with_error_outcome_in_history() {
             object: None,
             direction: None,
             peer: None,
+            project: None,
             limit: 100,
         })
         .unwrap();
@@ -613,6 +616,7 @@ async fn first_attempt_peer_offline_retries_then_fails() {
             object: None,
             direction: None,
             peer: None,
+            project: None,
             limit: 100,
         })
         .unwrap();
@@ -683,6 +687,7 @@ async fn first_attempt_peer_offline_then_online_completes() {
             object: None,
             direction: None,
             peer: None,
+            project: None,
             limit: 100,
         })
         .unwrap();
@@ -742,6 +747,7 @@ async fn cancel_moves_to_failed_cancelled() {
             object: None,
             direction: None,
             peer: None,
+            project: None,
             limit: 100,
         })
         .unwrap();

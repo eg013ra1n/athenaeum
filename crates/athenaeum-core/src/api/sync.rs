@@ -48,6 +48,9 @@ pub struct SyncHistoryQuery {
     pub direction: Option<Direction>,
     /// Exact peer node id (hex) filter; unfiltered when absent.
     pub peer: Option<String>,
+    /// Exact `project_id` filter (Stage II collab); unfiltered when absent. The
+    /// Transfers UI's project-dimension passthrough (Task 11).
+    pub project: Option<String>,
     /// Newest-first cap. `0` is treated as the default cap.
     pub limit: u32,
 }
@@ -300,35 +303,29 @@ fn on_project_ingested_hook(ctx: Arc<ServiceContext>) -> crate::sync::ProjectIng
     })
 }
 
-/// The process-wide dedicated collab sender map (a SECOND
-/// [`SyncSenderRuntime`](crate::sync::SyncSenderRuntime), distinct from the
-/// personal-sync `sync_sender` — collab serves ride a dedicated
-/// `blobs_collab` store, audit m7). Lazily created once and shared by every
-/// request-to-serve dispatch for the process lifetime. Task 11 hoists this to
-/// `AppState.collab_sender` so the Transfers UI can roll up collab transfers; for
-/// now it lives here so the holder-side serve wiring is self-contained and
-/// compiles headless.
-fn collab_sender_runtime() -> Arc<SyncSenderRuntime> {
-    static COLLAB_SENDER: std::sync::OnceLock<Arc<SyncSenderRuntime>> = std::sync::OnceLock::new();
-    Arc::clone(COLLAB_SENDER.get_or_init(|| Arc::new(SyncSenderRuntime::new())))
-}
-
 /// Build the holder-side [`ProjectRequestHandler`](crate::sync::ProjectRequestHandler)
 /// the receiver invokes on an inbound `ProjectRequestReceived` (task 6). The
-/// closure is `'static` — it captures a cloned `Arc<ServiceContext>`, the shared
-/// collab sender map, and the host emitter — and `tokio::spawn`s
+/// closure is `'static` — it captures a cloned `Arc<ServiceContext>`, the
+/// host-owned collab sender map, and the host emitter — and `tokio::spawn`s
 /// [`handle_project_request`](crate::api::collab_exchange::handle_project_request)
 /// so the synchronous receive loop never blocks on the serve. An authorization
 /// failure inside `handle_project_request` is a silent (warn-logged) drop; a real
 /// error is logged here.
+///
+/// `collab_sender` is the DEDICATED collab sender map (a SECOND
+/// [`SyncSenderRuntime`](crate::sync::SyncSenderRuntime), distinct from the
+/// personal-sync `sync_sender` — collab serves ride a dedicated `blobs_collab`
+/// store, audit m7). Task 11 hoists it to `AppState.collab_sender` /
+/// `WebAppState.collab_sender` so the Transfers UI can roll up collab transfers;
+/// both host state constructors build it beside `sync_sender`.
 fn project_request_handler(
     ctx: Arc<ServiceContext>,
+    collab_sender: Arc<SyncSenderRuntime>,
     emitter: Arc<dyn ProgressEmitter>,
 ) -> crate::sync::ProjectRequestHandler {
-    let sender = collab_sender_runtime();
     Arc::new(move |from: NodeId, project_id: String, package_id: String| {
         let ctx = Arc::clone(&ctx);
-        let sender = Arc::clone(&sender);
+        let sender = Arc::clone(&collab_sender);
         let emitter = Arc::clone(&emitter);
         tokio::spawn(async move {
             if let Err(e) = crate::api::collab_exchange::handle_project_request(
@@ -458,6 +455,7 @@ fn account_signed_in(ctx: &ServiceContext) -> Result<bool, ApiError> {
 pub async fn autostart_if_enabled(
     ctx: Arc<ServiceContext>,
     sync: &SyncRuntime,
+    collab_sender: Arc<SyncSenderRuntime>,
     emitter: Arc<dyn ProgressEmitter>,
 ) -> Result<bool, ApiError> {
     // Own the Arc (the request-to-serve handler clones it into a `'static`
@@ -481,7 +479,11 @@ pub async fn autostart_if_enabled(
     let authorized = peer_authorizer(ctx)?;
     let hooks = receiver_hooks(
         &ctx_arc,
-        Some(project_request_handler(Arc::clone(&ctx_arc), Arc::clone(&emitter))),
+        Some(project_request_handler(
+            Arc::clone(&ctx_arc),
+            Arc::clone(&collab_sender),
+            Arc::clone(&emitter),
+        )),
     )?;
     sync.ensure_started(sync_dir, db_path, relay_mode, incoming, authorized, hooks, emitter)
         .await
@@ -504,6 +506,7 @@ fn autostart_gate(dev: bool, signed_in: bool) -> bool {
 pub async fn get_pairing_ticket(
     ctx: Arc<ServiceContext>,
     sync: &SyncRuntime,
+    collab_sender: Arc<SyncSenderRuntime>,
     emitter: Arc<dyn ProgressEmitter>,
 ) -> Result<String, ApiError> {
     // Own the Arc (the request-to-serve handler clones it into a `'static`
@@ -528,7 +531,11 @@ pub async fn get_pairing_ticket(
     let authorized = peer_authorizer(ctx)?;
     let hooks = receiver_hooks(
         &ctx_arc,
-        Some(project_request_handler(Arc::clone(&ctx_arc), Arc::clone(&emitter))),
+        Some(project_request_handler(
+            Arc::clone(&ctx_arc),
+            Arc::clone(&collab_sender),
+            Arc::clone(&emitter),
+        )),
     )?;
 
     let ticket = sync
@@ -692,6 +699,7 @@ pub fn list_history(ctx: &ServiceContext, query: SyncHistoryQuery) -> Result<Vec
         object: query.object,
         direction: query.direction,
         peer: query.peer,
+        project: query.project,
         limit,
     };
     let db = db(ctx)?;
@@ -1530,6 +1538,7 @@ mod tests {
                 started_at: "2026-07-06T00:00:00.000Z".into(),
                 finished_at: None,
                 outcome: outcome.into(),
+                project: None,
             };
             let ins = crate::sync::store::insert_history_row;
             ins(&conn, &mk("s1", Direction::Sent, "peerA", "sent")).unwrap();
@@ -1541,6 +1550,7 @@ mod tests {
             object: None,
             direction,
             peer,
+            project: None,
             limit: 0,
         };
 
@@ -1630,9 +1640,14 @@ mod tests {
         let (_tmp, ctx) = test_ctx();
         let sync = SyncRuntime::new();
 
-        let started = autostart_if_enabled(Arc::new(ctx), &sync, Arc::new(crate::events::NullEmitter))
-            .await
-            .unwrap();
+        let started = autostart_if_enabled(
+            Arc::new(ctx),
+            &sync,
+            Arc::new(SyncSenderRuntime::new()),
+            Arc::new(crate::events::NullEmitter),
+        )
+        .await
+        .unwrap();
         assert!(!started, "signed-out + dev off must not start");
         assert!(!sync.is_started().await);
     }
@@ -1663,8 +1678,13 @@ mod tests {
             crate::db::set_setting(&conn, keys::ACCOUNT_DEVICE_ID, "device-1").unwrap();
         }
         let sync = SyncRuntime::new();
-        let started =
-            autostart_if_enabled(Arc::new(ctx), &sync, Arc::new(crate::events::NullEmitter)).await;
+        let started = autostart_if_enabled(
+            Arc::new(ctx),
+            &sync,
+            Arc::new(SyncSenderRuntime::new()),
+            Arc::new(crate::events::NullEmitter),
+        )
+        .await;
         assert!(
             !matches!(started, Ok(false)),
             "a signed-in node must pass the autostart gate regardless of role \

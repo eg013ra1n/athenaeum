@@ -176,6 +176,7 @@ fn history_for(agent: &Agent, filename: &str) -> Vec<HistoryRow> {
             object: None,
             direction: None,
             peer: None,
+            project: None,
             limit: 100,
         })
         .expect("search history")
@@ -248,6 +249,7 @@ async fn two_fixtures_are_enqueued_once_and_confirmed() {
             object: Some("M42".to_string()),
             direction: None,
             peer: None,
+            project: None,
             limit: 10,
         })
         .unwrap();

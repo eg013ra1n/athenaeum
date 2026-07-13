@@ -706,6 +706,8 @@ async fn api_history(
         object: None,
         direction,
         peer: None,
+        // Perseus's web status page has no project dimension (personal sync).
+        project: None,
         limit: q.limit.unwrap_or(DEFAULT_HISTORY_LIMIT),
     };
     let rows = state.store.search_history(hq).map_err(|e| {
@@ -1599,6 +1601,7 @@ mod tests {
                 started_at: "2026-07-08T10:00:00.000Z".into(),
                 finished_at: Some("2026-07-08T10:00:02.500Z".into()),
                 outcome: "sent".into(),
+                project: None,
             })
             .unwrap();
         store
@@ -1612,6 +1615,7 @@ mod tests {
                 started_at: "2026-07-08T11:00:00.000Z".into(),
                 finished_at: None, // unfinished → durationSecs is None
                 outcome: "ingested".into(),
+                project: None,
             })
             .unwrap();
 
@@ -2364,6 +2368,7 @@ mod tests {
                 object: None,
                 direction: None,
                 peer: None,
+                project: None,
                 limit: 1000,
             })
             .unwrap();

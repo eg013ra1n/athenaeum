@@ -278,6 +278,9 @@ fn build_source_history_row(conn: &Connection, package_ref: &str, src: &SyncSour
         started_at: now.clone(),
         finished_at: Some(now),
         outcome: "retention_deleted".to_string(),
+        // Retention is a personal-sync (full-app capture node) audit path — no
+        // project dimension.
+        project: None,
     }
 }
 
@@ -670,7 +673,7 @@ mod tests {
 
     fn history_outcome_count(store: &CatalogSyncStore, outcome: &str) -> usize {
         store
-            .search_history(HistoryQuery { filename: None, object: None, direction: None, peer: None, limit: 1000 })
+            .search_history(HistoryQuery { limit: 1000, ..Default::default() })
             .unwrap()
             .iter()
             .filter(|h| h.outcome == outcome)
@@ -751,6 +754,7 @@ mod tests {
                     started_at: "2026-07-06T00:00:00.000Z".into(),
                     finished_at: Some("2026-07-06T00:00:01.000Z".into()),
                     outcome: "sent".into(),
+                    project: None,
                 },
             )
             .unwrap();

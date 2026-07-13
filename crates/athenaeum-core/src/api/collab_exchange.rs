@@ -39,7 +39,8 @@ use crate::account::keys::{device_key_path, DeviceKey};
 use crate::api::{db, ApiError};
 use crate::collab::hub_client::{AnnouncementWire, CollabClient, HolderWire};
 use crate::db::collab_exchange::{
-    get_package, mark_superseded, set_local_status, upsert_package, ContributionRow, PackageRow,
+    contributions_for_project, get_package, list_packages, mark_superseded, set_local_status,
+    upsert_package, ContributionRow, PackageRow,
 };
 use crate::events::ProgressEmitter;
 use crate::services::ServiceContext;
@@ -598,6 +599,112 @@ pub async fn refresh_all_project_packages(
         }
     }
     Ok(all)
+}
+
+// ── Cache-only list views (Task 11) ──────────────────────────────────────────
+//
+// Both read `project_packages` / `project_contributions` rows the poll (Task 8)
+// already populated — no hub I/O — and project each row down to the fields the
+// Stage-II UI (Task 12) renders. Instant, offline-safe reads.
+
+/// One known package for a project, projected for the packages list. The two
+/// swarm counts (`holder_count`/`online_count`) come from the Task-3 columns the
+/// poll captures at announcement time (Task 8 writes them, this reads them).
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPackageView {
+    /// HUB package uuid (the `project_packages` row key).
+    pub package_id: String,
+    /// Hub-mirrored decision: `pending` | `published` | `rejected`.
+    pub state: String,
+    /// Local fetch progress: `none` | `downloading` | `complete` | `failed`.
+    pub local_status: String,
+    /// I published this package.
+    pub own: bool,
+    pub publisher: String,
+    pub byte_size: i64,
+    pub frame_count: i64,
+    pub created_at: String,
+    pub reject_reason: Option<String>,
+    /// Another announcement supersedes this one.
+    pub superseded: bool,
+    /// Holders the hub listed at poll time.
+    pub holder_count: i64,
+    /// Of those holders, how many the hub last saw within the online window.
+    pub online_count: i64,
+}
+
+impl From<PackageRow> for ProjectPackageView {
+    fn from(r: PackageRow) -> Self {
+        ProjectPackageView {
+            package_id: r.package_id,
+            state: r.state,
+            local_status: r.local_status,
+            own: r.own,
+            publisher: r.publisher_display,
+            byte_size: r.byte_size,
+            frame_count: r.frame_count,
+            created_at: r.created_at,
+            reject_reason: r.reject_reason,
+            superseded: r.superseded,
+            holder_count: r.holder_count,
+            online_count: r.online_count,
+        }
+    }
+}
+
+/// One received frame for a project, projected for the contributions list. These
+/// rows never enter `files`/`frames` — they live only in `project_contributions`.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ContributionView {
+    pub package_id: String,
+    pub frame_uuid: String,
+    pub publisher: String,
+    pub rel_path: String,
+    pub byte_size: i64,
+    /// A newer contribution for the same frame uuid supersedes this one.
+    pub superseded: bool,
+    pub created_at: String,
+}
+
+impl From<ContributionRow> for ContributionView {
+    fn from(r: ContributionRow) -> Self {
+        ContributionView {
+            package_id: r.package_id,
+            frame_uuid: r.frame_uuid,
+            publisher: r.publisher_display,
+            rel_path: r.rel_path,
+            byte_size: r.byte_size,
+            superseded: r.superseded,
+            created_at: r.created_at,
+        }
+    }
+}
+
+/// Every known package for a project (cache-only — no hub call). Newest
+/// announcement first (the `list_packages` order). The poll (Task 8) keeps the
+/// set and its swarm counts current.
+pub fn list_project_packages(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<Vec<ProjectPackageView>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let rows = list_packages(&conn, project_id)?;
+    Ok(rows.into_iter().map(ProjectPackageView::from).collect())
+}
+
+/// Every received contribution for a project (cache-only — no hub call), oldest
+/// first (the `contributions_for_project` order).
+pub fn list_contributions(
+    ctx: &ServiceContext,
+    project_id: &str,
+) -> Result<Vec<ContributionView>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let rows = contributions_for_project(&conn, project_id)?;
+    Ok(rows.into_iter().map(ContributionView::from).collect())
 }
 
 /// Report to the hub that this device now holds `package_id`'s blobs — the
@@ -1199,6 +1306,85 @@ mod tests {
             .unwrap();
         assert!(!sender.is_started().await, "a refused request never starts a collab engine");
         assert!(sender.started_peers().await.is_empty());
+    }
+
+    // ── Step 2: cache-only list views ────────────────────────────────────────
+
+    /// `list_project_packages` maps every `project_packages` row (cache-only,
+    /// newest-announcement-first) including the Task-3 holder/online swarm counts,
+    /// and scopes to the requested project.
+    #[test]
+    fn list_project_packages_projects_rows_with_swarm_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let mut p1 = base_package("hub-1", "p-1", "Alice");
+            p1.created_at = "2026-07-10 00:00:00".into();
+            p1.holder_count = 3;
+            p1.online_count = 2;
+            p1.state = "published".into();
+            upsert_package(&conn, &p1).unwrap();
+            let mut p2 = base_package("hub-2", "p-1", "Bob");
+            p2.created_at = "2026-07-12 00:00:00".into();
+            p2.state = "pending".into();
+            upsert_package(&conn, &p2).unwrap();
+            // A different project must not leak into the list.
+            upsert_package(&conn, &base_package("hub-x", "p-OTHER", "Zed")).unwrap();
+        }
+
+        let views = list_project_packages(&ctx, "p-1").unwrap();
+        assert_eq!(
+            views.iter().map(|v| v.package_id.as_str()).collect::<Vec<_>>(),
+            vec!["hub-2", "hub-1"],
+            "newest announcement first, scoped to p-1"
+        );
+        let hub1 = views.iter().find(|v| v.package_id == "hub-1").unwrap();
+        assert_eq!(hub1.holder_count, 3, "Task-3 holder count surfaced");
+        assert_eq!(hub1.online_count, 2, "Task-3 online count surfaced");
+        assert_eq!(hub1.publisher, "Alice");
+        assert_eq!(hub1.state, "published");
+    }
+
+    /// `list_contributions` returns every received frame for a project (oldest
+    /// first), projected down to the view shape.
+    #[test]
+    fn list_contributions_returns_received_frames() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            upsert_package(&conn, &base_package("hub-1", "p-1", "Alice")).unwrap();
+            insert_contribution(
+                &conn,
+                &ContributionRow {
+                    id: 0,
+                    project_id: "p-1".into(),
+                    package_id: "hub-1".into(),
+                    frame_uuid: "u-1".into(),
+                    publisher_display: "Alice".into(),
+                    rel_path: "Alice/u-1.fits".into(),
+                    landed_path: "/land/u-1.fits".into(),
+                    byte_size: 2048,
+                    xxh3: "hh".into(),
+                    frame_meta: "{}".into(),
+                    analysis: None,
+                    superseded: false,
+                    created_at: String::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        let views = list_contributions(&ctx, "p-1").unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].frame_uuid, "u-1");
+        assert_eq!(views[0].publisher, "Alice");
+        assert_eq!(views[0].byte_size, 2048);
+        assert!(!views[0].created_at.is_empty(), "created_at defaulted by SQL");
+        assert!(list_contributions(&ctx, "p-none").unwrap().is_empty());
     }
 
     // ── Step 3: loopback serve e2e ───────────────────────────────────────────

@@ -146,6 +146,12 @@ pub struct HistoryRow {
     /// `retention_deleted` (an automatic retention pass) and `deleted_manual`
     /// (the web "Delete selected" action).
     pub outcome: String,
+    /// Stage-II collab provenance: the `project_id` this frame moved for, taken
+    /// from the manifest record's [`ProjectStamp`](crate::package::ProjectStamp).
+    /// `None` for a personal-sync transfer (no project dimension) — the Transfers
+    /// UI shows a project chip only for the collab rows.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Minimal query surface for [`SyncStore::search_history`](super::store::SyncStore::search_history).
@@ -163,5 +169,8 @@ pub struct HistoryQuery {
     pub direction: Option<Direction>,
     /// Exact peer node id (hex) to restrict to.
     pub peer: Option<String>,
+    /// Exact `project_id` filter (unfiltered when absent) — the Transfers UI's
+    /// project-dimension passthrough (Stage II collab, Task 11).
+    pub project: Option<String>,
     pub limit: u32,
 }
