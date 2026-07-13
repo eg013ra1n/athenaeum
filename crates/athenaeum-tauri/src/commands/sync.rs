@@ -24,7 +24,7 @@ pub async fn get_sync_pairing_ticket(
     app: AppHandle,
 ) -> Result<String, String> {
     let emitter = Arc::new(TauriProgressEmitter(app));
-    api::get_pairing_ticket(&state.ctx, &state.sync, emitter)
+    api::get_pairing_ticket(Arc::clone(&state.ctx), &state.sync, emitter)
         .await
         .map_err(|e| e.to_string())
 }

@@ -85,6 +85,17 @@ pub type ProjectAnnouncementsRefresher = Arc<dyn Fn(&str) + Send + Sync>;
 /// acked. Task 8 wires it to report-have + notification data; absent = no-op.
 pub type ProjectIngestedHook = Arc<dyn Fn(String, String) + Send + Sync>;
 
+/// Holder-side handler for an inbound project pull request (slice 4, task 6):
+/// invoked with `(from, project_id, hub_package_id)` when a member asks us to
+/// serve a project package. The host wires it to
+/// [`collab_exchange::handle_project_request`](crate::api::collab_exchange::handle_project_request)
+/// — authorize (`may_serve_package`) → reconstruct the serve dir → enqueue an
+/// explicit-target serve back to `from` through the collab sender map. Absent ⇒
+/// the request is logged and dropped (the pre-task-6 behavior). Synchronous by
+/// contract (called on the receiver loop); the host closure `tokio::spawn`s the
+/// actual async serve so the receive loop never blocks.
+pub type ProjectRequestHandler = Arc<dyn Fn(NodeId, String, String) + Send + Sync>;
+
 /// The project-exchange receive hooks [`SyncReceiver::spawn`] threads into its
 /// loop (slice 4): the per-announce membership gate plus the Task-8 refresher /
 /// post-ingest callbacks. `Default` = "no project support installed" (every field
@@ -98,6 +109,9 @@ pub struct ProjectReceiveHooks {
     pub announcements_refresher: Option<ProjectAnnouncementsRefresher>,
     /// Fired after a project package is ingested + acked (task 8).
     pub on_project_ingested: Option<ProjectIngestedHook>,
+    /// Holder-side serve handler for inbound project pull requests (task 6).
+    /// Absent ⇒ an inbound request is logged and dropped.
+    pub request_handler: Option<ProjectRequestHandler>,
 }
 
 /// Optional receive-side hooks the host threads into
@@ -122,6 +136,11 @@ pub struct ReceiverHooks {
     /// Post-ingest callback (task 5 flow; Task 8 wires report-have + notification
     /// data). Absent = no-op.
     pub on_project_ingested: Option<ProjectIngestedHook>,
+    /// Holder-side serve handler for inbound `ProjectRequestReceived` events
+    /// (task 6): the host wires it to
+    /// [`collab_exchange::handle_project_request`](crate::api::collab_exchange::handle_project_request).
+    /// Absent ⇒ the request is logged and dropped (pre-task-6 behavior).
+    pub project_request_handler: Option<ProjectRequestHandler>,
 }
 
 /// `sync-progress` payload: a per-package stage tick (never per-frame — discrete
@@ -227,6 +246,7 @@ impl SyncReceiver {
             gate: project_gate,
             announcements_refresher,
             on_project_ingested,
+            request_handler,
         } = project;
 
         let mut events = transport.events().await;
@@ -318,20 +338,36 @@ impl SyncReceiver {
                             tracing::error!(error = %format!("{e:#}"), "sync receiver project announce handling failed");
                         }
                     }
-                    // Collab exchange (slice 4): a receive-role member asked us to
-                    // serve a project package. Serving lands in Task 6; log + drop.
+                    // Collab exchange (slice 4, task 6): a member asked us (a
+                    // holder) to serve a project package. Dispatch to the host's
+                    // serve handler, which authorizes (`may_serve_package`),
+                    // reconstructs the serve dir, and enqueues an explicit-target
+                    // serve back to `from` through the collab sender map. The
+                    // handler `tokio::spawn`s the async work, so this stays
+                    // non-blocking. Absent handler ⇒ log + drop (pre-task-6).
                     TransportEvent::ProjectRequestReceived {
                         from,
                         project_id,
                         package_id,
-                    } => {
-                        tracing::info!(
-                            from = %super::node_id_hex(&from),
-                            project_id,
-                            package_id,
-                            "project package requested — serving lands in Task 6"
-                        );
-                    }
+                    } => match &request_handler {
+                        Some(handler) => {
+                            tracing::info!(
+                                from = %super::node_id_hex(&from),
+                                project_id,
+                                package_id,
+                                "project package requested — dispatching serve"
+                            );
+                            handler(from, project_id, package_id);
+                        }
+                        None => {
+                            tracing::warn!(
+                                from = %super::node_id_hex(&from),
+                                project_id,
+                                package_id,
+                                "project package requested but no serve handler installed; dropping"
+                            );
+                        }
+                    },
                     // `AckReceived` / `FetchProgress` are the sender/UI halves —
                     // the receiver loop does not consume them.
                     _ => {}
@@ -777,6 +813,7 @@ impl SyncRuntime {
                 gate: hooks.project_gate,
                 announcements_refresher: hooks.announcements_refresher,
                 on_project_ingested: hooks.on_project_ingested,
+                request_handler: hooks.project_request_handler,
             },
             Arc::clone(&transport),
             emitter,

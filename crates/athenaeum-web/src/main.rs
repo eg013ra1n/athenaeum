@@ -247,7 +247,7 @@ async fn main() {
         let sync_for_sync = Arc::clone(&state.sync);
         let emitter = Arc::new(events::SseProgressEmitter::new(state.event_tx.clone()));
         tokio::spawn(async move {
-            match athenaeum_core::api::sync::autostart_if_enabled(&ctx_for_sync, &sync_for_sync, emitter).await {
+            match athenaeum_core::api::sync::autostart_if_enabled(ctx_for_sync, &sync_for_sync, emitter).await {
                 Ok(true) => tracing::info!("personal sync receiver autostarted (dev pairing enabled)"),
                 Ok(false) => tracing::debug!("personal sync disabled; receiver not started"),
                 Err(e) => tracing::error!(error = %e, "personal sync autostart failed"),

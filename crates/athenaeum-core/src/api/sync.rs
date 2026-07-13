@@ -92,7 +92,11 @@ fn dev_pairing_enabled(ctx: &ServiceContext) -> Result<bool, ApiError> {
 /// Resolve the sync data dir (`<db_parent>/sync`) and the catalog DB path.
 /// Everything sync needs — device key, blob store, landed files — lives beside
 /// the catalog so it follows the same OS-appdata / Docker `/data` location.
-fn sync_paths(ctx: &ServiceContext) -> Result<(PathBuf, PathBuf), ApiError> {
+///
+/// `pub(crate)` so the collab request-to-serve path
+/// ([`crate::api::collab_exchange`]) resolves the same sync dir + catalog path
+/// its dedicated `blobs_collab` sender engine binds under.
+pub(crate) fn sync_paths(ctx: &ServiceContext) -> Result<(PathBuf, PathBuf), ApiError> {
     let db = db(ctx)?;
     let db_path = db.path().to_path_buf();
     let sync_dir = db_path
@@ -242,8 +246,12 @@ fn project_announce_gate(ctx: &ServiceContext) -> Result<crate::sync::ProjectAnn
 
 /// Assemble the slice-4 [`ReceiverHooks`](crate::sync::ReceiverHooks) that both
 /// `ensure_started` callers pass: the composite connect gate (installed only when
-/// signed in) plus the always-on project announce gate.
-fn receiver_hooks(ctx: &ServiceContext) -> Result<crate::sync::ReceiverHooks, ApiError> {
+/// signed in) plus the always-on project announce gate, plus the task-6
+/// holder-side serve handler that answers inbound project pull requests.
+fn receiver_hooks(
+    ctx: &ServiceContext,
+    request_handler: Option<crate::sync::ProjectRequestHandler>,
+) -> Result<crate::sync::ReceiverHooks, ApiError> {
     Ok(crate::sync::ReceiverHooks {
         connect_gate: connect_gate(ctx)?,
         project_gate: Some(project_announce_gate(ctx)?),
@@ -251,6 +259,49 @@ fn receiver_hooks(ctx: &ServiceContext) -> Result<crate::sync::ReceiverHooks, Ap
         // report-have / notification path; None until then.
         announcements_refresher: None,
         on_project_ingested: None,
+        project_request_handler: request_handler,
+    })
+}
+
+/// The process-wide dedicated collab sender map (a SECOND
+/// [`SyncSenderRuntime`](crate::sync::SyncSenderRuntime), distinct from the
+/// personal-sync `sync_sender` — collab serves ride a dedicated
+/// `blobs_collab` store, audit m7). Lazily created once and shared by every
+/// request-to-serve dispatch for the process lifetime. Task 11 hoists this to
+/// `AppState.collab_sender` so the Transfers UI can roll up collab transfers; for
+/// now it lives here so the holder-side serve wiring is self-contained and
+/// compiles headless.
+fn collab_sender_runtime() -> Arc<SyncSenderRuntime> {
+    static COLLAB_SENDER: std::sync::OnceLock<Arc<SyncSenderRuntime>> = std::sync::OnceLock::new();
+    Arc::clone(COLLAB_SENDER.get_or_init(|| Arc::new(SyncSenderRuntime::new())))
+}
+
+/// Build the holder-side [`ProjectRequestHandler`](crate::sync::ProjectRequestHandler)
+/// the receiver invokes on an inbound `ProjectRequestReceived` (task 6). The
+/// closure is `'static` — it captures a cloned `Arc<ServiceContext>`, the shared
+/// collab sender map, and the host emitter — and `tokio::spawn`s
+/// [`handle_project_request`](crate::api::collab_exchange::handle_project_request)
+/// so the synchronous receive loop never blocks on the serve. An authorization
+/// failure inside `handle_project_request` is a silent (warn-logged) drop; a real
+/// error is logged here.
+fn project_request_handler(
+    ctx: Arc<ServiceContext>,
+    emitter: Arc<dyn ProgressEmitter>,
+) -> crate::sync::ProjectRequestHandler {
+    let sender = collab_sender_runtime();
+    Arc::new(move |from: NodeId, project_id: String, package_id: String| {
+        let ctx = Arc::clone(&ctx);
+        let sender = Arc::clone(&sender);
+        let emitter = Arc::clone(&emitter);
+        tokio::spawn(async move {
+            if let Err(e) = crate::api::collab_exchange::handle_project_request(
+                &ctx, &sender, from, project_id, package_id, Some(emitter),
+            )
+            .await
+            {
+                tracing::error!(error = %format!("{e:#}"), "collab request-to-serve failed");
+            }
+        });
     })
 }
 
@@ -321,7 +372,7 @@ fn allow_default_relays(signed_in: bool, dev_flag: bool) -> bool {
 /// signed out ([`allow_default_relays`]) — otherwise this returns an
 /// actionable error rather than silently starting the transport on public
 /// infrastructure (or, worse, mixed relay networks with a signed-in peer).
-async fn resolve_relay_mode(ctx: &ServiceContext) -> Result<(iroh::RelayMode, Vec<String>), ApiError> {
+pub(crate) async fn resolve_relay_mode(ctx: &ServiceContext) -> Result<(iroh::RelayMode, Vec<String>), ApiError> {
     let creds = crate::api::account::hub_credentials(ctx).unwrap_or(None);
     let cached = cached_relays(ctx).unwrap_or_default();
     let account = creds.as_ref().map(|(u, t)| (u.as_str(), t.as_str()));
@@ -368,10 +419,14 @@ fn account_signed_in(ctx: &ServiceContext) -> Result<bool, ApiError> {
 /// Tauri `setup()`). Idempotent regardless of call site:
 /// [`SyncRuntime::ensure_started`] only ever builds the transport once.
 pub async fn autostart_if_enabled(
-    ctx: &ServiceContext,
+    ctx: Arc<ServiceContext>,
     sync: &SyncRuntime,
     emitter: Arc<dyn ProgressEmitter>,
 ) -> Result<bool, ApiError> {
+    // Own the Arc (the request-to-serve handler clones it into a `'static`
+    // closure) and borrow it for the rest of the body unchanged.
+    let ctx_arc = ctx;
+    let ctx: &ServiceContext = &ctx_arc;
     let dev = dev_pairing_enabled(ctx)?;
     let signed_in = account_signed_in(ctx)?;
     if !autostart_gate(dev, signed_in) {
@@ -387,7 +442,10 @@ pub async fn autostart_if_enabled(
     // starts accepting, then enforce it live per-package (finding H1).
     refresh_authorized_peers(ctx).await;
     let authorized = peer_authorizer(ctx)?;
-    let hooks = receiver_hooks(ctx)?;
+    let hooks = receiver_hooks(
+        ctx,
+        Some(project_request_handler(Arc::clone(&ctx_arc), Arc::clone(&emitter))),
+    )?;
     sync.ensure_started(sync_dir, db_path, relay_mode, incoming, authorized, hooks, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
@@ -407,10 +465,14 @@ fn autostart_gate(dev: bool, signed_in: bool) -> bool {
 /// key, blob store, landed files) lives beside the catalog DB, under a `sync/`
 /// sibling directory.
 pub async fn get_pairing_ticket(
-    ctx: &ServiceContext,
+    ctx: Arc<ServiceContext>,
     sync: &SyncRuntime,
     emitter: Arc<dyn ProgressEmitter>,
 ) -> Result<String, ApiError> {
+    // Own the Arc (the request-to-serve handler clones it into a `'static`
+    // closure) and borrow it for the rest of the body unchanged.
+    let ctx_arc = ctx;
+    let ctx: &ServiceContext = &ctx_arc;
     // Dev-gate first; resolve paths and drop the DB borrow before awaiting.
     if !dev_pairing_enabled(ctx)? {
         return Err(ApiError::Forbidden(
@@ -427,7 +489,10 @@ pub async fn get_pairing_ticket(
     // primary that also flips the dev flag still enforces its account list.
     refresh_authorized_peers(ctx).await;
     let authorized = peer_authorizer(ctx)?;
-    let hooks = receiver_hooks(ctx)?;
+    let hooks = receiver_hooks(
+        ctx,
+        Some(project_request_handler(Arc::clone(&ctx_arc), Arc::clone(&emitter))),
+    )?;
 
     let ticket = sync
         .ensure_started(sync_dir, db_path, relay_mode, incoming, authorized, hooks, emitter)
@@ -1528,7 +1593,7 @@ mod tests {
         let (_tmp, ctx) = test_ctx();
         let sync = SyncRuntime::new();
 
-        let started = autostart_if_enabled(&ctx, &sync, Arc::new(crate::events::NullEmitter))
+        let started = autostart_if_enabled(Arc::new(ctx), &sync, Arc::new(crate::events::NullEmitter))
             .await
             .unwrap();
         assert!(!started, "signed-out + dev off must not start");
@@ -1562,7 +1627,7 @@ mod tests {
         }
         let sync = SyncRuntime::new();
         let started =
-            autostart_if_enabled(&ctx, &sync, Arc::new(crate::events::NullEmitter)).await;
+            autostart_if_enabled(Arc::new(ctx), &sync, Arc::new(crate::events::NullEmitter)).await;
         assert!(
             !matches!(started, Ok(false)),
             "a signed-in node must pass the autostart gate regardless of role \

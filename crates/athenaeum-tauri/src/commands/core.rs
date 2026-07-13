@@ -146,7 +146,7 @@ pub async fn initialize_database(
         let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
             Arc::new(crate::tauri_events::TauriProgressEmitter(app_handle.clone()));
         tauri::async_runtime::spawn(async move {
-            match athenaeum_core::api::sync::autostart_if_enabled(&ctx_for_sync, &sync_for_sync, emitter).await {
+            match athenaeum_core::api::sync::autostart_if_enabled(ctx_for_sync, &sync_for_sync, emitter).await {
                 Ok(true) => tracing::info!("personal sync receiver autostarted"),
                 Ok(false) => tracing::debug!("personal sync disabled; receiver not started"),
                 Err(e) => tracing::error!(error = %e, "personal sync autostart failed"),

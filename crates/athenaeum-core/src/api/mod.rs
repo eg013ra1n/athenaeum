@@ -12,6 +12,10 @@ pub mod sync;
 pub mod retention;
 // Account commands (Stage II, task B4). Ungated: db/settings/account only.
 pub mod account;
+// Stage-II collaboration package exchange — holder-side request-to-serve (slice 4,
+// task 6): serve-dir reconstruction + authorize + enqueue. UNGATED (no render
+// gate) — uses only db/sync/sharing/collab, so it compiles headless.
+pub mod collab_exchange;
 // These handler modules drive the render-only image pipeline (analysis,
 // master integration, light calibration) and are gated with it.
 #[cfg(feature = "render")]

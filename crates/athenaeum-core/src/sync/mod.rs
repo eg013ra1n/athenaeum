@@ -80,8 +80,9 @@ pub use project_ingest::{ingest_project_package, ProjectIngestOutcome};
 pub use retention::{evaluate_and_apply, DeleteOutcome, RetentionOutcome, RetentionPolicy};
 pub use receiver::{
     allow_all_peers, IncomingResolver, PeerAuthorizer, ProjectAnnounceGate,
-    ProjectAnnouncementsRefresher, ProjectIngestedHook, ProjectReceiveHooks, ReceiverHooks,
-    SyncFinishedEvent, SyncProgressEvent, SyncReceiver, SyncReceiverHandle, SyncRuntime,
+    ProjectAnnouncementsRefresher, ProjectIngestedHook, ProjectReceiveHooks, ProjectRequestHandler,
+    ReceiverHooks, SyncFinishedEvent, SyncProgressEvent, SyncReceiver, SyncReceiverHandle,
+    SyncRuntime,
 };
 pub use responder::{CatalogDedupResponder, DedupResponder};
 pub use sender::{StartedSender, SyncSenderRuntime};

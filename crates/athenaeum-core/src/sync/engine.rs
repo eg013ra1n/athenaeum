@@ -276,6 +276,31 @@ impl SyncEngine {
         )
     }
 
+    /// Spawn with BOTH a shared [`PackageCleanupSink`] and a host
+    /// [`ProgressEmitter`], default [`SyncConfig`] — the collab request-to-serve
+    /// map (slice 4). Where [`spawn_with_sink`] hard-codes `emitter: None`, the
+    /// collab sender needs both halves: the sink (a
+    /// [`CollabCleanupSink`](crate::api::collab_exchange::CollabCleanupSink)) so a
+    /// reconstructed `collab_serve` dir is cleaned on terminal while a retained
+    /// `collab_pub` publication survives confirm (Д4), AND an emitter so a project
+    /// serve still surfaces `sync-progress` / `sync-finished` for the Transfers UI.
+    pub fn spawn_with_sink_and_emitter(
+        store: Arc<dyn SyncStore>,
+        transport: Arc<dyn SharingTransport>,
+        peer: NodeId,
+        cleanup_sink: Arc<dyn PackageCleanupSink>,
+        emitter: Option<Arc<dyn ProgressEmitter>>,
+    ) -> SyncEngineHandle {
+        Self::spawn_inner(
+            store,
+            transport,
+            peer,
+            SyncConfig::default(),
+            emitter,
+            Some(cleanup_sink),
+        )
+    }
+
     /// The single full constructor every spawner delegates to. Starts a tokio
     /// task running the worker loop and returns a handle to it. `cleanup_sink`
     /// is `None` for the app and single-target Perseus (unchanged in-line
