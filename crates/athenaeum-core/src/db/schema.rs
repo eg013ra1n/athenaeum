@@ -1711,6 +1711,62 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // ---- Stage II collaboration (slice 3): project poll cache + local links ----
+    // Poll cache of my collaboration projects, one row per project. Holds the RAW
+    // signed snapshot (payload+signature, base64) so slice-4's project
+    // PeerAuthorizer can re-verify offline. Refreshed wholesale on each poll.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS collab_projects (
+            project_id             TEXT PRIMARY KEY,
+            slug                   TEXT NOT NULL,
+            title                  TEXT NOT NULL,
+            data_role              TEXT NOT NULL,
+            is_coordinator         INTEGER NOT NULL DEFAULT 0,
+            require_approval       INTEGER NOT NULL DEFAULT 0,
+            pending_announcements  INTEGER NOT NULL DEFAULT 0,
+            project_status         TEXT NOT NULL DEFAULT 'active',
+            target_name            TEXT NOT NULL,
+            target_ra_deg          REAL NOT NULL,
+            target_dec_deg         REAL NOT NULL,
+            target_radius_deg      REAL NOT NULL,
+            membership_version     INTEGER NOT NULL,
+            snapshot_payload_b64   TEXT NOT NULL,
+            snapshot_signature_b64 TEXT NOT NULL,
+            members_json           TEXT NOT NULL,
+            thresholds_version     INTEGER,
+            thresholds_rules_json  TEXT,
+            fetched_at             TEXT NOT NULL DEFAULT (datetime('now'))
+        )",
+        [],
+    )?;
+
+    // Local project↔frame-set links. NEVER sent to the hub (spec §7).
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS project_links (
+            project_id    TEXT    NOT NULL,
+            frames_set_id INTEGER NOT NULL,
+            created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (project_id, frames_set_id),
+            FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
+    // "Publish as project" deep-link intents: when the portal /new form was
+    // prefilled from this set, the next poll auto-links the newly appeared
+    // project whose target matches (spec §8 "source set auto-linked").
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS project_link_intents (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            frames_set_id INTEGER NOT NULL,
+            ra_deg        REAL    NOT NULL,
+            dec_deg       REAL    NOT NULL,
+            created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (frames_set_id) REFERENCES frames_set(id) ON DELETE CASCADE
+        )",
+        [],
+    )?;
+
     Ok(())
 }
 
