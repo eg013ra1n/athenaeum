@@ -457,6 +457,14 @@ fn process_file(
     if let Some(ref header) = header_text {
         let keys = parse_stored_header_keys(format.clone(), header);
         if let Some(identity) = calibrated_light_identity(&keys) {
+            // A received project contribution (slice 4) carries an ATH_PRJ stamp
+            // ON TOP of the calibrated-light cards — route it to the sibling
+            // project-contribution reconcile instead. Checked FIRST: the file
+            // also satisfies `calibrated_light_identity`.
+            if identity.project_id.is_some() {
+                reconcile_project_contribution(conn, path, &current_path, &identity, root_id)?;
+                return Ok(None);
+            }
             reconcile_calibrated_light(
                 conn,
                 path,
@@ -793,6 +801,109 @@ fn reconcile_calibrated_light(
     };
     upsert_light_calibration(conn, &row)?;
     tracing::info!(root_id, frame_id, path = %current_path, "adopted calibrated light");
+    Ok(())
+}
+
+/// Reconcile a received project-contribution artifact (Stage-II collaboration,
+/// slice 4, spec §7) against the `project_contributions` tracking table. Runs
+/// INSTEAD of [`reconcile_calibrated_light`] when the file carries an `ATH_PRJ`
+/// project stamp (a published contribution is a calibrated light, so it also
+/// carries `ATH_CSRC` — the project card is checked first). Like a calibrated
+/// light it is an out-of-catalog artifact: it NEVER registers a `files`/`frames`
+/// row on any branch. Four branches, keyed on the contribution table:
+///
+/// 1. **Known** — a row's `landed_path` equals the scanned path → no-op.
+/// 2. **Moved** — a row matches `(project_id, xxh3-of-file)` and its
+///    `landed_path` no longer exists on disk → repair `landed_path`, `info!`.
+/// 3. **Duplicate** — a row matches `(project_id, xxh3)` and its `landed_path`
+///    ALSO still exists → `warn!`, row untouched (a second copy of the bytes).
+/// 4. **Unknown** — no row matches → `warn!` and defer. NEVER auto-insert: a
+///    contribution row requires hub-anchored package context we don't have at
+///    scan time (re-download via the project page). Idempotent on re-scan.
+fn reconcile_project_contribution(
+    conn: &Connection,
+    path: &Path,
+    current_path: &str,
+    identity: &CalibratedIdentity,
+    root_id: i64,
+) -> anyhow::Result<()> {
+    use crate::db::collab_exchange::{
+        find_contribution_by_landed_path, find_contribution_by_project_and_hash,
+        update_contribution_landed_path,
+    };
+
+    // Guaranteed Some by the caller's `identity.project_id.is_some()` route, but
+    // stay defensive: an empty id can't scope a lookup, so leave the file be.
+    let Some(project_id) = identity.project_id.as_deref() else {
+        return Ok(());
+    };
+
+    // Branch 1 (known): a row already tracks this exact path. Cheaper than the
+    // content hash and must run first — a hash lookup would also match the
+    // known file and mis-classify it as a duplicate.
+    if find_contribution_by_landed_path(conn, current_path)?.is_some() {
+        tracing::debug!(
+            root_id,
+            path = %current_path,
+            project_id,
+            "known project contribution — skipping ingestion"
+        );
+        return Ok(());
+    }
+
+    // Full-content hash (the manifest-anchored key — NOT the sampling hash).
+    // A read failure means we can't classify moved-vs-duplicate-vs-unknown, so
+    // defer rather than risk a wrong branch; the file still never enters the
+    // catalog. Idempotent once the read succeeds on a later scan.
+    let xxh3 = match crate::package::xxh3_full_file(path) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(
+                root_id,
+                path = %current_path,
+                project_id,
+                error = %e,
+                "project contribution hash failed — leaving untouched"
+            );
+            return Ok(());
+        }
+    };
+
+    match find_contribution_by_project_and_hash(conn, project_id, &xxh3)? {
+        Some(row) => {
+            if !Path::new(&row.landed_path).exists() {
+                // Branch 2 (moved): the tracked copy is gone from its old
+                // location and this is it under a new path — repair the pointer.
+                update_contribution_landed_path(conn, row.id, current_path)?;
+                tracing::info!(
+                    root_id,
+                    old_path = %row.landed_path,
+                    path = %current_path,
+                    project_id,
+                    "project contribution moved — landed_path repaired"
+                );
+            } else {
+                // Branch 3 (duplicate): the tracked copy still exists elsewhere,
+                // so this is a second copy. Leave the tracking row untouched.
+                tracing::warn!(
+                    root_id,
+                    kept = %row.landed_path,
+                    duplicate = %current_path,
+                    project_id,
+                    "duplicate project contribution copy"
+                );
+            }
+        }
+        None => {
+            // Branch 4 (unknown): no tracking row. NEVER auto-insert — a
+            // contribution row needs hub package context we don't have here.
+            tracing::warn!(
+                path = %current_path,
+                project_id,
+                "project contribution without a tracking row — leaving untouched (re-download via the project page)"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1736,6 +1847,32 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         // phase (`calibrated_identity`); the DB-touching decision runs here,
         // inside the batch transaction, BEFORE any move/insert logic.
         if let Some(ref identity) = file_result.calibrated_identity {
+            // A received project contribution (slice 4) carries an ATH_PRJ stamp
+            // on top of the calibrated-light cards — divert to the sibling
+            // project-contribution reconcile. Checked FIRST (it also satisfies
+            // `calibrated_light_identity`); like a calibrated light it never
+            // registers a `files`/`frames` row.
+            if identity.project_id.is_some() {
+                if let Err(e) = reconcile_project_contribution(
+                    conn,
+                    Path::new(&file_result.file.path),
+                    &file_result.file.path,
+                    identity,
+                    root_id,
+                ) {
+                    tracing::error!(
+                        root_id,
+                        path = %file_result.file.path,
+                        error = %e,
+                        "project-contribution reconcile failed"
+                    );
+                    result.errors.push(format!(
+                        "{}: project-contribution reconcile failed: {}",
+                        file_result.file.path, e
+                    ));
+                }
+                continue;
+            }
             if let Err(e) = reconcile_calibrated_light(
                 conn,
                 Path::new(&file_result.file.path),
@@ -3412,6 +3549,227 @@ mod calibrated_light_scan_tests {
                 .unwrap();
             assert_eq!(m81_path, present_m81_str, "parallel={parallel}: M81 row unchanged");
             assert_eq!(light_cal_count(&conn), 2, "parallel={parallel}: repaired in place, no new row");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Project-contribution reconcile (slice 4, spec §7): a stamped received
+    // contribution carries ATH_PRJ on top of the calibrated-light cards, so the
+    // scanner diverts it to `reconcile_project_contribution` (sibling of the
+    // light-cal reconcile) — it NEVER enters `files`/`frames` on any branch.
+    // -----------------------------------------------------------------------
+
+    use crate::db::collab_exchange::{
+        find_contribution_by_landed_path, insert_contribution, upsert_package, ContributionRow,
+        PackageRow,
+    };
+
+    /// Write a project-contribution FITS: the SAME calibrated-light cards
+    /// production stamps, PLUS the `ATH_PRJ` project card publish appends. The
+    /// file therefore carries CALSTAT + ATH_CSRC + ATH_PRJ.
+    fn write_project_contribution(path: &Path, source_uuid: &str, filename: &str, project_id: &str) {
+        let inputs = LightCalCardInputs {
+            source_uuid: source_uuid.to_string(),
+            source_filename: filename.to_string(),
+            calstat: "BDF".to_string(),
+            dark: None,
+            flat: None,
+            bias: None,
+            scale_divisor: 65535.0,
+            flat_norm_divisor: 1.0,
+            pedestal_dn: 0.0,
+            trim_fraction: None,
+        };
+        let source_cards: Vec<Card> = Vec::new();
+        let mut cards = build_light_cal_cards(&source_cards, &inputs).unwrap();
+        cards.push(Card::new("ATH_PRJ", CardValue::Str(project_id.to_string())).unwrap());
+        let data = vec![0.5f32; 4 * 4];
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_fits_f32(path, 4, 4, 1, &data, &cards).unwrap();
+    }
+
+    /// Minimal parent package row (the contribution FK target).
+    fn seed_package(conn: &Connection, package_id: &str, project_id: &str) {
+        let row = PackageRow {
+            package_id: package_id.to_string(),
+            project_id: project_id.to_string(),
+            announcement_id: format!("ann-{package_id}"),
+            publisher_display: "Alice".into(),
+            own: false,
+            root_hash: "rh".into(),
+            byte_size: 0,
+            frame_count: 0,
+            manifest_xxh3: None,
+            aggregate_stats: "{}".into(),
+            supersedes: "[]".into(),
+            state: "published".into(),
+            reject_reason: None,
+            superseded: false,
+            origin: "received".into(),
+            local_dir: None,
+            manifest_ndjson: None,
+            local_status: "complete".into(),
+            holder_count: 0,
+            online_count: 0,
+            created_at: "2026-07-14 00:00:00".into(),
+            decided_at: None,
+            fetched_at: String::new(),
+        };
+        upsert_package(conn, &row).unwrap();
+    }
+
+    /// Seed a contribution tracking row (parent package auto-seeded) with a
+    /// specific `landed_path` and full-content `xxh3`.
+    fn seed_contribution(
+        conn: &Connection,
+        project_id: &str,
+        package_id: &str,
+        landed_path: &str,
+        xxh3: &str,
+    ) {
+        seed_package(conn, package_id, project_id);
+        let row = ContributionRow {
+            id: 0,
+            project_id: project_id.to_string(),
+            package_id: package_id.to_string(),
+            frame_uuid: "u-1".into(),
+            publisher_display: "Alice".into(),
+            rel_path: "Alice/c.fits".into(),
+            landed_path: landed_path.to_string(),
+            byte_size: 0,
+            xxh3: xxh3.to_string(),
+            frame_meta: "{}".into(),
+            analysis: None,
+            superseded: false,
+            created_at: String::new(),
+        };
+        insert_contribution(conn, &row).unwrap();
+    }
+
+    fn contributions_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM project_contributions", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Known: a tracking row's `landed_path` equals the scanned path — no-op.
+    /// Never registered as a frame, tracking row untouched.
+    #[test]
+    fn scan_skips_known_project_contribution() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let cal = root.path().join("proj/Alice/c_L_0001.fits");
+            write_project_contribution(&cal, "uuid-k", "L_0001.fits", "proj-1");
+            let cal_str = cal.to_str().unwrap().to_string();
+            let xxh3 = crate::package::xxh3_full_file(&cal).unwrap();
+
+            let conn = fresh_db(root.path(), 1);
+            seed_contribution(&conn, "proj-1", "pkg-1", &cal_str, &xxh3);
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: never registered");
+            assert_eq!(light_cal_count(&conn), 0, "parallel={parallel}: not a light-cal adoption");
+            assert_eq!(contributions_count(&conn), 1, "parallel={parallel}: no new tracking row");
+            let row = find_contribution_by_landed_path(&conn, &cal_str).unwrap().unwrap();
+            assert_eq!(row.landed_path, cal_str, "parallel={parallel}: landed_path unchanged");
+        }
+    }
+
+    /// Moved: a row matches `(project_id, xxh3)` and its `landed_path` is gone
+    /// from disk — repair the pointer to the new location.
+    #[test]
+    fn scan_repairs_moved_project_contribution() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let cal = root.path().join("proj/Alice/c_L_0002.fits");
+            write_project_contribution(&cal, "uuid-m", "L_0002.fits", "proj-1");
+            let cal_str = cal.to_str().unwrap().to_string();
+            let xxh3 = crate::package::xxh3_full_file(&cal).unwrap();
+
+            let conn = fresh_db(root.path(), 1);
+            // Old landed_path does not exist on disk.
+            let gone = root.path().join("old/gone/c_L_0002.fits");
+            seed_contribution(&conn, "proj-1", "pkg-1", gone.to_str().unwrap(), &xxh3);
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: never registered");
+            assert_eq!(contributions_count(&conn), 1, "parallel={parallel}: repaired in place");
+            let row = find_contribution_by_landed_path(&conn, &cal_str).unwrap().unwrap();
+            assert_eq!(row.landed_path, cal_str, "parallel={parallel}: landed_path repaired");
+        }
+    }
+
+    /// Duplicate: a row matches `(project_id, xxh3)` but its `landed_path` STILL
+    /// exists — this is a second copy. Leave the row untouched; never register.
+    #[test]
+    fn scan_leaves_duplicate_project_contribution() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            // Kept (tracked) copy lives OUTSIDE the scan root and stays on disk.
+            let kept_dir = TempDir::new().unwrap();
+            let kept = kept_dir.path().join("c_L_0003.fits");
+            write_project_contribution(&kept, "uuid-d", "L_0003.fits", "proj-1");
+            let kept_str = kept.to_str().unwrap().to_string();
+            let xxh3 = crate::package::xxh3_full_file(&kept).unwrap();
+
+            // The duplicate copy sits inside the scan root (byte-identical).
+            let dup = root.path().join("proj/Alice/c_L_0003.fits");
+            write_project_contribution(&dup, "uuid-d", "L_0003.fits", "proj-1");
+            let dup_str = dup.to_str().unwrap().to_string();
+
+            let conn = fresh_db(root.path(), 1);
+            seed_contribution(&conn, "proj-1", "pkg-1", &kept_str, &xxh3);
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(files_count(&conn, &dup_str), 0, "parallel={parallel}: dup never registered");
+            assert_eq!(contributions_count(&conn), 1, "parallel={parallel}: no new tracking row");
+            let row = find_contribution_by_landed_path(&conn, &kept_str).unwrap().unwrap();
+            assert_eq!(row.landed_path, kept_str, "parallel={parallel}: tracking row unchanged");
+            assert!(
+                find_contribution_by_landed_path(&conn, &dup_str).unwrap().is_none(),
+                "parallel={parallel}: the duplicate copy is not tracked"
+            );
+        }
+    }
+
+    /// Unknown: no tracking row (hand-dropped stamped file, or the package is
+    /// gone) — leave it untouched and defer. Nothing enters `files`/`frames`,
+    /// and NO contribution row is auto-inserted (a row needs hub context).
+    #[test]
+    fn scan_leaves_unknown_project_contribution() {
+        for parallel in [false, true] {
+            let root = TempDir::new().unwrap();
+            let cal = root.path().join("proj/Alice/c_L_orphan.fits");
+            write_project_contribution(&cal, "uuid-o", "L_orphan.fits", "proj-1");
+            let cal_str = cal.to_str().unwrap().to_string();
+
+            // No package, no contribution rows at all.
+            let conn = fresh_db(root.path(), 1);
+            // A cataloged source frame the light-cal adopt path COULD grab —
+            // proves the ATH_PRJ divert wins and never falls through to adoption.
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (900, '/src/L_orphan.fits', 'L_orphan.fits', 0, '2025-01-01T00:00:00Z', 'FITS')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO frames (id, file_id) VALUES (900, 900)", []).unwrap();
+
+            let result = run_scan(parallel, root.path(), &conn, 1);
+            assert!(result.errors.is_empty(), "parallel={parallel}: {:?}", result.errors);
+            assert_eq!(files_count(&conn, &cal_str), 0, "parallel={parallel}: never registered");
+            assert_eq!(
+                light_cal_count(&conn),
+                0,
+                "parallel={parallel}: ATH_PRJ divert wins — no light-cal adoption"
+            );
+            assert_eq!(contributions_count(&conn), 0, "parallel={parallel}: no auto-inserted row");
+            // The only file row is the pre-seeded source frame; the artifact is absent.
+            let total_files: i64 =
+                conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
+            assert_eq!(total_files, 1, "parallel={parallel}: artifact contributed no files row");
         }
     }
 }

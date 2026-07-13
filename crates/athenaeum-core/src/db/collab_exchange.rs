@@ -420,6 +420,57 @@ pub fn replace_contribution_for_uuid(
     Ok(old_path)
 }
 
+/// One contribution by its (unique) `landed_path`, if present. The scanner's
+/// project-contribution reconcile uses this for the **known** branch — a stamped
+/// file scanned at the exact path a tracking row already records is a no-op.
+pub fn find_contribution_by_landed_path(
+    conn: &Connection,
+    landed_path: &str,
+) -> Result<Option<ContributionRow>> {
+    conn.query_row(
+        &format!(
+            "SELECT {CONTRIBUTION_SELECT_COLS} FROM project_contributions WHERE landed_path = ?1"
+        ),
+        params![landed_path],
+        contribution_row_from_sql,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// One contribution matching `(project_id, xxh3)` — the full-content hash the
+/// manifest anchors (`package::xxh3_full_file`), scoped to the project so a copy
+/// of the same bytes under a different project can't cross-match. The scanner's
+/// reconcile uses this for the **moved**/**duplicate** branches; oldest row wins
+/// on the (rare) intra-project content collision.
+pub fn find_contribution_by_project_and_hash(
+    conn: &Connection,
+    project_id: &str,
+    xxh3: &str,
+) -> Result<Option<ContributionRow>> {
+    conn.query_row(
+        &format!(
+            "SELECT {CONTRIBUTION_SELECT_COLS} FROM project_contributions \
+             WHERE project_id = ?1 AND xxh3 = ?2 ORDER BY id LIMIT 1"
+        ),
+        params![project_id, xxh3],
+        contribution_row_from_sql,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Repoint a contribution's `landed_path` to a new on-disk location (the
+/// **moved** branch of the scanner reconcile). `landed_path` is UNIQUE; the
+/// caller has already established that no row occupies `new_path`.
+pub fn update_contribution_landed_path(conn: &Connection, id: i64, new_path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE project_contributions SET landed_path = ?2 WHERE id = ?1",
+        params![id, new_path],
+    )?;
+    Ok(())
+}
+
 /// Д9 supersede computation. When I publish a new package touching `uuids`, this
 /// returns the announcement ids of MY still-active packages (`own = 1`,
 /// `state != 'rejected'`, not already superseded) whose retained manifest
@@ -632,6 +683,49 @@ mod tests {
         assert_eq!(delete_package(&conn, "p1").unwrap(), 1);
         assert!(get_package(&conn, "p1").unwrap().is_none());
         assert!(contributions_for_project(&conn, "proj-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn contribution_lookup_by_landed_path_and_hash() {
+        let conn = test_conn();
+        upsert_package(&conn, &sample_package("p1", "proj-1", "2026-07-10 00:00:00")).unwrap();
+        // A second project (shares the same content hash) to prove scoping.
+        upsert_package(&conn, &sample_package("p2", "proj-2", "2026-07-10 00:00:00")).unwrap();
+
+        let mut c = sample_contribution("proj-1", "p1", "u-1", "/land/a.fits");
+        c.xxh3 = "deadbeefdeadbeef".into();
+        let id = insert_contribution(&conn, &c).unwrap();
+        let mut other = sample_contribution("proj-2", "p2", "u-9", "/land/other.fits");
+        other.xxh3 = "deadbeefdeadbeef".into(); // same bytes, different project
+        insert_contribution(&conn, &other).unwrap();
+
+        // by landed_path: exact hit / miss.
+        assert_eq!(
+            find_contribution_by_landed_path(&conn, "/land/a.fits").unwrap().unwrap().id,
+            id
+        );
+        assert!(find_contribution_by_landed_path(&conn, "/land/nope.fits").unwrap().is_none());
+
+        // by (project, hash): scoped to the project — never cross-matches proj-2.
+        let hit = find_contribution_by_project_and_hash(&conn, "proj-1", "deadbeefdeadbeef")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hit.id, id);
+        assert!(find_contribution_by_project_and_hash(&conn, "proj-1", "0000000000000000")
+            .unwrap()
+            .is_none());
+        // The hash exists but only under proj-2 -> a proj-3 query misses.
+        assert!(find_contribution_by_project_and_hash(&conn, "proj-3", "deadbeefdeadbeef")
+            .unwrap()
+            .is_none());
+
+        // Repoint (moved branch) and confirm the new path resolves, old does not.
+        update_contribution_landed_path(&conn, id, "/land/moved.fits").unwrap();
+        assert_eq!(
+            find_contribution_by_landed_path(&conn, "/land/moved.fits").unwrap().unwrap().id,
+            id
+        );
+        assert!(find_contribution_by_landed_path(&conn, "/land/a.fits").unwrap().is_none());
     }
 
     #[test]

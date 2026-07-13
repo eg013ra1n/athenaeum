@@ -52,6 +52,12 @@ pub struct CalibratedIdentity {
     pub flat_norm_divisor: Option<f64>,
     /// `ATH_CVER` — engine version the file was built with.
     pub engine_version: Option<i64>,
+    /// `ATH_PRJ` — Stage-II project id stamped at publish (slice 4). Present ONLY
+    /// on a received project contribution; `None` for a personal calibrated
+    /// light. Its presence diverts the scanner onto the project-contribution
+    /// reconcile (sibling of the light-cal reconcile) instead of frame-registering
+    /// or light-cal-adopting the file. `None` when the card is absent/empty.
+    pub project_id: Option<String>,
 }
 
 /// Trim a header value; treat empty as absent.
@@ -96,6 +102,7 @@ pub fn calibrated_light_identity(keys: &HashMap<String, String>) -> Option<Calib
         bias: parse_master_ref(keys, "ATH_CBIA"),
         flat_norm_divisor: keys.get("ATH_CFNM").and_then(|s| s.trim().parse::<f64>().ok()),
         engine_version: keys.get("ATH_CVER").and_then(|s| s.trim().parse::<i64>().ok()),
+        project_id: non_empty(keys, "ATH_PRJ"),
     })
 }
 
@@ -132,6 +139,26 @@ mod tests {
         assert!(id.bias.is_none());
         assert_eq!(id.flat_norm_divisor, Some(1234.5));
         assert_eq!(id.engine_version, Some(1));
+        // No ATH_PRJ card -> a personal calibrated light, not a project contribution.
+        assert!(id.project_id.is_none());
+    }
+
+    #[test]
+    fn parses_project_id_from_ath_prj() {
+        // A published contribution carries the calibrated-light cards PLUS the
+        // ATH_PRJ project stamp -> identity is present AND flags the project.
+        let k = keys(&[
+            ("CALSTAT", "BDF"),
+            ("ATH_CSRC", "uuid-1"),
+            ("ATH_CSRN", "L_0001.fits"),
+            ("ATH_PRJ", "proj-abc"),
+        ]);
+        let id = calibrated_light_identity(&k).expect("identity present");
+        assert_eq!(id.project_id.as_deref(), Some("proj-abc"));
+        // An empty ATH_PRJ is treated as absent (same as every other card).
+        let k = keys(&[("CALSTAT", "BDF"), ("ATH_CSRC", "uuid-1"), ("ATH_PRJ", "  ")]);
+        let id = calibrated_light_identity(&k).expect("identity present");
+        assert!(id.project_id.is_none(), "blank ATH_PRJ is absent");
     }
 
     #[test]
