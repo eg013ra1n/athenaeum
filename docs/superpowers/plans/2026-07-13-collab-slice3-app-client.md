@@ -766,18 +766,35 @@ mod tests {
     use crate::db::light_calibrations::LightCalStatus;
     use crate::models::FrameAnalysis;
 
+    /// `FrameAnalysis` fields are NOT `Option` (see `models.rs`): `median_fwhm:
+    /// f64`, `stars_detected: i64`, `possibly_trailed: bool`, … Only
+    /// `median_beta`/`quality_score`/`config_hash` are optional. Build the full
+    /// literal — there is no `Default` impl to lean on.
     fn analysis(fwhm_px: f64, ecc: f64, stars: i64, trailed: bool) -> FrameAnalysis {
         FrameAnalysis {
-            // Fill every other field with Default-ish values; FrameAnalysis has
-            // many Option fields — construct via ..Default::default() if the
-            // struct derives Default, otherwise build the full literal with
-            // None/0 defaults (check models.rs; use whichever compiles).
+            id: None,
             frame_id: 1,
-            stars_detected: Some(stars),
-            median_fwhm: Some(fwhm_px),
-            median_eccentricity: Some(ecc),
-            possibly_trailed: Some(if trailed { 1 } else { 0 }),
-            ..fixture_defaults()
+            file_id: 1,
+            stars_detected: stars,
+            median_fwhm: fwhm_px,
+            median_eccentricity: ecc,
+            median_snr: 10.0,
+            median_hfr: 2.0,
+            frame_snr: 10.0,
+            snr_weight: 1.0,
+            psf_signal: 100.0,
+            background: 10.0,
+            noise: 1.0,
+            detection_threshold: 5.0,
+            width: 6248,
+            height: 4176,
+            source_channels: 1,
+            trail_r_squared: 0.0,
+            possibly_trailed: trailed,
+            median_beta: None,
+            quality_score: None,
+            config_hash: None,
+            analyzed_at: "2026-07-13T00:00:00Z".to_string(),
         }
     }
 
@@ -881,7 +898,7 @@ mod tests {
     #[test]
     fn snr_family_rules_apply_generically() {
         let mut a = analysis(1.2, 0.4, 400, false);
-        a.median_snr = Some(4.0);
+        a.median_snr = 4.0;
         let r: Vec<ThresholdRuleView> = serde_json::from_value(serde_json::json!([
             {"metricKey": "median_snr", "op": "gte", "value": 5.0}
         ]))
@@ -891,8 +908,6 @@ mod tests {
     }
 }
 ```
-
-`fixture_defaults()` — a test-only helper returning a fully-`None`/zeroed `FrameAnalysis` literal for `..` struct-update (write it once at the top of the test module; if `FrameAnalysis` derives `Default`, use `FrameAnalysis::default()` instead — check `models.rs:943` and pick whichever compiles).
 
 - [ ] **Step 2: Run to verify failure** — `cargo test -p athenaeum-core collab::gate 2>&1 | tail -3` → compile error.
 
@@ -929,13 +944,16 @@ pub fn evaluate_frame(
         None => failures.push("no coordinates".to_string()),
     }
 
-    let fwhm_arcsec = analysis
-        .and_then(|a| a.median_fwhm)
-        .zip(input.pixel_scale_arcsec)
-        .map(|(px, scale)| px * scale);
-    let eccentricity = analysis.and_then(|a| a.median_eccentricity);
-    let stars_detected = analysis.and_then(|a| a.stars_detected);
-    let trailed = analysis.and_then(|a| a.possibly_trailed).map(|t| t != 0);
+    // NOTE: FrameAnalysis fields are NOT Option (models.rs) — the Option-ness
+    // here comes from "is there an analysis row at all" and "do we know the
+    // pixel scale", nothing else.
+    let fwhm_arcsec = match (analysis, input.pixel_scale_arcsec) {
+        (Some(a), Some(scale)) => Some(a.median_fwhm * scale),
+        _ => None,
+    };
+    let eccentricity = analysis.map(|a| a.median_eccentricity);
+    let stars_detected = analysis.map(|a| a.stars_detected);
+    let trailed = analysis.map(|a| a.possibly_trailed);
 
     for rule in rules {
         match rule.metric_key.as_str() {
@@ -953,9 +971,9 @@ pub fn evaluate_frame(
                     "fwhm_arcsec" => fwhm_arcsec,
                     "eccentricity" => eccentricity,
                     "stars_detected" => stars_detected.map(|s| s as f64),
-                    "median_snr" => analysis.and_then(|a| a.median_snr),
-                    "snr_weight" => analysis.and_then(|a| a.snr_weight),
-                    "frame_snr" => analysis.and_then(|a| a.frame_snr),
+                    "median_snr" => analysis.map(|a| a.median_snr),
+                    "snr_weight" => analysis.map(|a| a.snr_weight),
+                    "frame_snr" => analysis.map(|a| a.frame_snr),
                     _ => {
                         tracing::warn!(metric_key = %rule.metric_key, "unknown gate rule skipped");
                         continue;
@@ -1046,57 +1064,247 @@ git commit -m "feat(collab): quality-gate engine — spec §4 preconditions + th
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Reuse the api-test ServiceContext fixture pattern from api/sync.rs tests.
+    use crate::db::collab::CollabProjectRow;
 
-    /// Seed one cached project + one frames_set with two LIGHT frames:
-    /// frame A fully publishable, frame B trailed. Returns (set_id, [frame_a, frame_b]).
-    fn seed_catalog(conn: &rusqlite::Connection) -> (i64, Vec<i64>) {
-        crate::db::collab::upsert_project(conn, &crate::db::collab::CollabProjectRow {
-            project_id: "p-1".into(), slug: "m101".into(), title: "M 101".into(),
-            data_role: "send_receive".into(), is_coordinator: true, require_approval: false,
-            pending_announcements: 0, project_status: "active".into(),
-            target_name: "M101".into(), target_ra_deg: 210.8, target_dec_deg: 54.35,
-            target_radius_deg: 1.5, membership_version: 1,
-            snapshot_payload_b64: "e30=".into(), snapshot_signature_b64: "e30=".into(),
-            members_json: "[]".into(), thresholds_version: Some(1),
-            thresholds_rules_json: Some(r#"[{"metricKey":"not_trailed","op":"reject_if","value":true}]"#.into()),
-            fetched_at: String::new(),
-        }).unwrap();
-        // frames_set + imaging_night + session + two frames with analyses:
-        // build via direct INSERTs (files → frames(imagetyp='Light', ra/dec set,
-        // xpixsz/focallen set) → imaging_nights(frames_set_id) → sessions →
-        // session_members), then frame_analysis rows (A clean, B possibly_trailed=1),
-        // and a light_calibrations row per frame that derives Calibrated —
-        // OR, simpler and stable: leave light_calibrations empty and assert the
-        // gate reports "not calibrated (NotCalibrated)" as a failure, plus the
-        // trailed failure on B. The test asserts STRUCTURE (per-frame rows,
-        // reasons, counts), not a fully-green pipeline.
-        /* …INSERT statements per schema.rs columns… */
-        unimplemented!("full INSERT fixture written in Step 3 alongside the impl")
+    /// Cached project fixture: target M101 (210.8, +54.35), radius 1.5°, one
+    /// threshold rule (reject trailed frames).
+    fn cached_project(conn: &rusqlite::Connection) {
+        crate::db::collab::upsert_project(
+            conn,
+            &CollabProjectRow {
+                project_id: "p-1".into(),
+                slug: "m101".into(),
+                title: "M 101".into(),
+                data_role: "send_receive".into(),
+                is_coordinator: true,
+                require_approval: false,
+                pending_announcements: 0,
+                project_status: "active".into(),
+                target_name: "M101".into(),
+                target_ra_deg: 210.8,
+                target_dec_deg: 54.35,
+                target_radius_deg: 1.5,
+                membership_version: 1,
+                snapshot_payload_b64: "e30=".into(),
+                snapshot_signature_b64: "e30=".into(),
+                members_json: "[]".into(),
+                thresholds_version: Some(1),
+                thresholds_rules_json: Some(
+                    r#"[{"metricKey":"not_trailed","op":"reject_if","value":true}]"#.into(),
+                ),
+                fetched_at: String::new(), // filled by SQL
+            },
+        )
+        .unwrap();
+    }
+
+    /// A frames_set whose center is (`objctra`, `objctdec`), holding `lights`
+    /// LIGHT frames through the imaging_nights → sessions → session_members
+    /// chain. Every frame gets a frame_analysis row; frame index 1 (the second)
+    /// is flagged trailed. Returns (set_id, frame_ids).
+    fn seed_set(
+        conn: &rusqlite::Connection,
+        name: &str,
+        objctra: &str,
+        objctdec: &str,
+        ra_deg: f64,
+        dec_deg: f64,
+        lights: usize,
+    ) -> (i64, Vec<i64>) {
+        conn.execute(
+            "INSERT INTO frames_set (name, objctra, objctdec) VALUES (?1, ?2, ?3)",
+            rusqlite::params![name, objctra, objctdec],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO imaging_nights (frames_set_id, start_time, end_time) \
+             VALUES (?1, '2026-07-01T20:00:00Z', '2026-07-02T03:00:00Z')",
+            [set_id],
+        )
+        .unwrap();
+        let night_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'ASI2600MM')",
+            [night_id],
+        )
+        .unwrap();
+        let session_id = conn.last_insert_rowid();
+
+        let mut frame_ids = Vec::new();
+        for i in 0..lights {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) \
+                 VALUES (?1, ?2, 1000, '2026-07-01T21:00:00Z', 'FITS')",
+                rusqlite::params![
+                    format!("/data/{name}/L_{i:04}.fits"),
+                    format!("L_{i:04}.fits")
+                ],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+
+            // xpixsz (µm, already binned) + focallen (mm) give the header
+            // pixel-scale fallback: (3.76/1000 / 1000).atan() ≈ 0.776″/px.
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, object, instrume, ra, dec, xpixsz, focallen, exptime, filter) \
+                 VALUES (?1, 'Light', 'M101', 'ASI2600MM', ?2, ?3, 3.76, 1000.0, 300.0, 'L')",
+                rusqlite::params![file_id, ra_deg, dec_deg],
+            )
+            .unwrap();
+            let frame_id = conn.last_insert_rowid();
+
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![session_id, frame_id],
+            )
+            .unwrap();
+
+            // Every NOT NULL column of frame_analysis must be provided.
+            conn.execute(
+                "INSERT INTO frame_analysis \
+                 (frame_id, file_id, stars_detected, median_fwhm, median_eccentricity, median_snr, \
+                  median_hfr, frame_snr, snr_weight, psf_signal, background, noise, \
+                  detection_threshold, width, height, source_channels, trail_r_squared, possibly_trailed) \
+                 VALUES (?1, ?2, 400, 2.0, 0.4, 10.0, 2.0, 10.0, 1.0, 100.0, 10.0, 1.0, 5.0, \
+                         6248, 4176, 1, 0.0, ?3)",
+                rusqlite::params![frame_id, file_id, if i == 1 { 1 } else { 0 }],
+            )
+            .unwrap();
+
+            frame_ids.push(frame_id);
+        }
+        (set_id, frame_ids)
     }
 
     #[test]
-    fn gate_report_covers_union_of_linked_sets() { /* asserts: total == 2, rows carry
-        the expected failure strings, publishable == 0 with the calibration failure,
-        set linked via link_frame_set, NotFound for an uncached project */ }
+    fn gate_report_covers_union_of_linked_sets() {
+        let ctx = test_ctx(); // ServiceContext fixture — see the note below
+        let (set_id, frames) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 2)
+        };
+
+        // An uncached project id is a NotFound, not a panic.
+        assert!(matches!(
+            evaluate_project_gate(&ctx, "nope"),
+            Err(crate::api::ApiError::NotFound(_))
+        ));
+
+        // Nothing linked yet → no candidates.
+        assert_eq!(evaluate_project_gate(&ctx, "p-1").unwrap().total, 0);
+
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+        link_frame_set(&ctx, "p-1", set_id).unwrap(); // idempotent
+
+        let report = evaluate_project_gate(&ctx, "p-1").unwrap();
+        assert_eq!(report.total, 2, "both LIGHT frames are candidates");
+        assert_eq!(report.rows.len(), 2);
+        assert_eq!(report.publishable, 0, "no light_calibrations rows → not calibrated");
+
+        // Frame 0: blocked only by calibration. Frame 1: calibration + trailed.
+        let row0 = report.rows.iter().find(|r| r.frame_id == frames[0]).unwrap();
+        assert!(row0.failures.iter().any(|f| f.contains("not calibrated")), "{:?}", row0.failures);
+        assert!(!row0.failures.iter().any(|f| f.contains("trailed")));
+        assert_eq!(row0.stars_detected, Some(400));
+        // 2.0 px × ~0.776 ″/px (header fallback, no binning multiply).
+        let scale = ((3.76f64 / 1000.0) / 1000.0).atan().to_degrees() * 3600.0;
+        assert!((row0.fwhm_arcsec.unwrap() - 2.0 * scale).abs() < 1e-6);
+
+        let row1 = report.rows.iter().find(|r| r.frame_id == frames[1]).unwrap();
+        assert!(row1.failures.iter().any(|f| f.contains("trailed")), "{:?}", row1.failures);
+
+        unlink_frame_set(&ctx, "p-1", set_id).unwrap();
+        assert_eq!(evaluate_project_gate(&ctx, "p-1").unwrap().total, 0);
+    }
 
     #[test]
-    fn suggestions_rank_by_distance_and_flag_linked() { /* two sets: one at target
-        center (within), one 5° away (outside); link the first → already_linked=true,
-        ordering [within, outside] */ }
+    fn suggestions_rank_by_distance_and_flag_linked() {
+        let ctx = test_ctx();
+        let (near, far) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            let (near, _) = seed_set(&conn, "On target", "14:03:12", "+54:21:00", 210.8, 54.35, 1);
+            // ~5° south of the target — outside the 1.5° radius.
+            let (far, _) = seed_set(&conn, "Far away", "14:03:12", "+49:21:00", 210.8, 49.35, 1);
+            (near, far)
+        };
+
+        let suggestions = list_link_suggestions(&ctx, "p-1").unwrap();
+        assert_eq!(suggestions.len(), 2);
+        assert_eq!(suggestions[0].frames_set_id, near, "within-radius set ranks first");
+        assert!(suggestions[0].within_radius);
+        assert_eq!(suggestions[0].light_count, 1);
+        assert!(!suggestions[0].already_linked);
+
+        assert_eq!(suggestions[1].frames_set_id, far);
+        assert!(!suggestions[1].within_radius);
+        assert!(suggestions[1].distance_deg.unwrap() > 4.0);
+
+        link_frame_set(&ctx, "p-1", near).unwrap();
+        let suggestions = list_link_suggestions(&ctx, "p-1").unwrap();
+        assert!(suggestions[0].already_linked);
+    }
 
     #[test]
-    fn intent_builds_portal_url_and_persists() { /* set with objctra/objctdec →
-        url contains /new?object=...&ra=...; db::collab::list_link_intents len 1;
-        a set without center → ApiError::Invalid */ }
+    fn intent_builds_portal_url_and_persists() {
+        let ctx = test_ctx();
+        let (with_center, no_center) = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            cached_project(&conn);
+            let (with_center, _) =
+                seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 1);
+            conn.execute("INSERT INTO frames_set (name) VALUES ('No center')", [])
+                .unwrap();
+            (with_center, conn.last_insert_rowid())
+        };
+
+        let link = record_project_link_intent(&ctx, with_center).unwrap();
+        assert!(link.url.contains("/new?"), "portal deep link: {}", link.url);
+        assert!(link.url.contains("object=M101+Set") || link.url.contains("object=M101%20Set"));
+        assert!(link.url.contains("ra=210.8"));
+        assert!(link.url.starts_with("http"), "must be a plain web URL");
+
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            let intents = crate::db::collab::list_link_intents(&conn).unwrap();
+            assert_eq!(intents.len(), 1);
+            assert_eq!(intents[0].1, with_center);
+        }
+
+        assert!(matches!(
+            record_project_link_intent(&ctx, no_center),
+            Err(crate::api::ApiError::Invalid(_))
+        ));
+    }
 
     #[test]
-    fn find_matching_projects_excludes_linked() { /* point inside target →
-        1 match; after link_frame_set → 0 matches */ }
+    fn find_matching_projects_excludes_linked() {
+        let ctx = test_ctx();
+        let conn = crate::api::db(&ctx).unwrap().conn();
+        cached_project(&conn);
+        let (set_id, _) = seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 1);
+
+        let matches = find_matching_projects(&conn, 210.8, 54.35, set_id).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].project_id, "p-1");
+
+        // A point far outside the radius matches nothing.
+        assert!(find_matching_projects(&conn, 10.0, 10.0, set_id).unwrap().is_empty());
+
+        // Once linked, the project stops being suggested for that set.
+        crate::db::collab::link_set(&conn, "p-1", set_id).unwrap();
+        assert!(find_matching_projects(&conn, 210.8, 54.35, set_id).unwrap().is_empty());
+    }
 }
 ```
 
-**Note to the implementer:** the `unimplemented!` in the sketch above is a placeholder for YOU to replace in the same commit with real INSERT statements against the actual schema (columns documented in the plan's grounding: `files(path, filename, …)`, `frames(file_id, imagetyp, ra, dec, xpixsz, focallen, …)`, `imaging_nights(frames_set_id, …)`, `sessions(imaging_night_id, …)`, `session_members(session_id, frame_id)`, `frame_analysis(frame_id, median_fwhm, median_eccentricity, stars_detected, possibly_trailed, …)`). Read `schema.rs` for the NOT NULL columns each INSERT must provide. The four tests must be complete and passing — the sketch defines their required assertions.
+**`test_ctx()`** — the `ServiceContext` fixture. Do NOT invent one: `crates/athenaeum-core/src/api/sync.rs` already builds a `ServiceContext` over an in-memory `Database` in its `#[cfg(test)]` module. Copy that helper verbatim into this test module (or, if it is already `pub(crate)` in a shared test-support module, import it) and name it `test_ctx()`. It must give a context whose `api::db(&ctx)` returns a `Database` with `init_db` applied and whose `settings` resolve `ACCOUNT_HUB_URL` to the default (the intent test asserts the URL starts with `http`).
+
+**Note on `conn` lifetimes:** `crate::api::db(&ctx)?.conn()` hands out a pooled connection — take it in a short scope (as the tests above do with `{ … }` blocks) so the `api::*` calls that open their own connection do not deadlock on a single-connection pool.
 
 - [ ] **Step 2: Run to verify failure** — `cargo test -p athenaeum-core api::collab 2>&1 | tail -3` → compile error.
 
@@ -1840,7 +2048,478 @@ git commit -m "feat(ui): Projects page — cards, cached-first refresh, project 
 - Consumes: generated types (`ProjectDetail`, `GateReport`, `FrameGateRow`, `LinkSuggestion`, `PortalNewProjectLink`), `api`, `openUrl` from `src/api/desktop.ts` (portal opens in the browser — Tauri plugin-opener / web `window.open`), `notify()` from `useNotifications()`.
 - Produces: `/projects/:id` detail with two tabs (**Contribute**: linked-object chips + link dialog + gate candidate table with per-rule reasons + a disabled "Publish N passing frames" button, `title="Sending arrives with the exchange update"`; **Overview**: members, thresholds read-only, target line, "Manage on portal" opening `<portalBase>/p/<slug>/admin` for coordinators else `/p/<slug>`). `FrameSetDetail` gains a "Publish as project" button → `create_collab_link_intent` → `openUrl(result.url)`.
 
-> **Steps 1–5 of this task (the component code, route wiring, and gates) are still to be written.** Everything Task 8 must satisfy is fixed by the Interfaces block above plus the **Security requirements** section below — write the steps against those, in the same TDD/commit shape as Tasks 1–7.
+- [ ] **Step 1: The shared external-URL guard** (S3 — used by BOTH call sites in this task)
+
+Create `src/utils/externalUrl.ts`:
+
+```ts
+/**
+ * Only ever hand http(s) URLs to the OS browser. `openUrl` reaches
+ * plugin-opener on desktop, so a `javascript:`/`file:`/`data:` URL would be a
+ * real vector — and every candidate here traces back to the settings-configurable
+ * hub URL (portalBase, or the deep link minted by `create_collab_link_intent`).
+ * Returns the normalized URL, or null when it is not a plain web address.
+ */
+export function safeExternalUrl(raw: string): string | null {
+  try {
+    const u = new URL(raw);
+    return u.protocol === 'https:' || u.protocol === 'http:' ? u.toString() : null;
+  } catch {
+    return null;
+  }
+}
+```
+
+- [ ] **Step 2: `LinkObjectDialog.tsx`** — the ranked link picker
+
+Create `src/components/collab/LinkObjectDialog.tsx`:
+
+```tsx
+import { useCallback, useEffect, useState } from 'react';
+import { Check, Link2, X } from 'lucide-react';
+import { api } from '../../api';
+import type { LinkSuggestion } from '../../types/models';
+
+/**
+ * Link/unlink frame sets to a project (spec §7 — linking is explicit, never
+ * automatic). Suggestions are ranked by the backend: within-radius first, then
+ * ascending distance from the project target.
+ */
+export default function LinkObjectDialog({
+  projectId,
+  onClose,
+  onChanged,
+}: {
+  projectId: string;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [suggestions, setSuggestions] = useState<LinkSuggestion[]>([]);
+  const [busy, setBusy] = useState<number | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setSuggestions(
+        await api.invoke<LinkSuggestion[]>('list_collab_link_suggestions', { projectId }),
+      );
+    } catch (err) {
+      console.error('[projects] link suggestions failed:', err);
+    }
+  }, [projectId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const toggle = async (s: LinkSuggestion) => {
+    setBusy(s.framesSetId);
+    try {
+      await api.invoke('set_collab_link', {
+        projectId,
+        framesSetId: s.framesSetId,
+        linked: !s.alreadyLinked,
+      });
+      await load();
+      onChanged();
+    } catch (err) {
+      console.error('[projects] link toggle failed:', err);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      onClick={onClose}
+    >
+      <div
+        className="max-h-[80vh] w-[34rem] overflow-auto rounded-lg border border-border bg-surface p-4"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center gap-2">
+          <Link2 size={16} className="text-content-secondary" />
+          <h2 className="font-medium text-content">Link an object</h2>
+          <button
+            onClick={onClose}
+            className="ml-auto text-content-muted transition-colors hover:text-content"
+            aria-label="Close"
+          >
+            <X size={16} />
+          </button>
+        </div>
+        <p className="mb-3 text-xs text-content-muted">
+          Frame sets nearest the project target come first. Linking is a catalog-only
+          choice — each frame is still checked against the project&apos;s quality gate.
+        </p>
+        <ul className="space-y-1">
+          {suggestions.map((s) => (
+            <li
+              key={s.framesSetId}
+              className="flex items-center gap-2 rounded border border-border px-3 py-2 text-sm"
+            >
+              <span className="truncate text-content">{s.name ?? `Set #${s.framesSetId}`}</span>
+              <span className="flex-shrink-0 text-xs text-content-muted">
+                {s.lightCount} lights
+              </span>
+              {s.withinRadius ? (
+                <span className="flex-shrink-0 rounded bg-accent/20 px-1.5 py-0.5 text-xs text-accent">
+                  on target
+                </span>
+              ) : s.distanceDeg != null ? (
+                <span className="flex-shrink-0 text-xs text-content-muted">
+                  {s.distanceDeg.toFixed(1)}° away
+                </span>
+              ) : (
+                <span className="flex-shrink-0 text-xs text-content-muted">no center</span>
+              )}
+              <button
+                onClick={() => void toggle(s)}
+                disabled={busy === s.framesSetId}
+                className={`ml-auto flex-shrink-0 inline-flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors disabled:opacity-50 ${
+                  s.alreadyLinked
+                    ? 'border border-border text-content-secondary hover:bg-surface-hover'
+                    : 'bg-accent text-surface hover:bg-accent-hover'
+                }`}
+              >
+                {s.alreadyLinked ? (
+                  <>
+                    <Check size={12} /> Linked
+                  </>
+                ) : (
+                  'Link'
+                )}
+              </button>
+            </li>
+          ))}
+          {suggestions.length === 0 && (
+            <li className="py-2 text-sm text-content-muted">No frame sets to link yet.</li>
+          )}
+        </ul>
+      </div>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 3: `ProjectDetail.tsx`** — Contribute + Overview tabs
+
+Create `src/pages/ProjectDetail.tsx`:
+
+```tsx
+import { useCallback, useEffect, useState } from 'react';
+import { useParams } from 'react-router-dom';
+import { ExternalLink, Plus, Target } from 'lucide-react';
+import { api } from '../api';
+import { openUrl } from '../api/desktop';
+import { safeExternalUrl } from '../utils/externalUrl';
+import { useNotifications } from '../contexts/NotificationContext';
+import LinkObjectDialog from '../components/collab/LinkObjectDialog';
+import type { FrameGateRow, GateReport, ProjectDetail as Detail } from '../types/models';
+
+export default function ProjectDetail() {
+  const { id } = useParams();
+  const { notify } = useNotifications();
+  const [detail, setDetail] = useState<Detail | null>(null);
+  const [gate, setGate] = useState<GateReport | null>(null);
+  const [tab, setTab] = useState<'contribute' | 'overview'>('contribute');
+  const [linkOpen, setLinkOpen] = useState(false);
+  const [missing, setMissing] = useState(false);
+
+  const load = useCallback(async () => {
+    if (!id) return;
+    setMissing(false);
+    try {
+      // The detail comes from the local cache of VERIFIED snapshots (core owns
+      // verification); the gate is evaluated locally over the linked sets.
+      const [d, g] = await Promise.all([
+        api.invoke<Detail>('get_collab_project_detail', { projectId: id }),
+        api.invoke<GateReport>('evaluate_collab_gate', { projectId: id }),
+      ]);
+      setDetail(d);
+      setGate(g);
+    } catch (err) {
+      console.error('[projects] detail load failed:', err);
+      setMissing(true);
+    }
+  }, [id]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const openPortal = async (path: string) => {
+    if (!detail) return;
+    const candidate = `${detail.portalBase}${path}`;
+    const safe = safeExternalUrl(candidate);
+    if (!safe) {
+      console.error('[projects] refused non-http(s) portal url:', candidate);
+      notify({
+        title: 'Could not open the portal',
+        detail: 'The configured hub address is not a valid web address.',
+        kind: 'project',
+        tone: 'warning',
+      });
+      return;
+    }
+    await openUrl(safe);
+  };
+
+  if (missing)
+    return (
+      <p className="p-6 text-sm text-content-muted">
+        This project is not in your local list — refresh the Projects page.
+      </p>
+    );
+  if (!detail) return <p className="p-6 text-content-muted">Loading…</p>;
+
+  const c = detail.card;
+  const portalPath = c.coordinator ? `/p/${c.slug}/admin` : `/p/${c.slug}`;
+
+  return (
+    <div className="space-y-4 p-6">
+      <div className="flex flex-wrap items-center gap-3">
+        <h1 className="truncate text-lg font-semibold text-content">{c.title}</h1>
+        <span className="flex items-center gap-1 text-xs text-content-muted">
+          <Target size={12} /> {c.targetName} · r {c.targetRadiusDeg.toFixed(1)}°
+        </span>
+        {c.coordinator && (
+          <span className="rounded bg-accent/20 px-1.5 py-0.5 text-xs text-accent">coordinator</span>
+        )}
+        <button
+          onClick={() => void openPortal(portalPath)}
+          className="ml-auto inline-flex items-center gap-1 text-sm text-content-secondary transition-colors hover:text-content"
+        >
+          Manage on portal <ExternalLink size={13} />
+        </button>
+      </div>
+
+      <div className="flex gap-1 border-b border-border">
+        {(['contribute', 'overview'] as const).map((t) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={`px-4 py-2 text-sm capitalize transition-colors ${
+              tab === t
+                ? 'border-b-2 border-accent font-medium text-content'
+                : 'text-content-muted hover:text-content-secondary'
+            }`}
+          >
+            {t}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'contribute' ? (
+        <div className="space-y-4">
+          <div className="flex items-center gap-3">
+            <span className="text-sm font-medium text-content">Linked objects</span>
+            <button
+              onClick={() => setLinkOpen(true)}
+              className="inline-flex items-center gap-1 rounded border border-border px-2 py-1 text-xs text-content-secondary transition-colors hover:bg-surface-hover"
+            >
+              <Plus size={12} /> Link an object
+            </button>
+          </div>
+
+          {detail.links.length === 0 ? (
+            <p className="text-sm text-content-muted">Link an object to start.</p>
+          ) : (
+            <ul className="flex flex-wrap gap-2">
+              {detail.links.map((l) => (
+                <li
+                  key={l.framesSetId}
+                  className="rounded border border-border px-2 py-1 text-xs text-content-secondary"
+                >
+                  <span className="break-words">{l.name ?? `Set #${l.framesSetId}`}</span> ·{' '}
+                  {l.lightCount} lights
+                  {l.withinRadius ? ' · on target' : ''}
+                </li>
+              ))}
+            </ul>
+          )}
+
+          <GateTable gate={gate} />
+
+          <button
+            disabled
+            title="Sending arrives with the exchange update"
+            className="cursor-not-allowed rounded bg-surface-hover px-4 py-2 text-sm text-content-muted"
+          >
+            Publish {gate?.publishable ?? 0} passing frames (coming soon)
+          </button>
+        </div>
+      ) : (
+        <div className="space-y-4 text-sm">
+          <section>
+            <h2 className="mb-1 font-medium text-content">Members</h2>
+            <ul className="text-content-secondary">
+              {detail.members.map((m, i) => (
+                <li key={`${m.displayName}-${i}`} className="break-words">
+                  {m.displayName} — {m.coordinator ? 'coordinator' : m.dataRole}
+                </li>
+              ))}
+            </ul>
+          </section>
+
+          <section>
+            <h2 className="mb-1 font-medium text-content">
+              Quality thresholds
+              {detail.thresholdsVersion != null ? ` (v${detail.thresholdsVersion})` : ''}
+            </h2>
+            {detail.thresholds.length === 0 ? (
+              <p className="text-content-muted">No thresholds set.</p>
+            ) : (
+              <ul className="text-content-secondary">
+                {detail.thresholds.map((r, i) => (
+                  <li key={`${r.metricKey}-${i}`} className="break-words">
+                    {r.op === 'reject_if'
+                      ? `${r.metricKey} — reject when ${String(r.value)}`
+                      : `${r.metricKey} ${r.op === 'lte' ? '≤' : r.op === 'gte' ? '≥' : r.op} ${String(r.value)}`}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="mt-1 text-xs text-content-muted">
+              Thresholds are set by the coordinator on the portal. Changes are prospective —
+              already-published frames stay published.
+            </p>
+          </section>
+        </div>
+      )}
+
+      {linkOpen && id && (
+        <LinkObjectDialog
+          projectId={id}
+          onClose={() => setLinkOpen(false)}
+          onChanged={() => void load()}
+        />
+      )}
+    </div>
+  );
+}
+
+/** Candidate frames of the linked sets with their per-rule gate verdict. */
+function GateTable({ gate }: { gate: GateReport | null }) {
+  if (!gate) return null;
+  if (gate.total === 0)
+    return (
+      <p className="text-sm text-content-muted">
+        No candidate frames yet — link an object that has LIGHT frames.
+      </p>
+    );
+
+  return (
+    <div className="overflow-x-auto">
+      <p className="mb-1 text-sm text-content-secondary">
+        {gate.publishable} publishable of {gate.total}
+      </p>
+      <table className="w-full text-left text-xs">
+        <thead className="text-content-muted">
+          <tr>
+            <th className="py-1 pr-3 font-normal">Frame</th>
+            <th className="pr-3 font-normal">FWHM″</th>
+            <th className="pr-3 font-normal">Ecc</th>
+            <th className="pr-3 font-normal">Stars</th>
+            <th className="font-normal">Gate</th>
+          </tr>
+        </thead>
+        <tbody>
+          {gate.rows.map((r: FrameGateRow) => (
+            <tr key={r.frameId} className="border-t border-border/50">
+              <td className="max-w-[16rem] truncate py-1 pr-3 text-content">{r.filename}</td>
+              <td className="pr-3 text-content-secondary">
+                {r.fwhmArcsec != null ? r.fwhmArcsec.toFixed(2) : '—'}
+              </td>
+              <td className="pr-3 text-content-secondary">
+                {r.eccentricity != null ? r.eccentricity.toFixed(2) : '—'}
+              </td>
+              <td className="pr-3 text-content-secondary">{r.starsDetected ?? '—'}</td>
+              <td
+                className={r.publishable ? 'text-success' : 'text-error'}
+                title={r.publishable ? undefined : r.failures.join('; ')}
+              >
+                {r.publishable ? '✓ publishable' : (r.failures[0] ?? 'not publishable')}
+                {!r.publishable && r.failures.length > 1 ? ` (+${r.failures.length - 1})` : ''}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+```
+
+**Token check:** `text-success` / `text-error` / `bg-accent` / `border-border` / `bg-surface-hover` must exist in the design-token set — grep an existing table or badge (e.g. `src/components/CalibrationSetTable.tsx`) and swap in the established names if any differ. Never introduce a raw color.
+
+**Field-casing check:** `fwhmArcsec`, `starsDetected`, `framesSetId`, `portalBase`, `thresholdsVersion`, `alreadyLinked`, `withinRadius`, `distanceDeg`, `lightCount` come from the ts-rs regeneration in Task 6 — read `src/types/models.ts` and match exactly (do not hand-edit the generated file).
+
+- [ ] **Step 4: `FrameSetDetail.tsx` — "Publish as project" action**
+
+In `src/pages/FrameSetDetail.tsx`, add the handler next to the file's existing set-level actions (imports: `api` from `../api`, `openUrl` from `../api/desktop`, `safeExternalUrl` from `../utils/externalUrl`, `useNotifications`, a lucide icon such as `Users`):
+
+```tsx
+  const publishAsProject = async () => {
+    try {
+      // Core mints the deep link (percent-encoded, Url-built) and records an
+      // intent so the next poll auto-links this set to the project the portal
+      // creates from it (spec §8).
+      const { url } = await api.invoke<PortalNewProjectLink>('create_collab_link_intent', {
+        framesSetId: frameSetId,
+      });
+      const safe = safeExternalUrl(url);
+      if (!safe) {
+        console.error('[projects] refused non-http(s) intent url:', url);
+        notify({
+          title: 'Could not open the portal',
+          detail: 'The configured hub address is not a valid web address.',
+          kind: 'project',
+          tone: 'warning',
+        });
+        return;
+      }
+      await openUrl(safe);
+    } catch (err) {
+      console.error('[projects] publish-as-project failed:', err);
+      notify({
+        title: 'Could not start project creation',
+        detail: err instanceof Error ? err.message : String(err),
+        kind: 'project',
+        tone: 'warning',
+      });
+    }
+  };
+```
+
+Render it with the file's existing button styling:
+
+```tsx
+  <button
+    onClick={() => void publishAsProject()}
+    className="inline-flex items-center gap-2 rounded-lg border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover"
+  >
+    <Users size={14} />
+    Publish as project
+  </button>
+```
+
+Wire `frameSetId` to the id variable already in scope in that page (read the file — it is the route param / the loaded set's `id`), and import the `PortalNewProjectLink` type from `../types/models`. A set with no usable center coordinates fails in core with an `Invalid` error whose message reaches the user through the `catch` → notification.
+
+- [ ] **Step 5: Route + gates + commit**
+
+`src/App.tsx`: `import ProjectDetail from './pages/ProjectDetail';` and add `<Route path="projects/:id" element={<ProjectDetail />} />` as a sibling of the `projects` route from Task 7.
+
+Run: `npx tsc --noEmit`
+Expected: clean (0 errors).
+
+Manual pass against the **Security requirements** checklist below (the reviewer will repeat it): no `dangerouslySetInnerHTML`; every `openUrl` guarded by `safeExternalUrl`; no email/accountId/node-pubkey rendered; the publish button disabled; no direct hub `fetch`.
+
+```bash
+git add src/utils/externalUrl.ts src/components/collab/LinkObjectDialog.tsx \
+        src/pages/ProjectDetail.tsx src/pages/FrameSetDetail.tsx src/App.tsx
+git commit -m "feat(ui): project detail — Contribute/Overview tabs, link dialog, guarded portal deep links"
+```
 
 ---
 
@@ -1915,3 +2594,23 @@ export function safeExternalUrl(raw: string): string | null {
 **Reviewer checklist for Tasks 7–8:** no `dangerouslySetInnerHTML`; every `openUrl` call preceded by `safeExternalUrl`; no email/accountId/pubkey rendered; `notify({ link })` is in-app only; cancelled-flag listener; no direct hub `fetch`; publish button disabled.
 
 ---
+
+## Post-plan checklist (not tasks — verification/ops notes)
+
+- **Slice gates (run before the whole-branch review):** `cargo build --workspace` (clean, zero warnings), `cargo test -p athenaeum-core` (all suites; the new `collab`/`db::collab`/`api::collab` tests included), `cargo test -p athenaeum-core --test ts_contract` (no type drift after the Task-6 regen), `npx tsc --noEmit` (0 errors).
+- **Live verification — no deploy needed.** The collab hub already runs on `test-hub.artfrom.space` (slices 1+2), and debug builds default there. `npm run tauri dev`, sign in (Settings → Account), then:
+  1. Join a project on the portal → it appears on the Projects page within one poll (or immediately via Refresh).
+  2. Link a frame set → the Contribute gate table fills with per-frame verdicts and reasons.
+  3. Re-cluster a set whose center sits inside a project target → the `project-set-match` notification fires (suggestion only — nothing is auto-linked).
+  4. "Publish as project" on a frame set → the portal `/new` opens prefilled from the catalog; submit → the next poll auto-links that source set to the new project.
+  5. Coordinator "Manage on portal" opens `/p/<slug>/admin`; a member gets `/p/<slug>`.
+  - Web-mode smoke (the two-backend rule is only real if it runs): `cargo run -p athenaeum-web` + `npm run dev:web`, repeat steps 1–2.
+- **Nothing leaves the machine in this slice.** No publish, no announce, no P2P — the exchange is slice 4. The `collab_projects.snapshot_payload_b64` / `snapshot_signature_b64` columns are cached now precisely so slice 4's project `PeerAuthorizer` can re-verify offline.
+- **Slice-4 carry (unchanged from the slice-1/2 reviews):** apply every signature-verified snapshot (compare content, not version); node lists are ordered by raw pubkey bytes, never base64-ASCII; only hub-fetched snapshots may feed the authorizer; `supersedes` carries announcement ids.
+- **No version bump, no deploy, no merge in this slice** — app-only work on branch `0.5.0`; releases keep flowing from `0.4.0`.
+
+## Self-review notes (already applied)
+
+1. **Spec coverage (§4 / §7 / §13-slice-3):** verified snapshots ✓ (T1), membership cache + `project_links` ✓ (T2/T5), quality gate with all four preconditions + the metric registry + the arcsec conversion + the XPIXSZ-binning gotcha ✓ (T3 + Global Constraints), Projects page cards ✓ (T7), Contribute/Overview tabs ✓ (T8), project↔object linking with a ranked picker ✓ (T4/T8), join-first-shoot-later suggestion ✓ (T6 hook + T7 listener), "Publish as project" prefill + auto-link intent ✓ (T4/T5/T8), coordinator "Manage on portal" deep link ✓ (T8). **Deliberately NOT in slice 3** (per §13): publish/announce/receive/moderation and the Receive tab (all need the exchange → slice 4); member administration from the app (the portal owns it, §5a). The disabled "Publish N passing frames" button is the seam marker.
+2. **Type consistency:** each DTO is defined once (`ProjectCard`, `ProjectDetail`, `ProjectMemberView`, `LinkedSetView`, `LinkSuggestion`, `GateReport`, `FrameGateRow`, `ThresholdRuleView`, `ProjectSetMatch`, `ProjectSetMatchEvent`, `PortalNewProjectLink` — T3–T5), exported once (T6 `ts_export`), consumed under the same names in T7/T8. Command names are identical across Tauri, Axum, and the frontend: `list_collab_projects`, `refresh_collab_projects`, `get_collab_project_detail`, `evaluate_collab_gate`, `list_collab_link_suggestions`, `set_collab_link`, `create_collab_link_intent`. `frame_cal_status` exists in exactly one copy (extracted from `api/lights.rs` in T4).
+3. **Deliberate choices:** cache-first UI with a 5-minute poll (spec §2 cadence, not a live socket); TOFU pin of the hub's snapshot key per host (matches the hub's own "clients pin the pubkey" contract); per-project error isolation on refresh (one unreachable project never blanks the list); deep-link intents auto-link only against projects that are NEW in that refresh and within 0.1° (an intent can never re-link a set the user has since unlinked); the gate is a pure function (fully unit-testable with no hub, no DB); portal deep links are minted in core with `Url` + `query_pairs_mut` and re-validated in the UI by `safeExternalUrl` (defense in depth, S3).
