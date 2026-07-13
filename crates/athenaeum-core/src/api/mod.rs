@@ -21,6 +21,13 @@ pub mod compute;
 pub mod masters;
 #[cfg(feature = "render")]
 pub mod lights;
+// Stage-II collaboration orchestration (slice 3, Task 4): linking, ranked
+// suggestions, per-frame gate report, portal deep-link intents. Render-gated
+// because it imports `api::lights` internals (`frame_cal_status`); the
+// `crate::collab` core module and `db::collab` stay ungated. Keeping this gated
+// preserves `cargo build -p perseus --no-default-features`.
+#[cfg(feature = "render")]
+pub mod collab;
 
 #[derive(Debug)]
 pub enum ApiError {

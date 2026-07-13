@@ -211,6 +211,53 @@ fn status_str(s: LightCalStatus) -> &'static str {
     }
 }
 
+// ── Current calibration links + self-consistency status (shared with collab) ─
+
+/// The frame's current Dark/Flat/Bias calibration links, resolved from the
+/// catalog. Single resolution point shared by the readiness path
+/// ([`compute_readiness`]) and the Stage-II collab gate's self-consistency
+/// cal-status policy ([`frame_cal_status`]) — one copy of the links query, so
+/// the two callers can never drift.
+pub(crate) fn current_calibration_links(
+    conn: &Connection,
+    frame_id: i64,
+) -> anyhow::Result<Vec<CalibrationLink>> {
+    Ok(get_links_for_frame(conn, frame_id)?)
+}
+
+/// A light frame's derived calibration status under the **self-consistency
+/// policy** used by the collab gate (Task 4 brief): the "wanted" flat-norm
+/// flag/mode and advanced params are read back from the frame's OWN stored
+/// `light_calibrations` row (what was actually applied), never from settings or
+/// a dialog. Under this policy `derive_status`'s param-/norm-mismatch checks are
+/// vacuous by construction, while the staleness checks it cares about — link
+/// changes, master rebuilds, engine-version bumps — stay fully live. No tracking
+/// row → [`LightCalStatus::NotCalibrated`].
+pub(crate) fn frame_cal_status(
+    conn: &Connection,
+    frame_id: i64,
+) -> anyhow::Result<LightCalStatus> {
+    let Some(row) = get_light_calibration_for_frame(conn, frame_id)? else {
+        return Ok(LightCalStatus::NotCalibrated);
+    };
+    let links = current_calibration_links(conn, frame_id)?;
+    // The row stores what was applied; parse it back as the wanted values.
+    let flat_norm_mode = if row.flat_norm_mode == FlatNormMode::PixinsightTrimmed.as_wire_str() {
+        FlatNormMode::PixinsightTrimmed
+    } else {
+        FlatNormMode::CentralThird
+    };
+    let params = serde_json::from_str::<LightCalParams>(&row.cal_params).unwrap_or_default();
+    derive_status(
+        conn,
+        frame_id,
+        &links,
+        row.flat_norm_applied,
+        flat_norm_mode,
+        &params,
+    )
+}
+
 // ── Handler ─────────────────────────────────────────────────────────────────
 
 /// LIGHT members (frame_id, filename) of a frame set, mirroring the
@@ -252,7 +299,7 @@ fn compute_readiness(
     let mut raw_set_ids_to_build: Vec<i64> = Vec::new();
 
     for (frame_id, filename) in members {
-        let links = get_links_for_frame(conn, frame_id)?;
+        let links = current_calibration_links(conn, frame_id)?;
 
         let (dark, dark_raw) = classify(conn, &links, "Dark")?;
         let (flat, flat_raw) = classify(conn, &links, "Flat")?;
