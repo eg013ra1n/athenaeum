@@ -13,6 +13,7 @@ export default function ProjectDetail() {
   const { notify } = useNotifications();
   const [detail, setDetail] = useState<Detail | null>(null);
   const [gate, setGate] = useState<GateReport | null>(null);
+  const [gateError, setGateError] = useState(false);
   const [tab, setTab] = useState<'contribute' | 'overview'>('contribute');
   const [linkOpen, setLinkOpen] = useState(false);
   const [missing, setMissing] = useState(false);
@@ -20,18 +21,28 @@ export default function ProjectDetail() {
   const load = useCallback(async () => {
     if (!id) return;
     setMissing(false);
+    // Detail comes from the local cache of VERIFIED snapshots (core owns
+    // verification). Its failure means "not in my local list".
+    let d: Detail;
     try {
-      // The detail comes from the local cache of VERIFIED snapshots (core owns
-      // verification); the gate is evaluated locally over the linked sets.
-      const [d, g] = await Promise.all([
-        api.invoke<Detail>('get_collab_project_detail', { projectId: id }),
-        api.invoke<GateReport>('evaluate_collab_gate', { projectId: id }),
-      ]);
+      d = await api.invoke<Detail>('get_collab_project_detail', { projectId: id });
       setDetail(d);
-      setGate(g);
     } catch (err) {
       console.error('[projects] detail load failed:', err);
       setMissing(true);
+      return;
+    }
+    // The gate is evaluated locally over the linked sets, in its own try so a
+    // gate failure never masquerades as "project not found" — keep the detail
+    // rendered and surface an inline gate error instead.
+    setGateError(false);
+    try {
+      const g = await api.invoke<GateReport>('evaluate_collab_gate', { projectId: id });
+      setGate(g);
+    } catch (err) {
+      console.error('[projects] gate evaluation failed:', err);
+      setGate(null);
+      setGateError(true);
     }
   }, [id]);
 
@@ -130,7 +141,11 @@ export default function ProjectDetail() {
             </ul>
           )}
 
-          <GateTable gate={gate} />
+          {gateError ? (
+            <p className="text-sm text-error">Gate evaluation failed — see console.</p>
+          ) : (
+            <GateTable gate={gate} />
+          )}
 
           <button
             disabled
