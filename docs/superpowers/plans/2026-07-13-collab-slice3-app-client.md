@@ -16,10 +16,10 @@
 - **Never swallow errors** — log to `tracing` before returning; command wrappers wear `#[tracing::instrument(skip_all, err)]`.
 - **Design tokens only** in the frontend (`bg-surface`, `text-content-muted`, `bg-accent`, `text-error`, `border-border`, …); icons from `lucide-react`; notifications ONLY via `notify()` from `useNotifications()`; `api.listen` uses the cancelled-flag pattern (CLAUDE.md).
 - **Snapshot contract (BINDING, from the hub README):** clients apply EVERY signature-verified snapshot (compare content, not version — device add/revoke changes content without a version bump); node lists are ordered by raw pubkey bytes (never assume base64-ASCII order); ONLY hub-fetched snapshots are cached/used. Payload schema: `{schema: 1, projectId, membershipVersion, requireApproval, issuedAt, members: [{accountId, displayName, dataRole, coordinator, nodes: [<base64 32-byte pubkey>]}]}` — the exact signed bytes arrive base64-encoded in `payload` and MUST be verified before parsing.
-- **Gate metric registry (spec §4, exact keys/ops):** `fwhm_arcsec` (= `median_fwhm` px × pixel scale), `eccentricity` (= `median_eccentricity`), `stars_detected`, `not_trailed` (`possibly_trailed == 0`); SNR family `median_snr`/`snr_weight`/`frame_snr` supported generically. Ops: `"lte"`, `"gte"`, `"reject_if"` (value `true` → fail when the flag metric is set). Unknown metric key → rule skipped with `tracing::warn!` (registry is extensible).
+- **Gate metric registry (spec §4, exact keys/ops):** `fwhm_arcsec` (= `median_fwhm` px × pixel scale), `eccentricity` (= `median_eccentricity`), `stars_detected`, `not_trailed` (`FrameAnalysis.possibly_trailed` is a `bool` — fail when `true`); SNR family `median_snr`/`snr_weight`/`frame_snr` supported generically. Ops: `"lte"`, `"gte"`, `"reject_if"` (value `true` → fail when the flag metric is set). Unknown metric key → rule skipped with `tracing::warn!` (registry is extensible).
 - **Pixel scale:** prefer `plate_solves.pixel_scale_arcsec`; fallback = the atan form over `frames.xpixsz`/`focallen` **without multiplying by binning** (XPIXSZ is already the binned pixel size — mirror `plate_solve/hints.rs:158-176`). No scale → precondition failure "unknown pixel scale".
 - **Frame center precedence (on-target check):** `plate_solves.crval1/crval2` → `frames.ra/dec` → parsed `frames.objctra/objctdec` (`coordinates::parse_ra_sexagesimal`/`parse_dec_sexagesimal`); none → failure "no coordinates". Distance via `coordinates::angular_distance` (decimal degrees in/out).
-- **Tests:** core unit/integration tests use in-memory rusqlite (`Database`/`init_db`) + `wiremock` for hub HTTP. Gates for the slice: `cargo build --workspace`, `cargo test -p athenaeum-core`, `npx tsc --noEmit`.
+- **Tests:** core tests use an isolated throwaway rusqlite DB (`Connection::open_in_memory` for pure db-module tests; the api-layer `test_ctx()` fixture uses a TEMPDIR FILE so the pool's multiple connections see one database) + `wiremock` for hub HTTP. Gates for the slice: `cargo build --workspace`, `cargo test -p athenaeum-core`, `cargo build -p perseus --no-default-features` (the render-gate check), `npx tsc --noEmit`.
 - **Commit identity:** `eg013ra1n <vilen.sharifov@gmail.com>`, never a Claude author/co-author line.
 
 ---
@@ -28,7 +28,7 @@
 
 **Files:**
 - Create: `crates/athenaeum-core/src/collab/mod.rs`, `crates/athenaeum-core/src/collab/hub_client.rs`, `crates/athenaeum-core/src/collab/snapshot.rs`
-- Modify: `crates/athenaeum-core/src/lib.rs` (add `pub mod collab;` alphabetically), `crates/athenaeum-core/Cargo.toml` (add `ed25519-dalek = "2"`)
+- Modify: `crates/athenaeum-core/src/lib.rs` (add `pub mod collab;`), `crates/athenaeum-core/Cargo.toml` (add `ed25519-dalek = "3.0.0-rc.0"` — the exact version iroh 1.0.2 already carries transitively; `"2"` would resolve to a SECOND crate version and violate the consistent-dep-versions rule), `Cargo.lock` (refreshed by the first build)
 - Test: inline `#[cfg(test)]` in both new files (house style, like `account/client.rs`)
 
 **Interfaces:**
@@ -41,13 +41,13 @@
     - `pub async fn membership_snapshot(&self, token: &str, project_id: &str) -> Result<SignedSnapshotWire, AccountClientError>` — GET `/api/v1/projects/{id}/membership`.
     - `pub async fn thresholds(&self, token: &str, project_id: &str) -> Result<ThresholdsWire, AccountClientError>` — GET `/api/v1/projects/{id}/thresholds`.
   - Wire DTOs (all `#[derive(Debug, Clone, serde::Deserialize)]` + `#[serde(rename_all = "camelCase")]`): `MyProjectWire { id, slug, title, data_role, coordinator, require_approval, pending_announcements: i64 }`, `ProjectPageWire { project: ProjectWire, members: Vec<MemberWire> }`, `ProjectWire { id, slug, title, status, require_approval, target: TargetWire }`, `TargetWire { name, ra_deg, dec_deg, radius_deg }`, `MemberWire { display_name, data_role, coordinator }`, `SignedSnapshotWire { payload, signature, pubkey }`, `ThresholdsWire { current: Option<ThresholdSetWire> }`, `ThresholdSetWire { version: i32, rules: Vec<serde_json::Value> }`.
-  - `snapshot.rs`: `pub struct VerifiedSnapshot { pub membership_version: i64, pub require_approval: bool, pub members: Vec<SnapshotMember> }`, `pub struct SnapshotMember { pub account_id: String, pub display_name: String, pub data_role: String, pub coordinator: bool, pub nodes: Vec<String> }`, and `pub fn verify_and_parse(wire: &SignedSnapshotWire, pinned_pubkey_b64: &str) -> anyhow::Result<VerifiedSnapshot>` — decodes `payload`/`signature`/pinned key from base64, REQUIRES `wire.pubkey == pinned_pubkey_b64` (mismatch = hard error naming both), ed25519-verifies the signature over the EXACT payload bytes, THEN parses the payload JSON (schema must be `1`).
+  - `snapshot.rs`: `pub struct VerifiedSnapshot { pub membership_version: i64, pub require_approval: bool, pub members: Vec<SnapshotMember> }`, `pub struct SnapshotMember { pub account_id: String, pub display_name: String, pub data_role: String, pub coordinator: bool, pub nodes: Vec<String> }` — `SnapshotMember` derives **`Serialize` AND `Deserialize`** (Task 5 re-serializes `verified.members` into `members_json`), and `pub fn verify_and_parse(wire: &SignedSnapshotWire, pinned_pubkey_b64: &str) -> anyhow::Result<VerifiedSnapshot>` — decodes `payload`/`signature`/pinned key from base64, REQUIRES `wire.pubkey == pinned_pubkey_b64` (mismatch = hard error naming both), ed25519-verifies the signature over the EXACT payload bytes, THEN parses the payload JSON (schema must be `1`).
 
 - [ ] **Step 1: Cut the branch**
 
 ```bash
 cd /Volumes/BigMac/Users/astrobureau/Documents/Projects/athenaeum
-git checkout 0.4.0 && git pull && git checkout -b 0.5.0
+git checkout 0.4.0 && git checkout -b 0.5.0   # 0.4.0 has no upstream tracking — no pull
 ```
 
 - [ ] **Step 2: Write the failing tests**
@@ -214,9 +214,11 @@ Expected: compile error — `collab` module missing.
 `crates/athenaeum-core/Cargo.toml` — next to the `iroh` dependency add:
 
 ```toml
-# ed25519 verification of hub-signed membership snapshots (same version iroh
-# already carries transitively — no new build cost).
-ed25519-dalek = "2"
+# ed25519 verification of hub-signed membership snapshots. MUST match the
+# version iroh 1.0.2 already carries transitively (one crate version in the
+# tree — owner rule): check `grep -A1 'name = "ed25519-dalek"' Cargo.lock`
+# and pin exactly that (3.0.0-rc.0 at the time of writing).
+ed25519-dalek = "3.0.0-rc.0"
 ```
 
 `crates/athenaeum-core/src/collab/mod.rs`:
@@ -432,11 +434,13 @@ use anyhow::{bail, Context};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::hub_client::SignedSnapshotWire;
 
-#[derive(Debug, Clone, Deserialize)]
+// Serialize too: Task 5 re-serializes the verified member list into the
+// cache's members_json (camelCase preserved for the ProjectMemberView parse).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotMember {
     pub account_id: String,
@@ -516,7 +520,7 @@ pub fn verify_and_parse(
 }
 ```
 
-`crates/athenaeum-core/src/lib.rs`: add `pub mod collab;` in alphabetical position (after `pub mod clustering;`, before `pub mod coordinates;` — check the actual list).
+`crates/athenaeum-core/src/lib.rs`: add `pub mod collab;` to the module list (the file's ordering is NOT strictly alphabetical — place it near `clustering`/`coordinates` matching the file's existing grouping).
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -535,7 +539,7 @@ git commit -m "feat(collab): hub collab client + verified membership snapshots (
 ### Task 2: Catalog tables + `db/collab.rs`
 
 **Files:**
-- Modify: `crates/athenaeum-core/src/db/schema.rs` (three `CREATE TABLE IF NOT EXISTS` blocks at the end of `init_db`, following the house pattern; add the table names to the fresh-DB list comment at the top)
+- Modify: `crates/athenaeum-core/src/db/schema.rs` (three `CREATE TABLE IF NOT EXISTS` blocks at the end of `init_db`, following the house pattern)
 - Create: `crates/athenaeum-core/src/db/collab.rs`
 - Modify: `crates/athenaeum-core/src/db/mod.rs` (add `pub mod collab;` + re-exports if the module follows the house re-export pattern — mirror how `light_calibrations` is exposed)
 - Test: inline `#[cfg(test)]` in `db/collab.rs`
@@ -724,7 +728,15 @@ pub struct ProjectTarget { pub ra_deg: f64, pub dec_deg: f64, pub radius_deg: f6
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
-pub struct ThresholdRuleView { pub metric_key: String, pub op: String, pub value: serde_json::Value }
+pub struct ThresholdRuleView {
+    pub metric_key: String,
+    pub op: String,
+    /// The repo's ts-rs feature set has NO `serde-json-impl`, so
+    /// `serde_json::Value` cannot derive `TS` — override the emitted TS type
+    /// (the hub validates rule values to number|bool, so this is exact).
+    #[ts(type = "number | boolean")]
+    pub value: serde_json::Value,
+}
 
 pub struct GateFrameInput {
     pub frame_id: i64,
@@ -1036,13 +1048,16 @@ git commit -m "feat(collab): quality-gate engine — spec §4 preconditions + th
 
 **Files:**
 - Create: `crates/athenaeum-core/src/api/collab.rs`
-- Modify: `crates/athenaeum-core/src/api/mod.rs` (add `pub mod collab;`)
+- Modify: `crates/athenaeum-core/src/api/mod.rs` (add `#[cfg(feature = "render")] pub mod collab;` — `api::lights` is render-gated (`api/mod.rs:22-23`) and this module imports from it; an UNGATED `api::collab` breaks `cargo build -p perseus --no-default-features`, which is a routine gate in this repo. The `crate::collab` core module and `db::collab` stay ungated.)
 - Modify: `crates/athenaeum-core/src/api/lights.rs` (extract `frame_cal_status` — see below)
 - Test: inline `#[cfg(test)]` in `api/collab.rs`
 
 **Interfaces:**
 - Consumes: Task 2 `db::collab::*`, Task 3 `collab::gate::*`, `coordinates::{angular_distance, parse_ra_sexagesimal, parse_dec_sexagesimal}`, `db::analysis::get_frame_analyses_by_ids`, `api::db(ctx)`, `ApiError`.
-- **Refactor consumed from `api/lights.rs`:** its readiness path (`get_light_calibration_readiness`) already resolves, per frame, the current `CalibrationLink`s + the flat-norm/params settings and calls `db::light_calibrations::derive_status`. EXTRACT that per-frame resolution into `pub(crate) fn frame_cal_status(ctx: &ServiceContext, conn: &rusqlite::Connection, frame_id: i64) -> Result<LightCalStatus, ApiError>` inside `api/lights.rs`, make the readiness path call it (behavior-identical — the existing lights tests pin it), and import it from `api/collab.rs`. One copy of the status logic.
+- **Refactor consumed from `api/lights.rs` — read this carefully, it encodes a policy decision.** The readiness path (`get_light_calibration_readiness`, `api/lights.rs:239-337`) resolves the per-frame current `CalibrationLink`s from the catalog and calls `db::light_calibrations::derive_status` — but its `flat_norm`/`flat_norm_mode`/`params` "wanted" arguments are **caller-supplied by the frontend dialog on every path, NOT settings**. The collab gate has no dialog, so it uses the **self-consistency policy**: the "wanted" values are read back from the frame's OWN `light_calibrations` row (what was actually applied). Under this policy `derive_status` still catches everything the gate cares about — link changes, master rebuilds, engine-version bumps — while never marking a frame Stale merely because the user's dialog preferences differ from what they calibrated with. Concretely:
+  1. EXTRACT the per-frame current-links resolution from the readiness path into `pub(crate) fn current_calibration_links(conn: &rusqlite::Connection, frame_id: i64) -> anyhow::Result<Vec<CalibrationLink>>` in `api/lights.rs`; make readiness call it (behavior-identical — the existing lights tests pin it).
+  2. ADD `pub(crate) fn frame_cal_status(conn: &rusqlite::Connection, frame_id: i64) -> anyhow::Result<LightCalStatus>` in `api/lights.rs`: fetch the row via `db::light_calibrations::get_light_calibration_for_frame` (`None` → `Ok(LightCalStatus::NotCalibrated)`), then call `derive_status` with the current links from (1) and the ROW'S OWN stored flat-norm flag/mode/params as the wanted values (read the `LightCalRow` fields — the row stores what was applied; that is what makes `derive_status`'s param-mismatch checks vacuous by construction while keeping the staleness checks live).
+  Import only `frame_cal_status` from `api/collab.rs`. One copy of the links resolution, one of the status policy.
 - Produces (BINDING for Tasks 5–6; all response DTOs `#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]` + `#[serde(rename_all = "camelCase")]`):
   - `pub struct LinkSuggestion { pub frames_set_id: i64, pub name: Option<String>, pub light_count: i64, pub distance_deg: Option<f64>, pub within_radius: bool, pub already_linked: bool }`
   - `pub struct LinkedSetView { pub frames_set_id: i64, pub name: Option<String>, pub light_count: i64, pub distance_deg: Option<f64>, pub within_radius: bool }`
@@ -1056,7 +1071,7 @@ git commit -m "feat(collab): quality-gate engine — spec §4 preconditions + th
     - `pub fn evaluate_project_gate(ctx: &ServiceContext, project_id: &str) -> Result<GateReport, ApiError>` — union of LIGHT frames across linked sets (dedup by frame id), per-frame inputs assembled per the Global-Constraints precedence, `gate::evaluate_frame` per row.
     - `pub fn record_project_link_intent(ctx: &ServiceContext, frames_set_id: i64) -> Result<PortalNewProjectLink, ApiError>` — parses the set's `objctra`/`objctdec` (Invalid with reason when absent/unparseable), stores the intent, returns the portal URL `<hub_url>/new?object=<name>&ra=<deg>&dec=<deg>&radius=1.5` built with `reqwest::Url` query_pairs (never string-concat).
     - `pub fn find_matching_projects(conn: &rusqlite::Connection, ra_deg: f64, dec_deg: f64, frames_set_id: i64) -> anyhow::Result<Vec<ProjectSetMatch>>` — cached projects whose target radius contains the point AND that aren't already linked to this set (the Task-6 hook; plain `anyhow` so both thin layers can call it with just a conn).
-- Shared internal helpers this task also defines (used again by Task 5): `fn set_center(conn, frames_set_id) -> Option<(f64, f64)>` (parse `frames_set.objctra/objctdec` via the sexagesimal parsers, warn-and-None on parse failure), `fn light_count(conn, frames_set_id) -> Result<i64>` and `fn union_light_frames(conn, set_ids: &[i64]) -> Result<Vec<(i64, String)>>` — the `load_light_members` join from `api/lights.rs:220` generalized to `ino.frames_set_id IN (…)` with `SELECT DISTINCT`, plus `fn frame_gate_inputs(ctx, conn, frames: &[(i64, String)]) -> Result<Vec<GateFrameInput>>` which batch-reads: `plate_solves` (`SELECT frame_id, pixel_scale_arcsec, crval1, crval2 FROM plate_solves WHERE frame_id IN (…)`), `frames` (`SELECT id, ra, dec, objctra, objctdec, xpixsz, focallen FROM frames WHERE id IN (…)`), analyses via `get_frame_analyses_by_ids`, cal status via `frame_cal_status` — then resolves center precedence (crval → ra/dec → parsed strings) and scale precedence (plate-solve → `((xpixsz/1000)/focallen).atan().to_degrees()*3600` when both present and focallen > 0 — NO binning multiply).
+- Shared internal helpers this task also defines (used again by Task 5): `fn set_center(conn, frames_set_id) -> Option<(f64, f64)>` (parse `frames_set.objctra/objctdec` via the sexagesimal parsers, warn-and-None on parse failure), `fn light_count(conn, frames_set_id) -> Result<i64>` and `fn union_light_frames(conn, set_ids: &[i64]) -> Result<Vec<(i64, String)>>` — the `load_light_members` join from `api/lights.rs:220` generalized to `ino.frames_set_id IN (…)` with `SELECT DISTINCT`, plus `fn frame_gate_inputs(conn: &rusqlite::Connection, frames: &[(i64, String)]) -> anyhow::Result<Vec<GateFrameInput>>` (conn-only — the self-consistency cal-status policy needs no settings) which batch-reads: `plate_solves` (`SELECT frame_id, pixel_scale_arcsec, crval1, crval2 FROM plate_solves WHERE frame_id IN (…)`), `frames` (`SELECT id, ra, dec, objctra, objctdec, xpixsz, focallen FROM frames WHERE id IN (…)`), analyses via `get_frame_analyses_by_ids`, cal status via `frame_cal_status(conn, frame_id)` — then resolves center precedence (crval → ra/dec → parsed strings) and scale precedence (plate-solve → `((xpixsz/1000)/focallen).atan().to_degrees()*3600` when both present and focallen > 0 — NO binning multiply).
 
 - [ ] **Step 1: Write the failing tests** (inline; construct the test `ServiceContext` the same way the existing `api/sync.rs` tests do — search `crates/athenaeum-core/src/api/sync.rs` for its `#[cfg(test)]` ServiceContext/Database construction and reuse that exact fixture shape):
 
@@ -1181,7 +1196,7 @@ mod tests {
 
     #[test]
     fn gate_report_covers_union_of_linked_sets() {
-        let ctx = test_ctx(); // ServiceContext fixture — see the note below
+        let (_tmp, ctx) = test_ctx(); // (TempDir, ServiceContext) — see the note below
         let (set_id, frames) = {
             let conn = crate::api::db(&ctx).unwrap().conn();
             cached_project(&conn);
@@ -1223,7 +1238,7 @@ mod tests {
 
     #[test]
     fn suggestions_rank_by_distance_and_flag_linked() {
-        let ctx = test_ctx();
+        let (_tmp, ctx) = test_ctx();
         let (near, far) = {
             let conn = crate::api::db(&ctx).unwrap().conn();
             cached_project(&conn);
@@ -1251,7 +1266,7 @@ mod tests {
 
     #[test]
     fn intent_builds_portal_url_and_persists() {
-        let ctx = test_ctx();
+        let (_tmp, ctx) = test_ctx();
         let (with_center, no_center) = {
             let conn = crate::api::db(&ctx).unwrap().conn();
             cached_project(&conn);
@@ -1283,7 +1298,7 @@ mod tests {
 
     #[test]
     fn find_matching_projects_excludes_linked() {
-        let ctx = test_ctx();
+        let (_tmp, ctx) = test_ctx();
         let conn = crate::api::db(&ctx).unwrap().conn();
         cached_project(&conn);
         let (set_id, _) = seed_set(&conn, "M101 Set", "14:03:12", "+54:21:00", 210.8, 54.35, 1);
@@ -1302,7 +1317,7 @@ mod tests {
 }
 ```
 
-**`test_ctx()`** — the `ServiceContext` fixture. Do NOT invent one: `crates/athenaeum-core/src/api/sync.rs` already builds a `ServiceContext` over an in-memory `Database` in its `#[cfg(test)]` module. Copy that helper verbatim into this test module (or, if it is already `pub(crate)` in a shared test-support module, import it) and name it `test_ctx()`. It must give a context whose `api::db(&ctx)` returns a `Database` with `init_db` applied and whose `settings` resolve `ACCOUNT_HUB_URL` to the default (the intent test asserts the URL starts with `http`).
+**`test_ctx()`** — the `ServiceContext` fixture. Do NOT invent one: copy the helper from `crates/athenaeum-core/src/api/sync.rs:961-1005` (`fn test_ctx() -> (tempfile::TempDir, ServiceContext)` — a TEMPDIR-FILE-backed `Database`, not `:memory:`; that matters because the pool hands out multiple connections). Keep the tuple return and bind `let (_tmp, ctx) = test_ctx();` so the tempdir lives for the test's duration. It gives a context whose `api::db(&ctx)` returns a `Database` with `init_db` applied and whose `settings` resolve `ACCOUNT_HUB_URL` to the default (the intent test asserts the URL starts with `http`).
 
 **Note on `conn` lifetimes:** `crate::api::db(&ctx)?.conn()` hands out a pooled connection — take it in a short scope (as the tests above do with `{ … }` blocks) so the `api::*` calls that open their own connection do not deadlock on a single-connection pool.
 
@@ -1363,7 +1378,7 @@ pub fn evaluate_project_gate(ctx: &ServiceContext, project_id: &str) -> Result<G
 
     let set_ids = crate::db::collab::linked_set_ids(&conn, project_id).map_err(internal)?;
     let frames = union_light_frames(&conn, &set_ids).map_err(internal)?;
-    let inputs = frame_gate_inputs(ctx, &conn, &frames)?;
+    let inputs = frame_gate_inputs(&conn, &frames).map_err(internal)?;
 
     let rows: Vec<_> = inputs
         .iter()
@@ -1505,7 +1520,7 @@ git commit -m "feat(collab): linking + ranked suggestions + gate report + portal
     }
 ```
 
-**Note to the implementer:** the comment block above is the test's REQUIRED behavior — write it as real code in this step (the mocks and the signing fixture are fully specified by Task 1's tests; the ServiceContext/token fixture comes from the account api tests — search `crates/athenaeum-core/src/api/account.rs` `#[cfg(test)]` for `TokenStore::file_only` + `token_projects` usage, and mirror it).
+**Note to the implementer:** the comment block above is the test's REQUIRED behavior — write it as real code in this step (the mocks and the signing fixture are fully specified by Task 1's tests; the ServiceContext fixture is `test_ctx()` from Task 4; store the device token with `api::account::store_token_for_test` (`api/account.rs:366`, `#[cfg(test)] pub(crate)` — it writes through the same `resolve_config`/token-store path that `hub_credentials` reads)).
 
 - [ ] **Step 2: Run to verify failure** — `cargo test -p athenaeum-core api::collab::tests::refresh 2>&1 | tail -3` → compile error (`refresh_projects` missing).
 
@@ -1560,7 +1575,7 @@ pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, 
             {
                 crate::db::collab::link_set(&conn, project_id, set_id).map_err(internal)?;
                 crate::db::collab::delete_link_intent(&conn, intent_id).map_err(internal)?;
-                tracing::info!(project_id, frames_set_id = set_id, "auto-linked source set from portal deep-link intent");
+                tracing::info!(%project_id, frames_set_id = set_id, "auto-linked source set from portal deep-link intent");
             }
         }
     }
@@ -1603,7 +1618,7 @@ git commit -m "feat(collab): poll refresh with TOFU-pinned verified snapshots, c
 | `set_collab_link` | `projectId: String, framesSetId: i64, linked: bool` | `()` (calls link/unlink) |
 | `create_collab_link_intent` | `framesSetId: i64` | `PortalNewProjectLink` |
 
-- Discrete event `project-set-match` with payload `ProjectSetMatchEvent { frames_set_id: i64, set_name: Option<String>, matches: Vec<ProjectSetMatch> }` (serde camelCase + ts_rs, defined in `api/collab.rs`), emitted AFTER `auto_generate_frame_sets` persists each new set whose center matches a cached project (via `api::collab::find_matching_projects`) — in BOTH thin layers (each already holds the new set's metadata + an emitter; the Tauri layer uses `TauriProgressEmitter`, the web layer `SseProgressEmitter`, both via `athenaeum_core::events::emit_event`).
+- Discrete event `project-set-match` with payload `ProjectSetMatchEvent { frames_set_id: i64, set_name: Option<String>, matches: Vec<ProjectSetMatch> }` (serde camelCase + ts_rs, defined in `api/collab.rs`), emitted AFTER `auto_generate_frame_sets` persists each new set whose center matches a cached project (via `api::collab::find_matching_projects`) — in BOTH thin layers. **Neither layer currently holds an emitter in `auto_generate_frame_sets`** — construct one: the Tauri command gains an `app: tauri::AppHandle` parameter and builds `TauriProgressEmitter(app.clone())` (pattern: `commands/files.rs:234`; the struct is `TauriProgressEmitter(pub AppHandle)` at `tauri_events.rs:5`); the web mirror builds `SseProgressEmitter::new(state.event_tx.clone())` (pattern: `routes/masters.rs:118`). Both then call `athenaeum_core::events::emit_event(&emitter, "project-set-match", &event)`.
 
 - [ ] **Step 1: Tauri wrappers** (`commands/collab.rs`, house style — thin, `#[tracing::instrument(skip_all, err)]`):
 
@@ -1614,7 +1629,7 @@ use athenaeum_core::api::collab as api;
 use athenaeum_core::api::collab::{GateReport, LinkSuggestion, PortalNewProjectLink, ProjectCard, ProjectDetail};
 use tauri::State;
 
-use crate::AppState;
+use super::AppState; // AppState lives in commands/mod.rs and is NOT re-exported at the crate root
 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
@@ -1692,7 +1707,8 @@ use axum::extract::State;
 use axum::Json;
 use serde::Deserialize;
 
-use crate::routes::{api_err, AppState};
+use crate::routes::api_err;
+use crate::WebAppState; // the web crate's state type — there is no `AppState` in athenaeum-web
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1715,18 +1731,18 @@ pub struct IntentArgs {
 }
 
 #[tracing::instrument(skip_all, err(Debug))]
-pub async fn list_collab_projects(State(state): State<AppState>) -> Result<Json<Vec<api::ProjectCard>>, (axum::http::StatusCode, String)> {
+pub async fn list_collab_projects(State(state): State<WebAppState>) -> Result<Json<Vec<api::ProjectCard>>, (axum::http::StatusCode, String)> {
     api::list_projects(&state.ctx).map(Json).map_err(api_err)
 }
 
 #[tracing::instrument(skip_all, err(Debug))]
-pub async fn refresh_collab_projects(State(state): State<AppState>) -> Result<Json<Vec<api::ProjectCard>>, (axum::http::StatusCode, String)> {
+pub async fn refresh_collab_projects(State(state): State<WebAppState>) -> Result<Json<Vec<api::ProjectCard>>, (axum::http::StatusCode, String)> {
     api::refresh_projects(&state.ctx).await.map(Json).map_err(api_err)
 }
 
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_collab_project_detail(
-    State(state): State<AppState>,
+    State(state): State<WebAppState>,
     Json(args): Json<ProjectIdArgs>,
 ) -> Result<Json<api::ProjectDetail>, (axum::http::StatusCode, String)> {
     api::get_project_detail(&state.ctx, &args.project_id).map(Json).map_err(api_err)
@@ -1734,7 +1750,7 @@ pub async fn get_collab_project_detail(
 
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn evaluate_collab_gate(
-    State(state): State<AppState>,
+    State(state): State<WebAppState>,
     Json(args): Json<ProjectIdArgs>,
 ) -> Result<Json<api::GateReport>, (axum::http::StatusCode, String)> {
     api::evaluate_project_gate(&state.ctx, &args.project_id).map(Json).map_err(api_err)
@@ -1742,7 +1758,7 @@ pub async fn evaluate_collab_gate(
 
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn list_collab_link_suggestions(
-    State(state): State<AppState>,
+    State(state): State<WebAppState>,
     Json(args): Json<ProjectIdArgs>,
 ) -> Result<Json<Vec<api::LinkSuggestion>>, (axum::http::StatusCode, String)> {
     api::list_link_suggestions(&state.ctx, &args.project_id).map(Json).map_err(api_err)
@@ -1750,7 +1766,7 @@ pub async fn list_collab_link_suggestions(
 
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn set_collab_link(
-    State(state): State<AppState>,
+    State(state): State<WebAppState>,
     Json(args): Json<SetLinkArgs>,
 ) -> Result<Json<()>, (axum::http::StatusCode, String)> {
     let r = if args.linked {
@@ -1763,7 +1779,7 @@ pub async fn set_collab_link(
 
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn create_collab_link_intent(
-    State(state): State<AppState>,
+    State(state): State<WebAppState>,
     Json(args): Json<IntentArgs>,
 ) -> Result<Json<api::PortalNewProjectLink>, (axum::http::StatusCode, String)> {
     api::record_project_link_intent(&state.ctx, args.frames_set_id).map(Json).map_err(api_err)
@@ -2041,7 +2057,7 @@ git commit -m "feat(ui): Projects page — cards, cached-first refresh, project 
 ### Task 8: Frontend — Project detail (Contribute + Overview tabs), linking UI, "Publish as project" entry
 
 **Files:**
-- Create: `src/pages/ProjectDetail.tsx`, `src/components/collab/LinkObjectDialog.tsx`
+- Create: `src/utils/externalUrl.ts`, `src/pages/ProjectDetail.tsx`, `src/components/collab/LinkObjectDialog.tsx`
 - Modify: `src/App.tsx` (`projects/:id` route), `src/pages/FrameSetDetail.tsx` (a "Publish as project" action)
 
 **Interfaces:**
@@ -2597,7 +2613,7 @@ export function safeExternalUrl(raw: string): string | null {
 
 ## Post-plan checklist (not tasks — verification/ops notes)
 
-- **Slice gates (run before the whole-branch review):** `cargo build --workspace` (clean, zero warnings), `cargo test -p athenaeum-core` (all suites; the new `collab`/`db::collab`/`api::collab` tests included), `cargo test -p athenaeum-core --test ts_contract` (no type drift after the Task-6 regen), `npx tsc --noEmit` (0 errors).
+- **Slice gates (run before the whole-branch review):** `cargo build --workspace` (clean, zero warnings), `cargo test -p athenaeum-core` (all suites; the new `collab`/`db::collab`/`api::collab` tests included), **`cargo build -p perseus --no-default-features`** (proves the `#[cfg(feature = "render")]` gate on `api::collab` holds), `cargo test -p athenaeum-core --test ts_contract` (no type drift after the Task-6 regen), `npx tsc --noEmit` (0 errors).
 - **Live verification — no deploy needed.** The collab hub already runs on `test-hub.artfrom.space` (slices 1+2), and debug builds default there. `npm run tauri dev`, sign in (Settings → Account), then:
   1. Join a project on the portal → it appears on the Projects page within one poll (or immediately via Refresh).
   2. Link a frame set → the Contribute gate table fills with per-frame verdicts and reasons.
@@ -2608,9 +2624,10 @@ export function safeExternalUrl(raw: string): string | null {
 - **Nothing leaves the machine in this slice.** No publish, no announce, no P2P — the exchange is slice 4. The `collab_projects.snapshot_payload_b64` / `snapshot_signature_b64` columns are cached now precisely so slice 4's project `PeerAuthorizer` can re-verify offline.
 - **Slice-4 carry (unchanged from the slice-1/2 reviews):** apply every signature-verified snapshot (compare content, not version); node lists are ordered by raw pubkey bytes, never base64-ASCII; only hub-fetched snapshots may feed the authorizer; `supersedes` carries announcement ids.
 - **No version bump, no deploy, no merge in this slice** — app-only work on branch `0.5.0`; releases keep flowing from `0.4.0`.
+- **Poll seam (deliberate):** the 5-minute refresh interval lives in `useProjects` and runs only while the Projects page is mounted. Slice 4's project `PeerAuthorizer` needs an APP-LEVEL poll (serving decisions can't wait for the user to open a page) — plan that promotion there; the cache/refresh split in `api::collab` already supports it.
 
 ## Self-review notes (already applied)
 
-1. **Spec coverage (§4 / §7 / §13-slice-3):** verified snapshots ✓ (T1), membership cache + `project_links` ✓ (T2/T5), quality gate with all four preconditions + the metric registry + the arcsec conversion + the XPIXSZ-binning gotcha ✓ (T3 + Global Constraints), Projects page cards ✓ (T7), Contribute/Overview tabs ✓ (T8), project↔object linking with a ranked picker ✓ (T4/T8), join-first-shoot-later suggestion ✓ (T6 hook + T7 listener), "Publish as project" prefill + auto-link intent ✓ (T4/T5/T8), coordinator "Manage on portal" deep link ✓ (T8). **Deliberately NOT in slice 3** (per §13): publish/announce/receive/moderation and the Receive tab (all need the exchange → slice 4); member administration from the app (the portal owns it, §5a). The disabled "Publish N passing frames" button is the seam marker.
-2. **Type consistency:** each DTO is defined once (`ProjectCard`, `ProjectDetail`, `ProjectMemberView`, `LinkedSetView`, `LinkSuggestion`, `GateReport`, `FrameGateRow`, `ThresholdRuleView`, `ProjectSetMatch`, `ProjectSetMatchEvent`, `PortalNewProjectLink` — T3–T5), exported once (T6 `ts_export`), consumed under the same names in T7/T8. Command names are identical across Tauri, Axum, and the frontend: `list_collab_projects`, `refresh_collab_projects`, `get_collab_project_detail`, `evaluate_collab_gate`, `list_collab_link_suggestions`, `set_collab_link`, `create_collab_link_intent`. `frame_cal_status` exists in exactly one copy (extracted from `api/lights.rs` in T4).
+1. **Spec coverage (§4 / §7 / §13-slice-3):** verified snapshots ✓ (T1), membership cache + `project_links` ✓ (T2/T5), quality gate with all four preconditions + the metric registry + the arcsec conversion + the XPIXSZ-binning gotcha ✓ (T3 + Global Constraints), Projects page cards ✓ (T7), Contribute/Overview tabs ✓ (T8), project↔object linking with a ranked picker ✓ (T4/T8), join-first-shoot-later suggestion ✓ (T6 hook + T7 listener), "Publish as project" prefill + auto-link intent ✓ (T4/T5/T8), coordinator "Manage on portal" deep link ✓ (T8). **Deliberately NOT in slice 3** (per §13): publish/announce/receive/moderation and the Receive tab (all need the exchange → slice 4); member administration from the app (the portal owns it, §5a). The disabled "Publish N passing frames" button is the seam marker. **Two deliberate §7 trims:** the link picker ranks by distance only (the spec's OBJECT-name-similarity secondary signal is dropped — distance alone is decisive for real captures, and the name is displayed for the human to judge); the join-first-shoot-later hook fires on set CREATION (`auto_generate_frame_sets`) only, not on later set growth via merge/find-new-images (a set that grows into a target is rare and self-corrects on the next full re-cluster) — revisit both only if real usage asks.
+2. **Type consistency:** each DTO is defined once (`ProjectCard`, `ProjectDetail`, `ProjectMemberView`, `LinkedSetView`, `LinkSuggestion`, `GateReport`, `FrameGateRow`, `ThresholdRuleView`, `ProjectSetMatch`, `ProjectSetMatchEvent`, `PortalNewProjectLink` — T3–T5), exported once (T6 `ts_export`), consumed under the same names in T7/T8. Command names are identical across Tauri, Axum, and the frontend: `list_collab_projects`, `refresh_collab_projects`, `get_collab_project_detail`, `evaluate_collab_gate`, `list_collab_link_suggestions`, `set_collab_link`, `create_collab_link_intent`. `current_calibration_links` + `frame_cal_status(conn, frame_id)` exist in exactly one copy each (extracted/added in `api/lights.rs`, T4), and `frame_cal_status` encodes the self-consistency policy (wanted = the row's own stored flat-norm/params) explicitly.
 3. **Deliberate choices:** cache-first UI with a 5-minute poll (spec §2 cadence, not a live socket); TOFU pin of the hub's snapshot key per host (matches the hub's own "clients pin the pubkey" contract); per-project error isolation on refresh (one unreachable project never blanks the list); deep-link intents auto-link only against projects that are NEW in that refresh and within 0.1° (an intent can never re-link a set the user has since unlinked); the gate is a pure function (fully unit-testable with no hub, no DB); portal deep links are minted in core with `Url` + `query_pairs_mut` and re-validated in the UI by `safeExternalUrl` (defense in depth, S3).
