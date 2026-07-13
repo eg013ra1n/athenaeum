@@ -87,6 +87,7 @@ export function useProjects() {
               tone: 'warning',
               hasErrors: true,
               link,
+              dedupeKey: `pkg-dlfail-${change.packageId}`,
             });
             break;
           default:
