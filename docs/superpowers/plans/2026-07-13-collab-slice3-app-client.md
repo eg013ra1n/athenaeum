@@ -6,7 +6,7 @@
 
 **Architecture:** New core module `crates/athenaeum-core/src/collab/` (`hub_client.rs` — reqwest client for the collab endpoints, mirroring `account::client::HubClient`'s shape and error mapping; `snapshot.rs` — ed25519 verify + parse of the hub-signed membership snapshot with TOFU-pinned hub pubkey; `gate.rs` — the pure quality-gate engine). New catalog tables (`collab_projects` poll cache incl. the raw signed snapshot for slice-4's PeerAuthorizer, `project_links`, `project_link_intents`) in `db/schema.rs` + `db/collab.rs`. Orchestration in `api/collab.rs` (refresh/list/detail/link/suggest/gate) behind thin Tauri + Axum wrappers (both backends in the same task — house law). Frontend: `Projects` page + `ProjectDetail`, `useProjects` hook, `project` notification kind, a "Publish as project" entry on `FrameSetDetail` deep-linking to the portal's `/new` with a recorded auto-link intent.
 
-**Tech Stack:** Rust (rusqlite, reqwest 0.12, wiremock 0.6 dev, ed25519-dalek 2 — new direct dep, already in-tree via iroh), React 18 + TS (generated types via ts-rs), Tailwind design tokens.
+**Tech Stack:** Rust (rusqlite, reqwest 0.12, wiremock 0.6 dev, ed25519-dalek 3.0.0-rc.0 — new direct dep, exact version already in-tree via iroh), React 18 + TS (generated types via ts-rs), Tailwind design tokens.
 
 ## Global Constraints
 
