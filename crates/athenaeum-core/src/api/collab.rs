@@ -252,10 +252,12 @@ fn frame_gate_inputs(
         let frow = rows_by_id.get(frame_id);
 
         // Scale precedence: plate-solve pixel scale, else the header fallback
-        // atan(xpixsz_mm / focallen_mm) when both present and focallen > 0.
+        // atan(xpixsz_mm / focallen_mm) when both present and positive
+        // (mirrors plate_solve/hints.rs — a 0.0 xpixsz is a placeholder, not
+        // a real pixel size, and must yield "unknown scale", not 0.0).
         let pixel_scale_arcsec = solve.map(|(s, _, _)| *s).or_else(|| {
             frow.and_then(|f| match (f.xpixsz, f.focallen) {
-                (Some(xpixsz), Some(focallen)) if focallen > 0.0 => {
+                (Some(xpixsz), Some(focallen)) if focallen > 0.0 && xpixsz > 0.0 => {
                     Some(((xpixsz / 1000.0) / focallen).atan().to_degrees() * 3600.0)
                 }
                 _ => None,
