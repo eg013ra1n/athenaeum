@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A project member can publish gate-passing calibrated frames (announce to the hub + push-seed the first replica), a receive-role member can download any announced package from any online holder with per-holder Offer/Want dedup, received contributions land in the collaboration root + `project_contributions` (never `frames`), and a coordinator moderates pending contributions in the app. Spec §2/§2a/§3/§7/§8 + build-order §13 slice 4.
+**Goal:** A project member can publish gate-passing calibrated frames (announce to the hub + push-seed the first replica), a receive-role member can download any announced package from any online holder (sequential per-holder request-to-serve; full serve + ingest-level dedup — see Д2), received contributions land in the collaboration root + `project_contributions` (never `frames`), and a coordinator moderates pending contributions in the app. Spec §2/§2a/§3/§7/§8 + build-order §13 slice 4.
 
-**Architecture:** Everything assembles from shipped Stage-I/mesh primitives (per the 2026-07-12 exchange review): the per-peer `SyncEngine` map drives both push-seed and holder serves; Offer/Want (Plan 3) is the per-holder dedup; landing reuses the Plan-2B mirror shape; the scanner gains an `ATH_PRJ` sibling of the light-cal reconcile-adopt. New pieces: two appended `Msg` variants (`ProjectAnnounce`, `ProjectRequest`), an appended `ManifestRecord.project` stamp, a project-scoped authorizer fed by the cached verified snapshots (`collab/authz.rs`, ungated), byte-level `ATH_PRJ` FITS stamping (`fits_writer::stamp_extra_card`, no pixel decode), two catalog tables (`project_packages`, `project_contributions`), publish/download/moderation orchestration in `api/collab.rs` (render-gated) with the receive/serve path ungated, and the Contribute/Receive/Moderation UI. Manifest authenticity vs a malicious holder is anchored by `manifestXxh3` inside the hub announcement's `aggregateStats` (package-level — the hub never sees frame data).
+**Architecture:** Everything assembles from shipped Stage-I/mesh primitives (per the 2026-07-12 exchange review): the per-peer `SyncEngine` map drives both push-seed and holder serves (Offer/Want is deliberately skipped for project packages — the Д2 manifest anchor requires byte-identical manifests; dedup happens at ingest via Duplicate receipts); landing reuses the Plan-2B mirror shape; the scanner gains an `ATH_PRJ` sibling of the light-cal reconcile-adopt. New pieces: two appended `Msg` variants (`ProjectAnnounce`, `ProjectRequest`), an appended `ManifestRecord.project` stamp, a project-scoped authorizer fed by the cached verified snapshots (`collab/authz.rs`, ungated), byte-level `ATH_PRJ` FITS stamping (`fits_writer::stamp_extra_card`, no pixel decode), two catalog tables (`project_packages`, `project_contributions`), publish/download/moderation orchestration in `api/collab.rs` (render-gated) with the receive/serve path ungated, and the Contribute/Receive/Moderation UI. Manifest authenticity vs a malicious holder is anchored by `manifestXxh3` inside the hub announcement's `aggregateStats` (package-level — the hub never sees frame data).
 
 **Tech Stack:** Rust (rusqlite, postcard wire, iroh + iroh-blobs via the existing `sharing` layer, wiremock + LoopbackTransport for tests), React 18 + TS (ts-rs types), Tailwind design tokens.
 
@@ -25,8 +25,8 @@
 
 ## Design decisions (Д1–Д10 — deltas/refinements vs the spec text, for owner review)
 
-- **Д1 — Swarm fetch = "request-to-serve".** The engine is sender-driven, so a receiver pulls by ASKING a holder to push: new `Msg::ProjectRequest{project_id, package_id}`. The holder authorizes the requester (project authorizer + pending→coordinator-only), reconstructs the package dir from its local copy, and enqueues an explicit-target send to the requester through the existing per-peer engine — Offer/Want, receipts, history, `{new,duplicate}` counts all reused verbatim. Sequential per-holder: the requester tries hub-listed holders one at a time with a delivery timeout. (Spec §2's "fetch from any holder", expressed in the shipped engine's grain.)
-- **Д2 — Manifest authenticity anchor.** The hub announcement's free-form `aggregateStats` carries `manifestXxh3` (xxh3-64 of the exact `manifest.ndjson` bytes). A receiver verifies the fetched manifest against it BEFORE trusting any record — closing the "malicious holder re-authors manifest + content consistently" hole that per-frame xxh3 alone cannot (package-level datum, so the BRD "no frame-level metadata on hub" amendment holds). Every holder must therefore serve the byte-identical original manifest — `project_packages.manifest_ndjson` retains it.
+- **Д1 — Swarm fetch = "request-to-serve".** The engine is sender-driven, so a receiver pulls by ASKING a holder to push: new `Msg::ProjectRequest{project_id, package_id}`. The holder authorizes the requester (project authorizer + pending→coordinator-only), reconstructs the package dir from its local copy, and enqueues an explicit-target send to the requester through the existing per-peer engine — receipts, history, confirm semantics reused verbatim. Sequential per-holder: the requester tries hub-listed holders one at a time with a delivery timeout. **Identity note (audit B1):** the engine mints a FRESH wire `PackageId` per serve (`engine.rs:1333-1335`), so the HUB package id travels explicitly — in `ProjectStamp.package_id` and on the `ProjectAnnounce` wire variant. Receivers key `project_packages` rows on the hub id; acks/fetches keep using the wire `announce.package_id` (that's what the serving engine correlates on, `engine.rs:944`).
+- **Д2 — Manifest authenticity anchor.** The hub announcement's free-form `aggregateStats` carries `manifestXxh3` (xxh3-64 of the exact `manifest.ndjson` bytes). A receiver verifies the fetched manifest against it BEFORE trusting any record — closing the "malicious holder re-authors manifest + content consistently" hole that per-frame xxh3 alone cannot (package-level datum, so the BRD "no frame-level metadata on hub" amendment holds). Every holder must therefore serve the byte-identical original manifest — `project_packages.manifest_ndjson` retains it. **Consequence (audit B2): project serves are ALWAYS full** — the engine skips the Offer/Want negotiation for project packages (`want = None`), because a negotiated subset re-serializes a FILTERED manifest (`import_subset_collection`) whose bytes can never match the anchor. Transfer-level dedup for collab is deferred to the parallel-multi-source follow-up (same fetch-scheduling layer); v1 dedup happens at ingest — identical `(uuid, xxh3)` re-deliveries produce `Duplicate` receipts and land nothing.
 - **Д3 — `ATH_PRJ` stamping is a byte-level header edit, not a re-encode.** Our calibrated artifacts are simple single-HDU FITS written by `write_fits_f32`. `fits_writer::stamp_extra_card` copies the file inserting one 80-byte card before `END` (using the last header block's padding slot when free, else growing the header by one 2880-byte block and streaming the data after it). No pixel decode → ungated, fast, deterministic. The LOCAL artifact stays unstamped; the stamped copy is the published payload.
 - **Д4 — Publications are retained, not cleaned.** The publish package dir survives under `<sync_dir>/collab_pub/<package_id>/` (exempt from engine cleanup via a no-op cleanup sink) so the contributor can re-serve as a holder and re-seed. Deleted on reject or when its announcement is superseded by a later own-publication.
 - **Д5 — Publisher slug is hub-anchored.** Landing is `<CollabRoot>/<project-slug>/<publisher-slug>/<rel_path>` where publisher-slug = `sanitize_slug(announcement.publisherDisplayName)` from the HUB list (per-package), never from the package or the serving peer (the server may be a third-party holder). Project-slug = `sanitize_slug(collab_projects.slug)`.
@@ -34,7 +34,7 @@
 - **Д7 — Connect-time intercept goes live.** The mesh left iroh's connect-intercept unused (finding F5, same-account residual). Cross-account it becomes load-bearing: the receiver transport now rejects connections from node ids that are neither account devices nor members of any cached project snapshot (composite check, fail-closed on empty). Per-package/pending granularity stays at the serve/request layer; residual (a published-capable member fetching a pending blob by hash) is documented — non-coordinators never learn pending root hashes from the hub.
 - **Д8 — Push-seed target selection.** `require_approval` pending → coordinator's nodes only; else the snapshot's send_receive members' nodes (own nodes excluded), first candidate enqueued. The engine's own retry/backoff IS the announce-and-wait fallback (no separate mechanism); UX derives from outbound state (`queued/announced` = "waiting for a holder", `confirmed` = "replicated — safe to go offline").
 - **Д9 — Supersede computation.** Publishing frames whose `frame_uuid`s appear in my own earlier non-rejected announcements for this project → those announcement ids go into `supersedes`. On success, local rows for the superseded packages are marked superseded (kept for history). Receivers resolve uuid-supersede at ingest: same `(project, frame_uuid, publisher)` replaces the older contribution row + landed file.
-- **Д10 — Dedup responder learns project frames.** Offer/Want membership answers from `files.content_hash` OR `project_contributions.sampling_hash` (sampling hash computed at landing), so re-serves and cross-holder resumes dedup correctly even though contributions never enter `files`.
+- **Д10 — (superseded by the Д2 consequence, audit B2).** Originally: teach the dedup responder `project_contributions` sampling hashes. Dropped — project serves skip Offer/Want entirely (full serve + ingest-level `Duplicate` receipts), so no responder change, no `sampling_hash` column. Revisit together with parallel multi-source fetch.
 
 ## Task overview (12)
 
@@ -42,8 +42,8 @@
 2. Hub client extension: announcements/decide/have wire (`collab/hub_client.rs` + DTOs + wiremock).
 3. Tables + db layer (ungated): `project_packages`, `project_contributions`, `db/collab_exchange.rs`.
 4. Project authorizer + transport intercept (ungated): `collab/authz.rs`, composite connect gate, receiver announce gate.
-5. Project ingest (ungated): manifest-anchor verify, landing, contribution rows, receipts/ack/history + project dimension, sampling hashes, uuid-supersede replace.
-6. Dedup responder extension + serve reconstruction (ungated): composite responder, `serve_dir` rebuild from landed files + retained manifest, request-to-serve holder handler.
+5. Project ingest (ungated): manifest-anchor verify, landing, contribution rows, receipts/ack/history + project dimension, uuid-supersede replace.
+6. Serve reconstruction + request-to-serve (ungated): `serve_dir` rebuild from landed files + retained manifest, holder handler, collab sender map (dedicated blob store, retain-aware cleanup sink).
 7. Publish build + orchestration (render-gated `api/collab.rs`): stamped package build, aggregate stats + `manifestXxh3`, hub announce, supersedes, push-seed, publication rows.
 8. Download orchestration + announcements poll: sequential holder loop, package-state sync into `project_packages`, have-report, notifications data.
 9. Moderation orchestration (render-gated): pending review data, approve/reject + review-copy cleanup on reject.
@@ -68,10 +68,10 @@
 **Interfaces:**
 - Consumes: `Msg` postcard enum (`proto.rs:66`), `TransportEvent` (`types.rs:65`), `SharingTransport` (`sharing/mod.rs:39`), iroh accept loop (`iroh/mod.rs:611`), loopback mailboxes, `ManifestRecord` (`manifest.rs:33`), `format_card` (`fits_writer/card.rs:151`), `CARD_SIZE = 80`.
 - Produces (BINDING for Tasks 4–9):
-  - `pub struct ProjectStamp { pub project_id: String, pub thresholds_version: Option<i64>, pub cal_engine_version: Option<i64> }` (serde camelCase, Clone, Debug, PartialEq) and `ManifestRecord.project: Option<ProjectStamp>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`.
-  - `Msg::ProjectAnnounce { project_id: String, announce: PackageAnnounce }` and `Msg::ProjectRequest { project_id: String, package_id: PackageId }` — appended LAST, existing variants untouched.
-  - `TransportEvent::ProjectAnnounceReceived { from: NodeId, project_id: String, announce: PackageAnnounce }` and `TransportEvent::ProjectRequestReceived { from: NodeId, project_id: String, package_id: PackageId }`.
-  - `SharingTransport::announce_project(&self, to: NodeId, project_id: &str, announce: &PackageAnnounce) -> Result<()>` and `request_project(&self, to: NodeId, project_id: &str, package_id: &PackageId) -> Result<()>` — default impls `bail!("transport does not support project exchange")`.
+  - `pub struct ProjectStamp { pub project_id: String, pub package_id: String, pub thresholds_version: Option<i64>, pub cal_engine_version: Option<i64> }` (serde camelCase, Clone, Debug, PartialEq) — `package_id` is the HUB package uuid, minted at publish time (audit B1: the wire `PackageId` is engine-minted per serve and correlates acks only; the hub id is the row key everywhere else). `ManifestRecord.project: Option<ProjectStamp>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+  - `Msg::ProjectAnnounce { project_id: String, package_id: String, announce: PackageAnnounce }` (`package_id` = hub id) and `Msg::ProjectRequest { project_id: String, package_id: String }` (hub id — the holder's row key) — appended LAST, existing variants untouched.
+  - `TransportEvent::ProjectAnnounceReceived { from: NodeId, project_id: String, package_id: String, announce: PackageAnnounce }` and `TransportEvent::ProjectRequestReceived { from: NodeId, project_id: String, package_id: String }`.
+  - `SharingTransport::announce_project(&self, to: NodeId, project_id: &str, package_id: &str, announce: &PackageAnnounce) -> Result<()>` and `request_project(&self, to: NodeId, project_id: &str, package_id: &str) -> Result<()>` — default impls `bail!("transport does not support project exchange")`.
   - `pub fn stamp_extra_card(src: &Path, dest: &Path, card: &Card) -> Result<(), FitsWriteError>` in `fits_writer` (re-exported from `mod.rs`).
 
 - [ ] **Step 1: Manifest extension + failing test.** In `manifest.rs` add (below `PayloadKind`):
@@ -83,6 +83,9 @@
 #[serde(rename_all = "camelCase")]
 pub struct ProjectStamp {
     pub project_id: String,
+    /// HUB package uuid (announcement correlation key — audit B1). The wire
+    /// `PackageId` is engine-minted per serve and only correlates acks.
+    pub package_id: String,
     /// Threshold-set version the frames passed (spec §4 Q4 stamp).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thresholds_version: Option<i64>,
@@ -92,13 +95,13 @@ pub struct ProjectStamp {
 }
 ```
 
-and on `ManifestRecord`: `#[serde(default, skip_serializing_if = "Option::is_none")] pub project: Option<ProjectStamp>,` (LAST field). Fix every existing struct literal (`run.rs:234`, `api/sync.rs:~793`, tests) with `project: None`. Test in `manifest.rs` tests module:
+and on `ManifestRecord`: `#[serde(default, skip_serializing_if = "Option::is_none")] pub project: Option<ProjectStamp>,` (LAST field). Fix EVERY existing struct literal with `project: None` — the complete list (audit m3): production `crates/perseus/src/run.rs:234`, `crates/athenaeum-core/src/api/sync.rs:821`; tests `perseus/src/run.rs:1870,2280`, `perseus/src/web.rs:2117`, core `sharing/iroh/tests.rs:93,949`, `sharing/tests.rs:263`, `sync/ingest_tests.rs:93,127,237,281,803`, `sync/engine_tests.rs:59,1130`, `package/tests.rs:39` (`package/tests.rs:202` uses struct-update syntax — safe). `manifest.rs` has NO tests module today — add one with a `sample_record()` fixture as part of this step. Test:
 
 ```rust
 #[test]
 fn project_stamp_roundtrips_and_absent_field_parses() {
-    let mut r = sample_record(); // reuse/add the module's fixture helper
-    r.project = Some(ProjectStamp { project_id: "p-1".into(), thresholds_version: Some(3), cal_engine_version: Some(1) });
+    let mut r = sample_record(); // the fixture helper added in this step
+    r.project = Some(ProjectStamp { project_id: "p-1".into(), package_id: "pkg-1".into(), thresholds_version: Some(3), cal_engine_version: Some(1) });
     let s = serde_json::to_string(&r).unwrap();
     assert!(s.contains("\"projectId\":\"p-1\""));
     let back: ManifestRecord = serde_json::from_str(&s).unwrap();
@@ -114,9 +117,11 @@ fn project_stamp_roundtrips_and_absent_field_parses() {
 
 ```rust
     /// Provider advertises a PROJECT package (collab exchange, slice 4).
-    ProjectAnnounce { project_id: String, announce: PackageAnnounce },
-    /// A receive-role member asks a holder to serve a project package to it.
-    ProjectRequest { project_id: String, package_id: PackageId },
+    /// `package_id` is the HUB package uuid (row key); `announce.package_id`
+    /// stays the engine-minted wire id (ack correlation).
+    ProjectAnnounce { project_id: String, package_id: String, announce: PackageAnnounce },
+    /// A receive-role member asks a holder to serve a project package (hub id).
+    ProjectRequest { project_id: String, package_id: String },
 ```
 
 `types.rs`: append the two `TransportEvent` variants (in-process enum, no wire concern). `sharing/mod.rs`: add the two trait methods with `bail!` defaults (mirror `negotiate_want`'s default at `sharing/mod.rs:87`).
@@ -125,7 +130,7 @@ fn project_stamp_roundtrips_and_absent_field_parses() {
 
 - [ ] **Step 4: loopback impl.** In `loopback.rs` mirror how `announce` routes to the peer inbox → event, for both new methods (`fetch` path unchanged — project packages fetch the same collections). Ensure `LoopbackTransport`'s event mapping emits the two new `TransportEvent` variants.
 
-- [ ] **Step 5: engine project-awareness.** In `engine.rs::negotiate_and_build` (`engine.rs:726`), after reading the manifest records, capture `let project_id = records.iter().find_map(|r| r.project.as_ref().map(|p| p.project_id.clone()));` and store it on the `Pending` slot (new field `project_id: Option<String>`). At the announce call site (`engine.rs:649-658` region), branch: `Some(pid) => transport.announce_project(peer, pid, &announce)`, `None => transport.announce(peer, &announce)`. Thread `project_id` into `emit_progress`/`emit_finished` payloads as a new `project_id: Option<String>` field on `SyncProgressEvent`/`SyncFinishedEvent` (`receiver.rs:74`/`receiver.rs:90` — JSON events, additive field; regenerate TS in Task 11).
+- [ ] **Step 5: engine project-awareness.** In `engine.rs::negotiate_and_build` (`engine.rs:726`), after reading the manifest records, capture the stamp: `let stamp = records.iter().find_map(|r| r.project.clone());` and store `(project_id, hub_package_id)` on the `Pending` slot (new fields `project_id: Option<String>`, `hub_package_id: Option<String>`). **Project packages SKIP the Offer/Want negotiation entirely** (Д2/audit B2): when the stamp is present, do not call `negotiate_want` — proceed as the full-send fallback does (`want = None`; counts `(total, 0)` like the existing fallback at `engine.rs:746-764`). At the announce call site (`engine.rs:649-658` region), branch: stamp present ⇒ `transport.announce_project(peer, &pid, &hub_pkg, &announce)`, else `transport.announce(peer, &announce)`. Also update the OTHER exhaustive `TransportEvent` match in the engine (`engine.rs:886` — no wildcard arm; audit m1) with no-op arms for the two new variants. Thread `project_id` into `emit_progress`/`emit_finished` payloads as a new `project_id: Option<String>` field on `SyncProgressEvent`/`SyncFinishedEvent` (`receiver.rs:74`/`receiver.rs:90` — JSON events, additive field, both already derive TS and sit in ts_export; regenerate TS in Task 11).
 
 - [ ] **Step 6: `stamp_extra_card`.** Create `fits_writer/stamp.rs`:
 
@@ -159,7 +164,7 @@ pub fn stamp_extra_card(src: &Path, dest: &Path, card: &Card) -> Result<(), Fits
             }
         }
         if header.len() > BLOCK * 64 {
-            return Err(FitsWriteError::Invalid("no END card in the first 64 header blocks".into()));
+            return Err(FitsWriteError::Malformed("no END card in the first 64 header blocks".into()));
         }
     }
     let end_at = end_at.expect("loop exits only with END found");
@@ -188,7 +193,7 @@ pub fn stamp_extra_card(src: &Path, dest: &Path, card: &Card) -> Result<(), Fits
 }
 ```
 
-(If `FitsWriteError` lacks `Io`/`Invalid` variants of these exact shapes, use the module's existing error idiom — read `card.rs:9` first and adapt; do NOT add a new error type.) Re-export in `fits_writer/mod.rs`: `mod stamp; pub use stamp::stamp_extra_card;`.
+(Audit-verified: `FitsWriteError` HAS `Io(std::io::Error)` but NO `Invalid` variant (`card.rs:9-21`) — add one variant `Malformed(String)` to the existing enum following its shape for the no-END case; do NOT create a new error type. `CardValue`'s string variant is `Str`, not `Text` — audit M3.) Re-export in `fits_writer/mod.rs`: `mod stamp; pub use stamp::stamp_extra_card;`.
 
 - [ ] **Step 7: tests.**
 
@@ -202,11 +207,14 @@ fn stamped_copy_parses_with_new_card_and_identical_data() {
     let cards = vec![Card::new("ATH_TEST", crate::fits_writer::CardValue::Integer(7)).unwrap()];
     write_fits_f32(&src, 4, 4, 1, &data, &cards).unwrap();
     let dest = dir.path().join("b.fits");
-    stamp_extra_card(&src, &dest, &Card::new("ATH_PRJ", crate::fits_writer::CardValue::Text("proj-uuid".into())).unwrap()).unwrap();
+    stamp_extra_card(&src, &dest, &Card::new("ATH_PRJ", crate::fits_writer::CardValue::Str("proj-uuid".into())).unwrap()).unwrap();
     let src_bytes = std::fs::read(&src).unwrap();
     let dest_bytes = std::fs::read(&dest).unwrap();
-    // data region identical:
-    assert_eq!(&src_bytes[src_bytes.len() - 16 * 4..], &dest_bytes[dest_bytes.len() - 16 * 4..]);
+    // data region identical — compare the first 64 data bytes right AFTER each
+    // header (the tail is zero padding on both files, a vacuous compare):
+    let data_start = |b: &[u8]| (0..b.len()).step_by(2880).find(|&o| b[o..].chunks(80).take(36).any(|c| c.starts_with(b"END "))).map(|o| o + 2880).unwrap();
+    let (s0, d0) = (data_start(&src_bytes), data_start(&dest_bytes));
+    assert_eq!(&src_bytes[s0..s0 + 64], &dest_bytes[d0..d0 + 64]);
     // stamped header contains both keywords:
     let head = String::from_utf8_lossy(&dest_bytes[..dest_bytes.len() - 16 * 4]);
     assert!(head.contains("ATH_PRJ") && head.contains("ATH_TEST"));
@@ -257,17 +265,17 @@ pub struct AnnouncementWire {
     #[serde(default)] pub holders: Vec<HolderWire>,
 }
 impl CollabClient {
-    pub async fn announce(&self, token: &str, project_id: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, AccountError>;
-    pub async fn list_announcements(&self, token: &str, project_id: &str) -> Result<Vec<AnnouncementWire>, AccountError>;
-    pub async fn approve_announcement(&self, token: &str, announcement_id: &str) -> Result<AnnounceResponse, AccountError>;
-    pub async fn reject_announcement(&self, token: &str, announcement_id: &str, reason: &str) -> Result<AnnounceResponse, AccountError>;
-    pub async fn report_have(&self, token: &str, announcement_id: &str) -> Result<(), AccountError>; // 204
+    pub async fn announce(&self, token: &str, project_id: &str, req: &AnnounceRequest) -> Result<AnnounceResponse, AccountClientError>;
+    pub async fn list_announcements(&self, token: &str, project_id: &str) -> Result<Vec<AnnouncementWire>, AccountClientError>;
+    pub async fn approve_announcement(&self, token: &str, announcement_id: &str) -> Result<AnnounceResponse, AccountClientError>;
+    pub async fn reject_announcement(&self, token: &str, announcement_id: &str, reason: &str) -> Result<AnnounceResponse, AccountClientError>;
+    pub async fn report_have(&self, token: &str, announcement_id: &str) -> Result<(), AccountClientError>; // 204
 }
 ```
 
 POST bodies via the client's existing post idiom (mirror how `account/client.rs` posts + maps статусы: 200/204 ok, 401→Unauthorized, else read `{"error":..}` best-effort into the Network arm). Paths: `/projects/{id}/announcements`, `/announcements/{id}/approve|reject|have`.
 
-- [ ] **Step 1:** wiremock tests FIRST (in `hub_client.rs` tests): announce happy-path (assert serialized camelCase body incl. `aggregateStats.manifestXxh3` passthrough and `supersedes`), list decodes holders + tolerates unknown fields, reject sends `{"reason": ...}`, have returns 204 → Ok(()), 403 body-less maps to the client's forbidden/Network arm without panicking. Run: expect compile failures (methods missing).
+- [ ] **Step 1:** wiremock tests FIRST (in `hub_client.rs` tests): announce happy-path (assert serialized camelCase body incl. `aggregateStats.manifestXxh3` passthrough and `supersedes`), list decodes holders + tolerates unknown fields, reject sends `{"reason": ...}`, have returns 204 → Ok(()), 403 body-less maps to the client's forbidden/Network arm without panicking. Hub edge cases the client must surface distinctly (audit m5, all verified hub-side): announce 409 on a CLOSED project and on a DUPLICATE packageId (globally UNIQUE); `supersedes` ≤100 + hub-side dedup ⇒ pre-dedupe client-side; `have` with a non-device token ⇒ 400 `{"error"}` (not 401/403); reject reason bound is BYTES 1..=500. Run: expect compile failures (methods missing).
 - [ ] **Step 2:** implement DTOs + methods per the binding block. Run focused: `cargo test -p athenaeum-core --lib collab::hub_client 2>&1 | grep 'test result'` → all green.
 - [ ] **Step 3:** gates (`cargo build -p perseus --no-default-features` — module is ungated) + commit `feat(collab): hub client announcements/decide/have wire`.
 
@@ -322,7 +330,6 @@ CREATE TABLE IF NOT EXISTS project_contributions (
     landed_path     TEXT NOT NULL UNIQUE,
     byte_size       INTEGER NOT NULL,
     xxh3            TEXT NOT NULL,                 -- full-content, manifest-anchored
-    sampling_hash   TEXT NOT NULL,                 -- duplicates::compute_xxhash of the landed file (Offer/Want, Д10)
     frame_meta      TEXT NOT NULL DEFAULT '{}',
     analysis        TEXT,
     superseded      INTEGER NOT NULL DEFAULT 0,
@@ -330,12 +337,11 @@ CREATE TABLE IF NOT EXISTS project_contributions (
 );
 CREATE INDEX IF NOT EXISTS idx_project_contributions_project ON project_contributions(project_id);
 CREATE INDEX IF NOT EXISTS idx_project_contributions_uuid ON project_contributions(frame_uuid);
-CREATE INDEX IF NOT EXISTS idx_project_contributions_sampling ON project_contributions(sampling_hash);
 ```
 
-Functions (all `anyhow::Result`, `&Connection` first arg; SELECT_COLS idiom): `upsert_package(&PackageRow)`, `get_package(package_id) -> Option<PackageRow>`, `get_package_by_announcement(announcement_id)`, `list_packages(project_id) -> Vec<PackageRow>`, `set_local_status(package_id, status)`, `set_manifest(package_id, bytes)`, `mark_superseded(announcement_ids: &[String])`, `delete_package(package_id) -> usize` (CASCADE clears contributions), `insert_contribution(&ContributionRow)`, `contributions_for_package(package_id)`, `contributions_for_project(project_id)`, `replace_contribution_for_uuid(project_id, publisher, frame_uuid) -> Option<String /*old landed_path*/>` (deletes the older row for uuid-supersede, returns its path for file removal), `sampling_hashes_known(hashes: &[String]) -> HashSet<String>` (for Д10), `own_active_announcement_ids_for_uuids(project_id, uuids: &[String]) -> Vec<String>` (Д9 supersede computation: own + state != 'rejected' + not superseded packages containing any of the uuids).
+Functions (all `anyhow::Result`, `&Connection` first arg; SELECT_COLS idiom): `upsert_package(&PackageRow)`, `get_package(package_id) -> Option<PackageRow>`, `get_package_by_announcement(announcement_id)`, `list_packages(project_id) -> Vec<PackageRow>`, `set_local_status(package_id, status)`, `set_manifest(package_id, bytes)`, `mark_superseded(announcement_ids: &[String])`, `delete_package(package_id) -> usize` (CASCADE clears contributions), `insert_contribution(&ContributionRow)`, `contributions_for_package(package_id)`, `contributions_for_project(project_id)`, `replace_contribution_for_uuid(project_id, publisher, frame_uuid) -> Option<String /*old landed_path*/>` (deletes the older row for uuid-supersede, returns its path for file removal), `own_active_announcement_ids_for_uuids(project_id, uuids: &[String]) -> Vec<String>` (Д9 supersede computation: own + state != 'rejected' + not superseded packages containing any of the uuids).
 
-- [ ] **Step 1:** failing tests first (in-memory conn + `init_db`): package upsert/roundtrip + list ordering (created_at DESC), contribution insert + CASCADE on delete_package, `replace_contribution_for_uuid` returns the old path and removes the row, `own_active_announcement_ids_for_uuids` picks only own+active packages containing the uuids (fixture: 3 packages — own-active-with-uuid, own-rejected-with-uuid, foreign-with-uuid → exactly the first's announcement id), `sampling_hashes_known` intersection.
+- [ ] **Step 1:** failing tests first (in-memory conn + `init_db`): package upsert/roundtrip + list ordering (created_at DESC), contribution insert + CASCADE on delete_package, `replace_contribution_for_uuid` returns the old path and removes the row, `own_active_announcement_ids_for_uuids` picks only own+active packages containing the uuids (fixture: 3 packages — own-active-with-uuid, own-rejected-with-uuid, foreign-with-uuid → exactly the first's announcement id).
 - [ ] **Step 2:** implement DDL + module. Full `cargo test -p athenaeum-core --lib db::collab_exchange` green; full core suite green (schema additive).
 - [ ] **Step 3:** gates + commit `feat(collab): project_packages + project_contributions tables and access layer`.
 
@@ -373,8 +379,8 @@ Node matching decodes each member's `nodes[]` base64 into 32 bytes and compares 
 
 - [ ] **Step 1: failing tests** (in `authz.rs`, in-memory conn + `init_db` + a `collab_projects` row whose `members_json` holds two members: coordinator send_receive with node A, member send with node B): `member_for_node` finds A and B with right roles and None for unknown node; `may_serve_package(published)` true for A, false for B (send-only), false for unknown; `may_serve_package(pending)` true ONLY for A; `may_accept_announce` true for both A and B, false for stranger; `node_in_any_project` true/false accordingly; empty table ⇒ all false (fail-closed).
 - [ ] **Step 2:** implement; focused tests green.
-- [ ] **Step 3: connect gate.** `IrohTransport` gains `pub fn set_connect_gate(&self, gate: Arc<dyn Fn(&NodeId) -> bool + Send + Sync>)` (stored `OnceLock`/mutex option). In the accept path region documented as the unused F5 intercept (`iroh/mod.rs:198-208`) apply it to BOTH ALPNs' inbound connections: gate absent ⇒ accept-all (today's behavior — Perseus and sender transports unchanged); gate present and returns false ⇒ close the connection before protocol dispatch, `tracing::warn!(from, "connection refused by connect gate")`. (Read the surrounding accept/router code first; if per-connection interception must live inside each `ProtocolHandler::accept`, gate at the top of `SyncControlProtocol::accept` AND wrap the blobs handler with a thin gating `ProtocolHandler` — the mechanism may differ, the CONTRACT is: an ungated peer gets no blob bytes and no control dispatch.)
-- [ ] **Step 4: composite wiring + announce-gate skeleton.** In `api/sync.rs`, where the receiver transport starts, build the composite gate: `account allow-list contains node (existing SYNC_AUTHORIZED_PEERS logic) || collab::authz::node_in_any_project(&conn, node)` and `set_connect_gate` it. In `receiver.rs`'s event loop add the `TransportEvent::ProjectAnnounceReceived { from, project_id, announce }` arm: run `validate_package_id`, then a new `project_gate: Option<Arc<dyn Fn(&NodeId, &str) -> bool + Send + Sync>>` closure (threaded through `SyncReceiver::spawn` like the existing `PeerAuthorizer`; wired in `api/sync.rs` to `may_accept_announce`); unauthorized or gate-absent ⇒ `tracing::warn!` + `continue` (fail-closed). Authorized announces are, FOR THIS TASK, logged `info!(project_id, package_id, "project package announced — ingest lands in Task 5")` and dropped. `ProjectRequestReceived` likewise logged+dropped (Task 6).
+- [ ] **Step 3: connect gate.** `IrohTransport` gains `pub fn set_connect_gate(&self, gate: Arc<dyn Fn(&NodeId) -> bool + Send + Sync>)` (stored behind a mutexed `Option`). AUDIT NOTE (m6): the "F5 intercept region" at `iroh/mod.rs:198-208` is a COMMENT, not a hook — the router is a plain `Router::builder().accept(...)` (`:214-217`). The real mechanism: (a) gate at the TOP of `SyncControlProtocol::accept` (`iroh/mod.rs:611` — reject before decoding any `Msg`), and (b) wrap the blobs handler in a thin gating `ProtocolHandler` newtype that checks `connection.remote_id()` against the gate before delegating to the inner `iroh_blobs` handler. Gate absent ⇒ accept-all (today's behavior — Perseus and sender transports unchanged); gate refuses ⇒ close the connection, `tracing::warn!(from, "connection refused by connect gate")`. CONTRACT: an ungated peer gets no blob bytes and no control dispatch.
+- [ ] **Step 4: composite wiring + announce-gate skeleton.** AUDIT NOTE (M2): the receiver transport is built INSIDE `SyncRuntime::ensure_started` (`receiver.rs:403`, transport at `:440-448`; the only production `SyncReceiver::spawn` caller is `receiver.rs:452`) — api/sync.rs has NO spawn call sites, only two `ensure_started` callers (`api/sync.rs:333`, `:374`). Introduce a `ReceiverHooks` struct (connect gate + the Task-5/6/8 hooks, all `Option`, `Default`) as ONE new `ensure_started` parameter; update the two api/sync.rs callers (passing the composite gate, other hooks `None` for now) and the ~8 test spawn/start sites (`tests/sync_e2e.rs:249,524`; `sync/ingest_tests.rs:165,487,665,862,937,995`) with `Default::default()`. Build the composite gate in `api/sync.rs`: `account allow-list contains node (existing SYNC_AUTHORIZED_PEERS logic) || collab::authz::node_in_any_project(&conn, node)` and `set_connect_gate` it. In `receiver.rs`'s event loop add the `TransportEvent::ProjectAnnounceReceived { from, project_id, announce }` arm: run `validate_package_id`, then a new `project_gate: Option<Arc<dyn Fn(&NodeId, &str) -> bool + Send + Sync>>` closure (threaded through `SyncReceiver::spawn` like the existing `PeerAuthorizer`; wired in `api/sync.rs` to `may_accept_announce`); unauthorized or gate-absent ⇒ `tracing::warn!` + `continue` (fail-closed). Authorized announces are, FOR THIS TASK, logged `info!(project_id, package_id, "project package announced — ingest lands in Task 5")` and dropped. `ProjectRequestReceived` likewise logged+dropped (Task 6).
 - [ ] **Step 5:** loopback test: unauthorized project announce is dropped (no event past the gate — assert via log-capture or by the absence of staged files), authorized one reaches the info! path. Gates + commit `feat(collab): project authorizer, connect gate, fail-closed project announce gate`.
 
 ### Task 5: Project ingest — landing + contributions + receipts (ungated)
@@ -385,7 +391,7 @@ Node matching decodes each member's `nodes[]` base64 into 32 bytes and compares 
 - Modify: `crates/athenaeum-core/src/sync/ingest.rs` (make `sanitize_slug` `pub(crate)` visible to the sibling — it already is; reuse `unique_path` by making it `pub(crate)` if private)
 
 **Interfaces:**
-- Consumes: Task-3 db layer, Task-4 gates, `package::{read_manifest, validate_rel_path, xxh3_full_file, MANIFEST_FILENAME}`, `duplicates::compute_xxhash`, `db::scan_root_path_of_kind(conn, "collaboration")`, `sanitize_slug`, receipts/history idioms from `ingest.rs` (`FrameReceipt`, `ReceiptOutcome`, `insert_history_row`, `Direction::Received`).
+- Consumes: Task-3 db layer, Task-4 gates, `package::{read_manifest, validate_rel_path, xxh3_full_file, MANIFEST_FILENAME}`, `db::scan_root_path_of_kind(conn, "collaboration")`, `sanitize_slug`, receipts/history idioms from `ingest.rs` (`FrameReceipt`, `ReceiptOutcome`, `insert_history_row`, `Direction::Received`).
 - Produces (BINDING):
 
 ```rust
@@ -396,7 +402,7 @@ pub fn ingest_project_package(
     conn: &rusqlite::Connection,
     staging_dir: &std::path::Path,
     project_id: &str,
-    package_id: &str,
+    package_id: &str,            // HUB package uuid (the project_packages row key, audit B1)
     peer_device: &str,           // authenticated serving peer (history only — NOT the landing slug)
 ) -> anyhow::Result<ProjectIngestOutcome>;
 ```
@@ -407,27 +413,26 @@ Algorithm (each numbered item is a required behavior):
 3. `read_manifest`; per record: `validate_rel_path`, payload present, `xxh3_full_file(payload) == record.xxh3`, `record.project.as_ref().map(|p| &p.project_id) == Some(project_id)` (stamp cross-check) — any failure ⇒ per-frame `Rejected(reason)` receipt, batch continues.
 4. Landing root: `scan_root_path_of_kind(conn, "collaboration")` else `<staging parent's sync_dir>/collaboration` fallback (mirror the incoming-resolver fallback idiom); dest = `root/<sanitize_slug(project.slug)>/<sanitize_slug(package.publisher_display)>/<rel_path>` — publisher slug is HUB-anchored (Д5), never the serving peer, never the manifest.
 5. uuid-supersede (Д9 receiver side): `replace_contribution_for_uuid(project_id, publisher, frame_uuid)` — when it returns an old landed path, delete that file best-effort (`warn!` on failure). If a contribution with the SAME `xxh3` already exists for `(project, publisher, uuid)` ⇒ receipt `Duplicate`, skip landing.
-6. Land tmp-copy + atomic rename (mirror `land_payload`), compute `sampling_hash = duplicates::compute_xxhash(&dest)`, `insert_contribution` (frame_meta/analysis JSON straight from the record), receipt `Ingested`, `insert_history_row` (Direction::Received, project dimension — Task 11 adds the column; until then object field carries `frame_meta.object` like personal sync).
+6. Land tmp-copy + atomic rename (mirror `land_payload`), `insert_contribution` (frame_meta/analysis JSON straight from the record), receipt `Ingested`, `insert_history_row` (Direction::Received, project dimension — Task 11 adds the column; until then object field carries `frame_meta.object` like personal sync).
 7. On ≥1 Ingested: store the manifest bytes (`set_manifest`) and `set_local_status(package_id, "complete")` (partial failures still mark `complete` only when `failed.is_empty()`, else `failed`).
 
-Receiver arm (in `receiver.rs`, replacing the Task-4 stub): authorized ProjectAnnounce ⇒ if the package row is unknown, invoke a new `announcements_refresher: Option<Arc<dyn Fn(&str) + Send + Sync>>` hook (wired in Task 8 to the hub poll; absent or still-unknown afterwards ⇒ `warn!` + drop, fail-closed) ⇒ `validate_package_id` ⇒ staged `transport.fetch` (same as personal sync) ⇒ `spawn_blocking(ingest_project_package)` ⇒ `transport.ack(from, package_id, receipts)` ⇒ staging cleanup ⇒ `sync-progress`/`sync-finished` with `project_id: Some(..)` ⇒ post-ingest hook `on_project_ingested: Option<Arc<dyn Fn(String /*project*/, String /*package*/) + Send + Sync>>` (Task 8 wires report-have + notification data; absent = no-op).
+Receiver arm (in `receiver.rs`, replacing the Task-4 stub): authorized ProjectAnnounce ⇒ the ROW KEY is the event's hub `package_id` (audit B1) while fetch/ack use `announce.package_id` (wire id) ⇒ if the hub-id row is unknown, invoke a new `announcements_refresher: Option<Arc<dyn Fn(&str) + Send + Sync>>` hook (wired in Task 8 to the hub poll; absent or still-unknown afterwards ⇒ `warn!` + drop, fail-closed) ⇒ `validate_package_id` ⇒ staged `transport.fetch` (same as personal sync) ⇒ `spawn_blocking(ingest_project_package)` ⇒ `transport.ack(from, package_id, receipts)` ⇒ staging cleanup ⇒ `sync-progress`/`sync-finished` with `project_id: Some(..)` ⇒ post-ingest hook `on_project_ingested: Option<Arc<dyn Fn(String /*project*/, String /*package*/) + Send + Sync>>` (Task 8 wires report-have + notification data; absent = no-op).
 
 - [ ] **Step 1:** failing unit tests for the pure parts (tempdir + in-memory conn seeded with project + package rows): manifest-anchor mismatch rejects everything; per-frame bad xxh3 ⇒ Rejected receipt while good frames land; landing path shape `<root>/<project-slug>/<publisher-slug>/<rel>`; uuid re-publication replaces the row AND the old file disappears; identical re-delivery ⇒ Duplicate receipts and no second file; stamp/project mismatch ⇒ Rejected.
 - [ ] **Step 2:** implement `project_ingest.rs`; focused tests green.
-- [ ] **Step 3:** receiver arm + hooks threading (`SyncReceiver::spawn` gains the two optional hooks; update both spawn call sites in `api/sync.rs` passing `None` for now). Loopback e2e test (extend `sync` tests): node A enqueues a stamped package to node B (B's conn seeded with project + package row incl. correct manifest anchor) ⇒ B lands files under the collab layout, contributions rows exist, A's outbound row reaches `confirmed` (receipts flowed), `sync-finished` carries `project_id`.
+- [ ] **Step 3:** receiver arm + hooks threading — the two optional hooks live on the Task-4 `ReceiverHooks` struct (threaded through `SyncRuntime::ensure_started` → `SyncReceiver::spawn`; api/sync.rs callers keep passing them as `None` until Task 8 wires them). Loopback e2e test (extend `sync` tests): node A enqueues a stamped package to node B (B's conn seeded with project + package row incl. correct manifest anchor) ⇒ B lands files under the collab layout, contributions rows exist, A's outbound row reaches `confirmed` (receipts flowed), `sync-finished` carries `project_id`.
 - [ ] **Step 4:** gates + commit `feat(collab): project package ingest — anchored manifest, hub-resolved landing, contributions`.
 
-### Task 6: Dedup responder extension + serve reconstruction + request-to-serve (ungated)
+### Task 6: Serve reconstruction + request-to-serve (ungated)
 
 **Files:**
-- Modify: `crates/athenaeum-core/src/sync/responder.rs` (+ its store probe in `sync/store.rs`)
 - Create: `crates/athenaeum-core/src/api/collab_exchange.rs` (UNGATED api module); Modify: `crates/athenaeum-core/src/api/mod.rs` (`pub mod collab_exchange;` — NO render gate)
-- Modify: `crates/athenaeum-core/src/sync/receiver.rs` (ProjectRequestReceived → handler hook)
+- Modify: `crates/athenaeum-core/src/sync/receiver.rs` (ProjectRequestReceived → handler hook on `ReceiverHooks`)
 - Modify: `crates/athenaeum-core/src/api/sync.rs` (wire the request handler at receiver start; `ensure_collab_sender_engine`)
-- Modify: `crates/athenaeum-core/src/sync/engine.rs` ONLY if `spawn_with_sink` needs a public re-export — otherwise none
+- Modify: `crates/athenaeum-core/src/sync/engine.rs` — AUDIT M1: `spawn_with_sink` hard-codes `emitter: None` (`engine.rs:256-270`) and `spawn_inner` is private (`:276`); add `pub fn spawn_with_sink_and_emitter(store, transport, peer, sink, emitter)` delegating to `spawn_inner` so collab sends still emit `sync-progress`/`sync-finished`
 
 **Interfaces:**
-- Consumes: `CatalogDedupResponder` (`responder.rs:46`), `files_by_sampling_hashes` (`store.rs:775`), Task-3 `sampling_hashes_known`, `SyncSenderRuntime`/`ensure_sender_engine` idiom (`api/sync.rs:621`), `PackageCleanupSink` (`engine.rs:188`), Task-4 `may_serve_package`.
+- Consumes: `SyncSenderRuntime`/`ensure_sender_engine` idiom (`api/sync.rs:621`), `PackageCleanupSink` (`engine.rs:188`), Task-4 `may_serve_package` + `ReceiverHooks`.
 - Produces (BINDING):
 
 ```rust
@@ -449,9 +454,12 @@ pub async fn handle_project_request(
 ) -> anyhow::Result<()>;
 pub struct CollabCleanupSink; // PackageCleanupSink: deletes dirs under collab_serve/, NEVER under collab_pub/
 /// Mirror of api::sync::ensure_sender_engine (api/sync.rs:621) for the collab
-/// map: same transport build (blobs_out, dial hints), but engines spawn via
-/// SyncEngine::spawn_with_sink(CollabCleanupSink) so retained pub dirs survive
-/// confirm (Д4) while reconstructed serve dirs are cleaned on terminal.
+/// map: same transport build shape but a DEDICATED `<sync_dir>/blobs_collab`
+/// store dir (audit m7: a second FsStore over blobs_out risks the redb lock and
+/// the startup tag-sweep, `api/sync.rs:647-654`, `iroh/mod.rs:373-383`), and
+/// engines spawn via SyncEngine::spawn_with_sink_and_emitter(CollabCleanupSink,
+/// emitter) so retained pub dirs survive confirm (Д4) while reconstructed serve
+/// dirs are cleaned on terminal.
 pub async fn ensure_collab_sender_engine(
     ctx: &crate::services::ServiceContext,
     sender: &crate::sync::SyncSenderRuntime,
@@ -460,12 +468,11 @@ pub async fn ensure_collab_sender_engine(
 ) -> Result<(std::sync::Arc<crate::sync::SyncEngineHandle>, String), crate::api::ApiError>;
 ```
 
-Rules in `handle_project_request`: package row must exist with `origin='mine' || local_status='complete'`; `may_serve_package(conn, project, state=="pending", &from)` must be true (pending ⇒ only the coordinator's nodes); violations ⇒ `warn!` + return Ok (silent drop, cross-account). The collab sender map is a SECOND `SyncSenderRuntime` instance (`AppState.collab_sender` on both hosts, Task 11) whose engines are spawned via `spawn_with_sink(CollabCleanupSink)` — the retained publication dir must never be cleaned by a confirm (Д4), while reconstructed serve dirs are temp and are cleaned on terminal.
-- Responder (Д10): `CatalogDedupResponder::want_for_offer` unions membership from `files_by_sampling_hashes` AND `db::collab_exchange::sampling_hashes_known`; `confirm_full_hashes` gains the same union for full-hash probes (contribution rows carry full `xxh3` — no re-hash needed for that side; keep the files-side re-hash as is).
+Rules in `handle_project_request`: package row must exist with `origin='mine' || local_status='complete'`; `may_serve_package(conn, project, state=="pending", &from)` must be true (pending ⇒ only the coordinator's nodes); violations ⇒ `warn!` + return Ok (silent drop, cross-account). The collab sender map is a SECOND `SyncSenderRuntime` instance (`AppState.collab_sender` on both hosts, Task 11) whose engines are spawned via `spawn_with_sink_and_emitter(CollabCleanupSink, emitter)` over the dedicated `blobs_collab` store — the retained publication dir must never be cleaned by a confirm (Д4), while reconstructed serve dirs are temp and are cleaned on terminal. (No dedup-responder work: project serves skip Offer/Want — Д2/Д10.)
 
-- [ ] **Step 1:** failing tests: `reconstruct_serve_dir` (received package: dir contains byte-identical `manifest.ndjson` + hardlinked payloads at their `rel_path`s; second call idempotent; 'mine' returns `local_dir` untouched); responder union (a sampling hash present only in `project_contributions` is NOT wanted again); `CollabCleanupSink` deletes `collab_serve/x` but refuses `collab_pub/x`.
+- [ ] **Step 1:** failing tests: `reconstruct_serve_dir` (received package: dir contains byte-identical `manifest.ndjson` + hardlinked payloads at their `rel_path`s; second call idempotent; 'mine' returns `local_dir` untouched); `CollabCleanupSink` deletes `collab_serve/x` but refuses `collab_pub/x`.
 - [ ] **Step 2:** implement; focused green.
-- [ ] **Step 3:** receiver hook `project_request_handler: Option<Arc<dyn Fn(NodeId, String, String) + Send + Sync>>` invoked on `ProjectRequestReceived` (Task-4 stub replaced); `api/sync.rs` start sites pass a closure that `tokio::spawn`s `handle_project_request` (ctx/sender clones). Loopback e2e: A holds a received-complete package; B sends `ProjectRequest`; A authorizes + serves; B lands it (Task-5 path) and A's collab outbound row confirms; a send-only node's request is silently refused; a pending package is served to the coordinator node only.
+- [ ] **Step 3:** `ReceiverHooks.project_request_handler: Option<Arc<dyn Fn(NodeId, String, String) + Send + Sync>>` invoked on `ProjectRequestReceived` (Task-4 stub replaced); the two `ensure_started` callers in `api/sync.rs` pass a closure that `tokio::spawn`s `handle_project_request` (ctx/sender clones). Loopback e2e: A holds a received-complete package; B sends `ProjectRequest`; A authorizes + serves; B lands it (Task-5 path) and A's collab outbound row confirms; a send-only node's request is silently refused; a pending package is served to the coordinator node only.
 - [ ] **Step 4:** gates + commit `feat(collab): request-to-serve — holder authz, serve-dir reconstruction, dedup union`.
 
 ### Task 7: Publish — stamped build, hub announce, push-seed (render-gated)
@@ -500,11 +507,11 @@ pub async fn publish_collab_frames(
 
 Algorithm:
 1. `evaluate_project_gate` → publishable rows; empty ⇒ `ApiError::Invalid("no publishable frames")`. Resolve each frame's `light_calibrations.output_path` (missing file ⇒ skip with `warn!`, collect into a `skipped` list; all skipped ⇒ Invalid).
-2. Build the publication dir `<sync_dir>/collab_pub/<package-uuid>/payloads/…`: per frame `stamp_extra_card(output_path, dest, &Card::new("ATH_PRJ", CardValue::Text(project_id.into()))?)`; `rel_path` = output filename, uniqued per package (mirror `unique_rel_path`, `api/sync.rs:713`).
-3. `ManifestRecord` per frame: `frame_uuid = frames.uuid` (SOURCE identity, spec §3), `origin_catalog_uuid` = catalog uuid, `payload_kind: CalibratedLight`, `xxh3 = xxh3_full_file(stamped)`, `byte_size` of the stamped copy, `frame_meta` = Frame snapshot, `analysis` = frame_analysis JSON, `project: Some(ProjectStamp{ project_id, thresholds_version: detail-thresholds version, cal_engine_version: light_calibrations.engine_version })`. `write_package` into the pub dir → `PackageAnnounce`.
+2. Mint the HUB package uuid FIRST (`Uuid::new_v4()`) — it names the publication dir `<sync_dir>/collab_pub/<package-uuid>/payloads/…`, goes into every record's `ProjectStamp.package_id`, and is the `packageId` announced to the hub (audit B1; the writer-minted wire `PackageId` is ignored for identity). Per frame `stamp_extra_card(output_path, dest, &Card::new("ATH_PRJ", CardValue::Str(project_id.into()))?)`; `rel_path` = output filename, uniqued per package (mirror `unique_rel_path`, `api/sync.rs:713`).
+3. `ManifestRecord` per frame: `frame_uuid = frames.uuid` (SOURCE identity, spec §3), `origin_catalog_uuid` = catalog uuid, `payload_kind: CalibratedLight`, `xxh3 = xxh3_full_file(stamped)`, `byte_size` of the stamped copy, `frame_meta` = Frame snapshot, `analysis` = frame_analysis JSON, `project: Some(ProjectStamp{ project_id, package_id: hub_package_uuid, thresholds_version: detail-thresholds version, cal_engine_version: light_calibrations.engine_version })`. `write_package` into the pub dir → `PackageAnnounce`.
 4. Aggregate stats (from the gate rows of the PUBLISHED subset): `{"manifestXxh3": xxh3_full_file(pub_dir/manifest.ndjson), "fwhmArcsec": {"median","p10","p90"}, "eccentricityMedian", "frameCount", "integrationSecondsByFilter": {filter: Σ exptime}}` (filters/exptime from the frames rows; skip metrics that are absent — never invent).
 5. Д9 supersedes: `own_active_announcement_ids_for_uuids(project_id, &published_uuids)`.
-6. Hub `announce` (packageId = the writer-minted `PackageId` uuid, rootHash = the placeholder from `write_package` — 64-hex? The placeholder is xxh3-based 16-hex; the hub REQUIRES 64 hex chars. Compute the announce `rootHash` as the hex of BLAKE3 over the manifest bytes (`blake3` is already in-tree via iroh-blobs) — a stable 64-hex package identifier; document on the field that the WIRE transfer substitutes the real iroh collection hash per serve, so this hub value is an identifier + anchor, not the fetch hash). Hub errors map via the slice-3 `client_err` idiom; on failure delete the pub dir (best-effort) and return the error.
+6. Hub `announce` (packageId = the pre-minted hub uuid from step 2; rootHash: the hub REQUIRES exactly 64 hex chars and `write_package`'s placeholder is 16-hex xxh3 — compute it as `iroh_blobs::Hash::new(&manifest_bytes)` rendered to 64-hex (BLAKE3; `blake3` is NOT a direct dep — audit M5 — but `iroh_blobs::Hash` is importable). Document on the field that the WIRE transfer substitutes the real iroh collection hash per serve, so this hub value is an identifier, not the fetch hash. Pre-dedupe `supersedes` and cap awareness: hub rejects >100 entries and duplicates; expect 409 `{"error"}` on a closed project or a globally-duplicate packageId — map via the slice-3 `client_err` idiom (audit m5)). On failure delete the pub dir (best-effort) and return the error.
 7. Local rows: `upsert_package` (origin `'mine'`, own=1, state from the response, `local_dir` = pub dir, `manifest_xxh3`, `manifest_ndjson` bytes, `local_status='complete'`), `mark_superseded(&superseded)`; delete the superseded packages' retained dirs when origin='mine' (best-effort `warn!`).
 8. Push-seed (Д8): parse the project's `members_json`; candidate nodes = coordinator's nodes when `state=="pending"`, else every `send_receive` member's nodes; exclude own node id (`DeviceKey` pubkey); pick the FIRST candidate; none ⇒ `seed_target: None` (UI shows "no receive-capable member online yet"). Else `ensure_collab_sender_engine(ctx, collab_sender, node, emitter)` + `enqueue_package(pub_dir)` — the engine's retry/backoff IS announce-and-wait; `seed_target = member display name`.
 
@@ -544,7 +551,7 @@ Hook wiring (in `api/sync.rs` at receiver start): `announcements_refresher = |pr
 
 - [ ] **Step 1:** failing tests: poll upsert + diff kinds (wiremock list fixtures: new published foreign row ⇒ `newPackage`; own pending→published across two polls ⇒ `approved`; rejected with reason ⇒ `rejected` + detail; supersedes marking); download role guard (send-only own node ⇒ Invalid); download happy path over loopback (holder A completes the Task-6 e2e circuit; the poll-loop observes `complete`; `report_have` hits wiremock).
 - [ ] **Step 2:** implement; focused green.
-- [ ] **Step 3:** if the receiver's transport lacks a public outbound handle for `request_project`, add a minimal `SyncRuntime::transport_handle()` accessor (Arc clone) — no new state.
+- [ ] **Step 3 (AUDIT B4 — dial hints are mandatory):** the receiver runtime holds only `Arc<dyn SharingTransport>` (`receiver.rs:364-368`), and a bare node id CANNOT be dialed — `dial_target` falls back to a hint-less `EndpointAddr` (`iroh/mod.rs:281-287`) and fails with "No addressing information available"; the sender path only works because it attaches `pairing::peer_addr_with_relays` via the inherent `IrohTransport::add_peer` (`api/sync.rs:666-674`, `iroh/mod.rs:251`). Therefore: (a) `SyncRuntime` stores an additional `Arc<IrohTransport>` (concrete) alongside the trait object when it builds one, exposed as `pub fn iroh_handle(&self) -> Option<Arc<IrohTransport>>`; (b) the download loop, per holder, resolves relay urls exactly like `ensure_sender_engine` does and calls `handle.add_peer(pairing::peer_addr_with_relays(holder_node, &relay_urls))` BEFORE `request_project`. Loopback tests bypass dialing (mailbox routing) — add a doc-comment on `download_project_package` stating the hint step is what real-network paths depend on.
 - [ ] **Step 4:** gates + commit `feat(collab): announcements poll with state diffs + sequential-holder download`.
 
 ### Task 9: Moderation — review data + approve/reject (render-gated)
@@ -618,7 +625,7 @@ Both scan paths (sequential + parallel) must divert; the file contributes nothin
 
 `publish/list_collab_moderation/decide` wrappers are render-path-only in core but BOTH host crates always build with render — no extra gating in the hosts (mirror slice-3's arrangement). History project dimension: `project` column populated by the engine (`ManifestRecord.project` stamp at `append_*_history`), by `project_ingest` rows, NULL for personal sync; `TransfersPanel` query passthrough.
 
-- [ ] **Step 1:** history column + row/query structs + producers; core tests for insert/search with project filter.
+- [ ] **Step 1:** history column + row/query structs + producers. AUDIT B3 — `CREATE TABLE IF NOT EXISTS` never adds a column to an EXISTING table: add a guarded migration (`column_exists` + `ALTER TABLE sync_history ADD COLUMN project TEXT` — idiom at `db/schema.rs:49` used e.g. `:814`, `:1304`) at ALL THREE materialization sites: `db/schema.rs:1653` region, `StandaloneSyncStore::open` (`sync/store.rs:544` — use/extend Perseus's `ensure_column` idiom, `crates/perseus/src/seen.rs:51-65`), `CatalogSyncStore::open` (`store.rs:728`). AUDIT m2 — `HistoryRow` literals that must gain `project: None`: production `crates/perseus/src/run.rs:1160`, `:1181`; tests `perseus/src/web.rs:1592,1605`. Core tests for insert/search with project filter + a migration test (open a store over a pre-existing project-less `sync_history`, insert succeeds).
 - [ ] **Step 2:** list DTOs + `list_project_packages`/`list_contributions` with tests (poll captures holder counts into the columns).
 - [ ] **Step 3:** 7 commands + mirrors + registrations + `AppState`/`WebAppState.collab_sender` (constructed where `sync_sender` is); ts_export decls + `TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract`.
 - [ ] **Step 4:** all slice gates (`cargo build --workspace`, core suite, perseus suite + no-default-features build, `npx tsc --noEmit`) + commit `feat(collab): exchange command surface both backends, history project dimension, ts types`.
