@@ -169,6 +169,7 @@ async fn ingest_mirrors_rel_path_under_authenticated_peer_slug() {
         sync_dir.clone(),
         fixed_resolver(incoming.clone()),
         super::allow_all_peers(),
+        Default::default(), // no project announce gate in this test
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -493,6 +494,7 @@ async fn ack_replay_from_receipt_log() {
         sync_dir.clone(),
         fixed_resolver(incoming.clone()),
         super::allow_all_peers(),
+        Default::default(), // no project announce gate in this test
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -671,6 +673,7 @@ async fn transit_corruption_repaired_then_redelivery_confirms() {
         tmp.path().join("staging_root"),
         fixed_resolver(incoming),
         super::allow_all_peers(),
+        Default::default(), // no project announce gate in this test
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -869,6 +872,7 @@ async fn landing_root_is_resolved_live_per_package() {
         staging_root.clone(),
         Arc::clone(&resolver),
         super::allow_all_peers(),
+        Default::default(), // no project announce gate in this test
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -944,6 +948,7 @@ async fn receiver_drops_announce_from_unauthorized_peer() {
         sync_dir.clone(),
         fixed_resolver(incoming.clone()),
         authorizer,
+        Default::default(), // no project announce gate in this test
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -1002,6 +1007,7 @@ async fn receiver_ingests_from_authorized_peer() {
         sync_dir.clone(),
         fixed_resolver(incoming.clone()),
         authorizer,
+        Default::default(), // no project announce gate in this test
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )

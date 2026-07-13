@@ -104,6 +104,33 @@ const CONTROL_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// and [`Endpoint::online`] would otherwise block forever).
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A connection-level authorization predicate over a dialing peer's node id
+/// (collab exchange, slice 4). Installed via
+/// [`IrohTransport::set_connect_gate`] and shared (behind a mutexed `Option`) by
+/// the control-channel and gated-blobs handlers. `true` ⇒ admit; `false` ⇒ close
+/// the connection before any control dispatch or blob byte. A transport with no
+/// gate installed accepts every connection (today's behavior — Perseus + sender
+/// transports leave it unset).
+pub type ConnectGate = Arc<dyn Fn(&NodeId) -> bool + Send + Sync>;
+
+/// Shared, late-bindable slot for the [`ConnectGate`]. Cloned into both protocol
+/// handlers at construction; the host installs the actual predicate afterwards
+/// via [`IrohTransport::set_connect_gate`], so an already-spawned router picks it
+/// up without a rebuild.
+type SharedConnectGate = Arc<Mutex<Option<ConnectGate>>>;
+
+/// Evaluate the shared connect gate for `from`. Absent gate ⇒ admit (accept-all,
+/// today's behavior). The gate `Arc` is cloned out from under the lock BEFORE the
+/// predicate runs, so a gate that does blocking catalog I/O never holds the mutex
+/// across that work.
+fn connect_gate_admits(gate: &SharedConnectGate, from: &NodeId) -> bool {
+    let predicate = gate.lock().expect("connect_gate mutex poisoned").clone();
+    match predicate {
+        Some(g) => g(from),
+        None => true,
+    }
+}
+
 /// Where an [`IrohTransport`] keeps downloaded/served blob content.
 pub enum BlobStore {
     /// Ephemeral in-memory store (tests, or a stateless hop).
@@ -137,6 +164,10 @@ pub struct IrohTransport {
     event_tx: mpsc::Sender<TransportEvent>,
     /// Receiver half, handed out once by [`events`](SharingTransport::events).
     event_rx: Mutex<Option<mpsc::Receiver<TransportEvent>>>,
+    /// Connection-level authorization gate (collab exchange, slice 4). Cloned
+    /// into both protocol handlers at construction; the host installs the
+    /// predicate later via [`set_connect_gate`](Self::set_connect_gate).
+    connect_gate: SharedConnectGate,
 }
 
 impl IrohTransport {
@@ -195,21 +226,33 @@ impl IrohTransport {
         // Both protocols on one router: blobs for content, our control ALPN for
         // announce/ack. `spawn` registers both ALPNs on the endpoint.
         //
-        // Finding F5 (accepted residual, LOW): the blobs provider serves any
-        // stored blob to any node that requests it BY HASH. This is not the
-        // exploitable boundary — the real attack (unauthorized *ingestion*) is
-        // blocked receiver-side by the H1 peer-authorization gate in
-        // `sync::receiver`. Pulling a blob additionally requires the collection
-        // `root_hash`, an unguessable BLAKE3 digest transmitted only to the
-        // authorized peer over encrypted QUIC, and served content is released
-        // promptly after ack. iroh-blobs 0.103 does expose a connect-time
-        // `ConnectMode::Intercept` reject hook; wiring a dynamic allow-list into
-        // it is a possible future hardening, deliberately not taken here to keep
-        // the transport free of authorization state (which lives in the host).
-        let blobs = BlobsProtocol::new(&store, None);
+        // Finding F5 (was accepted residual, LOW; now hardened by the slice-4
+        // connect gate below): the blobs provider serves any stored blob to any
+        // node that requests it BY HASH. Unauthorized *ingestion* is blocked
+        // receiver-side by the H1 peer-authorization gate in `sync::receiver`,
+        // and pulling a blob additionally requires the collection `root_hash` (an
+        // unguessable BLAKE3 digest sent only to the authorized peer over
+        // encrypted QUIC, released promptly after ack). Rather than the
+        // iroh-blobs `ConnectMode::Intercept` hook, the connect gate is enforced
+        // at the `ProtocolHandler` layer (below): a host-installed predicate the
+        // transport merely stores a slot for — the authorization *state* still
+        // lives in the host closure, not the transport.
+        // Shared connect gate: unset at construction, installed later by the host
+        // (`set_connect_gate`). Cloned into BOTH handlers so a single install
+        // point governs the control channel AND the blobs provider.
+        let connect_gate: SharedConnectGate = Arc::new(Mutex::new(None));
+
+        // Wrap the blobs provider so an ungated peer never receives a blob byte:
+        // `GatedBlobs` checks the connect gate against the dialing node id before
+        // delegating to the inner `iroh_blobs` handler (finding F5 hardening).
+        let blobs = GatedBlobs {
+            inner: BlobsProtocol::new(&store, None),
+            gate: Arc::clone(&connect_gate),
+        };
         let control = SyncControlProtocol {
             event_tx: event_tx.clone(),
             responder,
+            gate: Arc::clone(&connect_gate),
         };
         let router = Router::builder(endpoint)
             .accept(iroh_blobs::ALPN, blobs)
@@ -231,12 +274,23 @@ impl IrohTransport {
             uses_relay,
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
+            connect_gate,
         })
     }
 
     /// This endpoint's node id, available before [`start`](SharingTransport::start).
     pub fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    /// Install the connection-level authorization [`ConnectGate`] (collab
+    /// exchange, slice 4). Governs BOTH the control channel and the blobs
+    /// provider: a peer the gate refuses is closed before any control dispatch or
+    /// blob byte. Overwrites any previously installed gate; passing is idempotent.
+    /// Left unset, the transport admits every connection (Perseus + sender
+    /// transports never call this).
+    pub fn set_connect_gate(&self, gate: ConnectGate) {
+        *self.connect_gate.lock().expect("connect_gate mutex poisoned") = Some(gate);
     }
 
     /// This endpoint's current [`EndpointAddr`] (direct addrs + relay url). Call
@@ -654,6 +708,9 @@ struct SyncControlProtocol {
     /// Answers the dedup handshake. `None` on a send-only endpoint or a peer
     /// with no catalog wired — in which case offers are answered want-all.
     responder: Option<Arc<dyn DedupResponder>>,
+    /// Connection-level authorization gate (slice 4). Checked once, at the top of
+    /// `accept`, before any `Msg` is decoded. Absent ⇒ admit (accept-all).
+    gate: SharedConnectGate,
 }
 
 // `dyn DedupResponder` isn't `Debug`, so the derive can't apply; the iroh
@@ -669,6 +726,13 @@ impl std::fmt::Debug for SyncControlProtocol {
 impl ProtocolHandler for SyncControlProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
         let from: NodeId = *connection.remote_id().as_bytes();
+        // Connection-level authorization (slice 4): reject an ungated peer before
+        // decoding a single `Msg`, so it gets no control dispatch at all.
+        if !connect_gate_admits(&self.gate, &from) {
+            tracing::warn!(from = %hex32(&from), "connection refused by connect gate");
+            connection.close(0u32.into(), b"unauthorized");
+            return Ok(());
+        }
         loop {
             // One control message per bidi stream. `accept_bi` errors when the
             // peer closes the connection — the normal end of the loop.
@@ -817,6 +881,43 @@ impl ProtocolHandler for SyncControlProtocol {
             let _ = tx.finish();
         }
         Ok(())
+    }
+}
+
+/// A thin gating wrapper around the iroh-blobs [`ProtocolHandler`] (collab
+/// exchange, slice 4). It evaluates the shared connect gate against the dialing
+/// peer's node id and only then delegates to the inner `iroh_blobs` handler, so
+/// an ungated peer never receives a single blob byte (finding F5 hardening).
+/// With no gate installed it delegates unconditionally — today's behavior.
+struct GatedBlobs {
+    inner: BlobsProtocol,
+    gate: SharedConnectGate,
+}
+
+// `SharedConnectGate` wraps a boxed closure (not `Debug`), so the `ProtocolHandler`
+// `Debug` bound can't be derived — hand-roll a minimal impl.
+impl std::fmt::Debug for GatedBlobs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatedBlobs").finish()
+    }
+}
+
+impl ProtocolHandler for GatedBlobs {
+    async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        let from: NodeId = *connection.remote_id().as_bytes();
+        if !connect_gate_admits(&self.gate, &from) {
+            tracing::warn!(from = %hex32(&from), "connection refused by connect gate");
+            connection.close(0u32.into(), b"unauthorized");
+            return Ok(());
+        }
+        <BlobsProtocol as ProtocolHandler>::accept(&self.inner, connection).await
+    }
+
+    // Forward the router-shutdown hook to the inner handler so the blobs store is
+    // still flushed on `Router::shutdown` — `BlobsProtocol` overrides `shutdown`,
+    // and the default (no-op) would otherwise silently drop that flush.
+    async fn shutdown(&self) {
+        <BlobsProtocol as ProtocolHandler>::shutdown(&self.inner).await
     }
 }
 

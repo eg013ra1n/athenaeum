@@ -197,6 +197,59 @@ fn peer_authorizer(ctx: &ServiceContext) -> Result<crate::sync::PeerAuthorizer, 
     }))
 }
 
+// ── collab exchange receiver hooks (slice 4) ─────────────────────────────────
+
+/// The receiver's connection-level connect gate (collab exchange, slice 4).
+/// A signed-in node admits a dialing peer when it is EITHER in the account
+/// device allow-list (`SYNC_AUTHORIZED_PEERS`, the same idiom as the H1
+/// per-package authorizer) OR a verified member of ANY cached collaboration
+/// project ([`collab::authz::node_in_any_project`](crate::collab::authz::node_in_any_project)).
+/// Both checks are re-read live per connection, so a hub / membership-snapshot
+/// refresh takes effect on the next dial without a transport restart.
+///
+/// Fail-closed: a signed-in node with empty caches admits nobody. A node with no
+/// account (pure dev-ticket mode) installs NO gate — accept-all, the same
+/// developer escape hatch as [`peer_authorizer`]'s [`crate::sync::allow_all_peers`].
+fn connect_gate(ctx: &ServiceContext) -> Result<Option<crate::sharing::iroh::ConnectGate>, ApiError> {
+    if !account_signed_in(ctx)? {
+        return Ok(None);
+    }
+    let db = db(ctx)?.clone();
+    Ok(Some(Arc::new(move |from: &NodeId| {
+        let hex = crate::sync::node_id_hex(from);
+        let conn = db.conn();
+        let in_account = match crate::db::get_setting(&conn, keys::SYNC_AUTHORIZED_PEERS) {
+            Ok(Some(raw)) => raw.lines().map(str::trim).any(|line| line == hex),
+            _ => false,
+        };
+        in_account || crate::collab::authz::node_in_any_project(&conn, from)
+    })))
+}
+
+/// The receiver's per-announce project-membership gate (collab exchange,
+/// slice 4): an inbound `ProjectAnnounceReceived` is accepted only from a
+/// verified current member of that project
+/// ([`collab::authz::may_accept_announce`](crate::collab::authz::may_accept_announce)),
+/// re-read live per announce. Always installed and fail-closed by construction —
+/// a node with no matching membership row simply drops every project announce.
+fn project_announce_gate(ctx: &ServiceContext) -> Result<crate::sync::ProjectAnnounceGate, ApiError> {
+    let db = db(ctx)?.clone();
+    Ok(Arc::new(move |from: &NodeId, project_id: &str| {
+        let conn = db.conn();
+        crate::collab::authz::may_accept_announce(&conn, project_id, from)
+    }))
+}
+
+/// Assemble the slice-4 [`ReceiverHooks`](crate::sync::ReceiverHooks) that both
+/// `ensure_started` callers pass: the composite connect gate (installed only when
+/// signed in) plus the always-on project announce gate.
+fn receiver_hooks(ctx: &ServiceContext) -> Result<crate::sync::ReceiverHooks, ApiError> {
+    Ok(crate::sync::ReceiverHooks {
+        connect_gate: connect_gate(ctx)?,
+        project_gate: Some(project_announce_gate(ctx)?),
+    })
+}
+
 /// Refresh the cached authorized-peer allow-list from the hub device list
 /// (finding H1). Best-effort: on any credential/hub failure the existing cache
 /// is left untouched (a node that synced before keeps working offline; a
@@ -330,7 +383,8 @@ pub async fn autostart_if_enabled(
     // starts accepting, then enforce it live per-package (finding H1).
     refresh_authorized_peers(ctx).await;
     let authorized = peer_authorizer(ctx)?;
-    sync.ensure_started(sync_dir, db_path, relay_mode, incoming, authorized, emitter)
+    let hooks = receiver_hooks(ctx)?;
+    sync.ensure_started(sync_dir, db_path, relay_mode, incoming, authorized, hooks, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     Ok(true)
@@ -369,9 +423,10 @@ pub async fn get_pairing_ticket(
     // primary that also flips the dev flag still enforces its account list.
     refresh_authorized_peers(ctx).await;
     let authorized = peer_authorizer(ctx)?;
+    let hooks = receiver_hooks(ctx)?;
 
     let ticket = sync
-        .ensure_started(sync_dir, db_path, relay_mode, incoming, authorized, emitter)
+        .ensure_started(sync_dir, db_path, relay_mode, incoming, authorized, hooks, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     Ok(ticket)

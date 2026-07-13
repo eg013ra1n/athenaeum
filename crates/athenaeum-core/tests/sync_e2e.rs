@@ -251,6 +251,7 @@ async fn two_instance_sync_e2e() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
+        Default::default(), // no project announce gate in this test
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -526,6 +527,7 @@ async fn resend_transfers_only_new_frames() {
         primary_dir.clone(),
         incoming,
         allow_all_peers(),
+        Default::default(), // no project announce gate in this test
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )

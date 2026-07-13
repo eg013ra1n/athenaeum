@@ -62,6 +62,33 @@ pub fn allow_all_peers() -> PeerAuthorizer {
     Arc::new(|_| true)
 }
 
+/// Decides whether an inbound PROJECT announce (collab exchange, slice 4) from
+/// `node` for `project_id` may be accepted. Evaluated **live, per announce** so a
+/// membership-snapshot refresh takes effect on the next event without a transport
+/// restart. Wired by the host to
+/// [`collab::authz::may_accept_announce`](crate::collab::authz::may_accept_announce)
+/// — a verified current member of the project. Returns `true` to accept, `false`
+/// to drop fail-closed. A missing gate is treated as "deny": a project announce
+/// is only ever accepted when a real membership check passes.
+pub type ProjectAnnounceGate = Arc<dyn Fn(&NodeId, &str) -> bool + Send + Sync>;
+
+/// Optional receive-side hooks the host threads into
+/// [`SyncRuntime::ensure_started`] (collab exchange, slice 4). Every field is
+/// optional and the whole struct is `Default` ("nothing installed"), so a caller
+/// wires only what it needs and the transport keeps its pre-slice-4 behavior when
+/// a hook is absent. Introduced with room for the Task-5/6/8 hooks.
+#[derive(Clone, Default)]
+pub struct ReceiverHooks {
+    /// Connection-level authorization predicate installed on the iroh transport
+    /// via [`set_connect_gate`](crate::sharing::iroh::IrohTransport::set_connect_gate):
+    /// the composite account-allow-list ∪ project-member gate. Absent ⇒ the
+    /// transport admits every connection (today's behavior).
+    pub connect_gate: Option<crate::sharing::iroh::ConnectGate>,
+    /// Per-announce project-membership gate for inbound `ProjectAnnounceReceived`
+    /// events. Absent or refusing ⇒ the announce is dropped fail-closed.
+    pub project_gate: Option<ProjectAnnounceGate>,
+}
+
 /// `sync-progress` payload: a per-package stage tick (never per-frame — discrete
 /// stages only, per the plan's "notify on outcomes, don't spam progress" rule).
 ///
@@ -153,6 +180,7 @@ impl SyncReceiver {
         staging_root: PathBuf,
         incoming: IncomingResolver,
         authorized: PeerAuthorizer,
+        project_gate: Option<ProjectAnnounceGate>,
         transport: Arc<dyn SharingTransport>,
         emitter: Arc<dyn ProgressEmitter>,
     ) -> Result<(StartInfo, SyncReceiverHandle)> {
@@ -165,33 +193,97 @@ impl SyncReceiver {
         let join = tokio::spawn(async move {
             tracing::info!(staging_root = %staging_root.display(), "sync receiver online");
             while let Some(ev) = events.recv().await {
-                if let TransportEvent::AnnounceReceived { from, announce } = ev {
-                    // Authorization gate (finding H1): only ingest from a peer on
-                    // this receiver's allow-list. An unauthorized (or revoked)
-                    // node is silently dropped BEFORE any fetch/ingest/ack — it
-                    // never touches the catalog or the landing folder, and gets
-                    // no signal it was even heard.
-                    if !authorized(&from) {
-                        tracing::warn!(
-                            from = %super::node_id_hex(&from),
-                            package_id = %announce.package_id.0,
-                            "sync receiver dropped announce from an unauthorized peer"
-                        );
-                        continue;
+                match ev {
+                    TransportEvent::AnnounceReceived { from, announce } => {
+                        // Authorization gate (finding H1): only ingest from a peer
+                        // on this receiver's allow-list. An unauthorized (or
+                        // revoked) node is silently dropped BEFORE any
+                        // fetch/ingest/ack — it never touches the catalog or the
+                        // landing folder, and gets no signal it was even heard.
+                        if !authorized(&from) {
+                            tracing::warn!(
+                                from = %super::node_id_hex(&from),
+                                package_id = %announce.package_id.0,
+                                "sync receiver dropped announce from an unauthorized peer"
+                            );
+                            continue;
+                        }
+                        if let Err(e) = handle_announce(
+                            &store,
+                            &staging_root,
+                            &incoming,
+                            loop_transport.as_ref(),
+                            emitter.as_ref(),
+                            from,
+                            announce,
+                        )
+                        .await
+                        {
+                            tracing::error!(error = %format!("{e:#}"), "sync receiver announce handling failed");
+                        }
                     }
-                    if let Err(e) = handle_announce(
-                        &store,
-                        &staging_root,
-                        &incoming,
-                        loop_transport.as_ref(),
-                        emitter.as_ref(),
+                    // Collab exchange (slice 4): an inbound PROJECT package
+                    // advertisement. Fail-closed skeleton — Task 5 lands the
+                    // ingest; here we only validate and gate, then drop.
+                    TransportEvent::ProjectAnnounceReceived {
                         from,
-                        announce,
-                    )
-                    .await
-                    {
-                        tracing::error!(error = %format!("{e:#}"), "sync receiver announce handling failed");
+                        project_id,
+                        package_id,
+                        announce: _,
+                    } => {
+                        // The hub package id is peer-controlled and will build a
+                        // staging path in Task 5 — reject anything that is not a
+                        // single safe path segment now (same C1 guard as personal
+                        // sync), before it can be used.
+                        if let Err(e) = crate::package::validate_package_id(&package_id) {
+                            tracing::warn!(
+                                from = %super::node_id_hex(&from),
+                                project_id,
+                                package_id,
+                                error = %e,
+                                "project announce rejected: unsafe package_id"
+                            );
+                            continue;
+                        }
+                        // Cross-account trust: only a verified current member of
+                        // `project_id` may push-seed to us. Gate absent or
+                        // refusing ⇒ drop (fail-closed — never accept-all).
+                        let accepted = project_gate
+                            .as_ref()
+                            .map(|gate| gate(&from, &project_id))
+                            .unwrap_or(false);
+                        if !accepted {
+                            tracing::warn!(
+                                from = %super::node_id_hex(&from),
+                                project_id,
+                                package_id,
+                                "project announce dropped: sender is not an authorized project member"
+                            );
+                            continue;
+                        }
+                        tracing::info!(
+                            project_id,
+                            package_id,
+                            "project package announced — ingest lands in Task 5"
+                        );
                     }
+                    // Collab exchange (slice 4): a receive-role member asked us to
+                    // serve a project package. Serving lands in Task 6; log + drop.
+                    TransportEvent::ProjectRequestReceived {
+                        from,
+                        project_id,
+                        package_id,
+                    } => {
+                        tracing::info!(
+                            from = %super::node_id_hex(&from),
+                            project_id,
+                            package_id,
+                            "project package requested — serving lands in Task 6"
+                        );
+                    }
+                    // `AckReceived` / `FetchProgress` are the sender/UI halves —
+                    // the receiver loop does not consume them.
+                    _ => {}
                 }
             }
             tracing::info!("sync receiver event stream closed; loop stopping");
@@ -423,6 +515,7 @@ impl SyncRuntime {
         relay_mode: iroh::RelayMode,
         incoming: IncomingResolver,
         authorized: PeerAuthorizer,
+        hooks: ReceiverHooks,
         emitter: Arc<dyn ProgressEmitter>,
     ) -> Result<String> {
         let mut guard = self.inner.lock().await;
@@ -461,6 +554,12 @@ impl SyncRuntime {
         )
         .await
         .context("build iroh transport for receiver")?;
+        // Install the connection-level authorization gate on the concrete
+        // transport BEFORE it is boxed (slice 4) — `set_connect_gate` is not on
+        // the `SharingTransport` trait. Absent ⇒ the transport admits all.
+        if let Some(gate) = hooks.connect_gate {
+            transport.set_connect_gate(gate);
+        }
         let transport: Arc<dyn SharingTransport> = Arc::new(transport);
 
         // Staging lives under the sync dir; the landing root is resolved live per
@@ -470,6 +569,7 @@ impl SyncRuntime {
             sync_dir.clone(),
             incoming,
             authorized,
+            hooks.project_gate,
             Arc::clone(&transport),
             emitter,
         )
@@ -560,5 +660,105 @@ mod tests {
             !events.iter().any(|(n, _)| n == "sync-progress"),
             "rejection happens before any fetch/ingest progress tick"
         );
+    }
+
+    /// Poll until the recorded gate-call log reaches `n` entries (or time out).
+    async fn wait_for_calls(seen: &Arc<Mutex<Vec<(NodeId, String)>>>, n: usize) {
+        for _ in 0..200 {
+            if seen.lock().unwrap().len() >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {n} project-gate call(s)");
+    }
+
+    /// Slice-4 receiver gate: an inbound project announce is validated (an unsafe
+    /// hub `package_id` is refused BEFORE the gate) and then routed through the
+    /// project gate. Task 4 only logs+drops, so the gate call itself — with the
+    /// transport-authenticated `from` and the project id — is the observable that
+    /// the announce reached the gate; the flippable verdict distinguishes the
+    /// dropped-unauthorized path from the accepted (info!) path.
+    #[tokio::test]
+    async fn project_announce_is_validated_then_routed_through_the_project_gate() {
+        use crate::sharing::SharingTransport;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let net = LoopbackNetwork::new();
+        let sender = net.endpoint();
+        let receiver_ep = net.endpoint();
+        let sender_node = sender.node_id();
+        let receiver_node = receiver_ep.node_id();
+
+        let store = Arc::new(CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap());
+        let staging = tmp.path().join("stage");
+        let incoming_root = tmp.path().join("incoming");
+        let incoming: IncomingResolver = Arc::new(move || incoming_root.clone());
+
+        // Recording gate: logs every (from, project_id) it is asked about and
+        // answers from a flippable verdict.
+        let seen: Arc<Mutex<Vec<(NodeId, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let verdict = Arc::new(AtomicBool::new(false));
+        let project_gate: ProjectAnnounceGate = {
+            let seen = Arc::clone(&seen);
+            let verdict = Arc::clone(&verdict);
+            Arc::new(move |from: &NodeId, project_id: &str| {
+                seen.lock().unwrap().push((*from, project_id.to_string()));
+                verdict.load(Ordering::SeqCst)
+            })
+        };
+
+        let (_info, _handle) = SyncReceiver::spawn(
+            store,
+            staging,
+            incoming,
+            allow_all_peers(),
+            Some(project_gate),
+            Arc::new(receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .expect("spawn receiver");
+
+        let announce = PackageAnnounce {
+            package_id: PackageId("wire-pkg".into()),
+            root_hash: "0".repeat(64),
+            byte_size: 0,
+            frame_count: 1,
+        };
+
+        // (1) Unsafe hub package_id: refused before the gate is ever consulted.
+        sender
+            .announce_project(receiver_node, "proj-1", "../evil", &announce)
+            .await
+            .expect("deliver unsafe project announce");
+        // (2) Safe hub package_id, verdict=false: reaches the gate, then dropped
+        //     as unauthorized — but the gate WAS consulted with the real sender.
+        sender
+            .announce_project(receiver_node, "proj-1", "hub-pkg-1", &announce)
+            .await
+            .expect("deliver unauthorized project announce");
+
+        wait_for_calls(&seen, 1).await;
+        {
+            let s = seen.lock().unwrap();
+            assert_eq!(s.len(), 1, "the unsafe package_id never reached the gate; the safe one did");
+            assert_eq!(s[0], (sender_node, "proj-1".to_string()));
+        }
+
+        // (3) Authorize: a safe announce now passes the gate (reaches the info!
+        //     path). Same authenticated sender, a different project id.
+        verdict.store(true, Ordering::SeqCst);
+        sender
+            .announce_project(receiver_node, "proj-2", "hub-pkg-2", &announce)
+            .await
+            .expect("deliver authorized project announce");
+        wait_for_calls(&seen, 2).await;
+        {
+            let s = seen.lock().unwrap();
+            assert_eq!(s.len(), 2);
+            assert_eq!(s[1], (sender_node, "proj-2".to_string()));
+        }
     }
 }
