@@ -1217,7 +1217,11 @@ pub async fn export_project_for_wbpp(
         // publisher (the organizer joins the publisher folder itself).
         let title_dir = Path::new(output_dir).join(sanitize_display_folder_name(&data.title));
         let mut files_organized = 0i32;
-        let mut warnings: Vec<String> = Vec::new();
+        // Prepend the collector's per-skip notes (own light with no calibrated
+        // output, missing output on disk, unreadable contribution metadata) so
+        // omitted frames reach ExportResult.warnings — and the dialog — rather
+        // than vanishing behind a smaller "N files organized" count.
+        let mut warnings: Vec<String> = data.warnings.clone();
         let mut cancelled = false;
         for (publisher, dataset) in &data.publishers {
             if cancel_flag.load(Ordering::Relaxed) {

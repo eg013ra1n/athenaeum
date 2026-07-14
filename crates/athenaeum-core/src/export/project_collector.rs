@@ -37,6 +37,13 @@ pub struct ProjectExportData {
     /// `(publisher display → folder, dataset)`, own-first then received in
     /// contribution (oldest-first) order.
     pub publishers: Vec<(String, ExportData)>,
+    /// Human-readable, one-per-skip notes for frames the collector dropped (an
+    /// own LIGHT with no calibrated output, a calibrated output missing on disk,
+    /// or a received contribution with unreadable metadata). The runner prepends
+    /// these to the organizer warnings so `ExportResult.warnings` — and thus the
+    /// export dialog — tells the user which expected frames were omitted rather
+    /// than silently reporting a smaller file count.
+    pub warnings: Vec<String>,
 }
 
 /// Collect a project's exportable frames: the processor's own calibrated LIGHT
@@ -70,20 +77,25 @@ pub fn collect_project_export_data(
     // Every `frame_uuid` already placed — own frames win, so they are added
     // first; a received contribution repeating one is dropped (rule 4).
     let mut seen_uuids: HashSet<String> = HashSet::new();
+    // One human-readable note per dropped frame — mirrors the `warn!`/`debug!`
+    // below so the skips reach `ExportResult.warnings` (the export dialog).
+    let mut warnings: Vec<String> = Vec::new();
 
     // ── Own side first (rule 3/4): the calibrated LIGHT outputs of the linked
     // sets, each with a fresh output file on disk. ──────────────────────────
     let set_ids = linked_set_ids(conn, project_id)?;
-    for (frame_id, _filename) in union_light_frames(conn, &set_ids)? {
+    for (frame_id, filename) in union_light_frames(conn, &set_ids)? {
         let Some(cal) = get_light_calibration_for_frame(conn, frame_id)? else {
             tracing::warn!(
                 frame_id,
                 "project export: linked light has no calibrated output — skipping"
             );
+            warnings.push(format!("skipped {filename}: no calibrated output"));
             continue;
         };
         if !Path::new(&cal.output_path).exists() {
             tracing::warn!(frame_id, path = %cal.output_path, "project export: calibrated output missing on disk — skipping");
+            warnings.push(format!("skipped {filename}: no calibrated output on disk"));
             continue;
         }
         let (ef, uuid) = own_export_frame(conn, frame_id, &cal.output_path)?;
@@ -116,6 +128,10 @@ pub fn collect_project_export_data(
                     error = %e,
                     "project export: contribution frame_meta is not valid json — skipping row"
                 );
+                warnings.push(format!(
+                    "skipped a contribution from {}: unreadable frame metadata",
+                    c.publisher_display
+                ));
                 continue;
             }
         };
@@ -155,9 +171,14 @@ pub fn collect_project_export_data(
     tracing::info!(
         project_id,
         publishers = publishers.len(),
+        skipped = warnings.len(),
         "collected project export data"
     );
-    Ok(ProjectExportData { title, publishers })
+    Ok(ProjectExportData {
+        title,
+        publishers,
+        warnings,
+    })
 }
 
 /// Append `ef` to the bucket for `display`, registering the display's insertion
@@ -734,6 +755,28 @@ mod tests {
             "own frames carry their real frame id"
         );
         assert_eq!(me.total_light_frames, 1);
+
+        // Both skips surface as warnings so the dialog can report the omissions.
+        assert_eq!(
+            data.warnings.len(),
+            2,
+            "one warning per skipped own frame; got {:?}",
+            data.warnings
+        );
+        assert!(
+            data.warnings
+                .iter()
+                .any(|w| w.contains("own-b.fits") && w.contains("no calibrated output")),
+            "missing cal-row skip warned; got {:?}",
+            data.warnings
+        );
+        assert!(
+            data.warnings
+                .iter()
+                .any(|w| w.contains("own-c.fits") && w.contains("no calibrated output on disk")),
+            "missing-output-on-disk skip warned; got {:?}",
+            data.warnings
+        );
     }
 
     // (d) malformed frame_meta skips only that row.
@@ -772,6 +815,19 @@ mod tests {
             "the malformed row is skipped, the valid one survives"
         );
         assert_eq!(frames[0].filename, "ok.fits");
+
+        // The skipped row surfaces one warning naming the publisher.
+        assert_eq!(
+            data.warnings.len(),
+            1,
+            "one warning for the malformed contribution; got {:?}",
+            data.warnings
+        );
+        assert!(
+            data.warnings[0].contains("Alice") && data.warnings[0].contains("unreadable"),
+            "warning names the publisher + unreadable metadata; got {:?}",
+            data.warnings
+        );
     }
 
     // (e) empty project → error.

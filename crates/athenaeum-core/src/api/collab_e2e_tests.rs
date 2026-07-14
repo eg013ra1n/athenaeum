@@ -735,6 +735,10 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
 
     {
         let conn = db(&proc_ctx).unwrap().conn();
+        // SOLE failure gate: download_project_package returns Ok(()) even when the
+        // download fails internally (an exhausted-holder attempt is a normal Ok),
+        // so this local_status assert is the only thing that fails the step on a
+        // broken download. Do not delete it as redundant with the `.unwrap()` above.
         assert_eq!(
             get_package(&conn, &pkg).unwrap().unwrap().local_status,
             "complete",
