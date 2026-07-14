@@ -16,6 +16,10 @@ export function useProjects() {
   const [refreshing, setRefreshing] = useState(false);
   const [signedOut, setSignedOut] = useState(false);
   const mounted = useRef(true);
+  // Д4d joined-project diff baseline: the set of project ids we last saw. `null`
+  // until a baseline loads (the cached list on mount, then every successful
+  // refresh) so the very first fetch never mis-fires a "Joined" toast.
+  const knownIdsRef = useRef<Set<string> | null>(null);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -38,6 +42,30 @@ export function useProjects() {
       }
     } finally {
       if (mounted.current) setRefreshing(false);
+    }
+
+    // Д4d joined-project diff: a project we don't coordinate that appeared since
+    // the last known baseline means our join request was approved. Skip the
+    // no-baseline round (knownIds === null) and coordinators (they created the
+    // project, they didn't join it). Always refresh the baseline from `fresh`,
+    // even when the diff was skipped, so the next round diffs against this list.
+    if (fresh) {
+      const knownIds = knownIdsRef.current;
+      if (knownIds !== null) {
+        for (const card of fresh) {
+          if (!knownIds.has(card.projectId) && !card.coordinator) {
+            notify({
+              title: `Joined "${card.title}"`,
+              detail: 'Your join request was approved.',
+              kind: 'project',
+              tone: 'success',
+              link: `/projects/${card.projectId}`,
+              dedupeKey: `project-joined-${card.projectId}`,
+            });
+          }
+        }
+      }
+      knownIdsRef.current = new Set(fresh.map((p) => p.projectId));
     }
 
     // Package poll only when the projects refresh succeeded (i.e. signed in).
@@ -90,9 +118,22 @@ export function useProjects() {
               dedupeKey: `pkg-dlfail-${change.packageId}`,
             });
             break;
+          case 'awaitingApproval':
+            // Coordinator-only (hub visibility gates foreign pending rows): a
+            // contributor's package is waiting on our decision. The change
+            // carries no detail, so we tag it with the project title.
+            notify({
+              title: 'Contribution awaiting your approval',
+              detail: title,
+              kind: 'project',
+              tone: 'info',
+              link,
+              dedupeKey: `pkg-approval-${change.packageId}`,
+            });
+            break;
           default:
-            // `downloadComplete` and any future kinds: the outcome is visible in
-            // the project's Receive tab, no toast needed.
+            // Any future kinds: the outcome is visible in the project's Receive
+            // tab, no toast needed.
             break;
         }
       }
@@ -109,6 +150,9 @@ export function useProjects() {
       try {
         const cached = await api.invoke<ProjectCard[]>('list_collab_projects');
         if (mounted.current) setProjects(cached);
+        // Seed the joined-diff baseline from the local cache so the first hub
+        // refresh can surface any project we were approved into meanwhile.
+        knownIdsRef.current = new Set(cached.map((p) => p.projectId));
       } catch (err) {
         console.error('[projects] cached list failed:', err);
       } finally {

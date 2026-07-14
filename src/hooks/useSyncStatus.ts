@@ -26,8 +26,74 @@ function shortPeer(hex: string): string {
  * `direction` routes send-side ("package delivered" / "transfer failed") vs
  * receive-side ("N frames arrived"). Dedupe keys are prefixed per direction so a
  * sender row id can never collide with a receiver package id.
+ *
+ * A project-tagged event (`projectId != null`, collab exchange slice 4/5) takes
+ * the project branch below and returns before ANY personal-sync path — so the
+ * sync-incoming nudge never fires for a project transfer, and personal sync
+ * (projectId == null) is byte-identical to before this branch existed.
  */
 export function notifyFinished(p: SyncFinishedEvent, notify: NotifyLike): void {
+  if (p.projectId != null) {
+    const link = `/projects/${p.projectId}`;
+    if (p.direction === 'sent') {
+      if (p.outcome === 'confirmed') {
+        notify({
+          title: 'Contribution replicated',
+          detail: `${p.okCount} frame${p.okCount === 1 ? '' : 's'} delivered — safe to go offline`,
+          kind: 'project',
+          tone: 'success',
+          link,
+          dedupeKey: `collab-sent-${p.packageId}`,
+        });
+      } else if (p.outcome.startsWith('failed')) {
+        // Reuse the personal-sync reason-extraction idiom (below): bare
+        // `failed` gets a generic reason, `failed: <msg>` carries the hub's.
+        const reason =
+          p.outcome === 'failed'
+            ? 'Retries exhausted or the peer was unreachable.'
+            : p.outcome.replace(/^failed:\s*/, '');
+        notify({
+          title: 'Contribution transfer failed',
+          detail: reason,
+          kind: 'project',
+          tone: 'warning',
+          hasErrors: true,
+          link,
+          dedupeKey: `collab-sent-${p.packageId}`,
+        });
+      }
+      // 'cancelled' is user-initiated — no notification (same as personal).
+      return;
+    }
+
+    // Receive side (coordinator/member pulled a project package).
+    if (p.okCount > 0) {
+      const partial = p.outcome === 'partial';
+      notify({
+        title: 'Project package downloaded',
+        detail: partial
+          ? `${p.okCount} received, ${p.failed.length} rejected`
+          : `${p.okCount} frame${p.okCount === 1 ? '' : 's'} received`,
+        kind: 'project',
+        tone: partial ? 'warning' : 'success',
+        hasErrors: partial,
+        link,
+        dedupeKey: `collab-recv-${p.packageId}`,
+      });
+    } else if (p.outcome === 'failed') {
+      notify({
+        title: 'Project package download failed',
+        detail: `${p.failed.length} frame${p.failed.length === 1 ? '' : 's'} failed the integrity check`,
+        kind: 'project',
+        tone: 'warning',
+        hasErrors: true,
+        link,
+        dedupeKey: `collab-recv-${p.packageId}`,
+      });
+    }
+    return;
+  }
+
   if (p.direction === 'sent') {
     if (p.outcome === 'confirmed') {
       notify({

@@ -893,7 +893,7 @@ reviewCopyComplete: boolean, frames: Array<ModerationFrame>, };
 
 export type PackageStateChange = { projectId: string, packageId: string, 
 /**
- * `newPackage` | `approved` | `rejected` | `downloadComplete` | `downloadFailed`.
+ * `newPackage` | `approved` | `rejected` | `downloadFailed` | `awaitingApproval`.
  */
 kind: string, detail: string | null, };
 

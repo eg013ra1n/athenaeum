@@ -487,7 +487,7 @@ const DOWNLOAD_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub struct PackageStateChange {
     pub project_id: String,
     pub package_id: String,
-    /// `newPackage` | `approved` | `rejected` | `downloadComplete` | `downloadFailed`.
+    /// `newPackage` | `approved` | `rejected` | `downloadFailed` | `awaitingApproval`.
     pub kind: String,
     pub detail: Option<String>,
 }
@@ -525,8 +525,11 @@ fn holder_online(h: &HolderWire, now: chrono::DateTime<chrono::Utc>) -> bool {
 /// exercised hermetically and reused by [`download_project_package`]'s fresh poll.
 ///
 /// Diff rules (brief): an unknown row that is `published` and not mine ⇒
-/// `newPackage`; a known OWN row moving `pending → published` ⇒ `approved`; any
-/// known row moving to `rejected` ⇒ `rejected` (carrying the hub reason). The
+/// `newPackage`; an unknown row that is `pending` and not mine ⇒ `awaitingApproval`
+/// (a coordinator's view of a contribution awaiting a decision — hub visibility
+/// already restricts foreign pending rows to coordinators); a known OWN row moving
+/// `pending → published` ⇒ `approved`; any known row moving to `rejected` ⇒
+/// `rejected` (carrying the hub reason). The
 /// upsert's forward-only origin + preserved local progress (T3) mean a poll can't
 /// downgrade a received/owned row or clobber its manifest / `local_status`.
 ///
@@ -553,6 +556,17 @@ fn apply_announcements(
                         project_id: project_id.to_string(),
                         package_id: ann.package_id.clone(),
                         kind: "newPackage".to_string(),
+                        detail: None,
+                    });
+                } else if ann.state == "pending" && !ann.own {
+                    // A foreign pending row is a contribution awaiting a decision.
+                    // Hub visibility already restricts foreign pending announcements
+                    // to that project's coordinators, so seeing one here means we
+                    // are a coordinator — no app-side role check is needed.
+                    changes.push(PackageStateChange {
+                        project_id: project_id.to_string(),
+                        package_id: ann.package_id.clone(),
+                        kind: "awaitingApproval".to_string(),
                         detail: None,
                     });
                 }
@@ -2083,6 +2097,42 @@ mod tests {
         let mine = get_package(&conn, "pkg-mine").unwrap().unwrap();
         assert_eq!(mine.origin, "mine");
         assert!(mine.own);
+    }
+
+    /// A fresh unknown PENDING foreign announcement polls in as an
+    /// `awaitingApproval` diff — a coordinator's view of someone else's
+    /// contribution awaiting a decision — NOT a `newPackage`. A second poll, with
+    /// the row now known and still pending, raises nothing.
+    #[tokio::test]
+    async fn poll_pending_foreign_is_awaiting_approval_then_idempotent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1/announcements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                ann_json("ann-p", "pkg-pending", false, "pending", &[], None, serde_json::json!([])),
+            ])))
+            .mount(&server)
+            .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+
+        let changes = refresh_project_packages(&ctx, "p-1").await.unwrap();
+        assert_eq!(changes.len(), 1, "a foreign pending row is one awaitingApproval change");
+        assert_eq!(changes[0].kind, "awaitingApproval");
+        assert_eq!(changes[0].package_id, "pkg-pending");
+        assert_eq!(changes[0].project_id, "p-1");
+        assert!(
+            changes.iter().all(|c| c.kind != "newPackage"),
+            "a pending row is never a newPackage"
+        );
+
+        // Second poll: the row is now known and still pending → no diff.
+        let again = refresh_project_packages(&ctx, "p-1").await.unwrap();
+        assert!(again.is_empty(), "a known pending row raises nothing on re-poll");
     }
 
     /// An own package moving `pending → published` across two polls diffs as
