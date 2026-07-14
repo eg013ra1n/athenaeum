@@ -11,6 +11,7 @@ use athenaeum_core::api::collab::{
 use athenaeum_core::api::collab_exchange as exchange;
 use athenaeum_core::api::collab_exchange::{ContributionView, PackageStateChange, ProjectPackageView};
 use athenaeum_core::events::ProgressEmitter;
+use athenaeum_core::export::models::ExportResult;
 use tauri::{AppHandle, State};
 
 use crate::tauri_events::TauriProgressEmitter;
@@ -176,6 +177,29 @@ pub async fn decide_collab_announcement(
     reason: Option<String>,
 ) -> Result<(), String> {
     api::decide_announcement(&state.ctx, &announcement_id, approve, reason)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ── Project-scoped WBPP export (slice 5, "processor payoff") ─────────────────
+
+/// Organize the project's received contributions ∪ own calibrated outputs into a
+/// WBPP folder tree — one subtree per publisher under the project title (Д2). The
+/// runner rides the standard export events with the Д3 sentinel `frame_set_id = -1`
+/// and registers its cancel flag under that key, so the EXISTING `cancel_export`
+/// command cancels a running project export (frontend: `api.invoke('cancel_export',
+/// { frameSetId: -1 })`).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn export_collab_project(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_id: String,
+    output_dir: String,
+    use_symlinks: bool,
+) -> Result<ExportResult, String> {
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
+    exchange::export_project_for_wbpp(&state.ctx, &project_id, &output_dir, use_symlinks, Some(emitter))
         .await
         .map_err(|e| e.to_string())
 }

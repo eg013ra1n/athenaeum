@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Download, FolderOpen, Loader2, RotateCw } from 'lucide-react';
+import { Download, FolderOpen, FolderOutput, Loader2, RotateCw } from 'lucide-react';
 import { api } from '../../api';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import { formatBytes } from './format';
+import ProjectExportDialog from './ProjectExportDialog';
 import type { ProjectPackageView } from '../../types/models';
 
 const POLL_MS = 3_000;
@@ -18,10 +19,12 @@ const POLL_MS = 3_000;
  */
 export default function ReceiveTab({
   projectId,
+  projectTitle,
   packages,
   reload,
 }: {
   projectId: string;
+  projectTitle?: string;
   packages: ProjectPackageView[] | null;
   reload: () => void;
 }) {
@@ -29,6 +32,7 @@ export default function ReceiveTab({
   const [collabDir, setCollabDir] = useState<string | null | undefined>(undefined);
   const [busy, setBusy] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
   const reloadRef = useRef(reload);
   reloadRef.current = reload;
 
@@ -102,6 +106,18 @@ export default function ReceiveTab({
 
   return (
     <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-sm font-medium text-content">Received contributions</span>
+        <button
+          type="button"
+          onClick={() => setExportOpen(true)}
+          className="inline-flex items-center gap-1.5 rounded border border-border px-3 py-1.5 text-sm text-content-secondary transition-colors hover:bg-surface-hover"
+          title="Organize the project's frames into a PixInsight WBPP folder tree"
+        >
+          <FolderOutput size={14} /> Export for WBPP
+        </button>
+      </div>
+
       {dirUnset && (
         <div className="flex flex-wrap items-center gap-2 rounded border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-content-secondary">
           <FolderOpen size={14} className="shrink-0 text-warning" />
@@ -158,6 +174,14 @@ export default function ReceiveTab({
             </li>
           ))}
         </ul>
+      )}
+
+      {exportOpen && (
+        <ProjectExportDialog
+          projectId={projectId}
+          projectTitle={projectTitle}
+          onClose={() => setExportOpen(false)}
+        />
       )}
     </div>
   );

@@ -261,7 +261,7 @@ export default function ProjectDetail() {
       )}
 
       {activeTab === 'receive' && id && (
-        <ReceiveTab projectId={id} packages={packages} reload={loadPackages} />
+        <ReceiveTab projectId={id} projectTitle={c.title} packages={packages} reload={loadPackages} />
       )}
 
       {activeTab === 'moderation' && id && (

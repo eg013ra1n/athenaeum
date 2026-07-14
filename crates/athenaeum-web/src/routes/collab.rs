@@ -5,6 +5,7 @@ use std::sync::Arc;
 use athenaeum_core::api::collab as api;
 use athenaeum_core::api::collab_exchange as exchange;
 use athenaeum_core::events::ProgressEmitter;
+use athenaeum_core::export::models::ExportResult;
 use axum::extract::State;
 use axum::Json;
 use serde::Deserialize;
@@ -46,6 +47,14 @@ pub struct DecideArgs {
     announcement_id: String,
     approve: bool,
     reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportProjectArgs {
+    project_id: String,
+    output_dir: String,
+    use_symlinks: bool,
 }
 
 #[tracing::instrument(skip_all, err(Debug))]
@@ -198,4 +207,45 @@ pub async fn decide_collab_announcement(
         .await
         .map(Json)
         .map_err(api_err)
+}
+
+// ── Project-scoped WBPP export (slice 5, "processor payoff") ─────────────────
+
+/// Web mirror of `export_collab_project`. Validates `output_dir` is within the
+/// server-configured export directory BEFORE running — mirroring `routes/export.rs`
+/// exactly: a violation returns HTTP 200 with a `success:false` ExportResult body
+/// (never a 4xx), and the check is skipped entirely when `export_dir` is `None`.
+/// The runner rides the `-1` sentinel export events; `cancel_export` with
+/// `frameSetId=-1` cancels a running export.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn export_collab_project(
+    State(state): State<WebAppState>,
+    Json(args): Json<ExportProjectArgs>,
+) -> Result<Json<ExportResult>, (axum::http::StatusCode, String)> {
+    // Validate output path is within the configured export directory.
+    if let Some(ref export_dir) = state.export_dir {
+        if !std::path::Path::new(&args.output_dir).starts_with(export_dir) {
+            return Ok(Json(ExportResult {
+                success: false,
+                output_dir: args.output_dir.clone(),
+                files_organized: 0,
+                scripts_generated: Vec::new(),
+                warnings: Vec::new(),
+                error: Some(format!("Export path must be within {}", export_dir.display())),
+            }));
+        }
+    }
+
+    let emitter: Arc<dyn ProgressEmitter> =
+        Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    exchange::export_project_for_wbpp(
+        &state.ctx,
+        &args.project_id,
+        &args.output_dir,
+        args.use_symlinks,
+        Some(emitter),
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
 }

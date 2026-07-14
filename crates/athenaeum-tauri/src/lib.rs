@@ -471,6 +471,7 @@ pub fn run() {
             commands::list_collab_contributions,
             commands::list_collab_moderation,
             commands::decide_collab_announcement,
+            commands::export_collab_project,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

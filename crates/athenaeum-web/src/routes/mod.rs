@@ -278,6 +278,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/list_collab_contributions", post(collab::list_collab_contributions))
         .route("/api/list_collab_moderation", post(collab::list_collab_moderation))
         .route("/api/decide_collab_announcement", post(collab::decide_collab_announcement))
+        .route("/api/export_collab_project", post(collab::export_collab_project))
         // Core
         .route("/api/initialize_database", post(initialize_database))
         .route("/api/get_log_path", post(get_log_path))

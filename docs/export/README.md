@@ -10,13 +10,16 @@ right folders and stops there — it does **not** create master calibration fram
 does not run PixInsight, and does not generate any external tool's scripts. All of
 that (master creation, registration, stacking) is done in PixInsight after export.
 
-This is the entire feature. There is no script generator, no CLI runner, no
-execution-mode selector, and no template-token engine (`{OBJECT}`, `{FRAME_FOLDER}`,
-`:slug`, etc. do not exist in this module — see "What this doc replaces" below).
+This is the whole of the *frame-set* export. There is no script generator, no CLI
+runner, no execution-mode selector, and no template-token engine (`{OBJECT}`,
+`{FRAME_FOLDER}`, `:slug`, etc. do not exist in this module — see "What this doc
+replaces" below). A second, project-scoped entry point (collab) reuses the same
+organizer over a different collector — see "Project-scoped export (collab)" below.
 
-Module: `crates/athenaeum-core/src/export/` — exactly three files:
-`models.rs`, `data_collector.rs`, `file_organizer.rs` (re-exported by `mod.rs`).
-Nothing else exists under `export/`.
+Module: `crates/athenaeum-core/src/export/` — `models.rs`, `data_collector.rs`,
+`file_organizer.rs`, and `project_collector.rs` (re-exported by `mod.rs`). The
+first three are the frame-set path described here; `project_collector.rs` feeds
+the collab project export.
 
 ## What this doc replaces
 
@@ -171,6 +174,45 @@ exposed through `ExportData.master_plan` (from `get_export_preview` /
 renders from it is a count (`masters_to_create` in `CalibrationRouteSummary`,
 `commands/export.rs:394`). PixInsight/WBPP creates the actual masters after the
 files are organized on disk.
+
+## Project-scoped export (collab)
+
+A second entry point exports a *collaboration project* instead of a single frame
+set. It reuses `organize_files_wbpp` untouched but swaps the collector:
+`collect_project_export_data` (`project_collector.rs`) gathers the project's
+**received contributions ∪ this device's own calibrated outputs** — the frames the
+project actually holds on disk, not a catalog frame set — and buckets them by
+publisher (Д2).
+
+- **Runner:** `export_project_for_wbpp` (`api/collab_exchange.rs`), wrapped by the
+  `export_collab_project` command (Tauri `commands/collab.rs` + Axum
+  `routes/collab.rs`, the web mirror validating `output_dir` is within the
+  configured export dir like `export_to_wbpp`). UI: an "Export for WBPP" button on
+  a project's **Receive** tab opening `ProjectExportDialog.tsx`.
+- **Tree shape** — one subtree per publisher under the sanitized project title:
+
+  ```
+  <output_dir>/
+  └── <project title, sanitized>/
+      └── <publisher display, sanitized>/     # one per contributor (own = your display)
+          └── camera_<instrume, sanitized>/
+              └── lights/                      # calibrated light frames
+  ```
+
+  Each publisher subtree is a separate `organize_files_wbpp` call whose dataset
+  `frame_set_name` is that publisher's display name.
+- **No calibration folders (calibration-off by design).** Project contributions are
+  already-calibrated lights, so per-publisher datasets carry no linked calibration
+  sets — there are no `BIAS_*` / `DARKS_*` / `FLAT_*` levels, only `lights/`. WBPP
+  runs with its own calibration step disabled.
+- **Events / cancel:** rides the standard `export-progress` / `export-complete`
+  events with the Д3 sentinel `frame_set_id = -1`, and registers its cancel flag
+  under that key — so the existing `cancel_export` command
+  (`api.invoke('cancel_export', { frameSetId: -1 })`) cancels a running project
+  export. Because each publisher is organized in its own pass, the emitted percent
+  **restarts per publisher**; the dialog shows a per-publisher counter alongside
+  the bar rather than one monotonic total. An empty project surfaces the
+  collector's "nothing to export" error inline (no separate pre-flight check).
 
 ## Commands
 
