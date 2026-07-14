@@ -446,6 +446,7 @@ dependencies = [
  "libc",
  "md-5",
  "memmap2",
+ "n0-future",
  "postcard",
  "quick-xml 0.36.2",
  "r2d2",

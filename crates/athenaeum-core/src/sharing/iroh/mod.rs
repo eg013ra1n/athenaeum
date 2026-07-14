@@ -190,6 +190,18 @@ impl IrohTransport {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let secret_key = SecretKey::from_bytes(&secret);
         let uses_relay = !matches!(relay_mode, RelayMode::Disabled);
+        // Snapshot what the ENDPOINT is being built with, before the builder
+        // consumes `relay_mode`. This is deliberately the transport-level view:
+        // `sync::pairing` logs the relay map it *resolved* from the hub, but a
+        // cached map (or a dev `RelayMode::Default` fallback) means the endpoint
+        // can end up on a different set — so this line states the actual build.
+        let relay_mode_label = match &relay_mode {
+            RelayMode::Disabled => "disabled",
+            RelayMode::Default => "default",
+            RelayMode::Staging => "staging",
+            RelayMode::Custom(_) => "custom",
+        };
+        let relay_count = relay_mode.relay_map().len();
         let lookup = iroh::address_lookup::memory::MemoryLookup::new();
 
         let endpoint = Endpoint::builder(presets::Minimal)
@@ -199,6 +211,12 @@ impl IrohTransport {
             .bind()
             .await
             .context("bind iroh endpoint")?;
+        tracing::info!(
+            relay_mode = relay_mode_label,
+            relay_count,
+            node_id = %endpoint.id().fmt_short(),
+            "iroh endpoint relay configuration"
+        );
 
         let store: Store = match store {
             BlobStore::Memory => MemStore::new().into(),
@@ -359,6 +377,7 @@ impl IrohTransport {
                 .connect(target, SYNC_ALPN)
                 .await
                 .context("connect sync control channel")?;
+            spawn_conn_path_diagnostics(&conn, "outgoing");
             let (mut tx, mut rx) = conn.open_bi().await.context("open control stream")?;
             tx.write_all(&bytes).await.context("write control message")?;
             tx.finish().context("finish control stream")?;
@@ -398,6 +417,7 @@ impl IrohTransport {
                 .connect(target, SYNC_ALPN)
                 .await
                 .context("connect sync control channel")?;
+            spawn_conn_path_diagnostics(&conn, "outgoing");
             let (mut tx, mut rx) = conn.open_bi().await.context("open control stream")?;
             tx.write_all(&bytes).await.context("write control request")?;
             tx.finish().context("finish control request")?;
@@ -440,8 +460,32 @@ impl SharingTransport for IrohTransport {
         // carries a relay url for NAT traversal. With the relay disabled there is
         // no home relay — `online()` would hang — and the direct addresses bound
         // at construction are already dialable, so we skip the wait. Idempotent.
+        // Both outcomes are logged: which home relay we landed on, or that we are
+        // proceeding without one (behind NAT that means unreachable) — the single
+        // most important startup fact for a NAT-traversal investigation.
         if self.uses_relay {
-            let _ = tokio::time::timeout(ONLINE_TIMEOUT, self.endpoint.online()).await;
+            match tokio::time::timeout(ONLINE_TIMEOUT, self.endpoint.online()).await {
+                Ok(()) => {
+                    let relay_url = self
+                        .endpoint
+                        .addr()
+                        .relay_urls()
+                        .next()
+                        .map(|u| u.to_string());
+                    tracing::info!(
+                        node_id = %self.endpoint.id().fmt_short(),
+                        relay_url = relay_url.as_deref().unwrap_or("unknown"),
+                        "home relay connected"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        node_id = %self.endpoint.id().fmt_short(),
+                        timeout_ms = ONLINE_TIMEOUT.as_millis() as u64,
+                        "home relay wait timed out; proceeding on direct addresses only (unreachable behind NAT)"
+                    );
+                }
+            }
         }
         let addr = self.endpoint.addr();
         let pairing_ticket = EndpointTicket::from(addr).to_string();
@@ -733,6 +777,7 @@ impl ProtocolHandler for SyncControlProtocol {
             connection.close(0u32.into(), b"unauthorized");
             return Ok(());
         }
+        spawn_conn_path_diagnostics(&connection, "incoming");
         loop {
             // One control message per bidi stream. `accept_bi` errors when the
             // peer closes the connection — the normal end of the loop.
@@ -910,6 +955,10 @@ impl ProtocolHandler for GatedBlobs {
             connection.close(0u32.into(), b"unauthorized");
             return Ok(());
         }
+        // A blob download connection lives for the whole transfer — the longest
+        // window this transport holds a `Connection` handle, so its path watcher
+        // is the most likely to observe a mid-transfer relay→direct upgrade.
+        spawn_conn_path_diagnostics(&connection, "incoming");
         <BlobsProtocol as ProtocolHandler>::accept(&self.inner, connection).await
     }
 
@@ -933,6 +982,91 @@ async fn write_reply(tx: &mut iroh::endpoint::SendStream, reply: &Msg, from: &No
         }
         Err(e) => tracing::warn!(from = %hex32(from), error = %e, "encode dedup reply failed"),
     }
+}
+
+/// Classify a live connection's transport path from its open-path snapshot,
+/// returning `(conn_type, addr)` for logging:
+///
+/// - `conn_type` — `"direct"` (only IP paths open), `"relay"` (only relay
+///   paths), `"mixed"` (both open — typically mid hole-punch), or `"pending"`
+///   (no path recorded yet).
+/// - `addr` — the *selected* transmission path's remote transport address,
+///   rendered with its `ip:<socket>` / `relay:<url>` prefix; falls back to any
+///   open path, or `None` when the snapshot is empty.
+fn describe_conn_path(conn: &Connection) -> (&'static str, Option<String>) {
+    let paths = conn.paths();
+    let mut has_ip = false;
+    let mut has_relay = false;
+    let mut selected: Option<String> = None;
+    let mut any: Option<String> = None;
+    for p in paths.iter() {
+        has_ip |= p.is_ip();
+        has_relay |= p.is_relay();
+        if p.is_selected() {
+            selected = Some(p.remote_addr().to_string());
+        } else if any.is_none() {
+            any = Some(p.remote_addr().to_string());
+        }
+    }
+    let conn_type = match (has_ip, has_relay) {
+        (true, true) => "mixed",
+        (true, false) => "direct",
+        (false, true) => "relay",
+        (false, false) => "pending",
+    };
+    (conn_type, selected.or(any))
+}
+
+/// Log a connection's established transport path (`info!`) and spawn a
+/// lightweight watcher that logs any later *path-type* change — a relay→direct
+/// hole-punch upgrade is the single most diagnostic event for NAT work.
+///
+/// The watcher consumes the connection's `'static` [`PathEventStream`], which
+/// ends when the connection closes (the endpoint drops that connection's
+/// per-connection path-state sender). So the task's lifetime is tied to the
+/// connection's exactly the way iroh ties its own per-connection state — it can
+/// never outlive the connection and never leaks. Fires on a *selection change*
+/// only, never per-packet/per-poll.
+fn spawn_conn_path_diagnostics(conn: &Connection, direction: &'static str) {
+    let peer = conn.remote_id().fmt_short();
+    let (conn_type, addr) = describe_conn_path(conn);
+    tracing::info!(
+        peer = %peer,
+        direction,
+        conn_type,
+        addr = addr.as_deref().unwrap_or("none"),
+        "connection path established"
+    );
+
+    let mut events = conn.path_events();
+    let mut last_type = conn_type;
+    tokio::spawn(async move {
+        use n0_future::StreamExt as _;
+        while let Some(event) = events.next().await {
+            // Only a `Selected` event moves the transmission path; classify the
+            // newly-selected remote address and log iff the direct/relay type
+            // flips (e.g. relay → direct after a successful hole-punch).
+            if let iroh::endpoint::PathEvent::Selected { remote_addr, .. } = event {
+                let new_type = if remote_addr.is_relay() {
+                    "relay"
+                } else if remote_addr.is_ip() {
+                    "direct"
+                } else {
+                    "other"
+                };
+                if new_type != last_type {
+                    tracing::info!(
+                        peer = %peer,
+                        direction,
+                        conn_type = new_type,
+                        addr = %remote_addr,
+                        "connection path changed"
+                    );
+                    last_type = new_type;
+                }
+            }
+        }
+    });
 }
 
 /// Generate a fresh random 32-byte secret key (for ephemeral endpoints / tests).

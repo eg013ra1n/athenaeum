@@ -818,6 +818,155 @@ async fn fetch_rejects_traversal_entry_names() {
 }
 
 // ---------------------------------------------------------------------------
+// 4b. Connection-path diagnostics (NAT investigation): the establishment line
+//     fires with a `conn_type` field. Relay is disabled here, so the in-process
+//     localhost connection classifies as `direct`. A minimal thread-local
+//     capture layer asserts the field without touching the global JSONL
+//     subscriber (the logging suite owns that) — `#[tokio::test]` runs on a
+//     current-thread runtime, so the inline outgoing dial and the spawned
+//     inbound accept both execute on this thread and are captured.
+// ---------------------------------------------------------------------------
+
+/// One captured tracing event: its message plus its string-rendered fields.
+#[derive(Clone, Default)]
+struct CapturedEvent {
+    message: String,
+    fields: std::collections::HashMap<String, String>,
+}
+
+/// Field visitor: records `message` separately and every other field as a
+/// string, covering both `record_str` (e.g. `conn_type = "direct"`) and
+/// `record_debug` (e.g. `%peer`, and the format_args message).
+#[derive(Default)]
+struct FieldCollector {
+    message: String,
+    fields: std::collections::HashMap<String, String>,
+}
+
+impl tracing::field::Visit for FieldCollector {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = rendered;
+        } else {
+            self.fields.insert(field.name().to_string(), rendered);
+        }
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields.insert(field.name().to_string(), value.to_string());
+        }
+    }
+}
+
+/// A minimal `tracing` layer capturing this module's events into a shared vec.
+/// Filtered to `athenaeum_core::sharing` targets (iroh's own high-volume events
+/// are dropped cheaply) and hinted to `INFO` so debug/trace callsites never even
+/// fire.
+#[derive(Clone)]
+struct CaptureLayer {
+    events: Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::INFO)
+    }
+
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if !event.metadata().target().starts_with("athenaeum_core::sharing") {
+            return;
+        }
+        let mut collector = FieldCollector::default();
+        event.record(&mut collector);
+        self.events.lock().unwrap().push(CapturedEvent {
+            message: collector.message,
+            fields: collector.fields,
+        });
+    }
+}
+
+#[tokio::test]
+async fn connection_path_established_line_carries_conn_type_field() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let captured: Arc<std::sync::Mutex<Vec<CapturedEvent>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let layer = CaptureLayer {
+        events: captured.clone(),
+    };
+    // Thread-local default (not global): takes precedence on this thread over any
+    // global subscriber a neighbouring test installed, and the current-thread
+    // runtime keeps every task on this thread, so all establishment lines land.
+    let _guard = tracing_subscriber::registry().with(layer).set_default();
+
+    let provider = mem_transport().await;
+    let receiver = mem_transport().await;
+    let (_provider_info, receiver_info) = start_and_pair(&provider, &receiver).await;
+    let mut receiver_events = receiver.events().await;
+
+    let tmp = tempdir().unwrap();
+    let (pkg_dir, announce) =
+        build_package(&tmp.path().join("src"), "uuid-path-1", "path1.fits", "M1", 4096);
+    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    // `announce` dials an outgoing control connection (logged inline on this
+    // task) AND drives the receiver's inbound accept (logged on its own task) —
+    // both emit the establishment line.
+    provider
+        .announce(receiver_info.node_id, &announce)
+        .await
+        .unwrap();
+    // Await dispatch so the inbound accept path has certainly run before we read.
+    match recv_next(&mut receiver_events).await {
+        TransportEvent::AnnounceReceived { .. } => {}
+        other => panic!("expected AnnounceReceived, got {other:?}"),
+    }
+
+    let events = captured.lock().unwrap();
+    let established: Vec<&CapturedEvent> = events
+        .iter()
+        .filter(|e| e.message == "connection path established")
+        .collect();
+    assert!(
+        !established.is_empty(),
+        "expected a 'connection path established' line; captured messages: {:?}",
+        events.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
+    );
+    assert!(
+        established
+            .iter()
+            .all(|e| e.fields.contains_key("conn_type")),
+        "every establishment line must carry a conn_type field; got: {:?}",
+        established
+            .iter()
+            .map(|e| e.fields.clone())
+            .collect::<Vec<_>>()
+    );
+    // Relay disabled + localhost ⇒ at least one path classifies as a direct IP path.
+    assert!(
+        established
+            .iter()
+            .any(|e| e.fields.get("conn_type").map(String::as_str) == Some("direct")),
+        "an in-process localhost connection (relay disabled) must classify as direct; got: {:?}",
+        established
+            .iter()
+            .map(|e| e.fields.clone())
+            .collect::<Vec<_>>()
+    );
+    drop(events);
+
+    provider.shutdown().await;
+    receiver.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // 5. Dedup handshake over iroh: negotiate_want drives Offer→Want→FullHashes→Want
 //    against a responder wired into the receiver's control channel.
 // ---------------------------------------------------------------------------
