@@ -21,8 +21,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine;
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::account::keys::{device_key_path, DeviceKey};
@@ -33,7 +31,7 @@ use crate::collab::gate::{
     evaluate_frame, FrameGateRow, GateFrameInput, ProjectTarget, ThresholdRuleView,
 };
 use crate::collab::hub_client::{AnnounceRequest, CollabClient};
-use crate::collab::snapshot::SnapshotMember;
+use crate::collab::snapshot::{member_node_ids, own_display_name, SnapshotMember};
 use crate::coordinates::{angular_distance, parse_dec_sexagesimal, parse_ra_sexagesimal};
 use crate::db::analysis::get_frame_analyses_by_ids;
 use crate::db::collab::CollabProjectRow;
@@ -1068,29 +1066,6 @@ fn sorted_f64(mut v: Vec<f64>) -> Vec<f64> {
     v
 }
 
-/// The base64 `nodes[]` of one snapshot member decoded to raw 32-byte node ids
-/// (malformed entries skipped). Mirrors [`crate::collab::authz`]'s decode.
-fn member_node_ids(member: &SnapshotMember) -> Vec<NodeId> {
-    member
-        .nodes
-        .iter()
-        .filter_map(|entry| {
-            let bytes = B64.decode(entry).ok()?;
-            <[u8; 32]>::try_from(bytes.as_slice()).ok()
-        })
-        .collect()
-}
-
-/// The publisher's own display name from the cached snapshot (the member owning
-/// `own_node`), or empty when it can't be resolved.
-fn own_display_name(members: &[SnapshotMember], own_node: &NodeId) -> String {
-    members
-        .iter()
-        .find(|m| member_node_ids(m).iter().any(|n| n == own_node))
-        .map(|m| m.display_name.clone())
-        .unwrap_or_default()
-}
-
 /// Push-seed target selection (Д8): the FIRST eligible member's first node,
 /// excluding our own. Candidate roles are the coordinator when the announcement
 /// is `pending` (only they can decide it), else every `send_receive` member.
@@ -1746,6 +1721,11 @@ pub async fn decide_announcement(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The production module no longer imports base64 (the `member_node_ids`
+    // helper that used it moved to `crate::collab::snapshot`); the tests still
+    // encode node ids into snapshot fixtures.
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
 
     /// A minimal real-`Database` [`ServiceContext`] (tempdir SQLite, no keychain
     /// involved anywhere). Copied verbatim from `api::sync` / `api::masters`

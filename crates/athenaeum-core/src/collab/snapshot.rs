@@ -14,6 +14,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use super::hub_client::SignedSnapshotWire;
+use crate::sharing::types::NodeId;
 
 // Serialize too: Task 5 re-serializes the verified member list into the
 // cache's members_json (camelCase preserved for the ProjectMemberView parse).
@@ -52,6 +53,33 @@ pub struct VerifiedSnapshot {
     pub members: Vec<SnapshotMember>,
 }
 
+/// The base64 `nodes[]` of one snapshot member decoded to raw 32-byte node ids
+/// (malformed entries skipped). Mirrors [`crate::collab::authz`]'s decode.
+///
+/// Lives here (rather than in the render-gated `api::collab` where it began) so
+/// the ungated project-export runner can resolve a publisher's own display name
+/// in the headless build (Д2).
+pub(crate) fn member_node_ids(member: &SnapshotMember) -> Vec<NodeId> {
+    member
+        .nodes
+        .iter()
+        .filter_map(|entry| {
+            let bytes = B64.decode(entry).ok()?;
+            <[u8; 32]>::try_from(bytes.as_slice()).ok()
+        })
+        .collect()
+}
+
+/// The publisher's own display name from a member list (the member owning
+/// `own_node`), or empty when it can't be resolved.
+pub(crate) fn own_display_name(members: &[SnapshotMember], own_node: &NodeId) -> String {
+    members
+        .iter()
+        .find(|m| member_node_ids(m).iter().any(|n| n == own_node))
+        .map(|m| m.display_name.clone())
+        .unwrap_or_default()
+}
+
 /// Verify the wire snapshot against the pinned hub pubkey and parse it.
 /// Every failure is a hard error — a snapshot that does not verify is never
 /// partially used.
@@ -72,7 +100,8 @@ pub fn verify_and_parse(
         .context("pinned pubkey is not valid base64")?
         .try_into()
         .map_err(|_| anyhow::anyhow!("pinned pubkey must decode to 32 bytes"))?;
-    let key = VerifyingKey::from_bytes(&key_bytes).context("pinned pubkey is not a valid ed25519 key")?;
+    let key =
+        VerifyingKey::from_bytes(&key_bytes).context("pinned pubkey is not a valid ed25519 key")?;
 
     let payload = B64
         .decode(&wire.payload)
@@ -131,7 +160,10 @@ mod tests {
         let wire = signed_fixture(&key, &payload());
         let pinned = wire.pubkey.clone();
         let snap = verify_and_parse(&wire, &pinned).unwrap();
-        assert_eq!(snap.project_id, "p-1", "project_id round-trips for the binding check");
+        assert_eq!(
+            snap.project_id, "p-1",
+            "project_id round-trips for the binding check"
+        );
         assert_eq!(snap.membership_version, 4);
         assert!(snap.require_approval);
         assert_eq!(snap.members[0].display_name, "Vilen");
@@ -148,7 +180,10 @@ mod tests {
         let mut tampered = serde_json::to_vec(&payload()).unwrap();
         tampered[10] ^= 0xFF;
         wire.payload = B64.encode(&tampered);
-        assert!(verify_and_parse(&wire, &pinned).is_err(), "tampered payload must fail");
+        assert!(
+            verify_and_parse(&wire, &pinned).is_err(),
+            "tampered payload must fail"
+        );
 
         // Signed by a DIFFERENT key but claiming the pinned pubkey → fails.
         let other = SigningKey::from_bytes(&[2u8; 32]);
@@ -156,12 +191,18 @@ mod tests {
             pubkey: pinned.clone(),
             ..signed_fixture(&other, &payload())
         };
-        assert!(verify_and_parse(&forged, &pinned).is_err(), "wrong key must fail");
+        assert!(
+            verify_and_parse(&forged, &pinned).is_err(),
+            "wrong key must fail"
+        );
 
         // Honest wire but the PIN doesn't match → hard error (never TOFU-drift).
         let honest = signed_fixture(&key, &payload());
         let other_pin = B64.encode(other.verifying_key().to_bytes());
-        assert!(verify_and_parse(&honest, &other_pin).is_err(), "pin mismatch must fail");
+        assert!(
+            verify_and_parse(&honest, &other_pin).is_err(),
+            "pin mismatch must fail"
+        );
     }
 
     #[test]
@@ -171,6 +212,9 @@ mod tests {
         p["schema"] = serde_json::json!(2);
         let wire = signed_fixture(&key, &p);
         let pinned = wire.pubkey.clone();
-        assert!(verify_and_parse(&wire, &pinned).is_err(), "schema 2 must be refused");
+        assert!(
+            verify_and_parse(&wire, &pinned).is_err(),
+            "schema 2 must be refused"
+        );
     }
 }
