@@ -33,6 +33,13 @@ pub mod lights;
 #[cfg(feature = "render")]
 pub mod collab;
 
+// Slice-5 capstone: the three-instance collaboration E2E (publish → moderation →
+// swarm delivery → project WBPP export) exercised in one process over the
+// in-memory loopback transport. Test-only, and additionally render-gated because
+// it drives `publish_collab_frames` (render-gated in `api::collab`).
+#[cfg(all(test, feature = "render"))]
+mod collab_e2e_tests;
+
 #[derive(Debug)]
 pub enum ApiError {
     NotFound(String),
