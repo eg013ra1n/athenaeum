@@ -97,33 +97,25 @@ fn device_key_in_use_message(path: &Path) -> String {
 /// original on the relay (one relay slot per node id). Dropping it (node
 /// shutdown) releases the OS lock so a later re-bind can re-acquire it.
 ///
-/// # Why the raw pointer
+/// # How the lock is held
 ///
-/// [`fd_lock::RwLock::try_write`] borrows the lock `&mut` for the returned
-/// guard's whole lifetime, and it is the guard's `Drop` that releases the OS
-/// `flock` (dropping the guard early would unlock). So the lock and its guard
-/// must stay alive together — a self-referential pair. We box the lock, hand the
-/// guard a `'static` borrow of that box, and reclaim the box in `Drop` after the
-/// guard has released. No leak (important: the node may re-bind), no external
-/// self-referential-struct crate.
+/// [`fd_lock::RwLock::try_write`] returns a guard borrowing the lock, and it is
+/// the guard's `Drop` that calls `flock(LOCK_UN)`. To hold the lock for this
+/// struct's whole lifetime we take the guard, [`std::mem::forget`] it (so
+/// `LOCK_UN` never runs), and keep the [`fd_lock::RwLock`] — which owns the open
+/// `File` — alive in `_lock`. The OS `flock` is bound to the open file
+/// description, so it is released exactly when this struct drops and the `File`
+/// closes. `fd_lock::RwLock<T>` has no `Drop` of its own, so nothing else can
+/// touch the lock. No `unsafe`, no raw pointers, no leak (the node may re-bind).
 pub struct DeviceKeyLock {
-    /// Dropped FIRST (Rust drops fields in declaration order): releasing the OS
-    /// lock before `lock` — the box it borrows — is freed. `Option` so `Drop`
-    /// can release it explicitly ahead of reclaiming the box.
-    guard: Option<fd_lock::RwLockWriteGuard<'static, std::fs::File>>,
-    /// Raw owner of the boxed lock the guard borrows; reclaimed exactly once in
-    /// `Drop`. Came from [`Box::into_raw`] in [`Self::acquire`].
-    lock: *mut fd_lock::RwLock<std::fs::File>,
+    /// Owns the open key `File` whose file-description carries the `flock`. The
+    /// lock stays held for as long as this field is alive (its guard was
+    /// `mem::forget`-ted, so no `LOCK_UN` runs); closing the `File` on drop is
+    /// what releases the OS lock.
+    _lock: fd_lock::RwLock<std::fs::File>,
     /// The locked key path, for the release log line (no secret material).
     path: PathBuf,
 }
-
-// Safety: the boxed `fd_lock::RwLock` is uniquely owned via `lock` (exactly one
-// `&mut` to it is ever created — the one held by `guard`), and the underlying
-// `flock` is bound to the open file description, not a thread. Moving the value
-// between threads and dropping it there (which unlocks) is therefore sound. Not
-// `Sync`: there is no shared access to the raw pointer.
-unsafe impl Send for DeviceKeyLock {}
 
 impl DeviceKeyLock {
     /// Acquire the exclusive advisory lock on `key_path`, which must already
@@ -137,45 +129,34 @@ impl DeviceKeyLock {
             .write(true)
             .open(key_path)
             .with_context(|| format!("open device key for locking {}", key_path.display()))?;
-        let ptr = Box::into_raw(Box::new(fd_lock::RwLock::new(file)));
-        // Safety: `ptr` is a fresh unique allocation from `Box::into_raw`; we
-        // create exactly one `&mut` from it, which moves into the guard on
-        // success or is dropped (via reclaiming the box) on every error path.
-        let lock_ref: &'static mut fd_lock::RwLock<std::fs::File> = unsafe { &mut *ptr };
-        match lock_ref.try_write() {
+        let mut lock = fd_lock::RwLock::new(file);
+        match lock.try_write() {
             Ok(guard) => {
+                // Keep the OS lock for the struct's lifetime: forget the guard so
+                // its `Drop` (the only caller of `flock(LOCK_UN)`) never runs.
+                // The lock releases when `_lock` closes the file on struct drop.
+                std::mem::forget(guard);
                 tracing::debug!(path = %key_path.display(), "device key lock acquired");
-                Ok(Self {
-                    guard: Some(guard),
-                    lock: ptr,
-                    path: key_path.to_path_buf(),
-                })
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // Contention — reclaim the box (no guard was taken) and report.
-                // Safety: `ptr` came from `Box::into_raw` above and no live
-                // borrow of it exists (`try_write` failed, `lock_ref` unused).
-                unsafe { drop(Box::from_raw(ptr)) };
                 anyhow::bail!(device_key_in_use_message(key_path))
             }
             Err(e) => {
-                // Safety: as above — reclaim the never-borrowed box.
-                unsafe { drop(Box::from_raw(ptr)) };
-                Err(e).with_context(|| format!("lock device key {}", key_path.display()))
+                return Err(e).with_context(|| format!("lock device key {}", key_path.display()));
             }
         }
+        Ok(Self {
+            _lock: lock,
+            path: key_path.to_path_buf(),
+        })
     }
 }
 
 impl Drop for DeviceKeyLock {
     fn drop(&mut self) {
-        // Release the OS lock (guard `Drop` → `flock(LOCK_UN)`) BEFORE freeing
-        // the box it borrows.
-        self.guard = None;
-        // Safety: `lock` came from `Box::into_raw` in `acquire` and is turned
-        // back into a `Box` — and dropped — exactly once, here; the only borrow
-        // of it (`guard`) was just released on the line above.
-        unsafe { drop(Box::from_raw(self.lock)) };
+        // Log only. The OS lock is released by `_lock` closing its file as this
+        // struct's fields drop after this method returns — nothing here touches
+        // the lock.
         tracing::debug!(path = %self.path.display(), "device key lock released");
     }
 }

@@ -346,12 +346,12 @@ impl SharedIrohNode {
             handle.abort();
         }
         if let Err(e) = self.router.shutdown().await {
-            tracing::debug!(error = %e, "shared iroh node router shutdown");
+            tracing::warn!(error = %e, "shared iroh node router shutdown");
         }
         // Flush the persistent store to disk (also releases the redb file lock
         // so a later re-bind over the same dir can reopen it).
         if let Err(e) = self.store.shutdown().await {
-            tracing::debug!(error = %e, "shared iroh node blob store shutdown");
+            tracing::warn!(error = %e, "shared iroh node blob store shutdown");
         }
         if tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, self.endpoint.close())
             .await
