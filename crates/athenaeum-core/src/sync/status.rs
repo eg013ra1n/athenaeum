@@ -40,8 +40,10 @@ pub struct SyncSenderStatus {
     pub transferring: u32,
     /// Terminal `confirmed` package count (all frames ingested-or-duplicate).
     pub confirmed_total: u32,
-    /// Terminal `failed` package count.
+    /// Terminal `failed` package count (local-unrecoverable payload only).
     pub failed_total: u32,
+    /// Terminal `cancelled` package count (user-cancelled sends).
+    pub cancelled_total: u32,
     /// The in-flight rows for the Active tab.
     pub active: Vec<OutboundSummary>,
 }

@@ -16,9 +16,9 @@ use crate::sharing::types::NodeId;
 /// Collapsed for v1 (see the [module docs](super)): `Delivered` is retained in
 /// the enum — keeping the DDL `state TEXT` value space stable for later tasks —
 /// but is never written by the engine, which learns completion from the peer's
-/// ack. Terminal states are [`Confirmed`](Self::Confirmed) and
-/// [`Failed`](Self::Failed); everything else is non-terminal and re-driven on
-/// crash-resume.
+/// ack. Terminal states are [`Confirmed`](Self::Confirmed),
+/// [`Failed`](Self::Failed) and [`Cancelled`](Self::Cancelled); everything else
+/// is non-terminal and re-driven on crash-resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum OutboundState {
@@ -36,13 +36,20 @@ pub enum OutboundState {
     /// frames ingested-or-duplicate". An ack carrying any `Rejected` receipt is
     /// a partial delivery — the engine does NOT confirm; the package stays in
     /// flight so the normal ack-timeout/retry path re-announces (redelivery)
-    /// until the peer accepts every frame, or `max_attempts` exhausts to
-    /// `Failed`.
+    /// forever until the peer accepts every frame. Pending states never expire
+    /// from a timeout (delivery-forever cycle, Tasks 1–2).
     Confirmed,
-    /// Retries exhausted or cancelled — terminal failure. Also reached when a
-    /// package keeps receiving a partial/rejected ack past `max_attempts`; the
-    /// recorded history names the frame(s) that were still rejected.
+    /// Terminal failure reserved for a **local, unrecoverable** payload problem
+    /// (e.g. the package dir is gone — see the missing-payload guard) or a
+    /// legacy row written before the delivery-forever cycle. It is NOT reached
+    /// from ack timeouts or from partial/rejected acks: those re-deliver forever
+    /// (`Confirmed` doc) rather than exhausting to `Failed`.
     Failed,
+    /// User cancel — terminal. Reached when the sender explicitly cancels an
+    /// in-flight package, or (a later task) when the receiver acks every frame
+    /// as cancelled. Distinct from [`Failed`](Self::Failed) so the UI and retry
+    /// eligibility can tell "user gave up" apart from "payload broke".
+    Cancelled,
 }
 
 impl OutboundState {
@@ -55,6 +62,7 @@ impl OutboundState {
             OutboundState::Delivered => "delivered",
             OutboundState::Confirmed => "confirmed",
             OutboundState::Failed => "failed",
+            OutboundState::Cancelled => "cancelled",
         }
     }
 
@@ -68,14 +76,19 @@ impl OutboundState {
             "delivered" => OutboundState::Delivered,
             "confirmed" => OutboundState::Confirmed,
             "failed" => OutboundState::Failed,
+            "cancelled" => OutboundState::Cancelled,
             other => return Err(anyhow!("unknown outbound state: {other}")),
         })
     }
 
-    /// True for the two terminal states ([`Confirmed`](Self::Confirmed),
-    /// [`Failed`](Self::Failed)) that crash-resume must *not* re-drive.
+    /// True for the three terminal states ([`Confirmed`](Self::Confirmed),
+    /// [`Failed`](Self::Failed), [`Cancelled`](Self::Cancelled)) that
+    /// crash-resume must *not* re-drive.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, OutboundState::Confirmed | OutboundState::Failed)
+        matches!(
+            self,
+            OutboundState::Confirmed | OutboundState::Failed | OutboundState::Cancelled
+        )
     }
 }
 

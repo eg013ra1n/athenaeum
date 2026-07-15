@@ -1562,7 +1562,7 @@ impl Worker {
             return Ok(());
         };
 
-        self.store.set_state(id, OutboundState::Failed)?;
+        self.store.set_state(id, OutboundState::Cancelled)?;
         // Terminal: no retry is pending — clear the persisted countdown (Task 2).
         self.clear_next_retry(id);
         // Terminal: release any served blobs (fire-and-forget).
@@ -1571,8 +1571,7 @@ impl Worker {
         }
         tracing::info!(
             package_id = id,
-            state = "failed",
-            reason = "cancelled",
+            state = "cancelled",
             "sync state"
         );
         self.append_terminal_history(id, &dir, "cancelled", None)?;

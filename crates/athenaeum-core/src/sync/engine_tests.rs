@@ -873,7 +873,7 @@ async fn first_attempt_peer_offline_then_online_completes() {
 }
 
 #[tokio::test]
-async fn cancel_moves_to_failed_cancelled() {
+async fn cancel_moves_to_cancelled_state() {
     let tmp = tempdir().unwrap();
     let net = LoopbackNetwork::new();
 
@@ -885,13 +885,18 @@ async fn cancel_moves_to_failed_cancelled() {
     let pkg = build_package(&tmp.path().join("src5"), "uuid-5", "frame5.fits", "Sol", 1024);
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let engine = SyncEngine::spawn_with_config(
+    // Spawn WITH a capturing emitter so we can assert the `sync-finished` outcome
+    // as well as the persisted terminal state.
+    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> = Arc::new(CapturingEmitter(events.clone()));
+    let engine = SyncEngine::spawn_with_config_and_emitter(
         store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
         receiver_id,
         SyncConfig {
             ack_timeout: Duration::from_secs(60),
         },
+        Some(emitter),
     );
 
     let id = engine.enqueue_package(&pkg).await.unwrap();
@@ -902,9 +907,13 @@ async fn cancel_moves_to_failed_cancelled() {
     .await;
 
     engine.cancel(id).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Failed), WAIT).await;
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
 
-    assert_eq!(state_of(&store, id), Some(OutboundState::Failed));
+    // A user cancel lands in the first-class terminal `Cancelled` state, NOT
+    // `Failed` — so the UI and retry eligibility can tell the two apart.
+    assert_eq!(state_of(&store, id), Some(OutboundState::Cancelled));
+
+    // History still records a `cancelled` outcome for the frame.
     let history = store
         .search_history(HistoryQuery {
             filename: Some("frame5.fits".to_string()),
@@ -919,6 +928,26 @@ async fn cancel_moves_to_failed_cancelled() {
         history.iter().any(|h| h.outcome == "cancelled"),
         "a cancelled outcome must be recorded in history"
     );
+
+    // The sender's single `sync-finished` event carries the `cancelled` outcome.
+    wait_until(
+        || {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, p)| n == "sync-finished" && p["outcome"].as_str() == Some("cancelled"))
+        },
+        WAIT,
+    )
+    .await;
+    let evts = events.lock().unwrap();
+    let finished = evts
+        .iter()
+        .find(|(n, _)| n == "sync-finished")
+        .expect("a sync-finished event");
+    assert_eq!(finished.1["outcome"].as_str(), Some("cancelled"));
+    drop(evts);
 
     engine.shutdown().await;
 }
@@ -1030,12 +1059,12 @@ async fn startup_heal_cleans_confirmed_payloads() {
     engine2.shutdown().await;
 }
 
-/// Test C: a package driven to terminal `Failed` KEEPS its payloads — Task 2's
-/// retry re-enqueues the same package dir and depends on them. Under
+/// Test C: a package driven to a terminal, non-`Confirmed` state KEEPS its
+/// payloads — only a `Confirmed` package's copies are reclaimed. Under
 /// delivery-forever semantics (spec §2) a timeout never terminalizes, so the
-/// terminal `Failed` here is reached by an explicit cancel.
+/// terminal state here is reached by an explicit cancel (→ `Cancelled`).
 #[tokio::test]
-async fn failed_package_keeps_payloads() {
+async fn cancelled_package_keeps_payloads() {
     let tmp = tempdir().unwrap();
     let net = LoopbackNetwork::new();
 
@@ -1063,15 +1092,15 @@ async fn failed_package_keeps_payloads() {
     )
     .await;
 
-    // Cancel → terminal Failed.
+    // Cancel → terminal Cancelled.
     engine.cancel(id).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Failed), WAIT).await;
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
 
     // A brief settle so any (erroneous) cleanup would have a chance to run.
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         pkg.join("frameC.fits").exists(),
-        "a failed package must KEEP its payloads (retry depends on them)"
+        "a terminal non-confirmed package must KEEP its payloads (only confirm reclaims them)"
     );
     assert!(pkg.join(MANIFEST_FILENAME).exists());
 

@@ -590,7 +590,7 @@ export type BiasFallback = "subtractBias" | "skipFrame";
 
 export type Direction = "sent" | "received";
 
-export type OutboundState = "queued" | "announced" | "transferring" | "delivered" | "confirmed" | "failed";
+export type OutboundState = "queued" | "announced" | "transferring" | "delivered" | "confirmed" | "failed" | "cancelled";
 
 export type HistoryRow = { frameUuid: string, filename: string, object: string | null, 
 /**
@@ -647,9 +647,13 @@ transferring: number,
  */
 confirmedTotal: number, 
 /**
- * Terminal `failed` package count.
+ * Terminal `failed` package count (local-unrecoverable payload only).
  */
 failedTotal: number, 
+/**
+ * Terminal `cancelled` package count (user-cancelled sends).
+ */
+cancelledTotal: number, 
 /**
  * The in-flight rows for the Active tab.
  */

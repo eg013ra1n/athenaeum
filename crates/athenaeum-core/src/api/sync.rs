@@ -795,10 +795,14 @@ async fn build_sender_status(
         }
     }
 
-    let (confirmed_total, failed_total) = {
+    let (confirmed_total, failed_total, cancelled_total) = {
         let db = db(ctx)?;
         let conn = db.conn();
-        (count_outbound_state(&conn, "confirmed")?, count_outbound_state(&conn, "failed")?)
+        (
+            count_outbound_state(&conn, "confirmed")?,
+            count_outbound_state(&conn, "failed")?,
+            count_outbound_state(&conn, "cancelled")?,
+        )
     };
 
     Ok(SyncSenderStatus {
@@ -807,6 +811,7 @@ async fn build_sender_status(
         transferring,
         confirmed_total,
         failed_total,
+        cancelled_total,
         active,
     })
 }

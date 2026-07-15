@@ -1157,8 +1157,9 @@ pub(crate) async fn enqueue_package_to_all(
 /// Each fanned-out package dir has one row per target it reached. Group by
 /// `package_ref` and, per dir:
 ///   - `expected` = number of rows (the targets that received it), and
-///   - already-terminal = rows in `Confirmed` or `Failed` (a cancel is stored as
-///     `Failed`), replayed as `on_terminal` calls.
+///   - already-terminal = rows in any terminal state (`Confirmed`, `Failed`, or
+///     `Cancelled` — a cancel is stored as `Cancelled`), replayed as
+///     `on_terminal` calls.
 ///
 /// A dir terminal on every target is cleaned exactly once here; a dir with any
 /// still-pending target keeps its payload — that target's engine resume re-drives
@@ -1182,7 +1183,7 @@ fn reconcile_shared_cleanup(
     for row in &rows {
         let entry = by_dir.entry(row.package_ref.clone()).or_insert((0, 0));
         entry.0 += 1;
-        if matches!(row.state, OutboundState::Confirmed | OutboundState::Failed) {
+        if row.state.is_terminal() {
             entry.1 += 1;
         }
     }

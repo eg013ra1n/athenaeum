@@ -721,10 +721,21 @@ impl SyncStore for StandaloneSyncStore {
 
     fn set_state(&self, id: i64, s: OutboundState) -> Result<()> {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
-        conn.execute(
-            "UPDATE sync_outbound SET state = ?1 WHERE id = ?2",
-            params![s.as_str(), id],
-        )
+        // Defense-in-depth (Task 2 M1): a terminal state has no pending retry,
+        // so clear any persisted countdown in the same write — a future
+        // non-engine caller can't leave a stale `next_retry_at` behind. The
+        // engine also clears it explicitly; that duplicate is harmless.
+        if s.is_terminal() {
+            conn.execute(
+                "UPDATE sync_outbound SET state = ?1, next_retry_at = NULL WHERE id = ?2",
+                params![s.as_str(), id],
+            )
+        } else {
+            conn.execute(
+                "UPDATE sync_outbound SET state = ?1 WHERE id = ?2",
+                params![s.as_str(), id],
+            )
+        }
         .with_context(|| format!("set state {} for outbound {id}", s.as_str()))?;
         Ok(())
     }
@@ -771,7 +782,7 @@ impl SyncStore for StandaloneSyncStore {
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {OUTBOUND_COLS} FROM sync_outbound
-                 WHERE state NOT IN ('confirmed', 'failed')
+                 WHERE state NOT IN ('confirmed', 'failed', 'cancelled')
                  ORDER BY id ASC"
             ))
             .context("prepare non_terminal")?;
@@ -806,7 +817,7 @@ impl SyncStore for StandaloneSyncStore {
         // ack that slipped past the engine's in-flight map).
         let changed = conn
             .execute(
-                "UPDATE sync_outbound SET state = ?1, confirmed_at = ?2, last_error = NULL
+                "UPDATE sync_outbound SET state = ?1, confirmed_at = ?2, last_error = NULL, next_retry_at = NULL
                  WHERE id = ?3 AND state <> ?1",
                 params![OutboundState::Confirmed.as_str(), now_iso(), id],
             )
@@ -947,10 +958,21 @@ impl SyncStore for CatalogSyncStore {
 
     fn set_state(&self, id: i64, s: OutboundState) -> Result<()> {
         let conn = self.lock_conn();
-        conn.execute(
-            "UPDATE sync_outbound SET state = ?1 WHERE id = ?2",
-            params![s.as_str(), id],
-        )
+        // Defense-in-depth (Task 2 M1): a terminal state has no pending retry,
+        // so clear any persisted countdown in the same write — a future
+        // non-engine caller can't leave a stale `next_retry_at` behind. The
+        // engine also clears it explicitly; that duplicate is harmless.
+        if s.is_terminal() {
+            conn.execute(
+                "UPDATE sync_outbound SET state = ?1, next_retry_at = NULL WHERE id = ?2",
+                params![s.as_str(), id],
+            )
+        } else {
+            conn.execute(
+                "UPDATE sync_outbound SET state = ?1 WHERE id = ?2",
+                params![s.as_str(), id],
+            )
+        }
         .with_context(|| format!("set state {} for outbound {id}", s.as_str()))?;
         Ok(())
     }
@@ -997,7 +1019,7 @@ impl SyncStore for CatalogSyncStore {
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {OUTBOUND_COLS} FROM sync_outbound
-                 WHERE state NOT IN ('confirmed', 'failed')
+                 WHERE state NOT IN ('confirmed', 'failed', 'cancelled')
                  ORDER BY id ASC"
             ))
             .context("prepare non_terminal")?;
@@ -1030,7 +1052,7 @@ impl SyncStore for CatalogSyncStore {
         let conn = self.lock_conn();
         let changed = conn
             .execute(
-                "UPDATE sync_outbound SET state = ?1, confirmed_at = ?2, last_error = NULL
+                "UPDATE sync_outbound SET state = ?1, confirmed_at = ?2, last_error = NULL, next_retry_at = NULL
                  WHERE id = ?3 AND state <> ?1",
                 params![OutboundState::Confirmed.as_str(), now_iso(), id],
             )
