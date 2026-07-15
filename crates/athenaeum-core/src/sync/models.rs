@@ -132,6 +132,14 @@ pub struct OutboundRow {
     /// *why* a package is stuck or failed, not just that it retried.
     #[serde(default)]
     pub last_error: Option<String>,
+    /// The wall-clock deadline (RFC3339 UTC, formatted like `created_at`) of the
+    /// next scheduled retry attempt (Task 2), or `None` when the package is not
+    /// currently waiting out a backoff window — it is awaiting an ack or terminal.
+    /// Written by the engine every time it arms a `Retry` deadline and cleared on
+    /// a successful announce / terminal transition, so the Transfers UI can render
+    /// a live countdown and a restart re-arms honestly. Read by tasks 9/14.
+    #[serde(default)]
+    pub next_retry_at: Option<String>,
 }
 
 /// One row of `sync_history`: an append-only audit entry for a per-frame

@@ -610,6 +610,40 @@ async fn timeouts_back_off_forever_without_failing() {
         "no `failed` history row may exist — timeouts never terminalize"
     );
 
+    // Task 2: the wall-clock retry deadline is persisted so the UI can render a
+    // live countdown. A successful re-announce clears it (now awaiting the ack),
+    // so wait for a backoff window where it is armed AND parses to a future
+    // instant — retrying past that transient clear.
+    wait_until(
+        || {
+            store
+                .non_terminal()
+                .unwrap()
+                .iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.next_retry_at.clone())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|t| t > chrono::Utc::now())
+                .unwrap_or(false)
+        },
+        WAIT,
+    )
+    .await;
+
+    // Receiver comes online: it fetches + acks the next re-announce, confirming
+    // the package — which clears next_retry_at on the terminal transition.
+    let _receiver = spawn_receiver(receiver.clone(), tmp.path().join("dest4"));
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        Duration::from_secs(12),
+    )
+    .await;
+    assert_eq!(
+        store.get_outbound(id).unwrap().unwrap().next_retry_at,
+        None,
+        "a confirmed package clears next_retry_at"
+    );
+
     engine.shutdown().await;
 }
 

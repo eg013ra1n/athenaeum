@@ -1650,11 +1650,15 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             DDL_HISTORY, DDL_INDEXES, DDL_OUTBOUND, DDL_RECEIPTS, DDL_SYNC_SOURCES,
         };
         conn.execute(DDL_OUTBOUND, [])?;
-        // Task 9: `CREATE TABLE IF NOT EXISTS` never adds a column to an existing
-        // `sync_outbound` — migrate the `last_error` column in place (guarded ALTER,
-        // the schema.rs idiom; never breaks a pre-Task-9 catalog).
+        // Task 9 / Task 2: `CREATE TABLE IF NOT EXISTS` never adds a column to an
+        // existing `sync_outbound` — migrate the `last_error` (Task 9) and
+        // `next_retry_at` (Task 2) columns in place (guarded ALTER, the schema.rs
+        // idiom; never breaks a pre-Task-9/pre-Task-2 catalog).
         if !column_exists(conn, "sync_outbound", "last_error")? {
             conn.execute("ALTER TABLE sync_outbound ADD COLUMN last_error TEXT", [])?;
+        }
+        if !column_exists(conn, "sync_outbound", "next_retry_at")? {
+            conn.execute("ALTER TABLE sync_outbound ADD COLUMN next_retry_at TEXT", [])?;
         }
         conn.execute(DDL_HISTORY, [])?;
         // AUDIT B3: `CREATE TABLE IF NOT EXISTS` never adds a column to an existing

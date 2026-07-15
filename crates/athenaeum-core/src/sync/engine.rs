@@ -98,6 +98,16 @@ pub fn retry_backoff(base: Duration, rung: u32) -> Duration {
     base * m
 }
 
+/// Wall-clock rendering of a retry deadline `delay` from now for the persisted
+/// `OutboundRow::next_retry_at` (Task 2): `Utc::now() + delay`, formatted exactly
+/// like the store's `created_at` (RFC3339 UTC, millisecond precision, `Z`) so the
+/// UI reads one timestamp shape across the whole sync surface. A `delay` that
+/// overflows `chrono`'s range degrades to `now` rather than panicking.
+fn retry_deadline_stamp(delay: Duration) -> String {
+    let at = chrono::Utc::now() + chrono::Duration::from_std(delay).unwrap_or_default();
+    at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 /// What the per-package deadline means when it fires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NextAction {
@@ -953,6 +963,9 @@ impl Worker {
         if let Err(se) = self.store.set_last_error(id, None) {
             tracing::warn!(package_id = id, error = %se, "clear last_error on announce success failed");
         }
+        // No retry is pending while we await the ack — clear the persisted
+        // countdown deadline (Task 2). Best-effort.
+        self.clear_next_retry(id);
         Ok(())
     }
 
@@ -1097,6 +1110,8 @@ impl Worker {
         self.store
             .confirm(pending.id, &receipts)
             .context("confirm all-duplicate outbound")?;
+        // Terminal: no retry is pending — clear the persisted countdown (Task 2).
+        self.clear_next_retry(pending.id);
         self.append_confirmed_history(&pending, &receipts)?;
         // Same shared-payload discipline as the ack path: defer to the
         // coordinator when fanned out, else clean the payload copies in line.
@@ -1130,10 +1145,40 @@ impl Worker {
     /// untouched — the row stays `Queued` until an announce actually succeeds, and
     /// is never terminalized from a network condition.
     fn arm_retry(&mut self, id: i64) {
-        if let Some(p) = self.pending.get_mut(&id) {
+        let delay = if let Some(p) = self.pending.get_mut(&id) {
             p.rung = p.rung.saturating_add(1);
             p.next_action = NextAction::Retry;
-            p.deadline = Instant::now() + retry_backoff(self.config.ack_timeout, p.rung);
+            let delay = retry_backoff(self.config.ack_timeout, p.rung);
+            p.deadline = Instant::now() + delay;
+            Some(delay)
+        } else {
+            None
+        };
+        // Persist the wall-clock retry deadline (Task 2) once the `&mut pending`
+        // borrow is dropped, so the UI can render a countdown and a restart re-arms
+        // honestly.
+        if let Some(delay) = delay {
+            self.persist_next_retry(id, delay);
+        }
+    }
+
+    /// Persist the wall-clock deadline (`now + delay`) of a just-armed `Retry`
+    /// window as `OutboundRow::next_retry_at` (Task 2). Best-effort (spec §2): a
+    /// store error is logged and dropped — a failed diagnostic write must never
+    /// break scheduling.
+    fn persist_next_retry(&self, id: i64, delay: Duration) {
+        let stamp = retry_deadline_stamp(delay);
+        if let Err(e) = self.store.set_next_retry_at(id, Some(&stamp)) {
+            tracing::warn!(package_id = id, error = %e, "persist next_retry_at failed");
+        }
+    }
+
+    /// Clear `OutboundRow::next_retry_at` (Task 2) — no retry is pending: on a
+    /// successful announce (now awaiting the ack) and on every terminal
+    /// transition. Best-effort, same rationale as [`persist_next_retry`].
+    fn clear_next_retry(&self, id: i64) {
+        if let Err(e) = self.store.set_next_retry_at(id, None) {
+            tracing::warn!(package_id = id, error = %e, "clear next_retry_at failed");
         }
     }
 
@@ -1302,6 +1347,8 @@ impl Worker {
         self.store
             .confirm(pending.id, &receipts)
             .context("confirm outbound")?;
+        // Terminal: no retry is pending — clear the persisted countdown (Task 2).
+        self.clear_next_retry(pending.id);
         self.append_confirmed_history(&pending, &receipts)?;
         // Terminal + confirmed: free the payload copies `write_package` made in
         // the package dir. They are dead weight once confirmed (the package is
@@ -1387,12 +1434,20 @@ impl Worker {
                     {
                         tracing::warn!(package_id = id, error = %se, "record last_error (ack timeout) failed");
                     }
-                    if let Some(p) = self.pending.get_mut(&id) {
+                    let delay = if let Some(p) = self.pending.get_mut(&id) {
                         p.rung = p.rung.saturating_add(1);
                         p.next_action = NextAction::Retry;
-                        p.deadline =
-                            Instant::now() + retry_backoff(self.config.ack_timeout, p.rung);
+                        let delay = retry_backoff(self.config.ack_timeout, p.rung);
+                        p.deadline = Instant::now() + delay;
                         tracing::info!(package_id = id, rung = p.rung, "ack timeout, backing off");
+                        Some(delay)
+                    } else {
+                        None
+                    };
+                    // Persist the wall-clock retry deadline (Task 2) after the
+                    // borrow drops so the UI countdown reflects the new backoff.
+                    if let Some(delay) = delay {
+                        self.persist_next_retry(id, delay);
                     }
                 }
                 NextAction::Retry => {
@@ -1447,6 +1502,8 @@ impl Worker {
             None => (None, Vec::new(), None, None, None),
         };
         self.store.set_state(id, OutboundState::Failed)?;
+        // Terminal: no retry is pending — clear the persisted countdown (Task 2).
+        self.clear_next_retry(id);
         // Terminal: release any served blobs (fire-and-forget). `pkg_id` is
         // `None` when the package never minted+served an announce (a pre-serve
         // failure) — nothing to release in that case.
@@ -1506,6 +1563,8 @@ impl Worker {
         };
 
         self.store.set_state(id, OutboundState::Failed)?;
+        // Terminal: no retry is pending — clear the persisted countdown (Task 2).
+        self.clear_next_retry(id);
         // Terminal: release any served blobs (fire-and-forget).
         if let Some(pid) = pkg_id {
             self.spawn_release(pid);
