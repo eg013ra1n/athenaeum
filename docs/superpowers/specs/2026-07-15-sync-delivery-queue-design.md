@@ -228,13 +228,22 @@ to consuming the iroh-blobs downloader progress stream:
   completion tick retained.
 - Loopback transport (`sharing/loopback.rs`) emits synthetic per-file progress
   so e2e tests can assert the contract without a network.
-- **Plan-time validation flag:** the exact progress API shape of iroh-blobs
-  `=0.103.0` (downloader progress stream vs `remote().fetch()` events) is
-  confirmed as the first planning task; the design assumes only "a stream of
-  (blob, offset) observations exists", which BLAKE3-verified streaming
-  guarantees in some form. Same task checks whether provider-side (upload)
-  events are free; if yes, batch-level upload bytes ride the same event; if
-  no, upload progress is out of this cycle (non-goal).
+- **Plan-time validation — RESOLVED (2026-07-15, crate-source review):**
+  iroh-blobs 0.103's `DownloadProgress::stream()` yields aggregate
+  `Progress(u64)` bytes for the whole request (no child identity); per-file
+  progress comes from `store.blobs().observe(child_hash)` `Bitfield`
+  streams, one per child, after a manifest-first phase
+  (`GetRequest::builder().root(..).child(0, ..)` → `Collection::load` gives
+  names + child hashes). Provider-side upload events ARE free —
+  `BlobsProtocol::new(store, Some(EventSender))` at the single construction
+  site, `RequestUpdate::Progress` per ~16 KiB with blob identity — so
+  **batch-level upload bytes on the sender are IN this cycle** (constraint:
+  every request's update receiver must be drained or the peer's download
+  aborts). Progress delivery uses a direct `FetchSink` callback passed into
+  `fetch` rather than the shared `TransportEvent` channel — the receiver
+  loop awaits `fetch` inline, so routing progress through the events mpsc
+  it isn't draining would risk backpressure/deadlock;
+  `TransportEvent::FetchProgress` (one-shot, consumer-less) is removed.
 - Sender side of the fetch (`serve`) is untouched — no wire change.
 
 ### 8. Persistent inbound rows
@@ -313,8 +322,16 @@ cancelled.
   use the **Nord palette** (frost blues for transfer/progress, aurora
   green/yellow/red for done/stalled/cancelled), wired through the existing
   design-token system (token values/extensions, never raw hex in
-  components) so both themes keep working. Mockup approved 2026-07-15
+  components) so both themes keep working. Verified at planning: the
+  existing token set in `tailwind.config.js:12-58` is already Nord
+  (`accent` = frost nord8-10, `success`/`warning`/`error` = aurora) — the
+  screen uses those tokens as-is. Mockup approved 2026-07-15
   (unified-table layout confirmed, quick-glance slide-over kept).
+- **History grouping needs a batch key:** `sync_history` rows carry no
+  package reference today, so the History tab's batch grouping adds a
+  `package_id TEXT` column to `sync_history` (guarded ALTER, nullable —
+  legacy rows group under "earlier"), populated by both terminal-history
+  writers (sender + ingest).
 
 ### 11. Perseus web parity
 
