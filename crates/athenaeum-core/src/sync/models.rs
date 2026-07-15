@@ -124,6 +124,14 @@ pub struct OutboundRow {
     pub attempts: u32,
     pub created_at: String,
     pub confirmed_at: Option<String>,
+    /// The most recent failed-attempt reason (Task 9), or `None` when the package
+    /// has never failed / was cleared on success or confirm. Written by the engine
+    /// on each failed serve/announce attempt and each ack-timeout, cleared when the
+    /// package announces successfully or reaches [`Confirmed`](OutboundState::Confirmed);
+    /// surfaced beside `attempts` on the Perseus status page so an operator sees
+    /// *why* a package is stuck or failed, not just that it retried.
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 /// One row of `sync_history`: an append-only audit entry for a per-frame

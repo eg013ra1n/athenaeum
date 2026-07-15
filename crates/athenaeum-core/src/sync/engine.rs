@@ -810,7 +810,14 @@ impl Worker {
             // `{e:#}` — same rationale as the build-announce branch above: the
             // bare `.context("announce package")` layer alone hid the real
             // cause (e.g. "peer not started: <hex>") in production logs.
-            tracing::error!(package_id = id, error = %format!("{e:#}"), "sync serve/announce failed; will retry");
+            let reason = format!("{e:#}");
+            tracing::error!(package_id = id, error = %reason, "sync serve/announce failed; will retry");
+            // Record the attempt-error reason for the Perseus status page (Task 9).
+            // Best-effort: a diagnostic write must never turn a retryable transfer
+            // into a failure, so a store error here is logged, not propagated.
+            if let Err(se) = self.store.set_last_error(id, Some(&reason)) {
+                tracing::warn!(package_id = id, error = %se, "record last_error (serve/announce) failed");
+            }
             if let Some(p) = self.pending.get_mut(&id) {
                 p.announce = Some(announce);
                 p.want = want;
@@ -859,6 +866,12 @@ impl Worker {
             p.started = true;
             p.started_at = started_at;
             p.deadline = Instant::now() + self.config.ack_timeout;
+        }
+        // The serve/announce succeeded — clear any stale attempt-error so a package
+        // now awaiting its ack no longer shows the previous failure (Task 9).
+        // Best-effort: a diagnostic write must never fail the send.
+        if let Err(se) = self.store.set_last_error(id, None) {
+            tracing::warn!(package_id = id, error = %se, "clear last_error on announce success failed");
         }
         Ok(())
     }
@@ -1263,6 +1276,15 @@ impl Worker {
         // gone) leaves the existing address in place — no worse than before.
         let mut refreshed = false;
         for id in due {
+            // A package that was already announced but whose ack never arrived
+            // records the ack-timeout as its last error (Task 9); a package that
+            // never announced already has its serve error recorded (site above) and
+            // must not be masked by "no ack". Best-effort diagnostic write.
+            if self.pending.get(&id).map(|p| p.started).unwrap_or(false) {
+                if let Err(se) = self.store.set_last_error(id, Some("no ack from peer within timeout")) {
+                    tracing::warn!(package_id = id, error = %se, "record last_error (ack timeout) failed");
+                }
+            }
             let attempts = self.store.bump_attempts(id).context("bump attempts")?;
             if attempts >= self.config.max_attempts {
                 self.fail_package(id)?;

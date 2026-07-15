@@ -1955,6 +1955,9 @@ mod retention_tests {
         fn set_state(&self, id: i64, s: OutboundState) -> Result<()> {
             self.0.set_state(id, s)
         }
+        fn set_last_error(&self, id: i64, err: Option<&str>) -> Result<()> {
+            self.0.set_last_error(id, err)
+        }
         fn bump_attempts(&self, id: i64) -> Result<u32> {
             self.0.bump_attempts(id)
         }

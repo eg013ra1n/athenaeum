@@ -384,7 +384,12 @@
                 // A failed package can be re-sent: retry re-enqueues its still-on-disk
                 // payload as a fresh package (the old failed row is left as-is).
                 const retry = r.state === 'failed' ? `<button class="warn" data-retry="${r.id}">Retry</button>` : '';
-                return `<tr><td>${sel}</td><td>${pkgCell(r)}</td><td><span class="chip ${esc(r.state)}">${esc(r.state)}</span></td><td class="mono">${esc(r.createdAt)}</td><td class="mono">${esc(r.confirmedAt || '–')}</td><td>${del}${retry}</td></tr>`;
+                // The most recent failed-attempt reason beside the attempt count
+                // (Task 9). Escaped like every other interpolated value on this page.
+                const err = r.lastError
+                  ? `<div class="mono" style="color:var(--err); font-size:0.72rem; margin-top:0.15rem">attempt ${r.attempts}: ${esc(r.lastError)}</div>`
+                  : '';
+                return `<tr><td>${sel}</td><td>${pkgCell(r)}</td><td><span class="chip ${esc(r.state)}">${esc(r.state)}</span>${err}</td><td class="mono">${esc(r.createdAt)}</td><td class="mono">${esc(r.confirmedAt || '–')}</td><td>${del}${retry}</td></tr>`;
               }).join('')
             : '<tr><td colspan="6" class="empty">nothing sent yet</td></tr>';
           document.querySelectorAll('.rowsel').forEach((c) => c.addEventListener('change', updateDelSelected));

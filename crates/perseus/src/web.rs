@@ -343,6 +343,10 @@ struct SentDto {
     attempts: u32,
     created_at: String,
     confirmed_at: Option<String>,
+    /// The most recent failed-attempt reason (Task 9), or `None` when the package
+    /// has never failed / was cleared on success. Rendered beside `attempts` on the
+    /// status page so an operator sees *why* a package is stuck or failed.
+    last_error: Option<String>,
     /// The single safe-to-delete predicate surfaced to the UI: only a
     /// `confirmed` (fully received by the peer) package may be deleted.
     deletable: bool,
@@ -1491,6 +1495,7 @@ fn to_sent_dto(r: &OutboundRow) -> SentDto {
         attempts: r.attempts,
         created_at: r.created_at.clone(),
         confirmed_at: r.confirmed_at.clone(),
+        last_error: r.last_error.clone(),
         deletable: r.state == OutboundState::Confirmed,
         files: sent_files(&r.package_ref),
     }

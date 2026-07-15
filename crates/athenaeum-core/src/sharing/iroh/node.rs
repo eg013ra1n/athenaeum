@@ -73,6 +73,64 @@ const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// that a peer gone quiet doesn't hold an endpoint slot indefinitely.
 const CONTROL_POOL_IDLE: Duration = Duration::from_secs(60);
 
+/// After a probe's control connection establishes, how long to watch for a
+/// peer-initiated close before calling the holder reachable (Task 9). A refusing
+/// [`ConnectGate`] closes the fresh connection within milliseconds
+/// (`close(0, "unauthorized")`), so a short window cleanly separates a
+/// *refused* holder (closed) from a *reachable* one (stays open); a reachable
+/// holder always waits the full window.
+const PROBE_CLOSE_WINDOW: Duration = Duration::from_secs(1);
+
+/// Why a short holder-reachability probe failed (Task 9), recorded per holder in
+/// the download orchestrator's transfer-history detail. Best-effort classification
+/// of a control-connect probe outcome: the real network can only ever be
+/// approximated here, so a class is a diagnostic hint, never an authorization
+/// signal (S5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeClass {
+    /// No route / no addressing info (or a dial timeout with no relay hint) — the
+    /// holder looks offline.
+    Offline,
+    /// The control connection established but the peer refused it (its
+    /// [`ConnectGate`] closed the connection) — the holder is up but declined us.
+    Refused,
+    /// A dial timeout with a relay hint present — the relay path is unreachable.
+    RelayUnreachable,
+}
+
+impl ProbeClass {
+    /// Stable lowercase tag for the transfer-history detail / log field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeClass::Offline => "offline",
+            ProbeClass::Refused => "refused",
+            ProbeClass::RelayUnreachable => "relay_unreachable",
+        }
+    }
+}
+
+/// Classify a *failed* control-dial (the `connect()` returned an error) into a
+/// [`ProbeClass`] (Task 9). Pure over the error text + whether a relay hint was
+/// present, so it is unit-testable without a network. A peer that refused the
+/// connection surfaces as an application close ("unauthorized"/"closed by peer");
+/// a relay-only route that timed out is `RelayUnreachable`; anything else (no
+/// addressing information, no route) is `Offline`.
+fn classify_connect_err(msg: &str, has_relay_hint: bool) -> ProbeClass {
+    let m = msg.to_lowercase();
+    if m.contains("unauthorized")
+        || m.contains("closed by peer")
+        || m.contains("application")
+        || m.contains("refused")
+        || m.contains("forbidden")
+    {
+        ProbeClass::Refused
+    } else if has_relay_hint && (m.contains("timed out") || m.contains("timeout")) {
+        ProbeClass::RelayUnreachable
+    } else {
+        ProbeClass::Offline
+    }
+}
+
 /// How often the relay-map refresh loop re-runs its resolver (H2, Task 8). Hourly
 /// is a slack cadence — a relay-map change is rare and the sign-in path triggers
 /// an immediate refresh out of band ([`SharedIrohNode::request_relay_refresh`]).
@@ -1121,6 +1179,60 @@ impl SharedIrohNode {
         Ok(EndpointAddr::new(id))
     }
 
+    /// Short control-level reachability probe of `to` (Task 9), run by the download
+    /// orchestrator before committing to a holder's long blob poll: a cheap
+    /// `Endpoint::connect` on the control ALPN, bounded by `timeout`, classified
+    /// into a [`ProbeClass`] on failure.
+    ///
+    /// `Ok(())` ⇒ the control connection established and stayed open past
+    /// [`PROBE_CLOSE_WINDOW`] (reachable). `Err(class)`:
+    /// - **Refused** — the connection established but the peer's [`ConnectGate`]
+    ///   closed it (authz refusal), or `connect` errored with an application close.
+    /// - **RelayUnreachable** — the dial timed out with a relay hint present.
+    /// - **Offline** — no addressing info / no route (or a dial timeout with no
+    ///   relay hint).
+    ///
+    /// A fresh connection is used (not the pooled one) so a refused/closing
+    /// connection never pollutes the control pool; it is dropped (closed) on return,
+    /// and the subsequent `request_project` dials its own pooled connection. This is
+    /// a best-effort diagnostic — a reported class can misdirect a retry but never
+    /// authenticate a holder (S5); content-hash + peer-authz remain the trust
+    /// boundary.
+    pub async fn probe_holder(
+        &self,
+        to: NodeId,
+        has_relay_hint: bool,
+        timeout: Duration,
+    ) -> std::result::Result<(), ProbeClass> {
+        let target = self.dial_target(to).map_err(|_| ProbeClass::Offline)?;
+        // A target with neither a direct addr nor a relay is undialable — offline
+        // without spending the timeout (deterministic; the download path always
+        // attaches a relay dial hint first, so this only short-circuits a genuinely
+        // address-less peer).
+        if target.is_empty() {
+            return Err(ProbeClass::Offline);
+        }
+        let endpoint = self.endpoint();
+        match tokio::time::timeout(timeout, endpoint.connect(target, SYNC_ALPN)).await {
+            Ok(Ok(conn)) => {
+                // Handshake + ALPN succeeded. A refusing gate closes the fresh
+                // connection almost immediately; a bounded wait separates refused
+                // (peer closed) from reachable (stays open). The connection is
+                // dropped (closed) at scope end either way.
+                match tokio::time::timeout(PROBE_CLOSE_WINDOW, conn.closed()).await {
+                    Ok(_reason) => Err(ProbeClass::Refused),
+                    Err(_) => Ok(()),
+                }
+            }
+            Ok(Err(e)) => Err(classify_connect_err(&format!("{e}"), has_relay_hint)),
+            Err(_) => Err(if has_relay_hint {
+                ProbeClass::RelayUnreachable
+            } else {
+                ProbeClass::Offline
+            }),
+        }
+    }
+
     /// Open a bidi stream on the peer's pooled control connection, send one
     /// [`Msg`], and wait for the peer's application-level delivery ack. The
     /// connection is NOT closed after the send — it stays pooled for reuse (Task
@@ -2163,6 +2275,72 @@ mod tests {
 
         s.shutdown().await;
         r.shutdown().await;
+    }
+
+    // (e) The Task-9 holder probe classifies a refusing holder as `refused` (the
+    //     connect handshake succeeds, then the gate closes the connection) and an
+    //     address-less holder as `offline`. Two real loopback nodes, relay disabled.
+    #[tokio::test]
+    async fn probe_holder_classifies_refused_and_offline() {
+        let ds = tempdir().unwrap();
+        let dr = tempdir().unwrap();
+        let client = bind_disabled(ds.path()).await;
+        let server = bind_disabled(dr.path()).await;
+
+        let c = client.handle(Role::Collab);
+        let s = server.handle(Role::Recv);
+        let c_info = c.start().await.unwrap();
+        let s_info = s.start().await.unwrap();
+        pair(&client, &c_info, &server, &s_info);
+
+        // The server refuses every inbound connection at the gate.
+        server.set_connect_gate(Arc::new(|_: &NodeId| false));
+
+        // Refused: the connect handshake succeeds, then the gate closes it.
+        let refused = client
+            .probe_holder(s_info.node_id, false, Duration::from_secs(5))
+            .await;
+        assert_eq!(
+            refused,
+            Err(ProbeClass::Refused),
+            "a gated holder must classify as refused"
+        );
+
+        // Offline: a node id we never learned an address for is undialable.
+        let offline = client
+            .probe_holder([42u8; 32], false, Duration::from_secs(2))
+            .await;
+        assert_eq!(
+            offline,
+            Err(ProbeClass::Offline),
+            "an address-less holder must classify as offline"
+        );
+
+        client.shutdown().await;
+        server.shutdown().await;
+    }
+
+    // (f) The pure connect-error classifier (Task 9): a relay-hinted timeout is
+    //     `relay_unreachable`; the same timeout with no relay hint is `offline`; an
+    //     application close is `refused`; a no-addressing error is `offline`.
+    #[test]
+    fn classify_connect_err_maps_each_class() {
+        assert_eq!(
+            classify_connect_err("connection timed out", true),
+            ProbeClass::RelayUnreachable
+        );
+        assert_eq!(
+            classify_connect_err("connection timed out", false),
+            ProbeClass::Offline
+        );
+        assert_eq!(
+            classify_connect_err("closed by peer: unauthorized", false),
+            ProbeClass::Refused
+        );
+        assert_eq!(
+            classify_connect_err("no addressing information available", true),
+            ProbeClass::Offline
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -19,6 +19,10 @@ use super::models::{Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundSt
 use super::{node_id_from_hex, node_id_hex, now_iso};
 
 /// `sync_outbound` — the durable outbound state machine, one row per package.
+///
+/// The trailing `last_error` column (Task 9) is created inline for a fresh DB; an
+/// existing table without it is migrated in place by [`ensure_outbound_columns`]
+/// (a `CREATE TABLE IF NOT EXISTS` never adds a column).
 pub const DDL_OUTBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_outbound (
     id INTEGER PRIMARY KEY,
     package_ref TEXT NOT NULL,
@@ -26,8 +30,33 @@ pub const DDL_OUTBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_outbound (
     state TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
-    confirmed_at TEXT
+    confirmed_at TEXT,
+    last_error TEXT
 )";
+
+/// Idempotently add the `last_error` column to an existing `sync_outbound` table.
+///
+/// The guarded-ALTER twin of [`ensure_history_columns`] (Task 9): `CREATE TABLE IF
+/// NOT EXISTS` never alters an already-materialised table, so a store opened over a
+/// pre-Task-9 catalog / Perseus DB is migrated in place here. SQLite has no `ADD
+/// COLUMN IF NOT EXISTS`, so this reads `PRAGMA table_info` first — the same idiom
+/// as [`ensure_history_columns`]. Called by every `sync_outbound` materialisation
+/// site (both store `open`s and `db::schema::init_db`) right after the DDL. Never
+/// breaks an existing DB: an already-present column is a no-op.
+pub fn ensure_outbound_columns(conn: &Connection) -> Result<()> {
+    let present = conn
+        .prepare("PRAGMA table_info(sync_outbound)")
+        .context("prepare table_info(sync_outbound)")?
+        .query_map([], |r| r.get::<_, String>(1))
+        .context("query table_info(sync_outbound)")?
+        .filter_map(|c| c.ok())
+        .any(|c| c == "last_error");
+    if !present {
+        conn.execute("ALTER TABLE sync_outbound ADD COLUMN last_error TEXT", [])
+            .context("add sync_outbound.last_error column")?;
+    }
+    Ok(())
+}
 
 /// `sync_history` — append-only per-frame transfer audit log.
 ///
@@ -140,6 +169,12 @@ pub trait SyncStore: Send + Sync {
     /// Force one outbound row to a new state.
     fn set_state(&self, id: i64, s: OutboundState) -> Result<()>;
 
+    /// Record the most recent failed-attempt reason for a package (Task 9), or
+    /// clear it with `None` on success. Best-effort diagnostic surfaced beside
+    /// `attempts` on the Perseus status page; [`confirm`](Self::confirm) also clears
+    /// it, so a `confirmed` row never carries a stale error.
+    fn set_last_error(&self, id: i64, err: Option<&str>) -> Result<()>;
+
     /// Increment `attempts` and return the new value (drives max-attempts).
     fn bump_attempts(&self, id: i64) -> Result<u32>;
 
@@ -174,10 +209,19 @@ pub trait SyncStore: Send + Sync {
 
 /// Raw column tuple for a `sync_outbound` row, parsed into [`OutboundRow`] by
 /// [`to_outbound`] so fallible text parsing happens outside the rusqlite closure.
-type OutboundRaw = (i64, String, String, String, i64, String, Option<String>);
+type OutboundRaw = (
+    i64,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    Option<String>,
+    Option<String>,
+);
 
 fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
-    let (id, package_ref, peer_hex, state, attempts, created_at, confirmed_at) = raw;
+    let (id, package_ref, peer_hex, state, attempts, created_at, confirmed_at, last_error) = raw;
     Ok(OutboundRow {
         id,
         package_ref,
@@ -186,6 +230,7 @@ fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
         attempts: attempts.max(0) as u32,
         created_at,
         confirmed_at,
+        last_error,
     })
 }
 
@@ -231,7 +276,7 @@ fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
 }
 
 const OUTBOUND_COLS: &str =
-    "id, package_ref, peer, state, attempts, created_at, confirmed_at";
+    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error";
 const HISTORY_COLS: &str =
     "frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project";
 
@@ -340,6 +385,7 @@ pub fn confirmed_outbound_rows(conn: &Connection) -> Result<Vec<OutboundRow>> {
                 r.get(4)?,
                 r.get(5)?,
                 r.get(6)?,
+                r.get(7)?,
             ))
         })
         .context("query confirmed_outbound_rows")?
@@ -371,6 +417,7 @@ pub fn all_outbound_rows(conn: &Connection, limit: u32) -> Result<Vec<OutboundRo
                 r.get(4)?,
                 r.get(5)?,
                 r.get(6)?,
+                r.get(7)?,
             ))
         })
         .context("query all_outbound_rows")?
@@ -587,6 +634,7 @@ impl StandaloneSyncStore {
         .context("configure sync db pragmas")?;
         conn.execute(DDL_OUTBOUND, [])
             .context("create sync_outbound")?;
+        ensure_outbound_columns(&conn)?;
         conn.execute(DDL_HISTORY, []).context("create sync_history")?;
         ensure_history_columns(&conn)?;
         for idx in DDL_INDEXES {
@@ -614,6 +662,7 @@ impl StandaloneSyncStore {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
                     ))
                 },
             )
@@ -659,6 +708,16 @@ impl SyncStore for StandaloneSyncStore {
         Ok(())
     }
 
+    fn set_last_error(&self, id: i64, err: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        conn.execute(
+            "UPDATE sync_outbound SET last_error = ?1 WHERE id = ?2",
+            params![err, id],
+        )
+        .with_context(|| format!("set last_error for outbound {id}"))?;
+        Ok(())
+    }
+
     fn bump_attempts(&self, id: i64) -> Result<u32> {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
         conn.execute(
@@ -695,6 +754,7 @@ impl SyncStore for StandaloneSyncStore {
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
+                    r.get(7)?,
                 ))
             })
             .context("query non_terminal")?
@@ -714,7 +774,7 @@ impl SyncStore for StandaloneSyncStore {
         // ack that slipped past the engine's in-flight map).
         let changed = conn
             .execute(
-                "UPDATE sync_outbound SET state = ?1, confirmed_at = ?2
+                "UPDATE sync_outbound SET state = ?1, confirmed_at = ?2, last_error = NULL
                  WHERE id = ?3 AND state <> ?1",
                 params![OutboundState::Confirmed.as_str(), now_iso(), id],
             )
@@ -772,6 +832,7 @@ impl CatalogSyncStore {
         )
         .context("configure catalog sync store pragmas")?;
         conn.execute(DDL_OUTBOUND, []).context("create sync_outbound")?;
+        ensure_outbound_columns(&conn)?;
         conn.execute(DDL_HISTORY, []).context("create sync_history")?;
         ensure_history_columns(&conn)?;
         conn.execute(DDL_RECEIPTS, []).context("create sync_receipts")?;
@@ -862,6 +923,16 @@ impl SyncStore for CatalogSyncStore {
         Ok(())
     }
 
+    fn set_last_error(&self, id: i64, err: Option<&str>) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE sync_outbound SET last_error = ?1 WHERE id = ?2",
+            params![err, id],
+        )
+        .with_context(|| format!("set last_error for outbound {id}"))?;
+        Ok(())
+    }
+
     fn bump_attempts(&self, id: i64) -> Result<u32> {
         let conn = self.lock_conn();
         conn.execute(
@@ -898,6 +969,7 @@ impl SyncStore for CatalogSyncStore {
                     r.get(4)?,
                     r.get(5)?,
                     r.get(6)?,
+                    r.get(7)?,
                 ))
             })
             .context("query non_terminal")?
@@ -915,7 +987,7 @@ impl SyncStore for CatalogSyncStore {
         let conn = self.lock_conn();
         let changed = conn
             .execute(
-                "UPDATE sync_outbound SET state = ?1, confirmed_at = ?2
+                "UPDATE sync_outbound SET state = ?1, confirmed_at = ?2, last_error = NULL
                  WHERE id = ?3 AND state <> ?1",
                 params![OutboundState::Confirmed.as_str(), now_iso(), id],
             )
@@ -978,6 +1050,92 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
         assert!(store.all_outbound(50).unwrap().is_empty());
+    }
+
+    /// `last_error` round-trips (Task 9): a fresh row carries `None`; a failed
+    /// attempt writes it; an explicit clear or a `confirm` wipes it — proving both
+    /// the new column's insert/read SQL and the confirm-clears invariant.
+    #[test]
+    fn last_error_writes_on_fail_and_clears_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
+
+        let id = store.enqueue("pkg", PEER).unwrap();
+        assert_eq!(
+            store.get_outbound(id).unwrap().unwrap().last_error,
+            None,
+            "a fresh row has no last_error"
+        );
+
+        // Written on a failed attempt.
+        store.set_last_error(id, Some("serve package: peer not started")).unwrap();
+        assert_eq!(
+            store.get_outbound(id).unwrap().unwrap().last_error.as_deref(),
+            Some("serve package: peer not started"),
+        );
+
+        // Explicit clear on a successful re-announce.
+        store.set_last_error(id, None).unwrap();
+        assert_eq!(store.get_outbound(id).unwrap().unwrap().last_error, None);
+
+        // Re-write, then confirm clears it in the same UPDATE — a confirmed row
+        // never carries a stale error.
+        store.set_last_error(id, Some("no ack from peer within timeout")).unwrap();
+        assert_eq!(
+            store.get_outbound(id).unwrap().unwrap().last_error.as_deref(),
+            Some("no ack from peer within timeout"),
+        );
+        store.confirm(id, &[]).unwrap();
+        let row = store.get_outbound(id).unwrap().unwrap();
+        assert_eq!(row.state, OutboundState::Confirmed);
+        assert_eq!(row.last_error, None, "confirm must clear last_error");
+    }
+
+    /// Migration (Task 9): opening a store over a PRE-EXISTING `sync_outbound` table
+    /// with no `last_error` column adds it in place, and a subsequent write/read of
+    /// the column round-trips — proving both the guarded `ALTER TABLE` and the new
+    /// column SQL on a legacy DB.
+    #[test]
+    fn opening_over_legacy_outbound_migrates_last_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("legacy.db");
+
+        // Materialise the OLD (last_error-less) sync_outbound shape by hand.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE sync_outbound (
+                    id INTEGER PRIMARY KEY,
+                    package_ref TEXT NOT NULL,
+                    peer TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    confirmed_at TEXT
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sync_outbound (package_ref, peer, state, attempts, created_at)
+                 VALUES ('pkg-old', ?1, 'queued', 0, 't0')",
+                params![node_id_hex(&PEER)],
+            )
+            .unwrap();
+        }
+
+        // Opening the store migrates the table in place (no error).
+        let store = StandaloneSyncStore::open(&db_path).unwrap();
+        let rows = store.all_outbound(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].last_error, None, "legacy row's last_error migrated to NULL");
+
+        // The new column accepts a write + reads it back.
+        store.set_last_error(rows[0].id, Some("boom")).unwrap();
+        assert_eq!(
+            store.get_outbound(rows[0].id).unwrap().unwrap().last_error.as_deref(),
+            Some("boom"),
+        );
     }
 
     /// Migration (AUDIT B3): opening a store over a PRE-EXISTING project-less

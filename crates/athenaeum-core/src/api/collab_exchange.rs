@@ -482,6 +482,11 @@ const HOLDER_ONLINE_WINDOW_SECS: i64 = 300;
 const DOWNLOAD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const DOWNLOAD_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Bound on the short control-connect reachability probe run against a holder
+/// (Task 9) BEFORE committing to the [`DOWNLOAD_POLL_TIMEOUT`] blob poll — a dead
+/// or refusing holder is skipped in seconds instead of stalling 90s.
+const HOLDER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One state change a poll observed, which the frontend (Task 11) turns into a
 /// `notify()` call. [`refresh_project_packages`] NEVER notifies itself.
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
@@ -932,14 +937,14 @@ pub async fn download_project_package(
 
     // ── Fresh poll: upsert the row AND read the package's current holders. ────
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
-        set_download_failed(ctx, project_id, package_id);
+        set_download_failed(ctx, project_id, package_id, None);
         return Err(ApiError::SignedOut("Sign in to download a project package.".into()));
     };
     let client = CollabClient::new(&hub_url).map_err(client_err)?;
     let anns = match client.list_announcements(&token, project_id).await {
         Ok(a) => a,
         Err(e) => {
-            set_download_failed(ctx, project_id, package_id);
+            set_download_failed(ctx, project_id, package_id, None);
             return Err(client_err(e));
         }
     };
@@ -952,7 +957,7 @@ pub async fn download_project_package(
     // The freshly-polled announcement for this package (keyed by hub uuid).
     let Some(ann) = anns.into_iter().find(|a| a.package_id == package_id) else {
         tracing::warn!(project_id, package_id, "download: hub no longer lists this package");
-        set_download_failed(ctx, project_id, package_id);
+        set_download_failed(ctx, project_id, package_id, None);
         return Ok(());
     };
 
@@ -972,7 +977,7 @@ pub async fn download_project_package(
 
     if holders.is_empty() {
         tracing::warn!(project_id, package_id, "download: no other holder to pull from");
-        set_download_failed(ctx, project_id, package_id);
+        set_download_failed(ctx, project_id, package_id, None);
         return Ok(());
     }
 
@@ -994,6 +999,12 @@ pub async fn download_project_package(
         Vec::new()
     };
 
+    // Per-holder probe failure classes (Task 9), surfaced in the terminal
+    // `downloadFailed` detail if every holder is exhausted — an operator then sees
+    // WHY each holder was skipped (offline / refused / relay_unreachable), not just
+    // "download failed".
+    let mut probe_failures: Vec<String> = Vec::new();
+
     for (holder_node, holder_name, holder_relay) in &holders {
         // Attach this holder's dial hint before the request, via the shared node's
         // `add_peer`. Prefer the holder's OWN reported relay (T7 / finding H1),
@@ -1014,6 +1025,26 @@ pub async fn download_project_package(
                     tracing::warn!(error = %format!("{e:#}"), holder = %holder_name, "download: dial hint build failed; skipping holder");
                     continue;
                 }
+            }
+
+            // Short reachability probe (Task 9): before committing to the 90s blob
+            // poll, a 5s control-connect probe skips a dead/refusing holder fast and
+            // records why. A relay hint is present when the holder reported one or
+            // we resolved our own relay set (the dial hint above carried it).
+            let has_relay_hint = holder_relay.is_some() || !relay_urls.is_empty();
+            if let Err(class) = node
+                .probe_holder(*holder_node, has_relay_hint, HOLDER_PROBE_TIMEOUT)
+                .await
+            {
+                tracing::warn!(
+                    project_id,
+                    package_id,
+                    holder = %holder_name,
+                    class = class.as_str(),
+                    "download: holder probe failed; next holder"
+                );
+                probe_failures.push(format!("{}: {}", holder_name, class.as_str()));
+                continue;
             }
         }
 
@@ -1038,8 +1069,14 @@ pub async fn download_project_package(
         tracing::warn!(project_id, package_id, holder = %holder_name, "download: holder did not deliver in time; next holder");
     }
 
-    // Every holder exhausted.
-    set_download_failed(ctx, project_id, package_id);
+    // Every holder exhausted. Carry the per-holder probe classes (Task 9) into the
+    // `downloadFailed` detail so the notification names why each holder was skipped.
+    let detail = if probe_failures.is_empty() {
+        None
+    } else {
+        Some(format!("no holder delivered — {}", probe_failures.join("; ")))
+    };
+    set_download_failed(ctx, project_id, package_id, detail);
     tracing::warn!(project_id, package_id, holders = holders.len(), "download failed: no holder delivered");
     Ok(())
 }
@@ -1047,15 +1084,22 @@ pub async fn download_project_package(
 /// Best-effort `set_local_status("failed")` for a genuine download attempt, plus
 /// an enqueued `downloadFailed` change so the next `refresh_all_project_packages`
 /// surfaces it (F3 — the download runs on a spawned task that can't `notify()`
-/// itself). Logged, never masks the caller's own error/return.
-fn set_download_failed(ctx: &ServiceContext, project_id: &str, package_id: &str) {
+/// itself). Logged, never masks the caller's own error/return. `detail` (Task 9)
+/// carries the per-holder probe classes for the notification; `None` when the
+/// failure had no per-holder classification (signed out, hub blip, no holders).
+fn set_download_failed(
+    ctx: &ServiceContext,
+    project_id: &str,
+    package_id: &str,
+    detail: Option<String>,
+) {
     if let Ok(db) = db(ctx) {
         let conn = db.conn();
         if let Err(e) = set_local_status(&conn, package_id, "failed") {
             tracing::warn!(package_id, error = %format!("{e}"), "download: set failed status errored");
         }
     }
-    push_download_failure(project_id, package_id);
+    push_download_failure(project_id, package_id, detail);
 }
 
 /// Process-local buffer of `downloadFailed` state changes a spawned
@@ -1070,14 +1114,15 @@ fn pending_download_failures() -> &'static std::sync::Mutex<Vec<PackageStateChan
 }
 
 /// Enqueue a `downloadFailed` change (F3). Poison-tolerant: a failed lock only
-/// means the change isn't surfaced this cycle, never a panic.
-fn push_download_failure(project_id: &str, package_id: &str) {
+/// means the change isn't surfaced this cycle, never a panic. `detail` (Task 9)
+/// is the per-holder probe classification summary, or `None`.
+fn push_download_failure(project_id: &str, package_id: &str, detail: Option<String>) {
     if let Ok(mut buf) = pending_download_failures().lock() {
         buf.push(PackageStateChange {
             project_id: project_id.to_string(),
             package_id: package_id.to_string(),
             kind: "downloadFailed".to_string(),
-            detail: None,
+            detail,
         });
     }
 }

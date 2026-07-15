@@ -40,6 +40,13 @@ pub mod collab;
 #[cfg(all(test, feature = "render"))]
 mod collab_e2e_tests;
 
+// Task 9: the C1 relay-eviction regression canary — one `#[ignore]`d test binding
+// two endpoints with the SAME device secret against a real relay (from
+// `ATHENAEUM_TEST_RELAY`) and asserting the first observes the eviction. Owner-run
+// against test-relay.artfrom.space; skipped (no-op) when the env var is unset.
+#[cfg(test)]
+mod relay_live_tests;
+
 #[derive(Debug)]
 pub enum ApiError {
     NotFound(String),
