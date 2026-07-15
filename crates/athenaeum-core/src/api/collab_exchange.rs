@@ -423,6 +423,22 @@ pub async fn ensure_collab_sender_engine(
     // The destination is an account/membership-resolved bare node id. Attach our
     // own resolved relay URL(s) as its dial hint before the first announce (same
     // reasoning as the personal-sync sender).
+    //
+    // T8 decision (peer_addr_with_relays vs. the T7 peer_dial_addr, and the retry
+    // refresher): the seed-target here is `dest` == the REQUESTER (`from`) of an
+    // inbound `ProjectRequestReceived` — a cross-account collaborator. Its own
+    // hub-reported `endpoint_addr` is genuinely NOT in scope at this call site: it
+    // arrives as a bare node id off the wire, and the collab membership snapshot
+    // carries pubkeys/roles, not per-member endpoint addresses (unlike the account
+    // device list the personal sender reads). So there is no reported/holder relay
+    // to prefer — `peer_addr_with_relays(peer, our_relays)` (relay-only, our set)
+    // is the strongest hint available, and switching to `peer_dial_addr` would add
+    // nothing without a reported address to pass it. For the same reason no
+    // per-peer retry `AddrRefresher` is wired on the collab sender: a refresher
+    // could only re-run this same our-relay-set resolution (the requester's real
+    // address stays out of scope), and the node-level hourly relay rebuild (H2)
+    // already re-establishes our relay reachability. If a per-member endpoint-
+    // address endpoint is added later, revisit both here.
     let peer_addr = pairing::peer_addr_with_relays(peer, &relay_urls)
         .map_err(|e| ApiError::Internal(format!("construct peer address: {e:#}")))?;
     node.add_peer(peer_addr);

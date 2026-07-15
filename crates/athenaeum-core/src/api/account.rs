@@ -244,6 +244,14 @@ pub async fn sign_in_verify(
     write_state(ctx, keys::ACCOUNT_EMAIL, &email)?;
     write_state(ctx, keys::ACCOUNT_DEVICE_ID, &resp.device_id)?;
 
+    // Sign-in changed the hub credentials → nudge the shared iroh node (if already
+    // bound, e.g. a dev-ticket session upgrading to an account) to re-resolve its
+    // relay map now instead of waiting for the hourly tick (T8, H2). A no-op when
+    // the node isn't bound yet — the eventual lazy bind resolves fresh relays.
+    if let Some(node) = ctx.iroh_node.lock().await.as_ref() {
+        node.request_relay_refresh();
+    }
+
     tracing::info!(hub = %cfg.hub_host, device_id = %resp.device_id, "device signed in");
     build_status(ctx, &cfg)
 }

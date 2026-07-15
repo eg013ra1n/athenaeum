@@ -33,6 +33,7 @@ use athenaeum_core::sharing::iroh::node::{Role, SharedIrohNode};
 use athenaeum_core::sharing::iroh::random_secret;
 use athenaeum_core::sharing::types::NodeId;
 use athenaeum_core::sharing::SharingTransport;
+use athenaeum_core::sync::engine::AddrRefresher;
 use athenaeum_core::sync::store::{StandaloneSyncStore, SyncStore};
 use athenaeum_core::sync::{
     evaluate_and_apply, node_id_hex, DeleteOutcome, Direction, HistoryRow, OutboundRow,
@@ -67,6 +68,67 @@ fn parse_ticket(ticket: &str) -> Result<EndpointTicket> {
 pub fn peer_node_id_from_ticket(ticket: &str) -> Result<NodeId> {
     let ticket = parse_ticket(ticket)?;
     Ok(*ticket.endpoint_addr().id.as_bytes())
+}
+
+/// Build the shared iroh node's relay-map resolver (iroh hardening T8, H2). The
+/// node's hourly refresh loop re-runs this to learn the CURRENT relay map
+/// ([`crate::account::resolve_relay_config`]); a changed set drives an idle
+/// endpoint rebuild. Captures an owned `Config` so it can run in the detached
+/// refresh task; a resolve error yields `None` (keep the current relay map).
+fn build_relay_resolver(config: Config) -> athenaeum_core::sharing::iroh::node::RelayResolver {
+    let config = Arc::new(config);
+    Arc::new(move || {
+        let config = Arc::clone(&config);
+        Box::pin(async move {
+            match crate::account::resolve_relay_config(&config).await {
+                Ok(pair) => Some(pair),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "relay refresh: resolve failed; keeping current relay map"
+                    );
+                    None
+                }
+            }
+        })
+    })
+}
+
+/// Build the retry-time peer-address refresher (T8): on a timed-out send retry,
+/// re-resolve the target's CURRENT address (a fresh [`crate::account::resolve_targets`]
+/// → [`peer_dial_addr`](athenaeum_core::sync::pairing::peer_dial_addr)) so a
+/// relay-map change or a target moving relays doesn't strand retries on a dead
+/// cached path. Dispatches on the peer arg, so one refresher serves every
+/// per-target engine. `None` (target gone / hub unreachable) leaves the existing
+/// address in place.
+fn build_target_addr_refresher(config: Config) -> AddrRefresher {
+    let config = Arc::new(config);
+    Arc::new(move |peer: NodeId| {
+        let config = Arc::clone(&config);
+        Box::pin(async move {
+            match crate::account::resolve_targets(&config).await {
+                Ok(resolved) => {
+                    let target = resolved.targets.iter().find(|t| t.peer == peer)?;
+                    match athenaeum_core::sync::pairing::peer_dial_addr(
+                        peer,
+                        target.endpoint_addr.as_ref(),
+                        &resolved.relay_urls,
+                        false, // same account
+                    ) {
+                        Ok(addr) => Some(addr),
+                        Err(e) => {
+                            tracing::warn!(error = %format!("{e:#}"), "retry addr refresh: address build failed");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "retry addr refresh: resolve_targets failed");
+                    None
+                }
+            }
+        })
+    })
 }
 
 /// Load the persisted 32-byte device secret, creating it (mode 0600) on first
@@ -485,6 +547,12 @@ impl Agent {
             );
         }
 
+        // Bound relay-map staleness (iroh hardening T8, H2): start the node's
+        // hourly relay-map refresh loop. Its resolver re-runs the relay half of
+        // target resolution ([`crate::account::resolve_relay_config`]); a changed
+        // relay set drives an idle endpoint rebuild (same node id, same store).
+        node.start_relay_refresh(build_relay_resolver(config.clone()));
+
         // One `Role::Out` handle + engine per resolved target (engines stay
         // one-per-peer; the Task 2 demux disambiguates each target's acks by
         // `(peer, package)`). Register each peer at the NODE level:
@@ -521,7 +589,12 @@ impl Agent {
             transports.push((target.peer, node.handle(Role::Out)));
         }
 
-        let mut agent = Self::start_with_transports(config, transports, node_id, watch).await?;
+        // T8 retry re-resolution: on a timed-out send retry, re-resolve the
+        // target's CURRENT address (a fresh `resolve_targets` → `peer_dial_addr`)
+        // so a relay-map change or a target moving relays doesn't strand retries.
+        let refresher = build_target_addr_refresher(config.clone());
+        let mut agent =
+            Self::start_with_transports(config, transports, node_id, watch, Some(refresher)).await?;
         // Retain the node so `shutdown` can tear the single endpoint + store down
         // and release the device-key lock (a supervisor stop→start then cleanly
         // re-acquires it). The injection seams leave `node` as `None`.
@@ -544,7 +617,7 @@ impl Agent {
         node_id: NodeId,
         watch: bool,
     ) -> Result<Self> {
-        Self::start_with_transports(config, vec![(peer, transport)], node_id, watch).await
+        Self::start_with_transports(config, vec![(peer, transport)], node_id, watch, None).await
     }
 
     /// Start an agent over N caller-supplied `(peer, transport)` pairs — one sync
@@ -562,6 +635,7 @@ impl Agent {
         transports: Vec<(NodeId, Arc<dyn SharingTransport>)>,
         node_id: NodeId,
         watch: bool,
+        addr_refresher: Option<AddrRefresher>,
     ) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
@@ -607,16 +681,23 @@ impl Agent {
         let engines: Vec<TargetEngine> = transports
             .into_iter()
             .map(|(peer, transport)| {
+                // Each per-target engine shares the one refresher (it dispatches on
+                // the peer arg), so a timed-out retry re-resolves that target's
+                // current address (T8). `None` on the injection/test seams.
                 let engine = match &cleanup {
-                    Some(coord) => SyncEngine::spawn_with_sink(
+                    Some(coord) => SyncEngine::spawn_with_sink_and_refresher(
                         Arc::clone(&store) as Arc<dyn SyncStore>,
                         transport,
                         peer,
                         Arc::clone(coord) as Arc<dyn PackageCleanupSink>,
+                        addr_refresher.clone(),
                     ),
-                    None => {
-                        SyncEngine::spawn(Arc::clone(&store) as Arc<dyn SyncStore>, transport, peer)
-                    }
+                    None => SyncEngine::spawn_with_refresher(
+                        Arc::clone(&store) as Arc<dyn SyncStore>,
+                        transport,
+                        peer,
+                        addr_refresher.clone(),
+                    ),
                 };
                 TargetEngine {
                     peer,
@@ -2617,7 +2698,7 @@ mod multi_target_tests {
             (b_id, Arc::new(net.endpoint())),
         ];
 
-        let agent = Agent::start_with_transports(config, transports, sender_id, false)
+        let agent = Agent::start_with_transports(config, transports, sender_id, false, None)
             .await
             .expect("agent starts with two targets");
         assert_eq!(agent.engine_count(), 2, "one engine per injected target");

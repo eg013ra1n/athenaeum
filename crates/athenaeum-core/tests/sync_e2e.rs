@@ -210,7 +210,10 @@ async fn two_instance_sync_e2e() {
     let primary_db = primary_dir.join("catalog.db");
 
     // Two full ServiceContexts, each with its own DB + data dir.
-    let capture_ctx = ServiceContext::new_for_tests(capture_db.clone());
+    // Owned `Arc` so `enqueue_sync_selection` (which now builds a `'static` retry
+    // address-refresher, T8) accepts `&capture_ctx`; `&Arc` still coerces to
+    // `&ServiceContext` for every other helper here.
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
     let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
     let cdb = capture_ctx.db.get().unwrap();
     let pdb = primary_ctx.db.get().unwrap();
@@ -484,7 +487,10 @@ async fn resend_transfers_only_new_frames() {
     let capture_db = capture_dir.join("catalog.db");
     let primary_db = primary_dir.join("catalog.db");
 
-    let capture_ctx = ServiceContext::new_for_tests(capture_db.clone());
+    // Owned `Arc` so `enqueue_sync_selection` (which now builds a `'static` retry
+    // address-refresher, T8) accepts `&capture_ctx`; `&Arc` still coerces to
+    // `&ServiceContext` for every other helper here.
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
     let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
     let pdb = primary_ctx.db.get().unwrap();
 

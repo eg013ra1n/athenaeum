@@ -26,7 +26,7 @@ use crate::events::ProgressEmitter;
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::services::ServiceContext;
 use crate::settings::{defaults, keys};
-use crate::sharing::iroh::node::{Role, SharedIrohNode};
+use crate::sharing::iroh::node::{RelayResolver, Role, SharedIrohNode};
 use crate::sharing::types::NodeId;
 use crate::sharing::SharingTransport;
 use crate::sync::store::search_history_rows;
@@ -420,6 +420,80 @@ pub(crate) async fn resolve_relay_mode(ctx: &ServiceContext) -> Result<(iroh::Re
     Ok((mode, res.urls))
 }
 
+// ── relay-map lifecycle wiring (iroh hardening T8, H2) ───────────────────────
+
+/// Build the node's relay-map resolver (H2): the hub-agnostic callback the node's
+/// hourly refresh loop re-runs to learn the CURRENT relay map. It re-runs
+/// [`resolve_relay_mode`] (which re-fetches + re-caches the hub relay map), so a
+/// relay-map change the hub publishes is picked up and drives an idle node
+/// rebuild. Captures an owned `Arc<ServiceContext>` so it can run inside the
+/// node's detached refresh task; a resolve error yields `None` (the loop keeps the
+/// current relay map).
+fn node_relay_resolver(ctx: Arc<ServiceContext>) -> RelayResolver {
+    Arc::new(move || {
+        let ctx = Arc::clone(&ctx);
+        Box::pin(async move {
+            match resolve_relay_mode(&ctx).await {
+                Ok((mode, urls)) => Some((mode, urls)),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e}"), "relay refresh: resolve failed; keeping current relay map");
+                    None
+                }
+            }
+        })
+    })
+}
+
+/// Start the node's hourly relay-map refresh loop (H2). Idempotent — the node
+/// no-ops a second call — so every entry point that binds/uses the node can call
+/// it (autostart, dev-ticket disclosure, first sender-engine build) and whichever
+/// runs first wins.
+fn start_node_relay_refresh(ctx: Arc<ServiceContext>, node: &Arc<SharedIrohNode>) {
+    node.start_relay_refresh(node_relay_resolver(ctx));
+}
+
+/// Build the T8 retry-time peer-address refresher for a personal-sync sender
+/// engine: on a timed-out retry it re-fetches the peer's CURRENT hub-reported
+/// endpoint address (a fresh `list_devices`) plus fresh relay urls, and returns
+/// the merged [`pairing::peer_dial_addr`] so the re-attempt dials the peer's
+/// current path instead of a cached-stale one. `None` (peer gone / hub blip)
+/// leaves the address the transport already knows in place. Same account, so
+/// `cross_account = false`.
+fn sender_addr_refresher(ctx: Arc<ServiceContext>) -> crate::sync::engine::AddrRefresher {
+    Arc::new(move |peer: NodeId| {
+        let ctx = Arc::clone(&ctx);
+        Box::pin(async move {
+            let relay_urls = match resolve_relay_mode(&ctx).await {
+                Ok((_, urls)) => urls,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e}"), "retry addr refresh: relay resolve failed");
+                    return None;
+                }
+            };
+            // The peer's CURRENT hub-reported address (may have moved relays).
+            let reported = match crate::api::account::list_devices(&ctx).await {
+                Ok(devices) => devices.into_iter().find_map(|d| {
+                    match pairing::node_id_from_pubkey_b64(&d.pubkey) {
+                        Ok(id) if id == peer => Some(d.endpoint_addr),
+                        _ => None,
+                    }
+                }).flatten(),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:?}"), "retry addr refresh: device list unavailable");
+                    None
+                }
+            };
+            match pairing::peer_dial_addr(peer, reported.as_ref(), &relay_urls, false) {
+                Ok(addr) => Some(addr),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "retry addr refresh: address build failed");
+                    None
+                }
+            }
+        })
+    })
+}
+
 /// Lazily bind (once per process) the ONE [`SharedIrohNode`] and stash it on
 /// [`ServiceContext::iroh_node`] (C1 fix, Д2). The first caller — whichever of
 /// the receiver / personal sender / collab sender needs a transport first —
@@ -537,6 +611,9 @@ pub async fn autostart_if_enabled(
     // endpoint/store on first need; the receiver rides it as its Recv role
     // handle). The receiver only listens, so no dial-hint relay URLs are needed.
     let node = ensure_iroh_node(ctx).await?;
+    // Bound relay-map staleness (T8, H2): start the node's hourly relay refresh
+    // loop at boot (idempotent).
+    start_node_relay_refresh(Arc::clone(&ctx_arc), &node);
     // Populate the authorized-peer allow-list (best-effort) before the receiver
     // starts accepting, then enforce it live per-package (finding H1).
     refresh_authorized_peers(ctx).await;
@@ -588,6 +665,9 @@ pub async fn get_pairing_ticket(
     // Same reasoning as `autostart_if_enabled`: bind the ONE shared node (relay
     // mode resolved inside), which the receiver rides as its Recv role handle.
     let node = ensure_iroh_node(ctx).await?;
+    // Bound relay-map staleness (T8, H2): start the node's hourly relay refresh
+    // loop (idempotent).
+    start_node_relay_refresh(Arc::clone(&ctx_arc), &node);
     // Enforce the authorized-peer allow-list here too (finding H1). In pure
     // dev-ticket mode (no account) this resolves to accept-any; a signed-in
     // primary that also flips the dev flag still enforces its account list.
@@ -868,7 +948,7 @@ fn sender_packages_dir(ctx: &ServiceContext) -> Result<PathBuf, ApiError> {
 /// engine and its captured emitter (a process-global sink, identical regardless
 /// of caller).
 pub async fn ensure_sender_engine(
-    ctx: &ServiceContext,
+    ctx: &Arc<ServiceContext>,
     sender: &SyncSenderRuntime,
     dest: NodeId,
     dest_endpoint_addr: Option<&crate::account::EndpointAddrReport>,
@@ -896,6 +976,10 @@ pub async fn ensure_sender_engine(
     // role-prefixed blob tags (Д3) keep the roles from clobbering each other's
     // tags on the shared store.
     let node = ensure_iroh_node(ctx).await?;
+    // Bound relay-map staleness (T8, H2): ensure the node's hourly relay refresh
+    // loop is running. Idempotent — the receiver's autostart usually started it
+    // first; this covers a sender-first bind.
+    start_node_relay_refresh(Arc::clone(ctx), &node);
     let transport: Arc<dyn SharingTransport> = node.handle(Role::Out);
     let origin_device = node_id_hex(&node.node_id());
 
@@ -915,11 +999,14 @@ pub async fn ensure_sender_engine(
         CatalogSyncStore::open(&db_path)
             .map_err(|e| ApiError::Internal(format!("open catalog sync store: {e:#}")))?,
     );
-    let engine = Arc::new(SyncEngine::spawn_with_emitter(
+    let engine = Arc::new(SyncEngine::spawn_with_emitter_and_refresher(
         store as Arc<dyn SyncStore>,
         transport,
         peer,
         emitter,
+        // T8: on a timed-out retry, re-resolve this peer's current address so a
+        // relay-map change or the peer moving relays doesn't strand every retry.
+        Some(sender_addr_refresher(Arc::clone(ctx))),
     ));
 
     tracing::info!(peer = %node_id_hex(&peer), origin = %origin_device, "sync sender engine started");
@@ -1149,7 +1236,7 @@ async fn build_and_enqueue_selection(
 /// there is nothing to send, so it must never start an engine for `dest` just
 /// because the caller happened to pass zero ids.
 pub async fn enqueue_sync_selection(
-    ctx: &ServiceContext,
+    ctx: &Arc<ServiceContext>,
     sender: &SyncSenderRuntime,
     dest: ResolvedDest,
     frame_ids: Vec<i64>,
@@ -1619,6 +1706,9 @@ mod tests {
     #[tokio::test]
     async fn enqueue_with_empty_selection_returns_zero_result_without_starting_engine() {
         let (_tmp, ctx) = test_ctx();
+        // `enqueue_sync_selection` now takes an owned `Arc<ServiceContext>` (it
+        // builds a `'static` retry address-refresher from it, T8).
+        let ctx = Arc::new(ctx);
         let sender = SyncSenderRuntime::new();
         let dest = ResolvedDest { node: [7u8; 32], endpoint_addr: None };
 

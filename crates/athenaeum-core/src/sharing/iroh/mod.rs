@@ -277,6 +277,9 @@ impl IrohTransport {
         let blobs = GatedBlobs {
             inner: BlobsProtocol::new(&store, None),
             gate: Arc::clone(&connect_gate),
+            // Legacy owned-endpoint transport: the router shutdown IS the store
+            // flush (no separate `self.store.shutdown()` in `IrohTransport`).
+            flush_store_on_shutdown: true,
         };
         let control = SyncControlProtocol {
             sink: EventSink::Direct(event_tx.clone()),
@@ -1026,6 +1029,14 @@ impl ProtocolHandler for SyncControlProtocol {
 struct GatedBlobs {
     inner: BlobsProtocol,
     gate: SharedConnectGate,
+    /// Whether a router shutdown should flush the backing blob store (iroh
+    /// hardening T8). `true` for the legacy [`IrohTransport`], whose only store
+    /// flush IS this router-driven path. `false` for the [`SharedIrohNode`], whose
+    /// store is SHARED across relay rebuilds: its per-rebuild router teardown must
+    /// NOT tear the store down (the accept loop calls `protocols.shutdown()` when
+    /// its endpoint closes), so the node flushes the store explicitly in its own
+    /// [`shutdown`](crate::sharing::iroh::node::SharedIrohNode::shutdown) instead.
+    flush_store_on_shutdown: bool,
 }
 
 // `SharedConnectGate` wraps a boxed closure (not `Debug`), so the `ProtocolHandler`
@@ -1056,9 +1067,14 @@ impl ProtocolHandler for GatedBlobs {
 
     // Forward the router-shutdown hook to the inner handler so the blobs store is
     // still flushed on `Router::shutdown` — `BlobsProtocol` overrides `shutdown`,
-    // and the default (no-op) would otherwise silently drop that flush.
+    // and the default (no-op) would otherwise silently drop that flush. The
+    // `SharedIrohNode` opts OUT (`flush_store_on_shutdown = false`): its store is
+    // shared across relay rebuilds, so a per-rebuild router teardown must not tear
+    // it down — the node flushes it explicitly at its own shutdown (T8).
     async fn shutdown(&self) {
-        <BlobsProtocol as ProtocolHandler>::shutdown(&self.inner).await
+        if self.flush_store_on_shutdown {
+            <BlobsProtocol as ProtocolHandler>::shutdown(&self.inner).await
+        }
     }
 }
 

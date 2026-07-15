@@ -429,6 +429,38 @@ pub async fn resolve_targets(config: &Config) -> Result<ResolvedTargets> {
     })
 }
 
+/// Resolve JUST the relay map (mode + urls) — the relay half of
+/// [`resolve_targets`], for the node's hourly relay-map refresh loop (iroh
+/// hardening T8, H2). Kept separate from target resolution so the node's refresh
+/// keeps working even when the hub device list is momentarily empty/unreachable:
+/// a relay-map change must still drive an idle endpoint rebuild. Re-fetches the
+/// hub relay map when signed in (persisting a fresh map as the offline cache),
+/// else uses the cache, honoring the same dev-only default-relay gate.
+pub async fn resolve_relay_config(config: &Config) -> Result<(RelayMode, Vec<String>)> {
+    let mut cache = PairingCache::load(&config.data_dir);
+    let account_token = match &config.account {
+        Some(account) => token_store(config, account)
+            .load()
+            .context("load device token")?
+            .map(|token| (account, token)),
+        None => None,
+    };
+    let relay_account = account_token
+        .as_ref()
+        .map(|(account, token)| (account.hub_url.clone(), token.clone()));
+    let relay_account_ref = relay_account.as_ref().map(|(u, t)| (u.as_str(), t.as_str()));
+    let relays = pairing::resolve_relays(relay_account_ref, &cache.relay_urls).await;
+    if relays.fresh {
+        cache.relay_urls = relays.urls.clone();
+        cache.save(&config.data_dir);
+    }
+    let signed_in = relay_account.is_some();
+    let dev_flag = config.account.as_ref().map_or(true, |a| a.allow_default_relays);
+    let mode = pairing::relay_mode_for(&relays.urls, allow_default_relays(signed_in, dev_flag))
+        .map_err(|reason| anyhow!("resolve relay map: {reason}"))?;
+    Ok((mode, relays.urls))
+}
+
 /// I3 gate parity with the app ([`athenaeum_core::api::sync`]'s
 /// `allow_default_relays`): whether the dev-only default-relay fallback
 /// ([`pairing::relay_mode_for`]'s `allow_default`) is permitted, given whether

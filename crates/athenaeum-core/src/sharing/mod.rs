@@ -150,6 +150,18 @@ pub trait SharingTransport: Send + Sync {
         let _ = from;
     }
 
+    /// Register / refresh a peer's dialable [`EndpointAddr`] (retry re-resolution,
+    /// iroh hardening T8). The sync engine calls this from its timeout path when
+    /// its address refresher yields a fresh address for the peer whose earlier
+    /// attempts timed out — a relay-map change or the peer moving relays can strand
+    /// a cached address, so re-registering the peer's CURRENT address lets the next
+    /// re-attempt dial the live path instead of the dead one. The default is a
+    /// no-op (the in-process loopback transport dials in-process); the shared-node
+    /// role handle merges it into the node's peer book + address lookup.
+    fn add_peer_addr(&self, addr: ::iroh::EndpointAddr) {
+        let _ = addr;
+    }
+
     /// Hand out the receiving half of this endpoint's [`TransportEvent`] stream.
     ///
     /// Single-consumer: the receiver is returned on the first call; subsequent

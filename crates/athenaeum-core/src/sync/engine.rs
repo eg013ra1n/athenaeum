@@ -46,6 +46,7 @@ use tokio::time::Instant;
 
 use crate::events::{emit_event, ProgressEmitter};
 use crate::package::{self, ManifestRecord, MANIFEST_FILENAME};
+use crate::sharing::iroh::node::BoxFuture;
 use crate::sharing::iroh::proto::OfferEntry;
 use crate::sharing::types::{
     FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
@@ -56,6 +57,17 @@ use super::models::{Direction, HistoryRow, OutboundRow, OutboundState};
 use super::receiver::{SyncFinishedEvent, SyncProgressEvent};
 use super::store::SyncStore;
 use super::{node_id_hex, now_iso};
+
+/// Retry-time peer-address re-resolver (iroh hardening T8). Given the engine's
+/// peer, yields the peer's CURRENT dialable [`EndpointAddr`](iroh::EndpointAddr)
+/// — the app re-fetches the peer's hub-reported address + fresh relays, Perseus
+/// re-resolves its target — or `None` when it can't be refreshed right now (hub
+/// blip / peer gone). [`handle_timeouts`](Worker::handle_timeouts) awaits it
+/// before a re-attempt so a stale cached address doesn't doom every retry to the
+/// same dead path; on `Some(addr)` the engine re-registers it on the transport
+/// ([`SharingTransport::add_peer_addr`]). `None` for tests + single-shot spawners.
+pub type AddrRefresher =
+    Arc<dyn Fn(NodeId) -> BoxFuture<Option<iroh::EndpointAddr>> + Send + Sync>;
 
 /// Default cap on announce attempts before a package is marked `Failed`. Five
 /// attempts balances resilience to transient peer/transport hiccups against
@@ -251,7 +263,70 @@ impl SyncEngine {
         config: SyncConfig,
         emitter: Option<Arc<dyn ProgressEmitter>>,
     ) -> SyncEngineHandle {
-        Self::spawn_inner(store, transport, peer, config, emitter, None)
+        Self::spawn_inner(store, transport, peer, config, emitter, None, None)
+    }
+
+    /// Spawn with a host [`ProgressEmitter`] AND a retry-time [`AddrRefresher`]
+    /// (iroh hardening T8) — the app's personal-sync sender path. On a timed-out
+    /// re-attempt the engine re-resolves the peer's current address through the
+    /// refresher so a relay-map change (or the peer moving relays) can't strand
+    /// every retry on a dead cached path.
+    pub fn spawn_with_emitter_and_refresher(
+        store: Arc<dyn SyncStore>,
+        transport: Arc<dyn SharingTransport>,
+        peer: NodeId,
+        emitter: Option<Arc<dyn ProgressEmitter>>,
+        addr_refresher: Option<AddrRefresher>,
+    ) -> SyncEngineHandle {
+        Self::spawn_inner(
+            store,
+            transport,
+            peer,
+            SyncConfig::default(),
+            emitter,
+            None,
+            addr_refresher,
+        )
+    }
+
+    /// Spawn with a retry-time [`AddrRefresher`] and no sink/emitter — Perseus's
+    /// single-target path (T8). Mirrors [`spawn`](Self::spawn) plus the refresher.
+    pub fn spawn_with_refresher(
+        store: Arc<dyn SyncStore>,
+        transport: Arc<dyn SharingTransport>,
+        peer: NodeId,
+        addr_refresher: Option<AddrRefresher>,
+    ) -> SyncEngineHandle {
+        Self::spawn_inner(
+            store,
+            transport,
+            peer,
+            SyncConfig::default(),
+            None,
+            None,
+            addr_refresher,
+        )
+    }
+
+    /// Spawn with a shared [`PackageCleanupSink`] AND a retry-time
+    /// [`AddrRefresher`] — Perseus's multi-target fan-out path (T8). Mirrors
+    /// [`spawn_with_sink`](Self::spawn_with_sink) plus the refresher.
+    pub fn spawn_with_sink_and_refresher(
+        store: Arc<dyn SyncStore>,
+        transport: Arc<dyn SharingTransport>,
+        peer: NodeId,
+        cleanup_sink: Arc<dyn PackageCleanupSink>,
+        addr_refresher: Option<AddrRefresher>,
+    ) -> SyncEngineHandle {
+        Self::spawn_inner(
+            store,
+            transport,
+            peer,
+            SyncConfig::default(),
+            None,
+            Some(cleanup_sink),
+            addr_refresher,
+        )
     }
 
     /// Spawn with a shared [`PackageCleanupSink`] and default [`SyncConfig`] /
@@ -273,6 +348,7 @@ impl SyncEngine {
             SyncConfig::default(),
             None,
             Some(cleanup_sink),
+            None,
         )
     }
 
@@ -298,6 +374,7 @@ impl SyncEngine {
             SyncConfig::default(),
             emitter,
             Some(cleanup_sink),
+            None,
         )
     }
 
@@ -305,13 +382,18 @@ impl SyncEngine {
     /// task running the worker loop and returns a handle to it. `cleanup_sink`
     /// is `None` for the app and single-target Perseus (unchanged in-line
     /// cleanup) and `Some(coordinator)` for the multi-target fan-out.
-    fn spawn_inner(
+    /// `addr_refresher` is `None` for every test + single-shot spawner and
+    /// `Some(..)` for the app/Perseus production paths that re-resolve a peer's
+    /// address on a timed-out retry (T8).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn spawn_inner(
         store: Arc<dyn SyncStore>,
         transport: Arc<dyn SharingTransport>,
         peer: NodeId,
         config: SyncConfig,
         emitter: Option<Arc<dyn ProgressEmitter>>,
         cleanup_sink: Option<Arc<dyn PackageCleanupSink>>,
+        addr_refresher: Option<AddrRefresher>,
     ) -> SyncEngineHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
         let worker = Worker {
@@ -322,6 +404,7 @@ impl SyncEngine {
             pending: HashMap::new(),
             emitter,
             cleanup_sink,
+            addr_refresher,
         };
         let join = tokio::spawn(async move {
             if let Err(e) = worker.run(cmd_rx).await {
@@ -410,6 +493,12 @@ struct Worker {
     /// terminal. `None` for the app + single-target Perseus → the original
     /// in-line cleanup runs unchanged.
     cleanup_sink: Option<Arc<dyn PackageCleanupSink>>,
+    /// Optional retry-time peer-address re-resolver (T8). `Some` on the
+    /// app/Perseus production paths: on a timed-out retry the worker awaits it and,
+    /// on `Some(addr)`, re-registers the peer's current address on the transport
+    /// before re-attempting. `None` for tests + single-shot spawners → retries use
+    /// the address already known to the transport (unchanged behavior).
+    addr_refresher: Option<AddrRefresher>,
 }
 
 impl Worker {
@@ -1165,11 +1254,31 @@ impl Worker {
             .map(|(k, _)| *k)
             .collect();
 
+        // Before re-attempting any timed-out package, re-resolve the peer's CURRENT
+        // dialable address once per timeout pass (T8): a relay-map change or the
+        // peer moving relays can strand the cached address so every retry hits the
+        // same dead path. All this engine's packages go to `self.peer`, so one
+        // refresh covers the whole `due` set; done lazily (only when something is
+        // actually due) and only when a refresher is wired. `None` (hub blip / peer
+        // gone) leaves the existing address in place — no worse than before.
+        let mut refreshed = false;
         for id in due {
             let attempts = self.store.bump_attempts(id).context("bump attempts")?;
             if attempts >= self.config.max_attempts {
                 self.fail_package(id)?;
             } else {
+                if !refreshed {
+                    refreshed = true;
+                    if let Some(refresher) = self.addr_refresher.clone() {
+                        if let Some(addr) = refresher(self.peer).await {
+                            tracing::info!(
+                                peer = %node_id_hex(&self.peer),
+                                "retry: re-resolved peer address"
+                            );
+                            self.transport.add_peer_addr(addr);
+                        }
+                    }
+                }
                 tracing::warn!(package_id = id, attempts, "sync timeout; re-attempting");
                 // `attempt` always re-arms a deadline (ack-wait on success, retry
                 // on failure), so a re-announce that keeps erroring can no longer

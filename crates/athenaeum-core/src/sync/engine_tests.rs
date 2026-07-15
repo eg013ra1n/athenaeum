@@ -1587,3 +1587,136 @@ async fn request_project_delivers_project_request_event() {
         other => panic!("expected ProjectRequestReceived, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Task 8 (H2): the retry path re-resolves the peer's address and re-registers it.
+// ---------------------------------------------------------------------------
+
+/// A minimal transport that ACCEPTS every announce/serve but never delivers an
+/// ack (its event stream stays open and silent), so every package's ack deadline
+/// elapses and drives `handle_timeouts`. It records each `add_peer_addr` call so
+/// the test can assert the engine re-registered the refresher's address.
+struct RetryProbeTransport {
+    node_id: NodeId,
+    /// Retained so the engine's `events()` receiver never closes → no ack ever
+    /// arrives → the ack deadline fires and the retry path runs.
+    keep_tx: std::sync::Mutex<Option<mpsc::Sender<TransportEvent>>>,
+    /// Every address the engine re-registered via `add_peer_addr` (T8).
+    added: Arc<std::sync::Mutex<Vec<iroh::EndpointAddr>>>,
+}
+
+#[async_trait::async_trait]
+impl SharingTransport for RetryProbeTransport {
+    async fn start(&self) -> anyhow::Result<crate::sharing::types::StartInfo> {
+        Ok(crate::sharing::types::StartInfo {
+            node_id: self.node_id,
+            pairing_ticket: String::new(),
+        })
+    }
+    async fn announce(&self, _to: NodeId, _a: &PackageAnnounce) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn fetch(&self, _from: NodeId, _pkg: &PackageAnnounce, _dest: &Path) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn serve(
+        &self,
+        _pkg: &PackageAnnounce,
+        _src: &Path,
+        _want: Option<&HashSet<String>>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn ack(
+        &self,
+        _to: NodeId,
+        _pid: &crate::sharing::types::PackageId,
+        _r: Vec<FrameReceipt>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn release(&self, _pid: &crate::sharing::types::PackageId) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn add_peer_addr(&self, addr: iroh::EndpointAddr) {
+        self.added.lock().unwrap().push(addr);
+    }
+    async fn events(&self) -> mpsc::Receiver<TransportEvent> {
+        let (tx, rx) = mpsc::channel(8);
+        // Retain the sender so the receiver never closes and no ack is ever sent.
+        *self.keep_tx.lock().unwrap() = Some(tx);
+        rx
+    }
+}
+
+/// (c) On a timed-out retry the engine awaits its address refresher and, on
+///     `Some(addr)`, re-registers it via the transport — so a relay-map change or
+///     the peer moving relays can't strand every retry on a dead cached path.
+///     A counting refresher proves it is invoked; the probe transport records the
+///     re-added address.
+#[tokio::test]
+async fn retry_path_re_resolves_and_re_adds_peer_address() {
+    use std::sync::atomic::AtomicUsize;
+
+    let tmp = tempdir().unwrap();
+    // A VALID ed25519 peer id so the refresher can build a real `EndpointAddr`.
+    let peer: NodeId = *iroh::SecretKey::generate().public().as_bytes();
+
+    let added = Arc::new(std::sync::Mutex::new(Vec::<iroh::EndpointAddr>::new()));
+    let transport = Arc::new(RetryProbeTransport {
+        node_id: peer,
+        keep_tx: std::sync::Mutex::new(None),
+        added: Arc::clone(&added),
+    });
+
+    // A counting refresher that returns the peer's (freshly built) address.
+    let refresh_count = Arc::new(AtomicUsize::new(0));
+    let rc = Arc::clone(&refresh_count);
+    let refresher: crate::sync::engine::AddrRefresher = Arc::new(move |p: NodeId| {
+        let rc = Arc::clone(&rc);
+        Box::pin(async move {
+            rc.fetch_add(1, SeqCst);
+            let id = iroh::EndpointId::from_bytes(&p).ok()?;
+            Some(iroh::EndpointAddr::new(id))
+        })
+    });
+
+    let pkg = build_package(&tmp.path().join("src-t8"), "uuid-t8", "f.fits", "M8", 1024);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    // Short ack timeout + a small attempt cap so the retry path runs quickly and
+    // the package terminalizes without hanging the test.
+    let engine = SyncEngine::spawn_inner(
+        store.clone() as Arc<dyn SyncStore>,
+        transport as Arc<dyn SharingTransport>,
+        peer,
+        SyncConfig {
+            ack_timeout: Duration::from_millis(80),
+            max_attempts: 3,
+        },
+        None,
+        None,
+        Some(refresher),
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    // The ack never comes, so the package walks its attempts to Failed — by which
+    // point the retry path has run at least once.
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Failed), WAIT).await;
+
+    assert!(
+        refresh_count.load(SeqCst) >= 1,
+        "the retry path must call the address refresher at least once"
+    );
+    let added = added.lock().unwrap();
+    assert!(
+        !added.is_empty(),
+        "the engine must re-register the refreshed address on the transport"
+    );
+    assert_eq!(
+        added[0].id.as_bytes(),
+        &peer,
+        "the re-added address must be the peer's refreshed address"
+    );
+
+    engine.shutdown().await;
+}
