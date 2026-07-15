@@ -85,6 +85,45 @@ pub async fn enqueue_sync_selection(
     .map_err(|e| e.to_string())
 }
 
+/// Retry a terminal (failed / cancelled) outbound package: re-enqueue its dir as
+/// a new durable row on the engine for the original row's peer (built lazily if
+/// that peer has no engine yet). Returns the new row id.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn retry_sync_package(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    id: i64,
+) -> Result<i64, String> {
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
+    api::retry_sync_package(
+        &state.ctx,
+        &state.sync_sender,
+        Arc::clone(&state.collab_sender),
+        &state.sync,
+        id,
+        Some(emitter),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Send-now a live outbound package: kick its owning engine so it re-announces
+/// immediately instead of waiting out its backoff.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn send_now_sync_package(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    api::send_now_sync_package(&state.sync_sender, id).await.map_err(|e| e.to_string())
+}
+
+/// Cancel a live outbound package: drive it to the terminal `Cancelled` state on
+/// its owning engine.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn cancel_sync_package(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    api::cancel_sync_package(&state.sync_sender, id).await.map_err(|e| e.to_string())
+}
+
 /// Whether full-app capture-node auto mode is enabled.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]

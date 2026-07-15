@@ -196,6 +196,12 @@ pub trait SyncStore: Send + Sync {
     /// Every non-terminal outbound row — the crash-resume enumeration.
     fn non_terminal(&self) -> Result<Vec<OutboundRow>>;
 
+    /// Fetch a single outbound row by id (`None` if absent). The terminal-state
+    /// read behind the retry command surface (Task 8) and the Perseus retry path;
+    /// promoted from a [`StandaloneSyncStore`] inherent into the trait so the
+    /// catalog-backed store exposes it too. Delegates to [`outbound_row_by_id`].
+    fn get_outbound(&self, id: i64) -> Result<Option<OutboundRow>>;
+
     /// Every package currently in [`Confirmed`](OutboundState::Confirmed),
     /// oldest-confirmed-first (`confirmed_at ASC, id ASC`).
     ///
@@ -446,6 +452,34 @@ pub fn all_outbound_rows(conn: &Connection, limit: u32) -> Result<Vec<OutboundRo
     raws.into_iter().map(to_outbound).collect()
 }
 
+/// Fetch a single `sync_outbound` row by id (`None` if absent). Defined once here
+/// so both store implementations share the by-id read verbatim; it backs
+/// [`SyncStore::get_outbound`] — the terminal-state read the retry command surface
+/// (Task 8) and the Perseus retry path rely on.
+pub fn outbound_row_by_id(conn: &Connection, id: i64) -> Result<Option<OutboundRow>> {
+    let raw = conn
+        .query_row(
+            &format!("SELECT {OUTBOUND_COLS} FROM sync_outbound WHERE id = ?1"),
+            params![id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            },
+        )
+        .optional()
+        .context("query sync_outbound by id")?;
+    raw.map(to_outbound).transpose()
+}
+
 /// One `sync_sources` row: a live (or historic) linkage from an app package back
 /// to one catalog source file it was built from. See [`DDL_SYNC_SOURCES`].
 ///
@@ -670,31 +704,13 @@ impl StandaloneSyncStore {
         })
     }
 
-    /// Fetch a single outbound row by id. Inherent helper (not part of the
-    /// trait) — used by tests and callers that need a terminal-state read.
+    /// Fetch a single outbound row by id. Inherent helper retained so existing
+    /// concrete-`StandaloneSyncStore` callers (Perseus, tests) need no `SyncStore`
+    /// import; the [`SyncStore::get_outbound`] trait method shares the same
+    /// [`outbound_row_by_id`] body.
     pub fn get_outbound(&self, id: i64) -> Result<Option<OutboundRow>> {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
-        let raw = conn
-            .query_row(
-                &format!("SELECT {OUTBOUND_COLS} FROM sync_outbound WHERE id = ?1"),
-                params![id],
-                |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                        r.get(6)?,
-                        r.get(7)?,
-                        r.get(8)?,
-                    ))
-                },
-            )
-            .optional()
-            .context("query sync_outbound by id")?;
-        raw.map(to_outbound).transpose()
+        outbound_row_by_id(&conn, id)
     }
 
     /// Every outbound row, newest-first, capped at `limit` — the Perseus web
@@ -809,6 +825,11 @@ impl SyncStore for StandaloneSyncStore {
             .collect::<rusqlite::Result<Vec<OutboundRaw>>>()
             .context("collect non_terminal")?;
         raws.into_iter().map(to_outbound).collect()
+    }
+
+    fn get_outbound(&self, id: i64) -> Result<Option<OutboundRow>> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        outbound_row_by_id(&conn, id)
     }
 
     fn confirmed(&self) -> Result<Vec<OutboundRow>> {
@@ -1046,6 +1067,11 @@ impl SyncStore for CatalogSyncStore {
             .collect::<rusqlite::Result<Vec<OutboundRaw>>>()
             .context("collect non_terminal")?;
         raws.into_iter().map(to_outbound).collect()
+    }
+
+    fn get_outbound(&self, id: i64) -> Result<Option<OutboundRow>> {
+        let conn = self.lock_conn();
+        outbound_row_by_id(&conn, id)
     }
 
     fn confirmed(&self) -> Result<Vec<OutboundRow>> {

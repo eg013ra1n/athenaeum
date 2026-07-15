@@ -104,6 +104,53 @@ pub async fn enqueue_sync_selection(
     .map_err(api_err)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdArgs {
+    pub id: i64,
+}
+
+/// POST /api/retry_sync_package
+///
+/// Retry a terminal (failed / cancelled) outbound package: re-enqueue its dir as
+/// a new durable row on the engine for the original row's peer. Returns the new id.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn retry_sync_package(
+    State(state): State<WebAppState>,
+    Json(args): Json<IdArgs>,
+) -> Result<Json<i64>, (StatusCode, String)> {
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    api::retry_sync_package(
+        &state.ctx,
+        &state.sync_sender,
+        Arc::clone(&state.collab_sender),
+        &state.sync,
+        args.id,
+        Some(emitter),
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
+}
+
+/// POST /api/send_now_sync_package
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn send_now_sync_package(
+    State(state): State<WebAppState>,
+    Json(args): Json<IdArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    api::send_now_sync_package(&state.sync_sender, args.id).await.map(Json).map_err(api_err)
+}
+
+/// POST /api/cancel_sync_package
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn cancel_sync_package(
+    State(state): State<WebAppState>,
+    Json(args): Json<IdArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    api::cancel_sync_package(&state.sync_sender, args.id).await.map(Json).map_err(api_err)
+}
+
 /// POST /api/get_sync_auto_mode
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_sync_auto_mode(

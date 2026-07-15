@@ -1968,6 +1968,9 @@ mod retention_tests {
         fn non_terminal(&self) -> Result<Vec<OutboundRow>> {
             self.0.non_terminal()
         }
+        fn get_outbound(&self, id: i64) -> Result<Option<OutboundRow>> {
+            self.0.get_outbound(id)
+        }
         fn confirmed(&self) -> Result<Vec<OutboundRow>> {
             self.0.confirmed()
         }

@@ -1415,6 +1415,161 @@ pub async fn enqueue_sync_selection(
     Ok(result)
 }
 
+// ── Retry / send-now / cancel command surface (Task 8) ───────────────────────
+
+/// Whether `dir` still holds a package's manifest AND at least one payload file —
+/// the retry precondition, ported from Perseus's `api_retry`. A confirmed package
+/// is manifest-only after payload cleanup (so this is `false` for it), and a
+/// vanished dir is `false`: re-announcing a manifest-only dir can never deliver,
+/// so retry rejects it up front.
+fn package_has_payload(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut has_manifest = false;
+    let mut has_payload = false;
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_file() {
+            continue;
+        }
+        if entry.file_name() == std::ffi::OsStr::new(package::MANIFEST_FILENAME) {
+            has_manifest = true;
+        } else {
+            has_payload = true;
+        }
+    }
+    has_manifest && has_payload
+}
+
+/// Resolve the started sender engine that owns the pending (non-terminal) row
+/// `id`, for the send-now / cancel command surfaces. The per-peer engines share
+/// ONE catalog store, so any started engine's non-terminal snapshot lists every
+/// in-flight row (peer-unfiltered); we read the row off the first started engine
+/// to learn its `peer`, then route to THAT peer's engine — the only one that
+/// actually holds the in-memory pending slot `kick` / `cancel` act on.
+///
+/// `Invalid("package is not active")` when no started engine's snapshot carries
+/// `id`: it is already terminal (a retry candidate, not send-now/cancel),
+/// unknown, or its peer has no started engine in this process.
+async fn active_engine_for_row(
+    sender: &Arc<SyncSenderRuntime>,
+    id: i64,
+) -> Result<Arc<SyncEngineHandle>, ApiError> {
+    for peer in sender.started_peers().await {
+        let Some((engine, _)) = sender.current_for(&peer).await else {
+            continue;
+        };
+        let snapshot = engine
+            .status_snapshot()
+            .map_err(|e| ApiError::Internal(format!("sender status snapshot: {e:#}")))?;
+        if let Some(row) = snapshot.into_iter().find(|r| r.id == id) {
+            return sender
+                .current_for(&row.peer)
+                .await
+                .map(|(eng, _)| eng)
+                .ok_or_else(|| ApiError::Invalid("package is not active".into()));
+        }
+    }
+    Err(ApiError::Invalid("package is not active".into()))
+}
+
+/// Retry a terminal outbound package: re-enqueue a `Failed` / `Cancelled`
+/// package's dir as a NEW durable row — the sanctioned retry model (the receiver
+/// dedups by frame uuid; the original terminal row is left intact). Ported from
+/// Perseus's `api_retry`: the row must be terminal, its payload must still be on
+/// disk, then `enqueue_package` mints the new row id.
+///
+/// The re-enqueue MUST run on the engine whose peer matches `row.peer` — the
+/// worker stamps the new row with the ENGINE's peer, so enqueueing on any other
+/// peer's engine would send the package to the wrong device. A started engine for
+/// `row.peer` is reused; otherwise one is built lazily via [`ensure_sender_engine`]
+/// (a restart clears the in-memory engine map while the terminal rows persist, so
+/// a retry after a restart legitimately has no engine yet). The first-attempt dial
+/// hint falls back to our own relay set (`dest_endpoint_addr = None`); the engine's
+/// T8 address refresher re-resolves the peer's real address on retry.
+pub async fn retry_sync_package(
+    ctx: &Arc<ServiceContext>,
+    sender: &Arc<SyncSenderRuntime>,
+    collab_sender: Arc<SyncSenderRuntime>,
+    sync: &SyncRuntime,
+    id: i64,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+) -> Result<i64, ApiError> {
+    let (_sync_dir, db_path) = sync_paths(ctx)?;
+    // Read the row from the shared catalog store (an engine may not be started for
+    // its peer yet — e.g. after a restart).
+    let row = {
+        let store = CatalogSyncStore::open(&db_path)
+            .map_err(|e| ApiError::Internal(format!("open catalog sync store: {e:#}")))?;
+        store
+            .get_outbound(id)
+            .map_err(|e| ApiError::Internal(format!("read outbound row {id}: {e:#}")))?
+            .ok_or_else(|| ApiError::Invalid(format!("unknown package id {id}")))?
+    };
+    // Only a terminal failed/cancelled row is retryable (a confirmed row is
+    // manifest-only after cleanup; a live row is send-now territory, not retry).
+    if !matches!(row.state, OutboundState::Failed | OutboundState::Cancelled) {
+        return Err(ApiError::Invalid(format!(
+            "package {id} is {} — only failed or cancelled packages can be retried",
+            row.state.as_str()
+        )));
+    }
+    // The payload must still be on disk — re-announcing a manifest-only dir can
+    // never deliver.
+    let dir = PathBuf::from(&row.package_ref);
+    if !package_has_payload(&dir) {
+        return Err(ApiError::Invalid(format!(
+            "package {id} data is missing on disk; cannot retry"
+        )));
+    }
+    // Enqueue on row.peer's engine — reuse a started one or build it lazily.
+    let engine = match sender.current_for(&row.peer).await {
+        Some((engine, _)) => engine,
+        None => {
+            let (engine, _origin) =
+                ensure_sender_engine(ctx, sender, collab_sender, sync, row.peer, None, emitter)
+                    .await?;
+            engine
+        }
+    };
+    let new_id = engine
+        .enqueue_package(&dir)
+        .await
+        .map_err(|e| ApiError::Internal(format!("re-enqueue package {id}: {e:#}")))?;
+    tracing::info!(old_id = id, new_id, peer = %node_id_hex(&row.peer), "sync package retried");
+    Ok(new_id)
+}
+
+/// Send-now a live outbound package: collapse its retry backoff so the owning
+/// engine re-announces on the next worker pass (spec §2 wake / send-now, Task 5's
+/// `kick`). Only a package currently in flight has a slot to kick —
+/// [`active_engine_for_row`] returns `Invalid("package is not active")` for a
+/// terminal / unknown id (retry, not send-now, is the terminal-row action).
+pub async fn send_now_sync_package(sender: &Arc<SyncSenderRuntime>, id: i64) -> Result<(), ApiError> {
+    let engine = active_engine_for_row(sender, id).await?;
+    engine
+        .kick(id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("send-now package {id}: {e:#}")))?;
+    tracing::info!(package_id = id, "sync package send-now");
+    Ok(())
+}
+
+/// Cancel a live outbound package: drive it to the terminal `Cancelled` state on
+/// its owning engine (Task 3). Only an in-flight package can be cancelled —
+/// [`active_engine_for_row`] returns `Invalid("package is not active")` for a
+/// terminal / unknown id (an already-terminal package needs no cancel).
+pub async fn cancel_sync_package(sender: &Arc<SyncSenderRuntime>, id: i64) -> Result<(), ApiError> {
+    let engine = active_engine_for_row(sender, id).await?;
+    engine
+        .cancel(id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("cancel package {id}: {e:#}")))?;
+    tracing::info!(package_id = id, "sync package cancel requested");
+    Ok(())
+}
+
 /// Whether full-app capture-node auto mode is enabled (`sync.auto_mode`).
 pub fn get_sync_auto_mode(ctx: &ServiceContext) -> Result<bool, ApiError> {
     let db = db(ctx)?;
@@ -1875,6 +2030,130 @@ mod tests {
         assert!(result.ineligible.is_empty());
         assert!(!sender.is_started().await, "no engine started for an empty selection");
         assert!(sender.started_peers().await.is_empty(), "no peer engine for an empty selection");
+    }
+
+    // ── Retry / send-now / cancel command surface (Task 8) ───────────────────
+
+    /// Build a real one-frame package (manifest + payload copied into the dir) in
+    /// the ctx's catalog and return its dir — the retry precondition needs a dir
+    /// `package_has_payload` accepts.
+    fn build_one_frame_package(ctx: &ServiceContext, tmp: &Path) -> PathBuf {
+        let f1 = insert_fixture_frame(ctx, tmp, "retry-0001.fits", "M42", false);
+        let pkg_root = tmp.join("packages");
+        let db = db(ctx).unwrap();
+        let conn = db.conn();
+        build_selection_package(&conn, "origin-dev", &pkg_root, &[f1])
+            .unwrap()
+            .pkg_dir
+            .expect("a package was written")
+    }
+
+    /// A loopback sender engine bound to the SAME catalog store the api fns read,
+    /// keyed under a made-up peer in a fresh runtime. The peer never starts an
+    /// endpoint, so the engine's announce fails fast ("peer not started") and the
+    /// row parks in `Queued` (non-terminal) — enough to cancel, with no receiver
+    /// endpoint to keep alive. The long ack timeout keeps a timeout from racing a
+    /// cancel.
+    async fn loopback_sender_for(db_path: &Path) -> (Arc<SyncSenderRuntime>, NodeId) {
+        use crate::sharing::loopback::LoopbackNetwork;
+        use crate::sharing::SharingTransport;
+        use crate::sync::SyncConfig;
+
+        let net = LoopbackNetwork::new();
+        let peer: NodeId = crate::sync::node_id_from_hex(&"ab".repeat(32)).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(db_path).unwrap());
+        let engine = Arc::new(SyncEngine::spawn_with_config(
+            store as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
+            peer,
+            SyncConfig { ack_timeout: Duration::from_secs(60) },
+        ));
+        let sender = Arc::new(SyncSenderRuntime::new());
+        sender
+            .lock_inner()
+            .await
+            .insert(peer, StartedSender { engine, origin_device: node_id_hex(&peer), peer });
+        (sender, peer)
+    }
+
+    /// Poll the shared catalog store until outbound row `id` reaches `want`.
+    async fn wait_outbound_state(db_path: &Path, id: i64, want: OutboundState) {
+        for _ in 0..500 {
+            let store = CatalogSyncStore::open(db_path).unwrap();
+            if store.get_outbound(id).unwrap().map(|r| r.state) == Some(want) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for outbound {id} to reach {want:?}");
+    }
+
+    /// Step 1: enqueue → cancel (terminal `Cancelled`) → `retry_sync_package`
+    /// re-enqueues the SAME package dir as a NEW durable row (new id ≠ old); the
+    /// original terminal row is left untouched and the new row is pending.
+    #[tokio::test]
+    async fn retry_reenqueues_terminal_package_as_new_row() {
+        let (tmp, ctx) = test_ctx();
+        let pkg_dir = build_one_frame_package(&ctx, tmp.path());
+        let ctx = Arc::new(ctx);
+        let db_path = db(&ctx).unwrap().path().to_path_buf();
+
+        let (sender, peer) = loopback_sender_for(&db_path).await;
+        let collab_sender = Arc::new(SyncSenderRuntime::new());
+        let sync = SyncRuntime::new();
+
+        // Enqueue on the peer's engine, then cancel it → terminal Cancelled.
+        let (engine, _) = sender.current_for(&peer).await.unwrap();
+        let old_id = engine.enqueue_package(&pkg_dir).await.unwrap();
+        engine.cancel(old_id).await.unwrap();
+        wait_outbound_state(&db_path, old_id, OutboundState::Cancelled).await;
+
+        // Retry re-enqueues the SAME dir as a NEW row on the same peer's engine.
+        let new_id =
+            retry_sync_package(&ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
+                .await
+                .unwrap();
+        assert_ne!(new_id, old_id, "retry mints a new durable row");
+
+        let store = CatalogSyncStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.get_outbound(old_id).unwrap().unwrap().state,
+            OutboundState::Cancelled,
+            "the original terminal row is left untouched",
+        );
+        let new_row = store.get_outbound(new_id).unwrap().expect("new row exists");
+        assert!(!new_row.state.is_terminal(), "the re-enqueued row is pending");
+        assert_eq!(
+            new_row.package_ref,
+            pkg_dir.to_string_lossy(),
+            "the new row points at the same package dir",
+        );
+    }
+
+    /// Step 1: `retry_sync_package` refuses a non-terminal (pending) package — only
+    /// a `Failed` / `Cancelled` row is a retry candidate.
+    #[tokio::test]
+    async fn retry_rejects_pending_package() {
+        let (tmp, ctx) = test_ctx();
+        let pkg_dir = build_one_frame_package(&ctx, tmp.path());
+        let ctx = Arc::new(ctx);
+        let db_path = db(&ctx).unwrap().path().to_path_buf();
+
+        let (sender, peer) = loopback_sender_for(&db_path).await;
+        let collab_sender = Arc::new(SyncSenderRuntime::new());
+        let sync = SyncRuntime::new();
+
+        // Enqueue but do NOT cancel — the row is non-terminal (Queued/Announced).
+        let (engine, _) = sender.current_for(&peer).await.unwrap();
+        let id = engine.enqueue_package(&pkg_dir).await.unwrap();
+
+        let err = retry_sync_package(&ctx, &sender, collab_sender, &sync, id, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(_)),
+            "retry rejects a pending (non-terminal) package, got {err:?}",
+        );
     }
 
     // ── Status enrichment (task M3) ──────────────────────────────────────────
