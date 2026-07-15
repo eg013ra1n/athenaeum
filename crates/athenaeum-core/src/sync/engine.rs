@@ -1273,6 +1273,75 @@ impl Worker {
             return Ok(());
         };
 
+        // Cancelled-by-receiver (Task 4): a non-empty ack whose receipts are ALL
+        // `Cancelled` is a deliberate "no" for the whole package — terminal, NOT a
+        // partial delivery. It must NOT run the confirm/completeness path below
+        // (`Cancelled` is not `Rejected`, so it would otherwise fall through and
+        // confirm). Mark the row `Cancelled`, stamp the exact "cancelled by
+        // receiver" reason (the UI keys its "by receiver" display off this string),
+        // record a per-frame `cancelled` history outcome through the shared
+        // receipts→history path, run the same terminal epilogue `cancel_package`
+        // uses (release blobs, cleanup_sink/in-line payload cleanup, drop the
+        // slot), and emit the single `cancelled` finished event. MIXED receipts
+        // (some cancelled, some ingested/rejected) fall through to the normal path
+        // below, where cancelled frames still map to a `cancelled` history outcome.
+        if !receipts.is_empty()
+            && receipts
+                .iter()
+                .all(|r| matches!(r.outcome, ReceiptOutcome::Cancelled))
+        {
+            let pending = self.pending.remove(&key).expect("key from live find");
+            self.store
+                .set_state(pending.id, OutboundState::Cancelled)
+                .context("cancel outbound (all-cancelled ack)")?;
+            // The exact reason string the Perseus/UI surface renders as "cancelled
+            // by receiver". Best-effort diagnostic write — never fail the terminal
+            // transition on it.
+            if let Err(se) = self
+                .store
+                .set_last_error(pending.id, Some("cancelled by receiver"))
+            {
+                tracing::warn!(package_id = pending.id, error = %se, "record last_error (cancelled by receiver) failed");
+            }
+            // Terminal: no retry is pending — clear the persisted countdown (Task 2).
+            self.clear_next_retry(pending.id);
+            // Per-frame `cancelled` history via the shared receipts→history path
+            // (every receipt is `Cancelled`, so each row's outcome is `cancelled`).
+            self.append_confirmed_history(&pending, &receipts)?;
+            // Terminal: free the served blobs (fire-and-forget). `package_id` is the
+            // id the ack correlated against (== pending.announce.package_id).
+            self.spawn_release(package_id);
+            // Same shared-payload discipline as the confirm/cancel paths: defer to
+            // the coordinator when fanned out, else clean the payload copies in line.
+            match &self.cleanup_sink {
+                Some(sink) => sink.on_terminal(&pending.dir),
+                None => match cleanup_package_payloads(&pending.dir) {
+                    Ok(freed_bytes) => {
+                        tracing::info!(package_id = pending.id, freed_bytes, "package payloads cleaned");
+                    }
+                    Err(e) => {
+                        tracing::warn!(package_id = pending.id, error = %format!("{e:#}"), "package payload cleanup failed");
+                    }
+                },
+            }
+            tracing::info!(
+                package_id = pending.id,
+                state = "cancelled",
+                reason = "cancelled_by_receiver",
+                "sync state"
+            );
+            self.emit_finished(
+                pending.id,
+                "cancelled",
+                0,
+                Vec::new(),
+                0,
+                0,
+                pending.project_id.clone(),
+            );
+            return Ok(());
+        }
+
         let rejected: Vec<&str> = receipts
             .iter()
             .filter_map(|r| matches!(r.outcome, ReceiptOutcome::Rejected(_)).then_some(r.frame_uuid.as_str()))
@@ -1732,6 +1801,7 @@ fn receipt_outcome_str(o: &ReceiptOutcome) -> String {
     match o {
         ReceiptOutcome::Ingested => "ingested",
         ReceiptOutcome::Duplicate => "duplicate",
+        ReceiptOutcome::Cancelled => "cancelled",
         ReceiptOutcome::Rejected(_) => "rejected",
     }
     .to_string()

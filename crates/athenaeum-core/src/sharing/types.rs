@@ -43,6 +43,14 @@ pub enum ReceiptOutcome {
     Ingested,
     Duplicate,
     Rejected(String),
+    /// The receiver deliberately declined this frame — a first-class "no", NOT a
+    /// transient rejection. Unlike [`Rejected`](Self::Rejected) (which keeps the
+    /// package in flight for redelivery), a package whose ack is entirely
+    /// `Cancelled` is terminal-by-receiver: the sender stops retrying and marks
+    /// the outbound row cancelled. This is the delivery-forever cycle's single
+    /// new wire value (spec §5); an old peer cannot deserialize it — accepted, no
+    /// compat shim. Produced by the receiver-cancel flow (a later task).
+    Cancelled,
 }
 
 /// Metadata returned when an endpoint comes online.

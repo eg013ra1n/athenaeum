@@ -531,11 +531,12 @@ pub fn mark_sync_source_deleted(conn: &Connection, package_ref: &str, path: &str
 }
 
 /// Stable text encoding of a [`ReceiptOutcome`] for the `sync_receipts.outcome`
-/// column: `ingested` / `duplicate` / `rejected:<reason>`.
+/// column: `ingested` / `duplicate` / `cancelled` / `rejected:<reason>`.
 pub fn receipt_outcome_to_db(o: &ReceiptOutcome) -> String {
     match o {
         ReceiptOutcome::Ingested => "ingested".to_string(),
         ReceiptOutcome::Duplicate => "duplicate".to_string(),
+        ReceiptOutcome::Cancelled => "cancelled".to_string(),
         ReceiptOutcome::Rejected(msg) => format!("rejected:{msg}"),
     }
 }
@@ -547,6 +548,10 @@ pub fn receipt_outcome_from_db(s: &str) -> ReceiptOutcome {
     match s {
         "ingested" => ReceiptOutcome::Ingested,
         "duplicate" => ReceiptOutcome::Duplicate,
+        // A deliberate receiver "no" — decoded as a first-class `Cancelled`, NOT
+        // via the `rejected:` catch-all below (which would strand it as a pending
+        // rejection). Kept ABOVE the catch-all so `cancelled` never falls through.
+        "cancelled" => ReceiptOutcome::Cancelled,
         other => ReceiptOutcome::Rejected(other.strip_prefix("rejected:").unwrap_or(other).to_string()),
     }
 }
@@ -1115,6 +1120,36 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
         assert!(store.all_outbound(50).unwrap().is_empty());
+    }
+
+    /// Task 4: a `Cancelled` receipt round-trips through the DB text encoding
+    /// (`insert_receipt` → `load_receipts`) unchanged, AND is counted as
+    /// *satisfied* by [`count_satisfied_receipts`]. A deliberate receiver "no" is
+    /// a settled verdict (like ingested/duplicate, unlike a pending `Rejected`),
+    /// so the receiver's ack-replay guard fires on a re-announce instead of
+    /// re-fetching a frame the receiver already declined.
+    #[test]
+    fn receipt_outcome_cancelled_roundtrips_and_counts_satisfied() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_RECEIPTS, []).unwrap();
+
+        let receipt = FrameReceipt {
+            frame_uuid: "uuid-cancel".to_string(),
+            xxh3: "hhhh".to_string(),
+            outcome: ReceiptOutcome::Cancelled,
+        };
+        insert_receipt(&conn, "pkg-cancel", &receipt, "2026-07-15T00:00:00Z").unwrap();
+
+        // Round-trips through the `cancelled` text encoding unchanged (a plain
+        // `from_db` arm, NOT the `Rejected` catch-all).
+        let loaded = load_receipts(&conn, "pkg-cancel").unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].frame_uuid, "uuid-cancel");
+        assert_eq!(loaded[0].outcome, ReceiptOutcome::Cancelled);
+
+        // Counted as satisfied (the `outcome NOT LIKE 'rejected:%'` guard) so the
+        // §4 ack-replay fires on re-announce.
+        assert_eq!(count_satisfied_receipts(&conn, "pkg-cancel").unwrap(), 1);
     }
 
     /// `next_retry_at` round-trips through a write + read and clears with `None`

@@ -182,6 +182,11 @@ pub fn ingest_project_package(
             }
             ReceiptOutcome::Duplicate => ok_count += 1,
             ReceiptOutcome::Rejected(_) => failed.push(record.frame_uuid.clone()),
+            // Project ingest never produces a `Cancelled` verdict: it is the
+            // receiver's per-frame ingest outcome (ingest/duplicate/reject), not
+            // the sender-facing receiver-cancel wire value. Defensive no-op — a
+            // cancelled frame is neither accepted (ok) nor failed here.
+            ReceiptOutcome::Cancelled => {}
         }
         receipts.push(receipt);
     }

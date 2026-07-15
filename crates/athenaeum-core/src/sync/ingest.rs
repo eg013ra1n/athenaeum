@@ -165,6 +165,13 @@ pub fn ingest_package(
                 match prior.outcome {
                     ReceiptOutcome::Ingested => outcome.ingested += 1,
                     ReceiptOutcome::Duplicate => outcome.duplicate += 1,
+                    // A prior `Cancelled` receipt (the receiver deliberately
+                    // declined this frame — receiver-cancel flow, a later task) is
+                    // a settled verdict: it is reused/replayed verbatim in the ack
+                    // (pushed below), matching `count_satisfied_receipts` counting
+                    // it as satisfied. It is neither an ingest nor a duplicate, so
+                    // it bumps no acceptance counter.
+                    ReceiptOutcome::Cancelled => {}
                     ReceiptOutcome::Rejected(_) => unreachable!("guarded above"),
                 }
                 outcome.receipts.push(prior.clone());

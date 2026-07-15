@@ -126,6 +126,38 @@ fn spawn_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf) -> Recei
     ReceiverStats { attempts, failures }
 }
 
+/// Spawn a reactive receiver that fetches on every `AnnounceReceived` and acks
+/// every manifest frame as `Cancelled` (Task 4) — the receiver deliberately
+/// declines the whole package. Drives the sender's all-cancelled-ack terminal
+/// path (a deliberate "no", distinct from a `Rejected` partial delivery).
+fn spawn_cancelling_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf) {
+    tokio::spawn(async move {
+        let mut events = endpoint.events().await;
+        let mut n = 0usize;
+        while let Some(event) = events.recv().await {
+            let TransportEvent::AnnounceReceived { from, announce } = event else {
+                continue;
+            };
+            n += 1;
+            let dest = dest_root.join(format!("fetch-{n}"));
+            if endpoint.fetch(from, &announce, &dest).await.is_ok() {
+                let Ok(records) = package::read_manifest(&dest) else {
+                    continue;
+                };
+                let receipts: Vec<FrameReceipt> = records
+                    .iter()
+                    .map(|r| FrameReceipt {
+                        frame_uuid: r.frame_uuid.clone(),
+                        xxh3: r.xxh3.clone(),
+                        outcome: ReceiptOutcome::Cancelled,
+                    })
+                    .collect();
+                let _ = endpoint.ack(from, &announce.package_id, receipts).await;
+            }
+        }
+    });
+}
+
 /// Poll `pred` every 10ms until true, panicking after `timeout`.
 async fn wait_until<F: FnMut() -> bool>(mut pred: F, timeout: Duration) {
     let deadline = Instant::now() + timeout;
@@ -930,6 +962,87 @@ async fn cancel_moves_to_cancelled_state() {
     );
 
     // The sender's single `sync-finished` event carries the `cancelled` outcome.
+    wait_until(
+        || {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(n, p)| n == "sync-finished" && p["outcome"].as_str() == Some("cancelled"))
+        },
+        WAIT,
+    )
+    .await;
+    let evts = events.lock().unwrap();
+    let finished = evts
+        .iter()
+        .find(|(n, _)| n == "sync-finished")
+        .expect("a sync-finished event");
+    assert_eq!(finished.1["outcome"].as_str(), Some("cancelled"));
+    drop(evts);
+
+    engine.shutdown().await;
+}
+
+/// Task 4: an ack whose receipts are non-empty and ALL `Cancelled` terminates the
+/// outbound row as **cancelled-by-receiver** — NOT the normal confirm path. The
+/// row lands in the first-class `Cancelled` terminal, carries the exact
+/// `last_error` string the UI keys its "by receiver" display off, records a
+/// per-frame `cancelled` history outcome, and emits a single `cancelled`
+/// `sync-finished` event.
+#[tokio::test]
+async fn all_cancelled_ack_marks_cancelled_by_receiver() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    spawn_cancelling_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(&tmp.path().join("src_cx"), "uuid-cx", "cx.fits", "M42", 2048);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> = Arc::new(CapturingEmitter(events.clone()));
+    let engine = SyncEngine::spawn_with_emitter(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        Some(emitter),
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
+
+    // Terminal `Cancelled` carrying the exact "by receiver" reason string.
+    let row = store.get_outbound(id).unwrap().unwrap();
+    assert_eq!(row.state, OutboundState::Cancelled);
+    assert_eq!(
+        row.last_error.as_deref(),
+        Some("cancelled by receiver"),
+        "the UI keys its 'by receiver' display off this exact string"
+    );
+    // Cancelled, not confirmed — no confirmed_at stamp.
+    assert!(row.confirmed_at.is_none(), "a cancelled row is never confirmed");
+
+    // Per-frame history records a `cancelled` outcome (via the shared
+    // receipts→history path with the new `Cancelled` mapping).
+    let history = store
+        .search_history(HistoryQuery {
+            filename: Some("cx.fits".to_string()),
+            object: None,
+            direction: None,
+            peer: None,
+            project: None,
+            limit: 100,
+        })
+        .unwrap();
+    assert!(
+        history.iter().any(|h| h.outcome == "cancelled"),
+        "a cancelled history outcome must be recorded"
+    );
+
+    // The single `sync-finished` event carries the `cancelled` outcome.
     wait_until(
         || {
             events
