@@ -30,6 +30,7 @@ pub async fn get_sync_pairing_ticket(
     api::get_pairing_ticket(
         Arc::clone(&state.ctx),
         &state.sync,
+        Arc::clone(&state.sync_sender),
         Arc::clone(&state.collab_sender),
         emitter,
     )
@@ -89,10 +90,17 @@ pub async fn enqueue_sync_selection(
     let dest = api::resolve_dest_node(&state.ctx, &args.destination_device_id)
         .await
         .map_err(api_err)?;
-    api::enqueue_sync_selection(&state.ctx, &state.sync_sender, dest, args.frame_ids, Some(emitter))
-        .await
-        .map(Json)
-        .map_err(api_err)
+    api::enqueue_sync_selection(
+        &state.ctx,
+        &state.sync_sender,
+        Arc::clone(&state.collab_sender),
+        dest,
+        args.frame_ids,
+        Some(emitter),
+    )
+    .await
+    .map(Json)
+    .map_err(api_err)
 }
 
 /// POST /api/get_sync_auto_mode

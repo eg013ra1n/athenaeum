@@ -27,6 +27,7 @@ pub async fn get_sync_pairing_ticket(
     api::get_pairing_ticket(
         Arc::clone(&state.ctx),
         &state.sync,
+        Arc::clone(&state.sync_sender),
         Arc::clone(&state.collab_sender),
         emitter,
     )
@@ -71,9 +72,16 @@ pub async fn enqueue_sync_selection(
     let dest = api::resolve_dest_node(&state.ctx, &destination_device_id)
         .await
         .map_err(|e| e.to_string())?;
-    api::enqueue_sync_selection(&state.ctx, &state.sync_sender, dest, frame_ids, Some(emitter))
-        .await
-        .map_err(|e| e.to_string())
+    api::enqueue_sync_selection(
+        &state.ctx,
+        &state.sync_sender,
+        Arc::clone(&state.collab_sender),
+        dest,
+        frame_ids,
+        Some(emitter),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Whether full-app capture-node auto mode is enabled.

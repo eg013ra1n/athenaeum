@@ -2205,6 +2205,112 @@ async fn runtime_kick_all_wakes_every_started_engine() {
     started.engine.shutdown().await;
 }
 
+/// Task 6 (the named handle-level acceptance test): `kick_all` resets EVERY
+/// pending slot, not just one. Two packages are parked mid-backoff against an
+/// offline peer (empty mailbox — every offline announce failed, so nothing
+/// buffered); the peer then comes online and a single `engine.kick_all()`
+/// collapses BOTH backoff windows, so both confirm promptly (well inside the
+/// >1.2s window they were parked in). This is the engine-level surface of the
+/// node's wake hook: a relay reconnect / relay-map change fires the hook, which
+/// fans `SyncSenderRuntime::kick_all` — itself `engine.kick_all()` — over every
+/// engine, and every pending package must wake, not merely the first.
+#[tokio::test]
+async fn kick_all_resets_every_pending_package() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // Peer endpoint minted but NOT started → every announce fails, engine backs
+    // off. Its mailbox stays empty, so once it comes online the only way it sees
+    // an announce is a fresh kick-driven re-attempt (no buffered announce can
+    // confirm first).
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.node_id();
+
+    let pkg_a = build_package(
+        &tmp.path().join("src_a"),
+        "uuid-multi-a",
+        "frame_a.fits",
+        "M101",
+        2048,
+    );
+    let pkg_b = build_package(
+        &tmp.path().join("src_b"),
+        "uuid-multi-b",
+        "frame_b.fits",
+        "M101",
+        4096,
+    );
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync_multi.db")).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig {
+            ack_timeout: Duration::from_millis(100),
+        },
+    );
+
+    let id_a = engine.enqueue_package(&pkg_a).await.unwrap();
+    let id_b = engine.enqueue_package(&pkg_b).await.unwrap();
+
+    // Park BOTH in a long backoff window: climbed a couple of rungs AND
+    // next_retry_at parses to comfortably (>1.2s) in the future. Without a kick
+    // the next natural re-announce is that far off, so a fast confirmation below
+    // can only be the kick's doing.
+    let parked_long = |id: i64| {
+        store
+            .get_outbound(id)
+            .unwrap()
+            .and_then(|r| r.next_retry_at)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|t| {
+                t.with_timezone(&chrono::Utc)
+                    > chrono::Utc::now() + chrono::Duration::milliseconds(1200)
+            })
+            .unwrap_or(false)
+    };
+    wait_until(|| attempts_of(&store, id_a) >= 2 && attempts_of(&store, id_b) >= 2, WAIT).await;
+    wait_until(|| parked_long(id_a) && parked_long(id_b), WAIT).await;
+    assert_ne!(
+        state_of(&store, id_a),
+        Some(OutboundState::Confirmed),
+        "package a must not deliver while the peer is offline"
+    );
+    assert_ne!(
+        state_of(&store, id_b),
+        Some(OutboundState::Confirmed),
+        "package b must not deliver while the peer is offline"
+    );
+
+    // Peer online (mailbox empty), acking. A single kick_all resets EVERY slot.
+    receiver.start().await.unwrap();
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv_multi"));
+    engine.kick_all().await.unwrap();
+
+    // BOTH confirm far sooner than the pending >1.2s windows would have allowed —
+    // proof that kick_all collapsed both deadlines, not just one.
+    wait_until(
+        || {
+            state_of(&store, id_a) == Some(OutboundState::Confirmed)
+                && state_of(&store, id_b) == Some(OutboundState::Confirmed)
+        },
+        Duration::from_millis(900),
+    )
+    .await;
+
+    for id in [id_a, id_b] {
+        let row = store.get_outbound(id).unwrap().unwrap();
+        assert_eq!(row.state, OutboundState::Confirmed, "id {id} must confirm");
+        assert_eq!(
+            row.next_retry_at, None,
+            "a confirmed package clears the persisted retry countdown"
+        );
+    }
+
+    engine.shutdown().await;
+}
+
 /// Kicking an id with no pending slot (already terminal / unknown) is a silent
 /// no-op — the handle call succeeds and nothing changes.
 #[tokio::test]

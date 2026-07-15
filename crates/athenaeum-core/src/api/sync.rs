@@ -452,6 +452,33 @@ fn start_node_relay_refresh(ctx: Arc<ServiceContext>, node: &Arc<SharedIrohNode>
     node.start_relay_refresh(node_relay_resolver(ctx));
 }
 
+/// Install the node's transport-level wake hook (T6, sync delivery-forever). On a
+/// home-relay **reconnect** transition or an **applied relay-map change** the node
+/// fires this hook; it kicks every pending outbound package — personal AND collab
+/// — out of its backoff so it re-announces the instant the node is reachable
+/// again, instead of waiting out the exponential retry window.
+///
+/// The node is a process singleton and every start entry point installs the SAME
+/// two host-global sender maps, so `set_wake_hook`'s last-writer-wins is benign
+/// (each install is an identical hook). The closure is `'static` — it owns cloned
+/// `Arc<SyncSenderRuntime>` handles — and `tokio::spawn`s the fire-and-forget
+/// `kick_all` fan-out so the hook itself returns promptly (it runs on the node's
+/// relay-watcher / refresh task, which must not block).
+fn install_node_wake_hook(
+    node: &Arc<SharedIrohNode>,
+    sync_sender: Arc<SyncSenderRuntime>,
+    collab_sender: Arc<SyncSenderRuntime>,
+) {
+    node.set_wake_hook(Arc::new(move || {
+        let sync_sender = Arc::clone(&sync_sender);
+        let collab_sender = Arc::clone(&collab_sender);
+        tokio::spawn(async move {
+            sync_sender.kick_all().await;
+            collab_sender.kick_all().await;
+        });
+    }));
+}
+
 /// Build the T8 retry-time peer-address refresher for a personal-sync sender
 /// engine: on a timed-out retry it re-fetches the peer's CURRENT hub-reported
 /// endpoint address (a fresh `list_devices`) plus fresh relay urls, and returns
@@ -592,6 +619,7 @@ fn account_signed_in(ctx: &ServiceContext) -> Result<bool, ApiError> {
 pub async fn autostart_if_enabled(
     ctx: Arc<ServiceContext>,
     sync: &SyncRuntime,
+    sync_sender: Arc<SyncSenderRuntime>,
     collab_sender: Arc<SyncSenderRuntime>,
     emitter: Arc<dyn ProgressEmitter>,
 ) -> Result<bool, ApiError> {
@@ -614,6 +642,9 @@ pub async fn autostart_if_enabled(
     // Bound relay-map staleness (T8, H2): start the node's hourly relay refresh
     // loop at boot (idempotent).
     start_node_relay_refresh(Arc::clone(&ctx_arc), &node);
+    // Wake event → kick pending packages (T6): relay reconnect / relay-map change
+    // fans a fire-and-forget kick_all over the personal + collab sender maps.
+    install_node_wake_hook(&node, Arc::clone(&sync_sender), Arc::clone(&collab_sender));
     // Populate the authorized-peer allow-list (best-effort) before the receiver
     // starts accepting, then enforce it live per-package (finding H1).
     refresh_authorized_peers(ctx).await;
@@ -647,6 +678,7 @@ fn autostart_gate(dev: bool, signed_in: bool) -> bool {
 pub async fn get_pairing_ticket(
     ctx: Arc<ServiceContext>,
     sync: &SyncRuntime,
+    sync_sender: Arc<SyncSenderRuntime>,
     collab_sender: Arc<SyncSenderRuntime>,
     emitter: Arc<dyn ProgressEmitter>,
 ) -> Result<String, ApiError> {
@@ -668,6 +700,9 @@ pub async fn get_pairing_ticket(
     // Bound relay-map staleness (T8, H2): start the node's hourly relay refresh
     // loop (idempotent).
     start_node_relay_refresh(Arc::clone(&ctx_arc), &node);
+    // Wake event → kick pending packages (T6): relay reconnect / relay-map change
+    // fans a fire-and-forget kick_all over the personal + collab sender maps.
+    install_node_wake_hook(&node, Arc::clone(&sync_sender), Arc::clone(&collab_sender));
     // Enforce the authorized-peer allow-list here too (finding H1). In pure
     // dev-ticket mode (no account) this resolves to accept-any; a signed-in
     // primary that also flips the dev flag still enforces its account list.
@@ -954,7 +989,8 @@ fn sender_packages_dir(ctx: &ServiceContext) -> Result<PathBuf, ApiError> {
 /// of caller).
 pub async fn ensure_sender_engine(
     ctx: &Arc<ServiceContext>,
-    sender: &SyncSenderRuntime,
+    sender: &Arc<SyncSenderRuntime>,
+    collab_sender: Arc<SyncSenderRuntime>,
     dest: NodeId,
     dest_endpoint_addr: Option<&crate::account::EndpointAddrReport>,
     emitter: Option<Arc<dyn ProgressEmitter>>,
@@ -985,6 +1021,10 @@ pub async fn ensure_sender_engine(
     // loop is running. Idempotent — the receiver's autostart usually started it
     // first; this covers a sender-first bind.
     start_node_relay_refresh(Arc::clone(ctx), &node);
+    // Wake event → kick pending packages (T6): install here too so a sender-first
+    // bind (send before the receiver autostarted) still wakes both sender maps on
+    // a relay reconnect / relay-map change.
+    install_node_wake_hook(&node, Arc::clone(sender), Arc::clone(&collab_sender));
     let transport: Arc<dyn SharingTransport> = node.handle(Role::Out);
     let origin_device = node_id_hex(&node.node_id());
 
@@ -1242,7 +1282,8 @@ async fn build_and_enqueue_selection(
 /// because the caller happened to pass zero ids.
 pub async fn enqueue_sync_selection(
     ctx: &Arc<ServiceContext>,
-    sender: &SyncSenderRuntime,
+    sender: &Arc<SyncSenderRuntime>,
+    collab_sender: Arc<SyncSenderRuntime>,
     dest: ResolvedDest,
     frame_ids: Vec<i64>,
     emitter: Option<Arc<dyn ProgressEmitter>>,
@@ -1255,8 +1296,15 @@ pub async fn enqueue_sync_selection(
             ineligible: Vec::new(),
         });
     }
-    let (engine, origin_device) =
-        ensure_sender_engine(ctx, sender, dest.node, dest.endpoint_addr.as_ref(), emitter).await?;
+    let (engine, origin_device) = ensure_sender_engine(
+        ctx,
+        sender,
+        collab_sender,
+        dest.node,
+        dest.endpoint_addr.as_ref(),
+        emitter,
+    )
+    .await?;
     let packages_dir = sender_packages_dir(ctx)?;
     let result =
         build_and_enqueue_selection(ctx, &engine, &origin_device, &packages_dir, &frame_ids).await?;
@@ -1714,10 +1762,13 @@ mod tests {
         // `enqueue_sync_selection` now takes an owned `Arc<ServiceContext>` (it
         // builds a `'static` retry address-refresher from it, T8).
         let ctx = Arc::new(ctx);
-        let sender = SyncSenderRuntime::new();
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let collab_sender = Arc::new(SyncSenderRuntime::new());
         let dest = ResolvedDest { node: [7u8; 32], endpoint_addr: None };
 
-        let result = enqueue_sync_selection(&ctx, &sender, dest, Vec::new(), None).await.unwrap();
+        let result = enqueue_sync_selection(&ctx, &sender, collab_sender, dest, Vec::new(), None)
+            .await
+            .unwrap();
         assert_eq!(result.enqueued_count, 0);
         assert_eq!(result.eligible_count, 0);
         assert_eq!(result.total_count, 0);
@@ -1852,6 +1903,7 @@ mod tests {
             Arc::new(ctx),
             &sync,
             Arc::new(SyncSenderRuntime::new()),
+            Arc::new(SyncSenderRuntime::new()),
             Arc::new(crate::events::NullEmitter),
         )
         .await
@@ -1889,6 +1941,7 @@ mod tests {
         let started = autostart_if_enabled(
             Arc::new(ctx),
             &sync,
+            Arc::new(SyncSenderRuntime::new()),
             Arc::new(SyncSenderRuntime::new()),
             Arc::new(crate::events::NullEmitter),
         )

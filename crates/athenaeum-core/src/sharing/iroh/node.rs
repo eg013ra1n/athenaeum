@@ -35,7 +35,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -164,6 +164,17 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// never reaches the hub itself, it only calls this callback.
 pub type RelayResolver =
     Arc<dyn Fn() -> BoxFuture<Option<(RelayMode, Vec<String>)>> + Send + Sync>;
+
+/// A transport-level wake hook (Task 6, sync delivery-forever). Invoked when the
+/// node comes back online — a home-relay **reconnect** transition in the watcher,
+/// or an **applied relay-map change** in the refresh loop — so the host can kick
+/// every pending outbound package out of its backoff at once (the api layer's
+/// closure fans a `SyncSenderRuntime::kick_all` over the personal + collab sender
+/// maps). Installed via [`SharedIrohNode::set_wake_hook`]; `None` until then, so
+/// every fire before install is a silent no-op. Stored behind an `Arc<RwLock<…>>`
+/// so the home-relay watcher task — respawned on every relay rebuild — reads the
+/// CURRENT hook at fire time rather than capturing a stale clone at spawn.
+pub type WakeHook = Arc<dyn Fn() + Send + Sync>;
 
 /// Which multiplexed role a [`SharedIrohNode`] handle plays. The variant selects
 /// the blob-tag prefix (Д3) — `recv/pkg/…`, `out/pkg/…`, `collab/pkg/…` — so the
@@ -560,6 +571,13 @@ pub struct SharedIrohNode {
     /// can re-acquire it. Kept HELD across a relay rebuild — the identity never
     /// changes, so the lock is neither released nor re-acquired.
     key_lock: Mutex<Option<DeviceKeyLock>>,
+    /// Transport-level wake hook (Task 6): fired on a home-relay reconnect
+    /// transition and after an applied relay-map change, so the host kicks every
+    /// pending outbound package. Behind an `Arc<RwLock<…>>` so the relay watcher —
+    /// respawned on every relay rebuild — reads the CURRENT hook live at fire time
+    /// (survives a rebuild). Never invoked while the lock is held: the value is
+    /// cloned out first, so a hook that re-enters the node can't self-deadlock.
+    wake_hook: Arc<RwLock<Option<WakeHook>>>,
 }
 
 /// A relay change awaiting an idle rebuild (Task 8, H2).
@@ -686,7 +704,12 @@ impl SharedIrohNode {
         let endpoint = router.endpoint().clone();
         let node_id: NodeId = *endpoint.id().as_bytes();
         let control_pool = ControlPool::new(endpoint.clone());
-        let relay_watcher = spawn_home_relay_watcher(endpoint.clone());
+        // The wake hook lives outside `NetLayer` (unaffected by a relay rebuild)
+        // but its Arc is handed to the watcher task, which IS respawned on rebuild —
+        // so the watcher reads whatever hook the api layer has installed at fire
+        // time, not a stale clone captured here at bind.
+        let wake_hook: Arc<RwLock<Option<WakeHook>>> = Arc::new(RwLock::new(None));
+        let relay_watcher = spawn_home_relay_watcher(endpoint.clone(), Arc::clone(&wake_hook));
 
         tracing::debug!(node_id = %endpoint.id().fmt_short(), "shared iroh node bound");
         Ok(Arc::new(Self {
@@ -720,6 +743,7 @@ impl SharedIrohNode {
             refresh_task: Mutex::new(None),
             key_lock: Mutex::new(Some(key_lock)),
             responder,
+            wake_hook,
         }))
     }
 
@@ -830,6 +854,31 @@ impl SharedIrohNode {
     /// control handler on the next inbound offer.
     pub fn set_dedup_responder(&self, responder: Arc<dyn DedupResponder>) {
         *self.responder.lock().expect("responder mutex poisoned") = Some(responder);
+    }
+
+    /// Install the transport-level [`WakeHook`] (Task 6): fired on a home-relay
+    /// reconnect transition and after an applied relay-map change, so the host can
+    /// kick every pending outbound package the moment the node is reachable again.
+    /// Overwrites any previously installed hook; picked up live by the
+    /// already-spawned relay watcher (it reads the hook at fire time) and by the
+    /// refresh loop. Left unset, both wake sources are silent no-ops.
+    pub fn set_wake_hook(&self, hook: WakeHook) {
+        *self.wake_hook.write().expect("wake_hook lock poisoned") = Some(hook);
+    }
+
+    /// Fire the installed wake hook, if any. Clones the hook out from under the
+    /// read lock FIRST, then releases the lock and invokes it — so a hook that
+    /// re-enters the node (or races [`set_wake_hook`](Self::set_wake_hook)) can
+    /// never deadlock on the wake-hook lock. A no-op when no hook is installed.
+    fn fire_wake_hook(&self) {
+        let hook = self
+            .wake_hook
+            .read()
+            .expect("wake_hook lock poisoned")
+            .clone();
+        if let Some(h) = hook {
+            h();
+        }
     }
 
     /// Register a peer's dialable address (from a pairing ticket or hub report),
@@ -976,7 +1025,13 @@ impl SharedIrohNode {
                 }
                 if run_resolver {
                     if let Some((mode, urls)) = resolver().await {
-                        node.consider_relay_change(mode, urls);
+                        // A relay-map change means the node is (re)homing onto a
+                        // fresh relay set — a wake event (Task 6): kick every
+                        // pending outbound package so it re-announces on the new
+                        // map instead of waiting out its backoff.
+                        if node.consider_relay_change(mode, urls) {
+                            node.fire_wake_hook();
+                        }
                     }
                 }
                 node.try_rebuild().await;
@@ -995,15 +1050,17 @@ impl SharedIrohNode {
 
     /// Fold a fresh resolver result into the change-detection baseline: on a
     /// CHANGED relay-url set, log + mark a pending rebuild for `mode`. Compares as
-    /// sorted sets so relay-url ordering is not a spurious change.
-    fn consider_relay_change(&self, mode: RelayMode, urls: Vec<String>) {
+    /// sorted sets so relay-url ordering is not a spurious change. Returns `true`
+    /// iff the set actually changed (a rebuild was marked) — the refresh loop uses
+    /// that signal to fire the wake hook (Task 6).
+    fn consider_relay_change(&self, mode: RelayMode, urls: Vec<String>) -> bool {
         let mut last = self.last_relay_urls.lock().expect("last_relay_urls mutex poisoned");
         let mut new_sorted = urls.clone();
         new_sorted.sort();
         let mut old_sorted = last.clone();
         old_sorted.sort();
         if new_sorted == old_sorted {
-            return; // unchanged — nothing to rebuild
+            return false; // unchanged — nothing to rebuild
         }
         let old_count = last.len();
         let new_count = urls.len();
@@ -1015,6 +1072,7 @@ impl SharedIrohNode {
             since: Instant::now(),
             warned: false,
         });
+        true
     }
 
     /// Execute a pending rebuild when the node is idle (or force it past
@@ -1123,7 +1181,9 @@ impl SharedIrohNode {
             "relay rebuild must preserve the node id (same device secret)"
         );
         let control_pool = ControlPool::new(endpoint.clone());
-        let relay_watcher = spawn_home_relay_watcher(endpoint.clone());
+        // Respawn the watcher on the new endpoint, handing it the SAME wake-hook
+        // lock so a hook installed before the rebuild keeps firing after it.
+        let relay_watcher = spawn_home_relay_watcher(endpoint.clone(), Arc::clone(&self.wake_hook));
 
         // Swap the freshly-built layer in — unless we raced host shutdown (which
         // set `shutdown_done` before taking the net lock), in which case discard
@@ -1769,7 +1829,17 @@ impl SharingTransport for RoleHandle {
 /// We log only *transitions* (`info!` on connect, `warn!` on disconnect) so a
 /// steady state is silent. The task ends when the last endpoint clone drops; the
 /// node aborts it at shutdown (closing the endpoint alone does not stop it).
-fn spawn_home_relay_watcher(endpoint: Endpoint) -> JoinHandle<()> {
+///
+/// A relay **connect** transition is a wake event (Task 6): the node just (re)came
+/// online, so it fires the installed [`WakeHook`] to kick every pending outbound
+/// package out of its backoff. `wake_hook` is the node's shared hook lock — read
+/// (and cloned out from under) at FIRE time, never captured here at spawn — so a
+/// hook installed after this task spawned, or re-installed across a relay rebuild
+/// that respawns this watcher, is always the one that fires.
+fn spawn_home_relay_watcher(
+    endpoint: Endpoint,
+    wake_hook: Arc<RwLock<Option<WakeHook>>>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         use n0_future::StreamExt as _;
         let mut stream = endpoint.home_relay_status().stream();
@@ -1783,6 +1853,12 @@ fn spawn_home_relay_watcher(endpoint: Endpoint) -> JoinHandle<()> {
                 }
                 if connected {
                     tracing::info!(relay_url = %url, "home relay connected");
+                    // Wake event: clone the hook out from under the lock, then
+                    // invoke it with no lock held (no reentrant deadlock).
+                    let hook = wake_hook.read().expect("wake_hook lock poisoned").clone();
+                    if let Some(h) = hook {
+                        h();
+                    }
                 } else if let Some(err) = st.last_error() {
                     tracing::warn!(relay_url = %url, error = %err, "home relay disconnected");
                 } else {
