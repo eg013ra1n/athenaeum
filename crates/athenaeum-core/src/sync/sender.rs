@@ -79,6 +79,27 @@ impl SyncSenderRuntime {
         self.inner.lock().await.keys().copied().collect()
     }
 
+    /// Wake **every** started peer engine (send-now / relay-online nudge, spec
+    /// §2, Task 5): each engine collapses its packages' backoff deadlines so a
+    /// retry fires on the next worker pass. Fire-and-forget and log-and-continue
+    /// — the engine handles are snapshotted under the lock (released before any
+    /// await), then each is kicked on its own detached task so one slow or
+    /// stopped engine can never block the others or the caller. Order across
+    /// peers is unspecified. Tasks 7/9 call this on an authorized-peers refresh.
+    pub async fn kick_all(&self) {
+        let engines: Vec<Arc<SyncEngineHandle>> = {
+            let inner = self.inner.lock().await;
+            inner.values().map(|s| Arc::clone(&s.engine)).collect()
+        };
+        for engine in engines {
+            tokio::spawn(async move {
+                if let Err(e) = engine.kick_all().await {
+                    tracing::warn!(error = %e, "sync sender kick_all: engine kick failed");
+                }
+            });
+        }
+    }
+
     /// Lock the per-peer map for the ensure critical section. The orchestration
     /// in [`crate::api::sync::ensure_sender_engine`] holds this guard across the
     /// transport build so a second concurrent enqueue to the SAME peer can never

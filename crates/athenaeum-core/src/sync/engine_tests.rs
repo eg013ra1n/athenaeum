@@ -32,7 +32,8 @@ use crate::sharing::types::{
 use crate::sharing::SharingTransport;
 
 use super::cleanup_coord::SharedPackageCleanup;
-use super::engine::{retry_backoff, PackageCleanupSink};
+use super::engine::{retry_backoff, PackageCleanupSink, SyncEngineHandle};
+use super::sender::{StartedSender, SyncSenderRuntime};
 use super::store::{StandaloneSyncStore, SyncStore};
 use super::DedupResponder;
 use super::{HistoryQuery, OutboundState, SyncConfig, SyncEngine};
@@ -2044,6 +2045,187 @@ async fn retry_path_re_resolves_and_re_adds_peer_address() {
         &peer,
         "the re-added address must be the peer's refreshed address"
     );
+
+    engine.shutdown().await;
+}
+
+// ── Task 5: kick / send-now (immediate out-of-band retry, backoff reset) ──────
+
+/// Drive an engine into a long backoff window against an OFFLINE peer, returning
+/// the store, the engine handle, the receiver endpoint (still offline), and the
+/// row id. The peer's mailbox is never registered while offline, so every
+/// announce fails ("peer not started") and nothing buffers — once the peer comes
+/// online the ONLY way it sees an announce is a fresh re-attempt, which is
+/// exactly what a kick triggers. This isolates the kick as the delivering event
+/// (no coincidental buffered announce / natural retry can confirm first).
+async fn park_in_long_backoff(
+    tmp: &tempfile::TempDir,
+    net: &LoopbackNetwork,
+    label: &str,
+) -> (
+    Arc<StandaloneSyncStore>,
+    SyncEngineHandle,
+    Arc<LoopbackTransport>,
+    i64,
+) {
+    // Peer endpoint minted but NOT started → announces fail, engine backs off.
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.node_id();
+
+    let pkg = build_package(
+        &tmp.path().join(format!("src_{label}")),
+        &format!("uuid-{label}"),
+        &format!("frame_{label}.fits"),
+        "M101",
+        2048,
+    );
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join(format!("sync_{label}.db"))).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig {
+            ack_timeout: Duration::from_millis(100),
+        },
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+
+    // Backoff climbing: a couple of failed announce attempts (spec §2).
+    wait_until(|| attempts_of(&store, id) >= 2, WAIT).await;
+
+    // Wait until the engine is parked in a LONG backoff window: next_retry_at
+    // parses to comfortably (>1.2s) in the future — a rung-3+ window. Without a
+    // kick the next natural re-announce is that far off, so a fast confirmation
+    // below can only be the kick's doing.
+    wait_until(
+        || {
+            store
+                .get_outbound(id)
+                .unwrap()
+                .and_then(|r| r.next_retry_at)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|t| t.with_timezone(&chrono::Utc) > chrono::Utc::now() + chrono::Duration::milliseconds(1200))
+                .unwrap_or(false)
+        },
+        WAIT,
+    )
+    .await;
+    assert_ne!(
+        state_of(&store, id),
+        Some(OutboundState::Confirmed),
+        "the package must not have delivered while the peer was offline"
+    );
+
+    (store, engine, receiver, id)
+}
+
+/// Step 1 (the named acceptance test): a package sitting out a long backoff
+/// window against a now-online peer delivers **immediately** when kicked. The
+/// kick collapses the retry deadline to now and resets the rung, so the next
+/// worker pass re-announces instead of waiting out the >1.2s window — proving
+/// the deadline collapsed.
+#[tokio::test]
+async fn kick_fires_immediate_attempt_and_resets_backoff() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let (store, engine, receiver, id) = park_in_long_backoff(&tmp, &net, "kick").await;
+
+    // Peer comes online (mailbox empty — no buffered announces) and starts
+    // acking. WITHOUT the kick the package would sit out its >1.2s backoff.
+    receiver.start().await.unwrap();
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv_kick"));
+
+    // Kick one package: collapse the deadline to now + reset the rung.
+    engine.kick(id).await.unwrap();
+
+    // Confirmation lands FAR sooner than the pending >1.2s backoff window would
+    // have allowed (8×ack_timeout is generous for CI yet well under the natural
+    // retry) — this only happens because the kick collapsed the deadline.
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        Duration::from_millis(800),
+    )
+    .await;
+
+    let row = store.get_outbound(id).unwrap().unwrap();
+    assert_eq!(row.state, OutboundState::Confirmed);
+    assert!(row.confirmed_at.is_some(), "confirmed_at must be stamped");
+    assert_eq!(
+        row.next_retry_at, None,
+        "a confirmed package clears the persisted retry countdown"
+    );
+
+    engine.shutdown().await;
+}
+
+/// `kick_all` applies the same immediate-retry reset to every pending slot, and
+/// the app-side [`SyncSenderRuntime::kick_all`] fans it out over every started
+/// engine (fire-and-forget). Driven through the runtime holder to lock that
+/// contract end to end: an engine parked in a long backoff delivers immediately
+/// once the runtime kicks it.
+#[tokio::test]
+async fn runtime_kick_all_wakes_every_started_engine() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let (store, engine, receiver, id) = park_in_long_backoff(&tmp, &net, "kickall").await;
+    let peer = receiver.node_id();
+
+    // Peer online, acking; empty mailbox (offline announces all failed).
+    receiver.start().await.unwrap();
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv_kickall"));
+
+    // Register the running engine in a fresh sender runtime, then kick every
+    // started engine through it.
+    let runtime = SyncSenderRuntime::new();
+    runtime.lock_inner().await.insert(
+        peer,
+        StartedSender {
+            engine: Arc::new(engine),
+            origin_device: "origin-device".to_string(),
+            peer,
+        },
+    );
+    runtime.kick_all().await;
+
+    // The runtime's fire-and-forget kick collapses the engine's backoff, so the
+    // package delivers well within the >1.2s window it was parked in.
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        Duration::from_millis(800),
+    )
+    .await;
+    assert_eq!(state_of(&store, id), Some(OutboundState::Confirmed));
+
+    // Drain the runtime and shut the engine down cleanly.
+    let started = runtime.lock_inner().await.remove(&peer).unwrap();
+    started.engine.shutdown().await;
+}
+
+/// Kicking an id with no pending slot (already terminal / unknown) is a silent
+/// no-op — the handle call succeeds and nothing changes.
+#[tokio::test]
+async fn kick_unknown_id_is_a_no_op() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+
+    // No package enqueued: id 999 has no pending slot. Kick must not error.
+    engine.kick(999).await.unwrap();
+    // kick_all over an empty pending map is likewise a no-op.
+    engine.kick_all().await.unwrap();
 
     engine.shutdown().await;
 }

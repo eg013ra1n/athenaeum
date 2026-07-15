@@ -144,6 +144,14 @@ enum Command {
     },
     /// Cancel an in-flight package → `Failed` (`cancelled`).
     Cancel(i64),
+    /// Kick one in-flight package: collapse its retry deadline to now and reset
+    /// its backoff rung so the next worker pass re-announces immediately (spec §2
+    /// wake event / send-now). A no-op for an id with no pending slot.
+    Kick(i64),
+    /// Kick **every** in-flight package (a relay-online / authorized-peer
+    /// refresh nudge): the same immediate-retry reset applied to all pending
+    /// slots.
+    KickAll,
     /// Stop the worker loop.
     Shutdown,
 }
@@ -506,6 +514,29 @@ impl SyncEngineHandle {
         Ok(())
     }
 
+    /// Kick one in-flight package (send-now / spec §2 wake event): wake it out of
+    /// its backoff so the worker re-announces on the next pass. A no-op on the
+    /// worker side if the id has no pending slot (already terminal / unknown).
+    /// Tasks 6/8/9 call this from the retry/send-now command surfaces.
+    pub async fn kick(&self, id: i64) -> Result<()> {
+        self.cmd_tx
+            .send(Command::Kick(id))
+            .await
+            .map_err(|_| anyhow!("sync engine worker stopped"))?;
+        Ok(())
+    }
+
+    /// Kick every in-flight package (a relay-online / authorized-peer refresh
+    /// nudge): the immediate-retry wake applied to all pending slots. The worker
+    /// resets each slot's deadline; delivery follows on the next pass.
+    pub async fn kick_all(&self) -> Result<()> {
+        self.cmd_tx
+            .send(Command::KickAll)
+            .await
+            .map_err(|_| anyhow!("sync engine worker stopped"))?;
+        Ok(())
+    }
+
     /// The current non-terminal outbound rows (live in-flight picture). Reads
     /// the store directly — no round-trip through the worker.
     pub fn status_snapshot(&self) -> Result<Vec<OutboundRow>> {
@@ -672,6 +703,15 @@ impl Worker {
                     Some(Command::Cancel(id)) => {
                         if let Err(e) = self.cancel_package(id) {
                             tracing::error!(package_id = id, error = %e, "sync cancel failed");
+                        }
+                    }
+                    Some(Command::Kick(id)) => self.kick_one(id),
+                    Some(Command::KickAll) => {
+                        // Snapshot the ids so no `&self.pending` borrow is held
+                        // across the `&mut self` kick_one calls.
+                        let ids: Vec<i64> = self.pending.keys().copied().collect();
+                        for id in ids {
+                            self.kick_one(id);
                         }
                     }
                     Some(Command::Shutdown) => {
@@ -1180,6 +1220,34 @@ impl Worker {
         if let Err(e) = self.store.set_next_retry_at(id, None) {
             tracing::warn!(package_id = id, error = %e, "clear next_retry_at failed");
         }
+    }
+
+    /// Kick one package (Task 5, spec §2 wake event / send-now): collapse its
+    /// retry deadline to `now` and reset its backoff rung so the very next worker
+    /// pass re-announces immediately instead of waiting out the current backoff
+    /// window ([`next_deadline`](Self::next_deadline) re-reads the deadline every
+    /// iteration, so no extra wakeup is needed). Sets [`NextAction::Retry`] so the
+    /// collapsed deadline means "attempt now", and clears the persisted countdown
+    /// (Task 2) since the retry is immediate. The attempts counter is left
+    /// untouched — it is a diagnostic tally, not a scheduling input. A no-op
+    /// (logged at debug) for an id with no pending slot: already terminal
+    /// (confirmed/failed/cancelled) or unknown.
+    fn kick_one(&mut self, id: i64) {
+        match self.pending.get_mut(&id) {
+            Some(p) => {
+                p.rung = 0;
+                p.next_action = NextAction::Retry;
+                p.deadline = Instant::now();
+            }
+            None => {
+                tracing::debug!(package_id = id, "kick ignored (no pending slot)");
+                return;
+            }
+        }
+        // The `&mut self.pending` borrow is dropped above; clear the persisted
+        // retry countdown (never-swallow helper) now that the retry is immediate.
+        self.clear_next_retry(id);
+        tracing::info!(package_id = id, "kick: immediate retry");
     }
 
     /// Fire-and-forget blob release for a package that has reached a terminal
