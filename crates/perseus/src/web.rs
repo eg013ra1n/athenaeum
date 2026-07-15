@@ -322,13 +322,18 @@ struct RetentionDto {
 }
 
 /// Coarse package tallies. `queued` is exact (derived from the live in-flight
-/// list); `confirmedTotal`/`failedTotal` are over the most recent
-/// [`STATUS_SCAN_LIMIT`] packages — a summary, not an exact lifetime total.
+/// list); `confirmedTotal`/`failedTotal`/`cancelledTotal` are over the most
+/// recent [`STATUS_SCAN_LIMIT`] packages — a summary, not an exact lifetime
+/// total.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CountsDto {
     confirmed_total: u64,
     failed_total: u64,
+    /// User-cancelled terminals over the recent window (Task 9). Bucketed
+    /// separately so a cancelled package is not silently dropped from the
+    /// status page's tallies.
+    cancelled_total: u64,
     queued: u64,
 }
 
@@ -354,8 +359,15 @@ struct SentDto {
     /// row content (the raw `package_ref` is a `data/packages/<uuid>` dir that
     /// misled operators into thinking a delete had failed). Capped at
     /// [`SENT_FILES_CAP`]; empty when the manifest can't be read. See
-    /// [`sent_files`].
+    /// [`sent_manifest_summary`].
     files: Vec<String>,
+    /// The wall-clock deadline of the next scheduled retry (Task 9), straight
+    /// from [`OutboundRow::next_retry_at`] — `None` when the package is not
+    /// waiting out a backoff window. Drives the status page's live countdown.
+    next_retry_at: Option<String>,
+    /// Total on-wire size of the package: the sum of every manifest record's
+    /// `byte_size` (Task 9). `0` when the manifest can't be read.
+    byte_size: u64,
 }
 
 /// One transfer-history row, for `GET /api/history`.
@@ -418,6 +430,10 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         .route("/api/batches", get(api_batches))
         .route("/api/delete", post(api_delete))
         .route("/api/retry", post(api_retry))
+        // Per-row send-now (wake out of backoff) and user-cancel (Task 9). Both
+        // bearer-gated; `/api/send-now` (the batcher flush) is a different route.
+        .route("/api/kick", post(api_kick))
+        .route("/api/cancel", post(api_cancel))
         // Account sign-in (Task 5) — email→OTP through the hub. These are
         // deliberately part of the bearer-gated `api` router, NOT exempt: they
         // read/mutate account state and must never be reachable without the token.
@@ -623,6 +639,10 @@ async fn api_status(
         .iter()
         .filter(|r| r.state == OutboundState::Failed)
         .count() as u64;
+    let cancelled_total = recent
+        .iter()
+        .filter(|r| r.state == OutboundState::Cancelled)
+        .count() as u64;
 
     Ok(Json(StatusDto {
         agent_state: agent.label().to_string(),
@@ -644,6 +664,7 @@ async fn api_status(
         counts: CountsDto {
             confirmed_total,
             failed_total,
+            cancelled_total,
             queued,
         },
     }))
@@ -1228,22 +1249,32 @@ async fn api_send_now(State(state): State<Arc<WebState>>) -> Json<SendNowDto> {
     Json(SendNowDto { flushed })
 }
 
-/// The batch-level outcome derived from its per-target outbound states: `failed`
-/// if any target failed, `confirmed` once every target confirmed, else `sending`
-/// (some target still in flight). An empty set — a batch whose outbound rows are
-/// not visible yet (just recorded, or aged out of the scan window) — is reported
-/// as `sending` so a just-sent batch reads honestly rather than as an error.
+/// The batch-level outcome derived from its per-target outbound states:
+/// `failed` if any target failed; else `cancelled` once every target is
+/// terminal and at least one was user-cancelled (Task 3 added the `Cancelled`
+/// terminal — an all-terminal batch must NEVER read as `sending`); else
+/// `confirmed` once every target confirmed; else `sending` (some target still
+/// in flight). An empty set — a batch whose outbound rows are not visible yet
+/// (just recorded, or aged out of the scan window) — is reported as `sending`
+/// so a just-sent batch reads honestly rather than as an error.
 fn aggregate_outcome(rows: &[&OutboundRow]) -> String {
     if rows.is_empty() {
         return "sending".to_string();
     }
     if rows.iter().any(|r| r.state == OutboundState::Failed) {
-        "failed".to_string()
-    } else if rows.iter().all(|r| r.state == OutboundState::Confirmed) {
-        "confirmed".to_string()
-    } else {
-        "sending".to_string()
+        return "failed".to_string();
     }
+    // Every target terminal but not all confirmed → at least one was cancelled
+    // (the only remaining terminal after failed is ruled out above). Report it
+    // as `cancelled` rather than leaving the batch stuck at `sending` forever.
+    let all_terminal = rows.iter().all(|r| r.state.is_terminal());
+    if all_terminal && rows.iter().any(|r| r.state == OutboundState::Cancelled) {
+        return "cancelled".to_string();
+    }
+    if rows.iter().all(|r| r.state == OutboundState::Confirmed) {
+        return "confirmed".to_string();
+    }
+    "sending".to_string()
 }
 
 /// `GET /api/batches` — every recorded send-batch (newest-first), each joined by
@@ -1359,12 +1390,26 @@ struct RetryPair {
     new_id: i64,
 }
 
-/// One rejected id from `POST /api/retry`, with a reason for the UI to surface.
+/// One rejected id from `POST /api/retry` / `/api/kick` / `/api/cancel`, with a
+/// reason for the UI to surface.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RetryRejection {
     id: i64,
     reason: String,
+}
+
+/// `POST /api/kick` and `POST /api/cancel` response: the ids acted on and the
+/// ids rejected (each with a reason). Mirrors [`RetryReport`]'s shape but with a
+/// flat `done` list — kick/cancel act on the row in place, so there is no
+/// old→new id mapping. Reuses [`RetryRequest`] for the request body.
+#[derive(serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct KickReport {
+    /// Ids the engine accepted the kick/cancel for.
+    done: Vec<i64>,
+    /// Ids not acted on, each with the reason (unknown, or terminal).
+    rejected: Vec<RetryRejection>,
 }
 
 /// True iff `dir` holds `manifest.ndjson` AND at least one non-manifest regular
@@ -1392,12 +1437,14 @@ fn package_has_payload(dir: &Path) -> bool {
     has_manifest && has_payload
 }
 
-/// `POST /api/retry` — re-enqueue failed packages. For each id: look up the
-/// outbound row, require `state == failed`, require the package dir to still
-/// hold its manifest + payload, then `enqueue_package` it — the sanctioned retry
-/// model. Re-enqueueing the same package dir mints a NEW durable row (the
-/// receiver dedups by frame uuid); the original `failed` row is left untouched.
-/// Unknown / non-failed / data-missing ids are rejected per-id, never enqueued.
+/// `POST /api/retry` — re-enqueue terminal packages. For each id: look up the
+/// outbound row, require a terminal `failed` OR `cancelled` state (Task 9 — a
+/// user-cancelled package is retryable just like a failed one), require the
+/// package dir to still hold its manifest + payload, then `enqueue_package` it —
+/// the sanctioned retry model. Re-enqueueing the same package dir mints a NEW
+/// durable row (the receiver dedups by frame uuid); the original terminal row is
+/// left untouched. Unknown / non-terminal / data-missing ids are rejected
+/// per-id, never enqueued.
 async fn api_retry(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RetryRequest>,
@@ -1439,13 +1486,14 @@ async fn api_retry(
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
             }
         };
-        // State check first: only a terminal `failed` row is retryable. (A
-        // confirmed id is manifest-only after task-1 cleanup, but it never
-        // reaches the payload gate — it is "not failed" here.)
-        if row.state != OutboundState::Failed {
+        // State check first: only a terminal `failed` or `cancelled` row is
+        // retryable (Task 9). (A confirmed id is manifest-only after task-1
+        // cleanup, but it never reaches the payload gate — it is "not terminal"
+        // here.)
+        if !matches!(row.state, OutboundState::Failed | OutboundState::Cancelled) {
             report.rejected.push(RetryRejection {
                 id,
-                reason: "not failed".to_string(),
+                reason: "not terminal".to_string(),
             });
             continue;
         }
@@ -1485,9 +1533,127 @@ async fn api_retry(
     Ok(Json(report))
 }
 
+/// `POST /api/kick` — send-now for one or more pending packages (spec §2 wake
+/// event, Task 9). Per id: look up the outbound row, reject a terminal row
+/// (`terminal` — nothing to wake), else [`kick`](SyncEngineHandle::kick) it so
+/// the worker re-announces on the next pass. `503` while the engine is detached
+/// (setup mode). Unknown / terminal ids are rejected per-id, never kicked.
+///
+/// This is the per-row wake; `/api/send-now` (the batcher flush) is unrelated.
+async fn api_kick(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RetryRequest>,
+) -> Result<Json<KickReport>, (StatusCode, String)> {
+    let Some(engine) = state.engine.read().await.clone() else {
+        tracing::warn!("web kick: sync engine is not running");
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sync engine is not running — finish setup first".to_string(),
+        ));
+    };
+    let mut report = KickReport::default();
+    for &id in &req.ids {
+        let row = match state.store.get_outbound(id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                report.rejected.push(RetryRejection {
+                    id,
+                    reason: "unknown package".to_string(),
+                });
+                continue;
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::error!(id, error = %msg, "web kick: outbound lookup failed");
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
+            }
+        };
+        // A terminal row has no pending slot to wake — reject honestly rather
+        // than firing a no-op kick.
+        if row.state.is_terminal() {
+            report.rejected.push(RetryRejection {
+                id,
+                reason: "terminal".to_string(),
+            });
+            continue;
+        }
+        // The engine's kick channel only errors when the worker has stopped; log
+        // it (never swallow) and report it per-id like the retry enqueue path,
+        // so one bad id doesn't 500 the whole batch.
+        if let Err(e) = engine.kick(id).await {
+            let msg = format!("{e:#}");
+            tracing::error!(id, error = %msg, "web kick: engine kick failed");
+            report.rejected.push(RetryRejection {
+                id,
+                reason: format!("kick failed: {msg}"),
+            });
+            continue;
+        }
+        tracing::info!(id, "package kicked via web");
+        report.done.push(id);
+    }
+    Ok(Json(report))
+}
+
+/// `POST /api/cancel` — user-cancel one or more pending packages (Task 9). Per
+/// id: look up the outbound row, reject a terminal row (`terminal` — already
+/// done), else [`cancel`](SyncEngineHandle::cancel) it (the engine drives it to
+/// the `Cancelled` terminal). `503` while the engine is detached (setup mode).
+/// A cancelled package is retryable again via `/api/retry`.
+async fn api_cancel(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<RetryRequest>,
+) -> Result<Json<KickReport>, (StatusCode, String)> {
+    let Some(engine) = state.engine.read().await.clone() else {
+        tracing::warn!("web cancel: sync engine is not running");
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sync engine is not running — finish setup first".to_string(),
+        ));
+    };
+    let mut report = KickReport::default();
+    for &id in &req.ids {
+        let row = match state.store.get_outbound(id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                report.rejected.push(RetryRejection {
+                    id,
+                    reason: "unknown package".to_string(),
+                });
+                continue;
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::error!(id, error = %msg, "web cancel: outbound lookup failed");
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
+            }
+        };
+        if row.state.is_terminal() {
+            report.rejected.push(RetryRejection {
+                id,
+                reason: "terminal".to_string(),
+            });
+            continue;
+        }
+        if let Err(e) = engine.cancel(id).await {
+            let msg = format!("{e:#}");
+            tracing::error!(id, error = %msg, "web cancel: engine cancel failed");
+            report.rejected.push(RetryRejection {
+                id,
+                reason: format!("cancel failed: {msg}"),
+            });
+            continue;
+        }
+        tracing::info!(id, "package cancel requested via web");
+        report.done.push(id);
+    }
+    Ok(Json(report))
+}
+
 /// Map an [`OutboundRow`] to its wire DTO. `deletable` is the single
 /// safe-to-delete predicate: only `confirmed` packages.
 fn to_sent_dto(r: &OutboundRow) -> SentDto {
+    let (files, byte_size) = sent_manifest_summary(&r.package_ref);
     SentDto {
         id: r.id,
         package_ref: r.package_ref.clone(),
@@ -1497,32 +1663,40 @@ fn to_sent_dto(r: &OutboundRow) -> SentDto {
         confirmed_at: r.confirmed_at.clone(),
         last_error: r.last_error.clone(),
         deletable: r.state == OutboundState::Confirmed,
-        files: sent_files(&r.package_ref),
+        files,
+        next_retry_at: r.next_retry_at.clone(),
+        byte_size,
     }
 }
 
-/// The filenames inside a package (from its manifest), for the operator-facing
-/// `Sent` row content. Capped at [`SENT_FILES_CAP`]; each entry is the file-name
-/// component of a manifest record's `rel_path`. An unreadable or missing
-/// manifest yields an empty vec — never an error, so `/api/sent` still lists the
-/// row and the UI falls back to the dir basename. T1 keeps the manifest alive
-/// through payload cleanup, so a confirmed row still resolves its names.
-fn sent_files(package_ref: &str) -> Vec<String> {
+/// Read a package's manifest ONCE and derive both the operator-facing filenames
+/// and the package's total byte size, for the `Sent` row. `files` are the
+/// file-name component of each record's `rel_path`, capped at [`SENT_FILES_CAP`];
+/// `byte_size` is the sum of EVERY record's `byte_size` (the full manifest, not
+/// just the capped names). An unreadable or missing manifest yields
+/// `(vec![], 0)` — never an error, so `/api/sent` still lists the row and the UI
+/// falls back to the dir basename. T1 keeps the manifest alive through payload
+/// cleanup, so a confirmed row still resolves its names + size.
+fn sent_manifest_summary(package_ref: &str) -> (Vec<String>, u64) {
     match read_manifest(Path::new(package_ref)) {
-        Ok(records) => records
-            .iter()
-            .take(SENT_FILES_CAP)
-            .map(|r| {
-                Path::new(&r.rel_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(r.rel_path.as_str())
-                    .to_string()
-            })
-            .collect(),
+        Ok(records) => {
+            let byte_size = records.iter().map(|r| r.byte_size).sum();
+            let files = records
+                .iter()
+                .take(SENT_FILES_CAP)
+                .map(|r| {
+                    Path::new(&r.rel_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(r.rel_path.as_str())
+                        .to_string()
+                })
+                .collect();
+            (files, byte_size)
+        }
         Err(error) => {
             tracing::debug!(package_ref, %error, "sent: manifest unreadable; no filenames");
-            Vec::new()
+            (Vec::new(), 0)
         }
     }
 }
@@ -2773,10 +2947,10 @@ mod tests {
         );
     }
 
-    /// A non-failed id (here: the seeded `transferring` package) is rejected
-    /// "not failed" and never re-enqueued — no new row is created.
+    /// A non-terminal id (here: the seeded `transferring` package) is rejected
+    /// "not terminal" and never re-enqueued — no new row is created.
     #[tokio::test]
-    async fn retry_rejects_non_failed() {
+    async fn retry_rejects_non_terminal() {
         let (state, _tmp) = test_state().await;
         let before = state.store.all_outbound(100).unwrap();
         let transferring = before
@@ -2793,11 +2967,41 @@ mod tests {
         let rejected = v["rejected"].as_array().unwrap();
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0]["id"].as_i64().unwrap(), transferring);
-        assert_eq!(rejected[0]["reason"], "not failed");
+        assert_eq!(rejected[0]["reason"], "not terminal");
         assert_eq!(
             store.all_outbound(100).unwrap().len(),
             before.len(),
             "no new row created for a rejected retry"
+        );
+    }
+
+    /// Task 9: a **cancelled** package (user gave up) is retryable exactly like a
+    /// failed one — provided its payload is still on disk. A brand-new outbound
+    /// row is minted; the original cancelled row is left untouched.
+    #[tokio::test]
+    async fn retry_reenqueues_cancelled_with_intact_payload() {
+        let (state, tmp) = test_state().await;
+        let pkg = make_package_dir(tmp.path(), "pkg-cancelled-intact", false);
+        let old_id = state.store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
+        state
+            .store
+            .set_state(old_id, OutboundState::Cancelled)
+            .unwrap();
+
+        let store = Arc::clone(&state.store);
+        let app = build_router(state, None);
+        let v = post_retry(app, &[old_id]).await;
+
+        let retried = v["retried"].as_array().unwrap();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0]["oldId"].as_i64().unwrap(), old_id);
+        let new_id = retried[0]["newId"].as_i64().unwrap();
+        assert_ne!(new_id, old_id, "a brand-new row id, not the old one");
+        assert!(v["rejected"].as_array().unwrap().is_empty());
+        assert_eq!(
+            store.get_outbound(old_id).unwrap().unwrap().state,
+            OutboundState::Cancelled,
+            "the old cancelled row is left as-is"
         );
     }
 
@@ -2826,6 +3030,221 @@ mod tests {
             before,
             "no new row created for a data-missing reject"
         );
+    }
+
+    // ── Task 9: kick / cancel endpoints, aggregate_outcome, DTO fields ────────
+
+    /// An [`OutboundRow`] in a given state for the pure `aggregate_outcome`
+    /// truth-table test (the other fields are irrelevant to it).
+    fn ob(state: OutboundState) -> OutboundRow {
+        OutboundRow {
+            id: 0,
+            package_ref: "pkg".to_string(),
+            peer: PEER,
+            state,
+            attempts: 0,
+            created_at: "2026-07-16T00:00:00Z".to_string(),
+            confirmed_at: None,
+            last_error: None,
+            next_retry_at: None,
+        }
+    }
+
+    /// The batch-outcome truth table — the regression is a batch that includes a
+    /// `Cancelled` terminal (Task 3): the old code matched neither the all-Failed
+    /// nor the all-Confirmed branch, so it reported "sending" **forever**. An
+    /// all-terminal batch must resolve to a terminal outcome.
+    #[test]
+    fn aggregate_outcome_truth_table() {
+        use OutboundState::*;
+        let (confirmed, cancelled, failed, transferring) =
+            (ob(Confirmed), ob(Cancelled), ob(Failed), ob(Transferring));
+
+        // Empty (rows not visible yet) → sending, never an error.
+        assert_eq!(aggregate_outcome(&[]), "sending");
+        // All confirmed → confirmed.
+        assert_eq!(aggregate_outcome(&[&confirmed, &confirmed]), "confirmed");
+        // The regression: one cancelled among confirmed. All terminal → must NOT
+        // be "sending"; a user-cancel present → "cancelled".
+        assert_eq!(
+            aggregate_outcome(&[&confirmed, &cancelled]),
+            "cancelled",
+            "a cancelled-among-confirmed batch is terminal, never stuck at sending"
+        );
+        assert_eq!(aggregate_outcome(&[&cancelled, &cancelled]), "cancelled");
+        // Any failed dominates (even alongside a cancelled).
+        assert_eq!(aggregate_outcome(&[&failed, &cancelled]), "failed");
+        assert_eq!(aggregate_outcome(&[&failed, &confirmed]), "failed");
+        // A still-in-flight target keeps the batch "sending" — even next to a
+        // cancelled one (the batch as a whole is not done).
+        assert_eq!(aggregate_outcome(&[&confirmed, &transferring]), "sending");
+        assert_eq!(aggregate_outcome(&[&cancelled, &transferring]), "sending");
+    }
+
+    /// `/api/status` buckets a cancelled terminal into `cancelledTotal` (Task 9)
+    /// — it must not vanish from the tallies the way it did before.
+    #[tokio::test]
+    async fn status_counts_bucket_cancelled() {
+        let (state, _tmp) = test_state().await;
+        let id = state.store.enqueue("pkg-cancelled", PEER).unwrap();
+        state.store.set_state(id, OutboundState::Cancelled).unwrap();
+        let app = build_router(state, None);
+        let v = body_json(get(&app, "/api/status").await).await;
+        assert_eq!(v["counts"]["cancelledTotal"], 1);
+        assert_eq!(v["counts"]["confirmedTotal"], 1, "the seeded confirmed row still counts");
+        assert_eq!(v["counts"]["failedTotal"], 0);
+    }
+
+    /// A package dir with a real manifest whose records carry the given
+    /// `(rel_path, byte_size)` pairs — for the `byteSize` DTO test.
+    fn write_sized_manifest_package(dir: &std::path::Path, files: &[(&str, u64)]) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut ndjson = String::new();
+        for (i, (rp, size)) in files.iter().enumerate() {
+            let rec = ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: format!("uuid-{i}"),
+                origin_catalog_uuid: format!("uuid-{i}"),
+                origin_device: "self-node".to_string(),
+                payload_kind: PayloadKind::RawFrame,
+                rel_path: rp.to_string(),
+                byte_size: *size,
+                xxh3: "0".repeat(16),
+                frame_meta: serde_json::json!({}),
+                analysis: None,
+                app_version: "test".to_string(),
+                project: None,
+            };
+            ndjson.push_str(&serde_json::to_string(&rec).unwrap());
+            ndjson.push('\n');
+        }
+        std::fs::write(dir.join(MANIFEST_FILENAME), ndjson).unwrap();
+        dir.to_path_buf()
+    }
+
+    /// `/api/sent` surfaces `nextRetryAt` (straight from the row) and `byteSize`
+    /// (sum over the FULL manifest, not just the capped `files`) — Task 9.
+    #[tokio::test]
+    async fn sent_reports_next_retry_at_and_byte_size() {
+        let (state, tmp) = test_state().await;
+        let pkg = write_sized_manifest_package(
+            &tmp.path().join("pkg-sized"),
+            &[("a.fits", 1000), ("b.fits", 2000), ("c.fits", 3000)],
+        );
+        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
+        state
+            .store
+            .set_next_retry_at(id, Some("2026-07-16T12:00:00Z"))
+            .unwrap();
+
+        let app = build_router(state, None);
+        let v = body_json(get(&app, "/api/sent").await).await;
+        let row = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["packageRef"].as_str().unwrap().ends_with("pkg-sized"))
+            .unwrap();
+        assert_eq!(row["byteSize"].as_u64().unwrap(), 6000, "sum of every record");
+        assert_eq!(row["nextRetryAt"], "2026-07-16T12:00:00Z");
+    }
+
+    async fn post_ids(app: Router, uri: &str, ids: &[i64]) -> serde_json::Value {
+        let body = serde_json::json!({ "ids": ids });
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        body_json(res).await
+    }
+
+    /// `POST /api/kick` on a non-terminal (transferring) row reports it `done`;
+    /// a terminal (confirmed) row is rejected "terminal". The engine's kick is a
+    /// no-op on a seeded row with no live slot, but still succeeds.
+    #[tokio::test]
+    async fn kick_acts_on_pending_rejects_terminal() {
+        let (state, _tmp) = test_state().await;
+        let rows = state.store.all_outbound(100).unwrap();
+        let transferring = rows
+            .iter()
+            .find(|r| r.state == OutboundState::Transferring)
+            .unwrap()
+            .id;
+        let confirmed = rows
+            .iter()
+            .find(|r| r.state == OutboundState::Confirmed)
+            .unwrap()
+            .id;
+        let app = build_router(state, None);
+        let v = post_ids(app, "/api/kick", &[transferring, confirmed]).await;
+        assert_eq!(v["done"].as_array().unwrap(), &[serde_json::json!(transferring)]);
+        let rejected = v["rejected"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["id"].as_i64().unwrap(), confirmed);
+        assert_eq!(rejected[0]["reason"], "terminal");
+    }
+
+    /// `POST /api/cancel` on a non-terminal row reports it `done`; a terminal
+    /// (confirmed) row is rejected "terminal"; an unknown id is rejected too.
+    #[tokio::test]
+    async fn cancel_acts_on_pending_rejects_terminal_and_unknown() {
+        let (state, _tmp) = test_state().await;
+        let rows = state.store.all_outbound(100).unwrap();
+        let transferring = rows
+            .iter()
+            .find(|r| r.state == OutboundState::Transferring)
+            .unwrap()
+            .id;
+        let confirmed = rows
+            .iter()
+            .find(|r| r.state == OutboundState::Confirmed)
+            .unwrap()
+            .id;
+        let app = build_router(state, None);
+        let v = post_ids(app, "/api/cancel", &[transferring, confirmed, 99999]).await;
+        assert_eq!(v["done"].as_array().unwrap(), &[serde_json::json!(transferring)]);
+        let rejected = v["rejected"].as_array().unwrap();
+        let reason_for = |id: i64| {
+            rejected
+                .iter()
+                .find(|r| r["id"].as_i64() == Some(id))
+                .map(|r| r["reason"].as_str().unwrap().to_string())
+        };
+        assert_eq!(reason_for(confirmed).as_deref(), Some("terminal"));
+        assert_eq!(reason_for(99999).as_deref(), Some("unknown package"));
+    }
+
+    /// Both write endpoints 503 on a detached node (engine absent, setup mode) —
+    /// there is nothing to kick/cancel into yet.
+    #[tokio::test]
+    async fn kick_and_cancel_return_503_when_engine_absent() {
+        for uri in ["/api/kick", "/api/cancel"] {
+            let (state, _tmp) = detached_test_state(AgentState::NeedsSetup {
+                needs: vec!["not signed in".to_string()],
+            })
+            .await;
+            let app = build_router(state, None);
+            let res = app
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&serde_json::json!({ "ids": [1] })).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri} needs the engine");
+        }
     }
 
     // ── Task 5: account sign-in (/api/account/*) ──────────────────────────────
