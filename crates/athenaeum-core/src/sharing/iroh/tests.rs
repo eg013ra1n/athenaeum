@@ -30,7 +30,7 @@
 //! very same announce through unchanged.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::{EndpointId, RelayMode};
@@ -41,12 +41,26 @@ use tokio::time::Instant;
 
 use crate::package::{self, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::sharing::types::{
-    FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
+    FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
 };
-use crate::sharing::{noop_fetch_sink, SharingTransport};
+use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
 use crate::sync::{HistoryQuery, OutboundState, StandaloneSyncStore, SyncEngine, SyncStore};
 
 use super::{random_secret, BlobStore, IrohTransport};
+
+/// A [`FetchSink`] that appends every event into a shared vec, plus the vec so a
+/// test can inspect the collected series after the fetch — the iroh-side
+/// counterpart of `sharing::tests::recording_sink`, pinning the REAL emission
+/// path (per-file observer tasks + the aggregate download stream), not just the
+/// loopback mock's synthetic one.
+fn recording_sink() -> (FetchSink, Arc<Mutex<Vec<FetchEvent>>>) {
+    let events: Arc<Mutex<Vec<FetchEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&events);
+    let sink: FetchSink = Arc::new(move |ev| {
+        sink_events.lock().expect("sink mutex poisoned").push(ev);
+    });
+    (sink, events)
+}
 
 /// Generous ceiling for a single event / transfer over a freshly-established
 /// QUIC connection (bind + handshake + transfer), well above the localhost norm.
@@ -186,10 +200,15 @@ async fn iroh_roundtrip_two_endpoints_localhost() {
         "announce should carry the iroh collection hash, not the xxh3 placeholder"
     );
 
-    // Receiver fetches into its own dir and verifies content + manifest.
+    // Receiver fetches into its own dir and verifies content + manifest. A
+    // recording sink pins the REAL iroh emission path (per-file observer tasks
+    // over `blobs().observe` + the aggregate download stream), not just the
+    // loopback mock's synthetic one, and proves the observer-abort guard
+    // (blobs.rs `AbortObserversOnDrop`) doesn't suppress the happy-path events.
+    let (sink, events) = recording_sink();
     let dest = tempdir().unwrap();
     receiver
-        .fetch(provider_info.node_id, &wire, dest.path(), noop_fetch_sink())
+        .fetch(provider_info.node_id, &wire, dest.path(), sink)
         .await
         .unwrap();
     let fetched = dest.path().join("frame1.fits");
@@ -202,6 +221,43 @@ async fn iroh_roundtrip_two_endpoints_localhost() {
     assert!(
         dest.path().join("manifest.ndjson").exists(),
         "manifest fetched as part of the collection"
+    );
+
+    // Per-file events (one series per collection entry — frame1.fits AND
+    // manifest.ndjson) are non-decreasing and end complete; at least one Batch
+    // event reaches the announce's byte_size.
+    let events = events.lock().unwrap().clone();
+    let mut per_file: std::collections::HashMap<String, Vec<(u64, u64)>> =
+        std::collections::HashMap::new();
+    for ev in &events {
+        if let FetchEvent::File { name, bytes_done, bytes_total } = ev {
+            per_file.entry(name.clone()).or_default().push((*bytes_done, *bytes_total));
+        }
+    }
+    assert!(!per_file.is_empty(), "expected at least one File event over real iroh");
+    for (name, series) in &per_file {
+        let mut last_done = 0u64;
+        for (done, _total) in series {
+            assert!(
+                *done >= last_done,
+                "File progress for {name} went backwards: {done} < {last_done}"
+            );
+            last_done = *done;
+        }
+        let (final_done, final_total) = *series.last().unwrap();
+        assert_eq!(final_done, final_total, "File {name} must end complete (done == total)");
+    }
+    let reached_total = events.iter().any(|ev| {
+        matches!(
+            ev,
+            FetchEvent::Batch { bytes_done, bytes_total }
+                if *bytes_done == wire.byte_size && *bytes_total == wire.byte_size
+        )
+    });
+    assert!(
+        reached_total,
+        "expected a Batch event reaching byte_size={}, got {events:?}",
+        wire.byte_size
     );
 
     // Receiver acks; provider observes the receipts.

@@ -33,6 +33,25 @@ use crate::sharing::FetchSink;
 /// event data, never a log.
 const FETCH_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(300);
 
+/// Aborts every spawned per-file observer task on drop — the ONE place that
+/// covers all exit paths from [`fetch_collection_to_dir`]: an early `?`
+/// (download-error), the whole `fetch` future being dropped mid-flight
+/// (cancellation — the receiver-cancel flow builds on exactly this), or a panic.
+/// Without this, a leaked observer keeps its `FetchSink` + `Blobs` clones alive,
+/// blocks on `stream.next()` forever for a blob that never completes, and can
+/// deliver a stale `File` event after `fetch` already returned. Aborting an
+/// already-finished handle is a harmless no-op, so draining the handles on the
+/// happy path before the guard drops is safe.
+struct AbortObserversOnDrop(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortObserversOnDrop {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
 /// A payload file discovered under a package directory.
 struct PkgFile {
     /// Absolute path on disk.
@@ -285,13 +304,16 @@ pub async fn fetch_collection_to_dir(
     // Per-file observers: one task per child hash. Each streams the child's
     // bitfield and emits a throttled (>=300 ms) `File` progress event, ALWAYS
     // emitting the terminal (is_complete) event so the sink sees each file finish.
-    let mut observers = Vec::with_capacity(collection.len());
+    // Held in `AbortObserversOnDrop` from spawn time so every exit path below —
+    // early `?`, the whole future being dropped/cancelled, or a panic — aborts
+    // any still-running observer instead of leaking it.
+    let mut observers = AbortObserversOnDrop(Vec::with_capacity(collection.len()));
     for (name, hash) in collection.iter() {
         let sink = sink.clone();
         let name = name.clone();
         let hash = *hash;
         let blobs = store.blobs().clone();
-        observers.push(tokio::spawn(async move {
+        observers.0.push(tokio::spawn(async move {
             // Seed `last` in the past so the first update emits immediately.
             let mut last = Instant::now()
                 .checked_sub(FETCH_PROGRESS_MIN_INTERVAL)
@@ -344,25 +366,20 @@ pub async fn fetch_collection_to_dir(
                     });
                 }
             }
-            DownloadProgressItem::Error(e) => {
-                for o in &observers {
-                    o.abort();
-                }
-                return Err(e.into());
-            }
+            // The `AbortObserversOnDrop` guard aborts every observer as `observers`
+            // drops on this early return/bail — no manual abort loop needed here.
+            DownloadProgressItem::Error(e) => return Err(e.into()),
             DownloadProgressItem::DownloadError => {
-                for o in &observers {
-                    o.abort();
-                }
-                anyhow::bail!("download collection {root_hash} failed");
+                anyhow::bail!("download collection {root_hash} failed")
             }
             _ => {}
         }
     }
-    // Drain observers so each file's terminal completion event is emitted (they
-    // break on is_complete, which holds now that every child is downloaded).
-    for o in observers {
-        let _ = o.await;
+    // Happy path: drain (await) each observer so its terminal completion event
+    // is emitted (they break on is_complete, which holds now that every child is
+    // downloaded) — then the now-empty guard drops harmlessly.
+    for h in observers.0.drain(..) {
+        let _ = h.await;
     }
     // The final batch event always fires, at exactly the announced total.
     sink(FetchEvent::Batch {
