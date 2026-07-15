@@ -2213,6 +2213,7 @@ mod tests {
             image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
+            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         });
 
         // Pool max_size is 8 — exceed it so, pre-fix, every task grabs one
@@ -2342,6 +2343,7 @@ mod tests {
             image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
+            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         });
 
         // Archive the raw set's originals for real (plan -> commit -> execute) —

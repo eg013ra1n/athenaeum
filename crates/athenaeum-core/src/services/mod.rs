@@ -122,6 +122,15 @@ pub struct ServiceContext {
     /// Global FIFO admission queue for heavy CPU jobs (analysis, master
     /// builds). See compute_queue module docs.
     pub compute_queue: compute_queue::ComputeQueue,
+    /// The ONE process-wide iroh node (C1 fix, Д2). Bound lazily on the first
+    /// sync/collab need via [`crate::api::sync::ensure_iroh_node`] and shared by
+    /// every role (receiver / personal sender / collab sender) as role handles
+    /// off a single endpoint + store. `None` until first bind; the host tears it
+    /// down at shutdown (`SharedIrohNode::shutdown`). A `tokio::sync::Mutex`
+    /// (held across the async first-bind) serializes concurrent first callers;
+    /// the `Option` allows a re-bind after shutdown.
+    pub iroh_node:
+        Arc<tokio::sync::Mutex<Option<Arc<crate::sharing::iroh::node::SharedIrohNode>>>>,
 }
 
 impl ServiceContext {
@@ -171,6 +180,7 @@ impl ServiceContext {
             ),
             operation_queue: operation_queue::OperationQueue::start(),
             compute_queue: compute_queue::ComputeQueue::new(),
+            iroh_node: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }

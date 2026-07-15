@@ -483,6 +483,7 @@ mod tests {
             image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
+            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
 
         clear_sync_caches(&ctx).unwrap();

@@ -89,6 +89,7 @@ pub fn run() {
                     ),
                     operation_queue: athenaeum_core::services::operation_queue::OperationQueue::start(),
                     compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
+                    iroh_node: Arc::new(tokio::sync::Mutex::new(None)),
                 }),
                 image_semaphore: std::sync::RwLock::new(Arc::new(
                     tokio::sync::Semaphore::new(default_permits),
@@ -473,6 +474,33 @@ pub fn run() {
             commands::decide_collab_announcement,
             commands::export_collab_project,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Graceful shutdown (I1): on exit, tear down the ONE shared iroh node
+            // if the sync autostart bound it. Bounded (5s) + best-effort via
+            // `block_on` so a stuck relay/close never hangs process exit;
+            // `SharedIrohNode::shutdown` is idempotent, so handling both
+            // ExitRequested and Exit (either may fire) never double-shuts.
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                let iroh_node = {
+                    let state: State<AppState> = app_handle.state();
+                    Arc::clone(&state.ctx.iroh_node)
+                };
+                tauri::async_runtime::block_on(async move {
+                    if let Some(node) = iroh_node.lock().await.take() {
+                        tracing::info!("app exiting; shutting down shared iroh node");
+                        if tokio::time::timeout(Duration::from_secs(5), node.shutdown())
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!("shared iroh node shutdown timed out");
+                        }
+                    }
+                });
+            }
+        });
 }

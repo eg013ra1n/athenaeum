@@ -46,6 +46,7 @@ use crate::db::collab_exchange::{
 use crate::events::ProgressEmitter;
 use crate::export::models::WbppExportConfig;
 use crate::services::ServiceContext;
+use crate::sharing::iroh::node::Role;
 use crate::sharing::types::NodeId;
 use crate::sharing::SharingTransport;
 use crate::sync::{
@@ -404,42 +405,27 @@ pub async fn ensure_collab_sender_engine(
     }
 
     let peer = dest;
-    let (relay_mode, relay_urls) = crate::api::sync::resolve_relay_mode(ctx).await?;
-    let (sync_dir, db_path) = crate::api::sync::sync_paths(ctx)?;
+    // Relay URLs for the dial hint (a bare account/membership-resolved dest is
+    // undialable without one); the shared node resolves the relay MODE once.
+    let (_relay_mode, relay_urls) = crate::api::sync::resolve_relay_mode(ctx).await?;
+    let (_sync_dir, db_path) = crate::api::sync::sync_paths(ctx)?;
 
-    std::fs::create_dir_all(&sync_dir)
-        .map_err(|e| ApiError::Internal(format!("create sync dir {}: {e}", sync_dir.display())))?;
-
-    // The ONE device identity — the same key file the account layer, receiver, and
-    // personal-sync sender bind. Never a second identity.
-    let secret = crate::account::keys::DeviceKey::load_or_create(
-        &crate::account::keys::device_key_path(&sync_dir),
-    )
-    .map_err(|e| ApiError::Internal(format!("device key: {e:#}")))?
-    .secret_bytes();
-
-    // DEDICATED `blobs_collab` store (audit m7): distinct from the receiver's
-    // `blobs` and the personal-sync sender's `blobs_out`, so this engine's startup
-    // tag-sweep can never race either.
-    let transport = crate::sharing::iroh::IrohTransport::new(
-        secret,
-        relay_mode,
-        crate::sharing::iroh::BlobStore::Fs(sync_dir.join("blobs_collab")),
-        // Serve-only: no inbound offers to answer (project serves full-send).
-        None,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("build iroh transport for collab sender: {e:#}")))?;
-    let origin_device = node_id_hex(&transport.node_id());
+    // The ONE shared iroh node (C1 fix): the collab sender is its `Collab` role
+    // handle, sharing the single endpoint + `<sync>/blobs` store with the
+    // receiver and the personal sender. Role-prefixed blob tags (Д3) keep the
+    // three roles from clobbering each other's tags on the shared store — this
+    // replaces the old dedicated `blobs_collab` `FsStore` (audit m7), which only
+    // existed because each role used to bind its OWN endpoint + store.
+    let node = crate::api::sync::ensure_iroh_node(ctx).await?;
+    let transport: Arc<dyn SharingTransport> = node.handle(Role::Collab);
+    let origin_device = node_id_hex(&node.node_id());
 
     // The destination is an account/membership-resolved bare node id. Attach our
     // own resolved relay URL(s) as its dial hint before the first announce (same
     // reasoning as the personal-sync sender).
     let peer_addr = pairing::peer_addr_with_relays(peer, &relay_urls)
         .map_err(|e| ApiError::Internal(format!("construct peer address: {e:#}")))?;
-    transport.add_peer(peer_addr);
-
-    let transport: Arc<dyn SharingTransport> = Arc::new(transport);
+    node.add_peer(peer_addr);
 
     let store = Arc::new(
         CatalogSyncStore::open(&db_path)
@@ -872,12 +858,13 @@ pub async fn report_have_after_ingest(
 ///
 /// **Dial hints are mandatory on the real network (audit B4).** A bare
 /// account-resolved holder node id is undialable: without a
-/// [`pairing::peer_addr_with_relays`] hint attached via the inherent
-/// [`IrohTransport::add_peer`](crate::sharing::iroh::IrohTransport::add_peer),
+/// [`pairing::peer_addr_with_relays`] hint attached via the shared node's
+/// [`add_peer`](crate::sharing::iroh::node::SharedIrohNode::add_peer),
 /// `request_project` falls back to a hint-less `EndpointAddr` and fails with "No
-/// addressing information available". Loopback tests bypass dialing (in-process
-/// mailbox routing), so [`SyncRuntime::iroh_handle`](crate::sync::SyncRuntime::iroh_handle)
-/// is `None` there and the hint step is skipped.
+/// addressing information available". The bound node is read off
+/// [`ServiceContext::iroh_node`]; loopback tests bypass dialing (in-process
+/// mailbox routing) and never bind a node, so it is `None` there and the hint
+/// step is skipped.
 ///
 /// Runs on a command-spawned task (Task 11): the terminal `local_status` +
 /// `sync-finished` event carry the outcome, so returning `Ok` on an exhausted
@@ -976,9 +963,14 @@ pub async fn download_project_package(
     let transport = sync.transport().await.ok_or_else(|| {
         ApiError::Internal("sync transport not started; cannot request a project package".into())
     })?;
-    let iroh = sync.iroh_handle();
+    // Dial hints ride the shared node (C1). Read the ALREADY-BOUND node off the
+    // context — never bind here: a loopback test injects a transport via
+    // `set_started_for_test` without binding a node, so `None` means in-process
+    // routing that needs no dial hint (exactly the old `iroh_handle().is_none()`
+    // case). Production always has a node bound (the receiver started it first).
+    let node = ctx.iroh_node.lock().await.clone();
     // The relay map is only needed to build dial hints on the real-network path.
-    let relay_urls = if iroh.is_some() {
+    let relay_urls = if node.is_some() {
         crate::api::sync::resolve_relay_mode(ctx).await?.1
     } else {
         Vec::new()
@@ -986,11 +978,11 @@ pub async fn download_project_package(
 
     for (holder_node, holder_name) in &holders {
         // Audit B4: attach OUR resolved relay URL(s) as this holder's dial hint
-        // before the request. A loopback runtime (no iroh handle) routes
-        // in-process and needs no hint.
-        if let Some(handle) = &iroh {
+        // before the request, via the shared node's `add_peer`. A loopback
+        // runtime (no bound node) routes in-process and needs no hint.
+        if let Some(node) = &node {
             match pairing::peer_addr_with_relays(*holder_node, &relay_urls) {
-                Ok(addr) => handle.add_peer(addr),
+                Ok(addr) => node.add_peer(addr),
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), holder = %holder_name, "download: dial hint build failed; skipping holder");
                     continue;
@@ -2015,6 +2007,7 @@ mod tests {
             image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
+            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
         (tmp, ctx)
     }

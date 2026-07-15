@@ -120,6 +120,16 @@ pub type ConnectGate = Arc<dyn Fn(&NodeId) -> bool + Send + Sync>;
 /// up without a rebuild.
 type SharedConnectGate = Arc<Mutex<Option<ConnectGate>>>;
 
+/// Shared, late-bindable slot for the dedup [`DedupResponder`]. Same shape as
+/// [`SharedConnectGate`]: cloned into [`SyncControlProtocol`] at construction so
+/// an already-spawned router can have its responder installed afterwards. The
+/// [`IrohTransport`] fills it once at build time (from its `responder` arg); the
+/// shared node ([`node::SharedIrohNode`]) leaves it empty until the receiver
+/// migrates onto it and calls
+/// [`set_dedup_responder`](node::SharedIrohNode::set_dedup_responder). Absent ⇒
+/// offers are answered want-all (nothing silently withheld).
+pub(crate) type SharedResponder = Arc<Mutex<Option<Arc<dyn DedupResponder>>>>;
+
 /// Evaluate the shared connect gate for `from`. Absent gate ⇒ admit (accept-all,
 /// today's behavior). The gate `Arc` is cloned out from under the lock BEFORE the
 /// predicate runs, so a gate that does blocking catalog I/O never holds the mutex
@@ -270,7 +280,11 @@ impl IrohTransport {
         };
         let control = SyncControlProtocol {
             sink: EventSink::Direct(event_tx.clone()),
-            responder,
+            // Fixed for this transport's lifetime — wrapped in the shared slot only
+            // so `SyncControlProtocol` has one responder type across both the
+            // legacy transport and the shared node (which installs its responder
+            // late). `IrohTransport` never re-sets it.
+            responder: Arc::new(Mutex::new(responder)),
             gate: Arc::clone(&connect_gate),
         };
         let router = Router::builder(endpoint)
@@ -798,9 +812,11 @@ struct SyncControlProtocol {
     /// Where decoded inbound `Announce`/`Ack`/`Project*` events are routed
     /// (legacy single stream, or the shared node's demux — see [`EventSink`]).
     sink: EventSink,
-    /// Answers the dedup handshake. `None` on a send-only endpoint or a peer
-    /// with no catalog wired — in which case offers are answered want-all.
-    responder: Option<Arc<dyn DedupResponder>>,
+    /// Answers the dedup handshake, in a late-bindable shared slot (so the shared
+    /// node can install it after the router is spawned). Empty ⇒ a send-only
+    /// endpoint or a peer with no catalog wired, in which case offers are
+    /// answered want-all.
+    responder: SharedResponder,
     /// Connection-level authorization gate (slice 4). Checked once, at the top of
     /// `accept`, before any `Msg` is decoded. Absent ⇒ admit (accept-all).
     gate: SharedConnectGate,
@@ -811,7 +827,10 @@ struct SyncControlProtocol {
 impl std::fmt::Debug for SyncControlProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SyncControlProtocol")
-            .field("has_responder", &self.responder.is_some())
+            .field(
+                "has_responder",
+                &self.responder.lock().map(|r| r.is_some()).unwrap_or(false),
+            )
             .finish()
     }
 }
@@ -900,7 +919,8 @@ impl ProtocolHandler for SyncControlProtocol {
                     // connections. A `spawn_blocking` join failure (the responder
                     // never panics) falls back to the safe direction: want
                     // everything, no candidates — matching the None branch.
-                    let (want, candidates) = match self.responder.clone() {
+                    let responder = self.responder.lock().expect("responder mutex poisoned").clone();
+                    let (want, candidates) = match responder {
                         Some(r) => {
                             let entries2 = entries.clone();
                             tokio::task::spawn_blocking(move || r.want_for_offer(&entries2))
@@ -940,7 +960,8 @@ impl ProtocolHandler for SyncControlProtocol {
                     // file from disk (potentially many GB on a re-send) — move it
                     // off the async worker. A join failure resolves to the safe
                     // direction: keep every candidate wanted (the None branch).
-                    let still = match self.responder.clone() {
+                    let responder = self.responder.lock().expect("responder mutex poisoned").clone();
+                    let still = match responder {
                         Some(r) => {
                             let entries2 = entries.clone();
                             tokio::task::spawn_blocking(move || r.confirm_full_hashes(&entries2))

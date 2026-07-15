@@ -397,6 +397,7 @@ mod relink_tests {
             image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
             operation_queue: OperationQueue::start(),
             compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
+            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
         WebAppState {

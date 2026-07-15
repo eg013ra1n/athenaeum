@@ -457,6 +457,7 @@ mod tests {
             // tests, which accept the same one-thread-per-test-run cost.
             operation_queue: OperationQueue::start(),
             compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
+            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         });
         let (event_tx, _) = tokio::sync::broadcast::channel::<SseEvent>(16);
         WebAppState {

@@ -27,6 +27,7 @@ use serde::Serialize;
 use tokio::task::JoinHandle;
 
 use crate::events::{emit_event, ProgressEmitter};
+use crate::sharing::iroh::node::{Role, SharedIrohNode};
 use crate::sharing::types::{NodeId, PackageAnnounce, ReceiptOutcome, StartInfo, TransportEvent};
 use crate::sharing::SharingTransport;
 
@@ -724,19 +725,6 @@ struct Started {
 /// the dev flag.
 pub struct SyncRuntime {
     inner: tokio::sync::Mutex<Option<Started>>,
-    /// The concrete iroh transport stored alongside the boxed trait object when
-    /// [`ensure_started`](Self::ensure_started) builds one (audit B4). A bare
-    /// account-resolved node id is undialable — the receiver runtime only holds
-    /// `Arc<dyn SharingTransport>`, and `request_project` over it would fall back
-    /// to a hint-less `EndpointAddr` and fail with "No addressing information
-    /// available". The collab download loop reaches for this handle to attach a
-    /// `pairing::peer_addr_with_relays` dial hint (via the inherent
-    /// [`add_peer`](crate::sharing::iroh::IrohTransport::add_peer), not on the
-    /// trait) BEFORE the request. `None` for a non-iroh (loopback test) runtime,
-    /// whose in-process mailbox routing needs no dial hint. Held in a plain
-    /// `std::sync::Mutex` so [`iroh_handle`](Self::iroh_handle) stays a cheap
-    /// synchronous getter, independent of the async `inner` lock.
-    iroh: std::sync::Mutex<Option<Arc<crate::sharing::iroh::IrohTransport>>>,
 }
 
 impl SyncRuntime {
@@ -744,7 +732,6 @@ impl SyncRuntime {
     pub fn new() -> Self {
         Self {
             inner: tokio::sync::Mutex::new(None),
-            iroh: std::sync::Mutex::new(None),
         }
     }
 
@@ -766,18 +753,10 @@ impl SyncRuntime {
         self.inner.lock().await.as_ref().map(|s| Arc::clone(&s.transport))
     }
 
-    /// The concrete iroh transport handle for outbound dial hints (audit B4).
-    /// `None` when the runtime was not started with an iroh transport (loopback
-    /// tests) — those bypass dialing entirely.
-    pub fn iroh_handle(&self) -> Option<Arc<crate::sharing::iroh::IrohTransport>> {
-        self.iroh.lock().expect("iroh handle mutex poisoned").clone()
-    }
-
     /// Test-only: seed a started runtime around an already-online `transport`
     /// (typically a loopback endpoint whose receiver was spawned separately), so
     /// [`transport`](Self::transport) hands it back to the collab download loop.
-    /// Leaves [`iroh_handle`](Self::iroh_handle) `None` — loopback routing needs
-    /// no dial hint.
+    /// Loopback routing needs no dial hint (no shared node is bound in tests).
     #[cfg(test)]
     pub(crate) async fn set_started_for_test(
         &self,
@@ -797,14 +776,17 @@ impl SyncRuntime {
     /// Idempotent — a second call returns the existing ticket without starting a
     /// second transport.
     ///
-    /// `relay_mode` is resolved by the caller (task M1): the hub's relay map when
-    /// signed in, the last cached map for an offline start, or iroh's default
-    /// relays as the ultimate fallback (see [`crate::sync::pairing`]).
+    /// The `node` is the process-wide [`SharedIrohNode`] (bound by
+    /// [`crate::api::sync::ensure_iroh_node`], which resolves the relay mode once):
+    /// the receiver rides it as its `Recv` role handle, sharing the single
+    /// endpoint + `<sync>/blobs` store with the personal + collab senders (C1
+    /// fix). This method installs the dedup responder + connect gate on that
+    /// shared node and spawns one receiver over its `Recv` handle.
     pub async fn ensure_started(
         &self,
+        node: Arc<SharedIrohNode>,
         sync_dir: PathBuf,
         db_path: PathBuf,
-        relay_mode: iroh::RelayMode,
         incoming: IncomingResolver,
         authorized: PeerAuthorizer,
         hooks: ReceiverHooks,
@@ -817,47 +799,30 @@ impl SyncRuntime {
 
         std::fs::create_dir_all(&sync_dir)
             .with_context(|| format!("create sync dir {}", sync_dir.display()))?;
-        // The ONE device identity (task B4, spec D-5): the account layer and the
-        // transport share this exact key file. Loaded through `account::keys` so
-        // a second identity can never be minted.
-        let secret = crate::account::keys::DeviceKey::load_or_create(
-            &crate::account::keys::device_key_path(&sync_dir),
-        )?
-        .secret_bytes();
         let store = Arc::new(
             CatalogSyncStore::open(&db_path)
                 .with_context(|| format!("open catalog sync store {}", db_path.display()))?,
         );
         // A running receiver answers a peer's pre-Announce dedup handshake from
-        // its own catalog: the transport's control channel routes inbound
-        // Offer/FullHashes to this responder (spec §7, task 4).
+        // its own catalog: install the responder on the shared node so the
+        // control channel routes inbound Offer/FullHashes to it (spec §7, task 4).
+        // Until this call the node answers offers want-all — nothing withheld.
         let responder: Arc<dyn crate::sync::DedupResponder> =
             Arc::new(crate::sync::CatalogDedupResponder::new(Arc::clone(&store)));
+        node.set_dedup_responder(responder);
 
-        // The receiver's blob store is `blobs`; the sender's is a SEPARATE
-        // `blobs_out` (see `api::sync::ensure_sender_engine`). Both halves may
-        // run in one process, and one `FsStore` per dir keeps the sender's
-        // startup `delete_all` sweep from ever wiping this receiver's live tags.
-        let transport = crate::sharing::iroh::IrohTransport::new(
-            secret,
-            relay_mode,
-            crate::sharing::iroh::BlobStore::Fs(sync_dir.join("blobs")),
-            Some(responder),
-        )
-        .await
-        .context("build iroh transport for receiver")?;
-        // Install the connection-level authorization gate on the concrete
-        // transport BEFORE it is boxed (slice 4) — `set_connect_gate` is not on
-        // the `SharingTransport` trait. Absent ⇒ the transport admits all.
+        // Install the connection-level authorization gate on the shared node
+        // (slice 4): it governs BOTH ALPNs at the node level. Absent ⇒ admit all.
         if let Some(gate) = hooks.connect_gate {
-            transport.set_connect_gate(gate);
+            node.set_connect_gate(gate);
         }
-        // Keep the CONCRETE handle alongside the boxed trait object (audit B4): the
-        // collab download loop needs `IrohTransport::add_peer` (an inherent method,
-        // not on `SharingTransport`) to attach a dial hint before `request_project`.
-        let iroh_arc: Arc<crate::sharing::iroh::IrohTransport> = Arc::new(transport);
-        *self.iroh.lock().expect("iroh handle mutex poisoned") = Some(Arc::clone(&iroh_arc));
-        let transport: Arc<dyn SharingTransport> = iroh_arc;
+
+        // The receiver is the node's `Recv` role handle — one endpoint + store
+        // shared with the personal/collab senders (C1 fix); role-prefixed blob
+        // tags (Д3) keep the roles isolated on the shared store. The collab
+        // download loop attaches its dial hints via the node's `add_peer` (it
+        // reads the bound node off `ServiceContext`), not through this handle.
+        let transport: Arc<dyn SharingTransport> = node.handle(Role::Recv);
 
         // Staging lives under the sync dir; the landing root is resolved live per
         // package by the caller-supplied resolver (task 5).

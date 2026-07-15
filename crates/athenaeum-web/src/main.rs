@@ -194,6 +194,7 @@ async fn main() {
         image_pool: Arc::new(image_pool),
         operation_queue: athenaeum_core::services::operation_queue::OperationQueue::start(),
         compute_queue: athenaeum_core::services::compute_queue::ComputeQueue::new(),
+        iroh_node: Arc::new(tokio::sync::Mutex::new(None)),
     });
 
     // SSE broadcast channel
@@ -344,7 +345,9 @@ async fn main() {
         });
     }
 
-    // Build router
+    // Build router. Keep a handle to the shared ServiceContext so the ONE iroh
+    // node (if the sync autostart bound it) can be torn down after serve returns.
+    let ctx_for_shutdown = Arc::clone(&state.ctx);
     let app = routes::build_router(state, config.static_dir);
 
     let addr = format!("0.0.0.0:{}", config.port);
@@ -355,6 +358,51 @@ async fn main() {
     tracing::info!(%addr, "Athenaeum web server started");
 
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .expect("Server error");
+
+    // Graceful shutdown (I1): after serve returns, tear down the shared iroh node
+    // if the sync autostart bound one. Bounded (5s) + best-effort so a stuck
+    // relay/close never hangs process exit; `SharedIrohNode::shutdown` is itself
+    // idempotent and logs its own completion.
+    tracing::info!("web server stopped; shutting down shared iroh node");
+    // Take the node out (dropping the guard) BEFORE awaiting shutdown, so the
+    // MutexGuard temporary never lives across the await.
+    let node_to_shutdown = ctx_for_shutdown.iroh_node.lock().await.take();
+    if let Some(node) = node_to_shutdown {
+        if tokio::time::timeout(Duration::from_secs(5), node.shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!("shared iroh node shutdown timed out");
+        }
+    } else {
+        tracing::debug!("no shared iroh node was bound; nothing to shut down");
+    }
+}
+
+/// Resolve when the process receives Ctrl-C or (on unix) SIGTERM — the trigger
+/// for `axum::serve`'s graceful shutdown so the shared iroh node can be closed
+/// cleanly on exit (I1). SIGTERM matters for `docker stop`, which sends it.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install Ctrl+C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received; draining server");
 }

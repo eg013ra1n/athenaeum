@@ -26,6 +26,7 @@ use crate::events::ProgressEmitter;
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::services::ServiceContext;
 use crate::settings::{defaults, keys};
+use crate::sharing::iroh::node::{Role, SharedIrohNode};
 use crate::sharing::types::NodeId;
 use crate::sharing::SharingTransport;
 use crate::sync::store::search_history_rows;
@@ -419,6 +420,61 @@ pub(crate) async fn resolve_relay_mode(ctx: &ServiceContext) -> Result<(iroh::Re
     Ok((mode, res.urls))
 }
 
+/// Lazily bind (once per process) the ONE [`SharedIrohNode`] and stash it on
+/// [`ServiceContext::iroh_node`] (C1 fix, Д2). The first caller — whichever of
+/// the receiver / personal sender / collab sender needs a transport first —
+/// resolves the relay mode ONCE, binds the single endpoint + store at
+/// `<sync>/blobs`, cleans up the now-orphaned per-role stores, and stores the
+/// node; every later caller reuses it. A re-bind after
+/// [`SharedIrohNode::shutdown`] is allowed (the `Option` is cleared at
+/// host-shutdown), so this can bind again on a subsequent boot within one
+/// process (tests).
+///
+/// The `iroh_node` mutex is held across the whole async bind so two concurrent
+/// first callers can't bind two endpoints from the same device key (the second
+/// blocks, then sees the populated slot). It is never held while acquiring the
+/// `SyncRuntime`/`SyncSenderRuntime` locks, so there is no lock-ordering cycle.
+pub(crate) async fn ensure_iroh_node(ctx: &ServiceContext) -> Result<Arc<SharedIrohNode>, ApiError> {
+    let mut guard = ctx.iroh_node.lock().await;
+    if let Some(node) = guard.as_ref() {
+        return Ok(Arc::clone(node));
+    }
+    let (relay_mode, _relay_urls) = resolve_relay_mode(ctx).await?;
+    let (sync_dir, _db_path) = sync_paths(ctx)?;
+    std::fs::create_dir_all(&sync_dir)
+        .map_err(|e| ApiError::Internal(format!("create sync dir {}: {e}", sync_dir.display())))?;
+    let node = SharedIrohNode::bind(&sync_dir, relay_mode)
+        .await
+        .map_err(|e| ApiError::Internal(format!("bind shared iroh node: {e:#}")))?;
+    // Unified store: the node binds at `<sync>/blobs`. After the first successful
+    // bind, the old per-role stores are dead weight — remove them so a migrated
+    // install doesn't carry three parallel blob DBs (tolerate absence).
+    cleanup_orphan_blob_stores(&sync_dir);
+    *guard = Some(Arc::clone(&node));
+    Ok(node)
+}
+
+/// Delete the now-orphaned per-role blob-store directories left by the
+/// pre-Task-3 split transports (`blobs_out` for the personal sender,
+/// `blobs_collab` for the collab sender). The shared node's single store lives
+/// at `<sync>/blobs`, so these two siblings hold nothing live once every role
+/// rides the node. Best-effort: a missing dir is the common (fresh-install)
+/// case and is silent; any other error is logged, never fatal.
+fn cleanup_orphan_blob_stores(sync_dir: &Path) {
+    for name in ["blobs_out", "blobs_collab"] {
+        let dir = sync_dir.join(name);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => tracing::info!(path = %dir.display(), "removed orphaned per-role blob store"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %dir.display(),
+                error = %e,
+                "failed to remove orphaned per-role blob store"
+            ),
+        }
+    }
+}
+
 /// Local-state-only "is this node signed in" check for [`autostart_if_enabled`]:
 /// the persisted `ACCOUNT_DEVICE_ID` the app writes on sign-in / clears on
 /// sign-out by `clear_local_session`. Every signed-in Athenaeum node is a full
@@ -470,9 +526,10 @@ pub async fn autostart_if_enabled(
     tracing::debug!(dev, signed_in, "sync autostart condition met");
     let (sync_dir, db_path) = sync_paths(ctx)?;
     let incoming = incoming_resolver(ctx, sync_dir.join("incoming"))?;
-    // The receiver only listens; it never dials a peer for announce, so the raw
-    // relay URLs (needed only to construct a dial hint) are irrelevant here.
-    let (relay_mode, _relay_urls) = resolve_relay_mode(ctx).await?;
+    // Lazily bind the ONE shared node (resolves the relay mode + binds the single
+    // endpoint/store on first need; the receiver rides it as its Recv role
+    // handle). The receiver only listens, so no dial-hint relay URLs are needed.
+    let node = ensure_iroh_node(ctx).await?;
     // Populate the authorized-peer allow-list (best-effort) before the receiver
     // starts accepting, then enforce it live per-package (finding H1).
     refresh_authorized_peers(ctx).await;
@@ -485,7 +542,7 @@ pub async fn autostart_if_enabled(
             Arc::clone(&emitter),
         )),
     )?;
-    sync.ensure_started(sync_dir, db_path, relay_mode, incoming, authorized, hooks, emitter)
+    sync.ensure_started(node, sync_dir, db_path, incoming, authorized, hooks, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     Ok(true)
@@ -521,9 +578,9 @@ pub async fn get_pairing_ticket(
     }
     let (sync_dir, db_path) = sync_paths(ctx)?;
     let incoming = incoming_resolver(ctx, sync_dir.join("incoming"))?;
-    // Same reasoning as `autostart_if_enabled`: the receiver never dials out
-    // for announce, so the raw relay URLs are not needed here.
-    let (relay_mode, _relay_urls) = resolve_relay_mode(ctx).await?;
+    // Same reasoning as `autostart_if_enabled`: bind the ONE shared node (relay
+    // mode resolved inside), which the receiver rides as its Recv role handle.
+    let node = ensure_iroh_node(ctx).await?;
     // Enforce the authorized-peer allow-list here too (finding H1). In pure
     // dev-ticket mode (no account) this resolves to accept-any; a signed-in
     // primary that also flips the dev flag still enforces its account list.
@@ -539,7 +596,7 @@ pub async fn get_pairing_ticket(
     )?;
 
     let ticket = sync
-        .ensure_started(sync_dir, db_path, relay_mode, incoming, authorized, hooks, emitter)
+        .ensure_started(node, sync_dir, db_path, incoming, authorized, hooks, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     Ok(ticket)
@@ -799,50 +856,34 @@ pub async fn ensure_sender_engine(
     }
 
     let peer = dest;
-    let (relay_mode, relay_urls) = resolve_relay_mode(ctx).await?;
-    let (sync_dir, db_path) = sync_paths(ctx)?;
+    // Relay URLs are still resolved here for the dial hint (a bare
+    // account-resolved dest is undialable without one); the shared node resolves
+    // the relay MODE once, inside `ensure_iroh_node`.
+    let (_relay_mode, relay_urls) = resolve_relay_mode(ctx).await?;
+    let (_sync_dir, db_path) = sync_paths(ctx)?;
 
-    std::fs::create_dir_all(&sync_dir)
-        .map_err(|e| ApiError::Internal(format!("create sync dir {}: {e}", sync_dir.display())))?;
-
-    // The ONE device identity — the same key file the account layer + receiver
-    // bind. Never a second identity.
-    let secret = crate::account::keys::DeviceKey::load_or_create(
-        &crate::account::keys::device_key_path(&sync_dir),
-    )
-    .map_err(|e| ApiError::Internal(format!("device key: {e:#}")))?
-    .secret_bytes();
-
-    // The sender's blob store is DISTINCT from the receiver's (`blobs`). Both
-    // halves can run in one process (dev-flag / loopback-validation configs;
-    // production role-gating otherwise keeps them mutually exclusive), and a
-    // second `FsStore` over the receiver's live dir would either fail on the
-    // redb lock or — worse — the sender's startup `delete_all` sweep would wipe
-    // the receiver's live `pkg/<id>` tags. A separate `blobs_out` dir keeps the
-    // two stores fully independent. (Receiver keeps `blobs` — existing primary
-    // deployments already have receiver data there.)
-    let transport = crate::sharing::iroh::IrohTransport::new(
-        secret,
-        relay_mode,
-        crate::sharing::iroh::BlobStore::Fs(sync_dir.join("blobs_out")),
-        // Send-only: no inbound offers to answer, so no dedup responder.
-        None,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("build iroh transport for sender: {e:#}")))?;
-    let origin_device = node_id_hex(&transport.node_id());
+    // The ONE shared iroh node (C1 fix): the personal sender is its `Out` role
+    // handle, sharing the single endpoint + `<sync>/blobs` store with the
+    // receiver and the collab sender. Before this, each of these three bound its
+    // OWN endpoint from the SAME device key over a separate store (`blobs` /
+    // `blobs_out` / `blobs_collab`); a relay admits one connection per node id,
+    // so they evicted each other and inbound datagrams reached only whichever
+    // endpoint held the relay slot. One endpoint removes that self-collision;
+    // role-prefixed blob tags (Д3) keep the roles from clobbering each other's
+    // tags on the shared store.
+    let node = ensure_iroh_node(ctx).await?;
+    let transport: Arc<dyn SharingTransport> = node.handle(Role::Out);
+    let origin_device = node_id_hex(&node.node_id());
 
     // The destination is an account-resolved bare node id (from
-    // `resolve_dest_node`). `IrohTransport` has no discovery services, so without
-    // a dial hint `announce` fails instantly with "No addressing information
-    // available". Attach our own resolved relay URL(s) — the same ones this
-    // endpoint itself binds with — as the peer's dial hint before the first
-    // announce ever goes out (devices on one account share the hub's relay set).
+    // `resolve_dest_node`). The node binds with `presets::Minimal` (no discovery
+    // services), so without a dial hint `announce` fails instantly with "No
+    // addressing information available". Attach our own resolved relay URL(s) as
+    // the peer's dial hint before the first announce (devices on one account
+    // share the hub's relay set).
     let peer_addr = pairing::peer_addr_with_relays(peer, &relay_urls)
         .map_err(|e| ApiError::Internal(format!("construct peer address: {e:#}")))?;
-    transport.add_peer(peer_addr);
-
-    let transport: Arc<dyn SharingTransport> = Arc::new(transport);
+    node.add_peer(peer_addr);
 
     let store = Arc::new(
         CatalogSyncStore::open(&db_path)
@@ -1170,8 +1211,52 @@ mod tests {
             image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
+            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
         (tmp, ctx)
+    }
+
+    /// Task 3 (Д2): `ensure_iroh_node` lazily binds the ONE shared node and
+    /// caches it on the ctx — two ensure calls return the SAME `Arc`, and a
+    /// host-style shutdown (take + `shutdown`) lets the next ensure re-bind a
+    /// FRESH node over the same sync dir (the device-key lock + store were
+    /// released cleanly). A bogus cached relay forces `resolve_relay_mode` →
+    /// `RelayMode::Custom` without a hub round-trip and without iroh's public
+    /// default relays; the endpoint binds locally (no role is ever started, so no
+    /// relay connection is attempted) and `.invalid` is guaranteed non-resolvable
+    /// (RFC 2606), keeping the test hermetic.
+    #[tokio::test]
+    async fn ensure_iroh_node_caches_then_rebinds_after_shutdown() {
+        let (_tmp, ctx) = test_ctx();
+        store_cached_relays(&ctx, &["https://relay.invalid".to_string()]);
+
+        let node1 = ensure_iroh_node(&ctx).await.expect("first bind");
+        let node2 = ensure_iroh_node(&ctx).await.expect("second ensure reuses");
+        assert!(
+            Arc::ptr_eq(&node1, &node2),
+            "two ensure calls must return the same cached node Arc"
+        );
+
+        // Host-style teardown: take the node out of the ctx and shut it down
+        // (releases the device-key lock + closes the store), clearing the slot.
+        let taken = ctx
+            .iroh_node
+            .lock()
+            .await
+            .take()
+            .expect("node present on the ctx");
+        assert!(Arc::ptr_eq(&taken, &node1), "the ctx held the same node");
+        taken.shutdown().await;
+
+        // Next ensure re-binds a fresh node (different Arc) over the same dir.
+        let node3 = ensure_iroh_node(&ctx).await.expect("re-bind after shutdown");
+        assert!(
+            !Arc::ptr_eq(&node1, &node3),
+            "an ensure after shutdown must bind a fresh node, not the shut-down one"
+        );
+
+        let taken3 = ctx.iroh_node.lock().await.take().expect("node3 present");
+        taken3.shutdown().await;
     }
 
     /// Sync 2C, task 3: the sender runtime holds ONE engine per destination

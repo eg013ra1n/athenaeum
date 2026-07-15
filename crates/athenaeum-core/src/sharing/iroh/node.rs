@@ -52,12 +52,13 @@ use crate::sharing::types::{
     FrameReceipt, NodeId, PackageAnnounce, PackageId, StartInfo, TransportEvent,
 };
 use crate::sharing::SharingTransport;
+use crate::sync::DedupResponder;
 
 use super::proto::{self, Msg, OfferEntry};
 use super::{
     blobs, hex32, spawn_conn_path_diagnostics, ConnectGate, Delivery, EventSink, GatedBlobs,
-    SharedConnectGate, SyncControlProtocol, CONTROL_SEND_TIMEOUT, EVENT_CHANNEL_CAPACITY,
-    GC_INTERVAL, MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
+    SharedConnectGate, SharedResponder, SyncControlProtocol, CONTROL_SEND_TIMEOUT,
+    EVENT_CHANNEL_CAPACITY, GC_INTERVAL, MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
 };
 
 /// Upper bound on the graceful `endpoint.close()` at shutdown (I1). A clean
@@ -393,6 +394,11 @@ pub struct SharedIrohNode {
     /// Connection-level authorization gate, cloned into both protocol handlers;
     /// the host installs the predicate via [`set_connect_gate`](Self::set_connect_gate).
     connect_gate: SharedConnectGate,
+    /// Dedup responder slot, cloned into the control protocol handler; the
+    /// receiver installs it via [`set_dedup_responder`](Self::set_dedup_responder)
+    /// when it migrates onto the node (Task 3). Empty ⇒ inbound offers are
+    /// answered want-all, so nothing is ever silently withheld.
+    responder: SharedResponder,
     /// Role prefixes whose startup sweep has already run (once per prefix).
     swept: Mutex<HashSet<&'static str>>,
     /// Whether the one-shot home-relay `online()` wait has run.
@@ -485,14 +491,16 @@ impl SharedIrohNode {
             inner: BlobsProtocol::new(&store, None),
             gate: Arc::clone(&connect_gate),
         };
-        // T1 wires no dedup responder into the shared control protocol — the
-        // receiver-role responder is installed by Task 3 when it migrates the
-        // receiver. A `None` responder answers offers want-all, so nothing is
-        // ever silently withheld in the meantime. Inbound events fan out through
-        // the demux (Task 2, Д4), not a single shared stream.
+        // Late-bindable dedup responder slot (Д3 shape): empty at bind, installed
+        // by the receiver when it migrates onto the node (`set_dedup_responder`,
+        // Task 3). Empty ⇒ offers are answered want-all, so nothing is ever
+        // silently withheld before the receiver wires its catalog responder.
+        // Inbound events fan out through the demux (Task 2, Д4), not a single
+        // shared stream.
+        let responder: SharedResponder = Arc::new(Mutex::new(None));
         let control = SyncControlProtocol {
             sink: EventSink::Demux(Arc::clone(&demux)),
-            responder: None,
+            responder: Arc::clone(&responder),
             gate: Arc::clone(&connect_gate),
         };
         let router = Router::builder(endpoint)
@@ -525,6 +533,7 @@ impl SharedIrohNode {
             shutdown_done: AtomicBool::new(false),
             relay_watcher: Mutex::new(Some(relay_watcher)),
             key_lock: Mutex::new(Some(key_lock)),
+            responder,
         }))
     }
 
@@ -583,6 +592,17 @@ impl SharedIrohNode {
     /// admits every connection.
     pub fn set_connect_gate(&self, gate: ConnectGate) {
         *self.connect_gate.lock().expect("connect_gate mutex poisoned") = Some(gate);
+    }
+
+    /// Install the dedup [`DedupResponder`] that answers inbound `Offer` /
+    /// `FullHashes` handshakes on the control channel (Task 3 receiver migration).
+    /// The running receiver installs a `CatalogDedupResponder` here so a peer's
+    /// pre-Announce dedup negotiation is answered from our catalog; left unset,
+    /// the node answers offers want-all (nothing silently withheld). Overwrites
+    /// any previously installed responder; picked up live by the already-spawned
+    /// control handler on the next inbound offer.
+    pub fn set_dedup_responder(&self, responder: Arc<dyn DedupResponder>) {
+        *self.responder.lock().expect("responder mutex poisoned") = Some(responder);
     }
 
     /// Register a peer's dialable address (from a pairing ticket or hub report),
