@@ -613,6 +613,80 @@ async fn timeouts_back_off_forever_without_failing() {
     engine.shutdown().await;
 }
 
+/// Spec §1: `Failed` stays reachable for exactly ONE non-network case — the
+/// package payload has vanished from disk, so re-announcing can never succeed no
+/// matter how long the engine backs off. Unlike every other retry trigger (spec
+/// §2), this one terminalizes instead of arming another backoff window.
+#[tokio::test]
+async fn missing_package_dir_fails_terminally() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // Receiver endpoint is started (so the first announce delivers) but has NO
+    // reactive loop — it never acks, so the ack wait times out and the engine
+    // moves to the Retry backoff path, which is where the missing-dir check runs.
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+
+    let pkg = build_package(&tmp.path().join("srcM"), "uuid-m", "frameM.fits", "M99", 1024);
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig {
+            ack_timeout: Duration::from_millis(50),
+        },
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+
+    // Let the first announce succeed (proves the normal path ran and the
+    // manifest was read + cached) before pulling the dir out from under it.
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Transferring),
+        WAIT,
+    )
+    .await;
+
+    // The payload vanishes from disk (e.g. cleaned up externally, moved,
+    // corrupted parent). Re-announcing this package can never succeed again.
+    std::fs::remove_dir_all(&pkg).unwrap();
+
+    // The ack never comes, so the ack-wait deadline elapses, the engine backs
+    // off into `Retry`, and the next `attempt()` finds the dir gone.
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Failed), WAIT).await;
+
+    let row = store.get_outbound(id).unwrap().unwrap();
+    assert_eq!(row.state, OutboundState::Failed);
+    assert!(
+        row.last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("missing"),
+        "last_error must mention the missing payload, got {:?}",
+        row.last_error
+    );
+
+    let history = store
+        .search_history(HistoryQuery {
+            filename: Some("frameM.fits".to_string()),
+            object: None,
+            direction: None,
+            peer: None,
+            project: None,
+            limit: 100,
+        })
+        .unwrap();
+    assert!(
+        history.iter().any(|h| h.outcome == "failed"),
+        "a failed outcome must be recorded in history even though the dir is gone"
+    );
+
+    engine.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Regression tests for the first-attempt "peer offline at send time" wedge
 // (review findings C1 + M1), now under delivery-forever semantics (spec §2).

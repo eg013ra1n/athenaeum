@@ -35,6 +35,11 @@
 //!   deadline every time, so it advances the backoff rather than busy-spinning.
 //! - [`cancel`](SyncEngineHandle::cancel) → `Failed` with a `cancelled` history
 //!   outcome.
+//! - Spec §1's one non-network terminal path: if the package dir/payload has
+//!   vanished from disk, [`attempt`](Worker::attempt) fails it immediately via
+//!   [`fail_package`](Worker::fail_package) — re-announcing can never succeed no
+//!   matter how long it backs off, so this (and `cancel`) are the only ways to
+//!   reach `Failed`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -186,6 +191,14 @@ struct Pending {
     /// dedup negotiation is skipped (full send). Both `None` for personal sync.
     project_id: Option<String>,
     hub_package_id: Option<String>,
+    /// Snapshot of the manifest records read on the first successful build,
+    /// cached so a terminal-fail epilogue (`fail_package`) can still name every
+    /// frame in the `failed` history outcome even when the package dir has since
+    /// vanished from disk (the missing-payload terminal path) and a live
+    /// [`package::read_manifest`] re-read is no longer possible. `None` until the
+    /// first successful manifest read; never re-read after that (same "decided
+    /// once, reused across retries" discipline as `want`).
+    manifest_records: Option<Vec<ManifestRecord>>,
 }
 
 /// Outcome of the first-build dedup handshake
@@ -759,6 +772,7 @@ impl Worker {
                 duplicate_count: 0,
                 project_id: None,
                 hub_package_id: None,
+                manifest_records: None,
             },
         );
         self.attempt(id).await
@@ -777,6 +791,11 @@ impl Worker {
     /// (C1) — delivery is retried forever, never terminalized from a network
     /// condition. Because it always re-arms a deadline, a persistently failing
     /// re-announce cannot busy-spin (M1).
+    ///
+    /// Spec §1's one exception: if the package dir has vanished from disk —
+    /// genuinely local, re-announcing can never succeed no matter how long we
+    /// back off — this fails the package terminally via [`fail_package`]
+    /// instead of arming another retry.
     async fn attempt(&mut self, id: i64) -> Result<()> {
         // One announce attempt is being made now: bump the persisted attempt
         // counter (announce attempts made) up front, before any early return, so
@@ -793,6 +812,26 @@ impl Worker {
             // Slot gone (cancelled/confirmed concurrently) — nothing to do.
             return Ok(());
         };
+
+        // Spec §1: a missing package dir means the payload is gone and
+        // re-announcing can never succeed — the ONE local-unrecoverable case
+        // that stays terminal under delivery-forever semantics (spec §2 governs
+        // every *network* condition, not this one).
+        if !dir.exists() {
+            tracing::error!(
+                package_id = id,
+                path = %dir.display(),
+                "package payload missing; failing terminally"
+            );
+            if let Err(se) = self
+                .store
+                .set_last_error(id, Some("package payload missing on disk"))
+            {
+                tracing::warn!(package_id = id, error = %se, "record last_error (missing payload) failed");
+            }
+            self.fail_package(id)?;
+            return Ok(());
+        }
 
         // Reuse the minted announce + negotiated want across retries (stable
         // `package_id` for ack correlation, no re-negotiation), or run the dedup
@@ -935,6 +974,13 @@ impl Worker {
                 return Ok(Negotiated::Deferred);
             }
         };
+        // Cache the manifest snapshot (once, on the first successful read) so a
+        // later terminal-fail epilogue can still name every frame in history even
+        // if the package dir has since vanished from disk and a live re-read of
+        // the manifest is no longer possible.
+        if let Some(p) = self.pending.get_mut(&id) {
+            p.manifest_records = Some(records.clone());
+        }
         let full_announce = match announce_for_dir(dir) {
             Ok(a) => a,
             Err(e) => {
@@ -1382,21 +1428,23 @@ impl Worker {
     /// recorded reason for terminal failure was the receiver's rejection.
     ///
     /// No longer reached from ack/announce timeouts: under delivery-forever
-    /// semantics (spec §2) a network condition never terminalizes a package. This
-    /// path is retained for genuinely-unrecoverable *local* failures (a missing
-    /// package dir / vanished payload) and the terminal wiring of later tasks;
-    /// `#[allow(dead_code)]` keeps the build clean until that caller lands.
-    #[allow(dead_code)]
+    /// semantics (spec §2) a network condition never terminalizes a package.
+    /// Spec §1: `Failed` stays reachable ONLY for the genuinely-unrecoverable
+    /// *local* case — the package dir/payload has vanished from disk, so
+    /// re-announcing can never succeed (see the `!dir.exists()` check at the top
+    /// of [`attempt`](Self::attempt)) — plus `cancel_package`'s own direct
+    /// `Failed` transition (not routed through here).
     fn fail_package(&mut self, id: i64) -> Result<()> {
         let removed = self.pending.remove(&id);
-        let (dir, last_rejected, pkg_id, project_id) = match removed {
+        let (dir, last_rejected, pkg_id, project_id, manifest_records) = match removed {
             Some(p) => (
                 Some(p.dir),
                 p.last_rejected,
                 p.announce.map(|a| a.package_id),
                 p.project_id,
+                p.manifest_records,
             ),
-            None => (None, Vec::new(), None, None),
+            None => (None, Vec::new(), None, None, None),
         };
         self.store.set_state(id, OutboundState::Failed)?;
         // Terminal: release any served blobs (fire-and-forget). `pkg_id` is
@@ -1412,7 +1460,11 @@ impl Worker {
             format!("failed: rejected frame(s) {}", last_rejected.join(","))
         };
         if let Some(dir) = dir {
-            self.append_terminal_history(id, &dir, &outcome)?;
+            // The dir may itself be the thing that's gone (missing-payload
+            // terminal path) — fall back to the cached first-build manifest
+            // snapshot so the `failed` history outcome is still recorded per
+            // frame instead of silently dropped.
+            self.append_terminal_history(id, &dir, &outcome, manifest_records.as_deref())?;
             // Multi-target fan-out: a `Failed` target is terminal too. Notify the
             // coordinator so a permanently-unreachable peer does not block the
             // shared payload's cleanup forever (spec: terminal = confirmed OR
@@ -1464,7 +1516,7 @@ impl Worker {
             reason = "cancelled",
             "sync state"
         );
-        self.append_terminal_history(id, &dir, "cancelled")?;
+        self.append_terminal_history(id, &dir, "cancelled", None)?;
         // Multi-target fan-out: a cancelled target is terminal — notify the
         // coordinator so it counts toward the all-targets-terminal cleanup gate.
         // No-op without a sink (unchanged single-target behavior).
@@ -1544,14 +1596,35 @@ impl Worker {
     }
 
     /// Append one terminal history row (`failed` / `cancelled`) per manifest
-    /// frame. A missing/unreadable manifest is logged, not fatal.
-    fn append_terminal_history(&self, id: i64, dir: &Path, outcome: &str) -> Result<()> {
+    /// frame. Prefers a live re-read of the manifest from `dir` (the freshest
+    /// state); when that fails AND `fallback_records` is `Some` (the missing-
+    /// payload terminal path, where the dir itself is what vanished), falls back
+    /// to the cached snapshot from the package's first successful build instead
+    /// of silently dropping the terminal history row. A missing/unreadable
+    /// manifest with no fallback available is logged, not fatal (unchanged).
+    fn append_terminal_history(
+        &self,
+        id: i64,
+        dir: &Path,
+        outcome: &str,
+        fallback_records: Option<&[ManifestRecord]>,
+    ) -> Result<()> {
         let records = match package::read_manifest(dir) {
             Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(package_id = id, error = %e, "sync history: manifest unreadable at terminal");
-                return Ok(());
-            }
+            Err(e) => match fallback_records {
+                Some(cached) => {
+                    tracing::info!(
+                        package_id = id,
+                        error = %e,
+                        "sync history: manifest unreadable at terminal, using cached records"
+                    );
+                    cached.to_vec()
+                }
+                None => {
+                    tracing::warn!(package_id = id, error = %e, "sync history: manifest unreadable at terminal");
+                    return Ok(());
+                }
+            },
         };
         let peer_device = node_id_hex(&self.peer);
         let ts = now_iso();
