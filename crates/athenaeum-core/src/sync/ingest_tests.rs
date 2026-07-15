@@ -687,7 +687,7 @@ async fn transit_corruption_repaired_then_redelivery_confirms() {
         sync_store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
         receiver_node,
-        SyncConfig { ack_timeout: Duration::from_millis(60), max_attempts: 30 },
+        SyncConfig { ack_timeout: Duration::from_millis(60) },
     );
 
     let id = engine.enqueue_package(&pkg_dir).await.unwrap();

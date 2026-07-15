@@ -71,7 +71,8 @@ mod retention_tests;
 pub use cleanup_coord::SharedPackageCleanup;
 pub use dedup::{confirm_candidates, partition_offer, WantSplit};
 pub use engine::{
-    PackageCleanupSink, SyncConfig, SyncEngine, SyncEngineHandle, DEFAULT_ACK_TIMEOUT, MAX_ATTEMPTS,
+    retry_backoff, PackageCleanupSink, SyncConfig, SyncEngine, SyncEngineHandle,
+    DEFAULT_ACK_TIMEOUT,
 };
 pub use ingest::{ingest_package, IngestOutcome};
 pub use pairing::{node_id_from_ticket, relay_mode_for, resolve_relays, RelayResolution};

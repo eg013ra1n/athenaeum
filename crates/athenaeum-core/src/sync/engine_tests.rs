@@ -32,7 +32,7 @@ use crate::sharing::types::{
 use crate::sharing::SharingTransport;
 
 use super::cleanup_coord::SharedPackageCleanup;
-use super::engine::PackageCleanupSink;
+use super::engine::{retry_backoff, PackageCleanupSink};
 use super::store::{StandaloneSyncStore, SyncStore};
 use super::DedupResponder;
 use super::{HistoryQuery, OutboundState, SyncConfig, SyncEngine};
@@ -408,7 +408,6 @@ async fn mid_transfer_abort_leaves_transferring_then_resume_completes() {
         receiver_id,
         SyncConfig {
             ack_timeout: Duration::from_secs(60),
-            max_attempts: 5,
         },
     );
     let id = engine_a.enqueue_package(&pkg).await.unwrap();
@@ -513,13 +512,30 @@ async fn ack_lost_then_duplicate_ack_confirms_once() {
     engine.shutdown().await;
 }
 
+#[test]
+fn backoff_schedule_multiplies_base_and_caps() {
+    use std::time::Duration;
+    let base = Duration::from_secs(30);
+    // 30s → 1m → 5m → 15m → 30m → 30m (cap), spec §2
+    assert_eq!(retry_backoff(base, 0), Duration::from_secs(30));
+    assert_eq!(retry_backoff(base, 1), Duration::from_secs(60));
+    assert_eq!(retry_backoff(base, 2), Duration::from_secs(300));
+    assert_eq!(retry_backoff(base, 3), Duration::from_secs(900));
+    assert_eq!(retry_backoff(base, 4), Duration::from_secs(1800));
+    assert_eq!(retry_backoff(base, 99), Duration::from_secs(1800));
+}
+
+/// Spec §2: a peer that never acks must NOT terminalize the package. Every ack
+/// timeout climbs a backoff rung and waits it out — attempts keep rising, the
+/// row stays non-terminal, `last_error` records the timeout, and NO `failed`
+/// history row is ever written. Delivery is retried forever.
 #[tokio::test]
-async fn failed_after_max_attempts_with_error_outcome_in_history() {
+async fn timeouts_back_off_forever_without_failing() {
     let tmp = tempdir().unwrap();
     let net = LoopbackNetwork::new();
 
     // Receiver endpoint is started (so announce can be delivered) but has NO
-    // reactive loop — it never acks, so every attempt times out.
+    // reactive loop — it never acks, so every attempt's ack wait times out.
     let receiver = Arc::new(net.endpoint());
     let receiver_id = receiver.start().await.unwrap().node_id;
 
@@ -531,17 +547,53 @@ async fn failed_after_max_attempts_with_error_outcome_in_history() {
         Arc::new(net.endpoint()),
         receiver_id,
         SyncConfig {
-            ack_timeout: Duration::from_millis(40),
-            max_attempts: 5,
+            ack_timeout: Duration::from_millis(50),
         },
     );
 
     let id = engine.enqueue_package(&pkg).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Failed), WAIT).await;
 
+    // Drive past 5+ deadline fires. With a 50ms base the backoff climbs
+    // 50ms → 100ms → 500ms → 1500ms → 3000ms, so reaching 5 announce attempts
+    // takes ~5s of wall clock — hence the generous wait window.
+    wait_until(|| attempts_of(&store, id) >= 5, Duration::from_secs(12)).await;
+
+    // `last_error` records each ack timeout but is cleared by the next successful
+    // announce, so wait for the ack-timeout record to land (it then persists for a
+    // full backoff window) rather than racing the announce that just cleared it.
+    wait_until(
+        || {
+            store
+                .get_outbound(id)
+                .unwrap()
+                .map(|r| r.last_error.is_some())
+                .unwrap_or(false)
+        },
+        WAIT,
+    )
+    .await;
+
+    // Still non-terminal: it must appear in `non_terminal()`, and be neither
+    // Failed nor Confirmed. Delivery is retried forever (spec §2).
+    assert!(
+        store.non_terminal().unwrap().iter().any(|r| r.id == id),
+        "a peer that never acks must leave the row non-terminal"
+    );
     let row = store.get_outbound(id).unwrap().unwrap();
-    assert_eq!(row.state, OutboundState::Failed);
-    assert_eq!(row.attempts, 5, "should fail after exactly max_attempts");
+    assert!(
+        !matches!(row.state, OutboundState::Failed | OutboundState::Confirmed),
+        "row must not terminalize from ack timeouts (state = {:?})",
+        row.state
+    );
+    assert!(
+        row.attempts >= 5,
+        "attempts must keep climbing past 5, got {}",
+        row.attempts
+    );
+    assert!(
+        row.last_error.is_some(),
+        "the ack timeout must be recorded as last_error"
+    );
 
     let history = store
         .search_history(HistoryQuery {
@@ -554,8 +606,8 @@ async fn failed_after_max_attempts_with_error_outcome_in_history() {
         })
         .unwrap();
     assert!(
-        history.iter().any(|h| h.outcome == "failed"),
-        "a failed outcome must be recorded in history"
+        !history.iter().any(|h| h.outcome == "failed"),
+        "no `failed` history row may exist — timeouts never terminalize"
     );
 
     engine.shutdown().await;
@@ -563,16 +615,16 @@ async fn failed_after_max_attempts_with_error_outcome_in_history() {
 
 // ---------------------------------------------------------------------------
 // Regression tests for the first-attempt "peer offline at send time" wedge
-// (review findings C1 + M1).
+// (review findings C1 + M1), now under delivery-forever semantics (spec §2).
 // ---------------------------------------------------------------------------
 
-/// C1: enqueue while the peer endpoint is NOT started. The very first announce
-/// fails ("peer not started"); the engine must treat that as a retryable
-/// attempt — retry (attempts climb) and terminalize `Failed` after
-/// `max_attempts`, with a `failed` outcome in history — instead of leaving the
-/// row wedged in `Queued` with no retry slot.
+/// Spec §2 / C1: enqueue while the peer endpoint is NOT started. Every announce
+/// fails ("peer not started"); the engine must back off and keep retrying — the
+/// row climbs backoff rungs and stays pending (`Queued`/`Announced`), never
+/// `Failed`, no matter how many windows elapse. A network-unreachable peer is
+/// never terminalized.
 #[tokio::test]
-async fn first_attempt_peer_offline_retries_then_fails() {
+async fn peer_offline_backs_off_and_stays_pending() {
     let tmp = tempdir().unwrap();
     let net = LoopbackNetwork::new();
 
@@ -589,25 +641,30 @@ async fn first_attempt_peer_offline_retries_then_fails() {
         Arc::new(net.endpoint()),
         receiver_id,
         SyncConfig {
-            ack_timeout: Duration::from_millis(40),
-            max_attempts: 5,
+            ack_timeout: Duration::from_millis(50),
         },
     );
 
     let id = engine.enqueue_package(&pkg).await.unwrap();
 
-    // The peer never comes online: the row must reach terminal Failed.
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Failed), WAIT).await;
+    // Drive several backoff windows: each failed announce bumps attempts and
+    // climbs a rung. The row must still be pending, never terminal.
+    wait_until(|| attempts_of(&store, id) >= 3, WAIT).await;
 
     let row = store.get_outbound(id).unwrap().unwrap();
-    assert_eq!(row.state, OutboundState::Failed);
-    assert_eq!(
-        row.attempts, 5,
-        "a first-attempt offline failure must be retried up to max_attempts, not wedged"
+    assert!(
+        matches!(row.state, OutboundState::Queued | OutboundState::Announced),
+        "an offline peer must leave the row pending (Queued/Announced), got {:?}",
+        row.state
+    );
+    assert_ne!(
+        row.state,
+        OutboundState::Failed,
+        "a network-unreachable peer must never terminalize the package (spec §2)"
     );
     assert!(
-        row.attempts >= 2,
-        "retry machinery must have re-attempted (attempts observable >= 2)"
+        row.last_error.is_some(),
+        "the serve/announce error must be recorded as last_error"
     );
 
     let history = store
@@ -621,17 +678,17 @@ async fn first_attempt_peer_offline_retries_then_fails() {
         })
         .unwrap();
     assert!(
-        history.iter().any(|h| h.outcome == "failed"),
-        "a failed outcome must be recorded in history"
+        !history.iter().any(|h| h.outcome == "failed"),
+        "no `failed` outcome may be recorded — offline peers back off forever"
     );
 
     engine.shutdown().await;
 }
 
 /// C1 companion: enqueue while the peer is offline (first announce fails), then
-/// bring the peer online before `max_attempts` is exhausted. A retry's announce
-/// then succeeds, the peer fetches + acks, and the row completes to `Confirmed`
-/// with the correct two-event history.
+/// bring the peer online while it is still backing off and retrying. A retry's
+/// announce then succeeds, the peer fetches + acks, and the row completes to
+/// `Confirmed` with the correct two-event history.
 #[tokio::test]
 async fn first_attempt_peer_offline_then_online_completes() {
     let tmp = tempdir().unwrap();
@@ -649,16 +706,16 @@ async fn first_attempt_peer_offline_then_online_completes() {
         Arc::new(net.endpoint()),
         receiver_id,
         SyncConfig {
-            // Fast retry cadence, generous cap so the peer has time to come up.
+            // Fast retry cadence so a backoff window lands soon after the peer
+            // comes up.
             ack_timeout: Duration::from_millis(50),
-            max_attempts: 20,
         },
     );
 
     let id = engine.enqueue_package(&pkg).await.unwrap();
 
-    // Prove it retried at least once while the peer was offline (each retry bumps
-    // attempts; the initial failed attempt does not).
+    // Prove it attempted at least once while the peer was offline (every announce
+    // attempt bumps the counter, including the first failing one).
     wait_until(|| attempts_of(&store, id) >= 1, WAIT).await;
     assert_ne!(
         state_of(&store, id),
@@ -726,7 +783,6 @@ async fn cancel_moves_to_failed_cancelled() {
         receiver_id,
         SyncConfig {
             ack_timeout: Duration::from_secs(60),
-            max_attempts: 5,
         },
     );
 
@@ -867,14 +923,16 @@ async fn startup_heal_cleans_confirmed_payloads() {
 }
 
 /// Test C: a package driven to terminal `Failed` KEEPS its payloads — Task 2's
-/// retry re-enqueues the same package dir and depends on them.
+/// retry re-enqueues the same package dir and depends on them. Under
+/// delivery-forever semantics (spec §2) a timeout never terminalizes, so the
+/// terminal `Failed` here is reached by an explicit cancel.
 #[tokio::test]
 async fn failed_package_keeps_payloads() {
     let tmp = tempdir().unwrap();
     let net = LoopbackNetwork::new();
 
-    // Receiver is started (announce delivers) but never acks → every attempt
-    // times out and the package terminalizes Failed.
+    // Receiver started but not acking, so the package stays in flight until we
+    // cancel it. Long ack timeout so a backoff pass does not race the cancel.
     let receiver = Arc::new(net.endpoint());
     let receiver_id = receiver.start().await.unwrap().node_id;
 
@@ -886,12 +944,19 @@ async fn failed_package_keeps_payloads() {
         Arc::new(net.endpoint()),
         receiver_id,
         SyncConfig {
-            ack_timeout: Duration::from_millis(40),
-            max_attempts: 5,
+            ack_timeout: Duration::from_secs(60),
         },
     );
 
     let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Transferring),
+        WAIT,
+    )
+    .await;
+
+    // Cancel → terminal Failed.
+    engine.cancel(id).await.unwrap();
     wait_until(|| state_of(&store, id) == Some(OutboundState::Failed), WAIT).await;
 
     // A brief settle so any (erroneous) cleanup would have a chance to run.
@@ -1683,15 +1748,15 @@ async fn retry_path_re_resolves_and_re_adds_peer_address() {
 
     let pkg = build_package(&tmp.path().join("src-t8"), "uuid-t8", "f.fits", "M8", 1024);
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    // Short ack timeout + a small attempt cap so the retry path runs quickly and
-    // the package terminalizes without hanging the test.
+    // Short ack timeout so the ack deadline fires quickly and the backoff/retry
+    // path runs. Delivery is retried forever (spec §2) — the retry path re-adding
+    // the refreshed address is the observable signal, not a terminal state.
     let engine = SyncEngine::spawn_inner(
         store.clone() as Arc<dyn SyncStore>,
         transport as Arc<dyn SharingTransport>,
         peer,
         SyncConfig {
             ack_timeout: Duration::from_millis(80),
-            max_attempts: 3,
         },
         None,
         None,
@@ -1699,9 +1764,21 @@ async fn retry_path_re_resolves_and_re_adds_peer_address() {
     );
 
     let id = engine.enqueue_package(&pkg).await.unwrap();
-    // The ack never comes, so the package walks its attempts to Failed — by which
-    // point the retry path has run at least once.
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Failed), WAIT).await;
+    // The ack never comes, so the ack deadline elapses and the Retry path runs,
+    // re-resolving + re-registering the peer's address. Wait on that side effect
+    // (the address landing on the transport) rather than a terminal state.
+    wait_until(|| !added.lock().unwrap().is_empty(), WAIT).await;
+
+    // The retry ran but the package is never terminalized from a network
+    // condition — it stays non-terminal and keeps retrying (spec §2).
+    assert!(
+        !matches!(
+            state_of(&store, id),
+            Some(OutboundState::Failed | OutboundState::Confirmed)
+        ),
+        "a retrying package must stay non-terminal, got {:?}",
+        state_of(&store, id)
+    );
 
     assert!(
         refresh_count.load(SeqCst) >= 1,

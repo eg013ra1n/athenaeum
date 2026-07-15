@@ -486,7 +486,6 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
         coord_recv_node,
         Some(SyncConfig {
             ack_timeout: Duration::from_millis(400),
-            max_attempts: 20,
         }),
     )
     .await;

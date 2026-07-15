@@ -15,22 +15,24 @@
 //! - `enqueue → Queued` (the worker inserts the row) → the worker `serve`s +
 //!   announces → `Announced` → `Transferring`.
 //! - A **first-attempt** build / `serve` / `announce` failure — the normal
-//!   "peer is asleep when we queue" case — is retryable, not fatal. The package
+//!   "peer is asleep when we queue" case — is retryable, never fatal. The package
 //!   keeps a pending retry slot with a deadline and stays `Queued` until an
-//!   announce succeeds, so [`handle_timeouts`](Worker::handle_timeouts) walks it
-//!   toward [`SyncConfig::max_attempts`] → `Failed`. It either eventually
-//!   announces (peer came online) or terminalizes — it is never left
-//!   non-terminal with no retry slot.
+//!   announce succeeds, so [`handle_timeouts`](Worker::handle_timeouts) re-drives
+//!   it on a capped exponential backoff ([`retry_backoff`], spec §2). It
+//!   eventually announces when the peer comes online; a network-unreachable peer
+//!   never terminalizes it — delivery is retried forever, never left non-terminal
+//!   with no retry slot.
 //! - The sender observes no `FetchProgress` on loopback (fetch is
 //!   receiver-driven), so `Transferring` is marked on the first *successful*
 //!   announce — the in-flight window during which we await the ack. A
 //!   `FetchProgress` arm remains for real transports and is a no-op here.
 //! - `AckReceived → Confirmed` (idempotent: a second ack for a package no longer
 //!   in the in-flight map is logged at debug and dropped).
-//! - Per-package ack/retry timeout → `bump_attempts` + re-announce, until
-//!   [`SyncConfig::max_attempts`] → `Failed`. A persistently-erroring
-//!   re-announce re-arms its deadline every time, so it advances toward `Failed`
-//!   rather than busy-spinning.
+//! - Per-package ack/retry timeout → climb one backoff rung and wait it out,
+//!   then re-announce ([`retry_backoff`]). A network condition (no ack, offline
+//!   peer, serve/announce error) never marks a package `Failed`; it backs off and
+//!   retries indefinitely. A persistently-erroring re-announce re-arms its
+//!   deadline every time, so it advances the backoff rather than busy-spinning.
 //! - [`cancel`](SyncEngineHandle::cancel) → `Failed` with a `cancelled` history
 //!   outcome.
 
@@ -69,11 +71,6 @@ use super::{node_id_hex, now_iso};
 pub type AddrRefresher =
     Arc<dyn Fn(NodeId) -> BoxFuture<Option<iroh::EndpointAddr>> + Send + Sync>;
 
-/// Default cap on announce attempts before a package is marked `Failed`. Five
-/// attempts balances resilience to transient peer/transport hiccups against
-/// wedging forever on a truly unreachable peer.
-pub const MAX_ATTEMPTS: u32 = 5;
-
 /// Default per-attempt wait for the peer's ack before retrying.
 pub const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -81,20 +78,42 @@ pub const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 /// wakes the worker before it elapses).
 const IDLE_SLEEP: Duration = Duration::from_secs(3600);
 
+/// Spec §2: capped exponential backoff, expressed as multiples of the base
+/// rung (ack_timeout) so tests with short timeouts scale down naturally.
+/// 30s → 1m → 5m → 15m → 30m with the default 30s base.
+const BACKOFF_MULTIPLIERS: [u32; 5] = [1, 2, 10, 30, 60];
+
+/// The backoff window for a given `rung`, as `base * multiplier[rung]` with the
+/// last multiplier held as the cap. Delivery is retried forever (spec §2): a
+/// network-unreachable peer never terminalizes a package, it just sits at the
+/// 30-minute cap. `base` is the engine's [`SyncConfig::ack_timeout`] so a test
+/// with a millisecond timeout gets a proportionally short schedule.
+pub fn retry_backoff(base: Duration, rung: u32) -> Duration {
+    let m = BACKOFF_MULTIPLIERS[(rung as usize).min(BACKOFF_MULTIPLIERS.len() - 1)];
+    base * m
+}
+
+/// What the per-package deadline means when it fires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NextAction {
+    /// Announce succeeded; deadline = ack wait. Firing = ack timed out.
+    AwaitAck,
+    /// Waiting out a backoff window. Firing = attempt the announce now.
+    Retry,
+}
+
 /// Tunables for the engine worker.
 #[derive(Clone, Debug)]
 pub struct SyncConfig {
-    /// How long to wait for an ack before re-announcing.
+    /// How long to wait for an ack before backing off. Doubles as the base rung
+    /// of the retry backoff schedule ([`retry_backoff`]).
     pub ack_timeout: Duration,
-    /// Announce attempts before giving up ([`OutboundState::Failed`]).
-    pub max_attempts: u32,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             ack_timeout: DEFAULT_ACK_TIMEOUT,
-            max_attempts: MAX_ATTEMPTS,
         }
     }
 }
@@ -133,8 +152,15 @@ struct Pending {
     /// When the transfer-start history row was written, reused as `started_at`
     /// on the confirm/terminal rows.
     started_at: String,
-    /// When to give up waiting (for the ack, or to retry a failed announce).
+    /// When the next deadline fires (an ack wait, or a backoff window).
     deadline: Instant,
+    /// Current backoff rung (spec §2). Climbs on every ack timeout / failed
+    /// announce, never resets; indexes [`retry_backoff`]'s capped schedule.
+    rung: u32,
+    /// What [`deadline`](Self::deadline) firing means: waiting for the peer's ack
+    /// ([`NextAction::AwaitAck`]) vs. waiting out a backoff window before the next
+    /// announce ([`NextAction::Retry`]).
+    next_action: NextAction,
     /// Frame uuids the most recent ack rejected, if any (task A7 fix-review).
     /// Empty until a partial ack arrives; overwritten (not accumulated) by each
     /// subsequent partial ack so it always reflects the latest verdict. Named
@@ -723,6 +749,10 @@ impl Worker {
                 started,
                 started_at: String::new(),
                 deadline: Instant::now(),
+                rung: 0,
+                // A fresh enqueue's first deadline is an immediate attempt,
+                // matching today's flow (start_package calls `attempt` directly).
+                next_action: NextAction::Retry,
                 last_rejected: Vec::new(),
                 want: None,
                 new_count: 0,
@@ -740,12 +770,20 @@ impl Worker {
     /// ([`handle_timeouts`](Self::handle_timeouts)).
     ///
     /// On success it records the transfer-start milestone the first time and
-    /// arms the ack-wait deadline. On a build/serve/announce failure it logs and
-    /// arms a *retry* deadline instead of returning `Err`, so the row keeps its
-    /// slot and `handle_timeouts` walks it toward `max_attempts` rather than
-    /// wedging (C1). Because it always re-arms a deadline, a persistently
-    /// failing re-announce cannot busy-spin (M1).
+    /// arms the ack-wait deadline ([`NextAction::AwaitAck`]). On a
+    /// build/serve/announce failure it logs and arms a *backoff* deadline instead
+    /// of returning `Err`, so the row keeps its slot and `handle_timeouts`
+    /// re-drives it on a capped exponential backoff (spec §2) rather than wedging
+    /// (C1) — delivery is retried forever, never terminalized from a network
+    /// condition. Because it always re-arms a deadline, a persistently failing
+    /// re-announce cannot busy-spin (M1).
     async fn attempt(&mut self, id: i64) -> Result<()> {
+        // One announce attempt is being made now: bump the persisted attempt
+        // counter (announce attempts made) up front, before any early return, so
+        // it reflects every serve/announce try — success or failure.
+        let attempts = self.store.bump_attempts(id).context("bump attempts")?;
+        tracing::debug!(package_id = id, attempts, "sync announce attempt");
+
         // Snapshot from the slot; drop the borrow before any await / mutation.
         let Some((dir, existing, started, cached_want)) = self
             .pending
@@ -859,12 +897,15 @@ impl Worker {
             tracing::info!(package_id = id, state = "transferring", "sync resume/retry re-announce");
         }
 
-        // Arm the ack-wait deadline and persist the announce/want/milestone.
+        // Arm the ack-wait deadline and persist the announce/want/milestone. The
+        // deadline now means "waiting for the peer's ack"; if it fires,
+        // `handle_timeouts` climbs a backoff rung rather than failing (spec §2).
         if let Some(p) = self.pending.get_mut(&id) {
             p.announce = Some(announce);
             p.want = want;
             p.started = true;
             p.started_at = started_at;
+            p.next_action = NextAction::AwaitAck;
             p.deadline = Instant::now() + self.config.ack_timeout;
         }
         // The serve/announce succeeded — clear any stale attempt-error so a package
@@ -1037,12 +1078,16 @@ impl Worker {
         Ok(())
     }
 
-    /// Arm a retry deadline on a still-pending package after a failed
-    /// build/serve/announce attempt. Leaves the milestone untouched — the row
-    /// stays `Queued` until an announce actually succeeds.
+    /// Arm a backoff deadline on a still-pending package after a failed
+    /// build/serve/announce attempt: climb one rung and wait out
+    /// [`retry_backoff`] before the next announce (spec §2). Leaves the milestone
+    /// untouched — the row stays `Queued` until an announce actually succeeds, and
+    /// is never terminalized from a network condition.
     fn arm_retry(&mut self, id: i64) {
         if let Some(p) = self.pending.get_mut(&id) {
-            p.deadline = Instant::now() + self.config.ack_timeout;
+            p.rung = p.rung.saturating_add(1);
+            p.next_action = NextAction::Retry;
+            p.deadline = Instant::now() + retry_backoff(self.config.ack_timeout, p.rung);
         }
     }
 
@@ -1102,9 +1147,10 @@ impl Worker {
     /// An ack carrying any `Rejected` receipt is a partial delivery: log the
     /// rejected frame uuids and leave the package's pending slot untouched (no
     /// confirm, no history, deadline unchanged) — the existing ack-timeout
-    /// deadline elapses normally and `handle_timeouts`' ordinary retry path
-    /// re-announces (redelivery) or, once `max_attempts` is exhausted, fails the
-    /// package with a history outcome naming the rejected frame(s).
+    /// deadline elapses normally and `handle_timeouts`' ordinary backoff/retry
+    /// path re-announces (redelivery) until the peer accepts every frame — a
+    /// partial ack, like any other network condition, never terminalizes the
+    /// package (spec §2).
     ///
     /// Idempotent for a fully-accepted ack: one for a package no longer in the
     /// in-flight map (already confirmed, or unknown) is dropped at debug.
@@ -1255,9 +1301,12 @@ impl Worker {
         Ok(())
     }
 
-    /// Handle every in-flight package whose deadline has elapsed (an ack that
-    /// never came, or a retry of a failed announce): bump its attempt count,
-    /// then either fail it (attempts exhausted) or re-attempt.
+    /// Handle every in-flight package whose deadline has elapsed. The deadline
+    /// means one of two things ([`NextAction`]): an ack that never arrived
+    /// ([`AwaitAck`](NextAction::AwaitAck)), or a backoff window that has elapsed
+    /// so it is time to re-announce ([`Retry`](NextAction::Retry)). A network
+    /// condition (no ack, offline peer, serve/announce error) never terminalizes
+    /// a package — it climbs one backoff rung and is retried forever (spec §2).
     async fn handle_timeouts(&mut self) -> Result<()> {
         let now = Instant::now();
         let due: Vec<i64> = self
@@ -1276,51 +1325,68 @@ impl Worker {
         // gone) leaves the existing address in place — no worse than before.
         let mut refreshed = false;
         for id in due {
-            // A package that was already announced but whose ack never arrived
-            // records the ack-timeout as its last error (Task 9); a package that
-            // never announced already has its serve error recorded (site above) and
-            // must not be masked by "no ack". Best-effort diagnostic write.
-            if self.pending.get(&id).map(|p| p.started).unwrap_or(false) {
-                if let Err(se) = self.store.set_last_error(id, Some("no ack from peer within timeout")) {
-                    tracing::warn!(package_id = id, error = %se, "record last_error (ack timeout) failed");
-                }
-            }
-            let attempts = self.store.bump_attempts(id).context("bump attempts")?;
-            if attempts >= self.config.max_attempts {
-                self.fail_package(id)?;
-            } else {
-                if !refreshed {
-                    refreshed = true;
-                    if let Some(refresher) = self.addr_refresher.clone() {
-                        if let Some(addr) = refresher(self.peer).await {
-                            tracing::info!(
-                                peer = %node_id_hex(&self.peer),
-                                "retry: re-resolved peer address"
-                            );
-                            self.transport.add_peer_addr(addr);
-                        }
+            // Copy the action out so no `&mut pending` borrow is held across the
+            // store / attempt calls below.
+            let Some(action) = self.pending.get(&id).map(|p| p.next_action) else {
+                continue;
+            };
+            match action {
+                NextAction::AwaitAck => {
+                    // The ack never came: record it, climb one backoff rung, and
+                    // wait it out. Never terminal (spec §2). Best-effort diagnostic
+                    // write — a store error must not fail the timeout pass.
+                    if let Err(se) = self
+                        .store
+                        .set_last_error(id, Some("no ack from peer within timeout"))
+                    {
+                        tracing::warn!(package_id = id, error = %se, "record last_error (ack timeout) failed");
+                    }
+                    if let Some(p) = self.pending.get_mut(&id) {
+                        p.rung = p.rung.saturating_add(1);
+                        p.next_action = NextAction::Retry;
+                        p.deadline =
+                            Instant::now() + retry_backoff(self.config.ack_timeout, p.rung);
+                        tracing::info!(package_id = id, rung = p.rung, "ack timeout, backing off");
                     }
                 }
-                tracing::warn!(package_id = id, attempts, "sync timeout; re-attempting");
-                // `attempt` always re-arms a deadline (ack-wait on success, retry
-                // on failure), so a re-announce that keeps erroring can no longer
-                // busy-spin (M1) and still advances toward max_attempts. Guard the
-                // rare store-error path with a retry so the deadline is never left
-                // stale.
-                if let Err(e) = self.attempt(id).await {
-                    tracing::error!(package_id = id, error = %e, "sync re-attempt failed");
-                    self.arm_retry(id);
+                NextAction::Retry => {
+                    if !refreshed {
+                        refreshed = true;
+                        if let Some(refresher) = self.addr_refresher.clone() {
+                            if let Some(addr) = refresher(self.peer).await {
+                                tracing::info!(
+                                    peer = %node_id_hex(&self.peer),
+                                    "retry: re-resolved peer address"
+                                );
+                                self.transport.add_peer_addr(addr);
+                            }
+                        }
+                    }
+                    // `attempt` bumps the counter, re-announces, and re-arms its own
+                    // deadline (ack-wait on success, backoff on failure) so it can
+                    // never busy-spin (M1). Guard the rare store-error path with a
+                    // backoff arm so the deadline is never left stale.
+                    if let Err(e) = self.attempt(id).await {
+                        tracing::warn!(package_id = id, error = %e, "attempt errored, backing off");
+                        self.arm_retry(id);
+                    }
                 }
             }
         }
         Ok(())
     }
 
-    /// Mark a package `Failed` after exhausting attempts and record a `failed`
-    /// history outcome. When the package's last known ack rejected one or more
-    /// frames, the outcome names them (task A7 fix-review) instead of the bare
-    /// `failed` string — the recorded reason for terminal failure was the
-    /// receiver's rejection, not just an unreachable peer.
+    /// Mark a package `Failed` and record a `failed` history outcome. When the
+    /// package's last known ack rejected one or more frames, the outcome names
+    /// them (task A7 fix-review) instead of the bare `failed` string — the
+    /// recorded reason for terminal failure was the receiver's rejection.
+    ///
+    /// No longer reached from ack/announce timeouts: under delivery-forever
+    /// semantics (spec §2) a network condition never terminalizes a package. This
+    /// path is retained for genuinely-unrecoverable *local* failures (a missing
+    /// package dir / vanished payload) and the terminal wiring of later tasks;
+    /// `#[allow(dead_code)]` keeps the build clean until that caller lands.
+    #[allow(dead_code)]
     fn fail_package(&mut self, id: i64) -> Result<()> {
         let removed = self.pending.remove(&id);
         let (dir, last_rejected, pkg_id, project_id) = match removed {
