@@ -20,19 +20,22 @@
 //! `IrohTransport` stays alive as the loopback/test engine until Task 3 migrates
 //! every production call site onto this node.
 //!
-//! Event demux and the pooled control connection are **Task 2**: for now every
-//! role handle's [`events`](SharingTransport::events) shares the node's single
-//! stream, and control messages still connect per message (`// T2 demux`).
+//! Event demux and the pooled control connection are **Task 2** and now live
+//! here: a per-`(peer, package)` ack-claim + single Recv-consumer [`EventDemux`]
+//! (Д4) routes each inbound event to exactly one consumer (never the ambiguous
+//! shared stream that let a misrouted ack be silently dropped, audit C1), and a
+//! per-peer [`ControlPool`] reuses one idle-closed QUIC connection per peer
+//! instead of dialing per control message.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use iroh::endpoint::presets;
+use iroh::endpoint::{presets, Connection};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Watcher};
 use iroh_blobs::api::Store;
@@ -52,15 +55,20 @@ use crate::sharing::SharingTransport;
 
 use super::proto::{self, Msg, OfferEntry};
 use super::{
-    blobs, hex32, spawn_conn_path_diagnostics, ConnectGate, GatedBlobs, SharedConnectGate,
-    SyncControlProtocol, CONTROL_SEND_TIMEOUT, EVENT_CHANNEL_CAPACITY, GC_INTERVAL,
-    MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
+    blobs, hex32, spawn_conn_path_diagnostics, ConnectGate, Delivery, EventSink, GatedBlobs,
+    SharedConnectGate, SyncControlProtocol, CONTROL_SEND_TIMEOUT, EVENT_CHANNEL_CAPACITY,
+    GC_INTERVAL, MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
 };
 
 /// Upper bound on the graceful `endpoint.close()` at shutdown (I1). A clean
 /// close lets peers see a QUIC close instead of a reset and clears the relay
 /// registration promptly; if it stalls we log and move on rather than hang exit.
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Idle window before a pooled control connection is closed and evicted (Task 2).
+/// Long enough that a burst of announces/acks reuses one connection; short enough
+/// that a peer gone quiet doesn't hold an endpoint slot indefinitely.
+const CONTROL_POOL_IDLE: Duration = Duration::from_secs(60);
 
 /// Which multiplexed role a [`SharedIrohNode`] handle plays. The variant selects
 /// the blob-tag prefix (Д3) — `recv/pkg/…`, `out/pkg/…`, `collab/pkg/…` — so the
@@ -95,6 +103,257 @@ fn role_package_tag(prefix: &str, package_id: &PackageId) -> String {
     format!("{prefix}/pkg/{}", package_id.0)
 }
 
+/// Per-`(peer, package)` ack-claim + single Recv-consumer router (Task 2, Д4).
+///
+/// The shared node owns ONE inbound event stream (the control-protocol accept
+/// path). Before this, every role handle shared that stream, so an ack could be
+/// delivered to the wrong sender engine which silently dropped it (audit C1). The
+/// demux instead routes each decoded inbound event to exactly one consumer:
+///
+/// - `AnnounceReceived` / `Project*Received` → the single registered **Recv**
+///   consumer (`handle(Role::Recv).events()`).
+/// - `AckReceived { from, package_id }` → the **claimant** that registered
+///   `(from, package_id)` when it announced (an Out/Collab handle's own channel).
+///
+/// An event with no matching claim/consumer is an **orphan**: logged and dropped
+/// WITHOUT a delivery ack (so the sender retries), never misrouted. Claims are
+/// released on the routed ack, an announce failure, or the owning handle's drop.
+pub(crate) struct EventDemux {
+    inner: Mutex<DemuxInner>,
+}
+
+#[derive(Default)]
+struct DemuxInner {
+    /// The single registered Recv consumer: `(owning handle id, sender)`.
+    recv: Option<(u64, mpsc::Sender<TransportEvent>)>,
+    /// Ack claims: `(peer, package_id)` → `(owning handle id, that handle's sender)`.
+    claims: HashMap<(NodeId, PackageId), (u64, mpsc::Sender<TransportEvent>)>,
+}
+
+impl EventDemux {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(DemuxInner::default()),
+        })
+    }
+
+    /// Register (or replace) the single Recv consumer. Only one Recv handle runs
+    /// in practice; a later registration wins (last-consumer-wins).
+    fn register_recv(&self, handle_id: u64, tx: mpsc::Sender<TransportEvent>) {
+        self.inner.lock().expect("demux mutex poisoned").recv = Some((handle_id, tx));
+    }
+
+    /// Register an ack claim for `(peer, package_id)` pointing at the announcing
+    /// handle's own events channel.
+    fn register_claim(
+        &self,
+        handle_id: u64,
+        key: (NodeId, PackageId),
+        tx: mpsc::Sender<TransportEvent>,
+    ) {
+        self.inner
+            .lock()
+            .expect("demux mutex poisoned")
+            .claims
+            .insert(key, (handle_id, tx));
+    }
+
+    /// Release a single ack claim (announce-failure path; the delivery path
+    /// consumes its own claim inside [`deliver_inbound`](Self::deliver_inbound)).
+    fn release_claim(&self, key: &(NodeId, PackageId)) {
+        self.inner
+            .lock()
+            .expect("demux mutex poisoned")
+            .claims
+            .remove(key);
+    }
+
+    /// Drop every registration owned by a handle that is going away (its `Drop`),
+    /// so a claim/consumer can never outlive its handle and leak.
+    fn release_handle(&self, handle_id: u64) {
+        let mut inner = self.inner.lock().expect("demux mutex poisoned");
+        inner.claims.retain(|_, (owner, _)| *owner != handle_id);
+        if matches!(inner.recv, Some((id, _)) if id == handle_id) {
+            inner.recv = None;
+        }
+    }
+
+    /// Route one decoded inbound accept-path event to its consumer, returning how
+    /// the accept loop should proceed (see [`Delivery`]). Called from the shared
+    /// [`EventSink::Demux`] arm in the parent module.
+    pub(crate) async fn deliver_inbound(&self, event: TransportEvent) -> Delivery {
+        // Resolve the target sender under the lock (consuming an ack's claim, so a
+        // claim is released the moment its ack routes), then send without the lock.
+        let target = {
+            let mut inner = self.inner.lock().expect("demux mutex poisoned");
+            match &event {
+                TransportEvent::AckReceived { from, package_id, .. } => inner
+                    .claims
+                    .remove(&(*from, package_id.clone()))
+                    .map(|(_, tx)| tx),
+                TransportEvent::AnnounceReceived { .. }
+                | TransportEvent::ProjectAnnounceReceived { .. }
+                | TransportEvent::ProjectRequestReceived { .. } => {
+                    inner.recv.as_ref().map(|(_, tx)| tx.clone())
+                }
+                // Self-generated; never routed through the accept path.
+                TransportEvent::FetchProgress { .. } => None,
+            }
+        };
+        match target {
+            Some(tx) => match tx.send(event).await {
+                Ok(()) => Delivery::Delivered,
+                Err(_) => Delivery::ConsumerGone,
+            },
+            None => {
+                let (kind, peer) = event_kind_and_peer(&event);
+                tracing::warn!(kind, peer = %hex32(&peer), "inbound event with no consumer");
+                Delivery::Orphan
+            }
+        }
+    }
+
+    /// Best-effort delivery of a self-generated [`TransportEvent::FetchProgress`]
+    /// to the Recv consumer (UI data; never blocks, dropped if the channel is
+    /// full or no consumer is registered).
+    fn emit_fetch_progress(&self, event: TransportEvent) {
+        if let Some((_, tx)) = self
+            .inner
+            .lock()
+            .expect("demux mutex poisoned")
+            .recv
+            .as_ref()
+        {
+            let _ = tx.try_send(event);
+        }
+    }
+
+    /// Number of live ack claims (test introspection).
+    #[cfg(test)]
+    fn claim_count(&self) -> usize {
+        self.inner.lock().expect("demux mutex poisoned").claims.len()
+    }
+}
+
+/// The inbound-event variant an orphan warn names, plus the peer it came from.
+fn event_kind_and_peer(event: &TransportEvent) -> (&'static str, NodeId) {
+    match event {
+        TransportEvent::AnnounceReceived { from, .. } => ("announce", *from),
+        TransportEvent::AckReceived { from, .. } => ("ack", *from),
+        TransportEvent::ProjectAnnounceReceived { from, .. } => ("project_announce", *from),
+        TransportEvent::ProjectRequestReceived { from, .. } => ("project_request", *from),
+        TransportEvent::FetchProgress { .. } => ("fetch_progress", [0u8; 32]),
+    }
+}
+
+/// Per-peer pooled control connection (Task 2): one dialed QUIC connection per
+/// peer node id, reused across control messages, idle-closed after
+/// [`CONTROL_POOL_IDLE`]. Replaces the previous connect-per-message idiom so a
+/// burst of announces/acks rides one connection (and spawns the path-diagnostics
+/// watcher once, not per message). Any send error invalidates the entry so the
+/// next send re-dials.
+struct ControlPool {
+    endpoint: Endpoint,
+    entries: Mutex<HashMap<NodeId, PoolEntry>>,
+    /// Count of real dials (test introspection: pooled reuse keeps this flat).
+    dials: AtomicU64,
+}
+
+struct PoolEntry {
+    conn: Connection,
+    /// Updated on every reuse; the idle reaper closes the connection once it has
+    /// been untouched for [`CONTROL_POOL_IDLE`].
+    last_used: Arc<Mutex<Instant>>,
+}
+
+impl ControlPool {
+    fn new(endpoint: Endpoint) -> Arc<Self> {
+        Arc::new(Self {
+            endpoint,
+            entries: Mutex::new(HashMap::new()),
+            dials: AtomicU64::new(0),
+        })
+    }
+
+    /// A live pooled connection to `to`: reused if one is open, else freshly
+    /// dialed (spawning its path-diagnostics watcher + idle reaper once).
+    async fn get_or_connect(
+        self: &Arc<Self>,
+        to: NodeId,
+        target: EndpointAddr,
+    ) -> Result<Connection> {
+        {
+            let entries = self.entries.lock().expect("control_pool mutex poisoned");
+            if let Some(entry) = entries.get(&to) {
+                if entry.conn.close_reason().is_none() {
+                    *entry.last_used.lock().expect("last_used mutex poisoned") = Instant::now();
+                    return Ok(entry.conn.clone());
+                }
+            }
+        }
+        let conn = self
+            .endpoint
+            .connect(target, SYNC_ALPN)
+            .await
+            .context("connect sync control channel")?;
+        self.dials.fetch_add(1, Ordering::Relaxed);
+        // Once per pooled connection (not per message): the establishment line +
+        // the relay→direct path-upgrade watcher.
+        spawn_conn_path_diagnostics(&conn, "outgoing");
+        let last_used = Arc::new(Mutex::new(Instant::now()));
+        {
+            let mut entries = self.entries.lock().expect("control_pool mutex poisoned");
+            entries.insert(
+                to,
+                PoolEntry {
+                    conn: conn.clone(),
+                    last_used: Arc::clone(&last_used),
+                },
+            );
+        }
+        Arc::clone(self).spawn_idle_reaper(to, conn.clone(), last_used);
+        Ok(conn)
+    }
+
+    /// Drop the pooled entry for `to` after a send error — but only if it still
+    /// holds `conn` (never evict a newer re-dial), so the next send re-dials.
+    fn invalidate(&self, to: NodeId, conn: &Connection) {
+        let mut entries = self.entries.lock().expect("control_pool mutex poisoned");
+        if entries.get(&to).map(|e| e.conn.stable_id()) == Some(conn.stable_id()) {
+            entries.remove(&to);
+        }
+    }
+
+    /// Close + evict a pooled connection once it has been idle for
+    /// [`CONTROL_POOL_IDLE`]. One task per pooled connection; holds only a `Weak`
+    /// to the pool so it never keeps it alive, and exits after it fires.
+    fn spawn_idle_reaper(self: Arc<Self>, to: NodeId, conn: Connection, last_used: Arc<Mutex<Instant>>) {
+        let stable_id = conn.stable_id();
+        let weak = Arc::downgrade(&self);
+        drop(self);
+        tokio::spawn(async move {
+            loop {
+                let deadline =
+                    *last_used.lock().expect("last_used mutex poisoned") + CONTROL_POOL_IDLE;
+                let now = Instant::now();
+                if now < deadline {
+                    tokio::time::sleep(deadline - now).await;
+                    continue;
+                }
+                conn.close(0u32.into(), b"idle");
+                if let Some(pool) = weak.upgrade() {
+                    let mut entries = pool.entries.lock().expect("control_pool mutex poisoned");
+                    if entries.get(&to).map(|e| e.conn.stable_id()) == Some(stable_id) {
+                        entries.remove(&to);
+                    }
+                }
+                tracing::debug!(peer = %hex32(&to), "pooled control connection closed after idle");
+                break;
+            }
+        });
+    }
+}
+
 /// The one iroh endpoint/router/store for this process (see module docs).
 pub struct SharedIrohNode {
     /// Endpoint handle (clone of the router's); dials peers + downloads blobs.
@@ -120,11 +379,17 @@ pub struct SharedIrohNode {
     uses_relay: bool,
     /// The relay URLs the endpoint was built with (H1 reporting groundwork, T7).
     relay_urls: Vec<String>,
-    /// Sender half of the node's single event stream; cloned into the control
-    /// handler. (T2 replaces the single stream with a per-role demux.)
-    event_tx: mpsc::Sender<TransportEvent>,
-    /// Receiver half, handed out once by the first [`events`](SharingTransport::events) call.
-    event_rx: Mutex<Option<mpsc::Receiver<TransportEvent>>>,
+    /// Per-`(peer, package)` ack-claim + Recv-consumer router (Task 2, Д4). Owns
+    /// the fan-out of the node's single inbound event stream; cloned into the
+    /// control-protocol handler (as [`EventSink::Demux`]) and consulted by every
+    /// role handle's [`events`](SharingTransport::events) /
+    /// [`announce`](SharingTransport::announce).
+    demux: Arc<EventDemux>,
+    /// Per-peer pooled control connections (Task 2), reused across control sends.
+    control_pool: Arc<ControlPool>,
+    /// Monotonic id source for role handles, so the demux can attribute a claim /
+    /// the Recv consumer to a specific handle and release them all on its drop.
+    next_handle_id: AtomicU64,
     /// Connection-level authorization gate, cloned into both protocol handlers;
     /// the host installs the predicate via [`set_connect_gate`](Self::set_connect_gate).
     connect_gate: SharedConnectGate,
@@ -159,7 +424,7 @@ impl SharedIrohNode {
         let key = DeviceKey::load_or_create_in(sync_dir).context("load device key")?;
         let key_lock = DeviceKeyLock::acquire(&device_key_path(sync_dir))?;
 
-        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let demux = EventDemux::new();
         let secret_key = SecretKey::from_bytes(&key.secret_bytes());
         let uses_relay = !matches!(relay_mode, RelayMode::Disabled);
         // Snapshot what the ENDPOINT is being built with before the builder
@@ -223,9 +488,10 @@ impl SharedIrohNode {
         // T1 wires no dedup responder into the shared control protocol — the
         // receiver-role responder is installed by Task 3 when it migrates the
         // receiver. A `None` responder answers offers want-all, so nothing is
-        // ever silently withheld in the meantime.
+        // ever silently withheld in the meantime. Inbound events fan out through
+        // the demux (Task 2, Д4), not a single shared stream.
         let control = SyncControlProtocol {
-            event_tx: event_tx.clone(),
+            sink: EventSink::Demux(Arc::clone(&demux)),
             responder: None,
             gate: Arc::clone(&connect_gate),
         };
@@ -236,6 +502,7 @@ impl SharedIrohNode {
 
         let endpoint = router.endpoint().clone();
         let node_id: NodeId = *endpoint.id().as_bytes();
+        let control_pool = ControlPool::new(endpoint.clone());
         let relay_watcher = spawn_home_relay_watcher(endpoint.clone());
 
         tracing::debug!(node_id = %endpoint.id().fmt_short(), "shared iroh node bound");
@@ -249,8 +516,9 @@ impl SharedIrohNode {
             served: Mutex::new(HashMap::new()),
             uses_relay,
             relay_urls,
-            event_tx,
-            event_rx: Mutex::new(Some(event_rx)),
+            demux,
+            control_pool,
+            next_handle_id: AtomicU64::new(0),
             connect_gate,
             swept: Mutex::new(HashSet::new()),
             online_waited: AtomicBool::new(false),
@@ -263,6 +531,19 @@ impl SharedIrohNode {
     /// This endpoint's node id (== ed25519 public key bytes).
     pub fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    /// Live ack-claim count (test introspection for the demux).
+    #[cfg(test)]
+    pub(crate) fn active_claims(&self) -> usize {
+        self.demux.claim_count()
+    }
+
+    /// Number of real control-connection dials (test introspection: pooled reuse
+    /// keeps this flat across sends to the same peer).
+    #[cfg(test)]
+    pub(crate) fn control_pool_dials(&self) -> u64 {
+        self.control_pool.dials.load(Ordering::Relaxed)
     }
 
     /// This endpoint's current [`EndpointAddr`] (direct addrs + relay url) — the
@@ -288,9 +569,12 @@ impl SharedIrohNode {
     /// the crate (and tests) when the concrete type's helpers (e.g.
     /// [`RoleHandle::store`]) are needed.
     pub(crate) fn role_handle(self: &Arc<Self>, role: Role) -> Arc<RoleHandle> {
+        let id = self.next_handle_id.fetch_add(1, Ordering::Relaxed);
         Arc::new(RoleHandle {
             node: Arc::clone(self),
             role,
+            id,
+            events_tx: Mutex::new(None),
         })
     }
 
@@ -380,21 +664,17 @@ impl SharedIrohNode {
         Ok(EndpointAddr::new(id))
     }
 
-    /// Open a control connection to `to`, send one [`Msg`] on a bidi stream, and
-    /// wait for the peer's application-level delivery ack before closing. (The
-    /// ack-before-close is what makes the connection safe to tear down; T2 pools
-    /// this connection instead of re-dialing per message.)
+    /// Open a bidi stream on the peer's pooled control connection, send one
+    /// [`Msg`], and wait for the peer's application-level delivery ack. The
+    /// connection is NOT closed after the send — it stays pooled for reuse (Task
+    /// 2); the ack-before-return semantics are unchanged verbatim. Any error
+    /// invalidates the pooled entry so the next send re-dials.
     async fn send_control(&self, to: NodeId, msg: Msg) -> Result<()> {
         let target = self.dial_target(to)?;
         let bytes = msg.encode()?;
-        let endpoint = &self.endpoint;
+        let conn = self.control_pool.get_or_connect(to, target).await?;
 
         let send = async {
-            let conn = endpoint
-                .connect(target, SYNC_ALPN)
-                .await
-                .context("connect sync control channel")?;
-            spawn_conn_path_diagnostics(&conn, "outgoing");
             let (mut tx, mut rx) = conn.open_bi().await.context("open control stream")?;
             tx.write_all(&bytes).await.context("write control message")?;
             tx.finish().context("finish control stream")?;
@@ -402,14 +682,20 @@ impl SharedIrohNode {
             if ack.is_empty() {
                 anyhow::bail!("control message not acknowledged by peer");
             }
-            conn.close(0u32.into(), b"ok");
             anyhow::Ok(())
         };
 
-        tokio::time::timeout(CONTROL_SEND_TIMEOUT, send)
-            .await
-            .map_err(|_| anyhow!("sync control send to {} timed out", hex32(&to)))??;
-        Ok(())
+        match tokio::time::timeout(CONTROL_SEND_TIMEOUT, send).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                self.control_pool.invalidate(to, &conn);
+                Err(e)
+            }
+            Err(_) => {
+                self.control_pool.invalidate(to, &conn);
+                Err(anyhow!("sync control send to {} timed out", hex32(&to)))
+            }
+        }
     }
 
     /// Open a control connection to `to`, send one request [`Msg`], and read the
@@ -419,14 +705,9 @@ impl SharedIrohNode {
     async fn send_request(&self, to: NodeId, msg: Msg) -> Result<Msg> {
         let target = self.dial_target(to)?;
         let bytes = msg.encode()?;
-        let endpoint = &self.endpoint;
+        let conn = self.control_pool.get_or_connect(to, target).await?;
 
         let exchange = async {
-            let conn = endpoint
-                .connect(target, SYNC_ALPN)
-                .await
-                .context("connect sync control channel")?;
-            spawn_conn_path_diagnostics(&conn, "outgoing");
             let (mut tx, mut rx) = conn.open_bi().await.context("open control stream")?;
             tx.write_all(&bytes).await.context("write control request")?;
             tx.finish().context("finish control request")?;
@@ -438,13 +719,19 @@ impl SharedIrohNode {
                 anyhow::bail!("control request closed without a reply");
             }
             let reply = Msg::decode(&reply).context("decode control reply")?;
-            conn.close(0u32.into(), b"ok");
             anyhow::Ok(reply)
         };
 
         match tokio::time::timeout(CONTROL_SEND_TIMEOUT, exchange).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow!("sync control request to {} timed out", hex32(&to))),
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(e)) => {
+                self.control_pool.invalidate(to, &conn);
+                Err(e)
+            }
+            Err(_) => {
+                self.control_pool.invalidate(to, &conn);
+                Err(anyhow!("sync control request to {} timed out", hex32(&to)))
+            }
         }
     }
 
@@ -608,7 +895,7 @@ impl SharedIrohNode {
         )
         .await?;
 
-        let _ = self.event_tx.try_send(TransportEvent::FetchProgress {
+        self.demux.emit_fetch_progress(TransportEvent::FetchProgress {
             package_id: pkg.package_id.clone(),
             bytes_done: pkg.byte_size,
             bytes_total: pkg.byte_size,
@@ -724,17 +1011,6 @@ impl SharedIrohNode {
         tracing::debug!(to = %hex32(&to), package_id = %package_id.0, want = wanted.len(), "negotiate_want resolved");
         Ok(wanted)
     }
-
-    fn take_events(&self) -> mpsc::Receiver<TransportEvent> {
-        let mut guard = self.event_rx.lock().expect("event_rx mutex poisoned");
-        match guard.take() {
-            Some(rx) => rx,
-            None => {
-                let (_tx, rx) = mpsc::channel(1);
-                rx
-            }
-        }
-    }
 }
 
 /// A per-[`Role`] view onto a [`SharedIrohNode`], implementing
@@ -744,6 +1020,12 @@ impl SharedIrohNode {
 pub struct RoleHandle {
     node: Arc<SharedIrohNode>,
     role: Role,
+    /// Unique id so the demux can attribute this handle's ack claims + Recv
+    /// consumer registration and release them all when the handle drops.
+    id: u64,
+    /// This handle's own events channel sender, set on the first
+    /// [`events`](SharingTransport::events) call; an ack claim points at it.
+    events_tx: Mutex<Option<mpsc::Sender<TransportEvent>>>,
 }
 
 impl RoleHandle {
@@ -752,6 +1034,34 @@ impl RoleHandle {
     #[allow(dead_code)] // consumed by the shared-store test below
     pub(crate) fn store(&self) -> &Store {
         self.node.store()
+    }
+
+    /// Register an ack claim for `(to, package_id)` pointing at this handle's
+    /// events channel, so the eventual [`AckReceived`](TransportEvent::AckReceived)
+    /// routes back here (Task 2). A no-op-with-warn if
+    /// [`events`](SharingTransport::events) has not been taken yet (the ack would
+    /// then have no claimant) — the engine always takes it first.
+    fn claim_ack(&self, to: NodeId, package_id: &PackageId) {
+        let tx = self.events_tx.lock().expect("events_tx mutex poisoned").clone();
+        match tx {
+            Some(tx) => self
+                .node
+                .demux
+                .register_claim(self.id, (to, package_id.clone()), tx),
+            None => tracing::warn!(
+                package_id = %package_id.0,
+                to = %hex32(&to),
+                "announce before events() taken; ack will have no claimant"
+            ),
+        }
+    }
+}
+
+impl Drop for RoleHandle {
+    fn drop(&mut self) {
+        // Release every claim + the Recv registration this handle owned, so
+        // nothing routes to a dropped handle's dead channel (claims can't leak).
+        self.node.demux.release_handle(self.id);
     }
 }
 
@@ -762,7 +1072,14 @@ impl SharingTransport for RoleHandle {
     }
 
     async fn announce(&self, to: NodeId, a: &PackageAnnounce) -> Result<()> {
-        self.node.role_announce(self.role, to, a).await
+        // Claim the eventual ack for THIS handle before announcing; release the
+        // claim if the announce itself fails (claims can't leak on the error path).
+        self.claim_ack(to, &a.package_id);
+        let res = self.node.role_announce(self.role, to, a).await;
+        if res.is_err() {
+            self.node.demux.release_claim(&(to, a.package_id.clone()));
+        }
+        res
     }
 
     async fn fetch(
@@ -811,9 +1128,16 @@ impl SharingTransport for RoleHandle {
         package_id: &str,
         announce: &PackageAnnounce,
     ) -> Result<()> {
-        self.node
+        // The wire announce's package_id is the ack-correlation id — claim on it.
+        self.claim_ack(to, &announce.package_id);
+        let res = self
+            .node
             .role_announce_project(self.role, to, project_id, package_id, announce)
-            .await
+            .await;
+        if res.is_err() {
+            self.node.demux.release_claim(&(to, announce.package_id.clone()));
+        }
+        res
     }
 
     async fn request_project(
@@ -830,11 +1154,16 @@ impl SharingTransport for RoleHandle {
     }
 
     async fn events(&self) -> mpsc::Receiver<TransportEvent> {
-        // T2 demux: for now every role handle shares the node's single event
-        // stream (single-consumer, taken once). Task 2 replaces this with a
-        // per-(peer, package id) ack-claim registry + one registered receiver
-        // consumer for inbound announces.
-        self.node.take_events()
+        // Task 2 demux: each handle gets its OWN channel. The Recv handle
+        // registers as the single inbound consumer (announces/requests); an
+        // Out/Collab handle stores its sender so its announces can claim the
+        // matching ack. The engine takes this exactly once per handle.
+        let (tx, rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        *self.events_tx.lock().expect("events_tx mutex poisoned") = Some(tx.clone());
+        if self.role == Role::Recv {
+            self.node.demux.register_recv(self.id, tx);
+        }
+        rx
     }
 
     async fn shutdown(&self) {
@@ -1052,5 +1381,362 @@ mod tests {
         );
 
         node.shutdown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 2: event demux ((peer, package) ack claims) + pooled control conn.
+    // Every test runs two/three real SharedIrohNodes in-process with the relay
+    // disabled, paired over localhost direct addresses — CI-safe, no network.
+    // -----------------------------------------------------------------------
+
+    use crate::sharing::types::ReceiptOutcome;
+    use std::time::Duration;
+    use tokio::sync::mpsc::Receiver;
+
+    /// A minimal announce carrying just the ack-correlation `package_id` (the
+    /// demux tests never fetch, so the placeholder root_hash is fine).
+    fn mk_announce(id: &str) -> PackageAnnounce {
+        PackageAnnounce {
+            package_id: PackageId(id.to_string()),
+            root_hash: "placeholder".to_string(),
+            byte_size: 0,
+            frame_count: 0,
+        }
+    }
+
+    fn mk_receipts() -> Vec<FrameReceipt> {
+        vec![FrameReceipt {
+            frame_uuid: "u".to_string(),
+            xxh3: "h".to_string(),
+            outcome: ReceiptOutcome::Ingested,
+        }]
+    }
+
+    async fn recv_next(rx: &mut Receiver<TransportEvent>) -> TransportEvent {
+        tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("event channel stalled")
+            .expect("event channel closed unexpectedly")
+    }
+
+    async fn wait_until<F: FnMut() -> bool>(mut pred: F, timeout: Duration) {
+        let start = std::time::Instant::now();
+        loop {
+            if pred() {
+                return;
+            }
+            if start.elapsed() >= timeout {
+                panic!("wait_until timed out after {timeout:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_until_claims(node: &Arc<SharedIrohNode>, want: usize) {
+        wait_until(|| node.active_claims() == want, Duration::from_secs(5)).await;
+    }
+
+    async fn bind_disabled(dir: &Path) -> Arc<SharedIrohNode> {
+        SharedIrohNode::bind(dir, RelayMode::Disabled)
+            .await
+            .expect("bind relay-disabled node")
+    }
+
+    /// Mutually register two paired nodes' addresses (each learns the other's).
+    fn pair(a: &Arc<SharedIrohNode>, a_info: &StartInfo, b: &Arc<SharedIrohNode>, b_info: &StartInfo) {
+        a.add_peer_ticket(&b_info.pairing_ticket).expect("a pairs b");
+        b.add_peer_ticket(&a_info.pairing_ticket).expect("b pairs a");
+    }
+
+    // (a) Two Out handles announce to DIFFERENT peers concurrently; each ack
+    //     routes to its own announcing handle — no cross-talk.
+    #[tokio::test]
+    async fn concurrent_acks_route_to_the_right_out_handle() {
+        let ds = tempdir().unwrap();
+        let d1 = tempdir().unwrap();
+        let d2 = tempdir().unwrap();
+        let s = bind_disabled(ds.path()).await;
+        let r1 = bind_disabled(d1.path()).await;
+        let r2 = bind_disabled(d2.path()).await;
+
+        let out_a = s.handle(Role::Out);
+        let out_b = s.handle(Role::Out);
+        let recv1 = r1.handle(Role::Recv);
+        let recv2 = r2.handle(Role::Recv);
+
+        let s_info = out_a.start().await.unwrap();
+        let r1_info = recv1.start().await.unwrap();
+        let r2_info = recv2.start().await.unwrap();
+        pair(&s, &s_info, &r1, &r1_info);
+        pair(&s, &s_info, &r2, &r2_info);
+
+        let mut ack_a = out_a.events().await;
+        let mut ack_b = out_b.events().await;
+        let mut r1_ev = recv1.events().await;
+        let mut r2_ev = recv2.events().await;
+
+        let p1 = mk_announce("pkg-a");
+        let p2 = mk_announce("pkg-b");
+
+        // Announce to the two distinct peers (delivery completes when each
+        // receiver's Recv consumer receives the announce).
+        out_a.announce(r1_info.node_id, &p1).await.unwrap();
+        out_b.announce(r2_info.node_id, &p2).await.unwrap();
+
+        // Each receiver observes its own announce, then acks back to the sender.
+        let pid1 = match recv_next(&mut r1_ev).await {
+            TransportEvent::AnnounceReceived { from, announce } => {
+                assert_eq!(from, s_info.node_id);
+                announce.package_id
+            }
+            other => panic!("expected AnnounceReceived on r1, got {other:?}"),
+        };
+        let pid2 = match recv_next(&mut r2_ev).await {
+            TransportEvent::AnnounceReceived { announce, .. } => announce.package_id,
+            other => panic!("expected AnnounceReceived on r2, got {other:?}"),
+        };
+        recv1.ack(s_info.node_id, &pid1, mk_receipts()).await.unwrap();
+        recv2.ack(s_info.node_id, &pid2, mk_receipts()).await.unwrap();
+
+        // The acks route to the correct Out handle — no cross-delivery.
+        match recv_next(&mut ack_a).await {
+            TransportEvent::AckReceived { from, package_id, .. } => {
+                assert_eq!(from, r1_info.node_id, "out_a's ack must come from r1");
+                assert_eq!(package_id, p1.package_id);
+            }
+            other => panic!("expected AckReceived on out_a, got {other:?}"),
+        }
+        match recv_next(&mut ack_b).await {
+            TransportEvent::AckReceived { from, package_id, .. } => {
+                assert_eq!(from, r2_info.node_id, "out_b's ack must come from r2");
+                assert_eq!(package_id, p2.package_id);
+            }
+            other => panic!("expected AckReceived on out_b, got {other:?}"),
+        }
+        assert!(ack_a.try_recv().is_err(), "out_a must not receive out_b's ack");
+        assert!(ack_b.try_recv().is_err(), "out_b must not receive out_a's ack");
+        // Both claims consumed on their acks.
+        wait_until_claims(&s, 0).await;
+
+        s.shutdown().await;
+        r1.shutdown().await;
+        r2.shutdown().await;
+    }
+
+    // (b) The SAME package id announced to two peers (Perseus multi-dest shape):
+    //     the two `(peer, package)` claims are distinct, and each ack completes
+    //     ONLY its own claim.
+    #[tokio::test]
+    async fn same_package_id_two_peers_each_ack_completes_only_its_claim() {
+        let ds = tempdir().unwrap();
+        let d1 = tempdir().unwrap();
+        let d2 = tempdir().unwrap();
+        let s = bind_disabled(ds.path()).await;
+        let r1 = bind_disabled(d1.path()).await;
+        let r2 = bind_disabled(d2.path()).await;
+
+        let out = s.handle(Role::Out); // one sender, two destinations
+        let recv1 = r1.handle(Role::Recv);
+        let recv2 = r2.handle(Role::Recv);
+
+        let s_info = out.start().await.unwrap();
+        let r1_info = recv1.start().await.unwrap();
+        let r2_info = recv2.start().await.unwrap();
+        pair(&s, &s_info, &r1, &r1_info);
+        pair(&s, &s_info, &r2, &r2_info);
+
+        let mut acks = out.events().await;
+        let mut r1_ev = recv1.events().await;
+        let mut r2_ev = recv2.events().await;
+
+        // ONE package id, announced to two peers.
+        let pkg = mk_announce("shared-pkg");
+        out.announce(r1_info.node_id, &pkg).await.unwrap();
+        out.announce(r2_info.node_id, &pkg).await.unwrap();
+        assert_eq!(s.active_claims(), 2, "two distinct (peer, package) claims");
+
+        let pid1 = match recv_next(&mut r1_ev).await {
+            TransportEvent::AnnounceReceived { announce, .. } => announce.package_id,
+            other => panic!("expected AnnounceReceived on r1, got {other:?}"),
+        };
+        let pid2 = match recv_next(&mut r2_ev).await {
+            TransportEvent::AnnounceReceived { announce, .. } => announce.package_id,
+            other => panic!("expected AnnounceReceived on r2, got {other:?}"),
+        };
+
+        // r1 acks: only the (r1, pkg) claim is consumed.
+        recv1.ack(s_info.node_id, &pid1, mk_receipts()).await.unwrap();
+        match recv_next(&mut acks).await {
+            TransportEvent::AckReceived { from, .. } => assert_eq!(from, r1_info.node_id),
+            other => panic!("expected r1 ack, got {other:?}"),
+        }
+        wait_until_claims(&s, 1).await;
+
+        // r2 acks: the (r2, pkg) claim is consumed too.
+        recv2.ack(s_info.node_id, &pid2, mk_receipts()).await.unwrap();
+        match recv_next(&mut acks).await {
+            TransportEvent::AckReceived { from, .. } => assert_eq!(from, r2_info.node_id),
+            other => panic!("expected r2 ack, got {other:?}"),
+        }
+        wait_until_claims(&s, 0).await;
+
+        s.shutdown().await;
+        r1.shutdown().await;
+        r2.shutdown().await;
+    }
+
+    // (c) An announce arriving with NO Recv consumer registered is an orphan:
+    //     the receiver logs the orphan warn and withholds the delivery ack, so
+    //     the sender never gets a silent success (it errors/times out → retry).
+    #[tokio::test]
+    async fn orphan_announce_warns_and_withholds_delivery_ack() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let captured: Arc<std::sync::Mutex<Vec<CapturedEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing_subscriber::registry()
+            .with(CaptureLayer {
+                events: captured.clone(),
+            })
+            .set_default();
+
+        let ds = tempdir().unwrap();
+        let dr = tempdir().unwrap();
+        let s = bind_disabled(ds.path()).await;
+        let r = bind_disabled(dr.path()).await;
+
+        let out = s.handle(Role::Out);
+        // A Recv handle exists but NEVER takes events() → no Recv consumer.
+        let recv = r.handle(Role::Recv);
+
+        let s_info = out.start().await.unwrap();
+        let r_info = recv.start().await.unwrap();
+        pair(&s, &s_info, &r, &r_info);
+
+        // Take the Out handle's events so its ack claim is registered — the
+        // orphan under test is the RECEIVER-side announce with no Recv consumer.
+        let _ack = out.events().await;
+
+        let pkg = mk_announce("orphan-pkg");
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(5), out.announce(r_info.node_id, &pkg)).await;
+        assert!(
+            !matches!(outcome, Ok(Ok(()))),
+            "an orphan announce must not receive a silent delivery ack, got {outcome:?}"
+        );
+
+        // The receiver logged the orphan warn naming the event kind.
+        wait_until(
+            || {
+                captured.lock().unwrap().iter().any(|e| {
+                    e.message == "inbound event with no consumer"
+                        && e.fields.get("kind").map(String::as_str) == Some("announce")
+                })
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        drop(_guard);
+        s.shutdown().await;
+        r.shutdown().await;
+    }
+
+    // (d) Two sequential control sends to one peer reuse a single pooled
+    //     connection (only one real dial).
+    #[tokio::test]
+    async fn sequential_control_sends_reuse_one_pooled_connection() {
+        let ds = tempdir().unwrap();
+        let dr = tempdir().unwrap();
+        let s = bind_disabled(ds.path()).await;
+        let r = bind_disabled(dr.path()).await;
+
+        let out = s.handle(Role::Out);
+        let recv = r.handle(Role::Recv);
+
+        let s_info = out.start().await.unwrap();
+        let r_info = recv.start().await.unwrap();
+        pair(&s, &s_info, &r, &r_info);
+
+        let _ack = out.events().await;
+        let mut r_ev = recv.events().await; // Recv consumer → announces deliver + ack
+        let pkg = mk_announce("pool-pkg");
+
+        out.announce(r_info.node_id, &pkg).await.unwrap();
+        out.announce(r_info.node_id, &pkg).await.unwrap();
+
+        // Both delivered to the receiver's single Recv consumer.
+        let _ = recv_next(&mut r_ev).await;
+        let _ = recv_next(&mut r_ev).await;
+
+        assert_eq!(
+            s.control_pool_dials(),
+            1,
+            "two sequential control sends to one peer must reuse a single pooled connection"
+        );
+
+        s.shutdown().await;
+        r.shutdown().await;
+    }
+
+    // A minimal thread-local tracing capture (mirrors the iroh tests.rs layer),
+    // scoped to `athenaeum_core::sharing` so the orphan warn can be asserted
+    // without touching the global JSONL subscriber.
+    #[derive(Clone, Default)]
+    struct CapturedEvent {
+        message: String,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FieldCollector {
+        message: String,
+        fields: std::collections::HashMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldCollector {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            if field.name() == "message" {
+                self.message = rendered;
+            } else {
+                self.fields.insert(field.name().to_string(), rendered);
+            }
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields.insert(field.name().to_string(), value.to_string());
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct CaptureLayer {
+        events: Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::INFO)
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if !event.metadata().target().starts_with("athenaeum_core::sharing") {
+                return;
+            }
+            let mut collector = FieldCollector::default();
+            event.record(&mut collector);
+            self.events.lock().unwrap().push(CapturedEvent {
+                message: collector.message,
+                fields: collector.fields,
+            });
+        }
     }
 }

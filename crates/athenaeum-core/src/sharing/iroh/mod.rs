@@ -269,7 +269,7 @@ impl IrohTransport {
             gate: Arc::clone(&connect_gate),
         };
         let control = SyncControlProtocol {
-            event_tx: event_tx.clone(),
+            sink: EventSink::Direct(event_tx.clone()),
             responder,
             gate: Arc::clone(&connect_gate),
         };
@@ -339,13 +339,15 @@ impl IrohTransport {
     }
 
     /// Gracefully tear down the endpoint + router (tests). Consumes `self`.
+    ///
+    /// `router.shutdown()` already drives `GatedBlobs::shutdown` →
+    /// `BlobsProtocol::shutdown` → `store.shutdown()` (flushing the persistent
+    /// store and releasing its redb lock so a re-open over the same dir
+    /// succeeds), so there is no separate `self.store.shutdown()` here — a second
+    /// one would be a redundant shutdown of the same underlying store.
     pub async fn shutdown(self) {
         if let Err(e) = self.router.shutdown().await {
             tracing::debug!(error = %e, "iroh router shutdown");
-        }
-        // Flush a persistent store to disk; a no-op for the memory store.
-        if let Err(e) = self.store.shutdown().await {
-            tracing::debug!(error = %e, "iroh blob store shutdown");
         }
     }
 
@@ -742,6 +744,50 @@ impl SharingTransport for IrohTransport {
     }
 }
 
+/// Where a control-accept handler routes a decoded inbound [`TransportEvent`],
+/// and how the accept loop should react (whether to send the transport-level
+/// delivery ack). Two shapes coexist while [`IrohTransport`] and the
+/// [`SharedIrohNode`](node::SharedIrohNode) both live (Task 3 removes the former):
+///
+/// - [`Direct`](EventSink::Direct): the legacy single-stream transport — one
+///   channel, ack on a successful send, stop on a gone consumer.
+/// - [`Demux`](EventSink::Demux): the shared node's per-`(peer, package)`
+///   ack-claim + single Recv-consumer router (Д4), which additionally
+///   distinguishes an *orphan* (no claim/consumer) so the accept loop withholds
+///   the delivery ack and the sender retries instead of losing the message.
+#[derive(Clone)]
+pub(crate) enum EventSink {
+    Direct(mpsc::Sender<TransportEvent>),
+    Demux(Arc<node::EventDemux>),
+}
+
+/// The outcome of routing one inbound control event through an [`EventSink`],
+/// telling [`SyncControlProtocol::accept`] whether to send the delivery ack.
+pub(crate) enum Delivery {
+    /// A consumer received the event — send the transport-level delivery ack.
+    Delivered,
+    /// No claim/consumer for this event — drop it and withhold the ack so the
+    /// sender retries (the demux logs the orphan).
+    Orphan,
+    /// The routed consumer's receiver is gone — withhold the ack and stop
+    /// accepting on this connection (legacy single-stream semantics).
+    ConsumerGone,
+}
+
+impl EventSink {
+    /// Route one decoded inbound event to its consumer, returning how the accept
+    /// loop should proceed.
+    async fn deliver(&self, event: TransportEvent) -> Delivery {
+        match self {
+            EventSink::Direct(tx) => match tx.send(event).await {
+                Ok(()) => Delivery::Delivered,
+                Err(_) => Delivery::ConsumerGone,
+            },
+            EventSink::Demux(demux) => demux.deliver_inbound(event).await,
+        }
+    }
+}
+
 /// The `athenaeum/sync/1` protocol handler: reads postcard [`Msg`]s off inbound
 /// bidirectional streams and either republishes them as in-process
 /// [`TransportEvent`]s (`Announce`/`Ack`, acked with a byte so the sender can
@@ -749,7 +795,9 @@ impl SharingTransport for IrohTransport {
 /// (`Offer`/`FullHashes`, replied to with a real [`Msg::Want`]).
 #[derive(Clone)]
 struct SyncControlProtocol {
-    event_tx: mpsc::Sender<TransportEvent>,
+    /// Where decoded inbound `Announce`/`Ack`/`Project*` events are routed
+    /// (legacy single stream, or the shared node's demux — see [`EventSink`]).
+    sink: EventSink,
     /// Answers the dedup handshake. `None` on a send-only endpoint or a peer
     /// with no catalog wired — in which case offers are answered want-all.
     responder: Option<Arc<dyn DedupResponder>>,
@@ -925,14 +973,25 @@ impl ProtocolHandler for SyncControlProtocol {
                     continue;
                 }
             };
-            // Deliver in-process, then ack. A closed consumer means the engine is
-            // gone — stop accepting and leave the ack unsent so the sender retries.
-            if self.event_tx.send(event).await.is_err() {
-                tracing::debug!(from = %hex32(&from), "control event consumer gone; closing");
-                break;
+            // Deliver in-process, then ack IFF a consumer received it. The
+            // shared node's demux routes by `(peer, package)` ack-claim / Recv
+            // consumer; an orphan (no claim/consumer) is dropped WITHOUT the
+            // transport-level delivery ack so the sender retries instead of
+            // losing the message silently (audit C1 / Task 2).
+            match self.sink.deliver(event).await {
+                Delivery::Delivered => {
+                    let _ = tx.write_all(b"1").await;
+                    let _ = tx.finish();
+                }
+                Delivery::Orphan => {
+                    // No delivery ack (the demux already warned): leave the
+                    // sender's read unanswered so it errors/times out and retries.
+                }
+                Delivery::ConsumerGone => {
+                    tracing::debug!(from = %hex32(&from), "control event consumer gone; closing");
+                    break;
+                }
             }
-            let _ = tx.write_all(b"1").await;
-            let _ = tx.finish();
         }
         Ok(())
     }
