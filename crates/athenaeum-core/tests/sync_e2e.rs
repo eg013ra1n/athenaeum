@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use athenaeum_core::api::retention::{evaluate, AppRetentionConfig};
-use athenaeum_core::api::sync::enqueue_sync_selection;
+use athenaeum_core::api::sync::{enqueue_sync_selection, ResolvedDest};
 use athenaeum_core::db::{insert_file, insert_frame, Database};
 use athenaeum_core::events::{NullEmitter, ProgressEmitter};
 use athenaeum_core::fits_writer::keywords::{FrameKind, HeaderBuilder};
@@ -296,7 +296,7 @@ async fn two_instance_sync_e2e() {
     assert!(keeper_path.exists(), "keeper file written");
 
     // ── (1) First enqueue → primary ingests ALL 50 with metadata ─────────────
-    let r1 = enqueue_sync_selection(&capture_ctx, &sender, receiver_node, frame_ids.clone(), None)
+    let r1 = enqueue_sync_selection(&capture_ctx, &sender, ResolvedDest { node: receiver_node, endpoint_addr: None }, frame_ids.clone(), None)
         .await
         .expect("first enqueue");
     assert_eq!(r1.enqueued_count, N as u32);
@@ -351,7 +351,7 @@ async fn two_instance_sync_e2e() {
     assert_eq!(landed.len(), N, "all frames land under the designated sync_incoming root");
 
     // ── (2) Re-run the identical enqueue → dedupe-safe ───────────────────────
-    let r2 = enqueue_sync_selection(&capture_ctx, &sender, receiver_node, frame_ids.clone(), None)
+    let r2 = enqueue_sync_selection(&capture_ctx, &sender, ResolvedDest { node: receiver_node, endpoint_addr: None }, frame_ids.clone(), None)
         .await
         .expect("second enqueue");
     assert_eq!(r2.enqueued_count, N as u32, "the same 50 frames re-enqueue");
@@ -573,7 +573,7 @@ async fn resend_transfers_only_new_frames() {
 
     // ── (1) First batch: 3 frames → B ingests all 3, all reported new ──────────
     let batch1: Vec<i64> = frame_ids[0..3].to_vec();
-    let r1 = enqueue_sync_selection(&capture_ctx, &sender, receiver_node, batch1, None)
+    let r1 = enqueue_sync_selection(&capture_ctx, &sender, ResolvedDest { node: receiver_node, endpoint_addr: None }, batch1, None)
         .await
         .expect("first enqueue");
     assert_eq!(r1.enqueued_count, 3, "the first 3 frames enqueue");
@@ -598,7 +598,7 @@ async fn resend_transfers_only_new_frames() {
     // Only the 1 new frame is transferred; the 3 B already holds are dropped by
     // the negotiate handshake before any announce/serve of them.
     let batch2: Vec<i64> = frame_ids[0..4].to_vec();
-    let r2 = enqueue_sync_selection(&capture_ctx, &sender, receiver_node, batch2, None)
+    let r2 = enqueue_sync_selection(&capture_ctx, &sender, ResolvedDest { node: receiver_node, endpoint_addr: None }, batch2, None)
         .await
         .expect("second enqueue");
     assert_eq!(r2.enqueued_count, 4, "all 4 frames re-enqueue at the app layer");
@@ -624,7 +624,7 @@ async fn resend_transfers_only_new_frames() {
     // want and the package terminalizes confirmed WITHOUT announcing or serving —
     // B never even sees an announce, and its catalog is untouched.
     let batch3: Vec<i64> = frame_ids[0..4].to_vec();
-    enqueue_sync_selection(&capture_ctx, &sender, receiver_node, batch3, None)
+    enqueue_sync_selection(&capture_ctx, &sender, ResolvedDest { node: receiver_node, endpoint_addr: None }, batch3, None)
         .await
         .expect("third enqueue");
 

@@ -240,6 +240,36 @@ impl HubClient {
         }
     }
 
+    /// `PUT /devices/self/address` — report this device's dialable endpoint
+    /// address (finding H1, iroh hardening T7). Body `{homeRelayUrl, directAddrs}`
+    /// (camelCase; the hub stamps `reportedAt`). A `200`/`204` is success; `401`
+    /// maps to [`AccountClientError::Unauthorized`] like every other authed call.
+    /// `home_relay_url` is `None` when the device has no home relay yet; the hub
+    /// serializes that as JSON `null`.
+    pub async fn put_device_address(
+        &self,
+        token: &str,
+        home_relay_url: Option<&str>,
+        direct_addrs: &[String],
+    ) -> Result<(), AccountClientError> {
+        let resp = self
+            .http
+            .put(self.url("/devices/self/address"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({
+                "homeRelayUrl": home_relay_url,
+                "directAddrs": direct_addrs,
+            }))
+            .send()
+            .await
+            .map_err(net)?;
+        match resp.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::UNAUTHORIZED => Err(AccountClientError::Unauthorized),
+            s => Err(unexpected(s, resp).await),
+        }
+    }
+
     /// `GET /relay-map` — the hub's advertised relay URLs.
     pub async fn relay_map(&self, token: &str) -> Result<Vec<String>, AccountClientError> {
         let resp = self
@@ -469,6 +499,56 @@ mod tests {
         assert!(debug.contains("dev-1"), "device_id should still be visible: {debug}");
     }
 
+    /// T7: `PUT /devices/self/address` reports this device's endpoint address —
+    /// the exact `{homeRelayUrl, directAddrs}` body the hub expects — and a 204
+    /// (or 200) is success. A `null` `homeRelayUrl` (no home relay yet) is valid.
+    #[tokio::test]
+    async fn put_device_address_reports_relay_and_direct_addrs() {
+        use wiremock::matchers::body_partial_json;
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/devices/self/address"))
+            .and(body_partial_json(serde_json::json!({
+                "homeRelayUrl": "https://relay1.example.org/",
+                "directAddrs": ["192.168.1.5:1234"],
+            })))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = HubClient::new(server.uri()).unwrap();
+        client
+            .put_device_address(
+                "tok",
+                Some("https://relay1.example.org/"),
+                &["192.168.1.5:1234".to_string()],
+            )
+            .await
+            .expect("address report succeeds on 204");
+        // MockServer verifies `.expect(1)` (and the body matcher) on drop.
+    }
+
+    /// A 401 on the address report maps to `Unauthorized` (→ SignedOut at the api
+    /// boundary), like every other authed call — never the generic `Network`.
+    #[tokio::test]
+    async fn put_device_address_401_maps_to_unauthorized() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v1/devices/self/address"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = HubClient::new(server.uri()).unwrap();
+        let err = client.put_device_address("stale", None, &[]).await.unwrap_err();
+        assert!(
+            matches!(err, AccountClientError::Unauthorized),
+            "401 on address report must map to Unauthorized, got {err:?}"
+        );
+    }
+
     /// `GET /devices` decodes the mesh `capability` field, and a payload missing
     /// it (older hub) defaults to `athenaeum` (see `AccountDevice::capability`'s
     /// `#[serde(default)]`).
@@ -481,7 +561,12 @@ mod tests {
                 {
                     "id": "dev-1", "name": "Studio Mac", "pubkey": "cHVia2V5",
                     "capability": "athenaeum",
-                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": "2026-07-06T00:00:00Z"
+                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": "2026-07-06T00:00:00Z",
+                    "endpointAddr": {
+                        "homeRelayUrl": "https://relay1.example.org/",
+                        "directAddrs": ["192.168.1.5:1234"],
+                        "reportedAt": "2026-07-14T00:00:00Z"
+                    }
                 },
                 {
                     "id": "dev-2", "name": "Mini PC", "pubkey": "cHVia2V5Mg",
@@ -503,5 +588,12 @@ mod tests {
         assert_eq!(devices[1].capability, DeviceCapability::Perseus);
         assert_eq!(devices[2].capability, DeviceCapability::Athenaeum); // missing → default
         assert_eq!(devices[2].last_seen_at, None);
+        // T7: the first device carries a self-reported endpoint address; the
+        // others (no `endpointAddr` key) default to `None` — old-hub compat.
+        let rep = devices[0].endpoint_addr.as_ref().expect("dev-1 reported an address");
+        assert_eq!(rep.home_relay_url.as_deref(), Some("https://relay1.example.org/"));
+        assert_eq!(rep.direct_addrs, vec!["192.168.1.5:1234".to_string()]);
+        assert_eq!(devices[1].endpoint_addr, None, "a device that never reported → None");
+        assert_eq!(devices[2].endpoint_addr, None);
     }
 }

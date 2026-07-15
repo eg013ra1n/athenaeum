@@ -796,6 +796,22 @@ ineligible: Array<IneligibleFrame>, };
 
 export type DeviceCapability = "athenaeum" | "perseus";
 
+export type EndpointAddrReport = { 
+/**
+ * The device's home relay url (`None` when it has no home relay yet).
+ */
+homeRelayUrl: string | null, 
+/**
+ * The device's direct (IP) socket addresses, as strings — used only for a
+ * SAME-ACCOUNT dial (never handed to a cross-account collaborator; S1).
+ */
+directAddrs: Array<string>, 
+/**
+ * When the hub last stamped this report (RFC3339). Diagnostics only; the
+ * hub owns it, so the app treats it as read-only and optional.
+ */
+reportedAt: string | null, };
+
 export type AccountDevice = { id: string, name: string, 
 /**
  * Base64 of the device's 32-byte ed25519 public key (== its node id).
@@ -805,7 +821,14 @@ pubkey: string,
  * What this device is in the mesh (full peer vs send-only agent). Absent on
  * older hub payloads → defaults to [`DeviceCapability::Athenaeum`].
  */
-capability: DeviceCapability, createdAt: string, lastSeenAt: string | null, };
+capability: DeviceCapability, createdAt: string, lastSeenAt: string | null, 
+/**
+ * This device's self-reported dialable endpoint address (finding H1, T7).
+ * Absent on older hub payloads (or a device that never reported) → `None`,
+ * in which case every dial path falls back to the our-relay-map hint exactly
+ * as it did before this field existed.
+ */
+endpointAddr: EndpointAddrReport | null, };
 
 export type AccountStatus = { 
 /**

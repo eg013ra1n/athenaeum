@@ -473,6 +473,18 @@ impl Agent {
             .context("bind shared iroh node")?;
         let node_id = node.node_id();
 
+        // Report THIS agent's dialable endpoint address to the hub (finding H1,
+        // T7): a fire-and-forget task that polls the node's address and PUTs it on
+        // change. Only when signed in (a dev-ticket run has no hub); never blocks
+        // the bind — spawned and detached, self-terminating on node drop.
+        if let Some((hub_url, token)) = crate::account::hub_credentials(&config) {
+            athenaeum_core::sync::pairing::spawn_endpoint_address_reporter(
+                Arc::clone(&node),
+                hub_url,
+                token,
+            );
+        }
+
         // One `Role::Out` handle + engine per resolved target (engines stay
         // one-per-peer; the Task 2 demux disambiguates each target's acks by
         // `(peer, package)`). Register each peer at the NODE level:
@@ -488,9 +500,15 @@ impl Agent {
                 node.add_peer_ticket(ticket)
                     .context("register peer address from pairing ticket")?;
             } else {
-                let peer_addr = athenaeum_core::sync::pairing::peer_addr_with_relays(
+                // Account path: prefer the target's OWN hub-reported address (its
+                // real home relay + direct addrs — same account, so direct is
+                // allowed) via `peer_dial_addr`, falling back to the shared relay
+                // set when the target never reported (T7 / finding H1).
+                let peer_addr = athenaeum_core::sync::pairing::peer_dial_addr(
                     target.peer,
+                    target.endpoint_addr.as_ref(),
                     &resolved.relay_urls,
+                    false, // same account
                 )
                 .context("construct account-resolved peer address")?;
                 node.add_peer(peer_addr);

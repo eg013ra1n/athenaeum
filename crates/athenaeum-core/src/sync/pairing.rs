@@ -25,12 +25,16 @@
 //! relay carries it, so this gate is about avoiding surprise dependence, not
 //! confidentiality — see [`crate::sharing::iroh`].)
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use iroh::{RelayMap, RelayMode};
 use iroh_tickets::endpoint::EndpointTicket;
 
-use crate::account::HubClient;
+use crate::account::{EndpointAddrReport, HubClient};
+use crate::sharing::iroh::node::SharedIrohNode;
 use crate::sharing::types::NodeId;
 
 /// The resolved relay URLs to build the transport with.
@@ -187,6 +191,147 @@ pub fn peer_addr_with_relays(peer: NodeId, relay_urls: &[String]) -> Result<iroh
         }
     }
     Ok(addr)
+}
+
+/// Construct the dialable [`iroh::EndpointAddr`] for a peer, preferring the
+/// peer's OWN hub-reported address (finding H1, iroh hardening T7) over the old
+/// guess-from-our-own-relay-set hint ([`peer_addr_with_relays`]).
+///
+/// - **`reported` present** (the peer has PUT an `endpointAddr` the hub served
+///   us): the peer's real `home_relay_url` AND `our_relays` are BOTH attached to
+///   the one `EndpointAddr` (the "merged-hint form" — iroh accepts multiple relay
+///   urls in one addr and tries them, so if the peer's own relay is momentarily
+///   unreachable the dial can still find it via a shared relay, without any
+///   per-call-site failure-retry plumbing). iroh stores the addrs in a sorted set,
+///   so there is no wire ordering to rely on; both are simply present, de-duped.
+///   Its `direct_addrs` are
+///   attached **only when `!cross_account`** (S1): a same-account device may take
+///   a LAN/direct shortcut, but a cross-account collaborator (a collab holder)
+///   must never receive another account's private addresses — the helper enforces
+///   this regardless of what the hub served, so a hub bug can't leak them.
+/// - **`reported` absent** (an older hub, or a device that never reported): falls
+///   back to exactly [`peer_addr_with_relays`] — the pre-T7 behavior, byte for
+///   byte, so nothing regresses.
+///
+/// Unparsable relay urls / direct addrs are logged and skipped (never fail the
+/// whole resolution); duplicates across the reported relay + `our_relays` are
+/// de-duplicated so the merged hint carries each relay once.
+pub fn peer_dial_addr(
+    peer: NodeId,
+    reported: Option<&EndpointAddrReport>,
+    our_relays: &[String],
+    cross_account: bool,
+) -> Result<iroh::EndpointAddr> {
+    let Some(reported) = reported else {
+        return peer_addr_with_relays(peer, our_relays);
+    };
+    let id = iroh::EndpointId::from_bytes(&peer).map_err(|e| anyhow!("invalid peer node id: {e}"))?;
+    let mut addr = iroh::EndpointAddr::new(id);
+
+    // Reported relay first, then our-map relays appended (merged-hint form).
+    let mut relay_urls: Vec<String> = Vec::new();
+    if let Some(url) = &reported.home_relay_url {
+        relay_urls.push(url.clone());
+    }
+    for url in our_relays {
+        if !relay_urls.contains(url) {
+            relay_urls.push(url.clone());
+        }
+    }
+    for url in &relay_urls {
+        match url.parse::<iroh::RelayUrl>() {
+            Ok(relay_url) => addr = addr.with_relay_url(relay_url),
+            Err(error) => {
+                tracing::warn!(%url, %error, "invalid relay url in peer address hint; skipping")
+            }
+        }
+    }
+
+    // Direct addresses: SAME-ACCOUNT only (S1). Never leak a cross-account peer's
+    // private/LAN addresses even if the hub erroneously served them.
+    if !cross_account {
+        for da in &reported.direct_addrs {
+            match da.parse::<std::net::SocketAddr>() {
+                Ok(sa) => addr = addr.with_ip_addr(sa),
+                Err(error) => {
+                    tracing::warn!(%da, %error, "invalid direct addr in peer report; skipping")
+                }
+            }
+        }
+    }
+    Ok(addr)
+}
+
+/// Poll interval — and debounce window — of the endpoint-address reporter (T7).
+/// A change observed at most once per interval is reported, so a flapping relay
+/// can't spam the hub.
+const ADDRESS_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Extract the reportable `(home_relay_url, direct_addrs)` from a node's current
+/// endpoint address. `home_relay_url` is the first relay url (iroh has at most
+/// one home relay in practice); `direct_addrs` are the IP socket addresses, as
+/// strings the hub round-trips back to peers verbatim.
+pub fn endpoint_addr_report_parts(addr: &iroh::EndpointAddr) -> (Option<String>, Vec<String>) {
+    let home_relay_url = addr.relay_urls().next().map(|u| u.to_string());
+    let direct_addrs = addr.ip_addrs().map(|a| a.to_string()).collect();
+    (home_relay_url, direct_addrs)
+}
+
+/// Spawn the fire-and-forget endpoint-address reporter (finding H1, T7).
+///
+/// Every [`ADDRESS_REPORT_INTERVAL`] it snapshots the node's current
+/// `endpoint_addr()` and — whenever the `(home_relay_url, direct_addrs)` tuple
+/// has **changed** since the last successful report AND is non-empty — PUTs it to
+/// the hub. This is the simplest honest mechanism for "on bind + on change": a
+/// 30s poll naturally reports the first settled address shortly after bind and
+/// re-reports whenever the relay/direct set shifts, without rebuilding the
+/// path/relay watcher plumbing. A report failure is `warn!`-logged and retried on
+/// the next change (the last-reported snapshot is only advanced on success). The
+/// task holds a [`std::sync::Weak`] to the node, so it exits on its own once the
+/// node is dropped (host shutdown) — it can never block or outlive transport.
+pub fn spawn_endpoint_address_reporter(
+    node: Arc<SharedIrohNode>,
+    hub_url: String,
+    token: String,
+) -> tokio::task::JoinHandle<()> {
+    let weak = Arc::downgrade(&node);
+    drop(node);
+    tokio::spawn(async move {
+        let client = match HubClient::new(&hub_url) {
+            Ok(c) => c,
+            Err(error) => {
+                tracing::warn!(%error, "endpoint-address reporter: hub client build failed; not reporting");
+                return;
+            }
+        };
+        let mut last: Option<(Option<String>, Vec<String>)> = None;
+        loop {
+            // Snapshot without holding the node across the await/sleep.
+            let current = match weak.upgrade() {
+                Some(node) => endpoint_addr_report_parts(&node.endpoint_addr()),
+                None => return, // node gone (host shutdown) → stop reporting
+            };
+            let (relay, direct) = &current;
+            let has_addr = relay.is_some() || !direct.is_empty();
+            if has_addr && last.as_ref() != Some(&current) {
+                match client.put_device_address(&token, relay.as_deref(), direct).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            relay_url = relay.as_deref().unwrap_or("none"),
+                            direct = direct.len(),
+                            "reported endpoint address to hub"
+                        );
+                        last = Some(current);
+                    }
+                    Err(error) => tracing::warn!(
+                        %error,
+                        "endpoint-address report failed; will retry on the next change"
+                    ),
+                }
+            }
+            tokio::time::sleep(ADDRESS_REPORT_INTERVAL).await;
+        }
+    })
 }
 
 #[cfg(test)]
@@ -408,5 +553,88 @@ mod tests {
         let peer = valid_peer_bytes();
         let addr = peer_addr_with_relays(peer, &[]).unwrap();
         assert!(addr.is_empty(), "no relay urls -> bare addr, same as pre-fix");
+    }
+
+    // ── peer_dial_addr (finding H1, T7): dial with the peer's REAL address ──────
+
+    /// A same-account peer that reported its own relay: the dial hint carries the
+    /// peer's REPORTED relay FIRST, then our-map relays appended (merged-hint
+    /// form), and — same account — its direct addresses are attached too.
+    #[test]
+    fn peer_dial_addr_prefers_reported_relay_and_keeps_direct_same_account() {
+        let peer = valid_peer_bytes();
+        let reported = EndpointAddrReport {
+            home_relay_url: Some("https://peer-relay.example.org".to_string()),
+            direct_addrs: vec!["192.168.1.9:5000".to_string()],
+            reported_at: None,
+        };
+        let addr = peer_dial_addr(peer, Some(&reported), &["https://our-relay.example.org".to_string()], false)
+            .unwrap();
+
+        // Both the reported relay AND our-map relay are attached (merged-hint
+        // form). `EndpointAddr` stores addrs in a BTreeSet, so the wire order is
+        // set-sorted, not insertion order — what matters is that iroh has BOTH
+        // relays to try; compare as sorted sets.
+        let mut relays: Vec<String> = addr.relay_urls().map(|u| u.to_string()).collect();
+        relays.sort();
+        let mut expected = vec![
+            normalized("https://peer-relay.example.org"),
+            normalized("https://our-relay.example.org"),
+        ];
+        expected.sort();
+        assert_eq!(relays, expected, "reported relay AND our relay both attached (merged-hint form)");
+        let ips: Vec<String> = addr.ip_addrs().map(|a| a.to_string()).collect();
+        assert_eq!(ips, vec!["192.168.1.9:5000".to_string()], "same-account keeps direct addrs");
+    }
+
+    /// S1: a CROSS-ACCOUNT peer (a collab holder) must NEVER receive direct
+    /// addresses — even when the hub erroneously served some. Only the relay hint
+    /// survives; the helper strips the direct addrs regardless of the input.
+    #[test]
+    fn peer_dial_addr_cross_account_strips_direct_addrs() {
+        let peer = valid_peer_bytes();
+        let reported = EndpointAddrReport {
+            home_relay_url: Some("https://holder-relay.example.org".to_string()),
+            // A hostile/buggy hub served direct addrs; they must be dropped.
+            direct_addrs: vec!["10.0.0.5:5000".to_string(), "192.168.1.9:5000".to_string()],
+            reported_at: None,
+        };
+        let addr = peer_dial_addr(peer, Some(&reported), &[], true).unwrap();
+
+        assert_eq!(addr.ip_addrs().count(), 0, "cross-account dial must carry NO direct addrs (S1)");
+        let relays: Vec<String> = addr.relay_urls().map(|u| u.to_string()).collect();
+        assert_eq!(
+            relays,
+            vec![normalized("https://holder-relay.example.org")],
+            "cross-account still gets the relay hint"
+        );
+    }
+
+    /// `reported` absent (older hub / a device that never reported): falls back to
+    /// exactly `peer_addr_with_relays` — the pre-T7 our-relay hint, unchanged.
+    #[test]
+    fn peer_dial_addr_reported_absent_falls_back_to_our_relays() {
+        let peer = valid_peer_bytes();
+        let our = vec!["https://our-relay.example.org".to_string()];
+        let via_dial = peer_dial_addr(peer, None, &our, false).unwrap();
+        let via_legacy = peer_addr_with_relays(peer, &our).unwrap();
+        assert_eq!(via_dial, via_legacy, "no report → identical to the legacy hint");
+    }
+
+    /// The report extractor pulls the home relay + direct IP addrs out of an
+    /// `EndpointAddr` as strings the hub round-trips (round-trip through
+    /// `peer_dial_addr` proves the shapes match).
+    #[test]
+    fn endpoint_addr_report_parts_extracts_relay_and_direct() {
+        let peer = valid_peer_bytes();
+        let reported = EndpointAddrReport {
+            home_relay_url: Some("https://relay1.example.org".to_string()),
+            direct_addrs: vec!["192.168.1.5:1234".to_string()],
+            reported_at: None,
+        };
+        let addr = peer_dial_addr(peer, Some(&reported), &[], false).unwrap();
+        let (relay, direct) = endpoint_addr_report_parts(&addr);
+        assert_eq!(relay.as_deref(), Some(normalized("https://relay1.example.org").as_str()));
+        assert_eq!(direct, vec!["192.168.1.5:1234".to_string()]);
     }
 }

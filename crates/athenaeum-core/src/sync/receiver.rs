@@ -476,6 +476,10 @@ async fn handle_announce(
         frame_count: announce.frame_count,
         project_id: None,
     });
+    // I2 (T7): `from` dialed in to announce; the blob pull dials back out, so give
+    // the downloader a relay dial hint for it before fetching (no-op on loopback /
+    // when no relay set is resolved — never regresses the existing path reuse).
+    transport.add_peer_dial_hint(from);
     transport
         .fetch(from, &announce, &staging)
         .await
@@ -630,6 +634,9 @@ async fn handle_project_announce(
         frame_count: announce.frame_count,
         project_id: Some(project_id.clone()),
     });
+    // I2 (T7): relay dial hint for the holder we're about to pull from (relay-only
+    // — cross-account safe; the node's hint never carries direct addrs).
+    transport.add_peer_dial_hint(from);
     transport
         .fetch(from, &announce, &staging)
         .await

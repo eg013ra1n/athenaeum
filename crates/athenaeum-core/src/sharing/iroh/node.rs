@@ -616,6 +616,26 @@ impl SharedIrohNode {
             .insert(node, addr);
     }
 
+    /// Merge a relay dial hint for an inbound peer we're about to pull blobs from
+    /// into the endpoint's address lookup (finding H1 / I2, T7). Built from OUR
+    /// own relay set — same-account peers ride the same hub relays — so an inbound
+    /// peer with no cached direct path still gets a relay route for the blob pull.
+    /// Written ONLY into the address lookup the blobs downloader dials through,
+    /// never the control-dial `peers` map, and as a MERGE (`add_endpoint_info`),
+    /// so it can never downgrade a richer address the node already knows. An empty
+    /// relay set yields a bare addr and is a no-op — exactly the pre-T7 behavior.
+    pub fn add_peer_dial_hint(&self, from: NodeId) {
+        match crate::sync::pairing::peer_addr_with_relays(from, &self.relay_urls) {
+            Ok(addr) if !addr.is_empty() => self.lookup.add_endpoint_info(addr),
+            Ok(_) => {} // no relays resolved → nothing to hint (current behavior)
+            Err(e) => tracing::warn!(
+                error = %format!("{e:#}"),
+                peer = %hex32(&from),
+                "add_peer_dial_hint: address build failed"
+            ),
+        }
+    }
+
     /// Parse a peer's pairing ticket ([`StartInfo::pairing_ticket`]) and register
     /// its address. Idempotent.
     pub fn add_peer_ticket(&self, ticket: &str) -> Result<()> {
@@ -1171,6 +1191,13 @@ impl SharingTransport for RoleHandle {
 
     async fn release(&self, package_id: &PackageId) -> Result<()> {
         self.node.role_release(self.role, package_id).await
+    }
+
+    fn add_peer_dial_hint(&self, from: NodeId) {
+        // I2 (T7): route the blob-pull dial hint to the shared node's address
+        // lookup (relay-only, our own relay set). The loopback transport keeps the
+        // trait default no-op.
+        self.node.add_peer_dial_hint(from);
     }
 
     async fn events(&self) -> mpsc::Receiver<TransportEvent> {

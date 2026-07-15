@@ -123,6 +123,12 @@ pub struct HolderWire {
     pub pubkey: String,
     pub display_name: String,
     pub last_seen_at: Option<String>,
+    /// The holder's self-reported home relay url (finding H1, T7). CROSS-ACCOUNT
+    /// by nature (a holder may be in a different account), so the hub serves the
+    /// relay ONLY — never direct addrs (S1). Absent on an older hub → `None`, in
+    /// which case the download falls back to our own resolved relay set.
+    #[serde(default)]
+    pub relay_url: Option<String>,
 }
 
 /// One announcement row from `GET /projects/{id}/announcements`. Unknown
@@ -626,7 +632,7 @@ mod tests {
                     "state": "published", "rejectReason": null,
                     "createdAt": "2026-07-13T00:00:00Z", "decidedAt": "2026-07-13T01:00:00Z",
                     "holders": [
-                        { "pubkey": "cHVia2V5", "displayName": "Vilen", "lastSeenAt": "2026-07-13T02:00:00Z" },
+                        { "pubkey": "cHVia2V5", "displayName": "Vilen", "lastSeenAt": "2026-07-13T02:00:00Z", "relayUrl": "https://holder-relay.example.org/" },
                         { "pubkey": "cHVia2V5Mg", "displayName": "Remote", "lastSeenAt": null }
                     ],
                     "someFutureField": { "nested": 1 }
@@ -646,6 +652,10 @@ mod tests {
         assert!(anns[0].own);
         assert_eq!(anns[0].holders.len(), 2);
         assert_eq!(anns[0].holders[0].display_name, "Vilen");
+        // T7: the holder's self-reported relay url decodes (fed into the download
+        // dial hint); a holder that reports no relay defaults to `None`.
+        assert_eq!(anns[0].holders[0].relay_url.as_deref(), Some("https://holder-relay.example.org/"));
+        assert_eq!(anns[0].holders[1].relay_url, None);
         assert_eq!(anns[0].holders[1].last_seen_at, None);
         assert_eq!(anns[0].supersedes, vec!["ann-0".to_string()]);
         assert_eq!(anns[0].aggregate_stats["manifestXxh3"], "abcd");

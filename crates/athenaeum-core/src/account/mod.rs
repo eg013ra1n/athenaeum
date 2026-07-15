@@ -61,6 +61,31 @@ impl Default for DeviceCapability {
     }
 }
 
+/// A device's self-reported dialable endpoint address (finding H1, iroh
+/// hardening T7). Each device PUTs its current `{homeRelayUrl, directAddrs}` to
+/// the hub (`PUT /devices/self/address`, T5); the hub stamps `reportedAt` and
+/// returns the whole thing on `GET /devices` as `endpointAddr`. A dialer uses
+/// the peer's REAL relay (not a guess from our own relay set) as its dial hint.
+///
+/// Lenient by construction: every field is `#[serde(default)]`, so a device that
+/// has never reported, or an older hub that omits `reportedAt`, still
+/// deserializes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointAddrReport {
+    /// The device's home relay url (`None` when it has no home relay yet).
+    #[serde(default)]
+    pub home_relay_url: Option<String>,
+    /// The device's direct (IP) socket addresses, as strings — used only for a
+    /// SAME-ACCOUNT dial (never handed to a cross-account collaborator; S1).
+    #[serde(default)]
+    pub direct_addrs: Vec<String>,
+    /// When the hub last stamped this report (RFC3339). Diagnostics only; the
+    /// hub owns it, so the app treats it as read-only and optional.
+    #[serde(default)]
+    pub reported_at: Option<String>,
+}
+
 /// One device registered under the account (from `GET /devices`). Field casing
 /// matches the hub JSON verbatim so this doubles as the client decode type.
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
@@ -76,6 +101,12 @@ pub struct AccountDevice {
     pub capability: DeviceCapability,
     pub created_at: String,
     pub last_seen_at: Option<String>,
+    /// This device's self-reported dialable endpoint address (finding H1, T7).
+    /// Absent on older hub payloads (or a device that never reported) → `None`,
+    /// in which case every dial path falls back to the our-relay-map hint exactly
+    /// as it did before this field existed.
+    #[serde(default)]
+    pub endpoint_addr: Option<EndpointAddrReport>,
 }
 
 /// Snapshot of this device's account state, resolvable offline from persisted
@@ -121,5 +152,42 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(without.capability, DeviceCapability::Athenaeum); // missing → default
+    }
+
+    /// T7 old-hub compat: a `GET /devices` payload with NO `endpointAddr` key
+    /// (every hub before T5) still decodes — the field defaults to `None`, so
+    /// every dial path falls back to the our-relay hint exactly as before.
+    #[test]
+    fn account_device_endpoint_addr_absent_defaults_none() {
+        let without: AccountDevice = serde_json::from_value(serde_json::json!({
+            "id":"d1","name":"Studio Mac","pubkey":"AAAA","createdAt":"t"
+        }))
+        .unwrap();
+        assert_eq!(without.endpoint_addr, None, "missing endpointAddr → None (old-hub compat)");
+    }
+
+    /// A present `endpointAddr` decodes its relay + direct addrs, and a report
+    /// that omits `reportedAt`/`directAddrs` is still accepted (lenient fields).
+    #[test]
+    fn endpoint_addr_report_decodes_and_is_lenient() {
+        let dev: AccountDevice = serde_json::from_value(serde_json::json!({
+            "id":"d1","name":"Studio","pubkey":"AAAA","createdAt":"t",
+            "endpointAddr": {
+                "homeRelayUrl": "https://relay1.example.org/",
+                "directAddrs": ["192.168.1.5:1234"],
+                "reportedAt": "2026-07-14T00:00:00Z"
+            }
+        }))
+        .unwrap();
+        let rep = dev.endpoint_addr.expect("endpointAddr present");
+        assert_eq!(rep.home_relay_url.as_deref(), Some("https://relay1.example.org/"));
+        assert_eq!(rep.direct_addrs, vec!["192.168.1.5:1234".to_string()]);
+
+        // Only a relay, nothing else — lenient defaults fill the rest.
+        let bare: EndpointAddrReport =
+            serde_json::from_value(serde_json::json!({ "homeRelayUrl": "https://r/" })).unwrap();
+        assert_eq!(bare.home_relay_url.as_deref(), Some("https://r/"));
+        assert!(bare.direct_addrs.is_empty());
+        assert_eq!(bare.reported_at, None);
     }
 }

@@ -159,6 +159,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::sync::IneligibleFrame,
             crate::api::sync::EnqueueSelectionResult,
             crate::account::DeviceCapability,
+            crate::account::EndpointAddrReport,
             crate::account::AccountDevice,
             crate::account::AccountStatus,
             crate::api::collab::ProjectCard,

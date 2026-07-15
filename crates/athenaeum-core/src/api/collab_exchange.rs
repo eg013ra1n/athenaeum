@@ -940,16 +940,18 @@ pub async fn download_project_package(
         return Ok(());
     };
 
-    // Candidate holders (exclude MY own node — I can't serve myself).
-    let holders: Vec<(NodeId, String)> = ann
+    // Candidate holders (exclude MY own node — I can't serve myself). Each
+    // carries the holder's self-reported relay url (T7 / finding H1) so the dial
+    // hint below can target the holder's REAL relay, not just our own set.
+    let holders: Vec<(NodeId, String, Option<String>)> = ann
         .holders
         .iter()
         .filter_map(|h| {
             pairing::node_id_from_pubkey_b64(&h.pubkey)
                 .ok()
-                .map(|n| (n, h.display_name.clone()))
+                .map(|n| (n, h.display_name.clone(), h.relay_url.clone()))
         })
-        .filter(|(n, _)| *n != own_node)
+        .filter(|(n, _, _)| *n != own_node)
         .collect();
 
     if holders.is_empty() {
@@ -976,12 +978,21 @@ pub async fn download_project_package(
         Vec::new()
     };
 
-    for (holder_node, holder_name) in &holders {
-        // Audit B4: attach OUR resolved relay URL(s) as this holder's dial hint
-        // before the request, via the shared node's `add_peer`. A loopback
-        // runtime (no bound node) routes in-process and needs no hint.
+    for (holder_node, holder_name, holder_relay) in &holders {
+        // Attach this holder's dial hint before the request, via the shared node's
+        // `add_peer`. Prefer the holder's OWN reported relay (T7 / finding H1),
+        // falling back to our resolved relay set when the hub served none. This is
+        // CROSS-ACCOUNT (a collab holder may be in a different account), so
+        // `peer_dial_addr(cross_account = true)` carries the relay ONLY and never
+        // any direct addrs (S1). A loopback runtime (no bound node) routes
+        // in-process and needs no hint.
         if let Some(node) = &node {
-            match pairing::peer_addr_with_relays(*holder_node, &relay_urls) {
+            let reported = holder_relay.as_ref().map(|url| crate::account::EndpointAddrReport {
+                home_relay_url: Some(url.clone()),
+                direct_addrs: Vec::new(),
+                reported_at: None,
+            });
+            match pairing::peer_dial_addr(*holder_node, reported.as_ref(), &relay_urls, true) {
                 Ok(addr) => node.add_peer(addr),
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:#}"), holder = %holder_name, "download: dial hint build failed; skipping holder");

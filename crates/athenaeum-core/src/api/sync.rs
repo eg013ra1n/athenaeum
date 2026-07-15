@@ -450,6 +450,13 @@ pub(crate) async fn ensure_iroh_node(ctx: &ServiceContext) -> Result<Arc<SharedI
     // bind, the old per-role stores are dead weight — remove them so a migrated
     // install doesn't carry three parallel blob DBs (tolerate absence).
     cleanup_orphan_blob_stores(&sync_dir);
+    // Report THIS device's dialable endpoint address to the hub (finding H1, T7):
+    // a fire-and-forget task that polls the node's address and PUTs it on change.
+    // Only when signed in (a pure dev-ticket node has no hub to report to); never
+    // blocks the bind — spawned and detached, self-terminating on node drop.
+    if let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx).ok().flatten() {
+        pairing::spawn_endpoint_address_reporter(Arc::clone(&node), hub_url, token);
+    }
     *guard = Some(Arc::clone(&node));
     Ok(node)
 }
@@ -796,14 +803,29 @@ pub async fn get_sync_device_names(
 // per-peer map; the orchestration lives here (not in `sync::sender`) because it
 // owns the account/device + iroh plumbing.
 
-/// Resolve an account device id → its [`NodeId`] via the account device list —
-/// the send-side counterpart of the receiver's allow-list resolver. Fetches the
-/// hub's device list, finds the device with `id == device_id`, and decodes its
-/// base64 `pubkey` into a node id. Errors (all [`ApiError::Invalid`], surfaced
-/// to the UI) when the device is absent, its pubkey is undecodable, or — per
-/// spec §10 — it is a send-only Perseus agent (never a valid destination: a
-/// Perseus node has no receiver, so a package sent to it would never land).
-pub async fn resolve_dest_node(ctx: &ServiceContext, device_id: &str) -> Result<NodeId, ApiError> {
+/// A resolved send destination: the peer node id plus its hub-reported endpoint
+/// address (finding H1, T7), threaded from [`resolve_dest_node`] through
+/// [`enqueue_sync_selection`] into [`ensure_sender_engine`] so the sender dials
+/// the peer's REAL relay instead of guessing from our own relay set.
+#[derive(Debug, Clone)]
+pub struct ResolvedDest {
+    /// The destination peer's node id (decoded from its account pubkey).
+    pub node: NodeId,
+    /// The peer's self-reported endpoint address, when the hub served one
+    /// (`None` on an older hub or a device that never reported).
+    pub endpoint_addr: Option<crate::account::EndpointAddrReport>,
+}
+
+/// Resolve an account device id → its [`NodeId`] (+ reported endpoint address)
+/// via the account device list — the send-side counterpart of the receiver's
+/// allow-list resolver. Fetches the hub's device list, finds the device with
+/// `id == device_id`, and decodes its base64 `pubkey` into a node id. Errors (all
+/// [`ApiError::Invalid`], surfaced to the UI) when the device is absent, its
+/// pubkey is undecodable, or — per spec §10 — it is a send-only Perseus agent
+/// (never a valid destination: a Perseus node has no receiver, so a package sent
+/// to it would never land). The device's `endpoint_addr` is carried through so
+/// [`ensure_sender_engine`] can dial the peer's real relay (T7).
+pub async fn resolve_dest_node(ctx: &ServiceContext, device_id: &str) -> Result<ResolvedDest, ApiError> {
     let devices = crate::api::account::list_devices(ctx).await?;
     let Some(device) = devices.iter().find(|d| d.id == device_id) else {
         return Err(ApiError::Invalid(format!(
@@ -815,9 +837,10 @@ pub async fn resolve_dest_node(ctx: &ServiceContext, device_id: &str) -> Result<
             "device {device_id} is a send-only Perseus agent and cannot receive frames"
         )));
     }
-    pairing::node_id_from_pubkey_b64(&device.pubkey).map_err(|e| {
+    let node = pairing::node_id_from_pubkey_b64(&device.pubkey).map_err(|e| {
         ApiError::Invalid(format!("destination device {device_id} has an invalid pubkey: {e:#}"))
-    })
+    })?;
+    Ok(ResolvedDest { node, endpoint_addr: device.endpoint_addr.clone() })
 }
 
 /// The directory the app writes outgoing packages into (`<sync_dir>/packages`).
@@ -848,6 +871,7 @@ pub async fn ensure_sender_engine(
     ctx: &ServiceContext,
     sender: &SyncSenderRuntime,
     dest: NodeId,
+    dest_endpoint_addr: Option<&crate::account::EndpointAddrReport>,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<(Arc<SyncEngineHandle>, String), ApiError> {
     let mut guard = sender.lock_inner().await;
@@ -878,10 +902,12 @@ pub async fn ensure_sender_engine(
     // The destination is an account-resolved bare node id (from
     // `resolve_dest_node`). The node binds with `presets::Minimal` (no discovery
     // services), so without a dial hint `announce` fails instantly with "No
-    // addressing information available". Attach our own resolved relay URL(s) as
-    // the peer's dial hint before the first announce (devices on one account
-    // share the hub's relay set).
-    let peer_addr = pairing::peer_addr_with_relays(peer, &relay_urls)
+    // addressing information available". Prefer the peer's OWN hub-reported
+    // address (its real home relay + direct addrs — same account, so direct is
+    // allowed) via `peer_dial_addr`, falling back to our own resolved relay set
+    // when the peer never reported (T7 / finding H1). `cross_account = false`:
+    // both devices are in this account.
+    let peer_addr = pairing::peer_dial_addr(peer, dest_endpoint_addr, &relay_urls, false)
         .map_err(|e| ApiError::Internal(format!("construct peer address: {e:#}")))?;
     node.add_peer(peer_addr);
 
@@ -1125,7 +1151,7 @@ async fn build_and_enqueue_selection(
 pub async fn enqueue_sync_selection(
     ctx: &ServiceContext,
     sender: &SyncSenderRuntime,
-    dest: NodeId,
+    dest: ResolvedDest,
     frame_ids: Vec<i64>,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<EnqueueSelectionResult, ApiError> {
@@ -1137,7 +1163,8 @@ pub async fn enqueue_sync_selection(
             ineligible: Vec::new(),
         });
     }
-    let (engine, origin_device) = ensure_sender_engine(ctx, sender, dest, emitter).await?;
+    let (engine, origin_device) =
+        ensure_sender_engine(ctx, sender, dest.node, dest.endpoint_addr.as_ref(), emitter).await?;
     let packages_dir = sender_packages_dir(ctx)?;
     let result =
         build_and_enqueue_selection(ctx, &engine, &origin_device, &packages_dir, &frame_ids).await?;
@@ -1380,6 +1407,7 @@ mod tests {
             capability,
             created_at: "2026-07-11T00:00:00Z".into(),
             last_seen_at: None,
+            endpoint_addr: None,
         };
         let devices = vec![
             dev(1, DeviceCapability::Athenaeum),
@@ -1592,7 +1620,7 @@ mod tests {
     async fn enqueue_with_empty_selection_returns_zero_result_without_starting_engine() {
         let (_tmp, ctx) = test_ctx();
         let sender = SyncSenderRuntime::new();
-        let dest: NodeId = [7u8; 32];
+        let dest = ResolvedDest { node: [7u8; 32], endpoint_addr: None };
 
         let result = enqueue_sync_selection(&ctx, &sender, dest, Vec::new(), None).await.unwrap();
         assert_eq!(result.enqueued_count, 0);

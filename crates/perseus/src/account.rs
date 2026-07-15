@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use athenaeum_core::account::{
-    default_device_name, DeviceCapability, DeviceKey, HubClient, TokenStore,
+    default_device_name, DeviceCapability, DeviceKey, EndpointAddrReport, HubClient, TokenStore,
 };
 use athenaeum_core::sharing::types::NodeId;
 use athenaeum_core::sync::pairing;
@@ -62,6 +62,13 @@ pub struct PairingCache {
     /// when the hub is unreachable (Task 7 multi-target send).
     #[serde(default)]
     pub target_peers: HashMap<String, String>,
+    /// target string → the target device's last-seen hub-reported endpoint
+    /// address (finding H1, iroh hardening T7). Refreshed on every live
+    /// resolution and used as the per-target offline dial hint when the hub is
+    /// unreachable, so an offline restart still dials the target's REAL relay.
+    /// `#[serde(default)]` so an old cache file (no such field) still parses.
+    #[serde(default)]
+    pub target_addrs: HashMap<String, EndpointAddrReport>,
     /// Last successfully resolved relay URLs.
     #[serde(default)]
     pub relay_urls: Vec<String>,
@@ -117,6 +124,11 @@ pub struct ResolvedTarget {
     /// dialable address from this ticket. `None` on the account path (a bare node
     /// id: the caller attaches the shared relay map as the dial hint instead).
     pub ticket: Option<String>,
+    /// The target device's hub-reported endpoint address (finding H1, T7), on the
+    /// account path. `Some` lets the caller dial the target's REAL relay (+ direct
+    /// addrs — same account) via `peer_dial_addr`; `None` (older hub / never
+    /// reported / dev-ticket path) falls back to the shared relay set.
+    pub endpoint_addr: Option<EndpointAddrReport>,
 }
 
 /// All resolved send targets + the shared relay map for one agent start.
@@ -234,6 +246,16 @@ pub fn token_present(config: &Config) -> bool {
     }
 }
 
+/// The signed-in hub credentials `(hub_url, token)`, or `None` when there is no
+/// `[account]` table or no stored token. The counterpart of the app's
+/// `api::account::hub_credentials`, used by [`crate::run::Agent::start`] to spawn
+/// the endpoint-address reporter (finding H1, T7).
+pub fn hub_credentials(config: &Config) -> Option<(String, String)> {
+    let account = config.account.as_ref()?;
+    let token = token_store(config, account).load().ok().flatten()?;
+    Some((account.hub_url.clone(), token))
+}
+
 /// Ask the hub to email a one-time code. Requires an `[account]` table (hub_url).
 /// The non-interactive counterpart of the OTP request inside [`login`], for the
 /// web page's email→OTP sign-in.
@@ -349,7 +371,7 @@ pub async fn resolve_targets(config: &Config) -> Result<ResolvedTargets> {
         let peers = resolve_all_target_peers(config, account, token, &mut cache).await?;
         let targets = peers
             .into_iter()
-            .map(|peer| ResolvedTarget { peer, ticket: None })
+            .map(|(peer, endpoint_addr)| ResolvedTarget { peer, ticket: None, endpoint_addr })
             .collect();
         (targets, Some((account.hub_url.clone(), token.clone())))
     } else if let Some(t) = dev_ticket {
@@ -359,6 +381,8 @@ pub async fn resolve_targets(config: &Config) -> Result<ResolvedTargets> {
             vec![ResolvedTarget {
                 peer,
                 ticket: Some(t.to_string()),
+                // The ticket embeds the peer's full address; no reported hint needed.
+                endpoint_addr: None,
             }],
             None,
         )
@@ -437,7 +461,7 @@ async fn resolve_all_target_peers(
     account: &AccountConfig,
     token: &str,
     cache: &mut PairingCache,
-) -> Result<Vec<NodeId>> {
+) -> Result<Vec<(NodeId, Option<EndpointAddrReport>)>> {
     let target_strings: Vec<String> = config
         .targets
         .iter()
@@ -454,6 +478,7 @@ async fn resolve_all_target_peers(
             cache.device_names = device_names_from(&devices);
             let mut peers = Vec::new();
             let mut resolved_target_peers = HashMap::new();
+            let mut resolved_target_addrs = HashMap::new();
             for target in &target_strings {
                 // Match by id first, then by name (either spelling is valid).
                 let Some(device) = devices
@@ -477,7 +502,12 @@ async fn resolve_all_target_peers(
                 match pairing::node_id_from_pubkey_b64(&device.pubkey) {
                     Ok(peer) => {
                         resolved_target_peers.insert(target.clone(), node_id_hex(&peer));
-                        peers.push(peer);
+                        // Cache the target's reported endpoint address for the
+                        // offline dial hint (T7); absent = no entry (falls back).
+                        if let Some(addr) = &device.endpoint_addr {
+                            resolved_target_addrs.insert(target.clone(), addr.clone());
+                        }
+                        peers.push((peer, device.endpoint_addr.clone()));
                         tracing::info!(target = %target, "resolved send target from account device list");
                     }
                     Err(error) => tracing::warn!(
@@ -487,8 +517,9 @@ async fn resolve_all_target_peers(
                     ),
                 }
             }
-            // Refresh the offline per-target cache with exactly what resolved.
+            // Refresh the offline per-target caches with exactly what resolved.
             cache.target_peers = resolved_target_peers;
+            cache.target_addrs = resolved_target_addrs;
             if peers.is_empty() {
                 bail!(
                     "none of the configured send targets could be resolved — check the \
@@ -499,7 +530,9 @@ async fn resolve_all_target_peers(
             Ok(peers)
         }
         Err(error) => {
-            // Hub unreachable: fall back to each target's last cached peer.
+            // Hub unreachable: fall back to each target's last cached peer + its
+            // last-seen reported address (T7), so an offline restart still dials
+            // the target's real relay.
             let mut peers = Vec::new();
             for target in &target_strings {
                 if let Some(peer) = cache
@@ -507,7 +540,7 @@ async fn resolve_all_target_peers(
                     .get(target)
                     .and_then(|s| node_id_from_hex(s).ok())
                 {
-                    peers.push(peer);
+                    peers.push((peer, cache.target_addrs.get(target).cloned()));
                 }
             }
             if peers.is_empty() {
@@ -712,6 +745,35 @@ mod tests {
         let reloaded = PairingCache::load(dir.path());
         assert_eq!(reloaded.device_names.get(&"aa".repeat(32)).map(String::as_str), Some("Studio"));
         assert_eq!(reloaded.device_names.get(&"bb".repeat(32)).map(String::as_str), Some("Laptop"));
+    }
+
+    /// T7: the new `target_addrs` map is `#[serde(default)]`, so (a) an old cache
+    /// file written before this field existed still parses (→ empty map, never an
+    /// error), and (b) a saved map of reported addresses round-trips through disk.
+    #[test]
+    fn pairing_cache_target_addrs_roundtrip_and_backcompat() {
+        // (a) Old-format JSON without `target_addrs` parses to an empty map.
+        let old = r#"{"device_id":"d","peer_node_id_hex":"ab","target_peers":{},"relay_urls":[]}"#;
+        let c: PairingCache = serde_json::from_str(old).unwrap();
+        assert!(c.target_addrs.is_empty(), "a pre-field cache file loads an empty map");
+
+        // (b) Save with a reported address → load returns it verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cache = PairingCache::default();
+        cache.target_addrs.insert(
+            "Studio".to_string(),
+            EndpointAddrReport {
+                home_relay_url: Some("https://relay1.example.org/".to_string()),
+                direct_addrs: vec!["192.168.1.5:1234".to_string()],
+                reported_at: Some("2026-07-14T00:00:00Z".to_string()),
+            },
+        );
+        cache.save(dir.path());
+
+        let reloaded = PairingCache::load(dir.path());
+        let rep = reloaded.target_addrs.get("Studio").expect("target addr round-trips");
+        assert_eq!(rep.home_relay_url.as_deref(), Some("https://relay1.example.org/"));
+        assert_eq!(rep.direct_addrs, vec!["192.168.1.5:1234".to_string()]);
     }
 
     use crate::config::{Config, Mode, RetentionConfig};
@@ -975,6 +1037,59 @@ mod tests {
         let cache = PairingCache::load(tmp.path());
         assert_eq!(cache.target_peers.get("Studio").map(String::as_str), Some(node_id_hex(&target_node).as_str()));
         assert_eq!(cache.relay_urls, vec!["https://relay1.example.org".to_string()]);
+    }
+
+    /// T7: when the hub serves a target's `endpointAddr`, resolution carries it
+    /// onto the `ResolvedTarget` (for the dial hint) AND caches it per target for
+    /// the next offline start.
+    #[tokio::test]
+    async fn resolve_targets_carries_and_caches_reported_endpoint_addr() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let target_key = DeviceKey::load_or_create_in(&tmp.path().join("target")).unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "id": "studio-1", "name": "Studio", "pubkey": target_key.pubkey_base64(),
+                    "capability": "athenaeum",
+                    "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null,
+                    "endpointAddr": {
+                        "homeRelayUrl": "https://peer-relay.example.org/",
+                        "directAddrs": ["192.168.1.9:5000"],
+                        "reportedAt": "2026-07-14T00:00:00Z"
+                    }
+                }
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/relay-map"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "relays": ["https://relay1.example.org"]
+            })))
+            .mount(&server)
+            .await;
+
+        let config = account_config(tmp.path(), &server.uri(), &["Studio"]);
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+
+        let resolved = resolve_targets(&config).await.expect("resolution succeeds");
+        let rep = resolved.targets[0]
+            .endpoint_addr
+            .as_ref()
+            .expect("the reported endpoint address is carried onto the target");
+        assert_eq!(rep.home_relay_url.as_deref(), Some("https://peer-relay.example.org/"));
+        assert_eq!(rep.direct_addrs, vec!["192.168.1.9:5000".to_string()]);
+
+        // Cached per target for the next offline start.
+        let cache = PairingCache::load(tmp.path());
+        let cached = cache.target_addrs.get("Studio").expect("addr cached per target");
+        assert_eq!(cached.home_relay_url.as_deref(), Some("https://peer-relay.example.org/"));
     }
 
     /// Sync 2C: every configured target resolves to its own peer, in order — the

@@ -133,6 +133,23 @@ pub trait SharingTransport: Send + Sync {
     /// caller's state transition — callers log-and-continue on Err.
     async fn release(&self, package_id: &PackageId) -> anyhow::Result<()>;
 
+    /// Attach a best-effort dial hint for an inbound peer `from` right before we
+    /// pull its blobs (finding H1 / I2, iroh hardening T7).
+    ///
+    /// A peer that announced to us dialed IN; the blob pull dials back OUT, and
+    /// with `presets::Minimal` (no discovery) the downloader needs an address for
+    /// `from`. The real node override merges a relay hint — our own relay set,
+    /// which same-account devices share — into the address lookup the downloader
+    /// dials through. Merge-only: it never downgrades a richer address the node
+    /// already knows, and an empty relay set is a no-op (exactly the pre-T7
+    /// behavior). `from` has already cleared the receiver's authorization /
+    /// project-membership gate by the time this is called, so it is a known peer.
+    /// The default is a no-op — the in-process loopback transport dials
+    /// in-process and needs no hint.
+    fn add_peer_dial_hint(&self, from: NodeId) {
+        let _ = from;
+    }
+
     /// Hand out the receiving half of this endpoint's [`TransportEvent`] stream.
     ///
     /// Single-consumer: the receiver is returned on the first call; subsequent
