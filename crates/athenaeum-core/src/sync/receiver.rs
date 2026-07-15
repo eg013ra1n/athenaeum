@@ -32,6 +32,7 @@ use crate::sharing::types::{NodeId, PackageAnnounce, ReceiptOutcome, StartInfo, 
 use crate::sharing::SharingTransport;
 
 use super::ingest::{self, IngestOutcome};
+use super::refusal::RefusalRefresher;
 use super::store::CatalogSyncStore;
 
 /// Resolves the landing root for the next received package, live. Called once per
@@ -732,6 +733,17 @@ struct Started {
 /// the dev flag.
 pub struct SyncRuntime {
     inner: tokio::sync::Mutex<Option<Started>>,
+    /// Once-per-process guard + handle for the hourly authorized-peers refresh
+    /// timer (task 7). `Some` after the first
+    /// [`ensure_peers_refresh_task`](crate::api::sync::ensure_peers_refresh_task);
+    /// every later call sees it populated and no-ops.
+    pub(crate) peers_refresh_task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Process-wide debounce shared by BOTH receiver gates (per-announce
+    /// authorizer + connection connect-gate): refusing an unknown peer kicks a
+    /// rate-limited hub refresh of the authorized set (task 7). One instance so a
+    /// refusal burst across either gate triggers at most one hub round-trip per
+    /// gap.
+    pub(crate) refusal: Arc<RefusalRefresher>,
 }
 
 impl SyncRuntime {
@@ -739,6 +751,10 @@ impl SyncRuntime {
     pub fn new() -> Self {
         Self {
             inner: tokio::sync::Mutex::new(None),
+            peers_refresh_task: tokio::sync::Mutex::new(None),
+            // 5-minute refusal debounce (spec): a machine just added to the
+            // account is admitted within one gap of its first refused retry.
+            refusal: Arc::new(RefusalRefresher::new(std::time::Duration::from_secs(300))),
         }
     }
 

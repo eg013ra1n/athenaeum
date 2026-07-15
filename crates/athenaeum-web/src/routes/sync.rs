@@ -94,6 +94,7 @@ pub async fn enqueue_sync_selection(
         &state.ctx,
         &state.sync_sender,
         Arc::clone(&state.collab_sender),
+        &state.sync,
         dest,
         args.frame_ids,
         Some(emitter),

@@ -18,6 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -32,7 +33,7 @@ use crate::sharing::SharingTransport;
 use crate::sync::store::search_history_rows;
 use crate::sync::{
     node_id_hex, pairing, CatalogSyncStore, Direction, HistoryQuery, HistoryRow, OutboundRow,
-    OutboundState, OutboundSummary, StartedSender, SyncEngine, SyncEngineHandle,
+    OutboundState, OutboundSummary, RefusalRefresher, StartedSender, SyncEngine, SyncEngineHandle,
     SyncReceiverStatus, SyncRuntime, SyncSenderRuntime, SyncSenderStatus, SyncStatus, SyncStore,
 };
 
@@ -187,7 +188,10 @@ fn account_peer_hexes(devices: &[crate::account::AccountDevice]) -> Vec<String> 
 ///
 /// Fail closed: a signed-in node whose cache is empty (never refreshed)
 /// authorizes nobody until [`refresh_authorized_peers`] populates it.
-fn peer_authorizer(ctx: &ServiceContext) -> Result<crate::sync::PeerAuthorizer, ApiError> {
+fn peer_authorizer(
+    ctx: &Arc<ServiceContext>,
+    refusal: Arc<RefusalRefresher>,
+) -> Result<crate::sync::PeerAuthorizer, ApiError> {
     if !account_signed_in(ctx)? {
         tracing::warn!(
             "sync receiver has no account allow-list (dev-ticket mode); accepting any peer"
@@ -195,13 +199,24 @@ fn peer_authorizer(ctx: &ServiceContext) -> Result<crate::sync::PeerAuthorizer, 
         return Ok(crate::sync::allow_all_peers());
     }
     let db = db(ctx)?.clone();
+    let ctx = Arc::clone(ctx);
     Ok(Arc::new(move |from: &crate::sharing::types::NodeId| {
         let hex = crate::sync::node_id_hex(from);
-        let conn = db.conn();
-        match crate::db::get_setting(&conn, keys::SYNC_AUTHORIZED_PEERS) {
-            Ok(Some(raw)) => raw.lines().map(str::trim).any(|line| line == hex),
-            _ => false, // fail closed: no list yet ⇒ authorize nobody
+        let authorized = {
+            let conn = db.conn();
+            match crate::db::get_setting(&conn, keys::SYNC_AUTHORIZED_PEERS) {
+                Ok(Some(raw)) => raw.lines().map(str::trim).any(|line| line == hex),
+                _ => false, // fail closed: no list yet ⇒ authorize nobody
+            }
+        };
+        // Refusing an unknown peer is a hint our cached set is stale (task 7):
+        // kick a debounced hub refresh so a machine just added to the account is
+        // admitted on the peer's next retry — no callback to the refused peer, its
+        // own retry loop redelivers.
+        if !authorized {
+            maybe_refresh_on_refusal(&refusal, &ctx, &hex);
         }
+        authorized
     }))
 }
 
@@ -218,19 +233,31 @@ fn peer_authorizer(ctx: &ServiceContext) -> Result<crate::sync::PeerAuthorizer, 
 /// Fail-closed: a signed-in node with empty caches admits nobody. A node with no
 /// account (pure dev-ticket mode) installs NO gate — accept-all, the same
 /// developer escape hatch as [`peer_authorizer`]'s [`crate::sync::allow_all_peers`].
-fn connect_gate(ctx: &ServiceContext) -> Result<Option<crate::sharing::iroh::ConnectGate>, ApiError> {
+fn connect_gate(
+    ctx: &Arc<ServiceContext>,
+    refusal: Arc<RefusalRefresher>,
+) -> Result<Option<crate::sharing::iroh::ConnectGate>, ApiError> {
     if !account_signed_in(ctx)? {
         return Ok(None);
     }
     let db = db(ctx)?.clone();
+    let ctx = Arc::clone(ctx);
     Ok(Some(Arc::new(move |from: &NodeId| {
         let hex = crate::sync::node_id_hex(from);
-        let conn = db.conn();
-        let in_account = match crate::db::get_setting(&conn, keys::SYNC_AUTHORIZED_PEERS) {
-            Ok(Some(raw)) => raw.lines().map(str::trim).any(|line| line == hex),
-            _ => false,
+        let admit = {
+            let conn = db.conn();
+            let in_account = match crate::db::get_setting(&conn, keys::SYNC_AUTHORIZED_PEERS) {
+                Ok(Some(raw)) => raw.lines().map(str::trim).any(|line| line == hex),
+                _ => false,
+            };
+            in_account || crate::collab::authz::node_in_any_project(&conn, from)
         };
-        in_account || crate::collab::authz::node_in_any_project(&conn, from)
+        // Same debounced-refresh hint as the per-announce authorizer (task 7): an
+        // unknown dialer we admit nobody-of may be a freshly-added account device.
+        if !admit {
+            maybe_refresh_on_refusal(&refusal, &ctx, &hex);
+        }
+        admit
     })))
 }
 
@@ -255,10 +282,11 @@ fn project_announce_gate(ctx: &ServiceContext) -> Result<crate::sync::ProjectAnn
 /// announcements-refresh + post-ingest report-have hooks.
 fn receiver_hooks(
     ctx: &Arc<ServiceContext>,
+    refusal: Arc<RefusalRefresher>,
     request_handler: Option<crate::sync::ProjectRequestHandler>,
 ) -> Result<crate::sync::ReceiverHooks, ApiError> {
     Ok(crate::sync::ReceiverHooks {
-        connect_gate: connect_gate(ctx)?,
+        connect_gate: connect_gate(ctx, refusal)?,
         project_gate: Some(project_announce_gate(ctx)?),
         announcements_refresher: Some(announcements_refresher(Arc::clone(ctx))),
         on_project_ingested: Some(on_project_ingested_hook(Arc::clone(ctx))),
@@ -376,6 +404,59 @@ pub async fn refresh_authorized_peers(ctx: &ServiceContext) {
         } else {
             tracing::info!(count = hexes.len(), "refreshed authorized account peers");
         }
+    }
+}
+
+/// How often the periodic timer re-pulls the authorized-device set from the hub
+/// (task 7). One hour bounds cache staleness without polling the hub hot; the
+/// refusal-triggered path ([`maybe_refresh_on_refusal`]) covers the fast case (a
+/// machine just added to the account), so the timer is only the slow backstop.
+const PEERS_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Install (once per process) the hourly authorized-peers refresh timer (task 7).
+/// The [`SyncRuntime::peers_refresh_task`] slot is the guard: the first caller
+/// spawns the loop and stashes its handle; every later call sees `Some` and
+/// no-ops, so all three startup sites (autostart / pairing-ticket disclosure /
+/// first sender-engine build) can call this and whichever runs first wins.
+///
+/// The loop drives a [`tokio::time::interval`]; its FIRST tick fires immediately
+/// (tokio semantics), which is a harmless extra refresh — the startup path already
+/// ran one — so it is left in rather than skipped. Each tick calls the existing
+/// best-effort [`refresh_authorized_peers`] (warns-and-keeps the cached set on any
+/// hub/credential failure). The `peers_refresh_task` lock is released before any
+/// `.await` inside the loop — it is only held to check-and-stamp the slot here.
+async fn ensure_peers_refresh_task(ctx: &Arc<ServiceContext>, sync: &SyncRuntime) {
+    let mut guard = sync.peers_refresh_task.lock().await;
+    if guard.is_some() {
+        return;
+    }
+    let ctx = Arc::clone(ctx);
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(PEERS_REFRESH_INTERVAL);
+        loop {
+            ticker.tick().await;
+            refresh_authorized_peers(&ctx).await;
+        }
+    });
+    *guard = Some(handle);
+    tracing::debug!(interval_secs = PEERS_REFRESH_INTERVAL.as_secs(), "authorized-peers refresh timer installed");
+}
+
+/// On refusing an UNKNOWN peer from either receiver gate, kick a debounced hub
+/// refresh of the authorized set (task 7). Shared process-wide by the one
+/// [`RefusalRefresher`] on [`SyncRuntime`], so a refusal burst across both gates
+/// triggers at most one hub round-trip per gap. The refused peer's own retry loop
+/// redelivers once its device row lands in our cache — no callback to it is
+/// needed. Synchronous by construction (the gates are sync closures): it only
+/// stamps the debounce and `tokio::spawn`s the async refresh, never blocking the
+/// gate.
+fn maybe_refresh_on_refusal(refusal: &Arc<RefusalRefresher>, ctx: &Arc<ServiceContext>, hex: &str) {
+    if refusal.should_fire() {
+        tracing::info!(peer = %hex, "unknown peer refused; refreshing authorized set");
+        let ctx = Arc::clone(ctx);
+        tokio::spawn(async move {
+            refresh_authorized_peers(&ctx).await;
+        });
     }
 }
 
@@ -645,12 +726,17 @@ pub async fn autostart_if_enabled(
     // Wake event → kick pending packages (T6): relay reconnect / relay-map change
     // fans a fire-and-forget kick_all over the personal + collab sender maps.
     install_node_wake_hook(&node, Arc::clone(&sync_sender), Arc::clone(&collab_sender));
+    // Periodic authorized-peers refresh (task 7): install the hourly hub re-pull
+    // so a machine added to the account later is admitted without a restart
+    // (idempotent — once per process across all three startup sites).
+    ensure_peers_refresh_task(&ctx_arc, sync).await;
     // Populate the authorized-peer allow-list (best-effort) before the receiver
     // starts accepting, then enforce it live per-package (finding H1).
     refresh_authorized_peers(ctx).await;
-    let authorized = peer_authorizer(ctx)?;
+    let authorized = peer_authorizer(&ctx_arc, Arc::clone(&sync.refusal))?;
     let hooks = receiver_hooks(
         &ctx_arc,
+        Arc::clone(&sync.refusal),
         Some(project_request_handler(
             Arc::clone(&ctx_arc),
             Arc::clone(&collab_sender),
@@ -703,13 +789,17 @@ pub async fn get_pairing_ticket(
     // Wake event → kick pending packages (T6): relay reconnect / relay-map change
     // fans a fire-and-forget kick_all over the personal + collab sender maps.
     install_node_wake_hook(&node, Arc::clone(&sync_sender), Arc::clone(&collab_sender));
+    // Periodic authorized-peers refresh (task 7): install the hourly hub re-pull
+    // here too (idempotent — no-ops if autostart already installed it).
+    ensure_peers_refresh_task(&ctx_arc, sync).await;
     // Enforce the authorized-peer allow-list here too (finding H1). In pure
     // dev-ticket mode (no account) this resolves to accept-any; a signed-in
     // primary that also flips the dev flag still enforces its account list.
     refresh_authorized_peers(ctx).await;
-    let authorized = peer_authorizer(ctx)?;
+    let authorized = peer_authorizer(&ctx_arc, Arc::clone(&sync.refusal))?;
     let hooks = receiver_hooks(
         &ctx_arc,
+        Arc::clone(&sync.refusal),
         Some(project_request_handler(
             Arc::clone(&ctx_arc),
             Arc::clone(&collab_sender),
@@ -991,6 +1081,7 @@ pub async fn ensure_sender_engine(
     ctx: &Arc<ServiceContext>,
     sender: &Arc<SyncSenderRuntime>,
     collab_sender: Arc<SyncSenderRuntime>,
+    sync: &SyncRuntime,
     dest: NodeId,
     dest_endpoint_addr: Option<&crate::account::EndpointAddrReport>,
     emitter: Option<Arc<dyn ProgressEmitter>>,
@@ -1025,6 +1116,11 @@ pub async fn ensure_sender_engine(
     // bind (send before the receiver autostarted) still wakes both sender maps on
     // a relay reconnect / relay-map change.
     install_node_wake_hook(&node, Arc::clone(sender), Arc::clone(&collab_sender));
+    // Periodic authorized-peers refresh (task 7): install here too so a
+    // sender-first process still runs the hourly hub re-pull (idempotent — no-ops
+    // if a receiver-start site already installed it, which it always has for a
+    // signed-in node that autostarted).
+    ensure_peers_refresh_task(ctx, sync).await;
     let transport: Arc<dyn SharingTransport> = node.handle(Role::Out);
     let origin_device = node_id_hex(&node.node_id());
 
@@ -1284,6 +1380,7 @@ pub async fn enqueue_sync_selection(
     ctx: &Arc<ServiceContext>,
     sender: &Arc<SyncSenderRuntime>,
     collab_sender: Arc<SyncSenderRuntime>,
+    sync: &SyncRuntime,
     dest: ResolvedDest,
     frame_ids: Vec<i64>,
     emitter: Option<Arc<dyn ProgressEmitter>>,
@@ -1300,6 +1397,7 @@ pub async fn enqueue_sync_selection(
         ctx,
         sender,
         collab_sender,
+        sync,
         dest.node,
         dest.endpoint_addr.as_ref(),
         emitter,
@@ -1764,11 +1862,13 @@ mod tests {
         let ctx = Arc::new(ctx);
         let sender = Arc::new(SyncSenderRuntime::new());
         let collab_sender = Arc::new(SyncSenderRuntime::new());
+        let sync = SyncRuntime::new();
         let dest = ResolvedDest { node: [7u8; 32], endpoint_addr: None };
 
-        let result = enqueue_sync_selection(&ctx, &sender, collab_sender, dest, Vec::new(), None)
-            .await
-            .unwrap();
+        let result =
+            enqueue_sync_selection(&ctx, &sender, collab_sender, &sync, dest, Vec::new(), None)
+                .await
+                .unwrap();
         assert_eq!(result.enqueued_count, 0);
         assert_eq!(result.eligible_count, 0);
         assert_eq!(result.total_count, 0);
