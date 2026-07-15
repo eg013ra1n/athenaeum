@@ -36,7 +36,10 @@ in the app and in Perseus.
    event-triggered instant retries.
 2. Receiver authorization refreshes itself — "add a new machine, the old one
    lets it in without restart" works unattended.
-3. Desktop resend for terminal packages; "send now" for stalled ones.
+3. Desktop resend for terminal packages; "send now" for stalled ones; user
+   cancellation on **both** sides — sender cancels a send, receiver cancels an
+   incoming transfer; either way the sender keeps the row in history and can
+   resend, the receiver keeps it recorded as cancelled.
 4. A dedicated Transfers screen: outgoing + incoming batches, status, file
    lists, live per-file byte progress on the receiving side, speed, retry
    controls. Perseus web page gets the same semantics surface (countdown,
@@ -44,13 +47,12 @@ in the app and in Perseus.
 
 ## Non-goals
 
-- No wire-protocol changes. Everything here is sender-local scheduling,
-  receiver-local observation, and hub-API reuse.
+- No wire-protocol *shape* changes. The single wire delta of this cycle is one
+  additive enum value, `ReceiptOutcome::Cancelled` (§4, §5) — announce, fetch,
+  ack structures stay byte-identical otherwise.
 - No per-file upload progress on the sending side in this cycle. Provider-side
   events are investigated during planning (§7); adopted only if iroh-blobs
   0.103 exposes them without protocol or architectural cost.
-- No receiver-side cancel of an in-flight download (v1: cancel is a sender
-  action).
 - Perseus receive UI — Perseus does not ingest; nothing to show.
 
 ---
@@ -68,11 +70,17 @@ may write `Failed` and when a package is allowed to rest in a pending state.
     and the per-frame `rejected` outcomes live in `sync_history`, exactly as
     today. A deliberate "no" from the receiver is terminal by design — it is
     not a network failure and is not retried.
-  - **Cancelled** — user action. New `OutboundState::Cancelled` variant (DB
-    text `cancelled`); `cancel_package` (`engine.rs:1365`) writes it instead
-    of `Failed`. History outcome stays `cancelled`. Legacy rows that recorded
-    cancellation as `failed` are indistinguishable from old attempt-failures —
-    acceptable; both are retryable history (§4).
+  - **Cancelled** — user action, *on either side*. New
+    `OutboundState::Cancelled` variant (DB text `cancelled`);
+    `cancel_package` (`engine.rs:1365`) writes it instead of `Failed` when
+    the local (sending) user cancels. When the **receiving** user cancels
+    (§4), the sender learns via an ack whose receipts are all
+    `Cancelled` and moves the row to the same `Cancelled` state with
+    `last_error = "cancelled by receiver"` — the UI chip distinguishes
+    "Cancelled" vs "Cancelled (by receiver)" by that reason. Either way the
+    row stays in the sender's history and is retryable (§4). Legacy rows that
+    recorded cancellation as `failed` are indistinguishable from old
+    attempt-failures — acceptable; both are retryable history (§4).
   - `Failed` — **local unrecoverable only**: package payload missing/corrupt
     on disk, i.e. re-announcing can never succeed. The attempt-counter path
     to `Failed` is deleted. Existing `Failed` rows in the store are left
@@ -139,13 +147,40 @@ Two additions, both hub-API-reuse (no new endpoints):
 - **`cancel_sync_package(id)`** — expose the existing engine `cancel`
   (`engine.rs:452`) as a command + route (it currently has no frontend
   surface at all).
+- **`cancel_incoming_package(id)`** — receiver-side cancel (command + route,
+  desktop only; N/A for Perseus). Mechanics, all within the existing
+  announce/fetch/ack flow:
+  1. Abort the in-flight fetch (cooperative, same §7 code path); discard
+     staged payload. Allowed in `Announced`/`Fetching`; once `Ingesting`
+     starts it is too late (ingest is local and fast).
+  2. Ensure the manifest is present — if the cancel landed before the
+     manifest blob arrived, fetch *only the manifest blob* (child of the
+     already-known collection root; small). This is what makes the cancel
+     ack-able without any new wire message.
+  3. Write a `ReceiptOutcome::Cancelled` receipt for every manifest frame
+     into `sync_receipts` (the existing ack-replay log), mark the
+     `sync_inbound` row `Cancelled` (§8), and send the ack. If the sender is
+     offline, the standard replay-on-reannounce path delivers the "no"
+     later — cancellation is durable on the receiver.
+  4. The sender receives the all-`Cancelled` ack → outbound row →
+     `Cancelled` with `last_error = "cancelled by receiver"` (§1); per-frame
+     `cancelled` history rows via the normal receipts→history path.
+  A resend by the sender (retry_sync_package) mints a **new** package id, so
+  it is a fresh announce the receiver evaluates from scratch — a past cancel
+  never blocks a deliberate re-send.
 - UI: buttons on the Transfers screen rows (§10); Perseus keeps its existing
-  Retry and gains Send now (§11).
+  Retry and gains Send now + Cancel (§11).
 
 ### 5. Compatibility and boundaries
 
-- **Wire protocol unchanged.** Announce/fetch/ack/receipts as-is; all changes
-  are sender scheduling, receiver-local progress observation, store columns.
+- **Wire protocol: one additive value, no shape changes.**
+  `ReceiptOutcome` gains a `Cancelled` variant (`sharing/types.rs:41`) —
+  announce/fetch/ack structures are otherwise untouched. Cross-version
+  honesty: an *old* sender (e.g. a beta Perseus) cannot deserialize an ack
+  containing the new variant, so a receiver-cancel against an old sender
+  degrades to a lost ack — the old sender times out under its old semantics.
+  Acceptable: both ends ship in the same release train, and Perseus never
+  receives.
 - Old `Failed` history/store rows remain as-is (readable, retryable).
 - Perseus inherits the semantics automatically (shared engine); its web
   `Retry` keeps working; its `/api/status` `inFlight` payload gains the new
@@ -164,6 +199,13 @@ Two additions, both hub-API-reuse (no new endpoints):
 - Loopback e2e (acceptance): peer offline → package waits (stalled, attempts
   climbing, no terminal state) → peer comes online → delivered + confirmed
   with **zero user action**.
+- Loopback e2e (two-sided cancel): receiver cancels mid-fetch → sender row
+  goes `Cancelled` with reason "cancelled by receiver", receiver row
+  `Cancelled` → sender hits Resend → fresh package id delivers normally.
+  Variant: sender offline at cancel time → next re-announce gets the
+  replayed cancelled ack (no re-fetch), same terminal states.
+- Unit: a `Cancelled` inbound row never re-fetches on re-announce; cancel
+  during `Ingesting` is refused.
 
 ---
 
@@ -199,13 +241,17 @@ to consuming the iroh-blobs downloader progress stream:
 
 New `sync_inbound` table (DDL next to `DDL_OUTBOUND`, guarded-ALTER pattern
 for future columns): `id`, `peer`, `package_id` (announce id), `state`
-(`Announced → Fetching → Ingesting → Done | Failed`), `frame_count`,
-`byte_size`, `bytes_done`, `last_error`, `created_at`, `finished_at`.
-`UNIQUE(peer, package_id)` — a re-announce after restart updates the same
-row. Per-frame outcomes (ingested/duplicate/rejected) stay in
+(`Announced → Fetching → Ingesting → Done | Failed | Cancelled`),
+`frame_count`, `byte_size`, `bytes_done`, `last_error`, `created_at`,
+`finished_at`. `UNIQUE(peer, package_id)` — a re-announce after restart
+updates the same row, **except** a `Cancelled` row, which is final: a
+re-announce of a cancelled package id gets the replayed cancelled ack (§4),
+never a re-fetch. Per-frame outcomes (ingested/duplicate/rejected) stay in
 receipts/history as today; a batch whose frames were all rejected still ends
-`Done` — the exchange completed, the rejection detail is per-frame. `Failed`
-is for fetch/ingest errors only.
+`Done` — the exchange completed, the rejection detail is per-frame.
+`Failed` is for fetch/ingest errors only; `Cancelled` is the receiving
+user's deliberate stop (§4) and stays visible in the queue history as
+cancelled.
 
 - Batch-level fields are persisted (`bytes_done` updated on the throttled
   batch tick, not per file). Per-file bytes are transient: an in-memory
@@ -250,8 +296,9 @@ is for fetch/ingest errors only.
   (`bytesDone/byteSize` for incoming; state-staged for outgoing), size,
   speed, attempts + next-retry countdown, actions.
 - Actions per row: **Send now** (stalled/pending outbound), **Cancel**
-  (pending outbound), **Resend** (terminal outbound). Incoming rows have no
-  actions in v1.
+  (pending outbound; incoming rows in `Announced`/`Fetching` — §4
+  `cancel_incoming_package`), **Resend** (terminal outbound, including rows
+  the receiver cancelled).
 - Row expands to the file list (`list_transfer_files`): incoming files show
   live per-file progress bars driven by `sync-file-progress`; outgoing files
   show name + size, and per-frame outcome chips (ingested/duplicate/rejected)
@@ -270,7 +317,10 @@ Same engine → same semantics for free. `index.html` changes only:
   for stalled rows (`POST /api/kick` with `{id}`, thin wrapper over engine
   `kick(id)`, mirroring the desktop `send_now_sync_package`), stalled badge,
   batch byte total.
-- Existing Retry button now also covers `cancelled` rows.
+- Existing Retry button now also covers `cancelled` rows (both the locally
+  cancelled and the cancelled-by-receiver kind). Pending rows gain **Cancel**
+  (`POST /api/cancel` with `{id}`, wrapping the same engine `cancel` the
+  desktop exposes in §4).
 - In-flight table gains the byte total; per-file receive progress is N/A
   (Perseus does not ingest). Upload progress only if §7's provider-events
   check lands in-cycle.
