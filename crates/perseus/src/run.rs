@@ -1,17 +1,24 @@
-//! The running agent: durable sync store, one iroh transport + sync engine **per
-//! configured send target**, and the capture watcher wired together (Sync 2C
-//! multi-target send).
+//! The running agent: durable sync store, ONE shared iroh node with a
+//! `Role::Out` handle + sync engine **per configured send target**, and the
+//! capture watcher wired together (Sync 2C multi-target send).
 //!
 //! [`Agent`] is transport-injectable. Production ([`Agent::start`]) resolves every
-//! target ([`crate::account::resolve_targets`]) and builds one [`IrohTransport`]
-//! (each with its own `blobs_out_<peer>` store dir) + one [`SyncEngine`] per
-//! target, all sharing the one durable store. The enqueue pipeline builds each
-//! package ONCE and fans it out to every engine — a per-target failure is
-//! `warn!`-logged and never drops the others (spec §8). Tests
-//! ([`Agent::start_with_transport`] for a single target,
+//! target ([`crate::account::resolve_targets`]) and binds ONE
+//! [`SharedIrohNode`](athenaeum_core::sharing::iroh::node::SharedIrohNode) from
+//! this install's device key — a single endpoint + blob store — then gives every
+//! resolved target its own [`Role::Out`](athenaeum_core::sharing::iroh::node::Role)
+//! handle onto that node + one [`SyncEngine`] per target, all sharing the one
+//! durable store. Binding one endpoint *per target* (the previous shape)
+//! self-collided on the relay: a relay keeps only one connection per node id, so
+//! a multi-destination batch evicted its own peers (the same C1 field incident
+//! the app hit). The Task 2 event demux disambiguates each target's acks by
+//! `(peer, package)`, so the engines stay one-per-peer over the shared node. The
+//! enqueue pipeline builds each package ONCE and fans it out to every engine — a
+//! per-target failure is `warn!`-logged and never drops the others (spec §8).
+//! Tests ([`Agent::start_with_transport`] for a single target,
 //! [`Agent::start_with_transports`] for N) inject in-process loopback transports
 //! and known peers, exercising the exact same enqueue/package/engine path without
-//! a network.
+//! a network (and without binding a node).
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -22,7 +29,8 @@ use athenaeum_core::fits_parser::{parse_fits_with_header, parse_xisf};
 use athenaeum_core::package::{
     self, read_manifest, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION,
 };
-use athenaeum_core::sharing::iroh::{random_secret, BlobStore, IrohTransport};
+use athenaeum_core::sharing::iroh::node::{Role, SharedIrohNode};
+use athenaeum_core::sharing::iroh::random_secret;
 use athenaeum_core::sharing::types::NodeId;
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::store::{StandaloneSyncStore, SyncStore};
@@ -349,8 +357,9 @@ fn parse_frame(path: &Path) -> Result<athenaeum_core::models::Frame> {
 
 /// One resolved send target's running engine: the peer it sends to plus the
 /// [`SyncEngine`] bound to it. Perseus fans each built package out to every
-/// [`TargetEngine`] (Sync 2C multi-target send), one engine + transport per
-/// target, all sharing the one durable [`StandaloneSyncStore`].
+/// [`TargetEngine`] (Sync 2C multi-target send), one engine per target — each
+/// riding its own `Role::Out` handle on the ONE shared iroh node — all sharing
+/// the one durable [`StandaloneSyncStore`].
 struct TargetEngine {
     /// The peer this engine sends to. Retained for diagnostics + to derive the
     /// audit `peer_device` (the engine itself already owns it).
@@ -378,6 +387,13 @@ pub struct Agent {
     /// it is terminal. A single-target agent leaves this `None` and keeps the
     /// engine's original in-line cleanup, byte-for-byte.
     cleanup: Option<Arc<SharedPackageCleanup>>,
+    /// The ONE shared iroh node backing every target's `Role::Out` engine (iroh
+    /// hardening Task 4). `Some` on the production path ([`start`](Self::start)),
+    /// `None` on the injection path (tests supply loopback transports and never
+    /// bind a node). Held so [`shutdown`](Self::shutdown) can tear the single
+    /// endpoint + store down and release the device-key advisory lock, letting a
+    /// supervisor stop→start cleanly re-acquire it.
+    node: Option<Arc<SharedIrohNode>>,
     origin_device: String,
     /// The configured sync peer id (hex) — the same value transfer history rows
     /// carry. Threaded into retention/manual-delete audit rows so a deleted
@@ -423,10 +439,11 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Start a production agent: persistent device key, iroh transport, and the
-    /// peer + relays resolved via the shared resolver (task M1) — account pairing
-    /// (primary from the hub device list) → dev ticket → error. `watch` arms the
-    /// capture watcher (true for `run`, false for `enqueue-backlog`).
+    /// Start a production agent: ONE shared iroh node (bound from the persistent
+    /// device key), and the peers + relays resolved via the shared resolver
+    /// (task M1) — account pairing (primary from the hub device list) → dev ticket
+    /// → error. `watch` arms the capture watcher (true for `run`, false for
+    /// `enqueue-backlog`).
     ///
     /// `_config_path` is the on-disk `perseus.toml` this config was loaded from.
     /// It is retained in the signature for the supervisor's production launcher
@@ -439,43 +456,36 @@ impl Agent {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
 
-        // Resolve EVERY send target + the shared relay map before binding any
-        // transport: account resolution when signed in (offline per-target cache
+        // Resolve EVERY send target + the shared relay map before binding the
+        // node: account resolution when signed in (offline per-target cache
         // fallback), else the dev ticket (a single target).
         let resolved = crate::account::resolve_targets(&config).await?;
 
-        let secret = load_or_create_device_key(&config.device_key_path())?;
+        // ONE shared iroh node per agent (iroh hardening Task 4). A single
+        // endpoint + blob store bound from this install's device key at
+        // `<data_dir>/device_key` (the exact key the hub registered at sign-in),
+        // instead of one endpoint per target — binding N endpoints from the SAME
+        // key made a multi-destination batch self-collide on the relay (only one
+        // connection per node id survives). The T1 device-key advisory lock is
+        // taken here, so a second Perseus on the same `data_dir` fails loudly.
+        let node = SharedIrohNode::bind(&config.data_dir, resolved.relay_mode.clone())
+            .await
+            .context("bind shared iroh node")?;
+        let node_id = node.node_id();
 
-        // One transport + engine per resolved target. Each transport gets its OWN
-        // blob store directory, keyed by the target's node id, so the per-target
-        // `redb` blob stores never collide on their exclusive directory lock.
-        let mut node_id: Option<NodeId> = None;
+        // One `Role::Out` handle + engine per resolved target (engines stay
+        // one-per-peer; the Task 2 demux disambiguates each target's acks by
+        // `(peer, package)`). Register each peer at the NODE level:
+        //   - ticket path — from the ticket's embedded relay + direct addresses;
+        //   - account path — the peer is a bare node id, and the node's endpoint
+        //     has NO discovery services (`presets::Minimal`), so `announce` would
+        //     fail instantly without a dial hint. Attach our own resolved relay
+        //     URL(s) — the shared set account devices on this hub publish — as the
+        //     peer's dial hint.
         let mut transports: Vec<(NodeId, Arc<dyn SharingTransport>)> = Vec::new();
         for target in &resolved.targets {
-            let blob_dir = config
-                .data_dir
-                .join(format!("blobs_out_{}", node_id_hex(&target.peer)));
-            let transport = IrohTransport::new(
-                secret,
-                resolved.relay_mode.clone(),
-                BlobStore::Fs(blob_dir),
-                // Perseus is send-only: it never answers inbound dedup offers.
-                None,
-            )
-            .await
-            .context("build iroh transport")?;
-            // On the ticket path, register the peer's full dialable address from
-            // the ticket (it embeds relay + direct addresses). On the account
-            // path the peer is a bare node id: `IrohTransport` has NO discovery
-            // services (`presets::Minimal`, task A5), so without a dial hint
-            // `announce` fails instantly with "No addressing information
-            // available" (fix-review, production bug). Attach our own resolved
-            // relay URL(s) — the same ones this endpoint itself binds with — as
-            // the peer's dial hint; account devices on the same hub share the
-            // same published relay set, so this is the correct minimal hint.
             if let Some(ticket) = &target.ticket {
-                transport
-                    .add_peer_ticket(ticket)
+                node.add_peer_ticket(ticket)
                     .context("register peer address from pairing ticket")?;
             } else {
                 let peer_addr = athenaeum_core::sync::pairing::peer_addr_with_relays(
@@ -483,21 +493,21 @@ impl Agent {
                     &resolved.relay_urls,
                 )
                 .context("construct account-resolved peer address")?;
-                transport.add_peer(peer_addr);
+                node.add_peer(peer_addr);
             }
-            node_id.get_or_insert_with(|| transport.node_id());
             tracing::info!(
-                node_id = %node_id_hex(&transport.node_id()),
+                node_id = %node_id_hex(&node_id),
                 peer = %node_id_hex(&target.peer),
-                "iroh transport ready"
+                "iroh out handle ready"
             );
-            transports.push((target.peer, Arc::new(transport)));
+            transports.push((target.peer, node.handle(Role::Out)));
         }
-        // `resolve_targets` guarantees at least one target resolved, so `node_id`
-        // is always set here.
-        let node_id = node_id.expect("resolve_targets yields at least one transport");
 
-        let agent = Self::start_with_transports(config, transports, node_id, watch).await?;
+        let mut agent = Self::start_with_transports(config, transports, node_id, watch).await?;
+        // Retain the node so `shutdown` can tear the single endpoint + store down
+        // and release the device-key lock (a supervisor stop→start then cleanly
+        // re-acquires it). The injection seams leave `node` as `None`.
+        agent.node = Some(node);
         // The embedded web status page is no longer bound here: its ownership
         // moved to the supervisor (Task 4), which attaches `WebState` to the
         // running engine via its `on_agent` seam. `bind_and_spawn_web` stays
@@ -714,6 +724,9 @@ impl Agent {
             seen,
             engines,
             cleanup,
+            // Injection path: no shared node (loopback transports). `start` sets
+            // this to the bound node on the production path.
+            node: None,
             origin_device,
             peer_device,
             watchers,
@@ -877,9 +890,24 @@ impl Agent {
         if let Some(t) = self.batcher_task {
             let _ = t.await;
         }
-        // Shut every target engine down (awaiting each worker).
+        // Shut every target engine down (awaiting each worker) FIRST: each engine
+        // holds a `Role::Out` handle onto the shared node, whose endpoint must
+        // outlive them.
         for t in self.engines {
             t.engine.shutdown().await;
+        }
+        // Then tear the ONE shared node down, bounded (Task 4): router + store
+        // shutdown + a graceful endpoint close, releasing the device-key advisory
+        // lock so a supervisor stop→start can re-acquire it. `None` on the
+        // injection path. The node's own close is internally bounded; the outer
+        // 5s guard is a belt-and-braces cap so shutdown can never hang exit.
+        if let Some(node) = self.node {
+            if tokio::time::timeout(std::time::Duration::from_secs(5), node.shutdown())
+                .await
+                .is_err()
+            {
+                tracing::warn!("shared iroh node shutdown timed out");
+            }
         }
     }
 
@@ -906,10 +934,12 @@ impl Agent {
         if let Some(t) = self.retention_task {
             t.abort();
         }
-        // `self.engines` (and `self.store`/`self.seen`) drop here, at end of
-        // scope: each dropped engine handle closes its worker's command channel,
-        // so every worker notices and exits on its own (the same mechanism
-        // `shutdown` relies on, minus the cooperative await).
+        // `self.engines` (and `self.store`/`self.seen`/`self.node`) drop here, at
+        // end of scope: each dropped engine handle closes its worker's command
+        // channel, so every worker notices and exits on its own (the same
+        // mechanism `shutdown` relies on, minus the cooperative await). The shared
+        // node's `Arc` drops WITHOUT a graceful `shutdown` — that is the point:
+        // a killed process never closes its endpoint cleanly.
     }
 }
 
@@ -2304,6 +2334,37 @@ mod multi_target_tests {
         pkg_dir
     }
 
+    /// As [`make_pkg`], but also returns the [`PackageAnnounce`] `write_package`
+    /// produced (its `package_id` is the serve tag) — for the shared-node test,
+    /// which serves real payloads onto the one node's store without a network.
+    fn make_announced_pkg(
+        dir: &Path,
+        uuid: &str,
+        name: &str,
+    ) -> (PathBuf, athenaeum_core::sharing::types::PackageAnnounce) {
+        let src = dir.join(name);
+        std::fs::write(&src, b"payload-bytes-0123456789").unwrap();
+        let byte_size = std::fs::metadata(&src).unwrap().len();
+        let xxh3 = package::xxh3_full_file(&src).unwrap();
+        let record = ManifestRecord {
+            v: MANIFEST_VERSION,
+            frame_uuid: uuid.to_string(),
+            origin_catalog_uuid: uuid.to_string(),
+            origin_device: "test-device".to_string(),
+            payload_kind: PayloadKind::RawFrame,
+            rel_path: name.to_string(),
+            byte_size,
+            xxh3,
+            frame_meta: serde_json::json!({ "object": "M42" }),
+            analysis: None,
+            app_version: "test".to_string(),
+            project: None,
+        };
+        let pkg_dir = dir.join(format!("apkg-{uuid}"));
+        let announce = write_package(&pkg_dir, vec![(src, record)]).unwrap();
+        (pkg_dir, announce)
+    }
+
     /// Spawn a reactive receiver on `endpoint`: fetch every announced package and
     /// ack every frame as `Ingested`, so the sender's row reaches `Confirmed`.
     fn spawn_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf) {
@@ -2543,6 +2604,70 @@ mod multi_target_tests {
             .expect("agent starts with two targets");
         assert_eq!(agent.engine_count(), 2, "one engine per injected target");
         agent.shutdown().await;
+    }
+
+    /// Task 4 (iroh hardening): the production shape is ONE `SharedIrohNode` with
+    /// a `Role::Out` handle per target — instead of one endpoint per target,
+    /// which self-collided on the relay (a relay keeps only one connection per
+    /// node id, so a two-destination batch evicted its own peers). Loopback
+    /// injection bypasses the node, so "one node" is unobservable through
+    /// `start_with_transports`; this pins the production invariant DIRECTLY over a
+    /// real relay-disabled node (node-handle introspection, the form the brief
+    /// blesses), staying hermetic and low-footprint — no background-dialing
+    /// engines, so it never destabilises a neighbouring timing test:
+    ///   1. two `Role::Out` handles both `start()` onto the SAME node identity —
+    ///      i.e. every target rides the ONE endpoint (the anti-self-collision
+    ///      property `Agent::start` now relies on);
+    ///   2. each handle takes its OWN inbound event stream (the Task-2 demux fans
+    ///      the node's single stream out per handle, so N per-peer send engines
+    ///      coexist on one node without stealing each other's acks); and
+    ///   3. both handles serve real payloads onto the node's ONE blob store
+    ///      (local, no network) — the store is shared and a serve on one target
+    ///      never trips the other's prefix-scoped tags.
+    /// End-to-end fan-out delivery/confirm is already covered hermetically by
+    /// `fan_out_delivers_to_every_target` (loopback); the novel Task-4 property is
+    /// the single shared node, which this test pins.
+    #[tokio::test]
+    async fn one_shared_node_serves_every_target() {
+        use athenaeum_core::sharing::iroh::node::{Role, SharedIrohNode};
+        use iroh::RelayMode;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // ONE node (relay-disabled, hermetic); its device key + advisory lock
+        // live under this data dir — the same key the hub registers at sign-in.
+        let node = SharedIrohNode::bind(tmp.path(), RelayMode::Disabled)
+            .await
+            .expect("bind the one shared node");
+
+        // (1) One Out handle per target — both are views on the ONE endpoint.
+        let h1: Arc<dyn SharingTransport> = node.handle(Role::Out);
+        let h2: Arc<dyn SharingTransport> = node.handle(Role::Out);
+        assert_eq!(
+            h1.start().await.unwrap().node_id,
+            node.node_id(),
+            "target 1 rides the one node's endpoint"
+        );
+        assert_eq!(
+            h2.start().await.unwrap().node_id,
+            node.node_id(),
+            "target 2 rides the SAME endpoint (no per-target endpoint)"
+        );
+
+        // (2) Each target handle gets its OWN inbound event stream.
+        let _e1 = h1.events().await;
+        let _e2 = h2.events().await;
+
+        // (3) Both targets serve onto the node's single blob store (local, no net).
+        let (pkg1, ann1) = make_announced_pkg(tmp.path(), "uuid-a", "a.fits");
+        let (pkg2, ann2) = make_announced_pkg(tmp.path(), "uuid-b", "b.fits");
+        h1.serve(&ann1, &pkg1, None)
+            .await
+            .expect("target 1 serves onto the shared store");
+        h2.serve(&ann2, &pkg2, None)
+            .await
+            .expect("target 2 serves onto the SAME shared store");
+
+        node.shutdown().await;
     }
 }
 

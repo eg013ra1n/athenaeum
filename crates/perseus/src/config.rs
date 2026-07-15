@@ -242,13 +242,15 @@ pub struct AccountConfig {
     /// Account email. Optional in the file — `perseus login` prompts when absent.
     #[serde(default)]
     pub email: Option<String>,
-    /// **Dev only.** When the hub's relay map is empty/unreachable and there is
-    /// no cached relay map yet, allow falling back to iroh's public default
-    /// relays (task M1 review finding #1). Defaults to `false` — a signed-in
-    /// production Perseus agent must not silently start riding the public n0
-    /// relays just because the hub is misconfigured; that failure should be
-    /// loud. Set `true` only for dev/test environments without a hub relay
-    /// deployment.
+    /// **Dev / ticket-mode only — effective ONLY when signed out.** When the
+    /// resolved relay map is empty/unreachable with no cache, allow falling back
+    /// to iroh's public default relays (task M1 review finding #1). A *signed-in*
+    /// agent IGNORES this flag entirely and never rides the public n0 relays,
+    /// even set to `true` (I3 gate parity with the app — a signed-in node on n0
+    /// while its account peer sits on the hub's relay map cannot dial it, mixed
+    /// relay networks). So the flag governs only the pure dev pairing-ticket
+    /// path. Defaults to `false`; set `true` only for dev/test environments
+    /// without a hub relay deployment.
     #[serde(default)]
     pub allow_default_relays: bool,
 }

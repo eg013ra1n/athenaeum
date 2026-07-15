@@ -378,12 +378,18 @@ pub async fn resolve_targets(config: &Config) -> Result<ResolvedTargets> {
     if relays.fresh {
         cache.relay_urls = relays.urls.clone();
     }
-    let allow_default_relays = if relay_account.is_some() {
-        config.account.as_ref().is_some_and(|a| a.allow_default_relays)
-    } else {
-        true
-    };
-    let relay_mode = match pairing::relay_mode_for(&relays.urls, allow_default_relays) {
+    // I3 gate parity with the app ([`allow_default_relays`]): the dev-only
+    // default-relay fallback is effective ONLY when signed OUT.
+    // `relay_account.is_some()` is "signed in"; when signed in the bare node-id
+    // peer sits on the hub's relay map, so a signed-in agent that dropped onto
+    // iroh's public n0 relays could no longer dial it (different relay networks)
+    // — the 2026-07 field incident. On the ticket/dev path the flag governs,
+    // defaulting to the historical dev-ticket allowance when there is no
+    // `[account]` table at all.
+    let signed_in = relay_account.is_some();
+    let dev_flag = config.account.as_ref().map_or(true, |a| a.allow_default_relays);
+    let relay_mode = match pairing::relay_mode_for(&relays.urls, allow_default_relays(signed_in, dev_flag))
+    {
         Ok(mode) => mode,
         Err(reason) => {
             cache.save(&config.data_dir);
@@ -397,6 +403,20 @@ pub async fn resolve_targets(config: &Config) -> Result<ResolvedTargets> {
         relay_mode,
         relay_urls: relays.urls.clone(),
     })
+}
+
+/// I3 gate parity with the app ([`athenaeum_core::api::sync`]'s
+/// `allow_default_relays`): whether the dev-only default-relay fallback
+/// ([`pairing::relay_mode_for`]'s `allow_default`) is permitted, given whether
+/// this device is signed in (has hub credentials) and whether the dev flag
+/// ([`AccountConfig::allow_default_relays`]) is on.
+///
+/// **Signed-in always wins, even with the flag on.** A signed-in Perseus agent
+/// must never end up on iroh's public n0 default relays: its account peer sits
+/// on the hub's relay map, so mixed relay networks make dial-by-node-id fail
+/// instantly. The flag is for **pure ticket/dev mode** (signed out) only.
+fn allow_default_relays(signed_in: bool, dev_flag: bool) -> bool {
+    !signed_in && dev_flag
 }
 
 /// Resolve every configured send target to its peer [`NodeId`], in order.
@@ -1200,11 +1220,16 @@ mod tests {
         );
     }
 
-    /// Review finding #1: the SAME empty-relay-map scenario, but with
-    /// `[account].allow_default_relays = true` — the dev-only opt-in allows
-    /// falling back to iroh's public default relays.
+    /// I3 gate parity (iroh hardening Task 4): signed in, the hub's relay map is
+    /// empty, no cache — and `[account].allow_default_relays = true`. The flag is
+    /// **ineffective when signed in**: a signed-in agent must NEVER ride iroh's
+    /// public default relays (its account peer sits on the hub relay map; mixing
+    /// relay networks breaks dial-by-node-id), so this must be the loud refusal,
+    /// NOT a silent fall-back to `RelayMode::Default`. The flag now governs only
+    /// on the signed-OUT ticket/dev path (see
+    /// `resolve_targets_dev_ticket_without_account`).
     #[tokio::test]
-    async fn resolve_targets_empty_relay_map_with_optin_uses_default() {
+    async fn resolve_targets_signed_in_with_optin_still_refuses_default() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path()).unwrap();
         let target_key = DeviceKey::load_or_create_in(&tmp.path().join("target")).unwrap();
@@ -1222,15 +1247,19 @@ mod tests {
             .mount(&server)
             .await;
 
+        // allow_default_relays = true, BUT signed in → the flag is ineffective.
         let config = account_config_allowing_default_relays(tmp.path(), &server.uri(), &["Studio"]);
         token_store(&config, config.account.as_ref().unwrap())
             .store("tok-signed-in")
             .unwrap();
 
-        let resolved = resolve_targets(&config)
+        let err = resolve_targets(&config)
             .await
-            .expect("the dev-only opt-in must allow the default-relay fallback");
-        assert!(matches!(resolved.relay_mode, RelayMode::Default));
+            .expect_err("a signed-in agent must refuse the default-relay fallback even with the flag on");
+        assert!(
+            format!("{err:#}").contains("refusing"),
+            "error should explain the refusal (never RelayMode::Default when signed in): {err:#}"
+        );
     }
 
     /// Sync 2C: the dev-ticket route still resolves a single peer with no account
