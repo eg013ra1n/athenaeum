@@ -308,6 +308,13 @@ cancelled.
 - Design tokens throughout; `formatTimestamp` for times; notifications stay
   on discrete outcomes only (no notification changes in this cycle beyond
   wording that no longer says "failed after N attempts").
+- **Palette (owner request, 2026-07-15 mockup review):** the screen's visual
+  accents — progress bars, status chips, the stalled badge, outcome chips —
+  use the **Nord palette** (frost blues for transfer/progress, aurora
+  green/yellow/red for done/stalled/cancelled), wired through the existing
+  design-token system (token values/extensions, never raw hex in
+  components) so both themes keep working. Mockup approved 2026-07-15
+  (unified-table layout confirmed, quick-glance slide-over kept).
 
 ### 11. Perseus web parity
 
