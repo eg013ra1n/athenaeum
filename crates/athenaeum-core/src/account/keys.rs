@@ -80,6 +80,106 @@ impl DeviceKey {
     }
 }
 
+/// Actionable, key-material-free message for a failed device-key lock (S2). It
+/// names the two real causes (a copied identity or a double launch) and the
+/// remedy, printing only the path — never any secret bytes.
+fn device_key_in_use_message(path: &Path) -> String {
+    format!(
+        "device key at {} is in use by another process (copied key or double launch) — each install needs its own identity",
+        path.display()
+    )
+}
+
+/// A held, process-lifetime advisory lock on the `device_key` file (iroh
+/// hardening I4). Taken at [`SharedIrohNode`](crate::sharing::iroh::node) bind so
+/// a second install started from a **copied** key — or a double launch of the
+/// same install — fails loudly at startup instead of silently dueling with the
+/// original on the relay (one relay slot per node id). Dropping it (node
+/// shutdown) releases the OS lock so a later re-bind can re-acquire it.
+///
+/// # Why the raw pointer
+///
+/// [`fd_lock::RwLock::try_write`] borrows the lock `&mut` for the returned
+/// guard's whole lifetime, and it is the guard's `Drop` that releases the OS
+/// `flock` (dropping the guard early would unlock). So the lock and its guard
+/// must stay alive together — a self-referential pair. We box the lock, hand the
+/// guard a `'static` borrow of that box, and reclaim the box in `Drop` after the
+/// guard has released. No leak (important: the node may re-bind), no external
+/// self-referential-struct crate.
+pub struct DeviceKeyLock {
+    /// Dropped FIRST (Rust drops fields in declaration order): releasing the OS
+    /// lock before `lock` — the box it borrows — is freed. `Option` so `Drop`
+    /// can release it explicitly ahead of reclaiming the box.
+    guard: Option<fd_lock::RwLockWriteGuard<'static, std::fs::File>>,
+    /// Raw owner of the boxed lock the guard borrows; reclaimed exactly once in
+    /// `Drop`. Came from [`Box::into_raw`] in [`Self::acquire`].
+    lock: *mut fd_lock::RwLock<std::fs::File>,
+    /// The locked key path, for the release log line (no secret material).
+    path: PathBuf,
+}
+
+// Safety: the boxed `fd_lock::RwLock` is uniquely owned via `lock` (exactly one
+// `&mut` to it is ever created — the one held by `guard`), and the underlying
+// `flock` is bound to the open file description, not a thread. Moving the value
+// between threads and dropping it there (which unlocks) is therefore sound. Not
+// `Sync`: there is no shared access to the raw pointer.
+unsafe impl Send for DeviceKeyLock {}
+
+impl DeviceKeyLock {
+    /// Acquire the exclusive advisory lock on `key_path`, which must already
+    /// exist (the caller creates it via [`DeviceKey::load_or_create`] first). A
+    /// second holder — this process or any other — fails with an actionable,
+    /// key-material-free error (I4/S2). A genuine I/O error (not contention)
+    /// propagates with context, never masquerading as "in use".
+    pub fn acquire(key_path: &Path) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(key_path)
+            .with_context(|| format!("open device key for locking {}", key_path.display()))?;
+        let ptr = Box::into_raw(Box::new(fd_lock::RwLock::new(file)));
+        // Safety: `ptr` is a fresh unique allocation from `Box::into_raw`; we
+        // create exactly one `&mut` from it, which moves into the guard on
+        // success or is dropped (via reclaiming the box) on every error path.
+        let lock_ref: &'static mut fd_lock::RwLock<std::fs::File> = unsafe { &mut *ptr };
+        match lock_ref.try_write() {
+            Ok(guard) => {
+                tracing::debug!(path = %key_path.display(), "device key lock acquired");
+                Ok(Self {
+                    guard: Some(guard),
+                    lock: ptr,
+                    path: key_path.to_path_buf(),
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Contention — reclaim the box (no guard was taken) and report.
+                // Safety: `ptr` came from `Box::into_raw` above and no live
+                // borrow of it exists (`try_write` failed, `lock_ref` unused).
+                unsafe { drop(Box::from_raw(ptr)) };
+                anyhow::bail!(device_key_in_use_message(key_path))
+            }
+            Err(e) => {
+                // Safety: as above — reclaim the never-borrowed box.
+                unsafe { drop(Box::from_raw(ptr)) };
+                Err(e).with_context(|| format!("lock device key {}", key_path.display()))
+            }
+        }
+    }
+}
+
+impl Drop for DeviceKeyLock {
+    fn drop(&mut self) {
+        // Release the OS lock (guard `Drop` → `flock(LOCK_UN)`) BEFORE freeing
+        // the box it borrows.
+        self.guard = None;
+        // Safety: `lock` came from `Box::into_raw` in `acquire` and is turned
+        // back into a `Box` — and dropped — exactly once, here; the only borrow
+        // of it (`guard`) was just released on the line above.
+        unsafe { drop(Box::from_raw(self.lock)) };
+        tracing::debug!(path = %self.path.display(), "device key lock released");
+    }
+}
+
 /// Load the persisted 32-byte device secret, creating it (mode 0600 on unix) on
 /// first run. The identity secret must never be group/world-readable — an
 /// existing file with loose bits is tightened on load.

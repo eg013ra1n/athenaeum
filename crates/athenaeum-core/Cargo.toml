@@ -62,6 +62,12 @@ iroh-tickets = "=1.0.0"
 # tree transitively — single version, no duplicate); `iroh` does not re-export a
 # StreamExt, so it is named directly here to poll the path-change watcher.
 n0-future = "0.3"
+# Cross-platform advisory file lock on the device-key file (iroh hardening C1/I4):
+# a process-lifetime lock so a second install started from a COPIED device key
+# fails loudly at node bind instead of silently dueling on the relay. Backed by
+# `rustix` on unix (single version 1.1.2 already in the tree — no duplicate) and
+# a native handle on Windows.
+fd-lock = "4"
 # ed25519 verification of hub-signed membership snapshots. MUST match the
 # version iroh 1.0.2 already carries transitively (one crate version in the
 # tree — owner rule): check `grep -A1 'name = "ed25519-dalek"' Cargo.lock`

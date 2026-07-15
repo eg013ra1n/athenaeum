@@ -139,4 +139,18 @@ pub trait SharingTransport: Send + Sync {
     /// calls yield an already-closed receiver (`recv()` returns `None`
     /// immediately). Callers (the engine) must take it exactly once.
     async fn events(&self) -> mpsc::Receiver<TransportEvent>;
+
+    /// Gracefully tear down whatever this transport owns (iroh hardening I1).
+    ///
+    /// Production transports are `Arc`-wrapped, so the drop-only teardown path
+    /// aborts the router mid-poll and skips `endpoint.close()` — peers then see
+    /// QUIC resets and a fast-restarting process leaves its old relay
+    /// registration lingering. A host that wants a clean close awaits this on
+    /// shutdown (receiver stop, web/Tauri exit, Perseus `Agent::shutdown`).
+    ///
+    /// The default is a no-op: the in-process [`LoopbackTransport`] and the
+    /// legacy owned-`IrohTransport::shutdown` path have nothing extra to do here.
+    /// The [`SharedIrohNode`](crate::sharing::iroh::node::SharedIrohNode) role
+    /// handles route it to the node's single bounded teardown. Idempotent.
+    async fn shutdown(&self) {}
 }

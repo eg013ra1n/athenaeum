@@ -61,6 +61,7 @@ use super::SharingTransport;
 use crate::sync::DedupResponder;
 
 pub mod blobs;
+pub mod node;
 pub mod proto;
 
 #[cfg(test)]
@@ -769,6 +770,14 @@ impl std::fmt::Debug for SyncControlProtocol {
 
 impl ProtocolHandler for SyncControlProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        // Gate placement (design decision Д1, iroh 1.0.2 verified 2026-07-15):
+        // the authenticated peer id first exists here, on the completed
+        // `Connection` (`remote_id()`). iroh's pre-handshake stages —
+        // `Incoming`/`Accepting` (`connection.rs`) — expose ONLY socket
+        // addresses, no identity, so an `incoming_filter`/`before_connect` gate
+        // could not authorize by node id. The handler-level gate therefore stays
+        // exactly where the remote identity becomes available; the residual
+        // pre-handshake DoS surface is the documented, accepted trade-off.
         let from: NodeId = *connection.remote_id().as_bytes();
         // Connection-level authorization (slice 4): reject an ungated peer before
         // decoding a single `Msg`, so it gets no control dispatch at all.
@@ -949,6 +958,9 @@ impl std::fmt::Debug for GatedBlobs {
 
 impl ProtocolHandler for GatedBlobs {
     async fn accept(&self, connection: Connection) -> Result<(), iroh::protocol::AcceptError> {
+        // Gate placement per Д1 (see `SyncControlProtocol::accept`): `remote_id()`
+        // on the completed `Connection` is the earliest point iroh 1.0.2 exposes
+        // the authenticated peer id, so the blobs gate lives here too.
         let from: NodeId = *connection.remote_id().as_bytes();
         if !connect_gate_admits(&self.gate, &from) {
             tracing::warn!(from = %hex32(&from), "connection refused by connect gate");
