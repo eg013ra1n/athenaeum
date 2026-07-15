@@ -142,6 +142,52 @@ fn connect_gate_admits(gate: &SharedConnectGate, from: &NodeId) -> bool {
     }
 }
 
+/// Mount both ALPNs on `endpoint` and spawn the accept loop — the single
+/// construction shape shared by the legacy [`IrohTransport::new`], the shared
+/// node's [`bind`](node::SharedIrohNode) and its relay [`rebuild`]. Each of the
+/// three sites previously hand-built the identical
+/// [`GatedBlobs`] + [`SyncControlProtocol`] + [`Router`] triple; the only
+/// per-site variation is threaded through the parameters:
+///
+/// - `sink` — [`EventSink::Direct`] for the legacy owned-endpoint transport,
+///   [`EventSink::Demux`] for the shared node (both bind and rebuild).
+/// - `flush_store_on_shutdown` — `true` only for [`IrohTransport`], whose router
+///   teardown IS its store flush; `false` for the shared node, whose store is
+///   shared across relay rebuilds and flushed explicitly at node shutdown (T8).
+///
+/// The `gate` and `responder` slots are cloned in (late-bindable), and the store
+/// is borrowed (the caller keeps ownership for its own struct field). Behaviour
+/// is byte-identical to the three inlined copies it replaces.
+///
+/// [`rebuild`]: node::SharedIrohNode
+pub(crate) fn build_router(
+    endpoint: Endpoint,
+    store: &Store,
+    gate: &SharedConnectGate,
+    sink: EventSink,
+    responder: SharedResponder,
+    flush_store_on_shutdown: bool,
+) -> Router {
+    // Wrap the blobs provider so an ungated peer never receives a blob byte:
+    // `GatedBlobs` checks the connect gate against the dialing node id before
+    // delegating to the inner `iroh_blobs` handler (finding F5 hardening).
+    let blobs = GatedBlobs {
+        inner: BlobsProtocol::new(store, None),
+        gate: Arc::clone(gate),
+        flush_store_on_shutdown,
+    };
+    let control = SyncControlProtocol {
+        sink,
+        responder,
+        gate: Arc::clone(gate),
+    };
+    // Both protocols on one router; `spawn` registers both ALPNs on the endpoint.
+    Router::builder(endpoint)
+        .accept(iroh_blobs::ALPN, blobs)
+        .accept(SYNC_ALPN, control)
+        .spawn()
+}
+
 /// Where an [`IrohTransport`] keeps downloaded/served blob content.
 pub enum BlobStore {
     /// Ephemeral in-memory store (tests, or a stateless hop).
@@ -271,29 +317,20 @@ impl IrohTransport {
         // point governs the control channel AND the blobs provider.
         let connect_gate: SharedConnectGate = Arc::new(Mutex::new(None));
 
-        // Wrap the blobs provider so an ungated peer never receives a blob byte:
-        // `GatedBlobs` checks the connect gate against the dialing node id before
-        // delegating to the inner `iroh_blobs` handler (finding F5 hardening).
-        let blobs = GatedBlobs {
-            inner: BlobsProtocol::new(&store, None),
-            gate: Arc::clone(&connect_gate),
-            // Legacy owned-endpoint transport: the router shutdown IS the store
-            // flush (no separate `self.store.shutdown()` in `IrohTransport`).
-            flush_store_on_shutdown: true,
-        };
-        let control = SyncControlProtocol {
-            sink: EventSink::Direct(event_tx.clone()),
-            // Fixed for this transport's lifetime — wrapped in the shared slot only
-            // so `SyncControlProtocol` has one responder type across both the
-            // legacy transport and the shared node (which installs its responder
-            // late). `IrohTransport` never re-sets it.
-            responder: Arc::new(Mutex::new(responder)),
-            gate: Arc::clone(&connect_gate),
-        };
-        let router = Router::builder(endpoint)
-            .accept(iroh_blobs::ALPN, blobs)
-            .accept(SYNC_ALPN, control)
-            .spawn();
+        // Legacy owned-endpoint transport: `EventSink::Direct` (single stream),
+        // and `flush_store_on_shutdown: true` because the router teardown IS this
+        // transport's only store flush (no separate `self.store.shutdown()`). The
+        // responder is fixed for this transport's lifetime — wrapped in the shared
+        // slot only so `SyncControlProtocol` has one responder type across both the
+        // legacy transport and the shared node; `IrohTransport` never re-sets it.
+        let router = build_router(
+            endpoint,
+            &store,
+            &connect_gate,
+            EventSink::Direct(event_tx.clone()),
+            Arc::new(Mutex::new(responder)),
+            true,
+        );
 
         let endpoint = router.endpoint().clone();
         let node_id: NodeId = *endpoint.id().as_bytes();

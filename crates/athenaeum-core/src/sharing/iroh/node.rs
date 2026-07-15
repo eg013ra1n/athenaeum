@@ -11,8 +11,11 @@
 //! self-collision.
 //!
 //! The node is a refactor of [`IrohTransport`](super::IrohTransport) — it reuses
-//! that module's construction shape, protocol handlers ([`SyncControlProtocol`],
-//! [`GatedBlobs`]), blob glue ([`blobs`]), and connection-path diagnostics
+//! that module's construction shape, protocol handlers
+//! ([`SyncControlProtocol`](super::SyncControlProtocol),
+//! [`GatedBlobs`](super::GatedBlobs)) — mounted via the shared
+//! [`build_router`](super::build_router) constructor — blob glue ([`blobs`]), and
+//! connection-path diagnostics
 //! verbatim, adding: a process-lifetime advisory **lock** on the device-key file
 //! (I4), **role-prefixed** blob tags with a **prefix-scoped** startup sweep (Д3,
 //! so one role's sweep can't wipe another's live tags on the shared store), a
@@ -44,7 +47,7 @@ use iroh_blobs::api::Store;
 use iroh_blobs::store::fs::options::Options as FsOptions;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::GcConfig;
-use iroh_blobs::{BlobsProtocol, Hash};
+use iroh_blobs::Hash;
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
@@ -58,9 +61,9 @@ use crate::sync::DedupResponder;
 
 use super::proto::{self, Msg, OfferEntry};
 use super::{
-    blobs, hex32, spawn_conn_path_diagnostics, ConnectGate, Delivery, EventSink, GatedBlobs,
-    SharedConnectGate, SharedResponder, SyncControlProtocol, CONTROL_SEND_TIMEOUT,
-    EVENT_CHANNEL_CAPACITY, GC_INTERVAL, MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
+    blobs, build_router, hex32, spawn_conn_path_diagnostics, ConnectGate, Delivery, EventSink,
+    SharedConnectGate, SharedResponder, CONTROL_SEND_TIMEOUT, EVENT_CHANNEL_CAPACITY, GC_INTERVAL,
+    MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
 };
 
 /// Upper bound on the graceful `endpoint.close()` at shutdown (I1). A clean
@@ -661,31 +664,24 @@ impl SharedIrohNode {
         // point governs the control channel AND the blobs provider (S4 parity
         // with `IrohTransport`).
         let connect_gate: SharedConnectGate = Arc::new(Mutex::new(None));
-        let blobs_proto = GatedBlobs {
-            inner: BlobsProtocol::new(&store, None),
-            gate: Arc::clone(&connect_gate),
-            // Shared store: a relay rebuild tears the router down (its accept loop
-            // calls `protocols.shutdown()` when the endpoint closes) but MUST NOT
-            // tear the shared store down — the node flushes it explicitly in
-            // `shutdown` (T8).
-            flush_store_on_shutdown: false,
-        };
         // Late-bindable dedup responder slot (Д3 shape): empty at bind, installed
         // by the receiver when it migrates onto the node (`set_dedup_responder`,
         // Task 3). Empty ⇒ offers are answered want-all, so nothing is ever
         // silently withheld before the receiver wires its catalog responder.
-        // Inbound events fan out through the demux (Task 2, Д4), not a single
-        // shared stream.
         let responder: SharedResponder = Arc::new(Mutex::new(None));
-        let control = SyncControlProtocol {
-            sink: EventSink::Demux(Arc::clone(&demux)),
-            responder: Arc::clone(&responder),
-            gate: Arc::clone(&connect_gate),
-        };
-        let router = Router::builder(endpoint)
-            .accept(iroh_blobs::ALPN, blobs_proto)
-            .accept(SYNC_ALPN, control)
-            .spawn();
+        // Shared node: `EventSink::Demux` (inbound events fan out through the demux,
+        // Task 2/Д4, not a single shared stream), and `flush_store_on_shutdown:
+        // false` because the store is SHARED across relay rebuilds — a per-rebuild
+        // router teardown must not tear it down; the node flushes it explicitly in
+        // `shutdown` (T8).
+        let router = build_router(
+            endpoint,
+            &store,
+            &connect_gate,
+            EventSink::Demux(Arc::clone(&demux)),
+            Arc::clone(&responder),
+            false,
+        );
 
         let endpoint = router.endpoint().clone();
         let node_id: NodeId = *endpoint.id().as_bytes();
@@ -1109,22 +1105,17 @@ impl SharedIrohNode {
 
         // Re-mount BOTH protocols on the SAME store, demux, gate, and responder —
         // so every Task-2 demux consumer stays registered and any installed
-        // gate/responder survives, transparently to SyncRuntime/engines.
-        let blobs_proto = GatedBlobs {
-            inner: BlobsProtocol::new(&self.store, None),
-            gate: Arc::clone(&self.connect_gate),
-            // See bind(): the shared store must survive this router's teardown.
-            flush_store_on_shutdown: false,
-        };
-        let control = SyncControlProtocol {
-            sink: EventSink::Demux(Arc::clone(&self.demux)),
-            responder: Arc::clone(&self.responder),
-            gate: Arc::clone(&self.connect_gate),
-        };
-        let router = Router::builder(endpoint)
-            .accept(iroh_blobs::ALPN, blobs_proto)
-            .accept(SYNC_ALPN, control)
-            .spawn();
+        // gate/responder survives, transparently to SyncRuntime/engines. Same
+        // construction shape as bind() (`flush_store_on_shutdown: false` — the
+        // shared store must survive this router's teardown).
+        let router = build_router(
+            endpoint,
+            &self.store,
+            &self.connect_gate,
+            EventSink::Demux(Arc::clone(&self.demux)),
+            Arc::clone(&self.responder),
+            false,
+        );
         let endpoint = router.endpoint().clone();
         let new_node_id: NodeId = *endpoint.id().as_bytes();
         debug_assert_eq!(
@@ -2453,6 +2444,94 @@ mod tests {
         assert_eq!(node.node_id(), id, "node id stable across the deferred rebuild");
 
         node.shutdown().await;
+    }
+
+    // (c) S4 survives the rebuild path: an installed connect gate is re-cloned
+    //     into the freshly-built router by `build_router`, so a relay refresh
+    //     never silently drops it. A deny-SPECIFIC-peer gate on the receiver is
+    //     asserted BOTH ways after a rebuild — the denied peer's inbound connect
+    //     is still refused (its announce fails, zero control dispatch), while an
+    //     allowed peer is still admitted (the companion that proves the refusal
+    //     is the gate's verdict, not broken post-rebuild connectivity).
+    #[tokio::test]
+    async fn connect_gate_survives_relay_rebuild() {
+        let dr = tempdir().unwrap();
+        let dd = tempdir().unwrap();
+        let da = tempdir().unwrap();
+        let r = bind_disabled(dr.path()).await; // gated receiver (will rebuild)
+        let denied = bind_disabled(dd.path()).await;
+        let allowed = bind_disabled(da.path()).await;
+
+        let recv = r.handle(Role::Recv);
+        let out_denied = denied.handle(Role::Out);
+        let out_allowed = allowed.handle(Role::Out);
+
+        let r_info = recv.start().await.unwrap();
+        let denied_info = out_denied.start().await.unwrap();
+        let allowed_info = out_allowed.start().await.unwrap();
+        pair(&r, &r_info, &denied, &denied_info);
+        pair(&r, &r_info, &allowed, &allowed_info);
+
+        // Deny the denied sender's node id; admit everyone else. Late-bindable —
+        // installed on the already-spawned router before the rebuild.
+        let denied_id = denied.node_id();
+        r.set_connect_gate(Arc::new(move |from: &NodeId| *from != denied_id));
+
+        // Force a relay-refresh rebuild of the receiver's router (deterministic
+        // defer machinery: idle node ⇒ the changed url set rebuilds immediately).
+        r.consider_relay_change(RelayMode::Disabled, vec!["rebuild-marker".to_string()]);
+        r.try_rebuild().await;
+        assert_eq!(r.rebuild_count(), 1, "receiver must have rebuilt its router once");
+
+        // Re-teach both senders the receiver's POST-rebuild address (a rebuild
+        // rebinds the endpoint ⇒ new direct addrs) so the connections actually
+        // reach the NEW router — the refusal below is then the gate's verdict,
+        // not unreachability.
+        let r_info2 = recv.start().await.unwrap();
+        denied.add_peer_ticket(&r_info2.pairing_ticket).unwrap();
+        allowed.add_peer_ticket(&r_info2.pairing_ticket).unwrap();
+
+        let mut r_events = recv.events().await;
+
+        // (1) The denied peer is STILL refused after the rebuild.
+        let pkg_denied = mk_announce("post-rebuild-denied");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(15),
+            out_denied.announce(r_info2.node_id, &pkg_denied),
+        )
+        .await;
+        match outcome {
+            Ok(Ok(())) => {
+                panic!("a denied peer's announce must not succeed after a relay rebuild")
+            }
+            Ok(Err(_)) | Err(_) => {} // expected: refused → no delivery ack, ever
+        }
+        // Zero control dispatch from the denied peer (the gate closed the
+        // connection before any `Msg` was decoded).
+        let never_arrived =
+            tokio::time::timeout(Duration::from_millis(300), r_events.recv()).await;
+        assert!(
+            never_arrived.is_err(),
+            "the denied peer must produce zero control dispatch post-rebuild"
+        );
+
+        // (2) An allowed peer is STILL admitted after the rebuild.
+        let pkg_allowed = mk_announce("post-rebuild-allowed");
+        out_allowed
+            .announce(r_info2.node_id, &pkg_allowed)
+            .await
+            .expect("an allowed peer must still be admitted after the relay rebuild");
+        match recv_next(&mut r_events).await {
+            TransportEvent::AnnounceReceived { from, .. } => assert_eq!(
+                from, allowed_info.node_id,
+                "the admitted announce must come from the allowed peer"
+            ),
+            other => panic!("expected AnnounceReceived from the allowed peer, got {other:?}"),
+        }
+
+        r.shutdown().await;
+        denied.shutdown().await;
+        allowed.shutdown().await;
     }
 
     // A minimal thread-local tracing capture (mirrors the iroh tests.rs layer),
