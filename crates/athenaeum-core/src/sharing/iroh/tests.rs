@@ -43,7 +43,7 @@ use crate::package::{self, write_package, ManifestRecord, PayloadKind, MANIFEST_
 use crate::sharing::types::{
     FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
 };
-use crate::sharing::SharingTransport;
+use crate::sharing::{noop_fetch_sink, SharingTransport};
 use crate::sync::{HistoryQuery, OutboundState, StandaloneSyncStore, SyncEngine, SyncStore};
 
 use super::{random_secret, BlobStore, IrohTransport};
@@ -189,7 +189,7 @@ async fn iroh_roundtrip_two_endpoints_localhost() {
     // Receiver fetches into its own dir and verifies content + manifest.
     let dest = tempdir().unwrap();
     receiver
-        .fetch(provider_info.node_id, &wire, dest.path())
+        .fetch(provider_info.node_id, &wire, dest.path(), noop_fetch_sink())
         .await
         .unwrap();
     let fetched = dest.path().join("frame1.fits");
@@ -273,7 +273,7 @@ async fn release_deletes_package_tags_on_both_sides() {
 
     let dest = tempdir().unwrap();
     receiver
-        .fetch(ip.node_id, &wire, dest.path())
+        .fetch(ip.node_id, &wire, dest.path(), noop_fetch_sink())
         .await
         .unwrap();
     // Receiver pinned the downloaded collection under the same name.
@@ -447,7 +447,7 @@ async fn iroh_resume_after_endpoint_restart() {
     // First attempt: cancel quickly (drops the download future mid-flight).
     let _ = tokio::time::timeout(
         Duration::from_millis(80),
-        receiver.fetch(provider_info.node_id, &wire, &dest),
+        receiver.fetch(provider_info.node_id, &wire, &dest, noop_fetch_sink()),
     )
     .await;
 
@@ -474,7 +474,7 @@ async fn iroh_resume_after_endpoint_restart() {
         .unwrap();
 
     receiver2
-        .fetch(provider_info.node_id, &wire, &dest)
+        .fetch(provider_info.node_id, &wire, &dest, noop_fetch_sink())
         .await
         .expect("re-fetch after restart must complete");
 
@@ -517,7 +517,7 @@ fn spawn_iroh_receiver(
             *captured.lock().unwrap() = Some(announce.package_id.clone());
             n += 1;
             let dest = dest_root.join(format!("fetch-{n}"));
-            if receiver.fetch(from, &announce, &dest).await.is_ok() {
+            if receiver.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
                 let records = match package::read_manifest(&dest) {
                     Ok(r) => r,
                     Err(_) => continue,
@@ -791,6 +791,8 @@ async fn fetch_rejects_traversal_entry_names() {
         root_hash,
         "pkg/traversal-probe",
         &dest,
+        0,
+        noop_fetch_sink(),
     )
     .await
     .expect_err("a malicious collection entry name must be rejected");
@@ -1160,7 +1162,7 @@ async fn subset_serve_transfers_only_want_frames() {
 
     let dest = tempdir().unwrap();
     receiver
-        .fetch(provider_info.node_id, &wire, dest.path())
+        .fetch(provider_info.node_id, &wire, dest.path(), noop_fetch_sink())
         .await
         .unwrap();
 
@@ -1341,7 +1343,7 @@ async fn connect_gate_refuses_blob_fetch() {
     let dest = dest_parent.path().join("dest");
     let outcome = tokio::time::timeout(
         Duration::from_secs(15),
-        receiver.fetch(provider_info.node_id, &wire, &dest),
+        receiver.fetch(provider_info.node_id, &wire, &dest, noop_fetch_sink()),
     )
     .await;
     match outcome {

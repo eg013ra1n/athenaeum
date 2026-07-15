@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 use crate::events::{emit_event, ProgressEmitter};
 use crate::sharing::iroh::node::{Role, SharedIrohNode};
 use crate::sharing::types::{NodeId, PackageAnnounce, ReceiptOutcome, StartInfo, TransportEvent};
-use crate::sharing::SharingTransport;
+use crate::sharing::{noop_fetch_sink, SharingTransport};
 
 use super::ingest::{self, IngestOutcome};
 use super::refusal::RefusalRefresher;
@@ -370,8 +370,8 @@ impl SyncReceiver {
                             );
                         }
                     },
-                    // `AckReceived` / `FetchProgress` are the sender/UI halves —
-                    // the receiver loop does not consume them.
+                    // `AckReceived` is the sender's half — the receiver loop does
+                    // not consume it.
                     _ => {}
                 }
             }
@@ -481,8 +481,9 @@ async fn handle_announce(
     // the downloader a relay dial hint for it before fetching (no-op on loopback /
     // when no relay set is resolved — never regresses the existing path reuse).
     transport.add_peer_dial_hint(from);
+    // Task 11 will thread a real sink here to surface per-file fetch progress.
     transport
-        .fetch(from, &announce, &staging)
+        .fetch(from, &announce, &staging, noop_fetch_sink())
         .await
         .with_context(|| format!("fetch package {package_id}"))?;
 
@@ -639,7 +640,7 @@ async fn handle_project_announce(
     // — cross-account safe; the node's hint never carries direct addrs).
     transport.add_peer_dial_hint(from);
     transport
-        .fetch(from, &announce, &staging)
+        .fetch(from, &announce, &staging, noop_fetch_sink())
         .await
         .with_context(|| format!("fetch project package {wire_package_id}"))?;
 

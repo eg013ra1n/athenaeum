@@ -82,12 +82,6 @@ pub enum TransportEvent {
         package_id: PackageId,
         receipts: Vec<FrameReceipt>,
     },
-    /// Progress of a fetch this endpoint is performing.
-    FetchProgress {
-        package_id: PackageId,
-        bytes_done: u64,
-        bytes_total: u64,
-    },
     /// A peer advertised a PROJECT package (collab exchange, slice 4). Carries the
     /// HUB package uuid (`package_id`) alongside the engine's wire `announce`
     /// (whose own `package_id` is the ack-correlation id).
@@ -102,5 +96,30 @@ pub enum TransportEvent {
         from: NodeId,
         project_id: String,
         package_id: String,
+    },
+}
+
+/// Live progress of a fetch, delivered on the [`FetchSink`] callback threaded
+/// into [`SharingTransport::fetch`], NOT on the shared [`TransportEvent`] stream.
+///
+/// The receiver loop awaits `fetch` inline and does not drain its event channel
+/// during a fetch, so routing per-file/batch progress through that channel would
+/// risk backpressure or deadlock. This callback is the seam instead: the caller
+/// (Task 11) turns each event into UI progress. Progress is UI data, never a log.
+///
+/// [`FetchSink`]: crate::sharing::FetchSink
+/// [`SharingTransport::fetch`]: crate::sharing::SharingTransport::fetch
+#[derive(Clone, Debug)]
+pub enum FetchEvent {
+    /// Aggregate progress across the whole collection download. `bytes_done` is
+    /// cumulative request bytes (including any already-present locally), clamped
+    /// to `bytes_total` (the announce's `byte_size`).
+    Batch { bytes_done: u64, bytes_total: u64 },
+    /// Per-file progress for one collection entry, keyed by its `name`
+    /// (forward-slash `rel_path`). Ends with `bytes_done == bytes_total`.
+    File {
+        name: String,
+        bytes_done: u64,
+        bytes_total: u64,
     },
 }

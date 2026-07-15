@@ -29,7 +29,7 @@ use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
 use crate::sharing::types::{
     FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, StartInfo, TransportEvent,
 };
-use crate::sharing::SharingTransport;
+use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
 
 use super::cleanup_coord::SharedPackageCleanup;
 use super::engine::{retry_backoff, PackageCleanupSink, SyncEngineHandle};
@@ -101,7 +101,7 @@ fn spawn_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf) -> Recei
             n += 1;
             a.fetch_add(1, SeqCst);
             let dest = dest_root.join(format!("fetch-{n}"));
-            match endpoint.fetch(from, &announce, &dest).await {
+            match endpoint.fetch(from, &announce, &dest, noop_fetch_sink()).await {
                 Ok(()) => {
                     let records = match package::read_manifest(&dest) {
                         Ok(r) => r,
@@ -141,7 +141,7 @@ fn spawn_cancelling_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBu
             };
             n += 1;
             let dest = dest_root.join(format!("fetch-{n}"));
-            if endpoint.fetch(from, &announce, &dest).await.is_ok() {
+            if endpoint.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
                 let Ok(records) = package::read_manifest(&dest) else {
                     continue;
                 };
@@ -287,7 +287,7 @@ async fn confirmed_package_is_released_from_transport() {
                 *captured.lock().unwrap() = Some(announce.clone());
                 n += 1;
                 let dest = dest_root.join(format!("fetch-{n}"));
-                if receiver.fetch(from, &announce, &dest).await.is_ok() {
+                if receiver.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
                     let Ok(records) = package::read_manifest(&dest) else {
                         continue;
                     };
@@ -334,7 +334,7 @@ async fn confirmed_package_is_released_from_transport() {
     let deadline = Instant::now() + WAIT;
     let err = loop {
         match receiver
-            .fetch(sender_node, &captured_announce, dest.path())
+            .fetch(sender_node, &captured_announce, dest.path(), noop_fetch_sink())
             .await
         {
             Err(e) => break e,
@@ -1529,8 +1529,17 @@ impl SharingTransport for NegotiateErrTransport {
         from: NodeId,
         pkg: &PackageAnnounce,
         dest_dir: &Path,
+        sink: FetchSink,
     ) -> anyhow::Result<()> {
-        self.0.fetch(from, pkg, dest_dir).await
+        self.0.fetch(from, pkg, dest_dir, sink).await
+    }
+    async fn fetch_manifest(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest_dir: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        self.0.fetch_manifest(from, pkg, dest_dir).await
     }
     async fn serve(
         &self,
@@ -1932,8 +1941,22 @@ impl SharingTransport for RetryProbeTransport {
     async fn announce(&self, _to: NodeId, _a: &PackageAnnounce) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn fetch(&self, _from: NodeId, _pkg: &PackageAnnounce, _dest: &Path) -> anyhow::Result<()> {
+    async fn fetch(
+        &self,
+        _from: NodeId,
+        _pkg: &PackageAnnounce,
+        _dest: &Path,
+        _sink: FetchSink,
+    ) -> anyhow::Result<()> {
         Ok(())
+    }
+    async fn fetch_manifest(
+        &self,
+        _from: NodeId,
+        _pkg: &PackageAnnounce,
+        _dest: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        anyhow::bail!("fetch_manifest not supported by RetryProbeTransport")
     }
     async fn serve(
         &self,

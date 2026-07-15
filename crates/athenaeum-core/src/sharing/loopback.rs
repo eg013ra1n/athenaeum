@@ -17,8 +17,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use super::iroh::proto::OfferEntry;
-use super::types::{FrameReceipt, NodeId, PackageAnnounce, PackageId, StartInfo, TransportEvent};
-use super::SharingTransport;
+use super::types::{
+    FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, StartInfo, TransportEvent,
+};
+use super::{FetchSink, SharingTransport};
+use crate::package::MANIFEST_FILENAME;
 use crate::sync::DedupResponder;
 
 /// Per-endpoint fault injection knobs.
@@ -35,8 +38,9 @@ pub struct FaultPlan {
 }
 
 /// Channel depth for an endpoint's event stream. Announce/ack are low-volume
-/// (blocking `send`); fetch progress is best-effort (`try_send`, dropped if
-/// full), so this need only comfortably hold pending control events.
+/// (blocking `send`), so this need only comfortably hold pending control events.
+/// Fetch progress does not ride this channel — it goes through the [`FetchSink`]
+/// callback threaded into `fetch`.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Copy granularity for `fetch`; small enough that `abort_after_bytes` can fire
@@ -242,6 +246,7 @@ impl SharingTransport for LoopbackTransport {
         from: NodeId,
         pkg: &PackageAnnounce,
         dest_dir: &Path,
+        sink: FetchSink,
     ) -> anyhow::Result<()> {
         // Resolve the provider's served package (source dir + optional want subset).
         let served = {
@@ -270,7 +275,6 @@ impl SharingTransport for LoopbackTransport {
                 subset_src_files(&src_dir, &kept)?
             }
         };
-        let bytes_total: u64 = files.iter().map(|f| f.size).sum();
         // Read the one-shot abort threshold once; disarm inside the loop if it fires.
         let abort_after = self.fault.lock().expect("fault mutex poisoned").abort_after_bytes;
 
@@ -280,6 +284,16 @@ impl SharingTransport for LoopbackTransport {
 
         let mut bytes_done: u64 = 0;
         for file in &files {
+            let name = rel_to_name(&file.rel);
+            // Synthetic per-file progress: start at 0, then jump to complete after
+            // the copy — deterministic, no timing (the iroh transport observes real
+            // per-file byte progress; the mock only needs the contract shape).
+            sink(FetchEvent::File {
+                name: name.clone(),
+                bytes_done: 0,
+                bytes_total: file.size,
+            });
+
             let dest_path = dest_dir.join(&file.rel);
             if let Some(parent) = dest_path.parent() {
                 tokio::fs::create_dir_all(parent)
@@ -302,13 +316,6 @@ impl SharingTransport for LoopbackTransport {
                 writer.write_all(&buf[..n]).await.context("write chunk")?;
                 bytes_done += n as u64;
 
-                // Progress is UI data, not control flow: best-effort, never blocks.
-                let _ = self.event_tx.try_send(TransportEvent::FetchProgress {
-                    package_id: pkg.package_id.clone(),
-                    bytes_done,
-                    bytes_total,
-                });
-
                 if let Some(threshold) = abort_after {
                     if bytes_done >= threshold {
                         writer.flush().await.ok();
@@ -327,7 +334,20 @@ impl SharingTransport for LoopbackTransport {
                 }
             }
             writer.flush().await.context("flush dest")?;
+
+            // File complete: emit the terminal per-file event unconditionally.
+            sink(FetchEvent::File {
+                name,
+                bytes_done: file.size,
+                bytes_total: file.size,
+            });
         }
+
+        // Final aggregate event reaches the announced package size.
+        sink(FetchEvent::Batch {
+            bytes_done: pkg.byte_size,
+            bytes_total: pkg.byte_size,
+        });
 
         tracing::debug!(
             from = %hex32(&from),
@@ -337,6 +357,46 @@ impl SharingTransport for LoopbackTransport {
             "loopback fetch complete"
         );
         Ok(())
+    }
+
+    async fn fetch_manifest(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest_dir: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        // Resolve the provider's served package source dir, then copy just its
+        // `manifest.ndjson` into `dest_dir` — the in-process mirror of the iroh
+        // manifest-only fetch (hash-seq + meta + the named manifest blob).
+        let src_dir = {
+            let reg = self.registry.lock().expect("registry mutex poisoned");
+            reg.get(&from)
+                .and_then(|inbox| inbox.served.get(&pkg.package_id.0).cloned())
+        }
+        .ok_or_else(|| {
+            anyhow!(
+                "package not served by peer: package_id={} from={}",
+                pkg.package_id.0,
+                hex32(&from)
+            )
+        })?
+        .src_dir;
+
+        tokio::fs::create_dir_all(dest_dir)
+            .await
+            .with_context(|| format!("create dest dir {}", dest_dir.display()))?;
+        let src = src_dir.join(MANIFEST_FILENAME);
+        let dest = dest_dir.join(MANIFEST_FILENAME);
+        tokio::fs::copy(&src, &dest)
+            .await
+            .with_context(|| format!("copy manifest {} -> {}", src.display(), dest.display()))?;
+        tracing::debug!(
+            from = %hex32(&from),
+            package_id = %pkg.package_id.0,
+            path = %dest.display(),
+            "loopback manifest fetched"
+        );
+        Ok(dest)
     }
 
     async fn serve(
@@ -545,6 +605,15 @@ fn subset_src_files(
         });
     }
     Ok(out)
+}
+
+/// Forward-slash collection-entry name for a relative path, matching the iroh
+/// transport's entry naming so [`FetchEvent::File`] keys agree across transports.
+fn rel_to_name(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Mint a fresh 32-byte node id (two uuid-v4s concatenated — no extra deps).

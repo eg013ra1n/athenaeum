@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tempfile::tempdir;
@@ -14,9 +15,20 @@ use tokio::sync::mpsc::Receiver;
 use crate::package::{self, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use super::loopback::{FaultPlan, LoopbackNetwork};
 use super::types::{
-    FrameReceipt, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
+    FetchEvent, FrameReceipt, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
 };
-use super::SharingTransport;
+use super::{noop_fetch_sink, FetchSink, SharingTransport};
+
+/// A [`FetchSink`] that appends every event into a shared vec, plus the vec so a
+/// test can inspect the collected series after the fetch.
+fn recording_sink() -> (FetchSink, Arc<Mutex<Vec<FetchEvent>>>) {
+    let events: Arc<Mutex<Vec<FetchEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&events);
+    let sink: FetchSink = Arc::new(move |ev| {
+        sink_events.lock().expect("sink mutex poisoned").push(ev);
+    });
+    (sink, events)
+}
 
 /// Write a deterministic `size`-byte file into `dir` and return its path.
 fn write_blob(dir: &Path, name: &str, size: usize) -> std::path::PathBuf {
@@ -85,7 +97,7 @@ async fn loopback_announce_fetch_ack_roundtrip() {
     // Receiver fetches into its own dir and verifies content.
     let dest = tempdir().unwrap();
     receiver
-        .fetch(provider_info.node_id, &pkg, dest.path())
+        .fetch(provider_info.node_id, &pkg, dest.path(), noop_fetch_sink())
         .await
         .unwrap();
     let fetched = dest.path().join("frame_0001.fits");
@@ -137,7 +149,7 @@ async fn loopback_release_makes_package_unfetchable() {
     // Served → fetch succeeds.
     let dest1 = tempdir().unwrap();
     receiver
-        .fetch(provider_info.node_id, &pkg, dest1.path())
+        .fetch(provider_info.node_id, &pkg, dest1.path(), noop_fetch_sink())
         .await
         .unwrap();
 
@@ -145,7 +157,7 @@ async fn loopback_release_makes_package_unfetchable() {
     provider.release(&pkg.package_id).await.unwrap();
     let dest2 = tempdir().unwrap();
     let err = receiver
-        .fetch(provider_info.node_id, &pkg, dest2.path())
+        .fetch(provider_info.node_id, &pkg, dest2.path(), noop_fetch_sink())
         .await
         .unwrap_err();
     assert!(err.to_string().contains("not served"), "got: {err}");
@@ -178,13 +190,13 @@ async fn loopback_fault_abort_mid_fetch_then_resume() {
 
     let dest = tempdir().unwrap();
     let first = receiver
-        .fetch(provider_info.node_id, &pkg, dest.path())
+        .fetch(provider_info.node_id, &pkg, dest.path(), noop_fetch_sink())
         .await;
     assert!(first.is_err(), "first fetch should abort mid-copy");
 
     // Fault is one-shot: second fetch completes and verifies.
     let second = receiver
-        .fetch(provider_info.node_id, &pkg, dest.path())
+        .fetch(provider_info.node_id, &pkg, dest.path(), noop_fetch_sink())
         .await;
     assert!(second.is_ok(), "second fetch should succeed: {second:?}");
 
@@ -305,7 +317,7 @@ async fn subset_serve_transfers_only_want_frames() {
 
     let dest = tempdir().unwrap();
     receiver
-        .fetch(provider.node_id(), &announce, dest.path())
+        .fetch(provider.node_id(), &announce, dest.path(), noop_fetch_sink())
         .await
         .unwrap();
 
@@ -327,5 +339,74 @@ async fn subset_serve_transfers_only_want_frames() {
         xxh3_of(&pkg_dir.join(&rels[0])),
         xxh3_of(&dest.path().join(&rels[0])),
         "frame1 content mismatch"
+    );
+}
+
+/// The [`FetchSink`] threaded into `fetch` must report monotonic per-file
+/// progress and an aggregate batch that reaches the announce's `byte_size`. This
+/// pins the [`FetchEvent`] contract deterministically over the loopback: for each
+/// file a `File{done:0}` then `File{done:total}`, then a final
+/// `Batch{done:byte_size, total:byte_size}`.
+#[tokio::test]
+async fn loopback_fetch_reports_monotonic_per_file_progress() {
+    let net = LoopbackNetwork::new();
+    let provider = net.endpoint();
+    let receiver = net.endpoint();
+    provider.start().await.unwrap();
+    receiver.start().await.unwrap();
+
+    let tmp = tempdir().unwrap();
+    let (pkg_dir, announce, _rels) = build_three_frame_package(&tmp.path().join("src"));
+    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+
+    let (sink, events) = recording_sink();
+    let dest = tempdir().unwrap();
+    receiver
+        .fetch(provider.node_id(), &announce, dest.path(), sink)
+        .await
+        .unwrap();
+
+    let events = events.lock().unwrap().clone();
+
+    // Every File series (grouped by name) is non-decreasing and ends complete.
+    let mut per_file: std::collections::HashMap<String, Vec<(u64, u64)>> =
+        std::collections::HashMap::new();
+    for ev in &events {
+        if let FetchEvent::File { name, bytes_done, bytes_total } = ev {
+            per_file
+                .entry(name.clone())
+                .or_default()
+                .push((*bytes_done, *bytes_total));
+        }
+    }
+    assert!(!per_file.is_empty(), "expected at least one File event");
+    for (name, series) in &per_file {
+        let mut last_done = 0u64;
+        for (done, _total) in series {
+            assert!(
+                *done >= last_done,
+                "File progress for {name} went backwards: {done} < {last_done}"
+            );
+            last_done = *done;
+        }
+        let (final_done, final_total) = *series.last().unwrap();
+        assert_eq!(
+            final_done, final_total,
+            "File {name} must end complete (done == total)"
+        );
+    }
+
+    // At least one Batch event ends at the announce's byte_size.
+    let reached_total = events.iter().any(|ev| {
+        matches!(
+            ev,
+            FetchEvent::Batch { bytes_done, bytes_total }
+                if *bytes_done == announce.byte_size && *bytes_total == announce.byte_size
+        )
+    });
+    assert!(
+        reached_total,
+        "expected a Batch event reaching byte_size={}, got {events:?}",
+        announce.byte_size
     );
 }

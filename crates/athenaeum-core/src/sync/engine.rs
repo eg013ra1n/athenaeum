@@ -22,10 +22,10 @@
 //!   eventually announces when the peer comes online; a network-unreachable peer
 //!   never terminalizes it — delivery is retried forever, never left non-terminal
 //!   with no retry slot.
-//! - The sender observes no `FetchProgress` on loopback (fetch is
-//!   receiver-driven), so `Transferring` is marked on the first *successful*
-//!   announce — the in-flight window during which we await the ack. A
-//!   `FetchProgress` arm remains for real transports and is a no-op here.
+//! - Fetch progress is receiver-driven and no longer rides the transport event
+//!   stream (it flows through the fetch-time `FetchSink` instead), so
+//!   `Transferring` is marked on the first *successful* announce — the in-flight
+//!   window during which we await the ack.
 //! - `AckReceived → Confirmed` (idempotent: a second ack for a package no longer
 //!   in the in-flight map is logged at debug and dropped).
 //! - Per-package ack/retry timeout → climb one backoff rung and wait it out,
@@ -1275,22 +1275,6 @@ impl Worker {
                 package_id,
                 receipts,
             } => self.on_ack(from, package_id, receipts),
-            TransportEvent::FetchProgress {
-                package_id,
-                bytes_done,
-                bytes_total,
-            } => {
-                // Loopback delivers this only to the fetcher, so the sender
-                // rarely sees it; kept for real transports that surface
-                // provider-side progress. Transferring is already set.
-                tracing::debug!(
-                    package_id = %package_id.0,
-                    bytes = bytes_done,
-                    total = bytes_total,
-                    "sync fetch progress"
-                );
-                Ok(())
-            }
             // Inbound announcements are the receiver's concern (task A7), not
             // this sender-side engine's.
             TransportEvent::AnnounceReceived { .. } => Ok(()),

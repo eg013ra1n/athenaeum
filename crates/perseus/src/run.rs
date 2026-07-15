@@ -2486,7 +2486,11 @@ mod multi_target_tests {
                 };
                 n += 1;
                 let dest = dest_root.join(format!("fetch-{n}"));
-                if endpoint.fetch(from, &announce, &dest).await.is_ok() {
+                if endpoint
+                    .fetch(from, &announce, &dest, athenaeum_core::sharing::noop_fetch_sink())
+                    .await
+                    .is_ok()
+                {
                     if let Ok(records) = read_manifest(&dest) {
                         let receipts: Vec<FrameReceipt> = records
                             .iter()

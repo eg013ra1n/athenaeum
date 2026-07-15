@@ -58,8 +58,9 @@ pub struct FullHashEntry {
 ///
 /// The `Announce`/`Ack` variants deliberately mirror the two peer-to-peer
 /// [`TransportEvent`](crate::sharing::types::TransportEvent)s that carry data
-/// between endpoints (`FetchProgress` is fetch-local UI data and never crosses
-/// the wire). `Announce` carries a [`PackageAnnounce`] whose `root_hash` is the
+/// between endpoints (fetch progress is fetch-local UI data delivered on the
+/// [`FetchSink`](crate::sharing::FetchSink) callback and never crosses the wire).
+/// `Announce` carries a [`PackageAnnounce`] whose `root_hash` is the
 /// iroh-blobs collection hash the receiver downloads by. The `Offer`/`Want`/
 /// `FullHashes` variants form the P2P dedup handshake (keyed by `rel_path`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

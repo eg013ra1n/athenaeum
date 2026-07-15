@@ -11,15 +11,27 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use iroh::{Endpoint, EndpointId};
-use iroh_blobs::api::downloader::Shuffled;
+use iroh_blobs::api::downloader::{DownloadProgressItem, Shuffled};
 use iroh_blobs::api::{Store, TempTag};
 use iroh_blobs::format::collection::Collection;
+use iroh_blobs::protocol::{ChunkRanges, GetRequest};
 use iroh_blobs::{Hash, HashAndFormat};
+use n0_future::StreamExt as _;
 
 use crate::package::{read_manifest, validate_rel_path, ManifestRecord, MANIFEST_FILENAME};
+use crate::sharing::types::FetchEvent;
+use crate::sharing::FetchSink;
+
+/// Minimum wall-clock gap between two throttled [`FetchEvent`]s from the same
+/// source — applied per-file (each observer) AND to the aggregate batch stream.
+/// A file's completion event and the final batch event are ALWAYS emitted,
+/// throttle or not, so the sink never misses a terminal value. Progress is UI
+/// event data, never a log.
+const FETCH_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(300);
 
 /// A payload file discovered under a package directory.
 struct PkgFile {
@@ -240,24 +252,25 @@ pub async fn fetch_collection_to_dir(
     root_hash: Hash,
     tag: &str,
     dest_dir: &Path,
+    byte_size: u64,
+    sink: FetchSink,
 ) -> Result<()> {
-    // Pull the whole hash-sequence (collection meta + every child blob).
-    store
-        .downloader(endpoint)
-        .download(HashAndFormat::hash_seq(root_hash), Shuffled::new(vec![provider]))
-        .await
-        .with_context(|| format!("download collection {root_hash}"))?;
+    // ONE downloader reused across phase 1 + phase 2: each `store.downloader`
+    // spins up a fresh actor + connection pool, so reusing it avoids re-dialing
+    // the provider between the two requests.
+    let downloader = store.downloader(endpoint);
 
-    // Pin the downloaded collection until the caller releases it (post-ack).
-    // Between download-complete and this set the data is untagged — the 900 s
-    // GC interval makes that window irrelevant in practice.
-    store
-        .tags()
-        .set(tag, HashAndFormat::hash_seq(root_hash))
+    // Phase 1: fetch only the hash-seq (root) + collection meta (child 0) so we
+    // learn the entry names and per-child hashes before the bulk transfer.
+    let meta_req = GetRequest::builder()
+        .root(ChunkRanges::all())
+        .child(0, ChunkRanges::all())
+        .build(root_hash);
+    downloader
+        .download(meta_req, Shuffled::new(vec![provider]))
         .await
-        .context("tag fetched collection")?;
+        .with_context(|| format!("download collection meta {root_hash}"))?;
 
-    // Reconstruct the package directory from the downloaded collection.
     let collection = Collection::load(root_hash, store)
         .await
         .with_context(|| format!("load collection {root_hash}"))?;
@@ -269,6 +282,104 @@ pub async fn fetch_collection_to_dir(
             .with_context(|| format!("collection entry name failed validation: {name}"))?;
     }
 
+    // Per-file observers: one task per child hash. Each streams the child's
+    // bitfield and emits a throttled (>=300 ms) `File` progress event, ALWAYS
+    // emitting the terminal (is_complete) event so the sink sees each file finish.
+    let mut observers = Vec::with_capacity(collection.len());
+    for (name, hash) in collection.iter() {
+        let sink = sink.clone();
+        let name = name.clone();
+        let hash = *hash;
+        let blobs = store.blobs().clone();
+        observers.push(tokio::spawn(async move {
+            // Seed `last` in the past so the first update emits immediately.
+            let mut last = Instant::now()
+                .checked_sub(FETCH_PROGRESS_MIN_INTERVAL)
+                .unwrap_or_else(Instant::now);
+            let stream = match blobs.observe(hash).stream().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut stream = Box::pin(stream);
+            while let Some(bf) = stream.next().await {
+                let bytes_done = bf.total_bytes();
+                let bytes_total = bf.size();
+                let complete = bf.is_complete();
+                if complete || last.elapsed() >= FETCH_PROGRESS_MIN_INTERVAL {
+                    last = Instant::now();
+                    sink(FetchEvent::File {
+                        name: name.clone(),
+                        bytes_done,
+                        bytes_total,
+                    });
+                }
+                if complete {
+                    break;
+                }
+            }
+        }));
+    }
+
+    // Phase 2: pull the whole hash-sequence (already-present ranges are skipped),
+    // deriving batch progress from the aggregate download stream. `Progress` is
+    // cumulative request bytes (incl. locally-present) and can exceed the payload
+    // `byte_size`, so clamp it; the terminal batch event below pins the total.
+    let progress = downloader.download(
+        HashAndFormat::hash_seq(root_hash),
+        Shuffled::new(vec![provider]),
+    );
+    let mut stream = progress
+        .stream()
+        .await
+        .with_context(|| format!("open collection download stream {root_hash}"))?;
+    let mut last = Instant::now();
+    while let Some(item) = stream.next().await {
+        match item {
+            DownloadProgressItem::Progress(done) => {
+                if last.elapsed() >= FETCH_PROGRESS_MIN_INTERVAL {
+                    last = Instant::now();
+                    sink(FetchEvent::Batch {
+                        bytes_done: done.min(byte_size),
+                        bytes_total: byte_size,
+                    });
+                }
+            }
+            DownloadProgressItem::Error(e) => {
+                for o in &observers {
+                    o.abort();
+                }
+                return Err(e.into());
+            }
+            DownloadProgressItem::DownloadError => {
+                for o in &observers {
+                    o.abort();
+                }
+                anyhow::bail!("download collection {root_hash} failed");
+            }
+            _ => {}
+        }
+    }
+    // Drain observers so each file's terminal completion event is emitted (they
+    // break on is_complete, which holds now that every child is downloaded).
+    for o in observers {
+        let _ = o.await;
+    }
+    // The final batch event always fires, at exactly the announced total.
+    sink(FetchEvent::Batch {
+        bytes_done: byte_size,
+        bytes_total: byte_size,
+    });
+
+    // Pin the downloaded collection until the caller releases it (post-ack).
+    // Between download-complete and this set the data is untagged — the 900 s
+    // GC interval makes that window irrelevant in practice.
+    store
+        .tags()
+        .set(tag, HashAndFormat::hash_seq(root_hash))
+        .await
+        .context("tag fetched collection")?;
+
+    // Reconstruct the package directory from the downloaded collection.
     tokio::fs::create_dir_all(dest_dir)
         .await
         .with_context(|| format!("create dest dir {}", dest_dir.display()))?;
@@ -295,4 +406,71 @@ pub async fn fetch_collection_to_dir(
         "collection fetched to package dir"
     );
     Ok(())
+}
+
+/// Fetch ONLY the package manifest (`manifest.ndjson`) of the collection at
+/// `root_hash` from `provider` into `dest_dir`, returning its path.
+///
+/// Runs phase 1 of [`fetch_collection_to_dir`] (hash-seq + collection meta), then
+/// downloads just the single named `manifest.ndjson` blob and exports it — the
+/// payload frames are never transferred. Used by the receiver-cancel flow (a
+/// later task) to inspect a package's frames without pulling their bytes. No tag
+/// is set: the manifest-only fetch is transient inspection, not a pinned package.
+pub async fn fetch_manifest_to_dir(
+    store: &Store,
+    endpoint: &Endpoint,
+    provider: EndpointId,
+    root_hash: Hash,
+    dest_dir: &Path,
+) -> Result<PathBuf> {
+    let downloader = store.downloader(endpoint);
+
+    // Phase 1: hash-seq + collection meta (child 0) → entry names + child hashes.
+    let meta_req = GetRequest::builder()
+        .root(ChunkRanges::all())
+        .child(0, ChunkRanges::all())
+        .build(root_hash);
+    downloader
+        .download(meta_req, Shuffled::new(vec![provider]))
+        .await
+        .with_context(|| format!("download collection meta {root_hash}"))?;
+
+    let collection = Collection::load(root_hash, store)
+        .await
+        .with_context(|| format!("load collection {root_hash}"))?;
+
+    // The manifest is a named collection entry; validate its name like any other.
+    let manifest_hash = collection
+        .iter()
+        .find(|(name, _)| name == MANIFEST_FILENAME)
+        .map(|(_, hash)| *hash)
+        .ok_or_else(|| {
+            anyhow::anyhow!("collection {root_hash} has no {MANIFEST_FILENAME} entry")
+        })?;
+    validate_rel_path(MANIFEST_FILENAME)
+        .with_context(|| format!("manifest entry name failed validation: {MANIFEST_FILENAME}"))?;
+
+    // Download just the manifest blob (single-hash raw request), then export it.
+    downloader
+        .download(HashAndFormat::raw(manifest_hash), Shuffled::new(vec![provider]))
+        .await
+        .with_context(|| format!("download manifest blob {manifest_hash}"))?;
+
+    tokio::fs::create_dir_all(dest_dir)
+        .await
+        .with_context(|| format!("create dest dir {}", dest_dir.display()))?;
+    let target = dest_dir.join(MANIFEST_FILENAME);
+    store
+        .blobs()
+        .export(manifest_hash, &target)
+        .await
+        .with_context(|| format!("export manifest -> {}", target.display()))?;
+
+    tracing::debug!(
+        provider = %provider.fmt_short(),
+        root_hash = %root_hash,
+        path = %target.display(),
+        "manifest fetched from collection"
+    );
+    Ok(target)
 }

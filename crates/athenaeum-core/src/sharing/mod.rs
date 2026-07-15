@@ -11,7 +11,8 @@
 //! sync engine; nothing here touches the render/solver features, so the module
 //! compiles in the headless (`--no-default-features`) build.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -24,8 +25,26 @@ pub mod types;
 mod tests;
 
 pub use types::{
-    FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, StartInfo, TransportEvent,
+    FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, StartInfo,
+    TransportEvent,
 };
+
+/// A callback that receives live [`FetchEvent`]s while a [`fetch`] is in flight.
+///
+/// Threaded directly into [`fetch`] rather than routed through the endpoint's
+/// [`TransportEvent`] stream: the receiver awaits `fetch` inline and does not
+/// drain that channel mid-fetch, so a callback avoids the backpressure/deadlock
+/// a shared channel would risk. `Arc` so a single sink can fan out to the batch
+/// stream plus one observer task per collection entry.
+///
+/// [`fetch`]: SharingTransport::fetch
+pub type FetchSink = Arc<dyn Fn(FetchEvent) + Send + Sync>;
+
+/// A [`FetchSink`] that discards every event — for call sites that do not (yet)
+/// surface fetch progress. Task 11 replaces these with a real sink.
+pub fn noop_fetch_sink() -> FetchSink {
+    Arc::new(|_| {})
+}
 
 /// A bidirectional peer-to-peer transport for sharing frame packages.
 ///
@@ -46,9 +65,29 @@ pub trait SharingTransport: Send + Sync {
     /// Pull a package (manifest + blobs) from `from` into `dest_dir`.
     ///
     /// Verified and resumable in the real transport; the mock re-copies the
-    /// served directory on each call (idempotent overwrite).
-    async fn fetch(&self, from: NodeId, pkg: &PackageAnnounce, dest_dir: &Path)
-        -> anyhow::Result<()>;
+    /// served directory on each call (idempotent overwrite). `sink` receives live
+    /// [`FetchEvent`]s (per-file + batch) while the transfer is in flight; pass
+    /// [`noop_fetch_sink`] when progress is not consumed.
+    async fn fetch(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest_dir: &Path,
+        sink: FetchSink,
+    ) -> anyhow::Result<()>;
+
+    /// Pull ONLY the package manifest (`manifest.ndjson`) from `from` into
+    /// `dest_dir`, returning its path. The real transport fetches just the
+    /// hash-sequence + collection meta and the single named manifest blob (not the
+    /// payload frames); the mock copies the manifest file from the served dir.
+    /// Used by the receiver-cancel flow (a later task) to inspect a package's
+    /// frames without downloading them.
+    async fn fetch_manifest(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest_dir: &Path,
+    ) -> anyhow::Result<PathBuf>;
 
     /// Register the local package directory that peers may fetch from
     /// (provider side).

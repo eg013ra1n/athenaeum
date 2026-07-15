@@ -26,7 +26,7 @@ use athenaeum_core::fits_writer::write_fits_f32;
 use athenaeum_core::package;
 use athenaeum_core::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
 use athenaeum_core::sharing::types::{FrameReceipt, ReceiptOutcome, TransportEvent};
-use athenaeum_core::sharing::SharingTransport;
+use athenaeum_core::sharing::{noop_fetch_sink, SharingTransport};
 use athenaeum_core::sync::{HistoryQuery, HistoryRow, OutboundState, SyncStore};
 
 use perseus::config::{Config, Mode, RetentionConfig, RetentionPolicy};
@@ -130,7 +130,7 @@ fn spawn_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf) -> Recei
             n += 1;
             a.fetch_add(1, SeqCst);
             let dest = dest_root.join(format!("fetch-{n}"));
-            match endpoint.fetch(from, &announce, &dest).await {
+            match endpoint.fetch(from, &announce, &dest, noop_fetch_sink()).await {
                 Ok(()) => {
                     let records = match package::read_manifest(&dest) {
                         Ok(r) => r,

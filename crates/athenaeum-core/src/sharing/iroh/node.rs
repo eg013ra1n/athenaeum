@@ -32,7 +32,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -56,7 +56,7 @@ use crate::account::keys::{device_key_path, DeviceKey, DeviceKeyLock};
 use crate::sharing::types::{
     FrameReceipt, NodeId, PackageAnnounce, PackageId, StartInfo, TransportEvent,
 };
-use crate::sharing::SharingTransport;
+use crate::sharing::{FetchSink, SharingTransport};
 use crate::sync::DedupResponder;
 
 use super::proto::{self, Msg, OfferEntry};
@@ -302,8 +302,6 @@ impl EventDemux {
                 | TransportEvent::ProjectRequestReceived { .. } => {
                     inner.recv.as_ref().map(|(_, tx)| tx.clone())
                 }
-                // Self-generated; never routed through the accept path.
-                TransportEvent::FetchProgress { .. } => None,
             }
         };
         match target {
@@ -316,21 +314,6 @@ impl EventDemux {
                 tracing::warn!(kind, peer = %hex32(&peer), "inbound event with no consumer");
                 Delivery::Orphan
             }
-        }
-    }
-
-    /// Best-effort delivery of a self-generated [`TransportEvent::FetchProgress`]
-    /// to the Recv consumer (UI data; never blocks, dropped if the channel is
-    /// full or no consumer is registered).
-    fn emit_fetch_progress(&self, event: TransportEvent) {
-        if let Some((_, tx)) = self
-            .inner
-            .lock()
-            .expect("demux mutex poisoned")
-            .recv
-            .as_ref()
-        {
-            let _ = tx.try_send(event);
         }
     }
 
@@ -350,7 +333,6 @@ fn event_kind_and_peer(event: &TransportEvent) -> (&'static str, NodeId) {
         TransportEvent::AckReceived { from, .. } => ("ack", *from),
         TransportEvent::ProjectAnnounceReceived { from, .. } => ("project_announce", *from),
         TransportEvent::ProjectRequestReceived { from, .. } => ("project_request", *from),
-        TransportEvent::FetchProgress { .. } => ("fetch_progress", [0u8; 32]),
     }
 }
 
@@ -1505,6 +1487,7 @@ impl SharedIrohNode {
         from: NodeId,
         pkg: &PackageAnnounce,
         dest_dir: &Path,
+        sink: FetchSink,
     ) -> Result<()> {
         let _op = self.op_guard();
         let root_hash: Hash = pkg.root_hash.parse().with_context(|| {
@@ -1523,16 +1506,30 @@ impl SharedIrohNode {
             root_hash,
             &tag,
             dest_dir,
+            pkg.byte_size,
+            sink,
         )
         .await?;
 
-        self.demux.emit_fetch_progress(TransportEvent::FetchProgress {
-            package_id: pkg.package_id.clone(),
-            bytes_done: pkg.byte_size,
-            bytes_total: pkg.byte_size,
-        });
         tracing::debug!(from = %hex32(&from), package_id = %pkg.package_id.0, "iroh fetch complete");
         Ok(())
+    }
+
+    async fn role_fetch_manifest(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest_dir: &Path,
+    ) -> Result<PathBuf> {
+        let _op = self.op_guard();
+        let root_hash: Hash = pkg.root_hash.parse().with_context(|| {
+            format!("parse collection hash from announce root_hash {:?}", pkg.root_hash)
+        })?;
+        let provider =
+            EndpointId::from_bytes(&from).map_err(|e| anyhow!("invalid provider node id: {e}"))?;
+        // Snapshot the endpoint so a concurrent relay rebuild can't swap it out.
+        let endpoint = self.endpoint();
+        blobs::fetch_manifest_to_dir(&self.store, &endpoint, provider, root_hash, dest_dir).await
     }
 
     async fn role_serve(
@@ -1721,8 +1718,20 @@ impl SharingTransport for RoleHandle {
         from: NodeId,
         pkg: &PackageAnnounce,
         dest_dir: &Path,
+        sink: FetchSink,
     ) -> Result<()> {
-        self.node.role_fetch(self.role, from, pkg, dest_dir).await
+        self.node
+            .role_fetch(self.role, from, pkg, dest_dir, sink)
+            .await
+    }
+
+    async fn fetch_manifest(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest_dir: &Path,
+    ) -> Result<PathBuf> {
+        self.node.role_fetch_manifest(from, pkg, dest_dir).await
     }
 
     async fn serve(

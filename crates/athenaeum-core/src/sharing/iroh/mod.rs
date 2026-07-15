@@ -57,7 +57,7 @@ use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::mpsc;
 
 use super::types::{FrameReceipt, NodeId, PackageAnnounce, PackageId, StartInfo, TransportEvent};
-use super::SharingTransport;
+use super::{FetchSink, SharingTransport};
 use crate::sync::DedupResponder;
 
 pub mod blobs;
@@ -217,7 +217,11 @@ pub struct IrohTransport {
     /// Whether a relay is configured. Gates the `online()` wait in `start` — with
     /// the relay disabled there is no home relay and `online()` would hang.
     uses_relay: bool,
-    /// Sender half of this endpoint's event stream; cloned into the control handler.
+    /// Sender half of this endpoint's event stream; cloned into the control
+    /// handler at construction. Retained here purely to keep the event channel
+    /// open for the transport's lifetime (no longer read directly now that fetch
+    /// progress flows through the `FetchSink` callback instead of this stream).
+    #[allow(dead_code)]
     event_tx: mpsc::Sender<TransportEvent>,
     /// Receiver half, handed out once by [`events`](SharingTransport::events).
     event_rx: Mutex<Option<mpsc::Receiver<TransportEvent>>>,
@@ -635,6 +639,7 @@ impl SharingTransport for IrohTransport {
         from: NodeId,
         pkg: &PackageAnnounce,
         dest_dir: &Path,
+        sink: FetchSink,
     ) -> Result<()> {
         let root_hash: Hash = pkg.root_hash.parse().with_context(|| {
             format!("parse collection hash from announce root_hash {:?}", pkg.root_hash)
@@ -656,17 +661,28 @@ impl SharingTransport for IrohTransport {
             root_hash,
             &tag,
             dest_dir,
+            pkg.byte_size,
+            sink,
         )
         .await?;
 
-        // Best-effort completion progress (UI data; never blocks).
-        let _ = self.event_tx.try_send(TransportEvent::FetchProgress {
-            package_id: pkg.package_id.clone(),
-            bytes_done: pkg.byte_size,
-            bytes_total: pkg.byte_size,
-        });
         tracing::debug!(from = %hex32(&from), package_id = %pkg.package_id.0, "iroh fetch complete");
         Ok(())
+    }
+
+    async fn fetch_manifest(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest_dir: &Path,
+    ) -> Result<PathBuf> {
+        let root_hash: Hash = pkg.root_hash.parse().with_context(|| {
+            format!("parse collection hash from announce root_hash {:?}", pkg.root_hash)
+        })?;
+        let provider =
+            EndpointId::from_bytes(&from).map_err(|e| anyhow!("invalid provider node id: {e}"))?;
+        blobs::fetch_manifest_to_dir(&self.store, &self.endpoint, provider, root_hash, dest_dir)
+            .await
     }
 
     async fn serve(

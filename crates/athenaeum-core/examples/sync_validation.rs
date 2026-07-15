@@ -175,9 +175,26 @@ async fn fetch(ticket: &str, dest: &Path) -> Result<()> {
         dest.display()
     );
     let started = std::time::Instant::now();
-    blobs::fetch_collection_to_dir(&store, &endpoint, provider, ticket.hash(), "pkg/validation", dest)
-        .await
-        .context("fetch collection")?;
+    // Print live batch progress so the validation harness shows transfer motion;
+    // byte_size is unknown to this CLI (no announce), so pass 0 — the batch total
+    // stays 0 and only the per-file `File` events carry real sizes.
+    let sink: athenaeum_core::sharing::FetchSink = std::sync::Arc::new(|ev| {
+        if let athenaeum_core::sharing::FetchEvent::File { name, bytes_done, bytes_total } = ev {
+            println!("  {name}: {bytes_done}/{bytes_total} bytes");
+        }
+    });
+    blobs::fetch_collection_to_dir(
+        &store,
+        &endpoint,
+        provider,
+        ticket.hash(),
+        "pkg/validation",
+        dest,
+        0,
+        sink,
+    )
+    .await
+    .context("fetch collection")?;
     println!("Download complete in {:.1}s.", started.elapsed().as_secs_f64());
 
     // If the served directory was a package (has a manifest), verify every
