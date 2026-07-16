@@ -222,6 +222,92 @@ fn sanitize_slug_is_path_safe() {
     assert!(s.len() <= 24 && s.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
+/// Set the cached node-id-hex → device-name map on `conn` (the source
+/// [`resolve_sender_slug`] reads).
+fn set_device_names(conn: &Connection, pairs: &[(&str, &str)]) {
+    let map: std::collections::HashMap<String, String> =
+        pairs.iter().map(|(h, n)| (h.to_string(), n.to_string())).collect();
+    crate::db::set_setting(
+        conn,
+        crate::settings::keys::SYNC_DEVICE_NAMES,
+        &serde_json::to_string(&map).unwrap(),
+    )
+    .unwrap();
+}
+
+/// The landing slug prefers the sender's CURRENT friendly device name from the
+/// cached map (sanitized with the shared `sanitize_for_filename`), and falls back
+/// to the hex slug for a peer not in the map.
+#[test]
+fn resolve_sender_slug_prefers_cached_device_name() {
+    let conn = catalog_conn();
+
+    // No cache yet → hex slug (pre-2C behavior, pinned).
+    assert_eq!(
+        super::ingest::resolve_sender_slug(&conn, PEER_HEX),
+        super::ingest::sanitize_slug(PEER_HEX)
+    );
+
+    // Cache the peer's friendly name → slug becomes the exact sanitized form.
+    set_device_names(&conn, &[(PEER_HEX, "My Mac Book"), (&"ff".repeat(32), "Other")]);
+    assert_eq!(
+        super::ingest::resolve_sender_slug(&conn, PEER_HEX),
+        "My_Mac_Book",
+        "whitespace → underscore via the shared sanitize_for_filename"
+    );
+
+    // A peer absent from the map → hex fallback (never fails).
+    let unknown = "aa".repeat(32);
+    assert_eq!(
+        super::ingest::resolve_sender_slug(&conn, &unknown),
+        super::ingest::sanitize_slug(&unknown)
+    );
+}
+
+/// A cached name that sanitizes to empty (all-reserved chars) must not yield an
+/// empty path segment — the hex slug is used instead.
+#[test]
+fn resolve_sender_slug_falls_back_when_name_sanitizes_empty() {
+    let conn = catalog_conn();
+    set_device_names(&conn, &[(PEER_HEX, "///")]); // "/"→"_", collapses+trims to ""
+    assert_eq!(
+        super::ingest::resolve_sender_slug(&conn, PEER_HEX),
+        super::ingest::sanitize_slug(PEER_HEX)
+    );
+}
+
+/// End to end through `ingest_package`: with a cached device name, the payload
+/// lands under `<incoming>/<sanitized name>/<rel_path>` and the catalog row
+/// points at that path.
+#[test]
+fn ingest_lands_under_resolved_device_name() {
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let (pkg_dir, announce) =
+        build_fixture_package(tmp.path(), "frame-uuid-named", "L_named.fits", "M31", "2026-01-16T10:00:00.000Z");
+
+    let conn = catalog_conn();
+    set_device_names(&conn, &[(PEER_HEX, "My Mac Book")]);
+
+    let outcome = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX).unwrap();
+    assert_eq!(outcome.ingested, 1);
+
+    let landed_path: String = conn
+        .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert!(Path::new(&landed_path).exists(), "landed file exists on disk");
+    assert!(
+        landed_path.ends_with("My_Mac_Book/L_named.fits"),
+        "lands under the sanitized device name, not the hex slug: {landed_path}"
+    );
+    // The hex-slug dir must NOT exist (the friendly name replaced it).
+    let hex_slug = super::ingest::sanitize_slug(PEER_HEX);
+    assert!(
+        !incoming.join(&hex_slug).exists(),
+        "a resolved name replaces the hex slug entirely"
+    );
+}
+
 /// Build a two-frame fixture package (one `pkg_dir`, one announce/`package_id`
 /// covering both frames) with genuinely distinct pixel content per frame — used
 /// by the transit-corruption test so corrupting one payload cannot coincidentally

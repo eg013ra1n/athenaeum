@@ -29,7 +29,9 @@
 //!    remains the primary key for those; acceptable v1.
 //! 4. **Ingest** — otherwise land the payload (tmp/rename into
 //!    `<incoming_root>/<sender_slug>/<rel_path>`, mirroring the sender's tree
-//!    under a slug derived from the *authenticated* peer node id) and insert `files` +
+//!    under a slug that is the *authenticated* peer's CURRENT friendly device
+//!    name (cached node-id-hex → name map, no hub round-trip) with the peer node
+//!    id hex as fallback) and insert `files` +
 //!    `frames` + `fits_header` rows (reusing the scanner primitives), carrying
 //!    the manifest's `frame_uuid` onto `frames.uuid` so a later redelivery
 //!    dedups. Receipt [`Ingested`](ReceiptOutcome::Ingested). If the catalog
@@ -138,10 +140,12 @@ pub fn ingest_package(
     let package_id = &announce.package_id.0;
 
     // Per-sender landing prefix, computed once (the whole package is from one
-    // authenticated peer). Derived from `peer_device` — the AUTHENTICATED node id
+    // authenticated peer). Resolved from `peer_device` — the AUTHENTICATED node id
     // (hex) the receiver verified — NOT the manifest's wire-supplied
-    // `origin_device`, which a peer could set to anything.
-    let sender_slug = sanitize_slug(peer_device);
+    // `origin_device`, which a peer could set to anything. Prefers that peer's
+    // CURRENT friendly device name (from the cached names map, no hub round-trip),
+    // falling back to the hex-derived slug when no name is known.
+    let sender_slug = resolve_sender_slug(conn, peer_device);
 
     // Redelivery optimization: load whatever this package already has on
     // record and reuse any non-Rejected receipt verbatim instead of
@@ -396,9 +400,10 @@ fn primary_wins_outcome(existing: Option<&str>, snapshot: Option<&str>) -> &'sta
 
 /// Land an accepted payload mirroring the sender's tree under
 /// `<incoming_root>/<sender_slug>/<rel_path>`, tmp-copy + atomic rename,
-/// collision-suffixed. `sender_slug` is derived from the AUTHENTICATED peer node
-/// id (Plan 2B); `rel_path` is `validate_rel_path`-guarded in `process_frame`, so
-/// the join cannot escape `<incoming_root>/<sender_slug>/`. Returns the final path.
+/// collision-suffixed. `sender_slug` is [`resolve_sender_slug`]'s output for the
+/// AUTHENTICATED peer (its friendly device name, hex fallback); `rel_path` is
+/// `validate_rel_path`-guarded in `process_frame`, so the join cannot escape
+/// `<incoming_root>/<sender_slug>/`. Returns the final path.
 fn land_payload(
     incoming_root: &Path,
     payload: &Path,
@@ -571,11 +576,60 @@ fn filename_of(rel_path: &str) -> String {
     rel_path.rsplit('/').next().unwrap_or(rel_path).to_string()
 }
 
+/// Resolve the per-sender landing-folder name for an authenticated peer. Prefers
+/// that peer's CURRENT friendly device name — looked up in the cached
+/// node-id-hex → name map ([`SYNC_DEVICE_NAMES`](crate::settings::keys::SYNC_DEVICE_NAMES),
+/// refreshed hourly from the hub alongside the authorized-peers allow-list) and
+/// sanitized for filesystem use with the shared
+/// [`sanitize_for_filename`](crate::archive::path_layout::sanitize_for_filename)
+/// (same sanitizer master/calibrated-light paths use) — and falls back to the
+/// hex-derived [`sanitize_slug`] when no name is cached, the read/parse fails, or
+/// the name sanitizes to empty. Naming is cosmetic: a resolution miss NEVER fails
+/// an ingest, it just lands under the hex slug (the pre-2C behavior).
+///
+/// A later device rename means NEW receives land under the new name; existing
+/// dirs are untouched (no migration) — catalog rows track individual file paths,
+/// so nothing breaks.
+pub(crate) fn resolve_sender_slug(conn: &Connection, peer_device: &str) -> String {
+    if let Some(name) = cached_device_name(conn, peer_device) {
+        let friendly = crate::archive::path_layout::sanitize_for_filename(&name);
+        if !friendly.is_empty() {
+            tracing::debug!(src = %peer_device, device_name = %name, "sync ingest: landing under resolved device name");
+            return friendly;
+        }
+        tracing::debug!(src = %peer_device, "sync ingest: device name sanitized to empty; using hex slug");
+    }
+    sanitize_slug(peer_device)
+}
+
+/// Look up `peer_hex` in the cached node-id-hex → device-name map
+/// ([`SYNC_DEVICE_NAMES`](crate::settings::keys::SYNC_DEVICE_NAMES), a JSON
+/// object). A cheap settings read (no hub round-trip). Best-effort: an absent
+/// setting, an unreadable settings row, or malformed JSON all yield `None`
+/// (logged at `warn`, never swallowed) so the caller falls back to the hex slug.
+fn cached_device_name(conn: &Connection, peer_hex: &str) -> Option<String> {
+    let raw = match crate::db::get_setting(conn, crate::settings::keys::SYNC_DEVICE_NAMES) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(error = %e, "sync ingest: device-names cache read failed; using hex slug");
+            return None;
+        }
+    };
+    match serde_json::from_str::<HashMap<String, String>>(&raw) {
+        Ok(map) => map.get(peer_hex).cloned(),
+        Err(e) => {
+            tracing::warn!(error = %e, "sync ingest: device-names cache parse failed; using hex slug");
+            None
+        }
+    }
+}
+
 /// A filesystem-safe single path segment derived from a display string (the
 /// per-sender landing-folder prefix). Lowercase; any char outside
 /// `[a-z0-9._-]` → `-`; runs of `-` collapse; leading/trailing `-`/`.` trimmed;
-/// capped at 24 chars; empty → `"node"`. Applied to the authenticated peer node
-/// id here (Plan 2C applies it to a resolved device name instead).
+/// capped at 24 chars; empty → `"node"`. The hex-slug FALLBACK for
+/// [`resolve_sender_slug`] when no friendly device name is cached for the peer.
 pub(crate) fn sanitize_slug(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len().min(24));
     let mut prev_dash = false;

@@ -183,6 +183,21 @@ fn account_peer_hexes(devices: &[crate::account::AccountDevice]) -> Vec<String> 
     devices.iter().filter_map(|d| pubkey_b64_to_hex(&d.pubkey)).collect()
 }
 
+/// A node-id-hex → current-device-name map over the account device list — the
+/// cached source the receiver reads to name an incoming sender's landing folder
+/// by that sender's CURRENT friendly name (with no per-package hub round-trip).
+/// Undecodable pubkeys are skipped; the same map `get_sync_device_names` builds,
+/// but persisted so the receiver can resolve offline. Serialized to
+/// [`SYNC_DEVICE_NAMES`](keys::SYNC_DEVICE_NAMES) by [`refresh_authorized_peers`].
+fn account_device_names(
+    devices: &[crate::account::AccountDevice],
+) -> HashMap<String, String> {
+    devices
+        .iter()
+        .filter_map(|d| pubkey_b64_to_hex(&d.pubkey).map(|hex| (hex, d.name.clone())))
+        .collect()
+}
+
 /// Build the receiver's live peer-authorization gate (finding H1). A signed-in
 /// node enforces the cached allow-list (`SYNC_AUTHORIZED_PEERS`), re-read from
 /// settings on **every** announce so a hub refresh takes effect on the next
@@ -399,6 +414,7 @@ pub async fn refresh_authorized_peers(ctx: &ServiceContext) {
         }
     };
     let hexes = account_peer_hexes(&devices);
+    let names = account_device_names(&devices);
     if let Ok(db) = db(ctx) {
         let conn = db.conn();
         if let Err(e) = crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &hexes.join("\n"))
@@ -406,6 +422,20 @@ pub async fn refresh_authorized_peers(ctx: &ServiceContext) {
             tracing::warn!(error = %e, "failed to cache authorized peers");
         } else {
             tracing::info!(count = hexes.len(), "refreshed authorized account peers");
+        }
+        // Cache the hex → device-name map too (best-effort, cosmetic): the receiver
+        // reads it to name incoming senders' landing folders by their current
+        // friendly name without a per-package hub round-trip. A serialize/write
+        // failure only degrades to hex-slug folders — never blocks the allow-list.
+        match serde_json::to_string(&names) {
+            Ok(json) => {
+                if let Err(e) = crate::db::set_setting(&conn, keys::SYNC_DEVICE_NAMES, &json) {
+                    tracing::warn!(error = %e, "failed to cache device names");
+                } else {
+                    tracing::debug!(count = names.len(), "refreshed cached device names");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to serialize device names cache"),
         }
     }
 }
@@ -2098,6 +2128,14 @@ mod tests {
         assert!(hexes.contains(&"01".repeat(32)));
         assert!(hexes.contains(&"02".repeat(32)));
         assert!(hexes.contains(&"03".repeat(32)));
+
+        // The device-names cache maps each decodable pubkey's hex → its current
+        // name — the source the receiver reads to name incoming landing folders.
+        let names = account_device_names(&devices);
+        assert_eq!(names.len(), 3);
+        assert_eq!(names.get(&"01".repeat(32)).map(String::as_str), Some("n1"));
+        assert_eq!(names.get(&"02".repeat(32)).map(String::as_str), Some("n2"));
+        assert_eq!(names.get(&"03".repeat(32)).map(String::as_str), Some("n3"));
     }
 
     /// The relay-map cache round-trips through settings the same way.

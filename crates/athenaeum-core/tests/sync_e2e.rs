@@ -501,6 +501,22 @@ async fn two_instance_sync_e2e() {
         );
     }
 
+    // Name the incoming sender's landing folder by its CURRENT friendly device
+    // name: seed the receiver's cached hex → name map (the source the ingest
+    // resolver reads with no hub round-trip). Received files must then land under
+    // `<designated>/Studio_iMac/...` (sanitized), not the sender's hex slug.
+    {
+        let mut m = std::collections::HashMap::new();
+        m.insert(node_id_hex(&sender_node), "Studio iMac".to_string());
+        let conn = pdb.conn();
+        athenaeum_core::db::set_setting(
+            &conn,
+            athenaeum_core::settings::keys::SYNC_DEVICE_NAMES,
+            &serde_json::to_string(&m).unwrap(),
+        )
+        .unwrap();
+    }
+
     // ── Seed 50 fixture frames into the capture catalog + one never-synced
     // "keeper" file that retention must never touch. ──
     let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
@@ -568,6 +584,18 @@ async fn two_instance_sync_e2e() {
         .filter(|e| e.file_type().is_file())
         .collect();
     assert_eq!(landed.len(), N, "all frames land under the designated sync_incoming root");
+
+    // …and every one lives under the sender's FRIENDLY-name folder (2C), not a
+    // hex slug: the ingest resolver read the cached device-names map above.
+    let named_dir = designated.join("Studio_iMac");
+    assert!(named_dir.is_dir(), "landing folder is named by the sender's current device name");
+    for e in &landed {
+        assert!(
+            e.path().starts_with(&named_dir),
+            "landed file is under the friendly-name dir: {}",
+            e.path().display()
+        );
+    }
 
     // ── (2) Re-run the identical enqueue → dedupe-safe ───────────────────────
     let r2 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, frame_ids.clone(), None)

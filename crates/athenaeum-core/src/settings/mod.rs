@@ -166,6 +166,14 @@ pub mod keys {
     /// only ingests announces from a peer on this list. Empty = accept nobody
     /// (fail closed) until the first successful hub refresh.
     pub const SYNC_AUTHORIZED_PEERS: &str = "sync.authorized_peer_ids";
+    /// Cached node-id-hex → current device name map (JSON object), refreshed
+    /// alongside [`SYNC_AUTHORIZED_PEERS`] from the hub device list. Lets the
+    /// receiver name an incoming sender's landing folder by that sender's CURRENT
+    /// friendly device name WITHOUT a per-package hub round-trip (it reads this
+    /// cache only). Absent / a hex not in the map / a name that sanitizes to empty
+    /// ⇒ the receiver falls back to the hex-derived slug. Purely cosmetic (folder
+    /// naming); never gates a transfer.
+    pub const SYNC_DEVICE_NAMES: &str = "sync.device_names";
 }
 
 /// Runtime overrides for settings (session-specific)
