@@ -1166,6 +1166,18 @@ impl SharedIrohNode {
         match self.rebuild(mode).await {
             Ok(()) => {
                 *self.pending_rebuild.lock().expect("pending mutex poisoned") = None;
+                // Log the completion (TEST-12): the pending marker used to clear
+                // silently, so the only smoke signal was watching the node stop
+                // re-homing. One `info!` turns the "did the rebuild land" check
+                // into a one-line `query_logs`. `relay_count` = the freshly-applied
+                // relay set the node is now homed on; `forced` = whether it fired
+                // past the idle gate (max-defer) or on a quiet instant.
+                let relay_count = self
+                    .last_relay_urls
+                    .lock()
+                    .expect("last_relay_urls mutex poisoned")
+                    .len();
+                tracing::info!(relay_count, forced = force, "relay map node rebuild complete");
             }
             Err(e) => {
                 tracing::error!(
@@ -2750,14 +2762,26 @@ mod tests {
     //     internal defer machinery (an `op_guard` stands in for a live
     //     serve/fetch/announce) so the defer→release→rebuild ordering is
     //     deterministic, with the node id stable across the deferred rebuild.
+    //     Also asserts the TEST-12 completion line + `relay_count` field.
     #[tokio::test]
     async fn relay_rebuild_deferred_while_busy_then_executes_after_release() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let captured: Arc<std::sync::Mutex<Vec<CapturedEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing_subscriber::registry()
+            .with(CaptureLayer {
+                events: captured.clone(),
+            })
+            .set_default();
+
         let dir = tempdir().unwrap();
         let node = bind_disabled(dir.path()).await;
         let id = node.node_id();
 
         // Mark the node busy → not idle.
-        let guard = node.op_guard();
+        let op = node.op_guard();
         assert!(!node.is_idle(), "an in-flight op means the node is not idle");
 
         // A relay change becomes pending; a rebuild attempt while busy must defer.
@@ -2766,11 +2790,32 @@ mod tests {
         assert_eq!(node.rebuild_count(), 0, "rebuild must defer while an op is in flight");
 
         // Release the op → idle → the next attempt rebuilds.
-        drop(guard);
+        drop(op);
         assert!(node.is_idle(), "released op → idle");
         node.try_rebuild().await;
         assert_eq!(node.rebuild_count(), 1, "rebuild must execute once the node is idle");
         assert_eq!(node.node_id(), id, "node id stable across the deferred rebuild");
+
+        // TEST-12: the success arm now logs a completion line carrying relay_count
+        // (was silent). The applied set was `["changed"]` ⇒ relay_count == 1.
+        let events = captured.lock().unwrap();
+        let complete: Vec<&CapturedEvent> = events
+            .iter()
+            .filter(|e| e.message == "relay map node rebuild complete")
+            .collect();
+        assert_eq!(
+            complete.len(),
+            1,
+            "exactly one rebuild-complete line; captured: {:?}",
+            events.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            complete[0].fields.get("relay_count").map(String::as_str),
+            Some("1"),
+            "the completion line must carry relay_count of the applied set; got {:?}",
+            complete[0].fields
+        );
+        drop(events);
 
         node.shutdown().await;
     }

@@ -1241,8 +1241,14 @@ impl Worker {
     /// store error is logged and dropped — a failed diagnostic write must never
     /// break scheduling.
     fn persist_next_retry(&self, id: i64, delay: Duration) {
-        let stamp = retry_deadline_stamp(delay);
-        if let Err(e) = self.store.set_next_retry_at(id, Some(&stamp)) {
+        self.persist_next_retry_at(id, &retry_deadline_stamp(delay));
+    }
+
+    /// As [`persist_next_retry`] but for a caller that has already rendered the
+    /// wall-clock stamp (the ack-timeout path logs it, so it reuses it here
+    /// rather than recomputing `Utc::now() + delay` a second time).
+    fn persist_next_retry_at(&self, id: i64, stamp: &str) {
+        if let Err(e) = self.store.set_next_retry_at(id, Some(stamp)) {
             tracing::warn!(package_id = id, error = %e, "persist next_retry_at failed");
         }
     }
@@ -1618,20 +1624,32 @@ impl Worker {
                     {
                         tracing::warn!(package_id = id, error = %se, "record last_error (ack timeout) failed");
                     }
-                    let delay = if let Some(p) = self.pending.get_mut(&id) {
+                    let retry_stamp = if let Some(p) = self.pending.get_mut(&id) {
                         p.rung = p.rung.saturating_add(1);
                         p.next_action = NextAction::Retry;
                         let delay = retry_backoff(self.config.ack_timeout, p.rung);
                         p.deadline = Instant::now() + delay;
-                        tracing::info!(package_id = id, rung = p.rung, "ack timeout, backing off");
-                        Some(delay)
+                        // Compute the wall-clock retry stamp ONCE and reuse it for
+                        // both the diagnostic log and the persisted countdown
+                        // (Task 2) — do not recompute (TEST-11: a one-line
+                        // `query_logs` smoke reads the delay + next-retry off this
+                        // event instead of watching the UI countdown).
+                        let stamp = retry_deadline_stamp(delay);
+                        tracing::info!(
+                            package_id = id,
+                            rung = p.rung,
+                            delay_ms = delay.as_millis() as u64,
+                            next_retry_at = %stamp,
+                            "ack timeout, backing off"
+                        );
+                        Some(stamp)
                     } else {
                         None
                     };
                     // Persist the wall-clock retry deadline (Task 2) after the
                     // borrow drops so the UI countdown reflects the new backoff.
-                    if let Some(delay) = delay {
-                        self.persist_next_retry(id, delay);
+                    if let Some(stamp) = retry_stamp {
+                        self.persist_next_retry_at(id, &stamp);
                     }
                 }
                 NextAction::Retry => {

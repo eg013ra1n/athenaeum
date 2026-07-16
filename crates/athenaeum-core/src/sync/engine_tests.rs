@@ -754,6 +754,157 @@ async fn timeouts_back_off_forever_without_failing() {
     engine.shutdown().await;
 }
 
+// ---------------------------------------------------------------------------
+// Log-assert (audit TEST-11): the ack-timeout backoff `info!` line must carry
+// `delay_ms` (the just-computed backoff window) and `next_retry_at` (the
+// wall-clock stamp reused from persistence) so an owner smoke reads the retry
+// schedule with a one-line `query_logs` instead of watching the UI countdown.
+// A minimal thread-local capture layer (mirrors the `sharing::iroh::tests`
+// pattern) scoped to `athenaeum_core::sync` targets; `#[tokio::test]` is a
+// current-thread runtime, so the engine worker task runs on this thread and its
+// events are captured by the `set_default` subscriber.
+// ---------------------------------------------------------------------------
+
+/// One captured tracing event: its message plus its string-rendered fields.
+#[derive(Clone, Default)]
+struct CapturedEvent {
+    message: String,
+    fields: HashMap<String, String>,
+}
+
+/// Field visitor: records `message` separately, every other field as a string.
+#[derive(Default)]
+struct FieldCollector {
+    message: String,
+    fields: HashMap<String, String>,
+}
+
+impl tracing::field::Visit for FieldCollector {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = rendered;
+        } else {
+            self.fields.insert(field.name().to_string(), rendered);
+        }
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.fields.insert(field.name().to_string(), value.to_string());
+    }
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields.insert(field.name().to_string(), value.to_string());
+        }
+    }
+}
+
+/// Minimal `tracing` layer capturing this crate's `sync` events into a shared vec.
+#[derive(Clone)]
+struct CaptureLayer {
+    events: Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::INFO)
+    }
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if !event.metadata().target().starts_with("athenaeum_core::sync") {
+            return;
+        }
+        let mut collector = FieldCollector::default();
+        event.record(&mut collector);
+        self.events.lock().unwrap().push(CapturedEvent {
+            message: collector.message,
+            fields: collector.fields,
+        });
+    }
+}
+
+/// TEST-11: the `"ack timeout, backing off"` info line carries `delay_ms` and
+/// `next_retry_at`, and the stamp is a parseable RFC3339 instant.
+#[tokio::test]
+async fn ack_timeout_backoff_log_carries_delay_and_next_retry() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let captured: Arc<std::sync::Mutex<Vec<CapturedEvent>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = tracing_subscriber::registry()
+        .with(CaptureLayer {
+            events: captured.clone(),
+        })
+        .set_default();
+
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // Receiver is started (so the announce delivers) but never acks — every
+    // attempt's ack wait times out, firing the backoff info line.
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+
+    let pkg = build_package(&tmp.path().join("src_log"), "uuid-log", "log.fits", "M31", 1024);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig {
+            ack_timeout: Duration::from_millis(50),
+        },
+    );
+    let _id = engine.enqueue_package(&pkg).await.unwrap();
+
+    // Wait until at least one backoff line has been captured.
+    wait_until(
+        || {
+            captured
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.message == "ack timeout, backing off")
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let events = captured.lock().unwrap();
+    let backoff: Vec<&CapturedEvent> = events
+        .iter()
+        .filter(|e| e.message == "ack timeout, backing off")
+        .collect();
+    assert!(
+        !backoff.is_empty(),
+        "expected an 'ack timeout, backing off' line; captured: {:?}",
+        events.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
+    );
+    for e in &backoff {
+        assert!(
+            e.fields.contains_key("delay_ms"),
+            "backoff line must carry delay_ms; got fields {:?}",
+            e.fields
+        );
+        let stamp = e
+            .fields
+            .get("next_retry_at")
+            .expect("backoff line must carry next_retry_at");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(stamp).is_ok(),
+            "next_retry_at must be a parseable RFC3339 instant, got {stamp:?}"
+        );
+    }
+    drop(events);
+
+    engine.shutdown().await;
+}
+
 /// Spec §1: `Failed` stays reachable for exactly ONE non-network case — the
 /// package payload has vanished from disk, so re-announcing can never succeed no
 /// matter how long the engine backs off. Unlike every other retry trigger (spec
