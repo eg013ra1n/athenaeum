@@ -416,6 +416,70 @@ async fn sender_emits_coarse_progress_and_finished_events() {
     engine.shutdown().await;
 }
 
+/// Task 13: a served package's upload progress reaches the SENDER as a
+/// `sync-progress` `transferring` tick carrying byte figures. Over the loopback
+/// the serving endpoint receives one synthetic `ServeProgress` == the announced
+/// byte size the moment the receiver fetches; the sender engine turns it into a
+/// send-side progress tick with `bytesDone == bytesTotal == byte_size`. This is
+/// the in-process stand-in for the iroh provider-upload-events path.
+#[tokio::test]
+async fn sent_progress_carries_bytes() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(&tmp.path().join("src_bytes"), "uuid-bytes", "bytes.fits", "M42", 4096);
+    // The announced byte size is the manifest's summed frame bytes.
+    let expected_bytes: u64 = package::read_manifest(&pkg)
+        .unwrap()
+        .iter()
+        .map(|r| r.byte_size)
+        .sum();
+    assert!(expected_bytes > 0, "sanity: package has bytes");
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> = Arc::new(CapturingEmitter(events.clone()));
+    let engine = SyncEngine::spawn_with_emitter(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        Some(emitter),
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    // Wait for the byte-bearing sent progress tick to flush onto the emitter.
+    wait_until(
+        || {
+            events.lock().unwrap().iter().any(|(n, p)| {
+                n == "sync-progress"
+                    && p["direction"].as_str() == Some("sent")
+                    && p["bytesDone"].as_u64() == Some(expected_bytes)
+            })
+        },
+        WAIT,
+    )
+    .await;
+
+    let evts = events.lock().unwrap();
+    let tick = evts
+        .iter()
+        .find(|(n, p)| {
+            n == "sync-progress" && p["direction"].as_str() == Some("sent") && p["bytesDone"].is_u64()
+        })
+        .expect("a send-side sync-progress tick carrying bytes");
+    assert_eq!(tick.1["stage"].as_str(), Some("transferring"));
+    assert_eq!(tick.1["bytesDone"].as_u64(), Some(expected_bytes));
+    assert_eq!(tick.1["bytesTotal"].as_u64(), Some(expected_bytes));
+    drop(evts);
+
+    engine.shutdown().await;
+}
+
 #[tokio::test]
 async fn mid_transfer_abort_leaves_transferring_then_resume_completes() {
     let tmp = tempdir().unwrap();

@@ -62,8 +62,8 @@ use crate::sync::DedupResponder;
 use super::proto::{self, Msg, OfferEntry};
 use super::{
     blobs, build_router, hex32, spawn_conn_path_diagnostics, ConnectGate, Delivery, EventSink,
-    SharedConnectGate, SharedResponder, CONTROL_SEND_TIMEOUT, EVENT_CHANNEL_CAPACITY, GC_INTERVAL,
-    MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
+    ServeRootResolver, SharedConnectGate, SharedResponder, CONTROL_SEND_TIMEOUT,
+    EVENT_CHANNEL_CAPACITY, GC_INTERVAL, MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
 };
 
 /// Upper bound on the graceful `endpoint.close()` at shutdown (I1). A clean
@@ -209,6 +209,27 @@ fn role_package_tag(prefix: &str, package_id: &PackageId) -> String {
     format!("{prefix}/pkg/{}", package_id.0)
 }
 
+/// Resolve a served collection's root hash back to the [`PackageId`] whose
+/// [`serve`](SharingTransport::serve) registered it (Task 13), by scanning the
+/// role-prefixed `served` map (`<prefix>/pkg/<package_id>` → hash). The package id
+/// is the segment after `/pkg/`. `None` for a child blob / hash-seq-internal /
+/// foreign hash — the provider-events consumer still drains those, it just emits
+/// no progress for them. Backs both [`SharedIrohNode::resolve_served_root`] and the
+/// [`ServeRootResolver`] closure the consumer holds.
+fn resolve_served_root_in(
+    served: &Mutex<HashMap<String, Hash>>,
+    hash: Hash,
+) -> Option<PackageId> {
+    let map = served.lock().expect("served mutex poisoned");
+    map.iter().find_map(|(tag, h)| {
+        if *h == hash {
+            tag.split("/pkg/").nth(1).map(|id| PackageId(id.to_string()))
+        } else {
+            None
+        }
+    })
+}
+
 /// Per-`(peer, package)` ack-claim + single Recv-consumer router (Task 2, Д4).
 ///
 /// The shared node owns ONE inbound event stream (the control-protocol accept
@@ -302,6 +323,11 @@ impl EventDemux {
                 | TransportEvent::ProjectRequestReceived { .. } => {
                     inner.recv.as_ref().map(|(_, tx)| tx.clone())
                 }
+                // ServeProgress originates on OUR endpoint (the provider-events
+                // consumer), never arrives as a decoded inbound control message,
+                // and is routed via `route_serve_progress` — not this path. Treat a
+                // stray one defensively as an orphan (no consumer, no delivery ack).
+                TransportEvent::ServeProgress { .. } => None,
             }
         };
         match target {
@@ -324,6 +350,29 @@ impl EventDemux {
     fn claim_count(&self) -> usize {
         self.inner.lock().expect("demux mutex poisoned").claims.len()
     }
+
+    /// Route a locally-generated [`ServeProgress`](TransportEvent::ServeProgress)
+    /// (Task 13) to the sender handle(s) that announced this package — matched by
+    /// `package_id` across the live ack claims. A claim points at the announcing
+    /// Out/Collab handle's own events channel and lives exactly for the transfer
+    /// window (registered at announce, released on the ack), so a tick routes to
+    /// that sender engine only while its transfer is in flight. Non-blocking
+    /// (`try_send`): a full channel drops the tick, and a package with no live
+    /// claim (already acked / terminal, or announced by a since-dropped handle) is
+    /// silently ignored — upload progress is best-effort UI data. A package fanned
+    /// out to N peers has N same-`package_id` claims; every one gets the tick (mild
+    /// over-report across destinations, never a misroute).
+    pub(crate) fn route_serve_progress(&self, package_id: &PackageId, bytes_sent: u64) {
+        let inner = self.inner.lock().expect("demux mutex poisoned");
+        for ((_, pid), (_, tx)) in inner.claims.iter() {
+            if pid == package_id {
+                let _ = tx.try_send(TransportEvent::ServeProgress {
+                    package_id: package_id.clone(),
+                    bytes_sent,
+                });
+            }
+        }
+    }
 }
 
 /// The inbound-event variant an orphan warn names, plus the peer it came from.
@@ -333,6 +382,8 @@ fn event_kind_and_peer(event: &TransportEvent) -> (&'static str, NodeId) {
         TransportEvent::AckReceived { from, .. } => ("ack", *from),
         TransportEvent::ProjectAnnounceReceived { from, .. } => ("project_announce", *from),
         TransportEvent::ProjectRequestReceived { from, .. } => ("project_request", *from),
+        // Locally-originated (no peer); never reaches the inbound orphan path.
+        TransportEvent::ServeProgress { .. } => ("serve_progress", [0u8; 32]),
     }
 }
 
@@ -498,8 +549,10 @@ pub struct SharedIrohNode {
     /// Prefixed package tag (`<role>/pkg/<id>`) → collection hash, registered by
     /// [`serve`](SharingTransport::serve), injected into the wire announce by
     /// [`announce`](SharingTransport::announce). Keyed by the FULL prefixed tag
-    /// so two roles serving the same package id never collide.
-    served: Mutex<HashMap<String, Hash>>,
+    /// so two roles serving the same package id never collide. Behind an `Arc` so
+    /// the provider-upload-events consumer's [`ServeRootResolver`] (Task 13) can
+    /// share it — the consumer is spawned at router build, before `Self` exists.
+    served: Arc<Mutex<HashMap<String, Hash>>>,
     /// Per-`(peer, package)` ack-claim + Recv-consumer router (Task 2, Д4). Owns
     /// the fan-out of the node's single inbound event stream; cloned into the
     /// control-protocol handler (as [`EventSink::Demux`]) and consulted by every
@@ -669,6 +722,15 @@ impl SharedIrohNode {
         // Task 3). Empty ⇒ offers are answered want-all, so nothing is ever
         // silently withheld before the receiver wires its catalog responder.
         let responder: SharedResponder = Arc::new(Mutex::new(None));
+        // The served map lives behind an `Arc` so the provider-upload-events
+        // consumer (Task 13) can resolve a served collection's root hash back to its
+        // package id. Created here — before `Self` — and shared into both the
+        // resolver and the struct field below.
+        let served: Arc<Mutex<HashMap<String, Hash>>> = Arc::new(Mutex::new(HashMap::new()));
+        let serve_resolver: ServeRootResolver = {
+            let served = Arc::clone(&served);
+            Arc::new(move |hash| resolve_served_root_in(&served, hash))
+        };
         // Shared node: `EventSink::Demux` (inbound events fan out through the demux,
         // Task 2/Д4, not a single shared stream), and `flush_store_on_shutdown:
         // false` because the store is SHARED across relay rebuilds — a per-rebuild
@@ -681,6 +743,7 @@ impl SharedIrohNode {
             EventSink::Demux(Arc::clone(&demux)),
             Arc::clone(&responder),
             false,
+            serve_resolver,
         );
 
         let endpoint = router.endpoint().clone();
@@ -708,7 +771,7 @@ impl SharedIrohNode {
             device_secret,
             peers: Mutex::new(HashMap::new()),
             lookup,
-            served: Mutex::new(HashMap::new()),
+            served,
             demux,
             active_ops: AtomicU64::new(0),
             rebuild_count: AtomicU64::new(0),
@@ -765,6 +828,17 @@ impl SharedIrohNode {
     /// This endpoint's node id (== ed25519 public key bytes).
     pub fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    /// Resolve a served collection's root hash to the [`PackageId`] whose
+    /// [`serve`](SharingTransport::serve) registered it (Task 13). The named
+    /// reverse-resolution entry point + test hook; the provider-upload-events
+    /// consumer resolves via a [`ServeRootResolver`] closure over the SAME shared
+    /// map (it is spawned before `Self` exists, so it can't hold `&self`). `None`
+    /// for a child blob / hash-seq-internal / foreign hash.
+    #[allow(dead_code)] // exposed contract; the consumer resolves via the shared closure
+    pub(crate) fn resolve_served_root(&self, hash: Hash) -> Option<PackageId> {
+        resolve_served_root_in(&self.served, hash)
     }
 
     /// Live ack-claim count (test introspection for the demux).
@@ -1147,7 +1221,12 @@ impl SharedIrohNode {
         // so every Task-2 demux consumer stays registered and any installed
         // gate/responder survives, transparently to SyncRuntime/engines. Same
         // construction shape as bind() (`flush_store_on_shutdown: false` — the
-        // shared store must survive this router's teardown).
+        // shared store must survive this router's teardown). The resolver captures
+        // the SAME (preserved) served map so the new consumer resolves identically.
+        let serve_resolver: ServeRootResolver = {
+            let served = Arc::clone(&self.served);
+            Arc::new(move |hash| resolve_served_root_in(&served, hash))
+        };
         let router = build_router(
             endpoint,
             &self.store,
@@ -1155,6 +1234,7 @@ impl SharedIrohNode {
             EventSink::Demux(Arc::clone(&self.demux)),
             Arc::clone(&self.responder),
             false,
+            serve_resolver,
         );
         let endpoint = router.endpoint().clone();
         let new_node_id: NodeId = *endpoint.id().as_bytes();
@@ -2051,6 +2131,45 @@ mod tests {
         assert!(
             tag_present(recv.store(), &tag).await,
             "a package imported via the Out handle must be visible through the Recv handle's store"
+        );
+
+        node.shutdown().await;
+    }
+
+    // Task 13: a served collection's root hash resolves back to its package id
+    // (the reverse lookup the provider-upload-events consumer labels progress
+    // with); an unknown hash resolves to None.
+    #[tokio::test]
+    async fn resolve_served_root_maps_collection_hash_to_package_id() {
+        let dir = tempdir().unwrap();
+        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled)
+            .await
+            .unwrap();
+
+        let out = node.role_handle(Role::Out);
+        let (pkg_dir, announce) = build_one_frame_package(dir.path());
+        out.serve(&announce, &pkg_dir, None).await.unwrap();
+
+        // The collection root hash the serve registered, read back off its tag.
+        let tag = format!("out/pkg/{}", announce.package_id.0);
+        let root = node
+            .store()
+            .tags()
+            .get(tag.as_bytes())
+            .await
+            .unwrap()
+            .expect("served tag present")
+            .hash;
+
+        assert_eq!(
+            node.resolve_served_root(root),
+            Some(announce.package_id.clone()),
+            "the served collection root must resolve back to its package id"
+        );
+        assert_eq!(
+            node.resolve_served_root(Hash::new(b"an unserved blob")),
+            None,
+            "an unknown hash must resolve to None (child blob / foreign / hash-seq internal)"
         );
 
         node.shutdown().await;

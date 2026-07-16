@@ -762,6 +762,35 @@ impl Worker {
         }
     }
 
+    /// Emit a send-side `sync-progress` tick that carries byte figures (Task 13) —
+    /// the byte-bearing sibling of [`emit_progress`](Self::emit_progress), used
+    /// for the `transferring` stage driven by real upload progress from the
+    /// transport's provider-upload events. `bytes_done` / `bytes_total` populate
+    /// the [`SyncProgressEvent`] Option fields; everything else matches
+    /// `emit_progress`. Never logs per tick (progress is UI data, not a log).
+    fn emit_progress_bytes(
+        &self,
+        id: i64,
+        stage: &str,
+        frame_count: u32,
+        bytes_done: u64,
+        bytes_total: u64,
+    ) {
+        if let Some(em) = &self.emitter {
+            let project_id = self.pending.get(&id).and_then(|p| p.project_id.clone());
+            emit_event(em.as_ref(), "sync-progress", &SyncProgressEvent {
+                package_id: id.to_string(),
+                direction: Direction::Sent,
+                stage: stage.to_string(),
+                peer_device: node_id_hex(&self.peer),
+                frame_count,
+                project_id,
+                bytes_done: Some(bytes_done),
+                bytes_total: Some(bytes_total),
+            });
+        }
+    }
+
     /// Emit the single send-side `sync-finished` event for a package (task M3).
     /// `new_count` / `duplicate_count` are the Sync Phase 3 dedup outcome — how
     /// many frames were actually sent vs. dropped as the peer's duplicates.
@@ -1286,7 +1315,33 @@ impl Worker {
             // slice 4) are handled by the receive side, not this sender engine.
             TransportEvent::ProjectAnnounceReceived { .. }
             | TransportEvent::ProjectRequestReceived { .. } => Ok(()),
+            // Upload progress for a package we are serving (Task 13): fold it into
+            // a send-side `transferring` tick carrying byte figures.
+            TransportEvent::ServeProgress { package_id, bytes_sent } => {
+                self.on_serve_progress(package_id, bytes_sent);
+                Ok(())
+            }
         }
+    }
+
+    /// Turn a transport [`ServeProgress`](TransportEvent::ServeProgress) tick into
+    /// a send-side `sync-progress` `transferring` event carrying byte figures
+    /// (Task 13). Locates the pending slot whose minted announce carries this
+    /// `package_id` (the same correlation [`on_ack`](Self::on_ack) uses); a tick
+    /// for no live slot (already confirmed / terminal, or an unknown package) is
+    /// dropped at debug. `bytes_sent` is the cumulative upload offset, clamped to
+    /// the announce's `byte_size` (the served collection carries manifest +
+    /// hash-seq overhead beyond the raw frame bytes, so an offset can run past it).
+    fn on_serve_progress(&self, package_id: PackageId, bytes_sent: u64) {
+        let slot = self.pending.iter().find_map(|(k, p)| match &p.announce {
+            Some(a) if a.package_id == package_id => Some((*k, a.byte_size, a.frame_count)),
+            _ => None,
+        });
+        let Some((id, byte_size, frame_count)) = slot else {
+            tracing::debug!(package_id = %package_id.0, "serve-progress for no pending slot; dropped");
+            return;
+        };
+        self.emit_progress_bytes(id, "transferring", frame_count, bytes_sent.min(byte_size), byte_size);
     }
 
     /// Handle an ack: confirm the package ONLY if every receipt is non-`Rejected`

@@ -40,7 +40,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -48,6 +48,9 @@ use iroh::endpoint::{presets, Connection};
 use iroh::protocol::{ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use iroh_blobs::api::Store;
+use iroh_blobs::provider::events::{
+    ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+};
 use iroh_blobs::store::fs::options::Options as FsOptions;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::mem::MemStore;
@@ -130,6 +133,28 @@ type SharedConnectGate = Arc<Mutex<Option<ConnectGate>>>;
 /// offers are answered want-all (nothing silently withheld).
 pub(crate) type SharedResponder = Arc<Mutex<Option<Arc<dyn DedupResponder>>>>;
 
+/// Resolves a served collection's root hash back to the [`PackageId`] whose
+/// [`serve`](SharingTransport::serve) registered it — so the provider-upload-events
+/// consumer (Task 13) can label an outgoing [`ServeProgress`](TransportEvent::ServeProgress).
+/// `None` for a child-blob / hash-seq-internal / foreign hash (drained but not
+/// emitted). Cloned into the consumer task at router build; each construction site
+/// supplies its own (the legacy [`IrohTransport`] resolves nothing, the shared node
+/// scans its role-prefixed `served` map).
+pub(crate) type ServeRootResolver = Arc<dyn Fn(Hash) -> Option<PackageId> + Send + Sync>;
+
+/// Depth of the provider-events channel feeding the upload-progress consumer
+/// (Task 13). Per-connection/per-request notify messages are low volume; the
+/// per-request transfer updates ride their own dedicated channels (drained by a
+/// task each), so this need only absorb bursts of new-request notifications.
+const PROVIDER_EVENT_CAPACITY: usize = 64;
+
+/// Minimum wall-clock gap between two outgoing [`ServeProgress`](TransportEvent::ServeProgress)
+/// ticks for one transfer (Task 13). Provider `Progress` events arrive ~per 16 KiB;
+/// throttling to this cadence keeps the byte progress coarse (UI data, never a log
+/// or a per-chunk event). A transfer shorter than one window still yields one tick
+/// (a final flush at channel close).
+const SERVE_PROGRESS_THROTTLE: Duration = Duration::from_millis(300);
+
 /// Evaluate the shared connect gate for `from`. Absent gate ⇒ admit (accept-all,
 /// today's behavior). The gate `Arc` is cloned out from under the lock BEFORE the
 /// predicate runs, so a gate that does blocking catalog I/O never holds the mutex
@@ -167,15 +192,107 @@ pub(crate) fn build_router(
     sink: EventSink,
     responder: SharedResponder,
     flush_store_on_shutdown: bool,
+    serve_resolver: ServeRootResolver,
 ) -> Router {
+    // Provider upload events (Task 13): a masked `EventSender` feeds a per-process
+    // consumer that turns a peer's collection pull into outgoing byte progress.
+    // Mask: `Notify` on connect + `NotifyLog` on get (per-request transfer events);
+    // everything else stays at the default (get_many/observe off, push disabled,
+    // `throttle: ThrottleMode::None` — we never rate-limit a peer).
+    let (events, mut rx) = EventSender::channel(
+        PROVIDER_EVENT_CAPACITY,
+        EventMask {
+            connected: ConnectMode::Notify,
+            get: RequestMode::NotifyLog,
+            ..EventMask::DEFAULT
+        },
+    );
     // Wrap the blobs provider so an ungated peer never receives a blob byte:
     // `GatedBlobs` checks the connect gate against the dialing node id before
     // delegating to the inner `iroh_blobs` handler (finding F5 hardening).
     let blobs = GatedBlobs {
-        inner: BlobsProtocol::new(store, None),
+        inner: BlobsProtocol::new(store, Some(events)),
         gate: Arc::clone(gate),
         flush_store_on_shutdown,
     };
+
+    // The provider-events consumer lives beside the router (never woven into the
+    // node internals): one task drains the masked event stream and, per GET
+    // request, spawns a detached drain task.
+    //
+    // LOAD-BEARING SAFETY RULE: every request-update receiver (`m.rx`) MUST be
+    // drained for the whole life of its transfer. `iroh-blobs` sends transfer
+    // progress with `try_send(..).await?` into that channel; a DROPPED receiver
+    // makes the next send error and that `?` aborts the PEER'S DOWNLOAD. So every
+    // rx-carrying message gets a detached drain task unconditionally — even an
+    // unmapped/foreign hash, even the Push*/Observe* notify messages a 0.103 mask
+    // quirk can deliver despite the mask — and we never block, never drop early.
+    let consumer_sink = sink.clone();
+    tokio::spawn(async move {
+        // A detached pure-drain task for any rx-carrying message we don't emit for
+        // (mask-quirk defense): keep reading until the sender drops, never abort.
+        macro_rules! drain_only {
+            ($m:expr) => {{
+                let mut updates = $m.rx;
+                tokio::spawn(async move { while let Ok(Some(_)) = updates.recv().await {} });
+            }};
+        }
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                ProviderMessage::GetRequestReceivedNotify(m) => {
+                    // Collection root of this serve; the resolver maps it to the
+                    // package we announced, or `None` (child blob / hash-seq
+                    // internal / foreign hash — still drained, just no emit).
+                    let root: Hash = (*m.inner).request.hash;
+                    let mut updates = m.rx;
+                    let resolver = Arc::clone(&serve_resolver);
+                    let sink = consumer_sink.clone();
+                    tokio::spawn(async move {
+                        let pkg = resolver(root);
+                        let mut sent: u64 = 0;
+                        let mut last = Instant::now();
+                        // Drain for the whole transfer; emit only on `Progress`, and
+                        // only when a package resolved. The loop ends when the sender
+                        // drops (`Ok(None)`) or errors — the receiver is never
+                        // dropped early (SAFETY RULE).
+                        while let Ok(Some(update)) = updates.recv().await {
+                            if let RequestUpdate::Progress(p) = update {
+                                sent = sent.max(p.end_offset);
+                                if let Some(pkg) = &pkg {
+                                    if last.elapsed() >= SERVE_PROGRESS_THROTTLE {
+                                        last = Instant::now();
+                                        sink.route_serve_progress(pkg, sent);
+                                    }
+                                }
+                            }
+                        }
+                        // Flush the peak once at close so a transfer shorter than the
+                        // throttle window still surfaces one tick.
+                        if let Some(pkg) = &pkg {
+                            if sent > 0 {
+                                sink.route_serve_progress(pkg, sent);
+                            }
+                        }
+                    });
+                }
+                // Every other rx-carrying variant: drain-only (SAFETY RULE), no
+                // emit. The masked-off / quirk variants land here.
+                ProviderMessage::GetRequestReceived(m) => drain_only!(m),
+                ProviderMessage::GetManyRequestReceived(m) => drain_only!(m),
+                ProviderMessage::GetManyRequestReceivedNotify(m) => drain_only!(m),
+                ProviderMessage::PushRequestReceived(m) => drain_only!(m),
+                ProviderMessage::PushRequestReceivedNotify(m) => drain_only!(m),
+                ProviderMessage::ObserveRequestReceived(m) => drain_only!(m),
+                ProviderMessage::ObserveRequestReceivedNotify(m) => drain_only!(m),
+                // No update channel to drain.
+                ProviderMessage::ClientConnected(_)
+                | ProviderMessage::ClientConnectedNotify(_)
+                | ProviderMessage::ConnectionClosed(_)
+                | ProviderMessage::Throttle(_) => {}
+            }
+        }
+    });
+
     let control = SyncControlProtocol {
         sink,
         responder,
@@ -327,6 +444,11 @@ impl IrohTransport {
         // responder is fixed for this transport's lifetime — wrapped in the shared
         // slot only so `SyncControlProtocol` has one responder type across both the
         // legacy transport and the shared node; `IrohTransport` never re-sets it.
+        // The legacy single-stream transport is test-only and does not surface
+        // serve-progress (production flows through the shared node's demux). Its
+        // consumer still drains every request-update channel (SAFETY RULE) and its
+        // Direct sink drops any ServeProgress, so it resolves nothing.
+        let serve_resolver: ServeRootResolver = Arc::new(|_: Hash| -> Option<PackageId> { None });
         let router = build_router(
             endpoint,
             &store,
@@ -334,6 +456,7 @@ impl IrohTransport {
             EventSink::Direct(event_tx.clone()),
             Arc::new(Mutex::new(responder)),
             true,
+            serve_resolver,
         );
 
         let endpoint = router.endpoint().clone();
@@ -854,6 +977,26 @@ impl EventSink {
                 Err(_) => Delivery::ConsumerGone,
             },
             EventSink::Demux(demux) => demux.deliver_inbound(event).await,
+        }
+    }
+
+    /// Route a locally-generated [`ServeProgress`](TransportEvent::ServeProgress)
+    /// (from the provider-upload-events consumer, Task 13) to the sender engine.
+    /// Non-blocking (`try_send`): a full or absent consumer drops the tick, which
+    /// is CORRECT — upload progress is best-effort UI data, and blocking here would
+    /// stall the consumer that must keep draining request updates for the transfer.
+    ///
+    /// - [`Direct`](EventSink::Direct): the legacy single-stream transport is
+    ///   test-only and does NOT surface serve-progress — folding it into the shared
+    ///   announce/ack stream is the exact misrouting hazard the demux exists to
+    ///   avoid (audit C1). No-op; production flows through `Demux` below.
+    /// - [`Demux`](EventSink::Demux): the ack-claim owner(s) for this `package_id`
+    ///   (the Out/Collab handle that announced it); a package with no live claim is
+    ///   dropped.
+    fn route_serve_progress(&self, package_id: &PackageId, bytes_sent: u64) {
+        match self {
+            EventSink::Direct(_) => {}
+            EventSink::Demux(demux) => demux.route_serve_progress(package_id, bytes_sent),
         }
     }
 }

@@ -97,6 +97,17 @@ pub enum TransportEvent {
         project_id: String,
         package_id: String,
     },
+    /// Upload progress for a package WE are serving (Task 13). Emitted locally —
+    /// by the iroh provider-upload-events consumer as a peer pulls our collection,
+    /// or as one synthetic tick from the loopback mock — carrying the cumulative
+    /// bytes sent for `package_id`. Routed to the sender engine, which turns it
+    /// into a send-side `sync-progress` `transferring` tick with byte figures.
+    /// Unlike the other variants this originates on OUR endpoint, not from a
+    /// peer's control message, so it carries no `from`.
+    ServeProgress {
+        package_id: PackageId,
+        bytes_sent: u64,
+    },
 }
 
 /// Live progress of a fetch, delivered on the [`FetchSink`] callback threaded

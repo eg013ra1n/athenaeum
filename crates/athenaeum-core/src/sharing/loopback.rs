@@ -263,6 +263,25 @@ impl SharingTransport for LoopbackTransport {
         })?;
         let ServedPackage { src_dir, want } = served;
 
+        // Synthetic upload progress to the SERVING endpoint's event stream (Task
+        // 13): the iroh transport emits `ServeProgress` from real provider upload
+        // events as a peer pulls the collection; the mock emits one deterministic
+        // tick equal to the full announced byte size, so the sender engine's
+        // `ServeProgress` arm is exercised in-process. Pushed here — before the
+        // file copy, and so strictly before the receiver's ack — so the sender
+        // sees it while the package's pending slot is still live. Best-effort
+        // (`try_send`): a full/closed provider channel just drops it (progress is
+        // UI data, never load-bearing).
+        if let Some(tx) = {
+            let reg = self.registry.lock().expect("registry mutex poisoned");
+            reg.get(&from).map(|inbox| inbox.event_tx.clone())
+        } {
+            let _ = tx.try_send(TransportEvent::ServeProgress {
+                package_id: pkg.package_id.clone(),
+                bytes_sent: pkg.byte_size,
+            });
+        }
+
         // Which files move: a full serve transfers every file under `src_dir`
         // (manifest included); a want-subset serve transfers only the wanted
         // payloads and re-synthesizes a manifest filtered to them, so the mock
