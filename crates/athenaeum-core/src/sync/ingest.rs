@@ -592,12 +592,24 @@ fn filename_of(rel_path: &str) -> String {
 /// so nothing breaks.
 pub(crate) fn resolve_sender_slug(conn: &Connection, peer_device: &str) -> String {
     if let Some(name) = cached_device_name(conn, peer_device) {
+        // `sanitize_for_filename` treats '.' as an ordinary character (it only
+        // targets whitespace/reserved/control chars), so a device name of ".."
+        // (or "  ..  ", which collapses to ".." after whitespace→'_'→trim) would
+        // otherwise survive as the slug verbatim and `land_payload`'s
+        // `incoming_root.join(sender_slug)` would resolve ONE LEVEL ABOVE the
+        // incoming root — breaking the module invariant that the join can never
+        // escape `<incoming_root>/<sender_slug>/`. Trim leading/trailing '.' the
+        // same way the hex-slug `sanitize_slug` trims '-'/'.', then re-check
+        // emptiness: any all-dot sanitized name (".", "..", "...", …) collapses to
+        // "" here and falls through to the hex slug; an ordinary name with dots
+        // elsewhere (e.g. "My.Mac") is untouched.
         let friendly = crate::archive::path_layout::sanitize_for_filename(&name);
+        let friendly = friendly.trim_matches('.').to_string();
         if !friendly.is_empty() {
             tracing::debug!(src = %peer_device, device_name = %name, "sync ingest: landing under resolved device name");
             return friendly;
         }
-        tracing::debug!(src = %peer_device, "sync ingest: device name sanitized to empty; using hex slug");
+        tracing::debug!(src = %peer_device, device_name = %name, "sync ingest: device name sanitized to empty/dots-only; using hex slug");
     }
     sanitize_slug(peer_device)
 }

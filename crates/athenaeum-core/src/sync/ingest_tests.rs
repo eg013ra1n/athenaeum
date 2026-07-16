@@ -276,6 +276,67 @@ fn resolve_sender_slug_falls_back_when_name_sanitizes_empty() {
     );
 }
 
+/// Batch-review finding: a device named ".." (or "." / "  ..  ", which whitespace-
+/// collapses to "..") must NOT survive as the slug — `sanitize_for_filename`
+/// treats '.' as an ordinary char, so without the dot-trim fix the slug would be
+/// literally ".." and `land_payload`'s `incoming_root.join(sender_slug)` would
+/// escape one level above the incoming root. Each of these must fall back to the
+/// HEX slug, and a normal dotted name must be unaffected.
+#[test]
+fn resolve_sender_slug_rejects_dot_only_names() {
+    let conn = catalog_conn();
+    let hex_slug = super::ingest::sanitize_slug(PEER_HEX);
+
+    for dotty in ["..", ".", "  ..  ", "...", "  .  "] {
+        set_device_names(&conn, &[(PEER_HEX, dotty)]);
+        let slug = super::ingest::resolve_sender_slug(&conn, PEER_HEX);
+        assert_eq!(slug, hex_slug, "device name {dotty:?} must fall back to the hex slug, got {slug:?}");
+        assert_ne!(slug, "..", "slug must never be the literal parent-dir component");
+        assert_ne!(slug, ".", "slug must never be the literal current-dir component");
+    }
+
+    // A normal name that merely contains a dot (not dot-only) is unaffected.
+    set_device_names(&conn, &[(PEER_HEX, "My.Mac")]);
+    assert_eq!(super::ingest::resolve_sender_slug(&conn, PEER_HEX), "My.Mac");
+}
+
+/// End to end through `ingest_package`: a resolver-cached ".." device name must
+/// land under the HEX slug directory, INSIDE `incoming_root` — never one level
+/// above it. Asserts the landed path has no ".." path component and stays
+/// under `incoming`.
+#[test]
+fn ingest_dot_only_device_name_lands_under_hex_slug_not_above_incoming_root() {
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let (pkg_dir, announce) =
+        build_fixture_package(tmp.path(), "frame-uuid-dotty", "L_dotty.fits", "M31", "2026-01-16T10:00:00.000Z");
+
+    let conn = catalog_conn();
+    set_device_names(&conn, &[(PEER_HEX, "..")]);
+
+    let outcome = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX).unwrap();
+    assert_eq!(outcome.ingested, 1);
+
+    let landed_path: String = conn
+        .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    let landed = Path::new(&landed_path);
+    assert!(landed.exists(), "landed file exists on disk");
+    assert!(
+        landed.starts_with(&incoming),
+        "landed file must stay under incoming_root, not escape it: {landed_path}"
+    );
+    assert!(
+        !landed.components().any(|c| c.as_os_str() == ".."),
+        "landed path must not contain a '..' component: {landed_path}"
+    );
+    let hex_slug = super::ingest::sanitize_slug(PEER_HEX);
+    assert!(
+        landed_path.ends_with(&format!("{hex_slug}/L_dotty.fits")),
+        "a dot-only device name falls back to the hex slug: {landed_path}"
+    );
+}
+
 /// End to end through `ingest_package`: with a cached device name, the payload
 /// lands under `<incoming>/<sanitized name>/<rel_path>` and the catalog row
 /// points at that path.
