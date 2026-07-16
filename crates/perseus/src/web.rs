@@ -414,6 +414,7 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
             get(api_get_capture_dirs).put(api_put_capture_dirs),
         )
         .route("/api/targets", get(api_get_targets).put(api_put_targets))
+        .route("/api/targets/options", get(api_get_target_options))
         .route(
             "/api/device-name",
             get(api_get_device_name).put(api_put_device_name),
@@ -999,6 +1000,58 @@ async fn api_put_targets(
     *state.config.write().await = new_cfg;
     state.supervisor_wake.notify_one();
     Ok(Json(targets_dto(&state).await))
+}
+
+/// `GET /api/targets/options` payload: the account's receiver-capable devices for
+/// the Send Targets picker. The list already EXCLUDES send-only Perseus devices
+/// and this device itself (see [`crate::account::list_target_options`]), so the
+/// picker only ever offers valid receivers.
+///
+/// `signedIn` is `true` only when a device list was obtained from the hub (a
+/// token is stored AND the hub answered). A signed-out node or an unreachable hub
+/// yields `signedIn: false` + an empty `devices` list; a hub failure additionally
+/// carries a human-readable `error` (omitted entirely on the clean/happy paths).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetOptionsDto {
+    signed_in: bool,
+    devices: Vec<TargetOptionDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// One receiver-capable device offered by the picker. `id` is the stable value
+/// the UI writes into `targets` (rename-robust); `name` is display only.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TargetOptionDto {
+    id: String,
+    name: String,
+    capability: String,
+}
+
+/// `GET /api/targets/options` — the account's receiver-capable devices for the
+/// Send Targets picker. Makes ONE hub `list_devices` call; the frontend fetches
+/// this only on load, after a sign-in state change, and on an explicit refresh —
+/// never on its 2 s poll, because a hub call is a remote round trip. Never fails:
+/// signed-out / hub-unreachable degrade to an empty list (`signedIn: false`) with
+/// an optional `error`, so the picker stays usable.
+async fn api_get_target_options(State(state): State<Arc<WebState>>) -> Json<TargetOptionsDto> {
+    let config = state.config.read().await.clone();
+    let opts = crate::account::list_target_options(&config).await;
+    Json(TargetOptionsDto {
+        signed_in: opts.signed_in,
+        devices: opts
+            .devices
+            .into_iter()
+            .map(|d| TargetOptionDto {
+                id: d.id,
+                name: d.name,
+                capability: d.capability.as_str().to_string(),
+            })
+            .collect(),
+        error: opts.error,
+    })
 }
 
 /// `GET`/`PUT /api/device-name` payload. `deviceName` is the explicit
@@ -3545,6 +3598,105 @@ mod tests {
         // GET /api/account is gated too.
         let res = get(&app, "/api/account").await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── Send-target picker options (/api/targets/options) ─────────────────────
+
+    /// Signed out (no stored token): the picker endpoint reports `signedIn:false`
+    /// with an empty device list and no error — a clean degrade, and the hub is
+    /// never dialed (the loopback url below would fail if it were).
+    #[tokio::test]
+    async fn target_options_signed_out_is_empty() {
+        let (state, _tmp) = account_test_state("http://127.0.0.1:1").await;
+        let app = build_router(state, None);
+
+        let v = body_json(get(&app, "/api/targets/options").await).await;
+        assert_eq!(v["signedIn"], false, "no token → not signed in");
+        assert_eq!(
+            v["devices"].as_array().unwrap().len(),
+            0,
+            "no devices are listed while signed out"
+        );
+        assert!(
+            v.get("error").map_or(true, |e| e.is_null()),
+            "a clean signed-out state carries no error: {v}"
+        );
+    }
+
+    /// Signed in: the picker lists only receiver-capable devices — a send-only
+    /// Perseus device and THIS device itself (own hub id from the sign-in) are
+    /// both excluded, leaving only the other full-peer receivers.
+    #[tokio::test]
+    async fn target_options_lists_receivers_excluding_perseus_and_self() {
+        let server = MockServer::start().await;
+        // Sign-in returns this node's own hub device id ("self-dev").
+        Mock::given(method("POST"))
+            .and(path("/api/v1/auth/verify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "deviceToken": "tok-secret-xyz",
+                "deviceId": "self-dev",
+            })))
+            .mount(&server)
+            .await;
+        // The account device list: one athenaeum receiver, one send-only Perseus
+        // agent, and this device itself (given the athenaeum capability so it is
+        // excluded ONLY by the self-id rule, not by the Perseus rule).
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "id": "studio-1", "name": "Studio", "pubkey": "cHVia2V5",
+                  "capability": "athenaeum", "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null },
+                { "id": "cam-1", "name": "CaptureCam", "pubkey": "cHVia2V5",
+                  "capability": "perseus", "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null },
+                { "id": "self-dev", "name": "ThisNode", "pubkey": "cHVia2V5",
+                  "capability": "athenaeum", "createdAt": "2026-07-01T00:00:00Z", "lastSeenAt": null }
+            ])))
+            .mount(&server)
+            .await;
+
+        let (state, _tmp) = account_test_state(&server.uri()).await;
+        let app = build_router(state, None);
+
+        // Sign in so a token + this device's id ("self-dev") are stored.
+        let res = post_json(
+            &app,
+            "/api/account/verify",
+            serde_json::json!({ "email": "u@e.com", "code": "123456" }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK, "sign-in succeeds");
+
+        let v = body_json(get(&app, "/api/targets/options").await).await;
+        assert_eq!(v["signedIn"], true, "a live hub list means signed in");
+        let devices = v["devices"].as_array().unwrap();
+        assert_eq!(
+            devices.len(),
+            1,
+            "only the non-Perseus, non-self receiver remains: {v}"
+        );
+        assert_eq!(devices[0]["id"], "studio-1");
+        assert_eq!(devices[0]["name"], "Studio");
+        assert_eq!(devices[0]["capability"], "athenaeum");
+        assert!(
+            v.get("error").map_or(true, |e| e.is_null()),
+            "no error on the happy path: {v}"
+        );
+    }
+
+    /// The picker endpoint lives behind the bearer gate: with a token configured,
+    /// an unauthenticated request is refused `401` before the handler runs (the
+    /// hub is never contacted).
+    #[tokio::test]
+    async fn target_options_is_behind_bearer_gate() {
+        let (state, _tmp) = account_test_state("http://127.0.0.1:1").await;
+        let app = build_router(state, Some("s3cret".to_string()));
+
+        let res = get(&app, "/api/targets/options").await;
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "no bearer token → 401 before the handler"
+        );
     }
 
     // ── Task 6 (Sync Phase 2): pending / send-mode / send-now / batches ────────

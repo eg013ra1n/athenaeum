@@ -335,6 +335,102 @@ pub fn account_status(config: &Config) -> AccountStatus {
     }
 }
 
+/// One receiver-capable send-target candidate for the web device picker. The
+/// picker writes the [`id`](Self::id) into `config.targets` (robust against hub
+/// renames — [`resolve_all_target_peers`] matches id-first-then-name). A device
+/// with the send-only [`DeviceCapability::Perseus`] capability, and this device
+/// itself, are excluded before the list is built, so every candidate here is a
+/// valid receiver.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetOption {
+    /// The hub device id — the stable value the picker adds to `targets`.
+    pub id: String,
+    /// The device's friendly name (display only; cosmetic — may be renamed).
+    pub name: String,
+    /// What the device is in the mesh (always a receiver here — never Perseus).
+    pub capability: DeviceCapability,
+}
+
+/// The result of listing send-target candidates for the web picker
+/// ([`list_target_options`]). Never an error type: a signed-out node or an
+/// unreachable hub degrades to `signed_in: false` + an empty list (with the hub
+/// failure carried in [`error`](Self::error)), so the UI stays usable.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TargetOptions {
+    /// A device list was produced from the hub (a token IS stored AND the hub
+    /// answered). Signed-out or hub-unreachable → `false`.
+    pub signed_in: bool,
+    /// The receiver-capable candidates (Perseus devices and self excluded).
+    pub devices: Vec<TargetOption>,
+    /// A best-effort human-readable reason the hub call failed (signed-in but
+    /// unreachable). `None` on the happy path and when simply signed out.
+    pub error: Option<String>,
+}
+
+/// List the account's **receiver-capable** devices for the web "Send Targets"
+/// picker. Reuses the exact hub plumbing [`resolve_all_target_peers`] uses — the
+/// stored account token + [`HubClient::list_devices`] — and applies the same
+/// receiver rule the resolver applies at run time:
+///
+/// - devices with the send-only [`DeviceCapability::Perseus`] capability are
+///   excluded (they cannot receive), and
+/// - **this** device is excluded (own hub id from the pairing cache), so the
+///   picker never offers the node itself as a send target.
+///
+/// Never returns `Err`: a signed-out node (no `[account]` table or no stored
+/// token) yields `signed_in: false` + an empty list with no `error`; an
+/// unreachable hub (or an undialable hub url) yields `signed_in: false` + an
+/// empty list with the failure logged (`warn!`, never swallowed) and surfaced in
+/// [`TargetOptions::error`]. The UI degrades honestly in every case.
+pub async fn list_target_options(config: &Config) -> TargetOptions {
+    // Signed in? (an [account] table AND a stored device token.)
+    let Some(account) = config.account.as_ref() else {
+        return TargetOptions::default();
+    };
+    let token = match token_store(config, account).load() {
+        Ok(Some(token)) => token,
+        Ok(None) => return TargetOptions::default(),
+        Err(error) => {
+            let msg = format!("{error:#}");
+            tracing::warn!(error = %msg, "target-options: could not load the device token");
+            return TargetOptions { signed_in: false, devices: Vec::new(), error: Some(msg) };
+        }
+    };
+
+    // This device's own hub id — used to drop the node itself from the picker.
+    let own_device_id = PairingCache::load(&config.data_dir).device_id;
+
+    let client = match HubClient::new(&account.hub_url) {
+        Ok(client) => client,
+        Err(error) => {
+            let msg = format!("{error}");
+            tracing::warn!(error = %msg, "target-options: could not build the hub client");
+            return TargetOptions { signed_in: false, devices: Vec::new(), error: Some(msg) };
+        }
+    };
+
+    match client.list_devices(&token).await {
+        Ok(devices) => {
+            let devices: Vec<TargetOption> = devices
+                .into_iter()
+                // (a) send-only Perseus agents cannot receive — same rule the
+                // run-time resolver applies.
+                .filter(|d| d.capability != DeviceCapability::Perseus)
+                // (b) never offer this device as a target of itself.
+                .filter(|d| own_device_id.as_deref() != Some(d.id.as_str()))
+                .map(|d| TargetOption { id: d.id, name: d.name, capability: d.capability })
+                .collect();
+            tracing::info!(count = devices.len(), "target-options: listed receiver candidates");
+            TargetOptions { signed_in: true, devices, error: None }
+        }
+        Err(error) => {
+            let msg = format!("{error}");
+            tracing::warn!(error = %msg, "target-options: hub device list failed");
+            TargetOptions { signed_in: false, devices: Vec::new(), error: Some(msg) }
+        }
+    }
+}
+
 /// Resolve **every** configured send target + the shared relay map for an agent
 /// start (Sync 2C multi-target send).
 ///

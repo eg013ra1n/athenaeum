@@ -32,6 +32,11 @@
       .chip.cancelled { background: var(--surface2); color: var(--muted); border: 1px solid var(--border); }
       .chip.stalled { background: #3a2d10; color: var(--warn); }
       .chip.safe { background: #12341c; color: var(--ok); }
+      /* Send-target chips: the current target list, each with an inline remove. */
+      .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+      .chip.target { display: inline-flex; align-items: center; gap: 0.4rem; background: #1f3a5f; color: #79c0ff; padding: 0.15rem 0.3rem 0.15rem 0.6rem; }
+      .chip.target .chipx { background: transparent; border: 0; color: inherit; font-size: 0.95rem; line-height: 1; padding: 0 0.15rem; cursor: pointer; border-radius: 6px; }
+      .chip.target .chipx:hover { background: rgba(255,255,255,0.15); }
       .stat-row { display: flex; gap: 2rem; flex-wrap: wrap; }
       .stat { display: flex; flex-direction: column; }
       .stat .n { font-size: 1.6rem; font-weight: 700; }
@@ -191,14 +196,27 @@
            saved edit shows an inline "applying…" note until the engines relaunch. -->
       <section id="targets-sec">
         <h2>Send Targets</h2>
-        <div class="muted" style="margin:-0.25rem 0 0.5rem;">Account devices this node sends captures to, by device name or id. Perseus is send-only.</div>
-        <div class="tablewrap"><table>
-          <thead><tr><th>target</th><th></th></tr></thead>
-          <tbody id="tgList"></tbody>
-        </table></div>
-        <div class="row" style="margin-top:0.5rem;">
-          <input id="tgAddInput" placeholder="device name or id" size="30" />
-          <button id="tgAdd" class="ghost">Add</button>
+        <div class="muted" style="margin:-0.25rem 0 0.5rem;">Devices in your account this node sends captures to. Pick from your devices below; Perseus capture agents are send-only and never listed.</div>
+        <div id="tgChips" class="chips"></div>
+        <!-- Picker: a dropdown of receiver-capable account devices (minus the ones
+             already added), plus a manual refresh. Fetched from
+             GET /api/targets/options on load / sign-in change / this ↻ — never on
+             the 2 s tick (each fetch proxies a hub call). -->
+        <div class="row" style="margin-top:0.6rem;">
+          <select id="tgSelect" style="min-width:14rem;"></select>
+          <button id="tgAddSel" class="ghost">Add</button>
+          <button id="tgRefresh" class="ghost" title="Refresh device list">&#8635;</button>
+        </div>
+        <div class="muted" id="tgPickerHint" style="margin-top:0.25rem; font-size:0.78rem;"></div>
+        <!-- Advanced / offline fallback: add a target by raw device name or id. -->
+        <details style="margin-top:0.5rem;">
+          <summary class="muted" style="cursor:pointer; font-size:0.8rem;">Advanced: add by device name or id</summary>
+          <div class="row" style="margin-top:0.4rem;">
+            <input id="tgAddInput" placeholder="device name or id" size="30" />
+            <button id="tgAdd" class="ghost">Add</button>
+          </div>
+        </details>
+        <div class="row" style="margin-top:0.6rem;">
           <button id="tgSave">Save</button>
         </div>
         <div class="flash" id="tgFlash"></div>
@@ -621,22 +639,77 @@
       $('cdAddInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addCaptureDir(); });
       $('cdSave').addEventListener('click', saveCaptureDirs);
 
-      // ── Send targets (restart-to-apply, mirrors capture dirs) ───────────────
+      // ── Send targets (device picker; restart-to-apply, mirrors capture dirs) ─
       // `tgWorking` is the local editable list, loaded on page load and re-synced
-      // after each Save; the Add/Remove buttons mutate it in place. Targets are
-      // bound at engine spawn, so a save is restart-to-apply — the flash reports
-      // "restarting…" while the server's restartPending holds.
+      // after each Save; the picker/free-text Add and the chip × mutate it in
+      // place. `tgOptions` is the receiver-capable device list from
+      // /api/targets/options, fetched only on load / sign-in change / manual ↻ —
+      // NEVER on the 2 s tick (each fetch proxies a hub call). Stored targets are
+      // device IDs (rename-robust); legacy name entries still resolve. Targets are
+      // bound at engine spawn, so a save is restart-to-apply.
       let tgWorking = [];
+      let tgOptions = [];             // [{ id, name, capability }] receiver candidates
+      let tgOptError = null;          // hub-failure string, or null
+      let tgAccountSignedIn = null;   // null = unknown yet; drives picker enable/hint
+
+      // Resolve a stored target entry (id, or a legacy name) to a display label via
+      // the options list; fall back to the raw string (offline, or not in the list).
+      function tgLabel(entry) {
+        const hit = tgOptions.find((d) => d.id === entry) || tgOptions.find((d) => d.name === entry);
+        return hit ? hit.name : entry;
+      }
 
       function renderTargets() {
-        const tb = $('tgList');
-        tb.innerHTML = tgWorking.length
-          ? tgWorking.map((t, i) => `<tr><td class="mono">${esc(t)}</td><td><button class="ghost" data-tgrm="${i}">Remove</button></td></tr>`).join('')
-          : '<tr><td colspan="2" class="empty">no send targets — add at least one (or use a dev pairing ticket)</td></tr>';
-        document.querySelectorAll('[data-tgrm]').forEach((b) => b.addEventListener('click', () => {
+        const box = $('tgChips');
+        if (!tgWorking.length) {
+          box.innerHTML = '<div class="empty">no send targets — pick a device below (or add one in Advanced)</div>';
+          return;
+        }
+        box.innerHTML = tgWorking.map((t, i) =>
+          `<span class="chip target"><span>${esc(tgLabel(t))}</span>`
+          + `<button class="chipx" data-tgrm="${i}" title="Remove" aria-label="Remove">&times;</button></span>`
+        ).join('');
+        box.querySelectorAll('[data-tgrm]').forEach((b) => b.addEventListener('click', () => {
           tgWorking.splice(Number(b.dataset.tgrm), 1);
           renderTargets();
+          renderTargetSelect();
         }));
+      }
+
+      // Populate the dropdown with receiver-capable devices not already added.
+      // Disabled with a hint when signed out, when the hub list failed, or when
+      // there is nothing left to add.
+      function renderTargetSelect() {
+        const sel = $('tgSelect');
+        const add = $('tgAddSel');
+        const hint = $('tgPickerHint');
+        const disable = (msg, hintText) => {
+          sel.innerHTML = `<option value="">${esc(msg)}</option>`;
+          sel.disabled = true; add.disabled = true; hint.textContent = hintText || '';
+        };
+        if (tgAccountSignedIn === null) { disable('loading…'); return; }
+        if (tgAccountSignedIn === false) { disable('sign in to list your devices'); return; }
+        if (tgOptError) { disable('could not load devices', tgOptError + ' — try ↻'); return; }
+        const added = new Set(tgWorking);
+        const avail = tgOptions.filter((d) => !added.has(d.id) && !added.has(d.name));
+        if (!avail.length) {
+          disable(tgOptions.length ? 'all devices added' : 'no receiver devices in your account');
+          return;
+        }
+        sel.innerHTML = avail.map((d) => `<option value="${esc(d.id)}">${esc(d.name)}</option>`).join('');
+        sel.disabled = false; add.disabled = false; hint.textContent = '';
+      }
+
+      async function loadTargetOptions() {
+        try {
+          const o = await getJson('/api/targets/options');
+          tgOptions = Array.isArray(o.devices) ? o.devices : [];
+          tgOptError = o.error || null;
+        } catch (e) {
+          tgOptions = []; tgOptError = e.message;
+        }
+        renderTargets();        // labels may now resolve id → name
+        renderTargetSelect();
       }
 
       async function loadTargets() {
@@ -644,15 +717,25 @@
           const c = await getJson('/api/targets');
           tgWorking = c.configured.slice();
           renderTargets();
+          renderTargetSelect();
         } catch (e) { const f = $('tgFlash'); f.textContent = 'load failed: ' + e.message; f.className = 'flash err'; }
+      }
+
+      function addTargetFromSelect() {
+        const v = $('tgSelect').value;
+        if (!v) return;
+        if (!tgWorking.includes(v)) tgWorking.push(v);
+        renderTargets();
+        renderTargetSelect();
       }
 
       function addTarget() {
         const v = $('tgAddInput').value.trim();
         if (!v) return;
-        tgWorking.push(v);
+        if (!tgWorking.includes(v)) tgWorking.push(v);
         $('tgAddInput').value = '';
         renderTargets();
+        renderTargetSelect();
       }
 
       async function saveTargets() {
@@ -664,11 +747,14 @@
           const c = await r.json();
           tgWorking = c.configured.slice();
           renderTargets();
+          renderTargetSelect();
           f.textContent = c.restartPending ? 'saved — restarting the sync engine to apply' : 'saved';
           f.className = 'flash ok';
         } catch (e) { f.textContent = 'save failed: ' + e.message; f.className = 'flash err'; }
       }
 
+      $('tgAddSel').addEventListener('click', addTargetFromSelect);
+      $('tgRefresh').addEventListener('click', loadTargetOptions);
       $('tgAdd').addEventListener('click', addTarget);
       $('tgAddInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') addTarget(); });
       $('tgSave').addEventListener('click', saveTargets);
@@ -718,6 +804,19 @@
           // Reset the two-click sign-out to its resting state.
           $('acctSignOut').style.display = '';
           $('acctSignOutConfirm').style.display = 'none';
+        }
+        // Send-targets picker: refetch the device list only when the signed-in
+        // state flips (sign-in → list devices; sign-out → clear). The 2 s tick
+        // calls renderAccount but this guard keeps it from ever hub-calling.
+        if (inGate !== tgAccountSignedIn) {
+          tgAccountSignedIn = inGate;
+          if (inGate) {
+            loadTargetOptions();
+          } else {
+            tgOptions = []; tgOptError = null;
+            renderTargets();
+            renderTargetSelect();
+          }
         }
       }
 
