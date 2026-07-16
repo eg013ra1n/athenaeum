@@ -782,7 +782,10 @@ pub fn upsert_inbound_announced(
 /// Force the inbound row for `package_id` to `state`, writing `last_error` (or
 /// clearing it with `None`). A terminal state ([`InboundState::is_terminal`])
 /// also stamps `finished_at = now`; a non-terminal transition leaves it NULL.
-/// Keyed by `package_id` (unique in practice — a per-announce UUID).
+/// Keyed by `package_id` alone, NOT the table's `UNIQUE(peer, package_id)` pair
+/// — safe only because `package_id` is a per-announce v4 UUID, effectively
+/// globally unique in practice; a hypothetical future path that reuses a
+/// `package_id` across two different peers would need the peer too.
 pub fn set_inbound_state(
     conn: &Connection,
     package_id: &str,
@@ -806,7 +809,8 @@ pub fn set_inbound_state(
 
 /// Record the cumulative bytes fetched so far for `package_id`. Called at the
 /// transport's batch-progress cadence during the fetch stage; best-effort from
-/// the sink's side (a failed write warns and never aborts the fetch).
+/// the sink's side (a failed write warns and never aborts the fetch). Keyed by
+/// `package_id` alone — see the uniqueness note on [`set_inbound_state`].
 pub fn set_inbound_bytes_done(conn: &Connection, package_id: &str, bytes_done: u64) -> Result<()> {
     conn.execute(
         "UPDATE sync_inbound SET bytes_done = ?1 WHERE package_id = ?2",
@@ -847,7 +851,8 @@ pub fn inbound_active(conn: &Connection) -> Result<Vec<InboundRow>> {
     raws.into_iter().map(to_inbound).collect()
 }
 
-/// Fetch a single `sync_inbound` row by `package_id` (`None` if absent).
+/// Fetch a single `sync_inbound` row by `package_id` (`None` if absent). Keyed
+/// by `package_id` alone — see the uniqueness note on [`set_inbound_state`].
 pub fn get_inbound(conn: &Connection, package_id: &str) -> Result<Option<InboundRow>> {
     let raw = conn
         .query_row(

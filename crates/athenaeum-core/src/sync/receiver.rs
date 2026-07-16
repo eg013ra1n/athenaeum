@@ -415,6 +415,24 @@ impl SyncReceiver {
     }
 }
 
+/// Best-effort: stamp `package_id`'s inbound row [`Failed`](InboundState::Failed)
+/// with `error`'s display text, warning (never propagating — the caller is
+/// already on its own error path) if the write itself fails.
+///
+/// Shared by every early-return error site in [`handle_announce`] AFTER the row
+/// exists (fetch / ingest / ack) — spec §8's terminal mapping requires "Failed +
+/// last_error on fetch/ingest errors", and a fetch/ingest/ack error propagated
+/// via `?` without this stamp leaves the row stuck non-terminal forever (visible
+/// as a perpetual in-progress transfer in [`inbound_active`](super::store::inbound_active)
+/// with no recorded reason) until a later re-announce happens to self-heal it
+/// (reviewer finding, Task 11 follow-up).
+fn stamp_inbound_failed(store: &CatalogSyncStore, package_id: &str, error: &anyhow::Error) {
+    let conn = store.lock_conn();
+    if let Err(e) = set_inbound_state(&conn, package_id, InboundState::Failed, Some(&format!("{error:#}"))) {
+        tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound failed state write failed");
+    }
+}
+
 /// Handle one announced package: persist an inbound row, ack-replay guard, else
 /// fetch → ingest → ack, emitting stage progress (with live fetch bytes) and a
 /// single finished event, walking the `sync_inbound` row through its lifecycle.
@@ -604,13 +622,7 @@ async fn handle_announce(
     if let Err(e) = transport.fetch(from, &announce, &staging, sink).await {
         // A failed fetch is terminal for this row (Failed + reason); propagate so
         // the receiver loop logs it too.
-        let msg = format!("{e:#}");
-        {
-            let conn = store.lock_conn();
-            if let Err(w) = set_inbound_state(&conn, &package_id, InboundState::Failed, Some(&msg)) {
-                tracing::warn!(package_id = %package_id, error = %format!("{w:#}"), "inbound failed state write failed");
-            }
-        }
+        stamp_inbound_failed(store, &package_id, &e);
         return Err(e).with_context(|| format!("fetch package {package_id}"));
     }
 
@@ -636,24 +648,41 @@ async fn handle_announce(
         bytes_done: None,
         bytes_total: None,
     });
-    let outcome = {
+    let ingest_result: Result<IngestOutcome> = {
         let store = Arc::clone(store);
         let staging_for_ingest = staging.clone();
         let announce = announce.clone();
         let peer_device = peer_device.clone();
-        tokio::task::spawn_blocking(move || -> Result<IngestOutcome> {
+        match tokio::task::spawn_blocking(move || -> Result<IngestOutcome> {
             let conn = store.lock_conn();
             ingest::ingest_package(&conn, &incoming_root, &staging_for_ingest, &announce, &peer_device)
         })
         .await
-        .context("ingest join")??
+        {
+            Ok(inner) => inner,
+            Err(join_err) => Err(anyhow::Error::new(join_err).context("ingest join")),
+        }
+    };
+    let outcome = match ingest_result {
+        Ok(o) => o,
+        Err(e) => {
+            // An ingest failure (manifest unreadable, DB error, or the blocking
+            // task itself panicking) is terminal for this row (Failed + reason);
+            // propagate so the receiver loop logs it too.
+            stamp_inbound_failed(store, &package_id, &e);
+            return Err(e).with_context(|| format!("ingest package {package_id}"));
+        }
     };
 
     // Ack the per-frame receipts, then emit the single finished event.
-    transport
-        .ack(from, &announce.package_id, outcome.receipts.clone())
-        .await
-        .with_context(|| format!("ack package {package_id}"))?;
+    if let Err(e) = transport.ack(from, &announce.package_id, outcome.receipts.clone()).await {
+        // An ack failure is terminal for this row too — the frames landed but the
+        // sender never learns their verdict this round; a redelivery re-acks from
+        // the receipt log (ack-replay guard above) once the peer is reachable
+        // again, but this row must not sit stuck non-terminal until then.
+        stamp_inbound_failed(store, &package_id, &e);
+        return Err(e).with_context(|| format!("ack package {package_id}"));
+    }
 
     // Terminal for the receiver: the package is acked, so drop the fetched
     // blobs. Never fails the (successful) receive — log-and-continue on error.
@@ -1341,5 +1370,85 @@ mod tests {
         assert!(fetch_with_bytes, "a fetching progress tick carried bytes: {events:?}");
         let file_ticks = events.iter().filter(|(n, _)| n == "sync-file-progress").count();
         assert!(file_ticks >= 1, "at least one sync-file-progress event: {events:?}");
+    }
+
+    /// Reviewer finding (Task 11 follow-up): an ingest failure AFTER the row is
+    /// stamped `Ingesting` must not leave it stuck non-terminal. Forced by
+    /// deleting `manifest.ndjson` from the served package dir before announcing
+    /// — the loopback `fetch` still succeeds (it just copies whatever files are
+    /// present), but `ingest_package`'s `read_manifest` then fails, which is
+    /// exactly the `.context("ingest join")??` early-return site at issue.
+    /// Asserts the persisted row ends `Failed` with `last_error` set and is
+    /// absent from `inbound_active`.
+    #[tokio::test]
+    async fn inbound_row_stamps_failed_on_ingest_error() {
+        use crate::sharing::SharingTransport;
+        use crate::sync::store::inbound_active;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        let recorder = Arc::new(RecordingEmitter::default());
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            Arc::new(move || incoming.clone()) as IncomingResolver,
+            allow_all_peers(),
+            Default::default(),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
+        // Remove the manifest AFTER `write_package` built it: the fetch (a plain
+        // filesystem copy in the loopback mock) still succeeds and lands the
+        // payload file into staging, but `ingest_package`'s `read_manifest` call
+        // on that staging dir then fails with a real "file not found" error —
+        // triggering the ingest-error early return, not the (already-covered)
+        // per-frame-rejected "all frames rejected" path.
+        std::fs::remove_file(pkg_dir.join(crate::package::MANIFEST_FILENAME)).unwrap();
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.announce(receiver_node, &announce).await.unwrap();
+
+        // The Failed write lands once the ingest join error propagates — poll for it.
+        let mut final_row = None;
+        for _ in 0..400 {
+            let row = {
+                let conn = store.lock_conn();
+                get_inbound(&conn, &announce.package_id.0).unwrap()
+            };
+            if let Some(r) = row {
+                if r.state == InboundState::Failed {
+                    final_row = Some(r);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let row = final_row.expect("inbound row reached Failed after the ingest error");
+        assert!(row.finished_at.is_some(), "a Failed row stamps finished_at");
+        assert!(
+            row.last_error.is_some(),
+            "a Failed row from an ingest error carries a reason"
+        );
+        let active_empty = {
+            let conn = store.lock_conn();
+            inbound_active(&conn).unwrap().is_empty()
+        };
+        assert!(active_empty, "a Failed row drops out of the active set — never stuck non-terminal");
     }
 }
