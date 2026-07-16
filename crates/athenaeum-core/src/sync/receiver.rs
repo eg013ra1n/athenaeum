@@ -29,7 +29,7 @@ use tokio::task::JoinHandle;
 use crate::events::{emit_event, ProgressEmitter};
 use crate::sharing::iroh::node::{Role, SharedIrohNode};
 use crate::sharing::types::{
-    FetchEvent, NodeId, PackageAnnounce, ReceiptOutcome, StartInfo, TransportEvent,
+    FetchEvent, FrameReceipt, NodeId, PackageAnnounce, ReceiptOutcome, StartInfo, TransportEvent,
 };
 use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
 
@@ -37,8 +37,8 @@ use super::ingest::{self, IngestOutcome};
 use super::models::InboundState;
 use super::refusal::RefusalRefresher;
 use super::store::{
-    get_inbound, set_inbound_bytes_done, set_inbound_state, upsert_inbound_announced,
-    CatalogSyncStore,
+    get_inbound, insert_receipt, set_inbound_bytes_done, set_inbound_state,
+    upsert_inbound_announced, CatalogSyncStore,
 };
 
 /// Resolves the landing root for the next received package, live. Called once per
@@ -235,6 +235,61 @@ pub struct SyncFinishedEvent {
     pub project_id: Option<String>,
 }
 
+/// Receiver-side cancellation control (Task 12): the shared signal the command
+/// layer uses to cancel an inbound package the receiver is about to fetch or is
+/// already fetching. One instance per started receiver, threaded into
+/// [`SyncReceiver::spawn`] and reachable from the command layer through
+/// [`SyncRuntime::inbound_control`].
+///
+/// `cancels` holds the `package_id`s the user asked to cancel; [`is_cancelled`]
+/// checks membership. [`request_cancel`] records one and wakes any in-flight
+/// fetch's select loop via `notify`, so a cancel requested DURING a fetch aborts
+/// the download promptly instead of waiting it out. The persisted
+/// [`InboundState::Cancelled`] row is the restart-proof twin of this in-memory
+/// set — a cancel survives a restart through the row even though this set does not.
+///
+/// [`is_cancelled`]: Self::is_cancelled
+/// [`request_cancel`]: Self::request_cancel
+#[derive(Default)]
+pub struct InboundControl {
+    cancels: std::sync::Mutex<std::collections::HashSet<String>>,
+    notify: tokio::sync::Notify,
+}
+
+impl InboundControl {
+    /// A fresh control with no cancellations requested.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request cancellation of `package_id`: record it and wake any in-flight
+    /// fetch select loop so it re-checks and aborts promptly.
+    pub fn request_cancel(&self, package_id: &str) {
+        self.cancels
+            .lock()
+            .expect("inbound cancels mutex poisoned")
+            .insert(package_id.to_string());
+        self.notify.notify_waiters();
+    }
+
+    /// Whether `package_id` has been requested for cancellation.
+    pub fn is_cancelled(&self, package_id: &str) -> bool {
+        self.cancels
+            .lock()
+            .expect("inbound cancels mutex poisoned")
+            .contains(package_id)
+    }
+
+    /// A future that resolves the next time [`request_cancel`](Self::request_cancel)
+    /// is called. The in-flight fetch loop selects on this to learn about a cancel
+    /// without polling. NB the tokio `Notify` registration caveat: the returned
+    /// [`Notified`](tokio::sync::futures::Notified) only registers the waiter once
+    /// polled/`enable`d, so the call site enables it before checking the flag.
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+}
+
 /// Handle to a running [`SyncReceiver`]. Dropping it (or calling
 /// [`shutdown`](Self::shutdown)) stops the event loop.
 pub struct SyncReceiverHandle {
@@ -270,6 +325,7 @@ impl SyncReceiver {
         incoming: IncomingResolver,
         authorized: PeerAuthorizer,
         project: ProjectReceiveHooks,
+        control: Arc<InboundControl>,
         transport: Arc<dyn SharingTransport>,
         emitter: Arc<dyn ProgressEmitter>,
     ) -> Result<(StartInfo, SyncReceiverHandle)> {
@@ -310,6 +366,7 @@ impl SyncReceiver {
                             &incoming,
                             loop_transport.as_ref(),
                             Arc::clone(&emitter),
+                            &control,
                             from,
                             announce,
                         )
@@ -442,6 +499,7 @@ async fn handle_announce(
     incoming: &IncomingResolver,
     transport: &dyn SharingTransport,
     emitter: Arc<dyn ProgressEmitter>,
+    control: &InboundControl,
     from: NodeId,
     announce: PackageAnnounce,
 ) -> Result<()> {
@@ -509,20 +567,34 @@ async fn handle_announce(
     let satisfied_count = store.count_satisfied_receipts(&announce.package_id)?;
     if announce.frame_count > 0 && satisfied_count == announce.frame_count {
         let receipts = store.load_receipts(&announce.package_id)?;
+        // MANDATORY carry-over item 1 (Task 4 review): a package whose replayed
+        // receipts are ALL `Cancelled` is a receiver-cancel replay — its finished
+        // outcome must be "cancelled", NEVER "ingested" (and the row must stay
+        // Cancelled, not be stamped Done). A `Cancelled` receipt bumps no ingest
+        // counter in `ingest.rs`, so without this the label would drift.
+        let all_cancelled =
+            !receipts.is_empty() && receipts.iter().all(|r| matches!(r.outcome, ReceiptOutcome::Cancelled));
         transport
             .ack(from, &announce.package_id, receipts)
             .await
             .context("ack (replayed)")?;
-        tracing::info!(package_id = %package_id, count = satisfied_count, "sync receiver replayed ack from receipt log");
+        tracing::info!(package_id = %package_id, count = satisfied_count, all_cancelled, "sync receiver replayed ack from receipt log");
         // Terminal for the receiver: drop the fetched blobs. A lost-ack resend
         // may have re-downloaded them; release is idempotent. Never fails the
         // (successful) receive — log-and-continue on error.
         if let Err(e) = transport.release(&announce.package_id).await {
             tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "receiver blob release failed");
         }
-        // A replayed receive is terminal-Done (idempotent) — unless the row is
-        // cancelled, which stays final.
-        if !is_cancelled {
+        // Terminal state: an all-cancelled replay is `Cancelled` (final — also
+        // repairs a crash between a prior epilogue's receipt writes and its row
+        // stamp); a normal replay is `Done`, unless the row is already cancelled
+        // (which stays final).
+        if all_cancelled {
+            let conn = store.lock_conn();
+            if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Cancelled, None) {
+                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound cancelled (replay) write failed");
+            }
+        } else if !is_cancelled {
             let conn = store.lock_conn();
             if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Done, None) {
                 tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound done (replay) write failed");
@@ -531,7 +603,7 @@ async fn handle_announce(
         emit_event(emitter.as_ref(), "sync-finished", &SyncFinishedEvent {
             package_id,
             direction: super::Direction::Received,
-            outcome: "replayed".to_string(),
+            outcome: if all_cancelled { "cancelled" } else { "replayed" }.to_string(),
             peer_device: peer_device.clone(),
             ok_count: satisfied_count,
             failed: Vec::new(),
@@ -542,16 +614,16 @@ async fn handle_announce(
         return Ok(());
     }
 
-    // A cancelled inbound row is final: never fetch it. It fell through the
-    // replay guard above (which re-acks it if fully receipted), so there is
-    // nothing more to do this round. Task 12 adds the real cancel-ack epilogue.
-    if is_cancelled {
-        tracing::info!(
-            package_id = %package_id,
-            peer_device = %peer_device,
-            "sync receiver skipped fetch for a cancelled inbound package"
-        );
-        return Ok(());
+    // Wire-in (a) — Task 12: a persisted-`Cancelled` inbound row (restart-proof)
+    // OR a control-requested cancel that reached us at/before this announce runs
+    // the cancel epilogue instead of fetching — it fetches only the manifest,
+    // writes a `Cancelled` receipt per frame, acks them, and stamps the row
+    // Cancelled. The replay guard above already handled a package whose epilogue
+    // previously wrote every frame's receipt (later re-announces replay from the
+    // log — cheaper, no manifest fetch), so this only runs on the FIRST cancel
+    // announce, before any receipts exist.
+    if is_cancelled || control.is_cancelled(&package_id) {
+        return cancel_epilogue(store, transport, emitter.as_ref(), from, &announce, staging_root).await;
     }
 
     // Fetch the package into a per-package staging dir under the staging root
@@ -619,7 +691,41 @@ async fn handle_announce(
             }
         })
     };
-    if let Err(e) = transport.fetch(from, &announce, &staging, sink).await {
+    // Wire-in (b) — Task 12: the fetch is abortable. Pin it and race it against a
+    // cancel signal; a cancel drops the fetch future — Task 10's downloader aborts
+    // the in-flight download on drop — and diverts to the cancel epilogue. The
+    // fetch future is scoped so it drops (aborting the download) BEFORE the
+    // epilogue's manifest fetch runs.
+    let fetch_outcome: Option<Result<()>> = {
+        let fetch_fut = transport.fetch(from, &announce, &staging, sink);
+        tokio::pin!(fetch_fut);
+        loop {
+            // Enable the notify waiter BEFORE checking the flag so a cancel that
+            // races in right after the check still wakes us (a tokio `Notified`
+            // only registers the waiter once polled / `enable`d).
+            let notified = control.notified();
+            tokio::pin!(notified);
+            // Register the waiter now (a `Notified` only enrolls once polled/enabled)
+            // so a cancel that races in right after the flag check still wakes us.
+            let _ = notified.as_mut().enable();
+            if control.is_cancelled(&package_id) {
+                break None;
+            }
+            tokio::select! {
+                biased;
+                r = &mut fetch_fut => break Some(r),
+                // Woken by a cancel (possibly for another package); loop back and
+                // let the flag re-check at the top decide.
+                _ = &mut notified => {}
+            }
+        }
+    };
+    let Some(fetch_result) = fetch_outcome else {
+        // Cancelled mid-fetch: the dropped fetch future aborted the download.
+        tracing::info!(package_id = %package_id, peer_device = %peer_device, "sync receiver cancelling in-flight fetch");
+        return cancel_epilogue(store, transport, emitter.as_ref(), from, &announce, staging_root).await;
+    };
+    if let Err(e) = fetch_result {
         // A failed fetch is terminal for this row (Failed + reason); propagate so
         // the receiver loop logs it too.
         stamp_inbound_failed(store, &package_id, &e);
@@ -733,6 +839,97 @@ async fn handle_announce(
         peer_device,
         ok_count: outcome.ok_count(),
         failed,
+        new_count: 0,
+        duplicate_count: 0,
+        project_id: None,
+    });
+    Ok(())
+}
+
+/// Cancel epilogue (Task 12): the receiver's terminal path for a package the user
+/// declined. Fetches ONLY the manifest (no payload frames), writes a
+/// [`Cancelled`](ReceiptOutcome::Cancelled) receipt for every manifest frame into
+/// the durable receipt log, acks them to the sender (best-effort — the replay path
+/// re-acks a lost ack on the next re-announce), stamps the inbound row
+/// [`Cancelled`](InboundState::Cancelled), and emits a single `sync-finished`
+/// "cancelled" event (direction `received`).
+///
+/// Idempotent (double-cancel / retried epilogue safe): `insert_receipt` upserts by
+/// `(package_id, frame_uuid)`, the `Cancelled` row is final and re-stamping it is a
+/// no-op-shaped write, and `release`/staging-cleanup are best-effort. A `Cancelled`
+/// receipt counts as satisfied, so the ONE full set of receipts written here makes
+/// every later re-announce replay the cancel from the log (the replay guard fires
+/// before wire-in (a)) — no repeat manifest fetch.
+async fn cancel_epilogue(
+    store: &Arc<CatalogSyncStore>,
+    transport: &dyn SharingTransport,
+    emitter: &dyn ProgressEmitter,
+    from: NodeId,
+    announce: &PackageAnnounce,
+    staging_root: &Path,
+) -> Result<()> {
+    let peer_device = super::node_id_hex(&from);
+    let package_id = announce.package_id.0.clone();
+
+    // 1. Fetch just the manifest into staging (tiny — no payload frames). We need
+    //    the per-frame identities (uuid + xxh3) to build the Cancelled receipts.
+    let staging = staging_root.join("staging").join(&package_id);
+    transport
+        .fetch_manifest(from, announce, &staging)
+        .await
+        .with_context(|| format!("fetch manifest for cancel {package_id}"))?;
+    // Reuse the same manifest reader `ingest_package` uses.
+    let records = crate::package::read_manifest(&staging)
+        .with_context(|| format!("read manifest for cancel {package_id}"))?;
+    let frame_count = records.len();
+
+    // 2. A `Cancelled` receipt per manifest frame → sync_receipts (the replay log).
+    let receipts: Vec<FrameReceipt> = records
+        .iter()
+        .map(|r| FrameReceipt {
+            frame_uuid: r.frame_uuid.clone(),
+            xxh3: r.xxh3.clone(),
+            outcome: ReceiptOutcome::Cancelled,
+        })
+        .collect();
+    let now = super::now_iso();
+    {
+        let conn = store.lock_conn();
+        for r in &receipts {
+            insert_receipt(&conn, &package_id, r, &now)
+                .with_context(|| format!("record cancel receipt for {}", r.frame_uuid))?;
+        }
+    }
+
+    // 3. Ack the Cancelled receipts (best-effort — a lost ack is re-sent by the
+    //    replay guard on the sender's next re-announce). The sender's all-cancelled
+    //    handler (Task 4) then drives its outbound row to Cancelled.
+    if let Err(e) = transport.ack(from, &announce.package_id, receipts).await {
+        tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "cancel ack failed; will replay");
+    }
+
+    // 4. Terminal row (final) + drop any fetched blobs + tidy staging.
+    {
+        let conn = store.lock_conn();
+        if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Cancelled, None) {
+            tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound cancelled state write failed");
+        }
+    }
+    if let Err(e) = transport.release(&announce.package_id).await {
+        tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "receiver blob release failed");
+    }
+    if let Err(e) = std::fs::remove_dir_all(&staging) {
+        tracing::debug!(error = %e, path = %staging.display(), "cancel epilogue staging cleanup skipped");
+    }
+
+    tracing::info!(package_id = %package_id, peer_device = %peer_device, frames = frame_count, "sync receiver cancelled inbound package");
+    emit_event(emitter, "sync-finished", &SyncFinishedEvent {
+        package_id,
+        direction: super::Direction::Received,
+        outcome: "cancelled".to_string(),
+        peer_device,
+        ok_count: 0,
+        failed: Vec::new(),
         new_count: 0,
         duplicate_count: 0,
         project_id: None,
@@ -907,11 +1104,15 @@ async fn handle_project_announce(
 /// One started-transport bundle held by [`SyncRuntime`]. `transport` is the
 /// live receive-side transport — read back by [`SyncRuntime::transport`] so the
 /// collab download loop can issue an outbound `request_project` over the SAME
-/// endpoint the receiver listens on. `_receiver` is a lifetime anchor — kept so
-/// the endpoint's event loop lives for the runtime's lifetime, not read directly.
+/// endpoint the receiver listens on. `inbound_control` is the cancel signal the
+/// running receiver loop watches (Task 12), handed back by
+/// [`SyncRuntime::inbound_control`] to the command layer. `_receiver` is a
+/// lifetime anchor — kept so the endpoint's event loop lives for the runtime's
+/// lifetime, not read directly.
 struct Started {
     transport: Arc<dyn SharingTransport>,
     ticket: String,
+    inbound_control: Arc<InboundControl>,
     _receiver: SyncReceiverHandle,
 }
 
@@ -965,6 +1166,16 @@ impl SyncRuntime {
         self.inner.lock().await.as_ref().map(|s| Arc::clone(&s.transport))
     }
 
+    /// The running receiver's [`InboundControl`], if started (Task 12). The
+    /// command layer ([`cancel_incoming_package`](crate::api::sync::cancel_incoming_package))
+    /// uses it to request cancellation of an inbound package. `None` before the
+    /// transport is started (nothing is being received, so there is nothing to
+    /// cancel through the in-memory signal — a persisted `Cancelled` row still
+    /// covers the restart case).
+    pub async fn inbound_control(&self) -> Option<Arc<InboundControl>> {
+        self.inner.lock().await.as_ref().map(|s| Arc::clone(&s.inbound_control))
+    }
+
     /// Test-only: seed a started runtime around an already-online `transport`
     /// (typically a loopback endpoint whose receiver was spawned separately), so
     /// [`transport`](Self::transport) hands it back to the collab download loop.
@@ -979,6 +1190,7 @@ impl SyncRuntime {
         *self.inner.lock().await = Some(Started {
             transport,
             ticket,
+            inbound_control: Arc::new(InboundControl::new()),
             _receiver: receiver,
         });
     }
@@ -1036,6 +1248,11 @@ impl SyncRuntime {
         // reads the bound node off `ServiceContext`), not through this handle.
         let transport: Arc<dyn SharingTransport> = node.handle(Role::Recv);
 
+        // The receiver-side cancel signal (Task 12): created here, watched by the
+        // spawned loop, and stashed on `Started` so `inbound_control()` hands it to
+        // the command layer.
+        let control = Arc::new(InboundControl::new());
+
         // Staging lives under the sync dir; the landing root is resolved live per
         // package by the caller-supplied resolver (task 5).
         let (info, receiver) = SyncReceiver::spawn(
@@ -1049,6 +1266,7 @@ impl SyncRuntime {
                 on_project_ingested: hooks.on_project_ingested,
                 request_handler: hooks.project_request_handler,
             },
+            Arc::clone(&control),
             Arc::clone(&transport),
             emitter,
         )
@@ -1058,6 +1276,7 @@ impl SyncRuntime {
         *guard = Some(Started {
             transport,
             ticket: info.pairing_ticket.clone(),
+            inbound_control: control,
             _receiver: receiver,
         });
         Ok(info.pairing_ticket)
@@ -1113,12 +1332,14 @@ mod tests {
             frame_count: 1,
         };
 
+        let control = InboundControl::new();
         handle_announce(
             &store,
             &staging_root,
             &incoming,
             &transport,
             Arc::clone(&emitter) as Arc<dyn ProgressEmitter>,
+            &control,
             [7u8; 32],
             announce,
         )
@@ -1194,6 +1415,7 @@ mod tests {
             incoming,
             allow_all_peers(),
             ProjectReceiveHooks { gate: Some(project_gate), ..Default::default() },
+            Arc::new(InboundControl::new()),
             Arc::new(receiver_ep) as Arc<dyn SharingTransport>,
             Arc::new(RecordingEmitter::default()),
         )
@@ -1320,6 +1542,7 @@ mod tests {
             Arc::new(move || incoming.clone()) as IncomingResolver,
             allow_all_peers(),
             Default::default(),
+            Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
         )
@@ -1407,6 +1630,7 @@ mod tests {
             Arc::new(move || incoming.clone()) as IncomingResolver,
             allow_all_peers(),
             Default::default(),
+            Arc::new(InboundControl::new()),
             Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
             Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
         )
@@ -1450,5 +1674,200 @@ mod tests {
             inbound_active(&conn).unwrap().is_empty()
         };
         assert!(active_empty, "a Failed row drops out of the active set — never stuck non-terminal");
+    }
+
+    // ── Task 12: receiver-side cancel ───────────────────────────────────────
+
+    /// Drain a peer endpoint's event stream until the next `AckReceived`,
+    /// returning its `(package_id, receipts)`. Times out with a panic.
+    async fn recv_ack(
+        events: &mut tokio::sync::mpsc::Receiver<TransportEvent>,
+    ) -> (PackageId, Vec<FrameReceipt>) {
+        for _ in 0..400 {
+            match tokio::time::timeout(std::time::Duration::from_millis(20), events.recv()).await {
+                Ok(Some(TransportEvent::AckReceived { package_id, receipts, .. })) => {
+                    return (package_id, receipts)
+                }
+                Ok(Some(_)) => continue,
+                Ok(None) => panic!("sender event stream closed before an ack arrived"),
+                Err(_) => continue, // timeout tick; keep polling
+            }
+        }
+        panic!("timed out waiting for an ack");
+    }
+
+    /// Poll the inbound row for `package_id` until it reaches `want` (or panic).
+    async fn poll_inbound(
+        store: &Arc<CatalogSyncStore>,
+        package_id: &str,
+        want: InboundState,
+    ) -> crate::sync::models::InboundRow {
+        for _ in 0..400 {
+            let row = {
+                let conn = store.lock_conn();
+                get_inbound(&conn, package_id).unwrap()
+            };
+            if let Some(r) = row {
+                if r.state == want {
+                    return r;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("inbound row for {package_id} never reached {want:?}");
+    }
+
+    /// True when no regular files exist under `incoming` (a cancelled package
+    /// lands nothing — only the manifest is fetched, into the sync staging dir).
+    fn no_files_landed(incoming: &std::path::Path) -> bool {
+        if !incoming.exists() {
+            return true;
+        }
+        !walkdir::WalkDir::new(incoming)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_type().is_file())
+    }
+
+    /// Every recorded `sync-finished` payload, in order.
+    fn finished_events(recorder: &RecordingEmitter) -> Vec<serde_json::Value> {
+        recorder
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == "sync-finished")
+            .map(|(_, v)| v.clone())
+            .collect()
+    }
+
+    /// Poll until at least `n` `sync-finished` events have been recorded.
+    async fn wait_for_finished(recorder: &RecordingEmitter, n: usize) {
+        for _ in 0..400 {
+            if finished_events(recorder).len() >= n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {n} sync-finished event(s)");
+    }
+
+    /// Step 1 (TDD): a package the receiver was told to cancel BEFORE its announce
+    /// (`InboundControl::request_cancel`) must, on that announce, ack every frame
+    /// `Cancelled` WITHOUT fetching the payload, land no files, and leave the
+    /// inbound row `Cancelled`. A SECOND announce replays the cancel from the
+    /// receipt log without re-fetching — discriminated from the epilogue by the
+    /// finished event's `okCount` (replay = frame_count; epilogue = 0), and the
+    /// outcome is never "ingested" (mandatory carry-over item 1).
+    #[tokio::test]
+    async fn cancel_before_fetch_acks_cancelled_and_replays() {
+        use crate::sharing::SharingTransport;
+        use crate::sync::store::inbound_active;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+        // Hold the sender's inbound event stream to capture the receiver's acks.
+        let mut sender_events = sender.events().await;
+
+        let control = Arc::new(InboundControl::new());
+        let recorder = Arc::new(RecordingEmitter::default());
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            {
+                let incoming = incoming.clone();
+                Arc::new(move || incoming.clone()) as IncomingResolver
+            },
+            allow_all_peers(),
+            Default::default(),
+            Arc::clone(&control),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+
+        // Cancel BEFORE the announce, then announce.
+        control.request_cancel(&announce.package_id.0);
+        sender.announce(receiver_node, &announce).await.unwrap();
+
+        // (b) The sender observes an all-Cancelled ack, one receipt per frame.
+        let (ack_pkg, ack_receipts) = recv_ack(&mut sender_events).await;
+        assert_eq!(ack_pkg.0, announce.package_id.0);
+        assert_eq!(
+            ack_receipts.len(),
+            announce.frame_count as usize,
+            "a cancel ack carries a receipt per manifest frame"
+        );
+        assert!(
+            ack_receipts.iter().all(|r| matches!(r.outcome, ReceiptOutcome::Cancelled)),
+            "every receipt in a cancel ack is Cancelled"
+        );
+
+        // (c) The inbound row reaches the terminal Cancelled state.
+        let row = poll_inbound(&store, &announce.package_id.0, InboundState::Cancelled).await;
+        assert!(row.finished_at.is_some(), "a Cancelled row stamps finished_at");
+        let active_empty = {
+            let conn = store.lock_conn();
+            inbound_active(&conn).unwrap().is_empty()
+        };
+        assert!(active_empty, "a Cancelled row drops out of the active set");
+
+        // (a) No payload files landed under the incoming root.
+        assert!(no_files_landed(&incoming), "cancel lands no payload files under {incoming:?}");
+
+        // The first (epilogue) finished event: outcome "cancelled", ok_count 0.
+        wait_for_finished(&recorder, 1).await;
+        let first = finished_events(&recorder);
+        assert_eq!(first[0]["outcome"], "cancelled", "the epilogue emits a cancelled outcome");
+        assert_eq!(
+            first[0]["okCount"].as_u64().unwrap(),
+            0,
+            "the epilogue accepts no frames"
+        );
+
+        // (d) A second announce replays the cancel from the receipt log WITHOUT
+        //     re-fetching — the replay path emits ok_count == frame_count (the
+        //     epilogue would emit 0), so this discriminates replay from re-fetch.
+        sender.announce(receiver_node, &announce).await.unwrap();
+        let (_pkg2, ack2) = recv_ack(&mut sender_events).await;
+        assert!(
+            ack2.iter().all(|r| matches!(r.outcome, ReceiptOutcome::Cancelled)),
+            "the replayed ack is still all-Cancelled"
+        );
+        wait_for_finished(&recorder, 2).await;
+        let all_finished = finished_events(&recorder);
+        let second = all_finished.last().unwrap();
+        assert_eq!(
+            second["outcome"], "cancelled",
+            "a replayed all-cancelled package is never labelled ingested (carry-over item 1)"
+        );
+        assert_eq!(
+            second["okCount"].as_u64().unwrap(),
+            announce.frame_count as u64,
+            "the replay guard (not the epilogue) handled the re-announce — no re-fetch"
+        );
+
+        // Still no files, still Cancelled.
+        assert!(no_files_landed(&incoming), "the replay lands no files either");
+        let row2 = {
+            let conn = store.lock_conn();
+            get_inbound(&conn, &announce.package_id.0).unwrap().unwrap()
+        };
+        assert_eq!(row2.state, InboundState::Cancelled, "the row stays Cancelled across the replay");
     }
 }

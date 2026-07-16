@@ -256,6 +256,7 @@ async fn two_instance_sync_e2e() {
         incoming,
         allow_all_peers(),
         Default::default(), // no project announce gate in this test
+        Arc::new(athenaeum_core::sync::InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -543,6 +544,7 @@ async fn resend_transfers_only_new_frames() {
         incoming,
         allow_all_peers(),
         Default::default(), // no project announce gate in this test
+        Arc::new(athenaeum_core::sync::InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )

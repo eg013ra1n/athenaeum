@@ -170,6 +170,7 @@ async fn ingest_mirrors_rel_path_under_authenticated_peer_slug() {
         fixed_resolver(incoming.clone()),
         super::allow_all_peers(),
         Default::default(), // no project announce gate in this test
+        Arc::new(crate::sync::InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -495,6 +496,7 @@ async fn ack_replay_from_receipt_log() {
         fixed_resolver(incoming.clone()),
         super::allow_all_peers(),
         Default::default(), // no project announce gate in this test
+        Arc::new(crate::sync::InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -674,6 +676,7 @@ async fn transit_corruption_repaired_then_redelivery_confirms() {
         fixed_resolver(incoming),
         super::allow_all_peers(),
         Default::default(), // no project announce gate in this test
+        Arc::new(crate::sync::InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -873,6 +876,7 @@ async fn landing_root_is_resolved_live_per_package() {
         Arc::clone(&resolver),
         super::allow_all_peers(),
         Default::default(), // no project announce gate in this test
+        Arc::new(crate::sync::InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -949,6 +953,7 @@ async fn receiver_drops_announce_from_unauthorized_peer() {
         fixed_resolver(incoming.clone()),
         authorizer,
         Default::default(), // no project announce gate in this test
+        Arc::new(crate::sync::InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -1008,6 +1013,7 @@ async fn receiver_ingests_from_authorized_peer() {
         fixed_resolver(incoming.clone()),
         authorizer,
         Default::default(), // no project announce gate in this test
+        Arc::new(crate::sync::InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::new(NullEmitter),
     )
@@ -1229,6 +1235,7 @@ async fn project_package_lands_contributions_and_acks() {
         fixed_resolver(tmp.path().join("unused_incoming")),
         super::allow_all_peers(),
         hooks,
+        Arc::new(crate::sync::InboundControl::new()),
         Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
         Arc::clone(&recorder) as Arc<dyn crate::events::ProgressEmitter>,
     )

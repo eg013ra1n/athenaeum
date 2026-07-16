@@ -546,6 +546,7 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
             request_handler: Some(coord_serve_handler),
             ..Default::default()
         },
+        Arc::new(crate::sync::InboundControl::new()),
         Arc::new(coord_recv_ep) as Arc<dyn SharingTransport>,
         Arc::new(crate::events::NullEmitter),
     )
@@ -567,6 +568,7 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
         proc_incoming,
         allow_all_peers(),
         ProjectReceiveHooks { gate: Some(proc_gate), ..Default::default() },
+        Arc::new(crate::sync::InboundControl::new()),
         Arc::clone(&proc_ep) as Arc<dyn SharingTransport>,
         Arc::new(crate::events::NullEmitter),
     )

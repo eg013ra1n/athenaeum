@@ -151,6 +151,28 @@ pub async fn cancel_sync_package(
     api::cancel_sync_package(&state.sync_sender, args.id).await.map(Json).map_err(api_err)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelIncomingArgs {
+    pub package_id: String,
+}
+
+/// POST /api/cancel_incoming_package
+///
+/// Cancel an inbound package the receiver is about to fetch or is fetching
+/// (Task 12): signals the running receiver so an in-flight fetch aborts and the
+/// receiver acks every frame `Cancelled`, then stamps the inbound row `Cancelled`.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn cancel_incoming_package(
+    State(state): State<WebAppState>,
+    Json(args): Json<CancelIncomingArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    api::cancel_incoming_package(&state.ctx, &state.sync, &args.package_id)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
 /// POST /api/get_sync_auto_mode
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_sync_auto_mode(

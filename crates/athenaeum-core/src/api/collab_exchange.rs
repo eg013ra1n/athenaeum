@@ -1986,6 +1986,7 @@ mod tests {
             Arc::new(move || b_incoming.clone()),
             allow_all_peers(),
             ProjectReceiveHooks { gate: Some(gate), ..Default::default() },
+            Arc::new(crate::sync::InboundControl::new()),
             Arc::clone(&b_ep) as Arc<dyn SharingTransport>,
             Arc::new(crate::events::NullEmitter),
         )
@@ -2485,6 +2486,7 @@ mod tests {
             a_incoming,
             allow_all_peers(),
             ProjectReceiveHooks { request_handler: Some(request_handler), ..Default::default() },
+            Arc::new(crate::sync::InboundControl::new()),
             Arc::new(a_recv_ep) as Arc<dyn SharingTransport>,
             Arc::new(crate::events::NullEmitter),
         )
@@ -2526,6 +2528,7 @@ mod tests {
             d_incoming,
             allow_all_peers(),
             ProjectReceiveHooks { gate: Some(gate), ..Default::default() },
+            Arc::new(crate::sync::InboundControl::new()),
             Arc::clone(&d_ep) as Arc<dyn SharingTransport>,
             Arc::new(crate::events::NullEmitter),
         )

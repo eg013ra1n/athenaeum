@@ -124,6 +124,20 @@ pub async fn cancel_sync_package(state: State<'_, AppState>, id: i64) -> Result<
     api::cancel_sync_package(&state.sync_sender, id).await.map_err(|e| e.to_string())
 }
 
+/// Cancel an inbound package the receiver is about to fetch or is fetching
+/// (Task 12): signals the running receiver so an in-flight fetch aborts and the
+/// receiver acks every frame `Cancelled`, then stamps the inbound row `Cancelled`.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn cancel_incoming_package(
+    state: State<'_, AppState>,
+    package_id: String,
+) -> Result<(), String> {
+    api::cancel_incoming_package(&state.ctx, &state.sync, &package_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Whether full-app capture-node auto mode is enabled.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]

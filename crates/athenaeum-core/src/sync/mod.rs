@@ -77,12 +77,14 @@ pub use engine::{
 };
 pub use ingest::{ingest_package, IngestOutcome};
 pub use pairing::{node_id_from_ticket, relay_mode_for, resolve_relays, RelayResolution};
-pub use models::{Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState};
+pub use models::{
+    Direction, HistoryQuery, HistoryRow, InboundRow, InboundState, OutboundRow, OutboundState,
+};
 pub use project_ingest::{ingest_project_package, ProjectIngestOutcome};
 pub use refusal::RefusalRefresher;
 pub use retention::{evaluate_and_apply, DeleteOutcome, RetentionOutcome, RetentionPolicy};
 pub use receiver::{
-    allow_all_peers, IncomingResolver, PeerAuthorizer, ProjectAnnounceGate,
+    allow_all_peers, InboundControl, IncomingResolver, PeerAuthorizer, ProjectAnnounceGate,
     ProjectAnnouncementsRefresher, ProjectIngestedHook, ProjectReceiveHooks, ProjectRequestHandler,
     ReceiverHooks, SyncFinishedEvent, SyncProgressEvent, SyncReceiver, SyncReceiverHandle,
     SyncRuntime,

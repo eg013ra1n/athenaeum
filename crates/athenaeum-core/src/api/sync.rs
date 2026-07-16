@@ -1570,6 +1570,83 @@ pub async fn cancel_sync_package(sender: &Arc<SyncSenderRuntime>, id: i64) -> Re
     Ok(())
 }
 
+/// Cancel an INBOUND package the receiver is about to fetch or is fetching
+/// (Task 12) — the receive-side counterpart of [`cancel_sync_package`]. Desktop
+/// only: Perseus never receives, so it has no inbound surface.
+///
+/// Signals the running receiver's [`InboundControl`](crate::sync::InboundControl)
+/// so an in-flight fetch aborts promptly and the receiver runs its cancel epilogue
+/// (fetch manifest → write a `Cancelled` receipt per frame → ack → row
+/// `Cancelled`); the sender's all-cancelled handler then marks its outbound row
+/// `Cancelled`. State-keyed on the persisted `sync_inbound` row:
+///
+/// - `Ingesting` → refused ([`ApiError::Invalid`] "too late: ingest in progress"):
+///   frames are landing in the catalog and there is no clean abort point.
+/// - terminal (`Done`/`Failed`/`Cancelled`) → no-op `Ok`.
+/// - `Announced` (no in-flight fetch to interrupt) → `request_cancel` + stamp the
+///   row `Cancelled` now (restart-proof); the epilogue runs on the sender's next
+///   re-announce, which the retry loop guarantees.
+/// - `Fetching` → `request_cancel`; the receiver's fetch select-loop notices,
+///   aborts the download, and its epilogue owns the terminal `Cancelled` stamp
+///   (so this never races the fetch's own state writes).
+/// - no row yet (cancel before the announce arrives) → `request_cancel` so the
+///   very first announce runs the epilogue.
+///
+/// When the transport is not started (`inbound_control` is `None`) there is no
+/// live fetch to interrupt; a non-terminal persisted row is still stamped
+/// `Cancelled` so a later receiver session self-heals it on re-announce.
+pub async fn cancel_incoming_package(
+    ctx: &ServiceContext,
+    sync: &SyncRuntime,
+    package_id: &str,
+) -> Result<(), ApiError> {
+    use crate::sync::store::{get_inbound, set_inbound_state};
+    use crate::sync::InboundState;
+
+    let (_sync_dir, db_path) = sync_paths(ctx)?;
+    let store = CatalogSyncStore::open(&db_path)
+        .map_err(|e| ApiError::Internal(format!("open catalog sync store: {e:#}")))?;
+    let control = sync.inbound_control().await;
+
+    let row = {
+        let conn = store.lock_conn();
+        get_inbound(&conn, package_id)
+            .map_err(|e| ApiError::Internal(format!("read inbound row {package_id}: {e:#}")))?
+    };
+
+    // Ingest already underway — refuse (spec §4): no clean abort once frames land.
+    if matches!(&row, Some(r) if r.state == InboundState::Ingesting) {
+        return Err(ApiError::Invalid("too late: ingest in progress".to_string()));
+    }
+    // Already terminal — no-op.
+    if matches!(&row, Some(r) if r.state.is_terminal()) {
+        return Ok(());
+    }
+
+    // Wake the running receiver (aborts an in-flight fetch; also covers the
+    // no-row "cancel before announce" case, where the first announce epilogues).
+    if let Some(c) = &control {
+        c.request_cancel(package_id);
+    }
+
+    // Persist the terminal `Cancelled` row for an `Announced` row now (no live
+    // fetch to interrupt), or defensively for any non-terminal row when no live
+    // receiver owns it. A live `Fetching` row's stamp is left to its select-loop
+    // epilogue so this never races the fetch's own writes.
+    let stamp_now = match row.as_ref().map(|r| r.state) {
+        Some(InboundState::Announced) => true,
+        Some(InboundState::Fetching) => control.is_none(),
+        _ => false,
+    };
+    if stamp_now {
+        let conn = store.lock_conn();
+        set_inbound_state(&conn, package_id, InboundState::Cancelled, None)
+            .map_err(|e| ApiError::Internal(format!("stamp inbound cancelled {package_id}: {e:#}")))?;
+    }
+    tracing::info!(package_id = %package_id, "sync inbound cancel requested");
+    Ok(())
+}
+
 /// Whether full-app capture-node auto mode is enabled (`sync.auto_mode`).
 pub fn get_sync_auto_mode(ctx: &ServiceContext) -> Result<bool, ApiError> {
     let db = db(ctx)?;

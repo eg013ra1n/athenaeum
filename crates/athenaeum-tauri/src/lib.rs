@@ -451,6 +451,7 @@ pub fn run() {
             commands::retry_sync_package,
             commands::send_now_sync_package,
             commands::cancel_sync_package,
+            commands::cancel_incoming_package,
             commands::get_sync_auto_mode,
             commands::set_sync_auto_mode,
             commands::get_sync_device_names,
