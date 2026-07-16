@@ -1069,6 +1069,17 @@ async fn cancel_moves_to_cancelled_state() {
 /// `last_error` string the UI keys its "by receiver" display off, records a
 /// per-frame `cancelled` history outcome, and emits a single `cancelled`
 /// `sync-finished` event.
+///
+/// It must ALSO **keep its payload copies** — spec §1 ("the row stays in the
+/// sender's history and is retryable") + §4 (retry checks payload presence)
+/// require a receiver-cancelled package to be resendable via
+/// `retry_sync_package`, which is only possible if the payload is still on disk.
+/// This branch is the all-cancelled-ack terminal epilogue and must mirror
+/// `cancel_package` exactly: only a `Confirmed` package's copies are ever
+/// reclaimed (see `cancelled_package_keeps_payloads` /
+/// `failed_package_keeps_payloads` for the sibling terminal states this one
+/// joins). Regression coverage for a real bug where an inline
+/// `cleanup_package_payloads` call here broke resend.
 #[tokio::test]
 async fn all_cancelled_ack_marks_cancelled_by_receiver() {
     let tmp = tempdir().unwrap();
@@ -1103,6 +1114,17 @@ async fn all_cancelled_ack_marks_cancelled_by_receiver() {
     );
     // Cancelled, not confirmed — no confirmed_at stamp.
     assert!(row.confirmed_at.is_none(), "a cancelled row is never confirmed");
+
+    // A brief settle so any (erroneous) cleanup would have a chance to run —
+    // same idiom as `cancelled_package_keeps_payloads`.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        pkg.join("cx.fits").exists(),
+        "an all-cancelled-ack (receiver-decline) package must KEEP its payload — \
+         only a Confirmed package's copies are reclaimed, so retry_sync_package \
+         can resend it (spec §1/§4)"
+    );
+    assert!(pkg.join(MANIFEST_FILENAME).exists());
 
     // Per-frame history records a `cancelled` outcome (via the shared
     // receipts→history path with the new `Cancelled` mapping).

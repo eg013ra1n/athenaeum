@@ -1427,18 +1427,15 @@ impl Worker {
             // Terminal: free the served blobs (fire-and-forget). `package_id` is the
             // id the ack correlated against (== pending.announce.package_id).
             self.spawn_release(package_id);
-            // Same shared-payload discipline as the confirm/cancel paths: defer to
-            // the coordinator when fanned out, else clean the payload copies in line.
-            match &self.cleanup_sink {
-                Some(sink) => sink.on_terminal(&pending.dir),
-                None => match cleanup_package_payloads(&pending.dir) {
-                    Ok(freed_bytes) => {
-                        tracing::info!(package_id = pending.id, freed_bytes, "package payloads cleaned");
-                    }
-                    Err(e) => {
-                        tracing::warn!(package_id = pending.id, error = %format!("{e:#}"), "package payload cleanup failed");
-                    }
-                },
+            // Mirrors `cancel_package` exactly (spec §1/§4: a receiver-cancelled
+            // package stays in the sender's history and is retryable, which requires
+            // the payload to still be on disk): notify the fan-out coordinator when
+            // shared, but — unlike the `Confirmed` path — never reclaim the payload
+            // copies in line. Only a `Confirmed` package's copies are ever reclaimed
+            // (see `cancelled_package_keeps_payloads` / `failed_package_keeps_payloads`
+            // for the sibling terminal states; this one joins them).
+            if let Some(sink) = &self.cleanup_sink {
+                sink.on_terminal(&pending.dir);
             }
             tracing::info!(
                 package_id = pending.id,

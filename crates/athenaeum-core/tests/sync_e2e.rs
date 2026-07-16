@@ -1181,37 +1181,15 @@ async fn receiver_cancel_terminates_sender_then_resend_delivers() {
     // Disarm the fault so the resend can fetch cleanly.
     receiver_ep.set_fault(FaultPlan::default());
 
-    // Resend delivers. The sanctioned retry command re-enqueues the terminal row's
-    // package dir; but the all-cancelled epilogue already reclaimed the (now dead)
-    // payload copies, so retry legitimately reports the payload is gone — the real
-    // user resend is then a fresh selection enqueue, which rebuilds the package from
-    // the still-present source frames. Either path proves the acceptance property:
-    // after a receiver decline, a resend DELIVERS.
+    // Resend delivers via the sanctioned retry command (spec §1: "the row stays in
+    // the sender's history and is retryable"; §4's retry payload-presence check
+    // requires the payload to still be on disk after a receiver decline — the
+    // all-cancelled-ack terminal epilogue mirrors `cancel_package` and keeps it,
+    // same as a `Failed`/plain-`Cancelled` row).
     let resend_id =
-        match retry_sync_package(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
+        retry_sync_package(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
             .await
-        {
-            Ok(new_id) => new_id,
-            Err(e) => {
-                let msg = format!("{e:?}");
-                assert!(
-                    msg.contains("missing") || msg.contains("cannot retry"),
-                    "retry of a cancelled package should fail only on the reclaimed payload; got: {msg}"
-                );
-                enqueue_sync_selection(
-                    &capture_ctx,
-                    &sender,
-                    Arc::clone(&collab_sender),
-                    &sync,
-                    ResolvedDest { node: receiver_node, endpoint_addr: None },
-                    frame_ids.clone(),
-                    None,
-                )
-                .await
-                .expect("resend enqueue");
-                latest_outbound_id(cdb)
-            }
-        };
+            .expect("retry_sync_package resends a receiver-cancelled package");
     assert_ne!(resend_id, old_id, "the resend is a NEW durable row, not the cancelled one");
 
     wait_until(|| outbound_state(cdb, resend_id) == "confirmed", WAIT).await;
