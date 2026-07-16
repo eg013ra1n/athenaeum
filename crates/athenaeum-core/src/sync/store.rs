@@ -23,10 +23,11 @@ use super::{node_id_from_hex, node_id_hex, now_iso};
 
 /// `sync_outbound` — the durable outbound state machine, one row per package.
 ///
-/// The trailing `last_error` (Task 9) and `next_retry_at` (Task 2) columns are
-/// created inline for a fresh DB; an existing table without them is migrated in
-/// place by [`ensure_outbound_columns`] (a `CREATE TABLE IF NOT EXISTS` never adds
-/// a column).
+/// The trailing `last_error` (Task 9), `next_retry_at` (Task 2) and
+/// `wire_package_id` (zombie-inbound fix) columns are created inline for a fresh
+/// DB; an existing table without them is migrated in place by
+/// [`ensure_outbound_columns`] (a `CREATE TABLE IF NOT EXISTS` never adds a
+/// column).
 pub const DDL_OUTBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_outbound (
     id INTEGER PRIMARY KEY,
     package_ref TEXT NOT NULL,
@@ -36,11 +37,13 @@ pub const DDL_OUTBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_outbound (
     created_at TEXT NOT NULL,
     confirmed_at TEXT,
     last_error TEXT,
-    next_retry_at TEXT
+    next_retry_at TEXT,
+    wire_package_id TEXT
 )";
 
 /// Idempotently add the trailing `sync_outbound` columns (`last_error` — Task 9,
-/// `next_retry_at` — Task 2) to an existing table.
+/// `next_retry_at` — Task 2, `wire_package_id` — zombie-inbound fix) to an
+/// existing table.
 ///
 /// The guarded-ALTER twin of [`ensure_history_columns`]: `CREATE TABLE IF NOT
 /// EXISTS` never alters an already-materialised table, so a store opened over a
@@ -58,7 +61,11 @@ pub fn ensure_outbound_columns(conn: &Connection) -> Result<()> {
         .context("query table_info(sync_outbound)")?
         .filter_map(|c| c.ok())
         .collect();
-    for (col, ty) in [("last_error", "TEXT"), ("next_retry_at", "TEXT")] {
+    for (col, ty) in [
+        ("last_error", "TEXT"),
+        ("next_retry_at", "TEXT"),
+        ("wire_package_id", "TEXT"),
+    ] {
         if !existing.contains(col) {
             conn.execute(&format!("ALTER TABLE sync_outbound ADD COLUMN {col} {ty}"), [])
                 .with_context(|| format!("add sync_outbound.{col} column"))?;
@@ -225,6 +232,18 @@ pub trait SyncStore: Send + Sync {
     /// failed persist is logged and never breaks scheduling.
     fn set_next_retry_at(&self, id: i64, at: Option<&str>) -> Result<()>;
 
+    /// Persist the stable wire `package_id` minted for this row's announce
+    /// (zombie-inbound fix). Minted ONCE by the engine on the first successful
+    /// announce build and reused on every crash-resume re-announce so the wire id
+    /// is stable across sender restarts — the receiver's `sync_inbound` row (keyed
+    /// on the wire id) is reused instead of orphaned when the sender restarts
+    /// mid-transfer. A re-enqueue (retry) is a NEW row with a NULL value here and
+    /// so mints a fresh id (deliberate — receiver receipts are keyed by the wire
+    /// id, so a resend must transfer anew rather than replay-confirm from stale
+    /// receipts). Best-effort from the engine's side — a failed persist is logged
+    /// and never breaks the send (a fresh id would just be minted next restart).
+    fn set_wire_package_id(&self, id: i64, wire_id: &str) -> Result<()>;
+
     /// Increment `attempts` and return the new value (drives max-attempts).
     fn bump_attempts(&self, id: i64) -> Result<u32>;
 
@@ -275,11 +294,22 @@ type OutboundRaw = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
-    let (id, package_ref, peer_hex, state, attempts, created_at, confirmed_at, last_error, next_retry_at) =
-        raw;
+    let (
+        id,
+        package_ref,
+        peer_hex,
+        state,
+        attempts,
+        created_at,
+        confirmed_at,
+        last_error,
+        next_retry_at,
+        wire_package_id,
+    ) = raw;
     Ok(OutboundRow {
         id,
         package_ref,
@@ -290,6 +320,7 @@ fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
         confirmed_at,
         last_error,
         next_retry_at,
+        wire_package_id,
     })
 }
 
@@ -338,7 +369,7 @@ fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
 }
 
 const OUTBOUND_COLS: &str =
-    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at";
+    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at, wire_package_id";
 const HISTORY_COLS: &str =
     "frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project, package_id";
 
@@ -455,6 +486,7 @@ pub fn confirmed_outbound_rows(conn: &Connection) -> Result<Vec<OutboundRow>> {
                 r.get(6)?,
                 r.get(7)?,
                 r.get(8)?,
+                r.get(9)?,
             ))
         })
         .context("query confirmed_outbound_rows")?
@@ -488,6 +520,7 @@ pub fn all_outbound_rows(conn: &Connection, limit: u32) -> Result<Vec<OutboundRo
                 r.get(6)?,
                 r.get(7)?,
                 r.get(8)?,
+                r.get(9)?,
             ))
         })
         .context("query all_outbound_rows")?
@@ -516,6 +549,7 @@ pub fn outbound_row_by_id(conn: &Connection, id: i64) -> Result<Option<OutboundR
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
+                    r.get(9)?,
                 ))
             },
         )
@@ -1036,6 +1070,16 @@ impl SyncStore for StandaloneSyncStore {
         Ok(())
     }
 
+    fn set_wire_package_id(&self, id: i64, wire_id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        conn.execute(
+            "UPDATE sync_outbound SET wire_package_id = ?1 WHERE id = ?2",
+            params![wire_id, id],
+        )
+        .with_context(|| format!("set wire_package_id for outbound {id}"))?;
+        Ok(())
+    }
+
     fn bump_attempts(&self, id: i64) -> Result<u32> {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
         conn.execute(
@@ -1074,6 +1118,7 @@ impl SyncStore for StandaloneSyncStore {
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
+                    r.get(9)?,
                 ))
             })
             .context("query non_terminal")?
@@ -1279,6 +1324,16 @@ impl SyncStore for CatalogSyncStore {
         Ok(())
     }
 
+    fn set_wire_package_id(&self, id: i64, wire_id: &str) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE sync_outbound SET wire_package_id = ?1 WHERE id = ?2",
+            params![wire_id, id],
+        )
+        .with_context(|| format!("set wire_package_id for outbound {id}"))?;
+        Ok(())
+    }
+
     fn bump_attempts(&self, id: i64) -> Result<u32> {
         let conn = self.lock_conn();
         conn.execute(
@@ -1317,6 +1372,7 @@ impl SyncStore for CatalogSyncStore {
                     r.get(6)?,
                     r.get(7)?,
                     r.get(8)?,
+                    r.get(9)?,
                 ))
             })
             .context("query non_terminal")?

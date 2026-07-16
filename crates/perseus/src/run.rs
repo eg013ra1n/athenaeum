@@ -1966,6 +1966,9 @@ mod retention_tests {
         fn set_next_retry_at(&self, id: i64, at: Option<&str>) -> Result<()> {
             self.0.set_next_retry_at(id, at)
         }
+        fn set_wire_package_id(&self, id: i64, wire_id: &str) -> Result<()> {
+            self.0.set_wire_package_id(id, wire_id)
+        }
         fn bump_attempts(&self, id: i64) -> Result<u32> {
             self.0.bump_attempts(id)
         }

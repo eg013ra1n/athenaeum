@@ -37,7 +37,7 @@ use super::ingest::{self, IngestOutcome};
 use super::models::InboundState;
 use super::refusal::RefusalRefresher;
 use super::store::{
-    get_inbound, insert_receipt, set_inbound_bytes_done, set_inbound_state,
+    get_inbound, inbound_active, insert_receipt, set_inbound_bytes_done, set_inbound_state,
     upsert_inbound_announced, CatalogSyncStore,
 };
 
@@ -341,6 +341,16 @@ impl SyncReceiver {
         } = project;
 
         let mut events = transport.events().await;
+
+        // Startup reconcile (zombie-inbound fix): any non-terminal `sync_inbound`
+        // row left by a prior process cannot resume — a fetch/ingest never
+        // survives a restart — so stamp every such row `Failed` BEFORE the event
+        // loop consumes its first announce. A later re-announce upserts the row
+        // back to `announced` (the non-cancelled reset rule), so this is a clean
+        // lifecycle reset, not data loss. Runs on this task, fully before the
+        // spawned loop exists.
+        reconcile_stale_inbound(&store);
+
         let loop_transport = Arc::clone(&transport);
         let join = tokio::spawn(async move {
             tracing::info!(staging_root = %staging_root.display(), "sync receiver online");
@@ -483,6 +493,46 @@ impl SyncReceiver {
 /// as a perpetual in-progress transfer in [`inbound_active`](super::store::inbound_active)
 /// with no recorded reason) until a later re-announce happens to self-heal it
 /// (reviewer finding, Task 11 follow-up).
+/// Startup reconcile (zombie-inbound fix): stamp every non-terminal
+/// `sync_inbound` row (`announced`/`fetching`/`ingesting`) `Failed` with
+/// `"interrupted by restart"`.
+///
+/// A fetch/ingest is in-memory and cannot survive the process it ran in, so any
+/// such row left on disk by a prior receiver is a zombie: the sender that owned
+/// it has since re-announced under a fresh wire `package_id` (the sender's wire
+/// id was not stable across its restart before this fix, and even with the fix a
+/// resend is a new id), leaving this row stuck non-terminal forever and visible
+/// in [`inbound_active`] as a perpetual in-progress transfer. [`inbound_active`]
+/// already excludes the terminal states, so a `Cancelled` row is left untouched.
+/// A later re-announce of the same `(peer, package_id)` upserts the row back to
+/// `announced` (the non-cancelled reset rule in [`upsert_inbound_announced`]),
+/// giving a clean lifecycle. Best-effort: a failed enumeration or per-row write
+/// warns and never blocks receiver startup.
+fn reconcile_stale_inbound(store: &CatalogSyncStore) {
+    let conn = store.lock_conn();
+    let stale = match inbound_active(&conn) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "inbound startup reconcile enumeration failed");
+            return;
+        }
+    };
+    let mut count: u32 = 0;
+    for row in stale {
+        match set_inbound_state(&conn, &row.package_id, InboundState::Failed, Some("interrupted by restart")) {
+            Ok(()) => count += 1,
+            Err(e) => tracing::warn!(
+                package_id = %row.package_id,
+                error = %format!("{e:#}"),
+                "inbound startup reconcile write failed"
+            ),
+        }
+    }
+    if count > 0 {
+        tracing::info!(count, "stale inbound rows reconciled to failed after restart");
+    }
+}
+
 fn stamp_inbound_failed(store: &CatalogSyncStore, package_id: &str, error: &anyhow::Error) {
     let conn = store.lock_conn();
     if let Err(e) = set_inbound_state(&conn, package_id, InboundState::Failed, Some(&format!("{error:#}"))) {
@@ -1359,6 +1409,78 @@ mod tests {
         assert!(
             !events.iter().any(|(n, _)| n == "sync-progress"),
             "rejection happens before any fetch/ingest progress tick"
+        );
+    }
+
+    /// Zombie-inbound fix (Part 2): on startup the receiver reconciles every
+    /// non-terminal `sync_inbound` row (announced/fetching/ingesting) to `failed`
+    /// with `"interrupted by restart"` — a fetch cannot survive a restart, so a
+    /// row left mid-fetch by a prior process is a zombie that would otherwise show
+    /// as a perpetual in-progress transfer. A `cancelled` row is terminal and left
+    /// untouched. This is what retro-cleans a field zombie on the next app launch.
+    #[tokio::test]
+    async fn startup_reconciles_stale_inbound_rows_to_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging_root = tmp.path().join("stage");
+        let store = Arc::new(CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap());
+
+        let peer = "aa".repeat(32);
+        {
+            let conn = store.lock_conn();
+            // A stuck `fetching` row (a pre-restart in-flight fetch) …
+            upsert_inbound_announced(&conn, &peer, "pkg-fetching", 3, 3000).unwrap();
+            set_inbound_state(&conn, "pkg-fetching", InboundState::Fetching, None).unwrap();
+            set_inbound_bytes_done(&conn, "pkg-fetching", 1500).unwrap();
+            // … and a terminal `cancelled` row that must stay untouched.
+            upsert_inbound_announced(&conn, &peer, "pkg-cancelled", 2, 2000).unwrap();
+            set_inbound_state(&conn, "pkg-cancelled", InboundState::Cancelled, Some("declined")).unwrap();
+        }
+
+        // Spawn the receiver: the reconcile runs on this task, before the loop
+        // consumes its first event, so it has completed once `spawn` returns.
+        let incoming_root = tmp.path().join("incoming");
+        let incoming: IncomingResolver = Arc::new(move || incoming_root.clone());
+        let transport: Arc<dyn SharingTransport> = Arc::new(LoopbackNetwork::new().endpoint());
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            staging_root,
+            incoming,
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            transport,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        let conn = store.lock_conn();
+        // The stuck fetching row is now failed with the restart reason, terminal
+        // (finished_at stamped), and gone from the active set.
+        let fetching = get_inbound(&conn, "pkg-fetching").unwrap().unwrap();
+        assert_eq!(
+            fetching.state,
+            InboundState::Failed,
+            "a stale fetching row is reconciled to failed"
+        );
+        assert_eq!(fetching.last_error.as_deref(), Some("interrupted by restart"));
+        assert!(fetching.finished_at.is_some(), "a terminal failed row stamps finished_at");
+        assert!(
+            !inbound_active(&conn).unwrap().iter().any(|r| r.package_id == "pkg-fetching"),
+            "the reconciled row is no longer active"
+        );
+
+        // The cancelled row is terminal and completely untouched.
+        let cancelled = get_inbound(&conn, "pkg-cancelled").unwrap().unwrap();
+        assert_eq!(
+            cancelled.state,
+            InboundState::Cancelled,
+            "a cancelled row stays cancelled"
+        );
+        assert_eq!(
+            cancelled.last_error.as_deref(),
+            Some("declined"),
+            "the cancel reason is preserved"
         );
     }
 

@@ -3181,6 +3181,7 @@ mod tests {
             confirmed_at: None,
             last_error: None,
             next_retry_at: None,
+            wire_package_id: None,
         }
     }
 

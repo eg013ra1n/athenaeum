@@ -245,6 +245,16 @@ pub struct OutboundRow {
     /// a live countdown and a restart re-arms honestly. Read by tasks 9/14.
     #[serde(default)]
     pub next_retry_at: Option<String>,
+    /// The stable wire `package_id` (a v4 UUID string) minted for this row's
+    /// announce (zombie-inbound fix). `None` until the engine's first successful
+    /// announce build persists it; from then on every crash-resume re-announce
+    /// reuses it, so the wire id is stable across sender restarts and the
+    /// receiver's `sync_inbound` row (keyed on the wire id) is reused rather than
+    /// orphaned. A re-enqueue (retry) is a fresh row that starts `None` and mints
+    /// a new id — deliberate, so a resend transfers anew instead of replay-acking
+    /// from stale receiver receipts.
+    #[serde(default)]
+    pub wire_package_id: Option<String>,
 }
 
 /// One row of `sync_history`: an append-only audit entry for a per-frame

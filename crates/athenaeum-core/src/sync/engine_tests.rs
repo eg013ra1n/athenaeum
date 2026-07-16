@@ -559,6 +559,161 @@ async fn mid_transfer_abort_leaves_transferring_then_resume_completes() {
     engine_b.shutdown().await;
 }
 
+/// Zombie-inbound fix (Part 1): the wire `package_id` is minted once per outbound
+/// row and persisted, so a crash-resume re-announce carries the SAME `package_id`
+/// as the pre-restart attempt. Before the fix `announce_for_dir` minted a fresh
+/// uuid on every build, so a sender that restarted mid-transfer re-announced under
+/// a new id and orphaned the receiver's `sync_inbound` row forever. Captures every
+/// announce the loopback receiver sees across a kill+restart and asserts they all
+/// carry one id; also asserts the id is persisted on the outbound row.
+#[tokio::test]
+async fn resume_reannounce_reuses_same_wire_package_id() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    // Abort the receiver's first fetch so the row rests in Transferring (no ack)
+    // and we can kill + restart the sender before it confirms.
+    receiver.set_fault(FaultPlan {
+        abort_after_bytes: Some(64),
+        ..Default::default()
+    });
+
+    // Record the wire package_id of every announce the receiver sees, and (on a
+    // successful fetch) ack every frame as ingested.
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let receiver = receiver.clone();
+        let seen = seen.clone();
+        let dest_root = tmp.path().join("recv");
+        tokio::spawn(async move {
+            let mut events = receiver.events().await;
+            let mut n = 0usize;
+            while let Some(event) = events.recv().await {
+                let TransportEvent::AnnounceReceived { from, announce } = event else {
+                    continue;
+                };
+                seen.lock().unwrap().push(announce.package_id.0.clone());
+                n += 1;
+                let dest = dest_root.join(format!("fetch-{n}"));
+                if receiver.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
+                    let Ok(records) = package::read_manifest(&dest) else {
+                        continue;
+                    };
+                    let receipts: Vec<FrameReceipt> = records
+                        .iter()
+                        .map(|r| FrameReceipt {
+                            frame_uuid: r.frame_uuid.clone(),
+                            xxh3: r.xxh3.clone(),
+                            outcome: ReceiptOutcome::Ingested,
+                        })
+                        .collect();
+                    let _ = receiver.ack(from, &announce.package_id, receipts).await;
+                }
+            }
+        });
+    }
+
+    let pkg = build_package(&tmp.path().join("srcw"), "uuid-w", "framew.fits", "M31", 4096);
+    let db_path = tmp.path().join("sync.db");
+
+    // Engine A: long ack timeout so it will not retry before we kill it.
+    let store_a = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
+    let engine_a = SyncEngine::spawn_with_config(
+        store_a.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig {
+            ack_timeout: Duration::from_secs(60),
+        },
+    );
+    let id = engine_a.enqueue_package(&pkg).await.unwrap();
+
+    // First announce seen; the row rests Transferring (its first fetch aborted).
+    wait_until(|| !seen.lock().unwrap().is_empty(), WAIT).await;
+    wait_until(
+        || state_of(&store_a, id) == Some(OutboundState::Transferring),
+        WAIT,
+    )
+    .await;
+    let first_wire = seen.lock().unwrap()[0].clone();
+    assert_eq!(
+        store_a.get_outbound(id).unwrap().unwrap().wire_package_id.as_deref(),
+        Some(first_wire.as_str()),
+        "the wire package_id must be persisted on the outbound row on the first build"
+    );
+
+    // Kill the engine mid-flight; restart over the SAME store file with a fresh
+    // transport endpoint (crash-resume).
+    drop(engine_a);
+    let store_b = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
+    let engine_b = SyncEngine::spawn(
+        store_b.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+
+    // The resume re-announces; a second announce is seen and the package confirms.
+    wait_until(|| seen.lock().unwrap().len() >= 2, WAIT).await;
+    wait_until(
+        || state_of(&store_b, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+
+    let all = seen.lock().unwrap().clone();
+    assert!(all.len() >= 2, "resume should have re-announced; saw {all:?}");
+    assert!(
+        all.iter().all(|w| *w == first_wire),
+        "every announce pre- and post-restart must carry the SAME wire package_id; saw {all:?}"
+    );
+
+    engine_b.shutdown().await;
+}
+
+/// Zombie-inbound fix (Part 1, the deliberate constraint): a re-enqueue of the
+/// SAME package dir is a NEW outbound row with no persisted wire id, so it mints a
+/// FRESH wire `package_id` — the id is NEVER derived from the dir. This is what
+/// makes a resend (e.g. after the receiver deleted the files) transfer anew
+/// instead of replay-confirming from stale receiver receipts keyed by the wire id.
+#[tokio::test]
+async fn reenqueue_same_dir_mints_a_new_wire_package_id() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(&tmp.path().join("srcr"), "uuid-r", "framer.fits", "M42", 2048);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+
+    let wire_of = |id: i64| store.get_outbound(id).unwrap().unwrap().wire_package_id;
+
+    // First enqueue: a wire id is minted + persisted during the announce build.
+    let id1 = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| wire_of(id1).is_some(), WAIT).await;
+    let wire1 = wire_of(id1).unwrap();
+
+    // Re-enqueue the SAME dir → a DISTINCT row that mints its own fresh id.
+    let id2 = engine.enqueue_package(&pkg).await.unwrap();
+    assert_ne!(id1, id2, "a re-enqueue is a distinct outbound row");
+    wait_until(|| wire_of(id2).is_some(), WAIT).await;
+    let wire2 = wire_of(id2).unwrap();
+
+    assert_ne!(
+        wire1, wire2,
+        "a re-enqueue of the same dir mints a fresh wire package_id, never derived from the dir"
+    );
+
+    engine.shutdown().await;
+}
+
 #[tokio::test]
 async fn ack_lost_then_duplicate_ack_confirms_once() {
     let tmp = tempdir().unwrap();

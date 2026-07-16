@@ -1068,7 +1068,7 @@ impl Worker {
         if let Some(p) = self.pending.get_mut(&id) {
             p.manifest_records = Some(records.clone());
         }
-        let full_announce = match announce_for_dir(dir) {
+        let mut full_announce = match announce_for_dir(dir) {
             Ok(a) => a,
             Err(e) => {
                 tracing::error!(package_id = id, error = %format!("{e:#}"), "sync build announce failed; will retry");
@@ -1076,6 +1076,34 @@ impl Worker {
                 return Ok(Negotiated::Deferred);
             }
         };
+
+        // Stable wire package_id across sender restarts (zombie-inbound fix).
+        // `announce_for_dir` mints a FRESH uuid on every call, but the row's wire
+        // id must be stable so a crash-resume re-announce reuses the same id the
+        // receiver's `sync_inbound` row was keyed on (else that row is orphaned as
+        // a perpetual "fetching" zombie while delivery completes under a new id).
+        // So: reuse the value persisted on the row if present, else persist the
+        // freshly-minted one. Done BEFORE the dedup negotiate + subset build below,
+        // which both derive from `full_announce.package_id`. A re-enqueue (retry)
+        // is a NEW row with no persisted value → mints fresh (deliberate — see
+        // `set_wire_package_id`). Persist is best-effort: a failed write warns and
+        // still sends now; the worst case is a fresh id minted on the next restart.
+        match self.store.get_outbound(id) {
+            Ok(Some(row)) => match row.wire_package_id {
+                Some(persisted) => full_announce.package_id = PackageId(persisted),
+                None => {
+                    if let Err(e) = self.store.set_wire_package_id(id, &full_announce.package_id.0) {
+                        tracing::warn!(package_id = id, error = %format!("{e:#}"), "persist wire_package_id failed");
+                    }
+                }
+            },
+            Ok(None) => {
+                tracing::warn!(package_id = id, "outbound row gone while building announce; wire id not persisted");
+            }
+            Err(e) => {
+                tracing::warn!(package_id = id, error = %format!("{e:#}"), "read outbound row for wire id failed");
+            }
+        }
 
         // Collab exchange (slice 4): a manifest carrying a project stamp marks a
         // PROJECT package. Record `(project_id, hub_package_id)` on the slot so

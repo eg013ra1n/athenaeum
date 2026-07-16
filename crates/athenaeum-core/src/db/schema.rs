@@ -2011,6 +2011,7 @@ mod identity_schema_tests {
         for (table, col) in [
             ("sync_outbound", "last_error"),
             ("sync_outbound", "next_retry_at"),
+            ("sync_outbound", "wire_package_id"),
             ("sync_history", "project"),
             ("sync_history", "package_id"),
         ] {
