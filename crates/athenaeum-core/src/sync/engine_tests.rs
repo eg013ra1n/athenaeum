@@ -2251,7 +2251,10 @@ async fn park_in_long_backoff(
 /// kick collapses the retry deadline to now and resets the rung, so the next
 /// worker pass re-announces instead of waiting out the >1.2s window — proving
 /// the deadline collapsed.
-#[tokio::test]
+// multi_thread runtime: the 800ms confirmation bound is structurally tight on
+// current_thread, which starves the single OS thread under host load (audit
+// TEST-8). Two workers keep the timing bound honest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kick_fires_immediate_attempt_and_resets_backoff() {
     let tmp = tempdir().unwrap();
     let net = LoopbackNetwork::new();
@@ -2291,7 +2294,9 @@ async fn kick_fires_immediate_attempt_and_resets_backoff() {
 /// engine (fire-and-forget). Driven through the runtime holder to lock that
 /// contract end to end: an engine parked in a long backoff delivers immediately
 /// once the runtime kicks it.
-#[tokio::test]
+// multi_thread runtime: same tight timing bound as the other kick tests; a
+// current_thread runtime starves under host load (audit TEST-8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn runtime_kick_all_wakes_every_started_engine() {
     let tmp = tempdir().unwrap();
     let net = LoopbackNetwork::new();
@@ -2339,7 +2344,9 @@ async fn runtime_kick_all_wakes_every_started_engine() {
 /// node's wake hook: a relay reconnect / relay-map change fires the hook, which
 /// fans `SyncSenderRuntime::kick_all` — itself `engine.kick_all()` — over every
 /// engine, and every pending package must wake, not merely the first.
-#[tokio::test]
+// multi_thread runtime: same tight timing bound as the other kick tests; a
+// current_thread runtime starves under host load (audit TEST-8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kick_all_resets_every_pending_package() {
     let tmp = tempdir().unwrap();
     let net = LoopbackNetwork::new();

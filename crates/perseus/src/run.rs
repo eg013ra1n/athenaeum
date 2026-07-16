@@ -2526,7 +2526,10 @@ mod multi_target_tests {
     /// One built package fans out to EVERY target engine: both peers receive and
     /// confirm it, so the shared store ends with one confirmed outbound row per
     /// target (proving per-target delivery).
-    #[tokio::test]
+    // multi_thread runtime: a current_thread test starves its single OS thread
+    // under host load (2 engines + 2 receivers + mutex loopback), the ~2/12 flake
+    // this test carried (audit TEST-9). Two workers give the loopback room to run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fan_out_delivers_to_every_target() {
         let tmp = tempfile::tempdir().unwrap();
         let net = LoopbackNetwork::new();
