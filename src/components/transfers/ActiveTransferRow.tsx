@@ -78,6 +78,22 @@ function outcomeTone(outcome: string): string {
   return 'bg-surface-hover text-content-muted';
 }
 
+/**
+ * Map a raw sync `last_error` string to a short, human-readable reason (audit
+ * UX-2). The known strings are matched as prefixes (case-insensitive) so any
+ * trailing context still resolves; anything unrecognized falls through verbatim
+ * so an error is never hidden. Exported for reuse by the Transfers slide-over
+ * mini-rows. Keep the raw string on a `title=` hover at the call site.
+ */
+export function plainTransferError(raw: string): string {
+  const s = raw.trim().toLowerCase();
+  if (s.startsWith('no ack from peer within timeout'))
+    return "Peer didn't respond — will keep retrying";
+  if (s.startsWith('package payload missing on disk')) return 'Local package data is missing';
+  if (s.startsWith('cancelled by receiver')) return 'Cancelled by the receiving device';
+  return raw;
+}
+
 interface ActiveTransferRowProps {
   row: TransferRow;
   busy: Set<string>;
@@ -164,6 +180,11 @@ export function ActiveTransferRow({
   const progress = stageProgress(row.state, row.bytesDone, row.byteSize);
   const speedLabel = row.isTransferring ? formatSpeed(row.speedBps) : null;
 
+  // Surface the last failed-attempt reason on a stalled (retrying) row or a
+  // terminal failed/cancelled row — the row otherwise shows only its state with
+  // no "why" (audit UX-2). Plain-mapped text, raw string on hover.
+  const showReason = !!row.lastError && (stalled || row.terminal);
+
   const sendBusy = busy.has(`send:${row.id}`);
   const cancelBusy =
     row.kind === 'outbound' ? busy.has(`cancel:${row.id}`) : busy.has(`cancelin:${row.packageId ?? ''}`);
@@ -202,6 +223,14 @@ export function ActiveTransferRow({
             <span className="ml-1.5 rounded bg-warning/20 px-1 py-0.5 text-[10px] font-medium text-warning">
               stalled
             </span>
+          )}
+          {showReason && (
+            <p
+              className="mt-0.5 max-w-[16rem] whitespace-normal break-words text-[10px] leading-tight text-error/70"
+              title={row.lastError ?? undefined}
+            >
+              {plainTransferError(row.lastError as string)}
+            </p>
           )}
         </td>
         <td className="px-2 py-2">

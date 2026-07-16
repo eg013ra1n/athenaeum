@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { X, Search, ArrowUp, ArrowDown, ArrowUpRight, Inbox, Users } from 'lucide-react';
 import { api } from '../../api';
 import { useTransfers } from '../../contexts/TransfersContext';
+import { plainTransferError } from './ActiveTransferRow';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
   Direction,
@@ -355,6 +356,11 @@ function ActiveTab({ active, incoming }: { active: OutboundSummary[]; incoming: 
               {row.peerShort}
               {row.attempts > 0 ? ` · attempt ${row.attempts + 1}` : ''}
             </p>
+            {row.attempts > 0 && row.lastError && (
+              <p className="mt-0.5 truncate text-[10px] text-error/70" title={row.lastError}>
+                {plainTransferError(row.lastError)}
+              </p>
+            )}
           </div>
           <span className={`shrink-0 text-xs font-medium ${stateTone(row.state)}`}>{row.state}</span>
         </li>
