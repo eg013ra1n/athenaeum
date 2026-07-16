@@ -626,13 +626,13 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
         conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
     }
 
-    // 9. Delete orphaned calibration sets
-    conn.execute(
-        "DELETE FROM calibration_set WHERE id NOT IN (
-            SELECT DISTINCT set_id FROM calibration_set_frames
-        )",
-        [],
-    )?;
+    // 9. Delete orphaned calibration sets. Guarded prune: a raw set that fed a
+    // Phase-2 master build is now member-less (its frames went in step 2/7) but
+    // is still referenced by the NO-ACTION FKs `master_provenance.source_set_id`
+    // and `calibration_set.superseded_by_set_id`. An unguarded delete of such a
+    // set aborts this whole transaction with a FOREIGN KEY failure — the shared
+    // helper preserves those lineage shells (same exemptions as the trigger).
+    crate::db::schema::prune_orphaned_calibration_sets(conn)?;
 
     // 10. Delete orphaned sessions and imaging_nights first
     conn.execute(
@@ -1486,22 +1486,6 @@ pub fn bulk_update_frame_metadata(
             .map(|id| rusqlite::types::Value::Integer(*id))
             .collect();
 
-        // Capture which calibration sets had any of these frames as members,
-        // BEFORE we delete the junction rows. We'll re-check each set after
-        // the delete and prune any that became empty.
-        let sql_affected = format!(
-            "SELECT DISTINCT set_id FROM calibration_set_frames WHERE frame_id IN ({})",
-            id_placeholders
-        );
-        let mut stmt_affected = conn.prepare(&sql_affected)?;
-        let affected_set_ids: Vec<i64> = stmt_affected
-            .query_map(
-                rusqlite::params_from_iter(frame_id_params.iter()),
-                |r| r.get::<_, i64>(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt_affected);
-
         // calibration_set_frames: was a member of a calibration set.
         let sql_csf = format!(
             "DELETE FROM calibration_set_frames WHERE frame_id IN ({})",
@@ -1535,27 +1519,17 @@ pub fn bulk_update_frame_metadata(
                 e
             })?;
 
-        // Prune calibration sets that now have zero member frames. Includes
-        // master sets (single-frame) — when their only frame is reclassified
-        // to a non-calibration type, the set is dead. Multi-frame regular
-        // sets only get pruned if EVERY member was just unlinked, which is
-        // the correct semantic. Consumer links (`calibration_set_to_frames`)
-        // are removed automatically by the FK CASCADE on
-        // calibration_set_to_frames.calibration_set_id.
-        for set_id in affected_set_ids {
-            let remaining: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1",
-                [set_id],
-                |r| r.get(0),
-            )?;
-            if remaining == 0 {
-                conn.execute("DELETE FROM calibration_set WHERE id = ?1", [set_id])
-                    .map_err(|e| {
-                        tracing::error!(table = "calibration_set", set_id, error = %e, "bulk_update_frame_metadata prune of empty set failed");
-                        e
-                    })?;
-            }
-        }
+        // Prune calibration sets that now have zero member frames. The shared
+        // helper garbage-collects every empty set in one guarded statement,
+        // EXCEPT master-library / superseded / provenance-anchor sets — deleting
+        // one of those would abort this transaction on a NO-ACTION FK
+        // (`master_provenance.source_set_id` / `superseded_by_set_id`). Consumer
+        // links (`calibration_set_to_frames`) are removed automatically by the
+        // FK CASCADE on calibration_set_to_frames.calibration_set_id.
+        crate::db::schema::prune_orphaned_calibration_sets(conn).map_err(|e| {
+            tracing::error!(table = "calibration_set", error = %e, "bulk_update_frame_metadata prune of empty sets failed");
+            e
+        })?;
     }
 
     // After writing the edits the override flag is on for every touched
@@ -3785,6 +3759,78 @@ mod bulk_metadata_tests {
     }
 
     #[test]
+    fn bulk_update_spares_superseded_source_set_when_last_member_reclassified() {
+        // A user reclassifies the raw calibration frames whose set already fed
+        // a master build (superseded + provenance-anchored). Unlinking empties
+        // the raw set — but the bulk_update cascade's prune must SPARE it (its
+        // NO-ACTION FKs would otherwise abort the whole edit with a FOREIGN KEY
+        // failure), exactly like the trigger and startup sweep do.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let dark_id = insert_frame(&conn, "/data/darks/d.fits", Some("Dark"));
+
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date) VALUES (700, 'Dark', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (701, 'MasterDark', '2026-01-01', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (700, ?1)",
+            [dark_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = 701 WHERE id = 700",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO master_provenance
+                (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+             VALUES (701, 700, '{}', '[]', 'h', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let edits = FrameMetadataEdits {
+            imagetyp: Some(Some("LIGHT".into())),
+            ..Default::default()
+        };
+        // Pre-fix this aborted with "FOREIGN KEY constraint failed".
+        bulk_update_frame_metadata(&conn, &[dark_id], &edits)
+            .expect("reclassifying a master-source frame must not FK-fail");
+
+        // Membership cleared, but the lineage shell + provenance survive.
+        let member_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = 700",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(member_after, 0, "the frame must be unlinked from the raw set");
+        let raw_set: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibration_set WHERE id = 700", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw_set, 1, "the superseded raw set shell must survive the cascade prune");
+        let prov: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM master_provenance WHERE source_set_id = 700",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prov, 1, "provenance must be preserved");
+    }
+
+    #[test]
     fn frame_ids_under_paths_matches_file_and_folder() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -4863,6 +4909,100 @@ mod path_prefix_range_tests {
             vec!["/data/M31XHa/b.fits".to_string()],
             "only the row under the literal /data/M31_Ha prefix should be deleted"
         );
+    }
+
+    #[test]
+    fn delete_scan_root_preserves_master_source_lineage() {
+        // Regression: a scan root holding raw calibration frames that fed a
+        // Phase-2 master build must delete cleanly. Once step 2/7 remove the
+        // raw frames, the raw set is member-less but still referenced by
+        // `master_provenance.source_set_id` (NO ACTION) and its own
+        // `superseded_by_set_id` (NO ACTION). The step-9 prune must SPARE it
+        // instead of aborting the whole delete with a FOREIGN KEY failure.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Scan root + one raw dark file/frame under it.
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/darks')", [])
+            .unwrap();
+        let root_id: i64 = conn
+            .query_row("SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format, created_at)
+             VALUES (900, '/data/darks/dark_0001.fits', 'dark_0001.fits', 0,
+                     '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO frames (id, file_id) VALUES (901, 900)", [])
+            .unwrap();
+
+        // Raw set 600 holds that frame; master set 601 (is_master_library=1)
+        // supersedes it and carries the provenance anchor back to 600. Note 601
+        // is deliberately member-less: without the is_master_library exemption
+        // the prune would also try to delete it, which the NO-ACTION
+        // `600.superseded_by_set_id → 601` FK would reject too.
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date) VALUES (600, 'Dark', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (601, 'MasterDark', '2026-01-01', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (600, 901)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = 601 WHERE id = 600",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO master_provenance
+                (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+             VALUES (601, 600, '{}', '[]', 'h', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Pre-fix this aborted at step 9 with "FOREIGN KEY constraint failed".
+        delete_scan_root(&conn, root_id)
+            .expect("scan-root delete must not trip over master provenance references");
+
+        // The root's file + frame are gone.
+        let files_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files WHERE id = 900", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(files_left, 0, "the root's file must be deleted");
+        let frames_left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM frames WHERE id = 901", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(frames_left, 0, "the root's frame must be deleted");
+
+        // Lineage survives as empty shells, provenance intact.
+        let raw: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibration_set WHERE id = 600", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, 1, "the superseded raw set shell must survive");
+        let master: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibration_set WHERE id = 601", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(master, 1, "the master set must survive");
+        let prov: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM master_provenance WHERE master_set_id = 601",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prov, 1, "the provenance row must survive");
     }
 
     /// The three scan-root-join sites (`find_duplicate_groups` and the two

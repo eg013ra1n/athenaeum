@@ -46,6 +46,44 @@ pub(crate) fn create_calibration_set_empty_prune_trigger(conn: &Connection) -> r
     Ok(())
 }
 
+/// Prune every empty `calibration_set` row (the manual, whole-table counterpart
+/// to the per-row [`create_calibration_set_empty_prune_trigger`]). A set with
+/// zero member frames is a zombie and gets garbage-collected — UNLESS it
+/// carries master lineage, in which case the row must survive as an empty
+/// shell. The exemptions are byte-for-byte identical to the trigger's `WHEN`
+/// clause (keep the two in sync):
+///
+/// - `is_master_library = 1` — a master library set; intrinsically
+///   single-frame and never garbage even when member-less. Excluding it here
+///   also stops the prune from cascade-deleting the master's
+///   `master_provenance` row (that FK is `ON DELETE CASCADE`, so it would not
+///   fail — it would *silently* lose the lineage).
+/// - `superseded_by_set_id IS NOT NULL` — a raw set a master replaced; its
+///   `→ M#id` UI link and rebuild provenance depend on the row surviving.
+/// - referenced by `master_provenance.source_set_id` — the same frozen
+///   lineage. Both this and `superseded_by_set_id` are NO-ACTION FKs to
+///   `calibration_set(id)`, so an unguarded prune of such a row aborts the
+///   *caller's own* transaction with "FOREIGN KEY constraint failed" — the
+///   scan-root-delete failure this guard exists to prevent.
+///
+/// The single source of truth for every whole-table prune site (`init_db`
+/// startup sweep, `delete_scan_root`, the `bulk_update_frame_metadata`
+/// cascade). Returns the number of rows pruned.
+pub(crate) fn prune_orphaned_calibration_sets(conn: &Connection) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM calibration_set
+         WHERE COALESCE(is_master_library, 0) = 0
+           AND superseded_by_set_id IS NULL
+           AND id NOT IN (SELECT source_set_id FROM master_provenance
+                           WHERE source_set_id IS NOT NULL)
+           AND NOT EXISTS (
+                SELECT 1 FROM calibration_set_frames
+                 WHERE set_id = calibration_set.id
+           )",
+        [],
+    )
+}
+
 fn column_exists(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
@@ -1517,18 +1555,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     create_calibration_set_empty_prune_trigger(conn)?;
     // One-shot startup sweep for empty sets that pre-date the trigger, with
     // the same exemptions the trigger applies (see helper doc).
-    conn.execute(
-        "DELETE FROM calibration_set
-         WHERE COALESCE(is_master_library, 0) = 0
-           AND superseded_by_set_id IS NULL
-           AND id NOT IN (SELECT source_set_id FROM master_provenance
-                           WHERE source_set_id IS NOT NULL)
-           AND NOT EXISTS (
-            SELECT 1 FROM calibration_set_frames
-             WHERE set_id = calibration_set.id
-         )",
-        [],
-    )?;
+    prune_orphaned_calibration_sets(conn)?;
 
     // archive_operations: frames_set_id nullable + calibration_set_id.
     // SQLite can't drop NOT NULL via ALTER — rebuild once, detected by the
@@ -2388,6 +2415,41 @@ mod archive_schema_tests {
             "SELECT COUNT(*) FROM calibration_set WHERE id = 512",
             [], |r| r.get(0)).unwrap();
         assert_eq!(still_there, 1, "startup sweep must spare superseded sets");
+    }
+
+    #[test]
+    fn shared_prune_spares_lineage_sets_but_removes_plain_orphans() {
+        // Direct coverage of the shared helper every whole-table prune site
+        // now calls (delete_scan_root step 9, the bulk_update cascade, the
+        // startup sweep). A master-source/superseded set that just lost its
+        // last member must SURVIVE (its NO-ACTION FKs would otherwise abort the
+        // caller's own transaction); a plain member-less set IS garbage.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Lineage set 514 (raw, superseded by master 515, provenance anchor)
+        // whose sole member we then remove, leaving it an empty shell.
+        seed_superseded_set(&conn, 514, 515, 7012);
+        conn.execute("DELETE FROM calibration_set_frames WHERE set_id = 514", []).unwrap();
+
+        // Plain orphan 516: no members, no references — pure zombie.
+        insert_dummy_calibration_set(&conn, 516, "Bias");
+
+        let pruned = super::prune_orphaned_calibration_sets(&conn).unwrap();
+        assert_eq!(pruned, 1, "only the plain orphan should be pruned");
+
+        let lineage: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set WHERE id = 514",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(lineage, 1, "superseded/provenance-anchor shell must survive");
+        let provenance: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM master_provenance WHERE source_set_id = 514",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(provenance, 1, "provenance row must be preserved intact");
+        let orphan: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set WHERE id = 516",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(orphan, 0, "plain member-less set must be pruned");
     }
 
     #[test]
