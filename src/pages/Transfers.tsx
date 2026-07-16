@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ArrowLeftRight } from 'lucide-react';
 import { ActiveTransferRow } from '../components/transfers/ActiveTransferRow';
+import { AppDataWarningStrip } from '../components/transfers/AppDataWarningStrip';
 import { TransfersHistoryTab } from '../components/transfers/TransfersHistoryTab';
 import { useTransferQueue } from '../hooks/useTransferQueue';
 
@@ -24,6 +25,8 @@ export default function Transfers() {
         <ArrowLeftRight size={22} className="text-accent" />
         <h2 className="text-2xl font-bold">Transfers</h2>
       </div>
+
+      <AppDataWarningStrip />
 
       <div className="mb-3 flex shrink-0 border-b border-border">
         {(['active', 'history'] as const).map((t) => (

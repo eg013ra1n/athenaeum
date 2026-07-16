@@ -136,12 +136,15 @@ export function notifyFinished(p: SyncFinishedEvent, notify: NotifyLike): void {
       dedupeKey: `sync-recv-${p.packageId}`,
     });
 
-    // Unconfigured-landing hint (Stage 1.5, Task 6): when no sync-incoming
-    // folder is designated, received files fall back to the app-data folder.
-    // Nudge ONCE (dedupeKey persists in localStorage) to designate one so they
-    // land with the image library. Fire-and-forget — `notify` is stable, the
-    // scan-root read is cheap, and a failure here must never derail the arrival
-    // notification above.
+    // Unconfigured-landing hint (Stage 1.5, Task 6; audit UX-1): when no
+    // sync-incoming folder is designated, received files fall back to the
+    // app-data folder. Nudge PER received batch — the dedupeKey is keyed on the
+    // package id so it fires again for each arrival (the old permanent
+    // `sync-incoming-unconfigured` key fired once, ever), while still
+    // suppressing duplicate/replay events for the same package. The standing
+    // strip on `/transfers` is the always-visible counterpart. Fire-and-forget:
+    // `notify` is stable, the scan-root read is cheap, and a failure here must
+    // never derail the arrival notification above.
     if (p.outcome === 'ingested' || p.outcome === 'partial') {
       void (async () => {
         try {
@@ -154,7 +157,7 @@ export function notifyFinished(p: SyncFinishedEvent, notify: NotifyLike): void {
               kind: 'sync',
               tone: 'warning',
               link: '/files',
-              dedupeKey: 'sync-incoming-unconfigured',
+              dedupeKey: `sync-incoming-unconfigured-${p.packageId}`,
             });
           }
         } catch (err) {

@@ -49,6 +49,31 @@ export default function FileManager() {
     setBrowserReveal(incoming);
     navigate(location.pathname, { replace: true, state: null });
   }, [location.state, location.pathname, navigate]);
+
+  // Deep-link from the `/transfers` app-data warning strip (UX-1): land on the
+  // Monitored Directories tab and scroll the Sync Incoming Folder designator
+  // into view. Captured into local state first so clearing the navigation state
+  // below doesn't cancel the pending scroll (the effect that scrolls keys off
+  // `focusSyncIncoming`, not `location.state`).
+  const [focusSyncIncoming, setFocusSyncIncoming] = useState(false);
+  useEffect(() => {
+    const state = location.state as { focusSyncIncoming?: boolean } | null;
+    if (!state?.focusSyncIncoming) return;
+    setActiveTab('directories');
+    setFocusSyncIncoming(true);
+    navigate(location.pathname, { replace: true, state: null });
+  }, [location.state, location.pathname, navigate]);
+  useEffect(() => {
+    if (!focusSyncIncoming) return;
+    const t = setTimeout(() => {
+      document
+        .getElementById('sync-incoming-folder')
+        ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setFocusSyncIncoming(false);
+    }, 120);
+    return () => clearTimeout(t);
+  }, [focusSyncIncoming]);
+
   const [duplicatesView, setDuplicatesView] = useState<DuplicatesViewMode>('files');
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [missingMetadataCount, setMissingMetadataCount] = useState<number | null>(null);
@@ -692,6 +717,7 @@ export default function FileManager() {
           <CalibrationFolderSection scanRoots={scanRoots} onRootsChanged={() => void refreshScanRoots()} />
 
           <SpecialFolderSection
+            id="sync-incoming-folder"
             title="Sync Incoming Folder"
             description="Files received from your capture devices land here."
             kind="sync_incoming"

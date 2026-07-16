@@ -28,6 +28,9 @@ interface SpecialFolderSectionProps {
   scanRoots: ScanRoot[];
   /** Called after set/clear so the parent refreshes the scan-root list. */
   onRootsChanged: () => void;
+  /** Optional DOM id on the section root, so other views can deep-link + scroll
+   *  to this designator (e.g. the `/transfers` app-data warning strip). */
+  id?: string;
 }
 
 /**
@@ -81,6 +84,7 @@ export function SpecialFolderSection({
   clearCommand,
   scanRoots,
   onRootsChanged,
+  id,
 }: SpecialFolderSectionProps) {
   const { notify } = useNotifications();
   const [dir, setDir] = useState<string | null>(null);
@@ -173,7 +177,7 @@ export function SpecialFolderSection({
     : false;
 
   return (
-    <div className="mt-8">
+    <div className="mt-8" id={id}>
       <div className="flex items-center justify-between mb-4">
         <div>
           <h3 className="text-xl font-semibold flex items-center gap-2">

@@ -15,6 +15,13 @@ interface TransfersContextValue extends UseSyncStatus {
   open: boolean;
   openPanel: () => void;
   closePanel: () => void;
+  /**
+   * Session-only dismissal of the "received files land in the app-data folder"
+   * strip (audit UX-1). Lives in the app-root context — NOT localStorage — so it
+   * survives route changes but resets on the next app launch.
+   */
+  appDataWarningDismissed: boolean;
+  dismissAppDataWarning: () => void;
 }
 
 const TransfersContext = createContext<TransfersContextValue | null>(null);
@@ -22,6 +29,7 @@ const TransfersContext = createContext<TransfersContextValue | null>(null);
 export function TransfersProvider({ children }: { children: ReactNode }) {
   const sync = useSyncStatus();
   const [open, setOpen] = useState(false);
+  const [appDataWarningDismissed, setAppDataWarningDismissed] = useState(false);
 
   const value = useMemo<TransfersContextValue>(
     () => ({
@@ -29,8 +37,10 @@ export function TransfersProvider({ children }: { children: ReactNode }) {
       open,
       openPanel: () => setOpen(true),
       closePanel: () => setOpen(false),
+      appDataWarningDismissed,
+      dismissAppDataWarning: () => setAppDataWarningDismissed(true),
     }),
-    [sync, open],
+    [sync, open, appDataWarningDismissed],
   );
 
   return <TransfersContext.Provider value={value}>{children}</TransfersContext.Provider>;
