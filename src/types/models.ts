@@ -668,6 +668,14 @@ export type InboundSummary = {
  */
 id: number, 
 /**
+ * The full wire package id (`sync_inbound.package_id`) — the exact key
+ * `cancel_incoming_package` matches on (`WHERE package_id = ?1`). A row
+ * surfaced only by the status poll (e.g. announced/fetching from a prior
+ * session) has no other way for the caller to obtain the full id, since
+ * [`package_short`](Self::package_short) is a truncated display string.
+ */
+packageId: string, 
+/**
  * Short, human-readable package handle (leading chars of the wire package id).
  */
 packageShort: string, 

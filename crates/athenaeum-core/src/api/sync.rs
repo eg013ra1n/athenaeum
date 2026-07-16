@@ -979,6 +979,7 @@ fn active_inbound_summaries(ctx: &ServiceContext) -> Result<Vec<InboundSummary>,
         .into_iter()
         .map(|r| InboundSummary {
             id: r.id,
+            package_id: r.package_id.clone(),
             package_short: short_id(&r.package_id),
             peer_short: short_id(&r.peer),
             state: r.state,
