@@ -155,6 +155,116 @@ const PROVIDER_EVENT_CAPACITY: usize = 64;
 /// (a final flush at channel close).
 const SERVE_PROGRESS_THROTTLE: Duration = Duration::from_millis(300);
 
+/// Cumulative-byte accumulator for one served collection's upload progress
+/// (Task 13 fix — a reviewer-caught regression in the first cut).
+///
+/// `RequestUpdate::Progress.end_offset` is PER-BLOB, not cumulative across a
+/// collection: `handle_get_impl` (iroh-blobs 0.103 `provider.rs`) calls
+/// `send_blob` once per hash-seq child (the hash-seq blob itself, then the
+/// manifest, then every frame payload), and each call's `write_with_progress`
+/// (`api/blobs.rs`) fires a fresh `Started` on `EncodedItem::Size` and reports
+/// `notify_payload_write(index, leaf.offset, len)` where `leaf.offset` is the
+/// BAO leaf offset WITHIN THAT BLOB — it restarts near 0 for every blob. Naively
+/// tracking `sent.max(end_offset)` across the whole stream therefore captures
+/// only the single LARGEST blob's size and freezes there for the rest of the
+/// transfer (a multi-file frame set's progress bar would climb to its biggest
+/// file and stop, e.g. 40 MB / 800 MB, forever).
+///
+/// This accumulator folds each blob's final offset into a running `base` the
+/// moment the NEXT blob's `Started` arrives, so [`total`](Self::total) is a true
+/// collection-wide cumulative figure.
+#[derive(Default)]
+pub(crate) struct UploadAccumulator {
+    /// Sum of every blob's final offset, for every blob that has since been
+    /// superseded by a later `Started`.
+    base: u64,
+    /// The current (most recently started) blob's highest-seen `end_offset`.
+    cur: u64,
+}
+
+impl UploadAccumulator {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// A new blob's transfer began: fold the previous blob's final offset into
+    /// the running base and reset the per-blob counter. A no-op-safe first call
+    /// (base and cur both start at 0).
+    pub(crate) fn on_started(&mut self) {
+        self.base += self.cur;
+        self.cur = 0;
+    }
+
+    /// The current blob's progress ticked to `end_offset`. `max`-guarded (not
+    /// assigned) so an out-of-order or duplicate tick within one blob can never
+    /// regress the running total.
+    pub(crate) fn on_progress(&mut self, end_offset: u64) {
+        self.cur = self.cur.max(end_offset);
+    }
+
+    /// Cumulative bytes sent across every blob of this request so far.
+    pub(crate) fn total(&self) -> u64 {
+        self.base + self.cur
+    }
+}
+
+#[cfg(test)]
+mod upload_accumulator_tests {
+    use super::UploadAccumulator;
+
+    /// The regression the reviewer caught: naive `max(end_offset)` across a
+    /// whole collection freezes the reported total at the single largest blob's
+    /// size. `UploadAccumulator` folds each blob's final offset into a running
+    /// base on `Started`, so a two-blob sequence's total reflects BOTH blobs —
+    /// 372 + 372 = 744, not 372.
+    #[test]
+    fn accumulates_across_multiple_blobs() {
+        let mut acc = UploadAccumulator::new();
+        acc.on_started(); // blob 1 begins
+        acc.on_progress(10);
+        acc.on_progress(372); // blob 1 finishes at offset 372
+        acc.on_started(); // blob 2 begins; blob 1's 372 folds into base
+        acc.on_progress(5);
+        acc.on_progress(372); // blob 2 finishes at offset 372 too
+        assert_eq!(
+            acc.total(),
+            744,
+            "cumulative total across two 372-byte blobs, not the single largest blob's size"
+        );
+    }
+
+    /// Three blobs of distinct sizes sum correctly (guards against an
+    /// off-by-one in the fold-on-Started ordering).
+    #[test]
+    fn accumulates_across_three_blobs_of_distinct_sizes() {
+        let mut acc = UploadAccumulator::new();
+        acc.on_started();
+        acc.on_progress(100); // blob 1: 100 bytes
+        acc.on_started();
+        acc.on_progress(50);
+        acc.on_progress(250); // blob 2: 250 bytes
+        acc.on_started();
+        acc.on_progress(400); // blob 3: 400 bytes
+        assert_eq!(acc.total(), 750);
+    }
+
+    /// Out-of-order / duplicate progress within one blob never regresses the
+    /// running total (defensive `max`).
+    #[test]
+    fn progress_within_one_blob_is_monotonic() {
+        let mut acc = UploadAccumulator::new();
+        acc.on_started();
+        acc.on_progress(100);
+        acc.on_progress(50); // a stale/out-of-order tick must not regress
+        assert_eq!(acc.total(), 100);
+    }
+
+    #[test]
+    fn empty_accumulator_totals_zero() {
+        assert_eq!(UploadAccumulator::new().total(), 0);
+    }
+}
+
 /// Evaluate the shared connect gate for `from`. Absent gate ⇒ admit (accept-all,
 /// today's behavior). The gate `Arc` is cloned out from under the lock BEFORE the
 /// predicate runs, so a gate that does blocking catalog I/O never holds the mutex
@@ -249,28 +359,38 @@ pub(crate) fn build_router(
                     let sink = consumer_sink.clone();
                     tokio::spawn(async move {
                         let pkg = resolver(root);
-                        let mut sent: u64 = 0;
+                        // Cumulative across every blob in this collection (Task 13
+                        // fix) — see `UploadAccumulator` docs for why a naive
+                        // `max(end_offset)` over the raw stream is wrong.
+                        let mut acc = UploadAccumulator::new();
                         let mut last = Instant::now();
                         // Drain for the whole transfer; emit only on `Progress`, and
                         // only when a package resolved. The loop ends when the sender
                         // drops (`Ok(None)`) or errors — the receiver is never
                         // dropped early (SAFETY RULE).
                         while let Ok(Some(update)) = updates.recv().await {
-                            if let RequestUpdate::Progress(p) = update {
-                                sent = sent.max(p.end_offset);
-                                if let Some(pkg) = &pkg {
-                                    if last.elapsed() >= SERVE_PROGRESS_THROTTLE {
-                                        last = Instant::now();
-                                        sink.route_serve_progress(pkg, sent);
+                            match update {
+                                // A new blob's transfer began: fold the PREVIOUS
+                                // blob's final offset into the running base before
+                                // this blob's offsets start counting from ~0.
+                                RequestUpdate::Started(_) => acc.on_started(),
+                                RequestUpdate::Progress(p) => {
+                                    acc.on_progress(p.end_offset);
+                                    if let Some(pkg) = &pkg {
+                                        if last.elapsed() >= SERVE_PROGRESS_THROTTLE {
+                                            last = Instant::now();
+                                            sink.route_serve_progress(pkg, acc.total());
+                                        }
                                     }
                                 }
+                                RequestUpdate::Completed(_) | RequestUpdate::Aborted(_) => {}
                             }
                         }
-                        // Flush the peak once at close so a transfer shorter than the
-                        // throttle window still surfaces one tick.
+                        // Flush the cumulative total once at close so a transfer
+                        // shorter than the throttle window still surfaces one tick.
                         if let Some(pkg) = &pkg {
-                            if sent > 0 {
-                                sink.route_serve_progress(pkg, sent);
+                            if acc.total() > 0 {
+                                sink.route_serve_progress(pkg, acc.total());
                             }
                         }
                     });

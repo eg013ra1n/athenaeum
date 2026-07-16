@@ -359,11 +359,17 @@ impl EventDemux {
     /// that sender engine only while its transfer is in flight. Non-blocking
     /// (`try_send`): a full channel drops the tick, and a package with no live
     /// claim (already acked / terminal, or announced by a since-dropped handle) is
-    /// silently ignored — upload progress is best-effort UI data. A package fanned
-    /// out to N peers has N same-`package_id` claims; every one gets the tick (mild
-    /// over-report across destinations, never a misroute).
+    /// silently ignored — upload progress is best-effort UI data.
     pub(crate) fn route_serve_progress(&self, package_id: &PackageId, bytes_sent: u64) {
         let inner = self.inner.lock().expect("demux mutex poisoned");
+        // TODO(sync-queue follow-up): keyed on `package_id` alone, so a package
+        // fanned out to N peers (N same-`package_id` claims, distinguished only by
+        // `(peer, package_id)`) delivers this SAME cumulative-bytes tick to every
+        // one of them — a mild cross-destination over-report (never a misroute:
+        // each claim still only ever sees ITS OWN transfer's real acks). Precise
+        // per-destination attribution needs the provider event's `connection_id`
+        // correlated to a peer via `ClientConnectedNotify.endpoint_id` (not
+        // threaded through today); out of scope for Task 13.
         for ((_, pid), (_, tx)) in inner.claims.iter() {
             if pid == package_id {
                 let _ = tx.try_send(TransportEvent::ServeProgress {
@@ -2010,6 +2016,52 @@ mod tests {
         (pkg_dir, announce)
     }
 
+    /// A two-frame package with DELIBERATELY distinct payload sizes (Task 13
+    /// regression test): a real iroh collection for even one frame already has
+    /// multiple blobs (the hash-seq blob + the manifest + the frame payload), so
+    /// two frames of different sizes give a clear, hard-to-fake signal that
+    /// upload-progress reporting is truly cumulative across ALL of them — a
+    /// per-blob-only bug would freeze at whichever single blob is largest
+    /// (`size_b`, assuming `size_b > size_a` and both dwarf the hash-seq/manifest
+    /// blobs), never reaching the collection's full announced `byte_size`.
+    fn build_two_frame_package(base: &Path, size_a: usize, size_b: usize) -> (PathBuf, PackageAnnounce) {
+        let src = base.join("src2");
+        std::fs::create_dir_all(&src).unwrap();
+        let mut records = Vec::new();
+        for (i, (name, size)) in [("frame_a.fits", size_a), ("frame_b.fits", size_b)]
+            .into_iter()
+            .enumerate()
+        {
+            let payload = src.join(name);
+            // Distinct, non-repeating content per file so a wrong-blob mixup would
+            // also fail a hash check, not just a size check.
+            let bytes: Vec<u8> = (0..size).map(|j| ((j + i * 97) % 251) as u8).collect();
+            std::fs::write(&payload, &bytes).unwrap();
+            let byte_size = std::fs::metadata(&payload).unwrap().len();
+            let xxh3 = crate::package::xxh3_full_file(&payload).unwrap();
+            records.push((
+                payload,
+                ManifestRecord {
+                    v: MANIFEST_VERSION,
+                    frame_uuid: format!("uuid-two-{i}"),
+                    origin_catalog_uuid: "catalog-uuid".to_string(),
+                    origin_device: "origin-device".to_string(),
+                    payload_kind: PayloadKind::RawFrame,
+                    rel_path: name.to_string(),
+                    byte_size,
+                    xxh3,
+                    frame_meta: serde_json::json!({ "object": "M42" }),
+                    analysis: None,
+                    app_version: "test".to_string(),
+                    project: None,
+                },
+            ));
+        }
+        let pkg_dir = base.join("pkg2");
+        let announce = write_package(&pkg_dir, records).unwrap();
+        (pkg_dir, announce)
+    }
+
     // (a) Two binds on the same sync_dir: the second fails on the device-key
     //     advisory lock with the actionable, key-material-free message.
     #[tokio::test]
@@ -2173,6 +2225,79 @@ mod tests {
         );
 
         node.shutdown().await;
+    }
+
+    // Task 13 fix (reviewer-caught regression): over a REAL iroh transfer, a
+    // multi-blob collection's cumulative upload progress must reach the FULL
+    // announced byte_size, not freeze at the single largest blob's size. Two
+    // real `SharedIrohNode`s, relay disabled (localhost direct addresses, no
+    // mock) — this exercises the actual `iroh_blobs::provider::events` stream
+    // and the `UploadAccumulator` wired into `build_router`'s consumer, pinning
+    // the fix against the real provider API (not just the pure accumulator unit
+    // tests above).
+    #[tokio::test]
+    async fn serve_progress_over_real_iroh_accumulates_across_collection_blobs() {
+        let ds = tempdir().unwrap();
+        let dr = tempdir().unwrap();
+        let s = bind_disabled(ds.path()).await;
+        let r = bind_disabled(dr.path()).await;
+
+        let out = s.handle(Role::Out);
+        let recv = r.handle(Role::Recv);
+        let s_info = out.start().await.unwrap();
+        let r_info = recv.start().await.unwrap();
+        pair(&s, &s_info, &r, &r_info);
+
+        // Two frames of clearly different sizes (4 KiB, 64 KiB) so a per-blob
+        // (not cumulative) bug would visibly undershoot the full byte_size.
+        let (pkg_dir, announce) = build_two_frame_package(ds.path(), 4 * 1024, 64 * 1024);
+        out.serve(&announce, &pkg_dir, None).await.unwrap();
+
+        // Register both handles' consumers BEFORE announcing (same ordering the
+        // other demux tests use): `out.events()` registers the ack-claim channel
+        // that `route_serve_progress` will target once `announce` claims it.
+        let mut out_events = out.events().await;
+        let mut r_ev = recv.events().await;
+
+        out.announce(r_info.node_id, &announce).await.unwrap();
+        let wire = match recv_next(&mut r_ev).await {
+            TransportEvent::AnnounceReceived { announce, .. } => announce,
+            other => panic!("expected AnnounceReceived, got {other:?}"),
+        };
+
+        // A real blob download over QUIC: this is what drives the provider's
+        // `GetRequestReceivedNotify` → our consumer → `ServeProgress` ticks.
+        let dest = tempdir().unwrap();
+        recv.fetch(s_info.node_id, &wire, dest.path(), crate::sharing::noop_fetch_sink())
+            .await
+            .unwrap();
+
+        // Poll for ServeProgress ticks until the peak reaches the full collection
+        // size (the consumer's close-time flush may land slightly after `fetch`
+        // returns — it runs on a detached task independent of the receiver's
+        // completion) or the bound elapses.
+        let mut peak = 0u64;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while peak < announce.byte_size && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, out_events.recv()).await {
+                Ok(Some(TransportEvent::ServeProgress { bytes_sent, .. })) => {
+                    peak = peak.max(bytes_sent);
+                }
+                Ok(Some(_)) | Ok(None) => break,
+                Err(_) => break, // overall deadline elapsed
+            }
+        }
+
+        assert!(
+            peak >= announce.byte_size,
+            "cumulative upload progress must reach the full collection size ({}), got peak={peak} \
+             (a per-blob-only regression would freeze at the largest single frame's size, ~64KiB)",
+            announce.byte_size
+        );
+
+        s.shutdown().await;
+        r.shutdown().await;
     }
 
     // -----------------------------------------------------------------------

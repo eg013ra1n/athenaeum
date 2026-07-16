@@ -1329,9 +1329,14 @@ impl Worker {
     /// (Task 13). Locates the pending slot whose minted announce carries this
     /// `package_id` (the same correlation [`on_ack`](Self::on_ack) uses); a tick
     /// for no live slot (already confirmed / terminal, or an unknown package) is
-    /// dropped at debug. `bytes_sent` is the cumulative upload offset, clamped to
-    /// the announce's `byte_size` (the served collection carries manifest +
-    /// hash-seq overhead beyond the raw frame bytes, so an offset can run past it).
+    /// dropped at debug. `bytes_sent` is the true collection-wide cumulative
+    /// upload offset — summed across every blob by the iroh consumer's
+    /// [`UploadAccumulator`](crate::sharing::iroh::UploadAccumulator), NOT
+    /// a single blob's offset (a real bug caught in review: the provider's
+    /// `Progress.end_offset` is per-blob, so a naive running-max freezes at the
+    /// largest blob's size) — clamped to the announce's `byte_size` because the
+    /// served collection carries manifest + hash-seq overhead beyond the raw
+    /// frame bytes, so the true cumulative figure genuinely runs past it.
     fn on_serve_progress(&self, package_id: PackageId, bytes_sent: u64) {
         let slot = self.pending.iter().find_map(|(k, p)| match &p.announce {
             Some(a) if a.package_id == package_id => Some((*k, a.byte_size, a.frame_count)),
