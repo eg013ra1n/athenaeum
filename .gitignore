@@ -25,6 +25,7 @@ dist-ssr
 
 # Rust / Cargo workspace
 /target/
+target-agent/*
 
 # Database
 *.db
@@ -32,3 +33,6 @@ dist-ssr
 *.db-wal
 builds/
 scripts/__pycache__/*/target-agent
+.superpowers/brainstorm/
+target-agent/
+scripts/__pycache__/*
