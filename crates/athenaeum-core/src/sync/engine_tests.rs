@@ -1076,9 +1076,10 @@ async fn cancel_moves_to_cancelled_state() {
 /// `retry_sync_package`, which is only possible if the payload is still on disk.
 /// This branch is the all-cancelled-ack terminal epilogue and must mirror
 /// `cancel_package` exactly: only a `Confirmed` package's copies are ever
-/// reclaimed (see `cancelled_package_keeps_payloads` /
-/// `failed_package_keeps_payloads` for the sibling terminal states this one
-/// joins). Regression coverage for a real bug where an inline
+/// reclaimed (see `cancelled_package_keeps_payloads`, the sibling terminal
+/// state this one joins; the `Failed` terminal has no keep-payloads twin —
+/// it is only ever the vanished-payload path, with no copies left to keep).
+/// Regression coverage for a real bug where an inline
 /// `cleanup_package_payloads` call here broke resend.
 #[tokio::test]
 async fn all_cancelled_ack_marks_cancelled_by_receiver() {

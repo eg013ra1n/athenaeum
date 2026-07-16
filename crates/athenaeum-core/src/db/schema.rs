@@ -55,6 +55,19 @@ fn column_exists(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<
     Ok(n > 0)
 }
 
+/// Bridge a `sync::store` column-guard helper's `anyhow` error into the
+/// `rusqlite::Result` that [`init_db`] returns. The guarded-ALTER helpers
+/// ([`ensure_outbound_columns`](crate::sync::store::ensure_outbound_columns) /
+/// [`ensure_history_columns`](crate::sync::store::ensure_history_columns)) are
+/// owned by the store and shared with the standalone Perseus store, so they
+/// speak `anyhow`; `init_db` speaks rusqlite. Preserves the failure message.
+fn sync_migrate_err(e: anyhow::Error) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+        Some(format!("{e:#}")),
+    )
+}
+
 fn backfill_identity(conn: &Connection) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
     for t in UUID_TABLES {
@@ -1647,26 +1660,22 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // per-frame receipts alongside the catalog it ingests into.
     {
         use crate::sync::store::{
-            DDL_HISTORY, DDL_INBOUND, DDL_INDEXES, DDL_OUTBOUND, DDL_RECEIPTS, DDL_SYNC_SOURCES,
+            ensure_history_columns, ensure_outbound_columns, DDL_HISTORY, DDL_INBOUND, DDL_INDEXES,
+            DDL_OUTBOUND, DDL_RECEIPTS, DDL_SYNC_SOURCES,
         };
         conn.execute(DDL_OUTBOUND, [])?;
-        // Task 9 / Task 2: `CREATE TABLE IF NOT EXISTS` never adds a column to an
-        // existing `sync_outbound` — migrate the `last_error` (Task 9) and
-        // `next_retry_at` (Task 2) columns in place (guarded ALTER, the schema.rs
-        // idiom; never breaks a pre-Task-9/pre-Task-2 catalog).
-        if !column_exists(conn, "sync_outbound", "last_error")? {
-            conn.execute("ALTER TABLE sync_outbound ADD COLUMN last_error TEXT", [])?;
-        }
-        if !column_exists(conn, "sync_outbound", "next_retry_at")? {
-            conn.execute("ALTER TABLE sync_outbound ADD COLUMN next_retry_at TEXT", [])?;
-        }
+        // `CREATE TABLE IF NOT EXISTS` never adds a column to an already-existing
+        // table, so the trailing columns (`sync_outbound`: `last_error` Task 9 /
+        // `next_retry_at` Task 2; `sync_history`: `project` Task 11 / `package_id`
+        // Task 14) must be back-filled by a guarded ALTER on an upgraded catalog.
+        // That column list is OWNED by `sync::store` and shared with the
+        // standalone Perseus store — call the store's own guards here (never a
+        // hand-rolled inline copy) so this DDL site and the store's `open` can
+        // never drift (a forgotten column here shipped a `no such column` on a
+        // read path; pinned now by `legacy_sync_tables_converge_to_fresh`).
+        ensure_outbound_columns(conn).map_err(sync_migrate_err)?;
         conn.execute(DDL_HISTORY, [])?;
-        // AUDIT B3: `CREATE TABLE IF NOT EXISTS` never adds a column to an existing
-        // `sync_history` — migrate the Stage-II collab `project` column in place
-        // (rusqlite-native `column_exists`, the schema.rs idiom).
-        if !column_exists(conn, "sync_history", "project")? {
-            conn.execute("ALTER TABLE sync_history ADD COLUMN project TEXT", [])?;
-        }
+        ensure_history_columns(conn).map_err(sync_migrate_err)?;
         conn.execute(DDL_RECEIPTS, [])?;
         conn.execute(DDL_SYNC_SOURCES, [])?;
         // Task 11: receive-side per-package state. A NEW table (no legacy shape to
@@ -1933,6 +1942,93 @@ mod identity_schema_tests {
         let u = u.expect("uuid backfilled");
         assert_eq!(u.len(), 36);
         assert!(ts.is_some(), "updated_at backfilled");
+    }
+
+    /// Sorted column-name set of a table (order-independent comparison).
+    fn table_columns(conn: &Connection, table: &str) -> Vec<String> {
+        let mut cols: Vec<String> = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        cols.sort();
+        cols
+    }
+
+    /// Legacy-catalog convergence (final review): a DB upgraded from 0.4.x carries
+    /// the PRE-cycle sync-table shapes — `sync_outbound` without `last_error` /
+    /// `next_retry_at`, `sync_history` without `project` / `package_id`. `init_db`
+    /// must back-fill every trailing column (via the store's shared guarded-ALTER
+    /// helpers) so a shipped read path — `list_sync_history` → `HISTORY_COLS`,
+    /// which names `package_id` — never faults with `no such column: package_id`.
+    ///
+    /// The real invariant is *convergence*: after `init_db`, a migrated legacy DB
+    /// and a freshly-initialised DB have IDENTICAL sync-table column sets. This
+    /// is what stops the two DDL sites (`db/schema.rs` here, `sync::store::open`)
+    /// from silently drifting again.
+    #[test]
+    fn legacy_sync_tables_converge_to_fresh() {
+        // Fresh reference: every current sync DDL applied by init_db.
+        let fresh = mem_db();
+
+        // Legacy catalog: materialise the pre-cycle sync-table shapes by hand
+        // (literal fixtures — SQLite can't easily DROP columns), then run the
+        // idempotent init_db over them.
+        let legacy = Connection::open_in_memory().unwrap();
+        legacy
+            .execute(
+                "CREATE TABLE sync_outbound (
+                    id INTEGER PRIMARY KEY,
+                    package_ref TEXT NOT NULL,
+                    peer TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    confirmed_at TEXT
+                )",
+                [],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "CREATE TABLE sync_history (
+                    id INTEGER PRIMARY KEY,
+                    frame_uuid TEXT, filename TEXT, object TEXT, peer_device TEXT,
+                    direction TEXT, bytes INTEGER, started_at TEXT, finished_at TEXT, outcome TEXT
+                )",
+                [],
+            )
+            .unwrap();
+        // Sanity: the fixtures really lack the cycle columns before migration.
+        assert!(!column_exists(&legacy, "sync_history", "package_id").unwrap());
+        assert!(!column_exists(&legacy, "sync_outbound", "next_retry_at").unwrap());
+
+        init_db(&legacy).unwrap();
+
+        // Every cycle-added trailing column is present after migration.
+        for (table, col) in [
+            ("sync_outbound", "last_error"),
+            ("sync_outbound", "next_retry_at"),
+            ("sync_history", "project"),
+            ("sync_history", "package_id"),
+        ] {
+            assert!(
+                column_exists(&legacy, table, col).unwrap(),
+                "{table}.{col} must be back-filled by init_db on a legacy catalog",
+            );
+        }
+
+        // The actual invariant: migrated-legacy and fresh column sets are identical
+        // for every sync table this cycle touches.
+        for table in ["sync_outbound", "sync_history", "sync_inbound"] {
+            assert_eq!(
+                table_columns(&legacy, table),
+                table_columns(&fresh, table),
+                "{table} column set must converge legacy → fresh",
+            );
+        }
     }
 
     fn assert_v4_shape(u: &str) {

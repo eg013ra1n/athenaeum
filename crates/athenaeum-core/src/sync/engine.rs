@@ -33,13 +33,14 @@
 //!   peer, serve/announce error) never marks a package `Failed`; it backs off and
 //!   retries indefinitely. A persistently-erroring re-announce re-arms its
 //!   deadline every time, so it advances the backoff rather than busy-spinning.
-//! - [`cancel`](SyncEngineHandle::cancel) → `Failed` with a `cancelled` history
-//!   outcome.
+//! - [`cancel`](SyncEngineHandle::cancel) → `Cancelled` with a `cancelled`
+//!   history outcome (a first-class terminal, distinct from `Failed`, since
+//!   Task 3).
 //! - Spec §1's one non-network terminal path: if the package dir/payload has
 //!   vanished from disk, [`attempt`](Worker::attempt) fails it immediately via
 //!   [`fail_package`](Worker::fail_package) — re-announcing can never succeed no
-//!   matter how long it backs off, so this (and `cancel`) are the only ways to
-//!   reach `Failed`.
+//!   matter how long it backs off, so this vanished-payload case is the only way
+//!   to reach `Failed` (an explicit `cancel` reaches the distinct `Cancelled`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -142,7 +143,7 @@ enum Command {
         dir: PathBuf,
         reply: oneshot::Sender<Result<i64>>,
     },
-    /// Cancel an in-flight package → `Failed` (`cancelled`).
+    /// Cancel an in-flight package → `Cancelled` (`cancelled` history outcome).
     Cancel(i64),
     /// Kick one in-flight package: collapse its retry deadline to now and reset
     /// its backoff rung so the next worker pass re-announces immediately (spec §2
@@ -504,7 +505,7 @@ impl SyncEngineHandle {
         }
     }
 
-    /// Cancel an in-flight package. Terminal (`Failed`) once processed; a no-op
+    /// Cancel an in-flight package. Terminal (`Cancelled`) once processed; a no-op
     /// if the package is already terminal.
     pub async fn cancel(&self, id: i64) -> Result<()> {
         self.cmd_tx
@@ -1432,8 +1433,9 @@ impl Worker {
             // the payload to still be on disk): notify the fan-out coordinator when
             // shared, but — unlike the `Confirmed` path — never reclaim the payload
             // copies in line. Only a `Confirmed` package's copies are ever reclaimed
-            // (see `cancelled_package_keeps_payloads` / `failed_package_keeps_payloads`
-            // for the sibling terminal states; this one joins them).
+            // (see `cancelled_package_keeps_payloads`, the sibling terminal state this
+            // one joins; the `Failed` terminal has no keep-payloads twin because it is
+            // only ever the vanished-payload path — there are no copies left to keep).
             if let Some(sink) = &self.cleanup_sink {
                 sink.on_terminal(&pending.dir);
             }
@@ -1669,8 +1671,9 @@ impl Worker {
     /// Spec §1: `Failed` stays reachable ONLY for the genuinely-unrecoverable
     /// *local* case — the package dir/payload has vanished from disk, so
     /// re-announcing can never succeed (see the `!dir.exists()` check at the top
-    /// of [`attempt`](Self::attempt)) — plus `cancel_package`'s own direct
-    /// `Failed` transition (not routed through here).
+    /// of [`attempt`](Self::attempt)). A cancel is the sibling terminal but a
+    /// distinct state: `cancel_package` transitions directly to `Cancelled`
+    /// (not `Failed`, and not routed through here).
     fn fail_package(&mut self, id: i64) -> Result<()> {
         let removed = self.pending.remove(&id);
         let (dir, last_rejected, pkg_id, project_id, manifest_records) = match removed {
@@ -1717,7 +1720,7 @@ impl Worker {
         Ok(())
     }
 
-    /// Cancel a package → `Failed` with a `cancelled` outcome. Idempotent: a
+    /// Cancel a package → `Cancelled` with a `cancelled` outcome. Idempotent: a
     /// no-op if the package is already terminal / unknown.
     fn cancel_package(&mut self, id: i64) -> Result<()> {
         // Resolve the package dir: prefer the in-flight entry, else a live row.
