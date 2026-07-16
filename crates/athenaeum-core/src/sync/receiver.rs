@@ -28,12 +28,18 @@ use tokio::task::JoinHandle;
 
 use crate::events::{emit_event, ProgressEmitter};
 use crate::sharing::iroh::node::{Role, SharedIrohNode};
-use crate::sharing::types::{NodeId, PackageAnnounce, ReceiptOutcome, StartInfo, TransportEvent};
-use crate::sharing::{noop_fetch_sink, SharingTransport};
+use crate::sharing::types::{
+    FetchEvent, NodeId, PackageAnnounce, ReceiptOutcome, StartInfo, TransportEvent,
+};
+use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
 
 use super::ingest::{self, IngestOutcome};
+use super::models::InboundState;
 use super::refusal::RefusalRefresher;
-use super::store::CatalogSyncStore;
+use super::store::{
+    get_inbound, set_inbound_bytes_done, set_inbound_state, upsert_inbound_announced,
+    CatalogSyncStore,
+};
 
 /// Resolves the landing root for the next received package, live. Called once per
 /// package (immediately before ingest), so designating or clearing the
@@ -170,6 +176,33 @@ pub struct SyncProgressEvent {
     /// it in Task 11 to route project transfers to the project view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Cumulative fetched bytes at this tick (Task 11). Present only on the
+    /// `fetching`-stage ticks driven by the transport's batch progress; `None` on
+    /// the coarse stage ticks (`received`/`ingesting`/sender stages) that carry no
+    /// byte figure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_done: Option<u64>,
+    /// Total package bytes for the fetch (the announce's `byte_size`), paired with
+    /// [`bytes_done`](Self::bytes_done) on `fetching` ticks; `None` elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_total: Option<u64>,
+}
+
+/// `sync-file-progress` payload: per-file fetch progress for one collection entry
+/// (Task 11), emitted from the receiver's [`FetchSink`](crate::sharing::FetchSink)
+/// as the transport streams a package's files. Distinct from the per-package
+/// `sync-progress` stage tick so the Transfers UI can show a live per-file bar
+/// without overloading the stage channel. Progress is UI data — never a log.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncFileProgressEvent {
+    pub package_id: String,
+    /// Sending peer's node id (hex).
+    pub peer_device: String,
+    /// The entry's forward-slash `rel_path` within the package.
+    pub file: String,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
 }
 
 /// `sync-finished` payload: emitted once per package at the end of processing.
@@ -276,7 +309,7 @@ impl SyncReceiver {
                             &staging_root,
                             &incoming,
                             loop_transport.as_ref(),
-                            emitter.as_ref(),
+                            Arc::clone(&emitter),
                             from,
                             announce,
                         )
@@ -382,14 +415,15 @@ impl SyncReceiver {
     }
 }
 
-/// Handle one announced package: ack-replay guard, else fetch → ingest → ack,
-/// emitting stage progress and a single finished event.
+/// Handle one announced package: persist an inbound row, ack-replay guard, else
+/// fetch → ingest → ack, emitting stage progress (with live fetch bytes) and a
+/// single finished event, walking the `sync_inbound` row through its lifecycle.
 async fn handle_announce(
     store: &Arc<CatalogSyncStore>,
     staging_root: &Path,
     incoming: &IncomingResolver,
     transport: &dyn SharingTransport,
-    emitter: &dyn ProgressEmitter,
+    emitter: Arc<dyn ProgressEmitter>,
     from: NodeId,
     announce: PackageAnnounce,
 ) -> Result<()> {
@@ -401,7 +435,8 @@ async fn handle_announce(
     // path segment BEFORE it is ever joined onto a path — an absolute or
     // `..`-laden id would place the fetched package at an attacker-chosen
     // location (arbitrary file write / RCE, finding C1). Fail closed: refuse the
-    // announce, emit a failed outcome, ingest nothing.
+    // announce, emit a failed outcome, ingest nothing. No inbound row is written
+    // for an unsafe id (we never persist an attacker-chosen key).
     if let Err(e) = crate::package::validate_package_id(&package_id) {
         tracing::warn!(
             from = %peer_device,
@@ -409,7 +444,7 @@ async fn handle_announce(
             error = %e,
             "sync receiver rejected announce with unsafe package_id"
         );
-        emit_event(emitter, "sync-finished", &SyncFinishedEvent {
+        emit_event(emitter.as_ref(), "sync-finished", &SyncFinishedEvent {
             package_id,
             direction: super::Direction::Received,
             outcome: "failed".to_string(),
@@ -423,13 +458,29 @@ async fn handle_announce(
         return Ok(());
     }
 
-    emit_event(emitter, "sync-progress", &SyncProgressEvent {
+    // Persist (or refresh) the inbound row to `announced`. A re-announced
+    // redelivery resets it back to `announced` and clears its byte/finished
+    // markers; a `cancelled` row (Task 12) is left untouched — it is final, so
+    // we must never re-fetch it.
+    {
+        let conn = store.lock_conn();
+        upsert_inbound_announced(&conn, &peer_device, &package_id, announce.frame_count, announce.byte_size)
+            .with_context(|| format!("record inbound announce {package_id}"))?;
+    }
+    let is_cancelled = {
+        let conn = store.lock_conn();
+        matches!(get_inbound(&conn, &package_id)?, Some(r) if r.state == InboundState::Cancelled)
+    };
+
+    emit_event(emitter.as_ref(), "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
         direction: super::Direction::Received,
         stage: "received".to_string(),
         peer_device: peer_device.clone(),
         frame_count: announce.frame_count,
         project_id: None,
+        bytes_done: None,
+        bytes_total: None,
     });
 
     // Ack-replay guard: a fully-receipted package is re-acked from the log,
@@ -451,7 +502,15 @@ async fn handle_announce(
         if let Err(e) = transport.release(&announce.package_id).await {
             tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "receiver blob release failed");
         }
-        emit_event(emitter, "sync-finished", &SyncFinishedEvent {
+        // A replayed receive is terminal-Done (idempotent) — unless the row is
+        // cancelled, which stays final.
+        if !is_cancelled {
+            let conn = store.lock_conn();
+            if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Done, None) {
+                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound done (replay) write failed");
+            }
+        }
+        emit_event(emitter.as_ref(), "sync-finished", &SyncFinishedEvent {
             package_id,
             direction: super::Direction::Received,
             outcome: "replayed".to_string(),
@@ -465,27 +524,95 @@ async fn handle_announce(
         return Ok(());
     }
 
+    // A cancelled inbound row is final: never fetch it. It fell through the
+    // replay guard above (which re-acks it if fully receipted), so there is
+    // nothing more to do this round. Task 12 adds the real cancel-ack epilogue.
+    if is_cancelled {
+        tracing::info!(
+            package_id = %package_id,
+            peer_device = %peer_device,
+            "sync receiver skipped fetch for a cancelled inbound package"
+        );
+        return Ok(());
+    }
+
     // Fetch the package into a per-package staging dir under the staging root
     // (out of the user-visible landing tree, so a half-fetched package never
     // shows up in the designated sync_incoming folder).
     let staging = staging_root.join("staging").join(&package_id);
-    emit_event(emitter, "sync-progress", &SyncProgressEvent {
+    {
+        let conn = store.lock_conn();
+        if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Fetching, None) {
+            tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound fetching state write failed");
+        }
+    }
+    emit_event(emitter.as_ref(), "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
         direction: super::Direction::Received,
         stage: "fetching".to_string(),
         peer_device: peer_device.clone(),
         frame_count: announce.frame_count,
         project_id: None,
+        bytes_done: None,
+        bytes_total: None,
     });
     // I2 (T7): `from` dialed in to announce; the blob pull dials back out, so give
     // the downloader a relay dial hint for it before fetching (no-op on loopback /
     // when no relay set is resolved — never regresses the existing path reuse).
     transport.add_peer_dial_hint(from);
-    // Task 11 will thread a real sink here to surface per-file fetch progress.
-    transport
-        .fetch(from, &announce, &staging, noop_fetch_sink())
-        .await
-        .with_context(|| format!("fetch package {package_id}"))?;
+    // Real fetch sink (Task 11): each batch tick persists live `bytes_done` and
+    // emits a `fetching` progress carrying the byte figures; each per-file tick
+    // emits a `sync-file-progress`. DB writes are best-effort — a failed byte
+    // update warns and never aborts the fetch. Ticks arrive throttled (≤ every
+    // 300ms per stream), so a write at that cadence is fine.
+    let sink: FetchSink = {
+        let emitter = Arc::clone(&emitter);
+        let store = Arc::clone(store);
+        let pkg = package_id.clone();
+        let peer_device = peer_device.clone();
+        let frame_count = announce.frame_count;
+        Arc::new(move |ev| match ev {
+            FetchEvent::Batch { bytes_done, bytes_total } => {
+                {
+                    let conn = store.lock_conn();
+                    if let Err(e) = set_inbound_bytes_done(&conn, &pkg, bytes_done) {
+                        tracing::warn!(package_id = %pkg, error = %format!("{e:#}"), "inbound bytes_done update failed");
+                    }
+                }
+                emit_event(emitter.as_ref(), "sync-progress", &SyncProgressEvent {
+                    package_id: pkg.clone(),
+                    direction: super::Direction::Received,
+                    stage: "fetching".to_string(),
+                    peer_device: peer_device.clone(),
+                    frame_count,
+                    project_id: None,
+                    bytes_done: Some(bytes_done),
+                    bytes_total: Some(bytes_total),
+                });
+            }
+            FetchEvent::File { name, bytes_done, bytes_total } => {
+                emit_event(emitter.as_ref(), "sync-file-progress", &SyncFileProgressEvent {
+                    package_id: pkg.clone(),
+                    peer_device: peer_device.clone(),
+                    file: name,
+                    bytes_done,
+                    bytes_total,
+                });
+            }
+        })
+    };
+    if let Err(e) = transport.fetch(from, &announce, &staging, sink).await {
+        // A failed fetch is terminal for this row (Failed + reason); propagate so
+        // the receiver loop logs it too.
+        let msg = format!("{e:#}");
+        {
+            let conn = store.lock_conn();
+            if let Err(w) = set_inbound_state(&conn, &package_id, InboundState::Failed, Some(&msg)) {
+                tracing::warn!(package_id = %package_id, error = %format!("{w:#}"), "inbound failed state write failed");
+            }
+        }
+        return Err(e).with_context(|| format!("fetch package {package_id}"));
+    }
 
     // Resolve the landing root LIVE, per package: a `sync_incoming` designation
     // (or clear) since the last package is honored here — not frozen at transport
@@ -493,13 +620,21 @@ async fn handle_announce(
     let incoming_root = incoming();
 
     // Ingest on a blocking thread (file I/O + SQLite); never block the runtime.
-    emit_event(emitter, "sync-progress", &SyncProgressEvent {
+    {
+        let conn = store.lock_conn();
+        if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Ingesting, None) {
+            tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound ingesting state write failed");
+        }
+    }
+    emit_event(emitter.as_ref(), "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
         direction: super::Direction::Received,
         stage: "ingesting".to_string(),
         peer_device: peer_device.clone(),
         frame_count: announce.frame_count,
         project_id: None,
+        bytes_done: None,
+        bytes_total: None,
     });
     let outcome = {
         let store = Arc::clone(store);
@@ -544,7 +679,25 @@ async fn handle_announce(
     } else {
         "partial"
     };
-    emit_event(emitter, "sync-finished", &SyncFinishedEvent {
+    // Stamp the terminal inbound state: Done on ingested/partial, Failed (with a
+    // reason) when every frame was rejected.
+    {
+        let conn = store.lock_conn();
+        let res = if finished_outcome == "failed" {
+            set_inbound_state(
+                &conn,
+                &package_id,
+                InboundState::Failed,
+                Some(&format!("{} frame(s) rejected", failed.len())),
+            )
+        } else {
+            set_inbound_state(&conn, &package_id, InboundState::Done, None)
+        };
+        if let Err(e) = res {
+            tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound terminal state write failed");
+        }
+    }
+    emit_event(emitter.as_ref(), "sync-finished", &SyncFinishedEvent {
         package_id,
         direction: super::Direction::Received,
         outcome: finished_outcome.to_string(),
@@ -623,6 +776,8 @@ async fn handle_project_announce(
         peer_device: peer_device.clone(),
         frame_count: announce.frame_count,
         project_id: Some(project_id.clone()),
+        bytes_done: None,
+        bytes_total: None,
     });
 
     // Fetch into a per-package staging dir keyed by the WIRE id (mirrors personal
@@ -635,6 +790,8 @@ async fn handle_project_announce(
         peer_device: peer_device.clone(),
         frame_count: announce.frame_count,
         project_id: Some(project_id.clone()),
+        bytes_done: None,
+        bytes_total: None,
     });
     // I2 (T7): relay dial hint for the holder we're about to pull from (relay-only
     // — cross-account safe; the node's hint never carries direct addrs).
@@ -652,6 +809,8 @@ async fn handle_project_announce(
         peer_device: peer_device.clone(),
         frame_count: announce.frame_count,
         project_id: Some(project_id.clone()),
+        bytes_done: None,
+        bytes_total: None,
     });
     let outcome = {
         let store = Arc::clone(store);
@@ -915,7 +1074,7 @@ mod tests {
         let transport = LoopbackNetwork::new().endpoint();
         let incoming_root = tmp.path().join("incoming");
         let incoming: IncomingResolver = Arc::new(move || incoming_root.clone());
-        let emitter = RecordingEmitter::default();
+        let emitter = Arc::new(RecordingEmitter::default());
 
         let evil = tmp.path().join("evil_escape");
         let announce = PackageAnnounce {
@@ -930,7 +1089,7 @@ mod tests {
             &staging_root,
             &incoming,
             &transport,
-            &emitter,
+            Arc::clone(&emitter) as Arc<dyn ProgressEmitter>,
             [7u8; 32],
             announce,
         )
@@ -1051,5 +1210,136 @@ mod tests {
             assert_eq!(s.len(), 2);
             assert_eq!(s[1], (sender_node, "proj-2".to_string()));
         }
+    }
+
+    /// Build a one-frame fixture package (real 4x4 FITS payload + a manifest with
+    /// a full `Frame` snapshot) under `root`; returns `(pkg_dir, announce)`. A
+    /// self-contained copy of the ingest-test fixtures so the receiver test can
+    /// drive a real fetch → ingest end to end.
+    fn build_inbound_fixture(root: &std::path::Path) -> (std::path::PathBuf, PackageAnnounce) {
+        use crate::models::{Frame, ImageType};
+        use crate::package::{ManifestRecord, PayloadKind, MANIFEST_VERSION};
+
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("L_0001.fits");
+        crate::fits_writer::write_fits_f32(&src, 4, 4, 1, &[0.25f32; 16], &[]).unwrap();
+
+        let byte_size = std::fs::metadata(&src).unwrap().len();
+        let xxh3 = crate::package::xxh3_full_file(&src).unwrap();
+        let frame = Frame {
+            object: Some("M31".to_string()),
+            date_obs: Some("2026-01-15T22:30:00Z".parse().unwrap()),
+            instrume: Some("ASI2600MM".to_string()),
+            imagetyp: Some(ImageType::Light),
+            naxis1: Some(4),
+            naxis2: Some(4),
+            uuid: Some("frame-inbound-track".to_string()),
+            updated_at: Some("2026-01-16T10:00:00.000Z".to_string()),
+            ..Default::default()
+        };
+        let record = ManifestRecord {
+            v: MANIFEST_VERSION,
+            frame_uuid: "frame-inbound-track".to_string(),
+            origin_catalog_uuid: "catalog-uuid".to_string(),
+            origin_device: "aa".repeat(32),
+            payload_kind: PayloadKind::RawFrame,
+            rel_path: "L_0001.fits".to_string(),
+            byte_size,
+            xxh3,
+            frame_meta: serde_json::to_value(&frame).unwrap(),
+            analysis: None,
+            app_version: "test".to_string(),
+            project: None,
+        };
+        let pkg_dir = root.join("pkg-inbound-track");
+        let announce = crate::package::write_package(&pkg_dir, vec![(src, record)]).unwrap();
+        (pkg_dir, announce)
+    }
+
+    /// Task 11 (Step 4): a full loopback receive walks the `sync_inbound` row
+    /// `Announced → Fetching → Ingesting → Done`. Asserts the final persisted row
+    /// is `Done` with a stamped `finished_at`, `bytes_done == byte_size`, and no
+    /// longer active; and that the recorded stage events include a `fetching`
+    /// `sync-progress` carrying bytes plus at least one `sync-file-progress`.
+    #[tokio::test]
+    async fn inbound_row_tracks_announce_to_done() {
+        use crate::sharing::SharingTransport;
+        use crate::sync::store::inbound_active;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        // Full catalog schema (files/frames/fits_header + sync tables) so ingest
+        // lands rows; the held connection keeps the DB file around.
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        let recorder = Arc::new(RecordingEmitter::default());
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            Arc::new(move || incoming.clone()) as IncomingResolver,
+            allow_all_peers(),
+            Default::default(),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
+        assert!(announce.byte_size > 0, "fixture package has non-zero bytes");
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.announce(receiver_node, &announce).await.unwrap();
+
+        // The terminal Done write lands just after the receiver acks — poll for it.
+        let mut final_row = None;
+        for _ in 0..400 {
+            let row = {
+                let conn = store.lock_conn();
+                get_inbound(&conn, &announce.package_id.0).unwrap()
+            };
+            if let Some(r) = row {
+                if r.state == InboundState::Done {
+                    final_row = Some(r);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let row = final_row.expect("inbound row reached Done");
+        assert!(row.finished_at.is_some(), "a Done row stamps finished_at");
+        assert_eq!(row.frame_count, announce.frame_count);
+        assert_eq!(row.byte_size, announce.byte_size);
+        assert_eq!(
+            row.bytes_done, announce.byte_size,
+            "the final batch tick persisted the full byte_size"
+        );
+        let active_empty = {
+            let conn = store.lock_conn();
+            inbound_active(&conn).unwrap().is_empty()
+        };
+        assert!(active_empty, "a Done row drops out of the active set");
+
+        // Recorded events: a fetching tick carrying bytes + ≥1 per-file tick.
+        let events = recorder.events.lock().unwrap();
+        let fetch_with_bytes = events.iter().any(|(n, v)| {
+            n == "sync-progress"
+                && v["stage"] == "fetching"
+                && v.get("bytesDone").map(|b| !b.is_null()).unwrap_or(false)
+        });
+        assert!(fetch_with_bytes, "a fetching progress tick carried bytes: {events:?}");
+        let file_ticks = events.iter().filter(|(n, _)| n == "sync-file-progress").count();
+        assert!(file_ticks >= 1, "at least one sync-file-progress event: {events:?}");
     }
 }

@@ -754,6 +754,10 @@ impl Worker {
                 peer_device: node_id_hex(&self.peer),
                 frame_count,
                 project_id,
+                // Sender-side ticks carry no byte figure (Task 11 fetch bytes are
+                // a receive-side concern).
+                bytes_done: None,
+                bytes_total: None,
             });
         }
     }

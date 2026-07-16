@@ -92,6 +92,98 @@ impl OutboundState {
     }
 }
 
+/// Receiver-side lifecycle of one inbound package (`sync_inbound`, Task 11).
+///
+/// Mirrors [`OutboundState`]'s `as_str`/`from_db`/`is_terminal` shape. The
+/// receiver walks a package `Announced → Fetching → Ingesting → Done` and stamps
+/// `Failed` (with a `last_error`) when a fetch fails or every frame is rejected.
+/// [`Cancelled`](Self::Cancelled) is the receiver-decline terminal (Task 12) and
+/// is **final**: a re-announce never resurrects a cancelled row. Terminal states
+/// ([`Done`](Self::Done), [`Failed`](Self::Failed), [`Cancelled`](Self::Cancelled))
+/// are excluded from [`inbound_active`](super::store::inbound_active).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum InboundState {
+    /// Advertised to us; not yet fetched.
+    Announced,
+    /// Pulling the package blobs (live `bytes_done` updates during this stage).
+    Fetching,
+    /// Fetched; landing + cataloguing the frames.
+    Ingesting,
+    /// Terminal success: all frames ingested (or a partial ingest with some
+    /// rejections), or re-acked from the receipt log.
+    Done,
+    /// Terminal failure: the fetch failed, or every frame was rejected.
+    Failed,
+    /// Terminal receiver-decline (Task 12). Final — a re-announce leaves the row
+    /// untouched (the caller checks state before fetching).
+    Cancelled,
+}
+
+impl InboundState {
+    /// Stable lowercase text stored in the `state` column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InboundState::Announced => "announced",
+            InboundState::Fetching => "fetching",
+            InboundState::Ingesting => "ingesting",
+            InboundState::Done => "done",
+            InboundState::Failed => "failed",
+            InboundState::Cancelled => "cancelled",
+        }
+    }
+
+    /// Parse the `state` column text. Errors on an unknown value rather than
+    /// silently coercing.
+    pub fn from_db(s: &str) -> Result<Self> {
+        Ok(match s {
+            "announced" => InboundState::Announced,
+            "fetching" => InboundState::Fetching,
+            "ingesting" => InboundState::Ingesting,
+            "done" => InboundState::Done,
+            "failed" => InboundState::Failed,
+            "cancelled" => InboundState::Cancelled,
+            other => return Err(anyhow!("unknown inbound state: {other}")),
+        })
+    }
+
+    /// True for the three terminal states ([`Done`](Self::Done),
+    /// [`Failed`](Self::Failed), [`Cancelled`](Self::Cancelled)) that
+    /// [`inbound_active`](super::store::inbound_active) excludes and that
+    /// [`set_inbound_state`](super::store::set_inbound_state) stamps `finished_at`
+    /// for.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            InboundState::Done | InboundState::Failed | InboundState::Cancelled
+        )
+    }
+}
+
+/// One row of `sync_inbound`: the durable state of a package we are receiving
+/// (Task 11). Keyed uniquely on `(peer, package_id)`; `peer` is the sending
+/// node id (hex). `bytes_done` is refreshed live during the fetch stage from the
+/// transport's [`FetchEvent::Batch`](crate::sharing::types::FetchEvent) ticks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboundRow {
+    pub id: i64,
+    /// Sending peer's node id, hex-encoded.
+    pub peer: String,
+    pub package_id: String,
+    pub state: InboundState,
+    pub frame_count: u32,
+    pub byte_size: u64,
+    /// Cumulative bytes fetched so far (0 until the fetch stage reports progress).
+    pub bytes_done: u64,
+    /// The failure reason when `state` is [`Failed`](InboundState::Failed), else
+    /// `None`.
+    pub last_error: Option<String>,
+    pub created_at: String,
+    /// Stamped when the row reaches a terminal state, else `None`.
+    pub finished_at: Option<String>,
+}
+
 /// Direction of a transfer recorded in [`HistoryRow`]. This sender-side task
 /// only ever writes [`Sent`](Self::Sent); [`Received`](Self::Received) is for
 /// the receiver task (A7) writing into the same table.

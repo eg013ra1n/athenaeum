@@ -16,7 +16,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::sharing::types::{FrameReceipt, NodeId, PackageId, ReceiptOutcome};
 
-use super::models::{Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState};
+use super::models::{
+    Direction, HistoryQuery, HistoryRow, InboundRow, InboundState, OutboundRow, OutboundState,
+};
 use super::{node_id_from_hex, node_id_hex, now_iso};
 
 /// `sync_outbound` — the durable outbound state machine, one row per package.
@@ -122,6 +124,32 @@ pub const DDL_RECEIPTS: &str = "CREATE TABLE IF NOT EXISTS sync_receipts (
     outcome TEXT NOT NULL,
     received_at TEXT NOT NULL,
     PRIMARY KEY (package_id, frame_uuid)
+)";
+
+/// `sync_inbound` — the receiver's durable per-package receive state (Task 11).
+///
+/// One row per `(peer, package_id)`: the mirror of [`DDL_OUTBOUND`] for the
+/// receive half. The receiver upserts a row to `announced` on every announce
+/// (refreshing `frame_count`/`byte_size` and resetting a re-delivery back to
+/// `announced` — but leaving a `cancelled` row untouched, since Cancelled is
+/// final), advances it through `fetching`/`ingesting`, streams live `bytes_done`
+/// during the fetch, and stamps a terminal `done`/`failed` at the end. It backs
+/// the Transfers UI's Active/receive pane (Task 14). Like the other sync tables
+/// the DDL lives here so `db/schema.rs` and both store `open`s share one
+/// definition; `sync_inbound` is a NEW table (no legacy shape to migrate, so no
+/// guarded `ALTER`).
+pub const DDL_INBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_inbound (
+    id INTEGER PRIMARY KEY,
+    peer TEXT NOT NULL,
+    package_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    frame_count INTEGER NOT NULL DEFAULT 0,
+    byte_size INTEGER NOT NULL DEFAULT 0,
+    bytes_done INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    finished_at TEXT,
+    UNIQUE(peer, package_id)
 )";
 
 /// `sync_sources` — the app sender's package → source-file linkage (task M4).
@@ -670,6 +698,181 @@ pub fn load_receipts(conn: &Connection, package_id: &str) -> Result<Vec<FrameRec
     Ok(rows)
 }
 
+// ── Inbound (receive-side) package rows ─────────────────────────────────────
+//
+// Free fns over a `&Connection` so both the receiver (via
+// [`CatalogSyncStore::lock_conn`]) and any store impl share one source. Keyed by
+// `package_id` (a per-announce UUID — unique in practice); the `(peer,
+// package_id)` UNIQUE constraint anchors the upsert.
+
+const INBOUND_COLS: &str =
+    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at";
+
+/// Raw column tuple for a `sync_inbound` row, parsed into [`InboundRow`] by
+/// [`to_inbound`] so fallible text parsing happens outside the rusqlite closure.
+type InboundRaw = (
+    i64,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
+    let (id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at) =
+        raw;
+    Ok(InboundRow {
+        id,
+        peer,
+        package_id,
+        state: InboundState::from_db(&state)?,
+        frame_count: frame_count.max(0) as u32,
+        byte_size: byte_size.max(0) as u64,
+        bytes_done: bytes_done.max(0) as u64,
+        last_error,
+        created_at,
+        finished_at,
+    })
+}
+
+/// Upsert the inbound row for `(peer_hex, package_id)` to `announced`, returning
+/// its durable id. A first announce inserts a fresh `announced` row; a
+/// re-announce (redelivery) refreshes `frame_count`/`byte_size`, resets the state
+/// back to `announced`, and clears `bytes_done`/`last_error`/`finished_at` so the
+/// row honestly reflects a restarting fetch — **except** when the existing row is
+/// `cancelled`, which is final: a cancelled row is left completely untouched (the
+/// caller checks its state before deciding to fetch). See [`DDL_INBOUND`].
+pub fn upsert_inbound_announced(
+    conn: &Connection,
+    peer_hex: &str,
+    package_id: &str,
+    frame_count: u32,
+    byte_size: u64,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO sync_inbound (peer, package_id, state, frame_count, byte_size, bytes_done, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+         ON CONFLICT(peer, package_id) DO UPDATE SET
+             frame_count = CASE WHEN sync_inbound.state = 'cancelled' THEN sync_inbound.frame_count ELSE excluded.frame_count END,
+             byte_size   = CASE WHEN sync_inbound.state = 'cancelled' THEN sync_inbound.byte_size   ELSE excluded.byte_size   END,
+             state       = CASE WHEN sync_inbound.state = 'cancelled' THEN sync_inbound.state       ELSE 'announced'        END,
+             bytes_done  = CASE WHEN sync_inbound.state = 'cancelled' THEN sync_inbound.bytes_done  ELSE 0                   END,
+             last_error  = CASE WHEN sync_inbound.state = 'cancelled' THEN sync_inbound.last_error  ELSE NULL                END,
+             finished_at = CASE WHEN sync_inbound.state = 'cancelled' THEN sync_inbound.finished_at ELSE NULL                END",
+        params![peer_hex, package_id, InboundState::Announced.as_str(), frame_count, byte_size as i64, now_iso()],
+    )
+    .context("upsert sync_inbound")?;
+    // `last_insert_rowid()` is NOT the conflicting row's id on an ON CONFLICT
+    // UPDATE, so read the id back by its unique key.
+    let id: i64 = conn
+        .query_row(
+            "SELECT id FROM sync_inbound WHERE peer = ?1 AND package_id = ?2",
+            params![peer_hex, package_id],
+            |r| r.get(0),
+        )
+        .context("read sync_inbound id")?;
+    Ok(id)
+}
+
+/// Force the inbound row for `package_id` to `state`, writing `last_error` (or
+/// clearing it with `None`). A terminal state ([`InboundState::is_terminal`])
+/// also stamps `finished_at = now`; a non-terminal transition leaves it NULL.
+/// Keyed by `package_id` (unique in practice — a per-announce UUID).
+pub fn set_inbound_state(
+    conn: &Connection,
+    package_id: &str,
+    state: InboundState,
+    last_error: Option<&str>,
+) -> Result<()> {
+    if state.is_terminal() {
+        conn.execute(
+            "UPDATE sync_inbound SET state = ?1, last_error = ?2, finished_at = ?3 WHERE package_id = ?4",
+            params![state.as_str(), last_error, now_iso(), package_id],
+        )
+    } else {
+        conn.execute(
+            "UPDATE sync_inbound SET state = ?1, last_error = ?2 WHERE package_id = ?3",
+            params![state.as_str(), last_error, package_id],
+        )
+    }
+    .with_context(|| format!("set sync_inbound state {} for {package_id}", state.as_str()))?;
+    Ok(())
+}
+
+/// Record the cumulative bytes fetched so far for `package_id`. Called at the
+/// transport's batch-progress cadence during the fetch stage; best-effort from
+/// the sink's side (a failed write warns and never aborts the fetch).
+pub fn set_inbound_bytes_done(conn: &Connection, package_id: &str, bytes_done: u64) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_inbound SET bytes_done = ?1 WHERE package_id = ?2",
+        params![bytes_done as i64, package_id],
+    )
+    .with_context(|| format!("set sync_inbound bytes_done for {package_id}"))?;
+    Ok(())
+}
+
+/// Every non-terminal inbound row (state NOT IN `done`/`failed`/`cancelled`),
+/// oldest-first — the receive-side crash-resume / Active-tab enumeration.
+pub fn inbound_active(conn: &Connection) -> Result<Vec<InboundRow>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {INBOUND_COLS} FROM sync_inbound
+             WHERE state NOT IN ('done', 'failed', 'cancelled')
+             ORDER BY id ASC"
+        ))
+        .context("prepare inbound_active")?;
+    let raws = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+            ))
+        })
+        .context("query inbound_active")?
+        .collect::<rusqlite::Result<Vec<InboundRaw>>>()
+        .context("collect inbound_active")?;
+    raws.into_iter().map(to_inbound).collect()
+}
+
+/// Fetch a single `sync_inbound` row by `package_id` (`None` if absent).
+pub fn get_inbound(conn: &Connection, package_id: &str) -> Result<Option<InboundRow>> {
+    let raw = conn
+        .query_row(
+            &format!("SELECT {INBOUND_COLS} FROM sync_inbound WHERE package_id = ?1"),
+            params![package_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            },
+        )
+        .optional()
+        .context("query sync_inbound by package_id")?;
+    raw.map(to_inbound).transpose()
+}
+
 /// Standalone [`SyncStore`] backed by its own WAL SQLite file. Used by the
 /// Perseus agent and by the engine's tests. The connection is guarded by a
 /// [`Mutex`] so the store is `Sync`; no lock is ever held across an `.await`
@@ -696,6 +899,7 @@ impl StandaloneSyncStore {
         ensure_outbound_columns(&conn)?;
         conn.execute(DDL_HISTORY, []).context("create sync_history")?;
         ensure_history_columns(&conn)?;
+        conn.execute(DDL_INBOUND, []).context("create sync_inbound")?;
         for idx in DDL_INDEXES {
             conn.execute(idx, []).context("create sync_history index")?;
         }
@@ -906,6 +1110,7 @@ impl CatalogSyncStore {
         ensure_history_columns(&conn)?;
         conn.execute(DDL_RECEIPTS, []).context("create sync_receipts")?;
         conn.execute(DDL_SYNC_SOURCES, []).context("create sync_sources")?;
+        conn.execute(DDL_INBOUND, []).context("create sync_inbound")?;
         for idx in DDL_INDEXES {
             conn.execute(idx, []).context("create sync_history index")?;
         }
@@ -1176,6 +1381,57 @@ mod tests {
         // Counted as satisfied (the `outcome NOT LIKE 'rejected:%'` guard) so the
         // §4 ack-replay fires on re-announce.
         assert_eq!(count_satisfied_receipts(&conn, "pkg-cancel").unwrap(), 1);
+    }
+
+    /// Task 11: one inbound package walks the full lifecycle through the
+    /// `sync_inbound` free fns — upsert lands `Announced`; `Fetching` + a
+    /// `bytes_done` write persist; a terminal `Done` stamps `finished_at` and
+    /// drops out of `inbound_active`; and a re-announce of a `Cancelled` row is a
+    /// no-op (Cancelled is final).
+    #[test]
+    fn inbound_row_lifecycle() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_INBOUND, []).unwrap();
+        let peer = "1122334455667788112233445566778811223344556677881122334455667788";
+        let pkg = "pkg-inbound-1";
+
+        // upsert → Announced, counts recorded, no bytes yet, active.
+        let id = upsert_inbound_announced(&conn, peer, pkg, 5, 1000).unwrap();
+        let row = get_inbound(&conn, pkg).unwrap().unwrap();
+        assert_eq!(row.id, id);
+        assert_eq!(row.peer, peer);
+        assert_eq!(row.state, InboundState::Announced);
+        assert_eq!(row.frame_count, 5);
+        assert_eq!(row.byte_size, 1000);
+        assert_eq!(row.bytes_done, 0);
+        assert!(row.finished_at.is_none());
+        assert_eq!(inbound_active(&conn).unwrap().len(), 1, "announced is active");
+
+        // Fetching + a live byte update.
+        set_inbound_state(&conn, pkg, InboundState::Fetching, None).unwrap();
+        set_inbound_bytes_done(&conn, pkg, 100).unwrap();
+        let row = get_inbound(&conn, pkg).unwrap().unwrap();
+        assert_eq!(row.state, InboundState::Fetching);
+        assert_eq!(row.bytes_done, 100);
+        assert!(row.finished_at.is_none());
+        assert_eq!(inbound_active(&conn).unwrap().len(), 1, "fetching is still active");
+
+        // Done → finished_at stamped, gone from the active set.
+        set_inbound_state(&conn, pkg, InboundState::Done, None).unwrap();
+        let row = get_inbound(&conn, pkg).unwrap().unwrap();
+        assert_eq!(row.state, InboundState::Done);
+        assert!(row.finished_at.is_some(), "a terminal state stamps finished_at");
+        assert!(inbound_active(&conn).unwrap().is_empty(), "done is not active");
+
+        // Cancel, then re-announce: the cancelled row is untouched (final).
+        set_inbound_state(&conn, pkg, InboundState::Cancelled, Some("declined")).unwrap();
+        let id2 = upsert_inbound_announced(&conn, peer, pkg, 9, 2000).unwrap();
+        assert_eq!(id2, id, "re-announce hits the same row");
+        let row = get_inbound(&conn, pkg).unwrap().unwrap();
+        assert_eq!(row.state, InboundState::Cancelled, "a cancelled row never resets to announced");
+        assert_eq!(row.frame_count, 5, "a cancelled row is a full no-op — counts not refreshed");
+        assert_eq!(row.byte_size, 1000);
+        assert_eq!(row.last_error.as_deref(), Some("declined"), "cancel reason preserved");
     }
 
     /// `next_retry_at` round-trips through a write + read and clears with `None`

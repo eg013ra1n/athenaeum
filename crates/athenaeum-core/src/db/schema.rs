@@ -1647,7 +1647,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // per-frame receipts alongside the catalog it ingests into.
     {
         use crate::sync::store::{
-            DDL_HISTORY, DDL_INDEXES, DDL_OUTBOUND, DDL_RECEIPTS, DDL_SYNC_SOURCES,
+            DDL_HISTORY, DDL_INBOUND, DDL_INDEXES, DDL_OUTBOUND, DDL_RECEIPTS, DDL_SYNC_SOURCES,
         };
         conn.execute(DDL_OUTBOUND, [])?;
         // Task 9 / Task 2: `CREATE TABLE IF NOT EXISTS` never adds a column to an
@@ -1669,6 +1669,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         }
         conn.execute(DDL_RECEIPTS, [])?;
         conn.execute(DDL_SYNC_SOURCES, [])?;
+        // Task 11: receive-side per-package state. A NEW table (no legacy shape to
+        // migrate), so `CREATE TABLE IF NOT EXISTS` alone materialises it.
+        conn.execute(DDL_INBOUND, [])?;
         for idx in DDL_INDEXES {
             conn.execute(idx, [])?;
         }
