@@ -72,7 +72,7 @@ Nothing found blocks the current push. Two items should land **before beta users
 
 ## Prioritized roadmap
 
-**Wave 1 — before beta users (all S):**
+**Wave 1 — before beta users (all S): ✅ DONE 2026-07-16** (commits `2d6f5e92`, `3b244097`, `0e068acd`, `6cba75e8`, `c35d2b3f`; review Approved). Residual notes: golden-test exhaustiveness is a manual count (an APPENDED variant passes unpinned — the safe case; reorders are caught); strip and toast use two independent "unconfigured" reads (should always agree); fan_out flake survives only under pathological host oversubscription.
 1. UX-1 standing app-data warning + deep link.
 2. UX-2 render `last_error` on stalled/failed rows (+ raw→plain map).
 3. TEST-9/8 `multi_thread` flavor on the 4 timing-tight tests (kills the flake).
