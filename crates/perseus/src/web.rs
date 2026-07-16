@@ -980,8 +980,10 @@ async fn api_get_targets(State(state): State<Arc<WebState>>) -> Json<TargetsDto>
 /// needed and the pending state clears itself once the engines relaunch.
 ///
 /// [`apply_targets_edit`] writes on an in-memory copy and only swaps it in after
-/// re-validation, so a rejected edit (a selection that leaves no usable send
-/// route) leaves the file byte-identical and returns `422`.
+/// re-validation at the parse-valid tier (syntax + field constraints, not
+/// run-readiness). An empty list is accepted — "at least one send target" is a
+/// run/start concern, not an edit gate; a genuinely malformed edit still leaves
+/// the file byte-identical and returns `422`.
 async fn api_put_targets(
     State(state): State<Arc<WebState>>,
     Json(edit): Json<TargetsEdit>,
@@ -1038,10 +1040,12 @@ async fn api_get_device_name(State(state): State<Arc<WebState>>) -> Json<DeviceN
 /// The local config edit is authoritative: a `409` duplicate name from the hub or
 /// an unreachable hub does NOT fail the request — the name is already saved
 /// locally and re-syncs on the next registration. The hub problem is surfaced in
-/// `hubError` (a `409` message, or the transport error) so the UI can warn. A
-/// rejected local edit (no send route, etc.) still returns `422` with the file
-/// left byte-identical. `device_name` is not engine-bound, so no restart is
-/// needed; the supervisor is woken so re-registration picks up the new name.
+/// `hubError` (a `409` message, or the transport error) so the UI can warn. The
+/// local edit re-validates at the parse-valid tier only, so a missing send target
+/// does NOT reject the rename (the fresh-setup case); a genuinely malformed edit
+/// still returns `422` with the file left byte-identical. `device_name` is not
+/// engine-bound, so no restart is needed; the supervisor is woken so
+/// re-registration picks up the new name.
 async fn api_put_device_name(
     State(state): State<Arc<WebState>>,
     Json(edit): Json<DeviceNameEdit>,
@@ -2186,6 +2190,78 @@ mod tests {
         assert!(v["deviceName"].is_null(), "a blank name clears the override: {v}");
         let text = std::fs::read_to_string(tmp.path().join("perseus.toml")).unwrap();
         assert!(!text.contains("device_name"), "the key is removed from disk: {text}");
+    }
+
+    /// A **detached** `WebState` whose on-disk config is account-only with NO
+    /// targets and NO pairing_ticket — parse-valid but not run-ready, the exact
+    /// fresh-setup shape the owner hit (hub set, not signed in, no targets yet).
+    /// The in-memory config is built leniently for the same reason.
+    async fn no_target_account_state() -> (Arc<WebState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+        let seen = Arc::new(crate::seen::SeenStore::open(tmp.path().join("sync.db")).unwrap());
+        let batches =
+            Arc::new(crate::batch_store::BatchStore::open(tmp.path().join("sync.db")).unwrap());
+        let toml_str = format!(
+            "capture_dir = \"{d}\"\ndata_dir = \"{d}\"\nmode = \"auto\"\n[account]\nhub_url = \"https://test-hub.artfrom.space\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            d = tmp.path().display()
+        );
+        let config_path = tmp.path().join("perseus.toml");
+        std::fs::write(&config_path, &toml_str).unwrap();
+        // Not run-ready (no send target), so build it at the parse-valid tier.
+        let config = Config::from_toml_str_lenient(&toml_str).unwrap();
+        let (_tx, rx) = watch::channel(AgentState::NeedsSetup {
+            needs: vec!["no send target configured".to_string()],
+        });
+        let state = Arc::new(WebState::detached(
+            store,
+            seen,
+            batches,
+            config,
+            config_path,
+            rx,
+            Arc::new(Notify::new()),
+        ));
+        (state, tmp)
+    }
+
+    /// The bug (2026-07-15): `PUT /api/device-name` must succeed even when the
+    /// config has no `targets` and no `pairing_ticket`. Field edits validate
+    /// config syntax only (parse-valid tier), not run-readiness — so renaming a
+    /// device while mid-setup returns `200`, not the `422` "no send target" the
+    /// owner hit. No stored token → the best-effort hub rename is a no-op
+    /// (`hubError` absent).
+    #[tokio::test]
+    async fn device_name_put_succeeds_without_send_target() {
+        let (state, tmp) = no_target_account_state().await;
+        let app = build_router(state, None);
+
+        let body = serde_json::json!({ "name": "Test Instance" });
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/device-name")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "a device rename must not be blocked by a missing send target"
+        );
+        let v = body_json(res).await;
+        assert_eq!(v["deviceName"], "Test Instance", "name saved");
+        assert!(v.get("hubError").is_none(), "no hub call when signed out: {v}");
+
+        let text = std::fs::read_to_string(tmp.path().join("perseus.toml")).unwrap();
+        assert!(
+            text.contains("device_name = \"Test Instance\""),
+            "written to disk: {text}"
+        );
     }
 
     // ── M2: DNS-rebinding Host guard ─────────────────────────────────────────

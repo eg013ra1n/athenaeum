@@ -1105,6 +1105,31 @@ dry_run = true
         );
     }
 
+    /// Bug (2026-07-15): an account-only config with NO targets and NO
+    /// pairing_ticket is **parse-valid** (structurally sound — the tier a config
+    /// file must satisfy to be saved/edited) but NOT **run-ready** (the run/start
+    /// path additionally demands a send target). The lenient constructor accepts
+    /// it; the strict one rejects it with the unchanged "no send target" message.
+    /// This is the exact fresh-setup state the owner hit editing the device name.
+    #[test]
+    fn account_only_no_targets_is_parse_valid_but_not_run_ready() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = format!(
+            "capture_dir=\"{}\"\ndata_dir=\"/d\"\nmode=\"auto\"\n[account]\nemail=\"me@example.com\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            capture.path().display()
+        );
+        // Parse-valid tier: structurally sound, so the file may be saved/edited.
+        Config::from_toml_str_lenient(&text)
+            .expect("account-only, no-targets config is parse-valid (structure)");
+        // Run-ready tier: the start path still demands a send target, with the
+        // exact error message unchanged (users/scripts may match it).
+        let err = Config::from_toml_str(&text).expect_err("run path still requires a send target");
+        assert!(
+            format!("{err:#}").contains("no send target configured"),
+            "run-ready error message must be unchanged: {err:#}"
+        );
+    }
+
     /// Sync 2C: `targets` parses as a string list preserving order.
     #[test]
     fn targets_parse_as_ordered_list() {

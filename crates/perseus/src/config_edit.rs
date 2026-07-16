@@ -1,19 +1,35 @@
-//! Comment-preserving write-back of the `[retention]` table.
+//! Comment-preserving write-back of the web-editable config fields.
 //!
-//! The web settings page (tasks 9/10) lets an operator tune retention live. This
-//! module performs the file edit: it rewrites **only** the handful of whitelisted
-//! `[retention]` keys via [`toml_edit`], leaving every other key, comment, and
-//! layout byte untouched (a trailing inline comment on one of the five rewritten
-//! value lines is the sole exception — value replacement drops that key's own
-//! suffix decor), then re-parses + validates the whole file and swaps it in
-//! atomically (`tmp` + rename). The two live-deletion soak keys
-//! (`dry_run = false` requires `i_have_verified_the_soak = true`) are deliberately
-//! **not** writable here: the only field this can touch that bears on deletion is
+//! The web settings page (tasks 9/10) lets an operator tune retention, capture
+//! dirs, targets, device name, and send mode live. Each `apply_*_edit` performs
+//! the file edit: it rewrites **only** the handful of whitelisted keys via
+//! [`toml_edit`], leaving every other key, comment, and layout byte untouched (a
+//! trailing inline comment on a rewritten value line is the sole exception —
+//! value replacement drops that key's own suffix decor), then re-parses +
+//! re-validates the whole file and swaps it in atomically (`tmp` + rename).
+//!
+//! # Two-tier validation: field edits check syntax, not run-readiness
+//!
+//! Re-validation here runs at the **parse-valid** tier
+//! ([`Config::from_toml_str_lenient`] → [`Config::validate_structure`]): syntax,
+//! every field-level constraint, path shapes, and the internal consistency of
+//! what IS present. It deliberately does NOT run the **run-ready** tier
+//! ([`Config::validate`] → [`Config::validate_ready`], which additionally demands
+//! at least one capture directory AND a send target). Run-readiness is a
+//! run/start concern the supervisor surfaces as a [`crate::config::SetupNeed`];
+//! it must never block editing an unrelated field. Before this split, editing any
+//! field (e.g. the device name) on a fresh config that had no `targets` /
+//! `pairing_ticket` yet was wrongly rejected with "no send target configured".
+//!
+//! The two live-deletion soak keys (`dry_run = false` requires
+//! `i_have_verified_the_soak = true`) live in the parse-valid tier, so they are
+//! still enforced here: the only deletion-bearing field a web edit can touch is
 //! `dry_run`, and turning it off while the on-disk `i_have_verified_the_soak`
-//! stays `false` is caught by the re-validate step and refused — the file is left
-//! untouched (the edit happens on an in-memory copy, written only after
-//! validation passes). Enabling live deletion therefore remains a deliberate
-//! two-key edit an operator makes by hand, never something the web UI can do.
+//! stays `false` is caught by [`Config::validate_structure`] and refused — the
+//! file is left untouched (the edit happens on an in-memory copy, written only
+//! after validation passes). Enabling live deletion therefore remains a
+//! deliberate two-key edit an operator makes by hand, never something the web UI
+//! can do.
 
 use std::path::Path;
 
@@ -43,7 +59,8 @@ pub struct RetentionEdit {
 ///
 /// The two live-deletion keys are intentionally not written here (module docs):
 /// a `dry_run = false` edit against a file whose `i_have_verified_the_soak` is
-/// still `false` fails [`Config::validate`]'s two-key gate. On **any** error the
+/// still `false` fails [`Config::validate_structure`]'s two-key gate (a
+/// parse-valid-tier check, so still enforced on edits). On **any** error the
 /// file is left byte-identical — the edit is applied to an in-memory copy and
 /// only written (via `tmp` + atomic rename) after validation succeeds, so a
 /// rejected edit never leaves a partial or orphaned tmp file behind.
@@ -63,13 +80,14 @@ pub fn apply_retention_edit(config_path: &Path, edit: &RetentionEdit) -> Result<
     table["interval_secs"] = toml_edit::value(edit.interval_secs as i64);
     table["dry_run"] = toml_edit::value(edit.dry_run);
 
-    // Re-parse + validate the ENTIRE edited document before it ever hits disk.
-    // `from_toml_str` both parses and runs `validate()` (the two-key soak gate),
-    // so an edit that would enable live deletion is rejected here, with the file
-    // still untouched.
     let candidate = doc.to_string();
-    let cfg = Config::from_toml_str(&candidate).context("re-parse edited config")?;
-    cfg.validate().context("edited config failed validation")?;
+    // Re-validate the whole edited document at the PARSE-VALID tier (see the
+    // module docs): `from_toml_str_lenient` runs `validate_structure` only, so
+    // every field-level constraint (incl. the soak gate + capture-dir existence)
+    // still fires, but run-readiness (`validate_ready`: needs a capture dir + send
+    // target) is NOT demanded — an unrelated field edit must not be blocked by a
+    // config that is merely mid-setup.
+    let cfg = Config::from_toml_str_lenient(&candidate).context("re-parse edited config")?;
 
     // Atomic replace: write the validated candidate to a sibling tmp, then rename
     // over the original. Only reached once validation has passed.
@@ -100,16 +118,18 @@ pub fn apply_retention_edit(config_path: &Path, edit: &RetentionEdit) -> Result<
 ///
 /// Two specifics versus [`apply_retention_edit`]: the whitelisted write is the
 /// `capture_dirs` array AND the legacy singular `capture_dir` key is **removed**
-/// — [`Config::validate`] treats both forms present as a misconfiguration, so an
-/// edit that left the singular key behind would be self-rejecting. An **empty**
-/// list is refused up front (Perseus must watch at least one directory), before
-/// the file is read or written.
+/// — [`Config::validate_structure`] treats both forms present as a
+/// misconfiguration, so an edit that left the singular key behind would be
+/// self-rejecting. An **empty** list is refused up front (Perseus must watch at
+/// least one directory), before the file is read or written — this edit keeps its
+/// own capture-required check even though the shared re-validate no longer runs
+/// the run-ready tier.
 ///
 /// On **any** error the file is left byte-identical: the empty-list guard errors
 /// before touching disk, and every later step edits an in-memory copy that is
-/// only written (via `tmp` + atomic rename) after [`Config::validate`] passes —
-/// so a directory that does not exist on the box (validation's existence check)
-/// leaves no partial or orphaned tmp file behind.
+/// only written (via `tmp` + atomic rename) after [`Config::validate_structure`]
+/// passes — so a directory that does not exist on the box (a parse-valid-tier
+/// existence check) leaves no partial or orphaned tmp file behind.
 pub fn apply_capture_dirs_edit(config_path: &Path, dirs: &[String]) -> Result<Config> {
     // Refuse an empty selection before reading anything — a rejected edit must
     // leave the file untouched, and this is the cheapest place to enforce it.
@@ -131,14 +151,14 @@ pub fn apply_capture_dirs_edit(config_path: &Path, dirs: &[String]) -> Result<Co
     doc["capture_dirs"] = toml_edit::value(array);
     doc.remove("capture_dir");
 
-    // Re-parse + validate the ENTIRE edited document before it ever hits disk.
-    // `from_toml_str` both parses and runs `validate()` (the exactly-one-form
-    // guard AND the per-directory existence check — correct here, since this
-    // edit runs on the observatory machine), so a bad selection is rejected with
-    // the file still untouched.
     let candidate = doc.to_string();
-    let cfg = Config::from_toml_str(&candidate).context("re-parse edited config")?;
-    cfg.validate().context("edited config failed validation")?;
+    // Re-validate the whole edited document at the PARSE-VALID tier (see the
+    // module docs): `from_toml_str_lenient` runs `validate_structure` only, so
+    // every field-level constraint (incl. the soak gate + capture-dir existence)
+    // still fires, but run-readiness (`validate_ready`: needs a capture dir + send
+    // target) is NOT demanded — an unrelated field edit must not be blocked by a
+    // config that is merely mid-setup.
+    let cfg = Config::from_toml_str_lenient(&candidate).context("re-parse edited config")?;
 
     // Atomic replace: write the validated candidate to a sibling tmp, then rename
     // over the original. Only reached once validation has passed.
@@ -161,13 +181,15 @@ pub fn apply_capture_dirs_edit(config_path: &Path, dirs: &[String]) -> Result<Co
 /// spawn, so a targets change is picked up by the supervisor's engine relaunch
 /// (which is the window the web page's `restartPending` reports).
 ///
-/// Unlike capture dirs, an **empty** list is NOT refused up front: a config with
-/// a dev `pairing_ticket` is a valid send route with zero `targets`. Emptiness is
-/// left to the whole-config re-validate step — an account-only config (no ticket)
-/// with zero targets fails [`Config::validate`]'s "no send target" check and the
-/// edit is rejected with the file left byte-identical (edit-on-copy,
-/// write-after-validate), so a rejected edit never leaves a partial or orphaned
-/// tmp file behind.
+/// An **empty** `targets` list is accepted: it is **parse-valid** (structurally
+/// sound). "At least one send target" is a run-ready demand ([`Config::validate`]
+/// / [`crate::config::SetupNeed`]), never an edit-path gate — so clearing every
+/// target on an account-only config (no ticket) SUCCEEDS and persists the empty
+/// list. A running engine keeps its in-memory targets until restart, so saving an
+/// empty list does not tear out a live send route; the supervisor surfaces the
+/// missing target as a setup need on the next reload. Edit-on-copy,
+/// write-after-validate: any error still leaves the file byte-identical with no
+/// orphan tmp.
 pub fn apply_targets_edit(config_path: &Path, targets: &[String]) -> Result<Config> {
     let original = std::fs::read_to_string(config_path)
         .with_context(|| format!("read {}", config_path.display()))?;
@@ -180,12 +202,14 @@ pub fn apply_targets_edit(config_path: &Path, targets: &[String]) -> Result<Conf
     let array: toml_edit::Array = targets.iter().map(|t| t.as_str()).collect();
     doc["targets"] = toml_edit::value(array);
 
-    // Re-parse + validate the ENTIRE edited document before it ever hits disk, so
-    // a selection that leaves no usable send route is rejected with the file
-    // still untouched.
     let candidate = doc.to_string();
-    let cfg = Config::from_toml_str(&candidate).context("re-parse edited config")?;
-    cfg.validate().context("edited config failed validation")?;
+    // Re-validate the whole edited document at the PARSE-VALID tier (see the
+    // module docs): `from_toml_str_lenient` runs `validate_structure` only, so
+    // every field-level constraint (incl. the soak gate + capture-dir existence)
+    // still fires, but run-readiness (`validate_ready`: needs a capture dir + send
+    // target) is NOT demanded — an unrelated field edit must not be blocked by a
+    // config that is merely mid-setup.
+    let cfg = Config::from_toml_str_lenient(&candidate).context("re-parse edited config")?;
 
     // Atomic replace: write the validated candidate to a sibling tmp, then rename
     // over the original. Only reached once validation has passed.
@@ -229,8 +253,13 @@ pub fn apply_device_name_edit(config_path: &Path, name: &str) -> Result<Config> 
     }
 
     let candidate = doc.to_string();
-    let cfg = Config::from_toml_str(&candidate).context("re-parse edited config")?;
-    cfg.validate().context("edited config failed validation")?;
+    // Re-validate the whole edited document at the PARSE-VALID tier (see the
+    // module docs): `from_toml_str_lenient` runs `validate_structure` only, so
+    // every field-level constraint (incl. the soak gate + capture-dir existence)
+    // still fires, but run-readiness (`validate_ready`: needs a capture dir + send
+    // target) is NOT demanded — an unrelated field edit must not be blocked by a
+    // config that is merely mid-setup.
+    let cfg = Config::from_toml_str_lenient(&candidate).context("re-parse edited config")?;
 
     let tmp = config_path.with_extension("toml.tmp");
     std::fs::write(&tmp, &candidate)
@@ -266,11 +295,14 @@ pub fn apply_send_mode_edit(
     doc["mode"] = toml_edit::value(mode_str(mode));
     doc["auto_quiet_secs"] = toml_edit::value(auto_quiet_secs as i64);
 
-    // Re-parse + validate the ENTIRE edited document before it ever hits disk, so
-    // a malformed result is rejected with the file still untouched.
     let candidate = doc.to_string();
-    let cfg = Config::from_toml_str(&candidate).context("re-parse edited config")?;
-    cfg.validate().context("edited config failed validation")?;
+    // Re-validate the whole edited document at the PARSE-VALID tier (see the
+    // module docs): `from_toml_str_lenient` runs `validate_structure` only, so
+    // every field-level constraint (incl. the soak gate + capture-dir existence)
+    // still fires, but run-readiness (`validate_ready`: needs a capture dir + send
+    // target) is NOT demanded — an unrelated field edit must not be blocked by a
+    // config that is merely mid-setup.
+    let cfg = Config::from_toml_str_lenient(&candidate).context("re-parse edited config")?;
 
     // Atomic replace: write the validated candidate to a sibling tmp, then rename
     // over the original. Only reached once validation has passed.
@@ -516,24 +548,26 @@ i_have_verified_the_soak = false
         assert!(text.contains("\"c\""), "the new array is written");
     }
 
-    /// Clearing every target on an account-only config (no dev ticket) leaves no
-    /// send route, so the whole-config re-validate rejects the edit and the file
-    /// is left byte-identical (no orphan tmp).
+    /// Field edits validate at the **parse-valid** tier, not run-readiness: an
+    /// account-only config whose `targets` are cleared is structurally sound (the
+    /// account route just has nothing to send to *yet*), so the edit SUCCEEDS and
+    /// persists an empty list. "At least one send target" is a run/start demand
+    /// (a `SetupNeed` the supervisor surfaces), never an edit-path gate — a
+    /// running engine keeps its in-memory targets until restart, so no live send
+    /// route is torn out by saving the file. (Before the 2026-07-15 fix this was
+    /// wrongly rejected with "no send target".)
     #[test]
-    fn apply_targets_edit_empty_on_account_rejected_and_file_byte_identical() {
+    fn apply_targets_edit_empty_on_account_is_parse_valid() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_min_config(dir.path());
-        let original = std::fs::read_to_string(&path).unwrap();
-        let err = apply_targets_edit(&path, &[]).expect_err("no send route must be rejected");
-        assert!(
-            format!("{err:#}").contains("send target"),
-            "error should name the missing send target: {err:#}"
-        );
-        let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(after, original, "a rejected edit leaves the file byte-identical");
+        let cfg = apply_targets_edit(&path, &[]).expect("empty targets is parse-valid");
+        assert!(cfg.targets.is_empty(), "targets cleared to empty");
+        // The write-back persisted the empty list and still re-parses (lenient).
+        let reloaded = Config::load_lenient(&path).unwrap();
+        assert!(reloaded.targets.is_empty(), "empty targets persisted to disk");
         assert!(
             !path.with_extension("toml.tmp").exists(),
-            "no orphan tmp file after a rejected edit"
+            "no orphan tmp file after a successful edit"
         );
     }
 
@@ -576,6 +610,38 @@ i_have_verified_the_soak = false
         let reloaded = Config::load_lenient(&path).unwrap();
         assert_eq!(reloaded.device_name.as_deref(), Some("Observatory Pi"));
         let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# top comment"), "unrelated comment preserved");
+    }
+
+    /// A minimal account-only config with NO targets and NO pairing_ticket:
+    /// parse-valid (structurally sound) but not run-ready. `dir` is the capture
+    /// dir so the existence check passes. This is the fresh-setup shape the owner
+    /// hit (hub_url set, not yet logged in, no targets yet).
+    fn write_account_only_no_targets_config(dir: &Path) -> std::path::PathBuf {
+        let p = dir.join("perseus.toml");
+        let text = format!(
+            "# top comment\ncapture_dir = \"{d}\"\ndata_dir = \"{d}\"\nmode = \"auto\"\n[account]\nhub_url = \"https://test-hub.artfrom.space\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            d = dir.display()
+        );
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    /// The bug (2026-07-15): editing an unrelated field (the device name) must
+    /// NOT be blocked by a missing send target. With no `targets` and no
+    /// `pairing_ticket`, the edit re-validates at the parse-valid tier and
+    /// succeeds — run-readiness ("at least one send target") is a run/start
+    /// concern, not a file-edit gate.
+    #[test]
+    fn apply_device_name_edit_succeeds_without_targets_or_ticket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_account_only_no_targets_config(dir.path());
+        let cfg = apply_device_name_edit(&path, "Test Instance").expect(
+            "editing the device name must not require a send target (parse-valid tier)",
+        );
+        assert_eq!(cfg.device_name.as_deref(), Some("Test Instance"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("device_name = \"Test Instance\""), "written to disk: {text}");
         assert!(text.contains("# top comment"), "unrelated comment preserved");
     }
 
