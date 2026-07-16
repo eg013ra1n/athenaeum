@@ -103,6 +103,9 @@ export interface TransferRow {
   terminal: boolean;
   speedBps: number | null;
   isTransferring: boolean;
+  /** Bumped on every `sync-finished` for this package — an expanded row watches
+   * this to know its cached `list_transfer_files` detail needs a re-fetch. */
+  finishNonce: number;
 }
 
 export interface UseTransferQueue {
@@ -135,6 +138,19 @@ export function useTransferQueue(): UseTransferQueue {
   >(new Map());
   const outSpeedRef = useRef<Map<string, SpeedTrackerEntry>>(new Map());
   const inSpeedRef = useRef<Map<string, SpeedTrackerEntry>>(new Map());
+
+  // Bumped per row `key` (`out:<id>` / `in:<packageId>`) on every `sync-finished`
+  // for that package — lets an already-expanded row (same component instance,
+  // same `key`, across the active→terminal transition) know its cached
+  // `list_transfer_files` detail is stale and re-fetch settled outcome chips.
+  const [finishNonce, setFinishNonce] = useState<Map<string, number>>(new Map());
+  const bumpFinishNonce = useCallback((rowKey: string) => {
+    setFinishNonce((prev) => {
+      const next = new Map(prev);
+      next.set(rowKey, (next.get(rowKey) ?? 0) + 1);
+      return next;
+    });
+  }, []);
 
   const [busy, setBusy] = useState<Set<string>>(new Set());
   const withBusy = useCallback((busyKey: string, fn: () => Promise<void>) => {
@@ -222,6 +238,7 @@ export function useTransferQueue(): UseTransferQueue {
         if (p.direction === 'sent') {
           const id = Number(p.packageId);
           if (!Number.isFinite(id)) return;
+          bumpFinishNonce(`out:${id}`);
           outSpeedRef.current.delete(`out:${id}`);
           setLiveOutboundBytes((prev) => {
             if (!prev.has(id)) return prev;
@@ -249,6 +266,7 @@ export function useTransferQueue(): UseTransferQueue {
             setTerminalOutbound((prev) => new Map(prev).set(id, { summary, outcome }));
           }
         } else {
+          bumpFinishNonce(`in:${p.packageId}`);
           inSpeedRef.current.delete(`in:${p.packageId}`);
           setLiveInboundBytes((prev) => {
             if (!prev.has(p.packageId)) return prev;
@@ -280,7 +298,9 @@ export function useTransferQueue(): UseTransferQueue {
 
   const rows = useMemo<TransferRow[]>(() => {
     const out: TransferRow[] = [];
+    const activeOutboundIds = new Set<number>();
     for (const s of status?.sender.active ?? []) {
+      activeOutboundIds.add(s.id);
       const live = liveOutboundBytes.get(s.id);
       out.push({
         key: `out:${s.id}`,
@@ -299,9 +319,20 @@ export function useTransferQueue(): UseTransferQueue {
         terminal: false,
         speedBps: s.state === 'transferring' ? (live?.speedBps ?? null) : null,
         isTransferring: s.state === 'transferring',
+        finishNonce: finishNonce.get(`out:${s.id}`) ?? 0,
       });
     }
+    // A `sync-finished` outcome lands in `terminalOutbound` synchronously, but
+    // the polled `status.sender.active` snapshot only drops the same id on its
+    // NEXT resolve — for that transient window both sources agree on the same
+    // id. The active-side entry above is the live, authoritative one, so a
+    // ledger entry for an id still (momentarily) `active` is skipped here
+    // rather than rendered as a second `out:<id>` row; once the next poll
+    // catches up, the id naturally leaves `active` and the ledger row takes
+    // over unmasked. No separate ledger pruning needed (ids are never reused —
+    // `retry_sync_package` always mints a new id).
     for (const { summary, outcome } of terminalOutbound.values()) {
+      if (activeOutboundIds.has(summary.id)) continue;
       out.push({
         key: `out:${summary.id}`,
         kind: 'outbound',
@@ -319,6 +350,7 @@ export function useTransferQueue(): UseTransferQueue {
         terminal: true,
         speedBps: null,
         isTransferring: false,
+        finishNonce: finishNonce.get(`out:${summary.id}`) ?? 0,
       });
     }
     for (const s of status?.receiver.active ?? []) {
@@ -340,10 +372,11 @@ export function useTransferQueue(): UseTransferQueue {
         terminal: false,
         speedBps: s.state === 'fetching' ? (live?.speedBps ?? null) : null,
         isTransferring: s.state === 'fetching',
+        finishNonce: finishNonce.get(`in:${s.packageId}`) ?? 0,
       });
     }
     return out;
-  }, [status, terminalOutbound, liveOutboundBytes, liveInboundBytes]);
+  }, [status, terminalOutbound, liveOutboundBytes, liveInboundBytes, finishNonce]);
 
   const activeCount = (status?.sender.queued ?? 0) + (status?.sender.transferring ?? 0) + rows.filter((r) => r.kind === 'inbound').length;
 

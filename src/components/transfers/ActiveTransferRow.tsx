@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowUp, ArrowDown, ChevronDown, ChevronRight, Loader2, RotateCw, Send, X } from 'lucide-react';
 import { api } from '../../api';
 import type { TransferRow } from '../../hooks/useTransferQueue';
@@ -110,24 +110,48 @@ export function ActiveTransferRow({
     return () => clearInterval(id);
   }, [row.nextRetryAt]);
 
+  const loadFiles = useCallback(() => {
+    setFilesLoading(true);
+    const direction: Direction = row.kind === 'outbound' ? 'sent' : 'received';
+    api
+      .invoke<TransferFileEntry[]>('list_transfer_files', { direction, id: row.id })
+      .then(setFiles)
+      .catch((err) => {
+        console.error('[ActiveTransferRow] list_transfer_files failed:', err);
+        setFiles([]);
+      })
+      .finally(() => setFilesLoading(false));
+  }, [row.kind, row.id]);
+
   const toggleExpand = useCallback(() => {
     setExpanded((prev) => {
       const next = !prev;
-      if (next && files === null && !filesLoading) {
-        setFilesLoading(true);
-        const direction: Direction = row.kind === 'outbound' ? 'sent' : 'received';
-        api
-          .invoke<TransferFileEntry[]>('list_transfer_files', { direction, id: row.id })
-          .then(setFiles)
-          .catch((err) => {
-            console.error('[ActiveTransferRow] list_transfer_files failed:', err);
-            setFiles([]);
-          })
-          .finally(() => setFilesLoading(false));
+      if (next) {
+        loadFiles();
+      } else {
+        // Collapsed — drop the cached detail so a later re-expand re-fetches
+        // rather than showing whatever was true at the last expand.
+        setFiles(null);
       }
       return next;
     });
-  }, [files, filesLoading, row.kind, row.id]);
+  }, [loadFiles]);
+
+  // The row's `key` (and so this component instance) is stable across the
+  // active→terminal transition (same outbound id / inbound packageId), so an
+  // already-expanded row survives a package finishing. `finishNonce` bumps
+  // exactly once per `sync-finished` for this package — re-fetch the cached
+  // detail then (settled outcome chips, or a cancel/failure) instead of
+  // leaving the pre-finish snapshot on screen. Skipped on the initial mount
+  // (no transition happened yet) via the "did the value actually change"
+  // check against the previous render's nonce.
+  const prevFinishNonceRef = useRef(row.finishNonce);
+  useEffect(() => {
+    if (row.finishNonce !== prevFinishNonceRef.current) {
+      prevFinishNonceRef.current = row.finishNonce;
+      if (expanded) loadFiles();
+    }
+  }, [row.finishNonce, expanded, loadFiles]);
 
   const pending = !row.terminal && (row.state === 'queued' || row.state === 'announced');
   const stalled = row.kind === 'outbound' && pending && row.attempts > 0;
