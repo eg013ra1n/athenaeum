@@ -442,7 +442,15 @@ pub async fn list_target_options(config: &Config) -> TargetOptions {
 /// The targets are resolved FIRST and a total failure bails immediately, before
 /// the relay map is resolved — there is no point spending a second hub round trip
 /// on relays when there is nothing to sync to yet.
-pub async fn resolve_targets(config: &Config) -> Result<ResolvedTargets> {
+///
+/// `config_path` is the on-disk `perseus.toml` this config was loaded from, passed
+/// so a renamed send target can self-heal: when a configured target string no
+/// longer matches any device id/name but its cached peer key still pins it to a
+/// (renamed) device, the config entry is rewritten to the device's permanent id
+/// (best-effort, via [`crate::config_edit::apply_targets_edit`]). `None` (the
+/// retry addr refresher, tests) skips only the file rewrite — the session still
+/// resolves and the offline cache still heals.
+pub async fn resolve_targets(config: &Config, config_path: Option<&Path>) -> Result<ResolvedTargets> {
     let mut cache = PairingCache::load(&config.data_dir);
 
     // Signed in? (an [account] table AND a stored device token.)
@@ -464,7 +472,7 @@ pub async fn resolve_targets(config: &Config) -> Result<ResolvedTargets> {
     // relay map is fetched with — `None` on the ticket path (an account-less
     // ticket run is dev/test).
     let (targets, relay_account) = if let Some((account, token)) = &account_token {
-        let peers = resolve_all_target_peers(config, account, token, &mut cache).await?;
+        let peers = resolve_all_target_peers(config, account, token, &mut cache, config_path).await?;
         let targets = peers
             .into_iter()
             .map(|(peer, endpoint_addr)| ResolvedTarget { peer, ticket: None, endpoint_addr })
@@ -580,6 +588,18 @@ fn allow_default_relays(signed_in: bool, dev_flag: bool) -> bool {
 /// pubkey cannot be decoded is **skipped with a `warn!`** — it never aborts the
 /// whole set. Only a resolution that yields ZERO peers is a hard error.
 ///
+/// **Rename self-heal.** Names on the hub are display-only: the owner renaming
+/// the receiving device must NEVER break sending. So a target that matches
+/// neither id nor name gets one more chance — its **cached peer key** (the node
+/// id from the last successful resolution, [`PairingCache::target_peers`]) is
+/// looked up against the fresh device list; if a device's node id equals that
+/// key, the device was simply renamed. It resolves normally, the config entry is
+/// rewritten to the device's **permanent id** (best-effort, via
+/// [`crate::config_edit::apply_targets_edit`] — a rewrite failure only means the
+/// next start re-heals from cache), and the offline cache is keyed by the id so
+/// subsequent resolutions are direct. Only when BOTH the list-match and the
+/// cache-heal miss is the target warn-skipped.
+///
 /// When the hub is unreachable, each target falls back to its last cached peer
 /// (`target_peers`); with no cached peer for any target this is an actionable
 /// error rather than a silent no-peer start. On a live resolution the cache's
@@ -589,6 +609,7 @@ async fn resolve_all_target_peers(
     account: &AccountConfig,
     token: &str,
     cache: &mut PairingCache,
+    config_path: Option<&Path>,
 ) -> Result<Vec<(NodeId, Option<EndpointAddrReport>)>> {
     let target_strings: Vec<String> = config
         .targets
@@ -607,18 +628,51 @@ async fn resolve_all_target_peers(
             let mut peers = Vec::new();
             let mut resolved_target_peers = HashMap::new();
             let mut resolved_target_addrs = HashMap::new();
+            // Targets healed from a hub rename: (stale config string → device id).
+            // The config file is rewritten once, after the loop.
+            let mut renamed: Vec<(String, String)> = Vec::new();
             for target in &target_strings {
                 // Match by id first, then by name (either spelling is valid).
-                let Some(device) = devices
+                let matched = devices
                     .iter()
                     .find(|d| &d.id == target)
-                    .or_else(|| devices.iter().find(|d| &d.name == target))
-                else {
-                    tracing::warn!(
-                        target = %target,
-                        "send target not found in the account device list; skipping"
-                    );
-                    continue;
+                    .or_else(|| devices.iter().find(|d| &d.name == target));
+                // Rename self-heal: a target matching neither id nor name may be a
+                // device the owner RENAMED — its cached peer key still pins it.
+                // `heal_id` is `Some(device id)` when this target was healed (used
+                // to key the offline cache under the permanent id + to rewrite the
+                // config entry). Names are display-only; a rename never drops a target.
+                let (device, heal_id) = match matched {
+                    Some(d) => (d, None),
+                    None => {
+                        let cached_hex = cache.target_peers.get(target).cloned();
+                        let healed = cached_hex.and_then(|hex| {
+                            devices.iter().find(|d| {
+                                pairing::node_id_from_pubkey_b64(&d.pubkey)
+                                    .map(|id| node_id_hex(&id) == hex)
+                                    .unwrap_or(false)
+                            })
+                        });
+                        match healed {
+                            Some(d) => {
+                                tracing::info!(
+                                    old_target = %target,
+                                    new_name = %d.name,
+                                    device_id = %d.id,
+                                    "send target was renamed; healing config entry"
+                                );
+                                renamed.push((target.clone(), d.id.clone()));
+                                (d, Some(d.id.clone()))
+                            }
+                            None => {
+                                tracing::warn!(
+                                    target = %target,
+                                    "send target not found in the account device list; skipping"
+                                );
+                                continue;
+                            }
+                        }
+                    }
                 };
                 if device.capability == DeviceCapability::Perseus {
                     tracing::warn!(
@@ -629,11 +683,24 @@ async fn resolve_all_target_peers(
                 }
                 match pairing::node_id_from_pubkey_b64(&device.pubkey) {
                     Ok(peer) => {
-                        resolved_target_peers.insert(target.clone(), node_id_hex(&peer));
+                        let hex = node_id_hex(&peer);
+                        resolved_target_peers.insert(target.clone(), hex.clone());
                         // Cache the target's reported endpoint address for the
                         // offline dial hint (T7); absent = no entry (falls back).
                         if let Some(addr) = &device.endpoint_addr {
                             resolved_target_addrs.insert(target.clone(), addr.clone());
+                        }
+                        // On a healed rename, ALSO key the offline cache by the
+                        // device's permanent id (the value the config is rewritten
+                        // to) so the next start resolves directly. The old-string
+                        // key above stays too, so a same-process re-resolution
+                        // against the still-old in-memory config (the retry addr
+                        // refresher) heals quietly from cache, not a misleading warn.
+                        if let Some(id) = &heal_id {
+                            resolved_target_peers.insert(id.clone(), hex);
+                            if let Some(addr) = &device.endpoint_addr {
+                                resolved_target_addrs.insert(id.clone(), addr.clone());
+                            }
                         }
                         peers.push((peer, device.endpoint_addr.clone()));
                         tracing::info!(target = %target, "resolved send target from account device list");
@@ -654,6 +721,36 @@ async fn resolve_all_target_peers(
                      device names/ids in `targets` (each must be a full Athenaeum device \
                      in your account, not a Perseus capture agent)"
                 );
+            }
+            // Persist the healed rename(s) to the config file once — replace each
+            // stale target string with the device's permanent id, reusing the
+            // comment-preserving atomic rewrite the web editors use. Best-effort:
+            // the session already resolved above, so a rewrite failure must NEVER
+            // fail the start (it only means the next start re-heals from cache).
+            if !renamed.is_empty() {
+                if let Some(path) = config_path {
+                    let new_targets: Vec<String> = config
+                        .targets
+                        .iter()
+                        .map(|t| {
+                            renamed
+                                .iter()
+                                .find(|(old, _)| old.as_str() == t.trim())
+                                .map(|(_, id)| id.clone())
+                                .unwrap_or_else(|| t.clone())
+                        })
+                        .collect();
+                    match crate::config_edit::apply_targets_edit(path, &new_targets) {
+                        Ok(_) => tracing::info!(
+                            count = renamed.len(),
+                            "rewrote renamed send targets to device ids in the config"
+                        ),
+                        Err(error) => tracing::warn!(
+                            error = %format!("{error:#}"),
+                            "could not persist healed send targets; resolving this session from cache"
+                        ),
+                    }
+                }
             }
             Ok(peers)
         }
@@ -1152,7 +1249,7 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let resolved = resolve_targets(&config).await.expect("resolution succeeds");
+        let resolved = resolve_targets(&config, None).await.expect("resolution succeeds");
         assert_eq!(resolved.targets.len(), 1, "one configured target resolves to one peer");
         assert_eq!(resolved.targets[0].peer, target_node, "peer decodes from the target's pubkey");
         assert!(resolved.targets[0].ticket.is_none(), "account path resolves by node id, not a ticket");
@@ -1206,7 +1303,7 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let resolved = resolve_targets(&config).await.expect("resolution succeeds");
+        let resolved = resolve_targets(&config, None).await.expect("resolution succeeds");
         let rep = resolved.targets[0]
             .endpoint_addr
             .as_ref()
@@ -1251,7 +1348,7 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let resolved = resolve_targets(&config).await.expect("both targets resolve");
+        let resolved = resolve_targets(&config, None).await.expect("both targets resolve");
         assert_eq!(resolved.targets.len(), 2, "both configured targets resolve");
         assert_eq!(resolved.targets[0].peer, key_a.node_id(), "first target order preserved");
         assert_eq!(resolved.targets[1].peer, key_b.node_id(), "second target order preserved");
@@ -1297,7 +1394,7 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let resolved = resolve_targets(&config).await.expect("the good target still resolves");
+        let resolved = resolve_targets(&config, None).await.expect("the good target still resolves");
         assert_eq!(resolved.targets.len(), 1, "only the good target resolves; the rest are skipped");
         assert_eq!(resolved.targets[0].peer, good.node_id());
     }
@@ -1331,7 +1428,7 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let resolved = resolve_targets(&config).await.expect("resolution by id succeeds");
+        let resolved = resolve_targets(&config, None).await.expect("resolution by id succeeds");
         assert_eq!(resolved.targets.len(), 1);
         assert_eq!(resolved.targets[0].peer, target_node, "matched the target by its device id");
     }
@@ -1358,7 +1455,7 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let err = resolve_targets(&config)
+        let err = resolve_targets(&config, None)
             .await
             .expect_err("a lone perseus target leaves zero resolved");
         assert!(
@@ -1387,7 +1484,7 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let err = resolve_targets(&config)
+        let err = resolve_targets(&config, None)
             .await
             .expect_err("a lone unknown target leaves zero resolved");
         assert!(
@@ -1418,7 +1515,7 @@ mod tests {
         cache.relay_urls = vec!["https://relay-cached.example.org".into()];
         cache.save(tmp.path());
 
-        let resolved = resolve_targets(&config).await.expect("offline resolution uses cache");
+        let resolved = resolve_targets(&config, None).await.expect("offline resolution uses cache");
         assert_eq!(resolved.targets.len(), 1);
         assert_eq!(resolved.targets[0].peer, cached_node, "an unreachable hub falls back to the cached peer");
         assert!(
@@ -1454,7 +1551,7 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let err = resolve_targets(&config)
+        let err = resolve_targets(&config, None)
             .await
             .expect_err("an empty hub relay map with no cache and no opt-in must be refused");
         assert!(
@@ -1496,7 +1593,7 @@ mod tests {
             .store("tok-signed-in")
             .unwrap();
 
-        let err = resolve_targets(&config)
+        let err = resolve_targets(&config, None)
             .await
             .expect_err("a signed-in agent must refuse the default-relay fallback even with the flag on");
         assert!(
@@ -1528,12 +1625,192 @@ mod tests {
         config.account = None;
         config.pairing_ticket = Some(info.pairing_ticket);
 
-        let resolved = resolve_targets(&config).await.expect("dev ticket resolves a peer");
+        let resolved = resolve_targets(&config, None).await.expect("dev ticket resolves a peer");
         assert_eq!(resolved.targets.len(), 1, "the dev ticket is a single target");
         assert_eq!(resolved.targets[0].peer, ticket_node, "peer comes from the pairing ticket");
         assert!(
             resolved.targets[0].ticket.is_some(),
             "the ticket is carried through for add_peer_ticket"
         );
+    }
+
+    /// Write a real, parse-valid `perseus.toml` at `dir/perseus.toml` with the
+    /// given hub url + one send `target`, so a rename heal can rewrite it in place
+    /// (`apply_targets_edit` reads + re-validates the file). `dir` is the capture +
+    /// data dir so the existence check passes.
+    fn write_rename_config(dir: &Path, hub_url: &str, target: &str) -> PathBuf {
+        let p = dir.join("perseus.toml");
+        let text = format!(
+            "capture_dir = \"{d}\"\ndata_dir = \"{d}\"\nmode = \"auto\"\ntargets = [\"{t}\"]\n[account]\nhub_url = \"{h}\"\nemail = \"me@example.com\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            d = dir.display(),
+            t = target,
+            h = hub_url,
+        );
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    /// The fix (owner rule: a rename must never break sending). The config target
+    /// is the OLD device name; the hub now lists that device under a NEW name (its
+    /// id is stable). The cached peer key from the last successful resolution pins
+    /// the old string to the still-present device, so resolution heals: the peer
+    /// resolves AND the config entry is rewritten to the device's permanent id.
+    #[tokio::test]
+    async fn resolve_targets_heals_renamed_target_to_device_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        // A real device key: its pubkey decodes to the node id the cache pins.
+        let target_key = DeviceKey::load_or_create_in(&tmp.path().join("target")).unwrap();
+        let target_node = target_key.node_id();
+
+        let server = MockServer::start().await;
+        // The hub lists the device under its NEW name; the config still says "Old
+        // Studio". The device id ("studio-1") is what the config must heal to.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                device_json("studio-1", "New Studio", &target_key.pubkey_base64(), "athenaeum")
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/relay-map"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "relays": ["https://relay1.example.org"]
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg_path = write_rename_config(tmp.path(), &server.uri(), "Old Studio");
+        let config = Config::load_lenient(&cfg_path).unwrap();
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+
+        // Seed the last-successful resolution: "Old Studio" resolved to this peer.
+        let mut cache = PairingCache::default();
+        cache
+            .target_peers
+            .insert("Old Studio".to_string(), node_id_hex(&target_node));
+        cache.save(tmp.path());
+
+        let resolved = resolve_targets(&config, Some(&cfg_path))
+            .await
+            .expect("a renamed target heals rather than failing");
+        assert_eq!(resolved.targets.len(), 1, "the renamed target still resolves");
+        assert_eq!(
+            resolved.targets[0].peer, target_node,
+            "resolved to the renamed device by its cached peer key"
+        );
+
+        // The config file was rewritten to the device's permanent id.
+        let reloaded = Config::load_lenient(&cfg_path).unwrap();
+        assert_eq!(
+            reloaded.targets,
+            vec!["studio-1".to_string()],
+            "the stale name was healed to the device id in the config: {:?}",
+            reloaded.targets
+        );
+
+        // The offline cache is keyed by the new id (subsequent starts are direct).
+        let cache = PairingCache::load(tmp.path());
+        assert_eq!(
+            cache.target_peers.get("studio-1").map(String::as_str),
+            Some(node_id_hex(&target_node).as_str()),
+            "offline cache keyed by the permanent id"
+        );
+    }
+
+    /// A stale cache entry alone must NOT cause a false heal: the cached peer key
+    /// points at a node that is no longer in the account device list, so the
+    /// target is a genuine miss (warn-skip → zero resolved → error), and the
+    /// config file is left untouched (no false rewrite).
+    #[tokio::test]
+    async fn resolve_targets_stale_cache_miss_does_not_heal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let present_key = DeviceKey::load_or_create_in(&tmp.path().join("present")).unwrap();
+
+        let server = MockServer::start().await;
+        // The list has a DIFFERENT device; the cached hex matches none of it.
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                device_json("other-1", "Other", &present_key.pubkey_base64(), "athenaeum")
+            ])))
+            .mount(&server)
+            .await;
+
+        let cfg_path = write_rename_config(tmp.path(), &server.uri(), "Ghost");
+        let config = Config::load_lenient(&cfg_path).unwrap();
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+
+        // A cache entry for "Ghost" exists, but its peer is not in the device list.
+        let mut cache = PairingCache::default();
+        cache
+            .target_peers
+            .insert("Ghost".to_string(), node_id_hex(&[7u8; 32]));
+        cache.save(tmp.path());
+
+        let err = resolve_targets(&config, Some(&cfg_path))
+            .await
+            .expect_err("a stale cache entry must not resolve a departed device");
+        assert!(
+            format!("{err:#}").contains("could be resolved"),
+            "error should say none of the targets resolved: {err:#}"
+        );
+        // No false rewrite: the config file still names "Ghost".
+        let reloaded = Config::load_lenient(&cfg_path).unwrap();
+        assert_eq!(reloaded.targets, vec!["Ghost".to_string()], "config untouched on a true miss");
+    }
+
+    /// Best-effort persistence: when the config rewrite fails (here the config
+    /// path does not exist on disk), the rename still heals the SESSION from the
+    /// cache match — sending must work regardless of whether the file could be
+    /// rewritten.
+    #[tokio::test]
+    async fn resolve_targets_rename_heals_session_even_when_rewrite_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let target_key = DeviceKey::load_or_create_in(&tmp.path().join("target")).unwrap();
+        let target_node = target_key.node_id();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/devices"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                device_json("studio-1", "New Studio", &target_key.pubkey_base64(), "athenaeum")
+            ])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/relay-map"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "relays": ["https://relay1.example.org"]
+            })))
+            .mount(&server)
+            .await;
+
+        // In-memory config only (no file written); the rewrite target is a path
+        // that does not exist, so `apply_targets_edit` fails on read — the seam.
+        let config = account_config(tmp.path(), &server.uri(), &["Old Studio"]);
+        token_store(&config, config.account.as_ref().unwrap())
+            .store("tok-signed-in")
+            .unwrap();
+        let mut cache = PairingCache::default();
+        cache
+            .target_peers
+            .insert("Old Studio".to_string(), node_id_hex(&target_node));
+        cache.save(tmp.path());
+
+        let missing_path = tmp.path().join("does-not-exist.toml");
+        let resolved = resolve_targets(&config, Some(&missing_path))
+            .await
+            .expect("a failed config rewrite must not fail the session resolve");
+        assert_eq!(resolved.targets.len(), 1, "the session still resolves from the cache heal");
+        assert_eq!(resolved.targets[0].peer, target_node);
+        assert!(!missing_path.exists(), "a failed rewrite creates no file");
     }
 }

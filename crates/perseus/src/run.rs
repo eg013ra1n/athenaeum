@@ -106,7 +106,11 @@ fn build_target_addr_refresher(config: Config) -> AddrRefresher {
     Arc::new(move |peer: NodeId| {
         let config = Arc::clone(&config);
         Box::pin(async move {
-            match crate::account::resolve_targets(&config).await {
+            // `None`: retry-time re-resolution never rewrites the config file — a
+            // rename was already healed (file + cache) at `Agent::start`, and this
+            // path holds only the spawn-time in-memory config, not its path. A
+            // still-renamed target resolves quietly from the cache heal.
+            match crate::account::resolve_targets(&config, None).await {
                 Ok(resolved) => {
                     let target = resolved.targets.iter().find(|t| t.peer == peer)?;
                     match athenaeum_core::sync::pairing::peer_dial_addr(
@@ -507,21 +511,24 @@ impl Agent {
     /// → error. `watch` arms the capture watcher (true for `run`, false for
     /// `enqueue-backlog`).
     ///
-    /// `_config_path` is the on-disk `perseus.toml` this config was loaded from.
-    /// It is retained in the signature for the supervisor's production launcher
-    /// ([`crate::supervisor::production_launcher`]); web-status-page ownership has
-    /// moved OFF the agent onto the supervisor, which attaches
+    /// `config_path` is the on-disk `perseus.toml` this config was loaded from. It
+    /// is retained in the signature for the supervisor's production launcher
+    /// ([`crate::supervisor::production_launcher`]) and passed to
+    /// [`resolve_targets`](crate::account::resolve_targets) so a renamed send
+    /// target self-heals its config entry to the device id. Web-status-page
+    /// ownership has moved OFF the agent onto the supervisor, which attaches
     /// [`WebState`](crate::web::WebState) to the running engine through its
-    /// `on_agent` seam (Task 4 restores that wiring on this branch). Until then
-    /// `start` no longer binds the status page itself.
-    pub async fn start(config: Config, _config_path: PathBuf, watch: bool) -> Result<Self> {
+    /// `on_agent` seam (Task 4 restores that wiring on this branch). `start` no
+    /// longer binds the status page itself.
+    pub async fn start(config: Config, config_path: PathBuf, watch: bool) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir)
             .with_context(|| format!("create data dir {}", config.data_dir.display()))?;
 
         // Resolve EVERY send target + the shared relay map before binding the
         // node: account resolution when signed in (offline per-target cache
-        // fallback), else the dev ticket (a single target).
-        let resolved = crate::account::resolve_targets(&config).await?;
+        // fallback), else the dev ticket (a single target). Pass the config path
+        // so a renamed target rewrites its entry to the device id in place.
+        let resolved = crate::account::resolve_targets(&config, Some(&config_path)).await?;
 
         // ONE shared iroh node per agent (iroh hardening Task 4). A single
         // endpoint + blob store bound from this install's device key at
