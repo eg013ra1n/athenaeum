@@ -24,6 +24,9 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod wire_golden_tests;
+
 pub use types::{
     FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, StartInfo,
     TransportEvent,

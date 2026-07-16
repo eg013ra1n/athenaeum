@@ -89,7 +89,14 @@ pub enum Msg {
         package_id: PackageId,
         entries: Vec<FullHashEntry>,
     },
-    // Slice-4 collab exchange — appended; postcard indices of the variants above are frozen.
+    // Slice-4 collab exchange — appended; postcard indices of the variants above
+    // are frozen. Postcard encodes each variant by its DECLARATION INDEX (a
+    // leading varint), so new variants may ONLY be appended at the END and no
+    // existing variant/field may be reordered, retyped, or removed. Any such
+    // BREAKING change is a wire-version bump: bump the `SYNC_ALPN` suffix
+    // (`iroh/mod.rs`) so mismatched peers fail the handshake loudly instead of
+    // silently mis-decoding, and update `sharing::wire_golden_tests` (the guard
+    // that fails the build the moment these bytes drift — never silently re-pin).
     /// Provider advertises a PROJECT package (collab exchange, slice 4).
     /// `package_id` is the HUB package uuid (row key); `announce.package_id`
     /// stays the engine-minted wire id (ack correlation).

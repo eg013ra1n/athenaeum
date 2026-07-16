@@ -74,6 +74,19 @@ use proto::{Msg, OfferEntry};
 
 /// Custom ALPN for the announce/ack control channel. Distinct from
 /// [`iroh_blobs::ALPN`] so the two protocols coexist on one endpoint.
+///
+/// **Load-bearing version signal (TECH-1).** The trailing `/1` is the wire
+/// protocol version. The control wire is postcard with POSITIONAL encoding
+/// (`proto::Msg` variants keyed by declaration index, struct fields by order —
+/// no field names), so any BREAKING change — reordering/removing a `Msg` variant,
+/// changing a field's type/order, renumbering `ReceiptOutcome` — makes old peers
+/// silently decode new bytes into the wrong shape with no error, surfacing only
+/// as an undiagnosable stalled transfer. The golden-byte guard
+/// (`sharing::wire_golden_tests`) fails the build on exactly that drift; when it
+/// does, BUMP THIS SUFFIX (`athenaeum/sync/1` → `.../2`) so mismatched peers fail
+/// the ALPN handshake LOUDLY at connect time instead of decode-dying, and add a
+/// new golden set. Additive-only changes (appending a new `Msg` variant at the
+/// END, as `ProjectAnnounce`/`ProjectRequest` were) do not require a bump.
 pub const SYNC_ALPN: &[u8] = b"athenaeum/sync/1";
 
 /// Deterministic blob-store tag for a package collection. `release` deletes by
