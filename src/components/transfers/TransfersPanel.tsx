@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { X, Search, ArrowUp, ArrowDown, Inbox, Users } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { X, Search, ArrowUp, ArrowDown, ArrowUpRight, Inbox, Users } from 'lucide-react';
 import { api } from '../../api';
 import { useTransfers } from '../../contexts/TransfersContext';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
   Direction,
   HistoryRow,
+  InboundState,
+  InboundSummary,
   OutboundState,
   OutboundSummary,
   ProjectCard,
@@ -29,6 +32,20 @@ function stateTone(state: OutboundState): string {
     case 'delivered':
       return 'text-accent';
     default: // queued / announced
+      return 'text-content-muted';
+  }
+}
+
+/** Tone class for an in-flight inbound package state. */
+function inboundStateTone(state: InboundState): string {
+  switch (state) {
+    case 'ingesting':
+      return 'text-success';
+    case 'failed':
+      return 'text-error';
+    case 'fetching':
+      return 'text-accent';
+    default: // announced
       return 'text-content-muted';
   }
 }
@@ -89,6 +106,8 @@ function isDelivered(r: HistoryRow): boolean {
  */
 export function TransfersPanel() {
   const { open, closePanel, status, active, refresh } = useTransfers();
+  const navigate = useNavigate();
+  const incoming = status?.receiver.active ?? [];
   const [tab, setTab] = useState<Tab>('active');
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [deviceNames, setDeviceNames] = useState<Record<string, string>>({});
@@ -239,7 +258,19 @@ export function TransfersPanel() {
         }`}
       >
         <div className="flex items-center justify-between border-b border-border px-4 py-3">
-          <h2 className="text-sm font-semibold">Transfers</h2>
+          <div className="flex items-center gap-3">
+            <h2 className="text-sm font-semibold">Transfers</h2>
+            <button
+              type="button"
+              onClick={() => {
+                closePanel();
+                navigate('/transfers');
+              }}
+              className="flex items-center gap-0.5 text-xs text-content-muted transition-colors hover:text-accent"
+            >
+              Open full screen <ArrowUpRight size={12} />
+            </button>
+          </div>
           <button
             ref={closeBtnRef}
             type="button"
@@ -265,25 +296,28 @@ export function TransfersPanel() {
         )}
 
         <div className="flex border-b border-border">
-          {(['active', 'history'] as const).map((t) => (
-            <button
-              key={t}
-              type="button"
-              onClick={() => setTab(t)}
-              className={`flex-1 px-4 py-2 text-xs font-medium capitalize transition-colors ${
-                tab === t
-                  ? 'border-b-2 border-accent text-content'
-                  : 'text-content-muted hover:text-content'
-              }`}
-            >
-              {t === 'active' ? `Active${active.length ? ` (${active.length})` : ''}` : 'History'}
-            </button>
-          ))}
+          {(['active', 'history'] as const).map((t) => {
+            const activeCount = active.length + incoming.length;
+            return (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setTab(t)}
+                className={`flex-1 px-4 py-2 text-xs font-medium capitalize transition-colors ${
+                  tab === t
+                    ? 'border-b-2 border-accent text-content'
+                    : 'text-content-muted hover:text-content'
+                }`}
+              >
+                {t === 'active' ? `Active${activeCount ? ` (${activeCount})` : ''}` : 'History'}
+              </button>
+            );
+          })}
         </div>
 
         <div className="flex-1 overflow-y-auto">
           {tab === 'active' ? (
-            <ActiveTab active={active} />
+            <ActiveTab active={active} incoming={incoming} />
           ) : (
             <HistoryTab
               rows={filteredHistory}
@@ -302,8 +336,8 @@ export function TransfersPanel() {
   );
 }
 
-function ActiveTab({ active }: { active: OutboundSummary[] }) {
-  if (active.length === 0) {
+function ActiveTab({ active, incoming }: { active: OutboundSummary[]; incoming: InboundSummary[] }) {
+  if (active.length === 0 && incoming.length === 0) {
     return (
       <p className="px-4 py-10 text-center text-sm text-content-muted">No active transfers</p>
     );
@@ -311,17 +345,34 @@ function ActiveTab({ active }: { active: OutboundSummary[] }) {
   return (
     <ul className="divide-y divide-border">
       {active.map((row) => (
-        <li key={row.id} className="flex items-center justify-between gap-2 px-4 py-3">
+        <li key={`out-${row.id}`} className="flex items-center justify-between gap-2 px-4 py-3">
           <div className="min-w-0">
             <p className="truncate font-mono text-xs text-content-secondary" title={row.packageShort}>
               {row.packageShort}
             </p>
             <p className="mt-0.5 text-[10px] text-content-muted" title={`to ${row.peerShort}`}>
-              → {row.peerShort}
+              <ArrowUp size={9} className="mr-0.5 inline text-accent" />
+              {row.peerShort}
               {row.attempts > 0 ? ` · attempt ${row.attempts + 1}` : ''}
             </p>
           </div>
           <span className={`shrink-0 text-xs font-medium ${stateTone(row.state)}`}>{row.state}</span>
+        </li>
+      ))}
+      {/* Incoming summary mini rows — no expansion, no per-file detail; the
+          full unified view with actions lives on the /transfers page. */}
+      {incoming.map((row) => (
+        <li key={`in-${row.id}`} className="flex items-center justify-between gap-2 px-4 py-3">
+          <div className="min-w-0">
+            <p className="truncate font-mono text-xs text-content-secondary" title={row.packageShort}>
+              {row.packageShort}
+            </p>
+            <p className="mt-0.5 text-[10px] text-content-muted" title={`from ${row.peerShort}`}>
+              <ArrowDown size={9} className="mr-0.5 inline text-success" />
+              {row.peerShort} · {row.frameCount} frame{row.frameCount === 1 ? '' : 's'}
+            </p>
+          </div>
+          <span className={`shrink-0 text-xs font-medium ${inboundStateTone(row.state)}`}>{row.state}</span>
         </li>
       ))}
     </ul>

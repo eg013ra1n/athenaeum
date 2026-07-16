@@ -17,6 +17,7 @@ import SkyChart from './pages/SkyChart';
 import Settings from './pages/Settings';
 import About from './pages/About';
 import ExcludedFrames from './pages/ExcludedFrames';
+import Transfers from './pages/Transfers';
 
 function App() {
   if (!isTauri) {
@@ -80,6 +81,7 @@ function AppContent() {
           <Route path="projects" element={<Projects />} />
           <Route path="projects/:id" element={<ProjectDetail />} />
           <Route path="excluded" element={<ExcludedFrames />} />
+          <Route path="transfers" element={<Transfers />} />
           <Route path="skychart" element={<SkyChart />} />
           <Route path="equipment" element={<Equipment />} />
           <Route path="blackhole" element={<BlackHole />} />
