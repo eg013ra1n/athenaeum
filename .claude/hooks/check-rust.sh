@@ -15,6 +15,11 @@ rm -f "$FLAG"
 
 cd "$CLAUDE_PROJECT_DIR" || exit 0
 
+# Isolated build dir (2026-07-16): agent-session cargo must never share the
+# user's ./target — concurrent writers poisoned rustc incremental caches twice
+# (linker "symbol not found" on the user's interactive tauri dev build).
+export CARGO_TARGET_DIR="$CLAUDE_PROJECT_DIR/target-agent"
+
 OUTPUT=$(cargo check --workspace --message-format=short 2>&1)
 if [ $? -eq 0 ]; then
   exit 0          # clean compile -> silent
