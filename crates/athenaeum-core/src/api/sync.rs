@@ -30,11 +30,14 @@ use crate::settings::{defaults, keys};
 use crate::sharing::iroh::node::{RelayResolver, Role, SharedIrohNode};
 use crate::sharing::types::NodeId;
 use crate::sharing::SharingTransport;
-use crate::sync::store::search_history_rows;
+use crate::sync::store::{
+    get_inbound_by_row_id, inbound_active, outbound_row_by_id, search_history_rows,
+};
 use crate::sync::{
-    node_id_hex, pairing, CatalogSyncStore, Direction, HistoryQuery, HistoryRow, OutboundRow,
-    OutboundState, OutboundSummary, RefusalRefresher, StartedSender, SyncEngine, SyncEngineHandle,
-    SyncReceiverStatus, SyncRuntime, SyncSenderRuntime, SyncSenderStatus, SyncStatus, SyncStore,
+    node_id_hex, pairing, CatalogSyncStore, Direction, HistoryQuery, HistoryRow, InboundSummary,
+    OutboundRow, OutboundState, OutboundSummary, RefusalRefresher, StartedSender, SyncEngine,
+    SyncEngineHandle, SyncReceiverStatus, SyncRuntime, SyncSenderRuntime, SyncSenderStatus,
+    SyncStatus, SyncStore, TransferFileEntry,
 };
 
 /// Request filter for [`list_history`] (mirrors [`HistoryQuery`] over the
@@ -863,13 +866,32 @@ fn received_total(ctx: &ServiceContext) -> Result<u32, ApiError> {
 /// packages, from which `queued`/`transferring` are then counted (never
 /// N-inflated). A [`std::collections::BTreeMap`] gives both first-occurrence
 /// (`or_insert`) and the stable ascending-by-id ordering the Active tab expects.
-fn dedup_active(rows: Vec<OutboundSummary>) -> Vec<OutboundSummary> {
-    let mut by_id: std::collections::BTreeMap<i64, OutboundSummary> =
-        std::collections::BTreeMap::new();
+/// Deduping the raw rows (not the summaries) means the one-manifest-read-per-row
+/// [`package_totals`] cost is paid once per DISTINCT package, not once per engine.
+fn dedup_active_rows(rows: Vec<OutboundRow>) -> Vec<OutboundRow> {
+    let mut by_id: std::collections::BTreeMap<i64, OutboundRow> = std::collections::BTreeMap::new();
     for row in rows {
         by_id.entry(row.id).or_insert(row);
     }
     by_id.into_values().collect()
+}
+
+/// `(file_count, total_bytes)` from a package dir's manifest (Task 14). One
+/// manifest read per call — cheap enough for the handful of in-flight rows a
+/// 5–10s status poll rolls up. A missing/unreadable manifest (a half-built or
+/// since-vanished package dir) yields `(0, 0)` (logged at `debug`, never fatal):
+/// a status poll must never fail on one bad package.
+fn package_totals(dir: &Path) -> (u32, u64) {
+    match package::read_manifest(dir) {
+        Ok(records) => (
+            records.len() as u32,
+            records.iter().map(|r| r.byte_size).sum(),
+        ),
+        Err(e) => {
+            tracing::debug!(path = %dir.display(), error = %format!("{e:#}"), "package_totals: manifest unreadable");
+            (0, 0)
+        }
+    }
 }
 
 /// The send-side rollup: live in-flight counts + rows from the engine's
@@ -896,20 +918,26 @@ async fn build_sender_status(
 
     // Every engine's `non_terminal()` reads the same peer-unfiltered store, so
     // `active_rows` holds one copy per started engine — dedup by id before
-    // counting so `queued`/`transferring` reflect distinct packages, not N×.
-    let active = dedup_active(
-        active_rows
-            .iter()
-            .map(|row| OutboundSummary {
+    // counting/summarizing so `queued`/`transferring` reflect distinct packages,
+    // not N×, and each package's manifest is read exactly once.
+    let active: Vec<OutboundSummary> = dedup_active_rows(active_rows)
+        .into_iter()
+        .map(|row| {
+            let (file_count, byte_size) = package_totals(Path::new(&row.package_ref));
+            OutboundSummary {
                 id: row.id,
                 package_short: short_pkg(&row.package_ref),
                 state: row.state,
                 attempts: row.attempts,
-                created_at: row.created_at.clone(),
+                created_at: row.created_at,
                 peer_short: short_id(&node_id_hex(&row.peer)),
-            })
-            .collect(),
-    );
+                last_error: row.last_error,
+                next_retry_at: row.next_retry_at,
+                byte_size,
+                file_count,
+            }
+        })
+        .collect();
 
     let mut queued = 0u32;
     let mut transferring = 0u32;
@@ -941,6 +969,27 @@ async fn build_sender_status(
     })
 }
 
+/// The receive-side Active-tab rows: every non-terminal `sync_inbound` row (Task
+/// 14), mapped to display summaries. Oldest-first (the store's ordering).
+fn active_inbound_summaries(ctx: &ServiceContext) -> Result<Vec<InboundSummary>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let rows = inbound_active(&conn).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|r| InboundSummary {
+            id: r.id,
+            package_short: short_id(&r.package_id),
+            peer_short: short_id(&r.peer),
+            state: r.state,
+            frame_count: r.frame_count,
+            byte_size: r.byte_size,
+            bytes_done: r.bytes_done,
+            created_at: r.created_at,
+        })
+        .collect())
+}
+
 /// Enriched snapshot for the Transfers UI (task M3): pairing summary + send-side
 /// rollup + receive-side rollup, all resolved without any network I/O so a
 /// 10-second UI poll never hits the hub.
@@ -954,6 +1003,7 @@ pub async fn get_status(
     let transport_started = sync.is_started().await;
     let pairing_ticket = sync.ticket().await;
     let sender_status = build_sender_status(ctx, sender).await?;
+    let active_inbound = active_inbound_summaries(ctx)?;
 
     Ok(SyncStatus {
         dev_pairing_enabled,
@@ -961,7 +1011,11 @@ pub async fn get_status(
         pairing_ticket,
         received_total,
         sender: sender_status,
-        receiver: SyncReceiverStatus { active: transport_started, received_total },
+        receiver: SyncReceiverStatus {
+            started: transport_started,
+            active: active_inbound,
+            received_total,
+        },
     })
 }
 
@@ -974,11 +1028,165 @@ pub fn list_history(ctx: &ServiceContext, query: SyncHistoryQuery) -> Result<Vec
         direction: query.direction,
         peer: query.peer,
         project: query.project,
+        // The history log is not scoped by batch; per-batch detail is
+        // `list_transfer_files`.
+        package_id: None,
         limit,
     };
     let db = db(ctx)?;
     let conn = db.conn();
     search_history_rows(&conn, &q).map_err(|e| ApiError::Internal(format!("{e:#}")))
+}
+
+/// A generous cap for a single package's per-frame history read — a package holds
+/// at most a few thousand frames (each with ≤2 sent rows or ≥1 received row), and
+/// the per-batch detail read is a rare user click-through, not the hot poll.
+const DETAIL_HISTORY_LIMIT: u32 = 100_000;
+
+/// Basename of a forward-slash manifest `rel_path` (the Transfers UI shows the
+/// file, not its in-package sub-path).
+fn detail_filename(rel_path: &str) -> String {
+    rel_path.rsplit('/').next().unwrap_or(rel_path).to_string()
+}
+
+/// The stable per-package batch key recovered from an outbound row's
+/// `package_ref`: the dir basename the sender-side history writers
+/// ([`crate::sync`]) stamp into `sync_history.package_id`.
+fn outbound_package_key(package_ref: &str) -> String {
+    Path::new(package_ref)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(package_ref)
+        .to_string()
+}
+
+/// Per-file detail for one transfer batch (Task 14) — the Transfers UI's
+/// expand-a-row view. `direction` selects the outbound (`Sent`) or inbound
+/// (`Received`) half; `id` is the durable row id in that half
+/// (`sync_outbound.id` / `sync_inbound.id`, from the corresponding summary).
+///
+/// **Sent:** the package's manifest (read from the outbound row's `package_ref`)
+/// is the authoritative file list — name + bytes per frame. Per-frame outcomes
+/// come from THIS sender's own confirmed/terminal history rows for the package,
+/// joined by the stable package-dir-basename batch key: a frame shows
+/// `ingested`/`duplicate`/`rejected`/… once the peer's ack lands, and `None`
+/// while the send is still in flight. (Receipts live only on the *receiver*, so a
+/// real two-machine sender's own history — not a `sync_receipts` read that would
+/// be empty there — is the durable per-frame verdict.)
+///
+/// **Received:** when the inbound row is terminal, entries come from this node's
+/// received-history rows for the package (`WHERE package_id = <wire id>`); while
+/// the fetch is still active, the staged manifest backfills names/sizes if it has
+/// landed, else an empty list (the live per-file bars are event-driven via
+/// `sync-file-progress`).
+pub fn list_transfer_files(
+    ctx: &ServiceContext,
+    direction: Direction,
+    id: i64,
+) -> Result<Vec<TransferFileEntry>, ApiError> {
+    match direction {
+        Direction::Sent => sent_transfer_files(ctx, id),
+        Direction::Received => received_transfer_files(ctx, id),
+    }
+}
+
+/// The [`Direction::Sent`] half of [`list_transfer_files`].
+fn sent_transfer_files(ctx: &ServiceContext, id: i64) -> Result<Vec<TransferFileEntry>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let row = outbound_row_by_id(&conn, id)
+        .map_err(|e| ApiError::Internal(format!("{e:#}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("outbound package {id} not found")))?;
+
+    let dir = PathBuf::from(&row.package_ref);
+    let records = package::read_manifest(&dir)
+        .map_err(|e| ApiError::Internal(format!("read manifest {}: {e:#}", dir.display())))?;
+
+    // This package's settled per-frame verdicts: the sender's confirmed/terminal
+    // rows carry `finished_at`; the started (`sent`) rows do not. Newest-first, so
+    // the first row seen per frame_uuid wins (a redelivery's latest verdict).
+    let settled = search_history_rows(
+        &conn,
+        &HistoryQuery {
+            direction: Some(Direction::Sent),
+            package_id: Some(outbound_package_key(&row.package_ref)),
+            limit: DETAIL_HISTORY_LIMIT,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    let mut outcome_by_frame: HashMap<String, String> = HashMap::new();
+    for h in settled.into_iter().filter(|h| h.finished_at.is_some()) {
+        outcome_by_frame.entry(h.frame_uuid).or_insert(h.outcome);
+    }
+
+    Ok(records
+        .iter()
+        .map(|r| TransferFileEntry {
+            name: detail_filename(&r.rel_path),
+            bytes_total: r.byte_size,
+            bytes_done: None,
+            outcome: outcome_by_frame.get(&r.frame_uuid).cloned(),
+        })
+        .collect())
+}
+
+/// The [`Direction::Received`] half of [`list_transfer_files`].
+fn received_transfer_files(
+    ctx: &ServiceContext,
+    id: i64,
+) -> Result<Vec<TransferFileEntry>, ApiError> {
+    let (sync_dir, _db_path) = sync_paths(ctx)?;
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let row = get_inbound_by_row_id(&conn, id)
+        .map_err(|e| ApiError::Internal(format!("{e:#}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("inbound package {id} not found")))?;
+
+    if row.state.is_terminal() {
+        // History is the durable record of what landed. Newest-first; keep the
+        // first row per frame_uuid (a redelivery's latest verdict).
+        let rows = search_history_rows(
+            &conn,
+            &HistoryQuery {
+                direction: Some(Direction::Received),
+                package_id: Some(row.package_id.clone()),
+                limit: DETAIL_HISTORY_LIMIT,
+                ..Default::default()
+            },
+        )
+        .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+        for h in rows {
+            if seen.insert(h.frame_uuid.clone()) {
+                out.push(TransferFileEntry {
+                    name: h.filename,
+                    bytes_total: h.bytes,
+                    bytes_done: Some(h.bytes),
+                    outcome: Some(h.outcome),
+                });
+            }
+        }
+        return Ok(out);
+    }
+
+    // Still active: backfill names/sizes from the staged manifest if the fetch has
+    // landed it (the receiver stages under `<sync_dir>/staging/<package_id>`), else
+    // an honest empty list — the live per-file bars come from `sync-file-progress`.
+    let staging = sync_dir.join("staging").join(&row.package_id);
+    match package::read_manifest(&staging) {
+        Ok(records) => Ok(records
+            .iter()
+            .map(|r| TransferFileEntry {
+                name: detail_filename(&r.rel_path),
+                bytes_total: r.byte_size,
+                bytes_done: None,
+                outcome: None,
+            })
+            .collect()),
+        Err(_) => Ok(Vec::new()),
+    }
 }
 
 /// Map of node-id-hex → hub device name, for enriching history rows (the rows
@@ -2254,6 +2462,7 @@ mod tests {
                 finished_at: None,
                 outcome: outcome.into(),
                 project: None,
+                package_id: None,
             };
             let ins = crate::sync::store::insert_history_row;
             ins(&conn, &mk("s1", Direction::Sent, "peerA", "sent")).unwrap();
@@ -2280,6 +2489,200 @@ mod tests {
         let combined = list_history(&ctx, q(Some(Direction::Sent), Some("peerB".into()))).unwrap();
         assert_eq!(combined.len(), 1);
         assert_eq!(combined[0].frame_uuid, "s2");
+    }
+
+    // ── Per-batch file detail (task 14) ──────────────────────────────────────
+
+    /// Task 14: after a real loopback confirm, `list_transfer_files(Sent, id)`
+    /// returns one entry per manifest frame with the peer's ack verdict —
+    /// `Some("ingested")` — recovered from the sender's OWN confirmed history via
+    /// the package-dir-basename batch key (no receiver-side `sync_receipts` read).
+    /// The manifest is the authoritative name/size source; sent entries carry no
+    /// `bytes_done`.
+    #[tokio::test]
+    async fn list_transfer_files_sent_reports_ingested_after_loopback_confirm() {
+        use crate::sharing::loopback::LoopbackNetwork;
+        use crate::sharing::types::{FrameReceipt, ReceiptOutcome, TransportEvent};
+        use crate::sharing::{noop_fetch_sink, SharingTransport};
+
+        let (tmp, ctx) = test_ctx();
+        let dir = tmp.path();
+        let f1 = insert_fixture_frame(&ctx, dir, "light-0001.fits", "M42", false);
+        let f2 = insert_fixture_frame(&ctx, dir, "light-0002.fits", "M42", false);
+
+        // The sender engine writes to the catalog sync store (== ctx's DB), so
+        // `list_transfer_files` reads the same rows it wrote.
+        let (_sync_dir, db_path) = sync_paths(&ctx).unwrap();
+        let pkg_root = tmp.path().join("packages");
+        let pkg_dir = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2])
+                .unwrap()
+                .pkg_dir
+                .expect("a package was written")
+        };
+
+        // Reactive loopback receiver: fetch every announce and ack each frame
+        // `Ingested`, driving the sender to Confirmed (+ its confirm history).
+        let net = LoopbackNetwork::new();
+        let receiver = Arc::new(net.endpoint());
+        let receiver_id = receiver.start().await.unwrap().node_id;
+        let recv_root = tmp.path().join("recv");
+        {
+            let receiver = receiver.clone();
+            tokio::spawn(async move {
+                let mut events = receiver.events().await;
+                let mut n = 0usize;
+                while let Some(event) = events.recv().await {
+                    let TransportEvent::AnnounceReceived { from, announce } = event else {
+                        continue;
+                    };
+                    n += 1;
+                    let dest = recv_root.join(format!("fetch-{n}"));
+                    if receiver.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
+                        if let Ok(records) = crate::package::read_manifest(&dest) {
+                            let receipts: Vec<FrameReceipt> = records
+                                .iter()
+                                .map(|r| FrameReceipt {
+                                    frame_uuid: r.frame_uuid.clone(),
+                                    xxh3: r.xxh3.clone(),
+                                    outcome: ReceiptOutcome::Ingested,
+                                })
+                                .collect();
+                            let _ = receiver.ack(from, &announce.package_id, receipts).await;
+                        }
+                    }
+                }
+            });
+        }
+
+        let store = Arc::new(CatalogSyncStore::open(&db_path).unwrap());
+        let engine = SyncEngine::spawn(
+            Arc::clone(&store) as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
+            receiver_id,
+        );
+        let id = engine.enqueue_package(&pkg_dir).await.unwrap();
+
+        // Poll until confirmed (bounded).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let confirmed = store.get_outbound(id).unwrap().map(|r| r.state)
+                == Some(OutboundState::Confirmed);
+            if confirmed {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "package never confirmed");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let files = list_transfer_files(&ctx, Direction::Sent, id).unwrap();
+        assert_eq!(files.len(), 2, "one entry per manifest frame");
+        assert!(
+            files.iter().all(|f| f.outcome.as_deref() == Some("ingested")),
+            "confirmed frames report the peer's ingested verdict: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.name == "light-0001.fits" && f.bytes_total > 0),
+            "the manifest supplies name + bytes: {files:?}"
+        );
+        assert!(files.iter().all(|f| f.bytes_done.is_none()), "sent entries carry no bytes_done");
+
+        engine.shutdown().await;
+    }
+
+    /// Task 14: an outbound package with NO confirm yet lists every manifest file
+    /// with `outcome = None` (in flight), never an error — the manifest is the
+    /// authoritative list even before any ack lands.
+    #[test]
+    fn list_transfer_files_sent_in_flight_lists_files_without_outcome() {
+        let (tmp, ctx) = test_ctx();
+        let dir = tmp.path();
+        let f1 = insert_fixture_frame(&ctx, dir, "light-0001.fits", "M42", false);
+
+        let (_sync_dir, db_path) = sync_paths(&ctx).unwrap();
+        let pkg_root = tmp.path().join("packages");
+        let (pkg_dir, id) = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let pkg_dir = build_selection_package(&conn, "origin-dev", &pkg_root, &[f1])
+                .unwrap()
+                .pkg_dir
+                .expect("a package was written");
+            drop(conn);
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            let id = store.enqueue(&pkg_dir.to_string_lossy(), [9u8; 32]).unwrap();
+            (pkg_dir, id)
+        };
+        let _ = pkg_dir;
+
+        let files = list_transfer_files(&ctx, Direction::Sent, id).unwrap();
+        assert_eq!(files.len(), 1, "manifest lists the one frame even with no ack yet");
+        assert_eq!(files[0].name, "light-0001.fits");
+        assert!(files[0].outcome.is_none(), "no verdict while the send is in flight");
+    }
+
+    /// Task 14: a terminal inbound package lists its received frames from history
+    /// (keyed by the wire package_id), each with the receiver's outcome and its
+    /// received bytes. Resolved by the durable `sync_inbound.id`, not the wire id.
+    #[test]
+    fn list_transfer_files_received_terminal_reads_from_history() {
+        use crate::sync::store::{set_inbound_state, upsert_inbound_announced};
+        use crate::sync::InboundState;
+
+        let (_tmp, ctx) = test_ctx();
+        let pkg = "wire-pkg-77";
+        let peer = "aa".repeat(32);
+        let inbound_id = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let id = upsert_inbound_announced(&conn, &peer, pkg, 2, 300).unwrap();
+            // Two received history rows for this batch, then drive the row terminal.
+            for (uuid, name, bytes) in [("u-1", "a.fits", 100u64), ("u-2", "b.fits", 200u64)] {
+                crate::sync::store::insert_history_row(
+                    &conn,
+                    &HistoryRow {
+                        frame_uuid: uuid.into(),
+                        filename: name.into(),
+                        object: Some("M42".into()),
+                        peer_device: peer.clone(),
+                        direction: Direction::Received,
+                        bytes,
+                        started_at: "2026-07-15T00:00:00.000Z".into(),
+                        finished_at: Some("2026-07-15T00:00:01.000Z".into()),
+                        outcome: "ingested".into(),
+                        project: None,
+                        package_id: Some(pkg.into()),
+                    },
+                )
+                .unwrap();
+            }
+            set_inbound_state(&conn, pkg, InboundState::Done, None).unwrap();
+            id
+        };
+
+        let files = list_transfer_files(&ctx, Direction::Received, inbound_id).unwrap();
+        assert_eq!(files.len(), 2, "one entry per received frame from history");
+        assert!(files.iter().all(|f| f.outcome.as_deref() == Some("ingested")));
+        let a = files.iter().find(|f| f.name == "a.fits").expect("a.fits present");
+        assert_eq!(a.bytes_total, 100);
+        assert_eq!(a.bytes_done, Some(100), "terminal received: bytes_done reflects received bytes");
+    }
+
+    /// Task 14: `list_transfer_files` surfaces a clean `NotFound` for an unknown
+    /// row id in either direction (never a panic or silent empty).
+    #[test]
+    fn list_transfer_files_unknown_id_is_not_found() {
+        let (_tmp, ctx) = test_ctx();
+        assert!(matches!(
+            list_transfer_files(&ctx, Direction::Sent, 4242),
+            Err(ApiError::NotFound(_))
+        ));
+        assert!(matches!(
+            list_transfer_files(&ctx, Direction::Received, 4242),
+            Err(ApiError::NotFound(_))
+        ));
     }
 
     // ── Production account-mode autostart (task A7 fix-review; sync 2A) ─────

@@ -9,7 +9,7 @@ use tauri::{AppHandle, State};
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{EnqueueSelectionResult, SyncHistoryQuery};
 use athenaeum_core::events::ProgressEmitter;
-use athenaeum_core::sync::{HistoryRow, SyncStatus};
+use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
 
 use crate::tauri_events::TauriProgressEmitter;
 use super::AppState;
@@ -52,6 +52,19 @@ pub async fn list_sync_history(
     query: SyncHistoryQuery,
 ) -> Result<Vec<HistoryRow>, String> {
     api::list_history(&state.ctx, query).map_err(|e| e.to_string())
+}
+
+/// Per-file detail for one transfer batch (Task 14): the outbound (`sent`) or
+/// inbound (`received`) package's manifest joined to this node's per-frame
+/// verdicts, for the Transfers UI's expand-a-row detail view.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn list_transfer_files(
+    state: State<'_, AppState>,
+    direction: Direction,
+    id: i64,
+) -> Result<Vec<TransferFileEntry>, String> {
+    api::list_transfer_files(&state.ctx, direction, id).map_err(|e| e.to_string())
 }
 
 /// Explicit-target send (sync 2C): enqueue the eligible frames of a selection to

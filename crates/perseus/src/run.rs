@@ -1300,6 +1300,8 @@ fn build_retention_history_rows(
             outcome: outcome.to_string(),
             // Perseus is a personal-sync capture agent — no project dimension.
             project: None,
+            // No per-batch detail surface on the Perseus agent (Task 14).
+            package_id: None,
         }];
     }
 
@@ -1325,6 +1327,8 @@ fn build_retention_history_rows(
                 outcome: outcome.to_string(),
                 // Perseus is a personal-sync capture agent — no project dimension.
                 project: None,
+                // No per-batch detail surface on the Perseus agent (Task 14).
+                package_id: None,
             }
         })
         .collect()
@@ -2058,6 +2062,7 @@ mod retention_tests {
                 direction: None,
                 peer: None,
                 project: None,
+                package_id: None,
                 limit: 1000,
             })
             .unwrap()
@@ -2146,6 +2151,7 @@ mod retention_tests {
                 direction: None,
                 peer: None,
                 project: None,
+                package_id: None,
                 limit: 1000,
             })
             .unwrap();

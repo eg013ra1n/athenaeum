@@ -9,7 +9,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{EnqueueSelectionResult, SyncHistoryQuery};
 use athenaeum_core::events::ProgressEmitter;
-use athenaeum_core::sync::{HistoryRow, SyncStatus};
+use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
 use serde::Deserialize;
 
 use crate::events::SseProgressEmitter;
@@ -68,6 +68,28 @@ pub async fn list_sync_history(
     Json(args): Json<ListHistoryArgs>,
 ) -> Result<Json<Vec<HistoryRow>>, (StatusCode, String)> {
     api::list_history(&state.ctx, args.query).map(Json).map_err(api_err)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTransferFilesArgs {
+    pub direction: Direction,
+    pub id: i64,
+}
+
+/// POST /api/list_transfer_files
+///
+/// Per-file detail for one transfer batch (Task 14): the outbound (`sent`) or
+/// inbound (`received`) package's manifest joined to this node's per-frame
+/// verdicts, for the Transfers UI's expand-a-row detail view.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn list_transfer_files(
+    State(state): State<WebAppState>,
+    Json(args): Json<ListTransferFilesArgs>,
+) -> Result<Json<Vec<TransferFileEntry>>, (StatusCode, String)> {
+    api::list_transfer_files(&state.ctx, args.direction, args.id)
+        .map(Json)
+        .map_err(api_err)
 }
 
 #[derive(Deserialize)]

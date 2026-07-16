@@ -1788,6 +1788,7 @@ impl Worker {
             .filter(|r| want.map(|w| w.contains(&r.rel_path)).unwrap_or(true))
             .collect();
         let peer_device = node_id_hex(&self.peer);
+        let package_key = package_dir_key(dir);
         for r in &records {
             self.store.append_history(HistoryRow {
                 frame_uuid: r.frame_uuid.clone(),
@@ -1800,6 +1801,7 @@ impl Worker {
                 finished_at: None,
                 outcome: "sent".to_string(),
                 project: project_of(r),
+                package_id: package_key.clone(),
             })?;
         }
         tracing::debug!(package_id = id, count = records.len(), "sync history: transfer started");
@@ -1816,6 +1818,7 @@ impl Worker {
             records.iter().map(|r| (r.frame_uuid.as_str(), r)).collect();
         let peer_device = node_id_hex(&self.peer);
         let finished = now_iso();
+        let package_key = package_dir_key(&pending.dir);
 
         for rec in receipts {
             let (filename, object, bytes, project) = match by_uuid.get(rec.frame_uuid.as_str()) {
@@ -1833,6 +1836,7 @@ impl Worker {
                 finished_at: Some(finished.clone()),
                 outcome: receipt_outcome_str(&rec.outcome),
                 project,
+                package_id: package_key.clone(),
             })?;
         }
         Ok(())
@@ -1871,6 +1875,7 @@ impl Worker {
         };
         let peer_device = node_id_hex(&self.peer);
         let ts = now_iso();
+        let package_key = package_dir_key(dir);
         for r in &records {
             self.store.append_history(HistoryRow {
                 frame_uuid: r.frame_uuid.clone(),
@@ -1883,6 +1888,7 @@ impl Worker {
                 finished_at: Some(ts.clone()),
                 outcome: outcome.to_string(),
                 project: project_of(r),
+                package_id: package_key.clone(),
             })?;
         }
         Ok(())
@@ -1896,6 +1902,17 @@ fn filename_of(rel_path: &str) -> String {
         .next()
         .unwrap_or(rel_path)
         .to_string()
+}
+
+/// The stable per-package history batch key (Task 14): the basename of the
+/// package directory, which is exactly the last component of the durable
+/// `sync_outbound.package_ref`. Stamped into `sync_history.package_id` by every
+/// sender-side history writer so
+/// [`list_transfer_files`](crate::api::sync::list_transfer_files) can recover the
+/// same key from the outbound row and join a package's per-frame verdicts back to
+/// its manifest. `None` only for the pathological path with no final component.
+fn package_dir_key(dir: &Path) -> Option<String> {
+    dir.file_name().and_then(|f| f.to_str()).map(str::to_string)
 }
 
 /// Extract `object` from a manifest record's opaque `frame_meta`, if present.

@@ -273,6 +273,16 @@ pub struct HistoryRow {
     /// UI shows a project chip only for the collab rows.
     #[serde(default)]
     pub project: Option<String>,
+    /// The per-package batch key this frame-transfer belonged to (Task 14) — the
+    /// durable handle each side already knows: the SENDER stamps its package
+    /// dir's basename (== the last component of `sync_outbound.package_ref`), the
+    /// RECEIVER stamps the wire announce `package_id` (== `sync_inbound.package_id`).
+    /// [`list_transfer_files`](crate::api::sync::list_transfer_files) recovers the
+    /// same key from the outbound / inbound row to join a package's per-frame
+    /// verdicts back to its manifest. Legacy rows written before this column stay
+    /// `None`.
+    #[serde(default)]
+    pub package_id: Option<String>,
 }
 
 /// Minimal query surface for [`SyncStore::search_history`](super::store::SyncStore::search_history).
@@ -293,5 +303,9 @@ pub struct HistoryQuery {
     /// Exact `project_id` filter (unfiltered when absent) — the Transfers UI's
     /// project-dimension passthrough (Stage II collab, Task 11).
     pub project: Option<String>,
+    /// Exact per-package batch-key filter (unfiltered when absent) — Task 14's
+    /// per-batch detail read ([`list_transfer_files`](crate::api::sync::list_transfer_files))
+    /// scopes a package's per-frame rows by [`HistoryRow::package_id`].
+    pub package_id: Option<String>,
     pub limit: u32,
 }

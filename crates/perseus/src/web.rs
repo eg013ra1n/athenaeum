@@ -733,6 +733,8 @@ async fn api_history(
         peer: None,
         // Perseus's web status page has no project dimension (personal sync).
         project: None,
+        // No per-batch detail surface on the Perseus agent (Task 14).
+        package_id: None,
         limit: q.limit.unwrap_or(DEFAULT_HISTORY_LIMIT),
     };
     let rows = state.store.search_history(hq).map_err(|e| {
@@ -1781,6 +1783,7 @@ mod tests {
                 finished_at: Some("2026-07-08T10:00:02.500Z".into()),
                 outcome: "sent".into(),
                 project: None,
+                package_id: None,
             })
             .unwrap();
         store
@@ -1795,6 +1798,7 @@ mod tests {
                 finished_at: None, // unfinished → durationSecs is None
                 outcome: "ingested".into(),
                 project: None,
+                package_id: None,
             })
             .unwrap();
 
@@ -2548,6 +2552,7 @@ mod tests {
                 direction: None,
                 peer: None,
                 project: None,
+                package_id: None,
                 limit: 1000,
             })
             .unwrap();

@@ -69,9 +69,10 @@ pub fn ensure_outbound_columns(conn: &Connection) -> Result<()> {
 
 /// `sync_history` — append-only per-frame transfer audit log.
 ///
-/// The trailing `project` column (Stage II collab, Task 11) is created inline for
-/// a fresh DB; an existing project-less table is migrated in place by
-/// [`ensure_history_columns`] (a `CREATE TABLE IF NOT EXISTS` never adds a column).
+/// The trailing `project` column (Stage II collab, Task 11) and `package_id`
+/// column (per-batch detail, Task 14) are created inline for a fresh DB; an
+/// existing table missing either is migrated in place by [`ensure_history_columns`]
+/// (a `CREATE TABLE IF NOT EXISTS` never adds a column).
 pub const DDL_HISTORY: &str = "CREATE TABLE IF NOT EXISTS sync_history (
     id INTEGER PRIMARY KEY,
     frame_uuid TEXT,
@@ -83,28 +84,34 @@ pub const DDL_HISTORY: &str = "CREATE TABLE IF NOT EXISTS sync_history (
     started_at TEXT,
     finished_at TEXT,
     outcome TEXT,
-    project TEXT
+    project TEXT,
+    package_id TEXT
 )";
 
-/// Idempotently add the `project` column to an existing `sync_history` table.
+/// Idempotently add the trailing `project` (Task 11) and `package_id` (Task 14)
+/// columns to an existing `sync_history` table.
 ///
 /// `CREATE TABLE IF NOT EXISTS` never alters an already-materialised table, so a
-/// store opened over a pre-Stage-II catalog / Perseus DB is migrated in place
-/// here (Task 11, AUDIT B3). SQLite has no `ADD COLUMN IF NOT EXISTS`, so this
-/// reads `PRAGMA table_info` first — the same idiom as Perseus's `ensure_column`.
-/// Called by every `sync_history` materialisation site (both store `open`s and
-/// `db::schema::init_db`) right after the DDL.
+/// store opened over a pre-Stage-II / pre-Task-14 catalog / Perseus DB is migrated
+/// in place here (AUDIT B3). SQLite has no `ADD COLUMN IF NOT EXISTS`, so this
+/// reads `PRAGMA table_info` once and adds only the missing columns — the same
+/// guarded-ALTER idiom as [`ensure_outbound_columns`]. Called by every
+/// `sync_history` materialisation site (both store `open`s and
+/// `db::schema::init_db`) right after the DDL. Never breaks an existing DB: an
+/// already-present column is a no-op.
 pub fn ensure_history_columns(conn: &Connection) -> Result<()> {
-    let present = conn
+    let existing: HashSet<String> = conn
         .prepare("PRAGMA table_info(sync_history)")
         .context("prepare table_info(sync_history)")?
         .query_map([], |r| r.get::<_, String>(1))
         .context("query table_info(sync_history)")?
         .filter_map(|c| c.ok())
-        .any(|c| c == "project");
-    if !present {
-        conn.execute("ALTER TABLE sync_history ADD COLUMN project TEXT", [])
-            .context("add sync_history.project column")?;
+        .collect();
+    for (col, ty) in [("project", "TEXT"), ("package_id", "TEXT")] {
+        if !existing.contains(col) {
+            conn.execute(&format!("ALTER TABLE sync_history ADD COLUMN {col} {ty}"), [])
+                .with_context(|| format!("add sync_history.{col} column"))?;
+        }
     }
     Ok(())
 }
@@ -298,6 +305,7 @@ type HistoryRaw = (
     Option<String>,
     String,
     Option<String>,
+    Option<String>,
 );
 
 fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
@@ -312,6 +320,7 @@ fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
         finished_at,
         outcome,
         project,
+        package_id,
     ) = raw;
     Ok(HistoryRow {
         frame_uuid,
@@ -324,13 +333,14 @@ fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
         finished_at,
         outcome,
         project,
+        package_id,
     })
 }
 
 const OUTBOUND_COLS: &str =
     "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at";
 const HISTORY_COLS: &str =
-    "frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project";
+    "frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project, package_id";
 
 // ── Free functions on a raw connection ──────────────────────────────────────
 //
@@ -345,8 +355,8 @@ const HISTORY_COLS: &str =
 pub fn insert_history_row(conn: &Connection, h: &HistoryRow) -> Result<()> {
     conn.execute(
         "INSERT INTO sync_history
-         (frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+         (frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project, package_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             h.frame_uuid,
             h.filename,
@@ -358,6 +368,7 @@ pub fn insert_history_row(conn: &Connection, h: &HistoryRow) -> Result<()> {
             h.finished_at,
             h.outcome,
             h.project,
+            h.package_id,
         ],
     )
     .context("insert sync_history")?;
@@ -388,6 +399,10 @@ pub fn search_history_rows(conn: &Connection, q: &HistoryQuery) -> Result<Vec<Hi
         sql.push_str(" AND project = ?");
         args.push(Box::new(project.clone()));
     }
+    if let Some(package_id) = &q.package_id {
+        sql.push_str(" AND package_id = ?");
+        args.push(Box::new(package_id.clone()));
+    }
     sql.push_str(" ORDER BY started_at DESC, id DESC LIMIT ?");
     args.push(Box::new(q.limit as i64));
 
@@ -406,6 +421,7 @@ pub fn search_history_rows(conn: &Connection, q: &HistoryQuery) -> Result<Vec<Hi
                 r.get(7)?,
                 r.get(8)?,
                 r.get(9)?,
+                r.get(10)?,
             ))
         })
         .context("query search_history")?
@@ -875,6 +891,36 @@ pub fn get_inbound(conn: &Connection, package_id: &str) -> Result<Option<Inbound
         )
         .optional()
         .context("query sync_inbound by package_id")?;
+    raw.map(to_inbound).transpose()
+}
+
+/// Fetch a single `sync_inbound` row by its durable row `id` (`None` if absent).
+/// The by-id read behind [`list_transfer_files`](crate::api::sync::list_transfer_files)'s
+/// received-detail path (Task 14): the Transfers UI holds the row id from the
+/// [`InboundSummary`](crate::sync::status::InboundSummary), not the wire package
+/// id, so the detail read resolves the row (and thence its `package_id`) by id.
+pub fn get_inbound_by_row_id(conn: &Connection, id: i64) -> Result<Option<InboundRow>> {
+    let raw = conn
+        .query_row(
+            &format!("SELECT {INBOUND_COLS} FROM sync_inbound WHERE id = ?1"),
+            params![id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            },
+        )
+        .optional()
+        .context("query sync_inbound by id")?;
     raw.map(to_inbound).transpose()
 }
 
@@ -1595,6 +1641,7 @@ mod tests {
                 finished_at: Some("t2".into()),
                 outcome: "ingested".into(),
                 project: Some("proj-42".into()),
+                package_id: None,
             })
             .unwrap();
 
@@ -1608,6 +1655,82 @@ mod tests {
         // A project filter that matches nothing returns empty (never the legacy row).
         assert!(store
             .search_history(HistoryQuery { project: Some("proj-none".into()), limit: 10, ..Default::default() })
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Task 14: opening a store over a PRE-EXISTING `sync_history` table with no
+    /// `package_id` column adds it in place; a legacy row still loads (with
+    /// `package_id = None`); and a fresh insert carrying a `package_id` round-trips
+    /// through both a plain search AND the new `package_id` batch-key filter —
+    /// proving the guarded `ALTER TABLE`, the new column's insert/read SQL, and the
+    /// per-batch detail filter [`list_transfer_files`](crate::api::sync::list_transfer_files)
+    /// relies on.
+    #[test]
+    fn history_package_id_migrates_roundtrips_and_filters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("legacy.db");
+
+        // Materialise a pre-Task-14 `sync_history` shape (project column present,
+        // package_id absent) and a legacy row that predates package_id.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE sync_history (
+                    id INTEGER PRIMARY KEY,
+                    frame_uuid TEXT, filename TEXT, object TEXT, peer_device TEXT,
+                    direction TEXT, bytes INTEGER, started_at TEXT, finished_at TEXT,
+                    outcome TEXT, project TEXT
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sync_history
+                    (frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project)
+                 VALUES ('u-old', 'old.fits', 'M42', 'peerA', 'sent', 10, 't0', NULL, 'sent', NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Opening migrates the table in place (adds package_id); the legacy row
+        // loads with package_id = None.
+        let store = StandaloneSyncStore::open(&db_path).unwrap();
+        let legacy = store
+            .search_history(HistoryQuery { filename: Some("old.fits".into()), limit: 10, ..Default::default() })
+            .unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].package_id, None, "legacy row's package_id migrated to NULL");
+
+        // A fresh insert carrying a package_id round-trips …
+        store
+            .append_history(HistoryRow {
+                frame_uuid: "u-new".into(),
+                filename: "new.fits".into(),
+                object: Some("M31".into()),
+                peer_device: "peerB".into(),
+                direction: Direction::Sent,
+                bytes: 20,
+                started_at: "t1".into(),
+                finished_at: Some("t2".into()),
+                outcome: "ingested".into(),
+                project: None,
+                package_id: Some("pkg-abc".into()),
+            })
+            .unwrap();
+
+        // … and the new package_id filter matches exactly that batch, never the
+        // legacy NULL row.
+        let by_pkg = store
+            .search_history(HistoryQuery { package_id: Some("pkg-abc".into()), limit: 10, ..Default::default() })
+            .unwrap();
+        assert_eq!(by_pkg.len(), 1, "package_id filter matches exactly the tagged row");
+        assert_eq!(by_pkg[0].frame_uuid, "u-new");
+        assert_eq!(by_pkg[0].package_id.as_deref(), Some("pkg-abc"));
+
+        assert!(store
+            .search_history(HistoryQuery { package_id: Some("pkg-none".into()), limit: 10, ..Default::default() })
             .unwrap()
             .is_empty());
     }

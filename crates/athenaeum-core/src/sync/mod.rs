@@ -91,7 +91,10 @@ pub use receiver::{
 };
 pub use responder::{CatalogDedupResponder, DedupResponder};
 pub use sender::{StartedSender, SyncSenderRuntime};
-pub use status::{OutboundSummary, SyncReceiverStatus, SyncSenderStatus, SyncStatus};
+pub use status::{
+    InboundSummary, OutboundSummary, SyncReceiverStatus, SyncSenderStatus, SyncStatus,
+    TransferFileEntry,
+};
 pub use store::{
     ensure_history_columns, insert_sync_source, live_sources_for_package, mark_sync_source_deleted,
     CatalogSyncStore, StandaloneSyncStore, SyncSourceRow, SyncStore,

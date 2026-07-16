@@ -321,7 +321,7 @@ fn process_frame(
         let tx = conn.unchecked_transaction().context("begin ingest tx")?;
         insert_ingested_rows(&tx, &landed, record, &snapshot, &sampling_hash)?;
         insert_receipt(&tx, package_id, &receipt, started_at)?;
-        insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, "ingested"))?;
+        insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, "ingested", package_id))?;
         tx.commit().context("commit ingest tx")
     })();
 
@@ -523,18 +523,23 @@ fn record_receipt_and_history(
     let snapshot: Frame = serde_json::from_value(record.frame_meta.clone()).unwrap_or_default();
     let tx = conn.unchecked_transaction().context("begin receipt tx")?;
     insert_receipt(&tx, package_id, receipt, started_at)?;
-    insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, history_outcome))?;
+    insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, history_outcome, package_id))?;
     tx.commit().context("commit receipt tx")?;
     Ok(())
 }
 
-/// Build a `direction = received` history row for a frame.
+/// Build a `direction = received` history row for a frame. `package_id` is the
+/// wire announce `package_id` (== `sync_inbound.package_id`), stamped as the
+/// per-batch key (Task 14) so the received-detail read
+/// ([`list_transfer_files`](crate::api::sync::list_transfer_files)) can join a
+/// terminal inbound package's rows back by `WHERE package_id = ?`.
 fn received_history(
     record: &ManifestRecord,
     snapshot: &Frame,
     peer_device: &str,
     started_at: &str,
     outcome: &str,
+    package_id: &str,
 ) -> HistoryRow {
     HistoryRow {
         frame_uuid: record.frame_uuid.clone(),
@@ -547,6 +552,7 @@ fn received_history(
         finished_at: Some(now_iso()),
         outcome: outcome.to_string(),
         project: record.project.as_ref().map(|p| p.project_id.clone()),
+        package_id: Some(package_id.to_string()),
     }
 }
 

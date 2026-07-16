@@ -592,6 +592,8 @@ export type Direction = "sent" | "received";
 
 export type OutboundState = "queued" | "announced" | "transferring" | "delivered" | "confirmed" | "failed" | "cancelled";
 
+export type InboundState = "announced" | "fetching" | "ingesting" | "done" | "failed" | "cancelled";
+
 export type HistoryRow = { frameUuid: string, filename: string, object: string | null, 
 /**
  * Peer node id, hex-encoded.
@@ -611,7 +613,18 @@ outcome: string,
  * `None` for a personal-sync transfer (no project dimension) — the Transfers
  * UI shows a project chip only for the collab rows.
  */
-project: string | null, };
+project: string | null, 
+/**
+ * The per-package batch key this frame-transfer belonged to (Task 14) — the
+ * durable handle each side already knows: the SENDER stamps its package
+ * dir's basename (== the last component of `sync_outbound.package_ref`), the
+ * RECEIVER stamps the wire announce `package_id` (== `sync_inbound.package_id`).
+ * [`list_transfer_files`](crate::api::sync::list_transfer_files) recovers the
+ * same key from the outbound / inbound row to join a package's per-frame
+ * verdicts back to its manifest. Legacy rows written before this column stay
+ * `None`.
+ */
+packageId: string | null, };
 
 export type OutboundSummary = { 
 /**
@@ -626,7 +639,46 @@ packageShort: string, state: OutboundState, attempts: number, createdAt: string,
 /**
  * Destination peer node id (hex), shortened for display.
  */
-peerShort: string, };
+peerShort: string, 
+/**
+ * The most recent failed-attempt reason (Task 9), or `None` when the package
+ * has never failed / was cleared on a successful announce or confirm.
+ */
+lastError: string | null, 
+/**
+ * Wall-clock deadline (RFC3339 UTC) of the next scheduled retry (Task 2), or
+ * `None` when the package is not currently waiting out a backoff window (it is
+ * awaiting an ack or terminal). Drives the Transfers UI's live countdown.
+ */
+nextRetryAt: string | null, 
+/**
+ * Total payload bytes across the package's manifest (Task 14).
+ */
+byteSize: number, 
+/**
+ * Number of frames/files in the package's manifest (Task 14).
+ */
+fileCount: number, };
+
+export type InboundSummary = { 
+/**
+ * Durable `sync_inbound` row id — the handle
+ * [`list_transfer_files`](crate::api::sync::list_transfer_files) resolves the
+ * received-detail read by.
+ */
+id: number, 
+/**
+ * Short, human-readable package handle (leading chars of the wire package id).
+ */
+packageShort: string, 
+/**
+ * Sending peer node id (hex), shortened for display.
+ */
+peerShort: string, state: InboundState, frameCount: number, byteSize: number, 
+/**
+ * Cumulative bytes fetched so far (0 until the fetch stage reports progress).
+ */
+bytesDone: number, createdAt: string, };
 
 export type SyncSenderStatus = { 
 /**
@@ -663,7 +715,12 @@ export type SyncReceiverStatus = {
 /**
  * Whether the receiver transport is running (a ticket has been minted).
  */
-active: boolean, 
+started: boolean, 
+/**
+ * The in-flight inbound rows for the receive-side Active tab (non-terminal
+ * `sync_inbound` rows, Task 14). Empty when nothing is being received.
+ */
+active: Array<InboundSummary>, 
 /**
  * Total frames received (history rows with `direction = received`).
  */
@@ -694,6 +751,29 @@ sender: SyncSenderStatus,
  * Receive-side rollup.
  */
 receiver: SyncReceiverStatus, };
+
+export type TransferFileEntry = { 
+/**
+ * The file's basename within the package.
+ */
+name: string, 
+/**
+ * The file's payload size in bytes (from the manifest).
+ */
+bytesTotal: number, 
+/**
+ * Cumulative bytes received for this file, when known (incoming detail); the
+ * live per-file bars are event-driven via `sync-file-progress`, so this is
+ * `None` mid-fetch and populated from history once the package is terminal.
+ */
+bytesDone: number | null, 
+/**
+ * Per-frame outcome once settled: outgoing — the peer's ack verdict recorded
+ * in this sender's confirmed history (`ingested`/`duplicate`/`rejected`/…),
+ * `None` while the send is still in flight; incoming — the receiver's verdict
+ * from history. `None` when not yet known.
+ */
+outcome: string | null, };
 
 export type SyncProgressEvent = { packageId: string, 
 /**
@@ -728,6 +808,16 @@ bytesDone: number | null,
  * [`bytes_done`](Self::bytes_done) on `fetching` ticks; `None` elsewhere.
  */
 bytesTotal: number | null, };
+
+export type SyncFileProgressEvent = { packageId: string, 
+/**
+ * Sending peer's node id (hex).
+ */
+peerDevice: string, 
+/**
+ * The entry's forward-slash `rel_path` within the package.
+ */
+file: string, bytesDone: number, bytesTotal: number, };
 
 export type SyncFinishedEvent = { packageId: string, 
 /**

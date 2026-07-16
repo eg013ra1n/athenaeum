@@ -234,6 +234,7 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
             direction: None,
             peer: None,
             project: None,
+            package_id: None,
             limit: 100,
         })
         .unwrap();
@@ -253,6 +254,13 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
             .iter()
             .any(|h| h.finished_at.is_some() && h.outcome == "ingested"),
         "expected an 'ingested' confirm event"
+    );
+    // Task 14: both the started + confirm rows carry the stable per-batch key —
+    // the package dir's basename (`build_package` names it `pkg-<uuid>`) — so
+    // `list_transfer_files` can recover it from the outbound row.
+    assert!(
+        history.iter().all(|h| h.package_id.as_deref() == Some("pkg-uuid-1")),
+        "every sent history row is stamped with the package dir basename batch key"
     );
 
     engine.shutdown().await;
@@ -593,6 +601,7 @@ async fn ack_lost_then_duplicate_ack_confirms_once() {
             direction: None,
             peer: None,
             project: None,
+            package_id: None,
             limit: 100,
         })
         .unwrap();
@@ -699,6 +708,7 @@ async fn timeouts_back_off_forever_without_failing() {
             direction: None,
             peer: None,
             project: None,
+            package_id: None,
             limit: 100,
         })
         .unwrap();
@@ -807,6 +817,7 @@ async fn missing_package_dir_fails_terminally() {
             direction: None,
             peer: None,
             project: None,
+            package_id: None,
             limit: 100,
         })
         .unwrap();
@@ -879,6 +890,7 @@ async fn peer_offline_backs_off_and_stays_pending() {
             direction: None,
             peer: None,
             project: None,
+            package_id: None,
             limit: 100,
         })
         .unwrap();
@@ -950,6 +962,7 @@ async fn first_attempt_peer_offline_then_online_completes() {
             direction: None,
             peer: None,
             project: None,
+            package_id: None,
             limit: 100,
         })
         .unwrap();
@@ -1018,6 +1031,7 @@ async fn cancel_moves_to_cancelled_state() {
             direction: None,
             peer: None,
             project: None,
+            package_id: None,
             limit: 100,
         })
         .unwrap();
@@ -1099,6 +1113,7 @@ async fn all_cancelled_ack_marks_cancelled_by_receiver() {
             direction: None,
             peer: None,
             project: None,
+            package_id: None,
             limit: 100,
         })
         .unwrap();

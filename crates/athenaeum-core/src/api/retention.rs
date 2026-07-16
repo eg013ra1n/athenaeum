@@ -279,8 +279,9 @@ fn build_source_history_row(conn: &Connection, package_ref: &str, src: &SyncSour
         finished_at: Some(now),
         outcome: "retention_deleted".to_string(),
         // Retention is a personal-sync (full-app capture node) audit path — no
-        // project dimension.
+        // project dimension, and not a per-package transfer batch.
         project: None,
+        package_id: None,
     }
 }
 
@@ -756,6 +757,7 @@ mod tests {
                     finished_at: Some("2026-07-06T00:00:01.000Z".into()),
                     outcome: "sent".into(),
                     project: None,
+                    package_id: None,
                 },
             )
             .unwrap();
