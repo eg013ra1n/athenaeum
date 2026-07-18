@@ -47,6 +47,15 @@ use chrono::Utc;
 
 use crate::sharing::types::NodeId;
 
+/// Threshold (ms) above which a completed sync store write is logged as slow
+/// (Task 4.1, candidate (b) — SQLite write contention between the sender's and
+/// receiver's separate rusqlite connections). Applied to the two heaviest writes:
+/// the receiver's per-frame ingest transaction ([`ingest`]) and the sender's
+/// `confirm` ([`store`]). Well under the 5000ms `busy_timeout` ceiling, so a
+/// contended-but-successful write still surfaces. Instrumentation only — no
+/// behavior change.
+pub(crate) const SLOW_STORE_WRITE_MS: u128 = 500;
+
 pub mod cleanup_coord;
 pub mod dedup;
 pub mod diagnostics;

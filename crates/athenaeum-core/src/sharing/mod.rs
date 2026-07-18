@@ -204,6 +204,23 @@ pub trait SharingTransport: Send + Sync {
         let _ = addr;
     }
 
+    /// Invalidate a peer's cached address-lookup entry before a fresh address
+    /// replaces it (iroh hardening T8 / Task 3.6). The sync engine's retry path
+    /// calls this — and ONLY when its refresher already yielded a fresh address —
+    /// when the last dial failed in a way that implicates stale peer addressing
+    /// (`no_route` / `timeout` / `relay_unreachable`). Because a
+    /// [`MemoryLookup`](iroh::address_lookup::memory::MemoryLookup) merge
+    /// (`add_endpoint_info`) can never *remove* a now-dead relay URL, the engine
+    /// removes the stale entry first so the immediately following
+    /// [`add_peer_addr`](Self::add_peer_addr) fully REPLACES it instead of merging
+    /// fresh hints on top of a dead relay. The default is a no-op (the in-process
+    /// loopback transport dials in-process); the shared-node role handle removes
+    /// the peer from the node's address lookup. Never called without a replacement
+    /// in hand, so last-known addressing is never dropped on a `None` refresh.
+    fn remove_peer_addr(&self, peer: NodeId) {
+        let _ = peer;
+    }
+
     /// Hand out the receiving half of this endpoint's [`TransportEvent`] stream.
     ///
     /// Single-consumer: the receiver is returned on the first call; subsequent

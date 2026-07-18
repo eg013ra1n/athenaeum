@@ -370,6 +370,12 @@ impl SyncReceiver {
                             );
                             continue;
                         }
+                        // Task 4.1 (candidate (a)): time each inline announce
+                        // handling. `announce` is moved into the call, so capture
+                        // the package id first; `from` (a `NodeId`) is `Copy`.
+                        // Instrumentation only — no behavior change.
+                        let announce_started = std::time::Instant::now();
+                        let package_id_for_log = announce.package_id.0.clone();
                         if let Err(e) = handle_announce(
                             &store,
                             &staging_root,
@@ -384,6 +390,12 @@ impl SyncReceiver {
                         {
                             tracing::error!(error = %format!("{e:#}"), "sync receiver announce handling failed");
                         }
+                        tracing::info!(
+                            package_id = %package_id_for_log,
+                            from = %super::node_id_hex(&from),
+                            duration_ms = announce_started.elapsed().as_millis() as u64,
+                            "sync receiver announce handled"
+                        );
                     }
                     // Collab exchange (slice 4): an inbound PROJECT package
                     // advertisement. The ROW KEY is the event's hub `package_id`

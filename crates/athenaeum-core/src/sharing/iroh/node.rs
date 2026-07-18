@@ -72,6 +72,13 @@ use super::{
 /// registration promptly; if it stalls we log and move on rather than hang exit.
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Threshold (ms) above which handing a decoded inbound event to its consumer's
+/// channel is logged as delayed (Task 4.1, candidate (a) — a receive stalling
+/// behind a send). A `tx.send().await` that blocks this long means the bounded
+/// consumer channel stayed full because the receiver loop was busy (e.g.
+/// processing a prior announce inline). Instrumentation only — no behavior change.
+const SLOW_INBOUND_DELIVERY_MS: u128 = 1000;
+
 /// Idle window before a pooled control connection is closed and evicted (Task 2).
 /// Long enough that a burst of announces/acks reuses one connection; short enough
 /// that a peer gone quiet doesn't hold an endpoint slot indefinitely.
@@ -362,10 +369,30 @@ impl EventDemux {
             }
         };
         match target {
-            Some(tx) => match tx.send(event).await {
-                Ok(()) => Delivery::Delivered,
-                Err(_) => Delivery::ConsumerGone,
-            },
+            Some(tx) => {
+                // Task 4.1 (candidate (a)): time the wait to hand this event to its
+                // consumer. Precompute (kind, peer) since `event` is moved into the
+                // send; both are cheap (a match + a 32-byte copy). A send that
+                // blocks past the threshold means the bounded channel stayed full
+                // because the consumer (the receiver loop) was busy — direct
+                // evidence a receive stalled behind a prior inline-processed send.
+                let (kind, peer) = event_kind_and_peer(&event);
+                let send_started = Instant::now();
+                let result = tx.send(event).await;
+                let wait_ms = send_started.elapsed().as_millis();
+                if wait_ms > SLOW_INBOUND_DELIVERY_MS {
+                    tracing::warn!(
+                        kind,
+                        peer = %hex32(&peer),
+                        duration_ms = wait_ms as u64,
+                        "inbound event delivery delayed"
+                    );
+                }
+                match result {
+                    Ok(()) => Delivery::Delivered,
+                    Err(_) => Delivery::ConsumerGone,
+                }
+            }
             None => {
                 let (kind, peer) = event_kind_and_peer(&event);
                 tracing::warn!(kind, peer = %hex32(&peer), "inbound event with no consumer");
@@ -1095,6 +1122,30 @@ impl SharedIrohNode {
                 error = %format!("{e:#}"),
                 peer = %hex32(&from),
                 "add_peer_dial_hint: address build failed"
+            ),
+        }
+    }
+
+    /// Remove a peer's cached address-lookup entry (iroh hardening T8 / Task 3.6).
+    ///
+    /// Called by the sync engine's retry path just before it re-registers a
+    /// freshly re-resolved address for a peer whose last dial failed with a
+    /// stale-addressing class. A [`MemoryLookup`](iroh::address_lookup::memory::MemoryLookup)
+    /// merge (`add_endpoint_info`) accumulates addresses and can never drop a
+    /// now-dead relay URL, so removing the entry first turns the subsequent
+    /// [`add_peer`](Self::add_peer) into a full REPLACE instead of a merge. Only
+    /// the address lookup is cleared — the control-dial `peers` book is overwritten
+    /// (not accumulated) by `add_peer`, so re-adding the fresh address restores it
+    /// correctly. A no-op when the id is unparseable or absent from the lookup.
+    pub fn remove_peer_addr(&self, peer: NodeId) {
+        match EndpointId::from_bytes(&peer) {
+            Ok(id) => {
+                self.lookup.remove_endpoint_info(id);
+            }
+            Err(e) => tracing::warn!(
+                peer = %hex32(&peer),
+                error = %e,
+                "remove_peer_addr: invalid node id"
             ),
         }
     }
@@ -2050,6 +2101,13 @@ impl SharingTransport for RoleHandle {
         // shared node (peer book + address lookup), so the engine's next re-attempt
         // dials the peer's current relay/direct path.
         self.node.add_peer(addr);
+    }
+
+    fn remove_peer_addr(&self, peer: NodeId) {
+        // Task 3.6: drop the peer's stale address-lookup entry so the engine's
+        // immediately following `add_peer_addr` fully replaces (not merges onto) a
+        // now-dead relay URL. Loopback keeps the trait default no-op.
+        self.node.remove_peer_addr(peer);
     }
 
     async fn events(&self) -> mpsc::Receiver<TransportEvent> {

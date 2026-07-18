@@ -1138,6 +1138,10 @@ impl SyncStore for StandaloneSyncStore {
     }
 
     fn confirm(&self, id: i64, receipts: &[FrameReceipt]) -> Result<()> {
+        // Task 4.1 (candidate (b)): time the confirm write — the sender's heaviest
+        // store write, where SQLite contention with the receiver's separate
+        // connection would surface. Instrumentation only — no behavior change.
+        let write_started = std::time::Instant::now();
         let conn = self.conn.lock().expect("sync store mutex poisoned");
         // Idempotent: only a non-confirmed row transitions (guards a duplicate
         // ack that slipped past the engine's in-flight map).
@@ -1148,6 +1152,10 @@ impl SyncStore for StandaloneSyncStore {
                 params![OutboundState::Confirmed.as_str(), now_iso(), id],
             )
             .with_context(|| format!("confirm outbound {id}"))?;
+        let write_ms = write_started.elapsed().as_millis();
+        if write_ms > crate::sync::SLOW_STORE_WRITE_MS {
+            tracing::warn!(op = "confirm", duration_ms = write_ms as u64, "sync store write slow");
+        }
         tracing::debug!(
             package_id = id,
             receipts = receipts.len(),
@@ -1392,6 +1400,9 @@ impl SyncStore for CatalogSyncStore {
     }
 
     fn confirm(&self, id: i64, receipts: &[FrameReceipt]) -> Result<()> {
+        // Task 4.1 (candidate (b)): time the confirm write — see the standalone
+        // store's `confirm` for the contention rationale. No behavior change.
+        let write_started = std::time::Instant::now();
         let conn = self.lock_conn();
         let changed = conn
             .execute(
@@ -1400,6 +1411,10 @@ impl SyncStore for CatalogSyncStore {
                 params![OutboundState::Confirmed.as_str(), now_iso(), id],
             )
             .with_context(|| format!("confirm outbound {id}"))?;
+        let write_ms = write_started.elapsed().as_millis();
+        if write_ms > crate::sync::SLOW_STORE_WRITE_MS {
+            tracing::warn!(op = "confirm", duration_ms = write_ms as u64, "sync store write slow");
+        }
         tracing::debug!(package_id = id, receipts = receipts.len(), changed, "catalog sync store confirm");
         Ok(())
     }

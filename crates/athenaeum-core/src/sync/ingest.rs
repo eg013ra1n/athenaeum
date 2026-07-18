@@ -321,6 +321,10 @@ fn process_frame(
         .with_context(|| format!("hash landed payload {}", landed.display()))?;
 
     let receipt = ingested_receipt(record);
+    // Task 4.1 (candidate (b)): time this ingest transaction — the receiver's
+    // heaviest store write, where SQLite write contention with the sender's
+    // separate connection would surface. Instrumentation only — no behavior change.
+    let write_started = std::time::Instant::now();
     let write_result: Result<()> = (|| {
         let tx = conn.unchecked_transaction().context("begin ingest tx")?;
         insert_ingested_rows(&tx, &landed, record, &snapshot, &sampling_hash)?;
@@ -328,6 +332,14 @@ fn process_frame(
         insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, "ingested", package_id))?;
         tx.commit().context("commit ingest tx")
     })();
+    let write_ms = write_started.elapsed().as_millis();
+    if write_ms > crate::sync::SLOW_STORE_WRITE_MS {
+        tracing::warn!(
+            op = "receiver_ingest",
+            duration_ms = write_ms as u64,
+            "sync store write slow"
+        );
+    }
 
     if let Err(e) = write_result {
         // The file was already landed (renamed into its final location) before

@@ -61,7 +61,7 @@ use crate::sharing::types::{
 };
 use crate::sharing::SharingTransport;
 
-use super::diagnostics::classify_send_error;
+use super::diagnostics::{classify_send_error, ConnectClass};
 use super::models::{Direction, HistoryRow, OutboundRow, OutboundState};
 use super::receiver::{SyncFinishedEvent, SyncProgressEvent};
 use super::store::SyncStore;
@@ -219,6 +219,13 @@ struct Pending {
     /// first successful manifest read; never re-read after that (same "decided
     /// once, reused across retries" discipline as `want`).
     manifest_records: Option<Vec<ManifestRecord>>,
+    /// Class of this package's most recent serve/announce dial failure (Task 3.1
+    /// taxonomy), or `None` once an announce has succeeded (the address proved
+    /// good) or before any classified failure. The retry path (Task 3.6) reads it
+    /// to decide whether a freshly re-resolved address should REPLACE the peer's
+    /// stale lookup entry (dead-addressing classes: `no_route` / `timeout` /
+    /// `relay_unreachable`) rather than merge onto a possibly-dead relay URL.
+    last_attempt_class: Option<ConnectClass>,
 }
 
 /// Outcome of the first-build dedup handshake
@@ -858,6 +865,7 @@ impl Worker {
                 project_id: None,
                 hub_package_id: None,
                 manifest_records: None,
+                last_attempt_class: None,
             },
         );
         self.attempt(id).await
@@ -977,19 +985,24 @@ impl Worker {
             // sees an anyhow chain through the transport trait) into a stable
             // snake_case class. It rides the log as `class` and prefixes the
             // stored `last_error` so a later UI task maps it to human text.
-            let class = classify_send_error(&reason).tag();
-            tracing::error!(package_id = id, attempts, class, error = %reason, "sync serve/announce failed; will retry");
+            let class = classify_send_error(&reason);
+            let class_tag = class.tag();
+            tracing::error!(package_id = id, attempts, class = class_tag, error = %reason, "sync serve/announce failed; will retry");
             // Record the class-prefixed attempt-error reason for the Perseus
             // status page (Task 9). Best-effort: a diagnostic write must never turn
             // a retryable transfer into a failure, so a store error here is logged,
             // not propagated.
-            let stored = format!("{class}: {reason}");
+            let stored = format!("{class_tag}: {reason}");
             if let Err(se) = self.store.set_last_error(id, Some(&stored)) {
                 tracing::warn!(package_id = id, error = %se, "record last_error (serve/announce) failed");
             }
             if let Some(p) = self.pending.get_mut(&id) {
                 p.announce = Some(announce);
                 p.want = want;
+                // Task 3.6: remember the dial-failure class so the retry path can
+                // decide whether a fresh re-resolved address should replace (not
+                // merge onto) the peer's stale lookup entry.
+                p.last_attempt_class = Some(class);
             }
             self.arm_retry(id);
             return Ok(());
@@ -1038,6 +1051,10 @@ impl Worker {
             p.started_at = started_at;
             p.next_action = NextAction::AwaitAck;
             p.deadline = Instant::now() + self.config.ack_timeout;
+            // The serve/announce reached the peer — the cached address proved good,
+            // so clear any stale dial-failure class (Task 3.6): a later retry after
+            // an ack timeout must not treat proven-good addressing as dead.
+            p.last_attempt_class = None;
         }
         // The serve/announce succeeded — clear any stale attempt-error so a package
         // now awaiting its ack no longer shows the previous failure (Task 9).
@@ -1727,13 +1744,47 @@ impl Worker {
                 NextAction::Retry => {
                     if !refreshed {
                         refreshed = true;
+                        // Task 3.6: whether this package's last dial failed in a way
+                        // that implicates STALE peer addressing (dead direct path or
+                        // dead relay). Read before the refresh so a fresh address can
+                        // fully replace the stale lookup entry rather than merge onto
+                        // a possibly-dead relay URL.
+                        let addressing_dead = matches!(
+                            self.pending.get(&id).and_then(|p| p.last_attempt_class),
+                            Some(
+                                ConnectClass::NoRoute
+                                    | ConnectClass::Timeout
+                                    | ConnectClass::RelayUnreachable
+                            )
+                        );
                         if let Some(refresher) = self.addr_refresher.clone() {
                             if let Some(addr) = refresher(self.peer).await {
+                                // Task 3.6: a dead-addressing failure means the
+                                // cached lookup entry (which never expires, and whose
+                                // relay URL a merge can't drop) is suspect — remove it
+                                // FIRST so the fresh hints below fully replace it. Only
+                                // ever with a replacement already in hand (refresher
+                                // returned `Some`); a `None` refresh keeps last-known.
+                                if addressing_dead {
+                                    self.transport.remove_peer_addr(self.peer);
+                                    tracing::info!(
+                                        peer = %node_id_hex(&self.peer),
+                                        "retry: invalidated stale peer addressing before refresh"
+                                    );
+                                }
                                 tracing::info!(
                                     peer = %node_id_hex(&self.peer),
                                     "retry: re-resolved peer address"
                                 );
                                 self.transport.add_peer_addr(addr);
+                            } else {
+                                // Task 3.4: the refresher is wired but yielded nothing
+                                // (hub blip / peer gone). Keep-last-good is correct;
+                                // log the fallback so a stuck retry is not silent.
+                                tracing::warn!(
+                                    peer = %node_id_hex(&self.peer),
+                                    "retry: address refresh unavailable; dialing last-known address"
+                                );
                             }
                         }
                     }

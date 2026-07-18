@@ -2623,6 +2623,257 @@ async fn retry_path_re_resolves_and_re_adds_peer_address() {
     engine.shutdown().await;
 }
 
+// ---------------------------------------------------------------------------
+// Task 3.6: a classified dial failure + a fresh re-resolve REPLACES (not merges)
+// the peer's stale address-lookup entry, so a dead relay URL can't survive.
+// ---------------------------------------------------------------------------
+
+/// A probe transport whose announce always FAILS with a `timeout`-classified
+/// error (so the engine records a dead-addressing class on the pending package),
+/// and whose peer-address writes go through a REAL
+/// [`MemoryLookup`](iroh::address_lookup::memory::MemoryLookup) exactly as the
+/// production node does: `add_peer_addr` MERGES via `add_endpoint_info`,
+/// `remove_peer_addr` clears via `remove_endpoint_info`. This lets the test assert
+/// the lookup's final addressing after the retry path runs.
+struct ReplaceProbeTransport {
+    node_id: NodeId,
+    lookup: iroh::address_lookup::memory::MemoryLookup,
+    /// Retained so the engine's `events()` receiver never closes → no ack ever
+    /// arrives → the retry path keeps running.
+    keep_tx: std::sync::Mutex<Option<mpsc::Sender<TransportEvent>>>,
+    /// How many times the retry path invalidated the stale lookup entry.
+    removed: Arc<std::sync::Mutex<u32>>,
+}
+
+#[async_trait::async_trait]
+impl SharingTransport for ReplaceProbeTransport {
+    async fn start(&self) -> anyhow::Result<StartInfo> {
+        Ok(StartInfo {
+            node_id: self.node_id,
+            pairing_ticket: String::new(),
+        })
+    }
+    async fn announce(&self, _to: NodeId, _a: &PackageAnnounce) -> anyhow::Result<()> {
+        // `classify_send_error` maps "timed out" → `ConnectClass::Timeout`, a
+        // dead-addressing class that gates the Task 3.6 replace.
+        anyhow::bail!("connection timed out")
+    }
+    async fn fetch(
+        &self,
+        _from: NodeId,
+        _pkg: &PackageAnnounce,
+        _dest: &Path,
+        _sink: FetchSink,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn fetch_manifest(
+        &self,
+        _from: NodeId,
+        _pkg: &PackageAnnounce,
+        _dest: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        anyhow::bail!("fetch_manifest not supported by ReplaceProbeTransport")
+    }
+    async fn serve(
+        &self,
+        _pkg: &PackageAnnounce,
+        _src: &Path,
+        _want: Option<&HashSet<String>>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn ack(
+        &self,
+        _to: NodeId,
+        _pid: &PackageId,
+        _r: Vec<FrameReceipt>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn release(&self, _pid: &PackageId) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn add_peer_addr(&self, addr: iroh::EndpointAddr) {
+        // Mirror the production node's `add_peer`: MERGE into the lookup.
+        self.lookup.add_endpoint_info(addr);
+    }
+    fn remove_peer_addr(&self, peer: NodeId) {
+        // Mirror the production node's `remove_peer_addr`.
+        if let Ok(id) = iroh::EndpointId::from_bytes(&peer) {
+            self.lookup.remove_endpoint_info(id);
+        }
+        *self.removed.lock().unwrap() += 1;
+    }
+    async fn events(&self) -> mpsc::Receiver<TransportEvent> {
+        let (tx, rx) = mpsc::channel(8);
+        *self.keep_tx.lock().unwrap() = Some(tx);
+        rx
+    }
+}
+
+/// Task 3.6: with a STALE relay URL cached in the lookup, a dial failure classified
+/// as a dead-addressing class followed by a fresh re-resolve must leave the lookup
+/// holding ONLY the fresh addressing — the dead relay URL (which a merge could never
+/// drop) is removed first, so re-adding the fresh address is a full replace.
+#[tokio::test]
+async fn retry_replaces_stale_addressing_after_classified_dial_failure() {
+    let tmp = tempdir().unwrap();
+    let peer: NodeId = *iroh::SecretKey::generate().public().as_bytes();
+    let peer_id = iroh::EndpointId::from_bytes(&peer).unwrap();
+
+    let stale_relay = "https://stale.relay.example./";
+    let fresh_relay = "https://fresh.relay.example./";
+
+    // A shared MemoryLookup pre-seeded with the peer's STALE relay URL — the dead
+    // path a merge could never remove.
+    let lookup = iroh::address_lookup::memory::MemoryLookup::new();
+    lookup.add_endpoint_info(
+        iroh::EndpointAddr::new(peer_id).with_relay_url(stale_relay.parse().unwrap()),
+    );
+
+    let removed = Arc::new(std::sync::Mutex::new(0u32));
+    let transport = Arc::new(ReplaceProbeTransport {
+        node_id: peer,
+        lookup: lookup.clone(),
+        keep_tx: std::sync::Mutex::new(None),
+        removed: Arc::clone(&removed),
+    });
+
+    // The refresher yields the peer's CURRENT (fresh) address — a different relay.
+    let refresher: crate::sync::engine::AddrRefresher = Arc::new(move |p: NodeId| {
+        Box::pin(async move {
+            let id = iroh::EndpointId::from_bytes(&p).ok()?;
+            Some(iroh::EndpointAddr::new(id).with_relay_url(fresh_relay.parse().unwrap()))
+        })
+    });
+
+    let pkg = build_package(&tmp.path().join("src-t36"), "uuid-t36", "f.fits", "M8", 1024);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_inner(
+        store.clone() as Arc<dyn SyncStore>,
+        transport as Arc<dyn SharingTransport>,
+        peer,
+        SyncConfig {
+            ack_timeout: Duration::from_millis(80),
+        },
+        None,
+        None,
+        Some(refresher),
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+
+    // The announce fails (timeout class) and arms a retry; when the backoff window
+    // elapses, the retry path re-resolves, REMOVES the stale entry, then re-adds the
+    // fresh one. Wait on the fresh relay appearing in the lookup.
+    wait_until(
+        || {
+            lookup
+                .get_endpoint_info(peer_id)
+                .map(|info| info.relay_urls().any(|u| u.to_string() == fresh_relay))
+                .unwrap_or(false)
+        },
+        WAIT,
+    )
+    .await;
+
+    // Delivery is retried forever — a network condition never terminalizes.
+    assert!(
+        !matches!(
+            state_of(&store, id),
+            Some(OutboundState::Failed | OutboundState::Confirmed)
+        ),
+        "a retrying package must stay non-terminal, got {:?}",
+        state_of(&store, id)
+    );
+
+    // The lookup now holds ONLY the fresh addressing — the dead relay URL is gone.
+    let info = lookup
+        .get_endpoint_info(peer_id)
+        .expect("peer must remain in the lookup after the replace");
+    let relays: Vec<String> = info.relay_urls().map(|u| u.to_string()).collect();
+    assert!(
+        relays.iter().any(|u| u == fresh_relay),
+        "the fresh relay must be present after the replace, got {relays:?}"
+    );
+    assert!(
+        !relays.iter().any(|u| u == stale_relay),
+        "the stale relay URL must be removed (full replace, not merge), got {relays:?}"
+    );
+    assert!(
+        *removed.lock().unwrap() >= 1,
+        "the retry path must invalidate the stale lookup entry before re-adding"
+    );
+
+    engine.shutdown().await;
+}
+
+/// Task 3.4: when the retry path's address refresher is wired but yields `None`
+/// (hub blip / peer gone), the engine keeps last-known addressing AND logs a
+/// `warn` naming the peer — the fallback is no longer silent.
+#[tokio::test]
+async fn retry_refresh_unavailable_warns_with_peer() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let captured: Arc<std::sync::Mutex<Vec<CapturedEvent>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let _guard = tracing_subscriber::registry()
+        .with(CaptureLayer {
+            events: captured.clone(),
+        })
+        .set_default();
+
+    let tmp = tempdir().unwrap();
+    let peer: NodeId = *iroh::SecretKey::generate().public().as_bytes();
+    // Announce succeeds → the ack never comes → the ack deadline fires → the Retry
+    // arm runs, where the refresher (wired, always `None`) triggers the warn.
+    let transport = Arc::new(RetryProbeTransport {
+        node_id: peer,
+        keep_tx: std::sync::Mutex::new(None),
+        added: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let refresher: crate::sync::engine::AddrRefresher =
+        Arc::new(|_p: NodeId| Box::pin(async { None::<iroh::EndpointAddr> }));
+
+    let pkg = build_package(&tmp.path().join("src-t34"), "uuid-t34", "f.fits", "M8", 1024);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_inner(
+        store.clone() as Arc<dyn SyncStore>,
+        transport as Arc<dyn SharingTransport>,
+        peer,
+        SyncConfig {
+            ack_timeout: Duration::from_millis(50),
+        },
+        None,
+        None,
+        Some(refresher),
+    );
+    let _id = engine.enqueue_package(&pkg).await.unwrap();
+
+    const MSG: &str = "retry: address refresh unavailable; dialing last-known address";
+    wait_until(
+        || captured.lock().unwrap().iter().any(|e| e.message == MSG),
+        WAIT,
+    )
+    .await;
+
+    let events = captured.lock().unwrap();
+    let warn = events
+        .iter()
+        .find(|e| e.message == MSG)
+        .expect("expected the refresh-unavailable warn line");
+    assert!(
+        warn.fields.contains_key("peer"),
+        "the warn must carry a peer field, got {:?}",
+        warn.fields
+    );
+    drop(events);
+
+    engine.shutdown().await;
+}
+
 // ── Task 5: kick / send-now (immediate out-of-band retry, backoff reset) ──────
 
 /// Drive an engine into a long backoff window against an OFFLINE peer, returning
