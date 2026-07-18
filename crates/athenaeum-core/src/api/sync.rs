@@ -37,7 +37,7 @@ use crate::sync::{
     node_id_hex, pairing, CatalogSyncStore, Direction, HistoryQuery, HistoryRow, InboundSummary,
     OutboundRow, OutboundState, OutboundSummary, RefusalRefresher, StartedSender, SyncEngine,
     SyncEngineHandle, SyncReceiverStatus, SyncRuntime, SyncSenderRuntime, SyncSenderStatus,
-    SyncStatus, SyncStore, TransferFileEntry,
+    SyncStatus, SyncStore, TransferFileEntry, TransportHealth,
 };
 
 /// Request filter for [`list_history`] (mirrors [`HistoryQuery`] over the
@@ -1021,9 +1021,35 @@ fn active_inbound_summaries(ctx: &ServiceContext) -> Result<Vec<InboundSummary>,
         .collect())
 }
 
+/// Transport-reachability health for the status poll (Task 3.3), resolved with
+/// NO network I/O and WITHOUT ever binding a node — a status poll must never spin
+/// up the transport just to report on it.
+///
+/// PEEKS at the (possibly-unbound) shared node on [`ServiceContext::iroh_node`]:
+/// - **bound** → its own [`SharedIrohNode::transport_health`] (`relay_connected`
+///   / `direct_only`); a bound node always has a resolved relay map, so
+///   `no_relay_map` can't apply.
+/// - **unbound** → distinguish a signed-in device stuck with no relay
+///   configuration (`no_relay_map` — worth surfacing, transfers would stall) from
+///   a device that simply hasn't started the transport yet (`not_started`). Both
+///   branches read only local settings ([`account_signed_in`] + [`cached_relays`],
+///   the same cache [`resolve_relay_mode`] would build a node from) — never the hub.
+async fn derive_transport_health(ctx: &ServiceContext) -> Result<TransportHealth, ApiError> {
+    // Peek only: clone the Arc out if a node is bound, then drop the lock. Never
+    // `ensure_iroh_node` here — that would lazily bind a transport on a poll.
+    let node = { ctx.iroh_node.lock().await.as_ref().map(Arc::clone) };
+    if let Some(node) = node {
+        return Ok(node.transport_health());
+    }
+    if account_signed_in(ctx)? && cached_relays(ctx)?.is_empty() {
+        return Ok(TransportHealth::no_relay_map());
+    }
+    Ok(TransportHealth::not_started())
+}
+
 /// Enriched snapshot for the Transfers UI (task M3): pairing summary + send-side
-/// rollup + receive-side rollup, all resolved without any network I/O so a
-/// 10-second UI poll never hits the hub.
+/// rollup + receive-side rollup + transport health (Task 3.3), all resolved
+/// without any network I/O so a 10-second UI poll never hits the hub.
 pub async fn get_status(
     ctx: &ServiceContext,
     sync: &SyncRuntime,
@@ -1035,6 +1061,7 @@ pub async fn get_status(
     let pairing_ticket = sync.ticket().await;
     let sender_status = build_sender_status(ctx, sender).await?;
     let active_inbound = active_inbound_summaries(ctx)?;
+    let transport = derive_transport_health(ctx).await?;
 
     Ok(SyncStatus {
         dev_pairing_enabled,
@@ -1047,6 +1074,7 @@ pub async fn get_status(
             active: active_inbound,
             received_total,
         },
+        transport,
     })
 }
 
@@ -1950,6 +1978,35 @@ mod tests {
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
         (tmp, ctx)
+    }
+
+    /// Task 3.3: with NO node bound and NOT signed in, transport health reads
+    /// `not_started` — the poll must not bind a node, and the ctx's node slot
+    /// stays `None` afterward (peek-only).
+    #[tokio::test]
+    async fn transport_health_no_node_is_not_started() {
+        let (_tmp, ctx) = test_ctx();
+        let health = derive_transport_health(&ctx).await.expect("derive health");
+        assert_eq!(health.status, "not_started");
+        assert!(
+            ctx.iroh_node.lock().await.is_none(),
+            "deriving health must never lazily bind a node"
+        );
+    }
+
+    /// Task 3.3: signed in but with an empty cached relay map and no node bound,
+    /// transport health reads `no_relay_map` — the stuck state worth surfacing
+    /// (transfers to remote peers would stall). Local settings only; no hub call.
+    #[tokio::test]
+    async fn transport_health_signed_in_empty_relays_is_no_relay_map() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(&conn, keys::ACCOUNT_DEVICE_ID, "device-1").unwrap();
+        }
+        let health = derive_transport_health(&ctx).await.expect("derive health");
+        assert_eq!(health.status, "no_relay_map");
     }
 
     /// Task 3 (Д2): `ensure_iroh_node` lazily binds the ONE shared node and

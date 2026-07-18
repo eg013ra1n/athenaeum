@@ -734,6 +734,26 @@ active: Array<InboundSummary>,
  */
 receivedTotal: number, };
 
+export type TransportHealth = { 
+/**
+ * One of `"not_started"` (no transport bound yet), `"relay_connected"`
+ * (a home relay is up — remote peers can be reached), `"direct_only"` (the
+ * relay is disabled or unreachable — peers behind NAT may not reach us), or
+ * `"no_relay_map"` (signed in but no relay configuration resolved or cached —
+ * remote transfers will stall).
+ */
+status: string, 
+/**
+ * The home-relay URL, when one is known (currently connected, or the last
+ * one the watcher saw). `None` before any relay transition / with no relay.
+ */
+relayUrl: string | null, 
+/**
+ * The most recent relay error, when the last transition was a disconnect.
+ * `None` on a healthy relay or when the disconnect carried no error.
+ */
+lastError: string | null, };
+
 export type SyncStatus = { 
 /**
  * Whether the dev pairing flag (`sync.dev_ticket_pairing`) is enabled.
@@ -758,7 +778,12 @@ sender: SyncSenderStatus,
 /**
  * Receive-side rollup.
  */
-receiver: SyncReceiverStatus, };
+receiver: SyncReceiverStatus, 
+/**
+ * Transport reachability health (Task 3.3): relay connected / direct-only /
+ * no relay map / not started. Drives the sidebar badge's health dot.
+ */
+transport: TransportHealth, };
 
 export type TransferFileEntry = { 
 /**

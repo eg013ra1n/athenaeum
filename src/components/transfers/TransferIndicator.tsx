@@ -1,5 +1,6 @@
 import { ArrowUp, ArrowDown, RefreshCw } from 'lucide-react';
 import { useTransfers } from '../../contexts/TransfersContext';
+import { transportHealthView } from './transportHealth';
 
 interface TransferIndicatorProps {
   collapsed: boolean;
@@ -9,7 +10,8 @@ interface TransferIndicatorProps {
  * Sidebar transfers badge (task M3), sibling of `ComputeQueueIndicator`.
  * Visible only when this device is signed in with a role set, or dev pairing is
  * enabled (`useSyncStatus.visible`). Shows a compact ↑ (queued + transferring
- * out) / ↓ (frames received) summary; clicking opens the `TransfersPanel`.
+ * out) / ↓ (frames received) summary plus a small transport-health dot (Task
+ * 3.3); clicking opens the `TransfersPanel`.
  *
  * The snapshot behind it is polled by the single shared `useSyncStatus` in
  * `TransfersProvider` — this component is presentational only.
@@ -20,7 +22,8 @@ export function TransferIndicator({ collapsed }: TransferIndicatorProps) {
 
   const up = status.sender.queued + status.sender.transferring;
   const down = status.receiver.receivedTotal;
-  const title = `Transfers — ${up} sending, ${down} received`;
+  const health = transportHealthView(status.transport);
+  const title = `Transfers — ${up} sending, ${down} received\n${health.detail}`;
 
   if (collapsed) {
     return (
@@ -37,6 +40,12 @@ export function TransferIndicator({ collapsed }: TransferIndicatorProps) {
               {up}
             </span>
           )}
+          {/* Transport-health dot (Task 3.3), bottom-right so it never collides
+              with the top-right in-flight count. */}
+          <span
+            className={`absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full ring-2 ring-surface ${health.dot}`}
+            aria-label={health.label}
+          />
         </button>
       </div>
     );
@@ -51,7 +60,14 @@ export function TransferIndicator({ collapsed }: TransferIndicatorProps) {
         className="flex w-full items-center justify-between gap-2 rounded-lg border border-border bg-surface p-2.5 transition-colors hover:bg-surface-hover"
       >
         <div className="flex items-center gap-1.5 min-w-0">
-          <RefreshCw size={14} className={up > 0 ? 'text-accent' : 'text-content-muted'} />
+          <span className="relative flex shrink-0">
+            <RefreshCw size={14} className={up > 0 ? 'text-accent' : 'text-content-muted'} />
+            {/* Transport-health dot (Task 3.3) tucked on the transfers icon. */}
+            <span
+              className={`absolute -bottom-1 -right-1 h-2 w-2 rounded-full ring-2 ring-surface ${health.dot}`}
+              aria-label={health.label}
+            />
+          </span>
           <span className="truncate text-xs text-content-secondary">Transfers</span>
         </div>
         <div className="flex shrink-0 items-center gap-2 text-xs">

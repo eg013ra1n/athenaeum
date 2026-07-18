@@ -4,6 +4,7 @@ import { X, Search, ArrowUp, ArrowDown, ArrowUpRight, Inbox, Users } from 'lucid
 import { api } from '../../api';
 import { useTransfers } from '../../contexts/TransfersContext';
 import { plainTransferError } from './ActiveTransferRow';
+import { transportHealthView } from './transportHealth';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
   Direction,
@@ -288,15 +289,28 @@ export function TransfersPanel() {
         </div>
 
         {status && (
-          <div className="flex items-center gap-4 border-b border-border px-4 py-2 text-xs text-content-muted">
-            <span className="flex items-center gap-1" title="Queued + transferring out">
-              <ArrowUp size={12} className="text-accent" />
-              {status.sender.queued + status.sender.transferring} sending
-            </span>
-            <span className="flex items-center gap-1" title="Frames received">
-              <ArrowDown size={12} />
-              {status.receiver.receivedTotal} received
-            </span>
+          <div className="flex flex-col gap-1.5 border-b border-border px-4 py-2 text-xs text-content-muted">
+            <div className="flex items-center gap-4">
+              <span className="flex items-center gap-1" title="Queued + transferring out">
+                <ArrowUp size={12} className="text-accent" />
+                {status.sender.queued + status.sender.transferring} sending
+              </span>
+              <span className="flex items-center gap-1" title="Frames received">
+                <ArrowDown size={12} />
+                {status.receiver.receivedTotal} received
+              </span>
+            </div>
+            {/* Transport-health line (Task 3.3): a coloured dot + human detail
+                (relay url / NAT / no-relay-map warning). */}
+            {(() => {
+              const health = transportHealthView(status.transport);
+              return (
+                <span className="flex items-center gap-1.5" title={health.detail}>
+                  <span className={`h-2 w-2 shrink-0 rounded-full ${health.dot}`} aria-hidden="true" />
+                  <span className="truncate">{health.detail}</span>
+                </span>
+              );
+            })()}
           </div>
         )}
 

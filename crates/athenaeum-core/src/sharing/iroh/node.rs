@@ -57,6 +57,7 @@ use crate::sharing::types::{
     FrameReceipt, NodeId, PackageAnnounce, PackageId, StartInfo, TransportEvent,
 };
 use crate::sharing::{FetchSink, SharingTransport};
+use crate::sync::status::TransportHealth;
 use crate::sync::DedupResponder;
 
 use super::proto::{self, Msg, OfferEntry};
@@ -175,6 +176,33 @@ pub type RelayResolver =
 /// so the home-relay watcher task — respawned on every relay rebuild — reads the
 /// CURRENT hook at fire time rather than capturing a stale clone at spawn.
 pub type WakeHook = Arc<dyn Fn() + Send + Sync>;
+
+/// The node's last-known home-relay connectivity (Task 3.3). Written by the
+/// home-relay watcher on every transition (the same values it already computes
+/// for its log lines) and read by [`SharedIrohNode::transport_health`] on the
+/// status poll. Held behind an `Arc<RwLock<…>>` on the rebuild-surviving OUTER
+/// layer of the node (like [`WakeHook`]) — the watcher is respawned per relay
+/// rebuild but writes into the SAME cell, so a poll always sees the current
+/// picture. The initial value is disconnected; the watcher overwrites it once a
+/// transition arrives.
+#[derive(Debug, Clone)]
+pub struct RelayHealth {
+    /// Whether a home relay is currently connected (last transition seen).
+    pub connected: bool,
+    /// The relay URL of the last transition (connect or disconnect), if any.
+    pub url: Option<String>,
+    /// The relay error from the last disconnect transition, if any.
+    pub last_error: Option<String>,
+    /// When this snapshot was recorded.
+    pub since: Instant,
+}
+
+impl RelayHealth {
+    /// The pre-transition disconnected baseline the node binds with.
+    fn initial() -> Self {
+        Self { connected: false, url: None, last_error: None, since: Instant::now() }
+    }
+}
 
 /// Which multiplexed role a [`SharedIrohNode`] handle plays. The variant selects
 /// the blob-tag prefix (Д3) — `recv/pkg/…`, `out/pkg/…`, `collab/pkg/…` — so the
@@ -615,6 +643,12 @@ pub struct SharedIrohNode {
     swept: Mutex<HashSet<&'static str>>,
     /// Whether the one-shot home-relay `online()` wait has run.
     online_waited: AtomicBool,
+    /// The outcome of that one-shot `online()` wait (Task 3.3): `true` once it
+    /// completed within [`ONLINE_TIMEOUT`], `false` before it runs or after it
+    /// times out. Persisted (instead of only logged) so `transport_health` can
+    /// report `relay_connected` even before the watcher observes its first
+    /// transition. Paired with `online_waited`, which latches that it has run.
+    online_ok: AtomicBool,
     /// Whether [`shutdown`](Self::shutdown) has already run (idempotency guard).
     shutdown_done: AtomicBool,
     /// Immediate relay-refresh trigger (H2): the sign-in path calls
@@ -644,6 +678,13 @@ pub struct SharedIrohNode {
     /// (survives a rebuild). Never invoked while the lock is held: the value is
     /// cloned out first, so a hook that re-enters the node can't self-deadlock.
     wake_hook: Arc<RwLock<Option<WakeHook>>>,
+    /// The home-relay watcher's last-recorded transition (Task 3.3). Like
+    /// [`wake_hook`](Self::wake_hook) it lives on this rebuild-surviving outer
+    /// layer and is handed to the watcher task, which IS respawned on every relay
+    /// rebuild — so the watcher writes into the SAME cell across rebuilds and
+    /// [`transport_health`](Self::transport_health) always reads the current
+    /// picture. Read under the lock and cloned out; never held across an await.
+    relay_health: Arc<RwLock<RelayHealth>>,
 }
 
 /// A relay change awaiting an idle rebuild (Task 8, H2).
@@ -785,7 +826,15 @@ impl SharedIrohNode {
         // so the watcher reads whatever hook the api layer has installed at fire
         // time, not a stale clone captured here at bind.
         let wake_hook: Arc<RwLock<Option<WakeHook>>> = Arc::new(RwLock::new(None));
-        let relay_watcher = spawn_home_relay_watcher(endpoint.clone(), Arc::clone(&wake_hook));
+        // The relay-health cell also lives outside `NetLayer` (survives a relay
+        // rebuild) and is handed to the watcher, which IS respawned on rebuild —
+        // so the watcher writes the CURRENT node's transitions into this same cell.
+        let relay_health: Arc<RwLock<RelayHealth>> = Arc::new(RwLock::new(RelayHealth::initial()));
+        let relay_watcher = spawn_home_relay_watcher(
+            endpoint.clone(),
+            Arc::clone(&wake_hook),
+            Arc::clone(&relay_health),
+        );
 
         tracing::debug!(node_id = %endpoint.id().fmt_short(), "shared iroh node bound");
         Ok(Arc::new(Self {
@@ -810,6 +859,7 @@ impl SharedIrohNode {
             connect_gate,
             swept: Mutex::new(HashSet::new()),
             online_waited: AtomicBool::new(false),
+            online_ok: AtomicBool::new(false),
             shutdown_done: AtomicBool::new(false),
             refresh_notify: Arc::new(Notify::new()),
             pending_rebuild: Mutex::new(None),
@@ -820,6 +870,7 @@ impl SharedIrohNode {
             key_lock: Mutex::new(Some(key_lock)),
             responder,
             wake_hook,
+            relay_health,
         }))
     }
 
@@ -903,6 +954,33 @@ impl SharedIrohNode {
     /// The relay URLs the current endpoint was built with (H1 groundwork, Task 7).
     pub fn relay_urls(&self) -> Vec<String> {
         self.net.lock().expect("net mutex poisoned").relay_urls.clone()
+    }
+
+    /// The node's current transport-reachability health for the status poll
+    /// (Task 3.3), combining three signals with NO network I/O: whether a relay
+    /// is configured on the current endpoint ([`uses_relay`](Self::uses_relay)),
+    /// the home-relay watcher's last-recorded [`RelayHealth`] transition, and the
+    /// one-shot `online()`-wait outcome. A bound node reports only
+    /// [`relay_connected`](TransportHealth::relay_connected) or
+    /// [`direct_only`](TransportHealth::direct_only) — `not_started` (no node) and
+    /// `no_relay_map` (signed in, no relay configuration) are api-layer
+    /// derivations in [`crate::api::sync::derive_transport_health`], which owns the
+    /// sign-in / cached-relay state this layer does not see.
+    pub fn transport_health(&self) -> TransportHealth {
+        // Relay disabled at bind (direct-only / loopback): there is no home relay,
+        // so the node is undialable by peers behind NAT.
+        if !self.uses_relay() {
+            return TransportHealth::direct_only(None, None);
+        }
+        let health = self.relay_health.read().expect("relay_health lock poisoned").clone();
+        // Either signal — the watcher's last transition OR the one-shot wait —
+        // reporting a live relay means we are reachable. Both start pessimistic,
+        // so a freshly-bound node reads `direct_only` until one flips.
+        if health.connected || self.online_ok.load(Ordering::SeqCst) {
+            TransportHealth::relay_connected(health.url)
+        } else {
+            TransportHealth::direct_only(health.url, health.last_error)
+        }
     }
 
     /// Acquire a role handle (Д3): a [`SharingTransport`] that role-prefixes its
@@ -1287,8 +1365,13 @@ impl SharedIrohNode {
         );
         let control_pool = ControlPool::new(endpoint.clone());
         // Respawn the watcher on the new endpoint, handing it the SAME wake-hook
-        // lock so a hook installed before the rebuild keeps firing after it.
-        let relay_watcher = spawn_home_relay_watcher(endpoint.clone(), Arc::clone(&self.wake_hook));
+        // and relay-health cells so a hook installed before the rebuild keeps
+        // firing after it and the health surface tracks the new endpoint's relay.
+        let relay_watcher = spawn_home_relay_watcher(
+            endpoint.clone(),
+            Arc::clone(&self.wake_hook),
+            Arc::clone(&self.relay_health),
+        );
 
         // Swap the freshly-built layer in — unless we raced host shutdown (which
         // set `shutdown_done` before taking the net lock), in which case discard
@@ -1496,6 +1579,11 @@ impl SharedIrohNode {
         if self.uses_relay() && !self.online_waited.swap(true, Ordering::SeqCst) {
             match tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()).await {
                 Ok(()) => {
+                    // Persist the outcome for the health surface (Task 3.3) instead
+                    // of only logging it: `transport_health` can then report
+                    // `relay_connected` immediately, before the watcher's first
+                    // transition arrives.
+                    self.online_ok.store(true, Ordering::SeqCst);
                     let relay_url = endpoint
                         .addr()
                         .relay_urls()
@@ -1508,6 +1596,9 @@ impl SharedIrohNode {
                     );
                 }
                 Err(_) => {
+                    // Explicit (already the default): the wait ran and timed out,
+                    // so we are direct-only until the watcher sees a connection.
+                    self.online_ok.store(false, Ordering::SeqCst);
                     tracing::warn!(
                         node_id = %endpoint.id().fmt_short(),
                         timeout_ms = ONLINE_TIMEOUT.as_millis() as u64,
@@ -1971,6 +2062,7 @@ impl SharingTransport for RoleHandle {
 fn spawn_home_relay_watcher(
     endpoint: Endpoint,
     wake_hook: Arc<RwLock<Option<WakeHook>>>,
+    relay_health: Arc<RwLock<RelayHealth>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         use n0_future::StreamExt as _;
@@ -1983,6 +2075,16 @@ fn spawn_home_relay_watcher(
                 if last.get(&url).copied() == Some(connected) {
                     continue;
                 }
+                // Record the transition for the queryable health surface (Task
+                // 3.3) — the same values these log lines carry. Written under the
+                // lock, no await held; a poll reads the current picture.
+                let last_error = if connected { None } else { st.last_error().map(|e| e.to_string()) };
+                *relay_health.write().expect("relay_health lock poisoned") = RelayHealth {
+                    connected,
+                    url: Some(url.clone()),
+                    last_error: last_error.clone(),
+                    since: Instant::now(),
+                };
                 if connected {
                     tracing::info!(relay_url = %url, "home relay connected");
                     // Wake event: clone the hook out from under the lock, then
@@ -1991,7 +2093,7 @@ fn spawn_home_relay_watcher(
                     if let Some(h) = hook {
                         h();
                     }
-                } else if let Some(err) = st.last_error() {
+                } else if let Some(err) = last_error.as_deref() {
                     tracing::warn!(relay_url = %url, error = %err, "home relay disconnected");
                 } else {
                     tracing::warn!(relay_url = %url, "home relay disconnected");
@@ -2193,6 +2295,22 @@ mod tests {
             "the same device key must yield the same node id across a re-bind"
         );
         node2.shutdown().await;
+    }
+
+    // Task 3.3: a relay-disabled node has no home relay, so its transport health
+    // is `direct_only` (undialable behind NAT) — never `relay_connected`. This is
+    // the node-level half of the health derivation (the api layer owns
+    // `not_started` / `no_relay_map`). No role is started and no relay is
+    // configured, so the online-wait never runs and the watcher records nothing —
+    // the bind-time `direct_only` baseline stands.
+    #[tokio::test]
+    async fn transport_health_relay_disabled_is_direct_only() {
+        let dir = tempdir().unwrap();
+        let node = bind_disabled(dir.path()).await;
+        let health = node.transport_health();
+        assert_eq!(health.status, "direct_only", "relay-disabled node is direct-only");
+        assert!(health.relay_url.is_none(), "no relay configured => no relay url");
+        node.shutdown().await;
     }
 
     // (d) Two role handles share ONE store: import a package via the Out handle,

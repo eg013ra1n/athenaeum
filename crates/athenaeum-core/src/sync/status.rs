@@ -121,11 +121,59 @@ pub struct TransferFileEntry {
     pub outcome: Option<String>,
 }
 
+/// Queryable transport-health surface for the Transfers UI (Task 3.3): whether
+/// this node can currently be reached by remote peers. Derived on each status
+/// poll with NO network I/O — from the bound iroh node's relay watcher +
+/// one-shot `online()`-wait outcome (a bound node reports `relay_connected` /
+/// `direct_only`), or, with no node bound, from local sign-in + cached-relay
+/// state (`not_started` / `no_relay_map`). Built by
+/// [`crate::api::sync::derive_transport_health`].
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TransportHealth {
+    /// One of `"not_started"` (no transport bound yet), `"relay_connected"`
+    /// (a home relay is up — remote peers can be reached), `"direct_only"` (the
+    /// relay is disabled or unreachable — peers behind NAT may not reach us), or
+    /// `"no_relay_map"` (signed in but no relay configuration resolved or cached —
+    /// remote transfers will stall).
+    pub status: String,
+    /// The home-relay URL, when one is known (currently connected, or the last
+    /// one the watcher saw). `None` before any relay transition / with no relay.
+    pub relay_url: Option<String>,
+    /// The most recent relay error, when the last transition was a disconnect.
+    /// `None` on a healthy relay or when the disconnect carried no error.
+    pub last_error: Option<String>,
+}
+
+impl TransportHealth {
+    /// No transport has been bound yet this session.
+    pub fn not_started() -> Self {
+        Self { status: "not_started".into(), relay_url: None, last_error: None }
+    }
+
+    /// Signed in, but no relay configuration was resolved or cached — a bound
+    /// transport could not reach remote peers.
+    pub fn no_relay_map() -> Self {
+        Self { status: "no_relay_map".into(), relay_url: None, last_error: None }
+    }
+
+    /// A home relay is connected; remote peers can reach this node.
+    pub fn relay_connected(relay_url: Option<String>) -> Self {
+        Self { status: "relay_connected".into(), relay_url, last_error: None }
+    }
+
+    /// Direct addresses only — the relay is disabled or its wait timed out, so
+    /// peers behind NAT may be unreachable.
+    pub fn direct_only(relay_url: Option<String>, last_error: Option<String>) -> Self {
+        Self { status: "direct_only".into(), relay_url, last_error }
+    }
+}
+
 /// The full snapshot the Transfers UI polls. Enriched in task M3 from the
 /// original receive-only shape (`devPairingEnabled` / `transportStarted` /
 /// `pairingTicket` / `receivedTotal` retained for back-compat) with the
 /// [`sender`](Self::sender) rollup and a symmetric [`receiver`](Self::receiver)
-/// rollup.
+/// rollup, and in Task 3.3 with the [`transport`](Self::transport) health line.
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncStatus {
@@ -141,4 +189,7 @@ pub struct SyncStatus {
     pub sender: SyncSenderStatus,
     /// Receive-side rollup.
     pub receiver: SyncReceiverStatus,
+    /// Transport reachability health (Task 3.3): relay connected / direct-only /
+    /// no relay map / not started. Drives the sidebar badge's health dot.
+    pub transport: TransportHealth,
 }
