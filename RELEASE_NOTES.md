@@ -1,24 +1,24 @@
-_The mesh beta — send frames between any of your machines, and only the new ones cross the wire._
+_The delivery beta — transfers you can watch, steer, and trust to finish._
 
 ## What's New
 
-- **Send anywhere — the sync mesh.** The one-primary model is gone: every machine signed in to your account is now a full peer. You choose exactly where each transfer goes — send from the observatory to the studio, from the studio to a backup machine, or to several destinations at once. Devices carry a capability instead of a role: an Athenaeum install can send and receive, a Perseus capture node is send-only.
-- **Send to… from the app.** Select frames in the frame table — or files and folders in the file browser — and send them straight to another of your machines. Pick one or more destinations in the new dialog; the Transfers panel tracks progress, and the finished notification tells you how many frames were new and how many the destination already had.
-- **Duplicate-aware transfers.** Before any data moves, the two machines compare notes: frames already in the destination's catalog are skipped, and only new frames cross the wire. A frame is only ever skipped after its full content hash matches — never on a guess. Re-sending an overlapping batch transfers just the difference.
-- **Perseus sends in batches.** Instead of firing every file the moment it lands, Perseus now accumulates finished frames and sends them as a single package — automatically once the camera has been quiet for a while, or manually with a Send-now button. The web page gained a "To sync" tree showing exactly what is waiting, an auto/manual toggle, and a history grouped by batch.
-- **Tidy landing.** Received frames land in a folder named after the sending machine, mirroring the sender's own folder layout — data arriving from several machines never mixes.
+- **The Transfers screen.** A new torrent-style view of everything moving between your machines: every batch with live per-file progress bars, transferred bytes, current speed and state — incoming and outgoing alike. Expand a batch to see each file; a History tab keeps finished, cancelled and failed batches grouped per batch with an honest reason on every row that stalled or failed.
+- **Delivery that doesn't give up.** A transfer to a machine that is offline, asleep or unreachable no longer fails — it waits and retries with a growing back-off, forever, and the row shows a countdown to the next attempt. The moment the destination comes back (or the relay reconnects), pending packages are kicked immediately instead of waiting out the timer. A "Send now" button skips the countdown on demand.
+- **Cancel from either side.** Both the sender and the receiver can cancel a transfer. Cancelling on the receiving end tells the sender, which stops retrying and marks the batch cancelled — and a cancelled batch keeps its payload, so it can simply be retried later.
+- **Perseus transfer controls.** The capture agent's web page gained the same powers: per-batch progress with retry countdowns, a stalled badge, Send-now/kick, cancel, retryable cancelled rows, and a device picker for choosing send targets.
+- **Sturdier transport.** The app and Perseus now each run a single sync transport for the whole process, which removes the device-identity conflicts that could kick a machine off the relay when several parts of the app talked at once. Machines also publish their current addresses to your account, so peers dial each other directly and reconnect faster after network changes.
+- **Collaboration preview.** This beta carries the first look at shared projects: joining a project, linking a frame set to it, publishing calibrated frames for the coordinator's review, receiving approved contributions from teammates, and exporting the whole project for stacking. The server side is still rolling out — the Projects page will come alive for accounts over the coming days, no update needed.
 
 ## Changes
 
-- Every device has a unique name in your account (new machines default to their hostname). Rename it inline from the app's Account section or the Perseus web page; the name keys the destination picker and the landing folder.
-- The sync channel and the Perseus web dashboard were hardened after an internal security review: stricter validation of incoming package identifiers, per-peer authorization on the receiving side, a stronger web-session model, and tighter permissions on the device key file.
-- The sidebar sync indicator now appears only while the transport is actually running.
+- Received files that would land inside the app's own data folder now raise a standing warning with a one-click way to pick a proper landing folder.
+- Incoming folders are named after the sending machine, with a safe fallback when a device name has no usable characters.
+- Transfer notifications and rows deduplicate cleanly when a batch reaches its final state.
 
 ## Bug Fixes
 
-- A package sent to several destinations is no longer cleaned up after the first confirmation — a destination that was offline can still finish its transfer later, with no silent data loss.
-- Retrying a failed transfer from the Perseus web page can no longer free a payload that other destinations still need.
-- Perseus marks a capture file as handled only once it has actually been packaged — a file that misses one batch is picked up by the next, never silently skipped.
-- Sending a folder no longer sweeps in sibling folders whose names share the same prefix.
-- The active-transfer count is no longer inflated when sending to several destinations at once.
-- The Perseus web session token is kept only for the lifetime of the browser tab.
+- **Master calibration builds no longer fail** with `non-printable-ASCII string value for ATH_REJ`. A single non-ASCII character in an internally generated header value aborted every master build at the final write — after all the integration work was already done. Header writing is now also safe for file paths and names in any language (non-ASCII characters degrade to `?` placeholders in the FITS header instead of failing the build).
+- Deleting a scan root no longer errors when master calibration provenance references frames under it.
+- Renamed send targets in Perseus self-heal to device ids instead of failing the batch.
+- Transfers get a stable package identity on the wire, and stale in-progress incoming rows are reconciled on startup instead of lingering forever.
+- Upload progress for multi-file batches accumulates correctly instead of resetting between files.
