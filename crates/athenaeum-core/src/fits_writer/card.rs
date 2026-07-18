@@ -9,7 +9,6 @@ const MAX_STR_CONTENT: usize = 68; // printable chars inside the quotes of one c
 pub enum FitsWriteError {
     InvalidKeyword(String),
     ReservedKeyword(String),
-    NonAsciiString(String),
     CommentTooLong(String),
     ValueTooLong(String),
     NonFiniteReal(String),
@@ -28,7 +27,6 @@ impl std::fmt::Display for FitsWriteError {
         match self {
             Self::InvalidKeyword(k) => write!(f, "invalid FITS keyword: {k}"),
             Self::ReservedKeyword(k) => write!(f, "structural keyword not allowed in user cards: {k}"),
-            Self::NonAsciiString(k) => write!(f, "non-printable-ASCII string value for {k}"),
             Self::CommentTooLong(k) => write!(f, "comment does not fit the card for {k}"),
             Self::ValueTooLong(k) => write!(f, "value does not fit fixed format for {k}"),
             Self::NonFiniteReal(k) => write!(f, "non-finite real value for {k}"),
@@ -92,10 +90,8 @@ impl Card {
     }
 
     fn text_cards(kind: &str, text: &str) -> Result<Vec<Card>, FitsWriteError> {
-        if !is_printable_ascii(text) {
-            return Err(FitsWriteError::NonAsciiString(kind.to_string()));
-        }
-        // Validated ASCII above, so byte-chunking is exact and lossless (one byte per char).
+        let text = sanitize_text(kind, text);
+        // Sanitized to ASCII above, so byte-chunking is exact and lossless (one byte per char).
         Ok(text
             .as_bytes()
             .chunks(72)
@@ -127,6 +123,21 @@ impl Card {
 
 fn is_printable_ascii(s: &str) -> bool {
     s.bytes().all(|b| (0x20..=0x7E).contains(&b))
+}
+
+/// FITS card values, comments and COMMENT/HISTORY text must be printable
+/// ASCII (0x20–0x7E). A hard error here can kill an entire file write at the
+/// final header-serialization step — after minutes of integration work — over
+/// one character (a recipe glyph, a Cyrillic path, a copied-through source
+/// card), so offending chars degrade lossily to '?' instead. One placeholder
+/// per CHAR, not per byte. Keywords stay strict (`validate_keyword`).
+fn sanitize_text<'a>(keyword: &str, s: &'a str) -> std::borrow::Cow<'a, str> {
+    if is_printable_ascii(s) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let cleaned: String = s.chars().map(|c| if (' '..='~').contains(&c) { c } else { '?' }).collect();
+    tracing::warn!(keyword, "non-ASCII characters in header value sanitized");
+    std::borrow::Cow::Owned(cleaned)
 }
 
 fn fmt_real(kw: &str, v: f64) -> Result<String, FitsWriteError> {
@@ -162,9 +173,7 @@ pub fn format_card(card: &Card) -> Result<Vec<[u8; 80]>, FitsWriteError> {
     }
     // COMMENT / HISTORY text cards
     if let Some(text) = &card.text {
-        if !is_printable_ascii(text) {
-            return Err(FitsWriteError::NonAsciiString(card.keyword.clone()));
-        }
+        let text = sanitize_text(&card.keyword, text);
         return Ok(vec![pack(&format!("{:<8}{}", card.keyword, text))]);
     }
 
@@ -175,17 +184,13 @@ pub fn format_card(card: &Card) -> Result<Vec<[u8; 80]>, FitsWriteError> {
 
     // Strings get their own path (CONTINUE support)
     if let CardValue::Str(s) = value {
-        if !is_printable_ascii(s) {
-            return Err(FitsWriteError::NonAsciiString(card.keyword.clone()));
-        }
+        let s = sanitize_text(&card.keyword, s);
         let escaped = s.replace('\'', "''");
         if escaped.len() <= MAX_STR_CONTENT {
             // fixed format: opening quote col 11, closing quote at/after col 20 => pad to >= 8
             let mut line = format!("{kw8}= '{:<9}'", escaped);
             if let Some(c) = &card.comment {
-                if !is_printable_ascii(c) {
-                    return Err(FitsWriteError::NonAsciiString(card.keyword.clone()));
-                }
+                let c = sanitize_text(&card.keyword, c);
                 let candidate = format!("{line} / {c}");
                 if candidate.len() > CARD_SIZE {
                     return Err(FitsWriteError::CommentTooLong(card.keyword.clone()));
@@ -213,9 +218,7 @@ pub fn format_card(card: &Card) -> Result<Vec<[u8; 80]>, FitsWriteError> {
             };
             if !cont {
                 if let Some(c) = &card.comment {
-                    if !is_printable_ascii(c) {
-                        return Err(FitsWriteError::NonAsciiString(card.keyword.clone()));
-                    }
+                    let c = sanitize_text(&card.keyword, c);
                     let candidate = format!("{line} / {c}");
                     if candidate.len() > CARD_SIZE {
                         return Err(FitsWriteError::CommentTooLong(card.keyword.clone()));
@@ -238,9 +241,7 @@ pub fn format_card(card: &Card) -> Result<Vec<[u8; 80]>, FitsWriteError> {
     };
     let mut line = format!("{kw8}= {vstr}");
     if let Some(c) = &card.comment {
-        if !is_printable_ascii(c) {
-            return Err(FitsWriteError::NonAsciiString(card.keyword.clone()));
-        }
+        let c = sanitize_text(&card.keyword, c);
         let candidate = format!("{line} / {c}");
         if candidate.len() > CARD_SIZE {
             return Err(FitsWriteError::CommentTooLong(card.keyword.clone()));
@@ -313,10 +314,27 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_rejected() {
+    fn non_ascii_value_sanitized_one_placeholder_per_char() {
+        // The exact string that failed every master build in the field:
+        // U+00B7 is 2 UTF-8 bytes but must become exactly ONE '?'.
+        let c = Card::new("ATH_REJ", CardValue::Str("Average · Winsorized sigma (3.0/3.0)".into())).unwrap();
+        let line = s(&format_card(&c).unwrap(), 0);
+        assert!(line.contains("'Average ? Winsorized sigma (3.0/3.0)'"), "got {line:?}");
+    }
+
+    #[test]
+    fn non_ascii_value_sanitized() {
+        let c = Card::new("OBJECT", CardValue::Str("Туманность".into())).unwrap();
+        let line = s(&format_card(&c).unwrap(), 0);
+        assert!(line.contains("'??????????'"), "10 chars -> 10 placeholders: {line:?}");
+    }
+
+    #[test]
+    fn non_ascii_keyword_still_rejected() {
+        // Sanitizing is for VALUES only; structure stays strict. "Е" is Cyrillic.
         assert!(matches!(
-            format_card(&Card::new("OBJECT", CardValue::Str("Туманность".into())).unwrap()),
-            Err(FitsWriteError::NonAsciiString(_))
+            Card::new("OBJЕCT", CardValue::Integer(1)),
+            Err(FitsWriteError::InvalidKeyword(_))
         ));
     }
 
@@ -344,24 +362,29 @@ mod tests {
     }
 
     #[test]
-    fn non_ascii_comment_rejected_on_string_card() {
+    fn non_ascii_comment_sanitized_on_string_card() {
         let c = Card::new("OBJECT", CardValue::Str("hello".into())).unwrap().with_comment("Ω-neb");
-        assert!(matches!(format_card(&c), Err(FitsWriteError::NonAsciiString(_))));
+        let line = s(&format_card(&c).unwrap(), 0);
+        assert!(line.contains("/ ?-neb"), "got {line:?}");
     }
 
     #[test]
-    fn non_ascii_comment_rejected_on_continue_card() {
+    fn non_ascii_comment_sanitized_on_continue_card() {
         let long = "x".repeat(100);
         let c = Card::new("ATH_SRC", CardValue::Str(long)).unwrap().with_comment("Ω-neb");
-        assert!(matches!(format_card(&c), Err(FitsWriteError::NonAsciiString(_))));
+        let r = format_card(&c).unwrap();
+        let last = s(&r, r.len() - 1);
+        assert!(last.contains("/ ?-neb"), "got {last:?}");
     }
 
     #[test]
-    fn non_ascii_text_cards_rejected() {
-        assert!(matches!(
-            Card::comment_cards(&"Ω".repeat(80)),
-            Err(FitsWriteError::NonAsciiString(_))
-        ));
+    fn non_ascii_text_cards_sanitized_before_chunking() {
+        // 80 Ω (160 bytes, 80 chars) must sanitize to 80 '?' FIRST, then
+        // byte-chunk at 72 — i.e. 2 cards, never a mid-char split.
+        let cards = Card::comment_cards(&"Ω".repeat(80)).unwrap();
+        assert_eq!(cards.len(), 2);
+        let line = s(&format_card(&cards[0]).unwrap(), 0);
+        assert!(line.starts_with("COMMENT ??????"), "got {line:?}");
     }
 
     #[test]

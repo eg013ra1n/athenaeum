@@ -39,9 +39,11 @@ impl IntegrationRecipe {
         Self { combination: Combination::Median, rejection }
     }
 
-    /// Human summary — "Average · Winsorized sigma (3.0/3.0)" style (spec §4).
+    /// Human summary — "Average | Winsorized sigma (3.0/3.0)" style (spec §4).
+    /// Printable-ASCII only: this string is written into the ATH_REJ FITS
+    /// card, whose values are restricted to 0x20–0x7E.
     pub fn describe(&self) -> String {
-        format!("{} · {}", self.combination.label(), self.rejection.label())
+        format!("{} | {}", self.combination.label(), self.rejection.label())
     }
 }
 
@@ -473,6 +475,29 @@ mod tests {
 
     // ── Combination basics ──────────────────────────────────────────────────
 
+    /// `describe()` feeds the ATH_REJ FITS card, whose string values must be
+    /// printable ASCII (0x20–0x7E) — a single non-ASCII char (the old ` · `
+    /// separator) failed EVERY master build at the final header write.
+    #[test]
+    fn describe_is_printable_ascii_for_all_variants() {
+        let rejections = [
+            Rejection::None,
+            Rejection::PercentileClip { low: 0.2, high: 0.1 },
+            Rejection::SigmaClip { sigma_low: 4.0, sigma_high: 3.0 },
+            Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 },
+            Rejection::LinearFitClip { sigma_low: 5.0, sigma_high: 2.5 },
+        ];
+        for rej in rejections {
+            for recipe in [IntegrationRecipe::average(rej), IntegrationRecipe::median(rej)] {
+                let d = recipe.describe();
+                assert!(
+                    d.bytes().all(|b| (0x20..=0x7E).contains(&b)),
+                    "describe() must be printable ASCII (FITS card value): {d:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn average_and_median_basics() {
         let (v, r) = combine_pixel(&mut [1.0, 2.0, 3.0, 4.0], IntegrationRecipe::average(Rejection::None));
@@ -824,12 +849,12 @@ mod tests {
             "syntheticBias": serde_json::Value::Null,
         })
         .to_string();
-        assert_eq!(describe_recipe_json(&legacy), "Average · Winsorized sigma (3.0/3.0)");
+        assert_eq!(describe_recipe_json(&legacy), "Average | Winsorized sigma (3.0/3.0)");
 
         // New blob (combine holds an IntegrationRecipe).
         let recipe = IntegrationRecipe::median(Rejection::LinearFitClip { sigma_low: 5.0, sigma_high: 3.5 });
         let new_blob = serde_json::json!({ "combine": recipe }).to_string();
-        assert_eq!(describe_recipe_json(&new_blob), "Median · Linear fit clip (5.0/3.5)");
+        assert_eq!(describe_recipe_json(&new_blob), "Median | Linear fit clip (5.0/3.5)");
 
         // Unparseable → raw passthrough (nothing lost).
         assert_eq!(describe_recipe_json("not json at all"), "not json at all");

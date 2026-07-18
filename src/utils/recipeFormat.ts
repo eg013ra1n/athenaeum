@@ -12,8 +12,9 @@ export function fmtParam(x: number): string {
   return Number.isInteger(x) ? x.toFixed(1) : String(x);
 }
 
-// "Average · Winsorized sigma (3.0/3.0)" — mirrors `IntegrationRecipe::describe()`
-// / `Rejection::label()` in combine.rs.
+// "Average | Winsorized sigma (3.0/3.0)" — mirrors `IntegrationRecipe::describe()`
+// / `Rejection::label()` in combine.rs. ASCII-only separator: the Rust side
+// writes this string into the ATH_REJ FITS card (printable-ASCII values only).
 export function formatCombine(r: IntegrationRecipe): string {
   const comb = r.combination === 'average' ? 'Average' : 'Median';
   const rej = r.rejection;
@@ -25,7 +26,7 @@ export function formatCombine(r: IntegrationRecipe): string {
     case 'winsorized_sigma': rejLabel = `Winsorized sigma (${fmtParam(rej.sigma_low)}/${fmtParam(rej.sigma_high)})`; break;
     case 'linear_fit_clip': rejLabel = `Linear fit clip (${fmtParam(rej.sigma_low)}/${fmtParam(rej.sigma_high)})`; break;
   }
-  return `${comb} · ${rejLabel}`;
+  return `${comb} | ${rejLabel}`;
 }
 
 // Narrow an unknown parsed value to a new-shape `IntegrationRecipe`.

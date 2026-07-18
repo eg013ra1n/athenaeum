@@ -251,6 +251,35 @@ mod tests {
         set_id
     }
 
+    /// Pins the exact path that broke in the field: the REAL
+    /// `recipe.describe()`-derived summary (not a hand-written ASCII stand-in)
+    /// must survive `build_master_cards` → `format_card` for every recipe.
+    #[test]
+    fn recipe_describe_summary_survives_card_formatting() {
+        use crate::fits_writer::card::format_card;
+        use crate::integration::combine::{IntegrationRecipe, Rejection};
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        let inputs = load_header_inputs(&conn, set_id).unwrap();
+        let recipes = [
+            IntegrationRecipe::average(Rejection::None),
+            IntegrationRecipe::median(Rejection::None),
+            IntegrationRecipe::average(Rejection::PercentileClip { low: 0.2, high: 0.1 }),
+            IntegrationRecipe::average(Rejection::SigmaClip { sigma_low: 4.0, sigma_high: 3.0 }),
+            IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }),
+            IntegrationRecipe::median(Rejection::LinearFitClip { sigma_low: 5.0, sigma_high: 2.5 }),
+        ];
+        for r in recipes {
+            let summary = format!("{} n=24", r.describe());
+            let cards = build_master_cards(&inputs, "0.5.0", &summary, "cafe", None).unwrap();
+            for c in &cards {
+                format_card(c).unwrap_or_else(|e| {
+                    panic!("card {} failed to format for summary {summary:?}: {e}", c.keyword)
+                });
+            }
+        }
+    }
+
     #[test]
     fn consolidated_cards_cover_the_vocabulary() {
         let conn = Connection::open_in_memory().unwrap();

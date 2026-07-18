@@ -966,7 +966,10 @@ fn run_master_build_thread(
     let (master_set_id, success, cancelled, error) = match result {
         Ok(id) => (Some(id), true, false, None),
         Err(BuildStepError::Cancelled) => (None, false, true, None),
-        Err(BuildStepError::Other(msg)) => (None, false, false, Some(msg)),
+        Err(BuildStepError::Other(msg)) => {
+            tracing::error!(set_id, error = %msg, "master build failed");
+            (None, false, false, Some(msg))
+        }
     };
 
     emit_event(emitter.as_ref(), "master-build-complete", &MasterBuildCompleteEvent {

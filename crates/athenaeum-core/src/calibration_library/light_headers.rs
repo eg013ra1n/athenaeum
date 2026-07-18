@@ -174,6 +174,22 @@ mod tests {
         }
     }
 
+    /// A master under a non-ASCII path (Cyrillic Windows username is the
+    /// common field case) must never brick the output write — the path chars
+    /// degrade to '?' placeholders instead.
+    #[test]
+    fn cyrillic_master_path_sanitized_not_fatal() {
+        use crate::fits_writer::card::format_card;
+        let c = master_ref_card(
+            "ATH_CDRK",
+            "abcd-1234",
+            r"C:\Users\Пользователь\Athenaeum\master_dark.fits",
+        )
+        .unwrap();
+        let line = String::from_utf8_lossy(&format_card(&c).unwrap()[0]).into_owned();
+        assert!(line.contains(r"C:\Users\????????????\Athenaeum\master_dark.fits"), "got {line:?}");
+    }
+
     #[test]
     fn cards_contain_calstat_and_identity() {
         let inputs = base_inputs();
