@@ -67,6 +67,11 @@ build:linux:
     - linux
   only:
     - tags
+  variables:
+    # The ubuntu24 runner has fuse3 only; the linuxdeploy AppImage that
+    # tauri-bundler downloads dlopens libfuse.so.2 and dies without this.
+    # Extract-and-run needs no FUSE at all (verified on the runner 2026-07-18).
+    APPIMAGE_EXTRACT_AND_RUN: "1"
   before_script:
     - source "$HOME/.cargo/env"
     # cmake + nasm are required by rustafits → turbojpeg-sys → libjpeg-turbo (built from source).
