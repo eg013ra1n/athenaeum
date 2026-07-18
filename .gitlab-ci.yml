@@ -656,6 +656,10 @@ publish_version:
         TARGET="version.json"
       fi
     - printf '{"version":"%s","download_url":"https://artfrom.space/releases/download"}' "$VERSION" > "$TARGET"
+    # Pre-delete: a manually restored copy owned by another user (seen with
+    # version-beta.json, astrobureau-owned after the 2026-07-12 wipe incident)
+    # makes the scp overwrite fail with EACCES; unlink only needs dir write.
+    - ${SSH_CMD} ${DEPLOY_USER}@${DEPLOY_HOST} "rm -f /var/www/artfrom.space/${TARGET}"
     - ${SCP_CMD} "$TARGET" ${DEPLOY_USER}@${DEPLOY_HOST}:/var/www/artfrom.space/"$TARGET"
   after_script:
     - ssh-agent -k 2>/dev/null || true
