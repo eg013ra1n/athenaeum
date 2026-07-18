@@ -115,12 +115,12 @@ async fn loopback_announce_fetch_ack_roundtrip() {
         .await
         .unwrap();
 
-    // The receiver's `fetch` above pushed a synthetic `ServeProgress` onto the
-    // provider's event stream (Task 13); skip those best-effort progress ticks to
-    // reach the ack this test asserts on.
+    // The receiver's `fetch` above pushed synthetic `ServeProgress` +
+    // `ServeComplete` onto the provider's event stream (Task 13 / 2.1); skip those
+    // best-effort local signals to reach the ack this test asserts on.
     let ack = loop {
         match recv_next(&mut provider_events).await {
-            TransportEvent::ServeProgress { .. } => continue,
+            TransportEvent::ServeProgress { .. } | TransportEvent::ServeComplete { .. } => continue,
             ev => break ev,
         }
     };

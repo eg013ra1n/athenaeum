@@ -48,6 +48,7 @@ use iroh::endpoint::{presets, Connection};
 use iroh::protocol::{ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use iroh_blobs::api::Store;
+use iroh_blobs::protocol::ChunkRangesSeq;
 use iroh_blobs::provider::events::{
     ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
 };
@@ -278,6 +279,34 @@ mod upload_accumulator_tests {
     }
 }
 
+/// Whether a GET request's ranges reach a collection **payload** — i.e. request
+/// a non-empty range at any hash-seq offset ≥ 2 (Task 2.1). In an iroh-blobs
+/// collection, offset 0 is the root hash-seq blob and offset 1 is the iroh
+/// `CollectionMeta`; offsets ≥ 2 are the collection's file entries (frame
+/// payloads + the manifest). So a phase-1 root+meta pull (offsets 0–1) and a
+/// `fetch_manifest` probe's first GET are NOT payload-carrying, while the phase-2
+/// hash-seq pull — and a resumed fetch that requests only the still-missing
+/// frame offsets — ARE.
+///
+/// The transport labels serve-progress and serve-complete off this predicate:
+/// only a payload-carrying request emits `ServeProgress` ticks (killing the
+/// manifest-probe spurious tick) or routes a terminal `ServeComplete`.
+///
+/// [`ChunkRangesSeq::iter_non_empty_infinite`] yields only the non-empty
+/// `(offset, ranges)` pairs and is INFINITE when the request repeats a non-empty
+/// tail forever (e.g. `all` / a whole hash-seq). The first offset ≥ 2 is a
+/// definitive yes, so the early return bounds the scan at offset 2 — a finite,
+/// non-payload request instead exhausts its (short) non-empty prefix and yields
+/// `false`.
+fn request_is_payload_carrying(ranges: &ChunkRangesSeq) -> bool {
+    for (offset, _) in ranges.iter_non_empty_infinite() {
+        if offset >= 2 {
+            return true;
+        }
+    }
+    false
+}
+
 /// Evaluate the shared connect gate for `from`. Absent gate ⇒ admit (accept-all,
 /// today's behavior). The gate `Arc` is cloned out from under the lock BEFORE the
 /// predicate runs, so a gate that does blocking catalog I/O never holds the mutex
@@ -363,24 +392,39 @@ pub(crate) fn build_router(
         while let Some(msg) = rx.recv().await {
             match msg {
                 ProviderMessage::GetRequestReceivedNotify(m) => {
-                    // Collection root of this serve; the resolver maps it to the
-                    // package we announced, or `None` (child blob / hash-seq
-                    // internal / foreign hash — still drained, just no emit).
+                    // Collection root + requested ranges of this GET (Task 2.1).
+                    // The resolver maps the root to the package we announced, or
+                    // `None` (child blob / hash-seq internal / foreign hash — e.g.
+                    // a manifest probe's second GET targets the manifest's own raw
+                    // hash). A request is PAYLOAD-CARRYING iff its ranges reach a
+                    // collection file entry (offset >= 2); a phase-1 root+meta pull
+                    // and a manifest probe's first GET are not. Only a
+                    // payload-carrying request that resolves to a served package
+                    // emits progress or a terminal complete — every other request
+                    // is still drained fully (SAFETY RULE), just silently.
                     let root: Hash = (*m.inner).request.hash;
+                    let payload_carrying =
+                        request_is_payload_carrying(&(*m.inner).request.ranges);
                     let mut updates = m.rx;
                     let resolver = Arc::clone(&serve_resolver);
                     let sink = consumer_sink.clone();
                     tokio::spawn(async move {
-                        let pkg = resolver(root);
-                        // Cumulative across every blob in this collection (Task 13
+                        // The single emit gate: `Some(pkg)` only when the request
+                        // both carries payload AND resolves to one of our packages.
+                        let emit = if payload_carrying { resolver(root) } else { None };
+                        // Cumulative across every blob in this request (Task 13
                         // fix) — see `UploadAccumulator` docs for why a naive
                         // `max(end_offset)` over the raw stream is wrong.
                         let mut acc = UploadAccumulator::new();
                         let mut last = Instant::now();
-                        // Drain for the whole transfer; emit only on `Progress`, and
-                        // only when a package resolved. The loop ends when the sender
-                        // drops (`Ok(None)`) or errors — the receiver is never
-                        // dropped early (SAFETY RULE).
+                        // Set once we flushed + signalled completion on a terminal
+                        // `Completed`, so the close-time flush below never emits a
+                        // stray `ServeProgress` AFTER the `ServeComplete` (which
+                        // would flip the UI stage back to `transferring`).
+                        let mut completed = false;
+                        // Drain for the whole transfer; the loop ends when the
+                        // sender drops (`Ok(None)`) or errors — the receiver is
+                        // never dropped early (SAFETY RULE).
                         while let Ok(Some(update)) = updates.recv().await {
                             match update {
                                 // A new blob's transfer began: fold the PREVIOUS
@@ -389,21 +433,43 @@ pub(crate) fn build_router(
                                 RequestUpdate::Started(_) => acc.on_started(),
                                 RequestUpdate::Progress(p) => {
                                     acc.on_progress(p.end_offset);
-                                    if let Some(pkg) = &pkg {
+                                    if let Some(pkg) = &emit {
                                         if last.elapsed() >= SERVE_PROGRESS_THROTTLE {
                                             last = Instant::now();
                                             sink.route_serve_progress(pkg, acc.total());
                                         }
                                     }
                                 }
-                                RequestUpdate::Completed(_) | RequestUpdate::Aborted(_) => {}
+                                // Terminal success of a payload-carrying serve: the
+                                // peer pulled everything it asked for. Flush the
+                                // final cumulative figure, then signal
+                                // upload-complete — the "uploaded — awaiting
+                                // confirmation" stage. No byte-threshold guard: a
+                                // resume legitimately serves fewer bytes than
+                                // `byte_size`, so `Completed` alone is the signal.
+                                RequestUpdate::Completed(_) => {
+                                    if let Some(pkg) = &emit {
+                                        if acc.total() > 0 {
+                                            sink.route_serve_progress(pkg, acc.total());
+                                        }
+                                        sink.route_serve_complete(pkg);
+                                    }
+                                    completed = true;
+                                }
+                                // Failure routes nothing (a distinct event, never a
+                                // `ServeComplete`); the ack stays delivery truth.
+                                RequestUpdate::Aborted(_) => {}
                             }
                         }
-                        // Flush the cumulative total once at close so a transfer
-                        // shorter than the throttle window still surfaces one tick.
-                        if let Some(pkg) = &pkg {
-                            if acc.total() > 0 {
-                                sink.route_serve_progress(pkg, acc.total());
+                        // Close-time flush for a stream that ended WITHOUT a
+                        // terminal `Completed` (a transfer shorter than one
+                        // throttle window, or an abort): surface the final tick.
+                        // Skipped after `Completed` (already flushed + completed).
+                        if !completed {
+                            if let Some(pkg) = &emit {
+                                if acc.total() > 0 {
+                                    sink.route_serve_progress(pkg, acc.total());
+                                }
                             }
                         }
                     });
@@ -1130,6 +1196,20 @@ impl EventSink {
         match self {
             EventSink::Direct(_) => {}
             EventSink::Demux(demux) => demux.route_serve_progress(package_id, bytes_sent),
+        }
+    }
+
+    /// Route a locally-generated [`ServeComplete`](TransportEvent::ServeComplete)
+    /// (Task 2.1) — the terminal-success sibling of
+    /// [`route_serve_progress`](Self::route_serve_progress), fired from the
+    /// provider-events consumer on the `Completed` of a payload-carrying request.
+    /// Same best-effort `try_send` semantics and the same Direct/Demux split: the
+    /// legacy single-stream transport (test-only) is a no-op; production routes
+    /// through the demux to the ack-claim owner(s) for this `package_id`.
+    fn route_serve_complete(&self, package_id: &PackageId) {
+        match self {
+            EventSink::Direct(_) => {}
+            EventSink::Demux(demux) => demux.route_serve_complete(package_id),
         }
     }
 }

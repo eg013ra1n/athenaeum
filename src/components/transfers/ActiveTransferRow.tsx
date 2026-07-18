@@ -30,9 +30,22 @@ function formatCountdown(nextRetryAt: string, now: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-/** State-staged progress fallback (0..1) for a row with no byte-level data yet. */
-function stageProgress(state: string, bytesDone: number, byteSize: number): number {
-  if (byteSize > 0 && bytesDone > 0) return Math.min(1, bytesDone / byteSize);
+/** State-staged progress fallback (0..1) for a row with no byte-level data yet.
+ *
+ * `capNonTerminalOutbound` caps the byte-derived fraction at 0.95 (Task 2.1):
+ * an in-flight outbound row must never read 100% off upload bytes alone —
+ * bytes == byteSize means "uploaded — awaiting confirmation", not delivered.
+ * Only a terminal `confirmed`/`done` state reaches 1.0. `stageProgress` can't
+ * see `row.kind`, so the caller passes the flag. */
+function stageProgress(
+  state: string,
+  bytesDone: number,
+  byteSize: number,
+  capNonTerminalOutbound: boolean,
+): number {
+  if (byteSize > 0 && bytesDone > 0) {
+    return Math.min(capNonTerminalOutbound ? 0.95 : 1, bytesDone / byteSize);
+  }
   switch (state) {
     case 'queued':
       return 0.02;
@@ -190,8 +203,21 @@ export function ActiveTransferRow({
   // `nextRetryAt` — not the state — is the truth signal that a retry is pending.
   const retrying = !!row.nextRetryAt && !row.terminal;
 
-  const progress = stageProgress(row.state, row.bytesDone, row.byteSize);
+  // Non-terminal outbound rows cap their byte-derived progress at 95% — a fully
+  // uploaded package that hasn't been acked is "awaiting confirmation", not done.
+  const progress = stageProgress(
+    row.state,
+    row.bytesDone,
+    row.byteSize,
+    row.kind === 'outbound' && !row.terminal,
+  );
   const speedLabel = row.isTransferring ? formatSpeed(row.speedBps) : null;
+
+  // The honest post-upload, pre-ack window (Task 2.1): the provider finished
+  // serving what the peer asked for, but the ack hasn't landed. Never shown on a
+  // terminal row, and a later `transferring` tick (a resume) clears it.
+  const awaitingConfirmation =
+    row.liveStage === 'uploaded' && row.state === 'transferring' && !row.terminal;
 
   // Surface the last failed-attempt reason on a retrying row (any state, e.g. a
   // `transferring` row mid-backoff) or a terminal failed/cancelled row — the row
@@ -237,6 +263,11 @@ export function ActiveTransferRow({
             <span className="ml-1.5 rounded bg-warning/20 px-1 py-0.5 text-[10px] font-medium text-warning">
               retrying
             </span>
+          )}
+          {awaitingConfirmation && (
+            <p className="mt-0.5 text-[10px] font-medium leading-tight text-accent">
+              uploaded — awaiting confirmation
+            </p>
           )}
           {showReason && (
             <p

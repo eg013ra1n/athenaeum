@@ -101,6 +101,10 @@ export interface TransferRow {
   nextRetryAt: string | null;
   /** `true` for a lingering failed/cancelled outbound row (Resend, not Cancel/Send-now). */
   terminal: boolean;
+  /** Latest `sync-progress` `stage` seen for this outbound id (`sent` ticks only),
+   * cleared on `sync-finished`. Outbound-only; `null` for inbound/terminal rows.
+   * Drives the "uploaded — awaiting confirmation" post-upload/pre-ack label. */
+  liveStage: string | null;
   speedBps: number | null;
   isTransferring: boolean;
   /** Bumped on every `sync-finished` for this package — an expanded row watches
@@ -133,6 +137,9 @@ export function useTransferQueue(): UseTransferQueue {
 
   const [liveOutboundBytes, setLiveOutboundBytes] = useState<Map<number, LiveBytes>>(new Map());
   const [liveInboundBytes, setLiveInboundBytes] = useState<Map<string, LiveBytes>>(new Map());
+  // Latest send-side `sync-progress` stage per outbound id (Task 2.1). Drives the
+  // "uploaded — awaiting confirmation" label; cleared on `sync-finished`.
+  const [liveOutboundStage, setLiveOutboundStage] = useState<Map<number, string>>(new Map());
   const [liveFiles, setLiveFiles] = useState<
     Map<string, Map<string, { bytesDone: number; bytesTotal: number }>>
   >(new Map());
@@ -204,6 +211,9 @@ export function useTransferQueue(): UseTransferQueue {
           if (!Number.isFinite(id)) return;
           const live = trackBytes(outSpeedRef.current, `out:${id}`, p.bytesDone, p.bytesTotal);
           setLiveOutboundBytes((prev) => new Map(prev).set(id, live));
+          // Record the stage so ActiveTransferRow can show "uploaded — awaiting
+          // confirmation"; a later `transferring` tick (a resume) flips it back.
+          setLiveOutboundStage((prev) => new Map(prev).set(id, p.stage));
         } else {
           const live = trackBytes(inSpeedRef.current, `in:${p.packageId}`, p.bytesDone, p.bytesTotal);
           setLiveInboundBytes((prev) => new Map(prev).set(p.packageId, live));
@@ -241,6 +251,12 @@ export function useTransferQueue(): UseTransferQueue {
           bumpFinishNonce(`out:${id}`);
           outSpeedRef.current.delete(`out:${id}`);
           setLiveOutboundBytes((prev) => {
+            if (!prev.has(id)) return prev;
+            const next = new Map(prev);
+            next.delete(id);
+            return next;
+          });
+          setLiveOutboundStage((prev) => {
             if (!prev.has(id)) return prev;
             const next = new Map(prev);
             next.delete(id);
@@ -317,6 +333,7 @@ export function useTransferQueue(): UseTransferQueue {
         lastError: s.lastError,
         nextRetryAt: s.nextRetryAt,
         terminal: false,
+        liveStage: liveOutboundStage.get(s.id) ?? null,
         speedBps: s.state === 'transferring' ? (live?.speedBps ?? null) : null,
         isTransferring: s.state === 'transferring',
         finishNonce: finishNonce.get(`out:${s.id}`) ?? 0,
@@ -348,6 +365,7 @@ export function useTransferQueue(): UseTransferQueue {
         lastError: summary.lastError,
         nextRetryAt: null,
         terminal: true,
+        liveStage: null,
         speedBps: null,
         isTransferring: false,
         finishNonce: finishNonce.get(`out:${summary.id}`) ?? 0,
@@ -370,13 +388,14 @@ export function useTransferQueue(): UseTransferQueue {
         lastError: null,
         nextRetryAt: null,
         terminal: false,
+        liveStage: null,
         speedBps: s.state === 'fetching' ? (live?.speedBps ?? null) : null,
         isTransferring: s.state === 'fetching',
         finishNonce: finishNonce.get(`in:${s.packageId}`) ?? 0,
       });
     }
     return out;
-  }, [status, terminalOutbound, liveOutboundBytes, liveInboundBytes, finishNonce]);
+  }, [status, terminalOutbound, liveOutboundBytes, liveInboundBytes, liveOutboundStage, finishNonce]);
 
   const activeCount = (status?.sender.queued ?? 0) + (status?.sender.transferring ?? 0) + rows.filter((r) => r.kind === 'inbound').length;
 

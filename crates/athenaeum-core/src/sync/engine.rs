@@ -1364,6 +1364,13 @@ impl Worker {
                 self.on_serve_progress(package_id, bytes_sent);
                 Ok(())
             }
+            // Upload finished serving what this peer asked for (Task 2.1): surface
+            // the honest "uploaded — awaiting confirmation" stage. No store write,
+            // no state transition — the ack remains the only delivery truth.
+            TransportEvent::ServeComplete { package_id } => {
+                self.on_serve_complete(package_id);
+                Ok(())
+            }
         }
     }
 
@@ -1390,6 +1397,35 @@ impl Worker {
             return;
         };
         self.emit_progress_bytes(id, "transferring", frame_count, bytes_sent.min(byte_size), byte_size);
+    }
+
+    /// Turn a transport [`ServeComplete`](TransportEvent::ServeComplete) into the
+    /// honest "uploaded — awaiting confirmation" stage (Task 2.1): a send-side
+    /// `sync-progress` `uploaded` tick reporting the FULL `byte_size` (the peer
+    /// pulled everything it asked for), correlated to the pending slot the same
+    /// way [`on_serve_progress`](Self::on_serve_progress) / [`on_ack`](Self::on_ack)
+    /// are — by the announce carrying this `package_id`.
+    ///
+    /// Semantics: "finished serving what this peer asked for", NOT "delivered".
+    /// There is deliberately NO store write and NO state transition — the receiver
+    /// ack stays the sole delivery truth. A later payload request (a resume)
+    /// produces fresh `ServeProgress` `transferring` ticks that flip the stage
+    /// back, self-correcting. A complete for no live slot (already confirmed /
+    /// terminal, or an unknown package) is dropped at debug.
+    fn on_serve_complete(&self, package_id: PackageId) {
+        let slot = self.pending.iter().find_map(|(k, p)| match &p.announce {
+            Some(a) if a.package_id == package_id => Some((*k, a.byte_size, a.frame_count)),
+            _ => None,
+        });
+        let Some((id, byte_size, frame_count)) = slot else {
+            tracing::debug!(package_id = %package_id.0, "serve-complete for no pending slot; dropped");
+            return;
+        };
+        self.emit_progress_bytes(id, "uploaded", frame_count, byte_size, byte_size);
+        tracing::info!(
+            package_id = %package_id.0,
+            "package upload complete; awaiting receiver confirmation"
+        );
     }
 
     /// Handle an ack: confirm the package ONLY if every receipt is non-`Rejected`

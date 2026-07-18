@@ -108,6 +108,20 @@ pub enum TransportEvent {
         package_id: PackageId,
         bytes_sent: u64,
     },
+    /// A package WE are serving has finished uploading to a peer (Task 2.1):
+    /// the iroh provider reported the terminal `Completed` of a
+    /// **payload-carrying** GET request (one whose ranges reach a collection
+    /// file entry, hash-seq offset ≥ 2 — never a phase-1 root+meta pull or a
+    /// manifest probe). Like [`ServeProgress`](Self::ServeProgress) this
+    /// originates LOCALLY — on OUR endpoint, from the provider-upload-events
+    /// consumer, or as one synthetic signal from the loopback mock — never from
+    /// a peer control message, so it carries no `from`. Routed to the sender
+    /// engine, which turns it into an "uploaded — awaiting confirmation" tick
+    /// (`sync-progress` `stage = "uploaded"`) with NO store write and NO state
+    /// transition: the receiver's ack stays the only delivery truth. A later
+    /// payload request (a resume) produces fresh `ServeProgress` ticks that flip
+    /// the stage back to `transferring`, self-correcting.
+    ServeComplete { package_id: PackageId },
 }
 
 /// Live progress of a fetch, delivered on the [`FetchSink`] callback threaded

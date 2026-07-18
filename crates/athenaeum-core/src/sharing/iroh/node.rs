@@ -323,11 +323,12 @@ impl EventDemux {
                 | TransportEvent::ProjectRequestReceived { .. } => {
                     inner.recv.as_ref().map(|(_, tx)| tx.clone())
                 }
-                // ServeProgress originates on OUR endpoint (the provider-events
-                // consumer), never arrives as a decoded inbound control message,
-                // and is routed via `route_serve_progress` — not this path. Treat a
-                // stray one defensively as an orphan (no consumer, no delivery ack).
-                TransportEvent::ServeProgress { .. } => None,
+                // ServeProgress / ServeComplete originate on OUR endpoint (the
+                // provider-events consumer), never arrive as a decoded inbound
+                // control message, and are routed via `route_serve_progress` /
+                // `route_serve_complete` — not this path. Treat a stray one
+                // defensively as an orphan (no consumer, no delivery ack).
+                TransportEvent::ServeProgress { .. } | TransportEvent::ServeComplete { .. } => None,
             }
         };
         match target {
@@ -379,6 +380,29 @@ impl EventDemux {
             }
         }
     }
+
+    /// Route a locally-generated [`ServeComplete`](TransportEvent::ServeComplete)
+    /// (Task 2.1) to the sender handle(s) that announced this package — the
+    /// terminal-success clone of [`route_serve_progress`](Self::route_serve_progress),
+    /// matched by `package_id` across the live ack claims. A claim lives exactly
+    /// for the transfer window (registered at announce, released on the ack), so a
+    /// complete routes to that sender engine only while its transfer is in flight.
+    /// Non-blocking (`try_send`): a full channel drops it, and a package with no
+    /// live claim (already acked / terminal, or announced by a since-dropped
+    /// handle) is silently ignored — upload-complete is best-effort UI signalling.
+    /// (Same keyed-on-`package_id`-only cross-destination caveat as
+    /// `route_serve_progress` above — a benign over-report to N same-id claims,
+    /// never a misroute.)
+    pub(crate) fn route_serve_complete(&self, package_id: &PackageId) {
+        let inner = self.inner.lock().expect("demux mutex poisoned");
+        for ((_, pid), (_, tx)) in inner.claims.iter() {
+            if pid == package_id {
+                let _ = tx.try_send(TransportEvent::ServeComplete {
+                    package_id: package_id.clone(),
+                });
+            }
+        }
+    }
 }
 
 /// The inbound-event variant an orphan warn names, plus the peer it came from.
@@ -388,8 +412,9 @@ fn event_kind_and_peer(event: &TransportEvent) -> (&'static str, NodeId) {
         TransportEvent::AckReceived { from, .. } => ("ack", *from),
         TransportEvent::ProjectAnnounceReceived { from, .. } => ("project_announce", *from),
         TransportEvent::ProjectRequestReceived { from, .. } => ("project_request", *from),
-        // Locally-originated (no peer); never reaches the inbound orphan path.
+        // Locally-originated (no peer); never reach the inbound orphan path.
         TransportEvent::ServeProgress { .. } => ("serve_progress", [0u8; 32]),
+        TransportEvent::ServeComplete { .. } => ("serve_complete", [0u8; 32]),
     }
 }
 
@@ -2296,6 +2321,10 @@ mod tests {
                 Ok(Some(TransportEvent::ServeProgress { bytes_sent, .. })) => {
                     peak = peak.max(bytes_sent);
                 }
+                // The terminal `ServeComplete` (Task 2.1) rides the same channel
+                // after the final progress flush — skip it, don't treat it as an
+                // early break, so a timing quirk can't truncate the poll.
+                Ok(Some(TransportEvent::ServeComplete { .. })) => continue,
                 Ok(Some(_)) | Ok(None) => break,
                 Err(_) => break, // overall deadline elapsed
             }
@@ -2306,6 +2335,190 @@ mod tests {
             "cumulative upload progress must reach the full collection size ({}), got peak={peak} \
              (a per-blob-only regression would freeze at the largest single frame's size, ~64KiB)",
             announce.byte_size
+        );
+
+        s.shutdown().await;
+        r.shutdown().await;
+    }
+
+    /// Collect every [`TransportEvent`] arriving on `rx` until it goes quiet for
+    /// `quiet` (no new event within that window) or the overall `max` elapses.
+    /// A quiet-window drain lets a NEGATIVE assertion (nothing arrives) return
+    /// promptly while still bounding a POSITIVE one.
+    async fn collect_until_quiet(
+        rx: &mut Receiver<TransportEvent>,
+        quiet: Duration,
+        max: Duration,
+    ) -> Vec<TransportEvent> {
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + max;
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let wait = quiet.min(deadline - now);
+            match tokio::time::timeout(wait, rx.recv()).await {
+                Ok(Some(ev)) => out.push(ev),
+                Ok(None) => break, // channel closed
+                Err(_) => break,   // quiet window elapsed with no new event
+            }
+        }
+        out
+    }
+
+    // Task 2.1: a payload-carrying full pull emits EXACTLY ONE `ServeComplete`
+    // (the terminal `Completed` of the phase-2 payload request), while a
+    // `fetch_manifest` probe emits NEITHER a `ServeComplete` NOR any
+    // `ServeProgress` tick — its only requests are the phase-1 root+meta pull
+    // (resolves to the package but is NOT payload-carrying) and the manifest's
+    // own raw blob (a different root the resolver maps to None). The full pull at
+    // the end proves the provider-event plumbing is live, so the probe's silence
+    // is a meaningful assertion, not a vacuous pass. Two real nodes, relay off.
+    #[tokio::test]
+    async fn manifest_probe_is_silent_and_full_pull_fires_one_serve_complete() {
+        let ds = tempdir().unwrap();
+        let dr = tempdir().unwrap();
+        let s = bind_disabled(ds.path()).await;
+        let r = bind_disabled(dr.path()).await;
+
+        let out = s.handle(Role::Out);
+        let recv = r.handle(Role::Recv);
+        let s_info = out.start().await.unwrap();
+        let r_info = recv.start().await.unwrap();
+        pair(&s, &s_info, &r, &r_info);
+
+        let (pkg_dir, announce) = build_two_frame_package(ds.path(), 4 * 1024, 64 * 1024);
+        out.serve(&announce, &pkg_dir, None).await.unwrap();
+
+        // Register consumers BEFORE announcing so the ack-claim channel exists for
+        // route_serve_progress / route_serve_complete to target.
+        let mut out_events = out.events().await;
+        let mut r_ev = recv.events().await;
+        out.announce(r_info.node_id, &announce).await.unwrap();
+        let wire = match recv_next(&mut r_ev).await {
+            TransportEvent::AnnounceReceived { announce, .. } => announce,
+            other => panic!("expected AnnounceReceived, got {other:?}"),
+        };
+
+        // (a) Manifest probe: NO ServeProgress, NO ServeComplete.
+        let mdest = tempdir().unwrap();
+        recv.fetch_manifest(s_info.node_id, &wire, mdest.path())
+            .await
+            .unwrap();
+        let probe = collect_until_quiet(
+            &mut out_events,
+            Duration::from_millis(1500),
+            Duration::from_secs(4),
+        )
+        .await;
+        assert!(
+            !probe
+                .iter()
+                .any(|e| matches!(e, TransportEvent::ServeComplete { .. })),
+            "a manifest probe must not emit ServeComplete, got {probe:?}"
+        );
+        assert!(
+            !probe
+                .iter()
+                .any(|e| matches!(e, TransportEvent::ServeProgress { .. })),
+            "a manifest probe must not emit a ServeProgress tick, got {probe:?}"
+        );
+
+        // (b) Full pull of the payload: EXACTLY ONE ServeComplete.
+        let fdest = tempdir().unwrap();
+        recv.fetch(s_info.node_id, &wire, fdest.path(), crate::sharing::noop_fetch_sink())
+            .await
+            .unwrap();
+        let pull = collect_until_quiet(
+            &mut out_events,
+            Duration::from_millis(1500),
+            Duration::from_secs(10),
+        )
+        .await;
+        let completes = pull
+            .iter()
+            .filter(|e| matches!(e, TransportEvent::ServeComplete { .. }))
+            .count();
+        assert_eq!(
+            completes, 1,
+            "a full payload pull must emit exactly one ServeComplete, got {completes} in {pull:?}"
+        );
+        assert!(
+            pull.iter().any(|e| matches!(
+                e,
+                TransportEvent::ServeComplete { package_id } if *package_id == announce.package_id
+            )),
+            "ServeComplete must carry the served package id"
+        );
+
+        s.shutdown().await;
+        r.shutdown().await;
+    }
+
+    // Task 2.1 (resume): `ServeComplete` fires on the terminal of the completing
+    // payload request EVEN WHEN the resumed fetch requests fewer bytes than the
+    // announced `byte_size` — precisely why the design forbids any byte-threshold
+    // completion guard. We model a killed-then-resumed transfer deterministically:
+    // pre-seed the receiver's store with the LARGER frame's content
+    // (content-addressed, so the downloader treats it as already present), then a
+    // full fetch pulls only the still-missing smaller frame. That completing
+    // payload-carrying request must still route a ServeComplete.
+    #[tokio::test]
+    async fn resume_fires_serve_complete_despite_partial_bytes() {
+        let ds = tempdir().unwrap();
+        let dr = tempdir().unwrap();
+        let s = bind_disabled(ds.path()).await;
+        let r = bind_disabled(dr.path()).await;
+
+        let out = s.handle(Role::Out);
+        let recv = r.handle(Role::Recv);
+        let s_info = out.start().await.unwrap();
+        let r_info = recv.start().await.unwrap();
+        pair(&s, &s_info, &r, &r_info);
+
+        // frame_a = 4 KiB, frame_b = 64 KiB; announced byte_size = 68 KiB.
+        let (pkg_dir, announce) = build_two_frame_package(ds.path(), 4 * 1024, 64 * 1024);
+        out.serve(&announce, &pkg_dir, None).await.unwrap();
+
+        // Pre-seed the receiver store with the 64 KiB frame so the fetch resumes,
+        // pulling only the 4 KiB frame — far fewer bytes than the 68 KiB byte_size.
+        // A byte-threshold completion guard would wrongly withhold ServeComplete
+        // here; there must be none.
+        let seeded = r
+            .store()
+            .blobs()
+            .add_path(pkg_dir.join("frame_b.fits"))
+            .temp_tag()
+            .await
+            .expect("pre-seed frame_b into the receiver store");
+
+        let mut out_events = out.events().await;
+        let mut r_ev = recv.events().await;
+        out.announce(r_info.node_id, &announce).await.unwrap();
+        let wire = match recv_next(&mut r_ev).await {
+            TransportEvent::AnnounceReceived { announce, .. } => announce,
+            other => panic!("expected AnnounceReceived, got {other:?}"),
+        };
+
+        let fdest = tempdir().unwrap();
+        recv.fetch(s_info.node_id, &wire, fdest.path(), crate::sharing::noop_fetch_sink())
+            .await
+            .unwrap();
+        drop(seeded); // the pre-seed temp tag is no longer needed
+
+        let events = collect_until_quiet(
+            &mut out_events,
+            Duration::from_millis(1500),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TransportEvent::ServeComplete { package_id } if *package_id == announce.package_id
+            )),
+            "a resumed fetch requesting fewer bytes than byte_size must still fire ServeComplete, got {events:?}"
         );
 
         s.shutdown().await;

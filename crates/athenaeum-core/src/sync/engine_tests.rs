@@ -418,7 +418,10 @@ async fn sender_emits_coarse_progress_and_finished_events() {
             && p["direction"].as_str() == Some("sent")),
         "expected a coarse 'transferring' progress tick, got {evts:?}"
     );
-    assert!(evts.len() <= 4, "coarse per-package events only, got {}: {evts:?}", evts.len());
+    // Coarse per-package stage events only, never per-byte spam. The happy path
+    // is: queued → transferring → transferring(bytes) → uploaded (Task 2.1's
+    // "awaiting confirmation" tick) → confirmed = 5 discrete events.
+    assert!(evts.len() <= 5, "coarse per-package events only, got {}: {evts:?}", evts.len());
     drop(evts);
 
     engine.shutdown().await;
@@ -483,6 +486,90 @@ async fn sent_progress_carries_bytes() {
     assert_eq!(tick.1["stage"].as_str(), Some("transferring"));
     assert_eq!(tick.1["bytesDone"].as_u64(), Some(expected_bytes));
     assert_eq!(tick.1["bytesTotal"].as_u64(), Some(expected_bytes));
+    drop(evts);
+
+    engine.shutdown().await;
+}
+
+/// Task 2.1: a successful loopback send surfaces the honest "uploaded — awaiting
+/// confirmation" stage — a send-side `sync-progress` with `stage == "uploaded"`
+/// — STRICTLY BEFORE the terminal `sync-finished{confirmed}`. The loopback mock
+/// synthesizes a `ServeComplete` after a successful fetch (mirroring the iroh
+/// provider's terminal `Completed` of a payload-carrying request), which the
+/// sender engine folds into the uploaded tick with NO store write and NO state
+/// transition; the receiver's ack (arriving after the fetch) is what actually
+/// confirms. Ordering is the whole point: an operator must see the post-upload,
+/// pre-ack window rather than a bar snapping to 100% while a batch is still
+/// mid-flight.
+#[tokio::test]
+async fn sent_upload_complete_precedes_confirmed() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(&tmp.path().join("src_up"), "uuid-up", "up.fits", "M42", 4096);
+    let expected_bytes: u64 = package::read_manifest(&pkg)
+        .unwrap()
+        .iter()
+        .map(|r| r.byte_size)
+        .sum();
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> = Arc::new(CapturingEmitter(events.clone()));
+    let engine = SyncEngine::spawn_with_emitter(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        Some(emitter),
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    // Both signals must have landed on the emitter: the uploaded tick and the
+    // confirmed finished event.
+    wait_until(
+        || {
+            let evts = events.lock().unwrap();
+            let uploaded = evts.iter().any(|(n, p)| {
+                n == "sync-progress"
+                    && p["direction"].as_str() == Some("sent")
+                    && p["stage"].as_str() == Some("uploaded")
+            });
+            let confirmed = evts
+                .iter()
+                .any(|(n, p)| n == "sync-finished" && p["outcome"].as_str() == Some("confirmed"));
+            uploaded && confirmed
+        },
+        WAIT,
+    )
+    .await;
+
+    let evts = events.lock().unwrap();
+    let uploaded_idx = evts
+        .iter()
+        .position(|(n, p)| {
+            n == "sync-progress"
+                && p["direction"].as_str() == Some("sent")
+                && p["stage"].as_str() == Some("uploaded")
+        })
+        .expect("an 'uploaded' (awaiting-confirmation) send-side sync-progress tick");
+    let confirmed_idx = evts
+        .iter()
+        .position(|(n, p)| n == "sync-finished" && p["outcome"].as_str() == Some("confirmed"))
+        .expect("a confirmed sync-finished event");
+    assert!(
+        uploaded_idx < confirmed_idx,
+        "the uploaded stage must be surfaced BEFORE the package confirms \
+         (uploaded @ {uploaded_idx}, confirmed @ {confirmed_idx})"
+    );
+    // The uploaded tick reports the full byte size but is NOT a terminal event.
+    let uploaded = &evts[uploaded_idx].1;
+    assert_eq!(uploaded["bytesDone"].as_u64(), Some(expected_bytes));
+    assert_eq!(uploaded["bytesTotal"].as_u64(), Some(expected_bytes));
     drop(evts);
 
     engine.shutdown().await;

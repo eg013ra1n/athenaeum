@@ -368,6 +368,25 @@ impl SharingTransport for LoopbackTransport {
             bytes_total: pkg.byte_size,
         });
 
+        // Synthetic upload-complete to the SERVING endpoint's event stream (Task
+        // 2.1): the iroh provider routes `ServeComplete` on the terminal
+        // `Completed` of a payload-carrying request; the mock emits one after a
+        // successful copy so the sender engine's ServeComplete arm ("uploaded —
+        // awaiting confirmation") is exercised in-process. Pushed here — after the
+        // copy but BEFORE the receiver's ack (which the engine's reactive receiver
+        // fires only after `fetch` returns) — so the sender sees `uploaded`
+        // strictly before `confirmed`. Best-effort (`try_send`): a full/closed
+        // provider channel just drops it (signalling is UI data, never
+        // load-bearing).
+        if let Some(tx) = {
+            let reg = self.registry.lock().expect("registry mutex poisoned");
+            reg.get(&from).map(|inbox| inbox.event_tx.clone())
+        } {
+            let _ = tx.try_send(TransportEvent::ServeComplete {
+                package_id: pkg.package_id.clone(),
+            });
+        }
+
         tracing::debug!(
             from = %hex32(&from),
             package_id = %pkg.package_id.0,
