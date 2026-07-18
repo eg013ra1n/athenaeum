@@ -91,6 +91,15 @@ export function plainTransferError(raw: string): string {
     return "Peer didn't respond — will keep retrying";
   if (s.startsWith('package payload missing on disk')) return 'Local package data is missing';
   if (s.startsWith('cancelled by receiver')) return 'Cancelled by the receiving device';
+  // Class-prefixed dial failures the sync engine persists as `<class>: <raw>`
+  // (Task 3.1). A retryable class is a warning, not a failure — delivery-forever
+  // keeps trying — so the copy says so. `other:` and any unknown prefix fall
+  // through verbatim; the raw string still rides the `title=` hover at the call.
+  if (s.startsWith('no_route:')) return 'No route to peer — will keep retrying';
+  if (s.startsWith('relay_unreachable:')) return 'Peer unreachable via relay — will keep retrying';
+  if (s.startsWith('refused:')) return 'Peer refused the connection';
+  if (s.startsWith('timeout:')) return "Peer didn't answer — will keep retrying";
+  if (s.startsWith('not_started:')) return 'Peer app not running — will keep retrying';
   return raw;
 }
 
@@ -170,20 +179,25 @@ export function ActiveTransferRow({
   }, [row.finishNonce, expanded, loadFiles]);
 
   const pending = !row.terminal && (row.state === 'queued' || row.state === 'announced');
-  const stalled = row.kind === 'outbound' && pending && row.attempts > 0;
   const canSendNow = row.kind === 'outbound' && pending;
   const canCancel =
     (row.kind === 'outbound' && pending) ||
     (row.kind === 'inbound' && (row.state === 'announced' || row.state === 'fetching'));
   const canResend = row.kind === 'outbound' && row.terminal;
 
+  // A row waiting out a backoff window is retrying, not failed. State is never
+  // demoted across retries (a package can sit in `transferring` forever), so
+  // `nextRetryAt` — not the state — is the truth signal that a retry is pending.
+  const retrying = !!row.nextRetryAt && !row.terminal;
+
   const progress = stageProgress(row.state, row.bytesDone, row.byteSize);
   const speedLabel = row.isTransferring ? formatSpeed(row.speedBps) : null;
 
-  // Surface the last failed-attempt reason on a stalled (retrying) row or a
-  // terminal failed/cancelled row — the row otherwise shows only its state with
-  // no "why" (audit UX-2). Plain-mapped text, raw string on hover.
-  const showReason = !!row.lastError && (stalled || row.terminal);
+  // Surface the last failed-attempt reason on a retrying row (any state, e.g. a
+  // `transferring` row mid-backoff) or a terminal failed/cancelled row — the row
+  // otherwise shows only its state with no "why" (audit UX-2). Plain-mapped
+  // text, raw string on hover.
+  const showReason = !!row.lastError && (row.terminal || row.attempts > 0);
 
   const sendBusy = busy.has(`send:${row.id}`);
   const cancelBusy =
@@ -219,14 +233,16 @@ export function ActiveTransferRow({
         </td>
         <td className="px-2 py-2">
           <span className={`text-xs font-medium ${stateTone(row.state)}`}>{row.state}</span>
-          {stalled && (
+          {retrying && (
             <span className="ml-1.5 rounded bg-warning/20 px-1 py-0.5 text-[10px] font-medium text-warning">
-              stalled
+              retrying
             </span>
           )}
           {showReason && (
             <p
-              className="mt-0.5 max-w-[16rem] whitespace-normal break-words text-[10px] leading-tight text-error/70"
+              className={`mt-0.5 max-w-[16rem] whitespace-normal break-words text-[10px] leading-tight ${
+                row.terminal ? 'text-error/70' : 'text-warning'
+              }`}
               title={row.lastError ?? undefined}
             >
               {plainTransferError(row.lastError as string)}
