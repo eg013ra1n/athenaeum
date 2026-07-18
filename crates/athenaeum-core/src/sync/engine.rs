@@ -61,6 +61,7 @@ use crate::sharing::types::{
 };
 use crate::sharing::SharingTransport;
 
+use super::diagnostics::classify_send_error;
 use super::models::{Direction, HistoryRow, OutboundRow, OutboundState};
 use super::receiver::{SyncFinishedEvent, SyncProgressEvent};
 use super::store::SyncStore;
@@ -972,11 +973,18 @@ impl Worker {
             // bare `.context("announce package")` layer alone hid the real
             // cause (e.g. "peer not started: <hex>") in production logs.
             let reason = format!("{e:#}");
-            tracing::error!(package_id = id, error = %reason, "sync serve/announce failed; will retry");
-            // Record the attempt-error reason for the Perseus status page (Task 9).
-            // Best-effort: a diagnostic write must never turn a retryable transfer
-            // into a failure, so a store error here is logged, not propagated.
-            if let Err(se) = self.store.set_last_error(id, Some(&reason)) {
+            // Task 3.1: classify the dial outcome (string-based — the engine only
+            // sees an anyhow chain through the transport trait) into a stable
+            // snake_case class. It rides the log as `class` and prefixes the
+            // stored `last_error` so a later UI task maps it to human text.
+            let class = classify_send_error(&reason).tag();
+            tracing::error!(package_id = id, attempts, class, error = %reason, "sync serve/announce failed; will retry");
+            // Record the class-prefixed attempt-error reason for the Perseus
+            // status page (Task 9). Best-effort: a diagnostic write must never turn
+            // a retryable transfer into a failure, so a store error here is logged,
+            // not propagated.
+            let stored = format!("{class}: {reason}");
+            if let Err(se) = self.store.set_last_error(id, Some(&stored)) {
                 tracing::warn!(package_id = id, error = %se, "record last_error (serve/announce) failed");
             }
             if let Some(p) = self.pending.get_mut(&id) {

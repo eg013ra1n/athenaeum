@@ -49,6 +49,7 @@ use crate::sharing::types::NodeId;
 
 pub mod cleanup_coord;
 pub mod dedup;
+pub mod diagnostics;
 pub mod engine;
 pub mod ingest;
 pub mod models;

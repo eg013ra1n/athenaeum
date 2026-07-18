@@ -65,6 +65,8 @@ Multi-process safety: desktop and web pointed at the same app-data dir use per-p
 
 **Dictionary extension (FITS writer sanitize, `fits_writer::card`, 2026-07-18):** `keyword` (the FITS header keyword whose string value/comment/text contained non-printable-ASCII chars and was lossily degraded to `?` placeholders on the `"non-ASCII characters in header value sanitized"` warn — the ATH_REJ master-build bug-report fix).
 
+**Dictionary extension (sync send-path dial classification, `sync::engine`/`sync::diagnostics`, 2026-07-19):** `class` (stable snake_case dial-outcome class of a failed serve/announce attempt — `no_route`/`relay_unreachable`/`refused`/`timeout`/`not_started`/`other` — derived string-only from the `anyhow`-chain error text on the `"sync serve/announce failed; will retry"` event, and mirrored as the machine-readable prefix of the outbound row's `last_error`; a best-effort diagnostic hint, never an authorization signal).
+
 **Message style rule**: the message is a short, stable human phrase; all data lives in fields. `info!(root_id, new = 12, unchanged = 4219, "scan finished")` — never `info!("scan finished — 12 new of 4231")`. This is what makes events aggregatable and MCP-queryable.
 
 **Per-domain required fields** (the catalog; enforced by the sweep tables and code review). "Required" means: present wherever the value exists at that point in the operation — an event before a value is computed omits it; the sweep tables specify exact fields per event:

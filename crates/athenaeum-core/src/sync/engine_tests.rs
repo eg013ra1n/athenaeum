@@ -1208,6 +1208,62 @@ async fn peer_offline_backs_off_and_stays_pending() {
     engine.shutdown().await;
 }
 
+/// Task 3.1: a failed serve/announce leaves a class-prefixed `last_error`. With
+/// the peer endpoint minted but never started, every announce fails with a "peer
+/// not started" chain, which classifies as `not_started` — so the persisted
+/// `last_error` must carry the stable `not_started: ` machine-readable prefix a
+/// later UI task maps to human text.
+#[tokio::test]
+async fn failed_announce_last_error_carries_not_started_class_prefix() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // Peer endpoint minted (stable node id to announce *to*) but never started →
+    // every serve/announce attempt fails with "peer not started".
+    let receiver = net.endpoint();
+    let receiver_id = receiver.node_id();
+
+    let pkg = build_package(&tmp.path().join("src_cls"), "uuid-cls", "cls.fits", "M64", 1024);
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig {
+            ack_timeout: Duration::from_millis(50),
+        },
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+
+    // Wait for a failed attempt to record its classified last_error.
+    wait_until(
+        || {
+            store
+                .get_outbound(id)
+                .unwrap()
+                .and_then(|r| r.last_error)
+                .is_some()
+        },
+        WAIT,
+    )
+    .await;
+
+    let last_error = store
+        .get_outbound(id)
+        .unwrap()
+        .unwrap()
+        .last_error
+        .expect("a failed announce must record last_error");
+    assert!(
+        last_error.starts_with("not_started: "),
+        "last_error must carry the classified prefix, got {last_error:?}"
+    );
+
+    engine.shutdown().await;
+}
+
 /// C1 companion: enqueue while the peer is offline (first announce fails), then
 /// bring the peer online while it is still backing off and retrying. A retry's
 /// announce then succeeds, the peer fetches + acks, and the row completes to
