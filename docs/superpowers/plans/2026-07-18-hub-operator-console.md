@@ -6,7 +6,9 @@
 
 **Architecture:** `HUB_OPERATOR_EMAILS` env → `AppState.operator_emails`; a `require_operator` middleware (layered INSIDE `require_account`) is the single choke point for a new `/api/v1/operator/*` router; `blocked_at` enforcement folds into the existing auth SQL; all operator mutations write `operator_audit` in the same transaction; portal gets an `/operator` page gated by `/me.operator`.
 
-**Tech Stack:** Rust/Axum/sqlx (Postgres), React portal (vite, `apiGet/apiPost` helpers), `#[sqlx::test]` + `tower::ServiceExt::oneshot` test harness, astronet Ansible for env.
+**Tech Stack:** Rust/Axum/sqlx (Postgres), React portal (vite, `apiGet/apiPost/apiPatch/apiDelete` helpers — all four exist in `portal/src/api.ts:35-38`), `#[sqlx::test]` + `tower::ServiceExt::oneshot` test harness, astronet Ansible for env.
+
+> **Plan verified against code 2026-07-18** (adversarial fact-check of every snippet; corrections folded in). Line numbers are anchors from that pass — re-locate by identifier if drifted.
 
 ## Global Constraints
 
@@ -17,19 +19,21 @@
 - Every operator mutation inserts an `operator_audit` row **in the same tx**.
 - Migration `0012_operator_console.sql`; header comment convention `-- 0012_operator_console — <one line>`.
 - Commits as `eg013ra1n` (repo-configured identity), messages `feat(hub): …` / `test(hub): …` / `feat(portal): …`.
-- Axum layering rule (used in Tasks 4+): `route_layer` added LAST runs FIRST (outermost). `require_account` must run before `require_operator`, so add `.route_layer(require_operator).route_layer(require_account)` in that source order.
+- Axum layering rule (used in Tasks 4+): `route_layer` added LAST runs FIRST (outermost). `require_account` must run before `require_operator`, so add `.route_layer(require_operator).route_layer(require_account)` in that source order. `middleware` is already imported from axum in `routes/mod.rs:19`.
+- **Error type**: `crate::error::ApiError` (`From<sqlx::Error>` exists, error.rs:89-93). Constructors that EXIST: `bad_request`, `conflict`, `not_found`. **There is NO `unauthorized`/`forbidden` constructor** — the codebase convention (error.rs:18-20, deliberate no-enumeration) is body-less `ApiError::Status(StatusCode::UNAUTHORIZED)` / `ApiError::Status(StatusCode::FORBIDDEN)` (see auth_mw.rs:72,134,163). Use exactly that form everywhere below.
+- **Test harness call conventions** (`tests/common/mod.rs`): `post(uri, &serde_json::Value, Option<&str> /*bearer*/) -> Request` (132), `get(uri, Option<&str>) -> Request` (145), `patch(uri, &Value, Option<&str>)` (153) — request BUILDERS; send with `send(&app, req).await -> (StatusCode, Vec<u8>)` (179). Cookie builders: `post_cookie(uri, &Value, &session) -> Request` (332), `get_cookie(uri, &session) -> Request` (344) — also builders, wrap in `send`. Unauthenticated GET = `get(uri, None)`. `register_device(app, mailer, email, pubkey_seed: u8, name) -> (String /*token*/, String /*deviceId*/)` (194-229; asserts OTP→204, verify→200). `portal_sign_in(app, mailer, email) -> String` (306). `create_project_via(app, token, title, require_approval: bool) -> serde_json::Value` (273-303) — returns FULL ProjectView JSON; extract `["id"].as_str()`. `join_and_approve(app, coordinator_token, member_token, project_id: &str, display_name: &str, data_role: &str) -> String /*accountId*/` (355-386) — coordinator token FIRST. There is no delete helper and no patch/delete cookie builders — Task 7 adds `patch_cookie`, Task 9 adds `delete_cookie` (mirror `post_cookie` 332-341).
 
 ---
 
 ### Task 1: Config + AppState plumbing for operator emails
 
 **Files:**
-- Modify: `src/config.rs` (struct at 5–15, `from_env` at 40–64)
+- Modify: `src/config.rs` (struct at 5–15, `from_env` at 40–64, hand-written `Debug` at 17–29)
 - Modify: `src/routes/mod.rs` (`AppState` 32–58)
 - Modify: `src/lib.rs:57-58` (wiring)
 
 **Interfaces:**
-- Produces: `Config.operator_emails: Vec<String>` (lowercased, trimmed, deduped-not-required); `pub fn parse_operator_emails(raw: &str) -> Vec<String>`; `AppState.operator_emails: Arc<Vec<String>>`; builder `with_operator_emails(self, Vec<String>) -> Self`.
+- Produces: `Config.operator_emails: Vec<String>` (lowercased, trimmed); `pub fn parse_operator_emails(raw: &str) -> Vec<String>`; `AppState.operator_emails: Arc<Vec<String>>`; builder `with_operator_emails(self, Vec<String>) -> Self`.
 
 - [ ] **Step 1: failing unit test** — in `src/config.rs` tests mod (create `#[cfg(test)] mod tests` if absent):
 
@@ -45,7 +49,7 @@ fn operator_emails_parse_trim_lowercase_filter_empty() {
 }
 ```
 
-- [ ] **Step 2: run** `cargo test operator_emails_parse -p athenaeum-hub` → FAIL (fn not found).
+- [ ] **Step 2: run** `cargo test operator_emails_parse` → FAIL (fn not found).
 - [ ] **Step 3: implement** in `src/config.rs`:
 
 ```rust
@@ -66,6 +70,8 @@ operator_emails: std::env::var("HUB_OPERATOR_EMAILS")
     .unwrap_or_default(),
 ```
 
+Add the field to the hand-written `Debug` impl (config.rs:17-29) as a count (`.field("operator_emails", &self.operator_emails.len())`) — do not print addresses.
+
 In `src/routes/mod.rs` add to `AppState`: `pub operator_emails: Arc<Vec<String>>`; in `AppState::new` init `operator_emails: Arc::new(Vec::new())`; add builder below `with_relay_auth_token` (55–58):
 
 ```rust
@@ -77,7 +83,7 @@ pub fn with_operator_emails(mut self, emails: Vec<String>) -> Self {
 
 In `src/lib.rs:57-58` chain `.with_operator_emails(config.operator_emails.clone())`.
 
-- [ ] **Step 4: run** `cargo test -p athenaeum-hub` (whole suite compiles + new test passes).
+- [ ] **Step 4: run** `cargo test` (whole suite compiles + new test passes).
 - [ ] **Step 5: commit** `feat(hub): HUB_OPERATOR_EMAILS config + AppState plumbing`
 
 ---
@@ -86,10 +92,10 @@ In `src/lib.rs:57-58` chain `.with_operator_emails(config.operator_emails.clone(
 
 **Files:**
 - Create: `migrations/0012_operator_console.sql`
-- Create: `tests/operator_schema.rs` (model on `tests/collab_schema.rs` structure)
+- Create: `tests/operator_schema.rs`
 
 **Interfaces:**
-- Produces: columns `projects.featured` (bool NOT NULL DEFAULT false), `projects.hidden_at` (timestamptz NULL), `accounts.blocked_at` (timestamptz NULL); table `operator_audit(id bigserial PK, actor uuid NOT NULL REFERENCES accounts(id), action text NOT NULL, target_kind text NOT NULL, target_id text NOT NULL, detail jsonb, at timestamptz NOT NULL DEFAULT now())`.
+- Produces: columns `projects.featured` (bool NOT NULL DEFAULT false), `projects.hidden_at` (timestamptz NULL), `accounts.blocked_at` (timestamptz NULL); table `operator_audit`.
 
 - [ ] **Step 1: failing test** `tests/operator_schema.rs`:
 
@@ -111,11 +117,6 @@ async fn migration_0012_columns_and_audit_table(pool: PgPool) {
     let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM operator_audit")
         .fetch_one(&pool).await.unwrap();
     assert_eq!(n, 1);
-    // projects flags exist with defaults
-    let ok: (bool, Option<chrono::DateTime<chrono::Utc>>,) = sqlx::query_as(
-        "SELECT false AS featured, NULL::timestamptz AS hidden_at")
-        .fetch_one(&pool).await.unwrap();
-    let _ = ok;
     sqlx::query("SELECT featured, hidden_at FROM projects LIMIT 0")
         .execute(&pool).await.unwrap();
 }
@@ -151,15 +152,15 @@ CREATE INDEX IF NOT EXISTS operator_audit_at_idx ON operator_audit (at DESC);
 
 **Files:**
 - Modify: `src/auth_mw.rs` (`require_auth` 67–97, `require_account` 119–184)
-- Modify: `src/routes/auth.rs` (`verify_otp`, blocked check after `upsert_account_tx` — around line 396)
-- Modify: `src/routes/portal_auth.rs` (`portal_verify`, same — around line 54)
+- Modify: `src/routes/auth.rs` (`verify_otp` — blocked check right after `let account_id = upsert_account_tx(&mut tx, &email).await?;` at line 396)
+- Modify: `src/routes/portal_auth.rs` (`portal_verify` — after `let account_id = auth::upsert_account_tx(&mut tx, &email).await?;` at line 54)
 - Create: `tests/operator_blocked.rs`
 
 **Interfaces:**
 - Consumes: `accounts.blocked_at` (Task 2).
-- Produces: blocked accounts get 401 on every authenticated path and cannot complete OTP sign-in (message `account blocked`).
+- Produces: blocked accounts get body-less 401 on every authenticated path and cannot complete OTP verify.
 
-- [ ] **Step 1: failing tests** `tests/operator_blocked.rs` (uses `common` helpers: `app_with_capture`, `register_device`, `portal_sign_in`, `get`, `send`, `post_cookie`):
+- [ ] **Step 1: failing tests** `tests/operator_blocked.rs`:
 
 ```rust
 mod common;
@@ -178,59 +179,63 @@ async fn blocked_bearer_and_session_get_401(pool: PgPool) {
     let (token, _dev) = register_device(&app, &mailer, "u@x.io", 1, "pc").await;
     let session = portal_sign_in(&app, &mailer, "u@x.io").await;
     block(&pool, "u@x.io").await;
-    let (st, _) = send(&app, get("/api/v1/devices", &token)).await;
+    let (st, _) = send(&app, get("/api/v1/devices", Some(&token))).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED, "blocked bearer must 401");
-    let (st, _) = get_cookie(&app, "/api/v1/me", &session).await;
+    let (st, _) = send(&app, get_cookie("/api/v1/me", &session)).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED, "blocked portal session must 401");
 }
 
 #[sqlx::test]
-async fn blocked_account_cannot_sign_in_and_unblock_restores(pool: PgPool) {
+async fn blocked_account_cannot_pass_otp_verify_and_unblock_restores(pool: PgPool) {
     let (app, mailer) = app_with_capture(pool.clone());
     let (_t, _d) = register_device(&app, &mailer, "u@x.io", 1, "pc").await;
     block(&pool, "u@x.io").await;
-    // re-registration path must refuse at OTP verify
-    let attempt = std::panic::AssertUnwindSafe(register_device(&app, &mailer, "u@x.io", 2, "pc2"));
-    // register_device asserts 200 internally, so instead drive verify manually if it panics:
-    let refused = futures::FutureExt::catch_unwind(attempt).await.is_err();
-    assert!(refused, "blocked OTP verify must not issue a token");
+    // Drive the OTP request+verify pair MANUALLY, mirroring register_device's
+    // internals VERBATIM (tests/common/mod.rs:194-229: exact endpoint paths,
+    // JSON field names, and how the code is read out of CaptureMailer).
+    // Expectations: the OTP request still succeeds (204 — delivery is not the
+    // gate), the VERIFY call returns 401 (blocked), and no token is issued.
+    // <copy the two request builders from register_device here, changing only
+    //  the final assert to StatusCode::UNAUTHORIZED>
     sqlx::query("UPDATE accounts SET blocked_at = NULL WHERE email = 'u@x.io'")
         .execute(&pool).await.unwrap();
     let (_t2, _d2) = register_device(&app, &mailer, "u@x.io", 3, "pc3").await; // works again
 }
 ```
 
-(If `futures` isn't already a dev-dependency, drive the OTP request/verify calls directly with `post`+`send` instead of `register_device` and assert `StatusCode::UNAUTHORIZED` — inspect `register_device` at `tests/common/mod.rs:194-229` for the exact request bodies and replicate its two calls.)
+(Do NOT use `futures::FutureExt::catch_unwind` — `futures` is not a dependency. The manual request pair is the whole point of this test's second half.)
 
 - [ ] **Step 2: run** `cargo test --test operator_blocked` → FAIL.
-- [ ] **Step 3: implement.** In `src/auth_mw.rs` change the two `require_account` lookups and the `require_auth` lookup to JOIN accounts:
+- [ ] **Step 3: implement.** In `src/auth_mw.rs` change the three lookups to JOIN accounts:
 
 ```sql
--- bearer branch (was: FROM devices WHERE token_hash=$1 AND revoked_at IS NULL)
+-- require_account bearer branch (127-128) and require_auth device query (76-78), was:
+--   SELECT id, account_id, role FROM devices WHERE token_hash = $1 AND revoked_at IS NULL
 SELECT d.id, d.account_id, d.role FROM devices d
 JOIN accounts a ON a.id = d.account_id
 WHERE d.token_hash = $1 AND d.revoked_at IS NULL AND a.blocked_at IS NULL
 
--- session branch (was: FROM portal_sessions WHERE token_hash=$1 AND expires_at>now())
+-- require_account session branch (148-149), was:
+--   SELECT id, account_id FROM portal_sessions WHERE token_hash = $1 AND expires_at > now()
 SELECT s.id, s.account_id FROM portal_sessions s
 JOIN accounts a ON a.id = s.account_id
 WHERE s.token_hash = $1 AND s.expires_at > now() AND a.blocked_at IS NULL
 ```
 
-Apply the same JOIN to `require_auth`'s device query (75–82). In `src/routes/auth.rs::verify_otp` right after `upsert_account_tx` returns `account_id` (~396) and in `src/routes/portal_auth.rs::portal_verify` (~54):
+In `src/routes/auth.rs` after line 396 and in `src/routes/portal_auth.rs` after line 54 (identical block; `tx` is in scope in both):
 
 ```rust
-let blocked: Option<Option<chrono::DateTime<chrono::Utc>>> =
+let blocked: Option<chrono::DateTime<chrono::Utc>> =
     sqlx::query_scalar("SELECT blocked_at FROM accounts WHERE id = $1")
-        .bind(account_id).fetch_optional(&mut *tx).await?;
-if matches!(blocked, Some(Some(_))) {
-    return Err(ApiError::unauthorized("account blocked"));
+        .bind(account_id).fetch_one(&mut *tx).await?;
+if blocked.is_some() {
+    return Err(ApiError::Status(axum::http::StatusCode::UNAUTHORIZED));
 }
 ```
 
-(Match the file's actual error-constructor names — `ApiError::unauthorized` per existing usage in `auth_mw.rs`.)
+(Body-less 401 per the error.rs:18-20 no-enumeration convention; `unauthorized(...)` constructors do not exist.)
 
-- [ ] **Step 4: run** `cargo test --test operator_blocked` → PASS; then full `cargo test` → no regressions.
+- [ ] **Step 4: run** `cargo test --test operator_blocked` → PASS; full `cargo test` → no regressions.
 - [ ] **Step 5: commit** `feat(hub): blocked_at enforcement on bearer/session/OTP paths`
 
 ---
@@ -240,12 +245,12 @@ if matches!(blocked, Some(Some(_))) {
 **Files:**
 - Create: `src/routes/operator.rs`
 - Modify: `src/routes/mod.rs` (module decl + router 92–182)
-- Modify: `src/routes/me.rs` (`MeResponse` 12–17, handler 19–32)
+- Modify: `src/routes/me.rs` (`MeResponse` 12–17, handler 19–32 — it already receives `State<AppState>`)
 - Modify: `tests/common/mod.rs` (new helper)
 - Create: `tests/operator_gate.rs`
 
 **Interfaces:**
-- Produces: `pub struct OperatorAuth { pub account_id: Uuid, pub email: String }`; middleware `pub async fn require_operator(State<AppState>, Request, Next) -> Response`; `pub async fn audit_tx(conn: &mut PgConnection, actor: Uuid, action: &str, target_kind: &str, target_id: &str, detail: serde_json::Value) -> Result<(), sqlx::Error>`; route `GET /api/v1/operator/audit?limit=` → `Vec<AuditRow{id, actorEmail, action, targetKind, targetId, detail, at}>`; `MeResponse.operator: bool`; test helper `app_with_operators(pool, &["email"]) -> (Router, CaptureMailer)`.
+- Produces: `pub struct OperatorAuth { pub account_id: Uuid, pub email: String }` (`AuthAccount` already derives Clone — auth_mw.rs:103); middleware `require_operator`; `audit_tx(conn, actor, action, target_kind, target_id, detail)`; `GET /api/v1/operator/audit?limit=` → `Vec<AuditRow{id, actorEmail, action, targetKind, targetId, detail, at}>`; `MeResponse.operator: bool`; test helper `app_with_operators(pool, &["email"]) -> (Router, CaptureMailer)`.
 
 - [ ] **Step 1: failing tests** `tests/operator_gate.rs`:
 
@@ -261,15 +266,15 @@ async fn operator_gate_and_me_flag(pool: PgPool) {
     let op = portal_sign_in(&app, &mailer, "op@x.io").await;
     let user = portal_sign_in(&app, &mailer, "user@x.io").await;
 
-    let (st, body) = get_cookie(&app, "/api/v1/me", &op).await;
+    let (st, body) = send(&app, get_cookie("/api/v1/me", &op)).await;
     assert_eq!(st, StatusCode::OK);
     assert!(String::from_utf8(body).unwrap().contains("\"operator\":true"));
-    let (_, body) = get_cookie(&app, "/api/v1/me", &user).await;
+    let (_, body) = send(&app, get_cookie("/api/v1/me", &user)).await;
     assert!(String::from_utf8(body).unwrap().contains("\"operator\":false"));
 
-    let (st, _) = get_cookie(&app, "/api/v1/operator/audit", &user).await;
+    let (st, _) = send(&app, get_cookie("/api/v1/operator/audit", &user)).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "non-operator must get 403");
-    let (st, body) = get_cookie(&app, "/api/v1/operator/audit", &op).await;
+    let (st, body) = send(&app, get_cookie("/api/v1/operator/audit", &op)).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(String::from_utf8(body).unwrap(), "[]");
 }
@@ -278,7 +283,7 @@ async fn operator_gate_and_me_flag(pool: PgPool) {
 async fn empty_allowlist_is_inert(pool: PgPool) {
     let (app, mailer) = app_with_capture(pool.clone());
     let s = portal_sign_in(&app, &mailer, "anyone@x.io").await;
-    let (st, _) = get_cookie(&app, "/api/v1/operator/audit", &s).await;
+    let (st, _) = send(&app, get_cookie("/api/v1/operator/audit", &s)).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 }
 ```
@@ -293,6 +298,7 @@ async fn empty_allowlist_is_inert(pool: PgPool) {
 
 use axum::{
     extract::{Request, State},
+    http::StatusCode,
     middleware::Next,
     response::Response,
     Extension, Json,
@@ -302,7 +308,7 @@ use uuid::Uuid;
 
 use super::AppState;
 use crate::auth_mw::AuthAccount;
-use crate::error::ApiError; // match the actual error module path used by sibling routes
+use crate::error::ApiError;
 
 #[derive(Clone, Debug)]
 pub struct OperatorAuth {
@@ -319,15 +325,15 @@ pub async fn require_operator(
         .extensions()
         .get::<AuthAccount>()
         .cloned()
-        .ok_or_else(|| ApiError::unauthorized("sign in required"))?;
+        .ok_or(ApiError::Status(StatusCode::UNAUTHORIZED))?;
     let email: String = sqlx::query_scalar("SELECT email FROM accounts WHERE id = $1")
         .bind(auth.account_id)
         .fetch_one(&state.db)
         .await
-        .map_err(|_| ApiError::unauthorized("sign in required"))?;
+        .map_err(|_| ApiError::Status(StatusCode::UNAUTHORIZED))?;
     let lower = email.to_ascii_lowercase();
     if !state.operator_emails.iter().any(|e| e == &lower) {
-        return Err(ApiError::forbidden("operator only"));
+        return Err(ApiError::Status(StatusCode::FORBIDDEN));
     }
     req.extensions_mut().insert(OperatorAuth { account_id: auth.account_id, email: lower });
     Ok(next.run(req).await)
@@ -381,38 +387,37 @@ pub async fn list_audit(
 }
 ```
 
-(`AuthAccount` must be `Clone` — add `#[derive(Clone)]` in `auth_mw.rs` if missing. If the error type lives elsewhere than `crate::error::ApiError`, mirror what `src/routes/members.rs` imports.)
-
-In `src/routes/mod.rs`: `pub mod operator;`; in `build_router` add before the final merge chain:
+In `src/routes/mod.rs`: `pub mod operator;`; in `build_router` before the final merge chain:
 
 ```rust
 let operator = Router::new()
     .route("/api/v1/operator/audit", get(operator::list_audit))
-    // require_account must run BEFORE require_operator → add operator layer first (inner)
-    .route_layer(axum::middleware::from_fn_with_state(state.clone(), operator::require_operator))
-    .route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth_mw::require_account));
+    // require_account must run BEFORE require_operator → operator layer added first (inner)
+    .route_layer(middleware::from_fn_with_state(state.clone(), operator::require_operator))
+    .route_layer(middleware::from_fn_with_state(state.clone(), auth_mw::require_account));
 ```
 
-and merge: `.merge(operator)` alongside the existing merges (176–181).
+merged via `.merge(operator)` in the final chain (176–181).
 
-In `src/routes/me.rs`: add `pub operator: bool` to `MeResponse`; in the handler compute after the email SELECT:
+In `src/routes/me.rs`: add `operator: bool` to `MeResponse`; compute after the existing email SELECT (24–27):
 
 ```rust
 let operator = state.operator_emails.iter().any(|e| e == &email.to_ascii_lowercase());
 ```
 
-In `tests/common/mod.rs` below `app_with_capture` (82–86):
+In `tests/common/mod.rs` below `app_with_capture` (82–86) — replicate its body exactly, chaining the builder:
 
 ```rust
 #[allow(dead_code)]
 pub fn app_with_operators(pool: sqlx::PgPool, emails: &[&str]) -> (axum::Router, CaptureMailer) {
     let mailer = CaptureMailer::default();
-    let state = crate::_hub_state_helper(pool, mailer.clone(), emails); // see note
+    let state = athenaeum_hub::routes::AppState::new(pool, std::sync::Arc::new(mailer.clone()))
+        .with_operator_emails(emails.iter().map(|s| s.to_string()).collect());
     (athenaeum_hub::routes::build_router(state), mailer)
 }
 ```
 
-Note: replicate the exact body of `app_with_capture` and chain `.with_operator_emails(emails.iter().map(|s| s.to_string()).collect())` on the `AppState` — no separate helper fn needed if inlined.
+(Mirror the exact AppState construction expression from `app_with_capture` — if it differs from the above, copy it and only append `.with_operator_emails(...)`.)
 
 - [ ] **Step 4: run** `cargo test --test operator_gate` → PASS; `cargo test` → green.
 - [ ] **Step 5: commit** `feat(hub): operator gate (env allowlist), /me.operator, audit table read`
@@ -426,7 +431,8 @@ Note: replicate the exact body of `app_with_capture` and chain `.with_operator_e
 - Create: `tests/operator_overview.rs`
 
 **Interfaces:**
-- Produces: `GET /api/v1/operator/overview` → `Overview{accounts, devicesActive, projectsActive, projectsHidden, projectsClosed, members, announcementsByState: {state: count}, joinRequestsOpen, events: [{at, kind, projectSlug, actorEmail, detail}]}` (events = project_events joined to projects+accounts, newest-first, limit 50).
+- Produces: `GET /api/v1/operator/overview` → `Overview{accounts, devicesActive, projectsActive, projectsHidden, projectsClosed, members, announcementsByState, joinRequestsOpen, events: [{at, kind, projectSlug, actorEmail, detail}]}`.
+- Table facts: announcements table is **`package_announcements`** (state column `state`, CHECK pending/published/rejected); events table `project_events` timestamp column is **`created_at`** (no `at` column); project creation records event kind **`"created"`** (projects.rs:374).
 
 - [ ] **Step 1: failing test** `tests/operator_overview.rs`:
 
@@ -441,20 +447,17 @@ async fn overview_counts_and_events(pool: PgPool) {
     let (app, mailer) = app_with_operators(pool.clone(), &["op@x.io"]);
     let op = portal_sign_in(&app, &mailer, "op@x.io").await;
     let (coord_token, _d) = register_device(&app, &mailer, "coord@x.io", 1, "pc").await;
-    let project = create_project_via(&app, &coord_token, "M31 Mosaic").await; // see common helper 273–303 for exact signature
-    let _ = project;
-    let (st, body) = get_cookie(&app, "/api/v1/operator/overview", &op).await;
+    let project = create_project_via(&app, &coord_token, "M31 Mosaic", false).await;
+    let _project_id = project["id"].as_str().unwrap();
+    let (st, body) = send(&app, get_cookie("/api/v1/operator/overview", &op)).await;
     assert_eq!(st, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v["accounts"].as_i64().unwrap() >= 2);
     assert_eq!(v["projectsActive"].as_i64().unwrap(), 1);
-    assert!(v["events"].as_array().unwrap().iter().any(|e| e["kind"] == "project_created"
-        || e["kind"].as_str().unwrap_or("").contains("created")),
-        "project creation must appear in events: {v}");
+    assert!(v["events"].as_array().unwrap().iter().any(|e| e["kind"] == "created"),
+        "project creation event must appear: {v}");
 }
 ```
-
-(Adjust the expected event `kind` to whatever `record_event_tx` writes on creation — check `create_project` in `src/routes/projects.rs:234-384`; if creation records no event, assert on any event kind after performing a `join_and_approve` instead.)
 
 - [ ] **Step 2: run** → FAIL (404).
 - [ ] **Step 3: implement** in `operator.rs`:
@@ -497,15 +500,16 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<Overview>, A
         sqlx::query_scalar("SELECT count(*) FROM projects WHERE status = 'closed'").fetch_one(db).await?;
     let members: i64 = sqlx::query_scalar("SELECT count(*) FROM project_members").fetch_one(db).await?;
     let ann: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT state, count(*) FROM announcements GROUP BY state").fetch_all(db).await.unwrap_or_default();
+        "SELECT state, count(*) FROM package_announcements GROUP BY state")
+        .fetch_all(db).await.unwrap_or_default();
     let join_requests_open: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM join_requests WHERE status = 'open'").fetch_one(db).await?;
     let events = sqlx::query_as::<_, EventRow>(
-        "SELECT e.at, e.kind, p.slug AS project_slug, a.email AS actor_email, e.detail
+        "SELECT e.created_at AS at, e.kind, p.slug AS project_slug, a.email AS actor_email, e.detail
          FROM project_events e
          LEFT JOIN projects p ON p.id = e.project_id
          LEFT JOIN accounts a ON a.id = e.actor
-         ORDER BY e.at DESC LIMIT 50",
+         ORDER BY e.created_at DESC LIMIT 50",
     ).fetch_all(db).await?;
     Ok(Json(Overview {
         accounts, devices_active, projects_active, projects_hidden, projects_closed,
@@ -514,7 +518,7 @@ pub async fn overview(State(state): State<AppState>) -> Result<Json<Overview>, A
 }
 ```
 
-(Verify the announcements table/column names against `src/routes/announcements.rs` — if the state column is named differently (e.g. `status`), match it; if `project_events` columns differ (check `EVENT_INSERT` at `src/collab_auth.rs:73-74` and migration 0009), match them.) Register `.route("/api/v1/operator/overview", get(operator::overview))` in the operator router.
+Register `.route("/api/v1/operator/overview", get(operator::overview))` in the operator router.
 
 - [ ] **Step 4: run** → PASS; `cargo test` → green.
 - [ ] **Step 5: commit** `feat(hub): operator overview — counts + recent events`
@@ -543,8 +547,8 @@ async fn lists_all_projects_with_aggregates(pool: PgPool) {
     let (app, mailer) = app_with_operators(pool.clone(), &["op@x.io"]);
     let op = portal_sign_in(&app, &mailer, "op@x.io").await;
     let (t, _) = register_device(&app, &mailer, "coord@x.io", 1, "pc").await;
-    let _p = create_project_via(&app, &t, "M31 Mosaic").await;
-    let (st, body) = get_cookie(&app, "/api/v1/operator/projects", &op).await;
+    let _p = create_project_via(&app, &t, "M31 Mosaic", false).await;
+    let (st, body) = send(&app, get_cookie("/api/v1/operator/projects", &op)).await;
     assert_eq!(st, StatusCode::OK);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let row = &v.as_array().unwrap()[0];
@@ -579,8 +583,8 @@ pub async fn list_projects(State(state): State<AppState>) -> Result<Json<Vec<Ope
         "SELECT p.id, p.slug, p.title, p.status, p.featured, p.hidden_at, p.created_at,
                 ca.email AS coordinator_email,
                 (SELECT count(*) FROM project_members m WHERE m.project_id = p.id) AS member_count,
-                (SELECT count(*) FROM announcements an WHERE an.project_id = p.id) AS announcement_count,
-                (SELECT max(e.at) FROM project_events e WHERE e.project_id = p.id) AS last_event_at
+                (SELECT count(*) FROM package_announcements an WHERE an.project_id = p.id) AS announcement_count,
+                (SELECT max(e.created_at) FROM project_events e WHERE e.project_id = p.id) AS last_event_at
          FROM projects p
          LEFT JOIN project_members cm ON cm.project_id = p.id AND cm.is_coordinator
          LEFT JOIN accounts ca ON ca.id = cm.account_id
@@ -596,18 +600,19 @@ Register `.route("/api/v1/operator/projects", get(operator::list_projects))`.
 
 ---
 
-### Task 7: operator PATCH (featured/hidden/status) + hidden semantics enforcement
+### Task 7: operator PATCH (featured/hidden/status) + hidden/featured semantics enforcement
 
 **Files:**
 - Modify: `src/routes/operator.rs` (PATCH handler)
-- Modify: `src/routes/projects.rs` (`directory` WHERE at ~436 + ORDER BY; `project_page` 567–694 hidden gate)
+- Modify: `src/routes/projects.rs` (`directory` 426–462: WHERE at 436, ORDER BY, `featured` in SELECT + `DirectoryRow` 393–406 + `DirectoryItem` 408–422; `PROJECT_COLUMNS` 187–189 + `ProjectRow` 168–185 gain `hidden_at`; `project_page` 567–694 hidden gate)
 - Modify: `src/auth_mw.rs` (new `optional_account` helper)
-- Modify: `src/routes/join_requests.rs` (`create_join_request` 55–62: also refuse hidden)
+- Modify: `src/routes/join_requests.rs` (`create_join_request` status check 55–62: also refuse hidden)
+- Modify: `tests/common/mod.rs` (add `patch_cookie` builder, mirror `post_cookie` 332–341 with method PATCH)
 - Create: `tests/operator_hidden.rs`
 
 **Interfaces:**
 - Consumes: `audit_tx` (Task 4).
-- Produces: `PATCH /api/v1/operator/projects/{id}` body `{featured?: bool, hidden?: bool, status?: "active"|"closed", note?: string}`; `pub async fn optional_account(state: &AppState, headers: &HeaderMap) -> Option<Uuid>` in `auth_mw.rs` (bearer-then-cookie, read-only, no CSRF — GET use only).
+- Produces: `PATCH /api/v1/operator/projects/{id}` body `{featured?, hidden?, status?, note?}`; `pub async fn optional_account(state: &AppState, headers: &HeaderMap) -> Option<Uuid>`; `DirectoryItem.featured: bool` on the public directory wire.
 
 - [ ] **Step 1: failing tests** `tests/operator_hidden.rs`:
 
@@ -615,6 +620,7 @@ Register `.route("/api/v1/operator/projects", get(operator::list_projects))`.
 mod common;
 use axum::http::StatusCode;
 use common::*;
+use serde_json::json;
 use sqlx::PgPool;
 
 #[sqlx::test]
@@ -624,40 +630,54 @@ async fn hidden_project_semantics(pool: PgPool) {
     let (coord, _) = register_device(&app, &mailer, "coord@x.io", 1, "pc").await;
     let (member, _) = register_device(&app, &mailer, "member@x.io", 2, "pc2").await;
     let (outsider, _) = register_device(&app, &mailer, "out@x.io", 3, "pc3").await;
-    let project = create_project_via(&app, &coord, "M31 Mosaic").await;
-    join_and_approve(&app, &member, &coord, &project).await; // exact signature: tests/common/mod.rs:355-386
+    let project = create_project_via(&app, &coord, "M31 Mosaic", false).await;
+    let pid = project["id"].as_str().unwrap().to_string();
+    join_and_approve(&app, &coord, &member, &pid, "M", "send").await;
 
-    // hide it
-    let (st, _) = post_cookie(&app,
-        &format!("/api/v1/operator/projects/{project}"),
-        r#"{"hidden":true,"note":"spam check"}"#, &op).await; // use PATCH variant helper — see step 3 note
+    let (st, _) = send(&app, patch_cookie(&format!("/api/v1/operator/projects/{pid}"),
+        &json!({"hidden": true, "note": "spam check"}), &op)).await;
     assert_eq!(st, StatusCode::OK);
 
     // 1) absent from public directory
-    let (_, body) = send(&app, get_public("/api/v1/projects")).await;
-    assert!(!String::from_utf8(body).unwrap().contains("M31"), "hidden project must not be in directory");
+    let (_, body) = send(&app, get("/api/v1/projects", None)).await;
+    assert!(!String::from_utf8(body).unwrap().contains("M31"), "hidden project must not be listed");
     // 2) page 404 for anonymous and for outsider
-    let (st, _) = send(&app, get_public(&format!("/api/v1/projects/{project}"))).await;
+    let (st, _) = send(&app, get(&format!("/api/v1/projects/{pid}"), None)).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
-    let (st, _) = send(&app, get(&format!("/api/v1/projects/{project}"), &outsider)).await;
+    let (st, _) = send(&app, get(&format!("/api/v1/projects/{pid}"), Some(&outsider))).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
     // 3) page 200 for member and operator
-    let (st, _) = send(&app, get(&format!("/api/v1/projects/{project}"), &member)).await;
+    let (st, _) = send(&app, get(&format!("/api/v1/projects/{pid}"), Some(&member))).await;
     assert_eq!(st, StatusCode::OK);
-    let (st, _) = get_cookie(&app, &format!("/api/v1/projects/{project}"), &op).await;
+    let (st, _) = send(&app, get_cookie(&format!("/api/v1/projects/{pid}"), &op)).await;
     assert_eq!(st, StatusCode::OK);
     // 4) join refused while hidden
-    let (st, _) = send(&app, post(&format!("/api/v1/projects/{project}/join-requests"),
-        r#"{"displayName":"X","desiredRole":"send"}"#, &outsider)).await;
+    let (st, _) = send(&app, post(&format!("/api/v1/projects/{pid}/join-requests"),
+        &json!({"displayName": "X", "desiredRole": "send"}), Some(&outsider))).await;
     assert_eq!(st, StatusCode::CONFLICT);
     // 5) audit row written
-    let (_, body) = get_cookie(&app, "/api/v1/operator/audit", &op).await;
+    let (_, body) = send(&app, get_cookie("/api/v1/operator/audit", &op)).await;
     let raw = String::from_utf8(body).unwrap();
     assert!(raw.contains("project.update") && raw.contains("spam check"));
 }
-```
 
-(`get_public` = request without auth header — add a tiny local builder if `common` lacks one; `post_cookie` does POST — for PATCH add `patch_cookie` to `tests/common/mod.rs` mirroring `post_cookie` at 332–341 with method PATCH.)
+#[sqlx::test]
+async fn featured_sorts_first_in_directory(pool: PgPool) {
+    let (app, mailer) = app_with_operators(pool.clone(), &["op@x.io"]);
+    let op = portal_sign_in(&app, &mailer, "op@x.io").await;
+    let (t, _) = register_device(&app, &mailer, "c@x.io", 1, "pc").await;
+    let p1 = create_project_via(&app, &t, "First", false).await;
+    let _p2 = create_project_via(&app, &t, "Second", false).await;
+    let (st, _) = send(&app, patch_cookie(
+        &format!("/api/v1/operator/projects/{}", p1["id"].as_str().unwrap()),
+        &json!({"featured": true}), &op)).await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, body) = send(&app, get("/api/v1/projects", None)).await;
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v[0]["title"], "First", "featured project must sort first");
+    assert_eq!(v[0]["featured"], true, "directory must carry the featured flag");
+}
+```
 
 - [ ] **Step 2: run** → FAIL. **Step 3: implement.**
 
@@ -678,7 +698,7 @@ pub async fn patch_project(
     Extension(op): Extension<OperatorAuth>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     Json(body): Json<OperatorPatchProject>,
-) -> Result<axum::http::StatusCode, ApiError> {
+) -> Result<StatusCode, ApiError> {
     if let Some(s) = &body.status {
         if s != "active" && s != "closed" {
             return Err(ApiError::bad_request("status must be active or closed"));
@@ -702,37 +722,45 @@ pub async fn patch_project(
         serde_json::json!({"featured": body.featured, "hidden": body.hidden,
                            "status": body.status, "note": body.note})).await?;
     tx.commit().await?;
-    Ok(axum::http::StatusCode::OK)
+    Ok(StatusCode::OK)
 }
 ```
 
-`projects.rs` `directory` (~436): AND-in `p.hidden_at IS NULL`; change ORDER BY to `p.featured DESC, p.created_at DESC`.
+`projects.rs` `directory` (426–462): the WHERE is an OR chain — **parenthesize before AND-ing** and add featured to SELECT + ORDER BY:
 
-`auth_mw.rs` new helper (read-only resolution — bearer branch then cookie branch, both WITHOUT the CSRF check, both WITH the blocked JOIN):
+```sql
+WHERE ($1::text IS NULL OR p.title ILIKE '%' || $1 || '%' OR p.target_name ILIKE '%' || $1 || '%')
+  AND p.hidden_at IS NULL
+GROUP BY p.id ORDER BY p.featured DESC, p.created_at DESC LIMIT 200
+```
+
+Add `p.featured` to the directory SELECT list, `featured: bool` to `DirectoryRow` (393–406) and `DirectoryItem` (408–422) with the mapping line in between. Add `hidden_at` to `PROJECT_COLUMNS` (187–189) and `pub(crate) hidden_at: Option<chrono::DateTime<chrono::Utc>>` to `ProjectRow` (168–185).
+
+`auth_mw.rs` new helper (read-only, GET use only — no CSRF; note the qualified helper paths):
 
 ```rust
-pub async fn optional_account(state: &AppState, headers: &HeaderMap) -> Option<Uuid> {
+pub async fn optional_account(state: &AppState, headers: &axum::http::HeaderMap) -> Option<Uuid> {
     if let Some(token) = bearer_token(headers) {
         if let Ok(Some(id)) = sqlx::query_scalar::<_, Uuid>(
             "SELECT d.account_id FROM devices d JOIN accounts a ON a.id = d.account_id
              WHERE d.token_hash = $1 AND d.revoked_at IS NULL AND a.blocked_at IS NULL")
-            .bind(hash_token(&token)).fetch_optional(&state.db).await
+            .bind(crate::security::hash_token(&token)).fetch_optional(&state.db).await
         { return Some(id); }
     }
-    if let Some(cookie) = session_cookie_value(headers) {
+    if let Some(cookie) = crate::routes::portal_auth::session_cookie_value(headers) {
         if let Ok(Some(id)) = sqlx::query_scalar::<_, Uuid>(
             "SELECT s.account_id FROM portal_sessions s JOIN accounts a ON a.id = s.account_id
              WHERE s.token_hash = $1 AND s.expires_at > now() AND a.blocked_at IS NULL")
-            .bind(hash_token(&cookie)).fetch_optional(&state.db).await
+            .bind(crate::security::hash_token(&cookie)).fetch_optional(&state.db).await
         { return Some(id); }
     }
     None
 }
 ```
 
-(Reuse the file's actual token-hash helper name — check how `require_account` hashes before SELECT.)
+(`session_cookie_value` is `pub(crate)` in `portal_auth.rs:23` and takes headers — mirror how auth_mw.rs:144 calls it. `security::hash_token` per auth_mw.rs:73.)
 
-`projects.rs` `project_page` (567–694): add `headers: axum::http::HeaderMap` parameter; after `resolve_project`:
+`projects.rs` `project_page` (567–570): add `headers: axum::http::HeaderMap` parameter; after `resolve_project`:
 
 ```rust
 if project.hidden_at.is_some() {
@@ -752,9 +780,9 @@ if project.hidden_at.is_some() {
 }
 ```
 
-(`ProjectRow`/`PROJECT_COLUMNS` at 187–189 must gain `hidden_at`; add the column there and to the struct.)
+`join_requests.rs` `create_join_request` (55–62): extend the SELECT to `SELECT status, hidden_at FROM projects …` and refuse when `hidden_at` is set with the SAME existing message `"project is closed to new members"` (join_requests.rs:61).
 
-`join_requests.rs` `create_join_request` (55–62): extend the status check to `SELECT status, hidden_at` and refuse with the existing conflict message when `hidden_at.is_some()`.
+`tests/common/mod.rs`: add `patch_cookie(uri: &str, body: &serde_json::Value, session_token: &str) -> Request<Body>` mirroring `post_cookie` (332–341) with `Method::PATCH`.
 
 Register `.route("/api/v1/operator/projects/{id}", patch(operator::patch_project))`.
 
@@ -770,8 +798,8 @@ Register `.route("/api/v1/operator/projects/{id}", patch(operator::patch_project
 - Create: `tests/operator_coordinator.rs`
 
 **Interfaces:**
-- Consumes: `bump_membership_version_tx`, `record_event_tx` (`src/collab_auth.rs:97-131`), `audit_tx`.
-- Produces: `POST /api/v1/operator/projects/{id}/coordinator` body `{email: string}` → 200; non-member target gets a `send_receive` membership created (display_name = email).
+- Consumes: `bump_membership_version_tx(conn, project_id)` and `record_event_tx(conn, project_id, kind, actor, subject, detail)` from `crate::collab_auth` (97–131); `audit_tx`.
+- Produces: `POST /api/v1/operator/projects/{id}/coordinator` body `{email}` → 200; non-member target gets a `send_receive` membership (display_name = email). Drop-then-raise flip order per the `one_coordinator_per_project` partial unique index (0009:40-42), same as `handover` (members.rs:279-293).
 
 - [ ] **Step 1: failing test**:
 
@@ -779,6 +807,7 @@ Register `.route("/api/v1/operator/projects/{id}", patch(operator::patch_project
 mod common;
 use axum::http::StatusCode;
 use common::*;
+use serde_json::json;
 use sqlx::PgPool;
 
 #[sqlx::test]
@@ -787,23 +816,24 @@ async fn appoints_non_member_as_coordinator(pool: PgPool) {
     let op = portal_sign_in(&app, &mailer, "op@x.io").await;
     let (coord, _) = register_device(&app, &mailer, "old@x.io", 1, "pc").await;
     let (_new, _) = register_device(&app, &mailer, "new@x.io", 2, "pc2").await;
-    let project = create_project_via(&app, &coord, "M31 Mosaic").await;
+    let project = create_project_via(&app, &coord, "M31 Mosaic", false).await;
+    let pid = project["id"].as_str().unwrap().to_string();
 
     let before: i64 = sqlx::query_scalar("SELECT membership_version FROM projects WHERE id = $1::uuid")
-        .bind(&project).fetch_one(&pool).await.unwrap();
-    let (st, _) = post_cookie(&app, &format!("/api/v1/operator/projects/{project}/coordinator"),
-        r#"{"email":"new@x.io"}"#, &op).await;
+        .bind(&pid).fetch_one(&pool).await.unwrap();
+    let (st, _) = send(&app, post_cookie(&format!("/api/v1/operator/projects/{pid}/coordinator"),
+        &json!({"email": "new@x.io"}), &op)).await;
     assert_eq!(st, StatusCode::OK);
     let after: i64 = sqlx::query_scalar("SELECT membership_version FROM projects WHERE id = $1::uuid")
-        .bind(&project).fetch_one(&pool).await.unwrap();
+        .bind(&pid).fetch_one(&pool).await.unwrap();
     assert!(after > before, "membership_version must bump");
     let coords: Vec<(String,)> = sqlx::query_as(
         "SELECT a.email FROM project_members m JOIN accounts a ON a.id=m.account_id
-         WHERE m.project_id=$1::uuid AND m.is_coordinator").bind(&project)
+         WHERE m.project_id=$1::uuid AND m.is_coordinator").bind(&pid)
         .fetch_all(&pool).await.unwrap();
     assert_eq!(coords, vec![("new@x.io".to_string(),)]);
-    let (st, _) = post_cookie(&app, &format!("/api/v1/operator/projects/{project}/coordinator"),
-        r#"{"email":"ghost@x.io"}"#, &op).await;
+    let (st, _) = send(&app, post_cookie(&format!("/api/v1/operator/projects/{pid}/coordinator"),
+        &json!({"email": "ghost@x.io"}), &op)).await;
     assert_eq!(st, StatusCode::NOT_FOUND, "unknown account email → 404");
 }
 ```
@@ -819,7 +849,7 @@ pub async fn appoint_coordinator(
     Extension(op): Extension<OperatorAuth>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     Json(body): Json<AppointCoordinator>,
-) -> Result<axum::http::StatusCode, ApiError> {
+) -> Result<StatusCode, ApiError> {
     let email = body.email.trim().to_ascii_lowercase();
     let target: Option<Uuid> = sqlx::query_scalar("SELECT id FROM accounts WHERE lower(email) = $1")
         .bind(&email).fetch_optional(&state.db).await?;
@@ -828,7 +858,6 @@ pub async fn appoint_coordinator(
     let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM projects WHERE id=$1)")
         .bind(id).fetch_one(&mut *tx).await?;
     if !exists { return Err(ApiError::not_found("project not found")); }
-    // membership upsert (deadlock-free takeover: target need not be a member)
     sqlx::query(
         "INSERT INTO project_members (project_id, account_id, display_name, data_role)
          VALUES ($1, $2, $3, 'send_receive')
@@ -841,31 +870,37 @@ pub async fn appoint_coordinator(
         .bind(id).bind(target).execute(&mut *tx).await?;
     crate::collab_auth::bump_membership_version_tx(&mut tx, id).await?;
     crate::collab_auth::record_event_tx(&mut tx, id, "coordinator_changed",
-        Some(op.account_id), Some(target), serde_json::json!({"by":"operator"})).await?;
+        Some(op.account_id), Some(target), serde_json::json!({"by": "operator"})).await?;
     audit_tx(&mut tx, op.account_id, "project.coordinator", "project", &id.to_string(),
         serde_json::json!({"email": email})).await?;
     tx.commit().await?;
-    Ok(axum::http::StatusCode::OK)
+    Ok(StatusCode::OK)
 }
 ```
 
-(Match `bump_membership_version_tx`/`record_event_tx` exact param types from `src/collab_auth.rs:97-131` — they take `&mut PgConnection`; pass `&mut *tx`. If `project_members` PK constraint name differs from `(project_id, account_id)` composite, mirror the ON CONFLICT target used by `approve_join_request` at `join_requests.rs:234-243`.) Register the route.
+(`bump_membership_version_tx`/`record_event_tx` take `&mut PgConnection` — pass `&mut *tx` if the compiler asks.) Register the route.
 
-- [ ] **Step 4: run** → PASS; full suite green (snapshot tests confirm lazy re-sign covers the flip).
+- [ ] **Step 4: run** → PASS; full suite green (snapshot signing is lazy — the next `membership_snapshot` fetch re-signs; no extra call needed, matching how `handover` works).
 - [ ] **Step 5: commit** `feat(hub): operator coordinator appointment — any account, deadlock-free takeover`
 
 ---
 
-### Task 9: on-behalf join decisions + member removal
+### Task 9: on-behalf join decisions, member removal, operator listings (joins + members)
 
 **Files:**
-- Modify: `src/routes/join_requests.rs` (factor cores from 201–297)
+- Modify: `src/routes/join_requests.rs` (factor cores from 201–297; factor the open-requests listing query from `list_join_requests` 156–183 — `JoinRequestView` fields are private, so the operator listing must be produced INSIDE this module as a `pub(crate)` fn)
 - Modify: `src/routes/members.rs` (factor core from 139–187)
 - Modify: `src/routes/operator.rs`, `src/routes/mod.rs`
+- Modify: `tests/common/mod.rs` (add `delete_cookie(uri, &session) -> Request` mirroring `post_cookie` 332–341 with `Method::DELETE`, no body)
 - Create: `tests/operator_members.rs`
 
 **Interfaces:**
-- Produces: `pub(crate) async fn approve_join_core(tx: &mut PgConnection, project_id: Uuid, req_id: Uuid, decided_by: Uuid, data_role_override: Option<String>) -> Result<ApproveResponse, ApiError>`; `pub(crate) async fn reject_join_core(tx, project_id, req_id, decided_by) -> Result<(), ApiError>`; `pub(crate) async fn remove_member_core(tx, project_id, target: Uuid) -> Result<(), ApiError>` (keeps the "cannot remove the coordinator — hand over first" 409 guard); operator routes `POST /api/v1/operator/projects/{id}/join-requests/{rid}/decide` body `{action: "approve"|"reject", dataRole?: string}` and `DELETE /api/v1/operator/projects/{id}/members/{account_id}`.
+- Produces:
+  - `pub(crate) async fn approve_join_core(tx: &mut sqlx::PgConnection, project_id: Uuid, req_id: Uuid, decided_by: Uuid, data_role_override: Option<String>) -> Result<ApproveResponse, ApiError>` (the 218–260 block: atomic consume UPDATE → member INSERT with 409 on `project_members_pkey` → bump → `record_event_tx("member_joined", …)`)
+  - `pub(crate) async fn reject_join_core(tx, project_id, req_id, decided_by) -> Result<(), ApiError>` (from 270–297)
+  - `pub(crate) async fn list_open_join_requests(db: &sqlx::PgPool, project_id: Uuid) -> Result<Vec<JoinRequestView>, ApiError>` (factored from 156–183, WITHOUT the coordinator gate)
+  - `pub(crate) async fn remove_member_core(tx, project_id, target: Uuid) -> Result<(), ApiError>` (from 152–181, keeps the "cannot remove the coordinator — hand over first" 409 guard)
+  - Operator routes: `POST /api/v1/operator/projects/{id}/join-requests/{rid}/decide` body `{action, dataRole?}`; `GET /api/v1/operator/projects/{id}/join-requests` → `Vec<JoinRequestView>`; `DELETE /api/v1/operator/projects/{id}/members/{account_id}`; `GET /api/v1/operator/projects/{id}/members` → `Vec<OperatorMemberRow{accountId, email, displayName, dataRole, coordinator, joinedAt}>` (the PUBLIC page deliberately never exposes accountId/emails — the portal remove-flow needs this operator-scoped listing).
 
 - [ ] **Step 1: failing tests** `tests/operator_members.rs`:
 
@@ -873,47 +908,54 @@ pub async fn appoint_coordinator(
 mod common;
 use axum::http::StatusCode;
 use common::*;
+use serde_json::json;
 use sqlx::PgPool;
 
 #[sqlx::test]
-async fn operator_decides_join_and_removes_member(pool: PgPool) {
+async fn operator_lists_decides_joins_and_removes_members(pool: PgPool) {
     let (app, mailer) = app_with_operators(pool.clone(), &["op@x.io"]);
     let op = portal_sign_in(&app, &mailer, "op@x.io").await;
     let (coord, _) = register_device(&app, &mailer, "coord@x.io", 1, "pc").await;
     let (joiner, _) = register_device(&app, &mailer, "j@x.io", 2, "pc2").await;
-    let project = create_project_via(&app, &coord, "M31 Mosaic").await;
-    // joiner files a request (mirror join_and_approve's request half; see common 355–386)
-    let (st, body) = send(&app, post(&format!("/api/v1/projects/{project}/join-requests"),
-        r#"{"displayName":"J","desiredRole":"send"}"#, &joiner)).await;
+    let project = create_project_via(&app, &coord, "M31 Mosaic", false).await;
+    let pid = project["id"].as_str().unwrap().to_string();
+    let (st, body) = send(&app, post(&format!("/api/v1/projects/{pid}/join-requests"),
+        &json!({"displayName": "J", "desiredRole": "send"}), Some(&joiner))).await;
     assert_eq!(st, StatusCode::OK);
-    let rid = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+    let rid = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str().unwrap().to_string();
 
-    let (st, _) = post_cookie(&app,
-        &format!("/api/v1/operator/projects/{project}/join-requests/{rid}/decide"),
-        r#"{"action":"approve"}"#, &op).await;
+    // operator sees the open request
+    let (st, body) = send(&app, get_cookie(&format!("/api/v1/operator/projects/{pid}/join-requests"), &op)).await;
     assert_eq!(st, StatusCode::OK);
-    let member_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM project_members WHERE project_id=$1::uuid").bind(&project)
-        .fetch_one(&pool).await.unwrap();
-    assert_eq!(member_count, 2);
+    assert!(String::from_utf8(body).unwrap().contains(&rid));
 
-    // removal: member ok, coordinator refused
-    let joiner_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE email='j@x.io'")
-        .fetch_one(&pool).await.unwrap();
-    let coord_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE email='coord@x.io'")
-        .fetch_one(&pool).await.unwrap();
-    let (st, _) = delete_cookie(&app,
-        &format!("/api/v1/operator/projects/{project}/members/{coord_id}"), &op).await;
+    let (st, _) = send(&app, post_cookie(
+        &format!("/api/v1/operator/projects/{pid}/join-requests/{rid}/decide"),
+        &json!({"action": "approve"}), &op)).await;
+    assert_eq!(st, StatusCode::OK);
+
+    // operator members listing carries accountId + email
+    let (st, body) = send(&app, get_cookie(&format!("/api/v1/operator/projects/{pid}/members"), &op)).await;
+    assert_eq!(st, StatusCode::OK);
+    let members: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(members.as_array().unwrap().len(), 2);
+    let joiner_row = members.as_array().unwrap().iter()
+        .find(|m| m["email"] == "j@x.io").expect("joiner listed");
+    let joiner_id = joiner_row["accountId"].as_str().unwrap().to_string();
+    let coord_id = members.as_array().unwrap().iter()
+        .find(|m| m["email"] == "coord@x.io").unwrap()["accountId"].as_str().unwrap().to_string();
+
+    let (st, _) = send(&app, delete_cookie(
+        &format!("/api/v1/operator/projects/{pid}/members/{coord_id}"), &op)).await;
     assert_eq!(st, StatusCode::CONFLICT, "coordinator removal must be refused");
-    let (st, _) = delete_cookie(&app,
-        &format!("/api/v1/operator/projects/{project}/members/{joiner_id}"), &op).await;
+    let (st, _) = send(&app, delete_cookie(
+        &format!("/api/v1/operator/projects/{pid}/members/{joiner_id}"), &op)).await;
     assert_eq!(st, StatusCode::OK);
 }
 ```
 
-(Add `delete_cookie` to `tests/common/mod.rs` mirroring `post_cookie` 332–341 with method DELETE, no body.)
-
-- [ ] **Step 2: run** → FAIL. **Step 3: implement.** In `join_requests.rs`, move the tx body of `approve_join_request` (218–260: atomic consume UPDATE → member INSERT with 409-on-pkey → `bump_membership_version_tx` → `record_event_tx("member_joined", …)`) into `approve_join_core` with `decided_by` parameterized; the existing handler becomes `require_coordinator` + tx + core + commit. Same split for reject (270–297) into `reject_join_core`. In `members.rs`, move the tx body of `remove_member` (152–181: `FOR UPDATE` re-read refusing coordinator target → DELETE → bump → event) into `remove_member_core(tx, project_id, target)`; existing handler keeps its `require_coordinator` + self-removal guard + `assert_still_coordinator` and calls the core. Operator handlers in `operator.rs`:
+- [ ] **Step 2: run** → FAIL. **Step 3: implement.** Factor the cores as specified in Interfaces (existing handlers keep their `require_coordinator`/self-guards and call the cores; existing tests re-pin them). Operator handlers in `operator.rs`:
 
 ```rust
 #[derive(serde::Deserialize)]
@@ -925,7 +967,7 @@ pub async fn decide_join(
     Extension(op): Extension<OperatorAuth>,
     axum::extract::Path((id, rid)): axum::extract::Path<(Uuid, Uuid)>,
     Json(body): Json<JoinDecision>,
-) -> Result<axum::http::StatusCode, ApiError> {
+) -> Result<StatusCode, ApiError> {
     let mut tx = state.db.begin().await?;
     match body.action.as_str() {
         "approve" => { crate::routes::join_requests::approve_join_core(&mut tx, id, rid, op.account_id, body.data_role).await?; }
@@ -935,39 +977,71 @@ pub async fn decide_join(
     audit_tx(&mut tx, op.account_id, "join_request.decide", "join_request", &rid.to_string(),
         serde_json::json!({"projectId": id, "action": body.action})).await?;
     tx.commit().await?;
-    Ok(axum::http::StatusCode::OK)
+    Ok(StatusCode::OK)
+}
+
+pub async fn list_join_requests(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<Vec<crate::routes::join_requests::JoinRequestView>>, ApiError> {
+    Ok(Json(crate::routes::join_requests::list_open_join_requests(&state.db, id).await?))
+}
+
+#[derive(serde::Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct OperatorMemberRow {
+    pub account_id: Uuid,
+    pub email: String,
+    pub display_name: String,
+    pub data_role: String,
+    pub coordinator: bool,
+    pub joined_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub async fn list_members(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<Json<Vec<OperatorMemberRow>>, ApiError> {
+    let rows = sqlx::query_as::<_, OperatorMemberRow>(
+        "SELECT m.account_id, a.email, m.display_name, m.data_role,
+                m.is_coordinator AS coordinator, m.joined_at
+         FROM project_members m JOIN accounts a ON a.id = m.account_id
+         WHERE m.project_id = $1 ORDER BY m.joined_at",
+    ).bind(id).fetch_all(&state.db).await?;
+    Ok(Json(rows))
 }
 
 pub async fn remove_member(
     State(state): State<AppState>,
     Extension(op): Extension<OperatorAuth>,
     axum::extract::Path((id, account_id)): axum::extract::Path<(Uuid, Uuid)>,
-) -> Result<axum::http::StatusCode, ApiError> {
+) -> Result<StatusCode, ApiError> {
     let mut tx = state.db.begin().await?;
     crate::routes::members::remove_member_core(&mut tx, id, account_id).await?;
     audit_tx(&mut tx, op.account_id, "member.remove", "member",
         &format!("{id}/{account_id}"), serde_json::json!({})).await?;
     tx.commit().await?;
-    Ok(axum::http::StatusCode::OK)
+    Ok(StatusCode::OK)
 }
 ```
 
-Register both routes (`post(...)` and `delete(...)`).
+(`JoinRequestView` needs `pub(crate)` visibility on the TYPE — keep its fields private; the operator handler only re-serializes it.) Register the four routes.
 
-- [ ] **Step 4: run** → PASS; full suite green (existing coordinator-path tests pin the refactor).
-- [ ] **Step 5: commit** `feat(hub): operator join decisions + member removal via factored coordinator cores`
+- [ ] **Step 4: run** → PASS; full suite green.
+- [ ] **Step 5: commit** `feat(hub): operator join listings/decisions + member listing/removal via factored cores`
 
 ---
 
 ### Task 10: operator project create + delete
 
 **Files:**
-- Modify: `src/routes/projects.rs` (factor creation core from `create_project` 234–384)
+- Modify: `src/routes/projects.rs` (factor creation core from `create_project` 234–384; `CreateProject` at 141–157 and `ProjectView` at 191 are already `pub`)
 - Modify: `src/routes/operator.rs`, `src/routes/mod.rs`
 - Create: `tests/operator_create_delete.rs`
 
 **Interfaces:**
-- Produces: `pub(crate) async fn create_project_core(tx: &mut PgConnection, coordinator: Uuid, coordinator_display_name: &str, body: &CreateProject) -> Result<ProjectView, ApiError>` (project INSERT + coordinator membership INSERT from 348–357, slug derivation as-is; rate-limit stays OUTSIDE the core in the user handler); operator routes `POST /api/v1/operator/projects` body = `CreateProject` fields + `coordinatorEmail: string`, `DELETE /api/v1/operator/projects/{id}`.
+- Produces: `pub(crate) async fn create_project_core(tx: &mut sqlx::PgConnection, coordinator: Uuid, body: &CreateProject) -> Result<ProjectView, ApiError>` (project INSERT with slugify+suffix retry 295–343 + coordinator membership INSERT 348–357, coordinator account parameterized; the 5/24h rate limit 276–286 stays in the USER handler only); operator routes `POST /api/v1/operator/projects` (body = `CreateProject` fields + `coordinatorEmail`), `DELETE /api/v1/operator/projects/{id}`.
+- **`CreateProject` required fields (verified)**: `title`, nested `target: {name, raDeg, decDeg, radiusDeg}` (ALL four required — there is NO top-level `targetName`), `coordinatorDisplayName`, `coordinatorDataRole`. Mirror `create_project_via`'s JSON body (common/mod.rs:283–291) when writing test payloads.
 
 - [ ] **Step 1: failing tests**:
 
@@ -975,7 +1049,18 @@ Register both routes (`post(...)` and `delete(...)`).
 mod common;
 use axum::http::StatusCode;
 use common::*;
+use serde_json::json;
 use sqlx::PgPool;
+
+fn create_body(coordinator_email: &str) -> serde_json::Value {
+    json!({
+        "title": "Official M31",
+        "target": {"name": "M31", "raDeg": 10.68, "decDeg": 41.27, "radiusDeg": 1.0},
+        "coordinatorDisplayName": "Astro",
+        "coordinatorDataRole": "send_receive",
+        "coordinatorEmail": coordinator_email
+    })
+}
 
 #[sqlx::test]
 async fn operator_creates_and_deletes_project(pool: PgPool) {
@@ -983,36 +1068,33 @@ async fn operator_creates_and_deletes_project(pool: PgPool) {
     let op = portal_sign_in(&app, &mailer, "op@x.io").await;
     let (_c, _) = register_device(&app, &mailer, "astro@x.io", 1, "pc").await;
 
-    // mirror the CreateProject JSON that create_project_via (common 273–303) sends, plus coordinatorEmail
-    let (st, body) = post_cookie(&app, "/api/v1/operator/projects",
-        r#"{"title":"Official M31","targetName":"M31","coordinatorEmail":"astro@x.io","coordinatorDataRole":"send_receive"}"#,
-        &op).await;
+    let (st, body) = send(&app, post_cookie("/api/v1/operator/projects",
+        &create_body("astro@x.io"), &op)).await;
     assert_eq!(st, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let project = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+    let pid = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+        .as_str().unwrap().to_string();
     let coord_email: String = sqlx::query_scalar(
         "SELECT a.email FROM project_members m JOIN accounts a ON a.id=m.account_id
-         WHERE m.project_id=$1::uuid AND m.is_coordinator").bind(&project)
+         WHERE m.project_id=$1::uuid AND m.is_coordinator").bind(&pid)
         .fetch_one(&pool).await.unwrap();
     assert_eq!(coord_email, "astro@x.io");
 
-    let (st, _) = post_cookie(&app, "/api/v1/operator/projects",
-        r#"{"title":"X","targetName":"X","coordinatorEmail":"ghost@x.io"}"#, &op).await;
+    let (st, _) = send(&app, post_cookie("/api/v1/operator/projects",
+        &create_body("ghost@x.io"), &op)).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
 
-    let (st, _) = delete_cookie(&app, &format!("/api/v1/operator/projects/{project}"), &op).await;
+    let (st, _) = send(&app, delete_cookie(&format!("/api/v1/operator/projects/{pid}"), &op)).await;
     assert_eq!(st, StatusCode::OK);
-    let (st, _) = send(&app, get_public(&format!("/api/v1/projects/{project}"))).await;
+    let (st, _) = send(&app, get(&format!("/api/v1/projects/{pid}"), None)).await;
     assert_eq!(st, StatusCode::NOT_FOUND);
-    let (_, body) = get_cookie(&app, "/api/v1/operator/audit", &op).await;
+    let (_, body) = send(&app, get_cookie("/api/v1/operator/audit", &op)).await;
     let raw = String::from_utf8(body).unwrap();
     assert!(raw.contains("project.delete") && raw.contains("Official M31"),
         "delete audit must snapshot the title: {raw}");
 }
 ```
 
-(Adjust the create JSON to the REAL required `CreateProject` fields — read `projects.rs:141-157` and `create_project_via` in common; include every NOT NULL field it sends.)
-
-- [ ] **Step 2: run** → FAIL. **Step 3: implement.** Factor `create_project_core` out of `create_project` (the INSERT block + membership INSERT 348–357, parameterizing `auth.account_id` → `coordinator` and the display name); user handler = rate limit (276–286) + core with `auth.account_id`. Operator handlers:
+- [ ] **Step 2: run** → FAIL. **Step 3: implement.** Factor `create_project_core` (coordinator account + `body.coordinator_display_name` parameterized where 348–357 binds `auth.account_id`); user handler = rate limit + core with `auth.account_id`. Operator handlers:
 
 ```rust
 #[derive(serde::Deserialize)]
@@ -1033,18 +1115,20 @@ pub async fn create_project(
         .bind(&email).fetch_optional(&state.db).await?;
     let coordinator = coordinator.ok_or_else(|| ApiError::not_found("no account with that email"))?;
     let mut tx = state.db.begin().await?;
-    let view = crate::routes::projects::create_project_core(&mut tx, coordinator, &email, &body.base).await?;
-    audit_tx(&mut tx, op.account_id, "project.create", "project", &view.id.to_string(),
+    let view = crate::routes::projects::create_project_core(&mut tx, coordinator, &body.base).await?;
+    audit_tx(&mut tx, op.account_id, "project.create", "project", &view_id_string(&view),
         serde_json::json!({"coordinatorEmail": email})).await?;
     tx.commit().await?;
     Ok(Json(view))
 }
+// view_id_string: ProjectView's id field — if private, add a `pub(crate) fn id(&self) -> Uuid`
+// accessor in projects.rs or make the field pub(crate); pick whichever matches the file's style.
 
 pub async fn delete_project(
     State(state): State<AppState>,
     Extension(op): Extension<OperatorAuth>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
-) -> Result<axum::http::StatusCode, ApiError> {
+) -> Result<StatusCode, ApiError> {
     let mut tx = state.db.begin().await?;
     let snap: Option<(String, String, i64)> = sqlx::query_as(
         "SELECT p.slug, p.title,
@@ -1055,13 +1139,13 @@ pub async fn delete_project(
         serde_json::json!({"slug": slug, "title": title, "memberCount": member_count})).await?;
     sqlx::query("DELETE FROM projects WHERE id = $1").bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
-    Ok(axum::http::StatusCode::OK)
+    Ok(StatusCode::OK)
 }
 ```
 
-(`CreateProject` and `ProjectView` need `pub` visibility from `projects.rs` — make them `pub` if `pub(crate)`; `#[serde(flatten)]` requires `CreateProject: Deserialize` — it already is.) Register routes.
+Register both routes.
 
-- [ ] **Step 4: run** → PASS; full suite green (user create_project path re-pinned by existing tests).
+- [ ] **Step 4: run** → PASS; full suite green (existing user-create tests re-pin the factored core).
 - [ ] **Step 5: commit** `feat(hub): operator project create (assigned coordinator) + hard delete with audit snapshot`
 
 ---
@@ -1073,7 +1157,7 @@ pub async fn delete_project(
 - Create: `tests/operator_accounts.rs`
 
 **Interfaces:**
-- Produces: `GET /api/v1/operator/accounts?search=` → `Vec<OperatorAccountRow{id, email, createdAt, lastSeenAt, blockedAt, deviceCount, projectCount}>`; `GET /api/v1/operator/accounts/{id}/devices` → `Vec<OperatorDeviceRow{id, name, capability, createdAt, lastSeenAt, revokedAt}>` (**NO endpoint_addr**); `POST /api/v1/operator/accounts/{id}/block` body `{note?: string}` / `POST .../unblock`; `POST /api/v1/operator/devices/{id}/revoke`.
+- Produces: `GET /api/v1/operator/accounts?search=` → `Vec<OperatorAccountRow{id, email, createdAt, lastSeenAt, blockedAt, deviceCount, projectCount}>` — **`accounts` has NO `last_seen_at` column**: derive it as `max(devices.last_seen_at)`; `GET /api/v1/operator/accounts/{id}/devices` → `Vec<OperatorDeviceRow{id, name, capability, createdAt, lastSeenAt, revokedAt}>` — **NO endpoint_addr** (S1); `name` is nullable (`Option<String>`), `capability` is NOT NULL (`String`); `POST /api/v1/operator/accounts/{id}/block|unblock` body `{note?}`; `POST /api/v1/operator/devices/{id}/revoke`.
 
 - [ ] **Step 1: failing tests** `tests/operator_accounts.rs`:
 
@@ -1081,6 +1165,7 @@ pub async fn delete_project(
 mod common;
 use axum::http::StatusCode;
 use common::*;
+use serde_json::json;
 use sqlx::PgPool;
 
 #[sqlx::test]
@@ -1090,12 +1175,10 @@ async fn accounts_block_guards_and_s1(pool: PgPool) {
     let (user_token, _) = register_device(&app, &mailer, "user@x.io", 1, "pc").await;
     let _ = portal_sign_in(&app, &mailer, "op2@x.io").await; // materialize fellow-operator account
 
-    // search
-    let (st, body) = get_cookie(&app, "/api/v1/operator/accounts?search=user", &op).await;
+    let (st, body) = send(&app, get_cookie("/api/v1/operator/accounts?search=user", &op)).await;
     assert_eq!(st, StatusCode::OK);
     let raw = String::from_utf8(body).unwrap();
     assert!(raw.contains("user@x.io") && raw.contains("\"deviceCount\":1"));
-    // S1: no endpoint address material in operator responses
     assert!(!raw.contains("endpointAddr") && !raw.contains("directAddrs"), "S1: {raw}");
 
     let user_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE email='user@x.io'")
@@ -1105,29 +1188,30 @@ async fn accounts_block_guards_and_s1(pool: PgPool) {
     let op2_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM accounts WHERE email='op2@x.io'")
         .fetch_one(&pool).await.unwrap();
 
-    // guards: self and fellow operator
-    let (st, _) = post_cookie(&app, &format!("/api/v1/operator/accounts/{op_id}/block"), "{}", &op).await;
+    let (st, _) = send(&app, post_cookie(&format!("/api/v1/operator/accounts/{op_id}/block"),
+        &json!({}), &op)).await;
     assert_eq!(st, StatusCode::CONFLICT, "cannot block self");
-    let (st, _) = post_cookie(&app, &format!("/api/v1/operator/accounts/{op2_id}/block"), "{}", &op).await;
+    let (st, _) = send(&app, post_cookie(&format!("/api/v1/operator/accounts/{op2_id}/block"),
+        &json!({}), &op)).await;
     assert_eq!(st, StatusCode::CONFLICT, "cannot block a fellow operator");
 
-    // block user → their bearer dies; devices listing shows them; S1 holds there too
-    let (st, _) = post_cookie(&app, &format!("/api/v1/operator/accounts/{user_id}/block"),
-        r#"{"note":"abuse"}"#, &op).await;
+    let (st, _) = send(&app, post_cookie(&format!("/api/v1/operator/accounts/{user_id}/block"),
+        &json!({"note": "abuse"}), &op)).await;
     assert_eq!(st, StatusCode::OK);
-    let (st, _) = send(&app, get("/api/v1/devices", &user_token)).await;
+    let (st, _) = send(&app, get("/api/v1/devices", Some(&user_token))).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
-    let (st, body) = get_cookie(&app, &format!("/api/v1/operator/accounts/{user_id}/devices"), &op).await;
+    let (st, body) = send(&app, get_cookie(&format!("/api/v1/operator/accounts/{user_id}/devices"), &op)).await;
     assert_eq!(st, StatusCode::OK);
     let raw = String::from_utf8(body).unwrap();
     assert!(!raw.contains("endpointAddr"), "S1 devices: {raw}");
-    // revoke the device via operator route
+
     let dev_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM devices WHERE account_id=$1")
         .bind(user_id).fetch_one(&pool).await.unwrap();
-    let (st, _) = post_cookie(&app, &format!("/api/v1/operator/devices/{dev_id}/revoke"), "{}", &op).await;
+    let (st, _) = send(&app, post_cookie(&format!("/api/v1/operator/devices/{dev_id}/revoke"),
+        &json!({}), &op)).await;
     assert_eq!(st, StatusCode::OK);
-    // unblock restores sign-in ability
-    let (st, _) = post_cookie(&app, &format!("/api/v1/operator/accounts/{user_id}/unblock"), "{}", &op).await;
+    let (st, _) = send(&app, post_cookie(&format!("/api/v1/operator/accounts/{user_id}/unblock"),
+        &json!({}), &op)).await;
     assert_eq!(st, StatusCode::OK);
 }
 ```
@@ -1155,7 +1239,9 @@ pub async fn list_accounts(
     axum::extract::Query(q): axum::extract::Query<AccountsQuery>,
 ) -> Result<Json<Vec<OperatorAccountRow>>, ApiError> {
     let rows = sqlx::query_as::<_, OperatorAccountRow>(
-        "SELECT a.id, a.email, a.created_at, a.last_seen_at, a.blocked_at,
+        "SELECT a.id, a.email, a.created_at,
+                (SELECT max(d.last_seen_at) FROM devices d WHERE d.account_id = a.id) AS last_seen_at,
+                a.blocked_at,
                 (SELECT count(*) FROM devices d WHERE d.account_id=a.id AND d.revoked_at IS NULL) AS device_count,
                 (SELECT count(*) FROM project_members m WHERE m.account_id=a.id) AS project_count
          FROM accounts a
@@ -1169,8 +1255,8 @@ pub async fn list_accounts(
 #[serde(rename_all = "camelCase")]
 pub struct OperatorDeviceRow {
     pub id: Uuid,
-    pub name: String,
-    pub capability: Option<String>,
+    pub name: Option<String>,          // nullable in schema (0001)
+    pub capability: String,            // NOT NULL DEFAULT 'athenaeum' (0007)
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1193,7 +1279,7 @@ pub struct BlockBody { pub note: Option<String> }
 
 async fn set_blocked(
     state: &AppState, op: &OperatorAuth, target: Uuid, blocked: bool, note: Option<String>,
-) -> Result<axum::http::StatusCode, ApiError> {
+) -> Result<StatusCode, ApiError> {
     let email: Option<String> = sqlx::query_scalar("SELECT email FROM accounts WHERE id = $1")
         .bind(target).fetch_optional(&state.db).await?;
     let email = email.ok_or_else(|| ApiError::not_found("account not found"))?;
@@ -1208,21 +1294,21 @@ async fn set_blocked(
     audit_tx(&mut tx, op.account_id, if blocked { "account.block" } else { "account.unblock" },
         "account", &target.to_string(), serde_json::json!({"email": lower, "note": note})).await?;
     tx.commit().await?;
-    Ok(axum::http::StatusCode::OK)
+    Ok(StatusCode::OK)
 }
 
 pub async fn block_account(State(state): State<AppState>, Extension(op): Extension<OperatorAuth>,
     axum::extract::Path(id): axum::extract::Path<Uuid>, Json(b): Json<BlockBody>)
-    -> Result<axum::http::StatusCode, ApiError> { set_blocked(&state, &op, id, true, b.note).await }
+    -> Result<StatusCode, ApiError> { set_blocked(&state, &op, id, true, b.note).await }
 
 pub async fn unblock_account(State(state): State<AppState>, Extension(op): Extension<OperatorAuth>,
     axum::extract::Path(id): axum::extract::Path<Uuid>, Json(b): Json<BlockBody>)
-    -> Result<axum::http::StatusCode, ApiError> { set_blocked(&state, &op, id, false, b.note).await }
+    -> Result<StatusCode, ApiError> { set_blocked(&state, &op, id, false, b.note).await }
 
 pub async fn revoke_device(
     State(state): State<AppState>, Extension(op): Extension<OperatorAuth>,
     axum::extract::Path(id): axum::extract::Path<Uuid>,
-) -> Result<axum::http::StatusCode, ApiError> {
+) -> Result<StatusCode, ApiError> {
     let mut tx = state.db.begin().await?;
     let n = sqlx::query("UPDATE devices SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL")
         .bind(id).execute(&mut *tx).await?.rows_affected();
@@ -1230,11 +1316,11 @@ pub async fn revoke_device(
     audit_tx(&mut tx, op.account_id, "device.revoke", "device", &id.to_string(),
         serde_json::json!({})).await?;
     tx.commit().await?;
-    Ok(axum::http::StatusCode::OK)
+    Ok(StatusCode::OK)
 }
 ```
 
-(Match `capability` column type against `DeviceRow` in `devices.rs:29-41` — if it's `String` not `Option<String>`, mirror it.) Register the five routes.
+Register the five routes.
 
 - [ ] **Step 4: run** → PASS; full suite green.
 - [ ] **Step 5: commit** `feat(hub): operator accounts/devices — search, block guards, revoke, S1-clean views`
@@ -1244,12 +1330,12 @@ pub async fn revoke_device(
 ### Task 12: portal — `/me.operator`, nav, page scaffold + Dashboard + Audit tabs
 
 **Files:**
-- Modify: `portal/src/useMe.ts` (Me at 4–7), `portal/src/App.tsx` (routes 13–18), `portal/src/Layout.tsx` (nav), `portal/src/types.ts`
+- Modify: `portal/src/useMe.ts` (Me at 4–7), `portal/src/App.tsx` (routes 13–19), `portal/src/Layout.tsx` (nav; it already calls `useMe` at line 6), `portal/src/types.ts`
 - Create: `portal/src/pages/Operator.tsx`
 
 **Interfaces:**
 - Consumes: Tasks 4–5 wire shapes.
-- Produces: `Me.operator: boolean`; route `/operator`; `types.ts` additions `OperatorOverview`, `OperatorEvent`, `OperatorAuditRow` mirroring Tasks 4–5 camelCase JSON; `Operator.tsx` exports default page with tab state `'dashboard' | 'projects' | 'accounts' | 'audit'` (projects/accounts tabs render "coming in the next commit" placeholders REPLACED in Tasks 13–14 — acceptable intra-plan since both land in this plan).
+- Produces: `Me.operator: boolean`; route `/operator`; types `OperatorOverview`, `OperatorEvent`, `OperatorAuditRow`; `Operator.tsx` default export with tab state `'dashboard' | 'projects' | 'accounts' | 'audit'` (Projects/Accounts tabs are placeholder components REPLACED by Tasks 13–14 of this same plan).
 
 - [ ] **Step 1: types + hook.** `useMe.ts`: add `operator: boolean` to `Me`. `types.ts` append:
 
@@ -1266,7 +1352,7 @@ export interface OperatorAuditRow { id: number; actorEmail: string; action: stri
 - [ ] **Step 2: page.** `portal/src/pages/Operator.tsx` (follow Admin.tsx patterns — `space-y-8` root, `section space-y-2`, `h2 font-semibold`, status line `text-sm text-neutral-500`):
 
 ```tsx
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { apiGet } from '../api';
 import { useMe } from '../useMe';
 import type { OperatorAuditRow, OperatorOverview } from '../types';
@@ -1354,22 +1440,22 @@ function ProjectsTab() { return <p className="text-sm text-neutral-500">Projects
 function AccountsTab() { return <p className="text-sm text-neutral-500">Accounts — next commit.</p>; }
 ```
 
-- [ ] **Step 3: routing + nav.** `App.tsx`: add `<Route path="/operator" element={<Operator />} />` inside the Layout route; import. `Layout.tsx`: in the nav, render an `Operator` link when `me?.operator` (Layout already consumes `useMe` — if not, mirror how it shows sign-in state).
+- [ ] **Step 3: routing + nav.** `App.tsx`: add `<Route path="/operator" element={<Operator />} />` inside the Layout route (13–19); import the page. `Layout.tsx`: next to the existing "New project" link, render `<Link to="/operator">Operator</Link>` when `me?.operator`.
 - [ ] **Step 4: verify** `cd portal && npm ci && npm run build` → tsc + vite succeed.
 - [ ] **Step 5: commit** `feat(portal): operator page scaffold — dashboard + audit tabs, nav gated by /me.operator`
 
 ---
 
-### Task 13: portal — Projects tab (actions)
+### Task 13: portal — Projects tab (actions) + Directory featured badge
 
 **Files:**
-- Modify: `portal/src/pages/Operator.tsx` (replace `ProjectsTab`), `portal/src/types.ts`
+- Modify: `portal/src/pages/Operator.tsx` (replace `ProjectsTab`), `portal/src/types.ts`, `portal/src/pages/Directory.tsx` (featured badge)
 
 **Interfaces:**
-- Consumes: Tasks 6–10 wire shapes (`OperatorProjectRow`, PATCH body, coordinator `{email}`, decide `{action, dataRole?}`, DELETE routes).
-- Produces: full Projects tab: table, feature/hide/status toggles, appoint-coordinator by email, expandable row with members (remove) + open join requests (approve/reject), delete with typed-slug confirm.
+- Consumes: Tasks 6–10 wire shapes; the page type in types.ts is **`ProjectPageData`** (not `ProjectPage`); member identity comes from the OPERATOR members endpoint (Task 9) — the public `MemberPublicView` deliberately has NO `accountId`.
+- Produces: full Projects tab + `DirectoryItem.featured` badge.
 
-- [ ] **Step 1: types.** Append to `types.ts`:
+- [ ] **Step 1: types.** Append to `types.ts` (and add `featured: boolean` to the existing `DirectoryItem`):
 
 ```ts
 export interface OperatorProjectRow {
@@ -1377,44 +1463,25 @@ export interface OperatorProjectRow {
   hiddenAt: string | null; createdAt: string; coordinatorEmail: string | null;
   memberCount: number; announcementCount: number; lastEventAt: string | null;
 }
-```
-
-- [ ] **Step 2: implement `ProjectsTab`** (replace the placeholder; uses `apiGet/apiPatch/apiPost/apiDelete`; reuse `MemberPublicView`/`JoinRequestView` from types.ts for the expanded row — fetch via the existing `/api/v1/projects/{slug}` page + `/api/v1/projects/{id}/join-requests` coordinator listing IF that listing is operator-accessible; if it is coordinator-gated, list open join requests from `overview.events` is NOT acceptable — instead add nothing and rely on the decide-by-id flow ONLY when the hub exposes them. **Resolution locked here:** reuse `GET /api/v1/operator/projects` for rows, and for the expanded row call `apiGet<ProjectPage>('/api/v1/projects/' + slug)` (operator passes the hidden gate per Task 7) which contains `members`; open join requests come from a small addition — extend Task 6's `list_projects` response? NO — keep v1 simple: the expanded row shows members with remove buttons; join-request decisions happen via the project's own Admin page which the operator can open (link `/p/{slug}/admin` — the coordinator gate there refuses non-coordinators, so instead the decide action lives HERE with a request-id input? Unacceptable UX.) **Final resolution:** add `GET /api/v1/operator/projects/{id}/join-requests` to Task 9's backend (same `Vec<JoinRequestView>` shape the coordinator listing uses — factor its query) and consume it here.**
-
-```tsx
-function ProjectsTab() {
-  const [rows, setRows] = useState<OperatorProjectRow[]>([]);
-  const [open, setOpen] = useState<string | null>(null);
-  const [msg, setMsg] = useState('');
-  const reload = useCallback(() => {
-    apiGet<OperatorProjectRow[]>('/api/v1/operator/projects').then(setRows)
-      .catch((e) => console.error('[operator] projects failed:', e));
-  }, []);
-  useEffect(reload, [reload]);
-  const act = (fn: () => Promise<unknown>, ok: string) =>
-    fn().then(() => { setMsg(ok); reload(); }).catch((e) => setMsg(String(e)));
-  return (
-    <section className="space-y-2">
-      <h2 className="font-semibold">Projects</h2>
-      {msg && <p className="text-sm text-neutral-500">{msg}</p>}
-      <table className="w-full text-left text-sm">
-        <thead><tr className="text-neutral-500">
-          <th>Project</th><th>Coordinator</th><th>Members</th><th>Status</th><th>Actions</th></tr></thead>
-        <tbody>{rows.map((p) => (
-          <ProjectRow key={p.id} p={p} open={open === p.id}
-            onToggle={() => setOpen(open === p.id ? null : p.id)} act={act} />
-        ))}</tbody>
-      </table>
-    </section>
-  );
+export interface OperatorMemberRow {
+  accountId: string; email: string; displayName: string; dataRole: string;
+  coordinator: boolean; joinedAt: string;
 }
 ```
 
-`ProjectRow` renders: title+slug (+`featured`/`hidden` badges), coordinator email, member/announcement counts, status; action buttons — `Feature`/`Unfeature` → `apiPatch('/api/v1/operator/projects/'+p.id, {featured: !p.featured})`; `Hide`/`Unhide` → `{hidden: !p.hiddenAt}`; `Close`/`Reopen` → `{status: p.status === 'active' ? 'closed' : 'active'}`; `Coordinator…` → `window.prompt('New coordinator email')` → `apiPost(.../coordinator, {email})`; `Delete…` → `window.prompt('Type the slug to confirm')` must equal `p.slug` → `apiDelete('/api/v1/operator/projects/'+p.id)`. Expanded row: fetch `apiGet('/api/v1/projects/'+p.slug)` for members (each with `Remove` → `apiDelete('/api/v1/operator/projects/'+p.id+'/members/'+m.accountId)`) and `apiGet('/api/v1/operator/projects/'+p.id+'/join-requests')` for open requests (Approve/Reject → `apiPost(.../join-requests/{rid}/decide, {action})`). Write the full JSX inline following the Admin.tsx field/button class constants.
+- [ ] **Step 2: implement `ProjectsTab`** (replace the placeholder). Data: rows from `apiGet<OperatorProjectRow[]>('/api/v1/operator/projects')`; expanded row loads `apiGet<OperatorMemberRow[]>('/api/v1/operator/projects/'+p.id+'/members')` and `apiGet<JoinRequestView[]>('/api/v1/operator/projects/'+p.id+'/join-requests')`. Actions (each → reload + status line, Admin.tsx `act` pattern):
+  - Feature/Unfeature → `apiPatch('/api/v1/operator/projects/'+p.id, {featured: !p.featured})`
+  - Hide/Unhide → `{hidden: !p.hiddenAt}`; Close/Reopen → `{status: p.status === 'active' ? 'closed' : 'active'}`
+  - Coordinator… → `window.prompt('New coordinator email')` → `apiPost('.../coordinator', {email})`
+  - Join requests: Approve/Reject → `apiPost('.../join-requests/'+r.id+'/decide', {action: 'approve'|'reject'})`
+  - Member remove → `window.confirm` → `apiDelete('.../members/'+m.accountId)` (skip the button when `m.coordinator`)
+  - Delete… → `window.prompt('Type the slug to confirm')` === `p.slug` → `apiDelete('/api/v1/operator/projects/'+p.id)`
 
-- [ ] **Step 3 (backend addendum from resolution above):** add to `src/routes/operator.rs` `GET /api/v1/operator/projects/{id}/join-requests` returning the same rows as the coordinator listing (find its handler/query in `join_requests.rs` — the open-requests SELECT — and factor or copy the query without `require_coordinator`), register the route, and extend `tests/operator_members.rs` with a listing assertion (operator sees the open request before deciding). Red → green.
-- [ ] **Step 4: verify** `cd portal && npm run build` → clean; `cargo test` → green.
-- [ ] **Step 5: commit** `feat(portal): operator projects tab — flags, coordinator, joins, member removal, typed-slug delete`
+Write the full JSX with the Admin.tsx class constants (`field`, primary button, `underline` text buttons); table columns: Project (title + slug + `featured`/`hidden` badges), Coordinator, Members, Announcements, Status, Actions.
+
+- [ ] **Step 3: Directory badge.** In `Directory.tsx`, render a `★ featured` badge (small `text-amber-500` span) on items where `item.featured` — the API already sorts them first (Task 7).
+- [ ] **Step 4: verify** `cd portal && npm run build` → clean.
+- [ ] **Step 5: commit** `feat(portal): operator projects tab — flags, coordinator, joins, member removal, typed-slug delete; directory featured badge`
 
 ---
 
@@ -1424,7 +1491,7 @@ function ProjectsTab() {
 - Modify: `portal/src/pages/Operator.tsx` (replace `AccountsTab`), `portal/src/types.ts`
 
 **Interfaces:**
-- Consumes: Task 11 wire shapes.
+- Consumes: Task 11 wire shapes (note `name: string | null`, `capability: string`).
 
 - [ ] **Step 1: types**:
 
@@ -1434,12 +1501,12 @@ export interface OperatorAccountRow {
   blockedAt: string | null; deviceCount: number; projectCount: number;
 }
 export interface OperatorDeviceRow {
-  id: string; name: string; capability: string | null; createdAt: string;
+  id: string; name: string | null; capability: string; createdAt: string;
   lastSeenAt: string | null; revokedAt: string | null;
 }
 ```
 
-- [ ] **Step 2: implement `AccountsTab`**: search input (`field` class constant) driving `apiGet('/api/v1/operator/accounts?search='+encodeURIComponent(q))`; account rows: email, created/last-seen, device/project counts, `Blocked` badge when `blockedAt`; actions: `Block…` (prompt for note → `apiPost(.../block, {note})`) / `Unblock` → `apiPost(.../unblock, {})`; expandable device list via `apiGet(.../accounts/{id}/devices)` with `Revoke` buttons (`window.confirm`) → `apiPost('/api/v1/operator/devices/'+d.id+'/revoke', {})`. Full JSX in the Admin.tsx style, reload after each action, error → status line.
+- [ ] **Step 2: implement `AccountsTab`**: search input (`field` class) driving `apiGet('/api/v1/operator/accounts?search='+encodeURIComponent(q))`; rows: email, created/last-seen, device/project counts, `Blocked` badge when `blockedAt`; actions: `Block…` (prompt note → `apiPost('.../block', {note})`) / `Unblock` (`apiPost('.../unblock', {})`); expandable device list via `apiGet('.../accounts/'+a.id+'/devices')` showing `d.name ?? '(unnamed)'`, capability, revoked state, with `Revoke` (`window.confirm` → `apiPost('/api/v1/operator/devices/'+d.id+'/revoke', {})`). Full JSX in the Admin.tsx style; reload after each action; errors to the status line.
 - [ ] **Step 3: verify** `cd portal && npm run build` → clean.
 - [ ] **Step 4: commit** `feat(portal): operator accounts tab — search, block/unblock, device revoke`
 
@@ -1463,21 +1530,20 @@ HUB_OPERATOR_EMAILS={{ hub_operator_emails }}
 
 In `inventory.yml`, add to BOTH `athenaeum_hub` and `athenaeum_hub_test` group vars: `hub_operator_emails: "vilen.sharifov@gmail.com"`. In astronet `CLAUDE.md` hub-vars line, append `hub_operator_emails → HUB_OPERATOR_EMAILS (comma-separated operator allowlist)`.
 - [ ] **Step 2: hub README** — add an "Operator console" section: env var, `/operator` portal path, audit table, blocked-account semantics (3–6 lines).
-- [ ] **Step 3: final gates.** `DATABASE_URL=postgres://hub:hub@localhost:5432/hub cargo test` (full, expect all green incl. 12 new test files), `cd portal && npm run build`, then push branch: `git push -u origin operator-console` → hub CI green (test + build jobs).
-- [ ] **Step 4: test-hub deploy (owner-confirmed 1Password prompts):**
+- [ ] **Step 3: final gates.** `DATABASE_URL=postgres://hub:hub@localhost:5432/hub cargo test` (full, all green), `cd portal && npm run build`, then push branch: `git push -u origin operator-console` → hub CI green (`test` + `build` jobs).
+- [ ] **Step 4: test-hub deploy (owner confirms 1Password prompts):**
 
 ```bash
 cd /Volumes/BigMac/Users/astrobureau/Documents/astronet
 ansible-playbook deploy_athenaeum_hub.yml -e hub_target=athenaeum_hub_test -e hub_artifact_ref=operator-console
 ```
 
-Verify: `curl https://test-hub.artfrom.space/api/v1/health`; portal sign-in as the owner → `/operator` renders; a non-operator account gets no nav link and 403 on the API. Commit astronet changes: `git commit -am "hub: HUB_OPERATOR_EMAILS for operator console"`.
-- [ ] **Step 5: commit + wrap.** Final hub commit if README pending; update the athenaeum-repo memory ledger note (operator console CODE COMPLETE on `operator-console`, test-hub soaked, prod deploy = owner procedure per hub-deploy discipline).
+Verify: `curl https://test-hub.artfrom.space/api/v1/health`; portal sign-in as the owner → `/operator` renders all four tabs; a non-operator account gets no nav link and 403 on `/api/v1/operator/audit`. Commit astronet changes: `git commit -am "hub: HUB_OPERATOR_EMAILS for operator console"`.
+- [ ] **Step 5: commit + wrap.** Final hub commit if README pending; update the athenaeum-repo memory ledger (operator console CODE COMPLETE on `operator-console`, test-hub soaked, prod deploy = owner procedure per hub-deploy discipline).
 
 ---
 
-## Self-review notes (done at authoring)
+## Self-review + verification notes
 
-- **Spec coverage**: identity/choke point (T4), migration (T2), blocked enforcement incl. OTP (T3), overview (T5), listing (T6), patch+hidden/featured/closed semantics (T7), coordinator any-account (T8), joins+member removal on behalf (T9, + operator join-request listing added in T13 step 3), create/delete (T10), accounts/devices/S1 (T11), portal (T12–14), env/deploy/test-hub-first (T15). Evolution section requires no code. Non-goals honored (no frame moderation, no roles UI, no account deletion).
-- **Line numbers** cited from the 2026-07-18 code brief — treat as anchors, re-locate by identifier if drifted.
-- **Known judgment calls locked in**: operator join-request listing endpoint (T13 step 3) added rather than reusing the coordinator-gated listing; `optional_account` skips CSRF (GET-only use); block guard covers self + allowlist.
+- **Spec coverage**: identity/choke point (T4), migration (T2), blocked enforcement incl. OTP (T3), overview (T5), listing (T6), patch + hidden/featured/closed semantics + directory badge data (T7), coordinator any-account (T8), joins/members on behalf + operator listings (T9), create/delete (T10), accounts/devices/S1 (T11), portal (T12–14), env/deploy/test-hub-first (T15). Evolution section requires no code. Non-goals honored.
+- **2026-07-18 adversarial fact-check corrections folded in**: `ApiError::Status(...)` form (no unauthorized/forbidden constructors); test-helper builder signatures + `send()` wrapping; `create_project_via` 4-arg/Value return; `join_and_approve` 6-arg coordinator-first; no `futures` dep (manual OTP drive); `security::hash_token` + `portal_auth::session_cookie_value` qualification; `package_announcements`; `project_events.created_at`; derived account `last_seen_at`; device `name` nullable / `capability` NOT NULL; nested `target` in CreateProject; parenthesized directory WHERE; `ProjectPageData` type name; operator members endpoint (public page hides accountId); `DirectoryItem.featured` added end-to-end; event kind `"created"`.
