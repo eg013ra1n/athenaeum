@@ -183,8 +183,10 @@ pub type WakeHook = Arc<dyn Fn() + Send + Sync>;
 /// status poll. Held behind an `Arc<RwLock<…>>` on the rebuild-surviving OUTER
 /// layer of the node (like [`WakeHook`]) — the watcher is respawned per relay
 /// rebuild but writes into the SAME cell, so a poll always sees the current
-/// picture. The initial value is disconnected; the watcher overwrites it once a
-/// transition arrives.
+/// picture. The initial value is disconnected; the successful one-shot
+/// `online()` wait seeds it connected as a bridge, and the watcher overwrites it
+/// on every later transition — so it is the sole connected-ness authority and a
+/// dropped relay always flips the surface back to `direct_only`.
 #[derive(Debug, Clone)]
 pub struct RelayHealth {
     /// Whether a home relay is currently connected (last transition seen).
@@ -641,14 +643,12 @@ pub struct SharedIrohNode {
     responder: SharedResponder,
     /// Role prefixes whose startup sweep has already run (once per prefix).
     swept: Mutex<HashSet<&'static str>>,
-    /// Whether the one-shot home-relay `online()` wait has run.
+    /// Whether the one-shot home-relay `online()` wait has run. On success it
+    /// seeds `relay_health` (connected + home-relay url) so `transport_health`
+    /// reports `relay_connected` immediately — a BRIDGE until the watcher records
+    /// its first transition, after which the watcher is the sole authority (Task
+    /// 3.3).
     online_waited: AtomicBool,
-    /// The outcome of that one-shot `online()` wait (Task 3.3): `true` once it
-    /// completed within [`ONLINE_TIMEOUT`], `false` before it runs or after it
-    /// times out. Persisted (instead of only logged) so `transport_health` can
-    /// report `relay_connected` even before the watcher observes its first
-    /// transition. Paired with `online_waited`, which latches that it has run.
-    online_ok: AtomicBool,
     /// Whether [`shutdown`](Self::shutdown) has already run (idempotency guard).
     shutdown_done: AtomicBool,
     /// Immediate relay-refresh trigger (H2): the sign-in path calls
@@ -859,7 +859,6 @@ impl SharedIrohNode {
             connect_gate,
             swept: Mutex::new(HashSet::new()),
             online_waited: AtomicBool::new(false),
-            online_ok: AtomicBool::new(false),
             shutdown_done: AtomicBool::new(false),
             refresh_notify: Arc::new(Notify::new()),
             pending_rebuild: Mutex::new(None),
@@ -942,6 +941,23 @@ impl SharedIrohNode {
         self.rebuild_count.load(Ordering::SeqCst)
     }
 
+    /// Test-only: overwrite the home-relay health cell to simulate a watcher
+    /// transition (or the online-wait seed) without a live relay, so the
+    /// `transport_health` derivation can be exercised deterministically (all
+    /// loopback binds are relay-disabled). Task 3.3 regression coverage.
+    #[cfg(test)]
+    pub(crate) fn set_relay_health_for_test(&self, health: RelayHealth) {
+        *self.relay_health.write().expect("relay_health lock poisoned") = health;
+    }
+
+    /// Test-only: force `uses_relay` on the current net layer so the health
+    /// derivation exercises the relay-configured branch without binding a real
+    /// relay endpoint (which would do network I/O). Task 3.3 regression coverage.
+    #[cfg(test)]
+    pub(crate) fn force_uses_relay_for_test(&self, uses_relay: bool) {
+        self.net.lock().expect("net mutex poisoned").uses_relay = uses_relay;
+    }
+
     /// This endpoint's current [`EndpointAddr`] (direct addrs + relay url) — the
     /// self-reported address for H1 (Task 7). Call after a handle's
     /// [`start`](SharingTransport::start) so address discovery has settled. Reads
@@ -957,11 +973,15 @@ impl SharedIrohNode {
     }
 
     /// The node's current transport-reachability health for the status poll
-    /// (Task 3.3), combining three signals with NO network I/O: whether a relay
-    /// is configured on the current endpoint ([`uses_relay`](Self::uses_relay)),
-    /// the home-relay watcher's last-recorded [`RelayHealth`] transition, and the
-    /// one-shot `online()`-wait outcome. A bound node reports only
-    /// [`relay_connected`](TransportHealth::relay_connected) or
+    /// (Task 3.3), combining two signals with NO network I/O: whether a relay is
+    /// configured on the current endpoint ([`uses_relay`](Self::uses_relay)) and
+    /// the [`RelayHealth`] cell — written by the home-relay watcher on every
+    /// transition, and seeded once by the successful one-shot `online()` wait as a
+    /// bridge before the watcher's first transition. The cell is the SOLE
+    /// connected-ness authority: once the watcher records a disconnect the node
+    /// correctly reads `direct_only`, so a dropped relay always flips the surface
+    /// (the earlier `online_ok` latch masked this — it never reset). A bound node
+    /// reports only [`relay_connected`](TransportHealth::relay_connected) or
     /// [`direct_only`](TransportHealth::direct_only) — `not_started` (no node) and
     /// `no_relay_map` (signed in, no relay configuration) are api-layer
     /// derivations in [`crate::api::sync::derive_transport_health`], which owns the
@@ -973,10 +993,11 @@ impl SharedIrohNode {
             return TransportHealth::direct_only(None, None);
         }
         let health = self.relay_health.read().expect("relay_health lock poisoned").clone();
-        // Either signal — the watcher's last transition OR the one-shot wait —
-        // reporting a live relay means we are reachable. Both start pessimistic,
-        // so a freshly-bound node reads `direct_only` until one flips.
-        if health.connected || self.online_ok.load(Ordering::SeqCst) {
+        // The cell (watcher transitions, online-wait-seeded before the first one)
+        // is the sole authority. It starts disconnected, so a freshly-bound node
+        // reads `direct_only` until the relay connects — and reverts to it the
+        // moment the watcher records a disconnect.
+        if health.connected {
             TransportHealth::relay_connected(health.url)
         } else {
             TransportHealth::direct_only(health.url, health.last_error)
@@ -1579,16 +1600,23 @@ impl SharedIrohNode {
         if self.uses_relay() && !self.online_waited.swap(true, Ordering::SeqCst) {
             match tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()).await {
                 Ok(()) => {
-                    // Persist the outcome for the health surface (Task 3.3) instead
-                    // of only logging it: `transport_health` can then report
-                    // `relay_connected` immediately, before the watcher's first
-                    // transition arrives.
-                    self.online_ok.store(true, Ordering::SeqCst);
                     let relay_url = endpoint
                         .addr()
                         .relay_urls()
                         .next()
                         .map(|u| u.to_string());
+                    // Seed the health cell for the status surface (Task 3.3): the
+                    // relay is connected right now, so `transport_health` can report
+                    // `relay_connected` immediately, before the watcher records its
+                    // first transition. This is a BRIDGE only — the watcher then
+                    // overwrites this cell on every later transition (including a
+                    // disconnect), so it never masks a dropped relay.
+                    *self.relay_health.write().expect("relay_health lock poisoned") = RelayHealth {
+                        connected: true,
+                        url: relay_url.clone(),
+                        last_error: None,
+                        since: Instant::now(),
+                    };
                     tracing::info!(
                         node_id = %endpoint.id().fmt_short(),
                         relay_url = relay_url.as_deref().unwrap_or("unknown"),
@@ -1596,9 +1624,9 @@ impl SharedIrohNode {
                     );
                 }
                 Err(_) => {
-                    // Explicit (already the default): the wait ran and timed out,
-                    // so we are direct-only until the watcher sees a connection.
-                    self.online_ok.store(false, Ordering::SeqCst);
+                    // The wait ran and timed out: leave the health cell to the
+                    // watcher (its initial baseline is disconnected), so we are
+                    // direct-only until the watcher sees a connection.
                     tracing::warn!(
                         node_id = %endpoint.id().fmt_short(),
                         timeout_ms = ONLINE_TIMEOUT.as_millis() as u64,
@@ -2310,6 +2338,58 @@ mod tests {
         let health = node.transport_health();
         assert_eq!(health.status, "direct_only", "relay-disabled node is direct-only");
         assert!(health.relay_url.is_none(), "no relay configured => no relay url");
+        node.shutdown().await;
+    }
+
+    // Task 3.3 regression: a relay-configured node that reports connected (the
+    // online-wait seed / the watcher's first connect transition) must flip to
+    // `direct_only` the moment the watcher records a DISCONNECT — the home relay
+    // dropped. This is the exact path the old `online_ok` one-shot latch masked:
+    // `health.connected || online_ok` stayed true forever after the single
+    // successful `online()` wait, so a later relay drop still read
+    // `relay_connected`. With `online_ok` gone, the `RelayHealth` cell is the sole
+    // authority, so the disconnect transition wins.
+    #[tokio::test]
+    async fn transport_health_relay_drop_flips_to_direct_only() {
+        let dir = tempdir().unwrap();
+        let node = bind_disabled(dir.path()).await;
+        // Loopback binds are relay-disabled; force the relay-configured branch so
+        // the derivation depends on the health cell (not the disabled short-circuit).
+        node.force_uses_relay_for_test(true);
+
+        // 1) Connected: seeded by the successful online-wait / watcher's first
+        //    connect transition.
+        node.set_relay_health_for_test(RelayHealth {
+            connected: true,
+            url: Some("https://relay.example".to_string()),
+            last_error: None,
+            since: Instant::now(),
+        });
+        assert_eq!(
+            node.transport_health().status,
+            "relay_connected",
+            "a connected relay reads relay_connected"
+        );
+
+        // 2) The watcher then records a DISCONNECT (home relay dropped).
+        node.set_relay_health_for_test(RelayHealth {
+            connected: false,
+            url: Some("https://relay.example".to_string()),
+            last_error: Some("relay closed".to_string()),
+            since: Instant::now(),
+        });
+        let health = node.transport_health();
+        assert_eq!(
+            health.status, "direct_only",
+            "a dropped relay must flip the surface to direct_only (regression: the \
+             online_ok latch reported relay_connected forever)"
+        );
+        assert_eq!(
+            health.last_error.as_deref(),
+            Some("relay closed"),
+            "the disconnect's last_error is surfaced"
+        );
+
         node.shutdown().await;
     }
 
