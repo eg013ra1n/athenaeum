@@ -55,7 +55,11 @@ function inboundStateTone(state: InboundState): string {
 function outcomeTone(outcome: string): string {
   if (outcome.startsWith('failed') || outcome.startsWith('rejected')) return 'text-error';
   if (outcome === 'cancelled') return 'text-content-muted';
-  return 'text-success'; // sent / ingested / duplicate / confirmed / replayed
+  // A `sent` row is only a transport-handoff start-marker, NOT proof of
+  // delivery — amber "awaiting confirmation". Success is reserved for the
+  // settled verdicts (see `isDelivered`).
+  if (outcome === 'sent') return 'text-warning';
+  return 'text-success'; // ingested / duplicate / confirmed / replayed
 }
 
 function shortPeer(hex: string): string {
@@ -462,8 +466,11 @@ function HistoryTab({
                   <span className="min-w-0 flex-1 truncate text-xs text-content-secondary" title={r.filename}>
                     {r.filename}
                   </span>
-                  <span className={`shrink-0 text-[11px] font-medium ${outcomeTone(r.outcome)}`}>
-                    {r.outcome}
+                  <span
+                    className={`shrink-0 text-[11px] font-medium ${outcomeTone(r.outcome)}`}
+                    title={r.outcome}
+                  >
+                    {r.outcome === 'sent' ? 'sent — awaiting confirmation' : r.outcome}
                   </span>
                 </div>
                 <p className="mt-0.5 flex items-center gap-2 pl-5 text-[10px] text-content-muted">

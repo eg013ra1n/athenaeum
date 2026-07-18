@@ -22,7 +22,98 @@ function shortProject(id: string): string {
 function outcomeTone(outcome: string): string {
   if (outcome.startsWith('failed') || outcome.startsWith('rejected')) return 'text-error';
   if (outcome === 'cancelled') return 'text-content-muted';
-  return 'text-success'; // sent / ingested / duplicate / confirmed / replayed
+  // A `sent` row is only a transport-handoff start-marker, NOT proof of
+  // delivery — colour it amber "awaiting confirmation". Success is reserved for
+  // the settled verdicts the receiver's ack produces.
+  if (outcome === 'sent') return 'text-warning';
+  return 'text-success'; // ingested / duplicate / confirmed / replayed
+}
+
+interface OutcomeChip {
+  key: string;
+  label: string;
+  tone: string;
+  /** Raw / explanatory string surfaced on hover; omitted when the label already says it all. */
+  title?: string;
+}
+
+/**
+ * Collapse a collapsed group's per-outcome counts into honest header chips:
+ * - `ingested` + `duplicate` merge into one green `N delivered`. When that set
+ *   is entirely `duplicate` (the dedup path confirms without ever transferring —
+ *   the peer already had every frame) the chip reads `N already on peer`, so a
+ *   "confirmed but nothing landed in the incoming folder" batch is self-explaining.
+ * - unconfirmed `sent` start-markers → amber `N awaiting confirmation`.
+ * - `rejected` / `failed*` fold into two stable red buckets.
+ * - anything else (cancelled, confirmed, replayed, audit rows) passes through
+ *   with its own tone via `outcomeTone`.
+ */
+function summarizeOutcomeChips(outcomeCounts: Record<string, number>): OutcomeChip[] {
+  const chips: OutcomeChip[] = [];
+
+  const ingested = outcomeCounts.ingested ?? 0;
+  const duplicate = outcomeCounts.duplicate ?? 0;
+  const delivered = ingested + duplicate;
+  if (delivered > 0) {
+    const allDuplicate = ingested === 0;
+    chips.push({
+      key: 'delivered',
+      label: allDuplicate ? `${delivered} already on peer` : `${delivered} delivered`,
+      tone: 'text-success',
+      title: allDuplicate ? 'Peer already had every frame — nothing was transferred' : undefined,
+    });
+  }
+
+  const sent = outcomeCounts.sent ?? 0;
+  if (sent > 0) {
+    chips.push({
+      key: 'sent',
+      label: `${sent} awaiting confirmation`,
+      tone: 'text-warning',
+      title: 'sent — not yet confirmed by the peer',
+    });
+  }
+
+  let failed = 0;
+  let rejected = 0;
+  const passthrough: OutcomeChip[] = [];
+  for (const [outcome, count] of Object.entries(outcomeCounts)) {
+    if (outcome === 'ingested' || outcome === 'duplicate' || outcome === 'sent') continue;
+    if (outcome.startsWith('failed')) failed += count;
+    else if (outcome.startsWith('rejected')) rejected += count;
+    else passthrough.push({ key: outcome, label: `${count} ${outcome}`, tone: outcomeTone(outcome) });
+  }
+  if (rejected > 0) chips.push({ key: 'rejected', label: `${rejected} rejected`, tone: 'text-error' });
+  if (failed > 0) chips.push({ key: 'failed', label: `${failed} failed`, tone: 'text-error' });
+  chips.push(...passthrough);
+
+  return chips;
+}
+
+/**
+ * Collapse a group's rows per `frameUuid`: a frame's `sent` start-marker
+ * (`finishedAt == null`) is superseded by its settled verdict
+ * (`ingested`/`duplicate`/`rejected`/…, `finishedAt != null`) the moment the
+ * receiver's ack lands. Rows arrive newest-first, so the first settled row is
+ * the newest verdict; a frame that only has a start-marker keeps the marker.
+ * Pure + exported so it can be unit-tested. Fixes the "8 sent · 8 ingested"
+ * double-count (start-marker + verdict were both counted) too.
+ */
+export function collapseSentGroup(rows: HistoryRow[]): HistoryRow[] {
+  const byFrame = new Map<string, HistoryRow[]>();
+  const order: string[] = [];
+  for (const r of rows) {
+    if (!byFrame.has(r.frameUuid)) {
+      byFrame.set(r.frameUuid, []);
+      order.push(r.frameUuid);
+    }
+    byFrame.get(r.frameUuid)!.push(r);
+  }
+  return order.map((uuid) => {
+    const frameRows = byFrame.get(uuid)!;
+    // Newest settled verdict if any (rows newest-first), else the newest marker.
+    return frameRows.find((r) => r.finishedAt != null) ?? frameRows[0];
+  });
 }
 
 /** A batch of `HistoryRow`s sharing the same `(direction, packageId)` key —
@@ -55,7 +146,10 @@ function groupHistory(rows: HistoryRow[]): HistoryGroup[] {
     byKey.get(key)!.push(r);
   }
   return order.map((key) => {
-    const grouped = byKey.get(key)!;
+    // Collapse each frame's start-marker against its settled verdict BEFORE
+    // deriving counts/bytes/timestamps, so a confirmed batch reads as "8
+    // delivered" rather than the double-counted "8 sent · 8 ingested".
+    const grouped = collapseSentGroup(byKey.get(key)!);
     const first = grouped[0];
     const totalBytes = grouped.reduce((sum, r) => sum + r.bytes, 0);
     const anyInFlight = grouped.some((r) => !r.finishedAt);
@@ -272,9 +366,13 @@ export function TransfersHistoryTab() {
                       {g.rows.length} file{g.rows.length === 1 ? '' : 's'} · {formatBytesShort(g.totalBytes)}
                     </span>
                     <span className="ml-auto flex shrink-0 items-center gap-1">
-                      {Object.entries(g.outcomeCounts).map(([outcome, count]) => (
-                        <span key={outcome} className={`text-[10px] font-medium ${outcomeTone(outcome)}`}>
-                          {count} {outcome}
+                      {summarizeOutcomeChips(g.outcomeCounts).map((chip) => (
+                        <span
+                          key={chip.key}
+                          className={`text-[10px] font-medium ${chip.tone}`}
+                          title={chip.title}
+                        >
+                          {chip.label}
                         </span>
                       ))}
                     </span>
@@ -293,8 +391,11 @@ export function TransfersHistoryTab() {
                             >
                               {r.filename}
                             </span>
-                            <span className={`shrink-0 text-[11px] font-medium ${outcomeTone(r.outcome)}`}>
-                              {r.outcome}
+                            <span
+                              className={`shrink-0 text-[11px] font-medium ${outcomeTone(r.outcome)}`}
+                              title={r.outcome}
+                            >
+                              {r.outcome === 'sent' ? 'sent — awaiting confirmation' : r.outcome}
                             </span>
                           </div>
                           <p className="mt-0.5 flex items-center gap-2 text-[10px] text-content-muted">
