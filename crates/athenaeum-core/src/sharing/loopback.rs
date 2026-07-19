@@ -30,11 +30,17 @@ use crate::sync::DedupResponder;
 ///   at least this many bytes, then disarms so a subsequent fetch succeeds.
 /// - `duplicate_ack`: the next `ack` delivers its event twice.
 /// - `delay_ack`: sleep this long before delivering an ack.
+/// - `delay_per_read`: sleep this long after every fetch read chunk, so a whole
+///   `fetch` takes a controllable, non-trivial wall-clock duration. Test-only,
+///   additive, off by default — the abort knob can only *fail* a fetch, so this
+///   is what lets a test make two concurrent fetches genuinely overlap (the
+///   bidirectional e2e's non-serialization proof).
 #[derive(Clone, Debug, Default)]
 pub struct FaultPlan {
     pub abort_after_bytes: Option<u64>,
     pub duplicate_ack: bool,
     pub delay_ack: Option<Duration>,
+    pub delay_per_read: Option<Duration>,
 }
 
 /// Channel depth for an endpoint's event stream. Announce/ack are low-volume
@@ -294,8 +300,12 @@ impl SharingTransport for LoopbackTransport {
                 subset_src_files(&src_dir, &kept)?
             }
         };
-        // Read the one-shot abort threshold once; disarm inside the loop if it fires.
-        let abort_after = self.fault.lock().expect("fault mutex poisoned").abort_after_bytes;
+        // Read the one-shot abort threshold + optional per-read pacing once; disarm
+        // the abort inside the loop if it fires.
+        let (abort_after, delay_per_read) = {
+            let f = self.fault.lock().expect("fault mutex poisoned");
+            (f.abort_after_bytes, f.delay_per_read)
+        };
 
         tokio::fs::create_dir_all(dest_dir)
             .await
@@ -350,6 +360,13 @@ impl SharingTransport for LoopbackTransport {
                             "injected fault: fetch aborted after {bytes_done} bytes"
                         ));
                     }
+                }
+
+                // Test-only pacing: yield and sleep after each read so the fetch
+                // takes a controllable duration. `.await` hands the runtime back to
+                // any concurrent fetch, so two paced fetches genuinely interleave.
+                if let Some(d) = delay_per_read {
+                    tokio::time::sleep(d).await;
                 }
             }
             writer.flush().await.context("flush dest")?;

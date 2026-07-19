@@ -174,12 +174,18 @@ async fn wait_until<F: FnMut() -> bool>(mut pred: F, timeout: Duration) {
 /// observable oracle for "the re-send moved only the new frames".
 #[derive(Default)]
 struct RecordingEmitter {
-    events: Mutex<Vec<(String, serde_json::Value)>>,
+    /// Each event is stamped with the monotonic `Instant` it was emitted, so the
+    /// bidirectional e2e can compare stage timings across two emitters (all from
+    /// the same process clock) to prove concurrent fetches overlap.
+    events: Mutex<Vec<(Instant, String, serde_json::Value)>>,
 }
 
 impl ProgressEmitter for RecordingEmitter {
     fn emit_json(&self, name: &str, payload: serde_json::Value) {
-        self.events.lock().unwrap().push((name.to_string(), payload));
+        self.events
+            .lock()
+            .unwrap()
+            .push((Instant::now(), name.to_string(), payload));
     }
 }
 
@@ -191,8 +197,8 @@ impl RecordingEmitter {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(name, p)| name == "sync-finished" && p["direction"] == "sent")
-            .map(|(_, p)| {
+            .filter(|(_, name, p)| name == "sync-finished" && p["direction"] == "sent")
+            .map(|(_, _, p)| {
                 (
                     p["newCount"].as_u64().expect("newCount is a number"),
                     p["duplicateCount"].as_u64().expect("duplicateCount is a number"),
@@ -208,9 +214,24 @@ impl RecordingEmitter {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(name, p)| name == "sync-progress" && p["direction"] == "received")
-            .map(|(_, p)| p["stage"].as_str().unwrap_or_default().to_string())
+            .filter(|(_, name, p)| name == "sync-progress" && p["direction"] == "received")
+            .map(|(_, _, p)| p["stage"].as_str().unwrap_or_default().to_string())
             .collect()
+    }
+
+    /// The `Instant` of the FIRST received-direction `sync-progress` tick whose
+    /// coarse `stage` matches. `None` if no such tick was recorded. The bidirectional
+    /// e2e reads `received` / `fetching` / `ingesting` off this to bound the
+    /// announce→fetching gap and to intersect the two directions' fetch windows.
+    fn first_received_stage_at(&self, stage: &str) -> Option<Instant> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, name, p)| {
+                name == "sync-progress" && p["direction"] == "received" && p["stage"] == stage
+            })
+            .map(|(t, _, _)| *t)
     }
 
     /// Every `sync-file-progress` tick as `(file, bytes_done, bytes_total)` in emit
@@ -220,8 +241,8 @@ impl RecordingEmitter {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(name, _)| name == "sync-file-progress")
-            .map(|(_, p)| {
+            .filter(|(_, name, _)| name == "sync-file-progress")
+            .map(|(_, _, p)| {
                 (
                     p["file"].as_str().unwrap_or_default().to_string(),
                     p["bytesDone"].as_u64().unwrap_or_default(),
@@ -239,12 +260,12 @@ impl RecordingEmitter {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(name, p)| {
+            .filter(|(_, name, p)| {
                 name == "sync-progress"
                     && p["stage"] == "fetching"
                     && p.get("bytesDone").is_some_and(|v| !v.is_null())
             })
-            .map(|(_, p)| {
+            .map(|(_, _, p)| {
                 (
                     p["bytesDone"].as_u64().unwrap_or_default(),
                     p["bytesTotal"].as_u64().unwrap_or_default(),
@@ -1370,4 +1391,223 @@ async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
 
     engine.shutdown().await;
     receiver.shutdown().await;
+}
+
+/// Task 4.2 — **send + receive concurrency contract** on loopback. The smoke
+/// complaint was "can't receive while sending"; code analysis found no hard
+/// serializer (an instance's send engine and receiver loop are independent tasks).
+/// This is the loopback-level proof.
+///
+/// Instance A sends a multi-frame package to B WHILE B sends one to A, over the
+/// same [`LoopbackNetwork`]. Each instance therefore drives BOTH halves at once —
+/// its own send engine (outbound rows) AND its receiver loop (inbound fetch), over
+/// the same catalog DB — which is exactly the "receive while sending" condition the
+/// smoke report doubted. Both receivers pace every fetch read (`delay_per_read`) so
+/// the two fetches take a controllable ~half-second each and genuinely overlap;
+/// each `.await` on the pacing sleep hands the runtime to the other in-flight fetch,
+/// so their receiver-stage timestamps interleave.
+///
+/// Asserts:
+///   1. both packages reach `Confirmed`, and each catalog ingests the peer's N
+///      frames (both directions completed);
+///   2. the two directions' fetch windows OVERLAP in wall-clock time — the direct
+///      proof neither fetch serialized behind the other;
+///   3. each direction's announce→fetching gap stays far below the OTHER direction's
+///      full fetch duration (serialization would force it to ≥ that duration), and
+///      under a generous absolute ceiling.
+///
+/// All `Instant`s come from one process's monotonic clock, so cross-emitter timing
+/// comparison is valid. Determinism: no wall-clock sleep is used for
+/// synchronization (only the existing `wait_until` poll helper); the pacing sleep
+/// shapes the fetch, it is never awaited as a barrier.
+#[tokio::test]
+async fn bidirectional_simultaneous_transfers_both_complete() {
+    const N: usize = 10;
+    // Pace each fetch read so a whole-package fetch takes ~N × delay (~0.5s here):
+    // long enough that the two directions reliably overlap and a serialized second
+    // fetch would be unmistakable, short enough to stay far under the WAIT budget.
+    const DELAY_PER_READ: Duration = Duration::from_millis(50);
+    // Generous absolute ceiling for the announce→fetching gap: 12× the harness poll
+    // step (25ms) = 300ms — well above concurrent scheduling jitter, well below the
+    // ~N×DELAY (~500ms+) a fetch serialized behind its peer's fetch would incur.
+    const ANNOUNCE_FETCH_CEILING: Duration = Duration::from_millis(300);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let a_dir = tmp.path().join("a");
+    let b_dir = tmp.path().join("b");
+    let a_files = a_dir.join("files");
+    let b_files = b_dir.join("files");
+    std::fs::create_dir_all(&a_files).unwrap();
+    std::fs::create_dir_all(&b_files).unwrap();
+    let a_db = a_dir.join("catalog.db");
+    let b_db = b_dir.join("catalog.db");
+
+    let ctx_a = Arc::new(ServiceContext::new_for_tests(a_db.clone()));
+    let ctx_b = Arc::new(ServiceContext::new_for_tests(b_db.clone()));
+    let dba = ctx_a.db.get().unwrap();
+    let dbb = ctx_b.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+
+    // ── One receiver per instance, each with its own recording emitter ───────────
+    let store_a = Arc::new(CatalogSyncStore::open(&a_db).unwrap());
+    let store_b = Arc::new(CatalogSyncStore::open(&b_db).unwrap());
+    let recv_ep_a = Arc::new(net.endpoint());
+    let recv_ep_b = Arc::new(net.endpoint());
+    let node_a_recv = recv_ep_a.node_id();
+    let node_b_recv = recv_ep_b.node_id();
+
+    // Pace BOTH receivers' fetch so the two directions overlap in wall-clock time.
+    recv_ep_a.set_fault(FaultPlan { delay_per_read: Some(DELAY_PER_READ), ..Default::default() });
+    recv_ep_b.set_fault(FaultPlan { delay_per_read: Some(DELAY_PER_READ), ..Default::default() });
+
+    let designated_a = tmp.path().join("incoming_a");
+    let designated_b = tmp.path().join("incoming_b");
+    designate_incoming(&ctx_a, &designated_a);
+    designate_incoming(&ctx_b, &designated_b);
+    let incoming_a = incoming_resolver_for(&ctx_a, a_dir.join("incoming"));
+    let incoming_b = incoming_resolver_for(&ctx_b, b_dir.join("incoming"));
+
+    let recorder_a = Arc::new(RecordingEmitter::default());
+    let recorder_b = Arc::new(RecordingEmitter::default());
+
+    let (_ia, receiver_a) = SyncReceiver::spawn(
+        Arc::clone(&store_a),
+        a_dir.clone(),
+        incoming_a,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&recv_ep_a) as Arc<dyn SharingTransport>,
+        Arc::clone(&recorder_a) as Arc<dyn ProgressEmitter>,
+    )
+    .await
+    .expect("spawn receiver A");
+
+    let (_ib, receiver_b) = SyncReceiver::spawn(
+        Arc::clone(&store_b),
+        b_dir.clone(),
+        incoming_b,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&recv_ep_b) as Arc<dyn SharingTransport>,
+        Arc::clone(&recorder_b) as Arc<dyn ProgressEmitter>,
+    )
+    .await
+    .expect("spawn receiver B");
+
+    // ── One send engine per instance, targeting the peer's receiver node. A long
+    // ack_timeout keeps the paced fetch from triggering a premature retry — both
+    // peers are already online, so delivery succeeds on the first attempt. ────────
+    let (engine_a, sender_a, collab_a, sync_a) =
+        inject_sender_engine(&net, &a_db, node_b_recv, Duration::from_secs(30)).await;
+    let (engine_b, sender_b, collab_b, sync_b) =
+        inject_sender_engine(&net, &b_db, node_a_recv, Duration::from_secs(30)).await;
+
+    // Seed N frames on each instance (own files dir + catalog). A's frames carry
+    // A-minted uuids and B's carry B-minted uuids, so neither side dedups the other.
+    let mut ids_a: Vec<i64> = Vec::with_capacity(N);
+    let mut ids_b: Vec<i64> = Vec::with_capacity(N);
+    for idx in 0..N {
+        ids_a.push(insert_capture_frame(&ctx_a, &a_files, idx).0);
+        ids_b.push(insert_capture_frame(&ctx_b, &b_files, idx).0);
+    }
+
+    // ── Fire BOTH directions back-to-back. `enqueue_sync_selection` hands off to the
+    // engine worker (async), so both packages are in flight before either paced
+    // fetch can finish. ──────────────────────────────────────────────────────────
+    let ra = enqueue_sync_selection(
+        &ctx_a,
+        &sender_a,
+        Arc::clone(&collab_a),
+        &sync_a,
+        ResolvedDest { node: node_b_recv, endpoint_addr: None },
+        ids_a.clone(),
+        None,
+    )
+    .await
+    .expect("A → B enqueue");
+    let rb = enqueue_sync_selection(
+        &ctx_b,
+        &sender_b,
+        Arc::clone(&collab_b),
+        &sync_b,
+        ResolvedDest { node: node_a_recv, endpoint_addr: None },
+        ids_b.clone(),
+        None,
+    )
+    .await
+    .expect("B → A enqueue");
+    assert_eq!(ra.enqueued_count, N as u32);
+    assert_eq!(rb.enqueued_count, N as u32);
+
+    // ── (1) Both packages reach Confirmed; each catalog ingests the peer's N frames.
+    wait_until(|| count(dba, "SELECT COUNT(*) FROM sync_outbound WHERE state = 'confirmed'") == 1, WAIT).await;
+    wait_until(|| count(dbb, "SELECT COUNT(*) FROM sync_outbound WHERE state = 'confirmed'") == 1, WAIT).await;
+    wait_until(
+        || count(dba, "SELECT COUNT(*) FROM sync_history WHERE direction = 'received' AND outcome = 'ingested'") == N as i64,
+        WAIT,
+    )
+    .await;
+    wait_until(
+        || count(dbb, "SELECT COUNT(*) FROM sync_history WHERE direction = 'received' AND outcome = 'ingested'") == N as i64,
+        WAIT,
+    )
+    .await;
+
+    assert_eq!(landed_count(&designated_a), N, "B → A delivered all N frames to A's incoming root");
+    assert_eq!(landed_count(&designated_b), N, "A → B delivered all N frames to B's incoming root");
+
+    // ── (2) Genuine overlap: the two fetch windows intersect in wall-clock time.
+    // recorder_b captured the A → B fetch (B is the receiver); recorder_a captured
+    // the B → A fetch. The window is [fetching-start, ingesting] — `fetching` is
+    // stamped just before `transport.fetch()`, `ingesting` just after it returns. ─
+    let a2b_start = recorder_b.first_received_stage_at("fetching").expect("A→B fetching tick");
+    let a2b_end = recorder_b.first_received_stage_at("ingesting").expect("A→B ingesting tick");
+    let b2a_start = recorder_a.first_received_stage_at("fetching").expect("B→A fetching tick");
+    let b2a_end = recorder_a.first_received_stage_at("ingesting").expect("B→A ingesting tick");
+
+    assert!(a2b_start < a2b_end, "A→B fetch window is well-formed");
+    assert!(b2a_start < b2a_end, "B→A fetch window is well-formed");
+    assert!(
+        a2b_start < b2a_end && b2a_start < a2b_end,
+        "the two directions' fetch windows overlap (genuine concurrency): \
+         A→B fetch [{a2b_start:?} .. {a2b_end:?}], B→A fetch [{b2a_start:?} .. {b2a_end:?}]"
+    );
+
+    // ── (3) Non-serialization: each direction's announce→fetching gap is far below
+    // the OTHER direction's full fetch duration — had it serialized behind that
+    // fetch, the gap would be ≥ that duration — and under a generous absolute
+    // ceiling. ───────────────────────────────────────────────────────────────────
+    let a2b_recv = recorder_b.first_received_stage_at("received").expect("A→B received tick");
+    let b2a_recv = recorder_a.first_received_stage_at("received").expect("B→A received tick");
+    let a2b_gap = a2b_start.duration_since(a2b_recv);
+    let b2a_gap = b2a_start.duration_since(b2a_recv);
+    let a2b_fetch = a2b_end.duration_since(a2b_start);
+    let b2a_fetch = b2a_end.duration_since(b2a_start);
+
+    assert!(
+        a2b_gap < b2a_fetch,
+        "A→B fetch did not serialize behind the concurrent B→A fetch \
+         (announce→fetching {a2b_gap:?} < peer fetch {b2a_fetch:?})"
+    );
+    assert!(
+        b2a_gap < a2b_fetch,
+        "B→A fetch did not serialize behind the concurrent A→B fetch \
+         (announce→fetching {b2a_gap:?} < peer fetch {a2b_fetch:?})"
+    );
+    assert!(
+        a2b_gap < ANNOUNCE_FETCH_CEILING,
+        "A→B announce→fetching gap within the generous ceiling ({a2b_gap:?} < {ANNOUNCE_FETCH_CEILING:?})"
+    );
+    assert!(
+        b2a_gap < ANNOUNCE_FETCH_CEILING,
+        "B→A announce→fetching gap within the generous ceiling ({b2a_gap:?} < {ANNOUNCE_FETCH_CEILING:?})"
+    );
+
+    engine_a.shutdown().await;
+    engine_b.shutdown().await;
+    receiver_a.shutdown().await;
+    receiver_b.shutdown().await;
 }
