@@ -42,7 +42,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use iroh::endpoint::{presets, Connection};
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey, Watcher};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, Watcher};
 use iroh_blobs::api::Store;
 use iroh_blobs::store::fs::options::Options as FsOptions;
 use iroh_blobs::store::fs::FsStore;
@@ -147,18 +147,6 @@ fn classify_connect_err(msg: &str, has_relay_hint: bool) -> ProbeClass {
 /// an immediate refresh out of band ([`SharedIrohNode::request_relay_refresh`]).
 const RELAY_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// Poll cadence used *only while a rebuild is pending but the node is not yet
-/// idle* (H2): the loop re-checks the idle gate this often so a deferred rebuild
-/// fires within seconds of the node going quiet, without re-running the resolver.
-const RELAY_REBUILD_RETRY_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Upper bound on how long a pending rebuild may be deferred waiting for idle
-/// before it is forced through regardless (H2). Bounding relay-map staleness is
-/// the whole point of the task, so an indefinitely-busy node must not pin a stale
-/// relay map forever; past this the rebuild runs at the next loop tick even if a
-/// serve/fetch is in flight (a `warn!` records the forced disruption).
-const RELAY_REBUILD_MAX_DEFER: Duration = Duration::from_secs(6 * 3600);
-
 /// A `Send` boxed future — the return type of the injected relay resolver and (in
 /// the engine) the retry address refresher. Defined locally so no `futures`/
 /// `n0-future` boxing type leaks into the node's public signature.
@@ -180,17 +168,17 @@ pub type RelayResolver =
 /// closure fans a `SyncSenderRuntime::kick_all` over the personal + collab sender
 /// maps). Installed via [`SharedIrohNode::set_wake_hook`]; `None` until then, so
 /// every fire before install is a silent no-op. Stored behind an `Arc<RwLock<…>>`
-/// so the home-relay watcher task — respawned on every relay rebuild — reads the
-/// CURRENT hook at fire time rather than capturing a stale clone at spawn.
+/// so the home-relay watcher task — spawned at bind, before the host installs the
+/// hook — reads the CURRENT hook at fire time rather than a stale clone at spawn.
 pub type WakeHook = Arc<dyn Fn() + Send + Sync>;
 
 /// The node's last-known home-relay connectivity (Task 3.3). Written by the
 /// home-relay watcher on every transition (the same values it already computes
 /// for its log lines) and read by [`SharedIrohNode::transport_health`] on the
-/// status poll. Held behind an `Arc<RwLock<…>>` on the rebuild-surviving OUTER
-/// layer of the node (like [`WakeHook`]) — the watcher is respawned per relay
-/// rebuild but writes into the SAME cell, so a poll always sees the current
-/// picture. The initial value is disconnected; the successful one-shot
+/// status poll. Held behind an `Arc<RwLock<…>>` on the OUTER layer of the node
+/// (like [`WakeHook`]) — the watcher writes into this cell and a status poll reads
+/// it, so a poll always sees the current picture. The initial value is
+/// disconnected; the successful one-shot
 /// `online()` wait seeds it connected as a bridge, and the watcher overwrites it
 /// on every later transition — so it is the sole connected-ness authority and a
 /// dropped relay always flips the surface back to `direct_only`.
@@ -433,10 +421,8 @@ impl EventDemux {
         }
     }
 
-    /// Number of live ack claims. Consumed by the node's idle gate (Task 8: a
-    /// node with an outstanding announce-ack claim is NOT idle — a rebuild would
-    /// break the connection the peer's ack rides back on) and by test
-    /// introspection.
+    /// Number of live ack claims (test introspection for the demux).
+    #[cfg(test)]
     fn claim_count(&self) -> usize {
         self.inner.lock().expect("demux mutex poisoned").claims.len()
     }
@@ -651,27 +637,29 @@ impl ControlPool {
     }
 }
 
-/// The rebuildable network layer of a [`SharedIrohNode`] (Task 8, H2). Everything
-/// a relay-map change replaces lives here behind one lock, so an idle rebuild can
-/// swap the whole set atomically WITHOUT invalidating the `Arc<SharedIrohNode>` or
-/// any role handle: the endpoint + router are re-bound (new relay mode, same
-/// device secret ⇒ same node id) and the control pool + relay watcher rebuilt on
-/// them, while the store, demux, gate, responder, peers, key lock, and node id
-/// (all outside this struct) are preserved untouched across the swap.
+/// The network layer of a [`SharedIrohNode`] (Task 8, H2). The endpoint, router,
+/// and control pool are built once at [`bind`](SharedIrohNode::bind) and live for
+/// the node's lifetime — a relay-map change is applied IN PLACE on the live
+/// endpoint ([`apply_relay_change`](SharedIrohNode::apply_relay_change),
+/// `insert_relay`/`remove_relay`), so nothing here is ever swapped. Held behind
+/// one lock only so the hot `endpoint`/`control_pool` accessors clone the cheap
+/// Arc-backed handle out; `relay_urls`/`uses_relay` are the mutable bookkeeping a
+/// hot-swap updates.
 struct NetLayer {
     /// Endpoint handle (clone of the router's); dials peers + downloads blobs.
     endpoint: Endpoint,
     /// Keeps the accept loop (both protocols) alive; torn down in
-    /// [`shutdown`](SharedIrohNode::shutdown), replaced on rebuild. `Router` is
-    /// `Clone` (Arc-backed accept task), so shutdown clones it out of the lock.
+    /// [`shutdown`](SharedIrohNode::shutdown). `Router` is `Clone` (Arc-backed
+    /// accept task), so shutdown clones it out of the lock.
     router: Router,
     /// Per-peer pooled control connections (Task 2), reused across control sends.
-    /// Rebound (dropped + freshly built) on the new endpoint at rebuild.
     control_pool: Arc<ControlPool>,
-    /// Home-relay status watcher task on this endpoint; aborted at shutdown and at
-    /// rebuild (iroh keeps the watcher alive until the last endpoint clone drops).
+    /// Home-relay status watcher task on this endpoint; aborted at shutdown (iroh
+    /// keeps the watcher alive until the last endpoint clone drops). A relay-map
+    /// hot-swap re-homes the SAME endpoint, so this one watcher observes it.
     relay_watcher: Option<JoinHandle<()>>,
-    /// The relay URLs the endpoint was built with (H1 reporting groundwork, T7).
+    /// The relay URLs the endpoint currently carries (H1 reporting groundwork, T7);
+    /// updated in place by a relay-map hot-swap.
     relay_urls: Vec<String>,
     /// Whether a relay is configured. Gates the `online()` wait — with the relay
     /// disabled there is no home relay and `online()` would hang.
@@ -680,27 +668,20 @@ struct NetLayer {
 
 /// The one iroh endpoint/router/store for this process (see module docs).
 pub struct SharedIrohNode {
-    /// The rebuildable endpoint/router/control-pool/relay-config (Task 8). Behind
-    /// one lock so a relay-map rebuild swaps the whole set atomically; hot readers
-    /// (`endpoint`/`control_pool` accessors) clone the cheap Arc-backed handle out
-    /// and never hold the lock across an await.
+    /// The endpoint/router/control-pool/relay-config (Task 8). Behind one lock so
+    /// the hot readers (`endpoint`/`control_pool` accessors) clone the cheap
+    /// Arc-backed handle out and never hold the lock across an await; a relay-map
+    /// change mutates the live endpoint in place rather than swapping this layer.
     net: Mutex<NetLayer>,
-    /// The single blob store shared by every role handle. NOT rebuilt on a relay
-    /// change (only the endpoint/router are) — a re-open would risk the redb lock.
+    /// The single blob store shared by every role handle.
     store: Store,
-    /// This endpoint's node id (== ed25519 public key bytes). STABLE across a
-    /// relay rebuild (same device secret is re-bound), so peers and history keep
-    /// addressing this node by the same id.
+    /// This endpoint's node id (== ed25519 public key bytes). Stable for the node's
+    /// lifetime, so peers and history keep addressing this node by the same id.
     node_id: NodeId,
-    /// The device secret the endpoint binds, kept so a relay rebuild can re-bind
-    /// the SAME identity without touching the key file or its advisory lock.
-    device_secret: [u8; 32],
     /// Known peer addresses (from pairing), used to dial the control channel.
     peers: Mutex<HashMap<NodeId, EndpointAddr>>,
     /// Endpoint address lookup — consumed by the blobs downloader when it dials
-    /// by node id. Cloned handle; shares state with the endpoint. Reused (its
-    /// learned peer info preserved) across a rebuild by re-binding the new
-    /// endpoint against this same instance.
+    /// by node id. Cloned handle; shares state with the endpoint.
     lookup: iroh::address_lookup::memory::MemoryLookup,
     /// Prefixed package tag (`<role>/pkg/<id>`) → collection hash, registered by
     /// [`serve`](SharingTransport::serve), injected into the wire announce by
@@ -721,28 +702,19 @@ pub struct SharedIrohNode {
     /// the fan-out of the node's single inbound event stream; cloned into the
     /// control-protocol handler (as [`EventSink::Demux`]) and consulted by every
     /// role handle's [`events`](SharingTransport::events) /
-    /// [`announce`](SharingTransport::announce). Preserved across a rebuild — the
-    /// new control handler references the SAME demux, so consumers stay registered.
+    /// [`announce`](SharingTransport::announce). The single control handler holds
+    /// this SAME demux for the node's lifetime, so consumers stay registered.
     demux: Arc<EventDemux>,
-    /// Count of in-flight serve/fetch/announce/ack operations (Task 8 idle gate).
-    /// A relay rebuild runs only at `active_ops == 0` AND zero demux claims, so it
-    /// never tears the endpoint out from under a live transfer.
-    active_ops: AtomicU64,
-    /// Number of relay rebuilds that have executed (test/observability
-    /// introspection — the T7 reporter + handles are meant to survive each one).
-    rebuild_count: AtomicU64,
     /// Monotonic id source for role handles, so the demux can attribute a claim /
     /// the Recv consumer to a specific handle and release them all on its drop.
     next_handle_id: AtomicU64,
     /// Connection-level authorization gate, cloned into both protocol handlers;
     /// the host installs the predicate via [`set_connect_gate`](Self::set_connect_gate).
-    /// Preserved across a rebuild (re-cloned into the new handlers).
     connect_gate: SharedConnectGate,
     /// Dedup responder slot, cloned into the control protocol handler; the
     /// receiver installs it via [`set_dedup_responder`](Self::set_dedup_responder)
     /// when it migrates onto the node (Task 3). Empty ⇒ inbound offers are
-    /// answered want-all, so nothing is ever silently withheld. Preserved across a
-    /// rebuild (re-cloned into the new handler).
+    /// answered want-all, so nothing is ever silently withheld.
     responder: SharedResponder,
     /// Role prefixes whose startup sweep has already run (once per prefix).
     swept: Mutex<HashSet<&'static str>>,
@@ -758,61 +730,31 @@ pub struct SharedIrohNode {
     /// [`request_relay_refresh`](Self::request_relay_refresh) to wake the loop now
     /// instead of waiting for the hourly tick.
     refresh_notify: Arc<Notify>,
-    /// A relay change awaiting an idle rebuild (H2): the target relay mode plus how
-    /// long it has been deferred (for the [`RELAY_REBUILD_MAX_DEFER`] force).
-    pending_rebuild: Mutex<Option<PendingRebuild>>,
-    /// The relay-url set the last resolver run reported — the change-detection
-    /// baseline (H2). A resolver reporting a DIFFERENT set marks a pending rebuild;
-    /// initialized to the bind-time relay set so the first unchanged resolve is a
-    /// no-op.
+    /// The relay-url set the last hot-swap applied — the change-detection baseline
+    /// (H2, Task 3.5). A resolver reporting a DIFFERENT set drives an in-place
+    /// `insert_relay`/`remove_relay` diff; initialized to the bind-time relay set
+    /// so the first unchanged resolve is a no-op.
     last_relay_urls: Mutex<Vec<String>>,
-    /// The relay-refresh loop task; aborted at shutdown so no rebuild starts
+    /// The relay-refresh loop task; aborted at shutdown so no refresh runs
     /// mid-teardown. `None` until [`start_relay_refresh`](Self::start_relay_refresh)
     /// runs (once; idempotent).
     refresh_task: Mutex<Option<JoinHandle<()>>>,
     /// The held device-key advisory lock (I4); dropped at shutdown so a re-bind
-    /// can re-acquire it. Kept HELD across a relay rebuild — the identity never
-    /// changes, so the lock is neither released nor re-acquired.
+    /// can re-acquire it. Held for the node's lifetime — the identity never changes.
     key_lock: Mutex<Option<DeviceKeyLock>>,
     /// Transport-level wake hook (Task 6): fired on a home-relay reconnect
     /// transition and after an applied relay-map change, so the host kicks every
     /// pending outbound package. Behind an `Arc<RwLock<…>>` so the relay watcher —
-    /// respawned on every relay rebuild — reads the CURRENT hook live at fire time
-    /// (survives a rebuild). Never invoked while the lock is held: the value is
+    /// spawned at bind, before the host installs the hook — reads the CURRENT hook
+    /// live at fire time. Never invoked while the lock is held: the value is
     /// cloned out first, so a hook that re-enters the node can't self-deadlock.
     wake_hook: Arc<RwLock<Option<WakeHook>>>,
     /// The home-relay watcher's last-recorded transition (Task 3.3). Like
-    /// [`wake_hook`](Self::wake_hook) it lives on this rebuild-surviving outer
-    /// layer and is handed to the watcher task, which IS respawned on every relay
-    /// rebuild — so the watcher writes into the SAME cell across rebuilds and
-    /// [`transport_health`](Self::transport_health) always reads the current
+    /// [`wake_hook`](Self::wake_hook) it lives on the node's outer layer and is
+    /// handed to the watcher task, which writes into this cell on every transition
+    /// so [`transport_health`](Self::transport_health) always reads the current
     /// picture. Read under the lock and cloned out; never held across an await.
     relay_health: Arc<RwLock<RelayHealth>>,
-}
-
-/// A relay change awaiting an idle rebuild (Task 8, H2).
-struct PendingRebuild {
-    /// The relay mode the endpoint should be re-bound with.
-    mode: RelayMode,
-    /// When this rebuild first became pending — drives the
-    /// [`RELAY_REBUILD_MAX_DEFER`] force.
-    since: Instant,
-    /// Whether the "deferred beyond max" `warn!` has already fired (once per
-    /// pending rebuild, not once per retry poll).
-    warned: bool,
-}
-
-/// RAII marker for one in-flight transport operation (Task 8 idle gate).
-/// Increments the node's `active_ops` on construction, decrements on drop, so an
-/// idle-gated relay rebuild never fires while a serve/fetch/announce is running.
-struct OpGuard<'a> {
-    counter: &'a AtomicU64,
-}
-
-impl Drop for OpGuard<'_> {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::SeqCst);
-    }
 }
 
 impl SharedIrohNode {
@@ -833,10 +775,7 @@ impl SharedIrohNode {
         let key_lock = DeviceKeyLock::acquire(&device_key_path(sync_dir))?;
 
         let demux = EventDemux::new();
-        // Keep the raw secret so a relay rebuild can re-bind the SAME identity
-        // (same node id) without touching the key file or its held advisory lock.
-        let device_secret = key.secret_bytes();
-        let secret_key = SecretKey::from_bytes(&device_secret);
+        let secret_key = SecretKey::from_bytes(&key.secret_bytes());
         let uses_relay = !matches!(relay_mode, RelayMode::Disabled);
         // Snapshot what the ENDPOINT is being built with before the builder
         // consumes `relay_mode` (same transport-level view as `IrohTransport`).
@@ -920,9 +859,8 @@ impl SharedIrohNode {
         };
         // Shared node: `EventSink::Demux` (inbound events fan out through the demux,
         // Task 2/Д4, not a single shared stream), and `flush_store_on_shutdown:
-        // false` because the store is SHARED across relay rebuilds — a per-rebuild
-        // router teardown must not tear it down; the node flushes it explicitly in
-        // `shutdown` (T8).
+        // false` so a router teardown never tears down the store — the node flushes
+        // it explicitly in `shutdown` (T8).
         let router = build_router(
             endpoint,
             &store,
@@ -937,14 +875,12 @@ impl SharedIrohNode {
         let endpoint = router.endpoint().clone();
         let node_id: NodeId = *endpoint.id().as_bytes();
         let control_pool = ControlPool::new(endpoint.clone());
-        // The wake hook lives outside `NetLayer` (unaffected by a relay rebuild)
-        // but its Arc is handed to the watcher task, which IS respawned on rebuild —
-        // so the watcher reads whatever hook the api layer has installed at fire
-        // time, not a stale clone captured here at bind.
+        // The wake hook lives outside `NetLayer`; its Arc is handed to the watcher
+        // task, which reads whatever hook the api layer has installed at fire time
+        // (installed after bind), not a stale clone captured here at bind.
         let wake_hook: Arc<RwLock<Option<WakeHook>>> = Arc::new(RwLock::new(None));
-        // The relay-health cell also lives outside `NetLayer` (survives a relay
-        // rebuild) and is handed to the watcher, which IS respawned on rebuild —
-        // so the watcher writes the CURRENT node's transitions into this same cell.
+        // The relay-health cell also lives outside `NetLayer` and is handed to the
+        // watcher, which writes the node's transitions into this same cell.
         let relay_health: Arc<RwLock<RelayHealth>> = Arc::new(RwLock::new(RelayHealth::initial()));
         let relay_watcher = spawn_home_relay_watcher(
             endpoint.clone(),
@@ -964,21 +900,17 @@ impl SharedIrohNode {
             }),
             store,
             node_id,
-            device_secret,
             peers: Mutex::new(HashMap::new()),
             lookup,
             served,
             served_files,
             demux,
-            active_ops: AtomicU64::new(0),
-            rebuild_count: AtomicU64::new(0),
             next_handle_id: AtomicU64::new(0),
             connect_gate,
             swept: Mutex::new(HashSet::new()),
             online_waited: AtomicBool::new(false),
             shutdown_done: AtomicBool::new(false),
             refresh_notify: Arc::new(Notify::new()),
-            pending_rebuild: Mutex::new(None),
             // The change-detection baseline starts at the bind-time relay set, so
             // the first resolver run that reports the SAME set is a no-op.
             last_relay_urls: Mutex::new(relay_urls),
@@ -990,7 +922,7 @@ impl SharedIrohNode {
         }))
     }
 
-    // ----- rebuildable network-layer accessors (Task 8) -----------------------
+    // ----- network-layer accessors (Task 8) -----------------------------------
 
     /// A clone of the current endpoint handle (cheap, Arc-backed). Never holds the
     /// `net` lock across an await — callers use the returned clone.
@@ -1003,24 +935,10 @@ impl SharedIrohNode {
         Arc::clone(&self.net.lock().expect("net mutex poisoned").control_pool)
     }
 
-    /// Whether a relay is configured on the CURRENT endpoint (gates the `online()`
-    /// wait). Reads through the rebuildable layer so a relay rebuild is reflected.
+    /// Whether a relay is configured on the endpoint (gates the `online()` wait).
+    /// A relay-map hot-swap updates this in place, so it reflects the live set.
     fn uses_relay(&self) -> bool {
         self.net.lock().expect("net mutex poisoned").uses_relay
-    }
-
-    /// An RAII guard that marks one in-flight serve/fetch/announce/ack operation
-    /// (Task 8 idle gate); a relay rebuild defers while any are outstanding.
-    fn op_guard(&self) -> OpGuard<'_> {
-        self.active_ops.fetch_add(1, Ordering::SeqCst);
-        OpGuard { counter: &self.active_ops }
-    }
-
-    /// Whether the node is idle enough to rebuild the endpoint (Task 8): no
-    /// in-flight transport operation AND no outstanding announce-ack claim (a
-    /// rebuild would break the connection a pending ack rides back on).
-    fn is_idle(&self) -> bool {
-        self.active_ops.load(Ordering::SeqCst) == 0 && self.demux.claim_count() == 0
     }
 
     /// This endpoint's node id (== ed25519 public key bytes).
@@ -1052,12 +970,6 @@ impl SharedIrohNode {
         self.control_pool().dials.load(Ordering::Relaxed)
     }
 
-    /// Number of relay rebuilds that have executed (Task 8 introspection).
-    #[cfg(test)]
-    pub(crate) fn rebuild_count(&self) -> u64 {
-        self.rebuild_count.load(Ordering::SeqCst)
-    }
-
     /// Test-only: overwrite the home-relay health cell to simulate a watcher
     /// transition (or the online-wait seed) without a live relay, so the
     /// `transport_health` derivation can be exercised deterministically (all
@@ -1078,13 +990,13 @@ impl SharedIrohNode {
     /// This endpoint's current [`EndpointAddr`] (direct addrs + relay url) — the
     /// self-reported address for H1 (Task 7). Call after a handle's
     /// [`start`](SharingTransport::start) so address discovery has settled. Reads
-    /// through the rebuildable layer, so the T7 reporter that polls this survives
-    /// a relay rebuild and reports the NEW endpoint's address.
+    /// the live endpoint, so the T7 reporter that polls this always reflects the
+    /// current relay set (a hot-swap re-homes the same endpoint in place).
     pub fn endpoint_addr(&self) -> EndpointAddr {
         self.endpoint().addr()
     }
 
-    /// The relay URLs the current endpoint was built with (H1 groundwork, Task 7).
+    /// The relay URLs the endpoint currently carries (H1 groundwork, Task 7).
     pub fn relay_urls(&self) -> Vec<String> {
         self.net.lock().expect("net mutex poisoned").relay_urls.clone()
     }
@@ -1263,15 +1175,13 @@ impl SharedIrohNode {
         if self.shutdown_done.swap(true, Ordering::SeqCst) {
             return;
         }
-        // Abort the relay-refresh loop first (Task 8): aborting it cancels any
-        // in-flight rebuild future at its next await, and the swap-time
-        // `shutdown_done` check below closes the race if a rebuild already built a
-        // new endpoint. Setting `shutdown_done` above (before this) means a
-        // rebuild racing the lock discards its freshly-built endpoint.
+        // Abort the relay-refresh loop first (Task 8): setting `shutdown_done`
+        // above means a refresh iteration racing this abort re-checks the flag
+        // after its resolver await and bails before touching the endpoint.
         if let Some(handle) = self.refresh_task.lock().expect("refresh_task mutex poisoned").take() {
             handle.abort();
         }
-        // Take the router + endpoint + relay watcher out of the rebuildable layer.
+        // Take the router + endpoint + relay watcher out of the network layer.
         // `Router` is `Clone` (shared accept task), so cloning it out of the lock
         // and shutting the clone down tears the one accept task down.
         let (router, endpoint, watcher) = {
@@ -1307,19 +1217,18 @@ impl SharedIrohNode {
         tracing::info!(node_id = %hex32(&self.node_id), "shared iroh node shut down");
     }
 
-    // ----- relay-map lifecycle: refresh loop + idle rebuild (Task 8, H2) -------
+    // ----- relay-map lifecycle: refresh loop + live hot-swap (Task 8, H2/3.5) --
 
     /// Start the hourly relay-map refresh loop (H2), bounding relay-map staleness.
     ///
     /// The loop re-runs the injected, hub-agnostic `resolver` on an hourly tick (or
     /// immediately when [`request_relay_refresh`](Self::request_relay_refresh) is
-    /// called on the sign-in path). On a CHANGED relay-url set it marks a pending
-    /// rebuild; the rebuild = a bounded internal endpoint/router re-bind executed
-    /// only when the node is idle (no in-flight serve/fetch/announce, no
-    /// outstanding ack claim), preserving the node id, store, and every role
-    /// handle. A rebuild deferred past [`RELAY_REBUILD_MAX_DEFER`] is forced
-    /// through regardless. Idempotent: a second call is a no-op (the first
-    /// resolver wins), so the app's several start entry points can all call it.
+    /// called on the sign-in path). On a CHANGED relay-url set it applies the diff
+    /// to the LIVE endpoint via `insert_relay`/`remove_relay`
+    /// ([`apply_relay_change`](Self::apply_relay_change)) — a connection-preserving
+    /// re-home, no endpoint/router rebuild. Idempotent: a second call is a no-op
+    /// (the first resolver wins), so the app's several start entry points can all
+    /// call it.
     pub fn start_relay_refresh(self: &Arc<Self>, resolver: RelayResolver) {
         let mut guard = self.refresh_task.lock().expect("refresh_task mutex poisoned");
         if guard.is_some() {
@@ -1329,39 +1238,33 @@ impl SharedIrohNode {
         let notify = Arc::clone(&self.refresh_notify);
         let handle = tokio::spawn(async move {
             loop {
-                // A shorter poll while a rebuild is pending-but-not-idle, so it
-                // fires within seconds of the node going quiet; hourly otherwise.
-                let pending = match weak.upgrade() {
-                    Some(node) => node.pending_rebuild.lock().expect("pending mutex poisoned").is_some(),
-                    None => return,
-                };
-                let wait = if pending {
-                    RELAY_REBUILD_RETRY_INTERVAL
-                } else {
-                    RELAY_REFRESH_INTERVAL
-                };
-                // Re-run the resolver on the hourly tick or an immediate trigger;
-                // the short pending-retry tick only re-checks the idle gate.
-                let run_resolver = tokio::select! {
-                    _ = tokio::time::sleep(wait) => !pending,
-                    _ = notify.notified() => true,
-                };
+                // Re-run the resolver on the hourly tick or an immediate trigger.
+                tokio::select! {
+                    _ = tokio::time::sleep(RELAY_REFRESH_INTERVAL) => {}
+                    _ = notify.notified() => {}
+                }
                 let Some(node) = weak.upgrade() else { return };
                 if node.shutdown_done.load(Ordering::SeqCst) {
                     return;
                 }
-                if run_resolver {
-                    if let Some((mode, urls)) = resolver().await {
-                        // A relay-map change means the node is (re)homing onto a
+                match resolver().await {
+                    Some((mode, _urls)) => {
+                        // A relay-map change re-homes the live endpoint onto a
                         // fresh relay set — a wake event (Task 6): kick every
                         // pending outbound package so it re-announces on the new
                         // map instead of waiting out its backoff.
-                        if node.consider_relay_change(mode, urls) {
+                        if node.apply_relay_change(mode).await {
                             node.fire_wake_hook();
                         }
                     }
+                    None => {
+                        // The resolver couldn't resolve the current map (hub blip):
+                        // the endpoint keeps the relay set it already carries, but
+                        // surface it — a silent keep would hide a hub that has gone
+                        // unreachable for hours.
+                        tracing::warn!("relay map refresh failed; keeping current map");
+                    }
                 }
-                node.try_rebuild().await;
             }
         });
         *guard = Some(handle);
@@ -1375,207 +1278,70 @@ impl SharedIrohNode {
         self.refresh_notify.notify_one();
     }
 
-    /// Fold a fresh resolver result into the change-detection baseline: on a
-    /// CHANGED relay-url set, log + mark a pending rebuild for `mode`. Compares as
+    /// Apply a fresh resolver result to the LIVE endpoint (Task 3.5): diff the new
+    /// relay set against the last-applied one and re-home in place via
+    /// [`Endpoint::insert_relay`]/[`Endpoint::remove_relay`] — no endpoint/router
+    /// rebuild, so in-flight QUIC connections and the pooled control channel are
+    /// preserved (iroh re-STUNs and re-homes the SAME endpoint id). Compares as
     /// sorted sets so relay-url ordering is not a spurious change. Returns `true`
-    /// iff the set actually changed (a rebuild was marked) — the refresh loop uses
-    /// that signal to fire the wake hook (Task 6).
-    fn consider_relay_change(&self, mode: RelayMode, urls: Vec<String>) -> bool {
-        let mut last = self.last_relay_urls.lock().expect("last_relay_urls mutex poisoned");
-        let mut new_sorted = urls.clone();
-        new_sorted.sort();
-        let mut old_sorted = last.clone();
-        old_sorted.sort();
-        if new_sorted == old_sorted {
-            return false; // unchanged — nothing to rebuild
-        }
-        let old_count = last.len();
-        let new_count = urls.len();
-        *last = urls;
-        drop(last);
-        tracing::info!(old_count, new_count, "relay map changed; node rebuild pending");
-        *self.pending_rebuild.lock().expect("pending mutex poisoned") = Some(PendingRebuild {
-            mode,
-            since: Instant::now(),
-            warned: false,
-        });
-        true
-    }
+    /// iff the set actually changed (a diff was applied) — the refresh loop fires
+    /// the wake hook on that signal (Task 6).
+    async fn apply_relay_change(&self, mode: RelayMode) -> bool {
+        // The authoritative new set — canonical `RelayUrl`s plus their configs,
+        // derived from the resolved mode exactly as `bind` seeds the baseline.
+        let new_map = mode.relay_map();
+        let new_urls: Vec<RelayUrl> = new_map.urls::<Vec<_>>();
+        let new_strs: Vec<String> = new_urls.iter().map(|u| u.to_string()).collect();
 
-    /// Execute a pending rebuild when the node is idle (or force it past
-    /// [`RELAY_REBUILD_MAX_DEFER`]). No-op when nothing is pending. Clears the
-    /// pending marker only on a successful rebuild — a failed re-bind stays pending
-    /// so a later pass retries.
-    async fn try_rebuild(self: &Arc<Self>) {
-        let (mode, force) = {
-            let mut pending = self.pending_rebuild.lock().expect("pending mutex poisoned");
-            let Some(p) = pending.as_mut() else {
-                return;
-            };
-            let deferred = p.since.elapsed();
-            let force = deferred >= RELAY_REBUILD_MAX_DEFER;
-            if force && !p.warned {
-                p.warned = true;
-                tracing::warn!(
-                    duration_ms = deferred.as_millis() as u64,
-                    "relay map rebuild deferred beyond max; forcing rebuild regardless of activity"
-                );
-            }
-            (p.mode.clone(), force)
-        };
-        // Normally wait for a quiet instant; a force past MAX_DEFER bypasses the
-        // idle gate so bounded staleness wins over an indefinitely-busy node.
-        if !force && !self.is_idle() {
-            return;
+        let old_strs: Vec<String> = self
+            .last_relay_urls
+            .lock()
+            .expect("last_relay_urls mutex poisoned")
+            .clone();
+        let (added, removed) = relay_set_diff(&old_strs, &new_strs);
+        if added.is_empty() && removed.is_empty() {
+            return false; // unchanged — nothing to hot-swap
         }
-        match self.rebuild(mode).await {
-            Ok(()) => {
-                *self.pending_rebuild.lock().expect("pending mutex poisoned") = None;
-                // Log the completion (TEST-12): the pending marker used to clear
-                // silently, so the only smoke signal was watching the node stop
-                // re-homing. One `info!` turns the "did the rebuild land" check
-                // into a one-line `query_logs`. `relay_count` = the freshly-applied
-                // relay set the node is now homed on; `forced` = whether it fired
-                // past the idle gate (max-defer) or on a quiet instant.
-                let relay_count = self
-                    .last_relay_urls
-                    .lock()
-                    .expect("last_relay_urls mutex poisoned")
-                    .len();
-                tracing::info!(relay_count, forced = force, "relay map node rebuild complete");
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %format!("{e:#}"),
-                    "relay map node rebuild failed; will retry"
-                );
+
+        let endpoint = self.endpoint();
+        // Insert each newly-present relay with its freshly-resolved config.
+        for url in &new_urls {
+            if added.contains(&url.to_string()) {
+                if let Some(config) = new_map.get(url) {
+                    endpoint.insert_relay(url.clone(), config).await;
+                }
             }
         }
-    }
-
-    /// Rebuild the endpoint + router on a new relay `mode` WITHOUT invalidating the
-    /// `Arc<SharedIrohNode>` or any role handle (the riskiest piece of H2). Tears
-    /// down the old endpoint/router/watcher (bounded), re-binds the SAME device
-    /// secret (⇒ same node id) with the new relay mode against the SAME address
-    /// lookup, re-mounts both protocols on the SAME store + demux + gate +
-    /// responder, then swaps the rebuildable layer in under one lock. The store,
-    /// peers, served map, key lock, and demux consumers are all preserved.
-    async fn rebuild(self: &Arc<Self>, new_mode: RelayMode) -> Result<()> {
-        // Tear the old endpoint down first (sequential, same secret ⇒ no relay-slot
-        // overlap with the new bind), and abort the watcher. CRUCIALLY we do NOT
-        // call `old_router.shutdown()`: the router's graceful shutdown invokes each
-        // protocol handler's `shutdown()`, and `BlobsProtocol::shutdown()` tears
-        // down the store actor — which is the SHARED store we must preserve. Closing
-        // the endpoint ends the router's accept loop; the old `Router` clone is then
-        // dropped at the swap below (drop aborts the accept task without touching the
-        // store). The device-key lock stays held throughout (same identity).
-        let (old_endpoint, old_watcher) = {
-            let mut net = self.net.lock().expect("net mutex poisoned");
-            (net.endpoint.clone(), net.relay_watcher.take())
-        };
-        if let Some(w) = old_watcher {
-            w.abort();
-        }
-        if tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, old_endpoint.close())
-            .await
-            .is_err()
-        {
-            tracing::warn!("relay rebuild: old endpoint close timed out");
+        // Remove each relay no longer in the set.
+        for s in &removed {
+            match s.parse::<RelayUrl>() {
+                Ok(url) => {
+                    endpoint.remove_relay(&url).await;
+                }
+                Err(e) => tracing::warn!(
+                    url = %s,
+                    error = %e,
+                    "relay hot-swap: unparseable removed relay url; skipping removal"
+                ),
+            }
         }
 
-        // Snapshot the new relay config before the builder consumes `new_mode`.
-        let uses_relay = !matches!(new_mode, RelayMode::Disabled);
-        let relay_map = new_mode.relay_map();
-        let relay_urls: Vec<String> = relay_map
-            .urls::<Vec<_>>()
-            .iter()
-            .map(|u| u.to_string())
-            .collect();
-        let secret_key = SecretKey::from_bytes(&self.device_secret);
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .secret_key(secret_key)
-            .relay_mode(new_mode)
-            .address_lookup(self.lookup.clone())
-            .bind()
-            .await
-            .context("re-bind iroh endpoint for relay rebuild")?;
-
-        // Re-mount BOTH protocols on the SAME store, demux, gate, and responder —
-        // so every Task-2 demux consumer stays registered and any installed
-        // gate/responder survives, transparently to SyncRuntime/engines. Same
-        // construction shape as bind() (`flush_store_on_shutdown: false` — the
-        // shared store must survive this router's teardown). The resolver captures
-        // the SAME (preserved) served map so the new consumer resolves identically.
-        let serve_resolver: ServeRootResolver = {
-            let served = Arc::clone(&self.served);
-            Arc::new(move |hash| resolve_served_root_in(&served, hash))
-        };
-        // The per-file resolver captures the SAME (preserved) served + served_files
-        // maps, so the new consumer attributes identically after the rebuild.
-        let serve_file_resolver: ServeFileResolver = {
-            let served = Arc::clone(&self.served);
-            let served_files = Arc::clone(&self.served_files);
-            Arc::new(move |root, index| {
-                resolve_served_file_in(&served, &served_files, root, index)
-            })
-        };
-        let router = build_router(
-            endpoint,
-            &self.store,
-            &self.connect_gate,
-            EventSink::Demux(Arc::clone(&self.demux)),
-            Arc::clone(&self.responder),
-            false,
-            serve_resolver,
-            serve_file_resolver,
-        );
-        let endpoint = router.endpoint().clone();
-        let new_node_id: NodeId = *endpoint.id().as_bytes();
-        debug_assert_eq!(
-            new_node_id, self.node_id,
-            "relay rebuild must preserve the node id (same device secret)"
-        );
-        let control_pool = ControlPool::new(endpoint.clone());
-        // Respawn the watcher on the new endpoint, handing it the SAME wake-hook
-        // and relay-health cells so a hook installed before the rebuild keeps
-        // firing after it and the health surface tracks the new endpoint's relay.
-        let relay_watcher = spawn_home_relay_watcher(
-            endpoint.clone(),
-            Arc::clone(&self.wake_hook),
-            Arc::clone(&self.relay_health),
-        );
-
-        // Swap the freshly-built layer in — unless we raced host shutdown (which
-        // set `shutdown_done` before taking the net lock), in which case discard
-        // the new endpoint so it isn't leaked past teardown.
+        // Update the bookkeeping the T7 reporter (`relay_urls`) and the `online()`
+        // gate (`uses_relay`) read, plus the change-detection baseline.
+        let uses_relay = !matches!(mode, RelayMode::Disabled);
         {
             let mut net = self.net.lock().expect("net mutex poisoned");
-            if self.shutdown_done.load(Ordering::SeqCst) {
-                drop(net);
-                // Discard the freshly-built layer without a graceful router
-                // shutdown (that would tear down the SHARED store, which
-                // `SharedIrohNode::shutdown` still owns): abort the watcher, close
-                // the new endpoint, and let `router` drop here (drop aborts its
-                // accept task, leaving the store intact).
-                relay_watcher.abort();
-                let _ = tokio::time::timeout(SHUTDOWN_CLOSE_TIMEOUT, endpoint.close()).await;
-                drop(router);
-                return Ok(());
-            }
-            net.endpoint = endpoint;
-            net.router = router;
-            net.control_pool = control_pool;
-            net.relay_watcher = Some(relay_watcher);
-            net.relay_urls = relay_urls.clone();
+            net.relay_urls = new_strs.clone();
             net.uses_relay = uses_relay;
         }
-        self.rebuild_count.fetch_add(1, Ordering::SeqCst);
+        *self.last_relay_urls.lock().expect("last_relay_urls mutex poisoned") = new_strs;
         tracing::info!(
-            node_id = %hex32(&self.node_id),
-            relay_count = relay_urls.len(),
-            "shared iroh node rebuilt after relay map change"
+            added = added.len(),
+            removed = removed.len(),
+            relay_count = new_urls.len(),
+            "relay map hot-swapped on live endpoint"
         );
-        Ok(())
+        true
     }
 
     // ----- role-parameterized transport primitives (shared by every handle) ---
@@ -1652,8 +1418,8 @@ impl SharedIrohNode {
     async fn send_control(&self, to: NodeId, msg: Msg) -> Result<()> {
         let target = self.dial_target(to)?;
         let bytes = msg.encode()?;
-        // Snapshot the current pooled-control handle so a concurrent relay rebuild
-        // (which swaps in a fresh pool) never tears this send's connection out.
+        // Clone the pooled-control handle out of the `net` lock so it is not held
+        // across the awaits below.
         let pool = self.control_pool();
         let conn = pool.get_or_connect(to, target).await?;
 
@@ -1797,7 +1563,6 @@ impl SharedIrohNode {
     }
 
     async fn role_announce(&self, role: Role, to: NodeId, a: &PackageAnnounce) -> Result<()> {
-        let _op = self.op_guard();
         let tag = role_package_tag(role.prefix(), &a.package_id);
         let mut wire = a.clone();
         {
@@ -1823,7 +1588,6 @@ impl SharedIrohNode {
         package_id: &str,
         a: &PackageAnnounce,
     ) -> Result<()> {
-        let _op = self.op_guard();
         let tag = role_package_tag(role.prefix(), &a.package_id);
         let mut wire = a.clone();
         {
@@ -1861,7 +1625,6 @@ impl SharedIrohNode {
         project_id: &str,
         package_id: &str,
     ) -> Result<()> {
-        let _op = self.op_guard();
         self.send_control(
             to,
             Msg::ProjectRequest {
@@ -1882,15 +1645,14 @@ impl SharedIrohNode {
         dest_dir: &Path,
         sink: FetchSink,
     ) -> Result<()> {
-        let _op = self.op_guard();
         let root_hash: Hash = pkg.root_hash.parse().with_context(|| {
             format!("parse collection hash from announce root_hash {:?}", pkg.root_hash)
         })?;
         let provider =
             EndpointId::from_bytes(&from).map_err(|e| anyhow!("invalid provider node id: {e}"))?;
         let tag = role_package_tag(role.prefix(), &pkg.package_id);
-        // Snapshot the endpoint so a concurrent relay rebuild can't swap it out
-        // mid-download.
+        // Clone the endpoint out of the `net` lock so it is not held across the
+        // download awaits below.
         let endpoint = self.endpoint();
         blobs::fetch_collection_to_dir(
             &self.store,
@@ -1914,13 +1676,12 @@ impl SharedIrohNode {
         pkg: &PackageAnnounce,
         dest_dir: &Path,
     ) -> Result<PathBuf> {
-        let _op = self.op_guard();
         let root_hash: Hash = pkg.root_hash.parse().with_context(|| {
             format!("parse collection hash from announce root_hash {:?}", pkg.root_hash)
         })?;
         let provider =
             EndpointId::from_bytes(&from).map_err(|e| anyhow!("invalid provider node id: {e}"))?;
-        // Snapshot the endpoint so a concurrent relay rebuild can't swap it out.
+        // Clone the endpoint out of the `net` lock so it is not held across the await.
         let endpoint = self.endpoint();
         blobs::fetch_manifest_to_dir(&self.store, &endpoint, provider, root_hash, dest_dir).await
     }
@@ -1932,7 +1693,6 @@ impl SharedIrohNode {
         src_dir: &Path,
         want: Option<&HashSet<String>>,
     ) -> Result<()> {
-        let _op = self.op_guard();
         let tag = role_package_tag(role.prefix(), &pkg.package_id);
         // The import returns the collection hash PLUS the ordered `(rel_path, size)`
         // entries in provider-iteration order — recorded in `served_files` for
@@ -1999,7 +1759,6 @@ impl SharedIrohNode {
         package_id: &PackageId,
         receipts: Vec<FrameReceipt>,
     ) -> Result<()> {
-        let _op = self.op_guard();
         let count = receipts.len();
         self.send_control(
             to,
@@ -2020,7 +1779,6 @@ impl SharedIrohNode {
         offer: Vec<OfferEntry>,
         full_by_rel: HashMap<String, String>,
     ) -> Result<HashSet<String>> {
-        let _op = self.op_guard();
         let reply = self
             .send_request(
                 to,
@@ -2259,6 +2017,26 @@ impl SharingTransport for RoleHandle {
     }
 }
 
+/// Compute the relay-url set difference for a hot-swap (Task 3.5): the urls to
+/// `insert_relay` (present in `new`, absent from `old`) and the urls to
+/// `remove_relay` (present in `old`, absent from `new`). Order-insensitive; a
+/// pure set diff (any within-side duplicates are irrelevant).
+fn relay_set_diff(old: &[String], new: &[String]) -> (Vec<String>, Vec<String>) {
+    let old_set: HashSet<&str> = old.iter().map(String::as_str).collect();
+    let new_set: HashSet<&str> = new.iter().map(String::as_str).collect();
+    let added: Vec<String> = new
+        .iter()
+        .filter(|u| !old_set.contains(u.as_str()))
+        .cloned()
+        .collect();
+    let removed: Vec<String> = old
+        .iter()
+        .filter(|u| !new_set.contains(u.as_str()))
+        .cloned()
+        .collect();
+    (added, removed)
+}
+
 /// Spawn the home-relay status watcher (spec §1, minor #4). iroh's
 /// [`home_relay_status`](iroh::Endpoint::home_relay_status) watcher surfaces relay
 /// connectivity transitions — a relay eviction (`SameEndpointIdConnected`, the C1
@@ -2271,8 +2049,9 @@ impl SharingTransport for RoleHandle {
 /// online, so it fires the installed [`WakeHook`] to kick every pending outbound
 /// package out of its backoff. `wake_hook` is the node's shared hook lock — read
 /// (and cloned out from under) at FIRE time, never captured here at spawn — so a
-/// hook installed after this task spawned, or re-installed across a relay rebuild
-/// that respawns this watcher, is always the one that fires.
+/// hook installed after this task spawned is always the one that fires. A
+/// relay-map hot-swap re-homes the SAME endpoint, so this one watcher observes
+/// every relay-set change without being respawned.
 fn spawn_home_relay_watcher(
     endpoint: Endpoint,
     wake_hook: Arc<RwLock<Option<WakeHook>>>,
@@ -3403,20 +3182,39 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Task 8: relay-map refresh + idle node rebuild (H2).
+    // Task 3.5: relay-map refresh + live hot-swap (was: idle node rebuild).
     // -----------------------------------------------------------------------
 
-    // (a) A refresh callback returning a CHANGED relay-url set triggers a rebuild
-    //     when the node is idle: the node id is STABLE, the shared store survives
-    //     (a seeded tag is still there), the T7 reporter's `endpoint_addr()` still
-    //     reports the same node id after the internal rebuild, and the role handles
-    //     keep working (a full announce→ack round trip completes post-rebuild).
-    //     Relay stays Disabled so the in-process endpoints keep dialing over
-    //     localhost; the "change" is detected off the resolver-reported url set,
-    //     which exercises the whole rebuild path honestly (endpoint + router
-    //     re-bound, control pool + watcher rebuilt) without a real relay.
+    // (0) The pure set diff that drives a hot-swap: `insert_relay` for urls newly
+    //     present, `remove_relay` for urls gone. Order-insensitive.
+    #[test]
+    fn relay_set_diff_is_the_symmetric_difference() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // Overlap: one added, one removed, the rest unchanged.
+        let (added, removed) = relay_set_diff(&s(&["a", "b", "c"]), &s(&["b", "c", "d"]));
+        assert_eq!(added, s(&["d"]), "d is newly present");
+        assert_eq!(removed, s(&["a"]), "a is gone");
+
+        // Same set, different order → no change.
+        let (added, removed) = relay_set_diff(&s(&["a", "b"]), &s(&["b", "a"]));
+        assert!(added.is_empty() && removed.is_empty(), "reordering is not a change");
+
+        // Empty new → everything removed; empty old → everything added.
+        assert_eq!(relay_set_diff(&s(&["a", "b"]), &s(&[])), (s(&[]), s(&["a", "b"])));
+        assert_eq!(relay_set_diff(&s(&[]), &s(&["a"])), (s(&["a"]), s(&[])));
+    }
+
+    // (a) A relay-map hot-swap on the LIVE endpoint preserves identity, the shared
+    //     store, AND the in-flight connection: it re-homes the SAME endpoint via
+    //     `insert_relay`/`remove_relay` (no rebuild), so a pooled control
+    //     connection opened before the swap is REUSED after it (`control_pool_dials`
+    //     stays flat — the whole point of Task 3.5) with no re-pairing, and a full
+    //     announce→ack round trip still completes. `relay_urls()` reflects the new
+    //     set. Relay is a fake-but-valid url (no server needed: `insert_relay` only
+    //     updates the map + re-STUNs in the background, never blocks on a dial).
     #[tokio::test]
-    async fn relay_refresh_changed_set_rebuilds_when_idle_preserving_identity_store_and_handles() {
+    async fn relay_hot_swap_preserves_identity_store_connection_and_handles() {
         let ds = tempdir().unwrap();
         let dr = tempdir().unwrap();
         let s = bind_disabled(ds.path()).await;
@@ -3429,69 +3227,79 @@ mod tests {
         pair(&s, &s_info, &r, &r_info);
 
         let id_before = s.node_id();
-        // T7 reporter survival groundwork: capture the sender addr before rebuild.
-        let addr_before = s.endpoint_addr();
-        assert_eq!(*addr_before.id.as_bytes(), id_before, "addr id == node id pre-rebuild");
+        assert_eq!(*s.endpoint_addr().id.as_bytes(), id_before, "addr id == node id pre-swap");
 
-        // Seed a tag on the shared store to prove the store is NOT rebuilt.
+        // Seed a tag on the shared store to prove the store is untouched by a swap.
         let tt = s.store().blobs().add_bytes(b"survive".to_vec()).temp_tag().await.unwrap();
         s.store().tags().set("out/pkg/keep", tt.hash_and_format()).await.unwrap();
         drop(tt);
 
-        // A resolver reporting a CHANGED url set (baseline was the empty
-        // relay-disabled set), rebuilding to Disabled again.
-        let resolver: RelayResolver =
-            Arc::new(|| Box::pin(async { Some((RelayMode::Disabled, vec!["marker-v2".to_string()])) }));
-        s.start_relay_refresh(resolver);
-        s.request_relay_refresh();
-        wait_until(|| s.rebuild_count() == 1, Duration::from_secs(10)).await;
-
-        // Node id STABLE + store intact + T7 reporter still reports the new addr
-        // (same id) after the internal rebuild.
-        assert_eq!(s.node_id(), id_before, "node id must be stable across a relay rebuild");
-        assert!(
-            tag_present(s.store(), "out/pkg/keep").await,
-            "the shared store (and its tag) must survive the rebuild"
-        );
-        let addr_after = s.endpoint_addr();
-        assert_eq!(
-            *addr_after.id.as_bytes(),
-            id_before,
-            "endpoint_addr() (polled by the T7 reporter via Weak) must survive the rebuild and \
-             report the same node id"
-        );
-
-        // Handles still work post-rebuild: the sender's endpoint changed, so
-        // re-teach the receiver our new address, then announce→ack round-trip.
-        let s_info2 = out.start().await.unwrap();
-        r.add_peer_ticket(&s_info2.pairing_ticket).unwrap();
-
+        // Open a live pooled control connection: one announce→ack round trip.
         let mut acks = out.events().await;
         let mut r_ev = recv.events().await;
-        let pkg = mk_announce("post-rebuild");
-        out.announce(r_info.node_id, &pkg).await.unwrap();
-        let pid = match recv_next(&mut r_ev).await {
+        let pkg1 = mk_announce("pre-swap");
+        out.announce(r_info.node_id, &pkg1).await.unwrap();
+        let pid1 = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce.package_id,
-            other => panic!("expected AnnounceReceived post-rebuild, got {other:?}"),
+            other => panic!("expected AnnounceReceived pre-swap, got {other:?}"),
         };
-        recv.ack(s_info2.node_id, &pid, mk_receipts()).await.unwrap();
+        recv.ack(s_info.node_id, &pid1, mk_receipts()).await.unwrap();
         match recv_next(&mut acks).await {
-            TransportEvent::AckReceived { package_id, .. } => assert_eq!(package_id, pkg.package_id),
-            other => panic!("expected AckReceived post-rebuild, got {other:?}"),
+            TransportEvent::AckReceived { package_id, .. } => assert_eq!(package_id, pkg1.package_id),
+            other => panic!("expected AckReceived pre-swap, got {other:?}"),
         }
+        assert_eq!(s.control_pool_dials(), 1, "one pooled dial established pre-swap");
+
+        // Hot-swap the sender's relay map onto a fresh (fake-but-valid) relay set.
+        let new_map = iroh::RelayMap::try_from_iter(["https://127.0.0.1:9"]).unwrap();
+        let want_urls: Vec<String> =
+            new_map.urls::<Vec<_>>().iter().map(|u| u.to_string()).collect();
+        let changed = s.apply_relay_change(RelayMode::Custom(new_map)).await;
+        assert!(changed, "inserting a relay onto the empty set is a change");
+
+        // Identity + store + reported set all reflect the swap without a rebuild.
+        assert_eq!(s.node_id(), id_before, "node id stable across a relay hot-swap");
+        assert!(
+            tag_present(s.store(), "out/pkg/keep").await,
+            "the shared store (and its tag) must survive a relay hot-swap"
+        );
+        assert_eq!(
+            *s.endpoint_addr().id.as_bytes(),
+            id_before,
+            "endpoint_addr id stable across a hot-swap (same endpoint, re-homed in place)"
+        );
+        assert_eq!(s.relay_urls(), want_urls, "relay_urls() must reflect the hot-swapped set");
+
+        // The pre-swap connection was NOT dropped: a second announce→ack reuses the
+        // SAME pooled connection (dials still 1). No re-pairing — the endpoint is
+        // re-homed in place, its direct addr unchanged. A rebuild would have reset
+        // the pool and forced a re-dial here.
+        let pkg2 = mk_announce("post-swap");
+        out.announce(r_info.node_id, &pkg2).await.unwrap();
+        let pid2 = match recv_next(&mut r_ev).await {
+            TransportEvent::AnnounceReceived { announce, .. } => announce.package_id,
+            other => panic!("expected AnnounceReceived post-swap, got {other:?}"),
+        };
+        recv.ack(s_info.node_id, &pid2, mk_receipts()).await.unwrap();
+        match recv_next(&mut acks).await {
+            TransportEvent::AckReceived { package_id, .. } => assert_eq!(package_id, pkg2.package_id),
+            other => panic!("expected AckReceived post-swap, got {other:?}"),
+        }
+        assert_eq!(
+            s.control_pool_dials(),
+            1,
+            "the live pooled connection must survive the relay hot-swap (no re-dial)"
+        );
 
         s.shutdown().await;
         r.shutdown().await;
     }
 
-    // (b) A pending rebuild is DEFERRED while an operation is in flight (the idle
-    //     gate) and EXECUTES once the node goes idle. Driven directly over the
-    //     internal defer machinery (an `op_guard` stands in for a live
-    //     serve/fetch/announce) so the defer→release→rebuild ordering is
-    //     deterministic, with the node id stable across the deferred rebuild.
-    //     Also asserts the TEST-12 completion line + `relay_count` field.
+    // (b) `apply_relay_change` is a no-op on an unchanged set (returns false, no
+    //     log), and on a real change logs the hot-swap line carrying added/removed
+    //     counts. Drives add → same → remove and asserts each verdict + the log.
     #[tokio::test]
-    async fn relay_rebuild_deferred_while_busy_then_executes_after_release() {
+    async fn relay_hot_swap_noop_when_unchanged_else_logs_diff() {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
 
@@ -3507,59 +3315,66 @@ mod tests {
         let node = bind_disabled(dir.path()).await;
         let id = node.node_id();
 
-        // Mark the node busy → not idle.
-        let op = node.op_guard();
-        assert!(!node.is_idle(), "an in-flight op means the node is not idle");
+        // Baseline is the empty relay-disabled set → re-applying Disabled is a no-op.
+        assert!(
+            !node.apply_relay_change(RelayMode::Disabled).await,
+            "re-applying the unchanged (empty) set must be a no-op"
+        );
 
-        // A relay change becomes pending; a rebuild attempt while busy must defer.
-        node.consider_relay_change(RelayMode::Disabled, vec!["changed".to_string()]);
-        node.try_rebuild().await;
-        assert_eq!(node.rebuild_count(), 0, "rebuild must defer while an op is in flight");
+        // Add one relay → a change (added=1, removed=0).
+        let map = iroh::RelayMap::try_from_iter(["https://127.0.0.1:9"]).unwrap();
+        assert!(
+            node.apply_relay_change(RelayMode::Custom(map.clone())).await,
+            "adding a relay is a change"
+        );
+        assert_eq!(node.relay_urls().len(), 1, "one relay now configured");
 
-        // Release the op → idle → the next attempt rebuilds.
-        drop(op);
-        assert!(node.is_idle(), "released op → idle");
-        node.try_rebuild().await;
-        assert_eq!(node.rebuild_count(), 1, "rebuild must execute once the node is idle");
-        assert_eq!(node.node_id(), id, "node id stable across the deferred rebuild");
+        // Re-apply the SAME set → no-op.
+        assert!(
+            !node.apply_relay_change(RelayMode::Custom(map)).await,
+            "re-applying the same set must be a no-op"
+        );
 
-        // TEST-12: the success arm now logs a completion line carrying relay_count
-        // (was silent). The applied set was `["changed"]` ⇒ relay_count == 1.
+        // Remove it (back to Disabled) → a change (added=0, removed=1).
+        assert!(
+            node.apply_relay_change(RelayMode::Disabled).await,
+            "removing the last relay is a change"
+        );
+        assert!(node.relay_urls().is_empty(), "no relays after removal");
+        assert_eq!(node.node_id(), id, "node id stable across every hot-swap");
+
+        // Exactly two hot-swap log lines (the add and the remove), carrying counts.
         let events = captured.lock().unwrap();
-        let complete: Vec<&CapturedEvent> = events
+        let swaps: Vec<&CapturedEvent> = events
             .iter()
-            .filter(|e| e.message == "relay map node rebuild complete")
+            .filter(|e| e.message == "relay map hot-swapped on live endpoint")
             .collect();
         assert_eq!(
-            complete.len(),
-            1,
-            "exactly one rebuild-complete line; captured: {:?}",
+            swaps.len(),
+            2,
+            "one log per applied change; captured: {:?}",
             events.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
         );
-        assert_eq!(
-            complete[0].fields.get("relay_count").map(String::as_str),
-            Some("1"),
-            "the completion line must carry relay_count of the applied set; got {:?}",
-            complete[0].fields
-        );
+        assert_eq!(swaps[0].fields.get("added").map(String::as_str), Some("1"));
+        assert_eq!(swaps[0].fields.get("removed").map(String::as_str), Some("0"));
+        assert_eq!(swaps[1].fields.get("added").map(String::as_str), Some("0"));
+        assert_eq!(swaps[1].fields.get("removed").map(String::as_str), Some("1"));
         drop(events);
 
         node.shutdown().await;
     }
 
-    // (c) S4 survives the rebuild path: an installed connect gate is re-cloned
-    //     into the freshly-built router by `build_router`, so a relay refresh
-    //     never silently drops it. A deny-SPECIFIC-peer gate on the receiver is
-    //     asserted BOTH ways after a rebuild — the denied peer's inbound connect
-    //     is still refused (its announce fails, zero control dispatch), while an
-    //     allowed peer is still admitted (the companion that proves the refusal
-    //     is the gate's verdict, not broken post-rebuild connectivity).
+    // (c) S4 survives a relay hot-swap: the router/gate are never rebuilt, so an
+    //     installed deny-SPECIFIC-peer gate keeps its verdict after the swap —
+    //     asserted BOTH ways (denied peer still refused with zero control dispatch;
+    //     allowed peer still admitted). No re-pairing: the endpoint is re-homed in
+    //     place, so the senders' addresses stay valid.
     #[tokio::test]
-    async fn connect_gate_survives_relay_rebuild() {
+    async fn connect_gate_survives_relay_hot_swap() {
         let dr = tempdir().unwrap();
         let dd = tempdir().unwrap();
         let da = tempdir().unwrap();
-        let r = bind_disabled(dr.path()).await; // gated receiver (will rebuild)
+        let r = bind_disabled(dr.path()).await; // gated receiver
         let denied = bind_disabled(dd.path()).await;
         let allowed = bind_disabled(da.path()).await;
 
@@ -3573,37 +3388,30 @@ mod tests {
         pair(&r, &r_info, &denied, &denied_info);
         pair(&r, &r_info, &allowed, &allowed_info);
 
-        // Deny the denied sender's node id; admit everyone else. Late-bindable —
-        // installed on the already-spawned router before the rebuild.
+        // Deny the denied sender's node id; admit everyone else.
         let denied_id = denied.node_id();
         r.set_connect_gate(Arc::new(move |from: &NodeId| *from != denied_id));
 
-        // Force a relay-refresh rebuild of the receiver's router (deterministic
-        // defer machinery: idle node ⇒ the changed url set rebuilds immediately).
-        r.consider_relay_change(RelayMode::Disabled, vec!["rebuild-marker".to_string()]);
-        r.try_rebuild().await;
-        assert_eq!(r.rebuild_count(), 1, "receiver must have rebuilt its router once");
-
-        // Re-teach both senders the receiver's POST-rebuild address (a rebuild
-        // rebinds the endpoint ⇒ new direct addrs) so the connections actually
-        // reach the NEW router — the refusal below is then the gate's verdict,
-        // not unreachability.
-        let r_info2 = recv.start().await.unwrap();
-        denied.add_peer_ticket(&r_info2.pairing_ticket).unwrap();
-        allowed.add_peer_ticket(&r_info2.pairing_ticket).unwrap();
+        // Hot-swap the receiver's relay map onto a fresh set (no rebuild — same
+        // router, same gate, same endpoint re-homed in place).
+        let new_map = iroh::RelayMap::try_from_iter(["https://127.0.0.1:9"]).unwrap();
+        assert!(
+            r.apply_relay_change(RelayMode::Custom(new_map)).await,
+            "the receiver's relay set changed"
+        );
 
         let mut r_events = recv.events().await;
 
-        // (1) The denied peer is STILL refused after the rebuild.
-        let pkg_denied = mk_announce("post-rebuild-denied");
+        // (1) The denied peer is STILL refused after the hot-swap.
+        let pkg_denied = mk_announce("post-swap-denied");
         let outcome = tokio::time::timeout(
             Duration::from_secs(15),
-            out_denied.announce(r_info2.node_id, &pkg_denied),
+            out_denied.announce(r_info.node_id, &pkg_denied),
         )
         .await;
         match outcome {
             Ok(Ok(())) => {
-                panic!("a denied peer's announce must not succeed after a relay rebuild")
+                panic!("a denied peer's announce must not succeed after a relay hot-swap")
             }
             Ok(Err(_)) | Err(_) => {} // expected: refused → no delivery ack, ever
         }
@@ -3613,15 +3421,15 @@ mod tests {
             tokio::time::timeout(Duration::from_millis(300), r_events.recv()).await;
         assert!(
             never_arrived.is_err(),
-            "the denied peer must produce zero control dispatch post-rebuild"
+            "the denied peer must produce zero control dispatch post-swap"
         );
 
-        // (2) An allowed peer is STILL admitted after the rebuild.
-        let pkg_allowed = mk_announce("post-rebuild-allowed");
+        // (2) An allowed peer is STILL admitted after the hot-swap.
+        let pkg_allowed = mk_announce("post-swap-allowed");
         out_allowed
-            .announce(r_info2.node_id, &pkg_allowed)
+            .announce(r_info.node_id, &pkg_allowed)
             .await
-            .expect("an allowed peer must still be admitted after the relay rebuild");
+            .expect("an allowed peer must still be admitted after the relay hot-swap");
         match recv_next(&mut r_events).await {
             TransportEvent::AnnounceReceived { from, .. } => assert_eq!(
                 from, allowed_info.node_id,
@@ -3633,6 +3441,49 @@ mod tests {
         r.shutdown().await;
         denied.shutdown().await;
         allowed.shutdown().await;
+    }
+
+    // (d) The refresh loop's silent branch: a resolver that fails to resolve
+    //     (returns `None`, a hub blip) keeps the current relay map AND surfaces a
+    //     `warn!` — a silent keep would hide a hub unreachable for hours.
+    #[tokio::test]
+    async fn relay_refresh_resolver_failure_warns_and_keeps_map() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+
+        let captured: Arc<std::sync::Mutex<Vec<CapturedEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _guard = tracing_subscriber::registry()
+            .with(CaptureLayer {
+                events: captured.clone(),
+            })
+            .set_default();
+
+        let dir = tempdir().unwrap();
+        let node = bind_disabled(dir.path()).await;
+        let before = node.relay_urls();
+
+        // A resolver that always fails (hub blip): keep the map, but not silently.
+        let resolver: RelayResolver = Arc::new(|| Box::pin(async { None }));
+        node.start_relay_refresh(resolver);
+        node.request_relay_refresh();
+
+        wait_until(
+            || {
+                captured
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.message == "relay map refresh failed; keeping current map")
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(node.relay_urls(), before, "a failed refresh must keep the current relay map");
+
+        drop(_guard);
+        node.shutdown().await;
     }
 
     // A minimal thread-local tracing capture (mirrors the iroh tests.rs layer),
