@@ -1861,6 +1861,21 @@ impl SharedIrohNode {
             .delete(tag.as_bytes())
             .await
             .map_err(|e| anyhow!("delete package tag: {e}"))?;
+        // Task 2.3 orphan hygiene: a terminal receiver outcome (Done via ack, or
+        // Cancelled via the epilogue) routes through here, so this is the seam that
+        // reclaims an in-flight download tag whose fetch errored or was cancelled
+        // without ever completing (the fetch itself deletes it only on success).
+        // Best-effort: a stray delete (there is none on the serve/sender side) must
+        // never fail a release. Never swallow: log first.
+        let in_flight = blobs::in_flight_tag(&tag);
+        if let Err(e) = self.store.tags().delete(in_flight.as_bytes()).await {
+            tracing::warn!(
+                package_id = %package_id.0,
+                in_flight_tag = %in_flight,
+                error = %format!("{e:#}"),
+                "delete in-flight download tag on release failed"
+            );
+        }
         tracing::debug!(package_id = %package_id.0, tags_removed = removed, "iroh released package");
         Ok(())
     }

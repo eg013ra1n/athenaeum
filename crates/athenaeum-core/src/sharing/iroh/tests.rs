@@ -873,6 +873,23 @@ async fn fetch_rejects_traversal_entry_names() {
         "absolute-path entry must not write to an arbitrary path"
     );
 
+    // Task 2.3: the fetch set the in-flight GC-protect tag right after phase 1
+    // yielded the root, and a fetch that errors (here on name validation) KEEPS
+    // it — an interrupted/errored fetch's partial data must stay GC-protected
+    // until a resume, not lose its tag on the error path. (Pre-fix there is no
+    // such tag at all, so this asserts the new set-and-keep behavior.)
+    let in_flight = super::blobs::in_flight_tag("pkg/traversal-probe");
+    assert!(
+        receiver
+            .store
+            .tags()
+            .get(in_flight.as_bytes())
+            .await
+            .unwrap()
+            .is_some(),
+        "an errored fetch must retain the in-flight download tag for a later resume"
+    );
+
     provider.shutdown().await;
     receiver.shutdown().await;
 }
@@ -1411,6 +1428,153 @@ async fn connect_gate_refuses_blob_fetch() {
     assert!(
         !dest.exists(),
         "no blob bytes land: dest_dir is only created after a successful download"
+    );
+
+    provider.shutdown().await;
+    receiver.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Task 2.3 — in-flight GC-protect tag (the live-bug fix). A collection whose
+//    root + children sit in the store under the in-flight hash_seq tag survives
+//    a REAL garbage-collection sweep, while an identically-shaped but untagged
+//    collection is collected. The survivor still loads + exports intact, i.e. a
+//    resumed fetch completes from the retained data instead of restarting from
+//    zero. Driven over a real FsStore with a short GC interval so the store's own
+//    background GC loop actually runs — no re-implemented GC.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn in_flight_tag_protects_partial_collection_across_gc() {
+    use iroh_blobs::api::Store;
+    use iroh_blobs::store::fs::options::Options as FsOptions;
+    use iroh_blobs::store::fs::FsStore;
+    use iroh_blobs::store::GcConfig;
+
+    let home = tempdir().unwrap();
+    let blob_dir = home.path().join("sync_blobs");
+    std::fs::create_dir_all(&blob_dir).unwrap();
+    // Real fs store with a short GC interval (production is 900 s). The GC loop
+    // sleeps `interval` before its first mark, and every blob below is held by a
+    // temp tag until its permanent protection (or lack thereof) is in place, so
+    // there is no unprotected setup window to race.
+    let mut options = FsOptions::new(&blob_dir);
+    options.gc = Some(GcConfig {
+        interval: Duration::from_millis(500),
+        add_protected: None,
+    });
+    let store: Store = FsStore::load_with_opts(blob_dir.join("blobs.db"), options)
+        .await
+        .unwrap()
+        .into();
+
+    // PROTECTED collection: two children + a hash-seq root, pinned by the
+    // in-flight tag (hash_seq format). Child temp tags stay alive until the
+    // permanent in-flight tag is set, so the collection is never unprotected.
+    let pa = store.blobs().add_bytes(vec![0xA1u8; 8192]).temp_tag().await.unwrap();
+    let pb = store.blobs().add_bytes(vec![0xB2u8; 8192]).temp_tag().await.unwrap();
+    let (pa_h, pb_h) = (pa.hash(), pb.hash());
+    let prot = Collection::from_iter([("a.fits".to_string(), pa_h), ("b.fits".to_string(), pb_h)]);
+    let prot_root_tt = prot.store(&store).await.unwrap();
+    let prot_root = prot_root_tt.hash();
+    let in_flight = super::blobs::in_flight_tag("recv/pkg/protected");
+    store
+        .tags()
+        .set(&in_flight, prot_root_tt.hash_and_format())
+        .await
+        .unwrap();
+    drop((pa, pb, prot_root_tt));
+
+    // CONTROL collection: same shape, NO tag → must be swept. Its temp tags are
+    // dropped here, before the canary is added, so a sweep that removes the canary
+    // necessarily saw (and swept) the control too.
+    let ca = store.blobs().add_bytes(vec![0xC3u8; 8192]).temp_tag().await.unwrap();
+    let cb = store.blobs().add_bytes(vec![0xD4u8; 8192]).temp_tag().await.unwrap();
+    let (ca_h, cb_h) = (ca.hash(), cb.hash());
+    let ctrl = Collection::from_iter([("a.fits".to_string(), ca_h), ("b.fits".to_string(), cb_h)]);
+    let ctrl_root_tt = ctrl.store(&store).await.unwrap();
+    let ctrl_root = ctrl_root_tt.hash();
+    drop((ca, cb, ctrl_root_tt));
+
+    // Canary: an untagged blob added LAST. Its disappearance is the deterministic
+    // signal that a full GC mark+sweep pass has run over the final store state.
+    let canary_tt = store.blobs().add_bytes(b"canary".to_vec()).temp_tag().await.unwrap();
+    let canary = canary_tt.hash();
+    drop(canary_tt);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if !store.blobs().has(canary).await.unwrap() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "GC did not run within the timeout");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The in-flight hash_seq tag kept the whole protected collection live...
+    assert!(store.blobs().has(prot_root).await.unwrap(), "protected root survives GC");
+    assert!(store.blobs().has(pa_h).await.unwrap(), "protected child a survives GC");
+    assert!(store.blobs().has(pb_h).await.unwrap(), "protected child b survives GC");
+    // ...while the untagged control collection was collected.
+    assert!(!store.blobs().has(ctrl_root).await.unwrap(), "untagged control root swept");
+    assert!(!store.blobs().has(ca_h).await.unwrap(), "untagged control child a swept");
+    assert!(!store.blobs().has(cb_h).await.unwrap(), "untagged control child b swept");
+
+    // Resume completes from the RETAINED data: the collection reloads and every
+    // child exports intact — a resumed fetch would find nothing left to pull.
+    let loaded = Collection::load(prot_root, &store).await.unwrap();
+    assert_eq!(loaded.len(), 2, "retained collection reloads with both entries");
+    let out_dir = home.path().join("resume_out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    for (name, hash) in loaded.iter() {
+        store.blobs().export(*hash, out_dir.join(name)).await.unwrap();
+    }
+    assert_eq!(std::fs::read(out_dir.join("a.fits")).unwrap(), vec![0xA1u8; 8192]);
+    assert_eq!(std::fs::read(out_dir.join("b.fits")).unwrap(), vec![0xB2u8; 8192]);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Task 2.3 — a SUCCESSFUL fetch retires the in-flight tag. After a full
+//    fetch, the permanent package tag pins the collection and NO in-flight tag
+//    is left behind (it is deleted right after the permanent tag is set).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn successful_fetch_clears_in_flight_tag() {
+    use super::package_tag;
+
+    let tmp = tempdir().unwrap();
+    let provider = mem_transport().await;
+    let receiver = mem_transport().await;
+    let (provider_info, receiver_info) = start_and_pair(&provider, &receiver).await;
+    let mut receiver_events = receiver.events().await;
+
+    let (pkg_dir, announce) =
+        build_package(&tmp.path().join("src"), "uuid-if", "if.fits", "M27", 64 * 1024);
+    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider.announce(receiver_info.node_id, &announce).await.unwrap();
+
+    let wire = match recv_next(&mut receiver_events).await {
+        TransportEvent::AnnounceReceived { announce, .. } => announce,
+        other => panic!("expected AnnounceReceived, got {other:?}"),
+    };
+
+    let dest = tmp.path().join("dest");
+    receiver
+        .fetch(provider_info.node_id, &wire, &dest, noop_fetch_sink())
+        .await
+        .expect("fetch must complete");
+
+    // Success invariant: permanent tag present, in-flight tag gone (no leak).
+    let permanent = package_tag(&wire.package_id);
+    let in_flight = super::blobs::in_flight_tag(&permanent);
+    assert!(
+        receiver.store.tags().get(permanent.as_bytes()).await.unwrap().is_some(),
+        "permanent package tag present after a successful fetch"
+    );
+    assert!(
+        receiver.store.tags().get(in_flight.as_bytes()).await.unwrap().is_none(),
+        "in-flight tag must be gone after a successful fetch (no leak)"
     );
 
     provider.shutdown().await;

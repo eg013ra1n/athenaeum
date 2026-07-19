@@ -1041,12 +1041,27 @@ impl SharingTransport for IrohTransport {
             .remove(&package_id.0);
         // `tags().delete` returns the removed count and does NOT error on a
         // missing tag — idempotency comes free.
+        let tag = package_tag(package_id);
         let removed = self
             .store
             .tags()
-            .delete(package_tag(package_id))
+            .delete(tag.as_bytes())
             .await
             .map_err(|e| anyhow!("delete package tag: {e}"))?;
+        // Task 2.3 orphan hygiene: also drop the in-flight download tag (see
+        // `blobs::fetch_collection_to_dir`). A terminal receiver outcome routes
+        // through release, so this reclaims an in-flight tag left by a fetch that
+        // errored/was cancelled without completing. Best-effort — never fail a
+        // release on it; log first.
+        let in_flight = blobs::in_flight_tag(&tag);
+        if let Err(e) = self.store.tags().delete(in_flight.as_bytes()).await {
+            tracing::warn!(
+                package_id = %package_id.0,
+                in_flight_tag = %in_flight,
+                error = %format!("{e:#}"),
+                "delete in-flight download tag on release failed"
+            );
+        }
         tracing::debug!(package_id = %package_id.0, tags_removed = removed, "iroh released package");
         Ok(())
     }

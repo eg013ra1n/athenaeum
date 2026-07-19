@@ -249,6 +249,28 @@ pub async fn import_subset_collection(
     Ok(hash)
 }
 
+/// The blob-store tag that GC-protects an **in-flight** collection download
+/// (Task 2.3), derived from the package's permanent `tag`. The iroh-blobs
+/// downloader holds no temp tag on in-flight content and GC marks live roots
+/// from tags + temp-tags only, so without this a GC sweep (900 s interval)
+/// collects the verified partial data of a transfer that straddles it — a
+/// GB-scale fetch then restarts from ZERO instead of resuming.
+///
+/// Two deliberate properties:
+/// - **hash_seq format at the root** (set with `HashAndFormat::hash_seq`), so the
+///   GC mark phase traverses the root hash-seq and marks every child live —
+///   partial children included (GC protection is blob-hash-granular: a live hash
+///   retains its blob file whether complete or a verified partial).
+/// - **Outside the `<role>/pkg/` namespace** the process-startup sweep clears
+///   (`node::role_start`'s `delete_prefix`). A fetch killed mid-transfer must keep
+///   its partial data protected ACROSS the restart until the resume re-announce
+///   re-fetches, so this tag has to survive that sweep. The trade-off is orphan
+///   hygiene: see [`fetch_collection_to_dir`] and the release paths in
+///   [`super::node`]/[`super`] for how a stale in-flight tag is reclaimed.
+pub(crate) fn in_flight_tag(permanent_tag: &str) -> String {
+    format!("in-flight/{permanent_tag}")
+}
+
 /// Download the collection identified by `root_hash` from `provider` into
 /// `store`, then export every entry to its `rel_path` under `dest_dir`,
 /// reconstructing the package directory.
@@ -293,6 +315,35 @@ pub async fn fetch_collection_to_dir(
     let collection = Collection::load(root_hash, store)
         .await
         .with_context(|| format!("load collection {root_hash}"))?;
+
+    // Task 2.3: GC-protect the in-flight download from here on. Phase 1 has landed
+    // the root hash-seq (+ child 0) in the store, so a named hash_seq tag on the
+    // root makes the GC mark phase traverse it and retain every child — even the
+    // verified partial bytes of a transfer that straddles a 900 s sweep — so an
+    // interrupted or slow phase-2 resumes from partial data instead of restarting
+    // from zero. Phase 1's own tiny window (root+meta, before the root is known)
+    // is inherently unprotected; that is fine.
+    //
+    // Set ONCE and, by DELIBERATE ASYMMETRY, deleted only on the SUCCESS path
+    // below (after the permanent tag is set). Every non-success exit — an early
+    // `?`/`bail` in phase 2, the whole future being dropped on a receiver cancel,
+    // or a process kill — KEEPS this tag so the partial data survives until the
+    // announce re-fires and the resume completes. Deleting here on a transient
+    // fetch error would strip protection exactly when a retry is coming, defeating
+    // the resume; that is why there is no drop-guard delete. Orphan hygiene for a
+    // fetch that errors and is then abandoned (never retried, never cancelled)
+    // rides on two reclaimers: the next successful fetch of the same package
+    // reuses this exact name (`set` overwrites, then success deletes), and the
+    // receiver's terminal `release` (Done via ack / Cancelled via the epilogue)
+    // deletes it — see `super::node::role_release` / `super::IrohTransport::release`.
+    // A process kill is not a code path, so a kill's orphan is reclaimed the same
+    // two ways on the next round.
+    let in_flight = in_flight_tag(tag);
+    store
+        .tags()
+        .set(&in_flight, HashAndFormat::hash_seq(root_hash))
+        .await
+        .with_context(|| format!("set in-flight download tag {in_flight}"))?;
 
     // Validate every entry name before writing anything at all — `dest_dir`
     // isn't even created yet, so a rejected entry leaves no trace on disk.
@@ -387,14 +438,28 @@ pub async fn fetch_collection_to_dir(
         bytes_total: byte_size,
     });
 
-    // Pin the downloaded collection until the caller releases it (post-ack).
-    // Between download-complete and this set the data is untagged — the 900 s
-    // GC interval makes that window irrelevant in practice.
+    // Pin the downloaded collection until the caller releases it (post-ack). The
+    // in-flight tag has protected the data continuously since phase 1, so there is
+    // NO untagged window here — set the permanent tag, THEN drop the in-flight one.
     store
         .tags()
         .set(tag, HashAndFormat::hash_seq(root_hash))
         .await
         .context("tag fetched collection")?;
+
+    // Success: the permanent tag now protects the collection, so retire the
+    // in-flight tag (this is the ONE path that deletes it — see the set site).
+    // Best-effort: a delete failure must not fail an otherwise-complete fetch (the
+    // data is safely pinned by the permanent tag); warn and continue — a later
+    // release or a same-name overwrite reclaims it. Never swallow: log first.
+    if let Err(e) = store.tags().delete(in_flight.as_bytes()).await {
+        tracing::warn!(
+            in_flight_tag = %in_flight,
+            root_hash = %root_hash,
+            error = %format!("{e:#}"),
+            "delete in-flight download tag after successful fetch failed"
+        );
+    }
 
     // Reconstruct the package directory from the downloaded collection.
     tokio::fs::create_dir_all(dest_dir)
