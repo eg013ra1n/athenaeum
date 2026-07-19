@@ -106,13 +106,15 @@ export function plainTransferError(raw: string): string {
   if (s.startsWith('cancelled by receiver')) return 'Cancelled by the receiving device';
   // Class-prefixed dial failures the sync engine persists as `<class>: <raw>`
   // (Task 3.1). A retryable class is a warning, not a failure — delivery-forever
-  // keeps trying — so the copy says so. `other:` and any unknown prefix fall
-  // through verbatim; the raw string still rides the `title=` hover at the call.
+  // keeps trying — so the copy says so. `other:` sheds its machine prefix (the
+  // raw reason is already the most specific text we have); any unknown prefix
+  // falls through verbatim; the raw string still rides the `title=` hover.
   if (s.startsWith('no_route:')) return 'No route to peer — will keep retrying';
   if (s.startsWith('relay_unreachable:')) return 'Peer unreachable via relay — will keep retrying';
   if (s.startsWith('refused:')) return 'Peer refused the connection';
   if (s.startsWith('timeout:')) return "Peer didn't answer — will keep retrying";
   if (s.startsWith('not_started:')) return 'Peer app not running — will keep retrying';
+  if (s.startsWith('other:')) return raw.slice(raw.indexOf(':') + 1).trim() || raw;
   return raw;
 }
 
