@@ -156,6 +156,18 @@ pub(crate) type SharedResponder = Arc<Mutex<Option<Arc<dyn DedupResponder>>>>;
 /// scans its role-prefixed `served` map).
 pub(crate) type ServeRootResolver = Arc<dyn Fn(Hash) -> Option<PackageId> + Send + Sync>;
 
+/// Resolves a served collection's `(root hash, hash-seq index)` to the collection
+/// ENTRY at that index (Task 2.2) — `index-2 → entries[index-2]`, returning its
+/// `(rel_path, byte_size)`; indices 0 (root hash-seq blob) and 1 (iroh
+/// `CollectionMeta`) resolve `None`. Attribution is STRICTLY by index, never by
+/// hash: two byte-identical files share one blob hash but occupy distinct
+/// collection entries, so only the index disambiguates them. Cloned into the
+/// consumer task at router build beside the [`ServeRootResolver`]; each
+/// construction site supplies its own (the legacy [`IrohTransport`] resolves
+/// nothing, the shared node scans its role-prefixed `served_files` map).
+pub(crate) type ServeFileResolver =
+    Arc<dyn Fn(Hash, u64) -> Option<(String, u64)> + Send + Sync>;
+
 /// Depth of the provider-events channel feeding the upload-progress consumer
 /// (Task 13). Per-connection/per-request notify messages are low volume; the
 /// per-request transfer updates ride their own dedicated channels (drained by a
@@ -279,6 +291,145 @@ mod upload_accumulator_tests {
     }
 }
 
+/// One per-file upload-progress tick: `(rel_path, bytes_done, bytes_total)`.
+pub(crate) type FileTick = (String, u64, u64);
+
+/// Per-FILE upload attribution for one served collection request (Task 2.2), the
+/// sibling of [`UploadAccumulator`]. Tracks which collection ENTRY the current
+/// hash-seq child maps to (resolved BY INDEX, never by hash) and its byte total,
+/// so the provider-events consumer can drive a per-file [`ServeFileProgress`] bar.
+///
+/// Pure + time-free (the consumer owns throttling): each method returns the tick
+/// to emit, if any. [`on_started`](Self::on_started) returns the PREVIOUS file's
+/// terminal (100%) tick — so a file that transferred inside one throttle window
+/// still completes its bar — then adopts the new child's entry (or `None` for a
+/// hash-seq-internal child at index 0/1). [`on_progress`](Self::on_progress)
+/// returns the current file's live tick. [`finish`](Self::finish) returns the
+/// last file's terminal tick — the terminal `Completed` has no next `Started` to
+/// flush it. `None` throughout for a non-payload child, so nothing spurious ever
+/// emits.
+#[derive(Default)]
+pub(crate) struct ServeFileTracker {
+    /// The current child's `(rel_path, byte_total)`, or `None` for a
+    /// hash-seq-internal child (index 0/1) that maps to no collection entry.
+    cur: Option<(String, u64)>,
+}
+
+impl ServeFileTracker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// A new hash-seq child's transfer began. Returns the PREVIOUS file's terminal
+    /// (100%) tick to flush before switching, then adopts `entry` — the resolver's
+    /// `index-2 → (rel_path, size)` for a payload child, or `None` for index 0/1.
+    pub(crate) fn on_started(&mut self, entry: Option<(String, u64)>) -> Option<FileTick> {
+        let flush = self.cur.take().map(|(name, total)| (name, total, total));
+        self.cur = entry;
+        flush
+    }
+
+    /// The current child ticked to `end_offset` (per-blob — it restarts near 0 for
+    /// each child, so it IS the current file's own offset). Returns the current
+    /// file's live tick (`end_offset` clamped to its total), or `None` when the
+    /// current child maps to no payload entry.
+    pub(crate) fn on_progress(&self, end_offset: u64) -> Option<FileTick> {
+        self.cur
+            .as_ref()
+            .map(|(name, total)| (name.clone(), end_offset.min(*total), *total))
+    }
+
+    /// The request completed. Returns the LAST file's terminal (100%) tick — it has
+    /// no next `Started` to flush it — and clears the tracker.
+    pub(crate) fn finish(&mut self) -> Option<FileTick> {
+        self.cur.take().map(|(name, total)| (name, total, total))
+    }
+}
+
+#[cfg(test)]
+mod serve_file_tracker_tests {
+    use super::ServeFileTracker;
+
+    fn e(name: &str, size: u64) -> Option<(String, u64)> {
+        Some((name.to_string(), size))
+    }
+
+    /// The core Task 2.2 shape: two payload children in hash-seq order. The FIRST
+    /// child's terminal (100%) tick is flushed when the SECOND child's `Started`
+    /// arrives (so a short file still completes its bar), and `finish` flushes the
+    /// LAST child at 100% (the terminal `Completed` has no next `Started`).
+    #[test]
+    fn flushes_previous_file_on_next_started_and_last_on_finish() {
+        let mut t = ServeFileTracker::new();
+        // Child A begins (index 2 → a.fits, 100 bytes): no previous file to flush.
+        assert_eq!(t.on_started(e("a.fits", 100)), None);
+        // A live tick mid-transfer.
+        assert_eq!(t.on_progress(40), Some(("a.fits".to_string(), 40, 100)));
+        // Child B begins (index 3 → b.fits, 250): A is flushed at 100% first.
+        assert_eq!(
+            t.on_started(e("b.fits", 250)),
+            Some(("a.fits".to_string(), 100, 100))
+        );
+        // Completed: B is flushed at 100%.
+        assert_eq!(t.finish(), Some(("b.fits".to_string(), 250, 250)));
+        // A second finish is a no-op (tracker cleared).
+        assert_eq!(t.finish(), None);
+    }
+
+    /// A SHORT file that never reported a live `Progress` still completes its bar:
+    /// the flush-on-next-`Started` emits its terminal tick even though `on_progress`
+    /// was never called for it.
+    #[test]
+    fn short_file_completes_via_flush_without_any_progress() {
+        let mut t = ServeFileTracker::new();
+        assert_eq!(t.on_started(e("short.fits", 12)), None);
+        // No on_progress for short.fits at all; the next Started flushes it at 100%.
+        assert_eq!(
+            t.on_started(e("next.fits", 30)),
+            Some(("short.fits".to_string(), 12, 12))
+        );
+    }
+
+    /// Hash-seq-internal children (index 0 = root, index 1 = `CollectionMeta`)
+    /// resolve to `None` and never produce a tick — not on start, progress, or the
+    /// flush when the first payload child begins.
+    #[test]
+    fn hash_seq_internal_children_never_tick() {
+        let mut t = ServeFileTracker::new();
+        assert_eq!(t.on_started(None), None); // index 0 (root hash-seq)
+        assert_eq!(t.on_progress(999), None); // progress on a non-payload child
+        assert_eq!(t.on_started(None), None); // index 1 (CollectionMeta), still None
+        assert_eq!(t.on_progress(999), None);
+        // First payload child (index 2): the previous (meta) child flushes nothing.
+        assert_eq!(t.on_started(e("first.fits", 64)), None);
+        assert_eq!(t.on_progress(64), Some(("first.fits".to_string(), 64, 64)));
+    }
+
+    /// Two byte-identical files (same size, would share one blob hash) are tracked
+    /// as DISTINCT entries — attribution is by index, so each gets its own bar
+    /// under its own `rel_path`. The tracker only ever sees the resolver's
+    /// per-index entry, so a duplicate hash can never collapse them here.
+    #[test]
+    fn duplicate_sized_files_stay_distinct_by_entry() {
+        let mut t = ServeFileTracker::new();
+        assert_eq!(t.on_started(e("dup_a.fits", 4096)), None);
+        assert_eq!(
+            t.on_started(e("dup_c.fits", 4096)),
+            Some(("dup_a.fits".to_string(), 4096, 4096))
+        );
+        assert_eq!(t.finish(), Some(("dup_c.fits".to_string(), 4096, 4096)));
+    }
+
+    /// An out-of-order / over-run `end_offset` is clamped to the file's total, so a
+    /// per-file bar never reports past 100%.
+    #[test]
+    fn progress_is_clamped_to_total() {
+        let mut t = ServeFileTracker::new();
+        t.on_started(e("f.fits", 50));
+        assert_eq!(t.on_progress(80), Some(("f.fits".to_string(), 50, 50)));
+    }
+}
+
 /// Whether a GET request's ranges reach a collection **payload** — i.e. request
 /// a non-empty range at any hash-seq offset ≥ 2 (Task 2.1). In an iroh-blobs
 /// collection, offset 0 is the root hash-seq blob and offset 1 is the iroh
@@ -345,6 +496,7 @@ pub(crate) fn build_router(
     responder: SharedResponder,
     flush_store_on_shutdown: bool,
     serve_resolver: ServeRootResolver,
+    serve_file_resolver: ServeFileResolver,
 ) -> Router {
     // Provider upload events (Task 13): a masked `EventSender` feeds a per-process
     // consumer that turns a peer's collection pull into outgoing byte progress.
@@ -407,16 +559,26 @@ pub(crate) fn build_router(
                         request_is_payload_carrying(&(*m.inner).request.ranges);
                     let mut updates = m.rx;
                     let resolver = Arc::clone(&serve_resolver);
+                    let file_resolver = Arc::clone(&serve_file_resolver);
                     let sink = consumer_sink.clone();
                     tokio::spawn(async move {
                         // The single emit gate: `Some(pkg)` only when the request
                         // both carries payload AND resolves to one of our packages.
+                        // ALL per-file emits are additionally gated on this, so a
+                        // non-payload request (or one for a foreign hash) never
+                        // routes a `ServeFileProgress` — not even on the flush.
                         let emit = if payload_carrying { resolver(root) } else { None };
                         // Cumulative across every blob in this request (Task 13
                         // fix) — see `UploadAccumulator` docs for why a naive
                         // `max(end_offset)` over the raw stream is wrong.
                         let mut acc = UploadAccumulator::new();
                         let mut last = Instant::now();
+                        // Per-FILE attribution (Task 2.2): the pure tracker maps the
+                        // current hash-seq child to its collection entry BY INDEX and
+                        // yields the tick to emit; `file_last` throttles the live
+                        // per-file ticks (reusing the same window as the batch tick).
+                        let mut files = ServeFileTracker::new();
+                        let mut file_last = Instant::now();
                         // Set once we flushed + signalled completion on a terminal
                         // `Completed`, so the close-time flush below never emits a
                         // stray `ServeProgress` AFTER the `ServeComplete` (which
@@ -430,7 +592,34 @@ pub(crate) fn build_router(
                                 // A new blob's transfer began: fold the PREVIOUS
                                 // blob's final offset into the running base before
                                 // this blob's offsets start counting from ~0.
-                                RequestUpdate::Started(_) => acc.on_started(),
+                                RequestUpdate::Started(t) => {
+                                    acc.on_started();
+                                    // Resolve THIS child's collection entry by its
+                                    // hash-seq index (`index-2 → entry`; 0/1 → None),
+                                    // pairing the name with the provider-reported
+                                    // blob size (`t.size`). Only for a payload
+                                    // request that resolves to one of our packages —
+                                    // otherwise no per-file entry is ever adopted, so
+                                    // the flush below can't emit for a non-payload
+                                    // request. The tracker returns the PREVIOUS
+                                    // file's terminal (100%) tick to flush.
+                                    let entry = if emit.is_some() {
+                                        file_resolver(root, t.index)
+                                            .map(|(name, _bytes)| (name, t.size))
+                                    } else {
+                                        None
+                                    };
+                                    if let (Some(pkg), Some((file, done, total))) =
+                                        (&emit, files.on_started(entry))
+                                    {
+                                        // A terminal per-file tick — emitted
+                                        // unconditionally (bypasses the throttle) so a
+                                        // file that finished inside one window still
+                                        // completes its bar.
+                                        file_last = Instant::now();
+                                        sink.route_serve_file_progress(pkg, file, done, total);
+                                    }
+                                }
                                 RequestUpdate::Progress(p) => {
                                     acc.on_progress(p.end_offset);
                                     if let Some(pkg) = &emit {
@@ -438,17 +627,34 @@ pub(crate) fn build_router(
                                             last = Instant::now();
                                             sink.route_serve_progress(pkg, acc.total());
                                         }
+                                        // Throttled live per-file tick for the current
+                                        // child (`p.end_offset` is per-blob, so it is
+                                        // this file's own offset).
+                                        if let Some((file, done, total)) =
+                                            files.on_progress(p.end_offset)
+                                        {
+                                            if file_last.elapsed() >= SERVE_PROGRESS_THROTTLE {
+                                                file_last = Instant::now();
+                                                sink.route_serve_file_progress(
+                                                    pkg, file, done, total,
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                                 // Terminal success of a payload-carrying serve: the
-                                // peer pulled everything it asked for. Flush the
-                                // final cumulative figure, then signal
+                                // peer pulled everything it asked for. Flush the LAST
+                                // file at 100% (no next `Started` to trigger it), then
+                                // the final cumulative figure, then signal
                                 // upload-complete — the "uploaded — awaiting
                                 // confirmation" stage. No byte-threshold guard: a
                                 // resume legitimately serves fewer bytes than
                                 // `byte_size`, so `Completed` alone is the signal.
                                 RequestUpdate::Completed(_) => {
                                     if let Some(pkg) = &emit {
+                                        if let Some((file, done, total)) = files.finish() {
+                                            sink.route_serve_file_progress(pkg, file, done, total);
+                                        }
                                         if acc.total() > 0 {
                                             sink.route_serve_progress(pkg, acc.total());
                                         }
@@ -457,14 +663,18 @@ pub(crate) fn build_router(
                                     completed = true;
                                 }
                                 // Failure routes nothing (a distinct event, never a
-                                // `ServeComplete`); the ack stays delivery truth.
+                                // `ServeComplete`); the ack stays delivery truth. The
+                                // current file is deliberately NOT flushed to 100% —
+                                // an aborted child did not finish.
                                 RequestUpdate::Aborted(_) => {}
                             }
                         }
                         // Close-time flush for a stream that ended WITHOUT a
                         // terminal `Completed` (a transfer shorter than one
-                        // throttle window, or an abort): surface the final tick.
-                        // Skipped after `Completed` (already flushed + completed).
+                        // throttle window, or an abort): surface the final batch
+                        // tick. Skipped after `Completed` (already flushed +
+                        // completed). No per-file 100% flush here — an incomplete
+                        // stream's last child did not finish.
                         if !completed {
                             if let Some(pkg) = &emit {
                                 if acc.total() > 0 {
@@ -648,6 +858,10 @@ impl IrohTransport {
         // consumer still drains every request-update channel (SAFETY RULE) and its
         // Direct sink drops any ServeProgress, so it resolves nothing.
         let serve_resolver: ServeRootResolver = Arc::new(|_: Hash| -> Option<PackageId> { None });
+        // The legacy single-stream transport surfaces no per-file progress either
+        // (its Direct sink drops any `ServeFileProgress`); resolve nothing.
+        let serve_file_resolver: ServeFileResolver =
+            Arc::new(|_: Hash, _: u64| -> Option<(String, u64)> { None });
         let router = build_router(
             endpoint,
             &store,
@@ -656,6 +870,7 @@ impl IrohTransport {
             Arc::new(Mutex::new(responder)),
             true,
             serve_resolver,
+            serve_file_resolver,
         );
 
         let endpoint = router.endpoint().clone();
@@ -1016,7 +1231,9 @@ impl SharingTransport for IrohTransport {
         let tag = package_tag(&pkg.package_id);
         // `None` → full package (pre-dedup). `Some(w)` → the negotiated subset:
         // only those payloads plus a manifest filtered to exactly them.
-        let hash = match want {
+        // The legacy transport surfaces no per-file progress, so the ordered
+        // entries are discarded here (only the shared node records them).
+        let (hash, _entries) = match want {
             None => blobs::import_package_collection(&self.store, src_dir, &tag).await?,
             Some(w) => blobs::import_subset_collection(&self.store, src_dir, w, &tag).await?,
         };
@@ -1225,6 +1442,29 @@ impl EventSink {
         match self {
             EventSink::Direct(_) => {}
             EventSink::Demux(demux) => demux.route_serve_complete(package_id),
+        }
+    }
+
+    /// Route a locally-generated
+    /// [`ServeFileProgress`](TransportEvent::ServeFileProgress) (Task 2.2) — the
+    /// per-file sibling of [`route_serve_progress`](Self::route_serve_progress),
+    /// fired from the provider-events consumer as it attributes a served child to
+    /// its collection entry by index. Same best-effort `try_send` semantics and the
+    /// same Direct/Demux split: the legacy single-stream transport (test-only) is a
+    /// no-op; production routes through the demux to the ack-claim owner(s) for this
+    /// `package_id`.
+    fn route_serve_file_progress(
+        &self,
+        package_id: &PackageId,
+        file: String,
+        bytes_done: u64,
+        bytes_total: u64,
+    ) {
+        match self {
+            EventSink::Direct(_) => {}
+            EventSink::Demux(demux) => {
+                demux.route_serve_file_progress(package_id, file, bytes_done, bytes_total)
+            }
         }
     }
 }

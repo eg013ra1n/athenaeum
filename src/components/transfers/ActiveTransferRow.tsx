@@ -230,7 +230,12 @@ export function ActiveTransferRow({
     row.kind === 'outbound' ? busy.has(`cancel:${row.id}`) : busy.has(`cancelin:${row.packageId ?? ''}`);
   const resendBusy = busy.has(`resend:${row.id}`);
 
-  const liveFilesForPkg = row.packageId ? liveFiles.get(row.packageId) : undefined;
+  // Live per-file bars are keyed by the packageId the transport event carries: the
+  // wire package id for an inbound fetch, but the outbound ROW id (as a string) for
+  // an outbound serve (Task 2.2) — an outbound row has no wire packageId, and the
+  // send-side `sync-file-progress` is keyed by the row id.
+  const liveKey = row.kind === 'outbound' ? String(row.id) : row.packageId;
+  const liveFilesForPkg = liveKey ? liveFiles.get(liveKey) : undefined;
 
   return (
     <>
@@ -361,7 +366,10 @@ export function ActiveTransferRow({
                   const doneBytes = live?.bytesDone ?? f.bytesDone ?? 0;
                   const totalBytes = live?.bytesTotal ?? f.bytesTotal;
                   const fileProgress = totalBytes > 0 ? Math.min(1, doneBytes / totalBytes) : 0;
-                  const showBar = row.kind === 'inbound' && f.outcome == null;
+                  // A live per-file bar shows for BOTH directions while the file has
+                  // no settled outcome and the row is still active — an outbound file
+                  // flips to its outcome chip only after the ack (Task 2.2).
+                  const showBar = f.outcome == null && !row.terminal;
                   return (
                     <li key={f.name} className="flex items-center gap-2 text-xs">
                       <span className="min-w-0 flex-1 truncate text-content-secondary" title={f.name}>

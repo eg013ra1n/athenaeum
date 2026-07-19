@@ -117,7 +117,7 @@ async fn serve(dir: &Path) -> Result<()> {
     router.endpoint().online().await;
 
     println!("Importing {} as a collection (hashing all files)...", dir.display());
-    let hash = blobs::import_package_collection(&store, dir, "pkg/validation")
+    let (hash, _entries) = blobs::import_package_collection(&store, dir, "pkg/validation")
         .await
         .context("import collection")?;
 

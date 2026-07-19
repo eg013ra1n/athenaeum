@@ -58,6 +58,9 @@ struct PkgFile {
     abs: PathBuf,
     /// Forward-slash path relative to the package root — the collection entry name.
     name: String,
+    /// Size in bytes (the served blob's size), recorded for per-file upload
+    /// attribution (Task 2.2).
+    len: u64,
 }
 
 /// Recursively list the regular files under a package dir, sorted by name so the
@@ -70,6 +73,10 @@ fn collect_files(root: &Path) -> Result<Vec<PkgFile>> {
             continue;
         }
         let abs = entry.path().to_path_buf();
+        let len = entry
+            .metadata()
+            .with_context(|| format!("stat {}", abs.display()))?
+            .len();
         let rel = abs
             .strip_prefix(root)
             .with_context(|| format!("strip prefix {}", root.display()))?;
@@ -79,7 +86,7 @@ fn collect_files(root: &Path) -> Result<Vec<PkgFile>> {
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        out.push(PkgFile { abs, name });
+        out.push(PkgFile { abs, name, len });
     }
     if out.is_empty() {
         anyhow::bail!("package dir has no files: {}", root.display());
@@ -88,11 +95,18 @@ fn collect_files(root: &Path) -> Result<Vec<PkgFile>> {
 }
 
 /// Import every file under `pkg_dir` into `store` and assemble them into a
-/// collection. Returns the collection [`Hash`] (the package `root_hash`) after
-/// pinning it under the deterministic `tag` name so it survives garbage
-/// collection and is serveable to peers — and so `release` can later delete it
-/// by that exact name.
-pub async fn import_package_collection(store: &Store, pkg_dir: &Path, tag: &str) -> Result<Hash> {
+/// collection. Returns the collection [`Hash`] (the package `root_hash`) plus the
+/// ORDERED collection entries `(rel_path, byte_size)` — in the exact order
+/// [`Collection::from_iter`] stores them (the sorted-name walk order) — so the
+/// provider-upload-events consumer (Task 2.2) can attribute a served child to its
+/// entry by hash-seq index. Pins the collection under the deterministic `tag`
+/// name so it survives garbage collection and is serveable to peers — and so
+/// `release` can later delete it by that exact name.
+pub async fn import_package_collection(
+    store: &Store,
+    pkg_dir: &Path,
+    tag: &str,
+) -> Result<(Hash, Vec<(String, u64)>)> {
     let files = collect_files(pkg_dir)?;
     let count = files.len();
 
@@ -100,6 +114,10 @@ pub async fn import_package_collection(store: &Store, pkg_dir: &Path, tag: &str)
     // so nothing it references can be collected mid-assembly.
     let mut child_tags: Vec<TempTag> = Vec::with_capacity(count);
     let mut items: Vec<(String, Hash)> = Vec::with_capacity(count);
+    // The ordered `(rel_path, size)` entries, in the SAME order they are handed to
+    // `Collection::from_iter` (== `files`' sorted-walk order) — the by-index
+    // attribution map for Task 2.2.
+    let mut entries: Vec<(String, u64)> = Vec::with_capacity(count);
     for f in &files {
         let tt = store
             .blobs()
@@ -108,6 +126,7 @@ pub async fn import_package_collection(store: &Store, pkg_dir: &Path, tag: &str)
             .await
             .with_context(|| format!("import blob {}", f.abs.display()))?;
         items.push((f.name.clone(), tt.hash()));
+        entries.push((f.name.clone(), f.len));
         child_tags.push(tt);
     }
 
@@ -118,7 +137,7 @@ pub async fn import_package_collection(store: &Store, pkg_dir: &Path, tag: &str)
         root_hash = %hash,
         "package imported as collection"
     );
-    Ok(hash)
+    Ok((hash, entries))
 }
 
 /// Assemble `items` (entry name → child blob hash) into a [`Collection`], store
@@ -170,7 +189,7 @@ pub async fn import_subset_collection(
     pkg_dir: &Path,
     want: &HashSet<String>,
     tag: &str,
-) -> Result<Hash> {
+) -> Result<(Hash, Vec<(String, u64)>)> {
     if want.is_empty() {
         anyhow::bail!(
             "import_subset_collection called with an empty want set (pkg {})",
@@ -218,22 +237,39 @@ pub async fn import_subset_collection(
 
     let mut child_tags: Vec<TempTag> = Vec::with_capacity(entries.len());
     let mut items: Vec<(String, Hash)> = Vec::with_capacity(entries.len());
+    // The ordered `(rel_path, size)` entries, in the SAME (sorted) order they are
+    // handed to `Collection::from_iter` — the by-index attribution map for the
+    // SUBSET collection (which is what the provider iterates, so its entry order,
+    // not the full manifest's, is the correct one to record; Task 2.2).
+    let mut ordered: Vec<(String, u64)> = Vec::with_capacity(entries.len());
     for (name, src) in entries {
-        let tt = match src {
-            Src::ManifestBytes(bytes) => store
-                .blobs()
-                .add_bytes(bytes)
-                .temp_tag()
-                .await
-                .context("import filtered manifest blob")?,
-            Src::Payload(abs) => store
-                .blobs()
-                .add_path(&abs)
-                .temp_tag()
-                .await
-                .with_context(|| format!("import blob {}", abs.display()))?,
+        let (tt, size) = match src {
+            Src::ManifestBytes(bytes) => {
+                let size = bytes.len() as u64;
+                let tt = store
+                    .blobs()
+                    .add_bytes(bytes)
+                    .temp_tag()
+                    .await
+                    .context("import filtered manifest blob")?;
+                (tt, size)
+            }
+            Src::Payload(abs) => {
+                let size = tokio::fs::metadata(&abs)
+                    .await
+                    .with_context(|| format!("stat {}", abs.display()))?
+                    .len();
+                let tt = store
+                    .blobs()
+                    .add_path(&abs)
+                    .temp_tag()
+                    .await
+                    .with_context(|| format!("import blob {}", abs.display()))?;
+                (tt, size)
+            }
         };
-        items.push((name, tt.hash()));
+        items.push((name.clone(), tt.hash()));
+        ordered.push((name, size));
         child_tags.push(tt);
     }
 
@@ -246,7 +282,7 @@ pub async fn import_subset_collection(
         root_hash = %hash,
         "package subset imported as collection"
     );
-    Ok(hash)
+    Ok((hash, ordered))
 }
 
 /// The blob-store tag that GC-protects an **in-flight** collection download

@@ -311,6 +311,17 @@ impl SharingTransport for LoopbackTransport {
             .await
             .with_context(|| format!("create dest dir {}", dest_dir.display()))?;
 
+        // The serving endpoint's event stream, cloned once for the synthetic
+        // per-file upload ticks (Task 2.2): the iroh provider attributes each served
+        // child to its collection entry by hash-seq index; the mock emits one
+        // deterministic `ServeFileProgress` per file, in order, mirroring that
+        // contract shape (per-file, ordered) so the sender engine's arm is exercised
+        // in-process. Best-effort (`try_send`).
+        let provider_tx = {
+            let reg = self.registry.lock().expect("registry mutex poisoned");
+            reg.get(&from).map(|inbox| inbox.event_tx.clone())
+        };
+
         let mut bytes_done: u64 = 0;
         for file in &files {
             let name = rel_to_name(&file.rel);
@@ -370,6 +381,19 @@ impl SharingTransport for LoopbackTransport {
                 }
             }
             writer.flush().await.context("flush dest")?;
+
+            // Synthetic per-file upload tick to the SERVING endpoint (Task 2.2),
+            // one per file in order — the mock's counterpart of the iroh consumer's
+            // by-index `ServeFileProgress`. Emitted BEFORE the receiver's ack so the
+            // sender sees it while the pending slot is live.
+            if let Some(tx) = &provider_tx {
+                let _ = tx.try_send(TransportEvent::ServeFileProgress {
+                    package_id: pkg.package_id.clone(),
+                    file: name.clone(),
+                    bytes_done: file.size,
+                    bytes_total: file.size,
+                });
+            }
 
             // File complete: emit the terminal per-file event unconditionally.
             sink(FetchEvent::File {

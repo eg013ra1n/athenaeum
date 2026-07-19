@@ -420,8 +420,20 @@ async fn sender_emits_coarse_progress_and_finished_events() {
     );
     // Coarse per-package stage events only, never per-byte spam. The happy path
     // is: queued → transferring → transferring(bytes) → uploaded (Task 2.1's
-    // "awaiting confirmation" tick) → confirmed = 5 discrete events.
-    assert!(evts.len() <= 5, "coarse per-package events only, got {}: {evts:?}", evts.len());
+    // "awaiting confirmation" tick) → confirmed = 5 discrete STAGE events, plus one
+    // per-file `sync-file-progress` bar PER FILE (Task 2.2) — a single-file package
+    // here, so exactly one. Assert the coarse stage events stay bounded and the
+    // per-file ticks never exceed the file count.
+    let stage_events = evts.iter().filter(|(n, _)| n != "sync-file-progress").count();
+    let file_events = evts.iter().filter(|(n, _)| n == "sync-file-progress").count();
+    assert!(
+        stage_events <= 5,
+        "coarse per-package stage events only, got {stage_events}: {evts:?}"
+    );
+    assert!(
+        file_events <= 1,
+        "one per-file bar for a single-file package, got {file_events}: {evts:?}"
+    );
     drop(evts);
 
     engine.shutdown().await;
@@ -570,6 +582,85 @@ async fn sent_upload_complete_precedes_confirmed() {
     let uploaded = &evts[uploaded_idx].1;
     assert_eq!(uploaded["bytesDone"].as_u64(), Some(expected_bytes));
     assert_eq!(uploaded["bytesTotal"].as_u64(), Some(expected_bytes));
+    drop(evts);
+
+    engine.shutdown().await;
+}
+
+/// Task 2.2: a successful loopback send surfaces per-FILE upload bars — a
+/// send-side `sync-file-progress` event PER FILE, keyed by the outbound ROW id
+/// (matching the outbound Active row key and the send-side `sync-progress`
+/// convention) with `file` a basename, each reaching its own size. The loopback
+/// mock synthesizes one `ServeFileProgress` per file (mirroring the iroh
+/// provider's per-file, by-index attribution), which the sender engine folds into
+/// `sync-file-progress`.
+#[tokio::test]
+async fn sent_per_file_upload_progress_keyed_by_row_id() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    // Two files of distinct sizes so each per-file bar's terminal is unambiguous.
+    let pkg = build_package_multi(
+        &tmp.path().join("src_files"),
+        "pf",
+        &[
+            ("uuid-f1", "one.fits", "M42", 4096),
+            ("uuid-f2", "two.fits", "M42", 8192),
+        ],
+    );
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
+    let engine = SyncEngine::spawn_with_emitter(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        Some(emitter),
+    );
+
+    let id = engine.enqueue_package(&pkg).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+
+    let evts = events.lock().unwrap();
+    let id_str = id.to_string();
+    // Every send-side `sync-file-progress` must be keyed by the outbound ROW id
+    // (`id.to_string()`), NOT any wire package id — this is what the outbound Active
+    // row keys its live-file map on.
+    let mut file_tick_count = 0;
+    for (n, p) in evts.iter() {
+        if n != "sync-file-progress" {
+            continue;
+        }
+        file_tick_count += 1;
+        assert_eq!(
+            p["packageId"].as_str(),
+            Some(id_str.as_str()),
+            "send-side sync-file-progress must be keyed by the outbound row id: {p}"
+        );
+    }
+    assert!(
+        file_tick_count > 0,
+        "at least one send-side sync-file-progress event: {evts:?}"
+    );
+    // Both files, by basename, reach their own size in a per-file tick.
+    for (file, size) in [("one.fits", 4096u64), ("two.fits", 8192u64)] {
+        let reached = evts.iter().any(|(n, p)| {
+            n == "sync-file-progress"
+                && p["file"].as_str() == Some(file)
+                && p["bytesDone"].as_u64() == Some(size)
+                && p["bytesTotal"].as_u64() == Some(size)
+        });
+        assert!(
+            reached,
+            "file {file} must reach its size ({size}) in a per-file tick: {evts:?}"
+        );
+    }
     drop(evts);
 
     engine.shutdown().await;

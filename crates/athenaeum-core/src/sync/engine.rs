@@ -63,7 +63,7 @@ use crate::sharing::SharingTransport;
 
 use super::diagnostics::{classify_send_error, ConnectClass};
 use super::models::{Direction, HistoryRow, OutboundRow, OutboundState};
-use super::receiver::{SyncFinishedEvent, SyncProgressEvent};
+use super::receiver::{SyncFileProgressEvent, SyncFinishedEvent, SyncProgressEvent};
 use super::store::SyncStore;
 use super::{node_id_hex, now_iso};
 
@@ -800,6 +800,24 @@ impl Worker {
         }
     }
 
+    /// Emit a send-side `sync-file-progress` tick for one file of a package we are
+    /// serving (Task 2.2). The direction-agnostic
+    /// [`SyncFileProgressEvent`](SyncFileProgressEvent) the receiver already emits
+    /// (`sync/receiver.rs`) is reused verbatim — `package_id` is the outbound row id
+    /// (matching the outbound Active row key), `file` a basename. No-op without a
+    /// host emitter; never logs per tick (progress is UI data, not a log).
+    fn emit_file_progress(&self, id: i64, file: String, bytes_done: u64, bytes_total: u64) {
+        if let Some(em) = &self.emitter {
+            emit_event(em.as_ref(), "sync-file-progress", &SyncFileProgressEvent {
+                package_id: id.to_string(),
+                peer_device: node_id_hex(&self.peer),
+                file,
+                bytes_done,
+                bytes_total,
+            });
+        }
+    }
+
     /// Emit the single send-side `sync-finished` event for a package (task M3).
     /// `new_count` / `duplicate_count` are the Sync Phase 3 dedup outcome — how
     /// many frames were actually sent vs. dropped as the peer's duplicates.
@@ -1388,6 +1406,18 @@ impl Worker {
                 self.on_serve_complete(package_id);
                 Ok(())
             }
+            // Per-file upload progress for a package we are serving (Task 2.2): fold
+            // it into a send-side `sync-file-progress` so the expanded outbound row
+            // shows a live per-file bar during the upload.
+            TransportEvent::ServeFileProgress {
+                package_id,
+                file,
+                bytes_done,
+                bytes_total,
+            } => {
+                self.on_serve_file_progress(package_id, file, bytes_done, bytes_total);
+                Ok(())
+            }
         }
     }
 
@@ -1443,6 +1473,35 @@ impl Worker {
             package_id = %package_id.0,
             "package upload complete; awaiting receiver confirmation"
         );
+    }
+
+    /// Turn a transport [`ServeFileProgress`](TransportEvent::ServeFileProgress)
+    /// tick into a send-side `sync-file-progress` event (Task 2.2), so the expanded
+    /// outbound row shows a live per-file bar while the peer pulls our collection.
+    /// Correlated to the pending slot by the announce carrying this `package_id`
+    /// (the same correlation [`on_serve_progress`](Self::on_serve_progress) uses),
+    /// then emitted keyed by the outbound row id — matching the outbound Active row
+    /// key and the send-side `sync-progress` convention. The transport `file` is a
+    /// forward-slash `rel_path`; it is reduced to its basename so it matches the
+    /// `TransferFileEntry.name` the expanded row lists (also a basename, api layer's
+    /// `detail_filename`). A tick for no live slot (already confirmed / terminal, or
+    /// an unknown package) is dropped at debug.
+    fn on_serve_file_progress(
+        &self,
+        package_id: PackageId,
+        file: String,
+        bytes_done: u64,
+        bytes_total: u64,
+    ) {
+        let id = self.pending.iter().find_map(|(k, p)| match &p.announce {
+            Some(a) if a.package_id == package_id => Some(*k),
+            _ => None,
+        });
+        let Some(id) = id else {
+            tracing::debug!(package_id = %package_id.0, "serve-file-progress for no pending slot; dropped");
+            return;
+        };
+        self.emit_file_progress(id, filename_of(&file), bytes_done, bytes_total);
     }
 
     /// Handle an ack: confirm the package ONLY if every receipt is non-`Rejected`

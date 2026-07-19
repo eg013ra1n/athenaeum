@@ -63,7 +63,7 @@ use crate::sync::DedupResponder;
 use super::proto::{self, Msg, OfferEntry};
 use super::{
     blobs, build_router, hex32, spawn_conn_path_diagnostics, ConnectGate, Delivery, EventSink,
-    ServeRootResolver, SharedConnectGate, SharedResponder, CONTROL_SEND_TIMEOUT,
+    ServeFileResolver, ServeRootResolver, SharedConnectGate, SharedResponder, CONTROL_SEND_TIMEOUT,
     EVENT_CHANNEL_CAPACITY, GC_INTERVAL, MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
 };
 
@@ -267,6 +267,35 @@ fn resolve_served_root_in(
     })
 }
 
+/// Resolve a served collection's `(root hash, hash-seq index)` to the collection
+/// ENTRY at that index (Task 2.2) — `index-2 → entries[index-2]`, returning its
+/// `(rel_path, byte_size)`. Indices 0 (root hash-seq blob) and 1 (iroh
+/// `CollectionMeta`) resolve `None` (they carry no payload entry). Attribution is
+/// STRICTLY by index: the root hash locates the serving tag (whose `served_files`
+/// row holds the entries in collection order — the SUBSET order for a want-subset
+/// serve, since that is what the provider iterates), then the index selects the
+/// entry, so two byte-identical files (one blob hash, two entries) each resolve to
+/// their own `rel_path`. Backs the [`ServeFileResolver`] closure the consumer
+/// holds; spawned before `Self` exists, so it works over the shared maps directly.
+fn resolve_served_file_in(
+    served: &Mutex<HashMap<String, Hash>>,
+    served_files: &Mutex<HashMap<String, Vec<(String, u64)>>>,
+    root: Hash,
+    hash_seq_index: u64,
+) -> Option<(String, u64)> {
+    // Offsets 0 (root hash-seq) and 1 (CollectionMeta) are not payload entries.
+    let entry_idx = usize::try_from(hash_seq_index.checked_sub(2)?).ok()?;
+    // Find the tag serving this root hash (the by-hash lookup is ONLY to locate
+    // the served package's entry list — the entry itself is then chosen by index).
+    let tag = {
+        let map = served.lock().expect("served mutex poisoned");
+        map.iter()
+            .find_map(|(tag, h)| (*h == root).then(|| tag.clone()))
+    }?;
+    let files = served_files.lock().expect("served_files mutex poisoned");
+    files.get(&tag).and_then(|entries| entries.get(entry_idx).cloned())
+}
+
 /// Per-`(peer, package)` ack-claim + single Recv-consumer router (Task 2, Д4).
 ///
 /// The shared node owns ONE inbound event stream (the control-protocol accept
@@ -360,12 +389,15 @@ impl EventDemux {
                 | TransportEvent::ProjectRequestReceived { .. } => {
                     inner.recv.as_ref().map(|(_, tx)| tx.clone())
                 }
-                // ServeProgress / ServeComplete originate on OUR endpoint (the
-                // provider-events consumer), never arrive as a decoded inbound
-                // control message, and are routed via `route_serve_progress` /
-                // `route_serve_complete` — not this path. Treat a stray one
-                // defensively as an orphan (no consumer, no delivery ack).
-                TransportEvent::ServeProgress { .. } | TransportEvent::ServeComplete { .. } => None,
+                // ServeProgress / ServeComplete / ServeFileProgress originate on OUR
+                // endpoint (the provider-events consumer), never arrive as a decoded
+                // inbound control message, and are routed via `route_serve_progress`
+                // / `route_serve_complete` / `route_serve_file_progress` — not this
+                // path. Treat a stray one defensively as an orphan (no consumer, no
+                // delivery ack).
+                TransportEvent::ServeProgress { .. }
+                | TransportEvent::ServeComplete { .. }
+                | TransportEvent::ServeFileProgress { .. } => None,
             }
         };
         match target {
@@ -460,6 +492,41 @@ impl EventDemux {
             }
         }
     }
+
+    /// Route a locally-generated
+    /// [`ServeFileProgress`](TransportEvent::ServeFileProgress) (Task 2.2) to the
+    /// sender handle(s) that announced this package — the per-file sibling of
+    /// [`route_serve_progress`](Self::route_serve_progress), matched by
+    /// `package_id` across the live ack claims. Non-blocking (`try_send`): a full
+    /// channel drops it, and a package with no live claim is silently ignored —
+    /// per-file progress is best-effort UI data.
+    ///
+    /// Same keyed-on-`package_id`-only cross-destination caveat as
+    /// [`route_serve_progress`](Self::route_serve_progress): a package fanned out to
+    /// N peers (N same-`package_id` claims) delivers this SAME per-file tick to
+    /// every one of them — a benign over-report, never a misroute (each claim still
+    /// only ever sees its own transfer's real acks). Precise per-destination
+    /// attribution needs the provider event's `connection_id`, not threaded through
+    /// today.
+    pub(crate) fn route_serve_file_progress(
+        &self,
+        package_id: &PackageId,
+        file: String,
+        bytes_done: u64,
+        bytes_total: u64,
+    ) {
+        let inner = self.inner.lock().expect("demux mutex poisoned");
+        for ((_, pid), (_, tx)) in inner.claims.iter() {
+            if pid == package_id {
+                let _ = tx.try_send(TransportEvent::ServeFileProgress {
+                    package_id: package_id.clone(),
+                    file: file.clone(),
+                    bytes_done,
+                    bytes_total,
+                });
+            }
+        }
+    }
 }
 
 /// The inbound-event variant an orphan warn names, plus the peer it came from.
@@ -472,6 +539,7 @@ fn event_kind_and_peer(event: &TransportEvent) -> (&'static str, NodeId) {
         // Locally-originated (no peer); never reach the inbound orphan path.
         TransportEvent::ServeProgress { .. } => ("serve_progress", [0u8; 32]),
         TransportEvent::ServeComplete { .. } => ("serve_complete", [0u8; 32]),
+        TransportEvent::ServeFileProgress { .. } => ("serve_file_progress", [0u8; 32]),
     }
 }
 
@@ -641,6 +709,14 @@ pub struct SharedIrohNode {
     /// the provider-upload-events consumer's [`ServeRootResolver`] (Task 13) can
     /// share it — the consumer is spawned at router build, before `Self` exists.
     served: Arc<Mutex<HashMap<String, Hash>>>,
+    /// Prefixed package tag (`<role>/pkg/<id>`) → the served collection's ORDERED
+    /// entries `(rel_path, byte_size)` (Task 2.2), in the exact order the provider
+    /// iterates the hash-seq (collection order — the SUBSET order for a want-subset
+    /// serve). Keyed identically to [`served`](Self::served) and set/cleared in the
+    /// same `role_serve` / `role_release` steps, so the two never drift. Behind an
+    /// `Arc` for the same reason as `served`: the consumer's [`ServeFileResolver`]
+    /// shares it, and is spawned at router build before `Self` exists.
+    served_files: Arc<Mutex<HashMap<String, Vec<(String, u64)>>>>,
     /// Per-`(peer, package)` ack-claim + Recv-consumer router (Task 2, Д4). Owns
     /// the fan-out of the node's single inbound event stream; cloned into the
     /// control-protocol handler (as [`EventSink::Demux`]) and consulted by every
@@ -826,9 +902,21 @@ impl SharedIrohNode {
         // package id. Created here — before `Self` — and shared into both the
         // resolver and the struct field below.
         let served: Arc<Mutex<HashMap<String, Hash>>> = Arc::new(Mutex::new(HashMap::new()));
+        // Ordered per-package collection entries for per-file attribution (Task
+        // 2.2); shared into the file resolver the same way `served` is into the
+        // root resolver.
+        let served_files: Arc<Mutex<HashMap<String, Vec<(String, u64)>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let serve_resolver: ServeRootResolver = {
             let served = Arc::clone(&served);
             Arc::new(move |hash| resolve_served_root_in(&served, hash))
+        };
+        let serve_file_resolver: ServeFileResolver = {
+            let served = Arc::clone(&served);
+            let served_files = Arc::clone(&served_files);
+            Arc::new(move |root, index| {
+                resolve_served_file_in(&served, &served_files, root, index)
+            })
         };
         // Shared node: `EventSink::Demux` (inbound events fan out through the demux,
         // Task 2/Д4, not a single shared stream), and `flush_store_on_shutdown:
@@ -843,6 +931,7 @@ impl SharedIrohNode {
             Arc::clone(&responder),
             false,
             serve_resolver,
+            serve_file_resolver,
         );
 
         let endpoint = router.endpoint().clone();
@@ -879,6 +968,7 @@ impl SharedIrohNode {
             peers: Mutex::new(HashMap::new()),
             lookup,
             served,
+            served_files,
             demux,
             active_ops: AtomicU64::new(0),
             rebuild_count: AtomicU64::new(0),
@@ -1420,6 +1510,15 @@ impl SharedIrohNode {
             let served = Arc::clone(&self.served);
             Arc::new(move |hash| resolve_served_root_in(&served, hash))
         };
+        // The per-file resolver captures the SAME (preserved) served + served_files
+        // maps, so the new consumer attributes identically after the rebuild.
+        let serve_file_resolver: ServeFileResolver = {
+            let served = Arc::clone(&self.served);
+            let served_files = Arc::clone(&self.served_files);
+            Arc::new(move |root, index| {
+                resolve_served_file_in(&served, &served_files, root, index)
+            })
+        };
         let router = build_router(
             endpoint,
             &self.store,
@@ -1428,6 +1527,7 @@ impl SharedIrohNode {
             Arc::clone(&self.responder),
             false,
             serve_resolver,
+            serve_file_resolver,
         );
         let endpoint = router.endpoint().clone();
         let new_node_id: NodeId = *endpoint.id().as_bytes();
@@ -1834,14 +1934,21 @@ impl SharedIrohNode {
     ) -> Result<()> {
         let _op = self.op_guard();
         let tag = role_package_tag(role.prefix(), &pkg.package_id);
-        let hash = match want {
+        // The import returns the collection hash PLUS the ordered `(rel_path, size)`
+        // entries in provider-iteration order — recorded in `served_files` for
+        // per-file upload attribution by hash-seq index (Task 2.2).
+        let (hash, entries) = match want {
             None => blobs::import_package_collection(&self.store, src_dir, &tag).await?,
             Some(w) => blobs::import_subset_collection(&self.store, src_dir, w, &tag).await?,
         };
         self.served
             .lock()
             .expect("served mutex poisoned")
-            .insert(tag, hash);
+            .insert(tag.clone(), hash);
+        self.served_files
+            .lock()
+            .expect("served_files mutex poisoned")
+            .insert(tag, entries);
         tracing::debug!(
             package_id = %pkg.package_id.0,
             root_hash = %hash,
@@ -1855,6 +1962,12 @@ impl SharedIrohNode {
     async fn role_release(&self, role: Role, package_id: &PackageId) -> Result<()> {
         let tag = role_package_tag(role.prefix(), package_id);
         self.served.lock().expect("served mutex poisoned").remove(&tag);
+        // Drop the per-file attribution entries in lock-step with `served` (Task
+        // 2.2) so the two maps never drift.
+        self.served_files
+            .lock()
+            .expect("served_files mutex poisoned")
+            .remove(&tag);
         let removed = self
             .store
             .tags()
@@ -2592,10 +2705,12 @@ mod tests {
                 Ok(Some(TransportEvent::ServeProgress { bytes_sent, .. })) => {
                     peak = peak.max(bytes_sent);
                 }
-                // The terminal `ServeComplete` (Task 2.1) rides the same channel
-                // after the final progress flush — skip it, don't treat it as an
-                // early break, so a timing quirk can't truncate the poll.
-                Ok(Some(TransportEvent::ServeComplete { .. })) => continue,
+                // The terminal `ServeComplete` (Task 2.1) and the per-file
+                // `ServeFileProgress` ticks (Task 2.2) ride the same channel
+                // interleaved with the batch progress — skip them, don't treat one
+                // as an early break, so a timing quirk can't truncate the poll.
+                Ok(Some(TransportEvent::ServeComplete { .. }))
+                | Ok(Some(TransportEvent::ServeFileProgress { .. })) => continue,
                 Ok(Some(_)) | Ok(None) => break,
                 Err(_) => break, // overall deadline elapsed
             }
@@ -2722,6 +2837,134 @@ mod tests {
             )),
             "ServeComplete must carry the served package id"
         );
+
+        s.shutdown().await;
+        r.shutdown().await;
+    }
+
+    /// A three-frame package with TWO BYTE-IDENTICAL files (Task 2.2 duplicate-hash
+    /// attribution test): `a.fits` and `c.fits` carry identical content — so they
+    /// share ONE blob hash — while `b.fits` differs. In the sorted collection they
+    /// occupy distinct hash-seq indices (a → offset 2, b → 3, c → 4), so per-file
+    /// upload attribution must resolve each to its OWN rel_path BY INDEX, never
+    /// collapse the two onto one by their shared hash. Returns
+    /// `(pkg_dir, announce, [(rel_path, size); 3])`.
+    fn build_three_frame_dup_package(
+        base: &Path,
+    ) -> (PathBuf, PackageAnnounce, Vec<(String, u64)>) {
+        let src = base.join("src3");
+        std::fs::create_dir_all(&src).unwrap();
+        // a.fits and c.fits are byte-identical (⇒ one shared blob hash); b differs.
+        let dup: Vec<u8> = (0..16 * 1024).map(|j| (j % 251) as u8).collect();
+        let mid: Vec<u8> = (0..32 * 1024).map(|j| ((j + 7) % 251) as u8).collect();
+        let specs: [(&str, &Vec<u8>); 3] = [("a.fits", &dup), ("b.fits", &mid), ("c.fits", &dup)];
+        let mut records = Vec::new();
+        let mut expected = Vec::new();
+        for (i, (name, bytes)) in specs.into_iter().enumerate() {
+            let payload = src.join(name);
+            std::fs::write(&payload, bytes).unwrap();
+            let byte_size = std::fs::metadata(&payload).unwrap().len();
+            let xxh3 = crate::package::xxh3_full_file(&payload).unwrap();
+            records.push((
+                payload,
+                ManifestRecord {
+                    v: MANIFEST_VERSION,
+                    frame_uuid: format!("uuid-dup-{i}"),
+                    origin_catalog_uuid: "catalog-uuid".to_string(),
+                    origin_device: "origin-device".to_string(),
+                    payload_kind: PayloadKind::RawFrame,
+                    rel_path: name.to_string(),
+                    byte_size,
+                    xxh3,
+                    frame_meta: serde_json::json!({ "object": "M42" }),
+                    analysis: None,
+                    app_version: "test".to_string(),
+                    project: None,
+                },
+            ));
+            expected.push((name.to_string(), byte_size));
+        }
+        let pkg_dir = base.join("pkg3");
+        let announce = write_package(&pkg_dir, records).unwrap();
+        (pkg_dir, announce, expected)
+    }
+
+    // Task 2.2: per-FILE upload attribution over a REAL iroh transfer. A 3-file
+    // package with two byte-identical files (`a.fits` == `c.fits`, ONE shared blob
+    // hash) must still produce a per-file `ServeFileProgress` bar for ALL THREE
+    // rel_paths, each ending at its own size — because attribution is by hash-seq
+    // INDEX, never by hash (which would collapse the two duplicates onto one). Two
+    // real `SharedIrohNode`s, relay off; exercises the real provider-events stream
+    // + the `ServeFileResolver`/`ServeFileTracker` wired into `build_router`.
+    #[tokio::test]
+    async fn per_file_upload_progress_attributes_by_index_incl_duplicate_hash() {
+        let ds = tempdir().unwrap();
+        let dr = tempdir().unwrap();
+        let s = bind_disabled(ds.path()).await;
+        let r = bind_disabled(dr.path()).await;
+
+        let out = s.handle(Role::Out);
+        let recv = r.handle(Role::Recv);
+        let s_info = out.start().await.unwrap();
+        let r_info = recv.start().await.unwrap();
+        pair(&s, &s_info, &r, &r_info);
+
+        let (pkg_dir, announce, expected) = build_three_frame_dup_package(ds.path());
+        out.serve(&announce, &pkg_dir, None).await.unwrap();
+
+        // Register consumers BEFORE announcing so the ack-claim channel exists for
+        // route_serve_file_progress to target.
+        let mut out_events = out.events().await;
+        let mut r_ev = recv.events().await;
+        out.announce(r_info.node_id, &announce).await.unwrap();
+        let wire = match recv_next(&mut r_ev).await {
+            TransportEvent::AnnounceReceived { announce, .. } => announce,
+            other => panic!("expected AnnounceReceived, got {other:?}"),
+        };
+
+        let dest = tempdir().unwrap();
+        recv.fetch(s_info.node_id, &wire, dest.path(), crate::sharing::noop_fetch_sink())
+            .await
+            .unwrap();
+
+        // Drain the provider's per-file ticks after the pull settles.
+        let evs = collect_until_quiet(
+            &mut out_events,
+            Duration::from_millis(1500),
+            Duration::from_secs(10),
+        )
+        .await;
+
+        // Every one of the three files (INCLUDING both duplicate-hash entries) must
+        // get a per-file bar reaching its own size, each carrying bytes_total ==
+        // that file's size — the two duplicates each attributed to their OWN
+        // rel_path by index, never collapsed onto one.
+        for (rel, size) in &expected {
+            let peak = evs
+                .iter()
+                .filter_map(|e| match e {
+                    TransportEvent::ServeFileProgress {
+                        package_id,
+                        file,
+                        bytes_done,
+                        bytes_total,
+                    } if *package_id == announce.package_id && file == rel => {
+                        assert_eq!(
+                            *bytes_total, *size,
+                            "bytes_total for {rel} must equal its size"
+                        );
+                        Some(*bytes_done)
+                    }
+                    _ => None,
+                })
+                .max();
+            assert_eq!(
+                peak,
+                Some(*size),
+                "file {rel} must get a per-file ServeFileProgress bar ending at its size ({size}); \
+                 got events {evs:?}"
+            );
+        }
 
         s.shutdown().await;
         r.shutdown().await;

@@ -122,6 +122,25 @@ pub enum TransportEvent {
     /// payload request (a resume) produces fresh `ServeProgress` ticks that flip
     /// the stage back to `transferring`, self-correcting.
     ServeComplete { package_id: PackageId },
+    /// Per-FILE upload progress for a package WE are serving (Task 2.2): the iroh
+    /// provider-upload-events consumer attributes one payload GET's per-child
+    /// transfer to a specific collection ENTRY **by hash-seq index** (offset ≥ 2 →
+    /// entry `index-2`; never by hash — two byte-identical files share one blob
+    /// hash but occupy distinct collection entries, so only the index
+    /// disambiguates them), or the loopback mock emits one synthetic tick per
+    /// file. Like [`ServeProgress`](Self::ServeProgress) /
+    /// [`ServeComplete`](Self::ServeComplete) it originates LOCALLY — on OUR
+    /// endpoint, never from a peer control message — so it carries no `from`.
+    /// `file` is the entry's forward-slash `rel_path`; the sender engine reduces it
+    /// to a basename and emits a send-side `sync-file-progress` keyed by the
+    /// outbound row id. Best-effort UI data (progress, never a log or delivery
+    /// truth).
+    ServeFileProgress {
+        package_id: PackageId,
+        file: String,
+        bytes_done: u64,
+        bytes_total: u64,
+    },
 }
 
 /// Live progress of a fetch, delivered on the [`FetchSink`] callback threaded
