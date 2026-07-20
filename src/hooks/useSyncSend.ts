@@ -50,6 +50,15 @@ export interface SendResult {
   error?: string;
 }
 
+/** Optional per-send naming/context (Transfers Status Model v2, §D1). A blank
+ *  `batchName` is omitted so the backend auto-names (frame-set name / common-dir
+ *  basename / "N files — date"); `frameSetId` enables the WBPP rel_path layout
+ *  server-side for an Object-page send. */
+export interface SendOptions {
+  batchName?: string | null;
+  frameSetId?: number | null;
+}
+
 export interface UseSyncSend {
   /** An enqueue fan-out is in flight. */
   sending: boolean;
@@ -58,9 +67,9 @@ export interface UseSyncSend {
    * destination per call, so we loop it, catching each destination independently
    * — a per-destination failure is returned as `{ deviceId, error }` and does NOT
    * abort the other destinations. Returns the per-destination results; the caller
-   * aggregates + notifies.
+   * aggregates + notifies. `opts` carries the optional batch name + frame-set id.
    */
-  sendSelection: (frameIds: number[], deviceIds: string[]) => Promise<SendResult[]>;
+  sendSelection: (frameIds: number[], deviceIds: string[], opts?: SendOptions) => Promise<SendResult[]>;
 }
 
 export function useSyncSend(): UseSyncSend {
@@ -75,8 +84,12 @@ export function useSyncSend(): UseSyncSend {
   }, []);
 
   const sendSelection = useCallback(
-    async (frameIds: number[], deviceIds: string[]): Promise<SendResult[]> => {
+    async (frameIds: number[], deviceIds: string[], opts?: SendOptions): Promise<SendResult[]> => {
       if (frameIds.length === 0 || deviceIds.length === 0) return [];
+      // Blank/whitespace name → omit so the backend auto-names (§D1).
+      const trimmed = opts?.batchName?.trim();
+      const batchName = trimmed ? trimmed : null;
+      const frameSetId = opts?.frameSetId ?? null;
       setSending(true);
       try {
         // Fan out in parallel, each destination independently caught so one
@@ -87,6 +100,8 @@ export function useSyncSend(): UseSyncSend {
               const result = await api.invoke<EnqueueSelectionResult>('enqueue_sync_selection', {
                 frameIds,
                 destinationDeviceId: deviceId,
+                batchName,
+                frameSetId,
               });
               return { deviceId, result };
             } catch (err) {

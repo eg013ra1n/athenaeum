@@ -31,6 +31,18 @@ interface SendToNodeDialogProps {
   open: boolean;
   /** Close the modal (also called after a successful send). */
   onClose: () => void;
+  /**
+   * Pre-fill for the editable "Transfer name" field (§D1). Object sends pass the
+   * frame-set name; the browser passes the selection's common folder name; blank
+   * → the field starts empty and the backend auto-names.
+   */
+  defaultBatchName?: string;
+  /**
+   * The originating frame set, when the caller has one (Object entry point). Sent
+   * to the backend to enable the WBPP rel_path layout server-side. `null`/absent
+   * for a browser selection (source-relative layout instead).
+   */
+  frameSetId?: number | null;
 }
 
 /** Explanatory empty state — signed out, or no eligible peers on the account. */
@@ -42,7 +54,13 @@ function EmptyState({ message }: { message: string }) {
   );
 }
 
-export function SendToNodeDialog({ frameIds, open, onClose }: SendToNodeDialogProps) {
+export function SendToNodeDialog({
+  frameIds,
+  open,
+  onClose,
+  defaultBatchName,
+  frameSetId,
+}: SendToNodeDialogProps) {
   const { notify } = useNotifications();
   const { sending, sendSelection } = useSyncSend();
 
@@ -51,6 +69,13 @@ export function SendToNodeDialog({ frameIds, open, onClose }: SendToNodeDialogPr
   const [signedIn, setSignedIn] = useState(false);
   const [candidates, setCandidates] = useState<AccountDevice[]>([]);
   const [checked, setChecked] = useState<Set<string>>(new Set());
+  const [batchName, setBatchName] = useState('');
+
+  // Reset the editable name to the caller's suggestion each open (§D1). Blank
+  // when no suggestion → the backend auto-names.
+  useEffect(() => {
+    if (open) setBatchName(defaultBatchName ?? '');
+  }, [open, defaultBatchName]);
 
   // Resolve destinations each time the dialog opens. StrictMode double-mounts in
   // dev, so guard the async resolve with a cancelled flag.
@@ -109,7 +134,10 @@ export function SendToNodeDialog({ frameIds, open, onClose }: SendToNodeDialogPr
     const checkedIds = [...checked];
     if (checkedIds.length === 0 || frameIds.length === 0 || sending) return;
 
-    const results = await sendSelection(frameIds, checkedIds);
+    const results = await sendSelection(frameIds, checkedIds, {
+      batchName,
+      frameSetId: frameSetId ?? null,
+    });
 
     // --- Aggregate the per-destination outcomes into one honest notification. ---
     const total = frameIds.length;
@@ -236,6 +264,19 @@ export function SendToNodeDialog({ frameIds, open, onClose }: SendToNodeDialogPr
                 );
               })}
             </div>
+
+            {/* Transfer name (§D1) — pre-filled, editable; blank sends omit it
+                so the backend auto-names the batch. */}
+            <label className="mb-3 block">
+              <span className="mb-1 block text-xs text-content-muted">Transfer name</span>
+              <input
+                type="text"
+                value={batchName}
+                onChange={(e) => setBatchName(e.target.value)}
+                placeholder="Auto-named if left blank"
+                className="w-full rounded border border-border bg-surface px-2 py-1.5 text-sm text-content placeholder:text-content-muted focus:border-accent focus:outline-none"
+              />
+            </label>
           </>
         )}
 

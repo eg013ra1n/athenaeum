@@ -359,6 +359,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
    *  guards against a double-invoke while the async resolve is in flight. */
   const [sendOpen, setSendOpen] = useState(false);
   const [sendFrameIds, setSendFrameIds] = useState<number[]>([]);
+  const [sendBatchName, setSendBatchName] = useState('');
   const [sendResolving, setSendResolving] = useState(false);
   const refreshTokenRef = useRef(0);
   /** Per-pane generation counter for in-flight directory loads. Each call to
@@ -885,6 +886,9 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
         return;
       }
       setSendFrameIds(frameIds);
+      // Suggest the selection's common folder name as the batch name (§D1); the
+      // dialog lets the user edit it, and a blank auto-names server-side.
+      setSendBatchName(commonFolderName(paths));
       setSendOpen(true);
     } catch (e) {
       console.error('resolve_frame_ids_for_paths failed:', e);
@@ -1448,6 +1452,7 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
         frameIds={sendFrameIds}
         open={sendOpen}
         onClose={() => setSendOpen(false)}
+        defaultBatchName={sendBatchName}
       />
     </div>
   );
@@ -1458,6 +1463,17 @@ export default function DualPaneFileBrowser({ scanRoots, reveal, leftCameraFilte
 /** Renders the first few item basenames inline ("foo.fit, bar.fit, baz.fit
  *  and 12 more"). Helps the user verify they selected the right things
  *  before confirming a move/delete. */
+/** Suggest a batch name from a file/folder selection (§D1): a single item → its
+ *  basename; multiple items sharing one parent dir → that dir's basename;
+ *  otherwise blank so the backend auto-names. Editable in the send dialog. */
+function commonFolderName(paths: string[]): string {
+  if (paths.length === 0) return '';
+  if (paths.length === 1) return getBasename(paths[0]);
+  const parents = paths.map(getParentPath);
+  const allSame = parents.every((p) => p === parents[0]);
+  return allSame ? getBasename(parents[0]) : '';
+}
+
 function ItemNameList({ paths, max = 3 }: { paths: string[]; max?: number }) {
   if (paths.length === 0) return null;
   const names = paths.slice(0, max).map(getBasename);

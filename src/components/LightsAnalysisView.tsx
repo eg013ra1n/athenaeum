@@ -944,6 +944,8 @@ export function LightsAnalysisView({ hierarchy, frameSetId, frameSetName, blackh
         frameIds={[...selectedFrameIds]}
         open={sendOpen}
         onClose={() => setSendOpen(false)}
+        defaultBatchName={frameSetName}
+        frameSetId={frameSetId}
       />
     </div>
   );
