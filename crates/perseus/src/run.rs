@@ -1309,6 +1309,9 @@ fn build_retention_history_rows(
             project: None,
             // No per-batch detail surface on the Perseus agent (Task 14).
             package_id: None,
+            // Batch naming (Transfers Status Model v2) is app-only; the agent
+            // never names its capture batches.
+            batch_name: None,
         }];
     }
 
@@ -1336,6 +1339,8 @@ fn build_retention_history_rows(
                 project: None,
                 // No per-batch detail surface on the Perseus agent (Task 14).
                 package_id: None,
+                // Batch naming (Transfers Status Model v2) is app-only.
+                batch_name: None,
             }
         })
         .collect()

@@ -182,6 +182,12 @@ pub struct InboundRow {
     pub created_at: String,
     /// Stamped when the row reaches a terminal state, else `None`.
     pub finished_at: Option<String>,
+    /// Human batch name carried in the v2 announce manifest (Transfers Status
+    /// Model v2, §D1). `None` for a v1 announce (no name on the wire) or a legacy
+    /// row created before this column. The receiver shows this instead of the raw
+    /// `package_id`; written by the receiver at announce time.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 /// Direction of a transfer recorded in [`HistoryRow`]. This sender-side task
@@ -255,6 +261,13 @@ pub struct OutboundRow {
     /// from stale receiver receipts.
     #[serde(default)]
     pub wire_package_id: Option<String>,
+    /// Human batch name for this send (Transfers Status Model v2, §D1) — an
+    /// auto-derived-then-editable label (frame-set name / common root dir / `N
+    /// files — <ts>`) that travels in the v2 announce manifest so both sides show
+    /// the same name. `None` for a legacy row created before this column; the send
+    /// path fills it. The raw UUIDs appear only in the Details tab.
+    #[serde(default)]
+    pub display_name: Option<String>,
 }
 
 /// One row of `sync_history`: an append-only audit entry for a per-frame
@@ -293,6 +306,13 @@ pub struct HistoryRow {
     /// `None`.
     #[serde(default)]
     pub package_id: Option<String>,
+    /// The human batch name this transfer belonged to (Transfers Status Model v2,
+    /// §D1) — mirrors [`OutboundRow::display_name`] / [`InboundRow::display_name`]
+    /// so the transfer log can show the named batch without re-joining the live
+    /// row. `None` for legacy rows and for callers that do not yet supply it
+    /// (later tasks fill it).
+    #[serde(default)]
+    pub batch_name: Option<String>,
 }
 
 /// Minimal query surface for [`SyncStore::search_history`](super::store::SyncStore::search_history).
@@ -318,4 +338,164 @@ pub struct HistoryQuery {
     /// scopes a package's per-frame rows by [`HistoryRow::package_id`].
     pub package_id: Option<String>,
     pub limit: u32,
+}
+
+// ── Transfers Status Model v2: per-file rows + event-log rows ────────────────
+//
+// The DB-side cousins of the wire manifest ([`AnnounceFileEntry`](crate::sharing::types::AnnounceFileEntry)):
+// one persisted row per file per batch on each side, so per-file status survives
+// restart/resume (spec §D4), plus a capped per-batch event journal (§D7). DDL +
+// CRUD live in [`super::store`]; text encodings go through the explicit
+// `as_str`/`from_db` helpers, not serde.
+
+/// Sender-side lifecycle of one file within an outbound batch (`sync_outbound_files`,
+/// §D4). Mirrors [`OutboundState`]'s `as_str`/`from_db` shape: a file walks
+/// `Pending → Sending → Uploaded → Done`. `Uploaded` means "the sender finished
+/// serving this file's bytes"; `Done` means the batch ack recorded the receiver's
+/// per-frame verdict for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum OutboundFileState {
+    /// Persisted at build time; not yet served.
+    Pending,
+    /// Bytes are being served to the peer (live `bytes_done` updates here).
+    Sending,
+    /// The sender finished serving this file's bytes; awaiting the batch ack.
+    Uploaded,
+    /// The batch ack recorded this file's per-frame receipt — terminal.
+    Done,
+}
+
+impl OutboundFileState {
+    /// Stable lowercase text stored in the `state` column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OutboundFileState::Pending => "pending",
+            OutboundFileState::Sending => "sending",
+            OutboundFileState::Uploaded => "uploaded",
+            OutboundFileState::Done => "done",
+        }
+    }
+
+    /// Parse the `state` column text. Errors on an unknown value rather than
+    /// silently coercing.
+    pub fn from_db(s: &str) -> Result<Self> {
+        Ok(match s {
+            "pending" => OutboundFileState::Pending,
+            "sending" => OutboundFileState::Sending,
+            "uploaded" => OutboundFileState::Uploaded,
+            "done" => OutboundFileState::Done,
+            other => return Err(anyhow!("unknown outbound file state: {other}")),
+        })
+    }
+}
+
+/// Receiver-side lifecycle of one file within an inbound batch (`sync_inbound_files`,
+/// §D4). Mirrors [`InboundState`]'s `as_str`/`from_db` shape: a file walks
+/// `Announced → Fetching → Done`, or lands `Failed` when its fetch/ingest fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub enum InboundFileState {
+    /// Advertised in the announce manifest; not yet fetched.
+    Announced,
+    /// Pulling this file's bytes (live `bytes_done` updates here).
+    Fetching,
+    /// Fetched + ingested — terminal success.
+    Done,
+    /// The fetch or ingest of this file failed — terminal failure (the batch as a
+    /// whole never fails; a per-file failure is recorded here).
+    Failed,
+}
+
+impl InboundFileState {
+    /// Stable lowercase text stored in the `state` column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InboundFileState::Announced => "announced",
+            InboundFileState::Fetching => "fetching",
+            InboundFileState::Done => "done",
+            InboundFileState::Failed => "failed",
+        }
+    }
+
+    /// Parse the `state` column text. Errors on an unknown value rather than
+    /// silently coercing.
+    pub fn from_db(s: &str) -> Result<Self> {
+        Ok(match s {
+            "announced" => InboundFileState::Announced,
+            "fetching" => InboundFileState::Fetching,
+            "done" => InboundFileState::Done,
+            "failed" => InboundFileState::Failed,
+            other => return Err(anyhow!("unknown inbound file state: {other}")),
+        })
+    }
+}
+
+/// One row of `sync_outbound_files`: the durable per-file state of a file within
+/// an outbound batch (§D4). Keyed uniquely on `(outbound_id, rel_path)`.
+/// `bytes_done` is checkpointed on state transitions and serve ticks; `outcome`
+/// carries the receiver's per-frame verdict text (same encoding as
+/// [`sync_receipts`](super::store::DDL_RECEIPTS)) once the ack lands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboundFileRow {
+    /// Parent `sync_outbound.id`.
+    pub outbound_id: i64,
+    /// Path of this file relative to the batch root (structured per §D2).
+    pub rel_path: String,
+    pub byte_size: u64,
+    pub frame_uuid: String,
+    pub state: OutboundFileState,
+    /// Cumulative bytes served so far (0 until the serve stage reports progress).
+    pub bytes_done: u64,
+    /// The receiver's per-frame verdict text once the ack lands, else `None`.
+    pub outcome: Option<String>,
+    /// A per-file error detail when this file's send fails, else `None`.
+    pub error: Option<String>,
+    pub updated_at: String,
+}
+
+/// One row of `sync_inbound_files`: the durable per-file state of a file within
+/// an inbound batch (§D4). Keyed uniquely on `(inbound_id, rel_path)`; created at
+/// announce time from the v2 manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboundFileRow {
+    /// Parent `sync_inbound.id`.
+    pub inbound_id: i64,
+    /// Path of this file relative to the batch root (from the announce manifest).
+    pub rel_path: String,
+    pub byte_size: u64,
+    pub frame_uuid: String,
+    pub state: InboundFileState,
+    /// Cumulative bytes fetched so far (0 until the fetch stage reports progress).
+    pub bytes_done: u64,
+    /// The local ingest verdict text once known, else `None`.
+    pub outcome: Option<String>,
+    /// A per-file error detail when this file's fetch/ingest fails, else `None`.
+    pub error: Option<String>,
+    pub updated_at: String,
+}
+
+/// One row of `sync_events`: a single timestamped entry in a batch's event
+/// journal (§D7 — the detail pane's **Log** tab). The `(direction, batch_key)`
+/// pair scopes a journal to one batch on one side; the table keeps only the
+/// newest ~200 rows per pair (see [`append_sync_event`](super::store::append_sync_event)).
+/// `batch_key` is not carried on the struct — it is the query scope, not per-row
+/// data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncEventRow {
+    pub id: i64,
+    /// Which half of the transfer this journal belongs to
+    /// ([`Sent`](Direction::Sent) / [`Received`](Direction::Received)).
+    pub direction: Direction,
+    /// RFC3339 UTC timestamp (rendered like the other sync columns).
+    pub ts: String,
+    /// Short snake_case event kind (`announce_sent`, `dial_failed`,
+    /// `retry_scheduled`, `serve_start`, `uploaded`, `ack_received`,
+    /// `fetch_start`, `fetch_done`, `ingest_done`, `cancel`, `reject`, …).
+    pub kind: String,
+    /// Optional human detail (e.g. a class-tagged error). `None` for a bare event.
+    pub detail: Option<String>,
 }

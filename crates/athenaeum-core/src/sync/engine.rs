@@ -2011,6 +2011,7 @@ impl Worker {
                 outcome: "sent".to_string(),
                 project: project_of(r),
                 package_id: package_key.clone(),
+                batch_name: None,
             })?;
         }
         tracing::debug!(package_id = id, count = records.len(), "sync history: transfer started");
@@ -2046,6 +2047,7 @@ impl Worker {
                 outcome: receipt_outcome_str(&rec.outcome),
                 project,
                 package_id: package_key.clone(),
+                batch_name: None,
             })?;
         }
         Ok(())
@@ -2098,6 +2100,7 @@ impl Worker {
                 outcome: outcome.to_string(),
                 project: project_of(r),
                 package_id: package_key.clone(),
+                batch_name: None,
             })?;
         }
         Ok(())

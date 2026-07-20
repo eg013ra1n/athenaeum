@@ -17,17 +17,18 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::sharing::types::{FrameReceipt, NodeId, PackageId, ReceiptOutcome};
 
 use super::models::{
-    Direction, HistoryQuery, HistoryRow, InboundRow, InboundState, OutboundRow, OutboundState,
+    Direction, HistoryQuery, HistoryRow, InboundFileRow, InboundFileState, InboundRow,
+    InboundState, OutboundFileRow, OutboundFileState, OutboundRow, OutboundState, SyncEventRow,
 };
 use super::{node_id_from_hex, node_id_hex, now_iso};
 
 /// `sync_outbound` — the durable outbound state machine, one row per package.
 ///
-/// The trailing `last_error` (Task 9), `next_retry_at` (Task 2) and
-/// `wire_package_id` (zombie-inbound fix) columns are created inline for a fresh
-/// DB; an existing table without them is migrated in place by
-/// [`ensure_outbound_columns`] (a `CREATE TABLE IF NOT EXISTS` never adds a
-/// column).
+/// The trailing `last_error` (Task 9), `next_retry_at` (Task 2),
+/// `wire_package_id` (zombie-inbound fix) and `display_name` (Transfers Status
+/// Model v2 §D1) columns are created inline for a fresh DB; an existing table
+/// without them is migrated in place by [`ensure_outbound_columns`] (a `CREATE
+/// TABLE IF NOT EXISTS` never adds a column).
 pub const DDL_OUTBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_outbound (
     id INTEGER PRIMARY KEY,
     package_ref TEXT NOT NULL,
@@ -38,12 +39,13 @@ pub const DDL_OUTBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_outbound (
     confirmed_at TEXT,
     last_error TEXT,
     next_retry_at TEXT,
-    wire_package_id TEXT
+    wire_package_id TEXT,
+    display_name TEXT
 )";
 
 /// Idempotently add the trailing `sync_outbound` columns (`last_error` — Task 9,
-/// `next_retry_at` — Task 2, `wire_package_id` — zombie-inbound fix) to an
-/// existing table.
+/// `next_retry_at` — Task 2, `wire_package_id` — zombie-inbound fix,
+/// `display_name` — Transfers Status Model v2 §D1) to an existing table.
 ///
 /// The guarded-ALTER twin of [`ensure_history_columns`]: `CREATE TABLE IF NOT
 /// EXISTS` never alters an already-materialised table, so a store opened over a
@@ -65,6 +67,7 @@ pub fn ensure_outbound_columns(conn: &Connection) -> Result<()> {
         ("last_error", "TEXT"),
         ("next_retry_at", "TEXT"),
         ("wire_package_id", "TEXT"),
+        ("display_name", "TEXT"),
     ] {
         if !existing.contains(col) {
             conn.execute(&format!("ALTER TABLE sync_outbound ADD COLUMN {col} {ty}"), [])
@@ -76,10 +79,11 @@ pub fn ensure_outbound_columns(conn: &Connection) -> Result<()> {
 
 /// `sync_history` — append-only per-frame transfer audit log.
 ///
-/// The trailing `project` column (Stage II collab, Task 11) and `package_id`
-/// column (per-batch detail, Task 14) are created inline for a fresh DB; an
-/// existing table missing either is migrated in place by [`ensure_history_columns`]
-/// (a `CREATE TABLE IF NOT EXISTS` never adds a column).
+/// The trailing `project` column (Stage II collab, Task 11), `package_id`
+/// column (per-batch detail, Task 14) and `batch_name` column (Transfers Status
+/// Model v2 §D1) are created inline for a fresh DB; an existing table missing any
+/// is migrated in place by [`ensure_history_columns`] (a `CREATE TABLE IF NOT
+/// EXISTS` never adds a column).
 pub const DDL_HISTORY: &str = "CREATE TABLE IF NOT EXISTS sync_history (
     id INTEGER PRIMARY KEY,
     frame_uuid TEXT,
@@ -92,11 +96,13 @@ pub const DDL_HISTORY: &str = "CREATE TABLE IF NOT EXISTS sync_history (
     finished_at TEXT,
     outcome TEXT,
     project TEXT,
-    package_id TEXT
+    package_id TEXT,
+    batch_name TEXT
 )";
 
-/// Idempotently add the trailing `project` (Task 11) and `package_id` (Task 14)
-/// columns to an existing `sync_history` table.
+/// Idempotently add the trailing `project` (Task 11), `package_id` (Task 14) and
+/// `batch_name` (Transfers Status Model v2 §D1) columns to an existing
+/// `sync_history` table.
 ///
 /// `CREATE TABLE IF NOT EXISTS` never alters an already-materialised table, so a
 /// store opened over a pre-Stage-II / pre-Task-14 catalog / Perseus DB is migrated
@@ -114,7 +120,7 @@ pub fn ensure_history_columns(conn: &Connection) -> Result<()> {
         .context("query table_info(sync_history)")?
         .filter_map(|c| c.ok())
         .collect();
-    for (col, ty) in [("project", "TEXT"), ("package_id", "TEXT")] {
+    for (col, ty) in [("project", "TEXT"), ("package_id", "TEXT"), ("batch_name", "TEXT")] {
         if !existing.contains(col) {
             conn.execute(&format!("ALTER TABLE sync_history ADD COLUMN {col} {ty}"), [])
                 .with_context(|| format!("add sync_history.{col} column"))?;
@@ -150,8 +156,10 @@ pub const DDL_RECEIPTS: &str = "CREATE TABLE IF NOT EXISTS sync_receipts (
 /// during the fetch, and stamps a terminal `done`/`failed` at the end. It backs
 /// the Transfers UI's Active/receive pane (Task 14). Like the other sync tables
 /// the DDL lives here so `db/schema.rs` and both store `open`s share one
-/// definition; `sync_inbound` is a NEW table (no legacy shape to migrate, so no
-/// guarded `ALTER`).
+/// definition. `sync_inbound` shipped in beta.3 (Task 11), so a 0.4.x DB already
+/// carries the table WITHOUT the trailing `display_name` column (Transfers Status
+/// Model v2 §D1); that column is created inline for a fresh DB and back-filled on
+/// an existing one by [`ensure_inbound_columns`].
 pub const DDL_INBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_inbound (
     id INTEGER PRIMARY KEY,
     peer TEXT NOT NULL,
@@ -163,7 +171,89 @@ pub const DDL_INBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_inbound (
     last_error TEXT,
     created_at TEXT NOT NULL,
     finished_at TEXT,
+    display_name TEXT,
     UNIQUE(peer, package_id)
+)";
+
+/// Idempotently add the trailing `sync_inbound.display_name` column (Transfers
+/// Status Model v2 §D1) to an existing table.
+///
+/// The guarded-ALTER twin of [`ensure_outbound_columns`] / [`ensure_history_columns`]:
+/// `sync_inbound` shipped in beta.3 without `display_name`, so a store opened over
+/// a 0.4.x catalog / Perseus DB is migrated in place here. Called by every
+/// `sync_inbound` materialisation site (both store `open`s and `db::schema::init_db`)
+/// right after the DDL. Never breaks an existing DB: an already-present column is
+/// a no-op.
+pub fn ensure_inbound_columns(conn: &Connection) -> Result<()> {
+    let existing: HashSet<String> = conn
+        .prepare("PRAGMA table_info(sync_inbound)")
+        .context("prepare table_info(sync_inbound)")?
+        .query_map([], |r| r.get::<_, String>(1))
+        .context("query table_info(sync_inbound)")?
+        .filter_map(|c| c.ok())
+        .collect();
+    for (col, ty) in [("display_name", "TEXT")] {
+        if !existing.contains(col) {
+            conn.execute(&format!("ALTER TABLE sync_inbound ADD COLUMN {col} {ty}"), [])
+                .with_context(|| format!("add sync_inbound.{col} column"))?;
+        }
+    }
+    Ok(())
+}
+
+/// `sync_outbound_files` — the sender's durable per-file state within a batch
+/// (Transfers Status Model v2 §D4). One row per `(outbound_id, rel_path)`, created
+/// at package-build time and transitioned `pending → sending → uploaded → done`
+/// as the send progresses. `bytes_done` is checkpointed on transitions + serve
+/// ticks so the per-file picture restores after a restart/resume; `outcome`
+/// records the receiver's per-frame verdict (same text encoding as
+/// [`DDL_RECEIPTS`]) once the ack lands. A NEW table — `CREATE TABLE IF NOT
+/// EXISTS` alone materialises it (no legacy shape to migrate).
+pub const DDL_OUTBOUND_FILES: &str = "CREATE TABLE IF NOT EXISTS sync_outbound_files (
+    outbound_id INTEGER NOT NULL,
+    rel_path TEXT NOT NULL,
+    byte_size INTEGER NOT NULL,
+    frame_uuid TEXT NOT NULL,
+    state TEXT NOT NULL,
+    bytes_done INTEGER NOT NULL DEFAULT 0,
+    outcome TEXT,
+    error TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (outbound_id, rel_path)
+)";
+
+/// `sync_inbound_files` — the receiver's durable per-file state within a batch
+/// (Transfers Status Model v2 §D4). One row per `(inbound_id, rel_path)`, created
+/// AT ANNOUNCE TIME from the v2 manifest and transitioned `announced → fetching →
+/// done` (or `failed`) as the fetch/ingest progresses. Mirror of
+/// [`DDL_OUTBOUND_FILES`]; a NEW table with no legacy shape.
+pub const DDL_INBOUND_FILES: &str = "CREATE TABLE IF NOT EXISTS sync_inbound_files (
+    inbound_id INTEGER NOT NULL,
+    rel_path TEXT NOT NULL,
+    byte_size INTEGER NOT NULL,
+    frame_uuid TEXT NOT NULL,
+    state TEXT NOT NULL,
+    bytes_done INTEGER NOT NULL DEFAULT 0,
+    outcome TEXT,
+    error TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (inbound_id, rel_path)
+)";
+
+/// `sync_events` — the capped per-batch event journal (Transfers Status Model v2
+/// §D7, the detail pane's **Log** tab). Append-only from the caller's side, but
+/// [`append_sync_event`] prunes each insert down to the newest ~200 rows per
+/// `(direction, batch_key)` so a long-lived batch never grows the table without
+/// bound. `batch_key` is the outbound row id (sent) or inbound row id (received),
+/// stored as text. A NEW table — `CREATE TABLE IF NOT EXISTS` alone materialises
+/// it.
+pub const DDL_SYNC_EVENTS: &str = "CREATE TABLE IF NOT EXISTS sync_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    direction TEXT NOT NULL,
+    batch_key TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    detail TEXT
 )";
 
 /// `sync_sources` — the app sender's package → source-file linkage (task M4).
@@ -199,11 +289,17 @@ pub const DDL_SYNC_SOURCES: &str = "CREATE TABLE IF NOT EXISTS sync_sources (
     PRIMARY KEY (package_ref, path)
 )";
 
-/// Search indexes for [`SyncStore::search_history`].
-pub const DDL_INDEXES: [&str; 3] = [
+/// Search indexes for [`SyncStore::search_history`], plus the per-batch event-log
+/// index (Transfers Status Model v2 §D7) that keeps [`list_sync_events`] /
+/// [`append_sync_event`]'s `(direction, batch_key)`-scoped, id-ordered scans fast.
+/// Iterated at every sync-table materialisation site, so a new entry here is
+/// created in the Perseus store, the catalog store, and `db::schema::init_db`
+/// alike.
+pub const DDL_INDEXES: [&str; 4] = [
     "CREATE INDEX IF NOT EXISTS idx_sync_history_filename ON sync_history(filename)",
     "CREATE INDEX IF NOT EXISTS idx_sync_history_object ON sync_history(object)",
     "CREATE INDEX IF NOT EXISTS idx_sync_history_started_at ON sync_history(started_at)",
+    "CREATE INDEX IF NOT EXISTS idx_sync_events_batch ON sync_events(direction, batch_key, id)",
 ];
 
 /// Durable persistence for the outbound state machine + transfer history.
@@ -295,6 +391,7 @@ type OutboundRaw = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
@@ -309,6 +406,7 @@ fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
         last_error,
         next_retry_at,
         wire_package_id,
+        display_name,
     ) = raw;
     Ok(OutboundRow {
         id,
@@ -321,6 +419,7 @@ fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
         last_error,
         next_retry_at,
         wire_package_id,
+        display_name,
     })
 }
 
@@ -335,6 +434,7 @@ type HistoryRaw = (
     String,
     Option<String>,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
 );
@@ -352,6 +452,7 @@ fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
         outcome,
         project,
         package_id,
+        batch_name,
     ) = raw;
     Ok(HistoryRow {
         frame_uuid,
@@ -365,13 +466,40 @@ fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
         outcome,
         project,
         package_id,
+        batch_name,
     })
 }
 
 const OUTBOUND_COLS: &str =
-    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at, wire_package_id";
+    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at, wire_package_id, display_name";
 const HISTORY_COLS: &str =
-    "frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project, package_id";
+    "frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project, package_id, batch_name";
+
+/// Decode one `OutboundRaw` tuple from a query row — the SINGLE place the
+/// `OUTBOUND_COLS` column order is read, shared by every outbound read path so a
+/// new trailing column is threaded through exactly once (`display_name` was).
+fn outbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<OutboundRaw> {
+    Ok((
+        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+        r.get(8)?, r.get(9)?, r.get(10)?,
+    ))
+}
+
+/// Decode one `HistoryRaw` tuple from a query row (the single `HISTORY_COLS` read point).
+fn history_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<HistoryRaw> {
+    Ok((
+        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+        r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
+    ))
+}
+
+/// Decode one `InboundRaw` tuple from a query row (the single `INBOUND_COLS` read point).
+fn inbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<InboundRaw> {
+    Ok((
+        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+        r.get(8)?, r.get(9)?, r.get(10)?,
+    ))
+}
 
 // ── Free functions on a raw connection ──────────────────────────────────────
 //
@@ -386,8 +514,8 @@ const HISTORY_COLS: &str =
 pub fn insert_history_row(conn: &Connection, h: &HistoryRow) -> Result<()> {
     conn.execute(
         "INSERT INTO sync_history
-         (frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project, package_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+         (frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project, package_id, batch_name)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             h.frame_uuid,
             h.filename,
@@ -400,6 +528,7 @@ pub fn insert_history_row(conn: &Connection, h: &HistoryRow) -> Result<()> {
             h.outcome,
             h.project,
             h.package_id,
+            h.batch_name,
         ],
     )
     .context("insert sync_history")?;
@@ -440,21 +569,7 @@ pub fn search_history_rows(conn: &Connection, q: &HistoryQuery) -> Result<Vec<Hi
     let params_ref: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql).context("prepare search_history")?;
     let raws = stmt
-        .query_map(params_ref.as_slice(), |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-                r.get(10)?,
-            ))
-        })
+        .query_map(params_ref.as_slice(), history_raw_from_row)
         .context("query search_history")?
         .collect::<rusqlite::Result<Vec<HistoryRaw>>>()
         .context("collect search_history")?;
@@ -475,20 +590,7 @@ pub fn confirmed_outbound_rows(conn: &Connection) -> Result<Vec<OutboundRow>> {
         ))
         .context("prepare confirmed_outbound_rows")?;
     let raws = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-            ))
-        })
+        .query_map([], outbound_raw_from_row)
         .context("query confirmed_outbound_rows")?
         .collect::<rusqlite::Result<Vec<OutboundRaw>>>()
         .context("collect confirmed_outbound_rows")?;
@@ -509,20 +611,7 @@ pub fn all_outbound_rows(conn: &Connection, limit: u32) -> Result<Vec<OutboundRo
         ))
         .context("prepare all_outbound_rows")?;
     let raws = stmt
-        .query_map(params![limit], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-            ))
-        })
+        .query_map(params![limit], outbound_raw_from_row)
         .context("query all_outbound_rows")?
         .collect::<rusqlite::Result<Vec<OutboundRaw>>>()
         .context("collect all_outbound_rows")?;
@@ -538,20 +627,7 @@ pub fn outbound_row_by_id(conn: &Connection, id: i64) -> Result<Option<OutboundR
         .query_row(
             &format!("SELECT {OUTBOUND_COLS} FROM sync_outbound WHERE id = ?1"),
             params![id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                    r.get(9)?,
-                ))
-            },
+            outbound_raw_from_row,
         )
         .optional()
         .context("query sync_outbound by id")?;
@@ -756,7 +832,7 @@ pub fn load_receipts(conn: &Connection, package_id: &str) -> Result<Vec<FrameRec
 // package_id)` UNIQUE constraint anchors the upsert.
 
 const INBOUND_COLS: &str =
-    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at";
+    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at, display_name";
 
 /// Raw column tuple for a `sync_inbound` row, parsed into [`InboundRow`] by
 /// [`to_inbound`] so fallible text parsing happens outside the rusqlite closure.
@@ -771,11 +847,23 @@ type InboundRaw = (
     Option<String>,
     String,
     Option<String>,
+    Option<String>,
 );
 
 fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
-    let (id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at) =
-        raw;
+    let (
+        id,
+        peer,
+        package_id,
+        state,
+        frame_count,
+        byte_size,
+        bytes_done,
+        last_error,
+        created_at,
+        finished_at,
+        display_name,
+    ) = raw;
     Ok(InboundRow {
         id,
         peer,
@@ -787,6 +875,7 @@ fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
         last_error,
         created_at,
         finished_at,
+        display_name,
     })
 }
 
@@ -881,20 +970,7 @@ pub fn inbound_active(conn: &Connection) -> Result<Vec<InboundRow>> {
         ))
         .context("prepare inbound_active")?;
     let raws = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
-            ))
-        })
+        .query_map([], inbound_raw_from_row)
         .context("query inbound_active")?
         .collect::<rusqlite::Result<Vec<InboundRaw>>>()
         .context("collect inbound_active")?;
@@ -908,20 +984,7 @@ pub fn get_inbound(conn: &Connection, package_id: &str) -> Result<Option<Inbound
         .query_row(
             &format!("SELECT {INBOUND_COLS} FROM sync_inbound WHERE package_id = ?1"),
             params![package_id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                    r.get(9)?,
-                ))
-            },
+            inbound_raw_from_row,
         )
         .optional()
         .context("query sync_inbound by package_id")?;
@@ -938,24 +1001,354 @@ pub fn get_inbound_by_row_id(conn: &Connection, id: i64) -> Result<Option<Inboun
         .query_row(
             &format!("SELECT {INBOUND_COLS} FROM sync_inbound WHERE id = ?1"),
             params![id],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                    r.get(9)?,
-                ))
-            },
+            inbound_raw_from_row,
         )
         .optional()
         .context("query sync_inbound by id")?;
     raw.map(to_inbound).transpose()
+}
+
+// ── Transfers Status Model v2: display_name, per-file rows, event journal ────
+//
+// Free fns over a `&Connection`, matching the receipt / source / inbound family:
+// the receiver holds a concrete `CatalogSyncStore` and calls these via
+// [`CatalogSyncStore::lock_conn`]; later sender/api tasks reach them the same way.
+// The SQL is the single source shared by both store impls, so nothing here grows
+// the [`SyncStore`] trait (no engine / mock-store churn this task).
+
+/// Persist (or clear with `None`) the human batch name on an outbound row
+/// (Transfers Status Model v2 §D1). The send path (T3) writes the auto-derived
+/// name here after enqueue; keyed by row `id`.
+pub fn set_outbound_display_name(conn: &Connection, id: i64, display_name: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_outbound SET display_name = ?1 WHERE id = ?2",
+        params![display_name, id],
+    )
+    .with_context(|| format!("set display_name for outbound {id}"))?;
+    Ok(())
+}
+
+/// Persist (or clear with `None`) the human batch name on an inbound row
+/// (Transfers Status Model v2 §D1). The receiver (T5) writes the v2 announce's
+/// `batch_name` here; keyed by row `id`.
+pub fn set_inbound_display_name(conn: &Connection, id: i64, display_name: Option<&str>) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_inbound SET display_name = ?1 WHERE id = ?2",
+        params![display_name, id],
+    )
+    .with_context(|| format!("set display_name for inbound {id}"))?;
+    Ok(())
+}
+
+/// Replace the entire per-file row set for an outbound batch (Transfers Status
+/// Model v2 §D4). Deletes any existing `sync_outbound_files` rows for
+/// `outbound_id`, then inserts `files` verbatim (each row's own `updated_at` is
+/// honoured) — the whole swap is one transaction so a reader never sees a partial
+/// set. Called once at package-build time; a resend that rebuilds the manifest
+/// re-runs it. Idempotent by the swap.
+pub fn replace_outbound_files(conn: &Connection, outbound_id: i64, files: &[OutboundFileRow]) -> Result<()> {
+    let tx = conn.unchecked_transaction().context("begin replace_outbound_files")?;
+    tx.execute("DELETE FROM sync_outbound_files WHERE outbound_id = ?1", params![outbound_id])
+        .context("clear sync_outbound_files")?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO sync_outbound_files
+                 (outbound_id, rel_path, byte_size, frame_uuid, state, bytes_done, outcome, error, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .context("prepare insert sync_outbound_files")?;
+        for f in files {
+            stmt.execute(params![
+                outbound_id,
+                f.rel_path,
+                f.byte_size as i64,
+                f.frame_uuid,
+                f.state.as_str(),
+                f.bytes_done as i64,
+                f.outcome,
+                f.error,
+                f.updated_at,
+            ])
+            .with_context(|| format!("insert sync_outbound_files row {}", f.rel_path))?;
+        }
+    }
+    tx.commit().context("commit replace_outbound_files")?;
+    Ok(())
+}
+
+/// Replace the entire per-file row set for an inbound batch (Transfers Status
+/// Model v2 §D4). The receive-side twin of [`replace_outbound_files`]; called
+/// once at announce time from the v2 manifest.
+pub fn replace_inbound_files(conn: &Connection, inbound_id: i64, files: &[InboundFileRow]) -> Result<()> {
+    let tx = conn.unchecked_transaction().context("begin replace_inbound_files")?;
+    tx.execute("DELETE FROM sync_inbound_files WHERE inbound_id = ?1", params![inbound_id])
+        .context("clear sync_inbound_files")?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO sync_inbound_files
+                 (inbound_id, rel_path, byte_size, frame_uuid, state, bytes_done, outcome, error, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .context("prepare insert sync_inbound_files")?;
+        for f in files {
+            stmt.execute(params![
+                inbound_id,
+                f.rel_path,
+                f.byte_size as i64,
+                f.frame_uuid,
+                f.state.as_str(),
+                f.bytes_done as i64,
+                f.outcome,
+                f.error,
+                f.updated_at,
+            ])
+            .with_context(|| format!("insert sync_inbound_files row {}", f.rel_path))?;
+        }
+    }
+    tx.commit().context("commit replace_inbound_files")?;
+    Ok(())
+}
+
+/// Update one outbound file's mutable fields — `state`, `bytes_done`, `outcome`,
+/// `error` — stamping a fresh `updated_at` (Transfers Status Model v2 §D4). Keyed
+/// on `(outbound_id, rel_path)`; the row is created up front by
+/// [`replace_outbound_files`], so this is an in-place UPDATE (a no-op if the file
+/// is unknown). Called on every per-file transition and serve-progress checkpoint.
+pub fn set_outbound_file_state(
+    conn: &Connection,
+    outbound_id: i64,
+    rel_path: &str,
+    state: OutboundFileState,
+    bytes_done: u64,
+    outcome: Option<&str>,
+    error: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_outbound_files
+         SET state = ?1, bytes_done = ?2, outcome = ?3, error = ?4, updated_at = ?5
+         WHERE outbound_id = ?6 AND rel_path = ?7",
+        params![state.as_str(), bytes_done as i64, outcome, error, now_iso(), outbound_id, rel_path],
+    )
+    .with_context(|| format!("set outbound file state for {outbound_id}/{rel_path}"))?;
+    Ok(())
+}
+
+/// Update one inbound file's mutable fields (Transfers Status Model v2 §D4). The
+/// receive-side twin of [`set_outbound_file_state`]; keyed on `(inbound_id,
+/// rel_path)`, in-place UPDATE over a row created by [`replace_inbound_files`].
+pub fn set_inbound_file_state(
+    conn: &Connection,
+    inbound_id: i64,
+    rel_path: &str,
+    state: InboundFileState,
+    bytes_done: u64,
+    outcome: Option<&str>,
+    error: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_inbound_files
+         SET state = ?1, bytes_done = ?2, outcome = ?3, error = ?4, updated_at = ?5
+         WHERE inbound_id = ?6 AND rel_path = ?7",
+        params![state.as_str(), bytes_done as i64, outcome, error, now_iso(), inbound_id, rel_path],
+    )
+    .with_context(|| format!("set inbound file state for {inbound_id}/{rel_path}"))?;
+    Ok(())
+}
+
+/// Raw column tuple for a `sync_outbound_files` / `sync_inbound_files` row (both
+/// tables share the same nine-column shape); parsed by [`to_outbound_file`] /
+/// [`to_inbound_file`] so fallible state parsing stays outside the rusqlite closure.
+type FileRaw = (
+    i64,
+    String,
+    i64,
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+fn file_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<FileRaw> {
+    Ok((
+        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+        r.get(8)?,
+    ))
+}
+
+fn to_outbound_file(raw: FileRaw) -> Result<OutboundFileRow> {
+    let (outbound_id, rel_path, byte_size, frame_uuid, state, bytes_done, outcome, error, updated_at) = raw;
+    Ok(OutboundFileRow {
+        outbound_id,
+        rel_path,
+        byte_size: byte_size.max(0) as u64,
+        frame_uuid,
+        state: OutboundFileState::from_db(&state)?,
+        bytes_done: bytes_done.max(0) as u64,
+        outcome,
+        error,
+        updated_at,
+    })
+}
+
+fn to_inbound_file(raw: FileRaw) -> Result<InboundFileRow> {
+    let (inbound_id, rel_path, byte_size, frame_uuid, state, bytes_done, outcome, error, updated_at) = raw;
+    Ok(InboundFileRow {
+        inbound_id,
+        rel_path,
+        byte_size: byte_size.max(0) as u64,
+        frame_uuid,
+        state: InboundFileState::from_db(&state)?,
+        bytes_done: bytes_done.max(0) as u64,
+        outcome,
+        error,
+        updated_at,
+    })
+}
+
+/// Every per-file row for an outbound batch, ordered by `rel_path` for a
+/// deterministic tree (Transfers Status Model v2 §D4).
+pub fn list_outbound_files(conn: &Connection, outbound_id: i64) -> Result<Vec<OutboundFileRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT outbound_id, rel_path, byte_size, frame_uuid, state, bytes_done, outcome, error, updated_at
+             FROM sync_outbound_files WHERE outbound_id = ?1 ORDER BY rel_path ASC",
+        )
+        .context("prepare list_outbound_files")?;
+    let raws = stmt
+        .query_map(params![outbound_id], file_raw_from_row)
+        .context("query list_outbound_files")?
+        .collect::<rusqlite::Result<Vec<FileRaw>>>()
+        .context("collect list_outbound_files")?;
+    raws.into_iter().map(to_outbound_file).collect()
+}
+
+/// Every per-file row for an inbound batch, ordered by `rel_path` (Transfers
+/// Status Model v2 §D4).
+pub fn list_inbound_files(conn: &Connection, inbound_id: i64) -> Result<Vec<InboundFileRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT inbound_id, rel_path, byte_size, frame_uuid, state, bytes_done, outcome, error, updated_at
+             FROM sync_inbound_files WHERE inbound_id = ?1 ORDER BY rel_path ASC",
+        )
+        .context("prepare list_inbound_files")?;
+    let raws = stmt
+        .query_map(params![inbound_id], file_raw_from_row)
+        .context("query list_inbound_files")?
+        .collect::<rusqlite::Result<Vec<FileRaw>>>()
+        .context("collect list_inbound_files")?;
+    raws.into_iter().map(to_inbound_file).collect()
+}
+
+/// Delete every per-file row for an outbound batch — the delete-with-parent
+/// cascade for `sync_outbound_files` (Transfers Status Model v2 §D4). This store
+/// uses no FK cascades, so a future outbound-row delete path must call this (plus
+/// [`delete_sync_events`] for the `Sent` journal) to avoid orphaned rows. No such
+/// delete path exists in the store today (retention deletes source files, never
+/// the outbound rows), so this is currently unwired but ready.
+pub fn delete_outbound_files(conn: &Connection, outbound_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM sync_outbound_files WHERE outbound_id = ?1", params![outbound_id])
+        .with_context(|| format!("delete sync_outbound_files for {outbound_id}"))?;
+    Ok(())
+}
+
+/// Delete every per-file row for an inbound batch — the delete-with-parent
+/// cascade for `sync_inbound_files` (see [`delete_outbound_files`]). Pair with
+/// [`delete_sync_events`] for the `Received` journal when an inbound-row delete
+/// path is added.
+pub fn delete_inbound_files(conn: &Connection, inbound_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM sync_inbound_files WHERE inbound_id = ?1", params![inbound_id])
+        .with_context(|| format!("delete sync_inbound_files for {inbound_id}"))?;
+    Ok(())
+}
+
+/// Newest-per-batch cap for [`append_sync_event`]: each insert prunes the batch's
+/// journal down to this many rows (Transfers Status Model v2 §D7).
+pub const SYNC_EVENTS_CAP: u32 = 200;
+
+/// Append one event to a batch's journal, then prune the journal to the newest
+/// [`SYNC_EVENTS_CAP`] rows for that `(direction, batch_key)` — insert + prune in
+/// one transaction (Transfers Status Model v2 §D7). `batch_key` is the outbound
+/// row id (sent) or inbound row id (received) as text; `ts` is stamped `now`.
+pub fn append_sync_event(
+    conn: &Connection,
+    direction: Direction,
+    batch_key: &str,
+    kind: &str,
+    detail: Option<&str>,
+) -> Result<()> {
+    let dir = direction.as_str();
+    let tx = conn.unchecked_transaction().context("begin append_sync_event")?;
+    tx.execute(
+        "INSERT INTO sync_events (direction, batch_key, ts, kind, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![dir, batch_key, now_iso(), kind, detail],
+    )
+    .context("insert sync_events")?;
+    // Keep only the newest SYNC_EVENTS_CAP rows for this batch's journal.
+    tx.execute(
+        "DELETE FROM sync_events
+         WHERE direction = ?1 AND batch_key = ?2
+           AND id NOT IN (
+               SELECT id FROM sync_events
+               WHERE direction = ?1 AND batch_key = ?2
+               ORDER BY id DESC LIMIT ?3
+           )",
+        params![dir, batch_key, SYNC_EVENTS_CAP],
+    )
+    .context("prune sync_events")?;
+    tx.commit().context("commit append_sync_event")?;
+    Ok(())
+}
+
+/// Every event in a batch's journal, newest-first (Transfers Status Model v2 §D7 —
+/// the detail pane's **Log** tab). Scoped to one `(direction, batch_key)` pair.
+pub fn list_sync_events(conn: &Connection, direction: Direction, batch_key: &str) -> Result<Vec<SyncEventRow>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, direction, ts, kind, detail FROM sync_events
+             WHERE direction = ?1 AND batch_key = ?2 ORDER BY id DESC",
+        )
+        .context("prepare list_sync_events")?;
+    let rows = stmt
+        .query_map(params![direction.as_str(), batch_key], |r| {
+            let id: i64 = r.get(0)?;
+            let dir: String = r.get(1)?;
+            let ts: String = r.get(2)?;
+            let kind: String = r.get(3)?;
+            let detail: Option<String> = r.get(4)?;
+            Ok((id, dir, ts, kind, detail))
+        })
+        .context("query list_sync_events")?
+        .collect::<rusqlite::Result<Vec<(i64, String, String, String, Option<String>)>>>()
+        .context("collect list_sync_events")?;
+    rows.into_iter()
+        .map(|(id, dir, ts, kind, detail)| {
+            Ok(SyncEventRow {
+                id,
+                direction: Direction::from_db(&dir)?,
+                ts,
+                kind,
+                detail,
+            })
+        })
+        .collect()
+}
+
+/// Delete a batch's entire event journal — the delete-with-parent cascade for
+/// `sync_events` (Transfers Status Model v2 §D7). Pair with
+/// [`delete_outbound_files`] / [`delete_inbound_files`] when a parent-row delete
+/// path is added; unwired today for the same reason (no outbound/inbound row
+/// delete path exists in the store).
+pub fn delete_sync_events(conn: &Connection, direction: Direction, batch_key: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM sync_events WHERE direction = ?1 AND batch_key = ?2",
+        params![direction.as_str(), batch_key],
+    )
+    .with_context(|| format!("delete sync_events for {}/{batch_key}", direction.as_str()))?;
+    Ok(())
 }
 
 /// Standalone [`SyncStore`] backed by its own WAL SQLite file. Used by the
@@ -985,8 +1378,12 @@ impl StandaloneSyncStore {
         conn.execute(DDL_HISTORY, []).context("create sync_history")?;
         ensure_history_columns(&conn)?;
         conn.execute(DDL_INBOUND, []).context("create sync_inbound")?;
+        ensure_inbound_columns(&conn)?;
+        conn.execute(DDL_OUTBOUND_FILES, []).context("create sync_outbound_files")?;
+        conn.execute(DDL_INBOUND_FILES, []).context("create sync_inbound_files")?;
+        conn.execute(DDL_SYNC_EVENTS, []).context("create sync_events")?;
         for idx in DDL_INDEXES {
-            conn.execute(idx, []).context("create sync_history index")?;
+            conn.execute(idx, []).context("create sync index")?;
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -1107,20 +1504,7 @@ impl SyncStore for StandaloneSyncStore {
             ))
             .context("prepare non_terminal")?;
         let raws = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                    r.get(9)?,
-                ))
-            })
+            .query_map([], outbound_raw_from_row)
             .context("query non_terminal")?
             .collect::<rusqlite::Result<Vec<OutboundRaw>>>()
             .context("collect non_terminal")?;
@@ -1215,8 +1599,12 @@ impl CatalogSyncStore {
         conn.execute(DDL_RECEIPTS, []).context("create sync_receipts")?;
         conn.execute(DDL_SYNC_SOURCES, []).context("create sync_sources")?;
         conn.execute(DDL_INBOUND, []).context("create sync_inbound")?;
+        ensure_inbound_columns(&conn)?;
+        conn.execute(DDL_OUTBOUND_FILES, []).context("create sync_outbound_files")?;
+        conn.execute(DDL_INBOUND_FILES, []).context("create sync_inbound_files")?;
+        conn.execute(DDL_SYNC_EVENTS, []).context("create sync_events")?;
         for idx in DDL_INDEXES {
-            conn.execute(idx, []).context("create sync_history index")?;
+            conn.execute(idx, []).context("create sync index")?;
         }
         Ok(Self {
             conn: Mutex::new(conn),
@@ -1369,20 +1757,7 @@ impl SyncStore for CatalogSyncStore {
             ))
             .context("prepare non_terminal")?;
         let raws = stmt
-            .query_map([], |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                    r.get(6)?,
-                    r.get(7)?,
-                    r.get(8)?,
-                    r.get(9)?,
-                ))
-            })
+            .query_map([], outbound_raw_from_row)
             .context("query non_terminal")?
             .collect::<rusqlite::Result<Vec<OutboundRaw>>>()
             .context("collect non_terminal")?;
@@ -1713,6 +2088,7 @@ mod tests {
                 outcome: "ingested".into(),
                 project: Some("proj-42".into()),
                 package_id: None,
+                batch_name: None,
             })
             .unwrap();
 
@@ -1788,6 +2164,7 @@ mod tests {
                 outcome: "ingested".into(),
                 project: None,
                 package_id: Some("pkg-abc".into()),
+                batch_name: None,
             })
             .unwrap();
 
@@ -1804,5 +2181,274 @@ mod tests {
             .search_history(HistoryQuery { package_id: Some("pkg-none".into()), limit: 10, ..Default::default() })
             .unwrap()
             .is_empty());
+    }
+
+    // ── Transfers Status Model v2 (tv2 Task 2) ──────────────────────────────
+
+    /// Sorted column names of `table` — a local PRAGMA helper for the migration
+    /// assertions below.
+    fn cols(conn: &Connection, table: &str) -> Vec<String> {
+        let mut v: Vec<String> = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn table_exists(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |_| Ok(()),
+        )
+        .optional()
+        .unwrap()
+        .is_some()
+    }
+
+    /// tv2 §D1/§D4/§D7: a fresh `open` materialises every new column and table,
+    /// and a second `open` over the same file is a clean no-op.
+    #[test]
+    fn fresh_open_creates_v2_tables_and_columns_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sync.db");
+        StandaloneSyncStore::open(&path).unwrap();
+        // Re-open the same file: idempotent (every DDL is `IF NOT EXISTS`, every
+        // guarded ALTER a no-op on an already-migrated table).
+        StandaloneSyncStore::open(&path).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        for t in ["sync_outbound_files", "sync_inbound_files", "sync_events"] {
+            assert!(table_exists(&conn, t), "{t} must be created on a fresh open");
+        }
+        assert!(cols(&conn, "sync_outbound").contains(&"display_name".to_string()));
+        assert!(cols(&conn, "sync_inbound").contains(&"display_name".to_string()));
+        assert!(cols(&conn, "sync_history").contains(&"batch_name".to_string()));
+    }
+
+    /// tv2 §D1: a simulated 0.4.x DB (pre-change `sync_outbound` / `sync_inbound`
+    /// / `sync_history` shapes) gains `display_name` / `batch_name` when the
+    /// guarded-ALTER migration fns run — and running them again is a no-op.
+    #[test]
+    fn legacy_db_migrates_v2_columns_idempotently() {
+        let conn = Connection::open_in_memory().unwrap();
+        // PRE-change DDL, copied verbatim from the CREATE statements before this
+        // cycle (sync_inbound shipped in beta.3 WITHOUT display_name).
+        conn.execute(
+            "CREATE TABLE sync_outbound (
+                id INTEGER PRIMARY KEY, package_ref TEXT NOT NULL, peer TEXT NOT NULL,
+                state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                confirmed_at TEXT, last_error TEXT, next_retry_at TEXT, wire_package_id TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE sync_inbound (
+                id INTEGER PRIMARY KEY, peer TEXT NOT NULL, package_id TEXT NOT NULL,
+                state TEXT NOT NULL, frame_count INTEGER NOT NULL DEFAULT 0,
+                byte_size INTEGER NOT NULL DEFAULT 0, bytes_done INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT, created_at TEXT NOT NULL, finished_at TEXT,
+                UNIQUE(peer, package_id)
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE sync_history (
+                id INTEGER PRIMARY KEY, frame_uuid TEXT, filename TEXT, object TEXT,
+                peer_device TEXT, direction TEXT, bytes INTEGER, started_at TEXT,
+                finished_at TEXT, outcome TEXT, project TEXT, package_id TEXT
+            )",
+            [],
+        )
+        .unwrap();
+
+        // Absent before migration.
+        assert!(!cols(&conn, "sync_outbound").contains(&"display_name".to_string()));
+        assert!(!cols(&conn, "sync_inbound").contains(&"display_name".to_string()));
+        assert!(!cols(&conn, "sync_history").contains(&"batch_name".to_string()));
+
+        // Migrate.
+        ensure_outbound_columns(&conn).unwrap();
+        ensure_inbound_columns(&conn).unwrap();
+        ensure_history_columns(&conn).unwrap();
+
+        assert!(cols(&conn, "sync_outbound").contains(&"display_name".to_string()));
+        assert!(cols(&conn, "sync_inbound").contains(&"display_name".to_string()));
+        assert!(cols(&conn, "sync_history").contains(&"batch_name".to_string()));
+
+        // Idempotent: a second pass never errors (an already-present column is a
+        // no-op) and leaves the columns in place.
+        ensure_outbound_columns(&conn).unwrap();
+        ensure_inbound_columns(&conn).unwrap();
+        ensure_history_columns(&conn).unwrap();
+        assert!(cols(&conn, "sync_inbound").contains(&"display_name".to_string()));
+    }
+
+    /// tv2 §D1: `display_name` write paths round-trip on both directions and clear
+    /// with `None`; a fresh row carries `None`.
+    #[test]
+    fn display_name_setters_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_OUTBOUND, []).unwrap();
+        conn.execute(DDL_INBOUND, []).unwrap();
+
+        conn.execute(
+            "INSERT INTO sync_outbound (package_ref, peer, state, attempts, created_at)
+             VALUES ('p', ?1, 'queued', 0, 't0')",
+            params![node_id_hex(&PEER)],
+        )
+        .unwrap();
+        let oid = conn.last_insert_rowid();
+        assert_eq!(outbound_row_by_id(&conn, oid).unwrap().unwrap().display_name, None);
+        set_outbound_display_name(&conn, oid, Some("M42 — 12 lights")).unwrap();
+        assert_eq!(
+            outbound_row_by_id(&conn, oid).unwrap().unwrap().display_name.as_deref(),
+            Some("M42 — 12 lights"),
+        );
+        set_outbound_display_name(&conn, oid, None).unwrap();
+        assert_eq!(outbound_row_by_id(&conn, oid).unwrap().unwrap().display_name, None);
+
+        let iid = upsert_inbound_announced(&conn, &node_id_hex(&PEER), "pkg-1", 3, 300).unwrap();
+        assert_eq!(get_inbound(&conn, "pkg-1").unwrap().unwrap().display_name, None);
+        set_inbound_display_name(&conn, iid, Some("Downloads batch")).unwrap();
+        assert_eq!(
+            get_inbound(&conn, "pkg-1").unwrap().unwrap().display_name.as_deref(),
+            Some("Downloads batch"),
+        );
+    }
+
+    /// tv2 §D4: outbound per-file CRUD — replace lands the set, per-file state
+    /// upsert touches exactly one row, replace overwrites the whole set, and
+    /// delete-with-parent removes one parent's rows only.
+    #[test]
+    fn outbound_file_rows_crud_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_OUTBOUND_FILES, []).unwrap();
+
+        let mk = |rel: &str, size: u64| OutboundFileRow {
+            outbound_id: 42,
+            rel_path: rel.into(),
+            byte_size: size,
+            frame_uuid: format!("uuid-{rel}"),
+            state: OutboundFileState::Pending,
+            bytes_done: 0,
+            outcome: None,
+            error: None,
+            updated_at: "2026-07-20T00:00:00.000Z".into(),
+        };
+        replace_outbound_files(&conn, 42, &[mk("a/y.fits", 200), mk("a/x.fits", 100)]).unwrap();
+        // A sibling parent, to prove scoping.
+        let sib = OutboundFileRow { outbound_id: 99, ..mk("z.fits", 5) };
+        replace_outbound_files(&conn, 99, &[sib]).unwrap();
+
+        let rows = list_outbound_files(&conn, 42).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Ordered by rel_path.
+        assert_eq!(rows[0].rel_path, "a/x.fits");
+        assert_eq!(rows[0].byte_size, 100);
+        assert_eq!(rows[0].frame_uuid, "uuid-a/x.fits");
+        assert_eq!(rows[0].state, OutboundFileState::Pending);
+        assert_eq!(rows[0].bytes_done, 0);
+
+        // Per-file state upsert touches only a/x.fits.
+        set_outbound_file_state(&conn, 42, "a/x.fits", OutboundFileState::Uploaded, 100, Some("ingested"), None)
+            .unwrap();
+        let rows = list_outbound_files(&conn, 42).unwrap();
+        let x = rows.iter().find(|r| r.rel_path == "a/x.fits").unwrap();
+        assert_eq!(x.state, OutboundFileState::Uploaded);
+        assert_eq!(x.bytes_done, 100);
+        assert_eq!(x.outcome.as_deref(), Some("ingested"));
+        let y = rows.iter().find(|r| r.rel_path == "a/y.fits").unwrap();
+        assert_eq!(y.state, OutboundFileState::Pending, "sibling file untouched");
+
+        // Replace overwrites the whole set for parent 42.
+        replace_outbound_files(&conn, 42, &[mk("only.fits", 7)]).unwrap();
+        let rows = list_outbound_files(&conn, 42).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rel_path, "only.fits");
+
+        // Delete-with-parent removes parent 42's rows; parent 99 untouched.
+        delete_outbound_files(&conn, 42).unwrap();
+        assert!(list_outbound_files(&conn, 42).unwrap().is_empty());
+        assert_eq!(list_outbound_files(&conn, 99).unwrap().len(), 1, "sibling parent unaffected");
+    }
+
+    /// tv2 §D4: inbound per-file CRUD — the receive-side twin of the outbound
+    /// roundtrip.
+    #[test]
+    fn inbound_file_rows_crud_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_INBOUND_FILES, []).unwrap();
+
+        let mk = |rel: &str, size: u64| InboundFileRow {
+            inbound_id: 7,
+            rel_path: rel.into(),
+            byte_size: size,
+            frame_uuid: format!("uuid-{rel}"),
+            state: InboundFileState::Announced,
+            bytes_done: 0,
+            outcome: None,
+            error: None,
+            updated_at: "2026-07-20T00:00:00.000Z".into(),
+        };
+        replace_inbound_files(&conn, 7, &[mk("f2.fits", 20), mk("f1.fits", 10)]).unwrap();
+        replace_inbound_files(&conn, 8, &[InboundFileRow { inbound_id: 8, ..mk("other.fits", 1) }]).unwrap();
+
+        let rows = list_inbound_files(&conn, 7).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].rel_path, "f1.fits");
+        assert_eq!(rows[0].state, InboundFileState::Announced);
+
+        set_inbound_file_state(&conn, 7, "f1.fits", InboundFileState::Failed, 3, None, Some("hash mismatch"))
+            .unwrap();
+        let rows = list_inbound_files(&conn, 7).unwrap();
+        let f1 = rows.iter().find(|r| r.rel_path == "f1.fits").unwrap();
+        assert_eq!(f1.state, InboundFileState::Failed);
+        assert_eq!(f1.bytes_done, 3);
+        assert_eq!(f1.error.as_deref(), Some("hash mismatch"));
+
+        delete_inbound_files(&conn, 7).unwrap();
+        assert!(list_inbound_files(&conn, 7).unwrap().is_empty());
+        assert_eq!(list_inbound_files(&conn, 8).unwrap().len(), 1, "sibling parent unaffected");
+    }
+
+    /// tv2 §D7: `append_sync_event` prunes each batch's journal to the newest
+    /// [`SYNC_EVENTS_CAP`] rows — 205 inserts for one key leave exactly 200 (the
+    /// newest), and other `(direction, batch_key)` journals are untouched.
+    #[test]
+    fn sync_events_append_prunes_to_cap() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_SYNC_EVENTS, []).unwrap();
+
+        for i in 0..205 {
+            append_sync_event(&conn, Direction::Sent, "7", "serve_start", Some(&format!("n{i}")))
+                .unwrap();
+        }
+        // Different journals (direction differs / batch_key differs) — unaffected
+        // by the prune of (Sent, "7").
+        append_sync_event(&conn, Direction::Received, "7", "fetch_start", None).unwrap();
+        append_sync_event(&conn, Direction::Sent, "8", "serve_start", None).unwrap();
+
+        let sent7 = list_sync_events(&conn, Direction::Sent, "7").unwrap();
+        assert_eq!(sent7.len(), SYNC_EVENTS_CAP as usize, "cap keeps exactly the newest 200");
+        // Newest-first ordering; n0..n4 (the oldest 5) were pruned.
+        assert_eq!(sent7[0].detail.as_deref(), Some("n204"), "newest first");
+        assert_eq!(sent7[0].direction, Direction::Sent);
+        assert_eq!(sent7[0].kind, "serve_start");
+        assert_eq!(sent7.last().unwrap().detail.as_deref(), Some("n5"), "oldest survivor is n5");
+
+        assert_eq!(list_sync_events(&conn, Direction::Received, "7").unwrap().len(), 1);
+        assert_eq!(list_sync_events(&conn, Direction::Sent, "8").unwrap().len(), 1);
+
+        // Delete-with-parent clears one journal only.
+        delete_sync_events(&conn, Direction::Sent, "7").unwrap();
+        assert!(list_sync_events(&conn, Direction::Sent, "7").unwrap().is_empty());
+        assert_eq!(list_sync_events(&conn, Direction::Sent, "8").unwrap().len(), 1);
     }
 }

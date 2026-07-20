@@ -1841,6 +1841,7 @@ mod tests {
                 outcome: "sent".into(),
                 project: None,
                 package_id: None,
+                batch_name: None,
             })
             .unwrap();
         store
@@ -1856,6 +1857,7 @@ mod tests {
                 outcome: "ingested".into(),
                 project: None,
                 package_id: None,
+                batch_name: None,
             })
             .unwrap();
 
@@ -3182,6 +3184,7 @@ mod tests {
             last_error: None,
             next_retry_at: None,
             wire_package_id: None,
+            display_name: None,
         }
     }
 

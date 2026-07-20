@@ -88,7 +88,8 @@ pub use engine::{
 pub use ingest::{ingest_package, IngestOutcome};
 pub use pairing::{node_id_from_ticket, relay_mode_for, resolve_relays, RelayResolution};
 pub use models::{
-    Direction, HistoryQuery, HistoryRow, InboundRow, InboundState, OutboundRow, OutboundState,
+    Direction, HistoryQuery, HistoryRow, InboundFileRow, InboundFileState, InboundRow,
+    InboundState, OutboundFileRow, OutboundFileState, OutboundRow, OutboundState, SyncEventRow,
 };
 pub use project_ingest::{ingest_project_package, ProjectIngestOutcome};
 pub use refusal::RefusalRefresher;

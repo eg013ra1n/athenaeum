@@ -2559,6 +2559,7 @@ mod tests {
                 outcome: outcome.into(),
                 project: None,
                 package_id: None,
+                batch_name: None,
             };
             let ins = crate::sync::store::insert_history_row;
             ins(&conn, &mk("s1", Direction::Sent, "peerA", "sent")).unwrap();
@@ -2750,6 +2751,7 @@ mod tests {
                         outcome: "ingested".into(),
                         project: None,
                         package_id: Some(pkg.into()),
+                        batch_name: None,
                     },
                 )
                 .unwrap();

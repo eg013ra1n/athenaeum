@@ -1687,8 +1687,9 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // per-frame receipts alongside the catalog it ingests into.
     {
         use crate::sync::store::{
-            ensure_history_columns, ensure_outbound_columns, DDL_HISTORY, DDL_INBOUND, DDL_INDEXES,
-            DDL_OUTBOUND, DDL_RECEIPTS, DDL_SYNC_SOURCES,
+            ensure_history_columns, ensure_inbound_columns, ensure_outbound_columns, DDL_HISTORY,
+            DDL_INBOUND, DDL_INBOUND_FILES, DDL_INDEXES, DDL_OUTBOUND, DDL_OUTBOUND_FILES,
+            DDL_RECEIPTS, DDL_SYNC_EVENTS, DDL_SYNC_SOURCES,
         };
         conn.execute(DDL_OUTBOUND, [])?;
         // `CREATE TABLE IF NOT EXISTS` never adds a column to an already-existing
@@ -1705,9 +1706,18 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ensure_history_columns(conn).map_err(sync_migrate_err)?;
         conn.execute(DDL_RECEIPTS, [])?;
         conn.execute(DDL_SYNC_SOURCES, [])?;
-        // Task 11: receive-side per-package state. A NEW table (no legacy shape to
-        // migrate), so `CREATE TABLE IF NOT EXISTS` alone materialises it.
+        // Task 11: receive-side per-package state. `sync_inbound` shipped in beta.3,
+        // so a 0.4.x catalog carries it WITHOUT the Transfers Status Model v2 §D1
+        // `display_name` column — back-filled here by the store's own guard (same
+        // owned-column-list discipline as the outbound / history guards above).
         conn.execute(DDL_INBOUND, [])?;
+        ensure_inbound_columns(conn).map_err(sync_migrate_err)?;
+        // Transfers Status Model v2 §D4/§D7: per-file rows + the capped event
+        // journal. NEW tables (no legacy shape to migrate), so `CREATE TABLE IF
+        // NOT EXISTS` alone materialises them.
+        conn.execute(DDL_OUTBOUND_FILES, [])?;
+        conn.execute(DDL_INBOUND_FILES, [])?;
+        conn.execute(DDL_SYNC_EVENTS, [])?;
         for idx in DDL_INDEXES {
             conn.execute(idx, [])?;
         }
@@ -2034,13 +2044,17 @@ mod identity_schema_tests {
 
         init_db(&legacy).unwrap();
 
-        // Every cycle-added trailing column is present after migration.
+        // Every cycle-added trailing column is present after migration
+        // (`display_name` / `batch_name` are the Transfers Status Model v2 §D1 adds).
         for (table, col) in [
             ("sync_outbound", "last_error"),
             ("sync_outbound", "next_retry_at"),
             ("sync_outbound", "wire_package_id"),
+            ("sync_outbound", "display_name"),
             ("sync_history", "project"),
             ("sync_history", "package_id"),
+            ("sync_history", "batch_name"),
+            ("sync_inbound", "display_name"),
         ] {
             assert!(
                 column_exists(&legacy, table, col).unwrap(),
@@ -2055,6 +2069,16 @@ mod identity_schema_tests {
                 table_columns(&legacy, table),
                 table_columns(&fresh, table),
                 "{table} column set must converge legacy → fresh",
+            );
+        }
+
+        // The Transfers Status Model v2 §D4/§D7 tables exist after init_db on a
+        // legacy catalog (they are NEW, so `CREATE TABLE IF NOT EXISTS` materialises
+        // them without a fixture).
+        for table in ["sync_outbound_files", "sync_inbound_files", "sync_events"] {
+            assert!(
+                !table_columns(&legacy, table).is_empty(),
+                "{table} must be created by init_db",
             );
         }
     }

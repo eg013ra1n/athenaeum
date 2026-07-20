@@ -421,6 +421,7 @@ fn received_history(record: &ManifestRecord, peer_device: &str, started_at: &str
         // The collab package's durable batch key (the hub package uuid) — the
         // received-detail per-batch key (Task 14) for a project transfer.
         package_id: record.project.as_ref().map(|p| p.package_id.clone()),
+        batch_name: None,
     }
 }
 

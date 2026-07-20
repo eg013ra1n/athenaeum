@@ -282,6 +282,7 @@ fn build_source_history_row(conn: &Connection, package_ref: &str, src: &SyncSour
         // project dimension, and not a per-package transfer batch.
         project: None,
         package_id: None,
+        batch_name: None,
     }
 }
 
@@ -758,6 +759,7 @@ mod tests {
                     outcome: "sent".into(),
                     project: None,
                     package_id: None,
+                    batch_name: None,
                 },
             )
             .unwrap();

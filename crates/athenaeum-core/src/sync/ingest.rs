@@ -570,6 +570,7 @@ fn received_history(
         outcome: outcome.to_string(),
         project: record.project.as_ref().map(|p| p.project_id.clone()),
         package_id: Some(package_id.to_string()),
+        batch_name: None,
     }
 }
 
