@@ -52,6 +52,39 @@ const DEFAULT_RELAYS: [&str; 5] = [
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(12);
 
+/// Per-OS default for the desktop app's sync dir (`<app-data>/sync`, where the
+/// device key lives), mirroring Tauri's app-data resolution for our identifier:
+/// macOS `~/Library/Application Support`, Windows `%APPDATA%` (Roaming), Linux
+/// `$XDG_DATA_HOME` falling back to `~/.local/share`. `--sync-dir` overrides.
+fn default_sync_dir() -> Result<std::path::PathBuf> {
+    const IDENT: &str = "com.vsharifov.athenaeum";
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").context("HOME not set; pass --sync-dir")?;
+        Ok(std::path::Path::new(&home)
+            .join("Library/Application Support")
+            .join(IDENT)
+            .join("sync"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA").context("APPDATA not set; pass --sync-dir")?;
+        Ok(std::path::Path::new(&appdata).join(IDENT).join("sync"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let base = match std::env::var("XDG_DATA_HOME") {
+            Ok(x) if !x.is_empty() => std::path::PathBuf::from(x),
+            _ => {
+                let home = std::env::var("HOME")
+                    .context("XDG_DATA_HOME/HOME not set; pass --sync-dir")?;
+                std::path::Path::new(&home).join(".local/share")
+            }
+        };
+        Ok(base.join(IDENT).join("sync"))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut ephemeral = false;
@@ -92,11 +125,7 @@ async fn main() -> Result<()> {
     } else {
         let dir = match sync_dir {
             Some(d) => d,
-            None => {
-                let home = std::env::var("HOME").context("HOME not set; pass --sync-dir")?;
-                std::path::Path::new(&home)
-                    .join("Library/Application Support/com.vsharifov.athenaeum/sync")
-            }
+            None => default_sync_dir()?,
         };
         let path = device_key_path(&dir);
         if !path.exists() {
