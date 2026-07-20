@@ -552,7 +552,7 @@ async fn two_instance_sync_e2e() {
     assert!(keeper_path.exists(), "keeper file written");
 
     // ── (1) First enqueue → primary ingests ALL 50 with metadata ─────────────
-    let r1 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, frame_ids.clone(), None)
+    let r1 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, frame_ids.clone(), None, None, None)
         .await
         .expect("first enqueue");
     assert_eq!(r1.enqueued_count, N as u32);
@@ -619,7 +619,7 @@ async fn two_instance_sync_e2e() {
     }
 
     // ── (2) Re-run the identical enqueue → dedupe-safe ───────────────────────
-    let r2 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, frame_ids.clone(), None)
+    let r2 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, frame_ids.clone(), None, None, None)
         .await
         .expect("second enqueue");
     assert_eq!(r2.enqueued_count, N as u32, "the same 50 frames re-enqueue");
@@ -853,7 +853,7 @@ async fn resend_transfers_only_new_frames() {
 
     // ── (1) First batch: 3 frames → B ingests all 3, all reported new ──────────
     let batch1: Vec<i64> = frame_ids[0..3].to_vec();
-    let r1 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, batch1, None)
+    let r1 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, batch1, None, None, None)
         .await
         .expect("first enqueue");
     assert_eq!(r1.enqueued_count, 3, "the first 3 frames enqueue");
@@ -878,7 +878,7 @@ async fn resend_transfers_only_new_frames() {
     // Only the 1 new frame is transferred; the 3 B already holds are dropped by
     // the negotiate handshake before any announce/serve of them.
     let batch2: Vec<i64> = frame_ids[0..4].to_vec();
-    let r2 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, batch2, None)
+    let r2 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, batch2, None, None, None)
         .await
         .expect("second enqueue");
     assert_eq!(r2.enqueued_count, 4, "all 4 frames re-enqueue at the app layer");
@@ -904,7 +904,7 @@ async fn resend_transfers_only_new_frames() {
     // want and the package terminalizes confirmed WITHOUT announcing or serving —
     // B never even sees an announce, and its catalog is untouched.
     let batch3: Vec<i64> = frame_ids[0..4].to_vec();
-    enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, batch3, None)
+    enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, batch3, None, None, None)
         .await
         .expect("third enqueue");
 
@@ -993,6 +993,8 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
         &sync,
         ResolvedDest { node: receiver_node, endpoint_addr: None },
         frame_ids.clone(),
+        None,
+        None,
         None,
     )
     .await
@@ -1162,6 +1164,8 @@ async fn receiver_cancel_terminates_sender_then_resend_delivers() {
         ResolvedDest { node: receiver_node, endpoint_addr: None },
         frame_ids.clone(),
         None,
+        None,
+        None,
     )
     .await
     .expect("enqueue selection");
@@ -1325,6 +1329,8 @@ async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
         &sync,
         ResolvedDest { node: receiver_node, endpoint_addr: None },
         frame_ids.clone(),
+        None,
+        None,
         None,
     )
     .await
@@ -1525,6 +1531,8 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
         ResolvedDest { node: node_b_recv, endpoint_addr: None },
         ids_a.clone(),
         None,
+        None,
+        None,
     )
     .await
     .expect("A → B enqueue");
@@ -1535,6 +1543,8 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
         &sync_b,
         ResolvedDest { node: node_a_recv, endpoint_addr: None },
         ids_b.clone(),
+        None,
+        None,
         None,
     )
     .await

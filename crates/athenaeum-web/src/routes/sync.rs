@@ -98,6 +98,13 @@ pub struct EnqueueSelectionArgs {
     pub frame_ids: Vec<i64>,
     /// The chosen destination — an account device id resolved to its node id.
     pub destination_device_id: String,
+    /// User-edited batch name; `None`/blank → the backend auto-computes it (T3).
+    #[serde(default)]
+    pub batch_name: Option<String>,
+    /// Present when the send originates from an Object / frame-set view (T3):
+    /// drives the WBPP rel_path layout + frame-set auto-name.
+    #[serde(default)]
+    pub frame_set_id: Option<i64>,
 }
 
 /// POST /api/enqueue_sync_selection
@@ -119,6 +126,8 @@ pub async fn enqueue_sync_selection(
         &state.sync,
         dest,
         args.frame_ids,
+        args.batch_name,
+        args.frame_set_id,
         Some(emitter),
     )
     .await

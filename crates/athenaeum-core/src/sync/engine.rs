@@ -57,7 +57,8 @@ use crate::package::{self, ManifestRecord, MANIFEST_FILENAME};
 use crate::sharing::iroh::node::BoxFuture;
 use crate::sharing::iroh::proto::OfferEntry;
 use crate::sharing::types::{
-    FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
+    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome,
+    TransportEvent,
 };
 use crate::sharing::SharingTransport;
 
@@ -971,13 +972,46 @@ impl Worker {
             }
         });
 
-        // tv2: the personal-sync announce now goes out as v2 (batch name + file
-        // manifest). Real values arrive with the send-path task; for now advertise
-        // the package-dir basename as the batch name and an empty manifest.
-        let batch_name = dir
+        // The personal-sync announce goes out as v2 (batch name + file manifest).
+        // Batch name = the outbound row's `display_name` (set by the send path),
+        // falling back to the package-dir basename for a row that never got a name
+        // (a re-enqueued retry, a foreign package). File manifest = the package's
+        // manifest records, cached on the first build (`negotiate_and_build`), with
+        // a fresh on-disk read as a defensive fallback so `files` is never empty
+        // when payloads exist.
+        let pkg_basename = dir
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let batch_name = match self.store.get_outbound(id) {
+            Ok(Some(row)) => row
+                .display_name
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(pkg_basename),
+            Ok(None) => pkg_basename,
+            Err(e) => {
+                tracing::warn!(package_id = id, error = %e, "read display_name for announce failed");
+                pkg_basename
+            }
+        };
+        let announce_files: Vec<AnnounceFileEntry> = {
+            let cached = self
+                .pending
+                .get(&id)
+                .and_then(|p| p.manifest_records.clone());
+            let records = match cached {
+                Some(r) => r,
+                None => package::read_manifest(&dir).unwrap_or_default(),
+            };
+            records
+                .iter()
+                .map(|r| AnnounceFileEntry {
+                    rel_path: r.rel_path.clone(),
+                    byte_size: r.byte_size,
+                    frame_uuid: r.frame_uuid.clone(),
+                })
+                .collect()
+        };
 
         // Provider side: register the served dir (the negotiated want-subset when
         // `Some`, the full package when `None`), then advertise it to the peer. A
@@ -996,8 +1030,7 @@ impl Worker {
                     .context("announce project package"),
                 None => self
                     .transport
-                    // tv2: real file manifest arrives with the send-path task.
-                    .announce(self.peer, &announce, &batch_name, &[])
+                    .announce(self.peer, &announce, &batch_name, &announce_files)
                     .await
                     .context("announce package"),
             }

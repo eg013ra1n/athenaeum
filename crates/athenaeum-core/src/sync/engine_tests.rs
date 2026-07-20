@@ -2114,6 +2114,82 @@ fn build_package_multi(
     pkg_dir
 }
 
+/// T3: the personal-sync announce carries the batch's REAL name (the outbound
+/// row's `display_name`) and the REAL file manifest (one `AnnounceFileEntry` per
+/// manifest record), not the T1 empty placeholder. Pre-seeds a NAMED `Queued`
+/// row so crash-resume drives it deterministically — sidestepping the
+/// enqueue→announce race for the name read.
+#[tokio::test]
+async fn announce_carries_batch_name_and_file_manifest() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    // Started receiver that captures the FIRST announce it sees.
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    type Captured = (Option<String>, Option<Vec<AnnounceFileEntry>>);
+    let captured: Arc<std::sync::Mutex<Option<Captured>>> = Arc::new(std::sync::Mutex::new(None));
+    {
+        let receiver = receiver.clone();
+        let captured = captured.clone();
+        tokio::spawn(async move {
+            let mut events = receiver.events().await;
+            while let Some(event) = events.recv().await {
+                if let TransportEvent::AnnounceReceived { batch_name, files, .. } = event {
+                    *captured.lock().unwrap() = Some((batch_name, files));
+                    break;
+                }
+            }
+        });
+    }
+
+    // A two-file package + a pre-seeded, NAMED Queued row over the same store.
+    let pkg = build_package_multi(
+        &tmp.path().join("src"),
+        "named",
+        &[("uuid-a", "a.fits", "M42", 2048), ("uuid-b", "b.fits", "M42", 4096)],
+    );
+    // `CatalogSyncStore` (over a fresh db) exposes `lock_conn`, so the pre-seed
+    // can set the row's `display_name` directly. Its `open` materialises the same
+    // sync tables the standalone store does.
+    let store = Arc::new(super::store::CatalogSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let id = store.enqueue(&pkg.to_string_lossy(), receiver_id).unwrap();
+    crate::sync::store::set_outbound_display_name(&store.lock_conn(), id, Some("Orion Nebula"))
+        .unwrap();
+
+    // Spawn the engine over the SAME store — crash-resume drives the named row.
+    let _engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
+        receiver_id,
+    );
+
+    wait_until(|| captured.lock().unwrap().is_some(), WAIT).await;
+    let (batch_name, files) = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("an announce was captured");
+
+    assert_eq!(
+        batch_name.as_deref(),
+        Some("Orion Nebula"),
+        "announce carries the row's display_name"
+    );
+    let files = files.expect("v2 announce carries a file manifest");
+    let expected = package::read_manifest(&pkg).unwrap();
+    assert_eq!(files.len(), expected.len(), "one entry per manifest record");
+    let got: HashSet<(String, u64, String)> = files
+        .into_iter()
+        .map(|f| (f.rel_path, f.byte_size, f.frame_uuid))
+        .collect();
+    let want: HashSet<(String, u64, String)> = expected
+        .into_iter()
+        .map(|r| (r.rel_path, r.byte_size, r.frame_uuid))
+        .collect();
+    assert_eq!(got, want, "announce files mirror the package manifest");
+}
+
 /// A [`DedupResponder`] that reports EVERY offered frame as a true duplicate:
 /// nothing is a definite want, and every candidate's full hash "matches" (drop
 /// them all) → the negotiated want is empty.

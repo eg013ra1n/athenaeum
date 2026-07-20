@@ -78,6 +78,8 @@ pub async fn enqueue_sync_selection(
     app: AppHandle,
     frame_ids: Vec<i64>,
     destination_device_id: String,
+    batch_name: Option<String>,
+    frame_set_id: Option<i64>,
 ) -> Result<EnqueueSelectionResult, String> {
     // The host emitter, captured into the sender engine on its first spawn, so
     // send-side state transitions surface as `sync-progress`/`sync-finished`.
@@ -92,6 +94,8 @@ pub async fn enqueue_sync_selection(
         &state.sync,
         dest,
         frame_ids,
+        batch_name,
+        frame_set_id,
         Some(emitter),
     )
     .await

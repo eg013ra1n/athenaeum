@@ -1436,6 +1436,188 @@ struct BuiltSelection {
     eligible: Vec<i64>,
     ineligible: Vec<IneligibleFrame>,
     total: usize,
+    /// The resolved human batch name (T3). `None` when nothing was eligible.
+    display_name: Option<String>,
+    /// Per-payload `(rel_path, byte_size, frame_uuid)` for the `sync_outbound_files`
+    /// rows written after the row id is minted. One entry per manifest record.
+    files: Vec<(String, u64, String)>,
+}
+
+/// The package `rel_path` layout chosen for one send (T3, spec §D2).
+enum RelPathLayout {
+    /// Object send: `frame_id → WBPP rel_dir` (forward-slash, frame-set name NOT
+    /// included — the receiver adds its own `<batch_name>` landing level).
+    Wbpp(HashMap<i64, String>),
+    /// Browser send: each file's path taken relative to this common ancestor dir.
+    /// `None` → no usable common ancestor (flat basename fallback).
+    SourceRelative(Option<PathBuf>),
+}
+
+/// The deepest directory that contains every path in `paths` (each path is a
+/// FILE, so its parent is the candidate). Returns `None` when the selection is
+/// empty, any path has no parent, or the common prefix collapses to a bare
+/// filesystem root (no `Normal` component) — the "flat fallback" trigger (§D2).
+fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut prefix: PathBuf = paths.first()?.parent()?.to_path_buf();
+    for p in paths.iter().skip(1) {
+        let parent = p.parent()?;
+        prefix = longest_common_dir(&prefix, parent);
+        if prefix.as_os_str().is_empty() {
+            return None;
+        }
+    }
+    // A prefix with no Normal component is `/` (or a bare prefix) → treat as none.
+    if !prefix.components().any(|c| matches!(c, std::path::Component::Normal(_))) {
+        return None;
+    }
+    Some(prefix)
+}
+
+/// The longest shared leading run of directory components of `a` and `b`.
+fn longest_common_dir(a: &Path, b: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for (ca, cb) in a.components().zip(b.components()) {
+        if ca == cb {
+            result.push(ca.as_os_str());
+        } else {
+            break;
+        }
+    }
+    result
+}
+
+/// Forward-slash directory of `path` relative to `ancestor` (the dirs BETWEEN the
+/// ancestor and the file; empty when the file sits directly in the ancestor).
+/// `None` when `path` is not under `ancestor`.
+fn source_rel_dir(path: &str, ancestor: &Path) -> Option<String> {
+    let rel = Path::new(path).strip_prefix(ancestor).ok()?;
+    let parent = rel.parent()?;
+    Some(
+        parent
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+/// Split a filename into `(stem, extension?)` on the LAST dot (`a.b.fits` →
+/// `("a.b", Some("fits"))`, `noext` → `("noext", None)`).
+fn split_stem_ext(filename: &str) -> (String, Option<String>) {
+    let p = Path::new(filename);
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| filename.to_string());
+    let ext = p.extension().map(|s| s.to_string_lossy().into_owned());
+    (stem, ext)
+}
+
+/// A collision-free filename WITHIN one target directory: returns `filename`
+/// unchanged on first use, else suffixes before the extension (`name_2.fits`,
+/// `name_3.fits`, …). Collision scope is per-directory (§D2 — never flatten dirs),
+/// so `used` is keyed on the directory.
+fn dedup_in_dir(dir: &str, filename: &str, used: &mut HashMap<String, HashSet<String>>) -> String {
+    let set = used.entry(dir.to_string()).or_default();
+    if set.insert(filename.to_string()) {
+        return filename.to_string();
+    }
+    let (stem, ext) = split_stem_ext(filename);
+    let mut n = 2u32;
+    loop {
+        let candidate = match &ext {
+            Some(e) => format!("{stem}_{n}.{e}"),
+            None => format!("{stem}_{n}"),
+        };
+        if set.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Resolve one payload's package `rel_path` under `layout`, suffixing on a
+/// per-directory filename collision. Always forward-slash and validate-safe.
+fn assign_rel_path(
+    layout: &RelPathLayout,
+    frame_id: i64,
+    file: &crate::models::File,
+    used_by_dir: &mut HashMap<String, HashSet<String>>,
+) -> String {
+    let base = if file.filename.trim().is_empty() {
+        format!("frame_{frame_id}.fits")
+    } else {
+        file.filename.clone()
+    };
+    let dir = match layout {
+        // WBPP: a frame not present in the placement map (e.g. selected but not a
+        // member of this frame set) falls back to a flat basename.
+        RelPathLayout::Wbpp(map) => map.get(&frame_id).cloned().unwrap_or_default(),
+        RelPathLayout::SourceRelative(Some(ancestor)) => {
+            source_rel_dir(&file.path, ancestor).unwrap_or_default()
+        }
+        RelPathLayout::SourceRelative(None) => String::new(),
+    };
+    let name = dedup_in_dir(&dir, &base, used_by_dir);
+    if dir.is_empty() {
+        name
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// The frame set's name for the auto-batch-name (§D1). `Some(raw name)` when the
+/// row exists (a NULL/blank name yields `"Frame Set {id}"`, matching the export
+/// collector); `None` when there is no such row.
+fn frame_set_name(conn: &rusqlite::Connection, frame_set_id: i64) -> Option<String> {
+    match conn.query_row(
+        "SELECT name FROM frames_set WHERE id = ?1",
+        [frame_set_id],
+        |row| row.get::<_, Option<String>>(0),
+    ) {
+        Ok(Some(name)) if !name.trim().is_empty() => Some(name),
+        Ok(_) => Some(format!("Frame Set {frame_set_id}")),
+        Err(_) => None,
+    }
+}
+
+/// Local wall-clock `YYYY-MM-DD HH:MM` for the loose-files auto-name (§D1).
+fn local_now_short() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// Resolve the batch's human `display_name` (§D1). A user-provided non-blank name
+/// is kept VERBATIM (raw human string — sanitizing happens only for the receiver
+/// landing path, later). Otherwise: frame-set name → common-ancestor basename →
+/// `"{N} files — {YYYY-MM-DD HH:MM}"`.
+fn resolve_batch_name(
+    user: Option<&str>,
+    conn: &rusqlite::Connection,
+    frame_set_id: Option<i64>,
+    ancestor: Option<&Path>,
+    file_count: usize,
+) -> String {
+    if let Some(n) = user {
+        if !n.trim().is_empty() {
+            return n.to_string();
+        }
+    }
+    if let Some(fsid) = frame_set_id {
+        if let Some(name) = frame_set_name(conn, fsid) {
+            return name;
+        }
+    }
+    if let Some(dir) = ancestor {
+        if let Some(base) = dir.file_name().and_then(|s| s.to_str()) {
+            if !base.is_empty() {
+                return base.to_string();
+            }
+        }
+    }
+    format!("{file_count} files — {}", local_now_short())
 }
 
 /// A collision-free package `rel_path` for a payload. Uses the source filename;
@@ -1468,6 +1650,8 @@ fn build_selection_package(
     origin_device: &str,
     packages_dir: &Path,
     frame_ids: &[i64],
+    batch_name: Option<&str>,
+    frame_set_id: Option<i64>,
 ) -> Result<BuiltSelection, ApiError> {
     // Dedup requested ids, preserving first-seen order for stable reporting.
     let mut seen_req = HashSet::new();
@@ -1485,11 +1669,48 @@ fn build_selection_package(
     let analysis_by_frame: HashMap<i64, &crate::models::FrameAnalysis> =
         analyses.iter().map(|a| (a.frame_id, a)).collect();
 
+    // Common ancestor of the selection's files — drives both the source-relative
+    // rel_path layout and the common-ancestor auto-name. Computed over every row
+    // that resolves to a catalog frame (a to-be-ineligible missing file only makes
+    // the ancestor shallower, never wrong).
+    let candidate_paths: Vec<PathBuf> = rows
+        .iter()
+        .filter(|(_, _, frame)| frame.id.is_some())
+        .map(|(_, file, _)| PathBuf::from(&file.path))
+        .collect();
+    let ancestor = common_ancestor(&candidate_paths);
+
+    // Choose the rel_path layout (§D2): object send → WBPP hierarchy; browser send
+    // → source-relative. A WBPP build failure degrades to source-relative (never
+    // fails the send) with a warn — the honest-fallback rule.
+    let layout = match frame_set_id {
+        Some(fsid) => match crate::export::collect_export_data(conn, fsid) {
+            Ok(data) => {
+                let map: HashMap<i64, String> =
+                    crate::export::file_organizer::compute_wbpp_placements(&data)
+                        .into_iter()
+                        .map(|p| (p.frame_id, p.rel_dir))
+                        .collect();
+                RelPathLayout::Wbpp(map)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    frame_set_id = fsid,
+                    error = %format!("{e:#}"),
+                    "WBPP layout unavailable; using source-relative send layout"
+                );
+                RelPathLayout::SourceRelative(ancestor.clone())
+            }
+        },
+        None => RelPathLayout::SourceRelative(ancestor.clone()),
+    };
+
     let mut resolved: HashSet<i64> = HashSet::new();
     let mut ineligible: Vec<IneligibleFrame> = Vec::new();
     let mut eligible: Vec<i64> = Vec::new();
     let mut records: Vec<(PathBuf, ManifestRecord)> = Vec::new();
-    let mut used_rel_paths: HashSet<String> = HashSet::new();
+    // Per-directory used-filename sets for collision suffixing (§D2).
+    let mut used_by_dir: HashMap<String, HashSet<String>> = HashMap::new();
     // Per-eligible source linkage recorded into `sync_sources` after the package
     // is written: (catalog file_id, absolute path, size, mtime_ms). This is what
     // retention (task M4) later joins on to resolve a confirmed package back to
@@ -1545,7 +1766,7 @@ fn build_selection_package(
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let rel_path = unique_rel_path(&file.filename, frame_id, &mut used_rel_paths);
+        let rel_path = assign_rel_path(&layout, frame_id, file, &mut used_by_dir);
 
         records.push((
             path.to_path_buf(),
@@ -1579,8 +1800,24 @@ fn build_selection_package(
     }
 
     if records.is_empty() {
-        return Ok(BuiltSelection { pkg_dir: None, eligible, ineligible, total });
+        return Ok(BuiltSelection {
+            pkg_dir: None,
+            eligible,
+            ineligible,
+            total,
+            display_name: None,
+            files: Vec::new(),
+        });
     }
+
+    // Resolve the batch's human name (§D1) and snapshot the per-file rows for the
+    // `sync_outbound_files` write, before `records` is moved into the writer.
+    let display_name =
+        resolve_batch_name(batch_name, conn, frame_set_id, ancestor.as_deref(), records.len());
+    let files: Vec<(String, u64, String)> = records
+        .iter()
+        .map(|(_, r)| (r.rel_path.clone(), r.byte_size, r.frame_uuid.clone()))
+        .collect();
 
     let pkg_dir = packages_dir.join(uuid::Uuid::new_v4().to_string());
     package::write_package(&pkg_dir, records)
@@ -1601,7 +1838,14 @@ fn build_selection_package(
         }
     }
 
-    Ok(BuiltSelection { pkg_dir: Some(pkg_dir), eligible, ineligible, total })
+    Ok(BuiltSelection {
+        pkg_dir: Some(pkg_dir),
+        eligible,
+        ineligible,
+        total,
+        display_name: Some(display_name),
+        files,
+    })
 }
 
 /// Build the selection package and enqueue it into `engine`. The transport-
@@ -1614,17 +1858,51 @@ async fn build_and_enqueue_selection(
     origin_device: &str,
     packages_dir: &Path,
     frame_ids: &[i64],
+    batch_name: Option<&str>,
+    frame_set_id: Option<i64>,
 ) -> Result<EnqueueSelectionResult, ApiError> {
     let built = {
         let db = db(ctx)?;
         let conn = db.conn();
-        build_selection_package(&conn, origin_device, packages_dir, frame_ids)?
+        build_selection_package(&conn, origin_device, packages_dir, frame_ids, batch_name, frame_set_id)?
     };
     if let Some(dir) = &built.pkg_dir {
-        engine
+        let new_id = engine
             .enqueue_package(dir)
             .await
             .map_err(|e| ApiError::Internal(format!("enqueue selection package: {e:#}")))?;
+
+        // Persist the batch name + per-file rows onto the freshly minted outbound
+        // row (§D1/§D4). Both are UI/persistence state, NOT the send itself: a
+        // failed write must never fail an accepted transfer, so errors here are
+        // logged, not propagated. (The engine reads `display_name` on announce; a
+        // rare enqueue→announce race before this write self-heals on re-announce.)
+        let db = db(ctx)?;
+        let conn = db.conn();
+        if let Some(name) = &built.display_name {
+            if let Err(e) = crate::sync::store::set_outbound_display_name(&conn, new_id, Some(name)) {
+                tracing::warn!(package_id = new_id, error = %format!("{e:#}"), "persist batch display_name failed");
+            }
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let rows: Vec<crate::sync::OutboundFileRow> = built
+            .files
+            .iter()
+            .map(|(rel_path, byte_size, frame_uuid)| crate::sync::OutboundFileRow {
+                outbound_id: new_id,
+                rel_path: rel_path.clone(),
+                byte_size: *byte_size,
+                frame_uuid: frame_uuid.clone(),
+                state: crate::sync::OutboundFileState::Pending,
+                bytes_done: 0,
+                outcome: None,
+                error: None,
+                updated_at: now.clone(),
+            })
+            .collect();
+        if let Err(e) = crate::sync::store::replace_outbound_files(&conn, new_id, &rows) {
+            tracing::warn!(package_id = new_id, error = %format!("{e:#}"), "persist sync_outbound_files failed");
+        }
     }
     Ok(EnqueueSelectionResult {
         enqueued_count: built.eligible.len() as u32,
@@ -1650,6 +1928,8 @@ pub async fn enqueue_sync_selection(
     sync: &SyncRuntime,
     dest: ResolvedDest,
     frame_ids: Vec<i64>,
+    batch_name: Option<String>,
+    frame_set_id: Option<i64>,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<EnqueueSelectionResult, ApiError> {
     if frame_ids.is_empty() {
@@ -1671,8 +1951,16 @@ pub async fn enqueue_sync_selection(
     )
     .await?;
     let packages_dir = sender_packages_dir(ctx)?;
-    let result =
-        build_and_enqueue_selection(ctx, &engine, &origin_device, &packages_dir, &frame_ids).await?;
+    let result = build_and_enqueue_selection(
+        ctx,
+        &engine,
+        &origin_device,
+        &packages_dir,
+        &frame_ids,
+        batch_name.as_deref(),
+        frame_set_id,
+    )
+    .await?;
     tracing::info!(
         enqueued = result.enqueued_count,
         total = result.total_count,
@@ -2306,7 +2594,7 @@ mod tests {
         let built = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2]).unwrap()
+            build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2], None, None).unwrap()
         };
         assert_eq!(built.eligible.len(), 2);
         assert!(built.ineligible.is_empty());
@@ -2344,7 +2632,7 @@ mod tests {
         let pkg_root = tmp.path().join("packages");
         let db = db(&ctx).unwrap();
         let conn = db.conn();
-        let built = build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2]).unwrap();
+        let built = build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2], None, None).unwrap();
         let pkg_ref = built.pkg_dir.clone().expect("a package was written").to_string_lossy().to_string();
 
         let sources = crate::sync::live_sources_for_package(&conn, &pkg_ref).unwrap();
@@ -2371,7 +2659,8 @@ mod tests {
         let built = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2, unknown]).unwrap()
+            build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2, unknown], None, None)
+                .unwrap()
         };
         assert_eq!(built.eligible, vec![f1], "only the present file is eligible");
         assert_eq!(built.total, 3);
@@ -2402,7 +2691,7 @@ mod tests {
         let dest = ResolvedDest { node: [7u8; 32], endpoint_addr: None };
 
         let result =
-            enqueue_sync_selection(&ctx, &sender, collab_sender, &sync, dest, Vec::new(), None)
+            enqueue_sync_selection(&ctx, &sender, collab_sender, &sync, dest, Vec::new(), None, None, None)
                 .await
                 .unwrap();
         assert_eq!(result.enqueued_count, 0);
@@ -2423,7 +2712,7 @@ mod tests {
         let pkg_root = tmp.join("packages");
         let db = db(ctx).unwrap();
         let conn = db.conn();
-        build_selection_package(&conn, "origin-dev", &pkg_root, &[f1])
+        build_selection_package(&conn, "origin-dev", &pkg_root, &[f1], None, None)
             .unwrap()
             .pkg_dir
             .expect("a package was written")
@@ -2614,7 +2903,7 @@ mod tests {
         let pkg_dir = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2])
+            build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2], None, None)
                 .unwrap()
                 .pkg_dir
                 .expect("a package was written")
@@ -2703,7 +2992,7 @@ mod tests {
         let (pkg_dir, id) = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            let pkg_dir = build_selection_package(&conn, "origin-dev", &pkg_root, &[f1])
+            let pkg_dir = build_selection_package(&conn, "origin-dev", &pkg_root, &[f1], None, None)
                 .unwrap()
                 .pkg_dir
                 .expect("a package was written");
@@ -2956,5 +3245,327 @@ mod tests {
             matches!(mode, iroh::RelayMode::Custom(_)),
             "must use the hub's relay map, not iroh's public defaults, got {mode:?}"
         );
+    }
+
+    // ── T3: structured rel_path + batch name ─────────────────────────────────
+
+    /// A minimal `File` for the pure rel_path/name helpers (no DB, no disk).
+    fn file_at(path: &str, filename: &str) -> crate::models::File {
+        crate::models::File {
+            id: None,
+            path: path.to_string(),
+            filename: filename.to_string(),
+            size: 0,
+            modified_at: chrono::Utc::now(),
+            format: crate::models::FileFormat::FITS,
+            created_at: chrono::Utc::now(),
+            metadata_hash: None,
+            content_hash: None,
+            archived_in_operation: None,
+            archive_zip_path: None,
+            archive_path_in_zip: None,
+            uuid: None,
+            updated_at: None,
+        }
+    }
+
+    /// `common_ancestor`: the deepest shared directory; disjoint filesystem roots
+    /// collapse to `None` (the flat-fallback trigger).
+    #[test]
+    fn common_ancestor_finds_deepest_shared_dir() {
+        let under_one = vec![
+            PathBuf::from("/data/M31/lights/a.fits"),
+            PathBuf::from("/data/M31/flats/b.fits"),
+        ];
+        assert_eq!(common_ancestor(&under_one), Some(PathBuf::from("/data/M31")));
+
+        // Same directory → that directory (rel_paths become flat basenames).
+        let same = vec![
+            PathBuf::from("/data/M31/a.fits"),
+            PathBuf::from("/data/M31/b.fits"),
+        ];
+        assert_eq!(common_ancestor(&same), Some(PathBuf::from("/data/M31")));
+
+        // Disjoint top-level roots → None.
+        let disjoint = vec![
+            PathBuf::from("/vol_a/x/a.fits"),
+            PathBuf::from("/vol_b/y/b.fits"),
+        ];
+        assert_eq!(common_ancestor(&disjoint), None);
+    }
+
+    /// `dedup_in_dir`: collision-free names within one directory, suffixed before
+    /// the extension; a different directory is an independent namespace.
+    #[test]
+    fn dedup_in_dir_suffixes_before_extension() {
+        let mut used: HashMap<String, HashSet<String>> = HashMap::new();
+        assert_eq!(dedup_in_dir("d", "a.fits", &mut used), "a.fits");
+        assert_eq!(dedup_in_dir("d", "a.fits", &mut used), "a_2.fits");
+        assert_eq!(dedup_in_dir("d", "a.fits", &mut used), "a_3.fits");
+        // Extensionless.
+        assert_eq!(dedup_in_dir("d", "readme", &mut used), "readme");
+        assert_eq!(dedup_in_dir("d", "readme", &mut used), "readme_2");
+        // A different directory does not collide.
+        assert_eq!(dedup_in_dir("other", "a.fits", &mut used), "a.fits");
+    }
+
+    /// `source_rel_dir`: forward-slash dir between the ancestor and the file;
+    /// empty when the file sits directly in the ancestor.
+    #[test]
+    fn source_rel_dir_is_forward_slash_relative() {
+        let anc = Path::new("/data/M31");
+        assert_eq!(
+            source_rel_dir("/data/M31/lights/sub/a.fits", anc).as_deref(),
+            Some("lights/sub")
+        );
+        assert_eq!(source_rel_dir("/data/M31/a.fits", anc).as_deref(), Some(""));
+        assert_eq!(source_rel_dir("/elsewhere/a.fits", anc), None);
+    }
+
+    /// `assign_rel_path` source-relative: preserves the on-disk subdir under the
+    /// ancestor, and a same-name file in the flat (no-ancestor) fallback is
+    /// suffixed rather than flattened over.
+    #[test]
+    fn assign_rel_path_source_relative_and_flat_collision() {
+        let layout = RelPathLayout::SourceRelative(Some(PathBuf::from("/data/M31")));
+        let mut used: HashMap<String, HashSet<String>> = HashMap::new();
+        assert_eq!(
+            assign_rel_path(&layout, 1, &file_at("/data/M31/lights/a.fits", "a.fits"), &mut used),
+            "lights/a.fits"
+        );
+        assert_eq!(
+            assign_rel_path(&layout, 2, &file_at("/data/M31/b.fits", "b.fits"), &mut used),
+            "b.fits"
+        );
+
+        // Flat fallback (disjoint roots): a repeated basename gets `_2`.
+        let flat = RelPathLayout::SourceRelative(None);
+        let mut used2: HashMap<String, HashSet<String>> = HashMap::new();
+        assert_eq!(
+            assign_rel_path(&flat, 1, &file_at("/vol_a/x/dup.fits", "dup.fits"), &mut used2),
+            "dup.fits"
+        );
+        assert_eq!(
+            assign_rel_path(&flat, 2, &file_at("/vol_b/y/dup.fits", "dup.fits"), &mut used2),
+            "dup_2.fits"
+        );
+    }
+
+    /// `assign_rel_path` WBPP: two frames sharing a rel_dir and basename collide,
+    /// so the second is suffixed inside that subdir (never flattened out).
+    #[test]
+    fn assign_rel_path_wbpp_subdir_collision() {
+        let mut map = HashMap::new();
+        map.insert(1i64, "camera_asi/lights".to_string());
+        map.insert(2i64, "camera_asi/lights".to_string());
+        let layout = RelPathLayout::Wbpp(map);
+        let mut used: HashMap<String, HashSet<String>> = HashMap::new();
+        assert_eq!(
+            assign_rel_path(&layout, 1, &file_at("/a/x.fits", "x.fits"), &mut used),
+            "camera_asi/lights/x.fits"
+        );
+        assert_eq!(
+            assign_rel_path(&layout, 2, &file_at("/b/x.fits", "x.fits"), &mut used),
+            "camera_asi/lights/x_2.fits"
+        );
+    }
+
+    /// `resolve_batch_name` — each of the three auto-name rules plus the verbatim
+    /// user override.
+    #[test]
+    fn resolve_batch_name_all_rules() {
+        let (_tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        // A frame set to name after.
+        conn.execute(
+            "INSERT INTO frames_set (id, name) VALUES (7, 'Andromeda Core')",
+            [],
+        )
+        .unwrap();
+
+        // 1) User-provided non-blank name is kept verbatim (whitespace preserved).
+        assert_eq!(
+            resolve_batch_name(Some("  My Send  "), &conn, Some(7), None, 3),
+            "  My Send  "
+        );
+        // A blank user name falls through to auto.
+        assert_eq!(
+            resolve_batch_name(Some("   "), &conn, Some(7), None, 3),
+            "Andromeda Core"
+        );
+        // 2) Object send → frame-set name.
+        assert_eq!(resolve_batch_name(None, &conn, Some(7), None, 3), "Andromeda Core");
+        // 3) Browser folder → common-ancestor basename.
+        assert_eq!(
+            resolve_batch_name(None, &conn, None, Some(Path::new("/data/M31_lights")), 4),
+            "M31_lights"
+        );
+        // 4) Loose files → "N files — YYYY-MM-DD HH:MM".
+        let loose = resolve_batch_name(None, &conn, None, None, 5);
+        assert!(loose.starts_with("5 files — "), "got {loose}");
+        assert!(
+            regex_like_timestamp(&loose),
+            "auto name must carry a YYYY-MM-DD HH:MM stamp: {loose}"
+        );
+    }
+
+    /// Loose check that the tail of an auto name is a `YYYY-MM-DD HH:MM` stamp
+    /// (no regex dep): digits/dashes/colon in the expected shape.
+    fn regex_like_timestamp(s: &str) -> bool {
+        let tail = s.rsplit("— ").next().unwrap_or("");
+        let b = tail.as_bytes();
+        b.len() == 16
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b[10] == b' '
+            && b[13] == b':'
+            && b.iter()
+                .enumerate()
+                .filter(|(i, _)| ![4usize, 7, 10, 13].contains(i))
+                .all(|(_, c)| c.is_ascii_digit())
+    }
+
+    /// Source-relative browser send: files under a common dir keep their on-disk
+    /// subdir structure in `rel_path`; the batch auto-name is the ancestor
+    /// basename; and one `sync_outbound_files` row lands per manifest record with
+    /// `state = pending`, `bytes_done = 0`.
+    #[tokio::test]
+    async fn source_relative_enqueue_writes_files_and_name() {
+        use crate::sharing::loopback::LoopbackNetwork;
+        use crate::sharing::SharingTransport;
+
+        let (tmp, ctx) = test_ctx();
+        let ctx = Arc::new(ctx);
+        // Two files under a common "M31_data" dir, in different subdirs.
+        let root = tmp.path().join("M31_data");
+        let f1 = {
+            let p = root.join("lights");
+            std::fs::create_dir_all(&p).unwrap();
+            insert_fixture_frame_at(&ctx, &p.join("light1.fits"), "M31")
+        };
+        let f2 = {
+            let p = root.join("flats");
+            std::fs::create_dir_all(&p).unwrap();
+            insert_fixture_frame_at(&ctx, &p.join("flat1.fits"), "M31")
+        };
+
+        let db_path = db(&ctx).unwrap().path().to_path_buf();
+        let net = LoopbackNetwork::new();
+        let store = Arc::new(CatalogSyncStore::open(&db_path).unwrap());
+        let engine = SyncEngine::spawn(
+            store as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
+            [9u8; 32],
+        );
+
+        let pkg_root = tmp.path().join("packages");
+        let result = build_and_enqueue_selection(
+            &ctx,
+            &engine,
+            "origin-dev",
+            &pkg_root,
+            &[f1, f2],
+            None, // auto-name → common-ancestor basename "M31_data"
+            None, // browser send (no frame set)
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.enqueued_count, 2);
+
+        // Inspect the row the engine minted.
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let rows = crate::sync::store::all_outbound_rows(&conn, 10).unwrap();
+        let row = rows.first().expect("an outbound row exists");
+        assert_eq!(row.display_name.as_deref(), Some("M31_data"), "auto name = ancestor basename");
+
+        let files = crate::sync::store::list_outbound_files(&conn, row.id).unwrap();
+        assert_eq!(files.len(), 2, "one row per manifest record");
+        let rel: HashSet<&str> = files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert!(rel.contains("lights/light1.fits"), "subdir preserved: {rel:?}");
+        assert!(rel.contains("flats/flat1.fits"), "subdir preserved: {rel:?}");
+        for f in &files {
+            assert_eq!(f.state, crate::sync::OutboundFileState::Pending);
+            assert_eq!(f.bytes_done, 0);
+            assert!(f.byte_size > 0, "byte_size carried from the manifest");
+        }
+    }
+
+    /// A user-provided batch name is stored verbatim on the outbound row.
+    #[tokio::test]
+    async fn user_batch_name_is_persisted_verbatim() {
+        use crate::sharing::loopback::LoopbackNetwork;
+        use crate::sharing::SharingTransport;
+
+        let (tmp, ctx) = test_ctx();
+        let ctx = Arc::new(ctx);
+        let f1 = insert_fixture_frame_at(&ctx, &tmp.path().join("a.fits"), "M42");
+
+        let db_path = db(&ctx).unwrap().path().to_path_buf();
+        let net = LoopbackNetwork::new();
+        let store = Arc::new(CatalogSyncStore::open(&db_path).unwrap());
+        let engine = SyncEngine::spawn(
+            store as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
+            [3u8; 32],
+        );
+
+        let pkg_root = tmp.path().join("packages");
+        let name = Some("Trip to M42".to_string());
+        build_and_enqueue_selection(
+            &ctx,
+            &engine,
+            "origin-dev",
+            &pkg_root,
+            &[f1],
+            name.as_deref(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let rows = crate::sync::store::all_outbound_rows(&conn, 10).unwrap();
+        assert_eq!(
+            rows.first().unwrap().display_name.as_deref(),
+            Some("Trip to M42")
+        );
+    }
+
+    /// Write a fixture file at an ABSOLUTE path (creating parent dirs) + its
+    /// `files`/`frames` rows; returns the frame id. Sibling of
+    /// `insert_fixture_frame` for tests that need real subdirectories.
+    fn insert_fixture_frame_at(ctx: &ServiceContext, abs_path: &Path, object: &str) -> i64 {
+        use crate::models::{File, FileFormat, Frame};
+        if let Some(parent) = abs_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(abs_path, format!("payload-{}", abs_path.display()).as_bytes()).unwrap();
+        let size = std::fs::metadata(abs_path).unwrap().len() as i64;
+        let filename = abs_path.file_name().unwrap().to_string_lossy().into_owned();
+
+        let db = db(ctx).unwrap();
+        let conn = db.conn();
+        let file = File {
+            id: None,
+            path: abs_path.to_string_lossy().into_owned(),
+            filename,
+            size,
+            modified_at: chrono::Utc::now(),
+            format: FileFormat::FITS,
+            created_at: chrono::Utc::now(),
+            metadata_hash: None,
+            content_hash: None,
+            archived_in_operation: None,
+            archive_zip_path: None,
+            archive_path_in_zip: None,
+            uuid: None,
+            updated_at: None,
+        };
+        let file_id = crate::db::insert_file(&conn, &file).unwrap();
+        let frame = Frame { file_id, object: Some(object.to_string()), ..Default::default() };
+        crate::db::insert_frame(&conn, &frame).unwrap()
     }
 }
