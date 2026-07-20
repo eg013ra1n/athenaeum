@@ -39,7 +39,7 @@ fn make_file(tmp: &tempfile::TempDir, name: &str) -> PathBuf {
 
 /// Enqueue a package whose `package_ref` is `path`; return the durable row id.
 fn enqueue(store: &StandaloneSyncStore, path: &Path) -> i64 {
-    store.enqueue(&path.to_string_lossy(), PEER).unwrap()
+    store.enqueue(&path.to_string_lossy(), PEER, None, &[]).unwrap()
 }
 
 /// Force a row's `confirmed_at` to an explicit RFC3339 value via a second raw

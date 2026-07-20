@@ -1564,7 +1564,7 @@ async fn api_retry(
             });
             continue;
         }
-        match engine.enqueue_package(dir).await {
+        match engine.enqueue_package(dir, None, Vec::new()).await {
             Ok(new_id) => {
                 tracing::info!(old_id = id, new_id, "failed package re-enqueued via web");
                 // The retry always routes to the sinked engine (`engines[0]`),
@@ -1821,9 +1821,9 @@ mod tests {
             PEER,
         ));
 
-        let confirmed = store.enqueue("pkg-confirmed", PEER).unwrap();
+        let confirmed = store.enqueue("pkg-confirmed", PEER, None, &[]).unwrap();
         store.confirm(confirmed, &[]).unwrap();
-        let transferring = store.enqueue("pkg-transferring", PEER).unwrap();
+        let transferring = store.enqueue("pkg-transferring", PEER, None, &[]).unwrap();
         store
             .set_state(transferring, OutboundState::Transferring)
             .unwrap();
@@ -2463,13 +2463,13 @@ mod tests {
 
         // A real one-file package → its filename surfaces (dir stripped).
         let pkg = write_manifest_package(&tmp.path().join("pkg-real"), &["frames/light-0009.fits"]);
-        state.store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
+        state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
 
         // Seven files → capped at SENT_FILES_CAP (6).
         let many: Vec<String> = (0..7).map(|i| format!("f-{i}.fits")).collect();
         let refs: Vec<&str> = many.iter().map(String::as_str).collect();
         let big = write_manifest_package(&tmp.path().join("pkg-many"), &refs);
-        state.store.enqueue(&big.to_string_lossy(), PEER).unwrap();
+        state.store.enqueue(&big.to_string_lossy(), PEER, None, &[]).unwrap();
 
         let app = build_router(state, None);
         let res = app
@@ -3055,7 +3055,7 @@ mod tests {
     async fn retry_reenqueues_failed_with_intact_payload() {
         let (state, tmp) = test_state().await;
         let pkg = make_package_dir(tmp.path(), "pkg-failed-intact", false);
-        let old_id = state.store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
+        let old_id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
         state
             .store
             .set_state(old_id, OutboundState::Failed)
@@ -3118,7 +3118,7 @@ mod tests {
     async fn retry_reenqueues_cancelled_with_intact_payload() {
         let (state, tmp) = test_state().await;
         let pkg = make_package_dir(tmp.path(), "pkg-cancelled-intact", false);
-        let old_id = state.store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
+        let old_id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
         state
             .store
             .set_state(old_id, OutboundState::Cancelled)
@@ -3148,7 +3148,7 @@ mod tests {
     async fn retry_rejects_missing_payload() {
         let (state, tmp) = test_state().await;
         let pkg = make_package_dir(tmp.path(), "pkg-manifest-only", true);
-        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
+        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
         state.store.set_state(id, OutboundState::Failed).unwrap();
 
         let store = Arc::clone(&state.store);
@@ -3224,7 +3224,7 @@ mod tests {
     #[tokio::test]
     async fn status_counts_bucket_cancelled() {
         let (state, _tmp) = test_state().await;
-        let id = state.store.enqueue("pkg-cancelled", PEER).unwrap();
+        let id = state.store.enqueue("pkg-cancelled", PEER, None, &[]).unwrap();
         state.store.set_state(id, OutboundState::Cancelled).unwrap();
         let app = build_router(state, None);
         let v = body_json(get(&app, "/api/status").await).await;
@@ -3269,7 +3269,7 @@ mod tests {
             &tmp.path().join("pkg-sized"),
             &[("a.fits", 1000), ("b.fits", 2000), ("c.fits", 3000)],
         );
-        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
+        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
         state
             .store
             .set_next_retry_at(id, Some("2026-07-16T12:00:00Z"))

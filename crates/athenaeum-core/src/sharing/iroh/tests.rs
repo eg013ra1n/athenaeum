@@ -618,7 +618,7 @@ async fn engine_suite_over_iroh() {
         receiver_id,
     );
 
-    let id = engine.enqueue_package(&pkg_dir).await.unwrap();
+    let id = engine.enqueue_package(&pkg_dir, None, Vec::new()).await.unwrap();
     wait_until(
         || state_of(&store, id) == Some(OutboundState::Confirmed),
         IROH_WAIT,
@@ -721,7 +721,7 @@ async fn engine_dup_ack_confirms_once_over_iroh() {
         receiver_id,
     );
 
-    let id = engine.enqueue_package(&pkg_dir).await.unwrap();
+    let id = engine.enqueue_package(&pkg_dir, None, Vec::new()).await.unwrap();
     wait_until(
         || state_of(&store, id) == Some(OutboundState::Confirmed),
         IROH_WAIT,

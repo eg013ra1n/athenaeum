@@ -345,6 +345,19 @@ impl SharingTransport for LoopbackTransport {
                 bytes_done: 0,
                 bytes_total: file.size,
             });
+            // Symmetric provider-side START tick (Task 2.2): the iroh provider emits
+            // real partial `ServeFileProgress` before a file completes, so the mock
+            // emits a `bytes_done: 0` tick here (mirroring the `FetchEvent::File`
+            // start above) — this is what lets the sender engine mark a per-file row
+            // `sending` before it uploads. Best-effort (`try_send`).
+            if let Some(tx) = &provider_tx {
+                let _ = tx.try_send(TransportEvent::ServeFileProgress {
+                    package_id: pkg.package_id.clone(),
+                    file: name.clone(),
+                    bytes_done: 0,
+                    bytes_total: file.size,
+                });
+            }
 
             let dest_path = dest_dir.join(&file.rel);
             if let Some(parent) = dest_path.parent() {

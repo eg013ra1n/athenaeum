@@ -1867,42 +1867,23 @@ async fn build_and_enqueue_selection(
         build_selection_package(&conn, origin_device, packages_dir, frame_ids, batch_name, frame_set_id)?
     };
     if let Some(dir) = &built.pkg_dir {
-        let new_id = engine
-            .enqueue_package(dir)
-            .await
-            .map_err(|e| ApiError::Internal(format!("enqueue selection package: {e:#}")))?;
-
-        // Persist the batch name + per-file rows onto the freshly minted outbound
-        // row (§D1/§D4). Both are UI/persistence state, NOT the send itself: a
-        // failed write must never fail an accepted transfer, so errors here are
-        // logged, not propagated. (The engine reads `display_name` on announce; a
-        // rare enqueue→announce race before this write self-heals on re-announce.)
-        let db = db(ctx)?;
-        let conn = db.conn();
-        if let Some(name) = &built.display_name {
-            if let Err(e) = crate::sync::store::set_outbound_display_name(&conn, new_id, Some(name)) {
-                tracing::warn!(package_id = new_id, error = %format!("{e:#}"), "persist batch display_name failed");
-            }
-        }
-        let now = chrono::Utc::now().to_rfc3339();
-        let rows: Vec<crate::sync::OutboundFileRow> = built
+        // §D1/§D4: the batch name + per-file `pending` rows travel WITH the enqueue
+        // now — the engine's `store.enqueue` writes them in the same transaction as
+        // the row, so the first announce can never read a nameless / file-less row
+        // (the T3 enqueue→announce race is gone; no post-hoc write, no self-heal).
+        let files: Vec<crate::sharing::types::AnnounceFileEntry> = built
             .files
             .iter()
-            .map(|(rel_path, byte_size, frame_uuid)| crate::sync::OutboundFileRow {
-                outbound_id: new_id,
+            .map(|(rel_path, byte_size, frame_uuid)| crate::sharing::types::AnnounceFileEntry {
                 rel_path: rel_path.clone(),
                 byte_size: *byte_size,
                 frame_uuid: frame_uuid.clone(),
-                state: crate::sync::OutboundFileState::Pending,
-                bytes_done: 0,
-                outcome: None,
-                error: None,
-                updated_at: now.clone(),
             })
             .collect();
-        if let Err(e) = crate::sync::store::replace_outbound_files(&conn, new_id, &rows) {
-            tracing::warn!(package_id = new_id, error = %format!("{e:#}"), "persist sync_outbound_files failed");
-        }
+        engine
+            .enqueue_package(dir, built.display_name.clone(), files)
+            .await
+            .map_err(|e| ApiError::Internal(format!("enqueue selection package: {e:#}")))?;
     }
     Ok(EnqueueSelectionResult {
         enqueued_count: built.eligible.len() as u32,
@@ -2089,7 +2070,7 @@ pub async fn retry_sync_package(
         }
     };
     let new_id = engine
-        .enqueue_package(&dir)
+        .enqueue_package(&dir, None, Vec::new())
         .await
         .map_err(|e| ApiError::Internal(format!("re-enqueue package {id}: {e:#}")))?;
     tracing::info!(old_id = id, new_id, peer = %node_id_hex(&row.peer), "sync package retried");
@@ -2407,8 +2388,8 @@ mod tests {
         let peer_x = node(0xcc);
         {
             let store = CatalogSyncStore::open(&db_path).unwrap();
-            let id1 = store.enqueue("/pkgs/one", peer_x).unwrap();
-            let id2 = store.enqueue("/pkgs/two", peer_x).unwrap();
+            let id1 = store.enqueue("/pkgs/one", peer_x, None, &[]).unwrap();
+            let id2 = store.enqueue("/pkgs/two", peer_x, None, &[]).unwrap();
             assert_eq!((id1, id2), (1, 2));
             store.set_state(id2, OutboundState::Transferring).unwrap();
         }
@@ -2774,7 +2755,7 @@ mod tests {
 
         // Enqueue on the peer's engine, then cancel it → terminal Cancelled.
         let (engine, _) = sender.current_for(&peer).await.unwrap();
-        let old_id = engine.enqueue_package(&pkg_dir).await.unwrap();
+        let old_id = engine.enqueue_package(&pkg_dir, None, Vec::new()).await.unwrap();
         engine.cancel(old_id).await.unwrap();
         wait_outbound_state(&db_path, old_id, OutboundState::Cancelled).await;
 
@@ -2815,7 +2796,7 @@ mod tests {
 
         // Enqueue but do NOT cancel — the row is non-terminal (Queued/Announced).
         let (engine, _) = sender.current_for(&peer).await.unwrap();
-        let id = engine.enqueue_package(&pkg_dir).await.unwrap();
+        let id = engine.enqueue_package(&pkg_dir, None, Vec::new()).await.unwrap();
 
         let err = retry_sync_package(&ctx, &sender, collab_sender, &sync, id, None)
             .await
@@ -2949,7 +2930,7 @@ mod tests {
             Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
             receiver_id,
         );
-        let id = engine.enqueue_package(&pkg_dir).await.unwrap();
+        let id = engine.enqueue_package(&pkg_dir, None, Vec::new()).await.unwrap();
 
         // Poll until confirmed (bounded).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2998,7 +2979,7 @@ mod tests {
                 .expect("a package was written");
             drop(conn);
             let store = CatalogSyncStore::open(&db_path).unwrap();
-            let id = store.enqueue(&pkg_dir.to_string_lossy(), [9u8; 32]).unwrap();
+            let id = store.enqueue(&pkg_dir.to_string_lossy(), [9u8; 32], None, &[]).unwrap();
             (pkg_dir, id)
         };
         let _ = pkg_dir;

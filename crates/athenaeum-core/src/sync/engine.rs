@@ -63,7 +63,7 @@ use crate::sharing::types::{
 use crate::sharing::SharingTransport;
 
 use super::diagnostics::{classify_send_error, ConnectClass};
-use super::models::{Direction, HistoryRow, OutboundRow, OutboundState};
+use super::models::{Direction, HistoryRow, OutboundFileState, OutboundRow, OutboundState};
 use super::receiver::{SyncFileProgressEvent, SyncFinishedEvent, SyncProgressEvent};
 use super::store::SyncStore;
 use super::{node_id_hex, now_iso};
@@ -140,9 +140,15 @@ impl Default for SyncConfig {
 enum Command {
     /// Enqueue + drive a package directory. The worker inserts the `Queued` row
     /// itself (so a fresh enqueue and the startup crash-resume enumeration can
-    /// never both drive the same row) and replies with the new id.
+    /// never both drive the same row) and replies with the new id. `display_name`
+    /// + `files` are the batch metadata (Transfers Status Model v2): the worker
+    /// writes them in the SAME enqueue transaction as the row (kills the T3
+    /// enqueue→announce race), so the row is never visible without its name +
+    /// per-file manifest.
     Process {
         dir: PathBuf,
+        display_name: Option<String>,
+        files: Vec<AnnounceFileEntry>,
         reply: oneshot::Sender<Result<i64>>,
     },
     /// Cancel an in-flight package → `Cancelled` (`cancelled` history outcome).
@@ -227,6 +233,23 @@ struct Pending {
     /// stale lookup entry (dead-addressing classes: `no_route` / `timeout` /
     /// `relay_unreachable`) rather than merge onto a possibly-dead relay URL.
     last_attempt_class: Option<ConnectClass>,
+    /// Last per-file state we PERSISTED for each served `rel_path` (Transfers
+    /// Status Model v2 §D4). In-memory transition tracker so a per-byte
+    /// [`ServeFileProgress`](TransportEvent::ServeFileProgress) tick only writes
+    /// the DB when the file's state actually changes (`pending → sending` on the
+    /// first partial tick, `sending → uploaded` on completion) — never per byte.
+    /// Rebuilt from scratch on a fresh engine (the DB holds the durable state).
+    file_states: HashMap<String, OutboundFileState>,
+    /// Whether the `serve_started` journal event has been recorded for this
+    /// send session (§D7). The first [`ServeProgress`](TransportEvent::ServeProgress)
+    /// tick (the peer began pulling) sets it; retries re-serve but do not re-log.
+    serve_started_logged: bool,
+    /// Set when a retry is armed (ack-timeout backoff or a failed serve/announce);
+    /// cleared on the first [`ServeProgress`](TransportEvent::ServeProgress) tick
+    /// after it, which also wipes the stale `last_error` (spec §D5: a transfer
+    /// actually moving bytes must never carry a stale reason). Exactly one
+    /// clear-write per retry cycle, only when bytes resume flowing.
+    clear_error_on_next_serve: bool,
 }
 
 /// Outcome of the first-build dedup handshake
@@ -496,14 +519,28 @@ pub struct SyncEngineHandle {
 
 impl SyncEngineHandle {
     /// Enqueue a package directory for sending and return its durable row id
-    /// (valid for [`cancel`](Self::cancel)). The worker inserts the row and
-    /// begins driving it; this awaits the worker's id reply.
-    pub async fn enqueue_package(&self, dir: impl AsRef<Path>) -> Result<i64> {
+    /// (valid for [`cancel`](Self::cancel)). The worker inserts the row —
+    /// together with its `display_name` and per-file `pending` rows, in one
+    /// transaction — and begins driving it; this awaits the worker's id reply.
+    ///
+    /// `display_name` is the human batch name (Transfers Status Model v2 §D1);
+    /// `files` the per-payload `(rel_path, byte_size, frame_uuid)` manifest (§D4).
+    /// Pass `None` / `Vec::new()` for a nameless / file-manifest-less send
+    /// (Perseus, a collab project package, a re-enqueued retry) — the announce's
+    /// basename fallback still applies.
+    pub async fn enqueue_package(
+        &self,
+        dir: impl AsRef<Path>,
+        display_name: Option<String>,
+        files: Vec<AnnounceFileEntry>,
+    ) -> Result<i64> {
         let dir = dir.as_ref().to_path_buf();
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Process {
                 dir,
+                display_name,
+                files,
                 reply: reply_tx,
             })
             .await
@@ -694,10 +731,18 @@ impl Worker {
                     }
                 },
                 cmd = cmd_rx.recv() => match cmd {
-                    Some(Command::Process { dir, reply }) => {
-                        match self.store.enqueue(&dir.to_string_lossy(), self.peer) {
+                    Some(Command::Process { dir, display_name, files, reply }) => {
+                        // The enqueue writes the row + its display_name + per-file
+                        // `pending` rows in one transaction, so the row is never
+                        // visible (to this worker's own `start_package`, to
+                        // `status_snapshot`, or to a concurrent reader) without its
+                        // name + manifest — the T3 enqueue→announce race is gone.
+                        match self.store.enqueue(&dir.to_string_lossy(), self.peer, display_name.as_deref(), &files) {
                             Ok(id) => {
                                 tracing::info!(package_id = id, state = "queued", "sync state");
+                                // Journal the batch's first lifecycle event (§D7).
+                                let byte_size: u64 = files.iter().map(|f| f.byte_size).sum();
+                                self.journal(id, "enqueued", Some(&format!("frames={} bytes={}", files.len(), byte_size)));
                                 self.emit_progress(id, "queued", 0);
                                 let _ = reply.send(Ok(id));
                                 if let Err(e) = self.start_package(id, dir, OutboundState::Queued).await {
@@ -847,6 +892,77 @@ impl Worker {
         }
     }
 
+    /// Append one entry to this batch's `sync_events` journal (Transfers Status
+    /// Model v2 §D7), `direction = sent`, `batch_key` = the outbound row id as
+    /// text. Best-effort: a journal-write failure `warn!`s and never fails the
+    /// transfer (§D7 — the log is a diagnostic, not delivery truth).
+    fn journal(&self, id: i64, kind: &str, detail: Option<&str>) {
+        if let Err(e) = self.store.append_sync_event(Direction::Sent, &id.to_string(), kind, detail) {
+            tracing::warn!(package_id = id, kind, error = %format!("{e:#}"), "append sync_event failed");
+        }
+    }
+
+    /// Settle each per-file row named in `receipts` (§D4): map `frame_uuid` →
+    /// `rel_path` via `records`, write the receiver's verdict (same text encoding
+    /// as `sync_receipts` — `ingested` / `duplicate` / `cancelled` /
+    /// `rejected:<reason>`), state `done`. A `Rejected` receipt also stamps the
+    /// per-file `error`. Best-effort per row (a write failure `warn!`s, never
+    /// fails the ack). A receipt whose `frame_uuid` isn't in the manifest, or a
+    /// row that doesn't exist (a Perseus batch with no per-file rows), is a no-op.
+    fn settle_files_from_receipts(&self, id: i64, records: &[ManifestRecord], receipts: &[FrameReceipt]) {
+        let by_uuid: HashMap<&str, &ManifestRecord> =
+            records.iter().map(|r| (r.frame_uuid.as_str(), r)).collect();
+        for rec in receipts {
+            let Some(m) = by_uuid.get(rec.frame_uuid.as_str()) else {
+                continue;
+            };
+            let outcome = super::store::receipt_outcome_to_db(&rec.outcome);
+            let error = match &rec.outcome {
+                ReceiptOutcome::Rejected(msg) => Some(msg.as_str()),
+                _ => None,
+            };
+            if let Err(e) = self.store.set_outbound_file_state(
+                id,
+                &m.rel_path,
+                OutboundFileState::Done,
+                m.byte_size,
+                Some(&outcome),
+                error,
+            ) {
+                tracing::warn!(package_id = id, rel_path = %m.rel_path, error = %format!("{e:#}"), "settle outbound file (receipt) failed");
+            }
+        }
+    }
+
+    /// Give every not-yet-settled per-file row of a terminal-`cancelled`/`failed`
+    /// batch that terminal `outcome`, state `done` (§D4). Rows already `done` (an
+    /// ack settled them) are left as they are — the receiver's verdict wins over
+    /// the batch terminal. Best-effort throughout.
+    fn settle_unsettled_files(&self, id: i64, outcome: &str) {
+        let rows = match self.store.list_outbound_files(id) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(package_id = id, error = %format!("{e:#}"), "list outbound files for terminal settle failed");
+                return;
+            }
+        };
+        for row in rows {
+            if row.state == OutboundFileState::Done {
+                continue;
+            }
+            if let Err(e) = self.store.set_outbound_file_state(
+                id,
+                &row.rel_path,
+                OutboundFileState::Done,
+                row.bytes_done,
+                Some(outcome),
+                None,
+            ) {
+                tracing::warn!(package_id = id, rel_path = %row.rel_path, error = %format!("{e:#}"), "settle outbound file (terminal) failed");
+            }
+        }
+    }
+
     /// Begin driving a package: install its pending slot, then make the first
     /// serve+announce attempt.
     ///
@@ -885,6 +1001,9 @@ impl Worker {
                 hub_package_id: None,
                 manifest_records: None,
                 last_attempt_class: None,
+                file_states: HashMap::new(),
+                serve_started_logged: false,
+                clear_error_on_next_serve: false,
             },
         );
         self.attempt(id).await
@@ -1056,6 +1175,9 @@ impl Worker {
             if let Err(se) = self.store.set_last_error(id, Some(&stored)) {
                 tracing::warn!(package_id = id, error = %se, "record last_error (serve/announce) failed");
             }
+            // Journal the class-tagged failure (§D7) before arming the retry (which
+            // journals `retry_scheduled`).
+            self.journal(id, "announce_failed", Some(&stored));
             if let Some(p) = self.pending.get_mut(&id) {
                 p.announce = Some(announce);
                 p.want = want;
@@ -1100,6 +1222,9 @@ impl Worker {
         } else {
             tracing::info!(package_id = id, state = "transferring", "sync resume/retry re-announce");
         }
+        // The announce reached the peer — journal it (§D7). Fires on every
+        // successful announce (first + every resume/retry re-announce).
+        self.journal(id, "announce_sent", None);
 
         // Arm the ack-wait deadline and persist the announce/want/milestone. The
         // deadline now means "waiting for the peer's ack"; if it fires,
@@ -1264,6 +1389,27 @@ impl Worker {
             p.duplicate_count = duplicate_count;
             p.want = want.clone();
         }
+        // §D4: files EXCLUDED from the want subset — the peer already has them, so
+        // they are never transferred. Settle them terminal now (`done`/`duplicate`)
+        // so the UI never shows a duplicate as pending. Only applies to a real
+        // subset (`want = Some`); a full send / fallback (`None`) excludes nothing.
+        if let Some(w) = &want {
+            for r in &records {
+                if !w.contains(&r.rel_path) {
+                    if let Err(e) = self.store.set_outbound_file_state(
+                        id,
+                        &r.rel_path,
+                        OutboundFileState::Done,
+                        0,
+                        Some("duplicate"),
+                        None,
+                    ) {
+                        tracing::warn!(package_id = id, rel_path = %r.rel_path, error = %format!("{e:#}"), "mark duplicate outbound file failed");
+                    }
+                }
+            }
+        }
+        self.journal(id, "negotiated", Some(&format!("new={new_count} duplicate={duplicate_count}")));
         Ok(Negotiated::Send { announce, want })
     }
 
@@ -1299,6 +1445,11 @@ impl Worker {
             .context("confirm all-duplicate outbound")?;
         // Terminal: no retry is pending — clear the persisted countdown (Task 2).
         self.clear_next_retry(pending.id);
+        // §D4/§D7: every file was a duplicate — settle each row `done`/`duplicate`
+        // and journal the negotiated + confirmed outcome.
+        self.journal(pending.id, "negotiated", Some(&format!("new=0 duplicate={}", records.len())));
+        self.settle_files_from_receipts(pending.id, records, &receipts);
+        self.journal(pending.id, "confirmed", Some("all_duplicate"));
         self.append_confirmed_history(&pending, &receipts)?;
         // Same shared-payload discipline as the ack path: defer to the
         // coordinator when fanned out, else clean the payload copies in line.
@@ -1332,20 +1483,29 @@ impl Worker {
     /// untouched — the row stays `Queued` until an announce actually succeeds, and
     /// is never terminalized from a network condition.
     fn arm_retry(&mut self, id: i64) {
-        let delay = if let Some(p) = self.pending.get_mut(&id) {
+        let armed = if let Some(p) = self.pending.get_mut(&id) {
             p.rung = p.rung.saturating_add(1);
             p.next_action = NextAction::Retry;
             let delay = retry_backoff(self.config.ack_timeout, p.rung);
             p.deadline = Instant::now() + delay;
-            Some(delay)
+            // §D5: a retry is now pending — the next serve tick (if bytes resume
+            // flowing) must clear the stale reason.
+            p.clear_error_on_next_serve = true;
+            let class = p.last_attempt_class.map(|c| c.tag());
+            Some((p.rung, delay, class))
         } else {
             None
         };
-        // Persist the wall-clock retry deadline (Task 2) once the `&mut pending`
-        // borrow is dropped, so the UI can render a countdown and a restart re-arms
-        // honestly.
-        if let Some(delay) = delay {
+        // Persist the wall-clock retry deadline (Task 2) + journal it (§D7) once the
+        // `&mut pending` borrow is dropped, so the UI can render a countdown and a
+        // restart re-arms honestly.
+        if let Some((rung, delay, class)) = armed {
             self.persist_next_retry(id, delay);
+            let detail = match class {
+                Some(c) => format!("rung={rung} delay_ms={} class={c}", delay.as_millis() as u64),
+                None => format!("rung={rung} delay_ms={}", delay.as_millis() as u64),
+            };
+            self.journal(id, "retry_scheduled", Some(&detail));
         }
     }
 
@@ -1476,7 +1636,7 @@ impl Worker {
     /// largest blob's size) — clamped to the announce's `byte_size` because the
     /// served collection carries manifest + hash-seq overhead beyond the raw
     /// frame bytes, so the true cumulative figure genuinely runs past it.
-    fn on_serve_progress(&self, package_id: PackageId, bytes_sent: u64) {
+    fn on_serve_progress(&mut self, package_id: PackageId, bytes_sent: u64) {
         let slot = self.pending.iter().find_map(|(k, p)| match &p.announce {
             Some(a) if a.package_id == package_id => Some((*k, a.byte_size, a.frame_count)),
             _ => None,
@@ -1485,6 +1645,33 @@ impl Worker {
             tracing::debug!(package_id = %package_id.0, "serve-progress for no pending slot; dropped");
             return;
         };
+
+        // §D5: the first serve tick after a retry clears the stale `last_error` +
+        // resets the attempt class — a transfer actually moving bytes must never
+        // carry a stale reason. Exactly one clear-write per retry cycle. §D7: the
+        // first tick of the session (peer began pulling) journals `serve_started`.
+        let mut clear_error = false;
+        let mut log_serve_started = false;
+        if let Some(p) = self.pending.get_mut(&id) {
+            if p.clear_error_on_next_serve {
+                p.clear_error_on_next_serve = false;
+                p.last_attempt_class = None;
+                clear_error = true;
+            }
+            if !p.serve_started_logged {
+                p.serve_started_logged = true;
+                log_serve_started = true;
+            }
+        }
+        if clear_error {
+            if let Err(e) = self.store.set_last_error(id, None) {
+                tracing::warn!(package_id = id, error = %e, "clear last_error on serve tick failed");
+            }
+        }
+        if log_serve_started {
+            self.journal(id, "serve_started", None);
+        }
+
         self.emit_progress_bytes(id, "transferring", frame_count, bytes_sent.min(byte_size), byte_size);
     }
 
@@ -1496,12 +1683,17 @@ impl Worker {
     /// are — by the announce carrying this `package_id`.
     ///
     /// Semantics: "finished serving what this peer asked for", NOT "delivered".
-    /// There is deliberately NO store write and NO state transition — the receiver
-    /// ack stays the sole delivery truth. A later payload request (a resume)
-    /// produces fresh `ServeProgress` `transferring` ticks that flip the stage
-    /// back, self-correcting. A complete for no live slot (already confirmed /
+    /// The receiver ack stays the sole delivery truth — the batch stays
+    /// non-terminal. Transfers Status Model v2 §D4/§D5 add persistence here: every
+    /// still-in-flight per-file row (`pending`/`sending`) transitions to `uploaded`
+    /// (a duplicate row already settled `done` is left as-is), and the batch row
+    /// itself moves `Transferring → Delivered` (the reserved non-terminal state,
+    /// "uploaded — awaiting confirmation") so the picture survives a restart. A
+    /// later payload request (a resume) produces fresh `ServeProgress`
+    /// `transferring` ticks; the ack path / retry / restart treat `Delivered`
+    /// exactly like `Transferring`. A complete for no live slot (already confirmed /
     /// terminal, or an unknown package) is dropped at debug.
-    fn on_serve_complete(&self, package_id: PackageId) {
+    fn on_serve_complete(&mut self, package_id: PackageId) {
         let slot = self.pending.iter().find_map(|(k, p)| match &p.announce {
             Some(a) if a.package_id == package_id => Some((*k, a.byte_size, a.frame_count)),
             _ => None,
@@ -1510,6 +1702,43 @@ impl Worker {
             tracing::debug!(package_id = %package_id.0, "serve-complete for no pending slot; dropped");
             return;
         };
+
+        // §D4: mark every still-in-flight per-file row `uploaded` (the peer pulled
+        // everything it asked for). Rows already settled `done` (a want-subset
+        // duplicate) are skipped — the negotiate verdict wins.
+        match self.store.list_outbound_files(id) {
+            Ok(rows) => {
+                for row in rows {
+                    if matches!(row.state, OutboundFileState::Pending | OutboundFileState::Sending) {
+                        if let Err(e) = self.store.set_outbound_file_state(
+                            id,
+                            &row.rel_path,
+                            OutboundFileState::Uploaded,
+                            row.byte_size,
+                            None,
+                            None,
+                        ) {
+                            tracing::warn!(package_id = id, rel_path = %row.rel_path, error = %format!("{e:#}"), "mark uploaded outbound file failed");
+                        }
+                        if let Some(p) = self.pending.get_mut(&id) {
+                            p.file_states.insert(row.rel_path, OutboundFileState::Uploaded);
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(package_id = id, error = %format!("{e:#}"), "list outbound files at serve-complete failed"),
+        }
+
+        // §D4/§D5: persist the batch `uploaded` stage as `Delivered` (non-terminal,
+        // survives restart; the ack remains delivery truth). The slot exists ⇒ the
+        // row is non-terminal, so this never clobbers a confirmed/cancelled row.
+        if let Err(e) = self.store.set_state(id, OutboundState::Delivered) {
+            tracing::warn!(package_id = id, error = %format!("{e:#}"), "persist Delivered state failed");
+        } else {
+            tracing::info!(package_id = id, state = "delivered", "sync state");
+        }
+        self.journal(id, "uploaded", None);
+
         self.emit_progress_bytes(id, "uploaded", frame_count, byte_size, byte_size);
         tracing::info!(
             package_id = %package_id.0,
@@ -1529,7 +1758,7 @@ impl Worker {
     /// `detail_filename`). A tick for no live slot (already confirmed / terminal, or
     /// an unknown package) is dropped at debug.
     fn on_serve_file_progress(
-        &self,
+        &mut self,
         package_id: PackageId,
         file: String,
         bytes_done: u64,
@@ -1543,6 +1772,47 @@ impl Worker {
             tracing::debug!(package_id = %package_id.0, "serve-file-progress for no pending slot; dropped");
             return;
         };
+
+        // §D4: persist the per-file lifecycle, keyed by `file` (the transport's
+        // forward-slash `rel_path`, == the `sync_outbound_files.rel_path` — the
+        // served/wanted collection order, not the full manifest order). A per-byte
+        // tick only WRITES the DB when the file's state actually changes (the slot's
+        // `file_states` tracks the last-persisted value), so the live bar stays
+        // event-driven: `pending → sending` on the first partial tick,
+        // `sending → uploaded` on completion. A served `manifest.ndjson` (or a
+        // Perseus batch with no per-file rows) matches no row — the setter no-ops
+        // at debug.
+        let target = if bytes_done >= bytes_total {
+            OutboundFileState::Uploaded
+        } else {
+            OutboundFileState::Sending
+        };
+        let changed = self
+            .pending
+            .get(&id)
+            .map(|p| p.file_states.get(&file) != Some(&target))
+            .unwrap_or(false);
+        if changed {
+            let persist_bytes = if target == OutboundFileState::Uploaded {
+                bytes_total
+            } else {
+                bytes_done
+            };
+            if let Err(e) = self.store.set_outbound_file_state(
+                id,
+                &file,
+                target,
+                persist_bytes,
+                None,
+                None,
+            ) {
+                tracing::warn!(package_id = id, rel_path = %file, error = %format!("{e:#}"), "set per-file serve state failed");
+            }
+            if let Some(p) = self.pending.get_mut(&id) {
+                p.file_states.insert(file.clone(), target);
+            }
+        }
+
         self.emit_file_progress(id, filename_of(&file), bytes_done, bytes_total);
     }
 
@@ -1585,6 +1855,38 @@ impl Worker {
             tracing::debug!(package_id = %package_id.0, "duplicate/late ack ignored");
             return Ok(());
         };
+
+        // §D4/§D7: settle each per-file row named in the receipts with the
+        // receiver's verdict (`ingested`/`duplicate`/`cancelled`/`rejected:<reason>`,
+        // state `done`; a rejection also stamps the per-file error), and journal the
+        // ack with its outcome counts. Done for EVERY ack shape (full confirm,
+        // partial/rejected, all-cancelled) so the per-file picture always reflects
+        // the latest verdict — even while a partial/rejected ack keeps the batch in
+        // flight for a redelivery.
+        let records = {
+            let cached = self.pending.get(&key).and_then(|p| p.manifest_records.clone());
+            match cached {
+                Some(r) => r,
+                None => {
+                    let dir = self.pending.get(&key).map(|p| p.dir.clone());
+                    dir.and_then(|d| crate::package::read_manifest(&d).ok())
+                        .unwrap_or_default()
+                }
+            }
+        };
+        self.settle_files_from_receipts(key, &records, &receipts);
+        {
+            let (mut ing, mut dup, mut rej, mut can) = (0u32, 0u32, 0u32, 0u32);
+            for r in &receipts {
+                match &r.outcome {
+                    ReceiptOutcome::Ingested => ing += 1,
+                    ReceiptOutcome::Duplicate => dup += 1,
+                    ReceiptOutcome::Rejected(_) => rej += 1,
+                    ReceiptOutcome::Cancelled => can += 1,
+                }
+            }
+            self.journal(key, "ack_received", Some(&format!("ingested={ing} duplicate={dup} rejected={rej} cancelled={can}")));
+        }
 
         // Cancelled-by-receiver (Task 4): a non-empty ack whose receipts are ALL
         // `Cancelled` is a deliberate "no" for the whole package — terminal, NOT a
@@ -1641,6 +1943,7 @@ impl Worker {
                 reason = "cancelled_by_receiver",
                 "sync state"
             );
+            self.journal(pending.id, "cancelled", Some("by_receiver"));
             self.emit_finished(
                 pending.id,
                 "cancelled",
@@ -1762,6 +2065,7 @@ impl Worker {
         // the confirm.
         self.spawn_release(package_id);
         tracing::info!(package_id = pending.id, state = "confirmed", "sync state");
+        self.journal(pending.id, "confirmed", None);
         self.emit_finished(
             pending.id,
             "confirmed",
@@ -1814,9 +2118,12 @@ impl Worker {
                     {
                         tracing::warn!(package_id = id, error = %se, "record last_error (ack timeout) failed");
                     }
-                    let retry_stamp = if let Some(p) = self.pending.get_mut(&id) {
+                    let retry_info = if let Some(p) = self.pending.get_mut(&id) {
                         p.rung = p.rung.saturating_add(1);
                         p.next_action = NextAction::Retry;
+                        // §D5: a retry is pending — the next serve tick (if the peer
+                        // is still pulling) must wipe this stale "no ack" reason.
+                        p.clear_error_on_next_serve = true;
                         let delay = retry_backoff(self.config.ack_timeout, p.rung);
                         p.deadline = Instant::now() + delay;
                         // Compute the wall-clock retry stamp ONCE and reuse it for
@@ -1832,14 +2139,16 @@ impl Worker {
                             next_retry_at = %stamp,
                             "ack timeout, backing off"
                         );
-                        Some(stamp)
+                        Some((stamp, p.rung, delay.as_millis() as u64))
                     } else {
                         None
                     };
-                    // Persist the wall-clock retry deadline (Task 2) after the
-                    // borrow drops so the UI countdown reflects the new backoff.
-                    if let Some(stamp) = retry_stamp {
+                    // Persist the wall-clock retry deadline (Task 2) + journal the
+                    // ack-timeout and the scheduled retry (§D7) after the borrow drops.
+                    if let Some((stamp, rung, delay_ms)) = retry_info {
                         self.persist_next_retry_at(id, &stamp);
+                        self.journal(id, "ack_timeout", None);
+                        self.journal(id, "retry_scheduled", Some(&format!("rung={rung} delay_ms={delay_ms}")));
                     }
                 }
                 NextAction::Retry => {
@@ -1931,6 +2240,8 @@ impl Worker {
         self.store.set_state(id, OutboundState::Failed)?;
         // Terminal: no retry is pending — clear the persisted countdown (Task 2).
         self.clear_next_retry(id);
+        // §D4: every not-yet-settled per-file row inherits the terminal outcome.
+        self.settle_unsettled_files(id, "failed");
         // Terminal: release any served blobs (fire-and-forget). `pkg_id` is
         // `None` when the package never minted+served an announce (a pre-serve
         // failure) — nothing to release in that case.
@@ -1958,6 +2269,7 @@ impl Worker {
                 sink.on_terminal(&dir);
             }
         }
+        self.journal(id, "failed", Some(&outcome));
         self.emit_finished(id, &outcome, 0, last_rejected, 0, 0, project_id);
         Ok(())
     }
@@ -1992,6 +2304,8 @@ impl Worker {
         self.store.set_state(id, OutboundState::Cancelled)?;
         // Terminal: no retry is pending — clear the persisted countdown (Task 2).
         self.clear_next_retry(id);
+        // §D4: every not-yet-settled per-file row inherits the `cancelled` outcome.
+        self.settle_unsettled_files(id, "cancelled");
         // Terminal: release any served blobs (fire-and-forget).
         if let Some(pid) = pkg_id {
             self.spawn_release(pid);
@@ -2001,6 +2315,7 @@ impl Worker {
             state = "cancelled",
             "sync state"
         );
+        self.journal(id, "cancelled", Some("by_user"));
         self.append_terminal_history(id, &dir, "cancelled", None)?;
         // Multi-target fan-out: a cancelled target is terminal — notify the
         // coordinator so it counts toward the all-targets-terminal cleanup gate.

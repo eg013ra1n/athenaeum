@@ -840,7 +840,7 @@ async fn transit_corruption_repaired_then_redelivery_confirms() {
         SyncConfig { ack_timeout: Duration::from_millis(60) },
     );
 
-    let id = engine.enqueue_package(&pkg_dir).await.unwrap();
+    let id = engine.enqueue_package(&pkg_dir, None, Vec::new()).await.unwrap();
 
     // First delivery: frame A ingests, frame B is rejected (corrupted) — the
     // sender must NOT confirm. Wait for the good frame to land, then assert the

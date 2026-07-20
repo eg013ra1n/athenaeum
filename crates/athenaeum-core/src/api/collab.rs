@@ -1461,7 +1461,7 @@ pub async fn publish_collab_frames(
                 // Best-effort: the package is already announced + recorded, so a
                 // transient sender-build/enqueue failure must not undo the publish.
                 match ensure_collab_sender_engine(ctx, collab_sender, node, emitter.clone()).await {
-                    Ok((engine, _origin)) => match engine.enqueue_package(&pub_dir).await {
+                    Ok((engine, _origin)) => match engine.enqueue_package(&pub_dir, None, Vec::new()).await {
                         Ok(_) => {
                             tracing::info!(
                                 project_id,

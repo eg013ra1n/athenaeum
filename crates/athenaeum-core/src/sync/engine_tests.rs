@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,7 +37,7 @@ use super::engine::{retry_backoff, PackageCleanupSink, SyncEngineHandle};
 use super::sender::{StartedSender, SyncSenderRuntime};
 use super::store::{StandaloneSyncStore, SyncStore};
 use super::DedupResponder;
-use super::{HistoryQuery, OutboundState, SyncConfig, SyncEngine};
+use super::{Direction, HistoryQuery, OutboundFileState, OutboundState, SyncConfig, SyncEngine};
 
 /// Build a one-frame package under `src_root`'s parent and return its directory.
 ///
@@ -217,7 +217,7 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
         receiver_id,
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(
         || state_of(&store, id) == Some(OutboundState::Confirmed),
         WAIT,
@@ -328,7 +328,7 @@ async fn confirmed_package_is_released_from_transport() {
         receiver_id,
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
 
     let captured_announce = captured
@@ -393,7 +393,7 @@ async fn sender_emits_coarse_progress_and_finished_events() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
     // Let the confirm event flush onto the emitter.
     wait_until(
@@ -421,10 +421,12 @@ async fn sender_emits_coarse_progress_and_finished_events() {
     );
     // Coarse per-package stage events only, never per-byte spam. The happy path
     // is: queued → transferring → transferring(bytes) → uploaded (Task 2.1's
-    // "awaiting confirmation" tick) → confirmed = 5 discrete STAGE events, plus one
-    // per-file `sync-file-progress` bar PER FILE (Task 2.2) — a single-file package
-    // here, so exactly one. Assert the coarse stage events stay bounded and the
-    // per-file ticks never exceed the file count.
+    // "awaiting confirmation" tick) → confirmed = 5 discrete STAGE events, plus the
+    // per-file `sync-file-progress` bars PER FILE (Task 2.2). A file emits a start
+    // (bytes_done 0) and a completion tick (tv2 Task 4 mock-fidelity — iroh emits
+    // real partial progress), so a single-file package here yields at most 2.
+    // Assert the coarse stage events stay bounded and the per-file ticks stay
+    // proportional to the file count (never per-byte spam).
     let stage_events = evts.iter().filter(|(n, _)| n != "sync-file-progress").count();
     let file_events = evts.iter().filter(|(n, _)| n == "sync-file-progress").count();
     assert!(
@@ -432,8 +434,8 @@ async fn sender_emits_coarse_progress_and_finished_events() {
         "coarse per-package stage events only, got {stage_events}: {evts:?}"
     );
     assert!(
-        file_events <= 1,
-        "one per-file bar for a single-file package, got {file_events}: {evts:?}"
+        file_events <= 2,
+        "bounded per-file bars for a single-file package (start + complete), got {file_events}: {evts:?}"
     );
     drop(evts);
 
@@ -474,7 +476,7 @@ async fn sent_progress_carries_bytes() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
     // Wait for the byte-bearing sent progress tick to flush onto the emitter.
     wait_until(
@@ -540,7 +542,7 @@ async fn sent_upload_complete_precedes_confirmed() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
     // Both signals must have landed on the emitter: the uploaded tick and the
     // confirmed finished event.
@@ -625,7 +627,7 @@ async fn sent_per_file_upload_progress_keyed_by_row_id() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
 
     let evts = events.lock().unwrap();
@@ -694,7 +696,7 @@ async fn mid_transfer_abort_leaves_transferring_then_resume_completes() {
             ack_timeout: Duration::from_secs(60),
         },
     );
-    let id = engine_a.enqueue_package(&pkg).await.unwrap();
+    let id = engine_a.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
     // The receiver aborts its first fetch; the row rests in Transferring.
     wait_until(|| stats.failures.load(SeqCst) >= 1, WAIT).await;
@@ -807,7 +809,7 @@ async fn resume_reannounce_reuses_same_wire_package_id() {
             ack_timeout: Duration::from_secs(60),
         },
     );
-    let id = engine_a.enqueue_package(&pkg).await.unwrap();
+    let id = engine_a.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
     // First announce seen; the row rests Transferring (its first fetch aborted).
     wait_until(|| !seen.lock().unwrap().is_empty(), WAIT).await;
@@ -875,12 +877,12 @@ async fn reenqueue_same_dir_mints_a_new_wire_package_id() {
     let wire_of = |id: i64| store.get_outbound(id).unwrap().unwrap().wire_package_id;
 
     // First enqueue: a wire id is minted + persisted during the announce build.
-    let id1 = engine.enqueue_package(&pkg).await.unwrap();
+    let id1 = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(|| wire_of(id1).is_some(), WAIT).await;
     let wire1 = wire_of(id1).unwrap();
 
     // Re-enqueue the SAME dir → a DISTINCT row that mints its own fresh id.
-    let id2 = engine.enqueue_package(&pkg).await.unwrap();
+    let id2 = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     assert_ne!(id1, id2, "a re-enqueue is a distinct outbound row");
     wait_until(|| wire_of(id2).is_some(), WAIT).await;
     let wire2 = wire_of(id2).unwrap();
@@ -917,7 +919,7 @@ async fn ack_lost_then_duplicate_ack_confirms_once() {
         receiver_id,
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(
         || state_of(&store, id) == Some(OutboundState::Confirmed),
         WAIT,
@@ -991,7 +993,7 @@ async fn timeouts_back_off_forever_without_failing() {
         },
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
     // Drive past 5+ deadline fires. With a 50ms base the backoff climbs
     // 50ms → 100ms → 500ms → 1500ms → 3000ms, so reaching 5 announce attempts
@@ -1194,7 +1196,7 @@ async fn ack_timeout_backoff_log_carries_delay_and_next_retry() {
             ack_timeout: Duration::from_millis(50),
         },
     );
-    let _id = engine.enqueue_package(&pkg).await.unwrap();
+    let _id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
     // Wait until at least one backoff line has been captured.
     wait_until(
@@ -1266,7 +1268,7 @@ async fn missing_package_dir_fails_terminally() {
         },
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
     // Let the first announce succeed (proves the normal path ran and the
     // manifest was read + cached) before pulling the dir out from under it.
@@ -1346,7 +1348,7 @@ async fn peer_offline_backs_off_and_stays_pending() {
         },
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
     // Drive several backoff windows: each failed announce bumps attempts and
     // climbs a rung. The row must still be pending, never terminal.
@@ -1414,7 +1416,7 @@ async fn failed_announce_last_error_carries_not_started_class_prefix() {
         },
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
     // Wait for a failed attempt to record its classified last_error.
     wait_until(
@@ -1470,7 +1472,7 @@ async fn first_attempt_peer_offline_then_online_completes() {
         },
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
     // Prove it attempted at least once while the peer was offline (every announce
     // attempt bumps the counter, including the first failing one).
@@ -1550,7 +1552,7 @@ async fn cancel_moves_to_cancelled_state() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(
         || state_of(&store, id) == Some(OutboundState::Transferring),
         WAIT,
@@ -1643,7 +1645,7 @@ async fn all_cancelled_ack_marks_cancelled_by_receiver() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
 
     // Terminal `Cancelled` carrying the exact "by receiver" reason string.
@@ -1744,7 +1746,7 @@ async fn confirm_cleans_payloads_to_manifest_only() {
         receiver_id,
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
 
     // Cleanup runs in the confirm path (after append_confirmed_history); poll.
@@ -1780,7 +1782,7 @@ async fn startup_heal_cleans_confirmed_payloads() {
 
     // Seed a confirmed outbound row pointing at the package dir.
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let id = store.enqueue(&pkg.to_string_lossy(), receiver_id).unwrap();
+    let id = store.enqueue(&pkg.to_string_lossy(), receiver_id, None, &[]).unwrap();
     store.confirm(id, &[]).unwrap();
 
     // Spawn the engine → its startup heal iterates confirmed() and cleans.
@@ -1842,7 +1844,7 @@ async fn cancelled_package_keeps_payloads() {
         },
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(
         || state_of(&store, id) == Some(OutboundState::Transferring),
         WAIT,
@@ -1896,7 +1898,7 @@ async fn sink_defers_shared_payload_cleanup_until_all_targets_terminal() {
         coord.clone() as Arc<dyn PackageCleanupSink>,
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
 
     // Confirmed, but the shared payload MUST still be here — the second target
@@ -1959,7 +1961,7 @@ async fn ack_from_unexpected_peer_does_not_confirm() {
         }
     });
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_ne!(
         state_of(&store, id),
@@ -2001,7 +2003,7 @@ async fn empty_ack_does_not_confirm() {
         }
     });
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_ne!(
         state_of(&store, id),
@@ -2041,8 +2043,8 @@ async fn crash_resume_only_redrives_its_own_peers_rows() {
     // Seed both rows directly (as a prior multi-engine run would have left them),
     // each bound to its own peer.
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let id_a = store.enqueue(&pkg_a.to_string_lossy(), receiver_a_id).unwrap();
-    let id_b = store.enqueue(&pkg_b.to_string_lossy(), receiver_b_id).unwrap();
+    let id_a = store.enqueue(&pkg_a.to_string_lossy(), receiver_a_id, None, &[]).unwrap();
+    let id_b = store.enqueue(&pkg_b.to_string_lossy(), receiver_b_id, None, &[]).unwrap();
 
     // ONE engine, bound to peer A only.
     let engine = SyncEngine::spawn(
@@ -2153,7 +2155,7 @@ async fn announce_carries_batch_name_and_file_manifest() {
     // can set the row's `display_name` directly. Its `open` materialises the same
     // sync tables the standalone store does.
     let store = Arc::new(super::store::CatalogSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let id = store.enqueue(&pkg.to_string_lossy(), receiver_id).unwrap();
+    let id = store.enqueue(&pkg.to_string_lossy(), receiver_id, None, &[]).unwrap();
     crate::sync::store::set_outbound_display_name(&store.lock_conn(), id, Some("Orion Nebula"))
         .unwrap();
 
@@ -2325,7 +2327,7 @@ async fn all_duplicate_package_terminalizes_without_announce() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
 
     // Let any (erroneous) announce reach the receiver before asserting none did.
@@ -2387,7 +2389,7 @@ async fn negotiate_error_falls_back_to_full_announce() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
 
     assert!(
@@ -2455,7 +2457,7 @@ async fn mixed_batch_serves_only_want_subset() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
 
     // Exactly one announce → exactly one fetch, of the wanted frame only.
@@ -2589,7 +2591,7 @@ async fn project_package_announces_via_announce_project() {
         Arc::new(net.endpoint()),
         receiver_id,
     );
-    let _id = engine.enqueue_package(&pkg).await.unwrap();
+    let _id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
     wait_until(|| seen.lock().unwrap().is_some(), WAIT).await;
     match seen.lock().unwrap().take().unwrap() {
@@ -2768,7 +2770,7 @@ async fn retry_path_re_resolves_and_re_adds_peer_address() {
         Some(refresher),
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
     // The ack never comes, so the ack deadline elapses and the Retry path runs,
     // re-resolving + re-registering the peer's address. Wait on that side effect
     // (the address landing on the transport) rather than a terminal state.
@@ -2948,7 +2950,7 @@ async fn retry_replaces_stale_addressing_after_classified_dial_failure() {
         Some(refresher),
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
     // The announce fails (timeout class) and arms a retry; when the backoff window
     // elapses, the retry path re-resolves, REMOVES the stale entry, then re-adds the
@@ -3036,7 +3038,7 @@ async fn retry_refresh_unavailable_warns_with_peer() {
         None,
         Some(refresher),
     );
-    let _id = engine.enqueue_package(&pkg).await.unwrap();
+    let _id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
     const MSG: &str = "retry: address refresh unavailable; dialing last-known address";
     wait_until(
@@ -3101,7 +3103,7 @@ async fn park_in_long_backoff(
         },
     );
 
-    let id = engine.enqueue_package(&pkg).await.unwrap();
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
     // Backoff climbing: a couple of failed announce attempts (spec §2).
     wait_until(|| attempts_of(&store, id) >= 2, WAIT).await;
@@ -3269,8 +3271,8 @@ async fn kick_all_resets_every_pending_package() {
         },
     );
 
-    let id_a = engine.enqueue_package(&pkg_a).await.unwrap();
-    let id_b = engine.enqueue_package(&pkg_b).await.unwrap();
+    let id_a = engine.enqueue_package(&pkg_a, None, Vec::new()).await.unwrap();
+    let id_b = engine.enqueue_package(&pkg_b, None, Vec::new()).await.unwrap();
 
     // Park BOTH in a long backoff window: climbed a couple of rungs AND
     // next_retry_at parses to comfortably (>1.2s) in the future. Without a kick
@@ -3350,6 +3352,399 @@ async fn kick_unknown_id_is_a_no_op() {
     engine.kick(999).await.unwrap();
     // kick_all over an empty pending map is likewise a no-op.
     engine.kick_all().await.unwrap();
+
+    engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Transfers Status Model v2 (tv2 Task 4): per-file states, persisted `uploaded`
+// (Delivered), error ⊥ state, event journal.
+// ---------------------------------------------------------------------------
+
+/// Per-payload manifest entries for `enqueue_package`, from `(uuid, name, size)`.
+fn entries(frames: &[(&str, &str, u64)]) -> Vec<AnnounceFileEntry> {
+    frames
+        .iter()
+        .map(|(uuid, name, size)| AnnounceFileEntry {
+            rel_path: name.to_string(),
+            byte_size: *size,
+            frame_uuid: uuid.to_string(),
+        })
+        .collect()
+}
+
+/// The outbound per-file rows for `id` via the `SyncStore` trait method.
+fn files_of(store: &StandaloneSyncStore, id: i64) -> Vec<crate::sync::OutboundFileRow> {
+    store.list_outbound_files(id).unwrap()
+}
+
+/// The one file row whose `rel_path == rel` (panics if absent).
+fn file_row<'a>(
+    rows: &'a [crate::sync::OutboundFileRow],
+    rel: &str,
+) -> &'a crate::sync::OutboundFileRow {
+    rows.iter()
+        .find(|r| r.rel_path == rel)
+        .unwrap_or_else(|| panic!("no file row {rel} in {rows:?}"))
+}
+
+/// The `sent`-direction `sync_events` kinds for `id`, read via a fresh connection
+/// to the WAL db (committed events are visible to a second reader).
+fn sent_event_kinds(db_path: &Path, id: i64) -> Vec<String> {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    crate::sync::store::list_sync_events(&conn, Direction::Sent, &id.to_string())
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect()
+}
+
+/// A reactive receiver that fetches on every announce but acks (Ingested) only
+/// while `allow_ack` is true — lets a test hold a transfer in flight (no ack)
+/// across a timeout/restart, then let it confirm.
+fn spawn_gated_receiver(
+    endpoint: Arc<LoopbackTransport>,
+    dest_root: PathBuf,
+    allow_ack: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let mut events = endpoint.events().await;
+        let mut n = 0usize;
+        while let Some(event) = events.recv().await {
+            let TransportEvent::AnnounceReceived { from, announce, .. } = event else {
+                continue;
+            };
+            n += 1;
+            let dest = dest_root.join(format!("fetch-{n}"));
+            if endpoint.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
+                if !allow_ack.load(SeqCst) {
+                    continue;
+                }
+                let Ok(records) = package::read_manifest(&dest) else {
+                    continue;
+                };
+                let receipts: Vec<FrameReceipt> = records
+                    .iter()
+                    .map(|r| FrameReceipt {
+                        frame_uuid: r.frame_uuid.clone(),
+                        xxh3: r.xxh3.clone(),
+                        outcome: ReceiptOutcome::Ingested,
+                    })
+                    .collect();
+                let _ = endpoint.ack(from, &announce.package_id, receipts).await;
+            }
+        }
+    });
+}
+
+/// A reactive receiver that fetches then acks every frame as `Rejected(reason)` —
+/// drives the sender's per-file rejected settlement while the batch stays in flight.
+fn spawn_rejecting_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf, reason: &str) {
+    let reason = reason.to_string();
+    tokio::spawn(async move {
+        let mut events = endpoint.events().await;
+        let mut n = 0usize;
+        while let Some(event) = events.recv().await {
+            let TransportEvent::AnnounceReceived { from, announce, .. } = event else {
+                continue;
+            };
+            n += 1;
+            let dest = dest_root.join(format!("fetch-{n}"));
+            if endpoint.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
+                let Ok(records) = package::read_manifest(&dest) else {
+                    continue;
+                };
+                let receipts: Vec<FrameReceipt> = records
+                    .iter()
+                    .map(|r| FrameReceipt {
+                        frame_uuid: r.frame_uuid.clone(),
+                        xxh3: r.xxh3.clone(),
+                        outcome: ReceiptOutcome::Rejected(reason.clone()),
+                    })
+                    .collect();
+                let _ = endpoint.ack(from, &announce.package_id, receipts).await;
+            }
+        }
+    });
+}
+
+/// tv2 §D1/§D4: `enqueue_package` writes the outbound row, its `display_name`, AND
+/// its `pending` per-file rows in ONE transaction — so the whole picture exists the
+/// instant the call returns, before the worker's first announce (the T3
+/// enqueue→announce race is gone). The `enqueued` journal event lands too.
+#[tokio::test]
+async fn enqueue_writes_row_files_and_name_before_first_announce() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+    // A peer that is never started → the worker's first announce always fails, so
+    // the file rows never leave `pending`.
+    let peer = [42u8; 32];
+
+    let pkg = build_package_multi(
+        &tmp.path().join("src"),
+        "meta",
+        &[("uuid-a", "a.fits", "M42", 2048), ("uuid-b", "b.fits", "M42", 4096)],
+    );
+    let db_path = tmp.path().join("sync.db");
+    let store = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
+    let engine = SyncEngine::spawn(store.clone() as Arc<dyn SyncStore>, Arc::new(net.endpoint()), peer);
+
+    let files = entries(&[("uuid-a", "a.fits", 2048), ("uuid-b", "b.fits", 4096)]);
+    let id = engine
+        .enqueue_package(&pkg, Some("M42 — 2 lights".to_string()), files)
+        .await
+        .unwrap();
+
+    // Atomically after the call returns: row name + both `pending` file rows exist.
+    let row = store.get_outbound(id).unwrap().unwrap();
+    assert_eq!(row.display_name.as_deref(), Some("M42 — 2 lights"));
+    let rows = files_of(&store, id);
+    assert_eq!(rows.len(), 2, "both file rows present: {rows:?}");
+    for r in &rows {
+        assert_eq!(r.state, OutboundFileState::Pending);
+        assert_eq!(r.bytes_done, 0);
+        assert!(r.outcome.is_none());
+    }
+    assert_eq!(file_row(&rows, "a.fits").byte_size, 2048);
+    assert_eq!(file_row(&rows, "b.fits").frame_uuid, "uuid-b");
+    assert!(
+        sent_event_kinds(&db_path, id).contains(&"enqueued".to_string()),
+        "the enqueued journal event landed"
+    );
+
+    engine.shutdown().await;
+}
+
+/// tv2 §D4: a want-subset send settles the EXCLUDED file terminal immediately
+/// (`done`/`duplicate` — the peer already has it) and the WANTED file walks to
+/// `done`/`ingested` across a full loopback transfer.
+#[tokio::test]
+async fn want_subset_settles_excluded_duplicate_and_wanted_ingested() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+    // The peer already has "a.fits"; it wants only "b.fits".
+    let receiver = Arc::new(net.endpoint_with_responder(Arc::new(WantOnlyResponder {
+        wanted_rel: "b.fits".to_string(),
+    })));
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package_multi(
+        &tmp.path().join("srcWant"),
+        "want",
+        &[("uuid-a", "a.fits", "M42", 2048), ("uuid-b", "b.fits", "M42", 4096)],
+    );
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(store.clone() as Arc<dyn SyncStore>, Arc::new(net.endpoint()), receiver_id);
+    let files = entries(&[("uuid-a", "a.fits", 2048), ("uuid-b", "b.fits", 4096)]);
+    let id = engine.enqueue_package(&pkg, None, files).await.unwrap();
+
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+
+    let rows = files_of(&store, id);
+    let a = file_row(&rows, "a.fits");
+    assert_eq!(a.state, OutboundFileState::Done, "excluded file is terminal");
+    assert_eq!(a.outcome.as_deref(), Some("duplicate"), "excluded file is a duplicate");
+    let b = file_row(&rows, "b.fits");
+    assert_eq!(b.state, OutboundFileState::Done, "wanted file is terminal");
+    assert_eq!(b.outcome.as_deref(), Some("ingested"), "wanted file was ingested");
+
+    engine.shutdown().await;
+}
+
+/// tv2 §D4/§D5: `ServeComplete` persists the batch `uploaded` stage as the reserved
+/// non-terminal `Delivered` state (every file row `uploaded`) and survives restart —
+/// a fresh engine over the same store re-drives the `Delivered` row exactly like a
+/// `Transferring` one and confirms on the (now-allowed) ack.
+#[tokio::test]
+async fn serve_complete_persists_delivered_uploaded_then_restart_confirms() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let allow_ack = Arc::new(AtomicBool::new(false));
+    spawn_gated_receiver(receiver.clone(), tmp.path().join("recv"), allow_ack.clone());
+
+    let pkg = build_package_multi(
+        &tmp.path().join("srcDel"),
+        "del",
+        &[("uuid-a", "a.fits", "M42", 2048), ("uuid-b", "b.fits", "M42", 4096)],
+    );
+    let db_path = tmp.path().join("sync.db");
+    let store_a = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
+    // Default (long) ack timeout: the row rests in Delivered awaiting the ack.
+    let engine_a = SyncEngine::spawn(store_a.clone() as Arc<dyn SyncStore>, Arc::new(net.endpoint()), receiver_id);
+    let files = entries(&[("uuid-a", "a.fits", 2048), ("uuid-b", "b.fits", 4096)]);
+    let id = engine_a.enqueue_package(&pkg, None, files).await.unwrap();
+
+    // Phase 1: the peer pulled everything (ServeComplete) but did not ack → the
+    // batch persists `Delivered` and every file row is `uploaded`.
+    wait_until(|| state_of(&store_a, id) == Some(OutboundState::Delivered), WAIT).await;
+    let rows = files_of(&store_a, id);
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        assert_eq!(r.state, OutboundFileState::Uploaded, "uploaded, not yet acked: {r:?}");
+    }
+    assert!(sent_event_kinds(&db_path, id).contains(&"uploaded".to_string()));
+
+    // Phase 2: a fresh engine over the SAME store re-drives the Delivered row; now
+    // that acks are allowed it confirms and every file row lands `done`/`ingested`.
+    drop(engine_a);
+    allow_ack.store(true, SeqCst);
+    let store_b = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
+    let engine_b = SyncEngine::spawn(store_b.clone() as Arc<dyn SyncStore>, Arc::new(net.endpoint()), receiver_id);
+    wait_until(|| state_of(&store_b, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let rows = files_of(&store_b, id);
+    for r in &rows {
+        assert_eq!(r.state, OutboundFileState::Done);
+        assert_eq!(r.outcome.as_deref(), Some("ingested"), "file {}: {r:?}", r.rel_path);
+    }
+
+    engine_b.shutdown().await;
+}
+
+/// tv2 §D5/§D7: an ack timeout sets `last_error` and journals `ack_timeout` +
+/// `retry_scheduled`; the subsequent successful delivery confirms, clears the stale
+/// error, and journals `ack_received` + `confirmed`.
+#[tokio::test]
+async fn ack_timeout_journals_retry_then_recovery_confirms_and_clears_error() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let allow_ack = Arc::new(AtomicBool::new(false));
+    spawn_gated_receiver(receiver.clone(), tmp.path().join("recv"), allow_ack.clone());
+
+    let pkg = build_package(&tmp.path().join("srcTo"), "uuid-to", "f.fits", "M42", 4096);
+    let db_path = tmp.path().join("sync.db");
+    let store = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig { ack_timeout: Duration::from_millis(300) },
+    );
+    let id = engine
+        .enqueue_package(&pkg, None, entries(&[("uuid-to", "f.fits", 4096)]))
+        .await
+        .unwrap();
+
+    // Phase 1: the peer pulls but never acks → the ack times out. `last_error` set,
+    // journal records ack_timeout + retry_scheduled.
+    wait_until(|| store.get_outbound(id).unwrap().unwrap().last_error.is_some(), WAIT).await;
+    assert_eq!(
+        store.get_outbound(id).unwrap().unwrap().last_error.as_deref(),
+        Some("no ack from peer within timeout")
+    );
+    let kinds = sent_event_kinds(&db_path, id);
+    assert!(kinds.contains(&"ack_timeout".to_string()), "kinds: {kinds:?}");
+    assert!(kinds.contains(&"retry_scheduled".to_string()), "kinds: {kinds:?}");
+
+    // Phase 2: allow the ack → a re-announce confirms; no stale error survives,
+    // journal records ack_received + confirmed.
+    allow_ack.store(true, SeqCst);
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let row = store.get_outbound(id).unwrap().unwrap();
+    assert_eq!(row.last_error, None, "a confirmed transfer carries no stale reason");
+    let kinds = sent_event_kinds(&db_path, id);
+    assert!(kinds.contains(&"ack_received".to_string()), "kinds: {kinds:?}");
+    assert!(kinds.contains(&"confirmed".to_string()), "kinds: {kinds:?}");
+
+    engine.shutdown().await;
+}
+
+/// tv2 §D4: a `Rejected` receipt settles the per-file row `done` with a
+/// `rejected:<reason>` outcome AND the per-file error, while the batch itself stays
+/// in flight (a rejection redelivers forever, never terminalizes).
+#[tokio::test]
+async fn rejected_receipt_settles_file_with_rejected_outcome() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    spawn_rejecting_receiver(receiver.clone(), tmp.path().join("recv"), "bad hash");
+
+    let pkg = build_package(&tmp.path().join("srcRej"), "uuid-r", "f.fits", "M42", 4096);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    // Long ack timeout so no retry re-serves during the window (which would flip the
+    // rejected row back through `sending`/`uploaded`).
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig { ack_timeout: Duration::from_secs(60) },
+    );
+    let id = engine
+        .enqueue_package(&pkg, None, entries(&[("uuid-r", "f.fits", 4096)]))
+        .await
+        .unwrap();
+
+    wait_until(
+        || {
+            files_of(&store, id)
+                .first()
+                .and_then(|r| r.outcome.clone())
+                .map(|o| o.starts_with("rejected:"))
+                .unwrap_or(false)
+        },
+        WAIT,
+    )
+    .await;
+    let rows = files_of(&store, id);
+    let f = file_row(&rows, "f.fits");
+    assert_eq!(f.state, OutboundFileState::Done);
+    assert_eq!(f.outcome.as_deref(), Some("rejected:bad hash"));
+    assert_eq!(f.error.as_deref(), Some("bad hash"));
+    // The batch is NOT confirmed — a rejection redelivers, never terminalizes.
+    assert_ne!(state_of(&store, id), Some(OutboundState::Confirmed));
+
+    engine.shutdown().await;
+}
+
+/// tv2 §D4: a fetch aborted AFTER a file's start-tick but BEFORE its completion
+/// leaves the per-file row `sending` (the intermediate state); the resumed serve
+/// then uploads it and the batch confirms `done`/`ingested`.
+#[tokio::test]
+async fn mid_transfer_abort_leaves_file_sending_then_resume_uploads() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    receiver.set_fault(FaultPlan {
+        abort_after_bytes: Some(64),
+        ..Default::default()
+    });
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(&tmp.path().join("srcSend"), "uuid-s", "f.fits", "M42", 4096);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    // Long ack timeout so the aborted transfer rests `sending` until we kick it.
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig { ack_timeout: Duration::from_secs(60) },
+    );
+    let id = engine
+        .enqueue_package(&pkg, None, entries(&[("uuid-s", "f.fits", 4096)]))
+        .await
+        .unwrap();
+
+    // The receiver's first fetch aborts after the file's start-tick (sending) but
+    // before its completion → the per-file row rests `sending`.
+    wait_until(
+        || files_of(&store, id).first().map(|r| r.state) == Some(OutboundFileState::Sending),
+        WAIT,
+    )
+    .await;
+    assert_eq!(files_of(&store, id)[0].state, OutboundFileState::Sending);
+
+    // Kick the retry: the second fetch completes → the file uploads → batch confirms.
+    engine.kick(id).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let rows = files_of(&store, id);
+    assert_eq!(rows[0].state, OutboundFileState::Done);
+    assert_eq!(rows[0].outcome.as_deref(), Some("ingested"));
 
     engine.shutdown().await;
 }

@@ -1138,7 +1138,7 @@ pub(crate) async fn enqueue_package_to_all(
     let mut first_id: Option<i64> = None;
     let mut delivered = 0usize;
     for (idx, engine) in engines.iter().enumerate() {
-        match engine.enqueue_package(pkg_dir).await {
+        match engine.enqueue_package(pkg_dir, None, Vec::new()).await {
             Ok(id) => {
                 first_id.get_or_insert(id);
                 delivered += 1;
@@ -1966,8 +1966,48 @@ mod retention_tests {
     struct FailingAppendHistoryStore<'a>(&'a StandaloneSyncStore);
 
     impl SyncStore for FailingAppendHistoryStore<'_> {
-        fn enqueue(&self, package_ref: &str, peer: NodeId) -> Result<i64> {
-            self.0.enqueue(package_ref, peer)
+        fn enqueue(
+            &self,
+            package_ref: &str,
+            peer: NodeId,
+            display_name: Option<&str>,
+            files: &[athenaeum_core::sharing::types::AnnounceFileEntry],
+        ) -> Result<i64> {
+            self.0.enqueue(package_ref, peer, display_name, files)
+        }
+        fn replace_outbound_files(
+            &self,
+            outbound_id: i64,
+            files: &[athenaeum_core::sync::OutboundFileRow],
+        ) -> Result<()> {
+            self.0.replace_outbound_files(outbound_id, files)
+        }
+        fn list_outbound_files(
+            &self,
+            outbound_id: i64,
+        ) -> Result<Vec<athenaeum_core::sync::OutboundFileRow>> {
+            self.0.list_outbound_files(outbound_id)
+        }
+        fn set_outbound_file_state(
+            &self,
+            outbound_id: i64,
+            rel_path: &str,
+            state: athenaeum_core::sync::OutboundFileState,
+            bytes_done: u64,
+            outcome: Option<&str>,
+            error: Option<&str>,
+        ) -> Result<()> {
+            self.0
+                .set_outbound_file_state(outbound_id, rel_path, state, bytes_done, outcome, error)
+        }
+        fn append_sync_event(
+            &self,
+            direction: athenaeum_core::sync::Direction,
+            batch_key: &str,
+            kind: &str,
+            detail: Option<&str>,
+        ) -> Result<()> {
+            self.0.append_sync_event(direction, batch_key, kind, detail)
         }
         fn set_state(&self, id: i64, s: OutboundState) -> Result<()> {
             self.0.set_state(id, s)
@@ -2061,7 +2101,7 @@ mod retention_tests {
         src: &Path,
     ) -> (PathBuf, i64) {
         let pkg = make_package(&config.packages_dir(), src, "M42");
-        let id = store.enqueue(&pkg.to_string_lossy(), PEER).unwrap();
+        let id = store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
         let meta = std::fs::metadata(src).unwrap();
         let mtime_ms = crate::seen::mtime_millis(meta.modified().ok());
         seen.mark_enqueued(src, meta.len(), mtime_ms, &pkg.to_string_lossy())
@@ -2680,8 +2720,8 @@ mod multi_target_tests {
         let pkg = make_pkg(tmp.path(), "uuid-off", "frame.fits");
         // The fan-out reached both targets → expected = 2.
         coord.register(&pkg, 2);
-        let _id_a = engine_a.enqueue_package(&pkg).await.unwrap();
-        let id_b = engine_b.enqueue_package(&pkg).await.unwrap();
+        let _id_a = engine_a.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+        let id_b = engine_b.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
         // A confirms. Under the OLD code this deleted the shared payload.
         wait_until(|| {

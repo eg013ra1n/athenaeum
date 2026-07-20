@@ -370,7 +370,7 @@ pub async fn handle_project_request(
     // routes through the `CollabCleanupSink`.
     let (engine, _origin) = ensure_collab_sender_engine(ctx, sender, from, emitter).await?;
     engine
-        .enqueue_package(&dir)
+        .enqueue_package(&dir, None, Vec::new())
         .await
         .with_context(|| format!("enqueue collab serve dir {}", dir.display()))?;
     tracing::info!(
@@ -2003,7 +2003,7 @@ mod tests {
             None,
         );
 
-        let id = a_engine.enqueue_package(&serve_dir).await.unwrap();
+        let id = a_engine.enqueue_package(&serve_dir, None, Vec::new()).await.unwrap();
         wait_until(
             || {
                 a_store.get_outbound(id).ok().flatten().map(|r| r.state)
@@ -2472,7 +2472,7 @@ mod tests {
                 let e = Arc::clone(&handler_engine);
                 let dir = handler_dir.clone();
                 tokio::spawn(async move {
-                    let _ = e.enqueue_package(&dir).await;
+                    let _ = e.enqueue_package(&dir, None, Vec::new()).await;
                 });
             });
         let a_recv_store = Arc::new(CatalogSyncStore::open(a_tmp.path().join("a_recv.db")).unwrap());

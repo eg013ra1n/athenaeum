@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::sharing::types::{FrameReceipt, NodeId, PackageId, ReceiptOutcome};
+use crate::sharing::types::{AnnounceFileEntry, FrameReceipt, NodeId, PackageId, ReceiptOutcome};
 
 use super::models::{
     Direction, HistoryQuery, HistoryRow, InboundFileRow, InboundFileState, InboundRow,
@@ -308,8 +308,53 @@ pub const DDL_INDEXES: [&str; 4] = [
 /// implementation is `Send + Sync` so it can live behind an `Arc<dyn SyncStore>`
 /// shared by the worker and the [`SyncEngineHandle`](super::engine::SyncEngineHandle).
 pub trait SyncStore: Send + Sync {
-    /// Insert a new package in [`Queued`](OutboundState::Queued); returns its id.
-    fn enqueue(&self, package_ref: &str, peer: NodeId) -> Result<i64>;
+    /// Insert a new package in [`Queued`](OutboundState::Queued), together with its
+    /// `display_name` and per-file `pending` rows, in ONE transaction; returns its
+    /// id. `display_name`/`files` may be `None`/empty (Perseus, a nameless retry).
+    /// See [`insert_outbound_with_files`] for the race-kill rationale (Transfers
+    /// Status Model v2 §D1/§D4).
+    fn enqueue(
+        &self,
+        package_ref: &str,
+        peer: NodeId,
+        display_name: Option<&str>,
+        files: &[AnnounceFileEntry],
+    ) -> Result<i64>;
+
+    /// Replace the whole per-file row set for an outbound batch (§D4). Delegates
+    /// to [`replace_outbound_files`]; on the trait so a future task can rebuild a
+    /// batch's file manifest through the engine's store handle.
+    fn replace_outbound_files(&self, outbound_id: i64, files: &[OutboundFileRow]) -> Result<()>;
+
+    /// Every per-file row for an outbound batch, ordered by `rel_path` (§D4).
+    /// Delegates to [`list_outbound_files`]. The engine reads it to settle the
+    /// un-acked rows on a terminal `cancelled`/`failed`.
+    fn list_outbound_files(&self, outbound_id: i64) -> Result<Vec<OutboundFileRow>>;
+
+    /// Update one outbound file's mutable fields (§D4). Delegates to
+    /// [`set_outbound_file_state`]. Where the UPDATE matches 0 rows (an unknown
+    /// `rel_path` — e.g. a served `manifest.ndjson`, or a Perseus batch with no
+    /// per-file rows) the implementation logs `debug!` rather than erroring.
+    fn set_outbound_file_state(
+        &self,
+        outbound_id: i64,
+        rel_path: &str,
+        state: OutboundFileState,
+        bytes_done: u64,
+        outcome: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()>;
+
+    /// Append one event to this batch's journal, pruned to the newest
+    /// [`SYNC_EVENTS_CAP`] (§D7). Delegates to [`append_sync_event`]; the engine
+    /// records the outbound lifecycle here (`enqueued`, `announce_sent`, …).
+    fn append_sync_event(
+        &self,
+        direction: Direction,
+        batch_key: &str,
+        kind: &str,
+        detail: Option<&str>,
+    ) -> Result<()>;
 
     /// Force one outbound row to a new state.
     fn set_state(&self, id: i64, s: OutboundState) -> Result<()>;
@@ -1125,13 +1170,20 @@ pub fn set_outbound_file_state(
     outcome: Option<&str>,
     error: Option<&str>,
 ) -> Result<()> {
-    conn.execute(
-        "UPDATE sync_outbound_files
-         SET state = ?1, bytes_done = ?2, outcome = ?3, error = ?4, updated_at = ?5
-         WHERE outbound_id = ?6 AND rel_path = ?7",
-        params![state.as_str(), bytes_done as i64, outcome, error, now_iso(), outbound_id, rel_path],
-    )
-    .with_context(|| format!("set outbound file state for {outbound_id}/{rel_path}"))?;
+    let changed = conn
+        .execute(
+            "UPDATE sync_outbound_files
+             SET state = ?1, bytes_done = ?2, outcome = ?3, error = ?4, updated_at = ?5
+             WHERE outbound_id = ?6 AND rel_path = ?7",
+            params![state.as_str(), bytes_done as i64, outcome, error, now_iso(), outbound_id, rel_path],
+        )
+        .with_context(|| format!("set outbound file state for {outbound_id}/{rel_path}"))?;
+    if changed == 0 {
+        // An unknown rel_path (e.g. a served `manifest.ndjson`, or a Perseus batch
+        // enqueued with no per-file rows). Not an error — the setter is a no-op
+        // upsert-in-place; log at debug so a genuinely missing row is discoverable.
+        tracing::debug!(outbound_id, rel_path, state = state.as_str(), "set_outbound_file_state matched 0 rows");
+    }
     Ok(())
 }
 
@@ -1351,6 +1403,67 @@ pub fn delete_sync_events(conn: &Connection, direction: Direction, batch_key: &s
     Ok(())
 }
 
+/// Insert a new `sync_outbound` row in [`Queued`](OutboundState::Queued) AND its
+/// `sync_outbound_files` rows (state `pending`, `bytes_done 0`) AND its
+/// `display_name` — all in ONE transaction — returning the new row id (Transfers
+/// Status Model v2 §D1/§D4).
+///
+/// This is the race-kill for the enqueue path: the T3 send path used to write the
+/// name + file rows *after* `enqueue_package` returned, so the engine's first
+/// announce could fire against a nameless / file-less row. Folding the whole write
+/// into the enqueue transaction means the row is never visible to a concurrent
+/// reader (or the worker's own `start_package`) without its name + file manifest.
+/// `files` are the per-payload `(rel_path, byte_size, frame_uuid)` triples
+/// ([`AnnounceFileEntry`]); each becomes a `pending` per-file row. An empty
+/// `files` (Perseus / a nameless retry) writes just the row + name.
+pub fn insert_outbound_with_files(
+    conn: &Connection,
+    package_ref: &str,
+    peer_hex: &str,
+    display_name: Option<&str>,
+    files: &[AnnounceFileEntry],
+) -> Result<i64> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin insert_outbound_with_files")?;
+    tx.execute(
+        "INSERT INTO sync_outbound (package_ref, peer, state, attempts, created_at, display_name)
+         VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+        params![
+            package_ref,
+            peer_hex,
+            OutboundState::Queued.as_str(),
+            now_iso(),
+            display_name,
+        ],
+    )
+    .context("insert sync_outbound")?;
+    let id = tx.last_insert_rowid();
+    if !files.is_empty() {
+        let now = now_iso();
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO sync_outbound_files
+                 (outbound_id, rel_path, byte_size, frame_uuid, state, bytes_done, outcome, error, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, NULL, NULL, ?6)",
+            )
+            .context("prepare insert sync_outbound_files (enqueue)")?;
+        for f in files {
+            stmt.execute(params![
+                id,
+                f.rel_path,
+                f.byte_size as i64,
+                f.frame_uuid,
+                OutboundFileState::Pending.as_str(),
+                now,
+            ])
+            .with_context(|| format!("insert sync_outbound_files row {} (enqueue)", f.rel_path))?;
+        }
+    }
+    tx.commit().context("commit insert_outbound_with_files")?;
+    Ok(id)
+}
+
 /// Standalone [`SyncStore`] backed by its own WAL SQLite file. Used by the
 /// Perseus agent and by the engine's tests. The connection is guarded by a
 /// [`Mutex`] so the store is `Sync`; no lock is ever held across an `.await`
@@ -1410,20 +1523,49 @@ impl StandaloneSyncStore {
 }
 
 impl SyncStore for StandaloneSyncStore {
-    fn enqueue(&self, package_ref: &str, peer: NodeId) -> Result<i64> {
+    fn enqueue(
+        &self,
+        package_ref: &str,
+        peer: NodeId,
+        display_name: Option<&str>,
+        files: &[AnnounceFileEntry],
+    ) -> Result<i64> {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
-        conn.execute(
-            "INSERT INTO sync_outbound (package_ref, peer, state, attempts, created_at)
-             VALUES (?1, ?2, ?3, 0, ?4)",
-            params![
-                package_ref,
-                node_id_hex(&peer),
-                OutboundState::Queued.as_str(),
-                now_iso()
-            ],
-        )
-        .context("insert sync_outbound")?;
-        Ok(conn.last_insert_rowid())
+        insert_outbound_with_files(&conn, package_ref, &node_id_hex(&peer), display_name, files)
+    }
+
+    fn replace_outbound_files(&self, outbound_id: i64, files: &[OutboundFileRow]) -> Result<()> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        replace_outbound_files(&conn, outbound_id, files)
+    }
+
+    fn list_outbound_files(&self, outbound_id: i64) -> Result<Vec<OutboundFileRow>> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        list_outbound_files(&conn, outbound_id)
+    }
+
+    fn set_outbound_file_state(
+        &self,
+        outbound_id: i64,
+        rel_path: &str,
+        state: OutboundFileState,
+        bytes_done: u64,
+        outcome: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        set_outbound_file_state(&conn, outbound_id, rel_path, state, bytes_done, outcome, error)
+    }
+
+    fn append_sync_event(
+        &self,
+        direction: Direction,
+        batch_key: &str,
+        kind: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        append_sync_event(&conn, direction, batch_key, kind, detail)
     }
 
     fn set_state(&self, id: i64, s: OutboundState) -> Result<()> {
@@ -1663,20 +1805,49 @@ impl CatalogSyncStore {
 }
 
 impl SyncStore for CatalogSyncStore {
-    fn enqueue(&self, package_ref: &str, peer: NodeId) -> Result<i64> {
+    fn enqueue(
+        &self,
+        package_ref: &str,
+        peer: NodeId,
+        display_name: Option<&str>,
+        files: &[AnnounceFileEntry],
+    ) -> Result<i64> {
         let conn = self.lock_conn();
-        conn.execute(
-            "INSERT INTO sync_outbound (package_ref, peer, state, attempts, created_at)
-             VALUES (?1, ?2, ?3, 0, ?4)",
-            params![
-                package_ref,
-                node_id_hex(&peer),
-                OutboundState::Queued.as_str(),
-                now_iso()
-            ],
-        )
-        .context("insert sync_outbound")?;
-        Ok(conn.last_insert_rowid())
+        insert_outbound_with_files(&conn, package_ref, &node_id_hex(&peer), display_name, files)
+    }
+
+    fn replace_outbound_files(&self, outbound_id: i64, files: &[OutboundFileRow]) -> Result<()> {
+        let conn = self.lock_conn();
+        replace_outbound_files(&conn, outbound_id, files)
+    }
+
+    fn list_outbound_files(&self, outbound_id: i64) -> Result<Vec<OutboundFileRow>> {
+        let conn = self.lock_conn();
+        list_outbound_files(&conn, outbound_id)
+    }
+
+    fn set_outbound_file_state(
+        &self,
+        outbound_id: i64,
+        rel_path: &str,
+        state: OutboundFileState,
+        bytes_done: u64,
+        outcome: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.lock_conn();
+        set_outbound_file_state(&conn, outbound_id, rel_path, state, bytes_done, outcome, error)
+    }
+
+    fn append_sync_event(
+        &self,
+        direction: Direction,
+        batch_key: &str,
+        kind: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.lock_conn();
+        append_sync_event(&conn, direction, batch_key, kind, detail)
     }
 
     fn set_state(&self, id: i64, s: OutboundState) -> Result<()> {
@@ -1819,9 +1990,9 @@ mod tests {
         let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
 
         // Three packages in distinct states.
-        let queued = store.enqueue("pkg-queued", PEER).unwrap();
-        let transferring = store.enqueue("pkg-transferring", PEER).unwrap();
-        let confirmed = store.enqueue("pkg-confirmed", PEER).unwrap();
+        let queued = store.enqueue("pkg-queued", PEER, None, &[]).unwrap();
+        let transferring = store.enqueue("pkg-transferring", PEER, None, &[]).unwrap();
+        let confirmed = store.enqueue("pkg-confirmed", PEER, None, &[]).unwrap();
         store.set_state(transferring, OutboundState::Transferring).unwrap();
         store.confirm(confirmed, &[]).unwrap();
 
@@ -1939,7 +2110,7 @@ mod tests {
     fn next_retry_at_roundtrips_and_clears() {
         let tmp = tempfile::tempdir().unwrap();
         let store = StandaloneSyncStore::open(tmp.path().join("s.db")).unwrap();
-        let id = store.enqueue("/tmp/pkg", [7u8; 32]).unwrap();
+        let id = store.enqueue("/tmp/pkg", [7u8; 32], None, &[]).unwrap();
         store.set_next_retry_at(id, Some("2026-07-15T12:00:00Z")).unwrap();
         let row = store.non_terminal().unwrap().pop().unwrap();
         assert_eq!(row.next_retry_at.as_deref(), Some("2026-07-15T12:00:00Z"));
@@ -1955,7 +2126,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
 
-        let id = store.enqueue("pkg", PEER).unwrap();
+        let id = store.enqueue("pkg", PEER, None, &[]).unwrap();
         assert_eq!(
             store.get_outbound(id).unwrap().unwrap().last_error,
             None,
