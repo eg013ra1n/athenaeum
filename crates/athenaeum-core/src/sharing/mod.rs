@@ -28,8 +28,8 @@ mod tests;
 mod wire_golden_tests;
 
 pub use types::{
-    FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, StartInfo,
-    TransportEvent,
+    AnnounceFileEntry, FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV2,
+    PackageId, ReceiptOutcome, StartInfo, TransportEvent,
 };
 
 /// A callback that receives live [`FetchEvent`]s while a [`fetch`] is in flight.
@@ -63,7 +63,20 @@ pub trait SharingTransport: Send + Sync {
     async fn start(&self) -> anyhow::Result<StartInfo>;
 
     /// Broadcast a package announcement to peer `to`.
-    async fn announce(&self, to: NodeId, a: &PackageAnnounce) -> anyhow::Result<()>;
+    ///
+    /// The app sender emits only v2: implementors encode a `Msg::Announce2`
+    /// carrying `a`'s fields plus `batch_name` (a human batch display name) and
+    /// `files` (the full manifest). Until the send-path task supplies real values
+    /// a caller may pass the package-dir basename as `batch_name` and an empty
+    /// `files` slice. The receive side accepts both v2 and legacy v1
+    /// (`Msg::Announce`, extras `None`) announces.
+    async fn announce(
+        &self,
+        to: NodeId,
+        a: &PackageAnnounce,
+        batch_name: &str,
+        files: &[AnnounceFileEntry],
+    ) -> anyhow::Result<()>;
 
     /// Pull a package (manifest + blobs) from `from` into `dest_dir`.
     ///

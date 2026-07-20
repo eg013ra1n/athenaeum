@@ -29,6 +29,34 @@ pub struct PackageAnnounce {
     pub frame_count: u32,
 }
 
+/// One manifest entry advertised in a v2 announce ([`PackageAnnounceV2`]).
+///
+/// Lets the receiver learn a package's file contents at announce time — before
+/// any fetch — so a later task can create per-file rows from the manifest. Byte
+/// image is pinned by `sharing::wire_golden_tests`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnnounceFileEntry {
+    pub rel_path: String,
+    pub byte_size: u64,
+    pub frame_uuid: String,
+}
+
+/// V2 package announce: the [`PackageAnnounce`] fields plus a human batch display
+/// name and the full file manifest.
+///
+/// A separate type (not new fields on [`PackageAnnounce`], whose positional
+/// postcard bytes are frozen) carried by the appended `Msg::Announce2` wire
+/// variant. `Msg::Announce` (v1) stays byte-identical for old peers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageAnnounceV2 {
+    pub package_id: PackageId,
+    pub root_hash: String,
+    pub byte_size: u64,
+    pub frame_count: u32,
+    pub batch_name: String,
+    pub files: Vec<AnnounceFileEntry>,
+}
+
 /// The receiver's verdict on one frame, returned to the provider in an ack.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct FrameReceipt {
@@ -72,9 +100,17 @@ pub struct StartInfo {
 #[derive(Clone, Debug)]
 pub enum TransportEvent {
     /// A peer announced a package to us.
+    ///
+    /// `batch_name` / `files` are the v2 extras: `Some` when the announce arrived
+    /// as `Msg::Announce2` (or the loopback mock emulating a v2 send), `None` for
+    /// a v1 `Msg::Announce` (an old peer, e.g. Perseus beta.3). The receiver logic
+    /// that consumes the manifest lands in a later task; here they are threaded
+    /// through and default to `None` on every v1 path.
     AnnounceReceived {
         from: NodeId,
         announce: PackageAnnounce,
+        batch_name: Option<String>,
+        files: Option<Vec<AnnounceFileEntry>>,
     },
     /// A peer acknowledged a package we sent, returning per-frame receipts.
     AckReceived {

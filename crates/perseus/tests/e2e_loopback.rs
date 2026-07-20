@@ -124,7 +124,7 @@ fn spawn_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf) -> Recei
         let mut events = endpoint.events().await;
         let mut n = 0usize;
         while let Some(event) = events.recv().await {
-            let TransportEvent::AnnounceReceived { from, announce } = event else {
+            let TransportEvent::AnnounceReceived { from, announce, .. } = event else {
                 continue;
             };
             n += 1;

@@ -15,7 +15,8 @@ use tokio::sync::mpsc::Receiver;
 use crate::package::{self, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use super::loopback::{FaultPlan, LoopbackNetwork};
 use super::types::{
-    FetchEvent, FrameReceipt, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
+    AnnounceFileEntry, FetchEvent, FrameReceipt, PackageAnnounce, PackageId, ReceiptOutcome,
+    TransportEvent,
 };
 use super::{noop_fetch_sink, FetchSink, SharingTransport};
 
@@ -81,13 +82,13 @@ async fn loopback_announce_fetch_ack_roundtrip() {
 
     provider.serve(&pkg, src.path(), None).await.unwrap();
     provider
-        .announce(receiver_info.node_id, &pkg)
+        .announce(receiver_info.node_id, &pkg, "", &[])
         .await
         .unwrap();
 
     // Receiver sees the announcement.
     match recv_next(&mut receiver_events).await {
-        TransportEvent::AnnounceReceived { from, announce } => {
+        TransportEvent::AnnounceReceived { from, announce, .. } => {
             assert_eq!(from, provider_info.node_id);
             assert_eq!(announce.package_id, pkg.package_id);
         }
@@ -138,6 +139,55 @@ async fn loopback_announce_fetch_ack_roundtrip() {
             assert_eq!(got, receipts);
         }
         other => panic!("expected AckReceived, got {other:?}"),
+    }
+}
+
+/// tv2 wire: a v2 announce (batch name + file manifest) threads its extras
+/// end-to-end. The loopback emulates the app sender (v2-only), so the receiver's
+/// `AnnounceReceived` carries `Some(batch_name)` + `Some(files)` byte-for-byte,
+/// while the v1 fields (`announce`) stay untouched.
+#[tokio::test]
+async fn loopback_announce_delivers_v2_extras() {
+    let net = LoopbackNetwork::new();
+    let provider = net.endpoint();
+    let receiver = net.endpoint();
+
+    let provider_info = provider.start().await.unwrap();
+    let receiver_info = receiver.start().await.unwrap();
+    let mut receiver_events = receiver.events().await;
+
+    let pkg = sample_announce();
+    let files = vec![
+        AnnounceFileEntry {
+            rel_path: "M31/L_0001.fits".to_string(),
+            byte_size: 4096,
+            frame_uuid: "frame-uuid-1".to_string(),
+        },
+        AnnounceFileEntry {
+            rel_path: "M31/L_0002.fits".to_string(),
+            byte_size: 2048,
+            frame_uuid: "frame-uuid-2".to_string(),
+        },
+    ];
+
+    provider
+        .announce(receiver_info.node_id, &pkg, "Туманность M31", &files)
+        .await
+        .unwrap();
+
+    match recv_next(&mut receiver_events).await {
+        TransportEvent::AnnounceReceived {
+            from,
+            announce,
+            batch_name,
+            files: got_files,
+        } => {
+            assert_eq!(from, provider_info.node_id);
+            assert_eq!(announce.package_id, pkg.package_id);
+            assert_eq!(batch_name.as_deref(), Some("Туманность M31"));
+            assert_eq!(got_files.as_deref(), Some(files.as_slice()));
+        }
+        other => panic!("expected AnnounceReceived, got {other:?}"),
     }
 }
 

@@ -971,6 +971,14 @@ impl Worker {
             }
         });
 
+        // tv2: the personal-sync announce now goes out as v2 (batch name + file
+        // manifest). Real values arrive with the send-path task; for now advertise
+        // the package-dir basename as the batch name and an empty manifest.
+        let batch_name = dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
         // Provider side: register the served dir (the negotiated want-subset when
         // `Some`, the full package when `None`), then advertise it to the peer. A
         // failure here (e.g. the peer is offline) is retryable, not fatal:
@@ -988,7 +996,8 @@ impl Worker {
                     .context("announce project package"),
                 None => self
                     .transport
-                    .announce(self.peer, &announce)
+                    // tv2: real file manifest arrives with the send-path task.
+                    .announce(self.peer, &announce, &batch_name, &[])
                     .await
                     .context("announce package"),
             }

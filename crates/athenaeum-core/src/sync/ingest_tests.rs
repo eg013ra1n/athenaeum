@@ -185,7 +185,7 @@ async fn ingest_mirrors_rel_path_under_authenticated_peer_slug() {
         "deadbeefdeadbeefdeadbeefdeadbeef", // decoy origin_device
     );
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
-    sender.announce(receiver_node, &announce).await.unwrap();
+    sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
     let receipts =
         wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
     assert!(matches!(receipts[0].outcome, ReceiptOutcome::Ingested));
@@ -656,7 +656,7 @@ async fn ack_replay_from_receipt_log() {
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
 
     // First delivery: announce → receiver fetches, ingests, acks.
-    sender.announce(receiver_node, &announce).await.unwrap();
+    sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
     let receipts1 = wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
     assert_eq!(receipts1.len(), 1);
     assert!(matches!(receipts1[0].outcome, ReceiptOutcome::Ingested));
@@ -672,7 +672,7 @@ async fn ack_replay_from_receipt_log() {
 
     // Second delivery of the SAME announce (same package_id): the receiver must
     // re-ack from the receipt log WITHOUT re-fetching or re-ingesting.
-    sender.announce(receiver_node, &announce).await.unwrap();
+    sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
     let receipts2 = wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
 
     // Identical receipts, replayed straight from the log.
@@ -1035,7 +1035,7 @@ async fn landing_root_is_resolved_live_per_package() {
     let (pkg1, announce1) =
         build_fixture_package_val(tmp.path(), "frame-live-a", "L_live_a.fits", "M42", 0.0);
     sender.serve(&announce1, &pkg1, None).await.unwrap();
-    sender.announce(receiver_node, &announce1).await.unwrap();
+    sender.announce(receiver_node, &announce1, "", &[]).await.unwrap();
     let r1 = wait_for_ack(&mut sender_events, &announce1.package_id.0, Duration::from_secs(5)).await;
     assert!(matches!(r1[0].outcome, ReceiptOutcome::Ingested));
     assert_eq!(count_files(&dir_a), 1, "package 1 landed under the first resolver target");
@@ -1047,7 +1047,7 @@ async fn landing_root_is_resolved_live_per_package() {
     let (pkg2, announce2) =
         build_fixture_package_val(tmp.path(), "frame-live-b", "L_live_b.fits", "NGC7000", 1.0);
     sender.serve(&announce2, &pkg2, None).await.unwrap();
-    sender.announce(receiver_node, &announce2).await.unwrap();
+    sender.announce(receiver_node, &announce2, "", &[]).await.unwrap();
     let r2 = wait_for_ack(&mut sender_events, &announce2.package_id.0, Duration::from_secs(5)).await;
     assert!(matches!(r2[0].outcome, ReceiptOutcome::Ingested));
     assert_eq!(count_files(&dir_b), 1, "package 2 landed under the NEW resolver target (live per-package)");
@@ -1115,7 +1115,7 @@ async fn receiver_drops_announce_from_unauthorized_peer() {
         "2026-01-16T10:00:00.000Z",
     );
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
-    sender.announce(receiver_node, &announce).await.unwrap();
+    sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
 
     // Give the receiver ample time to (wrongly) ingest, then assert it did not.
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1175,7 +1175,7 @@ async fn receiver_ingests_from_authorized_peer() {
         "2026-01-16T10:00:00.000Z",
     );
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
-    sender.announce(receiver_node, &announce).await.unwrap();
+    sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
 
     let receipts =
         wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;

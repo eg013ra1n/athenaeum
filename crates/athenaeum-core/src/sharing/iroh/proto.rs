@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::sharing::types::{FrameReceipt, PackageAnnounce, PackageId};
+use crate::sharing::types::{FrameReceipt, PackageAnnounce, PackageAnnounceV2, PackageId};
 
 /// One frame the provider could send, as advertised in a [`Msg::Offer`].
 ///
@@ -110,6 +110,14 @@ pub enum Msg {
         project_id: String,
         package_id: String,
     },
+    // Transfers-status-v2 announce — appended AFTER `ProjectRequest`; the postcard
+    // indices of every variant above stay frozen (same append-only rule as the
+    // slice-4 block). `Announce2` is the v2 counterpart of `Announce`: it adds a
+    // human batch name + the full file manifest so the receiver knows a package's
+    // contents at announce time. The app sender emits only `Announce2`; the
+    // receive side still decodes legacy `Announce` (v1) byte-for-byte.
+    /// Provider advertises a fetchable package with its v2 manifest + batch name.
+    Announce2(PackageAnnounceV2),
 }
 
 impl Msg {
@@ -166,7 +174,7 @@ pub(crate) fn build_full_hash_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sharing::types::{PackageId, ReceiptOutcome};
+    use crate::sharing::types::{AnnounceFileEntry, PackageId, ReceiptOutcome};
 
     fn sample_announce() -> PackageAnnounce {
         PackageAnnounce {
@@ -177,12 +185,60 @@ mod tests {
         }
     }
 
+    fn sample_announce_v2() -> PackageAnnounceV2 {
+        PackageAnnounceV2 {
+            package_id: PackageId("pkg-uuid-1".to_string()),
+            root_hash: "blake3-collection-hash".to_string(),
+            byte_size: 4096,
+            frame_count: 3,
+            batch_name: "Туманность M31".to_string(),
+            files: vec![
+                AnnounceFileEntry {
+                    rel_path: "M31/L_0001.fits".to_string(),
+                    byte_size: 4096,
+                    frame_uuid: "frame-uuid-1".to_string(),
+                },
+                AnnounceFileEntry {
+                    rel_path: "M31/L_0002.fits".to_string(),
+                    byte_size: 2048,
+                    frame_uuid: "frame-uuid-2".to_string(),
+                },
+            ],
+        }
+    }
+
     #[test]
     fn announce_roundtrips_through_postcard() {
         let msg = Msg::Announce(sample_announce());
         let bytes = msg.encode().unwrap();
         let back = Msg::decode(&bytes).unwrap();
         assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn announce2_roundtrips_through_postcard() {
+        let msg = Msg::Announce2(sample_announce_v2());
+        let bytes = msg.encode().unwrap();
+        let back = Msg::decode(&bytes).unwrap();
+        assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn package_announce_v2_roundtrips_through_postcard() {
+        // The embedded struct (and its `Vec<AnnounceFileEntry>`) roundtrips on its
+        // own, including the non-ASCII batch name and an empty manifest.
+        for v2 in [
+            sample_announce_v2(),
+            PackageAnnounceV2 {
+                files: Vec::new(),
+                batch_name: String::new(),
+                ..sample_announce_v2()
+            },
+        ] {
+            let bytes = postcard::to_stdvec(&v2).unwrap();
+            let back: PackageAnnounceV2 = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(v2, back);
+        }
     }
 
     #[test]

@@ -60,7 +60,10 @@ use iroh_blobs::{BlobsProtocol, Hash};
 use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::mpsc;
 
-use super::types::{FrameReceipt, NodeId, PackageAnnounce, PackageId, StartInfo, TransportEvent};
+use super::types::{
+    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV2, PackageId,
+    StartInfo, TransportEvent,
+};
 use super::{FetchSink, SharingTransport};
 use crate::sync::DedupResponder;
 
@@ -1094,7 +1097,13 @@ impl SharingTransport for IrohTransport {
         })
     }
 
-    async fn announce(&self, to: NodeId, a: &PackageAnnounce) -> Result<()> {
+    async fn announce(
+        &self,
+        to: NodeId,
+        a: &PackageAnnounce,
+        batch_name: &str,
+        files: &[AnnounceFileEntry],
+    ) -> Result<()> {
         // Substitute the collection hash registered by `serve` so the receiver
         // can download by it; keep everything else (crucially `package_id`).
         let mut wire = a.clone();
@@ -1108,7 +1117,16 @@ impl SharingTransport for IrohTransport {
                 ),
             }
         }
-        self.send_control(to, Msg::Announce(wire)).await?;
+        // The app sender emits only v2: carry the batch name + manifest.
+        let wire_v2 = PackageAnnounceV2 {
+            package_id: wire.package_id,
+            root_hash: wire.root_hash,
+            byte_size: wire.byte_size,
+            frame_count: wire.frame_count,
+            batch_name: batch_name.to_string(),
+            files: files.to_vec(),
+        };
+        self.send_control(to, Msg::Announce2(wire_v2)).await?;
         tracing::debug!(to = %hex32(&to), package_id = %a.package_id.0, "iroh announce sent");
         Ok(())
     }
@@ -1543,7 +1561,36 @@ impl ProtocolHandler for SyncControlProtocol {
                 }
             };
             let event = match msg {
-                Msg::Announce(announce) => TransportEvent::AnnounceReceived { from, announce },
+                // v1 announce (e.g. Perseus beta.3): no manifest extras.
+                Msg::Announce(announce) => TransportEvent::AnnounceReceived {
+                    from,
+                    announce,
+                    batch_name: None,
+                    files: None,
+                },
+                // v2 announce: split the manifest extras off the wire struct and
+                // hand the v1 fields on unchanged so downstream code is agnostic.
+                Msg::Announce2(v2) => {
+                    let PackageAnnounceV2 {
+                        package_id,
+                        root_hash,
+                        byte_size,
+                        frame_count,
+                        batch_name,
+                        files,
+                    } = v2;
+                    TransportEvent::AnnounceReceived {
+                        from,
+                        announce: PackageAnnounce {
+                            package_id,
+                            root_hash,
+                            byte_size,
+                            frame_count,
+                        },
+                        batch_name: Some(batch_name),
+                        files: Some(files),
+                    }
+                }
                 Msg::Ack {
                     package_id,
                     receipts,

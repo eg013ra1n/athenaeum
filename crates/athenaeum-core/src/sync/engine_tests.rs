@@ -27,7 +27,8 @@ use crate::package::{
 use crate::sharing::iroh::proto::{FullHashEntry, OfferEntry};
 use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
 use crate::sharing::types::{
-    FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, StartInfo, TransportEvent,
+    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, StartInfo,
+    TransportEvent,
 };
 use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
 
@@ -95,7 +96,7 @@ fn spawn_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf) -> Recei
         let mut events = endpoint.events().await;
         let mut n = 0usize;
         while let Some(event) = events.recv().await {
-            let TransportEvent::AnnounceReceived { from, announce } = event else {
+            let TransportEvent::AnnounceReceived { from, announce, .. } = event else {
                 continue;
             };
             n += 1;
@@ -136,7 +137,7 @@ fn spawn_cancelling_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBu
         let mut events = endpoint.events().await;
         let mut n = 0usize;
         while let Some(event) = events.recv().await {
-            let TransportEvent::AnnounceReceived { from, announce } = event else {
+            let TransportEvent::AnnounceReceived { from, announce, .. } = event else {
                 continue;
             };
             n += 1;
@@ -289,7 +290,7 @@ async fn confirmed_package_is_released_from_transport() {
             let mut events = receiver.events().await;
             let mut n = 0usize;
             while let Some(event) = events.recv().await {
-                let TransportEvent::AnnounceReceived { from, announce } = event else {
+                let TransportEvent::AnnounceReceived { from, announce, .. } = event else {
                     continue;
                 };
                 *captured.lock().unwrap() = Some(announce.clone());
@@ -769,7 +770,7 @@ async fn resume_reannounce_reuses_same_wire_package_id() {
             let mut events = receiver.events().await;
             let mut n = 0usize;
             while let Some(event) = events.recv().await {
-                let TransportEvent::AnnounceReceived { from, announce } = event else {
+                let TransportEvent::AnnounceReceived { from, announce, .. } = event else {
                     continue;
                 };
                 seen.lock().unwrap().push(announce.package_id.0.clone());
@@ -2163,8 +2164,14 @@ impl SharingTransport for NegotiateErrTransport {
     async fn start(&self) -> anyhow::Result<StartInfo> {
         self.0.start().await
     }
-    async fn announce(&self, to: NodeId, a: &PackageAnnounce) -> anyhow::Result<()> {
-        self.0.announce(to, a).await
+    async fn announce(
+        &self,
+        to: NodeId,
+        a: &PackageAnnounce,
+        batch_name: &str,
+        files: &[AnnounceFileEntry],
+    ) -> anyhow::Result<()> {
+        self.0.announce(to, a, batch_name, files).await
     }
     async fn fetch(
         &self,
@@ -2580,7 +2587,13 @@ impl SharingTransport for RetryProbeTransport {
             pairing_ticket: String::new(),
         })
     }
-    async fn announce(&self, _to: NodeId, _a: &PackageAnnounce) -> anyhow::Result<()> {
+    async fn announce(
+        &self,
+        _to: NodeId,
+        _a: &PackageAnnounce,
+        _batch_name: &str,
+        _files: &[AnnounceFileEntry],
+    ) -> anyhow::Result<()> {
         Ok(())
     }
     async fn fetch(
@@ -2744,7 +2757,13 @@ impl SharingTransport for ReplaceProbeTransport {
             pairing_ticket: String::new(),
         })
     }
-    async fn announce(&self, _to: NodeId, _a: &PackageAnnounce) -> anyhow::Result<()> {
+    async fn announce(
+        &self,
+        _to: NodeId,
+        _a: &PackageAnnounce,
+        _batch_name: &str,
+        _files: &[AnnounceFileEntry],
+    ) -> anyhow::Result<()> {
         // `classify_send_error` maps "timed out" → `ConnectClass::Timeout`, a
         // dead-addressing class that gates the Task 3.6 replace.
         anyhow::bail!("connection timed out")

@@ -356,7 +356,7 @@ impl SyncReceiver {
             tracing::info!(staging_root = %staging_root.display(), "sync receiver online");
             while let Some(ev) = events.recv().await {
                 match ev {
-                    TransportEvent::AnnounceReceived { from, announce } => {
+                    TransportEvent::AnnounceReceived { from, announce, .. } => {
                         // Authorization gate (finding H1): only ingest from a peer
                         // on this receiver's allow-list. An unauthorized (or
                         // revoked) node is silently dropped BEFORE any
@@ -1686,7 +1686,7 @@ mod tests {
         let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
         assert!(announce.byte_size > 0, "fixture package has non-zero bytes");
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
-        sender.announce(receiver_node, &announce).await.unwrap();
+        sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
 
         // The terminal Done write lands just after the receiver acks — poll for it.
         let mut final_row = None;
@@ -1780,7 +1780,7 @@ mod tests {
         // per-frame-rejected "all frames rejected" path.
         std::fs::remove_file(pkg_dir.join(crate::package::MANIFEST_FILENAME)).unwrap();
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
-        sender.announce(receiver_node, &announce).await.unwrap();
+        sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
 
         // The Failed write lands once the ingest join error propagates — poll for it.
         let mut final_row = None;
@@ -1937,7 +1937,7 @@ mod tests {
 
         // Cancel BEFORE the announce, then announce.
         control.request_cancel(&announce.package_id.0);
-        sender.announce(receiver_node, &announce).await.unwrap();
+        sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
 
         // (b) The sender observes an all-Cancelled ack, one receipt per frame.
         let (ack_pkg, ack_receipts) = recv_ack(&mut sender_events).await;
@@ -1977,7 +1977,7 @@ mod tests {
         // (d) A second announce replays the cancel from the receipt log WITHOUT
         //     re-fetching — the replay path emits ok_count == frame_count (the
         //     epilogue would emit 0), so this discriminates replay from re-fetch.
-        sender.announce(receiver_node, &announce).await.unwrap();
+        sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
         let (_pkg2, ack2) = recv_ack(&mut sender_events).await;
         assert!(
             ack2.iter().all(|r| matches!(r.outcome, ReceiptOutcome::Cancelled)),

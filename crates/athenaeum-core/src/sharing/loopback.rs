@@ -18,7 +18,8 @@ use tokio::sync::mpsc;
 
 use super::iroh::proto::OfferEntry;
 use super::types::{
-    FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, StartInfo, TransportEvent,
+    AnnounceFileEntry, FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, StartInfo,
+    TransportEvent,
 };
 use super::{FetchSink, SharingTransport};
 use crate::package::MANIFEST_FILENAME;
@@ -182,11 +183,22 @@ impl SharingTransport for LoopbackTransport {
         })
     }
 
-    async fn announce(&self, to: NodeId, a: &PackageAnnounce) -> anyhow::Result<()> {
+    async fn announce(
+        &self,
+        to: NodeId,
+        a: &PackageAnnounce,
+        batch_name: &str,
+        files: &[AnnounceFileEntry],
+    ) -> anyhow::Result<()> {
         let tx = self.peer_tx(to)?;
+        // The loopback emulates the app sender, which emits only v2 — so the
+        // extras always arrive as `Some` (mirroring a `Msg::Announce2` decode),
+        // even when a caller passes an empty manifest / basename placeholder.
         tx.send(TransportEvent::AnnounceReceived {
             from: self.node_id,
             announce: a.clone(),
+            batch_name: Some(batch_name.to_string()),
+            files: Some(files.to_vec()),
         })
         .await
         .map_err(|_| anyhow!("peer event channel closed: {}", hex32(&to)))?;
