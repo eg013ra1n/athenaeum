@@ -3,15 +3,13 @@ import { useNavigate } from 'react-router-dom';
 import { X, Search, ArrowUp, ArrowDown, ArrowUpRight, Inbox, Users } from 'lucide-react';
 import { api } from '../../api';
 import { useTransfers } from '../../contexts/TransfersContext';
-import { plainTransferError } from './ActiveTransferRow';
+import { plainTransferError, displayStateChip, displayStateSubline } from './presentation';
 import { transportHealthView } from './transportHealth';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import type {
   Direction,
   HistoryRow,
-  InboundState,
   InboundSummary,
-  OutboundState,
   OutboundSummary,
   ProjectCard,
   SyncHistoryQuery,
@@ -22,35 +20,6 @@ type DirFilter = 'all' | Direction;
 
 const HISTORY_LIMIT = 200;
 const POLL_MS = 5_000;
-
-/** Tone class for an in-flight outbound package state. */
-function stateTone(state: OutboundState): string {
-  switch (state) {
-    case 'confirmed':
-      return 'text-success';
-    case 'failed':
-      return 'text-error';
-    case 'transferring':
-    case 'delivered':
-      return 'text-accent';
-    default: // queued / announced
-      return 'text-content-muted';
-  }
-}
-
-/** Tone class for an in-flight inbound package state. */
-function inboundStateTone(state: InboundState): string {
-  switch (state) {
-    case 'ingesting':
-      return 'text-success';
-    case 'failed':
-      return 'text-error';
-    case 'fetching':
-      return 'text-accent';
-    default: // announced
-      return 'text-content-muted';
-  }
-}
 
 /** Tone class for a history-row outcome tag. */
 function outcomeTone(outcome: string): string {
@@ -363,42 +332,69 @@ function ActiveTab({ active, incoming }: { active: OutboundSummary[]; incoming: 
   }
   return (
     <ul className="divide-y divide-border">
-      {active.map((row) => (
-        <li key={`out-${row.id}`} className="flex items-center justify-between gap-2 px-4 py-3">
-          <div className="min-w-0">
-            <p className="truncate font-mono text-xs text-content-secondary" title={row.packageShort}>
-              {row.packageShort}
-            </p>
-            <p className="mt-0.5 text-[10px] text-content-muted" title={`to ${row.peerShort}`}>
-              <ArrowUp size={9} className="mr-0.5 inline text-accent" />
-              {row.peerShort}
-              {row.attempts > 0 ? ` · attempt ${row.attempts + 1}` : ''}
-            </p>
-            {row.attempts > 0 && row.lastError && (
-              <p className="mt-0.5 truncate text-[10px] text-error/70" title={row.lastError}>
-                {plainTransferError(row.lastError)}
+      {/* Outbound mini-rows — same presentation model as the full page (batch
+          name, device name, `displayState` chip incl. neutral waiting). The full
+          unified view with actions + per-file detail lives on /transfers. */}
+      {active.map((row) => {
+        const chip = displayStateChip(row.displayState);
+        const subline = displayStateSubline(row.displayState);
+        const total = row.fileCounts.total || row.fileCount;
+        return (
+          <li key={`out-${row.id}`} className="flex items-start justify-between gap-2 px-4 py-3">
+            <div className="min-w-0">
+              <p className="truncate text-xs font-medium text-content" title={row.displayName ?? row.packageShort}>
+                {row.displayName ?? row.packageShort}
               </p>
-            )}
-          </div>
-          <span className={`shrink-0 text-xs font-medium ${stateTone(row.state)}`}>{row.state}</span>
-        </li>
-      ))}
-      {/* Incoming summary mini rows — no expansion, no per-file detail; the
-          full unified view with actions lives on the /transfers page. */}
-      {incoming.map((row) => (
-        <li key={`in-${row.id}`} className="flex items-center justify-between gap-2 px-4 py-3">
-          <div className="min-w-0">
-            <p className="truncate font-mono text-xs text-content-secondary" title={row.packageShort}>
-              {row.packageShort}
-            </p>
-            <p className="mt-0.5 text-[10px] text-content-muted" title={`from ${row.peerShort}`}>
-              <ArrowDown size={9} className="mr-0.5 inline text-success" />
-              {row.peerShort} · {row.frameCount} frame{row.frameCount === 1 ? '' : 's'}
-            </p>
-          </div>
-          <span className={`shrink-0 text-xs font-medium ${inboundStateTone(row.state)}`}>{row.state}</span>
-        </li>
-      ))}
+              <p className="mt-0.5 flex items-center gap-1 text-[10px] text-content-muted" title={row.deviceName ?? row.peerShort}>
+                <ArrowUp size={9} className="shrink-0 text-accent" />
+                <span className="truncate">{row.deviceName ?? row.peerShort}</span>
+                <span aria-hidden="true">·</span>
+                <span className="shrink-0 tabular-nums">
+                  {row.fileCounts.done} of {total}
+                </span>
+              </p>
+              {row.displayState === 'waiting' && (
+                <p className="mt-0.5 text-[10px] text-content-secondary">retry soon</p>
+              )}
+              {subline && <p className="mt-0.5 text-[10px] text-content-muted">{subline}</p>}
+              {/* Reason shows only while a retry is genuinely pending — never
+                  gated on the monotonic attempts counter. */}
+              {row.retrying && row.lastError && (
+                <p className="mt-0.5 truncate text-[10px] text-warning" title={row.lastError}>
+                  {plainTransferError(row.lastError)}
+                </p>
+              )}
+            </div>
+            <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${chip.className}`}>
+              {chip.label}
+            </span>
+          </li>
+        );
+      })}
+      {incoming.map((row) => {
+        const chip = displayStateChip(row.displayState);
+        const total = row.fileCounts.total || row.frameCount;
+        return (
+          <li key={`in-${row.id}`} className="flex items-start justify-between gap-2 px-4 py-3">
+            <div className="min-w-0">
+              <p className="truncate text-xs font-medium text-content" title={row.displayName ?? row.packageShort}>
+                {row.displayName ?? row.packageShort}
+              </p>
+              <p className="mt-0.5 flex items-center gap-1 text-[10px] text-content-muted" title={row.deviceName ?? row.peerShort}>
+                <ArrowDown size={9} className="shrink-0 text-success" />
+                <span className="truncate">{row.deviceName ?? row.peerShort}</span>
+                <span aria-hidden="true">·</span>
+                <span className="shrink-0 tabular-nums">
+                  {row.fileCounts.done} of {total}
+                </span>
+              </p>
+            </div>
+            <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${chip.className}`}>
+              {chip.label}
+            </span>
+          </li>
+        );
+      })}
     </ul>
   );
 }
@@ -488,6 +484,11 @@ function HistoryTab({
                   </span>
                 </div>
                 <p className="mt-0.5 flex items-center gap-2 pl-5 text-[10px] text-content-muted">
+                  {r.batchName && (
+                    <span className="truncate font-medium text-content-secondary" title={r.batchName}>
+                      {r.batchName}
+                    </span>
+                  )}
                   {r.object && <span className="truncate">{r.object}</span>}
                   {r.project && (
                     <span

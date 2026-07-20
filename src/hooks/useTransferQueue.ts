@@ -81,7 +81,13 @@ function trackBytes(
 export type TransferRowKind = 'outbound' | 'inbound';
 
 /** One unified Active-tab row — an in-flight outbound/inbound package, or a
- * page-session-lingering terminal outbound package kept around for Resend. */
+ * page-session-lingering terminal outbound package kept around for Resend.
+ *
+ * Transfers Status Model v2: presentation keys off `displayState` /
+ * `retrying` / `stalledUntil` / `fileCounts` (never the raw `attempts` gate),
+ * and shows `displayName` / `deviceName` instead of the raw handle + hex. The
+ * raw `state`, `attempts`, `packageShort`, `peerShort` survive for the Details
+ * tab (the ONLY place ids/hex/raw state appear). */
 export interface TransferRow {
   key: string;
   kind: TransferRowKind;
@@ -91,24 +97,38 @@ export interface TransferRow {
   packageId: string | null;
   packageShort: string;
   peerShort: string;
+  /** Human batch name (§D1), or `null` for a legacy/unnamed batch. */
+  displayName: string | null;
+  /** Friendly peer device name (§D5), or `null` when the peer isn't in the cache. */
+  deviceName: string | null;
+  /** Backend-derived presentation state (§D5): outbound
+   *  `queued|preparing|transferring|uploaded|waiting|confirmed|cancelled|failed`,
+   *  inbound `announced|fetching|ingesting|done|failed|cancelled`. */
+  displayState: string;
+  /** RFC3339 retry deadline while `displayState === 'waiting'`, else `null` — the countdown target. */
+  stalledUntil: string | null;
+  /** Whether a retry is armed (`next_retry_at` set) — gates the error-reason line. NOT `attempts`. */
+  retrying: boolean;
+  /** Per-file rollup for the "N of M files" progress line. */
+  fileCounts: { total: number; done: number; failed: number };
   fileCount: number;
   byteSize: number;
   bytesDone: number;
   state: string;
-  /** Outbound-only; `0` for inbound rows (the field doesn't exist there). */
+  createdAt: string;
+  /** Outbound-only; `0` for inbound rows (the field doesn't exist there). Details-tab only. */
   attempts: number;
   lastError: string | null;
   nextRetryAt: string | null;
   /** `true` for a lingering failed/cancelled outbound row (Resend, not Cancel/Send-now). */
   terminal: boolean;
   /** Latest `sync-progress` `stage` seen for this outbound id (`sent` ticks only),
-   * cleared on `sync-finished`. Outbound-only; `null` for inbound/terminal rows.
-   * Drives the "uploaded — awaiting confirmation" post-upload/pre-ack label. */
+   * cleared on `sync-finished`. Outbound-only; `null` for inbound/terminal rows. */
   liveStage: string | null;
   speedBps: number | null;
   isTransferring: boolean;
-  /** Bumped on every `sync-finished` for this package — an expanded row watches
-   * this to know its cached `list_transfer_files` detail needs a re-fetch. */
+  /** Bumped on every `sync-finished` for this package — a selected/expanded row
+   * watches this to know its cached `list_transfer_files` detail needs a re-fetch. */
   finishNonce: number;
 }
 
@@ -211,8 +231,8 @@ export function useTransferQueue(): UseTransferQueue {
           if (!Number.isFinite(id)) return;
           const live = trackBytes(outSpeedRef.current, `out:${id}`, p.bytesDone, p.bytesTotal);
           setLiveOutboundBytes((prev) => new Map(prev).set(id, live));
-          // Record the stage so ActiveTransferRow can show "uploaded — awaiting
-          // confirmation"; a later `transferring` tick (a resume) flips it back.
+          // Record the stage for the row's post-upload/pre-ack label; a later
+          // `transferring` tick (a resume) flips it back.
           setLiveOutboundStage((prev) => new Map(prev).set(id, p.stage));
         } else {
           const live = trackBytes(inSpeedRef.current, `in:${p.packageId}`, p.bytesDone, p.bytesTotal);
@@ -338,10 +358,17 @@ export function useTransferQueue(): UseTransferQueue {
         packageId: null,
         packageShort: s.packageShort,
         peerShort: s.peerShort,
+        displayName: s.displayName,
+        deviceName: s.deviceName,
+        displayState: s.displayState,
+        stalledUntil: s.stalledUntil,
+        retrying: s.retrying,
+        fileCounts: s.fileCounts,
         fileCount: s.fileCount,
         byteSize: s.byteSize,
         bytesDone: live?.bytesDone ?? 0,
         state: s.state,
+        createdAt: s.createdAt,
         attempts: s.attempts,
         lastError: s.lastError,
         nextRetryAt: s.nextRetryAt,
@@ -370,10 +397,19 @@ export function useTransferQueue(): UseTransferQueue {
         packageId: null,
         packageShort: summary.packageShort,
         peerShort: summary.peerShort,
+        displayName: summary.displayName,
+        deviceName: summary.deviceName,
+        // A terminal ledger row is settled — its display state IS the outcome,
+        // never a stale `transferring`/`waiting` from before it finished.
+        displayState: outcome,
+        stalledUntil: null,
+        retrying: false,
+        fileCounts: summary.fileCounts,
         fileCount: summary.fileCount,
         byteSize: summary.byteSize,
         bytesDone: 0,
         state: outcome,
+        createdAt: summary.createdAt,
         attempts: summary.attempts,
         lastError: summary.lastError,
         nextRetryAt: null,
@@ -393,10 +429,17 @@ export function useTransferQueue(): UseTransferQueue {
         packageId: s.packageId,
         packageShort: s.packageShort,
         peerShort: s.peerShort,
+        displayName: s.displayName,
+        deviceName: s.deviceName,
+        displayState: s.displayState,
+        stalledUntil: s.stalledUntil,
+        retrying: false,
+        fileCounts: s.fileCounts,
         fileCount: s.frameCount,
         byteSize: s.byteSize,
         bytesDone: Math.max(s.bytesDone, live?.bytesDone ?? 0),
         state: s.state,
+        createdAt: s.createdAt,
         attempts: 0,
         lastError: null,
         nextRetryAt: null,
