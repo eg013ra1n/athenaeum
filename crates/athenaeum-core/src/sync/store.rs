@@ -172,14 +172,15 @@ pub const DDL_INBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_inbound (
     created_at TEXT NOT NULL,
     finished_at TEXT,
     display_name TEXT,
+    landing_dir TEXT,
     UNIQUE(peer, package_id)
 )";
 
-/// Idempotently add the trailing `sync_inbound.display_name` column (Transfers
-/// Status Model v2 §D1) to an existing table.
+/// Idempotently add the trailing `sync_inbound.display_name` (Transfers Status
+/// Model v2 §D1) and `landing_dir` (§D2) columns to an existing table.
 ///
 /// The guarded-ALTER twin of [`ensure_outbound_columns`] / [`ensure_history_columns`]:
-/// `sync_inbound` shipped in beta.3 without `display_name`, so a store opened over
+/// `sync_inbound` shipped in beta.3 without either column, so a store opened over
 /// a 0.4.x catalog / Perseus DB is migrated in place here. Called by every
 /// `sync_inbound` materialisation site (both store `open`s and `db::schema::init_db`)
 /// right after the DDL. Never breaks an existing DB: an already-present column is
@@ -192,7 +193,7 @@ pub fn ensure_inbound_columns(conn: &Connection) -> Result<()> {
         .context("query table_info(sync_inbound)")?
         .filter_map(|c| c.ok())
         .collect();
-    for (col, ty) in [("display_name", "TEXT")] {
+    for (col, ty) in [("display_name", "TEXT"), ("landing_dir", "TEXT")] {
         if !existing.contains(col) {
             conn.execute(&format!("ALTER TABLE sync_inbound ADD COLUMN {col} {ty}"), [])
                 .with_context(|| format!("add sync_inbound.{col} column"))?;
@@ -542,7 +543,7 @@ fn history_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<HistoryRaw> {
 fn inbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<InboundRaw> {
     Ok((
         r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
-        r.get(8)?, r.get(9)?, r.get(10)?,
+        r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
     ))
 }
 
@@ -877,7 +878,7 @@ pub fn load_receipts(conn: &Connection, package_id: &str) -> Result<Vec<FrameRec
 // package_id)` UNIQUE constraint anchors the upsert.
 
 const INBOUND_COLS: &str =
-    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at, display_name";
+    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at, display_name, landing_dir";
 
 /// Raw column tuple for a `sync_inbound` row, parsed into [`InboundRow`] by
 /// [`to_inbound`] so fallible text parsing happens outside the rusqlite closure.
@@ -891,6 +892,7 @@ type InboundRaw = (
     i64,
     Option<String>,
     String,
+    Option<String>,
     Option<String>,
     Option<String>,
 );
@@ -908,6 +910,7 @@ fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
         created_at,
         finished_at,
         display_name,
+        landing_dir,
     ) = raw;
     Ok(InboundRow {
         id,
@@ -921,6 +924,7 @@ fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
         created_at,
         finished_at,
         display_name,
+        landing_dir,
     })
 }
 
@@ -1206,6 +1210,63 @@ pub fn set_inbound_file_state(
         params![state.as_str(), bytes_done as i64, outcome, error, now_iso(), inbound_id, rel_path],
     )
     .with_context(|| format!("set inbound file state for {inbound_id}/{rel_path}"))?;
+    Ok(())
+}
+
+/// Persist the resolved on-disk landing directory for an inbound package
+/// (Transfers Status Model v2 §D2). Written ONCE per package at first landing so a
+/// resume/restart lands into the same tree; keyed by row `id`. See
+/// [`InboundRow::landing_dir`](super::models::InboundRow::landing_dir).
+pub fn set_inbound_landing_dir(conn: &Connection, id: i64, landing_dir: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_inbound SET landing_dir = ?1 WHERE id = ?2",
+        params![landing_dir, id],
+    )
+    .with_context(|| format!("set landing_dir for inbound {id}"))?;
+    Ok(())
+}
+
+/// True if some OTHER (id ≠ `exclude_id`) NON-terminal inbound row already claims
+/// `landing_dir` (Transfers Status Model v2 §D2 collision rule). A terminal prior
+/// batch (done/failed/cancelled) with the same dir does NOT count — repeat sends
+/// of the same object merge into one tree — so this only reports a live conflict
+/// that must be suffixed `_2`/`_3`…
+pub fn landing_dir_claimed_by_active(
+    conn: &Connection,
+    landing_dir: &str,
+    exclude_id: i64,
+) -> Result<bool> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_inbound
+             WHERE landing_dir = ?1 AND id <> ?2
+               AND state NOT IN ('done', 'failed', 'cancelled')",
+            params![landing_dir, exclude_id],
+            |r| r.get(0),
+        )
+        .context("count active landing_dir claims")?;
+    Ok(n > 0)
+}
+
+/// Settle every not-yet-`done` per-file row of an inbound batch to `state` with
+/// `outcome`/`error` in ONE UPDATE (Transfers Status Model v2 §D4). The batch-level
+/// closer used on a fetch/ingest failure (→ `failed` + reason), a receiver cancel
+/// (→ `done` + `cancelled`), and the restart reconcile (→ `failed` + "interrupted
+/// by restart"). Rows already `done` (per-frame verdict recorded) are left intact.
+pub fn settle_unsettled_inbound_files(
+    conn: &Connection,
+    inbound_id: i64,
+    state: InboundFileState,
+    outcome: Option<&str>,
+    error: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_inbound_files
+         SET state = ?1, outcome = ?2, error = ?3, updated_at = ?4
+         WHERE inbound_id = ?5 AND state <> 'done'",
+        params![state.as_str(), outcome, error, now_iso(), inbound_id],
+    )
+    .with_context(|| format!("settle unsettled inbound files for {inbound_id}"))?;
     Ok(())
 }
 

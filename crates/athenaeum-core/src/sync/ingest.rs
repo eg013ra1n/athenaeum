@@ -123,6 +123,8 @@ pub fn ingest_package(
     package_dir: &Path,
     announce: &PackageAnnounce,
     peer_device: &str,
+    batch_name: Option<&str>,
+    landing_override: Option<&Path>,
 ) -> Result<IngestOutcome> {
     let records = package::read_manifest(package_dir)
         .with_context(|| format!("read manifest for ingest {}", package_dir.display()))?;
@@ -139,13 +141,19 @@ pub fn ingest_package(
 
     let package_id = &announce.package_id.0;
 
-    // Per-sender landing prefix, computed once (the whole package is from one
-    // authenticated peer). Resolved from `peer_device` — the AUTHENTICATED node id
-    // (hex) the receiver verified — NOT the manifest's wire-supplied
-    // `origin_device`, which a peer could set to anything. Prefers that peer's
-    // CURRENT friendly device name (from the cached names map, no hub round-trip),
-    // falling back to the hex-derived slug when no name is known.
-    let sender_slug = resolve_sender_slug(conn, peer_device);
+    // Resolve the landing base directory for this package's files (Transfers
+    // Status Model v2 §D2). A named (v2) batch passes a `landing_override` — the
+    // fully-resolved `<incoming_root>/<sender_slug>/<batch_slug>` the receiver
+    // computed + persisted once at announce time (reused verbatim on resume). An
+    // unnamed (v1) batch has no override, so the base is
+    // `<incoming_root>/<sender_slug>` computed here from `peer_device` — the
+    // AUTHENTICATED node id (hex) the receiver verified — preferring that peer's
+    // CURRENT friendly device name (cached names map, no hub round-trip), falling
+    // back to the hex slug. This keeps the v1 landing layout byte-identical.
+    let landing_base: PathBuf = match landing_override {
+        Some(dir) => dir.to_path_buf(),
+        None => incoming_root.join(resolve_sender_slug(conn, peer_device)),
+    };
 
     // Redelivery optimization: load whatever this package already has on
     // record and reuse any non-Rejected receipt verbatim instead of
@@ -185,7 +193,7 @@ pub fn ingest_package(
             // — the source may have been repaired since the last attempt.
         }
 
-        let verdict = match process_frame(conn, incoming_root, package_dir, record, package_id, peer_device, &sender_slug, &started_at) {
+        let verdict = match process_frame(conn, &landing_base, package_dir, record, package_id, peer_device, &started_at, batch_name) {
             Ok(v) => v,
             Err(e) => {
                 // A processing error (I/O, DB) is surfaced as a Rejected receipt
@@ -205,7 +213,7 @@ pub fn ingest_package(
                 // Best-effort receipt/history so the failure is still durable and
                 // the ack carries a verdict for this frame.
                 let _ = record_receipt_and_history(
-                    conn, package_id, &receipt, record, peer_device, &started_at, "rejected",
+                    conn, package_id, &receipt, record, peer_device, &started_at, "rejected", batch_name,
                 );
                 FrameVerdict { receipt, history_outcome: "rejected" }
             }
@@ -233,15 +241,16 @@ pub fn ingest_package(
 
 /// Process one manifest record end to end and return its verdict. All DB writes
 /// happen inside a single transaction on `conn`.
+#[allow(clippy::too_many_arguments)]
 fn process_frame(
     conn: &Connection,
-    incoming_root: &Path,
+    landing_base: &Path,
     package_dir: &Path,
     record: &ManifestRecord,
     package_id: &str,
     peer_device: &str,
-    sender_slug: &str,
     started_at: &str,
+    batch_name: Option<&str>,
 ) -> Result<FrameVerdict> {
     // Guard the record's rel_path (untrusted, wire-supplied) before joining.
     package::validate_rel_path(&record.rel_path)
@@ -253,14 +262,14 @@ fn process_frame(
         Ok(h) => h,
         Err(e) => {
             let receipt = rejected_receipt(record, format!("payload unreadable: {e}"));
-            record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, "rejected")?;
+            record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, "rejected", batch_name)?;
             return Ok(FrameVerdict { receipt, history_outcome: "rejected" });
         }
     };
     if actual != record.xxh3 {
         tracing::warn!(frame_uuid = %record.frame_uuid, "sync ingest xxh3 mismatch; rejecting");
         let receipt = rejected_receipt(record, format!("xxh3 mismatch: manifest {}, disk {actual}", record.xxh3));
-        record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, "rejected")?;
+        record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, "rejected", batch_name)?;
         return Ok(FrameVerdict { receipt, history_outcome: "rejected" });
     }
 
@@ -290,7 +299,7 @@ fn process_frame(
         }
 
         let receipt = duplicate_receipt(record);
-        record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, history_outcome)?;
+        record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, history_outcome, batch_name)?;
         tracing::debug!(frame_uuid = %record.frame_uuid, outcome = history_outcome, "sync ingest duplicate by uuid");
         return Ok(FrameVerdict { receipt, history_outcome });
     }
@@ -308,12 +317,12 @@ fn process_frame(
     if full_hash_already_ingested(conn, &record.xxh3)? {
         tracing::debug!(frame_uuid = %record.frame_uuid, "sync ingest duplicate by full content hash");
         let receipt = duplicate_receipt(record);
-        record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, "duplicate")?;
+        record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, "duplicate", batch_name)?;
         return Ok(FrameVerdict { receipt, history_outcome: "duplicate" });
     }
 
     // 4. Ingest: land the payload, then insert catalog rows in one transaction.
-    let landed = land_payload(incoming_root, &payload, record, sender_slug)
+    let landed = land_payload(landing_base, &payload, record)
         .with_context(|| format!("land payload {}", record.rel_path))?;
     // The sampling hash is computed here purely to populate `files.content_hash`
     // (the unrelated scanner-side Duplicates view) — it never decides a skip.
@@ -329,7 +338,7 @@ fn process_frame(
         let tx = conn.unchecked_transaction().context("begin ingest tx")?;
         insert_ingested_rows(&tx, &landed, record, &snapshot, &sampling_hash)?;
         insert_receipt(&tx, package_id, &receipt, started_at)?;
-        insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, "ingested", package_id))?;
+        insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, "ingested", package_id, batch_name))?;
         tx.commit().context("commit ingest tx")
     })();
     let write_ms = write_started.elapsed().as_millis();
@@ -410,19 +419,17 @@ fn primary_wins_outcome(existing: Option<&str>, snapshot: Option<&str>) -> &'sta
     }
 }
 
-/// Land an accepted payload mirroring the sender's tree under
-/// `<incoming_root>/<sender_slug>/<rel_path>`, tmp-copy + atomic rename,
-/// collision-suffixed. `sender_slug` is [`resolve_sender_slug`]'s output for the
-/// AUTHENTICATED peer (its friendly device name, hex fallback); `rel_path` is
-/// `validate_rel_path`-guarded in `process_frame`, so the join cannot escape
-/// `<incoming_root>/<sender_slug>/`. Returns the final path.
+/// Land an accepted payload mirroring the sender's tree under `<landing_base>/<rel_path>`,
+/// tmp-copy + atomic rename, collision-suffixed. `landing_base` is the package's
+/// resolved landing directory (`<incoming_root>/<sender_slug>[/<batch_slug>]`,
+/// Transfers Status Model v2 §D2); `rel_path` is `validate_rel_path`-guarded in
+/// `process_frame`, so the join cannot escape `<landing_base>/`. Returns the final path.
 fn land_payload(
-    incoming_root: &Path,
+    landing_base: &Path,
     payload: &Path,
     record: &ManifestRecord,
-    sender_slug: &str,
 ) -> Result<PathBuf> {
-    let dest = unique_path(&incoming_root.join(sender_slug).join(Path::new(&record.rel_path)));
+    let dest = unique_path(&landing_base.join(Path::new(&record.rel_path)));
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create landing dir {}", parent.display()))?;
@@ -528,6 +535,7 @@ fn insert_ingested_rows(
 /// Write the receipt + history rows for one frame in a single transaction.
 /// Used by the duplicate/rejected paths (the ingest path writes them inline in
 /// its own transaction alongside the catalog rows).
+#[allow(clippy::too_many_arguments)]
 fn record_receipt_and_history(
     conn: &Connection,
     package_id: &str,
@@ -536,13 +544,37 @@ fn record_receipt_and_history(
     peer_device: &str,
     started_at: &str,
     history_outcome: &str,
+    batch_name: Option<&str>,
 ) -> Result<()> {
     let snapshot: Frame = serde_json::from_value(record.frame_meta.clone()).unwrap_or_default();
     let tx = conn.unchecked_transaction().context("begin receipt tx")?;
     insert_receipt(&tx, package_id, receipt, started_at)?;
-    insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, history_outcome, package_id))?;
+    insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, history_outcome, package_id, batch_name))?;
     tx.commit().context("commit receipt tx")?;
     Ok(())
+}
+
+/// Build one `direction = received`, outcome `cancelled` history row per manifest
+/// frame for the receiver's cancel epilogue (Transfers Status Model v2 §D6) — the
+/// receiver-side twin of the sender's "cancelled by receiver" audit. `batch_name`
+/// is the inbound row's `display_name`; each row carries the same per-frame shape
+/// [`received_history`] produces on the ingest path. Deserializes each record's
+/// `frame_meta` for the `object` column (a malformed snapshot defaults, never
+/// panics — the row still records the cancel).
+pub(crate) fn cancelled_history_rows(
+    records: &[ManifestRecord],
+    peer_device: &str,
+    package_id: &str,
+    batch_name: Option<&str>,
+) -> Vec<HistoryRow> {
+    let started_at = now_iso();
+    records
+        .iter()
+        .map(|record| {
+            let snapshot: Frame = serde_json::from_value(record.frame_meta.clone()).unwrap_or_default();
+            received_history(record, &snapshot, peer_device, &started_at, "cancelled", package_id, batch_name)
+        })
+        .collect()
 }
 
 /// Build a `direction = received` history row for a frame. `package_id` is the
@@ -550,6 +582,7 @@ fn record_receipt_and_history(
 /// per-batch key (Task 14) so the received-detail read
 /// ([`list_transfer_files`](crate::api::sync::list_transfer_files)) can join a
 /// terminal inbound package's rows back by `WHERE package_id = ?`.
+#[allow(clippy::too_many_arguments)]
 fn received_history(
     record: &ManifestRecord,
     snapshot: &Frame,
@@ -557,6 +590,7 @@ fn received_history(
     started_at: &str,
     outcome: &str,
     package_id: &str,
+    batch_name: Option<&str>,
 ) -> HistoryRow {
     HistoryRow {
         frame_uuid: record.frame_uuid.clone(),
@@ -570,7 +604,7 @@ fn received_history(
         outcome: outcome.to_string(),
         project: record.project.as_ref().map(|p| p.project_id.clone()),
         package_id: Some(package_id.to_string()),
-        batch_name: None,
+        batch_name: batch_name.map(|s| s.to_string()),
     }
 }
 

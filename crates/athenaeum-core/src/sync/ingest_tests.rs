@@ -314,7 +314,7 @@ fn ingest_dot_only_device_name_lands_under_hex_slug_not_above_incoming_root() {
     let conn = catalog_conn();
     set_device_names(&conn, &[(PEER_HEX, "..")]);
 
-    let outcome = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX).unwrap();
+    let outcome = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX, None, None).unwrap();
     assert_eq!(outcome.ingested, 1);
 
     let landed_path: String = conn
@@ -350,7 +350,7 @@ fn ingest_lands_under_resolved_device_name() {
     let conn = catalog_conn();
     set_device_names(&conn, &[(PEER_HEX, "My Mac Book")]);
 
-    let outcome = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX).unwrap();
+    let outcome = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX, None, None).unwrap();
     assert_eq!(outcome.ingested, 1);
 
     let landed_path: String = conn
@@ -468,7 +468,7 @@ fn ingest_lands_files_and_rows() {
         build_fixture_package(tmp.path(), "frame-uuid-1", "L_0001.fits", "M31", "2026-01-16T10:00:00.000Z");
 
     let conn = catalog_conn();
-    let outcome = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX).unwrap();
+    let outcome = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX, None, None).unwrap();
 
     // Catalog rows created from manifest metadata.
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "one files row");
@@ -524,7 +524,7 @@ fn duplicate_delivery_single_row_but_acked() {
     let conn = catalog_conn();
 
     // First delivery ingests.
-    let out1 = ingest_package(&conn, &incoming, &pkg_dir, &announce1, PEER_HEX).unwrap();
+    let out1 = ingest_package(&conn, &incoming, &pkg_dir, &announce1, PEER_HEX, None, None).unwrap();
     assert_eq!(out1.ingested, 1);
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
 
@@ -535,7 +535,7 @@ fn duplicate_delivery_single_row_but_acked() {
         package_id: crate::sharing::types::PackageId("second-delivery".to_string()),
         ..announce1.clone()
     };
-    let out2 = ingest_package(&conn, &incoming, &pkg_dir, &announce2, PEER_HEX).unwrap();
+    let out2 = ingest_package(&conn, &incoming, &pkg_dir, &announce2, PEER_HEX, None, None).unwrap();
 
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "still one files row");
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1, "still one frames row");
@@ -575,7 +575,7 @@ fn primary_wins_metadata() {
     // Deliver an OLDER snapshot for the same uuid.
     let (pkg_dir, announce) =
         build_fixture_package(tmp.path(), "frame-uuid-3", "L_0003.fits", "ORIGINAL_NAME", "2020-01-01T00:00:00.000Z");
-    let out = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX).unwrap();
+    let out = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX, None, None).unwrap();
 
     // Not overwritten: still one frame, object unchanged, receipt Duplicate.
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1, "no new frame inserted");
@@ -779,10 +779,10 @@ fn sampling_collision_is_not_treated_as_duplicate() {
         "test premise: full content hash must differ"
     );
 
-    let out_a = ingest_package(&conn, &incoming, &pkg_a, &announce_a, PEER_HEX).unwrap();
+    let out_a = ingest_package(&conn, &incoming, &pkg_a, &announce_a, PEER_HEX, None, None).unwrap();
     assert_eq!(out_a.ingested, 1);
 
-    let out_b = ingest_package(&conn, &incoming, &pkg_b, &announce_b, PEER_HEX).unwrap();
+    let out_b = ingest_package(&conn, &incoming, &pkg_b, &announce_b, PEER_HEX, None, None).unwrap();
     assert_eq!(
         out_b.ingested, 1,
         "distinct content must ingest despite a sampling-hash collision with an already-ingested frame"

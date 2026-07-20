@@ -188,6 +188,15 @@ pub struct InboundRow {
     /// `package_id`; written by the receiver at announce time.
     #[serde(default)]
     pub display_name: Option<String>,
+    /// The resolved on-disk landing directory for this package's files (Transfers
+    /// Status Model v2, §D2): `<incoming_root>/<sender_slug>/<batch_slug>` for a
+    /// named (v2) batch, collision-suffixed `_2`/`_3`… A v1/unnamed batch never
+    /// resolves one (the receiver lands under `<incoming_root>/<sender_slug>`
+    /// directly, computed at ingest time), so it stays `None`. Resolved ONCE per
+    /// package at first landing and reused on resume so a restart lands into the
+    /// same tree; written by the receiver.
+    #[serde(default)]
+    pub landing_dir: Option<String>,
 }
 
 /// Direction of a transfer recorded in [`HistoryRow`]. This sender-side task

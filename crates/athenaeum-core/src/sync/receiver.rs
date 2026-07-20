@@ -19,6 +19,7 @@
 //! is itself idempotent (per-frame uuid/content dedup), so even a bypassed replay
 //! guard is safe.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,17 +30,23 @@ use tokio::task::JoinHandle;
 use crate::events::{emit_event, ProgressEmitter};
 use crate::sharing::iroh::node::{Role, SharedIrohNode};
 use crate::sharing::types::{
-    FetchEvent, FrameReceipt, NodeId, PackageAnnounce, ReceiptOutcome, StartInfo, TransportEvent,
+    AnnounceFileEntry, FetchEvent, FrameReceipt, NodeId, PackageAnnounce, ReceiptOutcome, StartInfo,
+    TransportEvent,
 };
 use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
 
 use super::ingest::{self, IngestOutcome};
-use super::models::InboundState;
+use super::models::{InboundFileRow, InboundFileState, InboundState};
 use super::refusal::RefusalRefresher;
+use super::models::Direction;
 use super::store::{
-    get_inbound, inbound_active, insert_receipt, set_inbound_bytes_done, set_inbound_state,
+    append_sync_event, get_inbound, inbound_active, insert_history_row,
+    landing_dir_claimed_by_active, list_inbound_files, replace_inbound_files, insert_receipt,
+    receipt_outcome_to_db, set_inbound_bytes_done, set_inbound_display_name, set_inbound_file_state,
+    set_inbound_landing_dir, set_inbound_state, settle_unsettled_inbound_files,
     upsert_inbound_announced, CatalogSyncStore,
 };
+use super::now_iso;
 
 /// Resolves the landing root for the next received package, live. Called once per
 /// package (immediately before ingest), so designating or clearing the
@@ -356,7 +363,7 @@ impl SyncReceiver {
             tracing::info!(staging_root = %staging_root.display(), "sync receiver online");
             while let Some(ev) = events.recv().await {
                 match ev {
-                    TransportEvent::AnnounceReceived { from, announce, .. } => {
+                    TransportEvent::AnnounceReceived { from, announce, batch_name, files } => {
                         // Authorization gate (finding H1): only ingest from a peer
                         // on this receiver's allow-list. An unauthorized (or
                         // revoked) node is silently dropped BEFORE any
@@ -385,6 +392,8 @@ impl SyncReceiver {
                             &control,
                             from,
                             announce,
+                            batch_name,
+                            files,
                         )
                         .await
                         {
@@ -539,22 +548,149 @@ fn reconcile_stale_inbound(store: &CatalogSyncStore) {
                 "inbound startup reconcile write failed"
             ),
         }
+        // Settle this row's un-settled per-file rows too (Transfers Status Model v2
+        // §D4): a later re-announce refreshes them back to `announced` via
+        // `record_inbound_manifest`. Best-effort.
+        if let Err(e) = settle_unsettled_inbound_files(
+            &conn,
+            row.id,
+            InboundFileState::Failed,
+            None,
+            Some("interrupted by restart"),
+        ) {
+            tracing::warn!(
+                inbound_id = row.id,
+                error = %format!("{e:#}"),
+                "inbound startup reconcile file-row settle failed"
+            );
+        }
     }
     if count > 0 {
         tracing::info!(count, "stale inbound rows reconciled to failed after restart");
     }
 }
 
+/// Stamp `package_id`'s inbound row [`Failed`](InboundState::Failed) AND settle its
+/// un-settled per-file rows to `failed` (Transfers Status Model v2 §D4 — a
+/// batch-level fetch/ingest/ack failure closes every not-yet-`done` file row).
+/// Best-effort throughout: the caller is already on its own error path, so a failed
+/// write only warns.
 fn stamp_inbound_failed(store: &CatalogSyncStore, package_id: &str, error: &anyhow::Error) {
+    let reason = format!("{error:#}");
     let conn = store.lock_conn();
-    if let Err(e) = set_inbound_state(&conn, package_id, InboundState::Failed, Some(&format!("{error:#}"))) {
+    if let Err(e) = set_inbound_state(&conn, package_id, InboundState::Failed, Some(&reason)) {
         tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound failed state write failed");
     }
+    if let Some(row) = get_inbound(&conn, package_id).ok().flatten() {
+        if let Err(e) = settle_unsettled_inbound_files(
+            &conn,
+            row.id,
+            InboundFileState::Failed,
+            None,
+            Some(&reason),
+        ) {
+            tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound failed file-row settle failed");
+        }
+    }
+}
+
+/// Best-effort per-batch event journal (Transfers Status Model v2 §D7, direction
+/// `received`, `batch_key` = the inbound row id as text). Never fails the receive —
+/// a failed append only warns. The receive-side twin of the sender engine's journal.
+fn journal(store: &CatalogSyncStore, inbound_id: i64, kind: &str, detail: Option<&str>) {
+    let conn = store.lock_conn();
+    if let Err(e) = append_sync_event(&conn, Direction::Received, &inbound_id.to_string(), kind, detail) {
+        tracing::warn!(inbound_id, kind, error = %format!("{e:#}"), "sync receiver journal append failed");
+    }
+}
+
+/// Sanitize a human batch name into a single filesystem-safe path segment for the
+/// landing tree (Transfers Status Model v2 §D2), reusing the same sanitizer family
+/// as [`resolve_sender_slug`](ingest::resolve_sender_slug): whitespace/reserved
+/// chars collapse, then leading/trailing `.` are trimmed so an all-dot name (`..`)
+/// can never escape a directory level. `None` when the name is blank or sanitizes
+/// to empty — the caller then lands without a batch level (v1-style).
+fn sanitize_batch_slug(name: &str) -> Option<String> {
+    let slug = crate::archive::path_layout::sanitize_for_filename(name);
+    let slug = slug.trim_matches('.').to_string();
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
+}
+
+/// Persist a v2 announce manifest onto the inbound row (Transfers Status Model v2
+/// §D1/§D4): its `display_name` and the full set of `announced` per-file rows
+/// (`bytes_done` 0), BEFORE any fetch — the receiver knows the whole tree the moment
+/// the announce lands. `replace_*` swaps the whole set so a re-announce refreshes it.
+/// Called only for a non-cancelled row (a cancelled row is final — the caller guards).
+fn record_inbound_manifest(
+    conn: &rusqlite::Connection,
+    inbound_id: i64,
+    name: Option<&str>,
+    files: &[AnnounceFileEntry],
+) -> Result<()> {
+    set_inbound_display_name(conn, inbound_id, name)?;
+    if !files.is_empty() {
+        let now = now_iso();
+        let rows: Vec<InboundFileRow> = files
+            .iter()
+            .map(|f| InboundFileRow {
+                inbound_id,
+                rel_path: f.rel_path.clone(),
+                byte_size: f.byte_size,
+                frame_uuid: f.frame_uuid.clone(),
+                state: InboundFileState::Announced,
+                bytes_done: 0,
+                outcome: None,
+                error: None,
+                updated_at: now.clone(),
+            })
+            .collect();
+        replace_inbound_files(conn, inbound_id, &rows)?;
+    }
+    Ok(())
+}
+
+/// Resolve the on-disk landing directory for a NAMED (v2) inbound package
+/// (Transfers Status Model v2 §D2). Reuses the row's persisted `landing_dir` when
+/// present (so a resume/restart lands into the same tree), else computes
+/// `<incoming_root>/<sender_slug>/<batch_slug>` — suffixing `_2`/`_3`… while another
+/// NON-terminal inbound row already claims that dir — persists it, and returns it.
+/// A terminal prior batch with the same dir is reused (repeat sends of one object
+/// merge). Best-effort persist: a failed write just means the next run re-resolves.
+fn resolve_landing_dir(
+    conn: &rusqlite::Connection,
+    inbound_id: i64,
+    incoming_root: &Path,
+    peer_device: &str,
+    batch_slug: &str,
+) -> PathBuf {
+    // Reuse the persisted dir first — the resume/restart guarantee.
+    if let Ok(Some(row)) = super::store::get_inbound_by_row_id(conn, inbound_id) {
+        if let Some(dir) = row.landing_dir.filter(|d| !d.is_empty()) {
+            return PathBuf::from(dir);
+        }
+    }
+    let sender_slug = ingest::resolve_sender_slug(conn, peer_device);
+    let parent = incoming_root.join(sender_slug);
+    let mut candidate = parent.join(batch_slug);
+    let mut n: u32 = 2;
+    while landing_dir_claimed_by_active(conn, &candidate.to_string_lossy(), inbound_id).unwrap_or(false) {
+        candidate = parent.join(format!("{batch_slug}_{n}"));
+        n += 1;
+    }
+    if let Err(e) = set_inbound_landing_dir(conn, inbound_id, &candidate.to_string_lossy()) {
+        tracing::warn!(inbound_id, error = %format!("{e:#}"), "persist landing_dir failed; will re-resolve next run");
+    }
+    candidate
 }
 
 /// Handle one announced package: persist an inbound row, ack-replay guard, else
 /// fetch → ingest → ack, emitting stage progress (with live fetch bytes) and a
 /// single finished event, walking the `sync_inbound` row through its lifecycle.
+#[allow(clippy::too_many_arguments)]
 async fn handle_announce(
     store: &Arc<CatalogSyncStore>,
     staging_root: &Path,
@@ -564,9 +700,19 @@ async fn handle_announce(
     control: &InboundControl,
     from: NodeId,
     announce: PackageAnnounce,
+    batch_name: Option<String>,
+    files: Option<Vec<AnnounceFileEntry>>,
 ) -> Result<()> {
     let peer_device = super::node_id_hex(&from);
     let package_id = announce.package_id.0.clone();
+
+    // v2 announce extras (Transfers Status Model v2): a blank/whitespace batch name
+    // is treated as absent (v1-style, no batch landing level), an empty manifest as
+    // "no per-file rows". The loopback mock always sends `Some("")`/`Some(vec![])`
+    // for a nameless send, so normalise both here.
+    let effective_name: Option<String> = batch_name.filter(|n| !n.trim().is_empty());
+    let effective_files: Vec<AnnounceFileEntry> = files.unwrap_or_default();
+    let has_manifest = !effective_files.is_empty();
 
     // The wire `package_id` is peer-controlled and is used below to build the
     // per-package staging directory. Reject anything that is not a single safe
@@ -600,15 +746,38 @@ async fn handle_announce(
     // redelivery resets it back to `announced` and clears its byte/finished
     // markers; a `cancelled` row (Task 12) is left untouched — it is final, so
     // we must never re-fetch it.
-    {
+    let inbound_id = {
         let conn = store.lock_conn();
         upsert_inbound_announced(&conn, &peer_device, &package_id, announce.frame_count, announce.byte_size)
-            .with_context(|| format!("record inbound announce {package_id}"))?;
-    }
+            .with_context(|| format!("record inbound announce {package_id}"))?
+    };
     let is_cancelled = {
         let conn = store.lock_conn();
         matches!(get_inbound(&conn, &package_id)?, Some(r) if r.state == InboundState::Cancelled)
     };
+
+    // Record the v2 manifest onto the row BEFORE any fetch — the receiver knows the
+    // whole tree the moment the announce lands. Refreshes name + the per-file set on
+    // a re-announce; NEVER touches a `cancelled` row (it is final — the CASE guard in
+    // `upsert_inbound_announced` and this check keep it inert). Best-effort — a failed
+    // write only warns, never blocks the receive.
+    if !is_cancelled && (effective_name.is_some() || has_manifest) {
+        let conn = store.lock_conn();
+        if let Err(e) = record_inbound_manifest(&conn, inbound_id, effective_name.as_deref(), &effective_files) {
+            tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "record inbound manifest failed");
+        }
+    }
+    journal(
+        store,
+        inbound_id,
+        "announce_received",
+        Some(&format!(
+            "name={} files={} frames={}",
+            effective_name.as_deref().unwrap_or("-"),
+            effective_files.len(),
+            announce.frame_count
+        )),
+    );
 
     emit_event(emitter.as_ref(), "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
@@ -641,6 +810,12 @@ async fn handle_announce(
             .await
             .context("ack (replayed)")?;
         tracing::info!(package_id = %package_id, count = satisfied_count, all_cancelled, "sync receiver replayed ack from receipt log");
+        journal(
+            store,
+            inbound_id,
+            if all_cancelled { "cancelled" } else { "replayed" },
+            Some(&format!("count={satisfied_count}")),
+        );
         // Terminal for the receiver: drop the fetched blobs. A lost-ack resend
         // may have re-downloaded them; release is idempotent. Never fails the
         // (successful) receive — log-and-continue on error.
@@ -685,7 +860,11 @@ async fn handle_announce(
     // log — cheaper, no manifest fetch), so this only runs on the FIRST cancel
     // announce, before any receipts exist.
     if is_cancelled || control.is_cancelled(&package_id) {
-        return cancel_epilogue(store, transport, emitter.as_ref(), from, &announce, staging_root).await;
+        return cancel_epilogue(
+            store, transport, emitter.as_ref(), from, &announce, staging_root, inbound_id,
+            effective_name.as_deref(),
+        )
+        .await;
     }
 
     // Fetch the package into a per-package staging dir under the staging root
@@ -698,6 +877,7 @@ async fn handle_announce(
             tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound fetching state write failed");
         }
     }
+    journal(store, inbound_id, "fetch_started", None);
     emit_event(emitter.as_ref(), "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
         direction: super::Direction::Received,
@@ -723,6 +903,14 @@ async fn handle_announce(
         let pkg = package_id.clone();
         let peer_device = peer_device.clone();
         let frame_count = announce.frame_count;
+        // Per-file transition tracker (Transfers Status Model v2 §D4): only WRITE the
+        // `sync_inbound_files` row on the first tick of a file (announced → fetching)
+        // and on its completion (full bytes), never per byte-tick. `completed` marks
+        // the second write done. Only populated when the v2 manifest gave us per-file
+        // rows (`has_manifest`); a v1/nameless batch has none, so the writes are skipped.
+        let track_files = has_manifest;
+        let file_seen: Arc<std::sync::Mutex<HashMap<String, bool>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         Arc::new(move |ev| match ev {
             FetchEvent::Batch { bytes_done, bytes_total } => {
                 {
@@ -743,6 +931,38 @@ async fn handle_announce(
                 });
             }
             FetchEvent::File { name, bytes_done, bytes_total } => {
+                // Persist the per-file row transition (best-effort) BEFORE emitting the
+                // live progress event. A write happens only on the first tick (→
+                // `fetching`) and on completion (bytes reach the total) — the live bar
+                // stays the event stream; the DB row is the restart checkpoint.
+                if track_files {
+                    let mut map = file_seen.lock().expect("inbound file_seen mutex poisoned");
+                    let write = match map.get(&name).copied() {
+                        None => {
+                            map.insert(name.clone(), false);
+                            true // transition write
+                        }
+                        Some(false) if bytes_total > 0 && bytes_done >= bytes_total => {
+                            map.insert(name.clone(), true);
+                            true // completion write
+                        }
+                        _ => false,
+                    };
+                    if write {
+                        let conn = store.lock_conn();
+                        if let Err(e) = set_inbound_file_state(
+                            &conn,
+                            inbound_id,
+                            &name,
+                            InboundFileState::Fetching,
+                            bytes_done,
+                            None,
+                            None,
+                        ) {
+                            tracing::warn!(inbound_id, rel_path = %name, error = %format!("{e:#}"), "inbound file fetching write failed");
+                        }
+                    }
+                }
                 emit_event(emitter.as_ref(), "sync-file-progress", &SyncFileProgressEvent {
                     package_id: pkg.clone(),
                     peer_device: peer_device.clone(),
@@ -785,11 +1005,16 @@ async fn handle_announce(
     let Some(fetch_result) = fetch_outcome else {
         // Cancelled mid-fetch: the dropped fetch future aborted the download.
         tracing::info!(package_id = %package_id, peer_device = %peer_device, "sync receiver cancelling in-flight fetch");
-        return cancel_epilogue(store, transport, emitter.as_ref(), from, &announce, staging_root).await;
+        return cancel_epilogue(
+            store, transport, emitter.as_ref(), from, &announce, staging_root, inbound_id,
+            effective_name.as_deref(),
+        )
+        .await;
     };
     if let Err(e) = fetch_result {
         // A failed fetch is terminal for this row (Failed + reason); propagate so
         // the receiver loop logs it too.
+        journal(store, inbound_id, "fetch_failed", Some(&format!("{e:#}")));
         stamp_inbound_failed(store, &package_id, &e);
         return Err(e).with_context(|| format!("fetch package {package_id}"));
     }
@@ -799,6 +1024,19 @@ async fn handle_announce(
     // start. Falls back to the caller's app-data default when none is designated.
     let incoming_root = incoming();
 
+    // Resolve the per-package landing directory ONCE (Transfers Status Model v2 §D2).
+    // A named (v2) batch lands under `<incoming_root>/<sender_slug>/<batch_slug>`
+    // (collision-suffixed, persisted, resume-stable); an unnamed (v1) batch has no
+    // override, so ingest lands under `<incoming_root>/<sender_slug>` — byte-identical
+    // to the pre-v2 layout.
+    let landing_override: Option<PathBuf> = match effective_name.as_deref().and_then(sanitize_batch_slug) {
+        Some(batch_slug) => {
+            let conn = store.lock_conn();
+            Some(resolve_landing_dir(&conn, inbound_id, &incoming_root, &peer_device, &batch_slug))
+        }
+        None => None,
+    };
+
     // Ingest on a blocking thread (file I/O + SQLite); never block the runtime.
     {
         let conn = store.lock_conn();
@@ -806,6 +1044,7 @@ async fn handle_announce(
             tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound ingesting state write failed");
         }
     }
+    journal(store, inbound_id, "ingest_started", None);
     emit_event(emitter.as_ref(), "sync-progress", &SyncProgressEvent {
         package_id: package_id.clone(),
         direction: super::Direction::Received,
@@ -821,9 +1060,19 @@ async fn handle_announce(
         let staging_for_ingest = staging.clone();
         let announce = announce.clone();
         let peer_device = peer_device.clone();
+        let batch_name = effective_name.clone();
+        let landing_override = landing_override.clone();
         match tokio::task::spawn_blocking(move || -> Result<IngestOutcome> {
             let conn = store.lock_conn();
-            ingest::ingest_package(&conn, &incoming_root, &staging_for_ingest, &announce, &peer_device)
+            ingest::ingest_package(
+                &conn,
+                &incoming_root,
+                &staging_for_ingest,
+                &announce,
+                &peer_device,
+                batch_name.as_deref(),
+                landing_override.as_deref(),
+            )
         })
         .await
         {
@@ -837,10 +1086,21 @@ async fn handle_announce(
             // An ingest failure (manifest unreadable, DB error, or the blocking
             // task itself panicking) is terminal for this row (Failed + reason);
             // propagate so the receiver loop logs it too.
+            journal(store, inbound_id, "failed", Some(&format!("{e:#}")));
             stamp_inbound_failed(store, &package_id, &e);
             return Err(e).with_context(|| format!("ingest package {package_id}"));
         }
     };
+
+    // Settle the per-file rows from the per-frame receipts (Transfers Status Model v2
+    // §D4) — OUTSIDE the ingest transaction (it committed inside `ingest_package`),
+    // keyed rel_path ← frame_uuid via the announced file rows. `done` + the receiver's
+    // verdict text (same encoding as `sync_receipts`); a rejected frame also stamps the
+    // per-file `error`. Skipped when there are no per-file rows (v1). Best-effort.
+    if has_manifest {
+        let conn = store.lock_conn();
+        settle_inbound_files_from_receipts(&conn, inbound_id, &outcome.receipts);
+    }
 
     // Ack the per-frame receipts, then emit the single finished event.
     if let Err(e) = transport.ack(from, &announce.package_id, outcome.receipts.clone()).await {
@@ -894,6 +1154,23 @@ async fn handle_announce(
             tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound terminal state write failed");
         }
     }
+    // Journal the terminal ingest outcome (§D7): `ingested` (any accepted) carries
+    // the ok/duplicate/rejected split; a whole-package rejection journals `failed`.
+    if finished_outcome == "failed" {
+        journal(store, inbound_id, "failed", Some(&format!("{} frame(s) rejected", failed.len())));
+    } else {
+        journal(
+            store,
+            inbound_id,
+            "ingested",
+            Some(&format!(
+                "ingested={} duplicate={} rejected={}",
+                outcome.ingested,
+                outcome.duplicate + outcome.skipped_older,
+                outcome.rejected
+            )),
+        );
+    }
     emit_event(emitter.as_ref(), "sync-finished", &SyncFinishedEvent {
         package_id,
         direction: super::Direction::Received,
@@ -906,6 +1183,56 @@ async fn handle_announce(
         project_id: None,
     });
     Ok(())
+}
+
+/// Settle an inbound batch's per-file rows from the per-frame ingest receipts
+/// (Transfers Status Model v2 §D4). Maps each receipt's `frame_uuid` to its
+/// `rel_path` via the announced per-file rows, then stamps that row `done` with the
+/// receiver's verdict text (same encoding as `sync_receipts`); a `Rejected` receipt
+/// also records the reason as the per-file `error`. MUST run OUTSIDE the ingest
+/// transaction (the per-file CRUD open their own `unchecked_transaction`). Every
+/// write is best-effort — a failure only warns.
+fn settle_inbound_files_from_receipts(
+    conn: &rusqlite::Connection,
+    inbound_id: i64,
+    receipts: &[FrameReceipt],
+) {
+    let rows = match list_inbound_files(conn, inbound_id) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(inbound_id, error = %format!("{e:#}"), "list inbound files for settle failed");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+    // frame_uuid → (rel_path, byte_size) from the announced rows.
+    let by_uuid: HashMap<&str, (&str, u64)> = rows
+        .iter()
+        .map(|r| (r.frame_uuid.as_str(), (r.rel_path.as_str(), r.byte_size)))
+        .collect();
+    for receipt in receipts {
+        let Some(&(rel_path, byte_size)) = by_uuid.get(receipt.frame_uuid.as_str()) else {
+            continue;
+        };
+        let outcome_txt = receipt_outcome_to_db(&receipt.outcome);
+        let error = match &receipt.outcome {
+            ReceiptOutcome::Rejected(msg) => Some(msg.as_str()),
+            _ => None,
+        };
+        if let Err(e) = set_inbound_file_state(
+            conn,
+            inbound_id,
+            rel_path,
+            InboundFileState::Done,
+            byte_size,
+            Some(&outcome_txt),
+            error,
+        ) {
+            tracing::warn!(inbound_id, rel_path, error = %format!("{e:#}"), "inbound file settle write failed");
+        }
+    }
 }
 
 /// Cancel epilogue (Task 12): the receiver's terminal path for a package the user
@@ -922,6 +1249,7 @@ async fn handle_announce(
 /// receipt counts as satisfied, so the ONE full set of receipts written here makes
 /// every later re-announce replay the cancel from the log (the replay guard fires
 /// before wire-in (a)) — no repeat manifest fetch.
+#[allow(clippy::too_many_arguments)]
 async fn cancel_epilogue(
     store: &Arc<CatalogSyncStore>,
     transport: &dyn SharingTransport,
@@ -929,6 +1257,8 @@ async fn cancel_epilogue(
     from: NodeId,
     announce: &PackageAnnounce,
     staging_root: &Path,
+    inbound_id: i64,
+    batch_name: Option<&str>,
 ) -> Result<()> {
     let peer_device = super::node_id_hex(&from);
     let package_id = announce.package_id.0.clone();
@@ -945,7 +1275,18 @@ async fn cancel_epilogue(
         .with_context(|| format!("read manifest for cancel {package_id}"))?;
     let frame_count = records.len();
 
-    // 2. A `Cancelled` receipt per manifest frame → sync_receipts (the replay log).
+    // A cancel row may carry a batch name resolved at announce time even when the
+    // caller passed none (re-announce refreshed it, restart, …). Prefer the caller's
+    // value; else fall back to the persisted `display_name`.
+    let batch_name: Option<String> = batch_name.map(|s| s.to_string()).or_else(|| {
+        let conn = store.lock_conn();
+        get_inbound(&conn, &package_id).ok().flatten().and_then(|r| r.display_name)
+    });
+
+    // 2. A `Cancelled` receipt per manifest frame → sync_receipts (the replay log),
+    //    plus a receiver-side `sync_history` row per frame (Transfers Status Model v2
+    //    §D6 — a declined package is a first-class outcome on BOTH sides). One tx so
+    //    the receipt + history never drift.
     let receipts: Vec<FrameReceipt> = records
         .iter()
         .map(|r| FrameReceipt {
@@ -954,12 +1295,18 @@ async fn cancel_epilogue(
             outcome: ReceiptOutcome::Cancelled,
         })
         .collect();
+    let history = ingest::cancelled_history_rows(&records, &peer_device, &package_id, batch_name.as_deref());
     let now = super::now_iso();
     {
         let conn = store.lock_conn();
         for r in &receipts {
             insert_receipt(&conn, &package_id, r, &now)
                 .with_context(|| format!("record cancel receipt for {}", r.frame_uuid))?;
+        }
+        for h in &history {
+            if let Err(e) = insert_history_row(&conn, h) {
+                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "cancel history row write failed");
+            }
         }
     }
 
@@ -970,19 +1317,30 @@ async fn cancel_epilogue(
         tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "cancel ack failed; will replay");
     }
 
-    // 4. Terminal row (final) + drop any fetched blobs + tidy staging.
-    {
+    // 4. Terminal row (final) + settle the per-file rows + drop any fetched blobs +
+    //    tidy staging. Un-landed file rows (announced/fetching) settle to `done` with
+    //    a `cancelled` outcome; any file that DID land keeps its own verdict.
+    let landed = {
         let conn = store.lock_conn();
+        // Count files that made it (state `done` before this settle) for the journal.
+        let landed = list_inbound_files(&conn, inbound_id)
+            .map(|rows| rows.iter().filter(|r| r.state == InboundFileState::Done).count())
+            .unwrap_or(0);
         if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Cancelled, None) {
             tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound cancelled state write failed");
         }
-    }
+        if let Err(e) = settle_unsettled_inbound_files(&conn, inbound_id, InboundFileState::Done, Some("cancelled"), None) {
+            tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound cancel file-row settle failed");
+        }
+        landed
+    };
     if let Err(e) = transport.release(&announce.package_id).await {
         tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "receiver blob release failed");
     }
     if let Err(e) = std::fs::remove_dir_all(&staging) {
         tracing::debug!(error = %e, path = %staging.display(), "cancel epilogue staging cleanup skipped");
     }
+    journal(store, inbound_id, "cancelled", Some(&format!("frames={frame_count} landed={landed}")));
 
     tracing::info!(package_id = %package_id, peer_device = %peer_device, frames = frame_count, "sync receiver cancelled inbound package");
     emit_event(emitter, "sync-finished", &SyncFinishedEvent {
@@ -1404,6 +1762,8 @@ mod tests {
             &control,
             [7u8; 32],
             announce,
+            None,
+            None,
         )
         .await
         .expect("an unsafe announce is rejected as a clean Ok, not an error");
@@ -2003,5 +2363,432 @@ mod tests {
             get_inbound(&conn, &announce.package_id.0).unwrap().unwrap()
         };
         assert_eq!(row2.state, InboundState::Cancelled, "the row stays Cancelled across the replay");
+    }
+
+    // ── Transfers Status Model v2 (Task 5): manifest-at-announce, batch landing,
+    //    per-file settle, cancel history, restart reconcile, journal ────────────
+
+    /// One `AnnounceFileEntry` for a manifest test.
+    fn afe(rel: &str, uuid: &str, size: u64) -> AnnounceFileEntry {
+        AnnounceFileEntry { rel_path: rel.to_string(), byte_size: size, frame_uuid: uuid.to_string() }
+    }
+
+    /// Build a TWO-file v2 fixture package (one flat, one nested `rel_path`) with
+    /// real distinct FITS payloads + a full manifest; returns
+    /// `(pkg_dir, announce, files)` where `files` is the announce manifest the
+    /// loopback delivers as the v2 extras.
+    fn build_v2_fixture(root: &std::path::Path) -> (std::path::PathBuf, PackageAnnounce, Vec<AnnounceFileEntry>) {
+        use crate::models::{Frame, ImageType};
+        use crate::package::{ManifestRecord, PayloadKind, MANIFEST_VERSION};
+
+        let src_dir = root.join("v2src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        // (rel_path in the package, frame uuid, pixel value → distinct hash)
+        let specs = [
+            ("L_0001.fits", "frame-v2-a", 0.25f32),
+            ("camera_ASI/lights/L_0002.fits", "frame-v2-b", 0.5f32),
+        ];
+        let mut entries = Vec::new();
+        let mut items = Vec::new();
+        for (rel, uuid, val) in specs {
+            let src = src_dir.join(uuid); // unique flat source name
+            crate::fits_writer::write_fits_f32(&src, 4, 4, 1, &[val; 16], &[]).unwrap();
+            let byte_size = std::fs::metadata(&src).unwrap().len();
+            let xxh3 = crate::package::xxh3_full_file(&src).unwrap();
+            let frame = Frame {
+                object: Some("M31".to_string()),
+                imagetyp: Some(ImageType::Light),
+                naxis1: Some(4),
+                naxis2: Some(4),
+                uuid: Some(uuid.to_string()),
+                updated_at: Some("2026-01-16T10:00:00.000Z".to_string()),
+                ..Default::default()
+            };
+            let record = ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: uuid.to_string(),
+                origin_catalog_uuid: "catalog-uuid".to_string(),
+                origin_device: "aa".repeat(32),
+                payload_kind: PayloadKind::RawFrame,
+                rel_path: rel.to_string(),
+                byte_size,
+                xxh3,
+                frame_meta: serde_json::to_value(&frame).unwrap(),
+                analysis: None,
+                app_version: "test".to_string(),
+                project: None,
+            };
+            entries.push(afe(rel, uuid, byte_size));
+            items.push((src, record));
+        }
+        let pkg_dir = root.join("pkg-v2");
+        let announce = crate::package::write_package(&pkg_dir, items).unwrap();
+        (pkg_dir, announce, entries)
+    }
+
+    /// Item 1: a v2 manifest is recorded onto the inbound row at announce time —
+    /// the `display_name` plus one `announced`/`bytes_done 0` per-file row per
+    /// entry, ordered by rel_path, BEFORE any fetch.
+    #[test]
+    fn record_inbound_manifest_writes_name_and_announced_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap();
+        let conn = store.lock_conn();
+        let peer = "aa".repeat(32);
+        let id = upsert_inbound_announced(&conn, &peer, "pkg-1", 2, 100).unwrap();
+
+        let files = vec![afe("b/L2.fits", "u2", 40), afe("L1.fits", "u1", 60)];
+        record_inbound_manifest(&conn, id, Some("M31 Lights"), &files).unwrap();
+
+        assert_eq!(
+            get_inbound(&conn, "pkg-1").unwrap().unwrap().display_name.as_deref(),
+            Some("M31 Lights")
+        );
+        let rows = list_inbound_files(&conn, id).unwrap();
+        assert_eq!(rows.len(), 2, "one row per manifest entry");
+        assert_eq!(rows[0].rel_path, "L1.fits", "rows ordered by rel_path");
+        assert!(
+            rows.iter().all(|r| r.state == InboundFileState::Announced
+                && r.bytes_done == 0
+                && r.outcome.is_none()
+                && r.error.is_none()),
+            "every row is announced with no progress/verdict before any fetch"
+        );
+    }
+
+    /// Item 1: a re-announce replaces the whole per-file set and updates the name.
+    #[test]
+    fn record_inbound_manifest_refresh_replaces_rows_and_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap();
+        let conn = store.lock_conn();
+        let peer = "aa".repeat(32);
+        let id = upsert_inbound_announced(&conn, &peer, "pkg-1", 1, 10).unwrap();
+
+        record_inbound_manifest(&conn, id, Some("A"), &[afe("x.fits", "ux", 10)]).unwrap();
+        record_inbound_manifest(&conn, id, Some("B"), &[afe("y.fits", "uy", 20), afe("z.fits", "uz", 30)]).unwrap();
+
+        assert_eq!(get_inbound(&conn, "pkg-1").unwrap().unwrap().display_name.as_deref(), Some("B"));
+        let rels: Vec<String> = list_inbound_files(&conn, id).unwrap().into_iter().map(|r| r.rel_path).collect();
+        assert_eq!(rels, vec!["y.fits".to_string(), "z.fits".to_string()], "the old set is fully replaced");
+    }
+
+    /// Item 2: the landing-dir collision rule — an active same-name batch forces a
+    /// `_2` suffix; a terminal prior batch's dir is reused; a persisted dir is
+    /// reused verbatim on resume.
+    #[test]
+    fn resolve_landing_dir_suffixes_active_collision_reuses_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap();
+        let conn = store.lock_conn();
+        let peer = "bb".repeat(32);
+        let incoming = tmp.path().join("incoming");
+
+        let id1 = upsert_inbound_announced(&conn, &peer, "p1", 1, 10).unwrap();
+        let d1 = resolve_landing_dir(&conn, id1, &incoming, &peer, "M31");
+        assert!(d1.to_string_lossy().ends_with("M31"));
+
+        // id1 is still `announced` (active) → id2 with the same name is suffixed.
+        let id2 = upsert_inbound_announced(&conn, &peer, "p2", 1, 10).unwrap();
+        let d2 = resolve_landing_dir(&conn, id2, &incoming, &peer, "M31");
+        assert_ne!(d1, d2);
+        assert!(d2.to_string_lossy().ends_with("M31_2"), "an active collision suffixes _2: {d2:?}");
+
+        // Retire id1 → its dir is now free; id3 reuses it (merge repeat sends).
+        set_inbound_state(&conn, "p1", InboundState::Done, None).unwrap();
+        let id3 = upsert_inbound_announced(&conn, &peer, "p3", 1, 10).unwrap();
+        let d3 = resolve_landing_dir(&conn, id3, &incoming, &peer, "M31");
+        assert_eq!(d3, d1, "a terminal prior batch's dir is reused");
+
+        // Resume: re-resolving id2 returns its persisted dir unchanged.
+        assert_eq!(resolve_landing_dir(&conn, id2, &incoming, &peer, "M31"), d2, "persisted landing_dir reused on resume");
+    }
+
+    /// Item 2: the batch-slug sanitizer trims dot-only names to absent (v1-style).
+    #[test]
+    fn sanitize_batch_slug_handles_spaces_dots_and_blanks() {
+        assert_eq!(sanitize_batch_slug("M31 Lights").as_deref(), Some("M31_Lights"));
+        assert_eq!(sanitize_batch_slug("   "), None);
+        assert_eq!(sanitize_batch_slug(".."), None);
+        assert_eq!(sanitize_batch_slug("My.Object").as_deref(), Some("My.Object"));
+    }
+
+    /// Items 2/3/7: a full v2 loopback receive lands files under
+    /// `<sender>/<batch>/rel…` (nested preserved), settles every per-file row
+    /// `done`/`ingested`, persists the landing dir + name, and stamps `batch_name`
+    /// on the received history rows.
+    #[tokio::test]
+    async fn v2_receive_lands_under_batch_and_settles_files_with_history() {
+        use crate::sync::store::list_sync_events;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        let recorder = Arc::new(RecordingEmitter::default());
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            { let incoming = incoming.clone(); Arc::new(move || incoming.clone()) as IncomingResolver },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.announce(receiver_node, &announce, "M31 Lights", &files).await.unwrap();
+
+        let row = poll_inbound(&store, &announce.package_id.0, InboundState::Done).await;
+        assert_eq!(row.display_name.as_deref(), Some("M31 Lights"), "the batch name is persisted");
+        let landing = row.landing_dir.clone().expect("a v2 batch persists its landing dir");
+        assert!(landing.ends_with("M31_Lights"), "landing dir carries the sanitized batch name: {landing}");
+
+        // Files landed under <incoming>/<sender_slug>/M31_Lights/… — nested preserved.
+        let landed: Vec<std::path::PathBuf> = walkdir::WalkDir::new(&incoming)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.into_path())
+            .collect();
+        assert_eq!(landed.len(), 2, "both files landed: {landed:?}");
+        assert!(landed.iter().all(|p| p.starts_with(&landing)), "every file lands under the batch dir");
+        assert!(
+            landed.iter().any(|p| p.to_string_lossy().contains("camera_ASI/lights/L_0002.fits")),
+            "the nested rel_path is preserved: {landed:?}"
+        );
+
+        // Per-file rows all settled done/ingested.
+        let file_rows = { let conn = store.lock_conn(); list_inbound_files(&conn, row.id).unwrap() };
+        assert_eq!(file_rows.len(), 2);
+        assert!(
+            file_rows.iter().all(|r| r.state == InboundFileState::Done && r.outcome.as_deref() == Some("ingested")),
+            "each per-file row settled done/ingested: {file_rows:?}"
+        );
+
+        // Received history rows carry the batch name.
+        let named: i64 = {
+            let conn = store.lock_conn();
+            conn.query_row(
+                "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND batch_name='M31 Lights'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(named, 2, "both received history rows carry the batch name");
+
+        // The event journal saw the lifecycle.
+        let kinds: Vec<String> = {
+            let conn = store.lock_conn();
+            list_sync_events(&conn, Direction::Received, &row.id.to_string())
+                .unwrap()
+                .into_iter()
+                .map(|e| e.kind)
+                .collect()
+        };
+        for want in ["announce_received", "fetch_started", "ingest_started", "ingested"] {
+            assert!(kinds.iter().any(|k| k == want), "journal has {want}: {kinds:?}");
+        }
+    }
+
+    /// Item 1: a v1 announce (blank name, empty files) creates NO per-file rows and
+    /// NO display name, and never resolves a landing dir (the pre-v2 layout).
+    #[tokio::test]
+    async fn v1_announce_creates_no_file_rows_or_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            { let incoming = incoming.clone(); Arc::new(move || incoming.clone()) as IncomingResolver },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        // v1: blank name, empty manifest (the loopback delivers Some("")/Some(vec![])).
+        sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
+
+        let row = poll_inbound(&store, &announce.package_id.0, InboundState::Done).await;
+        assert!(row.display_name.is_none(), "a v1 announce records no name");
+        assert!(row.landing_dir.is_none(), "a v1 announce resolves no batch landing dir");
+        let file_rows = { let conn = store.lock_conn(); list_inbound_files(&conn, row.id).unwrap() };
+        assert!(file_rows.is_empty(), "a v1 announce creates no per-file rows");
+        // A file still landed (byte-identical v1 layout under the sender slug).
+        let landed = walkdir::WalkDir::new(&incoming)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .count();
+        assert_eq!(landed, 1, "the frame still lands under the v1 layout");
+    }
+
+    /// Item 4: a receiver cancel of a v2 package writes one `cancelled` received
+    /// history row per frame (with the batch name), settles every per-file row
+    /// `done`/`cancelled`, and journals `cancelled` — no files land.
+    #[tokio::test]
+    async fn cancel_v2_writes_receiver_history_settles_files_and_journals() {
+        use crate::sync::store::list_sync_events;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        let control = Arc::new(InboundControl::new());
+        let recorder = Arc::new(RecordingEmitter::default());
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            { let incoming = incoming.clone(); Arc::new(move || incoming.clone()) as IncomingResolver },
+            allow_all_peers(),
+            Default::default(),
+            Arc::clone(&control),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+
+        // Cancel BEFORE the announce → the epilogue runs (manifest still recorded).
+        control.request_cancel(&announce.package_id.0);
+        sender.announce(receiver_node, &announce, "M31 Lights", &files).await.unwrap();
+
+        let row = poll_inbound(&store, &announce.package_id.0, InboundState::Cancelled).await;
+
+        // Receiver history: one cancelled row per frame, carrying the batch name.
+        let cancelled_named: i64 = {
+            let conn = store.lock_conn();
+            conn.query_row(
+                "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='cancelled' AND batch_name='M31 Lights'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(cancelled_named, announce.frame_count as i64, "one cancelled history row per frame, batch-named");
+
+        // Per-file rows: created at announce, then settled done/cancelled.
+        let file_rows = { let conn = store.lock_conn(); list_inbound_files(&conn, row.id).unwrap() };
+        assert_eq!(file_rows.len(), 2);
+        assert!(
+            file_rows.iter().all(|r| r.state == InboundFileState::Done && r.outcome.as_deref() == Some("cancelled")),
+            "un-landed file rows settle done/cancelled: {file_rows:?}"
+        );
+
+        // Journal has a cancelled entry; no files landed.
+        let kinds: Vec<String> = {
+            let conn = store.lock_conn();
+            list_sync_events(&conn, Direction::Received, &row.id.to_string())
+                .unwrap()
+                .into_iter()
+                .map(|e| e.kind)
+                .collect()
+        };
+        assert!(kinds.iter().any(|k| k == "cancelled"), "journal records the cancel: {kinds:?}");
+        assert!(no_files_landed(&incoming), "a declined package lands no files");
+
+        // The durable replay source: a cancelled receipt per frame (existing behavior).
+        let cancelled_receipts: i64 = {
+            let conn = store.lock_conn();
+            conn.query_row(
+                "SELECT COUNT(*) FROM sync_receipts WHERE package_id=?1 AND outcome='cancelled'",
+                [&announce.package_id.0],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(cancelled_receipts, announce.frame_count as i64, "a cancelled receipt per frame is written");
+    }
+
+    /// Item 5: the restart reconcile settles a stale row's un-settled per-file rows
+    /// to `failed`; a later re-announce restores them to `announced`.
+    #[test]
+    fn reconcile_settles_file_rows_then_reannounce_restores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap();
+        let peer = "cc".repeat(32);
+        let files = vec![afe("L1.fits", "u1", 10), afe("L2.fits", "u2", 20)];
+
+        let id = {
+            let conn = store.lock_conn();
+            let id = upsert_inbound_announced(&conn, &peer, "pkg", 2, 30).unwrap();
+            record_inbound_manifest(&conn, id, Some("N"), &files).unwrap();
+            // Simulate a mid-fetch process: row fetching, one file row fetching.
+            set_inbound_state(&conn, "pkg", InboundState::Fetching, None).unwrap();
+            set_inbound_file_state(&conn, id, "L1.fits", InboundFileState::Fetching, 5, None, None).unwrap();
+            id
+        };
+
+        reconcile_stale_inbound(&store);
+
+        {
+            let conn = store.lock_conn();
+            assert_eq!(get_inbound(&conn, "pkg").unwrap().unwrap().state, InboundState::Failed);
+            let rows = list_inbound_files(&conn, id).unwrap();
+            assert!(
+                rows.iter().all(|r| r.state == InboundFileState::Failed
+                    && r.error.as_deref() == Some("interrupted by restart")),
+                "every un-settled file row is failed with the restart reason: {rows:?}"
+            );
+        }
+
+        // A re-announce refreshes the row + rows back to announced.
+        {
+            let conn = store.lock_conn();
+            let id2 = upsert_inbound_announced(&conn, &peer, "pkg", 2, 30).unwrap();
+            assert_eq!(id2, id, "the same durable row is reused");
+            record_inbound_manifest(&conn, id2, Some("N"), &files).unwrap();
+            let rows = list_inbound_files(&conn, id2).unwrap();
+            assert!(
+                rows.iter().all(|r| r.state == InboundFileState::Announced),
+                "a re-announce restores the file rows to announced: {rows:?}"
+            );
+        }
     }
 }
