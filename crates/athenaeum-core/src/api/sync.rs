@@ -30,8 +30,11 @@ use crate::settings::{defaults, keys};
 use crate::sharing::iroh::node::{RelayResolver, Role, SharedIrohNode};
 use crate::sharing::types::NodeId;
 use crate::sharing::SharingTransport;
+use crate::sync::status::outbound_display_state;
 use crate::sync::store::{
-    get_inbound_by_row_id, inbound_active, outbound_row_by_id, search_history_rows,
+    get_inbound_by_row_id, inbound_active, inbound_file_counts, list_inbound_files,
+    list_outbound_files, list_sync_events, outbound_file_counts, outbound_row_by_id,
+    search_history_rows,
 };
 use crate::sync::{
     node_id_hex, pairing, CatalogSyncStore, Direction, HistoryQuery, HistoryRow, InboundSummary,
@@ -885,6 +888,28 @@ fn received_total(ctx: &ServiceContext) -> Result<u32, ApiError> {
     Ok(n.max(0) as u32)
 }
 
+/// The cached node-id-hex → friendly device-name map (`SYNC_DEVICE_NAMES`), read
+/// ONCE per status poll — a plain settings read with NO hub round-trip (§D5/§D8;
+/// the same cache the receiver's landing-folder naming reads). Best-effort: an
+/// absent setting or malformed JSON yields an empty map (warned, never fatal), so
+/// the UI falls back to short hex.
+fn cached_device_names(conn: &rusqlite::Connection) -> HashMap<String, String> {
+    match crate::db::get_setting(conn, keys::SYNC_DEVICE_NAMES) {
+        Ok(Some(raw)) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!(error = %e, "sync status: device-names cache parse failed; using hex");
+                HashMap::new()
+            }
+        },
+        Ok(None) => HashMap::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "sync status: device-names cache read failed; using hex");
+            HashMap::new()
+        }
+    }
+}
+
 /// Dedup in-flight rows by durable `sync_outbound` id, keeping the first
 /// occurrence and ordering ascending by id.
 ///
@@ -950,21 +975,54 @@ async fn build_sender_status(
     // `active_rows` holds one copy per started engine — dedup by id before
     // counting/summarizing so `queued`/`transferring` reflect distinct packages,
     // not N×, and each package's manifest is read exactly once.
-    let active: Vec<OutboundSummary> = dedup_active_rows(active_rows)
+    let rows = dedup_active_rows(active_rows);
+
+    // One DB borrow for everything the summary needs: ONE grouped per-file-counts
+    // query for the whole active set (§D5 — never a per-row loop), the device-name
+    // cache (one settings read, no hub), and the terminal totals.
+    let (file_counts, device_names, confirmed_total, failed_total, cancelled_total) = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        (
+            outbound_file_counts(&conn, &ids).map_err(|e| ApiError::Internal(format!("{e:#}")))?,
+            cached_device_names(&conn),
+            count_outbound_state(&conn, "confirmed")?,
+            count_outbound_state(&conn, "failed")?,
+            count_outbound_state(&conn, "cancelled")?,
+        )
+    };
+
+    let now = chrono::Utc::now();
+    let active: Vec<OutboundSummary> = rows
         .into_iter()
         .map(|row| {
             let (file_count, byte_size) = package_totals(Path::new(&row.package_ref));
+            let peer_hex = node_id_hex(&row.peer);
+            let display_state =
+                outbound_display_state(row.state, row.next_retry_at.as_deref(), now);
+            let stalled_until = if display_state == "waiting" {
+                row.next_retry_at.clone()
+            } else {
+                None
+            };
             OutboundSummary {
                 id: row.id,
                 package_short: short_pkg(&row.package_ref),
                 state: row.state,
                 attempts: row.attempts,
                 created_at: row.created_at,
-                peer_short: short_id(&node_id_hex(&row.peer)),
+                peer_short: short_id(&peer_hex),
                 last_error: row.last_error,
+                retrying: row.next_retry_at.is_some(),
                 next_retry_at: row.next_retry_at,
                 byte_size,
                 file_count,
+                display_name: row.display_name.filter(|s| !s.trim().is_empty()),
+                device_name: device_names.get(&peer_hex).cloned(),
+                display_state,
+                stalled_until,
+                file_counts: file_counts.get(&row.id).copied().unwrap_or_default(),
             }
         })
         .collect();
@@ -977,16 +1035,6 @@ async fn build_sender_status(
             _ => queued += 1, // Queued / Announced
         }
     }
-
-    let (confirmed_total, failed_total, cancelled_total) = {
-        let db = db(ctx)?;
-        let conn = db.conn();
-        (
-            count_outbound_state(&conn, "confirmed")?,
-            count_outbound_state(&conn, "failed")?,
-            count_outbound_state(&conn, "cancelled")?,
-        )
-    };
 
     Ok(SyncSenderStatus {
         started,
@@ -1005,6 +1053,11 @@ fn active_inbound_summaries(ctx: &ServiceContext) -> Result<Vec<InboundSummary>,
     let db = db(ctx)?;
     let conn = db.conn();
     let rows = inbound_active(&conn).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    // ONE grouped per-file-counts query for the whole active set (§D5), plus the
+    // device-name cache (one settings read, no hub).
+    let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+    let file_counts = inbound_file_counts(&conn, &ids).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    let device_names = cached_device_names(&conn);
     Ok(rows
         .into_iter()
         .map(|r| InboundSummary {
@@ -1012,11 +1065,18 @@ fn active_inbound_summaries(ctx: &ServiceContext) -> Result<Vec<InboundSummary>,
             package_id: r.package_id.clone(),
             package_short: short_id(&r.package_id),
             peer_short: short_id(&r.peer),
+            // Inbound presentation state mirrors the raw state (no receiver-side
+            // retry/backoff concept yet), so `stalled_until` is always None.
+            display_state: r.state.as_str().to_string(),
+            stalled_until: None,
             state: r.state,
             frame_count: r.frame_count,
             byte_size: r.byte_size,
             bytes_done: r.bytes_done,
             created_at: r.created_at,
+            display_name: r.display_name.filter(|s| !s.trim().is_empty()),
+            device_name: device_names.get(&r.peer).cloned(),
+            file_counts: file_counts.get(&r.id).copied().unwrap_or_default(),
         })
         .collect())
 }
@@ -1119,25 +1179,23 @@ fn outbound_package_key(package_ref: &str) -> String {
         .to_string()
 }
 
-/// Per-file detail for one transfer batch (Task 14) — the Transfers UI's
-/// expand-a-row view. `direction` selects the outbound (`Sent`) or inbound
-/// (`Received`) half; `id` is the durable row id in that half
-/// (`sync_outbound.id` / `sync_inbound.id`, from the corresponding summary).
+/// Per-file detail for one transfer batch — the Transfers UI's expand-a-row
+/// view. `direction` selects the outbound (`Sent`) or inbound (`Received`) half;
+/// `id` is the durable row id in that half (`sync_outbound.id` /
+/// `sync_inbound.id`, from the corresponding summary).
 ///
-/// **Sent:** the package's manifest (read from the outbound row's `package_ref`)
-/// is the authoritative file list — name + bytes per frame. Per-frame outcomes
-/// come from THIS sender's own confirmed/terminal history rows for the package,
-/// joined by the stable package-dir-basename batch key: a frame shows
-/// `ingested`/`duplicate`/`rejected`/… once the peer's ack lands, and `None`
-/// while the send is still in flight. (Receipts live only on the *receiver*, so a
-/// real two-machine sender's own history — not a `sync_receipts` read that would
-/// be empty there — is the durable per-frame verdict.)
+/// **Primary source (Transfers Status Model v2 §D4):** the persisted per-file
+/// tables (`sync_outbound_files` / `sync_inbound_files`). They exist from enqueue
+/// / announce onward, so a batch shows its full structure — `rel_path`, size,
+/// per-file `state`, live `bytes_done`, settled `outcome`, and any `error` — at
+/// every stage (queued/announced, mid-transfer, terminal), surviving restart.
 ///
-/// **Received:** when the inbound row is terminal, entries come from this node's
-/// received-history rows for the package (`WHERE package_id = <wire id>`); while
-/// the fetch is still active, the staged manifest backfills names/sizes if it has
-/// landed, else an empty list (the live per-file bars are event-driven via
-/// `sync-file-progress`).
+/// **Legacy fallback (a pre-v2 row with no per-file rows):** the old
+/// manifest/history join, so old history stays viewable. Sent → the package
+/// manifest (names/sizes) joined to this sender's settled history verdicts;
+/// received → the received-history rows when terminal, else the staged manifest.
+/// The fallback entries carry `state = None` / `error = None` (never tracked
+/// per-file for those rows).
 pub fn list_transfer_files(
     ctx: &ServiceContext,
     direction: Direction,
@@ -1157,13 +1215,30 @@ fn sent_transfer_files(ctx: &ServiceContext, id: i64) -> Result<Vec<TransferFile
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?
         .ok_or_else(|| ApiError::NotFound(format!("outbound package {id} not found")))?;
 
+    // Primary source: the per-file rows (present from enqueue onward).
+    let file_rows = list_outbound_files(&conn, id).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    if !file_rows.is_empty() {
+        return Ok(file_rows
+            .into_iter()
+            .map(|f| TransferFileEntry {
+                name: detail_filename(&f.rel_path),
+                rel_path: f.rel_path,
+                bytes_total: f.byte_size,
+                bytes_done: Some(f.bytes_done),
+                state: Some(f.state.as_str().to_string()),
+                outcome: f.outcome,
+                error: f.error,
+            })
+            .collect());
+    }
+
+    // Legacy fallback: the package manifest joined to this sender's settled
+    // per-frame history verdicts (the confirmed/terminal rows carry `finished_at`;
+    // the started `sent` rows do not). Newest-first, so the first row per
+    // frame_uuid wins (a redelivery's latest verdict).
     let dir = PathBuf::from(&row.package_ref);
     let records = package::read_manifest(&dir)
         .map_err(|e| ApiError::Internal(format!("read manifest {}: {e:#}", dir.display())))?;
-
-    // This package's settled per-frame verdicts: the sender's confirmed/terminal
-    // rows carry `finished_at`; the started (`sent`) rows do not. Newest-first, so
-    // the first row seen per frame_uuid wins (a redelivery's latest verdict).
     let settled = search_history_rows(
         &conn,
         &HistoryQuery {
@@ -1182,10 +1257,13 @@ fn sent_transfer_files(ctx: &ServiceContext, id: i64) -> Result<Vec<TransferFile
     Ok(records
         .iter()
         .map(|r| TransferFileEntry {
+            rel_path: r.rel_path.clone(),
             name: detail_filename(&r.rel_path),
             bytes_total: r.byte_size,
             bytes_done: None,
+            state: None,
             outcome: outcome_by_frame.get(&r.frame_uuid).cloned(),
+            error: None,
         })
         .collect())
 }
@@ -1202,9 +1280,29 @@ fn received_transfer_files(
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?
         .ok_or_else(|| ApiError::NotFound(format!("inbound package {id} not found")))?;
 
+    // Primary source: the per-file rows written at announce time (§D4) —
+    // available at every stage (announced / fetching / terminal).
+    let file_rows = list_inbound_files(&conn, id).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    if !file_rows.is_empty() {
+        return Ok(file_rows
+            .into_iter()
+            .map(|f| TransferFileEntry {
+                name: detail_filename(&f.rel_path),
+                rel_path: f.rel_path,
+                bytes_total: f.byte_size,
+                bytes_done: Some(f.bytes_done),
+                state: Some(f.state.as_str().to_string()),
+                outcome: f.outcome,
+                error: f.error,
+            })
+            .collect());
+    }
+
+    // Legacy fallback (a v1/unnamed batch or pre-v2 row with no per-file rows).
     if row.state.is_terminal() {
         // History is the durable record of what landed. Newest-first; keep the
-        // first row per frame_uuid (a redelivery's latest verdict).
+        // first row per frame_uuid (a redelivery's latest verdict). History has no
+        // rel_path, so the basename stands in.
         let rows = search_history_rows(
             &conn,
             &HistoryQuery {
@@ -1220,10 +1318,13 @@ fn received_transfer_files(
         for h in rows {
             if seen.insert(h.frame_uuid.clone()) {
                 out.push(TransferFileEntry {
+                    rel_path: h.filename.clone(),
                     name: h.filename,
                     bytes_total: h.bytes,
                     bytes_done: Some(h.bytes),
+                    state: None,
                     outcome: Some(h.outcome),
+                    error: None,
                 });
             }
         }
@@ -1238,14 +1339,54 @@ fn received_transfer_files(
         Ok(records) => Ok(records
             .iter()
             .map(|r| TransferFileEntry {
+                rel_path: r.rel_path.clone(),
                 name: detail_filename(&r.rel_path),
                 bytes_total: r.byte_size,
                 bytes_done: None,
+                state: None,
                 outcome: None,
+                error: None,
             })
             .collect()),
         Err(_) => Ok(Vec::new()),
     }
+}
+
+/// One entry in a batch's event journal (Transfers Status Model v2 §D7), for the
+/// detail pane's **Log** tab. The presentation slice of a
+/// [`SyncEventRow`](crate::sync::SyncEventRow) (its `id` + `direction` are the
+/// query scope, not shown).
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferEventEntry {
+    /// RFC3339 UTC timestamp of the event.
+    pub ts: String,
+    /// Short snake_case event kind (`announce_sent`, `dial_failed`,
+    /// `retry_scheduled`, `serve_started`, `uploaded`, `ack_received`,
+    /// `fetch_started`, `ingested`, `cancelled`, …).
+    pub kind: String,
+    /// Optional human detail (e.g. a class-tagged reason). `None` for a bare event.
+    pub detail: Option<String>,
+}
+
+/// The event journal for one transfer batch (Transfers Status Model v2 §D7),
+/// newest-first — the detail pane's **Log** tab. `direction` selects the send
+/// (`Sent`) or receive (`Received`) half; `id` is the durable row id in that half
+/// (`sync_outbound.id` / `sync_inbound.id`), which is the journal's `batch_key`.
+/// Fired on detail-pane open (not per-frame), so a plain read is fine.
+pub fn list_transfer_events(
+    ctx: &ServiceContext,
+    direction: Direction,
+    id: i64,
+) -> Result<Vec<TransferEventEntry>, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let rows = list_sync_events(&conn, direction, &id.to_string())
+        .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|e| TransferEventEntry { ts: e.ts, kind: e.kind, detail: e.detail })
+        .collect())
 }
 
 /// Map of node-id-hex → hub device name, for enriching history rows (the rows
@@ -2490,6 +2631,135 @@ mod tests {
         }
         let names = get_sync_device_names(&ctx).await.unwrap();
         assert!(names.is_empty(), "a signed-out device resolves to an empty map, not an error");
+    }
+
+    /// tv2 §D5/§D8: the status path resolves device names from the cached
+    /// `SYNC_DEVICE_NAMES` settings map (present / absent / malformed) with NO hub
+    /// round-trip — a settings-only, best-effort read.
+    #[test]
+    fn device_names_cache_resolves_present_absent_and_malformed() {
+        let (_tmp, ctx) = test_ctx();
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let peer_a = "aa".repeat(32);
+        let peer_z = "99".repeat(32);
+
+        // Absent setting → empty map (falls back to hex at the call site).
+        assert!(cached_device_names(&conn).is_empty(), "no cache yet → empty");
+
+        // Present → hex→name lookups; an uncached hex is absent.
+        let json = format!(r#"{{"{peer_a}":"My Mac"}}"#);
+        crate::db::set_setting(&conn, keys::SYNC_DEVICE_NAMES, &json).unwrap();
+        let map = cached_device_names(&conn);
+        assert_eq!(map.get(&peer_a).map(String::as_str), Some("My Mac"));
+        assert!(map.get(&peer_z).is_none(), "an uncached peer resolves to None");
+
+        // Malformed JSON → empty map, never a panic/error.
+        crate::db::set_setting(&conn, keys::SYNC_DEVICE_NAMES, "not json").unwrap();
+        assert!(cached_device_names(&conn).is_empty(), "malformed cache → empty, best-effort");
+    }
+
+    /// tv2 §D4: `list_transfer_files` reads the persisted per-file tables as its
+    /// primary source — a v2 inbound batch returns its `announced` rows (rel_path
+    /// + state + bytes_done) before any fetch — and falls back to the legacy
+    /// history source for a pre-v2 batch that has no per-file rows.
+    #[test]
+    fn list_transfer_files_v2_rows_then_legacy_fallback() {
+        use crate::sync::{InboundFileRow, InboundFileState, InboundState};
+        let (_tmp, ctx) = test_ctx();
+        let peer = "aa".repeat(32);
+
+        // A v2 inbound batch: announced rows written at announce time, no fetch yet.
+        let v2_id = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let id =
+                crate::sync::store::upsert_inbound_announced(&conn, &peer, "pkg-v2", 2, 300).unwrap();
+            let mk = |rel: &str, size: u64| InboundFileRow {
+                inbound_id: id,
+                rel_path: rel.into(),
+                byte_size: size,
+                frame_uuid: format!("u-{rel}"),
+                state: InboundFileState::Announced,
+                bytes_done: 0,
+                outcome: None,
+                error: None,
+                updated_at: "2026-07-20T00:00:00.000Z".into(),
+            };
+            crate::sync::store::replace_inbound_files(
+                &conn,
+                id,
+                &[mk("cam/lights/b.fits", 200), mk("cam/lights/a.fits", 100)],
+            )
+            .unwrap();
+            id
+        };
+        let files = list_transfer_files(&ctx, Direction::Received, v2_id).unwrap();
+        assert_eq!(files.len(), 2, "both announced rows surface before any fetch");
+        // Ordered by rel_path; forward-slash rel_path preserved, basename in `name`.
+        assert_eq!(files[0].rel_path, "cam/lights/a.fits");
+        assert_eq!(files[0].name, "a.fits");
+        assert_eq!(files[0].state.as_deref(), Some("announced"));
+        assert_eq!(files[0].bytes_done, Some(0));
+        assert!(files[0].outcome.is_none());
+        assert!(files[0].error.is_none());
+
+        // A legacy inbound batch: NO per-file rows, terminal, with received history.
+        let legacy_id = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let id =
+                crate::sync::store::upsert_inbound_announced(&conn, &peer, "pkg-legacy", 1, 50).unwrap();
+            crate::sync::store::set_inbound_state(&conn, "pkg-legacy", InboundState::Done, None).unwrap();
+            crate::sync::store::insert_history_row(
+                &conn,
+                &HistoryRow {
+                    frame_uuid: "legacy-uuid".into(),
+                    filename: "old.fits".into(),
+                    object: Some("M31".into()),
+                    peer_device: peer.clone(),
+                    direction: Direction::Received,
+                    bytes: 50,
+                    started_at: "2026-01-01T00:00:00.000Z".into(),
+                    finished_at: Some("2026-01-01T00:00:01.000Z".into()),
+                    outcome: "ingested".into(),
+                    project: None,
+                    package_id: Some("pkg-legacy".into()),
+                    batch_name: None,
+                },
+            )
+            .unwrap();
+            id
+        };
+        let legacy = list_transfer_files(&ctx, Direction::Received, legacy_id).unwrap();
+        assert_eq!(legacy.len(), 1, "falls back to received history");
+        assert_eq!(legacy[0].name, "old.fits");
+        assert_eq!(legacy[0].rel_path, "old.fits", "no rel_path in history → basename");
+        assert_eq!(legacy[0].outcome.as_deref(), Some("ingested"));
+        assert!(legacy[0].state.is_none(), "legacy fallback has no per-file state");
+    }
+
+    /// tv2 §D7: `list_transfer_events` returns a batch's journal newest-first, in
+    /// the `{ ts, kind, detail }` shape, scoped to the (direction, row id) key.
+    #[test]
+    fn list_transfer_events_returns_newest_first() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            for (kind, detail) in
+                [("enqueued", Some("frames=2")), ("announce_sent", None), ("uploaded", Some("bytes=300"))]
+            {
+                crate::sync::store::append_sync_event(&conn, Direction::Sent, "7", kind, detail).unwrap();
+            }
+            // A different batch's journal must not leak into batch 7.
+            crate::sync::store::append_sync_event(&conn, Direction::Sent, "8", "enqueued", None).unwrap();
+        }
+        let events = list_transfer_events(&ctx, Direction::Sent, 7).unwrap();
+        assert_eq!(events.len(), 3, "only batch 7's events");
+        assert_eq!(events[0].kind, "uploaded", "newest first");
+        assert_eq!(events[0].detail.as_deref(), Some("bytes=300"));
+        assert_eq!(events[2].kind, "enqueued", "oldest last");
     }
 
     // ── Manual/auto send (task M2) ───────────────────────────────────────────

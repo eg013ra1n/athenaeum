@@ -267,6 +267,51 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
     engine.shutdown().await;
 }
 
+/// tv2 §D1 (item 5): the outbound row's `display_name` is threaded onto every
+/// sent history row (`batch_name`) — so the transfer log shows the named batch on
+/// the send side too — after a full confirmed loopback transfer.
+#[tokio::test]
+async fn sent_history_rows_carry_batch_name_after_confirm() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let pkg = build_package(&tmp.path().join("src1"), "uuid-1", "frame1.fits", "M42", 4096);
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+
+    // Enqueue WITH a human batch name (the send path supplies it in production).
+    let id = engine
+        .enqueue_package(&pkg, Some("My M42 Batch".to_string()), Vec::new())
+        .await
+        .unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+
+    let history = store
+        .search_history(HistoryQuery {
+            filename: Some("frame1.fits".to_string()),
+            direction: Some(Direction::Sent),
+            limit: 100,
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(history.len(), 2, "start + confirm rows");
+    assert!(
+        history.iter().all(|h| h.batch_name.as_deref() == Some("My M42 Batch")),
+        "every sent history row (started + confirmed) carries the batch name"
+    );
+
+    engine.shutdown().await;
+}
+
 /// Task 3: once a package reaches `Confirmed`, the sender must **release** its
 /// served blobs — a fresh fetch of the same announce from the sender then fails
 /// with "not served". Release is fire-and-forget (a detached task off the

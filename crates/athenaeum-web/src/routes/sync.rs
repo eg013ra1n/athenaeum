@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::{extract::State, http::StatusCode, Json};
 
 use athenaeum_core::api::sync as api;
-use athenaeum_core::api::sync::{EnqueueSelectionResult, SyncHistoryQuery};
+use athenaeum_core::api::sync::{EnqueueSelectionResult, SyncHistoryQuery, TransferEventEntry};
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
 use serde::Deserialize;
@@ -88,6 +88,27 @@ pub async fn list_transfer_files(
     Json(args): Json<ListTransferFilesArgs>,
 ) -> Result<Json<Vec<TransferFileEntry>>, (StatusCode, String)> {
     api::list_transfer_files(&state.ctx, args.direction, args.id)
+        .map(Json)
+        .map_err(api_err)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTransferEventsArgs {
+    pub direction: Direction,
+    pub id: i64,
+}
+
+/// POST /api/list_transfer_events
+///
+/// The event journal for one transfer batch (Transfers Status Model v2 §D7),
+/// newest-first — the detail pane's Log tab. Fired on detail-pane open.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn list_transfer_events(
+    State(state): State<WebAppState>,
+    Json(args): Json<ListTransferEventsArgs>,
+) -> Result<Json<Vec<TransferEventEntry>>, (StatusCode, String)> {
+    api::list_transfer_events(&state.ctx, args.direction, args.id)
         .map(Json)
         .map_err(api_err)
 }

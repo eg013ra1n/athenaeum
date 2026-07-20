@@ -7,12 +7,12 @@
 //! implementation reuses [`DDL_OUTBOUND`] / [`DDL_HISTORY`] / [`DDL_INDEXES`]
 //! verbatim from a `db/schema.rs` migration; A4 does not touch the app catalog.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::sharing::types::{AnnounceFileEntry, FrameReceipt, NodeId, PackageId, ReceiptOutcome};
 
@@ -20,6 +20,7 @@ use super::models::{
     Direction, HistoryQuery, HistoryRow, InboundFileRow, InboundFileState, InboundRow,
     InboundState, OutboundFileRow, OutboundFileState, OutboundRow, OutboundState, SyncEventRow,
 };
+use super::status::TransferFileCounts;
 use super::{node_id_from_hex, node_id_hex, now_iso};
 
 /// `sync_outbound` — the durable outbound state machine, one row per package.
@@ -1356,6 +1357,84 @@ pub fn list_inbound_files(conn: &Connection, inbound_id: i64) -> Result<Vec<Inbo
     raws.into_iter().map(to_inbound_file).collect()
 }
 
+/// Grouped per-file rollup for a set of outbound batch ids — ONE query for the
+/// whole set (never a per-row loop), for the cheap status poll (Transfers Status
+/// Model v2 §D5). Only ids with ≥1 per-file row appear in the map; a legacy batch
+/// with no per-file rows is simply absent (the caller defaults it to zeroes).
+///
+/// `done`/`failed` are mutually exclusive:
+/// - **failed** — `state = 'failed'` OR `outcome` starts with `rejected`.
+/// - **done** — (`state = 'done'` OR `state = 'uploaded'`) AND not failed; a
+///   user-cancelled file (`outcome = 'cancelled'`, `state = 'done'`) therefore
+///   counts as done — terminal, not an error.
+pub fn outbound_file_counts(
+    conn: &Connection,
+    ids: &[i64],
+) -> Result<HashMap<i64, TransferFileCounts>> {
+    grouped_file_counts(conn, "sync_outbound_files", "outbound_id", ids)
+}
+
+/// The receive-side twin of [`outbound_file_counts`] — ONE grouped query over
+/// `sync_inbound_files`. `state = 'uploaded'` never occurs inbound (a file walks
+/// `announced → fetching → done|failed`), so inbound `done` reduces to
+/// `state = 'done'`.
+pub fn inbound_file_counts(
+    conn: &Connection,
+    ids: &[i64],
+) -> Result<HashMap<i64, TransferFileCounts>> {
+    grouped_file_counts(conn, "sync_inbound_files", "inbound_id", ids)
+}
+
+/// Shared implementation for [`outbound_file_counts`] / [`inbound_file_counts`]:
+/// one `GROUP BY` over the parent-id `IN (…)` set. `COALESCE(outcome,'')` keeps
+/// the `rejected%` predicate boolean (a NULL `outcome` must not poison the
+/// `done` CASE via three-valued logic), so an `uploaded` file with no outcome
+/// still counts as done.
+fn grouped_file_counts(
+    conn: &Connection,
+    table: &str,
+    id_col: &str,
+    ids: &[i64],
+) -> Result<HashMap<i64, TransferFileCounts>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT {id_col}, \
+                COUNT(*), \
+                SUM(CASE WHEN state = 'failed' OR COALESCE(outcome,'') LIKE 'rejected%' \
+                         THEN 1 ELSE 0 END), \
+                SUM(CASE WHEN (state = 'done' OR state = 'uploaded') \
+                          AND NOT (state = 'failed' OR COALESCE(outcome,'') LIKE 'rejected%') \
+                         THEN 1 ELSE 0 END) \
+         FROM {table} WHERE {id_col} IN ({placeholders}) GROUP BY {id_col}"
+    );
+    let mut stmt = conn.prepare(&sql).context("prepare grouped_file_counts")?;
+    let rows = stmt
+        .query_map(params_from_iter(ids.iter()), |r| {
+            let id: i64 = r.get(0)?;
+            let total: i64 = r.get(1)?;
+            let failed: i64 = r.get(2)?;
+            let done: i64 = r.get(3)?;
+            Ok((id, total, done, failed))
+        })
+        .context("query grouped_file_counts")?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (id, total, done, failed) = row.context("row grouped_file_counts")?;
+        map.insert(
+            id,
+            TransferFileCounts {
+                total: total.max(0) as u32,
+                done: done.max(0) as u32,
+                failed: failed.max(0) as u32,
+            },
+        );
+    }
+    Ok(map)
+}
+
 /// Delete every per-file row for an outbound batch — the delete-with-parent
 /// cascade for `sync_outbound_files` (Transfers Status Model v2 §D4). This store
 /// uses no FK cascades, so a future outbound-row delete path must call this (plus
@@ -2648,6 +2727,68 @@ mod tests {
         delete_inbound_files(&conn, 7).unwrap();
         assert!(list_inbound_files(&conn, 7).unwrap().is_empty());
         assert_eq!(list_inbound_files(&conn, 8).unwrap().len(), 1, "sibling parent unaffected");
+    }
+
+    /// tv2 §D5: the grouped file-counts rollup — one query over a mixed table
+    /// (pending / sending / uploaded / done / failed / rejected) yields correct,
+    /// mutually-exclusive `done`/`failed` counts per parent, scopes to the
+    /// requested id set, and omits an id with no per-file rows.
+    #[test]
+    fn grouped_file_counts_classifies_mixed_states() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_OUTBOUND_FILES, []).unwrap();
+
+        // Parent 1: a realistic in-flight-then-terminal mix.
+        let row = |parent: i64, rel: &str, state: OutboundFileState, outcome: Option<&str>| {
+            OutboundFileRow {
+                outbound_id: parent,
+                rel_path: rel.into(),
+                byte_size: 10,
+                frame_uuid: format!("u-{parent}-{rel}"),
+                state,
+                bytes_done: 0,
+                outcome: outcome.map(str::to_string),
+                error: None,
+                updated_at: "2026-07-20T00:00:00.000Z".into(),
+            }
+        };
+        replace_outbound_files(
+            &conn,
+            1,
+            &[
+                row(1, "pending.fits", OutboundFileState::Pending, None),
+                row(1, "sending.fits", OutboundFileState::Sending, None),
+                // Uploaded with no outcome yet → counts as done (NULL outcome
+                // must not poison the CASE).
+                row(1, "uploaded.fits", OutboundFileState::Uploaded, None),
+                row(1, "ingested.fits", OutboundFileState::Done, Some("ingested")),
+                // Rejected receipt lands state=done + outcome=rejected:… → failed,
+                // NOT done (mutual exclusivity).
+                row(1, "rejected.fits", OutboundFileState::Done, Some("rejected:bad hash")),
+                // Cancelled is terminal-but-not-error → done.
+                row(1, "cancelled.fits", OutboundFileState::Done, Some("cancelled")),
+            ],
+        )
+        .unwrap();
+        // Parent 2: a sibling, to prove IN-set scoping.
+        replace_outbound_files(&conn, 2, &[row(2, "only.fits", OutboundFileState::Pending, None)])
+            .unwrap();
+
+        let counts = outbound_file_counts(&conn, &[1, 2, 999]).unwrap();
+        let p1 = counts.get(&1).expect("parent 1 present");
+        assert_eq!(p1.total, 6);
+        // done = uploaded + ingested + cancelled = 3.
+        assert_eq!(p1.done, 3, "uploaded/ingested/cancelled are done");
+        // failed = rejected = 1.
+        assert_eq!(p1.failed, 1, "rejected is failed, not done");
+        // in-flight remainder = pending + sending = 6 - 3 - 1 = 2.
+        assert_eq!(p1.total - p1.done - p1.failed, 2);
+
+        assert_eq!(counts.get(&2).unwrap().total, 1);
+        assert!(!counts.contains_key(&999), "an id with no rows is absent");
+
+        // Empty id set → no query, empty map.
+        assert!(outbound_file_counts(&conn, &[]).unwrap().is_empty());
     }
 
     /// tv2 §D7: `append_sync_event` prunes each batch's journal to the newest

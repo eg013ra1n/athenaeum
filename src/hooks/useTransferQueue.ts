@@ -266,7 +266,7 @@ export function useTransferQueue(): UseTransferQueue {
             const outcome: 'failed' | 'cancelled' = p.outcome === 'cancelled' ? 'cancelled' : 'failed';
             const cached = outboundSeenRef.current.get(id);
             const summary: OutboundSummary = cached
-              ? { ...cached, state: outcome }
+              ? { ...cached, state: outcome, displayState: outcome }
               : {
                   id,
                   packageShort: shortId(String(id)),
@@ -278,6 +278,19 @@ export function useTransferQueue(): UseTransferQueue {
                   nextRetryAt: null,
                   byteSize: 0,
                   fileCount: p.okCount + p.failed.length,
+                  // Transfers Status Model v2 additive fields (T7 will consume
+                  // them fully); a synthesized terminal row has no batch/device
+                  // name and is not retrying.
+                  displayName: null,
+                  deviceName: null,
+                  displayState: outcome,
+                  stalledUntil: null,
+                  fileCounts: {
+                    total: p.okCount + p.failed.length,
+                    done: p.okCount,
+                    failed: p.failed.length,
+                  },
+                  retrying: false,
                 };
             setTerminalOutbound((prev) => new Map(prev).set(id, { summary, outcome }));
           }

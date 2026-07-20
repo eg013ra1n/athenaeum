@@ -104,7 +104,7 @@ pub use responder::{CatalogDedupResponder, DedupResponder};
 pub use sender::{StartedSender, SyncSenderRuntime};
 pub use status::{
     InboundSummary, OutboundSummary, SyncReceiverStatus, SyncSenderStatus, SyncStatus,
-    TransferFileEntry, TransportHealth,
+    TransferFileCounts, TransferFileEntry, TransportHealth,
 };
 pub use store::{
     ensure_history_columns, insert_sync_source, live_sources_for_package, mark_sync_source_deleted,

@@ -624,7 +624,30 @@ project: string | null,
  * verdicts back to its manifest. Legacy rows written before this column stay
  * `None`.
  */
-packageId: string | null, };
+packageId: string | null, 
+/**
+ * The human batch name this transfer belonged to (Transfers Status Model v2,
+ * §D1) — mirrors [`OutboundRow::display_name`] / [`InboundRow::display_name`]
+ * so the transfer log can show the named batch without re-joining the live
+ * row. `None` for legacy rows and for callers that do not yet supply it
+ * (later tasks fill it).
+ */
+batchName: string | null, };
+
+export type TransferFileCounts = { 
+/**
+ * Total per-file rows for the batch (0 for a legacy pre-v2 batch with no
+ * per-file rows — the summary's `file_count` is the manifest fallback).
+ */
+total: number, 
+/**
+ * Files that finished transferring and were not rejected.
+ */
+done: number, 
+/**
+ * Files that failed or were rejected by the peer.
+ */
+failed: number, };
 
 export type OutboundSummary = { 
 /**
@@ -658,7 +681,44 @@ byteSize: number,
 /**
  * Number of frames/files in the package's manifest (Task 14).
  */
-fileCount: number, };
+fileCount: number, 
+/**
+ * The human batch name (`sync_outbound.display_name`, §D1), or `None` for a
+ * legacy/never-named row. The Transfers UI shows this instead of the raw
+ * package handle.
+ */
+displayName: string | null, 
+/**
+ * The destination peer's friendly device name, resolved from the cached
+ * `SYNC_DEVICE_NAMES` hex→name map (no hub round-trip). `None` when the peer
+ * is not in the cache.
+ */
+deviceName: string | null, 
+/**
+ * Backend-derived presentation state (§D5): `queued` | `preparing` |
+ * `transferring` | `uploaded` | `waiting` | `confirmed` | `cancelled` |
+ * `failed`. `waiting` (a live backoff window) WINS over the raw
+ * [`state`](Self::state) when a retry is armed for the future; the raw
+ * `state` field stays for compatibility. See
+ * [`outbound_display_state`].
+ */
+displayState: string, 
+/**
+ * RFC3339 deadline of the armed retry when [`display_state`](Self::display_state)
+ * is `waiting`, else `None` — the countdown target.
+ */
+stalledUntil: string | null, 
+/**
+ * Per-file rollup for the progress line ("N of M files").
+ */
+fileCounts: TransferFileCounts, 
+/**
+ * Whether a retry is armed (`next_retry_at` is set). The frontend reads this
+ * instead of deriving "retrying" from `attempts`. Distinct from the
+ * `waiting` display-state, which additionally requires the deadline to be in
+ * the future.
+ */
+retrying: boolean, };
 
 export type InboundSummary = { 
 /**
@@ -686,7 +746,33 @@ peerShort: string, state: InboundState, frameCount: number, byteSize: number,
 /**
  * Cumulative bytes fetched so far (0 until the fetch stage reports progress).
  */
-bytesDone: number, createdAt: string, };
+bytesDone: number, createdAt: string, 
+/**
+ * The human batch name (`sync_inbound.display_name`, §D1) carried in the v2
+ * announce, or `None` for a v1/unnamed batch. Shown instead of the raw
+ * package id.
+ */
+displayName: string | null, 
+/**
+ * The sending peer's friendly device name, resolved from the cached
+ * `SYNC_DEVICE_NAMES` hex→name map (no hub round-trip). `None` when unknown.
+ */
+deviceName: string | null, 
+/**
+ * Backend-derived presentation state (§D5): `announced` | `fetching` |
+ * `ingesting` | `done` | `cancelled` | `failed`. Currently mirrors the raw
+ * [`state`](Self::state) (the receiver has no `waiting`/backoff concept yet).
+ */
+displayState: string, 
+/**
+ * Always `None` for inbound in v2 (no receiver-side retry backoff yet);
+ * present for shape-parity with [`OutboundSummary`].
+ */
+stalledUntil: string | null, 
+/**
+ * Per-file rollup for the progress line ("N of M files").
+ */
+fileCounts: TransferFileCounts, };
 
 export type SyncSenderStatus = { 
 /**
@@ -787,26 +873,42 @@ transport: TransportHealth, };
 
 export type TransferFileEntry = { 
 /**
- * The file's basename within the package.
+ * The file's path relative to the batch root (forward-slash, structured per
+ * §D2) — the primary key of the per-file tables (Transfers Status Model v2).
+ * Drives the detail pane's collapsible directory tree. For a legacy pre-v2
+ * batch with no per-file rows this falls back to the manifest `rel_path`
+ * (sent) or the history `filename` (received).
+ */
+relPath: string, 
+/**
+ * The file's basename within the package (kept for compat).
  */
 name: string, 
 /**
- * The file's payload size in bytes (from the manifest).
+ * The file's payload size in bytes (from the per-file row / manifest).
  */
 bytesTotal: number, 
 /**
- * Cumulative bytes received for this file, when known (incoming detail); the
- * live per-file bars are event-driven via `sync-file-progress`, so this is
- * `None` mid-fetch and populated from history once the package is terminal.
+ * Cumulative bytes transferred for this file, when known; `None` on the
+ * legacy fallback path where no per-file row exists.
  */
 bytesDone: number | null, 
 /**
- * Per-frame outcome once settled: outgoing — the peer's ack verdict recorded
- * in this sender's confirmed history (`ingested`/`duplicate`/`rejected`/…),
- * `None` while the send is still in flight; incoming — the receiver's verdict
- * from history. `None` when not yet known.
+ * Per-file lifecycle state (`pending`/`sending`/`uploaded`/`done` outgoing;
+ * `announced`/`fetching`/`done`/`failed` incoming), from the per-file row.
+ * `None` on the legacy fallback path.
  */
-outcome: string | null, };
+state: string | null, 
+/**
+ * Per-frame outcome once settled: outgoing — the peer's ack verdict
+ * (`ingested`/`duplicate`/`rejected`/…); incoming — this node's ingest
+ * verdict. `None` while still in flight / not yet known.
+ */
+outcome: string | null, 
+/**
+ * A per-file error detail when this file's transfer failed, else `None`.
+ */
+error: string | null, };
 
 export type SyncProgressEvent = { packageId: string, 
 /**
@@ -932,6 +1034,22 @@ totalCount: number,
  * Frames that could not be sent, each with a reason. Never silently dropped.
  */
 ineligible: Array<IneligibleFrame>, };
+
+export type TransferEventEntry = { 
+/**
+ * RFC3339 UTC timestamp of the event.
+ */
+ts: string, 
+/**
+ * Short snake_case event kind (`announce_sent`, `dial_failed`,
+ * `retry_scheduled`, `serve_started`, `uploaded`, `ack_received`,
+ * `fetch_started`, `ingested`, `cancelled`, …).
+ */
+kind: string, 
+/**
+ * Optional human detail (e.g. a class-tagged reason). `None` for a bare event.
+ */
+detail: string | null, };
 
 export type DeviceCapability = "athenaeum" | "perseus";
 

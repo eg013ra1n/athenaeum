@@ -252,6 +252,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_sync_status", post(sync::get_sync_status))
         .route("/api/list_sync_history", post(sync::list_sync_history))
         .route("/api/list_transfer_files", post(sync::list_transfer_files))
+        .route("/api/list_transfer_events", post(sync::list_transfer_events))
         .route("/api/enqueue_sync_selection", post(sync::enqueue_sync_selection))
         .route("/api/retry_sync_package", post(sync::retry_sync_package))
         .route("/api/send_now_sync_package", post(sync::send_now_sync_package))

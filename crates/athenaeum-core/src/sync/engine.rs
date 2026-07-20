@@ -2331,6 +2331,23 @@ impl Worker {
     /// `want` is the negotiated subset (Sync Phase 3): `Some(w)` records only the
     /// frames in `w` (the peer's duplicates were never transferred), `None`
     /// records every manifest frame (full send / fallback).
+    /// The human batch name to stamp on this package's sent history rows
+    /// (Transfers Status Model v2 §D1): the outbound row's `display_name` when
+    /// set (non-blank), else `None` — so the transfer log shows the named batch,
+    /// with the raw UUIDs/basename reserved for the Details tab. One store read
+    /// per history-append call (before the per-frame loop, never per row); a read
+    /// failure is warned and degrades to `None`, never aborting the history write.
+    fn outbound_batch_name(&self, id: i64) -> Option<String> {
+        match self.store.get_outbound(id) {
+            Ok(Some(row)) => row.display_name.filter(|s| !s.trim().is_empty()),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(package_id = id, error = %e, "read display_name for history failed");
+                None
+            }
+        }
+    }
+
     fn append_started_history(
         &self,
         id: i64,
@@ -2346,6 +2363,7 @@ impl Worker {
             .collect();
         let peer_device = node_id_hex(&self.peer);
         let package_key = package_dir_key(dir);
+        let batch_name = self.outbound_batch_name(id);
         for r in &records {
             self.store.append_history(HistoryRow {
                 frame_uuid: r.frame_uuid.clone(),
@@ -2359,7 +2377,7 @@ impl Worker {
                 outcome: "sent".to_string(),
                 project: project_of(r),
                 package_id: package_key.clone(),
-                batch_name: None,
+                batch_name: batch_name.clone(),
             })?;
         }
         tracing::debug!(package_id = id, count = records.len(), "sync history: transfer started");
@@ -2377,6 +2395,7 @@ impl Worker {
         let peer_device = node_id_hex(&self.peer);
         let finished = now_iso();
         let package_key = package_dir_key(&pending.dir);
+        let batch_name = self.outbound_batch_name(pending.id);
 
         for rec in receipts {
             let (filename, object, bytes, project) = match by_uuid.get(rec.frame_uuid.as_str()) {
@@ -2395,7 +2414,7 @@ impl Worker {
                 outcome: receipt_outcome_str(&rec.outcome),
                 project,
                 package_id: package_key.clone(),
-                batch_name: None,
+                batch_name: batch_name.clone(),
             })?;
         }
         Ok(())
@@ -2435,6 +2454,7 @@ impl Worker {
         let peer_device = node_id_hex(&self.peer);
         let ts = now_iso();
         let package_key = package_dir_key(dir);
+        let batch_name = self.outbound_batch_name(id);
         for r in &records {
             self.store.append_history(HistoryRow {
                 frame_uuid: r.frame_uuid.clone(),
@@ -2448,7 +2468,7 @@ impl Worker {
                 outcome: outcome.to_string(),
                 project: project_of(r),
                 package_id: package_key.clone(),
-                batch_name: None,
+                batch_name: batch_name.clone(),
             })?;
         }
         Ok(())

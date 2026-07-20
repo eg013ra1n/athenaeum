@@ -5,9 +5,34 @@
 //! into one poll. It is built by [`crate::api::sync::get_status`], which is the
 //! only place that reads the sender/receiver runtimes and the catalog together.
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use super::models::{InboundState, OutboundState};
+
+/// Per-file rollup for one transfer batch (Transfers Status Model v2 §D5),
+/// aggregated from the per-file tables (`sync_outbound_files` /
+/// `sync_inbound_files`) with ONE grouped query per direction per status poll.
+///
+/// `done` and `failed` are mutually exclusive; the remainder (`total - done -
+/// failed`) is still in flight. See
+/// [`crate::sync::store::outbound_file_counts`] for the exact SQL and the
+/// precise definitions:
+/// - **failed** — a file whose per-file `state` is `failed` OR whose `outcome`
+///   starts with `rejected` (the receiver refused it).
+/// - **done** — a file that reached `done`/`uploaded` AND was not rejected
+///   (a user-cancelled file counts as `done`: terminal, not an error).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferFileCounts {
+    /// Total per-file rows for the batch (0 for a legacy pre-v2 batch with no
+    /// per-file rows — the summary's `file_count` is the manifest fallback).
+    pub total: u32,
+    /// Files that finished transferring and were not rejected.
+    pub done: u32,
+    /// Files that failed or were rejected by the peer.
+    pub failed: u32,
+}
 
 /// One in-flight outbound package for the Active tab (never a terminal row —
 /// those are summarized by the counts and live in history).
@@ -35,6 +60,62 @@ pub struct OutboundSummary {
     pub byte_size: u64,
     /// Number of frames/files in the package's manifest (Task 14).
     pub file_count: u32,
+    /// The human batch name (`sync_outbound.display_name`, §D1), or `None` for a
+    /// legacy/never-named row. The Transfers UI shows this instead of the raw
+    /// package handle.
+    pub display_name: Option<String>,
+    /// The destination peer's friendly device name, resolved from the cached
+    /// `SYNC_DEVICE_NAMES` hex→name map (no hub round-trip). `None` when the peer
+    /// is not in the cache.
+    pub device_name: Option<String>,
+    /// Backend-derived presentation state (§D5): `queued` | `preparing` |
+    /// `transferring` | `uploaded` | `waiting` | `confirmed` | `cancelled` |
+    /// `failed`. `waiting` (a live backoff window) WINS over the raw
+    /// [`state`](Self::state) when a retry is armed for the future; the raw
+    /// `state` field stays for compatibility. See
+    /// [`outbound_display_state`].
+    pub display_state: String,
+    /// RFC3339 deadline of the armed retry when [`display_state`](Self::display_state)
+    /// is `waiting`, else `None` — the countdown target.
+    pub stalled_until: Option<String>,
+    /// Per-file rollup for the progress line ("N of M files").
+    pub file_counts: TransferFileCounts,
+    /// Whether a retry is armed (`next_retry_at` is set). The frontend reads this
+    /// instead of deriving "retrying" from `attempts`. Distinct from the
+    /// `waiting` display-state, which additionally requires the deadline to be in
+    /// the future.
+    pub retrying: bool,
+}
+
+/// The outbound presentation state (§D5), derived from the raw
+/// [`OutboundState`] and the armed-retry deadline. `waiting` (a live backoff
+/// window — neutral, not an error) WINS over the raw state when the package is
+/// non-terminal AND `next_retry_at` is set AND that deadline is still in the
+/// future; an armed-but-past deadline falls through to the raw state.
+pub fn outbound_display_state(
+    state: OutboundState,
+    next_retry_at: Option<&str>,
+    now: DateTime<Utc>,
+) -> String {
+    if !state.is_terminal() {
+        if let Some(ts) = next_retry_at {
+            if let Ok(deadline) = DateTime::parse_from_rfc3339(ts) {
+                if deadline.with_timezone(&Utc) > now {
+                    return "waiting".to_string();
+                }
+            }
+        }
+    }
+    match state {
+        OutboundState::Queued => "queued",
+        OutboundState::Announced => "preparing",
+        OutboundState::Transferring => "transferring",
+        OutboundState::Delivered => "uploaded",
+        OutboundState::Confirmed => "confirmed",
+        OutboundState::Failed => "failed",
+        OutboundState::Cancelled => "cancelled",
+    }
+    .to_string()
 }
 
 /// One in-flight inbound package for the receive-side Active tab (Task 14) — the
@@ -62,6 +143,22 @@ pub struct InboundSummary {
     /// Cumulative bytes fetched so far (0 until the fetch stage reports progress).
     pub bytes_done: u64,
     pub created_at: String,
+    /// The human batch name (`sync_inbound.display_name`, §D1) carried in the v2
+    /// announce, or `None` for a v1/unnamed batch. Shown instead of the raw
+    /// package id.
+    pub display_name: Option<String>,
+    /// The sending peer's friendly device name, resolved from the cached
+    /// `SYNC_DEVICE_NAMES` hex→name map (no hub round-trip). `None` when unknown.
+    pub device_name: Option<String>,
+    /// Backend-derived presentation state (§D5): `announced` | `fetching` |
+    /// `ingesting` | `done` | `cancelled` | `failed`. Currently mirrors the raw
+    /// [`state`](Self::state) (the receiver has no `waiting`/backoff concept yet).
+    pub display_state: String,
+    /// Always `None` for inbound in v2 (no receiver-side retry backoff yet);
+    /// present for shape-parity with [`OutboundSummary`].
+    pub stalled_until: Option<String>,
+    /// Per-file rollup for the progress line ("N of M files").
+    pub file_counts: TransferFileCounts,
 }
 
 /// Send-side rollup: live in-flight counts from the engine's non-terminal
@@ -106,19 +203,29 @@ pub struct SyncReceiverStatus {
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferFileEntry {
-    /// The file's basename within the package.
+    /// The file's path relative to the batch root (forward-slash, structured per
+    /// §D2) — the primary key of the per-file tables (Transfers Status Model v2).
+    /// Drives the detail pane's collapsible directory tree. For a legacy pre-v2
+    /// batch with no per-file rows this falls back to the manifest `rel_path`
+    /// (sent) or the history `filename` (received).
+    pub rel_path: String,
+    /// The file's basename within the package (kept for compat).
     pub name: String,
-    /// The file's payload size in bytes (from the manifest).
+    /// The file's payload size in bytes (from the per-file row / manifest).
     pub bytes_total: u64,
-    /// Cumulative bytes received for this file, when known (incoming detail); the
-    /// live per-file bars are event-driven via `sync-file-progress`, so this is
-    /// `None` mid-fetch and populated from history once the package is terminal.
+    /// Cumulative bytes transferred for this file, when known; `None` on the
+    /// legacy fallback path where no per-file row exists.
     pub bytes_done: Option<u64>,
-    /// Per-frame outcome once settled: outgoing — the peer's ack verdict recorded
-    /// in this sender's confirmed history (`ingested`/`duplicate`/`rejected`/…),
-    /// `None` while the send is still in flight; incoming — the receiver's verdict
-    /// from history. `None` when not yet known.
+    /// Per-file lifecycle state (`pending`/`sending`/`uploaded`/`done` outgoing;
+    /// `announced`/`fetching`/`done`/`failed` incoming), from the per-file row.
+    /// `None` on the legacy fallback path.
+    pub state: Option<String>,
+    /// Per-frame outcome once settled: outgoing — the peer's ack verdict
+    /// (`ingested`/`duplicate`/`rejected`/…); incoming — this node's ingest
+    /// verdict. `None` while still in flight / not yet known.
     pub outcome: Option<String>,
+    /// A per-file error detail when this file's transfer failed, else `None`.
+    pub error: Option<String>,
 }
 
 /// Queryable transport-health surface for the Transfers UI (Task 3.3): whether
@@ -192,4 +299,79 @@ pub struct SyncStatus {
     /// Transport reachability health (Task 3.3): relay connected / direct-only /
     /// no relay map / not started. Drives the sidebar badge's health dot.
     pub transport: TransportHealth,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    /// RFC3339 stamp `secs` from `base` (positive = future, negative = past),
+    /// formatted exactly like the engine's `next_retry_at`.
+    fn offset(base: DateTime<Utc>, secs: i64) -> String {
+        (base + Duration::seconds(secs)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    #[test]
+    fn outbound_display_state_maps_every_raw_state_without_retry() {
+        let now = Utc::now();
+        let cases = [
+            (OutboundState::Queued, "queued"),
+            (OutboundState::Announced, "preparing"),
+            (OutboundState::Transferring, "transferring"),
+            (OutboundState::Delivered, "uploaded"),
+            (OutboundState::Confirmed, "confirmed"),
+            (OutboundState::Failed, "failed"),
+            (OutboundState::Cancelled, "cancelled"),
+        ];
+        for (state, expected) in cases {
+            assert_eq!(outbound_display_state(state, None, now), expected, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn armed_future_retry_wins_over_raw_state_for_non_terminal() {
+        let now = Utc::now();
+        let future = offset(now, 30);
+        // Every non-terminal raw state → waiting when a future retry is armed.
+        for state in [
+            OutboundState::Queued,
+            OutboundState::Announced,
+            OutboundState::Transferring,
+            OutboundState::Delivered,
+        ] {
+            assert_eq!(
+                outbound_display_state(state, Some(&future), now),
+                "waiting",
+                "{state:?} with a future retry should be waiting"
+            );
+        }
+    }
+
+    #[test]
+    fn armed_past_retry_does_not_win() {
+        let now = Utc::now();
+        let past = offset(now, -30);
+        assert_eq!(outbound_display_state(OutboundState::Transferring, Some(&past), now), "transferring");
+        assert_eq!(outbound_display_state(OutboundState::Announced, Some(&past), now), "preparing");
+    }
+
+    #[test]
+    fn terminal_states_never_show_waiting_even_if_armed() {
+        let now = Utc::now();
+        let future = offset(now, 30);
+        // A terminal row never shows waiting, even if a stale next_retry_at lingers.
+        assert_eq!(outbound_display_state(OutboundState::Confirmed, Some(&future), now), "confirmed");
+        assert_eq!(outbound_display_state(OutboundState::Failed, Some(&future), now), "failed");
+        assert_eq!(outbound_display_state(OutboundState::Cancelled, Some(&future), now), "cancelled");
+    }
+
+    #[test]
+    fn unparseable_retry_deadline_falls_through_to_raw_state() {
+        let now = Utc::now();
+        assert_eq!(
+            outbound_display_state(OutboundState::Transferring, Some("not-a-date"), now),
+            "transferring"
+        );
+    }
 }

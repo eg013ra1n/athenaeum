@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tauri::{AppHandle, State};
 
 use athenaeum_core::api::sync as api;
-use athenaeum_core::api::sync::{EnqueueSelectionResult, SyncHistoryQuery};
+use athenaeum_core::api::sync::{EnqueueSelectionResult, SyncHistoryQuery, TransferEventEntry};
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
 
@@ -65,6 +65,18 @@ pub async fn list_transfer_files(
     id: i64,
 ) -> Result<Vec<TransferFileEntry>, String> {
     api::list_transfer_files(&state.ctx, direction, id).map_err(|e| e.to_string())
+}
+
+/// The event journal for one transfer batch (Transfers Status Model v2 §D7),
+/// newest-first — the detail pane's Log tab. Fired on detail-pane open.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn list_transfer_events(
+    state: State<'_, AppState>,
+    direction: Direction,
+    id: i64,
+) -> Result<Vec<TransferEventEntry>, String> {
+    api::list_transfer_events(&state.ctx, direction, id).map_err(|e| e.to_string())
 }
 
 /// Explicit-target send (sync 2C): enqueue the eligible frames of a selection to
