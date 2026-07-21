@@ -363,7 +363,10 @@ impl SyncReceiver {
             tracing::info!(staging_root = %staging_root.display(), "sync receiver online");
             while let Some(ev) = events.recv().await {
                 match ev {
-                    TransportEvent::AnnounceReceived { from, announce, batch_name, files } => {
+                    // `batch_uuid` (spec §D2) is threaded through the transport but
+                    // not yet consumed by the receiver — B4 keys the inbound row on
+                    // it. Deliberately ignored here (no behavior change in B1).
+                    TransportEvent::AnnounceReceived { from, announce, batch_name, batch_uuid: _, files } => {
                         // Authorization gate (finding H1): only ingest from a peer
                         // on this receiver's allow-list. An unauthorized (or
                         // revoked) node is silently dropped BEFORE any
@@ -491,6 +494,17 @@ impl SyncReceiver {
                             );
                         }
                     },
+                    // A sender revoked an outstanding announce (spec §D2). No
+                    // consumer wires the abort/cleanup yet (B4) — log and ignore it
+                    // for now (never dropped silently without a trace).
+                    TransportEvent::RevokeReceived { from, package_id, reason } => {
+                        tracing::debug!(
+                            from = %super::node_id_hex(&from),
+                            package_id = %package_id.0,
+                            ?reason,
+                            "sync receiver received revoke (no handler yet; ignoring)"
+                        );
+                    }
                     // `AckReceived` is the sender's half — the receiver loop does
                     // not consume it.
                     _ => {}
@@ -2046,7 +2060,7 @@ mod tests {
         let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
         assert!(announce.byte_size > 0, "fixture package has non-zero bytes");
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
-        sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
+        sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
 
         // The terminal Done write lands just after the receiver acks — poll for it.
         let mut final_row = None;
@@ -2140,7 +2154,7 @@ mod tests {
         // per-frame-rejected "all frames rejected" path.
         std::fs::remove_file(pkg_dir.join(crate::package::MANIFEST_FILENAME)).unwrap();
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
-        sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
+        sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
 
         // The Failed write lands once the ingest join error propagates — poll for it.
         let mut final_row = None;
@@ -2297,7 +2311,7 @@ mod tests {
 
         // Cancel BEFORE the announce, then announce.
         control.request_cancel(&announce.package_id.0);
-        sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
+        sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
 
         // (b) The sender observes an all-Cancelled ack, one receipt per frame.
         let (ack_pkg, ack_receipts) = recv_ack(&mut sender_events).await;
@@ -2337,7 +2351,7 @@ mod tests {
         // (d) A second announce replays the cancel from the receipt log WITHOUT
         //     re-fetching — the replay path emits ok_count == frame_count (the
         //     epilogue would emit 0), so this discriminates replay from re-fetch.
-        sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
+        sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
         let (_pkg2, ack2) = recv_ack(&mut sender_events).await;
         assert!(
             ack2.iter().all(|r| matches!(r.outcome, ReceiptOutcome::Cancelled)),
@@ -2551,7 +2565,7 @@ mod tests {
 
         let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
-        sender.announce(receiver_node, &announce, "M31 Lights", &files).await.unwrap();
+        sender.announce(receiver_node, &announce, "M31 Lights", "", &files).await.unwrap();
 
         let row = poll_inbound(&store, &announce.package_id.0, InboundState::Done).await;
         assert_eq!(row.display_name.as_deref(), Some("M31 Lights"), "the batch name is persisted");
@@ -2640,7 +2654,7 @@ mod tests {
         let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
         // v1: blank name, empty manifest (the loopback delivers Some("")/Some(vec![])).
-        sender.announce(receiver_node, &announce, "", &[]).await.unwrap();
+        sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
 
         let row = poll_inbound(&store, &announce.package_id.0, InboundState::Done).await;
         assert!(row.display_name.is_none(), "a v1 announce records no name");
@@ -2697,7 +2711,7 @@ mod tests {
 
         // Cancel BEFORE the announce → the epilogue runs (manifest still recorded).
         control.request_cancel(&announce.package_id.0);
-        sender.announce(receiver_node, &announce, "M31 Lights", &files).await.unwrap();
+        sender.announce(receiver_node, &announce, "M31 Lights", "", &files).await.unwrap();
 
         let row = poll_inbound(&store, &announce.package_id.0, InboundState::Cancelled).await;
 

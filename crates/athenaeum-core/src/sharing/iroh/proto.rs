@@ -27,7 +27,10 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::sharing::types::{FrameReceipt, PackageAnnounce, PackageAnnounceV2, PackageId};
+use crate::sharing::types::{
+    FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV2, PackageAnnounceV3, PackageId,
+    RevokeReason, TransportEvent,
+};
 
 /// One frame the provider could send, as advertised in a [`Msg::Offer`].
 ///
@@ -118,6 +121,101 @@ pub enum Msg {
     // receive side still decodes legacy `Announce` (v1) byte-for-byte.
     /// Provider advertises a fetchable package with its v2 manifest + batch name.
     Announce2(PackageAnnounceV2),
+    // Transfers-batch-model announce + revoke (spec §D2) — appended AFTER
+    // `Announce2` as the LAST two variants; every index above stays frozen (same
+    // append-only rule as the blocks above). `Announce3` is the v3 counterpart of
+    // `Announce2`: it adds the durable per-transfer `batch_uuid` so the receiver
+    // keeps ONE row per transfer across re-attempts. The app sender emits only
+    // `Announce3`; the receive side still decodes legacy `Announce` (v1) and
+    // `Announce2` (v2) byte-for-byte, falling back to the wire `package_id` as the
+    // batch key. `Revoke` is a one-shot, best-effort sender→receiver control
+    // signal to abort an outstanding announce.
+    /// Provider advertises a fetchable package with its v3 batch identity.
+    Announce3(PackageAnnounceV3),
+    /// Sender revokes an outstanding announce (abort the pending/in-flight transfer).
+    Revoke {
+        package_id: PackageId,
+        reason: RevokeReason,
+    },
+}
+
+/// Map a decoded *announce* control message — `Announce` (v1), `Announce2` (v2),
+/// or `Announce3` (v3) — to its in-process
+/// [`AnnounceReceived`](TransportEvent::AnnounceReceived) event, applying the
+/// batch-identity migration fallback (spec §D2 Migration): v3 carries
+/// `batch_uuid` on the wire; a legacy v1/v2 announce predates it, so the receiver
+/// adopts the wire `package_id` as the `batch_uuid` (guaranteeing ONE stable
+/// per-transfer key on every path). Shared by the transport accept loop and its
+/// wire-golden fallback test so the mapping cannot drift.
+///
+/// # Panics
+/// Only ever called on an announce variant (the accept loop guards the call);
+/// any other `Msg` is a caller bug and hits `unreachable!`.
+pub(crate) fn announce_received_from_msg(from: NodeId, msg: Msg) -> TransportEvent {
+    match msg {
+        // v1 announce (e.g. Perseus beta.3): no manifest extras; batch key falls
+        // back to the wire package id.
+        Msg::Announce(announce) => {
+            let batch_uuid = announce.package_id.0.clone();
+            TransportEvent::AnnounceReceived {
+                from,
+                announce,
+                batch_name: None,
+                batch_uuid,
+                files: None,
+            }
+        }
+        // v2 announce: split the manifest extras off the wire struct; batch key
+        // still falls back to the wire package id (v2 predates batch identity).
+        Msg::Announce2(v2) => {
+            let PackageAnnounceV2 {
+                package_id,
+                root_hash,
+                byte_size,
+                frame_count,
+                batch_name,
+                files,
+            } = v2;
+            let batch_uuid = package_id.0.clone();
+            TransportEvent::AnnounceReceived {
+                from,
+                announce: PackageAnnounce {
+                    package_id,
+                    root_hash,
+                    byte_size,
+                    frame_count,
+                },
+                batch_name: Some(batch_name),
+                batch_uuid,
+                files: Some(files),
+            }
+        }
+        // v3 announce: the durable `batch_uuid` rides the wire — use it verbatim.
+        Msg::Announce3(v3) => {
+            let PackageAnnounceV3 {
+                package_id,
+                root_hash,
+                byte_size,
+                frame_count,
+                batch_name,
+                batch_uuid,
+                files,
+            } = v3;
+            TransportEvent::AnnounceReceived {
+                from,
+                announce: PackageAnnounce {
+                    package_id,
+                    root_hash,
+                    byte_size,
+                    frame_count,
+                },
+                batch_name: Some(batch_name),
+                batch_uuid,
+                files: Some(files),
+            }
+        }
+        other => unreachable!("announce_received_from_msg called with non-announce Msg: {other:?}"),
+    }
 }
 
 impl Msg {
@@ -207,6 +305,29 @@ mod tests {
         }
     }
 
+    fn sample_announce_v3() -> PackageAnnounceV3 {
+        PackageAnnounceV3 {
+            package_id: PackageId("pkg-uuid-1".to_string()),
+            root_hash: "blake3-collection-hash".to_string(),
+            byte_size: 4096,
+            frame_count: 3,
+            batch_name: "Туманность M31".to_string(),
+            batch_uuid: "batch-uuid-9".to_string(),
+            files: vec![
+                AnnounceFileEntry {
+                    rel_path: "M31/L_0001.fits".to_string(),
+                    byte_size: 4096,
+                    frame_uuid: "frame-uuid-1".to_string(),
+                },
+                AnnounceFileEntry {
+                    rel_path: "M31/L_0002.fits".to_string(),
+                    byte_size: 2048,
+                    frame_uuid: "frame-uuid-2".to_string(),
+                },
+            ],
+        }
+    }
+
     #[test]
     fn announce_roundtrips_through_postcard() {
         let msg = Msg::Announce(sample_announce());
@@ -238,6 +359,99 @@ mod tests {
             let bytes = postcard::to_stdvec(&v2).unwrap();
             let back: PackageAnnounceV2 = postcard::from_bytes(&bytes).unwrap();
             assert_eq!(v2, back);
+        }
+    }
+
+    #[test]
+    fn announce3_roundtrips_through_postcard() {
+        let msg = Msg::Announce3(sample_announce_v3());
+        let bytes = msg.encode().unwrap();
+        let back = Msg::decode(&bytes).unwrap();
+        assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn package_announce_v3_roundtrips_through_postcard() {
+        // The embedded struct roundtrips on its own, including the non-ASCII batch
+        // name, an empty manifest, and an empty batch_uuid.
+        for v3 in [
+            sample_announce_v3(),
+            PackageAnnounceV3 {
+                files: Vec::new(),
+                batch_name: String::new(),
+                batch_uuid: String::new(),
+                ..sample_announce_v3()
+            },
+        ] {
+            let bytes = postcard::to_stdvec(&v3).unwrap();
+            let back: PackageAnnounceV3 = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(v3, back);
+        }
+    }
+
+    #[test]
+    fn revoke_roundtrips_through_postcard_for_every_reason() {
+        for reason in [
+            RevokeReason::Cancelled,
+            RevokeReason::Superseded,
+            RevokeReason::Failed,
+        ] {
+            let msg = Msg::Revoke {
+                package_id: PackageId("pkg-uuid-1".to_string()),
+                reason,
+            };
+            let back = Msg::decode(&msg.encode().unwrap()).unwrap();
+            assert_eq!(msg, back);
+        }
+    }
+
+    #[test]
+    fn announce_received_from_msg_maps_every_version() {
+        let from: NodeId = [7u8; 32];
+
+        // v3 carries the durable batch_uuid on the wire — use it verbatim.
+        match announce_received_from_msg(from, Msg::Announce3(sample_announce_v3())) {
+            TransportEvent::AnnounceReceived {
+                batch_uuid,
+                batch_name,
+                files,
+                announce,
+                ..
+            } => {
+                assert_eq!(batch_uuid, "batch-uuid-9");
+                assert_eq!(batch_name.as_deref(), Some("Туманность M31"));
+                assert!(files.is_some());
+                assert_eq!(announce.package_id, PackageId("pkg-uuid-1".to_string()));
+            }
+            other => panic!("expected AnnounceReceived, got {other:?}"),
+        }
+
+        // v2 predates batch identity — batch_uuid falls back to the wire package id.
+        match announce_received_from_msg(from, Msg::Announce2(sample_announce_v2())) {
+            TransportEvent::AnnounceReceived {
+                batch_uuid,
+                batch_name,
+                ..
+            } => {
+                assert_eq!(batch_uuid, "pkg-uuid-1");
+                assert_eq!(batch_name.as_deref(), Some("Туманность M31"));
+            }
+            other => panic!("expected AnnounceReceived, got {other:?}"),
+        }
+
+        // v1 predates the extras entirely — no batch_name/files, batch_uuid == wire id.
+        match announce_received_from_msg(from, Msg::Announce(sample_announce())) {
+            TransportEvent::AnnounceReceived {
+                batch_uuid,
+                batch_name,
+                files,
+                ..
+            } => {
+                assert_eq!(batch_uuid, "pkg-uuid-1");
+                assert!(batch_name.is_none());
+                assert!(files.is_none());
+            }
+            other => panic!("expected AnnounceReceived, got {other:?}"),
         }
     }
 

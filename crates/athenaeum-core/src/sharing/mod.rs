@@ -29,7 +29,7 @@ mod wire_golden_tests;
 
 pub use types::{
     AnnounceFileEntry, FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV2,
-    PackageId, ReceiptOutcome, StartInfo, TransportEvent,
+    PackageAnnounceV3, PackageId, ReceiptOutcome, RevokeReason, StartInfo, TransportEvent,
 };
 
 /// A callback that receives live [`FetchEvent`]s while a [`fetch`] is in flight.
@@ -64,19 +64,43 @@ pub trait SharingTransport: Send + Sync {
 
     /// Broadcast a package announcement to peer `to`.
     ///
-    /// The app sender emits only v2: implementors encode a `Msg::Announce2`
-    /// carrying `a`'s fields plus `batch_name` (a human batch display name) and
-    /// `files` (the full manifest). Until the send-path task supplies real values
-    /// a caller may pass the package-dir basename as `batch_name` and an empty
-    /// `files` slice. The receive side accepts both v2 and legacy v1
-    /// (`Msg::Announce`, extras `None`) announces.
+    /// The app sender emits only v3: implementors encode a `Msg::Announce3`
+    /// carrying `a`'s fields plus `batch_name` (a human batch display name),
+    /// `batch_uuid` (the durable per-transfer identity, spec §D2), and `files`
+    /// (the full manifest). The engine passes the package-dir basename as
+    /// `batch_uuid` — which per spec D1/B3 IS the final batch identity for an
+    /// outbound transfer, so it is the real value, not a placeholder. The receive
+    /// side accepts all three announce versions; a legacy v1 (`Msg::Announce`,
+    /// extras `None`) / v2 (`Msg::Announce2`) announce falls back to the wire
+    /// `package_id` as its `batch_uuid`.
     async fn announce(
         &self,
         to: NodeId,
         a: &PackageAnnounce,
         batch_name: &str,
+        batch_uuid: &str,
         files: &[AnnounceFileEntry],
     ) -> anyhow::Result<()>;
+
+    /// Revoke an outstanding announce to peer `to` (spec §D2): tell the receiver
+    /// to abort the pending / in-flight transfer for `package_id` (the current
+    /// attempt's wire id) because it was `reason` (cancelled / superseded /
+    /// failed). A one-shot, best-effort control message — the caller (B3)
+    /// log-and-continues on `Err`; it never fails a sender state transition. No
+    /// caller wires this yet.
+    ///
+    /// The default bails (like the project methods): a transport without revoke
+    /// support fails loudly rather than silently swallowing a revoke. The two real
+    /// iroh transports and the in-process loopback mock override it.
+    async fn revoke(
+        &self,
+        to: NodeId,
+        package_id: &PackageId,
+        reason: crate::sharing::types::RevokeReason,
+    ) -> anyhow::Result<()> {
+        let _ = (to, package_id, reason);
+        anyhow::bail!("transport does not support revoke")
+    }
 
     /// Pull a package (manifest + blobs) from `from` into `dest_dir`.
     ///

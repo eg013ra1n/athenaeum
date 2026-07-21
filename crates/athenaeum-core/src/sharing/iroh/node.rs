@@ -54,8 +54,8 @@ use tokio::task::JoinHandle;
 
 use crate::account::keys::{device_key_path, DeviceKey, DeviceKeyLock};
 use crate::sharing::types::{
-    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV2, PackageId,
-    StartInfo, TransportEvent,
+    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageId,
+    RevokeReason, StartInfo, TransportEvent,
 };
 use crate::sharing::{FetchSink, SharingTransport};
 use crate::sync::status::TransportHealth;
@@ -374,6 +374,7 @@ impl EventDemux {
                     .remove(&(*from, package_id.clone()))
                     .map(|(_, tx)| tx),
                 TransportEvent::AnnounceReceived { .. }
+                | TransportEvent::RevokeReceived { .. }
                 | TransportEvent::ProjectAnnounceReceived { .. }
                 | TransportEvent::ProjectRequestReceived { .. } => {
                     inner.recv.as_ref().map(|(_, tx)| tx.clone())
@@ -520,6 +521,7 @@ impl EventDemux {
 fn event_kind_and_peer(event: &TransportEvent) -> (&'static str, NodeId) {
     match event {
         TransportEvent::AnnounceReceived { from, .. } => ("announce", *from),
+        TransportEvent::RevokeReceived { from, .. } => ("revoke", *from),
         TransportEvent::AckReceived { from, .. } => ("ack", *from),
         TransportEvent::ProjectAnnounceReceived { from, .. } => ("project_announce", *from),
         TransportEvent::ProjectRequestReceived { from, .. } => ("project_request", *from),
@@ -1569,6 +1571,7 @@ impl SharedIrohNode {
         to: NodeId,
         a: &PackageAnnounce,
         batch_name: &str,
+        batch_uuid: &str,
         files: &[AnnounceFileEntry],
     ) -> Result<()> {
         let tag = role_package_tag(role.prefix(), &a.package_id);
@@ -1583,17 +1586,40 @@ impl SharedIrohNode {
                 ),
             }
         }
-        // The app sender emits only v2: carry the batch name + manifest.
-        let wire_v2 = PackageAnnounceV2 {
+        // The app sender emits only v3: carry the batch name + durable batch_uuid
+        // + manifest.
+        let wire_v3 = PackageAnnounceV3 {
             package_id: wire.package_id,
             root_hash: wire.root_hash,
             byte_size: wire.byte_size,
             frame_count: wire.frame_count,
             batch_name: batch_name.to_string(),
+            batch_uuid: batch_uuid.to_string(),
             files: files.to_vec(),
         };
-        self.send_control(to, Msg::Announce2(wire_v2)).await?;
+        self.send_control(to, Msg::Announce3(wire_v3)).await?;
         tracing::debug!(to = %hex32(&to), package_id = %a.package_id.0, "iroh announce sent");
+        Ok(())
+    }
+
+    async fn revoke_inner(
+        &self,
+        to: NodeId,
+        package_id: &PackageId,
+        reason: RevokeReason,
+    ) -> Result<()> {
+        // One-shot best-effort control message (spec §D2): tell the receiver to
+        // abort the transfer for `package_id`. `send_control` awaits the peer's
+        // delivery ack; the caller (B3) log-and-continues on Err.
+        self.send_control(
+            to,
+            Msg::Revoke {
+                package_id: package_id.clone(),
+                reason,
+            },
+        )
+        .await?;
+        tracing::debug!(to = %hex32(&to), package_id = %package_id.0, ?reason, "iroh revoke sent");
         Ok(())
     }
 
@@ -1903,6 +1929,7 @@ impl SharingTransport for RoleHandle {
         to: NodeId,
         a: &PackageAnnounce,
         batch_name: &str,
+        batch_uuid: &str,
         files: &[AnnounceFileEntry],
     ) -> Result<()> {
         // Claim the eventual ack for THIS handle before announcing; release the
@@ -1910,12 +1937,23 @@ impl SharingTransport for RoleHandle {
         self.claim_ack(to, &a.package_id);
         let res = self
             .node
-            .role_announce(self.role, to, a, batch_name, files)
+            .role_announce(self.role, to, a, batch_name, batch_uuid, files)
             .await;
         if res.is_err() {
             self.node.demux.release_claim(&(to, a.package_id.clone()));
         }
         res
+    }
+
+    async fn revoke(
+        &self,
+        to: NodeId,
+        package_id: &PackageId,
+        reason: RevokeReason,
+    ) -> Result<()> {
+        // Best-effort control message; no ack-claim to manage (revoke never
+        // correlates a return receipt). Routes to the shared node's send path.
+        self.node.revoke_inner(to, package_id, reason).await
     }
 
     async fn fetch(
@@ -2485,7 +2523,7 @@ mod tests {
         let mut out_events = out.events().await;
         let mut r_ev = recv.events().await;
 
-        out.announce(r_info.node_id, &announce, "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &announce, "", "", &[]).await.unwrap();
         let wire = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce,
             other => panic!("expected AnnounceReceived, got {other:?}"),
@@ -2586,7 +2624,7 @@ mod tests {
         // route_serve_progress / route_serve_complete to target.
         let mut out_events = out.events().await;
         let mut r_ev = recv.events().await;
-        out.announce(r_info.node_id, &announce, "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &announce, "", "", &[]).await.unwrap();
         let wire = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce,
             other => panic!("expected AnnounceReceived, got {other:?}"),
@@ -2721,7 +2759,7 @@ mod tests {
         // route_serve_file_progress to target.
         let mut out_events = out.events().await;
         let mut r_ev = recv.events().await;
-        out.announce(r_info.node_id, &announce, "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &announce, "", "", &[]).await.unwrap();
         let wire = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce,
             other => panic!("expected AnnounceReceived, got {other:?}"),
@@ -2814,7 +2852,7 @@ mod tests {
 
         let mut out_events = out.events().await;
         let mut r_ev = recv.events().await;
-        out.announce(r_info.node_id, &announce, "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &announce, "", "", &[]).await.unwrap();
         let wire = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce,
             other => panic!("expected AnnounceReceived, got {other:?}"),
@@ -2941,8 +2979,8 @@ mod tests {
 
         // Announce to the two distinct peers (delivery completes when each
         // receiver's Recv consumer receives the announce).
-        out_a.announce(r1_info.node_id, &p1, "", &[]).await.unwrap();
-        out_b.announce(r2_info.node_id, &p2, "", &[]).await.unwrap();
+        out_a.announce(r1_info.node_id, &p1, "", "", &[]).await.unwrap();
+        out_b.announce(r2_info.node_id, &p2, "", "", &[]).await.unwrap();
 
         // Each receiver observes its own announce, then acks back to the sender.
         let pid1 = match recv_next(&mut r1_ev).await {
@@ -3012,8 +3050,8 @@ mod tests {
 
         // ONE package id, announced to two peers.
         let pkg = mk_announce("shared-pkg");
-        out.announce(r1_info.node_id, &pkg, "", &[]).await.unwrap();
-        out.announce(r2_info.node_id, &pkg, "", &[]).await.unwrap();
+        out.announce(r1_info.node_id, &pkg, "", "", &[]).await.unwrap();
+        out.announce(r2_info.node_id, &pkg, "", "", &[]).await.unwrap();
         assert_eq!(s.active_claims(), 2, "two distinct (peer, package) claims");
 
         let pid1 = match recv_next(&mut r1_ev).await {
@@ -3081,7 +3119,7 @@ mod tests {
 
         let pkg = mk_announce("orphan-pkg");
         let outcome =
-            tokio::time::timeout(Duration::from_secs(5), out.announce(r_info.node_id, &pkg, "", &[])).await;
+            tokio::time::timeout(Duration::from_secs(5), out.announce(r_info.node_id, &pkg, "", "", &[])).await;
         assert!(
             !matches!(outcome, Ok(Ok(()))),
             "an orphan announce must not receive a silent delivery ack, got {outcome:?}"
@@ -3124,8 +3162,8 @@ mod tests {
         let mut r_ev = recv.events().await; // Recv consumer → announces deliver + ack
         let pkg = mk_announce("pool-pkg");
 
-        out.announce(r_info.node_id, &pkg, "", &[]).await.unwrap();
-        out.announce(r_info.node_id, &pkg, "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &pkg, "", "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &pkg, "", "", &[]).await.unwrap();
 
         // Both delivered to the receiver's single Recv consumer.
         let _ = recv_next(&mut r_ev).await;
@@ -3264,7 +3302,7 @@ mod tests {
         let mut acks = out.events().await;
         let mut r_ev = recv.events().await;
         let pkg1 = mk_announce("pre-swap");
-        out.announce(r_info.node_id, &pkg1, "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &pkg1, "", "", &[]).await.unwrap();
         let pid1 = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce.package_id,
             other => panic!("expected AnnounceReceived pre-swap, got {other:?}"),
@@ -3301,7 +3339,7 @@ mod tests {
         // re-homed in place, its direct addr unchanged. A rebuild would have reset
         // the pool and forced a re-dial here.
         let pkg2 = mk_announce("post-swap");
-        out.announce(r_info.node_id, &pkg2, "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &pkg2, "", "", &[]).await.unwrap();
         let pid2 = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce.package_id,
             other => panic!("expected AnnounceReceived post-swap, got {other:?}"),
@@ -3432,7 +3470,7 @@ mod tests {
         let pkg_denied = mk_announce("post-swap-denied");
         let outcome = tokio::time::timeout(
             Duration::from_secs(15),
-            out_denied.announce(r_info.node_id, &pkg_denied, "", &[]),
+            out_denied.announce(r_info.node_id, &pkg_denied, "", "", &[]),
         )
         .await;
         match outcome {
@@ -3453,7 +3491,7 @@ mod tests {
         // (2) An allowed peer is STILL admitted after the hot-swap.
         let pkg_allowed = mk_announce("post-swap-allowed");
         out_allowed
-            .announce(r_info.node_id, &pkg_allowed, "", &[])
+            .announce(r_info.node_id, &pkg_allowed, "", "", &[])
             .await
             .expect("an allowed peer must still be admitted after the relay hot-swap");
         match recv_next(&mut r_events).await {

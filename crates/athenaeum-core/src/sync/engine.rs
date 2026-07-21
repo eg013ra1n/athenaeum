@@ -1103,6 +1103,10 @@ impl Worker {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // Durable batch identity (spec §D2/B3): the package-dir basename IS the
+        // final batch_uuid for an outbound transfer, stable across re-attempts, so
+        // this is the real value the receiver keys ONE row on — not a placeholder.
+        let batch_uuid = pkg_basename.clone();
         let batch_name = match self.store.get_outbound(id) {
             Ok(Some(row)) => row
                 .display_name
@@ -1150,7 +1154,7 @@ impl Worker {
                     .context("announce project package"),
                 None => self
                     .transport
-                    .announce(self.peer, &announce, &batch_name, &announce_files)
+                    .announce(self.peer, &announce, &batch_name, &batch_uuid, &announce_files)
                     .await
                     .context("announce package"),
             }
@@ -1592,6 +1596,9 @@ impl Worker {
             // Inbound announcements are the receiver's concern (task A7), not
             // this sender-side engine's.
             TransportEvent::AnnounceReceived { .. } => Ok(()),
+            // A sender's revoke is likewise the receiver's concern (spec §D2 / B4);
+            // this sender-side engine never consumes its own revoke.
+            TransportEvent::RevokeReceived { .. } => Ok(()),
             // Inbound project advertisements / pull requests (collab exchange,
             // slice 4) are handled by the receive side, not this sender engine.
             TransportEvent::ProjectAnnounceReceived { .. }

@@ -26,15 +26,17 @@
 //!
 //! Scope: the postcard control wire only — the `Msg` envelope (`proto.rs`) and
 //! every type it embeds (`PackageAnnounce`, `PackageId`, `FrameReceipt` with all
-//! four `ReceiptOutcome` variants, `OfferEntry`, `FullHashEntry`, and the v2
-//! `PackageAnnounceV2` + `AnnounceFileEntry`). `TransportEvent` / `StartInfo` are
-//! in-process only (no serde, never serialized). The package manifest is JSON +
-//! `MANIFEST_VERSION`-versioned (field-named, not positional), so it is not part
-//! of this positional-fragility guard.
+//! four `ReceiptOutcome` variants, `OfferEntry`, `FullHashEntry`, the v2
+//! `PackageAnnounceV2` + `AnnounceFileEntry`, and the v3 `PackageAnnounceV3` +
+//! `RevokeReason`). `TransportEvent` / `StartInfo` are in-process only (no serde,
+//! never serialized). The package manifest is JSON + `MANIFEST_VERSION`-versioned
+//! (field-named, not positional), so it is not part of this positional-fragility
+//! guard.
 
-use crate::sharing::iroh::proto::{FullHashEntry, Msg, OfferEntry};
+use crate::sharing::iroh::proto::{announce_received_from_msg, FullHashEntry, Msg, OfferEntry};
 use crate::sharing::types::{
-    AnnounceFileEntry, FrameReceipt, PackageAnnounce, PackageAnnounceV2, PackageId, ReceiptOutcome,
+    AnnounceFileEntry, FrameReceipt, PackageAnnounce, PackageAnnounceV2, PackageAnnounceV3,
+    PackageId, ReceiptOutcome, RevokeReason, TransportEvent,
 };
 
 /// Render bytes as lowercase hex, matching the pinned-literal format below.
@@ -95,6 +97,20 @@ fn sample_announce_v2() -> PackageAnnounceV2 {
         byte_size: 4096,
         frame_count: 3,
         batch_name: "Туманность".to_string(),
+        files: vec![sample_announce_file_entry()],
+    }
+}
+
+/// V3 announce sample — the v2 fields + a durable `batch_uuid`, keeping the
+/// NON-ASCII batch name so the golden pins the UTF-8 string encoding too.
+fn sample_announce_v3() -> PackageAnnounceV3 {
+    PackageAnnounceV3 {
+        package_id: PackageId("pkg-uuid-1".to_string()),
+        root_hash: "blake3-collection-hash".to_string(),
+        byte_size: 4096,
+        frame_count: 3,
+        batch_name: "Туманность".to_string(),
+        batch_uuid: "batch-uuid-9".to_string(),
         files: vec![sample_announce_file_entry()],
     }
 }
@@ -160,6 +176,19 @@ fn golden_cases() -> Vec<(&'static str, Vec<u8>, &'static str)> {
             "package_announce_v2",
             postcard::to_stdvec(&sample_announce_v2()).unwrap(),
             "0a706b672d757569642d3116626c616b65332d636f6c6c656374696f6e2d6861736880200314d0a2d183d0bcd0b0d0bdd0bdd0bed181d182d18c010f4d33312f4c5f303030312e666974730c0c6672616d652d757569642d31",
+        ),
+        // Transfers-batch-model embedded types.
+        (
+            "package_announce_v3",
+            postcard::to_stdvec(&sample_announce_v3()).unwrap(),
+            "0a706b672d757569642d3116626c616b65332d636f6c6c656374696f6e2d6861736880200314d0a2d183d0bcd0b0d0bdd0bdd0bed181d182d18c0c62617463682d757569642d39010f4d33312f4c5f303030312e666974730c0c6672616d652d757569642d31",
+        ),
+        // `RevokeReason` is a NEW enum — pin ONE sample (a non-zero variant,
+        // `Superseded` = 1) so a reorder of the variant ORDER trips the guard.
+        (
+            "revoke_reason",
+            postcard::to_stdvec(&RevokeReason::Superseded).unwrap(),
+            "01",
         ),
         // ── Msg envelope × every variant ────────────────────────────────────
         // The LEADING discriminant byte (00..=07) freezes the Msg variant ORDER.
@@ -241,6 +270,22 @@ fn golden_cases() -> Vec<(&'static str, Vec<u8>, &'static str)> {
             Msg::Announce2(sample_announce_v2()).encode().unwrap(),
             "070a706b672d757569642d3116626c616b65332d636f6c6c656374696f6e2d6861736880200314d0a2d183d0bcd0b0d0bdd0bdd0bed181d182d18c010f4d33312f4c5f303030312e666974730c0c6672616d652d757569642d31",
         ),
+        // Transfers-batch-model: appended `Announce3` (disc 08) + `Revoke` (disc 09).
+        (
+            "msg_announce3",
+            Msg::Announce3(sample_announce_v3()).encode().unwrap(),
+            "080a706b672d757569642d3116626c616b65332d636f6c6c656374696f6e2d6861736880200314d0a2d183d0bcd0b0d0bdd0bdd0bed181d182d18c0c62617463682d757569642d39010f4d33312f4c5f303030312e666974730c0c6672616d652d757569642d31",
+        ),
+        (
+            "msg_revoke",
+            Msg::Revoke {
+                package_id: PackageId("pkg-uuid-1".to_string()),
+                reason: RevokeReason::Superseded,
+            }
+            .encode()
+            .unwrap(),
+            "090a706b672d757569642d3101",
+        ),
     ]
 }
 
@@ -264,8 +309,72 @@ fn wire_format_is_frozen() {
 /// deliberately when adding a new wire type + its golden (never to silence it).
 #[test]
 fn all_wire_types_are_pinned() {
-    // 10 embedded/standalone samples + 8 Msg variants = 18.
-    assert_eq!(golden_cases().len(), 18, "add a golden case for every new wire type");
+    // 12 embedded/standalone samples + 10 Msg variants = 22.
+    assert_eq!(golden_cases().len(), 22, "add a golden case for every new wire type");
+}
+
+/// Migration guard (spec §D2): the FROZEN v1/v2 announce byte-pins still decode,
+/// and the receive path assigns their `batch_uuid` from the wire `package_id`
+/// (they predate batch identity). The v3 pin carries `batch_uuid` on the wire, so
+/// its value is used verbatim. Exercises the SAME `announce_received_from_msg` the
+/// transport accept loop uses, against the exact pinned bytes.
+#[test]
+fn legacy_announce_bytes_decode_with_batch_uuid_fallback() {
+    let from = [7u8; 32];
+    // Pull the v1/v2/v3 announce Msg byte-images straight from the golden set, so
+    // this test is anchored to the exact frozen bytes.
+    let by_name = |name: &str| -> Vec<u8> {
+        golden_cases()
+            .into_iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, bytes, _)| bytes)
+            .unwrap_or_else(|| panic!("missing golden case {name}"))
+    };
+
+    // v1 `Msg::Announce` → batch_uuid falls back to the wire package id, no extras.
+    match announce_received_from_msg(from, Msg::decode(&by_name("msg_announce")).unwrap()) {
+        TransportEvent::AnnounceReceived {
+            batch_uuid,
+            batch_name,
+            files,
+            announce,
+            ..
+        } => {
+            assert_eq!(batch_uuid, announce.package_id.0);
+            assert_eq!(batch_uuid, "pkg-uuid-1");
+            assert!(batch_name.is_none());
+            assert!(files.is_none());
+        }
+        other => panic!("expected AnnounceReceived, got {other:?}"),
+    }
+
+    // v2 `Msg::Announce2` → batch_uuid still falls back to the wire package id.
+    match announce_received_from_msg(from, Msg::decode(&by_name("msg_announce2")).unwrap()) {
+        TransportEvent::AnnounceReceived {
+            batch_uuid,
+            batch_name,
+            announce,
+            ..
+        } => {
+            assert_eq!(batch_uuid, announce.package_id.0);
+            assert_eq!(batch_uuid, "pkg-uuid-1");
+            assert_eq!(batch_name.as_deref(), Some("Туманность"));
+        }
+        other => panic!("expected AnnounceReceived, got {other:?}"),
+    }
+
+    // v3 `Msg::Announce3` → batch_uuid comes from the wire verbatim.
+    match announce_received_from_msg(from, Msg::decode(&by_name("msg_announce3")).unwrap()) {
+        TransportEvent::AnnounceReceived {
+            batch_uuid,
+            batch_name,
+            ..
+        } => {
+            assert_eq!(batch_uuid, "batch-uuid-9");
+            assert_eq!(batch_name.as_deref(), Some("Туманность"));
+        }
+        other => panic!("expected AnnounceReceived, got {other:?}"),
+    }
 }
 
 /// One-off generator: prints `GOLDEN name = "hex"` for every sample so the pinned

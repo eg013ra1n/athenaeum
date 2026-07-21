@@ -61,8 +61,8 @@ use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::mpsc;
 
 use super::types::{
-    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV2, PackageId,
-    StartInfo, TransportEvent,
+    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageId,
+    RevokeReason, StartInfo, TransportEvent,
 };
 use super::{FetchSink, SharingTransport};
 use crate::sync::DedupResponder;
@@ -74,7 +74,7 @@ pub mod proto;
 #[cfg(test)]
 mod tests;
 
-use proto::{Msg, OfferEntry};
+use proto::{announce_received_from_msg, Msg, OfferEntry};
 
 /// Custom ALPN for the announce/ack control channel. Distinct from
 /// [`iroh_blobs::ALPN`] so the two protocols coexist on one endpoint.
@@ -1102,6 +1102,7 @@ impl SharingTransport for IrohTransport {
         to: NodeId,
         a: &PackageAnnounce,
         batch_name: &str,
+        batch_uuid: &str,
         files: &[AnnounceFileEntry],
     ) -> Result<()> {
         // Substitute the collection hash registered by `serve` so the receiver
@@ -1117,17 +1118,40 @@ impl SharingTransport for IrohTransport {
                 ),
             }
         }
-        // The app sender emits only v2: carry the batch name + manifest.
-        let wire_v2 = PackageAnnounceV2 {
+        // The app sender emits only v3: carry the batch name + durable batch_uuid
+        // + manifest.
+        let wire_v3 = PackageAnnounceV3 {
             package_id: wire.package_id,
             root_hash: wire.root_hash,
             byte_size: wire.byte_size,
             frame_count: wire.frame_count,
             batch_name: batch_name.to_string(),
+            batch_uuid: batch_uuid.to_string(),
             files: files.to_vec(),
         };
-        self.send_control(to, Msg::Announce2(wire_v2)).await?;
+        self.send_control(to, Msg::Announce3(wire_v3)).await?;
         tracing::debug!(to = %hex32(&to), package_id = %a.package_id.0, "iroh announce sent");
+        Ok(())
+    }
+
+    async fn revoke(
+        &self,
+        to: NodeId,
+        package_id: &PackageId,
+        reason: RevokeReason,
+    ) -> Result<()> {
+        // One-shot best-effort control message (spec §D2): tell the receiver to
+        // abort the transfer for `package_id`. `send_control` awaits the peer's
+        // delivery ack; the caller (B3) log-and-continues on Err.
+        self.send_control(
+            to,
+            Msg::Revoke {
+                package_id: package_id.clone(),
+                reason,
+            },
+        )
+        .await?;
+        tracing::debug!(to = %hex32(&to), package_id = %package_id.0, ?reason, "iroh revoke sent");
         Ok(())
     }
 
@@ -1561,35 +1585,12 @@ impl ProtocolHandler for SyncControlProtocol {
                 }
             };
             let event = match msg {
-                // v1 announce (e.g. Perseus beta.3): no manifest extras.
-                Msg::Announce(announce) => TransportEvent::AnnounceReceived {
-                    from,
-                    announce,
-                    batch_name: None,
-                    files: None,
-                },
-                // v2 announce: split the manifest extras off the wire struct and
-                // hand the v1 fields on unchanged so downstream code is agnostic.
-                Msg::Announce2(v2) => {
-                    let PackageAnnounceV2 {
-                        package_id,
-                        root_hash,
-                        byte_size,
-                        frame_count,
-                        batch_name,
-                        files,
-                    } = v2;
-                    TransportEvent::AnnounceReceived {
-                        from,
-                        announce: PackageAnnounce {
-                            package_id,
-                            root_hash,
-                            byte_size,
-                            frame_count,
-                        },
-                        batch_name: Some(batch_name),
-                        files: Some(files),
-                    }
+                // Announce v1 (e.g. Perseus beta.3) / v2 / v3 → AnnounceReceived.
+                // The shared mapping splits the manifest extras off the wire struct
+                // and applies the batch-identity fallback (v1/v2 → wire package id),
+                // so downstream code is version-agnostic.
+                m @ (Msg::Announce(_) | Msg::Announce2(_) | Msg::Announce3(_)) => {
+                    announce_received_from_msg(from, m)
                 }
                 Msg::Ack {
                     package_id,
@@ -1598,6 +1599,15 @@ impl ProtocolHandler for SyncControlProtocol {
                     from,
                     package_id,
                     receipts,
+                },
+                // Sender revoked an outstanding announce (spec §D2): forward it as
+                // an in-process event, then the b"1" delivery ack — the same
+                // deliver-then-ack shape as Announce/Ack. No consumer wires the
+                // abort yet (B4); the receiver loop logs + ignores it.
+                Msg::Revoke { package_id, reason } => TransportEvent::RevokeReceived {
+                    from,
+                    package_id,
+                    reason,
                 },
                 // Collab exchange (slice 4): forward the project advertisement /
                 // pull request as an in-process event, then the b"1" delivery ack

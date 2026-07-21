@@ -2363,9 +2363,10 @@ impl SharingTransport for NegotiateErrTransport {
         to: NodeId,
         a: &PackageAnnounce,
         batch_name: &str,
+        batch_uuid: &str,
         files: &[AnnounceFileEntry],
     ) -> anyhow::Result<()> {
-        self.0.announce(to, a, batch_name, files).await
+        self.0.announce(to, a, batch_name, batch_uuid, files).await
     }
     async fn fetch(
         &self,
@@ -2786,6 +2787,7 @@ impl SharingTransport for RetryProbeTransport {
         _to: NodeId,
         _a: &PackageAnnounce,
         _batch_name: &str,
+        _batch_uuid: &str,
         _files: &[AnnounceFileEntry],
     ) -> anyhow::Result<()> {
         Ok(())
@@ -2956,6 +2958,7 @@ impl SharingTransport for ReplaceProbeTransport {
         _to: NodeId,
         _a: &PackageAnnounce,
         _batch_name: &str,
+        _batch_uuid: &str,
         _files: &[AnnounceFileEntry],
     ) -> anyhow::Result<()> {
         // `classify_send_error` maps "timed out" → `ConnectClass::Timeout`, a

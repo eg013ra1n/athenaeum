@@ -57,6 +57,46 @@ pub struct PackageAnnounceV2 {
     pub files: Vec<AnnounceFileEntry>,
 }
 
+/// V3 package announce: the [`PackageAnnounceV2`] fields plus a durable batch
+/// identity (`batch_uuid`) that survives re-attempts (a resend under a fresh
+/// per-attempt `package_id`), letting the receiver keep exactly ONE row per
+/// transfer instead of one per attempt.
+///
+/// Like [`PackageAnnounceV2`] this is a SEPARATE type carried by the appended
+/// `Msg::Announce3` wire variant — the older announce structs' positional
+/// postcard bytes stay frozen, so `Msg::Announce` (v1) and `Msg::Announce2` (v2)
+/// still decode byte-for-byte for old peers. The app sender emits only v3; the
+/// receive side accepts all three (v1/v2 fall back to the wire `package_id` as the
+/// batch key). `package_id` is the CURRENT attempt's wire id (ack correlation);
+/// `batch_uuid` is stable across the transfer's attempts. Byte image pinned by
+/// `sharing::wire_golden_tests`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageAnnounceV3 {
+    pub package_id: PackageId,
+    pub root_hash: String,
+    pub byte_size: u64,
+    pub frame_count: u32,
+    pub batch_name: String,
+    pub batch_uuid: String,
+    pub files: Vec<AnnounceFileEntry>,
+}
+
+/// Why a sender revoked an outstanding announce (spec §D2). A one-shot,
+/// best-effort control signal (`Msg::Revoke`) telling the receiver to abort an
+/// in-flight or pending transfer: `Cancelled` (the user cancelled the send),
+/// `Superseded` (a newer attempt/batch replaces this one), or `Failed` (the
+/// sender gave up). No consumer wires the abort yet (B4); this is the wire value.
+///
+/// A NEW enum — its variant order (`Cancelled` = 0, `Superseded` = 1,
+/// `Failed` = 2) is a frozen positional contract on the wire, pinned by
+/// `sharing::wire_golden_tests`. New variants may ONLY be appended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RevokeReason {
+    Cancelled,
+    Superseded,
+    Failed,
+}
+
 /// The receiver's verdict on one frame, returned to the provider in an ack.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct FrameReceipt {
@@ -102,14 +142,19 @@ pub enum TransportEvent {
     /// A peer announced a package to us.
     ///
     /// `batch_name` / `files` are the v2 extras: `Some` when the announce arrived
-    /// as `Msg::Announce2` (or the loopback mock emulating a v2 send), `None` for
-    /// a v1 `Msg::Announce` (an old peer, e.g. Perseus beta.3). The receiver logic
-    /// that consumes the manifest lands in a later task; here they are threaded
-    /// through and default to `None` on every v1 path.
+    /// as `Msg::Announce2` / `Msg::Announce3` (or the loopback mock emulating a v2+
+    /// send), `None` for a v1 `Msg::Announce` (an old peer, e.g. Perseus beta.3).
+    ///
+    /// `batch_uuid` is the durable per-transfer identity (spec §D2): a v3
+    /// `Msg::Announce3` carries it on the wire; a v1/v2 announce predates it, so
+    /// the receive path falls back to the wire `package_id` (guaranteeing ONE
+    /// stable batch key on every path). The receiver logic that keys a row on it
+    /// lands in a later task (B4); here it is threaded through.
     AnnounceReceived {
         from: NodeId,
         announce: PackageAnnounce,
         batch_name: Option<String>,
+        batch_uuid: String,
         files: Option<Vec<AnnounceFileEntry>>,
     },
     /// A peer acknowledged a package we sent, returning per-frame receipts.
@@ -117,6 +162,17 @@ pub enum TransportEvent {
         from: NodeId,
         package_id: PackageId,
         receipts: Vec<FrameReceipt>,
+    },
+    /// A sender revoked an outstanding announce (spec §D2): abort the pending /
+    /// in-flight transfer for `package_id` (the current attempt's wire id). The
+    /// in-process counterpart of an inbound `Msg::Revoke`, delivered on the
+    /// receive-role event stream just like [`AnnounceReceived`](Self::AnnounceReceived).
+    /// No consumer wires the abort/cleanup yet (B4) — the receiver loop logs and
+    /// ignores it for now (never dropped silently).
+    RevokeReceived {
+        from: NodeId,
+        package_id: PackageId,
+        reason: RevokeReason,
     },
     /// A peer advertised a PROJECT package (collab exchange, slice 4). Carries the
     /// HUB package uuid (`package_id`) alongside the engine's wire `announce`

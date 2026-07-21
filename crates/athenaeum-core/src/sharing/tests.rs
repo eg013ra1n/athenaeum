@@ -82,7 +82,7 @@ async fn loopback_announce_fetch_ack_roundtrip() {
 
     provider.serve(&pkg, src.path(), None).await.unwrap();
     provider
-        .announce(receiver_info.node_id, &pkg, "", &[])
+        .announce(receiver_info.node_id, &pkg, "", "", &[])
         .await
         .unwrap();
 
@@ -171,7 +171,7 @@ async fn loopback_announce_delivers_v2_extras() {
     ];
 
     provider
-        .announce(receiver_info.node_id, &pkg, "Туманность M31", &files)
+        .announce(receiver_info.node_id, &pkg, "Туманность M31", "batch-M31", &files)
         .await
         .unwrap();
 
@@ -180,14 +180,51 @@ async fn loopback_announce_delivers_v2_extras() {
             from,
             announce,
             batch_name,
+            batch_uuid,
             files: got_files,
         } => {
             assert_eq!(from, provider_info.node_id);
             assert_eq!(announce.package_id, pkg.package_id);
             assert_eq!(batch_name.as_deref(), Some("Туманность M31"));
+            // The durable batch identity threads end-to-end (spec §D2).
+            assert_eq!(batch_uuid, "batch-M31");
             assert_eq!(got_files.as_deref(), Some(files.as_slice()));
         }
         other => panic!("expected AnnounceReceived, got {other:?}"),
+    }
+}
+
+/// tvb wire: a `revoke` reaches the peer as a `RevokeReceived` carrying the exact
+/// package id + reason. The loopback mirrors the real transports' revoke routing.
+#[tokio::test]
+async fn loopback_revoke_reaches_receiver_with_reason() {
+    use super::types::RevokeReason;
+
+    let net = LoopbackNetwork::new();
+    let provider = net.endpoint();
+    let receiver = net.endpoint();
+
+    let provider_info = provider.start().await.unwrap();
+    let receiver_info = receiver.start().await.unwrap();
+    let mut receiver_events = receiver.events().await;
+
+    let pkg = sample_announce();
+    provider
+        .revoke(receiver_info.node_id, &pkg.package_id, RevokeReason::Superseded)
+        .await
+        .unwrap();
+
+    match recv_next(&mut receiver_events).await {
+        TransportEvent::RevokeReceived {
+            from,
+            package_id,
+            reason,
+        } => {
+            assert_eq!(from, provider_info.node_id);
+            assert_eq!(package_id, pkg.package_id);
+            assert_eq!(reason, RevokeReason::Superseded);
+        }
+        other => panic!("expected RevokeReceived, got {other:?}"),
     }
 }
 
