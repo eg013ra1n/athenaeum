@@ -8,7 +8,8 @@ use tauri::{AppHandle, State};
 
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{
-    EnqueueSelectionResult, SyncHistoryQuery, TerminalTransfers, TransferEventEntry,
+    DeletedTransferRecord, EnqueueSelectionResult, SyncHistoryQuery, TerminalTransfers,
+    TransferEventEntry,
 };
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
@@ -37,9 +38,11 @@ pub async fn get_sync_pairing_ticket(
     .map_err(|e| e.to_string())
 }
 
-/// Snapshot of the receive side for the Transfers UI.
+/// Snapshot of the receive side for the Transfers UI. Instrumented at `debug`
+/// (hot-path rule, `get_setting`/`get_frame_preview` precedent): the Transfers UI
+/// polls this every 10s, so an `info` boundary span would flood the logs.
 #[tauri::command]
-#[tracing::instrument(skip_all, err)]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn get_sync_status(state: State<'_, AppState>) -> Result<SyncStatus, String> {
     api::get_status(&state.ctx, &state.sync, &state.sync_sender)
         .await
@@ -181,6 +184,20 @@ pub async fn cancel_incoming_package(
     api::cancel_incoming_package(&state.ctx, &state.sync, &package_id)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Delete one transfer batch's durable records (Transfers Status Model v2 UX
+/// wave 2): removes the batch's state row(s), per-file rows, event journal, and
+/// history rows. Refuses (`Invalid`) if any attempt is still active. Records only
+/// — never the received files on disk or the catalog.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn delete_transfer_history(
+    state: State<'_, AppState>,
+    direction: Direction,
+    package_key: String,
+) -> Result<DeletedTransferRecord, String> {
+    api::delete_transfer_history(&state.ctx, direction, package_key).map_err(|e| e.to_string())
 }
 
 /// Whether full-app capture-node auto mode is enabled.

@@ -2731,6 +2731,128 @@ pub async fn cancel_incoming_package(
     Ok(())
 }
 
+/// The count of durable rows removed by [`delete_transfer_history`] — the state
+/// rows (`sync_outbound` for sent / `sync_inbound` for received) and the
+/// `sync_history` audit rows — for the caller's confirmation toast.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedTransferRecord {
+    /// Number of state rows deleted — `sync_outbound` rows (sent) or `sync_inbound`
+    /// rows (received). A batch's attempts share the key, so this is ≥1 for a real
+    /// batch and 0 for an already-absent one.
+    pub rows: u32,
+    /// Number of `sync_history` audit rows deleted for the batch.
+    pub history: u32,
+}
+
+/// Delete one transfer BATCH's records from the durable store — the Transfers UI's
+/// "remove from history" action (Transfers Status Model v2, UX wave 2).
+/// Batch-level, not row-level: every attempt of a batch shares `package_key`, so
+/// all of that batch's rows go together.
+///
+/// `package_key` is the batch identity the Transfers UI already holds: for
+/// [`Sent`](Direction::Sent) it is the package-dir BASENAME
+/// ([`outbound_package_key`], which is also what `sync_history.package_id`
+/// carries); for [`Received`](Direction::Received) it is the wire package uuid
+/// (`sync_inbound.package_id`, == the received history `package_id`).
+///
+/// **Terminal-only, atomically.** If ANY matching row is non-terminal (an active
+/// attempt) the whole call refuses with [`ApiError::Invalid`] and deletes NOTHING
+/// — cancel the attempt first. The terminal check and every delete run inside ONE
+/// `BEGIN IMMEDIATE` transaction on ONE connection, so a concurrently
+/// restarted/resurrected attempt cannot flip a row non-terminal between the check
+/// and the delete (the IMMEDIATE write lock blocks the engine's writer until we
+/// commit or roll back), and a refusal — an early `return` before `commit` — rolls
+/// the whole thing back untouched.
+///
+/// **Records only — never disk data or catalog.** This removes `sync_outbound` /
+/// `sync_inbound` state rows, their per-file (`sync_*_files`) rows, their
+/// `sync_events` journal, and their `sync_history` rows. It does NOT touch the
+/// catalog (`files`/`frames`), the received files on disk, or a sent batch's
+/// on-disk payload directory — retention owns the payload lifecycle, so a
+/// still-present package dir is left exactly as it is.
+pub fn delete_transfer_history(
+    ctx: &ServiceContext,
+    direction: Direction,
+    package_key: String,
+) -> Result<DeletedTransferRecord, ApiError> {
+    use crate::sync::store::{
+        delete_history_for_package, delete_inbound_files, delete_inbound_row,
+        delete_outbound_files, delete_outbound_row, delete_sync_events,
+        inbound_id_states_by_package, outbound_ref_states,
+    };
+    use crate::sync::InboundState;
+
+    let db = db(ctx)?;
+    let mut conn = db.conn();
+    // BEGIN IMMEDIATE: take the reserved write lock up front so the terminal guard
+    // and the deletes are atomic against a concurrently resurrected attempt (the
+    // engine's writer blocks until we commit/rollback). An early `return Err` (the
+    // non-terminal refusal) or any `?` failure drops the tx → rollback → no partial
+    // delete.
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| ApiError::Internal(format!("begin delete_transfer_history tx: {e}")))?;
+
+    let result = match direction {
+        Direction::Sent => {
+            // Group this batch's attempts: every outbound row whose package_ref
+            // basename equals the key (Rust-side compare — no LIKE).
+            let matching: Vec<(i64, OutboundState)> = outbound_ref_states(&tx)?
+                .into_iter()
+                .filter(|(_, package_ref, _)| outbound_package_key(package_ref) == package_key)
+                .map(|(id, _, state)| Ok::<_, ApiError>((id, OutboundState::from_db(&state)?)))
+                .collect::<Result<_, _>>()?;
+            if matching.iter().any(|(_, s)| !s.is_terminal()) {
+                return Err(ApiError::Invalid(
+                    "batch has an active attempt — cancel it first".into(),
+                ));
+            }
+            let mut rows = 0u32;
+            for (id, _) in &matching {
+                delete_outbound_files(&tx, *id)?;
+                delete_sync_events(&tx, Direction::Sent, &id.to_string())?;
+                delete_outbound_row(&tx, *id)?;
+                rows += 1;
+            }
+            let history = delete_history_for_package(&tx, Direction::Sent, &package_key)?;
+            DeletedTransferRecord { rows, history }
+        }
+        Direction::Received => {
+            let matching: Vec<(i64, InboundState)> =
+                inbound_id_states_by_package(&tx, &package_key)?
+                    .into_iter()
+                    .map(|(id, state)| Ok::<_, ApiError>((id, InboundState::from_db(&state)?)))
+                    .collect::<Result<_, _>>()?;
+            if matching.iter().any(|(_, s)| !s.is_terminal()) {
+                return Err(ApiError::Invalid(
+                    "batch has an active attempt — cancel it first".into(),
+                ));
+            }
+            let mut rows = 0u32;
+            for (id, _) in &matching {
+                delete_inbound_files(&tx, *id)?;
+                delete_sync_events(&tx, Direction::Received, &id.to_string())?;
+                delete_inbound_row(&tx, *id)?;
+                rows += 1;
+            }
+            let history = delete_history_for_package(&tx, Direction::Received, &package_key)?;
+            DeletedTransferRecord { rows, history }
+        }
+    };
+
+    tx.commit()
+        .map_err(|e| ApiError::Internal(format!("commit delete_transfer_history: {e}")))?;
+    tracing::info!(
+        direction = direction.as_str(),
+        package_key = %package_key,
+        rows = result.rows,
+        history = result.history,
+        "transfer history deleted"
+    );
+    Ok(result)
+}
+
 /// Whether full-app capture-node auto mode is enabled (`sync.auto_mode`).
 pub fn get_sync_auto_mode(ctx: &ServiceContext) -> Result<bool, ApiError> {
     let db = db(ctx)?;
@@ -2795,6 +2917,208 @@ mod tests {
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
         (tmp, ctx)
+    }
+
+    /// tv2 UX wave 2: deleting a cancelled SENT batch removes every durable record
+    /// for that batch — both attempt rows (sharing a dir basename), their per-file
+    /// rows, their event journals, and their history rows — while a sibling batch
+    /// is left completely intact.
+    #[test]
+    fn delete_sent_batch_removes_all_records_and_leaves_siblings() {
+        use crate::sharing::types::AnnounceFileEntry;
+        use crate::sync::store::{append_sync_event, insert_history_row, insert_outbound_with_files};
+
+        let (_tmp, ctx) = test_ctx();
+        let peer = "aa".repeat(32);
+        let hist = |uuid: &str, key: &str| HistoryRow {
+            frame_uuid: uuid.to_string(),
+            filename: format!("{uuid}.fits"),
+            object: Some("M42".into()),
+            peer_device: peer.clone(),
+            direction: Direction::Sent,
+            bytes: 10,
+            started_at: "2026-07-20T00:00:00Z".into(),
+            finished_at: Some("2026-07-20T00:01:00Z".into()),
+            outcome: "sent".into(),
+            project: None,
+            package_id: Some(key.to_string()),
+            batch_name: None,
+        };
+
+        // Seed batchA as TWO cancelled attempts sharing the dir basename, each with
+        // a per-file row + an event + a history row; plus a control batchB (one
+        // cancelled attempt) that must survive untouched.
+        let (a1, a2);
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let files = |uuid: &str| {
+                vec![AnnounceFileEntry {
+                    rel_path: format!("Lights/{uuid}.fits"),
+                    byte_size: 10,
+                    frame_uuid: uuid.to_string(),
+                }]
+            };
+            a1 = insert_outbound_with_files(&conn, "/pkgs/batchA", &peer, Some("Batch A"), &files("f1")).unwrap();
+            a2 = insert_outbound_with_files(&conn, "/pkgs/batchA", &peer, Some("Batch A"), &files("f2")).unwrap();
+            let b1 = insert_outbound_with_files(&conn, "/pkgs/batchB", &peer, Some("Batch B"), &files("g1")).unwrap();
+            for id in [a1, a2, b1] {
+                conn.execute("UPDATE sync_outbound SET state = 'cancelled' WHERE id = ?1", [id]).unwrap();
+                append_sync_event(&conn, Direction::Sent, &id.to_string(), "cancel", None).unwrap();
+            }
+            insert_history_row(&conn, &hist("f1", "batchA")).unwrap();
+            insert_history_row(&conn, &hist("f2", "batchA")).unwrap();
+            insert_history_row(&conn, &hist("g1", "batchB")).unwrap();
+        }
+
+        let deleted =
+            delete_transfer_history(&ctx, Direction::Sent, "batchA".to_string()).expect("delete ok");
+        assert_eq!(deleted.rows, 2, "both batchA attempt rows deleted");
+        assert_eq!(deleted.history, 2, "both batchA history rows deleted");
+
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        // batchA fully gone across all four record tables.
+        assert_eq!(count("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/batchA'"), 0);
+        assert_eq!(count(&format!("SELECT COUNT(*) FROM sync_outbound_files WHERE outbound_id IN ({a1},{a2})")), 0);
+        assert_eq!(count(&format!("SELECT COUNT(*) FROM sync_events WHERE batch_key IN ('{a1}','{a2}')")), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM sync_history WHERE package_id = 'batchA'"), 0);
+        // batchB intact — exactly its one file row, event, history row, and outbound row.
+        assert_eq!(count("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/batchB'"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM sync_outbound_files"), 1, "only batchB's file row remains");
+        assert_eq!(count("SELECT COUNT(*) FROM sync_events"), 1, "only batchB's event remains");
+        assert_eq!(count("SELECT COUNT(*) FROM sync_history WHERE package_id = 'batchB'"), 1);
+    }
+
+    /// tv2 UX wave 2: a batch with ANY non-terminal attempt refuses deletion
+    /// (`Invalid`) and removes nothing — the terminal guard is atomic with the
+    /// deletes, so a mixed terminal+active batch stays completely intact.
+    #[test]
+    fn delete_batch_refuses_when_an_attempt_is_active() {
+        use crate::sharing::types::AnnounceFileEntry;
+        use crate::sync::store::{insert_history_row, insert_outbound_with_files};
+
+        let (_tmp, ctx) = test_ctx();
+        let peer = "bb".repeat(32);
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let files = vec![AnnounceFileEntry {
+                rel_path: "Lights/x.fits".into(),
+                byte_size: 4,
+                frame_uuid: "x".into(),
+            }];
+            // Attempt 1 cancelled (terminal); attempt 2 transferring (non-terminal).
+            let done = insert_outbound_with_files(&conn, "/pkgs/live", &peer, None, &files).unwrap();
+            conn.execute("UPDATE sync_outbound SET state = 'cancelled' WHERE id = ?1", [done]).unwrap();
+            let live = insert_outbound_with_files(&conn, "/pkgs/live", &peer, None, &files).unwrap();
+            conn.execute("UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1", [live]).unwrap();
+            insert_history_row(
+                &conn,
+                &HistoryRow {
+                    frame_uuid: "x".into(),
+                    filename: "x.fits".into(),
+                    object: None,
+                    peer_device: peer.clone(),
+                    direction: Direction::Sent,
+                    bytes: 4,
+                    started_at: "t".into(),
+                    finished_at: None,
+                    outcome: "sent".into(),
+                    project: None,
+                    package_id: Some("live".into()),
+                    batch_name: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let err = delete_transfer_history(&ctx, Direction::Sent, "live".to_string()).unwrap_err();
+        assert!(matches!(err, ApiError::Invalid(_)), "active attempt refuses with Invalid");
+
+        // Nothing deleted — both rows and the history row survive.
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/live'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "both attempt rows still present");
+        let h: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_history WHERE package_id = 'live'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(h, 1, "history untouched");
+    }
+
+    /// tv2 UX wave 2: deleting a cancelled RECEIVED batch (keyed by wire package
+    /// uuid) removes the inbound row, its per-file rows, its event journal, and its
+    /// received history rows.
+    #[test]
+    fn delete_received_batch_removes_all_records() {
+        use crate::sync::store::{
+            append_sync_event, insert_history_row, replace_inbound_files, set_inbound_state,
+            upsert_inbound_announced,
+        };
+        use crate::sync::{InboundFileRow, InboundFileState, InboundState};
+
+        let (_tmp, ctx) = test_ctx();
+        let peer = "cc".repeat(32);
+        let pkg = "pkg-uuid-1";
+        let id;
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            id = upsert_inbound_announced(&conn, &peer, pkg, 1, 10).unwrap();
+            replace_inbound_files(
+                &conn,
+                id,
+                &[InboundFileRow {
+                    inbound_id: id,
+                    rel_path: "Lights/r.fits".into(),
+                    byte_size: 10,
+                    frame_uuid: "r".into(),
+                    state: InboundFileState::Done,
+                    bytes_done: 10,
+                    outcome: Some("ingested".into()),
+                    error: None,
+                    updated_at: "t".into(),
+                }],
+            )
+            .unwrap();
+            append_sync_event(&conn, Direction::Received, &id.to_string(), "fetch_done", None).unwrap();
+            set_inbound_state(&conn, pkg, InboundState::Cancelled, None).unwrap();
+            insert_history_row(
+                &conn,
+                &HistoryRow {
+                    frame_uuid: "r".into(),
+                    filename: "r.fits".into(),
+                    object: None,
+                    peer_device: peer.clone(),
+                    direction: Direction::Received,
+                    bytes: 10,
+                    started_at: "t".into(),
+                    finished_at: Some("t2".into()),
+                    outcome: "cancelled".into(),
+                    project: None,
+                    package_id: Some(pkg.into()),
+                    batch_name: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let deleted =
+            delete_transfer_history(&ctx, Direction::Received, pkg.to_string()).expect("delete ok");
+        assert_eq!(deleted.rows, 1, "the inbound row deleted");
+        assert_eq!(deleted.history, 1, "the received history row deleted");
+
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM sync_inbound"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM sync_inbound_files"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM sync_events"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM sync_history WHERE direction = 'received'"), 0);
     }
 
     /// Task 3.3: with NO node bound and NOT signed in, transport health reads

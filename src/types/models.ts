@@ -1074,6 +1074,18 @@ kind: string,
  */
 detail: string | null, };
 
+export type DeletedTransferRecord = { 
+/**
+ * Number of state rows deleted — `sync_outbound` rows (sent) or `sync_inbound`
+ * rows (received). A batch's attempts share the key, so this is ≥1 for a real
+ * batch and 0 for an already-absent one.
+ */
+rows: number, 
+/**
+ * Number of `sync_history` audit rows deleted for the batch.
+ */
+history: number, };
+
 export type DeviceCapability = "athenaeum" | "perseus";
 
 export type EndpointAddrReport = { 

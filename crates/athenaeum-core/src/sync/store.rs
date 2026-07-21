@@ -1604,6 +1604,88 @@ pub fn delete_sync_events(conn: &Connection, direction: Direction, batch_key: &s
     Ok(())
 }
 
+// ── batch record deletion (Transfers Status Model v2, UX wave 2) ─────────────
+//
+// The parent-row deletes + lean scan reads that back
+// [`delete_transfer_history`](crate::api::sync::delete_transfer_history) — the
+// Transfers UI's "remove a batch from history" action. This store uses no FK
+// cascades, so the api layer composes these with the per-file
+// ([`delete_outbound_files`] / [`delete_inbound_files`]) + event
+// ([`delete_sync_events`]) cascades under ONE transaction.
+
+/// Every `sync_outbound` row as a lightweight `(id, package_ref, state)` tuple.
+/// The sent-batch delete scan reads these and compares each `package_ref`
+/// basename in Rust to group a batch's attempts (the key is a dir basename, which
+/// no `LIKE` predicate can match safely). Deliberately lean — it does NOT parse
+/// the `peer` hex like [`all_outbound_rows`], so one malformed legacy row can
+/// never abort a delete.
+pub fn outbound_ref_states(conn: &Connection) -> Result<Vec<(i64, String, String)>> {
+    let mut stmt = conn
+        .prepare("SELECT id, package_ref, state FROM sync_outbound")
+        .context("prepare outbound_ref_states")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .context("query outbound_ref_states")?
+        .collect::<rusqlite::Result<Vec<(i64, String, String)>>>()
+        .context("collect outbound_ref_states")?;
+    Ok(rows)
+}
+
+/// Every `sync_inbound` row matching `package_id` as a `(id, state)` tuple — the
+/// received-half batch-delete scan. A wire package uuid is effectively unique, so
+/// this is normally one row, but the `UNIQUE(peer, package_id)` schema permits
+/// several across peers, so the delete handles them all.
+pub fn inbound_id_states_by_package(
+    conn: &Connection,
+    package_id: &str,
+) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn
+        .prepare("SELECT id, state FROM sync_inbound WHERE package_id = ?1")
+        .context("prepare inbound_id_states_by_package")?;
+    let rows = stmt
+        .query_map(params![package_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .context("query inbound_id_states_by_package")?
+        .collect::<rusqlite::Result<Vec<(i64, String)>>>()
+        .context("collect inbound_id_states_by_package")?;
+    Ok(rows)
+}
+
+/// Delete one `sync_outbound` row by id — the parent-row delete of the batch
+/// record cascade. Pair with [`delete_outbound_files`] + [`delete_sync_events`]
+/// under one transaction (this store has no FK cascades).
+pub fn delete_outbound_row(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM sync_outbound WHERE id = ?1", params![id])
+        .with_context(|| format!("delete sync_outbound row {id}"))?;
+    Ok(())
+}
+
+/// Delete one `sync_inbound` row by id — the received-half twin of
+/// [`delete_outbound_row`]. Pair with [`delete_inbound_files`] +
+/// [`delete_sync_events`] under one transaction.
+pub fn delete_inbound_row(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM sync_inbound WHERE id = ?1", params![id])
+        .with_context(|| format!("delete sync_inbound row {id}"))?;
+    Ok(())
+}
+
+/// Delete every `sync_history` row for one batch `(direction, package_id)`,
+/// returning the number removed — the history side of the batch record delete.
+/// `package_id` is the outbound dir basename (sent) or wire package uuid
+/// (received) the history writers stamp into that column.
+pub fn delete_history_for_package(
+    conn: &Connection,
+    direction: Direction,
+    package_id: &str,
+) -> Result<u32> {
+    let n = conn
+        .execute(
+            "DELETE FROM sync_history WHERE direction = ?1 AND package_id = ?2",
+            params![direction.as_str(), package_id],
+        )
+        .with_context(|| format!("delete sync_history for {}/{package_id}", direction.as_str()))?;
+    Ok(n as u32)
+}
+
 /// Insert a new `sync_outbound` row in [`Queued`](OutboundState::Queued) AND its
 /// `sync_outbound_files` rows (state `pending`, `bytes_done 0`) AND its
 /// `display_name` — all in ONE transaction — returning the new row id (Transfers

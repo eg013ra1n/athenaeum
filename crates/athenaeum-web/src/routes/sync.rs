@@ -8,7 +8,8 @@ use axum::{extract::State, http::StatusCode, Json};
 
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{
-    EnqueueSelectionResult, SyncHistoryQuery, TerminalTransfers, TransferEventEntry,
+    DeletedTransferRecord, EnqueueSelectionResult, SyncHistoryQuery, TerminalTransfers,
+    TransferEventEntry,
 };
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
@@ -42,7 +43,10 @@ pub async fn get_sync_pairing_ticket(
 }
 
 /// POST /api/get_sync_status
-#[tracing::instrument(skip_all, err(Debug))]
+///
+/// Instrumented at `debug` (hot-path rule): the Transfers UI polls this every
+/// 10s, so an `info` boundary span would flood the logs.
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn get_sync_status(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
@@ -245,6 +249,29 @@ pub async fn cancel_incoming_package(
 ) -> Result<Json<()>, (StatusCode, String)> {
     api::cancel_incoming_package(&state.ctx, &state.sync, &args.package_id)
         .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteTransferHistoryArgs {
+    pub direction: Direction,
+    pub package_key: String,
+}
+
+/// POST /api/delete_transfer_history
+///
+/// Delete one transfer batch's durable records (Transfers Status Model v2 UX
+/// wave 2): the batch's state row(s), per-file rows, event journal, and history
+/// rows. Refuses (`Invalid` → 400) if any attempt is still active. Records only —
+/// never the received files on disk or the catalog.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn delete_transfer_history(
+    State(state): State<WebAppState>,
+    Json(args): Json<DeleteTransferHistoryArgs>,
+) -> Result<Json<DeletedTransferRecord>, (StatusCode, String)> {
+    api::delete_transfer_history(&state.ctx, args.direction, args.package_key)
         .map(Json)
         .map_err(api_err)
 }
