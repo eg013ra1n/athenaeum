@@ -1204,13 +1204,20 @@ pub fn set_inbound_file_state(
     outcome: Option<&str>,
     error: Option<&str>,
 ) -> Result<()> {
-    conn.execute(
-        "UPDATE sync_inbound_files
-         SET state = ?1, bytes_done = ?2, outcome = ?3, error = ?4, updated_at = ?5
-         WHERE inbound_id = ?6 AND rel_path = ?7",
-        params![state.as_str(), bytes_done as i64, outcome, error, now_iso(), inbound_id, rel_path],
-    )
-    .with_context(|| format!("set inbound file state for {inbound_id}/{rel_path}"))?;
+    let changed = conn
+        .execute(
+            "UPDATE sync_inbound_files
+             SET state = ?1, bytes_done = ?2, outcome = ?3, error = ?4, updated_at = ?5
+             WHERE inbound_id = ?6 AND rel_path = ?7",
+            params![state.as_str(), bytes_done as i64, outcome, error, now_iso(), inbound_id, rel_path],
+        )
+        .with_context(|| format!("set inbound file state for {inbound_id}/{rel_path}"))?;
+    if changed == 0 {
+        // Same discoverability guard as the outbound twin: a v1/manifest-less batch
+        // has no rows, so the no-op is legitimate — but a missing row on a v2 batch
+        // must be findable in the logs, never silent.
+        tracing::debug!(inbound_id, rel_path, state = state.as_str(), "set_inbound_file_state matched 0 rows");
+    }
     Ok(())
 }
 
