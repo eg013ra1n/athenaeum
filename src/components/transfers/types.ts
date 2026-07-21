@@ -19,11 +19,12 @@ export type TransferFilter =
   | 'cancelled'
   | 'failed';
 
-/** The batch identity `delete_transfer_history` deletes by (UX wave 2). For a SENT
- *  batch it is `batchUuid` (== the package-dir basename == the `sent` history
- *  `packageId`); for a RECEIVED batch it is the wire `packageId` — NEVER `batchUuid`,
- *  on which the backend received-delete silently no-ops (B5 deferred the received
- *  re-key). `null` on a row that cannot be deleted (a non-terminal live row, or a
+/** The batch identity `delete_transfer_history` deletes by (UX wave 2). `batchUuid`
+ *  in BOTH directions (B5b unified the received side onto it, symmetric with sent —
+ *  for sent it's the package-dir basename == the `sent` history `packageId`; for
+ *  received it's `sync_inbound.batch_uuid` == the `received` history `packageId`).
+ *  The received wire `packageId` still rotates per attempt but is no longer the
+ *  delete key. `null` on a row that cannot be deleted (a non-terminal live row, or a
  *  legacy "Earlier transfers" history bucket with no single package key). */
 export interface DeleteKey {
   direction: Direction;

@@ -59,21 +59,21 @@ export default function Transfers() {
   // as a live/terminal row. `list_terminal_transfers` is a recent (~100) window, so
   // the surviving history groups are OLDER transfers beyond that window — the one
   // thing history still contributes. Dedup + delete keys are now direct field
-  // reads: a SENT row's `batchUuid` == the sent history `packageId`; a RECEIVED
-  // row's `packageId` (current wire id) == the received history `packageId`.
+  // reads, and — since B5b — symmetric across BOTH directions: a row's `batchUuid`
+  // == its history group's `packageId` (the received writer + delete now key on the
+  // durable `batch_uuid`, not the rotating wire id; this also kills the old-attempt
+  // phantom history group a receiver re-attempt used to leave behind, since every
+  // attempt of one batch now writes history under the SAME key).
   const unified = useMemo<UnifiedRow[]>(() => {
-    // Delete keys (item 3, HARD CONTRACT): a SENT transfer deletes by `batchUuid`
-    // (== the package-dir basename == the sent history `packageId`); a RECEIVED
-    // transfer deletes by `packageId` (the wire id) — NEVER `batchUuid`, on which
-    // the backend received-delete silently no-ops (B5 deferred the received re-key).
-    // Trash shows only on a settled (terminal) row; a live row IS the same row, so
-    // there is no sibling to suppress it against.
+    // Delete key (item 3): BOTH directions delete by `batchUuid` now (B5b fully
+    // unified the received side onto it, symmetric with sent — the backend's
+    // NULL-edge fallback to the wire id covers only a legacy pre-batch-model row,
+    // which the frontend never sees since the summary mapper already resolves that
+    // fallback into `batchUuid` itself). Trash shows only on a settled (terminal)
+    // row; a live row IS the same row, so there is no sibling to suppress it against.
     const liveDeleteKey = (r: TransferRowModel): DeleteKey | null => {
-      if (!r.terminal) return null;
-      if (r.kind === 'inbound') {
-        return r.packageId ? { direction: 'received', packageKey: r.packageId } : null;
-      }
-      return r.batchUuid ? { direction: 'sent', packageKey: r.batchUuid } : null;
+      if (!r.terminal || !r.batchUuid) return null;
+      return { direction: r.kind === 'inbound' ? 'received' : 'sent', packageKey: r.batchUuid };
     };
 
     const liveUnified: UnifiedRow[] = rows.map(
@@ -86,22 +86,20 @@ export default function Transfers() {
     );
 
     // Batch keys already on screen as a live/terminal row, so their history groups
-    // don't double: sent by `batchUuid`, received by the current wire `packageId`.
+    // don't double — both directions by `batchUuid` (B5b).
     const liveSentKeys = new Set<string>();
-    const liveRecvIds = new Set<string>();
+    const liveRecvKeys = new Set<string>();
     for (const r of rows) {
-      if (r.kind === 'outbound') {
-        if (r.batchUuid) liveSentKeys.add(r.batchUuid);
-      } else if (r.packageId) {
-        liveRecvIds.add(r.packageId);
-      }
+      if (!r.batchUuid) continue;
+      if (r.kind === 'outbound') liveSentKeys.add(r.batchUuid);
+      else liveRecvKeys.add(r.batchUuid);
     }
 
     const historyUnified: UnifiedRow[] = [];
     for (const g of groups) {
       const dup =
         g.packageId != null &&
-        (g.direction === 'sent' ? liveSentKeys.has(g.packageId) : liveRecvIds.has(g.packageId));
+        (g.direction === 'sent' ? liveSentKeys.has(g.packageId) : liveRecvKeys.has(g.packageId));
       if (dup) continue;
       historyUnified.push({
         kind: 'history',
@@ -109,9 +107,9 @@ export default function Transfers() {
         group: g,
         deviceName: deviceNames[g.peerDevice] ?? null,
         projectName: g.project ? projectNames[g.project] ?? null : null,
-        // A history group's `packageId` IS its delete key — sent == batchUuid,
-        // received == the wire id (item 3). `null` for a legacy "Earlier transfers"
-        // bucket with no single package key.
+        // A history group's `packageId` IS its delete key — `batchUuid` in both
+        // directions since B5b. `null` for a legacy "Earlier transfers" bucket with
+        // no single package key.
         deleteKey: g.packageId ? { direction: g.direction, packageKey: g.packageId } : null,
       });
     }

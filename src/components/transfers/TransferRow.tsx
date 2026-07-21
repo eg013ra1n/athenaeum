@@ -7,6 +7,7 @@ import {
   formatCountdown,
   formatEta,
   formatSpeed,
+  isSenderRevokeReason,
   isTransientTransferError,
   plainTransferError,
   shortPeer,
@@ -200,9 +201,16 @@ function LiveRowBody({
   // monotonic `attempts` counter (that was the bug that made errors stick after
   // recovery). On a terminal row a "will keep retrying" promise is void, so the
   // transient-family causes render WITHOUT the suffix and in a muted tone; an
-  // explicit terminal cause (cancelled-by-peer, failure) keeps error styling.
+  // explicit terminal cause (cancelled-by-peer, failure) keeps error styling. An
+  // INBOUND row's `lastError` (B5b) is a sender-revoke reason ("by sender" /
+  // "sender failed" / superseded) — purely explanatory (the receiver has no retry
+  // to act on), so it renders muted regardless of the row's own chip color.
   const showReason = !!row.lastError && (row.retrying || row.terminal);
-  const reasonMuted = row.terminal && !!row.lastError && isTransientTransferError(row.lastError);
+  const reasonMuted =
+    row.terminal &&
+    !!row.lastError &&
+    (isTransientTransferError(row.lastError) ||
+      (row.kind === 'inbound' && isSenderRevokeReason(row.lastError)));
   const reasonTone = !row.terminal
     ? 'text-warning'
     : reasonMuted

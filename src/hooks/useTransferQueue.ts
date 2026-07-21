@@ -132,11 +132,14 @@ export interface TransferRow {
    *  as "attempt N" when `> 1`, on active AND terminal rows. */
   generation: number;
   /** The durable per-transfer batch identity (§D1): outbound == the package-dir
-   *  basename (== the sent `sync_history.package_id`, the `delete_transfer_history`
-   *  key for a SENT row); inbound == `sync_inbound.batch_uuid` (the stable batch id).
-   *  NOTE: a RECEIVED transfer is deleted by `packageId` (the wire id), NEVER this —
-   *  see the delete wiring in `Transfers.tsx`. */
+   *  basename (== the sent `sync_history.package_id`); inbound == `sync_inbound
+   *  .batch_uuid` (== the received `sync_history.package_id`, B5b). `delete_transfer
+   *  _history`'s `package_key` is THIS field in BOTH directions (B5b unified) — the
+   *  wire `packageId` still rotates per attempt but is no longer the delete key. */
   batchUuid: string;
+  /** The terminal reason: outbound engine failure/cancel text, or (B5b) an inbound
+   *  sender-revoke reason — `"by sender"` / `"sender failed"` / a superseded detail.
+   *  See `plainTransferError`/`isSenderRevokeReason` for the inbound mapping. */
   lastError: string | null;
   nextRetryAt: string | null;
   /** `true` for a lingering failed/cancelled outbound row (Resend, not Cancel/Send-now). */
@@ -598,7 +601,9 @@ export function useTransferQueue(): UseTransferQueue {
         attempts: 0,
         generation: s.generation,
         batchUuid: s.batchUuid,
-        lastError: null,
+        // B5b: `InboundSummary.lastError` — a sender-revoke reason (rare on an
+        // active row; only meaningful once terminal, but read honestly either way).
+        lastError: s.lastError,
         nextRetryAt: null,
         terminal: false,
         resendable: false,
@@ -634,7 +639,9 @@ export function useTransferQueue(): UseTransferQueue {
         attempts: 0,
         generation: s.generation,
         batchUuid: s.batchUuid,
-        lastError: null,
+        // B5b: the terminal reason (e.g. a sender revoke's "by sender"/"sender
+        // failed"/superseded) — see `plainTransferError`/`isSenderRevokeReason`.
+        lastError: s.lastError,
         nextRetryAt: null,
         terminal: true,
         // Inbound rows carry NO actions (no Resend concept for a receive).
@@ -756,10 +763,11 @@ export function useTransferQueue(): UseTransferQueue {
   // construction — the trash affordance never appears on an active row — but the
   // backend also refuses (`Invalid`) if any attempt is momentarily active, in
   // which case we notify and remove nothing. On success we optimistically drop the
-  // batch's terminal rows from both durable sources by EXACT key (batch model: ONE
-  // row per batch — sent matches `batchUuid`, received matches the wire `packageId`)
-  // and re-read the durable window to reconcile. Returns success so the page can
-  // also clear the batch's history rows.
+  // batch's terminal rows from both durable sources by EXACT key (batch model, B5b:
+  // ONE row per batch — BOTH directions now match on `batchUuid`, symmetric with the
+  // sent side; the received wire `packageId` rotates per attempt and is no longer
+  // the delete key) and re-read the durable window to reconcile. Returns success so
+  // the page can also clear the batch's history rows.
   const deleteTransfer = useCallback(
     (direction: Direction, packageKey: string): Promise<boolean> => {
       const busyKey = `delete:${direction}:${packageKey}`;
@@ -768,8 +776,11 @@ export function useTransferQueue(): UseTransferQueue {
         .invoke<DeletedTransferRecord>('delete_transfer_history', { direction, packageKey })
         .then(() => {
           if (direction === 'received') {
-            // Received batch key IS the wire `packageId` (item 3 contract).
-            setDbTerminalReceived((prev) => prev.filter((s) => s.packageId !== packageKey));
+            // B5b: received batch key IS `batchUuid` (the durable id; falls back to
+            // the wire id server-side only for a legacy NULL-batch_uuid row, which
+            // the frontend never sees since the summary mapper already resolves
+            // that fallback into `batchUuid` itself).
+            setDbTerminalReceived((prev) => prev.filter((s) => s.batchUuid !== packageKey));
           } else {
             // Sent batch key IS `batchUuid` (== the package-dir basename == the sent
             // history `packageId`) — an exact match, no prefix scan.

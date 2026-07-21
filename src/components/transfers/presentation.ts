@@ -92,6 +92,13 @@ export function plainTransferError(raw: string, terminal = false): string {
   if (s.startsWith('timeout:')) return `Peer didn't answer${retryHint}`;
   if (s.startsWith('not_started:')) return `Peer app not running${retryHint}`;
   if (s.startsWith('other:')) return raw.slice(raw.indexOf(':') + 1).trim() || raw;
+  // Inbound sender-revoke reasons (Transfers Batch Model §D2, B5b) — the exact
+  // `sync_inbound.last_error` strings `handle_revoke` stamps. Always terminal (the
+  // receiver never retries these), so no retry-hint suffix applies.
+  if (s === 'by sender') return 'Cancelled by the sending device';
+  if (s === 'sender failed') return 'Sender failed';
+  if (s.startsWith('nothing to fetch')) return 'Peer already had everything';
+  if (s.startsWith('superseded')) return 'Superseded — peer already had the rest';
   return raw;
 }
 
@@ -109,6 +116,18 @@ export function isTransientTransferError(raw: string): boolean {
     s.startsWith('timeout:') ||
     s.startsWith('not_started:')
   );
+}
+
+/** Whether a raw inbound `last_error` is a sender-driven revoke reason (Transfers
+ *  Batch Model §D2, B5b: `handle_revoke`'s "by sender" / "sender failed" /
+ *  "nothing to fetch (superseded by sender)" / "superseded (N of M landed)") — the
+ *  sender ended this transfer, not a receiver-side operational failure the user can
+ *  act on. Rendered MUTED regardless of the row's own chip color (a red `failed`
+ *  chip can still carry a plain, non-alarming reason underneath it — the same
+ *  muted-reason-under-a-settled-chip pattern [`isTransientTransferError`] uses). */
+export function isSenderRevokeReason(raw: string): boolean {
+  const s = raw.trim().toLowerCase();
+  return s === 'by sender' || s === 'sender failed' || s.startsWith('nothing to fetch') || s.startsWith('superseded');
 }
 
 /** A rendered state chip: a short label + its design-token tone classes. */
