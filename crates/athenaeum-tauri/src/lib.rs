@@ -456,6 +456,8 @@ pub fn run() {
             commands::cancel_sync_package,
             commands::cancel_incoming_package,
             commands::delete_transfer_history,
+            commands::get_transfer_storage,
+            commands::cleanup_finished_transfers,
             commands::get_sync_auto_mode,
             commands::set_sync_auto_mode,
             commands::get_sync_device_names,

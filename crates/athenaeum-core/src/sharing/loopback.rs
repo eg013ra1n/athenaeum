@@ -103,6 +103,7 @@ impl LoopbackNetwork {
             event_rx: Mutex::new(Some(event_rx)),
             fault: Mutex::new(FaultPlan::default()),
             responder: None,
+            in_flight: Mutex::new(HashSet::new()),
         }
     }
 
@@ -140,6 +141,14 @@ pub struct LoopbackTransport {
     /// Registered into this endpoint's [`PeerInbox`] on `start`; answers dedup
     /// handshakes from peers. `None` for a plain (want-all) endpoint.
     responder: Option<Arc<dyn DedupResponder>>,
+    /// The in-process stand-in for the receiver's `in-flight/recv/pkg/<id>` blob
+    /// tags: the set of wire package ids whose in-flight download tag this
+    /// endpoint "holds" (the iroh transport's real tags have no such peek).
+    /// Seeded by [`seed_in_flight_tag`](Self::seed_in_flight_tag), enumerated by
+    /// [`list_in_flight_tags`](SharingTransport::list_in_flight_tags), and dropped
+    /// by [`release`](SharingTransport::release) — so a test can prove the B7
+    /// orphan sweep releases an orphaned tag and keeps a non-terminal-row one.
+    in_flight: Mutex<HashSet<String>>,
 }
 
 impl LoopbackTransport {
@@ -173,6 +182,29 @@ impl LoopbackTransport {
         reg.get(&self.node_id)
             .map(|inbox| inbox.served.contains_key(package_id))
             .unwrap_or(false)
+    }
+
+    /// Test-only: seed a receiver-side in-flight download tag for `package_id`
+    /// (the loopback stand-in for `in-flight/recv/pkg/<package_id>`). The B7
+    /// orphan sweep enumerates these via
+    /// [`list_in_flight_tags`](SharingTransport::list_in_flight_tags) and
+    /// [`release`](SharingTransport::release)s the orphaned ones.
+    #[cfg(test)]
+    pub(crate) fn seed_in_flight_tag(&self, package_id: &str) {
+        self.in_flight
+            .lock()
+            .expect("in_flight mutex poisoned")
+            .insert(package_id.to_string());
+    }
+
+    /// Test-only: whether this endpoint still holds an in-flight download tag for
+    /// `package_id` — the observable for "the orphan sweep released (or kept) it".
+    #[cfg(test)]
+    pub(crate) fn has_in_flight_tag(&self, package_id: &str) -> bool {
+        self.in_flight
+            .lock()
+            .expect("in_flight mutex poisoned")
+            .contains(package_id)
     }
 }
 
@@ -570,12 +602,32 @@ impl SharingTransport for LoopbackTransport {
     }
 
     async fn release(&self, package_id: &PackageId) -> anyhow::Result<()> {
+        // Mirror the iroh `role_release`: drop BOTH the served (permanent-tag)
+        // entry and this package's in-flight download tag, so the loopback is an
+        // honest stand-in for "release deletes `recv/pkg/<id>` + `in-flight/recv/
+        // pkg/<id>`".
+        let in_flight_removed = self
+            .in_flight
+            .lock()
+            .expect("in_flight mutex poisoned")
+            .remove(&package_id.0);
         let mut reg = self.registry.lock().expect("registry mutex poisoned");
         if let Some(inbox) = reg.get_mut(&self.node_id) {
             let removed = inbox.served.remove(&package_id.0).is_some();
-            tracing::debug!(package_id = %package_id.0, removed, "loopback released package");
+            tracing::debug!(package_id = %package_id.0, removed, in_flight_removed, "loopback released package");
         }
         Ok(())
+    }
+
+    async fn list_in_flight_tags(&self) -> anyhow::Result<Vec<PackageId>> {
+        Ok(self
+            .in_flight
+            .lock()
+            .expect("in_flight mutex poisoned")
+            .iter()
+            .cloned()
+            .map(PackageId)
+            .collect())
     }
 
     async fn ack(

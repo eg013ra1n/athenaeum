@@ -797,6 +797,11 @@ pub async fn autostart_if_enabled(
         Arc::clone(&sync),
         emitter_for_resurrect,
     ));
+    // B7: reclaim leftover transfer temp data (row-less payload dirs + orphaned
+    // receiver in-flight blob tags). Fire-and-forget AFTER `ensure_started`, same
+    // placement as the resurrection spawn; race-safe against it by construction
+    // (see `sweep_transfer_orphans`), so autostart latency is unchanged.
+    tokio::spawn(sweep_transfer_orphans(Arc::clone(&ctx_arc), Arc::clone(&sync)));
     Ok(true)
 }
 
@@ -1095,6 +1100,10 @@ pub async fn get_pairing_ticket(
         Arc::clone(&sync),
         emitter_for_resurrect,
     ));
+    // B7: reclaim leftover transfer temp data here too — the OTHER startup site
+    // that runs `ensure_started`. Fire-and-forget, race-safe against resurrection
+    // (see `sweep_transfer_orphans`); never blocks the ticket return.
+    tokio::spawn(sweep_transfer_orphans(Arc::clone(&ctx_arc), Arc::clone(&sync)));
     Ok(ticket)
 }
 
@@ -3026,6 +3035,315 @@ pub async fn delete_transfer_history(
     Ok(result)
 }
 
+// ── Transfer storage: startup orphan sweep + stats + cleanup (Batch Model §D4, B7) ──
+
+/// A directory's total on-disk size — the recursive sum of regular-file lengths.
+/// Best-effort: an unreadable entry (permission / vanished mid-walk) contributes
+/// 0 and never fails, so a stats/cleanup pass never aborts on one bad file.
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let mut total = 0u64;
+    for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
+        if entry.file_type().is_file() {
+            if let Ok(md) = entry.metadata() {
+                total += md.len();
+            }
+        }
+    }
+    total
+}
+
+/// The set of package-dir BASENAMES ([`outbound_package_key`]) referenced by ANY
+/// `sync_outbound` row — terminal or not. A `<sync>/packages/<name>` dir whose
+/// basename is in this set is referenced by some row (a terminal row keeps its
+/// payload for Resend; a non-terminal row for its live attempt) and is therefore
+/// NOT a row-less orphan. Basename-keyed, not full-path: every package dir is
+/// minted `<sync>/packages/<uuid>` so the basename is the unique batch identity,
+/// robust against `/Volumes` vs `/private/Volumes` path normalization. Read fresh
+/// at sweep time (not cached at boot) so a package a concurrent resurrection /
+/// user-enqueue just wrote is already protected.
+fn referenced_package_keys(ctx: &ServiceContext) -> Result<HashSet<String>, ApiError> {
+    use crate::sync::store::outbound_ref_states;
+    let db = db(ctx)?;
+    let conn = db.conn();
+    Ok(outbound_ref_states(&conn)?
+        .into_iter()
+        .map(|(_, package_ref, _)| outbound_package_key(&package_ref))
+        .collect())
+}
+
+/// Startup pass 1 — remove ROW-LESS orphan payload dirs under `<sync>/packages/`:
+/// a dir whose basename matches NO `sync_outbound` row (an interrupted build, or a
+/// dir whose rows were deleted without their reclaim landing). Never touches a dir
+/// referenced by any row (terminal rows keep payload for Resend — only truly
+/// row-less orphans go). Returns `(dirs_removed, bytes_reclaimed)`. Best-effort:
+/// one un-removable dir `warn!`s and the pass continues.
+fn sweep_orphan_payload_dirs(ctx: &ServiceContext) -> Result<(u32, u64), ApiError> {
+    let packages_dir = sender_packages_dir(ctx)?;
+    // Fresh DB read AT removal time (the race choice, see [`sweep_transfer_orphans`]):
+    // resurrection never deletes rows, so any dir a resurrected row needs is in this
+    // set → never removed.
+    let referenced = referenced_package_keys(ctx)?;
+    let entries = match std::fs::read_dir(&packages_dir) {
+        Ok(e) => e,
+        // No packages dir yet (never sent) → nothing to sweep.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(ApiError::Internal(format!("read packages dir: {e}"))),
+    };
+    let mut dirs = 0u32;
+    let mut bytes = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if referenced.contains(name) {
+            continue; // referenced by some row → keep
+        }
+        let sz = dir_size_bytes(&path);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                dirs += 1;
+                bytes += sz;
+                tracing::info!(path = %path.display(), "orphan payload dir removed");
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "orphan payload dir removal failed")
+            }
+        }
+    }
+    Ok((dirs, bytes))
+}
+
+/// Cleanup pass 1 — remove the payload dirs of TERMINAL outbound rows
+/// (confirmed / failed / cancelled), the explicit "reclaim finished transfers"
+/// action. A dir also referenced by a NON-terminal row of the same batch (attempts
+/// share one dir post batch-model) is KEPT — a live attempt's payload is never
+/// touched. Removing a terminal row's payload honestly flips its summary
+/// `resendable` to false (that flag is derived from [`package_has_payload`], not
+/// stored). Returns `(dirs_removed, bytes_reclaimed)`.
+fn remove_terminal_payload_dirs(ctx: &ServiceContext) -> Result<(u32, u64), ApiError> {
+    use crate::sync::store::outbound_ref_states;
+    let rows = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        outbound_ref_states(&conn)?
+    };
+    let mut non_terminal_dirs: HashSet<String> = HashSet::new();
+    let mut terminal_dirs: HashSet<String> = HashSet::new();
+    for (_, package_ref, state) in &rows {
+        let st = OutboundState::from_db(state).map_err(|e| ApiError::Internal(e.to_string()))?;
+        if st.is_terminal() {
+            terminal_dirs.insert(package_ref.clone());
+        } else {
+            non_terminal_dirs.insert(package_ref.clone());
+        }
+    }
+    let mut dirs = 0u32;
+    let mut bytes = 0u64;
+    for package_ref in terminal_dirs {
+        if non_terminal_dirs.contains(&package_ref) {
+            continue; // shared with a live attempt → never touch a non-terminal payload
+        }
+        let path = Path::new(&package_ref);
+        if !path.exists() {
+            continue; // already reclaimed (delete) / retention-swept / never materialized
+        }
+        let sz = dir_size_bytes(path);
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {
+                dirs += 1;
+                bytes += sz;
+                tracing::info!(path = %package_ref, "finished-transfer payload dir removed");
+            }
+            Err(e) => {
+                tracing::warn!(path = %package_ref, error = %e, "finished-transfer payload dir removal failed")
+            }
+        }
+    }
+    Ok((dirs, bytes))
+}
+
+/// Release receiver-side `in-flight/recv/pkg/<id>` download tags whose transfer is
+/// no longer non-terminal, so GC can reclaim the verified partial blobs (Batch
+/// Model §D4; B0 findings Q4/R2). Shared by the startup sweep and the cleanup
+/// command. For every in-flight tag the live receive-side transport holds
+/// ([`SharingTransport::list_in_flight_tags`], already namespace-filtered to the
+/// transfer machinery's own tags), release it UNLESS a non-terminal `sync_inbound`
+/// row still carries that exact wire id — the tag then belongs to a live/resumable
+/// fetch and is kept. Returns the number released. No live transport (receiver not
+/// started) → 0 (nothing to enumerate or release). Best-effort per tag: a release
+/// failure `warn!`s and the pass continues.
+///
+/// **GC note:** iroh-blobs 0.103 exposes no on-demand GC trigger reachable from our
+/// layer (`gc_run_once` is `pub` but lives in the private `store::gc` module; only
+/// `GcConfig`/`ProtectCb`/`ProtectOutcome` are re-exported). Releasing the tag
+/// removes the GC root immediately; the blob bytes are physically reclaimed on the
+/// store's next periodic sweep (`GC_INTERVAL`, ~15 min).
+async fn release_orphan_in_flight_tags(
+    ctx: &ServiceContext,
+    sync: &SyncRuntime,
+) -> Result<u32, ApiError> {
+    let Some(transport) = sync.transport().await else {
+        return Ok(0);
+    };
+    let in_flight = transport
+        .list_in_flight_tags()
+        .await
+        .map_err(|e| ApiError::Internal(format!("list in-flight tags: {e:#}")))?;
+    if in_flight.is_empty() {
+        return Ok(0);
+    }
+    // Fresh read of the non-terminal inbound wire ids, in an inner block so the
+    // pooled connection drops before the release awaits (keeps the future `Send`).
+    // Re-checked here (not snapshotted at boot) so a fetch that just created its
+    // inbound row + in-flight tag is never released out from under itself: the
+    // receiver writes the non-terminal row BEFORE it sets the in-flight tag.
+    let active: HashSet<String> = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        inbound_active(&conn)?
+            .into_iter()
+            .map(|r| r.package_id)
+            .collect()
+    };
+    let mut released = 0u32;
+    for pid in in_flight {
+        if active.contains(&pid.0) {
+            continue; // a live/resumable fetch owns this tag → keep it
+        }
+        match transport.release(&pid).await {
+            Ok(()) => released += 1,
+            Err(e) => tracing::warn!(
+                wire_id = %pid.0,
+                error = %format!("{e:#}"),
+                "orphan in-flight tag release failed"
+            ),
+        }
+    }
+    Ok(released)
+}
+
+/// Fire-and-forget startup orphan sweep (Batch Model §D4, B7) — spawned AFTER
+/// [`SyncRuntime::ensure_started`] at every autostart site, same
+/// pattern/placement as [`resurrect_pending_senders`]. Two reclaim passes:
+/// row-less orphan payload dirs under `<sync>/packages/`, and orphaned receiver
+/// in-flight blob tags. Silent when nothing is found; one `info!` with the totals
+/// otherwise. Never fails: each pass is best-effort and a pass error only `warn!`s.
+///
+/// **Sweep-vs-resurrection ordering (the constraint's race choice):** the two are
+/// both spawned post-`ensure_started` and run concurrently, made safe by *fresh DB
+/// reads at deletion time* rather than by ordering. The payload-dir pass removes
+/// ONLY row-less dirs and re-reads the referenced-basename set fresh
+/// ([`referenced_package_keys`]); resurrection never deletes rows (it re-drives
+/// existing non-terminal rows), so any dir a resurrected row needs is in that set
+/// and is never removed. The in-flight pass keys on non-terminal `sync_inbound`
+/// rows, which resurrection (sender-side) never touches. No lock/ordering needed.
+pub async fn sweep_transfer_orphans(ctx: Arc<ServiceContext>, sync: Arc<SyncRuntime>) {
+    let (payload_dirs, bytes_reclaimed) = match sweep_orphan_payload_dirs(&ctx) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "transfer orphan sweep: payload-dir pass failed");
+            (0, 0)
+        }
+    };
+    let tags_released = match release_orphan_in_flight_tags(&ctx, &sync).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "transfer orphan sweep: in-flight tag pass failed");
+            0
+        }
+    };
+    if payload_dirs > 0 || bytes_reclaimed > 0 || tags_released > 0 {
+        tracing::info!(payload_dirs, bytes_reclaimed, tags_released, "transfer orphan sweep");
+    }
+}
+
+/// On-disk footprint of the transfer machinery's temp data (Batch Model §D4, B7),
+/// for the Settings "Transfer storage" line. Walks `<sync>/packages/` (one entry
+/// per outbound package dir) and sums the blob store dir `<sync>/blobs/`.
+///
+/// `blobs_bytes` is a **directory walk of `<sync>/blobs`** — iroh-blobs 0.103
+/// exposes no store-size accessor on the public `Store` API, and the walk is the
+/// honest on-disk figure (partial + complete blobs alike). It includes bytes still
+/// pinned by not-yet-swept GC roots, so right after a cleanup it can lag the
+/// eventual reclaimed size by up to one GC window (~15 min).
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferStorage {
+    /// Total bytes across every `<sync>/packages/<uuid>` payload dir.
+    pub packages_bytes: u64,
+    /// Number of top-level package dirs under `<sync>/packages/`.
+    pub packages_count: u32,
+    /// Total bytes under the blob store dir `<sync>/blobs/` (directory walk).
+    pub blobs_bytes: u64,
+}
+
+/// Compute the [`TransferStorage`] footprint (see its doc). Pure fs walk — never
+/// touches the DB or the transport; a missing dir reads as empty (0).
+pub fn get_transfer_storage(ctx: &ServiceContext) -> Result<TransferStorage, ApiError> {
+    let (sync_dir, _db_path) = sync_paths(ctx)?;
+    let packages_dir = sync_dir.join("packages");
+    let blobs_dir = sync_dir.join("blobs");
+
+    let mut packages_count = 0u32;
+    let mut packages_bytes = 0u64;
+    if let Ok(entries) = std::fs::read_dir(&packages_dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                packages_count += 1;
+                packages_bytes += dir_size_bytes(&entry.path());
+            }
+        }
+    }
+    let blobs_bytes = dir_size_bytes(&blobs_dir);
+    Ok(TransferStorage { packages_bytes, packages_count, blobs_bytes })
+}
+
+/// The reclaim totals returned by [`cleanup_finished_transfers`] — for the
+/// Settings result toast.
+///
+/// **GC note (mirrors the fn doc):** `payload_bytes` is reclaimed immediately;
+/// `tags_released` counts the receiver in-flight blob tags whose GC root was
+/// dropped, but iroh-blobs 0.103 has no on-demand GC trigger reachable from our
+/// layer, so the blob bytes those tags pinned come back within the store's
+/// periodic GC window (~15 min), NOT in this result. Only the payload bytes are
+/// reflected here as freed-now.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferCleanup {
+    /// Terminal-transfer payload dirs removed from `<sync>/packages/`.
+    pub payload_dirs: u32,
+    /// Bytes reclaimed by removing those payload dirs (freed immediately).
+    pub payload_bytes: u64,
+    /// Orphan receiver in-flight blob tags released (blob bytes reclaimed by the
+    /// next periodic GC sweep, ~15 min — see the type doc).
+    pub tags_released: u32,
+}
+
+/// Reclaim finished transfers' temp data on demand (Batch Model §D4, B7) — the
+/// Settings "Clean up finished transfers" action. Removes TERMINAL outbound rows'
+/// payload dirs (never a non-terminal row's — a live attempt's payload is kept)
+/// and releases orphan receiver in-flight blob tags (same discrimination as the
+/// startup sweep). Records are untouched — this reclaims disk only. See
+/// [`TransferCleanup`] for the GC-window caveat on `tags_released`.
+pub async fn cleanup_finished_transfers(
+    ctx: &ServiceContext,
+    sync: &SyncRuntime,
+) -> Result<TransferCleanup, ApiError> {
+    let (payload_dirs, payload_bytes) = remove_terminal_payload_dirs(ctx)?;
+    let tags_released = release_orphan_in_flight_tags(ctx, sync).await?;
+    tracing::info!(
+        payload_dirs,
+        payload_bytes,
+        tags_released,
+        "finished-transfer cleanup"
+    );
+    Ok(TransferCleanup { payload_dirs, payload_bytes, tags_released })
+}
+
 /// Whether full-app capture-node auto mode is enabled (`sync.auto_mode`).
 pub fn get_sync_auto_mode(ctx: &ServiceContext) -> Result<bool, ApiError> {
     let db = db(ctx)?;
@@ -3705,6 +4023,202 @@ mod tests {
                 .expect("delete + reclaim ok");
         assert_eq!(deleted.rows, 1, "the inbound row deleted");
         assert!(!ep.is_serving(wire), "delete releases the received batch's blob tags");
+    }
+
+    /// B7 helper: a started receive-side [`SyncRuntime`] over a loopback endpoint
+    /// (the same substitution `delete_received_batch_releases_blob_tags` makes), so
+    /// `sync.transport()` hands the loopback back to the sweep/cleanup in-flight-tag
+    /// pass. Returns the endpoint (to seed/observe in-flight tags) + the runtime.
+    async fn started_loopback_runtime(
+        tmp: &tempfile::TempDir,
+    ) -> (Arc<crate::sharing::loopback::LoopbackTransport>, Arc<SyncRuntime>) {
+        use crate::sharing::loopback::LoopbackNetwork;
+        use crate::sync::receiver::{allow_all_peers, IncomingResolver, InboundControl, SyncReceiver};
+        use crate::sync::store::CatalogSyncStore;
+
+        let net = LoopbackNetwork::new();
+        let ep = Arc::new(net.endpoint());
+        let recv_store = Arc::new(CatalogSyncStore::open(tmp.path().join("recv.db")).unwrap());
+        let staging = tmp.path().join("recv-staging");
+        let incoming: IncomingResolver = {
+            let p = tmp.path().join("recv-incoming");
+            Arc::new(move || p.clone())
+        };
+        let (_info, handle) = SyncReceiver::spawn(
+            recv_store,
+            staging,
+            incoming,
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&ep) as Arc<dyn SharingTransport>,
+            Arc::new(crate::events::NullEmitter),
+        )
+        .await
+        .unwrap();
+        let runtime = Arc::new(SyncRuntime::new());
+        runtime
+            .set_started_for_test(Arc::clone(&ep) as Arc<dyn SharingTransport>, handle, "t".into())
+            .await;
+        (ep, runtime)
+    }
+
+    /// B7 core contract: the startup sweep removes ONLY row-less orphan payload
+    /// dirs (a terminal-row dir and a non-terminal-row dir are both kept), and
+    /// releases ONLY orphan in-flight tags (a tag whose wire id still has a
+    /// non-terminal inbound row is kept).
+    #[tokio::test]
+    async fn sweep_removes_only_rowless_orphans_and_orphan_tags() {
+        use crate::sharing::types::AnnounceFileEntry;
+        use crate::sync::store::{insert_outbound_with_files, upsert_inbound_announced};
+
+        let (tmp, ctx) = test_ctx();
+        let packages_dir = sender_packages_dir(&ctx).unwrap();
+        std::fs::create_dir_all(&packages_dir).unwrap();
+
+        // Three payload dirs under <sync>/packages/, each with a payload file.
+        let mk = |name: &str| {
+            let d = packages_dir.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("frame.fits"), b"payload").unwrap();
+            d
+        };
+        let orphan_dir = mk("orphan-uuid"); // (a) NO row → removed
+        let terminal_dir = mk("terminal-uuid"); // (b) terminal row → kept
+        let live_dir = mk("live-uuid"); // (c) non-terminal row → kept
+
+        let peer = "aa".repeat(32);
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let files = vec![AnnounceFileEntry {
+                rel_path: "L/frame.fits".into(),
+                byte_size: 7,
+                frame_uuid: "f".into(),
+            }];
+            // (b) terminal (confirmed) row referencing terminal_dir.
+            let tid = insert_outbound_with_files(
+                &conn,
+                terminal_dir.to_str().unwrap(),
+                &peer,
+                Some("term"),
+                &files,
+            )
+            .unwrap();
+            conn.execute("UPDATE sync_outbound SET state = 'confirmed' WHERE id = ?1", [tid]).unwrap();
+            // (c) non-terminal (announced) row referencing live_dir.
+            insert_outbound_with_files(&conn, live_dir.to_str().unwrap(), &peer, Some("live"), &files)
+                .unwrap();
+            // A non-terminal inbound row pins its in-flight tag ("live-wire").
+            upsert_inbound_announced(&conn, &peer, "live-wire", 1, 10).unwrap();
+        }
+
+        // Seed two in-flight tags on the loopback: one orphan, one with a live row.
+        let (ep, runtime) = started_loopback_runtime(&tmp).await;
+        ep.seed_in_flight_tag("orphan-wire");
+        ep.seed_in_flight_tag("live-wire");
+
+        sweep_transfer_orphans(Arc::new(ctx), Arc::clone(&runtime)).await;
+
+        // Payload dirs: only the row-less orphan is gone.
+        assert!(!orphan_dir.exists(), "row-less orphan payload dir removed");
+        assert!(terminal_dir.exists(), "a terminal-row payload dir is kept for Resend");
+        assert!(live_dir.exists(), "a non-terminal-row payload dir is kept for its live attempt");
+
+        // In-flight tags: only the orphan is released; the live-row tag survives.
+        assert!(
+            !ep.has_in_flight_tag("orphan-wire"),
+            "an orphan in-flight tag (no non-terminal inbound row) is released"
+        );
+        assert!(
+            ep.has_in_flight_tag("live-wire"),
+            "an in-flight tag whose wire id still has a non-terminal inbound row is kept"
+        );
+    }
+
+    /// B7 cleanup: `cleanup_finished_transfers` removes TERMINAL rows' payloads
+    /// (their `resendable` honestly flips false), keeps non-terminal payloads, and
+    /// the storage stats drop across the call.
+    #[tokio::test]
+    async fn cleanup_removes_terminal_payloads_and_flips_resendable() {
+        use crate::sharing::types::AnnounceFileEntry;
+        use crate::sync::store::insert_outbound_with_files;
+
+        let (_tmp, ctx) = test_ctx();
+        let packages_dir = sender_packages_dir(&ctx).unwrap();
+        std::fs::create_dir_all(&packages_dir).unwrap();
+        // `resendable` requires a real payload dir (manifest + a payload file), the
+        // exact shape `package_has_payload` accepts.
+        let mk = |name: &str| {
+            let d = packages_dir.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(package::MANIFEST_FILENAME), b"{}\n").unwrap();
+            std::fs::write(d.join("frame.fits"), b"payload-bytes").unwrap();
+            d
+        };
+        let failed_dir = mk("failed-uuid"); // terminal → reclaimed
+        let live_dir = mk("live-uuid"); // non-terminal → kept
+
+        let peer = "bb".repeat(32);
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let files = vec![AnnounceFileEntry {
+                rel_path: "L/frame.fits".into(),
+                byte_size: 13,
+                frame_uuid: "f".into(),
+            }];
+            // A FAILED terminal row with its payload still on disk → resendable now.
+            let fid = insert_outbound_with_files(
+                &conn,
+                failed_dir.to_str().unwrap(),
+                &peer,
+                Some("failed"),
+                &files,
+            )
+            .unwrap();
+            conn.execute("UPDATE sync_outbound SET state = 'failed' WHERE id = ?1", [fid]).unwrap();
+            insert_outbound_with_files(&conn, live_dir.to_str().unwrap(), &peer, Some("live"), &files)
+                .unwrap();
+        }
+
+        // Before: the failed row is resendable (payload present); stats see 2 dirs.
+        let before = list_terminal_transfers(&ctx, None).expect("terminal transfers");
+        let failed_summary = before
+            .sent
+            .iter()
+            .find(|s| s.batch_uuid == "failed-uuid")
+            .expect("failed summary present");
+        assert!(failed_summary.resendable, "a failed row with payload is resendable before cleanup");
+        let stats_before = get_transfer_storage(&ctx).expect("stats before");
+        assert_eq!(stats_before.packages_count, 2, "two package dirs before cleanup");
+
+        let result = cleanup_finished_transfers(&ctx, &SyncRuntime::new())
+            .await
+            .expect("cleanup ok");
+        assert_eq!(result.payload_dirs, 1, "one terminal payload dir reclaimed");
+        assert!(result.payload_bytes > 0, "reclaimed some bytes");
+        assert_eq!(result.tags_released, 0, "no transport started → no tags released");
+
+        // After: terminal payload gone, live payload kept, resendable flipped false.
+        assert!(!failed_dir.exists(), "cleanup removed the terminal payload dir");
+        assert!(live_dir.exists(), "cleanup kept the non-terminal payload dir");
+        let after = list_terminal_transfers(&ctx, None).expect("terminal transfers after");
+        let failed_after = after
+            .sent
+            .iter()
+            .find(|s| s.batch_uuid == "failed-uuid")
+            .expect("failed summary still present");
+        assert!(
+            !failed_after.resendable,
+            "resendable honestly flips false once the payload is reclaimed"
+        );
+        let stats_after = get_transfer_storage(&ctx).expect("stats after");
+        assert_eq!(stats_after.packages_count, 1, "one package dir remains after cleanup");
+        assert!(
+            stats_after.packages_bytes < stats_before.packages_bytes,
+            "packages_bytes drops after cleanup"
+        );
     }
 
     /// Batch Model §D5: the status summaries carry the new `generation` (attempt N)

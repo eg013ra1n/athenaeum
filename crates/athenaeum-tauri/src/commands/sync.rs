@@ -9,7 +9,7 @@ use tauri::{AppHandle, State};
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{
     DeletedTransferRecord, EnqueueSelectionResult, SyncHistoryQuery, TerminalTransfers,
-    TransferEventEntry,
+    TransferCleanup, TransferEventEntry, TransferStorage,
 };
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
@@ -198,6 +198,27 @@ pub async fn delete_transfer_history(
     package_key: String,
 ) -> Result<DeletedTransferRecord, String> {
     api::delete_transfer_history(&state.ctx, &state.sync, direction, package_key)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// On-disk footprint of the transfer temp data (Batch Model §D4, B7): package
+/// payload dirs + the blob store dir, for the Settings "Transfer storage" line.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn get_transfer_storage(state: State<'_, AppState>) -> Result<TransferStorage, String> {
+    api::get_transfer_storage(&state.ctx).map_err(|e| e.to_string())
+}
+
+/// Reclaim finished transfers' temp data on demand (Batch Model §D4, B7): remove
+/// terminal outbound rows' payload dirs and release orphan receiver in-flight blob
+/// tags. Records untouched — reclaims disk only.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn cleanup_finished_transfers(
+    state: State<'_, AppState>,
+) -> Result<TransferCleanup, String> {
+    api::cleanup_finished_transfers(&state.ctx, &state.sync)
         .await
         .map_err(|e| e.to_string())
 }

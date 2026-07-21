@@ -8,7 +8,7 @@
 // signed-out user sees a quiet "sign in to configure sync" empty state and no sync
 // code runs. Every status is guarded against null/undefined — nothing here throws.
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Loader2,
   Inbox,
@@ -17,9 +17,12 @@ import {
   ChevronDown,
   Copy,
   Check,
+  Trash2,
 } from 'lucide-react';
 import { api } from '../../api';
-import type { AccountStatus, SyncStatus } from '../../types/models';
+import { formatBytes } from '../transfers/presentation';
+import { useNotifications } from '../../contexts/NotificationContext';
+import type { AccountStatus, SyncStatus, TransferStorage, TransferCleanup } from '../../types/models';
 
 /** Tauri and Axum both reject with a plain string, not an `Error`. */
 function errMsg(err: unknown): string {
@@ -28,12 +31,18 @@ function errMsg(err: unknown): string {
 
 export default function SyncSection() {
   const mounted = useRef(true);
+  const { notify } = useNotifications();
 
   const [status, setStatus] = useState<AccountStatus | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(true);
 
   const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
   const [devFlag, setDevFlag] = useState(false);
+
+  // Transfer storage (B7): the on-disk footprint of the transfer temp data +
+  // the one-click "clean up finished transfers" reclaim.
+  const [storage, setStorage] = useState<TransferStorage | null>(null);
+  const [cleaning, setCleaning] = useState(false);
 
   // Dev pairing-ticket disclosure — lazily fetched on first expand.
   const [showTicket, setShowTicket] = useState(false);
@@ -63,10 +72,21 @@ export default function SyncSection() {
     };
   }, []);
 
+  // Transfer-storage footprint — best-effort, degrades to null on failure.
+  const refreshStorage = useCallback(async () => {
+    try {
+      const s = await api.invoke<TransferStorage>('get_transfer_storage');
+      if (mounted.current) setStorage(s ?? null);
+    } catch (err) {
+      console.error('[sync] transfer storage poll failed:', err);
+    }
+  }, []);
+
   // Sync-side state loads only once signed in.
   useEffect(() => {
     if (!signedIn) {
       setSyncStatus(null);
+      setStorage(null);
       return;
     }
     (async () => {
@@ -85,7 +105,37 @@ export default function SyncSection() {
         console.error('[sync] load sync settings failed:', err);
       }
     })();
-  }, [signedIn]);
+    refreshStorage();
+  }, [signedIn, refreshStorage]);
+
+  const handleCleanup = async () => {
+    setCleaning(true);
+    try {
+      const result = await api.invoke<TransferCleanup>('cleanup_finished_transfers');
+      const pkgs = `${result.payloadDirs} package${result.payloadDirs === 1 ? '' : 's'}`;
+      const tags =
+        result.tagsReleased > 0
+          ? `, released ${result.tagsReleased} download${result.tagsReleased === 1 ? '' : 's'}`
+          : '';
+      notify({
+        title: 'Finished transfers cleaned up',
+        detail: `Freed ${formatBytes(result.payloadBytes)} (${pkgs})${tags}`,
+        kind: 'sync',
+        tone: 'success',
+      });
+      await refreshStorage();
+    } catch (err) {
+      console.error('[sync] cleanup finished transfers failed:', err);
+      notify({
+        title: 'Cleanup failed',
+        detail: errMsg(err),
+        kind: 'sync',
+        tone: 'warning',
+      });
+    } finally {
+      if (mounted.current) setCleaning(false);
+    }
+  };
 
   const handleToggleTicket = async () => {
     const next = !showTicket;
@@ -189,6 +239,43 @@ export default function SyncSection() {
             This machine is a full peer: it always receives, and sends are explicit and per-device.
           </p>
         </div>
+      </div>
+
+      {/* Transfer storage (B7): footprint + one-click reclaim of finished-transfer temp data. */}
+      <div>
+        <h4 className="text-sm font-medium text-content-secondary mb-2">Transfer storage</h4>
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-sm text-content-muted">
+            {storage ? (
+              <>
+                <span className="text-content-secondary">{storage.packagesCount}</span> package
+                {storage.packagesCount === 1 ? '' : 's'} ·{' '}
+                <span className="text-content-secondary">{formatBytes(storage.packagesBytes)}</span> on
+                disk · blobs{' '}
+                <span className="text-content-secondary">{formatBytes(storage.blobsBytes)}</span>
+              </>
+            ) : (
+              'Calculating…'
+            )}
+          </p>
+          <button
+            type="button"
+            onClick={handleCleanup}
+            disabled={cleaning}
+            className="flex-shrink-0 inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs text-content-secondary hover:bg-surface-hover disabled:opacity-50 transition-colors"
+          >
+            {cleaning ? (
+              <Loader2 size={13} className="animate-spin" />
+            ) : (
+              <Trash2 size={13} />
+            )}
+            Clean up finished transfers
+          </button>
+        </div>
+        <p className="mt-1.5 text-xs text-content-muted">
+          Removes finished transfers' temporary payloads and releases orphaned download data.
+          Received files and transfer history are untouched.
+        </p>
       </div>
 
       {/* Dev pairing ticket — only when the dev flag is on (sync.dev_ticket_pairing). */}

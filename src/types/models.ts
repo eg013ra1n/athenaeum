@@ -1123,6 +1123,35 @@ rows: number,
  */
 history: number, };
 
+export type TransferStorage = { 
+/**
+ * Total bytes across every `<sync>/packages/<uuid>` payload dir.
+ */
+packagesBytes: number, 
+/**
+ * Number of top-level package dirs under `<sync>/packages/`.
+ */
+packagesCount: number, 
+/**
+ * Total bytes under the blob store dir `<sync>/blobs/` (directory walk).
+ */
+blobsBytes: number, };
+
+export type TransferCleanup = { 
+/**
+ * Terminal-transfer payload dirs removed from `<sync>/packages/`.
+ */
+payloadDirs: number, 
+/**
+ * Bytes reclaimed by removing those payload dirs (freed immediately).
+ */
+payloadBytes: number, 
+/**
+ * Orphan receiver in-flight blob tags released (blob bytes reclaimed by the
+ * next periodic GC sweep, ~15 min — see the type doc).
+ */
+tagsReleased: number, };
+
 export type DeviceCapability = "athenaeum" | "perseus";
 
 export type EndpointAddrReport = { 

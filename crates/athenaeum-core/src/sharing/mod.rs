@@ -212,6 +212,29 @@ pub trait SharingTransport: Send + Sync {
     /// caller's state transition — callers log-and-continue on Err.
     async fn release(&self, package_id: &PackageId) -> anyhow::Result<()>;
 
+    /// List the wire [`PackageId`]s of the receiver-side **in-flight download
+    /// tags** currently GC-protecting a partial collection in this transport's
+    /// blob store (Transfers Batch Model §D4, B7 orphan reclaim).
+    ///
+    /// An aborted/killed fetch deliberately keeps its `in-flight/…` tag so a
+    /// later resume can reuse the verified partial bytes (B0 findings Q4); the
+    /// receiver's startup sweep and the "clean up finished transfers" action
+    /// call this to find those tags, cross-check them against the durable
+    /// `sync_inbound` rows, and [`release`](Self::release) the ones whose
+    /// transfer is no longer non-terminal so GC can reclaim the blobs.
+    ///
+    /// **Namespace contract (B7):** the implementation enumerates ONLY the
+    /// transfer-owned in-flight namespace (`in-flight/recv/pkg/<id>`) and returns
+    /// exactly those wire ids — a permanent `<role>/pkg/…` tag, a future
+    /// `project/…` seeding tag, or any foreign tag is never returned, so a caller
+    /// that releases every id this yields can never touch a tag outside the
+    /// transfer machinery. The default returns empty (the in-process loopback
+    /// mock and any store-less transport carry no such tags unless a test seeds
+    /// them).
+    async fn list_in_flight_tags(&self) -> anyhow::Result<Vec<PackageId>> {
+        Ok(Vec::new())
+    }
+
     /// Attach a best-effort dial hint for an inbound peer `from` right before we
     /// pull its blobs (finding H1 / I2, iroh hardening T7).
     ///

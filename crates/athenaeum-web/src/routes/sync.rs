@@ -9,7 +9,7 @@ use axum::{extract::State, http::StatusCode, Json};
 use athenaeum_core::api::sync as api;
 use athenaeum_core::api::sync::{
     DeletedTransferRecord, EnqueueSelectionResult, SyncHistoryQuery, TerminalTransfers,
-    TransferEventEntry,
+    TransferCleanup, TransferEventEntry, TransferStorage,
 };
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
@@ -272,6 +272,34 @@ pub async fn delete_transfer_history(
     Json(args): Json<DeleteTransferHistoryArgs>,
 ) -> Result<Json<DeletedTransferRecord>, (StatusCode, String)> {
     api::delete_transfer_history(&state.ctx, &state.sync, args.direction, args.package_key)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// POST /api/get_transfer_storage
+///
+/// On-disk footprint of the transfer temp data (Batch Model §D4, B7): package
+/// payload dirs + the blob store dir, for the Settings "Transfer storage" line.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_transfer_storage(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<TransferStorage>, (StatusCode, String)> {
+    api::get_transfer_storage(&state.ctx).map(Json).map_err(api_err)
+}
+
+/// POST /api/cleanup_finished_transfers
+///
+/// Reclaim finished transfers' temp data on demand (Batch Model §D4, B7): remove
+/// terminal outbound rows' payload dirs and release orphan receiver in-flight blob
+/// tags. Records untouched — reclaims disk only.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn cleanup_finished_transfers(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<TransferCleanup>, (StatusCode, String)> {
+    api::cleanup_finished_transfers(&state.ctx, &state.sync)
         .await
         .map(Json)
         .map_err(api_err)

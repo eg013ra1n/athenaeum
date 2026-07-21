@@ -235,6 +235,27 @@ fn role_package_tag(prefix: &str, package_id: &PackageId) -> String {
     format!("{prefix}/pkg/{}", package_id.0)
 }
 
+/// The tag-store prefix under which the RECEIVER's in-flight download tags live:
+/// `in-flight/recv/pkg/`. In-flight tags are receiver-only — a fetch (their only
+/// writer, [`blobs::in_flight_tag`]) runs on the [`Role::Recv`] handle — so this
+/// is the one namespace the B7 orphan sweep enumerates. Kept as a single literal
+/// and pinned against the tag constructors ([`blobs::in_flight_tag`] +
+/// [`role_package_tag`]) by `recv_in_flight_prefix_matches_constructors` so the
+/// sweep and the writer can never drift.
+const RECV_IN_FLIGHT_PREFIX: &str = "in-flight/recv/pkg/";
+
+/// If `tag` is a receiver-side in-flight download tag
+/// (`in-flight/recv/pkg/<wire_package_id>`), return that wire package id; else
+/// `None`. This one function IS the B7 namespace contract: a permanent
+/// `<role>/pkg/…` tag, a future `project/…` seeding tag, or any other foreign
+/// tag yields `None`, so the orphan sweep that releases what this matches can
+/// never touch a tag the transfer machinery does not own. Package ids are single
+/// path-segment uuids/hex, so a value carrying a `/` is rejected as malformed.
+fn recv_in_flight_package_id(tag: &str) -> Option<&str> {
+    tag.strip_prefix(RECV_IN_FLIGHT_PREFIX)
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+}
+
 /// Resolve a served collection's root hash back to the [`PackageId`] whose
 /// [`serve`](SharingTransport::serve) registered it (Task 13), by scanning the
 /// role-prefixed `served` map (`<prefix>/pkg/<package_id>` → hash). The package id
@@ -1796,6 +1817,32 @@ impl SharedIrohNode {
         Ok(())
     }
 
+    /// Enumerate the receiver-side in-flight download tags currently in the
+    /// shared store as their wire [`PackageId`]s (B7 orphan reclaim). Lists ONLY
+    /// the `in-flight/recv/pkg/` namespace via a prefixed tag scan and parses
+    /// each name through [`recv_in_flight_package_id`], so a permanent
+    /// `<role>/pkg/…` tag, a `project/…` tag, or any foreign tag is never
+    /// surfaced — the namespace contract holds by construction. Best-effort per
+    /// entry: a malformed tag name is skipped, never fatal.
+    async fn role_list_in_flight_tags(&self) -> Result<Vec<PackageId>> {
+        use n0_future::StreamExt as _;
+        let mut ids = Vec::new();
+        let mut stream = self
+            .store
+            .tags()
+            .list_prefix(RECV_IN_FLIGHT_PREFIX.as_bytes())
+            .await
+            .map_err(|e| anyhow!("list in-flight tags: {e}"))?;
+        while let Some(entry) = stream.next().await {
+            let info = entry.map_err(|e| anyhow!("list in-flight tag entry: {e}"))?;
+            let name = String::from_utf8_lossy(info.name.as_ref());
+            if let Some(id) = recv_in_flight_package_id(&name) {
+                ids.push(PackageId(id.to_string()));
+            }
+        }
+        Ok(ids)
+    }
+
     async fn ack_inner(
         &self,
         to: NodeId,
@@ -2037,6 +2084,10 @@ impl SharingTransport for RoleHandle {
 
     async fn release(&self, package_id: &PackageId) -> Result<()> {
         self.node.role_release(self.role, package_id).await
+    }
+
+    async fn list_in_flight_tags(&self) -> Result<Vec<PackageId>> {
+        self.node.role_list_in_flight_tags().await
     }
 
     fn add_peer_dial_hint(&self, from: NodeId) {
@@ -2330,6 +2381,80 @@ mod tests {
         );
 
         node.shutdown().await;
+    }
+
+    // (b2) B7 namespace contract: `list_in_flight_tags` enumerates ONLY the
+    //      receiver in-flight namespace (`in-flight/recv/pkg/<id>`) and `release`
+    //      deletes ONLY that id's own tags — a permanent `<role>/pkg/…` tag and a
+    //      foreign `project/…` tag survive both, so the B7 sweep/cleanup (which
+    //      reach the store only through these two primitives) can never touch a
+    //      tag the transfer machinery does not own.
+    #[tokio::test]
+    async fn in_flight_tag_list_and_release_honor_the_transfer_namespace() {
+        let dir = tempdir().unwrap();
+        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled).await.unwrap();
+        let store = node.store();
+        let tt = store.blobs().add_bytes(b"seed".to_vec()).temp_tag().await.unwrap();
+        for name in [
+            "in-flight/recv/pkg/orphan", // orphan in-flight → enumerated, released
+            "in-flight/recv/pkg/live",   // in-flight → enumerated, kept
+            "recv/pkg/perm",             // permanent receiver tag → NOT in-flight
+            "out/pkg/x",                 // sender permanent tag
+            "project/seed/deadbeef",     // FOREIGN (future project seeding) → must survive
+        ] {
+            store.tags().set(name, tt.hash_and_format()).await.unwrap();
+        }
+        drop(tt);
+
+        let recv = node.handle(Role::Recv);
+
+        // list surfaces EXACTLY the two in-flight wire ids — nothing else.
+        let mut ids: Vec<String> =
+            recv.list_in_flight_tags().await.unwrap().into_iter().map(|p| p.0).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["live".to_string(), "orphan".to_string()],
+            "list_in_flight_tags returns only the in-flight/recv/pkg/ namespace"
+        );
+
+        // Release the orphan: only its in-flight tag goes; everything else survives.
+        recv.release(&PackageId("orphan".into())).await.unwrap();
+        assert!(
+            !tag_present(store, "in-flight/recv/pkg/orphan").await,
+            "the orphan in-flight tag is released"
+        );
+        assert!(
+            tag_present(store, "in-flight/recv/pkg/live").await,
+            "the other in-flight tag is untouched"
+        );
+        assert!(tag_present(store, "recv/pkg/perm").await, "a permanent recv tag survives");
+        assert!(tag_present(store, "out/pkg/x").await, "a sender permanent tag survives");
+        assert!(
+            tag_present(store, "project/seed/deadbeef").await,
+            "a foreign project/… tag survives both list and release (B7 namespace contract)"
+        );
+
+        node.shutdown().await;
+    }
+
+    // B7: the in-flight prefix constant matches the tag constructors, so the sweep
+    // and the fetch-path writer can never drift.
+    #[test]
+    fn recv_in_flight_prefix_matches_constructors() {
+        assert_eq!(
+            RECV_IN_FLIGHT_PREFIX,
+            super::blobs::in_flight_tag(&format!("{}/pkg/", Role::Recv.prefix())),
+        );
+        // The parser round-trips a real receiver in-flight tag and rejects foreign
+        // / permanent / malformed names.
+        let tag = super::blobs::in_flight_tag(&role_package_tag(Role::Recv.prefix(), &PackageId("abc".into())));
+        assert_eq!(recv_in_flight_package_id(&tag), Some("abc"));
+        assert_eq!(recv_in_flight_package_id("recv/pkg/abc"), None);
+        assert_eq!(recv_in_flight_package_id("out/pkg/abc"), None);
+        assert_eq!(recv_in_flight_package_id("project/x/hash"), None);
+        assert_eq!(recv_in_flight_package_id("in-flight/recv/pkg/"), None);
+        assert_eq!(recv_in_flight_package_id("in-flight/recv/pkg/a/b"), None);
     }
 
     // (c) bind → shutdown → re-bind on the same dir succeeds: the lock is
