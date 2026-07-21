@@ -1631,6 +1631,56 @@ pub fn outbound_ref_states(conn: &Connection) -> Result<Vec<(i64, String, String
     Ok(rows)
 }
 
+/// The raw `peer` hex of one `sync_outbound` row, or `None` if the row is absent.
+/// Lean sibling of [`outbound_ref_states`] for the [`delete_transfer_history`]
+/// dead-peer split: returns the stored hex string verbatim (NO `NodeId` parse) so
+/// it compares directly against the cached `SYNC_AUTHORIZED_PEERS` hex allow-list
+/// and a malformed legacy hex can never abort a delete.
+///
+/// [`delete_transfer_history`]: crate::api::sync::delete_transfer_history
+pub fn outbound_peer_hex(conn: &Connection, id: i64) -> Result<Option<String>> {
+    conn.query_row("SELECT peer FROM sync_outbound WHERE id = ?1", params![id], |r| r.get(0))
+        .optional()
+        .with_context(|| format!("read peer hex for outbound {id}"))
+}
+
+/// Force one `sync_outbound` row to terminal `cancelled` on an arbitrary
+/// connection/transaction — the free-function form of [`SyncStore::set_state`]`(id,
+/// Cancelled)` for the [`delete_transfer_history`] dead-peer path, which runs
+/// inside its own `BEGIN IMMEDIATE` tx and cannot borrow the engine's locked
+/// store. Clears `next_retry_at` (a terminal state has no pending retry), matching
+/// the trait impl's terminal-state write.
+///
+/// [`delete_transfer_history`]: crate::api::sync::delete_transfer_history
+pub fn cancel_outbound_row(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_outbound SET state = ?1, next_retry_at = NULL WHERE id = ?2",
+        params![OutboundState::Cancelled.as_str(), id],
+    )
+    .with_context(|| format!("cancel outbound row {id}"))?;
+    Ok(())
+}
+
+/// Settle every not-yet-`done` per-file row of an OUTBOUND batch to terminal
+/// `done` carrying `outcome` in ONE UPDATE — the outbound twin of
+/// [`settle_unsettled_inbound_files`], matching the engine's per-row terminal
+/// settle (`state=done`, `outcome=<outcome>`; see `settle_unsettled_files` in
+/// `engine.rs`). Rows already `done` are left intact.
+pub fn settle_unsettled_outbound_files(
+    conn: &Connection,
+    outbound_id: i64,
+    outcome: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_outbound_files
+         SET state = ?1, outcome = ?2, error = NULL, updated_at = ?3
+         WHERE outbound_id = ?4 AND state <> 'done'",
+        params![OutboundFileState::Done.as_str(), outcome, now_iso(), outbound_id],
+    )
+    .with_context(|| format!("settle unsettled outbound files for {outbound_id}"))?;
+    Ok(())
+}
+
 /// Every `sync_inbound` row matching `package_id` as a `(id, state)` tuple — the
 /// received-half batch-delete scan. A wire package uuid is effectively unique, so
 /// this is normally one row, but the `UNIQUE(peer, package_id)` schema permits

@@ -83,6 +83,28 @@ export default function Transfers() {
       return full ? { direction: 'sent', packageKey: full } : null;
     };
 
+    // Package keys of the VISIBLE active (non-terminal) live rows. An active row
+    // owns the live Cancel action and already carries `deleteKey: null`; we also
+    // suppress the trash on any collapsed-terminal row or history group that
+    // shares its key, so the visible-active case never surfaces the backend's
+    // "cancel it first" refusal — the user cancels via the live row instead. (A
+    // dead-peer orphan has NO visible active row, so its collapsed/history row
+    // keeps its trash and the backend now cancels+deletes it.)
+    const activeSentPrefixes: string[] = [];
+    const activeRecvIds = new Set<string>();
+    for (const r of activeRows) {
+      if (r.kind === 'outbound') activeSentPrefixes.push(r.packageShort);
+      else if (r.packageId) activeRecvIds.add(r.packageId);
+    }
+    const hasActiveSibling = (dk: DeleteKey | null): boolean => {
+      if (!dk) return false;
+      return dk.direction === 'sent'
+        ? activeSentPrefixes.some((p) => dk.packageKey.startsWith(p))
+        : activeRecvIds.has(dk.packageKey);
+    };
+    const deleteKeyUnlessActive = (dk: DeleteKey | null): DeleteKey | null =>
+      hasActiveSibling(dk) ? null : dk;
+
     // Collapse terminal rows by batch key, preserving first-seen order.
     const collapseKey = (r: TransferRowModel) =>
       r.kind === 'outbound' ? `out:${r.packageShort}` : `in:${r.packageId ?? r.id}`;
@@ -111,7 +133,7 @@ export default function Transfers() {
         selKey: newest.key,
         row: newest,
         attemptCount: attempts.length,
-        deleteKey: resolveDeleteKey(newest),
+        deleteKey: deleteKeyUnlessActive(resolveDeleteKey(newest)),
       });
     }
 
@@ -138,7 +160,9 @@ export default function Transfers() {
         group: g,
         deviceName: deviceNames[g.peerDevice] ?? null,
         projectName: g.project ? projectNames[g.project] ?? null : null,
-        deleteKey: g.packageId ? { direction: g.direction, packageKey: g.packageId } : null,
+        deleteKey: deleteKeyUnlessActive(
+          g.packageId ? { direction: g.direction, packageKey: g.packageId } : null,
+        ),
       });
     }
     return [...liveUnified, ...historyUnified];

@@ -2777,9 +2777,10 @@ pub fn delete_transfer_history(
     package_key: String,
 ) -> Result<DeletedTransferRecord, ApiError> {
     use crate::sync::store::{
-        delete_history_for_package, delete_inbound_files, delete_inbound_row,
+        cancel_outbound_row, delete_history_for_package, delete_inbound_files, delete_inbound_row,
         delete_outbound_files, delete_outbound_row, delete_sync_events,
-        inbound_id_states_by_package, outbound_ref_states,
+        inbound_id_states_by_package, outbound_peer_hex, outbound_ref_states,
+        settle_unsettled_outbound_files,
     };
     use crate::sync::InboundState;
 
@@ -2803,10 +2804,63 @@ pub fn delete_transfer_history(
                 .filter(|(_, package_ref, _)| outbound_package_key(package_ref) == package_key)
                 .map(|(id, _, state)| Ok::<_, ApiError>((id, OutboundState::from_db(&state)?)))
                 .collect::<Result<_, _>>()?;
-            if matching.iter().any(|(_, s)| !s.is_terminal()) {
-                return Err(ApiError::Invalid(
-                    "batch has an active attempt — cancel it first".into(),
-                ));
+
+            // Split the non-terminal (active-attempt) rows by peer liveness. A row
+            // whose peer has LEFT the account can never complete: the resurrection
+            // account-gate (1a645e17) skips it, so it has no engine, is invisible in
+            // the active list, and cannot be cancelled — the old terminal-only guard
+            // then blocked this batch's record deletion forever. Read each
+            // non-terminal row's peer as the RAW stored hex (no `NodeId` parse) so a
+            // malformed legacy row can't abort the delete.
+            let mut non_terminal: Vec<(i64, OutboundState, String)> = Vec::new();
+            for (id, state) in &matching {
+                if !state.is_terminal() {
+                    let peer_hex = outbound_peer_hex(&tx, *id)?.unwrap_or_default();
+                    non_terminal.push((*id, *state, peer_hex));
+                }
+            }
+            if !non_terminal.is_empty() {
+                // Reuse the EXACT cached hex allow-list the resurrection gate reads
+                // (a local-DB peek — NO hub call). This grabs a second pooled
+                // connection; in WAL mode its read never blocks on our `IMMEDIATE`
+                // write lock, and `settings` is untouched by this tx.
+                let authorized = cached_authorized_peer_hexes(ctx);
+                if authorized.is_empty() {
+                    // No device data at all — a cold/never-populated cache. Never
+                    // guess about liveness with no data: refuse and retry later.
+                    return Err(ApiError::Invalid(
+                        "device list unavailable — retry after the account refreshes".into(),
+                    ));
+                }
+                // Any non-terminal row whose peer is STILL a live account device is a
+                // genuine in-flight attempt — refuse and name the state so the UI can
+                // point the user at the live row. Check ALL before cancelling ANY
+                // (all-or-refuse, atomic inside this tx).
+                if let Some((_, state, _)) =
+                    non_terminal.iter().find(|(_, _, peer)| authorized.contains(peer))
+                {
+                    return Err(ApiError::Invalid(format!(
+                        "batch has an active attempt ({}) — cancel it in Sending/Waiting first",
+                        state.as_str()
+                    )));
+                }
+                // Every remaining non-terminal row is a dead-peer orphan (peer absent
+                // from a NON-EMPTY account set) → transition each to `cancelled`
+                // in-place before the batch delete below. The state write + file
+                // settle are moot on their own (both rows are deleted a few lines down
+                // in THIS tx) but keep the honest cancel-then-delete semantic; the
+                // `sync_events` journal write is deliberately SKIPPED — the immediate
+                // `delete_sync_events` below would erase it in the same tx — while the
+                // durable audit trail is the `info!` here.
+                for (id, _, peer_hex) in &non_terminal {
+                    cancel_outbound_row(&tx, *id)?;
+                    settle_unsettled_outbound_files(&tx, *id, Some("cancelled"))?;
+                    tracing::info!(
+                        package_key = %package_key,
+                        peer = %peer_hex,
+                        "orphaned attempt cancelled during delete (peer left account)"
+                    );
+                }
             }
             let mut rows = 0u32;
             for (id, _) in &matching {
@@ -3119,6 +3173,154 @@ mod tests {
         assert_eq!(count("SELECT COUNT(*) FROM sync_inbound_files"), 0);
         assert_eq!(count("SELECT COUNT(*) FROM sync_events"), 0);
         assert_eq!(count("SELECT COUNT(*) FROM sync_history WHERE direction = 'received'"), 0);
+    }
+
+    /// Dead-peer delete (tv2 blocker fix): a SENT batch whose only non-terminal
+    /// attempt is a permanent orphan — an old `transferring` row whose peer is no
+    /// longer in the account's cached device set — must delete cleanly. Such a row
+    /// has no engine (the resurrection account-gate skips it), is invisible in the
+    /// active list, and can never be cancelled, so the old terminal-only guard
+    /// blocked record deletion forever. With a NON-EMPTY device cache that does
+    /// NOT list the peer, the orphan is cancelled in-place and the whole batch
+    /// (both attempt rows, their files, events, and history) is removed.
+    #[test]
+    fn delete_sent_batch_cancels_and_removes_dead_peer_orphan() {
+        use crate::sharing::types::AnnounceFileEntry;
+        use crate::sync::store::{append_sync_event, insert_history_row, insert_outbound_with_files};
+
+        let (_tmp, ctx) = test_ctx();
+        let dead_peer = "de".repeat(32); // absent from the seeded account cache
+        let live_peer = "aa".repeat(32); // the sole seeded account device
+        let (term, orphan);
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            // Non-empty account-device cache that does NOT contain `dead_peer`.
+            crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &live_peer).unwrap();
+            let files = |u: &str| {
+                vec![AnnounceFileEntry {
+                    rel_path: format!("Lights/{u}.fits"),
+                    byte_size: 8,
+                    frame_uuid: u.to_string(),
+                }]
+            };
+            // Terminal sibling + a non-terminal orphan sharing the dir basename.
+            term = insert_outbound_with_files(&conn, "/pkgs/gone", &dead_peer, None, &files("f1")).unwrap();
+            orphan = insert_outbound_with_files(&conn, "/pkgs/gone", &dead_peer, None, &files("f2")).unwrap();
+            conn.execute("UPDATE sync_outbound SET state = 'cancelled' WHERE id = ?1", [term]).unwrap();
+            conn.execute("UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1", [orphan]).unwrap();
+            append_sync_event(&conn, Direction::Sent, &term.to_string(), "cancel", None).unwrap();
+            append_sync_event(&conn, Direction::Sent, &orphan.to_string(), "attempt", None).unwrap();
+            insert_history_row(
+                &conn,
+                &HistoryRow {
+                    frame_uuid: "f2".into(),
+                    filename: "f2.fits".into(),
+                    object: None,
+                    peer_device: dead_peer.clone(),
+                    direction: Direction::Sent,
+                    bytes: 8,
+                    started_at: "t".into(),
+                    finished_at: None,
+                    outcome: "sent".into(),
+                    project: None,
+                    package_id: Some("gone".into()),
+                    batch_name: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let deleted = delete_transfer_history(&ctx, Direction::Sent, "gone".to_string())
+            .expect("dead-peer orphan deletes");
+        assert_eq!(deleted.rows, 2, "both attempt rows deleted");
+        assert_eq!(deleted.history, 1, "the history row deleted");
+
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/gone'"), 0);
+        assert_eq!(count(&format!("SELECT COUNT(*) FROM sync_outbound_files WHERE outbound_id IN ({term},{orphan})")), 0);
+        assert_eq!(count(&format!("SELECT COUNT(*) FROM sync_events WHERE batch_key IN ('{term}','{orphan}')")), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM sync_history WHERE package_id = 'gone'"), 0);
+    }
+
+    /// Dead-peer delete guard: a non-terminal attempt whose peer IS still a live
+    /// account device is genuinely in flight — deletion must refuse (deleting
+    /// nothing), and the message must name the state so the UI can point the user
+    /// at the live row to cancel it there.
+    #[test]
+    fn delete_sent_batch_refuses_when_peer_still_in_account() {
+        use crate::sharing::types::AnnounceFileEntry;
+        use crate::sync::store::insert_outbound_with_files;
+
+        let (_tmp, ctx) = test_ctx();
+        let live_peer = "aa".repeat(32);
+        let live;
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &live_peer).unwrap();
+            let files = vec![AnnounceFileEntry { rel_path: "Lights/x.fits".into(), byte_size: 4, frame_uuid: "x".into() }];
+            live = insert_outbound_with_files(&conn, "/pkgs/live", &live_peer, None, &files).unwrap();
+            conn.execute("UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1", [live]).unwrap();
+        }
+
+        let err = delete_transfer_history(&ctx, Direction::Sent, "live".to_string()).unwrap_err();
+        match err {
+            ApiError::Invalid(msg) => assert!(
+                msg.contains("transferring"),
+                "refusal names the active state, got: {msg}"
+            ),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/live'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "nothing deleted while the peer is still an account device");
+        let state: String = conn
+            .query_row("SELECT state FROM sync_outbound WHERE id = ?1", [live], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "transferring", "the live attempt is left untouched");
+    }
+
+    /// Dead-peer delete guard: with a COLD device cache (never populated), liveness
+    /// is unknowable — the delete must refuse with the retry message rather than
+    /// guess the peer left the account, and touch nothing.
+    #[test]
+    fn delete_sent_batch_refuses_when_device_cache_cold() {
+        use crate::sharing::types::AnnounceFileEntry;
+        use crate::sync::store::insert_outbound_with_files;
+
+        let (_tmp, ctx) = test_ctx();
+        let peer = "de".repeat(32);
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            // Deliberately DO NOT seed SYNC_AUTHORIZED_PEERS — cold cache.
+            let files = vec![AnnounceFileEntry { rel_path: "Lights/x.fits".into(), byte_size: 4, frame_uuid: "x".into() }];
+            let id = insert_outbound_with_files(&conn, "/pkgs/cold", &peer, None, &files).unwrap();
+            conn.execute("UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1", [id]).unwrap();
+        }
+
+        let err = delete_transfer_history(&ctx, Direction::Sent, "cold".to_string()).unwrap_err();
+        match err {
+            ApiError::Invalid(msg) => assert!(
+                msg.contains("device list unavailable"),
+                "cold cache refuses with the retry message, got: {msg}"
+            ),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/cold'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "cold cache never deletes — no guessing about liveness");
     }
 
     /// Task 3.3: with NO node bound and NOT signed in, transport health reads
