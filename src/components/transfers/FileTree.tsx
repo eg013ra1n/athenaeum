@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Folder, FileIcon } from 'lucide-react';
-import { formatBytes, outcomeChipClass, fileStateChipClass } from './presentation';
+import { formatBytes, outcomeChipClass, outcomeLabel, fileStateChipClass } from './presentation';
 import type { TransferFileEntry } from '../../types/models';
 
 interface FileTreeProps {
@@ -174,9 +174,9 @@ function FileRow({ entry, depth, liveOverlay, active }: FileRowProps) {
       ) : entry.outcome ? (
         <span
           className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${outcomeChipClass(entry.outcome)}`}
-          title={entry.error ?? undefined}
+          title={entry.error ?? entry.outcome}
         >
-          {entry.outcome}
+          {outcomeLabel(entry.outcome)}
         </span>
       ) : entry.state ? (
         <span

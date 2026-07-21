@@ -72,10 +72,13 @@ function passthroughTone(outcome: string): string {
 }
 
 /**
- * Collapse a group's rows per `frameUuid`: a frame's `sent` start-marker
- * (`finishedAt == null`) is superseded by its settled verdict the moment the
- * receiver's ack lands. Rows arrive newest-first, so the first settled row is
- * the newest verdict; a frame that only has a start-marker keeps the marker.
+ * Collapse a group's rows per `frameUuid` (== per (frame, package), since a group
+ * is one packageId): a frame's `sent` start-marker (`finishedAt == null`) is
+ * superseded by its settled verdict the moment the receiver's ack lands. Rows
+ * arrive newest-first, so the first settled row is the newest verdict; a frame that
+ * only has a start-marker keeps the marker. Batch model (B4/B6): the same row now
+ * accumulates verdicts across re-attempts, so a frame can carry BOTH an `ingested`
+ * and a later `superseded` row — keep-newest-settled resolves that to the newest.
  */
 export function collapseSentGroup(rows: HistoryRow[]): HistoryRow[] {
   const byFrame = new Map<string, HistoryRow[]>();

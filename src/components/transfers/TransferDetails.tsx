@@ -42,8 +42,11 @@ function liveRows(item: Extract<UnifiedRow, { kind: 'live' }>): Array<{ label: s
     { label: 'Raw state', value: r.state, mono: true },
     { label: 'Display state', value: r.displayState, mono: true },
     { label: 'Created', value: formatTimestamp(r.createdAt) },
+    // §D5: `generation` is the user-facing "attempt N" (bumped only by a resend);
+    // outbound `attempts` is the engine's internal announce-retry counter.
+    { label: 'Attempt (generation)', value: String(r.generation) },
   );
-  if (r.kind === 'outbound') rows.push({ label: 'Attempts', value: String(r.attempts) });
+  if (r.kind === 'outbound') rows.push({ label: 'Announce retries', value: String(r.attempts) });
   rows.push({ label: 'Size', value: formatBytes(r.byteSize) });
   if (r.lastError) rows.push({ label: 'Last error', value: r.lastError });
   return rows;

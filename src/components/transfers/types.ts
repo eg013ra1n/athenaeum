@@ -19,12 +19,12 @@ export type TransferFilter =
   | 'cancelled'
   | 'failed';
 
-/** The batch identity `delete_transfer_history` deletes by (UX wave 2). For a
- *  sent batch it is the full package-dir basename (== the `sent` history
- *  `packageId`); for a received batch it is the wire package uuid. `null` on a
- *  row that cannot be deleted (an active attempt, or a sent terminal row whose
- *  full basename can't be resolved from history — the live row only carries the
- *  truncated `packageShort`). */
+/** The batch identity `delete_transfer_history` deletes by (UX wave 2). For a SENT
+ *  batch it is `batchUuid` (== the package-dir basename == the `sent` history
+ *  `packageId`); for a RECEIVED batch it is the wire `packageId` — NEVER `batchUuid`,
+ *  on which the backend received-delete silently no-ops (B5 deferred the received
+ *  re-key). `null` on a row that cannot be deleted (a non-terminal live row, or a
+ *  legacy "Earlier transfers" history bucket with no single package key). */
 export interface DeleteKey {
   direction: Direction;
   packageKey: string;
@@ -39,12 +39,9 @@ export type UnifiedRow =
       kind: 'live';
       selKey: string;
       row: TransferRow;
-      /** How many DB-terminal attempts of this batch collapsed into this row
-       *  (≥1). `>1` renders the muted "· N attempts" hint. Always `1` for an
-       *  active (non-terminal) row — those are never collapsed. */
-      attemptCount: number;
-      /** Batch delete key (trash action), or `null` when the row can't be
-       *  deleted (active, or an unresolvable sent terminal row). */
+      /** Batch delete key (trash action), or `null` on a non-terminal live row.
+       *  Batch model: one row per transfer, so there is nothing to collapse — the
+       *  "attempt N" hint reads `row.generation`, not a collapsed count. */
       deleteKey: DeleteKey | null;
     }
   | {

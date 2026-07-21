@@ -3,7 +3,7 @@ import { api } from '../../api';
 import { FileTree } from './FileTree';
 import { TransferLog } from './TransferLog';
 import { TransferDetails } from './TransferDetails';
-import { outcomeChipClass } from './presentation';
+import { outcomeChipClass, outcomeLabel } from './presentation';
 import type { UnifiedRow } from './types';
 import type { Direction, TransferEventEntry, TransferFileEntry } from '../../types/models';
 
@@ -92,6 +92,14 @@ export function TransferDetail({ item, liveFiles, onClose }: TransferDetailProps
       ? item.row.displayName ?? item.row.packageShort
       : item.group.batchName ?? 'Transfer detail';
 
+  // All-duplicate transfer (§D6): every listed file's outcome is `duplicate`, i.e.
+  // the peer already held every frame and nothing was re-transferred. Shown as a
+  // Files-tab subline. Only fires once outcomes are settled (an in-flight file has
+  // a `null` outcome, so a still-moving batch never reads as all-duplicate).
+  const fileOutcomes: Array<string | null> =
+    item.kind === 'live' ? files.map((f) => f.outcome) : item.group.rows.map((r) => r.outcome);
+  const allDuplicate = fileOutcomes.length > 0 && fileOutcomes.every((o) => o === 'duplicate');
+
   return (
     <div className="flex h-full flex-col">
       <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2">
@@ -126,12 +134,20 @@ export function TransferDetail({ item, liveFiles, onClose }: TransferDetailProps
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-1">
-        {tab === 'files' &&
-          (item.kind === 'live' ? (
-            <FileTree entries={files} liveOverlay={liveOverlay} active={active} />
-          ) : (
-            <HistoryFileList item={item} />
-          ))}
+        {tab === 'files' && (
+          <>
+            {allDuplicate && (
+              <p className="px-1 pt-2 text-xs text-content-muted">
+                Peer already had every file — nothing was re-transferred.
+              </p>
+            )}
+            {item.kind === 'live' ? (
+              <FileTree entries={files} liveOverlay={liveOverlay} active={active} />
+            ) : (
+              <HistoryFileList item={item} />
+            )}
+          </>
+        )}
         {tab === 'log' &&
           (item.kind === 'live' ? (
             <TransferLog events={events} loading={loadingEvents} />
@@ -166,7 +182,7 @@ function HistoryFileList({ item }: { item: Extract<UnifiedRow, { kind: 'history'
             className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${outcomeChipClass(r.outcome)}`}
             title={r.outcome}
           >
-            {r.outcome === 'sent' ? 'awaiting confirmation' : r.outcome}
+            {outcomeLabel(r.outcome)}
           </span>
         </li>
       ))}

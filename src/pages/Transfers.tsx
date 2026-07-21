@@ -48,111 +48,60 @@ export default function Transfers() {
     };
   }, [refetch]);
 
-  // Merge live rows + history groups into one list.
+  // Merge live rows + history groups into one unified list (§D8). The batch model
+  // guarantees ONE durable row per transfer per direction — the sender reuses its
+  // row across resends (state flips in place, `generation++`), the receiver keeps
+  // one row per (peer, batch) — so `rows` already carries exactly one entry per
+  // transfer. No attempt-collapse, no supersession, no sibling-scan: a live and a
+  // settled transfer are the SAME row id, deduped by id upstream in the hook.
   //
-  // 1. Live rows split into ACTIVE (non-terminal — never collapsed, they own the
-  //    live actions) and TERMINAL (settled). Terminal rows sharing a batch key
-  //    collapse into ONE visible row (UX wave 2, §problem 1): outbound attempts
-  //    share the package-dir basename → the same (truncated) `packageShort`;
-  //    inbound rows share the wire `packageId`. The NEWEST attempt (max id) wins
-  //    its state/chips/detail; `attemptCount` drives the "· N attempts" hint.
-  // 2. History groups fold in behind the live rows, de-duping any group already
-  //    represented by a live row (a lingering failed/cancelled ledger row wins —
-  //    it carries live detail + a Resend action). The dedup keys off the same set
-  //    of live `packageShort`s the collapse produced, so no resurrected duplicate
-  //    appears below a collapsed row. Live keys: an outbound row's `packageShort`
-  //    is the truncated (≤10-char) prefix of the package-dir basename that a
-  //    `sent` history row stamps as its full `packageId`; an inbound row's full
-  //    `packageId` equals a `received` history row's `packageId`.
+  // History groups fold in BEHIND the live rows, hiding any group already on screen
+  // as a live/terminal row. `list_terminal_transfers` is a recent (~100) window, so
+  // the surviving history groups are OLDER transfers beyond that window — the one
+  // thing history still contributes. Dedup + delete keys are now direct field
+  // reads: a SENT row's `batchUuid` == the sent history `packageId`; a RECEIVED
+  // row's `packageId` (current wire id) == the received history `packageId`.
   const unified = useMemo<UnifiedRow[]>(() => {
-    const activeRows = rows.filter((r) => !r.terminal);
-    const terminalRows = rows.filter((r) => r.terminal);
-
-    // The full sent package-dir basenames live only in history (a live outbound
-    // row carries just the truncated `packageShort`); a collapsed terminal sent
-    // row resolves its delete key by prefix-matching against these.
-    const sentHistoryFullKeys = groups
-      .filter((g) => g.direction === 'sent' && g.packageId != null)
-      .map((g) => g.packageId as string);
-
-    const resolveDeleteKey = (r: TransferRowModel): DeleteKey | null => {
+    // Delete keys (item 3, HARD CONTRACT): a SENT transfer deletes by `batchUuid`
+    // (== the package-dir basename == the sent history `packageId`); a RECEIVED
+    // transfer deletes by `packageId` (the wire id) — NEVER `batchUuid`, on which
+    // the backend received-delete silently no-ops (B5 deferred the received re-key).
+    // Trash shows only on a settled (terminal) row; a live row IS the same row, so
+    // there is no sibling to suppress it against.
+    const liveDeleteKey = (r: TransferRowModel): DeleteKey | null => {
+      if (!r.terminal) return null;
       if (r.kind === 'inbound') {
         return r.packageId ? { direction: 'received', packageKey: r.packageId } : null;
       }
-      const full = sentHistoryFullKeys.find((k) => k.startsWith(r.packageShort));
-      return full ? { direction: 'sent', packageKey: full } : null;
+      return r.batchUuid ? { direction: 'sent', packageKey: r.batchUuid } : null;
     };
 
-    // Package keys of the VISIBLE active (non-terminal) live rows. An active row
-    // owns the live Cancel action and already carries `deleteKey: null`; we also
-    // suppress the trash on any collapsed-terminal row or history group that
-    // shares its key, so the visible-active case never surfaces the backend's
-    // "cancel it first" refusal — the user cancels via the live row instead. (A
-    // dead-peer orphan has NO visible active row, so its collapsed/history row
-    // keeps its trash and the backend now cancels+deletes it.)
-    const activeSentPrefixes: string[] = [];
-    const activeRecvIds = new Set<string>();
-    for (const r of activeRows) {
-      if (r.kind === 'outbound') activeSentPrefixes.push(r.packageShort);
-      else if (r.packageId) activeRecvIds.add(r.packageId);
-    }
-    const hasActiveSibling = (dk: DeleteKey | null): boolean => {
-      if (!dk) return false;
-      return dk.direction === 'sent'
-        ? activeSentPrefixes.some((p) => dk.packageKey.startsWith(p))
-        : activeRecvIds.has(dk.packageKey);
-    };
-    const deleteKeyUnlessActive = (dk: DeleteKey | null): DeleteKey | null =>
-      hasActiveSibling(dk) ? null : dk;
-
-    // Collapse terminal rows by batch key, preserving first-seen order.
-    const collapseKey = (r: TransferRowModel) =>
-      r.kind === 'outbound' ? `out:${r.packageShort}` : `in:${r.packageId ?? r.id}`;
-    const byBatch = new Map<string, TransferRowModel[]>();
-    const batchOrder: string[] = [];
-    for (const r of terminalRows) {
-      const k = collapseKey(r);
-      if (!byBatch.has(k)) {
-        byBatch.set(k, []);
-        batchOrder.push(k);
-      }
-      byBatch.get(k)!.push(r);
-    }
-
-    const liveUnified: UnifiedRow[] = [];
-    // Active rows first (never collapsed, no delete affordance).
-    for (const r of activeRows) {
-      liveUnified.push({ kind: 'live', selKey: r.key, row: r, attemptCount: 1, deleteKey: null });
-    }
-    // Then one collapsed row per terminal batch (newest attempt wins).
-    for (const k of batchOrder) {
-      const attempts = byBatch.get(k)!;
-      const newest = attempts.reduce((a, b) => (b.id > a.id ? b : a));
-      liveUnified.push({
+    const liveUnified: UnifiedRow[] = rows.map(
+      (r): UnifiedRow => ({
         kind: 'live',
-        selKey: newest.key,
-        row: newest,
-        attemptCount: attempts.length,
-        deleteKey: deleteKeyUnlessActive(resolveDeleteKey(newest)),
-      });
-    }
+        selKey: r.key,
+        row: r,
+        deleteKey: liveDeleteKey(r),
+      }),
+    );
 
-    // Dedup history groups against every live row's batch key (pre-collapse set
-    // is identical — collapse never adds/removes a `packageShort`/`packageId`).
-    const liveSentPrefixes: string[] = [];
+    // Batch keys already on screen as a live/terminal row, so their history groups
+    // don't double: sent by `batchUuid`, received by the current wire `packageId`.
+    const liveSentKeys = new Set<string>();
     const liveRecvIds = new Set<string>();
     for (const r of rows) {
-      if (r.kind === 'outbound') liveSentPrefixes.push(r.packageShort);
-      else if (r.packageId) liveRecvIds.add(r.packageId);
+      if (r.kind === 'outbound') {
+        if (r.batchUuid) liveSentKeys.add(r.batchUuid);
+      } else if (r.packageId) {
+        liveRecvIds.add(r.packageId);
+      }
     }
 
     const historyUnified: UnifiedRow[] = [];
     for (const g of groups) {
       const dup =
         g.packageId != null &&
-        (g.direction === 'sent'
-          ? liveSentPrefixes.some((p) => g.packageId!.startsWith(p))
-          : liveRecvIds.has(g.packageId));
+        (g.direction === 'sent' ? liveSentKeys.has(g.packageId) : liveRecvIds.has(g.packageId));
       if (dup) continue;
       historyUnified.push({
         kind: 'history',
@@ -160,9 +109,10 @@ export default function Transfers() {
         group: g,
         deviceName: deviceNames[g.peerDevice] ?? null,
         projectName: g.project ? projectNames[g.project] ?? null : null,
-        deleteKey: deleteKeyUnlessActive(
-          g.packageId ? { direction: g.direction, packageKey: g.packageId } : null,
-        ),
+        // A history group's `packageId` IS its delete key — sent == batchUuid,
+        // received == the wire id (item 3). `null` for a legacy "Earlier transfers"
+        // bucket with no single package key.
+        deleteKey: g.packageId ? { direction: g.direction, packageKey: g.packageId } : null,
       });
     }
     return [...liveUnified, ...historyUnified];

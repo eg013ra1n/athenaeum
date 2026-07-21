@@ -69,7 +69,6 @@ export function TransferRow({
       {item.kind === 'live' ? (
         <LiveRowBody
           row={item.row}
-          attemptCount={item.attemptCount}
           deleteKey={item.deleteKey}
           now={now}
           busy={busy}
@@ -151,9 +150,7 @@ function stageProgress(
 
 interface LiveRowBodyProps {
   row: TransferRowModel;
-  /** Collapsed-attempt count (≥1); `>1` renders the "· N attempts" hint. */
-  attemptCount: number;
-  /** Batch delete key, or `null` when the row can't be deleted (active row). */
+  /** Batch delete key, or `null` when the row can't be deleted (non-terminal row). */
   deleteKey: DeleteKey | null;
   now: number;
   busy: Set<string>;
@@ -166,7 +163,6 @@ interface LiveRowBodyProps {
 
 function LiveRowBody({
   row,
-  attemptCount,
   deleteKey,
   now,
   busy,
@@ -266,17 +262,21 @@ function LiveRowBody({
               <span className="inline-flex shrink-0 items-center gap-1 text-[11px] text-content-secondary tabular-nums">
                 <Clock size={11} />
                 retry in {formatCountdown(row.stalledUntil, now)}
-                {row.attempts > 1 && ` · attempt ${row.attempts}`}
+                {row.generation > 1 && ` · attempt ${row.generation}`}
               </span>
             )}
           </div>
 
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-content-muted">
             <span title={deviceLabel}>{deviceLabel}</span>
-            {attemptCount > 1 && (
+            {/* User-facing "attempt N" (§D5), from `generation` (bumped only by a
+                resend — never the engine's internal announce-retries). Shown on
+                active AND terminal rows; suppressed while `waiting`, where the
+                countdown above already carries its own "· attempt N". */}
+            {row.generation > 1 && !waiting && (
               <>
                 <span aria-hidden="true">·</span>
-                <span className="text-content-muted tabular-nums">{attemptCount} attempts</span>
+                <span className="text-content-muted tabular-nums">attempt {row.generation}</span>
               </>
             )}
             <span aria-hidden="true">·</span>

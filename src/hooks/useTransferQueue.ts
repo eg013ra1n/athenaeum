@@ -124,8 +124,19 @@ export interface TransferRow {
   bytesDone: number;
   state: string;
   createdAt: string;
-  /** Outbound-only; `0` for inbound rows (the field doesn't exist there). Details-tab only. */
+  /** Outbound-only; `0` for inbound rows (the field doesn't exist there). Details-tab only.
+   *  Includes the engine's internal announce-retries — NOT the user-facing counter. */
   attempts: number;
+  /** User-facing "attempt N" counter (Transfers Batch Model §D5) — bumped ONLY by a
+   *  resend, never by the engine's internal announce-retries (`attempts`). Rendered
+   *  as "attempt N" when `> 1`, on active AND terminal rows. */
+  generation: number;
+  /** The durable per-transfer batch identity (§D1): outbound == the package-dir
+   *  basename (== the sent `sync_history.package_id`, the `delete_transfer_history`
+   *  key for a SENT row); inbound == `sync_inbound.batch_uuid` (the stable batch id).
+   *  NOTE: a RECEIVED transfer is deleted by `packageId` (the wire id), NEVER this —
+   *  see the delete wiring in `Transfers.tsx`. */
+  batchUuid: string;
   lastError: string | null;
   nextRetryAt: string | null;
   /** `true` for a lingering failed/cancelled outbound row (Resend, not Cancel/Send-now). */
@@ -456,6 +467,8 @@ export function useTransferQueue(): UseTransferQueue {
         state: s.state,
         createdAt: s.createdAt,
         attempts: s.attempts,
+        generation: s.generation,
+        batchUuid: s.batchUuid,
         lastError: s.lastError,
         nextRetryAt: s.nextRetryAt,
         terminal: false,
@@ -478,8 +491,9 @@ export function useTransferQueue(): UseTransferQueue {
     // ledger entry for an id still (momentarily) `active` is skipped here
     // rather than rendered as a second `out:<id>` row; once the next poll
     // catches up, the id naturally leaves `active` and the ledger row takes
-    // over unmasked. No separate ledger pruning needed (ids are never reused —
-    // `retry_sync_package` always mints a new id).
+    // over unmasked. Batch model: a resend reuses the same id (resets the row in
+    // place, generation++), so a ledger entry for an id that has gone active
+    // again is correctly masked here until the resend settles.
     for (const { summary, outcome } of terminalOutbound.values()) {
       if (activeOutboundIds.has(summary.id)) continue;
       if (dbTerminalSentIds.has(summary.id)) continue;
@@ -504,6 +518,8 @@ export function useTransferQueue(): UseTransferQueue {
         state: outcome,
         createdAt: summary.createdAt,
         attempts: summary.attempts,
+        generation: summary.generation,
+        batchUuid: summary.batchUuid,
         lastError: summary.lastError,
         nextRetryAt: null,
         terminal: true,
@@ -541,6 +557,8 @@ export function useTransferQueue(): UseTransferQueue {
         state: s.state,
         createdAt: s.createdAt,
         attempts: s.attempts,
+        generation: s.generation,
+        batchUuid: s.batchUuid,
         lastError: s.lastError,
         nextRetryAt: null,
         terminal: true,
@@ -578,6 +596,8 @@ export function useTransferQueue(): UseTransferQueue {
         state: s.state,
         createdAt: s.createdAt,
         attempts: 0,
+        generation: s.generation,
+        batchUuid: s.batchUuid,
         lastError: null,
         nextRetryAt: null,
         terminal: false,
@@ -612,6 +632,8 @@ export function useTransferQueue(): UseTransferQueue {
         state: s.state,
         createdAt: s.createdAt,
         attempts: 0,
+        generation: s.generation,
+        batchUuid: s.batchUuid,
         lastError: null,
         nextRetryAt: null,
         terminal: true,
@@ -703,11 +725,12 @@ export function useTransferQueue(): UseTransferQueue {
       withBusy(`resend:${id}`, async () => {
         try {
           await api.invoke<number>('retry_sync_package', { id });
-          // Drop the just-resent id from BOTH terminal sources for immediate
-          // feedback (the new in-flight row takes its place). `retry_sync_package`
-          // leaves the original terminal DB row intact and mints a new id, so a
-          // later `fetchTerminal` may legitimately re-surface the old attempt —
-          // an honest record, not a duplicate (different id).
+          // Batch model (§D1): resend REUSES the same row — `retry_sync_package`
+          // resets `sync_outbound` id `id` in place (state → queued, generation++)
+          // and returns the SAME id. Drop it from both terminal sources so it stops
+          // rendering as settled; the next `get_sync_status` poll returns the same
+          // id in `sender.active` and the row flips back to live IN PLACE (one row,
+          // "attempt N"). No new id is minted, so `fetchTerminal` won't re-surface it.
           setTerminalOutbound((prev) => {
             if (!prev.has(id)) return prev;
             const next = new Map(prev);
@@ -732,12 +755,11 @@ export function useTransferQueue(): UseTransferQueue {
   // Trash a settled batch's durable records (UX wave 2). Terminal-only by
   // construction — the trash affordance never appears on an active row — but the
   // backend also refuses (`Invalid`) if any attempt is momentarily active, in
-  // which case we notify and remove nothing. On success we optimistically drop
-  // the batch's terminal rows from both durable sources (a sent batch's attempts
-  // all share the truncated `packageShort`, of which the full `packageKey` is a
-  // prefix; a received batch matches its full `packageId` exactly) and re-read
-  // the durable window to reconcile. Returns success so the page can also clear
-  // the batch's history rows.
+  // which case we notify and remove nothing. On success we optimistically drop the
+  // batch's terminal rows from both durable sources by EXACT key (batch model: ONE
+  // row per batch — sent matches `batchUuid`, received matches the wire `packageId`)
+  // and re-read the durable window to reconcile. Returns success so the page can
+  // also clear the batch's history rows.
   const deleteTransfer = useCallback(
     (direction: Direction, packageKey: string): Promise<boolean> => {
       const busyKey = `delete:${direction}:${packageKey}`;
@@ -746,16 +768,17 @@ export function useTransferQueue(): UseTransferQueue {
         .invoke<DeletedTransferRecord>('delete_transfer_history', { direction, packageKey })
         .then(() => {
           if (direction === 'received') {
+            // Received batch key IS the wire `packageId` (item 3 contract).
             setDbTerminalReceived((prev) => prev.filter((s) => s.packageId !== packageKey));
           } else {
-            setDbTerminalSent((prev) =>
-              prev.filter((s) => !packageKey.startsWith(s.packageShort)),
-            );
+            // Sent batch key IS `batchUuid` (== the package-dir basename == the sent
+            // history `packageId`) — an exact match, no prefix scan.
+            setDbTerminalSent((prev) => prev.filter((s) => s.batchUuid !== packageKey));
             setTerminalOutbound((prev) => {
               let changed = false;
               const next = new Map(prev);
               for (const [id, entry] of prev) {
-                if (packageKey.startsWith(entry.summary.packageShort)) {
+                if (entry.summary.batchUuid === packageKey) {
                   next.delete(id);
                   changed = true;
                 }

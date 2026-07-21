@@ -179,6 +179,16 @@ export function outcomeChipClass(outcome: string): string {
   return CHIP_MUTED;
 }
 
+/** Human label for a per-file / per-frame outcome tag (Files tab + history rows).
+ *  `duplicate` reads "already on peer" (§D6 copy — the frame was NOT re-transferred
+ *  because the peer already held it); `sent` reads "awaiting confirmation" (a start
+ *  marker the receiver hasn't acked yet). Everything else passes through verbatim. */
+export function outcomeLabel(outcome: string): string {
+  if (outcome === 'duplicate') return 'already on peer';
+  if (outcome === 'sent') return 'awaiting confirmation';
+  return outcome;
+}
+
 /** Per-file lifecycle-state chip tone (a file that has no settled outcome yet). */
 export function fileStateChipClass(state: string): string {
   switch (state) {
@@ -218,6 +228,11 @@ export function humanizeEventKind(kind: string): string {
     ingested: 'Ingested',
     replayed: 'Replayed (already received)',
     dial_failed: 'Dial failed',
+    // Transfers Batch Model (§D2/§D3): resend + sender-revoke journal kinds.
+    resend: 'Resent',
+    revoke_sent: 'Revoke sent',
+    revoked: 'Revoked by sender',
+    superseded: 'Superseded (peer already had every file)',
   };
   return map[kind] ?? kind.replace(/_/g, ' ');
 }
