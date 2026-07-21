@@ -173,10 +173,10 @@ pub const DDL_RECEIPTS: &str = "CREATE TABLE IF NOT EXISTS sync_receipts (
 /// `(peer, batch_uuid)` across all attempts, enforced by the `idx_sync_inbound_batch`
 /// unique index ([`DDL_INDEXES`]). The legacy `UNIQUE(peer, package_id)` constraint
 /// stays — `package_id` is still per-attempt-unique (now "current attempt's wire
-/// id"). **The ABSENCE of `batch_uuid` doubles as the batch-model upgrade
-/// detector** ([`wipe_transfer_bookkeeping_on_upgrade`]): a fresh DB is born with
-/// it (so it never wipes), a pre-batch DB lacks it (so it wipes once, then gains
-/// it).
+/// id"). Its presence feeds the batch-model upgrade detector
+/// ([`transfer_wipe_needed`], driving [`wipe_transfer_bookkeeping_on_upgrade`]) —
+/// see that fn's docs for the full two-shape detection (it also catches a
+/// pre-Task-11 DB that lacks this table entirely).
 pub const DDL_INBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_inbound (
     id INTEGER PRIMARY KEY,
     peer TEXT NOT NULL,
@@ -203,9 +203,11 @@ pub const DDL_INBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_inbound (
 /// `sync_inbound` shipped in beta.3 without these columns, so a store opened over
 /// a 0.4.x catalog / Perseus DB is migrated in place here. Called by every
 /// `sync_inbound` materialisation site (both store `open`s and `db::schema::init_db`)
-/// right after the DDL and AFTER [`wipe_transfer_bookkeeping_on_upgrade`] (which
-/// keys on the ABSENCE of `batch_uuid`, so it must run before this adds it). Never
-/// breaks an existing DB: an already-present column is a no-op.
+/// right after the DDL. [`wipe_transfer_bookkeeping_on_upgrade`] (and its detector,
+/// [`transfer_wipe_needed`]) must run BEFORE this — indeed before any DDL in the
+/// same pass — so its inspection of `batch_uuid`/table presence reflects the
+/// pre-call state, not a shape this very call already created. Never breaks an
+/// existing DB: an already-present column is a no-op.
 pub fn ensure_inbound_columns(conn: &Connection) -> Result<()> {
     let existing: HashSet<String> = conn
         .prepare("PRAGMA table_info(sync_inbound)")
@@ -273,17 +275,52 @@ fn table_present(conn: &Connection, table: &str) -> Result<bool> {
     Ok(n > 0)
 }
 
+/// Detect whether [`wipe_transfer_bookkeeping_on_upgrade`] must run — the
+/// batch-model upgrade detector.
+///
+/// **Must be evaluated BEFORE any of the caller's own DDL executes this pass.**
+/// Every sync-table `CREATE TABLE` is `IF NOT EXISTS`, so it un-conditionally
+/// materialises the table; checking table/column presence any later can no
+/// longer distinguish "freshly created by this very call" (fresh DB) from
+/// "pre-existing with legacy rows" (an upgrade). This fn is pure inspection
+/// (`PRAGMA`/`sqlite_master` reads) — it never creates anything, so calling it
+/// first is always safe.
+///
+/// Two DB shapes both signal "wipe needed":
+/// - **`sync_inbound` exists but lacks `batch_uuid`** — the beta.3-through-0.4.x
+///   shape (Task 11 shipped `sync_inbound` without it).
+/// - **`sync_inbound` does not exist at all, but `sync_outbound` or
+///   `sync_history` does** — the PRE-Task-11 beta.1/beta.2 shape.
+///   `sync_inbound` shipped only in beta.3, so an observatory/device still on
+///   beta.1/beta.2 has neither the table nor the column, yet may already carry
+///   `sync_outbound`/`sync_history` rows (including non-terminal outbound rows
+///   [`resurrect_pending_senders`](super::engine) would otherwise pick back up).
+///   Column-presence alone reads this shape as "already migrated" (wrong) once
+///   `DDL_INBOUND` has created a fresh, columned `sync_inbound` earlier in the
+///   same call — hence the BEFORE-any-DDL requirement above.
+///
+/// A truly fresh DB has NEITHER `sync_inbound` NOR `sync_outbound` NOR
+/// `sync_history` yet (nothing this call's own DDL has touched) → `false`,
+/// guaranteed no-op — never skipped by flag-purity alone.
+fn transfer_wipe_needed(conn: &Connection) -> Result<bool> {
+    if table_present(conn, "sync_inbound")? {
+        return Ok(!column_present(conn, "sync_inbound", "batch_uuid")?);
+    }
+    Ok(table_present(conn, "sync_outbound")? || table_present(conn, "sync_history")?)
+}
+
 /// One-shot **clean reset** of ALL transfer bookkeeping on the batch-model upgrade
 /// (spec §Migration, owner decision 2026-07-21: the accumulated records are
 /// smoke-test debris; preserving them buys nothing).
 ///
-/// `sync_inbound.batch_uuid` is the migrated-flag. A fresh DB creates the column
-/// inline ([`DDL_INBOUND`]), so by the time this runs — right AFTER `DDL_INBOUND`,
-/// BEFORE [`ensure_inbound_columns`] — the detector sees it and NEVER wipes; a
-/// pre-batch (0.4.x / beta.3) DB lacks it, so the wipe fires exactly once. After
-/// the wipe, `ensure_inbound_columns` adds the column, so every later init sees the
-/// flag and this is a no-op. **The wipe therefore can never fire on a post-upgrade
-/// DB — column presence IS the flag.**
+/// Gated by [`transfer_wipe_needed`] — call THIS fn (and thus that detector) at
+/// the very top of the sync-table materialisation block, before any
+/// `conn.execute(DDL_*)` in this pass, so the detector sees the true pre-call
+/// state (see its docs for why order matters). The wipe itself only needs tables
+/// to ALREADY exist from a prior run — `DELETE FROM` does not care about a
+/// table's exact column shape — so running before this call's own DDL is safe:
+/// a table this call is about to create fresh is, by definition, not present yet
+/// and is skipped by the [`table_present`] guard below (nothing to delete).
 ///
 /// The wipe runs in its OWN transaction: the caller (either store `open` or
 /// `init_db`) holds no open transaction on this connection, matching the
@@ -295,7 +332,7 @@ fn table_present(conn: &Connection, table: &str) -> Result<bool> {
 /// DELETE is guarded by [`table_present`] so a missing table is skipped, never an
 /// error. `info!` records the per-table deleted count.
 pub fn wipe_transfer_bookkeeping_on_upgrade(conn: &Connection) -> Result<()> {
-    if column_present(conn, "sync_inbound", "batch_uuid")? {
+    if !transfer_wipe_needed(conn)? {
         return Ok(());
     }
     let tx = conn
@@ -2101,17 +2138,21 @@ impl StandaloneSyncStore {
              PRAGMA synchronous = NORMAL;",
         )
         .context("configure sync db pragmas")?;
+        // Transfers Batch Model reset (spec §Migration): MUST run before any DDL
+        // below — the detector inspects table/column presence, and every
+        // `CREATE TABLE IF NOT EXISTS` here un-conditionally materialises its
+        // table, so checking any later could no longer tell "freshly created by
+        // this very call" from "pre-existing with legacy rows" (see
+        // `transfer_wipe_needed`'s docs — this is what catches a pre-Task-11
+        // beta.1/beta.2 DB that has `sync_outbound`/`sync_history` rows but no
+        // `sync_inbound` table at all). A no-op on a fresh or already-migrated DB.
+        wipe_transfer_bookkeeping_on_upgrade(&conn)?;
         conn.execute(DDL_OUTBOUND, [])
             .context("create sync_outbound")?;
         ensure_outbound_columns(&conn)?;
         conn.execute(DDL_HISTORY, []).context("create sync_history")?;
         ensure_history_columns(&conn)?;
         conn.execute(DDL_INBOUND, []).context("create sync_inbound")?;
-        // Transfers Batch Model reset (spec §Migration): gated on the ABSENCE of
-        // `sync_inbound.batch_uuid`, so it MUST run after `DDL_INBOUND` (the fresh
-        // DB is born with the column → never wipes) and BEFORE `ensure_inbound_columns`
-        // (which adds it → would hide the flag). A no-op on a fresh / post-upgrade DB.
-        wipe_transfer_bookkeeping_on_upgrade(&conn)?;
         ensure_inbound_columns(&conn)?;
         conn.execute(DDL_OUTBOUND_FILES, []).context("create sync_outbound_files")?;
         conn.execute(DDL_INBOUND_FILES, []).context("create sync_inbound_files")?;
@@ -2360,6 +2401,15 @@ impl CatalogSyncStore {
              PRAGMA synchronous = NORMAL;",
         )
         .context("configure catalog sync store pragmas")?;
+        // Transfers Batch Model reset (spec §Migration): MUST run before any DDL
+        // below — see the standalone `open` for the detector-placement rationale
+        // (checking table/column presence after `CREATE TABLE IF NOT EXISTS` has
+        // run can no longer tell "fresh" from "legacy"). Here all eight transfer
+        // tables may already exist on a legacy catalog, so the wipe reaches
+        // receipts/sources too. (`init_db` normally runs this same guard first on
+        // the pooled connection; this is defense-in-depth for this store's own
+        // second connection.)
+        wipe_transfer_bookkeeping_on_upgrade(&conn)?;
         conn.execute(DDL_OUTBOUND, []).context("create sync_outbound")?;
         ensure_outbound_columns(&conn)?;
         conn.execute(DDL_HISTORY, []).context("create sync_history")?;
@@ -2367,11 +2417,6 @@ impl CatalogSyncStore {
         conn.execute(DDL_RECEIPTS, []).context("create sync_receipts")?;
         conn.execute(DDL_SYNC_SOURCES, []).context("create sync_sources")?;
         conn.execute(DDL_INBOUND, []).context("create sync_inbound")?;
-        // Transfers Batch Model reset (spec §Migration): after `DDL_INBOUND`,
-        // before `ensure_inbound_columns` — see the standalone `open` for the
-        // detector-placement rationale. Here all eight transfer tables exist on a
-        // legacy catalog, so the wipe reaches receipts/sources too.
-        wipe_transfer_bookkeeping_on_upgrade(&conn)?;
         ensure_inbound_columns(&conn)?;
         conn.execute(DDL_OUTBOUND_FILES, []).context("create sync_outbound_files")?;
         conn.execute(DDL_INBOUND_FILES, []).context("create sync_inbound_files")?;
@@ -2824,6 +2869,17 @@ mod tests {
                 params![node_id_hex(&PEER)],
             )
             .unwrap();
+            // Stand in for "this DB is already on the batch model" (`sync_inbound`
+            // present with `batch_uuid`) so opening below does NOT trigger the
+            // Transfers Batch Model upgrade wipe — this fixture pins the Task-9
+            // `last_error` column migration in isolation, not the wipe.
+            conn.execute(
+                "CREATE TABLE sync_inbound (id INTEGER PRIMARY KEY, peer TEXT NOT NULL, \
+                 package_id TEXT NOT NULL, state TEXT NOT NULL, batch_uuid TEXT, \
+                 UNIQUE(peer, package_id))",
+                [],
+            )
+            .unwrap();
         }
 
         // Opening the store migrates the table in place (no error).
@@ -2866,6 +2922,16 @@ mod tests {
                 "INSERT INTO sync_history
                     (frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome)
                  VALUES ('u-old', 'old.fits', 'M42', 'peerA', 'sent', 10, 't0', NULL, 'sent')",
+                [],
+            )
+            .unwrap();
+            // Stand in for "this DB is already on the batch model" so opening below
+            // does NOT trigger the Transfers Batch Model upgrade wipe — this fixture
+            // pins the AUDIT-B3 `project` column migration in isolation.
+            conn.execute(
+                "CREATE TABLE sync_inbound (id INTEGER PRIMARY KEY, peer TEXT NOT NULL, \
+                 package_id TEXT NOT NULL, state TEXT NOT NULL, batch_uuid TEXT, \
+                 UNIQUE(peer, package_id))",
                 [],
             )
             .unwrap();
@@ -2943,6 +3009,16 @@ mod tests {
                 "INSERT INTO sync_history
                     (frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project)
                  VALUES ('u-old', 'old.fits', 'M42', 'peerA', 'sent', 10, 't0', NULL, 'sent', NULL)",
+                [],
+            )
+            .unwrap();
+            // Stand in for "this DB is already on the batch model" so opening below
+            // does NOT trigger the Transfers Batch Model upgrade wipe — this fixture
+            // pins the Task-14 `package_id` column migration in isolation.
+            conn.execute(
+                "CREATE TABLE sync_inbound (id INTEGER PRIMARY KEY, peer TEXT NOT NULL, \
+                 package_id TEXT NOT NULL, state TEXT NOT NULL, batch_uuid TEXT, \
+                 UNIQUE(peer, package_id))",
                 [],
             )
             .unwrap();
@@ -3391,6 +3467,40 @@ mod tests {
         wipe_transfer_bookkeeping_on_upgrade(&conn).unwrap();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM sync_outbound", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1, "flag present → second wipe is a no-op");
+    }
+
+    /// Batch Model §Migration (review fix): a beta.1/beta.2 DB predates
+    /// `sync_inbound` entirely — the table shipped only in beta.3 (Task 11) — so it
+    /// carries `sync_outbound`/`sync_history` rows with NO `sync_inbound` table at
+    /// all. The ORIGINAL detector (keyed solely on `sync_inbound.batch_uuid`) missed
+    /// this shape once a caller's own `DDL_INBOUND` had already created a fresh,
+    /// columned `sync_inbound` earlier in the same pass — it would read "column
+    /// present" and skip. `transfer_wipe_needed` (via `wipe_transfer_bookkeeping_on_upgrade`)
+    /// closes this: it fires when `sync_inbound` is absent but a legacy table
+    /// (`sync_outbound`/`sync_history`) is present — pinned here at the raw-function
+    /// level, independent of any caller's DDL ordering.
+    #[test]
+    fn upgrade_wipe_catches_beta1_shape_with_no_sync_inbound_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        // The pre-Task-11 shape: sync_outbound / sync_history exist with rows;
+        // sync_inbound does not exist AT ALL.
+        conn.execute("CREATE TABLE sync_outbound (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE sync_history (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
+        conn.execute("INSERT INTO sync_outbound DEFAULT VALUES", []).unwrap();
+        conn.execute("INSERT INTO sync_history DEFAULT VALUES", []).unwrap();
+        assert!(!table_present(&conn, "sync_inbound").unwrap(), "sanity: no sync_inbound table (beta.1 shape)");
+
+        wipe_transfer_bookkeeping_on_upgrade(&conn).unwrap();
+
+        let n_out: i64 = conn.query_row("SELECT COUNT(*) FROM sync_outbound", [], |r| r.get(0)).unwrap();
+        let n_hist: i64 = conn.query_row("SELECT COUNT(*) FROM sync_history", [], |r| r.get(0)).unwrap();
+        assert_eq!(n_out, 0, "sync_outbound wiped even though sync_inbound never existed");
+        assert_eq!(n_hist, 0, "sync_history wiped even though sync_inbound never existed");
+
+        // A truly empty DB (neither sync_inbound nor sync_outbound nor sync_history)
+        // must NOT be flagged — guaranteed no-op, not skipped by flag-purity.
+        let empty = Connection::open_in_memory().unwrap();
+        assert!(!transfer_wipe_needed(&empty).unwrap(), "a genuinely fresh DB never needs a wipe");
     }
 
     /// Batch Model §D1/§D3: `reset_outbound_for_resend` reuses the SAME row —

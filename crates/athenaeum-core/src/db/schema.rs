@@ -1723,6 +1723,19 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             DDL_INDEXES, DDL_OUTBOUND, DDL_OUTBOUND_FILES, DDL_RECEIPTS, DDL_SYNC_EVENTS,
             DDL_SYNC_SOURCES,
         };
+        // Transfers Batch Model reset (spec §Migration, owner decision 2026-07-21):
+        // one-shot wipe of ALL transfer bookkeeping on the batch-model upgrade. MUST
+        // run before ANY `conn.execute(DDL_*)` below — the detector inspects
+        // table/column presence, and every sync-table `CREATE TABLE IF NOT EXISTS`
+        // un-conditionally materialises its table, so evaluating the detector any
+        // later could no longer tell "freshly created by this very call" (fresh
+        // catalog) from "pre-existing with legacy rows" (an upgrade) — this is what
+        // lets it also catch a pre-Task-11 beta.1/beta.2 catalog that has
+        // `sync_outbound`/`sync_history` rows but no `sync_inbound` table at all
+        // (see `transfer_wipe_needed`'s docs). The store owns the wipe SQL — call
+        // its guard here, never an inline copy, so this third materialisation site
+        // can never drift. Catalog tables (`files`/`frames`/…) are never touched.
+        wipe_transfer_bookkeeping_on_upgrade(conn).map_err(sync_migrate_err)?;
         conn.execute(DDL_OUTBOUND, [])?;
         // `CREATE TABLE IF NOT EXISTS` never adds a column to an already-existing
         // table, so the trailing columns (`sync_outbound`: `last_error` Task 9 /
@@ -1743,14 +1756,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         // `display_name` column — back-filled here by the store's own guard (same
         // owned-column-list discipline as the outbound / history guards above).
         conn.execute(DDL_INBOUND, [])?;
-        // Transfers Batch Model reset (spec §Migration, owner decision 2026-07-21):
-        // one-shot wipe of ALL transfer bookkeeping on the batch-model upgrade,
-        // gated on the ABSENCE of `sync_inbound.batch_uuid` (the migrated-flag). Runs
-        // after `DDL_INBOUND` (fresh DB is born with the column → never wipes) and
-        // before `ensure_inbound_columns` (which adds it → would hide the flag). The
-        // store owns the wipe SQL — call its guard here, never an inline copy, so this
-        // third materialisation site can never drift. Catalog tables are never touched.
-        wipe_transfer_bookkeeping_on_upgrade(conn).map_err(sync_migrate_err)?;
         ensure_inbound_columns(conn).map_err(sync_migrate_err)?;
         // Transfers Status Model v2 §D4/§D7: per-file rows + the capped event
         // journal. NEW tables (no legacy shape to migrate), so `CREATE TABLE IF
@@ -2265,6 +2270,101 @@ mod identity_schema_tests {
 
         // 6) EXACTLY once: a sentinel transfer row inserted AFTER the wipe must
         //    survive a second init (batch_uuid now present → detector skips the wipe).
+        conn.execute(
+            "INSERT INTO sync_outbound (package_ref, peer, state, created_at)
+             VALUES ('pkg-sentinel', 'peerhex', 'confirmed', 't1')",
+            [],
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(count(&conn, "sync_outbound"), 1, "second init must NOT re-wipe (sentinel survives)");
+        assert_eq!(count(&conn, "files"), 1, "catalog still intact after the second init");
+    }
+
+    /// Transfers Batch Model (review fix, tvb B2): a beta.1/beta.2 DB predates
+    /// `sync_inbound` entirely — it shipped only in beta.3 (Task 11) — so such a DB
+    /// carries `sync_outbound` / `sync_history` rows with NO `sync_inbound` table at
+    /// all. The observatory Perseus device ran beta.1, so this is a REAL upgrade
+    /// path, not a hypothetical.
+    ///
+    /// The original detector (keyed solely on `sync_inbound.batch_uuid`) missed this
+    /// shape: it ran AFTER `DDL_INBOUND` had already created a fresh `sync_inbound`
+    /// WITH `batch_uuid` earlier in the SAME `init_db` call, so it read "column
+    /// present" and skipped the wipe — leaving the beta.1 `sync_outbound` /
+    /// `sync_history` rows in place, including any non-terminal outbound row
+    /// `resurrect_pending_senders` would then wrongly pick back up. The fix moves the
+    /// detector before ANY of this call's own DDL and adds the
+    /// sync_inbound-absent-but-legacy-table-present branch.
+    #[test]
+    fn beta1_shape_missing_sync_inbound_table_wipes_via_init_db() {
+        fn count(conn: &Connection, table: &str) -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        }
+        fn table_exists(conn: &Connection, table: &str) -> bool {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            n > 0
+        }
+
+        // 1) A correct, fully-initialised catalog (so files/frames/triggers/every
+        //    other sync table exist in their current shape).
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // 2) Catalog fixtures that MUST survive the wipe.
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES ('/data/b.fits', 'b.fits', 100, '2026-07-21T00:00:00Z', 'FITS')",
+            [],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE path = '/data/b.fits'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute("INSERT INTO frames (file_id, object) VALUES (?1, 'M31')", rusqlite::params![file_id])
+            .unwrap();
+
+        // 3) Seed the beta.1-era tables — sync_outbound / sync_history — with rows.
+        conn.execute(
+            "INSERT INTO sync_outbound (package_ref, peer, state, created_at)
+             VALUES ('pkg-beta1', 'peerhex', 'confirmed', 't0')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_history (frame_uuid, filename, direction, outcome)
+             VALUES ('u1', 'b.fits', 'sent', 'sent')",
+            [],
+        )
+        .unwrap();
+
+        // 4) Simulate the beta.1/beta.2 shape: sync_inbound never existed (it shipped
+        //    only in beta.3 / Task 11) — drop it entirely, not just its batch_uuid
+        //    column.
+        conn.execute("DROP TABLE sync_inbound", []).unwrap();
+        assert!(!table_exists(&conn, "sync_inbound"), "sanity: sync_inbound absent (the beta.1 shape)");
+        assert_eq!(count(&conn, "sync_outbound"), 1, "seed: sync_outbound has one row before the upgrade wipe");
+        assert_eq!(count(&conn, "sync_history"), 1, "seed: sync_history has one row before the upgrade wipe");
+
+        // 5) Upgrade init: the wipe must fire — sync_inbound is absent, but the
+        //    legacy sync_outbound/sync_history tables are present — emptying both;
+        //    the catalog is untouched.
+        init_db(&conn).unwrap();
+        assert_eq!(count(&conn, "sync_outbound"), 0, "upgrade wipe emptied sync_outbound");
+        assert_eq!(count(&conn, "sync_history"), 0, "upgrade wipe emptied sync_history");
+        assert_eq!(count(&conn, "files"), 1, "catalog files row survives the wipe");
+        assert_eq!(count(&conn, "frames"), 1, "catalog frames row survives the wipe");
+        // sync_inbound is recreated, migrated, with the flag present.
+        assert!(table_exists(&conn, "sync_inbound"));
+        assert!(column_exists(&conn, "sync_inbound", "batch_uuid").unwrap());
+
+        // 6) Second init must NOT re-wipe (sentinel survives) — the flag now holds.
         conn.execute(
             "INSERT INTO sync_outbound (package_ref, peer, state, created_at)
              VALUES ('pkg-sentinel', 'peerhex', 'confirmed', 't1')",
