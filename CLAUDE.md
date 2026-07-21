@@ -298,6 +298,19 @@ Calibration stage 2: apply master dark/bias + flat to a frame set's LIGHT frames
 
 **Key files**: `crates/athenaeum-core/src/calibration_library/light_cal.rs` (engine: band streaming, formula, fallbacks, `ATH_FNRM`), `light_headers.rs` (card builder), `crates/athenaeum-core/src/api/lights.rs` (readiness/start/cancel, preflight, per-frame resolution + the `#[ignore]`d real-data e2e harness `real_data_e2e_light_calibration`), `crates/athenaeum-core/src/db/light_calibrations.rs` (table + `derive_status`), scanner reconcile-adopt in `scanner/mod.rs`. Frontend: `src/components/calibration/CalibrateLightsDialog.tsx` + frame-table badge + `calibration` notification kind.
 
+## Transfers / Personal Sync (status model v2)
+
+Device-to-device batch transfers over iroh (spec: `docs/superpowers/specs/2026-07-20-transfers-status-v2-design.md`). Core in `crates/athenaeum-core/src/sync/` (engine/receiver/store/status/ingest) + `sharing/` (wire).
+
+- **Batch = named entity.** `display_name` on `sync_outbound`/`sync_inbound`, `batch_name` on history rows. Auto-name (frame-set name / common-dir basename / "N files — date") or user name from the send dialog; travels in the announce.
+- **Wire `Msg::Announce2`** carries `batch_name` + full file manifest (`rel_path`, size, frame uuid) — the receiver persists `sync_inbound_files` AT ANNOUNCE, before any fetch. v1 `Announce` still decoded (Perseus compat). `Msg` postcard variant indices are FROZEN: append-only, golden pins in `sharing/wire_golden_tests.rs`.
+- **Structured rel_path**: object sends use the WBPP hierarchy (pure computation `export/file_organizer.rs::compute_wbpp_placements`, shared with export); browser sends preserve source-relative paths. Receiver lands at `<incoming>/<sender_slug>/<batch_slug>/<rel_path>` (`landing_dir` persisted on the inbound row; suffix `_2` only vs a non-terminal claimant, terminal same-name batches merge).
+- **Per-file state persisted both sides** (`sync_outbound_files`/`sync_inbound_files`): bytes checkpointed on transitions only (live bars stay event-driven via `sync-file-progress`, whose `file` field is the FULL rel_path). Survives restart/resume; `list_transfer_files` always answers (incl. `announced`/`waiting`).
+- **State ⊥ error**: network trouble is never a failure — `displayState` (backend-derived in `sync/status.rs`) shows `waiting` + `stalledUntil` when a retry is armed; `last_error` auto-clears on the first successful serve tick; `failed` is local-fatal only (delivery-forever). `OutboundState::Delivered` = "uploaded — awaiting confirmation", persisted, non-terminal, treated like `Transferring` everywhere.
+- **`sync_events` journal** (capped 200/batch, both directions) — connection noise lives here (`list_transfer_events`), NEVER in the status string.
+- **Cancel/decline is a first-class outcome** recorded in BOTH sides' history with the batch name.
+- Frontend: master-detail `src/pages/Transfers.tsx` (filter chips with counts; Completed = merged history in the same list) + detail pane `src/components/transfers/TransferDetail.tsx` (Files tree / Log / Details — node-id hex appears ONLY in Details). Device names via `get_sync_device_names`; never render raw hex in lists.
+
 ## Reference
 
 - [Tauri 2.0](https://tauri.app/start/) · [FITS Standard](https://heasarc.gsfc.nasa.gov/docs/fcg/standard_dict.html) · [XISF 1.0](https://pixinsight.com/doc/docs/XISF-1.0-spec/XISF-1.0-spec.html) · [xxHash](https://xxhash.com/)
