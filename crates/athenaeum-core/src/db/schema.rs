@@ -133,8 +133,39 @@ fn backfill_identity(conn: &Connection) -> rusqlite::Result<()> {
     tx.commit()
 }
 
-/// Initialize the database schema
+/// Serializes [`init_db`] across every in-process caller (desktop command, web
+/// startup, tests) so two concurrent initialisations can't interleave the
+/// trigger-evolution DROP+CREATE DDL. Held for the whole `init_db` body.
+static INIT_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Initialize the database schema.
+///
+/// **Idempotent** — safe to call repeatedly on the same catalog; every table /
+/// index uses `CREATE ... IF NOT EXISTS` and the identity/touch triggers are
+/// authoritatively reinstalled (DROP+CREATE) on each run.
+///
+/// **In-process concurrency-safe** (since the concurrent-double-init fix): the
+/// whole body runs under [`INIT_DB_LOCK`], so two callers on two separate
+/// connections to the same file are serialized rather than racing the trigger
+/// reinstall (which would otherwise fail the second `CREATE TRIGGER` with
+/// "trigger `<t>_identity` already exists"). **Cross-*process* concurrent init
+/// remains out of scope** — no deployment runs two processes against one
+/// catalog file, so a process-local mutex is sufficient.
 pub fn init_db(conn: &Connection) -> Result<()> {
+    // Serialize the entire body across threads. Two `initialize_database`
+    // command invocations previously ran init_db concurrently on two pooled
+    // connections; because the trigger DDL below is DROP+CREATE (authoritative,
+    // not IF NOT EXISTS), interleaving A-drop / B-drop / B-create / A-create
+    // made the second CREATE TRIGGER fail "already exists". Holding this guard
+    // for the whole function makes the runs mutually exclusive.
+    //
+    // Recover a poisoned lock (`into_inner`): an init panic on one thread must
+    // not brick every future init. The guarded value is `()` — there is no
+    // invariant left half-updated by a panic, so it is always safe to resume.
+    let _init_guard = INIT_DB_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     // Files table - includes metadata hash for quick duplicate detection and content_hash for xxhash-based detection
     conn.execute(
         "CREATE TABLE IF NOT EXISTS files (
@@ -2819,5 +2850,85 @@ mod archive_schema_tests {
              WHERE ao.id = 1",
             [], |r| r.get(0)).unwrap();
         assert_eq!(joined, 1, "parent and both children must survive the rebuild joinable");
+    }
+}
+
+#[cfg(test)]
+mod init_db_concurrency_tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    /// Mirror production's connection setup (`db::mod::setup_connection`) for the
+    /// bits that matter to serialized DDL: `busy_timeout` + WAL. The busy_timeout
+    /// stops a serialized run from returning `SQLITE_BUSY` if the two connections
+    /// ever contend for the write lock; WAL matches how the app opens the catalog.
+    fn open_like_prod(path: &std::path::Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;")
+            .unwrap();
+        conn
+    }
+
+    /// Regression: two `initialize_database` command invocations landed on two
+    /// separate pooled connections and ran `init_db` at overlapping times (owner
+    /// log: `database init failed error=trigger files_identity already exists`).
+    /// The trigger-evolution DDL is authoritative DROP+CREATE (schema.rs ~1751),
+    /// so an interleaving of A-drop / B-drop / B-create / A-create makes the
+    /// second `CREATE TRIGGER` fail with "already exists".
+    ///
+    /// Two threads, each with its OWN connection to the SAME on-disk file, a
+    /// `Barrier` so both enter `init_db` together, repeated so the pre-fix race
+    /// lands reliably. Pre-fix this panicked with the "already exists" message;
+    /// post-fix `init_db`'s process-wide mutex serializes the two runs and this
+    /// is deterministic-green.
+    #[test]
+    fn concurrent_init_db_on_shared_file_is_race_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("race.db");
+
+        // More than two contenders and a re-synchronising barrier every iteration
+        // widen the window in which one thread's `CREATE TRIGGER` can land after
+        // another's for the same trigger. The production failure was a two-caller
+        // race; the extra threads only make the pre-fix reproduction reliable.
+        const THREADS: usize = 8;
+        const ITERS: usize = 50;
+
+        // Open every connection up front, sequentially, on the main thread: the
+        // one-time `journal_mode = WAL` conversion must not itself race (that
+        // would be a test-harness artifact, not the bug under test). rusqlite
+        // `Connection` is `Send`, so each connection then moves into its worker.
+        let conns: Vec<Connection> = (0..THREADS).map(|_| open_like_prod(&db_path)).collect();
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles: Vec<_> = conns
+            .into_iter()
+            .map(|conn| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut errs: Vec<(usize, String)> = Vec::new();
+                    for i in 0..ITERS {
+                        // Line every thread up so their DROP/CREATE trigger pairs
+                        // interleave — this is what triggered the production failure.
+                        barrier.wait();
+                        if let Err(e) = init_db(&conn) {
+                            errs.push((i, e.to_string()));
+                        }
+                    }
+                    errs
+                })
+            })
+            .collect();
+
+        let errs: Vec<(usize, String)> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+
+        assert!(
+            errs.is_empty(),
+            "init_db raced under concurrent double-init: {errs:?}"
+        );
     }
 }
