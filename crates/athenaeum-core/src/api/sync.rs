@@ -2119,6 +2119,22 @@ fn package_has_payload(dir: &Path) -> bool {
     has_manifest && has_payload
 }
 
+/// Map manifest records to the announce file entries the engine persists as the
+/// §D4 per-file rows. The retry counterpart of [`build_and_enqueue_selection`]'s
+/// tuple mapping and the engine's own announce build (`sync/engine.rs`) — the
+/// three must stay in lockstep so a re-enqueued package carries the same per-file
+/// structure a first-send does.
+fn manifest_to_announce_files(records: &[ManifestRecord]) -> Vec<crate::sharing::types::AnnounceFileEntry> {
+    records
+        .iter()
+        .map(|r| crate::sharing::types::AnnounceFileEntry {
+            rel_path: r.rel_path.clone(),
+            byte_size: r.byte_size,
+            frame_uuid: r.frame_uuid.clone(),
+        })
+        .collect()
+}
+
 /// Resolve the started sender engine that owns the pending (non-terminal) row
 /// `id`, for the send-now / cancel command surfaces. The per-peer engines share
 /// ONE catalog store, so any started engine's non-terminal snapshot lists every
@@ -2210,8 +2226,22 @@ pub async fn retry_sync_package(
             engine
         }
     };
+    // Re-enqueue with the SAME structure a first-send has (Transfers Status Model
+    // v2): the on-disk manifest becomes the §D4 per-file rows and the old row's
+    // batch name travels through. A bare `None, Vec::new()` here (the T4 placeholder)
+    // silently regressed both: with zero `sync_outbound_files` rows every per-file
+    // transition during the re-transfer is an UPDATE-only no-op AND `sent_transfer_files`
+    // falls back to the history join keyed on the package dir basename shared with
+    // the cancelled attempt (stale `cancelled` verdicts); `None` also lands the retry
+    // under a UUID-named folder on the receiver. An unreadable manifest is a HARD
+    // error — consistent with the `package_has_payload` gate above; an empty list
+    // would silently reintroduce the bug rather than fail loudly.
+    let records = package::read_manifest(&dir).map_err(|e| {
+        ApiError::Internal(format!("read manifest for retry {}: {e:#}", dir.display()))
+    })?;
+    let files = manifest_to_announce_files(&records);
     let new_id = engine
-        .enqueue_package(&dir, None, Vec::new())
+        .enqueue_package(&dir, row.display_name.clone(), files)
         .await
         .map_err(|e| ApiError::Internal(format!("re-enqueue package {id}: {e:#}")))?;
     tracing::info!(old_id = id, new_id, peer = %node_id_hex(&row.peer), "sync package retried");
@@ -3048,6 +3078,98 @@ mod tests {
             new_row.package_ref,
             pkg_dir.to_string_lossy(),
             "the new row points at the same package dir",
+        );
+    }
+
+    /// Regression (owner live-smoke, TV2): a retry must re-enqueue with the OLD
+    /// row's `display_name` AND real manifest-backed per-file rows — not the
+    /// historical `None, Vec::new()` placeholder. Without the file rows the new
+    /// batch gets ZERO `sync_outbound_files` rows, so every per-file transition
+    /// during the re-transfer is a silent UPDATE-only no-op AND `sent_transfer_files`
+    /// falls into the legacy history join keyed on the package DIR BASENAME shared
+    /// with the cancelled attempt — so every file shows the stale `cancelled`
+    /// verdict for the whole re-transfer. Without the name the receiver lands the
+    /// retry under a UUID-named folder.
+    #[tokio::test]
+    async fn retry_carries_display_name_and_manifest_file_rows() {
+        let (tmp, ctx) = test_ctx();
+        let pkg_dir = build_one_frame_package(&ctx, tmp.path());
+        let ctx = Arc::new(ctx);
+        let db_path = db(&ctx).unwrap().path().to_path_buf();
+
+        // The real announce file entries the send path derives from the on-disk
+        // manifest, built inline here (independent of the fix under test) so the
+        // OLD row has genuine per-file rows to inherit.
+        let manifest = package::read_manifest(&pkg_dir).unwrap();
+        assert!(!manifest.is_empty(), "fixture package has >=1 manifest record");
+        let files: Vec<crate::sharing::types::AnnounceFileEntry> = manifest
+            .iter()
+            .map(|r| crate::sharing::types::AnnounceFileEntry {
+                rel_path: r.rel_path.clone(),
+                byte_size: r.byte_size,
+                frame_uuid: r.frame_uuid.clone(),
+            })
+            .collect();
+        let display = "M42 — retry batch".to_string();
+
+        let (sender, peer) = loopback_sender_for(&db_path).await;
+        let collab_sender = Arc::new(SyncSenderRuntime::new());
+        let sync = SyncRuntime::new();
+
+        // Enqueue WITH a display name + file rows, then cancel → terminal Cancelled.
+        // `cancel_package`'s epilogue writes a `cancelled` history row per frame
+        // keyed on the package dir basename (`append_terminal_history`) — the stale
+        // verdict the retry must NOT inherit.
+        let (engine, _) = sender.current_for(&peer).await.unwrap();
+        let old_id = engine
+            .enqueue_package(&pkg_dir, Some(display.clone()), files.clone())
+            .await
+            .unwrap();
+        engine.cancel(old_id).await.unwrap();
+        wait_outbound_state(&db_path, old_id, OutboundState::Cancelled).await;
+
+        let new_id =
+            retry_sync_package(&ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
+                .await
+                .unwrap();
+        assert_ne!(new_id, old_id, "retry mints a new durable row");
+
+        let store = CatalogSyncStore::open(&db_path).unwrap();
+        let new_row = store.get_outbound(new_id).unwrap().expect("new row exists");
+
+        // (c) the display name carries over to the retry.
+        assert_eq!(
+            new_row.display_name.as_deref(),
+            Some(display.as_str()),
+            "retry carries the old row's display_name",
+        );
+
+        // (a) the retry got the full manifest set as fresh `pending` per-file rows,
+        // none carrying a settled outcome.
+        let file_rows = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            list_outbound_files(&conn, new_id).unwrap()
+        };
+        assert_eq!(
+            file_rows.len(),
+            manifest.len(),
+            "retry re-enqueues every manifest file as a per-file row",
+        );
+        assert!(
+            file_rows
+                .iter()
+                .all(|f| f.state == crate::sync::OutboundFileState::Pending && f.outcome.is_none()),
+            "every retried file row is pending with no settled outcome, got {file_rows:?}",
+        );
+
+        // (b) the Details view for the retry shows NO stale `cancelled` verdict — it
+        // reads the fresh per-file rows, not the shared-basename history join.
+        let detail = sent_transfer_files(&ctx, new_id).unwrap();
+        assert_eq!(detail.len(), manifest.len(), "details covers every manifest file");
+        assert!(
+            detail.iter().all(|f| f.outcome.as_deref() != Some("cancelled")),
+            "no retried file inherits the cancelled attempt's verdict, got {detail:?}",
         );
     }
 
