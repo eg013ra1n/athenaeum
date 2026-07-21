@@ -34,13 +34,14 @@
 //! catalog store — is the same public API the desktop/web hosts use.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use athenaeum_core::api::sync::{
-    cancel_incoming_package, cancel_sync_package, enqueue_sync_selection, get_status,
-    list_transfer_files, resurrect_pending_senders_with, retry_sync_package, ResolvedDest,
+    cancel_incoming_package, cancel_sync_package, delete_transfer_history, enqueue_sync_selection,
+    get_status, get_transfer_storage, list_terminal_transfers, list_transfer_files,
+    resurrect_pending_senders_with, retry_sync_package, ResolvedDest,
 };
 use athenaeum_core::api::ApiError;
 use athenaeum_core::api::retention::{evaluate, AppRetentionConfig};
@@ -50,6 +51,7 @@ use athenaeum_core::fits_writer::keywords::{FrameKind, HeaderBuilder};
 use athenaeum_core::fits_writer::write_fits_f32;
 use athenaeum_core::models::{File, FileFormat, Frame, ImageType};
 use athenaeum_core::services::ServiceContext;
+use athenaeum_core::sharing::iroh::proto::{FullHashEntry, OfferEntry};
 use athenaeum_core::sharing::loopback::{FaultPlan, LoopbackNetwork};
 use athenaeum_core::sharing::types::NodeId;
 use athenaeum_core::sharing::SharingTransport;
@@ -272,6 +274,25 @@ impl RecordingEmitter {
                 (
                     p["bytesDone"].as_u64().unwrap_or_default(),
                     p["bytesTotal"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// The receive-side `sync-finished` events as `(outcome, ok_count)` pairs, in
+    /// emit order — the terminal signal the receiver's Transfers widget dismisses a
+    /// row on. B8 scenario 1 reads the revoke path's single terminal `sync-finished`
+    /// (outcome == the mapped row state) off this.
+    fn received_finished(&self) -> Vec<(String, u64)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, name, p)| name == "sync-finished" && p["direction"] == "received")
+            .map(|(_, _, p)| {
+                (
+                    p["outcome"].as_str().unwrap_or_default().to_string(),
+                    p["okCount"].as_u64().unwrap_or_default(),
                 )
             })
             .collect()
@@ -2821,6 +2842,963 @@ async fn wbpp_object_send_lands_identical_tree_on_both_sides() {
             "received history carries the frame filename {filename}"
         );
     }
+
+    engine.shutdown().await;
+    receiver.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// tvb B8 — the batch-model contract, end to end. Five two-engine loopback
+// scenarios composing the whole Transfers Batch Model stack (B1–B7) at the
+// two-`ServiceContext` level: (1) a SENDER cancel aborts the receiver's in-flight
+// fetch promptly and terminalizes both sides via Revoke; (2) a mid-fetch failure →
+// resend delivers into the SAME batch-keyed inbound row (only the missing dedup
+// subset travels); (3) the all-duplicate-after-announce race closes the stuck
+// receiver row with Revoke(Superseded); (4) a restart mid-resend resumes the SAME
+// row and confirms; (5) delete reclaims rows/files/events/history + the sender
+// payload dir, scoped to its batch (a foreign batch survives). Deterministic waits
+// only (the harness `wait_until`); generous bounded deadlines.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A [`DedupResponder`] whose verdict flips on a shared flag: want-all while
+/// `false` (session 1 gets a real announce + fetch), all-duplicate while `true`
+/// (session 2's re-negotiate finds the peer already holds every frame). The e2e
+/// twin of the engine-unit `SwitchableResponder`, used to construct the superseded
+/// race (scenario 3) against a REAL [`SyncReceiver`] instead of a recording double.
+struct SwitchableResponder {
+    all_duplicate: Arc<AtomicBool>,
+}
+impl DedupResponder for SwitchableResponder {
+    fn want_for_offer(&self, entries: &[OfferEntry]) -> (Vec<String>, Vec<String>) {
+        if self.all_duplicate.load(Ordering::SeqCst) {
+            (Vec::new(), entries.iter().map(|e| e.rel_path.clone()).collect())
+        } else {
+            (entries.iter().map(|e| e.rel_path.clone()).collect(), Vec::new())
+        }
+    }
+    fn confirm_full_hashes(&self, _entries: &[FullHashEntry]) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// `sync_outbound.generation` for a row — the user-facing "attempt N" counter,
+/// bumped ONLY by a resend (never by an announce-retry, which bumps `attempts`).
+fn outbound_generation(db: &Database, id: i64) -> i64 {
+    db.conn()
+        .query_row("SELECT generation FROM sync_outbound WHERE id = ?1", [id], |r| r.get(0))
+        .expect("outbound row present")
+}
+
+/// `sync_inbound.generation` for a row id — bumped on each receiver re-attempt of
+/// the same `(peer, batch_uuid)`.
+fn inbound_generation(db: &Database, inbound_id: i64) -> i64 {
+    db.conn()
+        .query_row("SELECT generation FROM sync_inbound WHERE id = ?1", [inbound_id], |r| r.get(0))
+        .expect("inbound row present")
+}
+
+/// `sync_inbound.batch_uuid` for a row id — the durable per-transfer batch key the
+/// receiver holds one long-lived row on (constant across a resend's wire rotation).
+fn inbound_batch_uuid(db: &Database, inbound_id: i64) -> Option<String> {
+    db.conn()
+        .query_row("SELECT batch_uuid FROM sync_inbound WHERE id = ?1", [inbound_id], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten()
+}
+
+/// `sync_inbound.last_error` for a wire `package_id` — the terminal detail
+/// (`"by sender"` / `"nothing to fetch (superseded by sender)"` / …) the
+/// `InboundSummary.last_error` surfaces (B5b).
+fn inbound_last_error(db: &Database, package_id: &str) -> Option<String> {
+    db.conn()
+        .query_row("SELECT last_error FROM sync_inbound WHERE package_id = ?1", [package_id], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .ok()
+        .flatten()
+}
+
+/// The on-disk payload dir (`sync_outbound.package_ref`) for an outbound row.
+fn outbound_package_ref(db: &Database, id: i64) -> String {
+    db.conn()
+        .query_row("SELECT package_ref FROM sync_outbound WHERE id = ?1", [id], |r| r.get(0))
+        .expect("outbound row present")
+}
+
+/// The current wire id (`sync_outbound.wire_package_id`) for an outbound row — the
+/// per-attempt id a resend rotates.
+fn outbound_wire_id(db: &Database, id: i64) -> String {
+    db.conn()
+        .query_row("SELECT wire_package_id FROM sync_outbound WHERE id = ?1", [id], |r| r.get(0))
+        .expect("outbound row present")
+}
+
+/// Like [`inject_sender_engine`] but spawns the engine with a host
+/// [`ProgressEmitter`] (so a test can read each package's `{new, duplicate}` dedup
+/// split off the send-side `sync-finished`) alongside the short `ack_timeout`.
+async fn inject_sender_engine_with_emitter(
+    net: &LoopbackNetwork,
+    capture_db: &Path,
+    peer: NodeId,
+    ack_timeout: Duration,
+    emitter: Arc<dyn ProgressEmitter>,
+) -> (Arc<SyncEngineHandle>, Arc<SyncSenderRuntime>, Arc<SyncSenderRuntime>, SyncRuntime) {
+    let sender_ep = net.endpoint();
+    let sender_node = sender_ep.node_id();
+    let engine_store = Arc::new(CatalogSyncStore::open(capture_db).unwrap());
+    let engine = Arc::new(SyncEngine::spawn_with_config_and_emitter(
+        engine_store as Arc<dyn SyncStore>,
+        Arc::new(sender_ep) as Arc<dyn SharingTransport>,
+        peer,
+        SyncConfig { ack_timeout },
+        Some(emitter),
+    ));
+    let sender = Arc::new(SyncSenderRuntime::new());
+    let collab_sender = Arc::new(SyncSenderRuntime::new());
+    let sync = SyncRuntime::new();
+    {
+        let mut guard = sender.lock_inner().await;
+        guard.insert(
+            peer,
+            StartedSender { engine: Arc::clone(&engine), origin_device: node_id_hex(&sender_node), peer },
+        );
+    }
+    (engine, sender, collab_sender, sync)
+}
+
+/// B8 scenario 1 — **sender cancel stops the receiver promptly (two-engine)**. The
+/// two-context composition of the receiver-unit
+/// `revoke_mid_fetch_aborts_promptly_not_at_fetch_completion`: a genuinely-blocking
+/// fetch (10 files paced at 500ms/read ⇒ ~5.5s uninterrupted) is cancelled on the
+/// SENDER engine mid-flight; the sender's `Revoke{Cancelled}` aborts the receiver's
+/// in-flight fetch WITHIN a 3s deadline (« 5.5s, so NOT at fetch completion). Asserts
+/// the whole revoke teardown across both catalogs: receiver row `cancelled`
+/// ("by sender"), staging cleaned, in-flight tags absent, sender row `cancelled`,
+/// both journals (`revoke_sent` sent / `revoked` received), and the single terminal
+/// `sync-finished` the receiver emits on the revoke path (outcome == the row).
+#[tokio::test]
+async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
+    const N: usize = 10;
+    // Pace each fetch read so an uninterrupted whole-package fetch (files + manifest)
+    // takes ~5.5s — far longer than ABORT_DEADLINE, so "cancelled within the
+    // deadline" proves the revoke aborted the fetch, not that it finished on its own.
+    const DELAY: Duration = Duration::from_millis(500);
+    const ABORT_DEADLINE: Duration = Duration::from_secs(3);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    // Pace the fetch so it is genuinely mid-flight when we fire the sender cancel.
+    receiver_ep.set_fault(FaultPlan { delay_per_read: Some(DELAY), ..Default::default() });
+
+    // A recording emitter on the RECEIVER: the revoke path's terminal `sync-finished`
+    // is the observable the Transfers widget dismisses a row on.
+    let recorder = Arc::new(RecordingEmitter::default());
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    // Long ack timeout so the sender rests in Transferring (awaiting the never-coming
+    // ack) rather than re-announcing during the paced fetch.
+    let (engine, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
+
+    let mut frame_ids = Vec::with_capacity(N);
+    for idx in 0..N {
+        frame_ids.push(insert_capture_frame(&capture_ctx, &capture_files, idx).0);
+    }
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids.clone(),
+        Some("Cancel Mid-Fetch".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("enqueue");
+    let out_id = latest_outbound_id(cdb);
+
+    // Wait until the receiver row is `fetching` — the announce reached it (so the
+    // sender is Transferring, `started=true`, and a cancel WILL Revoke) and the paced
+    // fetch is in flight.
+    let mut wire = String::new();
+    wait_until(
+        || match latest_inbound_package_id(pdb) {
+            Some(p) => match inbound_row(pdb, &p) {
+                Some((s, _, _)) if s == "fetching" => {
+                    wire = p;
+                    true
+                }
+                _ => false,
+            },
+            None => false,
+        },
+        WAIT,
+    )
+    .await;
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "no frame ingested while the fetch is paced");
+
+    // Fire the SENDER cancel.
+    let fired = Instant::now();
+    cancel_sync_package(&sender, out_id).await.expect("cancel the sending package");
+
+    // The receiver's in-flight fetch aborts and its row terminalizes `cancelled`
+    // ("by sender") WITHIN the deadline — well under the uninterrupted fetch time.
+    wait_until(
+        || matches!(inbound_row(pdb, &wire), Some((s, _, _)) if s == "cancelled"),
+        ABORT_DEADLINE,
+    )
+    .await;
+    let elapsed = fired.elapsed();
+    assert!(
+        elapsed < ABORT_DEADLINE,
+        "the receiver aborted promptly ({elapsed:?} < {ABORT_DEADLINE:?}), NOT at fetch completion (~{:?})",
+        DELAY * (N as u32 + 1)
+    );
+    assert_eq!(
+        inbound_last_error(pdb, &wire).as_deref(),
+        Some("by sender"),
+        "the receiver records the sender-revoke reason"
+    );
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "a sender-cancelled transfer lands no frames");
+    assert_eq!(landed_count(&designated), 0, "nothing on disk in the landing tree");
+
+    // Staging cleaned (handle_revoke teardown) + in-flight tags released. The
+    // loopback fetch never SEEDS an in-flight tag (only the cfg(test) seeder does, out
+    // of an integration test's reach), so `list_in_flight_tags` pins the release-call
+    // namespace-emptiness, not a seeded→released transition — the seeded transition is
+    // the B7 unit `in_flight_tag_list_and_release_honor_the_transfer_namespace`.
+    let staging = primary_dir.join("staging").join(&wire);
+    wait_until(|| !staging.exists(), ABORT_DEADLINE).await;
+    assert!(!staging.exists(), "the partially-fetched staging dir is fully cleaned on revoke");
+    assert!(
+        receiver_ep.list_in_flight_tags().await.unwrap().is_empty(),
+        "no receiver in-flight tags remain after the revoke release"
+    );
+
+    // Sender terminalizes cancelled.
+    wait_until(|| outbound_state(cdb, out_id) == "cancelled", WAIT).await;
+
+    // Both journals carry the revoke crumbs: sent → revoke_sent, received → revoked.
+    let sent_kinds = journal_kinds(cdb, "sent", out_id);
+    assert!(sent_kinds.contains(&"revoke_sent".to_string()), "sent journal records revoke_sent: {sent_kinds:?}");
+    let in_id = inbound_id_of(pdb, &wire).expect("inbound row id");
+    let recv_kinds = journal_kinds(pdb, "received", in_id);
+    assert!(recv_kinds.contains(&"revoked".to_string()), "received journal records revoked: {recv_kinds:?}");
+
+    // The revoke path emitted a single terminal `sync-finished` whose outcome matches
+    // the row (`cancelled`).
+    wait_until(|| recorder.received_finished().iter().any(|(o, _)| o == "cancelled"), WAIT).await;
+    let rf = recorder.received_finished();
+    assert!(
+        rf.iter().any(|(o, _)| o == "cancelled"),
+        "sync-finished emitted on the revoke path with outcome == the row (cancelled): {rf:?}"
+    );
+
+    engine.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// B8 scenario 2 — **failure → resend → confirm into ONE batch-keyed row**. The
+/// route (documented): a receiver fetch-abort never terminalizes the sender
+/// (delivery-forever), and a SENDER cancel would leave the receiver row `cancelled`
+/// (cancelled-is-final ⇒ a resend is re-acked cancelled, never delivered — pinned by
+/// `receiver_cancel_is_final_then_resend_reacked_cancelled`). So the ONLY honest
+/// route to a delivering resend is the **fail path**: the payload dir is renamed away
+/// so the sender's next attempt hits the missing-payload terminal (`Revoke{Failed}` →
+/// the receiver's already-`failed` row is a terminal no-op, staying non-cancelled and
+/// re-drivable). The payload is restored, `resend_transfer` rotates the wire id
+/// (generation 2) and re-drives — and the receiver maps it, via the durable
+/// `batch_uuid`, onto the SAME inbound row it failed on. Two frames are pre-seeded on
+/// the receiver (a prior clean transfer) so the dedup Want is a STRICT subset: only
+/// the missing frames travel.
+#[tokio::test]
+async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    // Receiver WITH a catalog dedup responder so the resend's negotiate drops the
+    // pre-seeded frames (strict-subset Want).
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let responder: Arc<dyn DedupResponder> =
+        Arc::new(CatalogDedupResponder::new(Arc::clone(&primary_store)));
+    let receiver_ep = Arc::new(net.endpoint_with_responder(responder));
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    // Long ack timeout so, after attempt-1's single announce + aborted fetch, the
+    // sender rests in Transferring and does NOT re-announce on its own — so the
+    // receiver row is reset EXACTLY once (by the resend) → generation 2, deterministic.
+    let emitter = Arc::new(RecordingEmitter::default());
+    let (engine, sender, collab_sender, sync) = inject_sender_engine_with_emitter(
+        &net,
+        &capture_db,
+        receiver_node,
+        Duration::from_secs(30),
+        Arc::clone(&emitter) as Arc<dyn ProgressEmitter>,
+    )
+    .await;
+
+    // 5 frames; idx 0,1 are pre-seeded on the receiver, idx 2,3,4 are the missing
+    // subset the batch delivers.
+    let mut frame_ids = Vec::with_capacity(5);
+    for idx in 0..5 {
+        frame_ids.push(insert_capture_frame(&capture_ctx, &capture_files, idx).0);
+    }
+
+    // ── Pre-seed: a prior CLEAN transfer of {0,1} → the receiver ingests them and
+    // populates `files.content_hash` (the sampling hash the responder dedups on). ──
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids[0..2].to_vec(),
+        Some("Pre-seed".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("pre-seed enqueue");
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 2, WAIT).await;
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL") == 2, WAIT).await;
+
+    // ── The batch: {0,1,2,3,4}. Negotiate drops {0,1} (dupes) → Want {2,3,4}. Arm a
+    // one-shot abort so attempt-1's fetch of that subset aborts → inbound row failed. ──
+    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids.clone(),
+        Some("Resend Into One Row".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("batch enqueue");
+    let out_id = latest_outbound_id(cdb);
+
+    // Attempt 1: a SECOND inbound row appears (the batch's), and its subset fetch
+    // aborts → it lands `failed` at generation 1. Capture its id + attempt-1 wire.
+    wait_until(
+        || {
+            count(pdb, "SELECT COUNT(*) FROM sync_inbound") == 2
+                && matches!(latest_inbound_package_id(pdb), Some(p) if matches!(inbound_row(pdb, &p), Some((s, _, _)) if s == "failed"))
+        },
+        WAIT,
+    )
+    .await;
+    let wire_attempt1 = latest_inbound_package_id(pdb).expect("batch inbound wire (attempt 1)");
+    let in_id = inbound_id_of(pdb, &wire_attempt1).expect("batch inbound row id");
+    let batch_uuid = inbound_batch_uuid(pdb, in_id).expect("batch inbound batch_uuid");
+    assert_eq!(inbound_generation(pdb, in_id), 1, "the batch inbound row is at generation 1 after attempt 1");
+
+    // ── Drive the sender terminal via the fail path: rename the payload away, kick a
+    // re-attempt (missing-payload → `Failed`), then restore it. ──
+    let pkg_ref = outbound_package_ref(cdb, out_id);
+    let stashed = format!("{pkg_ref}.stashed");
+    std::fs::rename(&pkg_ref, &stashed).expect("stash the payload dir");
+    engine.kick(out_id).await.expect("kick a re-attempt onto the missing payload");
+    wait_until(|| outbound_state(cdb, out_id) == "failed", WAIT).await;
+    assert_eq!(
+        outbound_last_error(cdb, out_id).as_deref(),
+        Some("package payload missing on disk"),
+        "the sender failed on the missing payload (the honest resend route)"
+    );
+    // The receiver row is STILL failed (the Revoke{Failed} hit an already-terminal
+    // row → no-op), non-cancelled, generation still 1 — re-drivable.
+    assert!(
+        matches!(inbound_row(pdb, &wire_attempt1), Some((s, _, _)) if s == "failed"),
+        "the receiver row stays failed (not cancelled) — a resend can re-drive it"
+    );
+    assert_eq!(inbound_generation(pdb, in_id), 1, "no stray re-announce bumped the inbound generation before the resend");
+    std::fs::rename(&stashed, &pkg_ref).expect("restore the payload dir");
+
+    // ── Resend: rotates the wire id (generation 2) and re-drives; the one-shot abort
+    // already fired, so this fetch delivers. ──
+    let resend_id = retry_sync_package(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, out_id, None)
+        .await
+        .expect("resend the failed transfer");
+    assert_eq!(resend_id, out_id, "resend-as-reset returns the SAME outbound row");
+    let wire_resend = outbound_wire_id(cdb, out_id);
+    assert_ne!(wire_resend, wire_attempt1, "the resend rotates the wire id");
+
+    wait_until(|| outbound_state(cdb, out_id) == "confirmed", WAIT).await;
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 5, WAIT).await;
+
+    // ── The batch delivered into the SAME inbound row (id + batch_uuid constant),
+    // generation 2, only the missing subset travelled. ──
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 2, "still just the pre-seed row + the ONE batch row");
+    assert_eq!(inbound_id_of(pdb, &wire_resend), Some(in_id), "the resend maps onto the SAME inbound row id");
+    assert_eq!(inbound_batch_uuid(pdb, in_id).as_deref(), Some(batch_uuid.as_str()), "batch_uuid is constant across attempts");
+    assert_eq!(inbound_generation(pdb, in_id), 2, "the receiver row is at generation 2 (reset exactly once, by the resend)");
+    assert!(matches!(inbound_row(pdb, &wire_resend), Some((s, _, _)) if s == "done"), "the batch inbound row is terminal Done");
+
+    // Only the 3 MISSING frames travelled: exactly the {2,3,4} per-file rows settled
+    // done/ingested, and the 2 pre-seeded {0,1} were dedup-dropped by the sender
+    // (never served, never ingested on the batch) — the strict-subset Want. (The
+    // announce carries the full manifest; the dedup shows in what is FETCHED, so the
+    // ingested subset is the honest "what travelled" oracle.)
+    assert_eq!(
+        count(pdb, &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {in_id} AND outcome = 'ingested'")),
+        3,
+        "exactly the 3 missing frames settled ingested on the batch row"
+    );
+    for idx in [2usize, 3, 4] {
+        let fname = format!("light_{idx:04}.fits");
+        assert_eq!(
+            count(pdb, &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {in_id} AND outcome = 'ingested' AND rel_path LIKE '%{fname}'")),
+            1,
+            "the missing frame {fname} travelled on the batch"
+        );
+    }
+    for idx in [0usize, 1] {
+        let fname = format!("light_{idx:04}.fits");
+        assert_eq!(
+            count(pdb, &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {in_id} AND outcome = 'ingested' AND rel_path LIKE '%{fname}'")),
+            0,
+            "the pre-seeded (deduped) frame {fname} did NOT travel on the batch"
+        );
+    }
+
+    // B5b at e2e: every received history row keys on the durable batch_uuid, NONE on a
+    // wire id (no phantom wire-keyed groups across the resend).
+    assert_eq!(
+        count(pdb, &format!("SELECT COUNT(*) FROM sync_history WHERE direction = 'received' AND package_id IN ('{wire_attempt1}', '{wire_resend}')")),
+        0,
+        "no received history row keys on a wire id"
+    );
+    assert!(
+        count(pdb, &format!("SELECT COUNT(*) FROM sync_history WHERE direction = 'received' AND package_id = '{batch_uuid}' AND outcome = 'ingested'")) >= 3,
+        "the batch's received history keys on the batch_uuid"
+    );
+
+    // Generation 2 in BOTH summaries (list_terminal_transfers), attempts >= generation.
+    assert_eq!(outbound_generation(cdb, out_id), 2, "sender outbound at generation 2");
+    assert!(outbound_attempts(cdb, out_id) >= outbound_generation(cdb, out_id), "attempts >= generation");
+    let terminal_sent = list_terminal_transfers(&capture_ctx, None).expect("sender terminal transfers");
+    let sent_sum = terminal_sent.sent.iter().find(|s| s.id == out_id).expect("sender summary present");
+    assert_eq!(sent_sum.state.as_str(), "confirmed", "sender summary is confirmed");
+    assert_eq!(sent_sum.generation, 2, "sender summary carries generation 2");
+    let terminal_recv = list_terminal_transfers(&primary_ctx, None).expect("receiver terminal transfers");
+    let recv_sum = terminal_recv.received.iter().find(|s| s.id == in_id).expect("receiver summary present");
+    assert_eq!(recv_sum.generation, 2, "receiver summary carries generation 2");
+
+    // The resend's send-side `sync-finished` shows the strict-subset split (new=3,
+    // dup=2); it is the LAST finished (the middle (0,0) is the fail's terminal emit).
+    assert_eq!(
+        emitter.sent_finished().last().copied(),
+        Some((3, 2)),
+        "the resend moved only the 3 missing frames (new=3, duplicate=2): {:?}",
+        emitter.sent_finished()
+    );
+
+    engine.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// B8 scenario 3 — **all-duplicate-after-announce race → Revoke(Superseded) closes
+/// the receiver row**. B3's crash-resume superseded construction at the two-engine
+/// level with a REAL [`SyncReceiver`]: session 1 (want-all) announces + the receiver
+/// begins fetching, HELD by a long per-read pace so its row rests non-terminal
+/// (`fetching`) with nothing ingested; the sender reaches Transferring and is killed.
+/// The responder flips to all-duplicate; session 2 (fresh engine, SAME store)
+/// crash-resumes → re-negotiates → all-duplicate → confirms locally AND revokes the
+/// stuck row. The receiver's `handle_revoke(Superseded)` aborts the held fetch and
+/// terminalizes the row `done` ("superseded") — no stuck `announced`/`fetching` row
+/// remains.
+#[tokio::test]
+async fn all_duplicate_after_announce_supersedes_stuck_receiver_row() {
+    const N: usize = 3;
+    // Pace each fetch read so, once the FIRST file lands in staging, the fetch rests
+    // inside a long per-read sleep — wide enough that the session-2 superseded revoke's
+    // abort fires DURING the sleep (before the next file-open), so the fetch aborts
+    // cleanly rather than tripping over the payload engine2 cleans on its all-duplicate
+    // confirm. We kill/resume only AFTER file 0 is on disk in staging, so the fetch is
+    // provably past `subset_src_files` (which ran while engine1 kept the payload
+    // present) and mid-sleep — never at the payload-touching setup. Generous (12s) so
+    // a slow-CI engine2 (crash-resume → re-negotiate → confirm → revoke, normally
+    // sub-second) still aborts the fetch well within the sleep, before the next
+    // file-open would touch the cleaned payload.
+    const HOLD: Duration = Duration::from_secs(12);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    // Receiver WITH a flipping responder (want-all → all-duplicate).
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let all_dup = Arc::new(AtomicBool::new(false));
+    let responder: Arc<dyn DedupResponder> =
+        Arc::new(SwitchableResponder { all_duplicate: Arc::clone(&all_dup) });
+    let receiver_ep = Arc::new(net.endpoint_with_responder(responder));
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    // Hold every fetch so session 1's row rests `fetching`, nothing ingests.
+    receiver_ep.set_fault(FaultPlan { delay_per_read: Some(HOLD), ..Default::default() });
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    // ── Session 1: want-all announce → Transferring; held fetch keeps the receiver
+    // row non-terminal. Long ack timeout so the sender rests (doesn't re-announce). ──
+    let (engine1, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
+    let mut frame_ids = Vec::with_capacity(N);
+    for idx in 0..N {
+        frame_ids.push(insert_capture_frame(&capture_ctx, &capture_files, idx).0);
+    }
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids.clone(),
+        Some("Superseded Race".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("session 1 enqueue");
+    let id = latest_outbound_id(cdb);
+
+    // Sender Transferring AND the receiver row `fetching`. Capture wire W1.
+    wait_until(|| outbound_state(cdb, id) == "transferring", WAIT).await;
+    let mut w1 = String::new();
+    wait_until(
+        || match latest_inbound_package_id(pdb) {
+            Some(p) => match inbound_row(pdb, &p) {
+                Some((s, _, _)) if s == "fetching" => {
+                    w1 = p;
+                    true
+                }
+                _ => false,
+            },
+            None => false,
+        },
+        WAIT,
+    )
+    .await;
+    let in_id = inbound_id_of(pdb, &w1).expect("session-1 inbound row id");
+    // Wait until file 0 has landed in the per-package staging dir: the fetch is now
+    // provably past `subset_src_files`/the first file's copy (which ran while engine1
+    // kept the payload present) and resting inside the long per-read sleep — the safe
+    // kill point where the superseded revoke's abort lands mid-sleep, before the next
+    // file-open would trip over the payload engine2 cleans.
+    let staged_file0 = primary_dir.join("staging").join(&w1).join("light_0000.fits");
+    wait_until(|| staged_file0.exists(), WAIT).await;
+
+    // Peer now holds everything; kill session 1 (row stays non-terminal; the fetch is
+    // orphaned mid-sleep on the receiver).
+    all_dup.store(true, Ordering::SeqCst);
+    engine1.shutdown().await;
+
+    // ── Session 2: fresh engine, SAME store → crash-resume re-negotiates → the peer
+    // reports all-duplicate → confirm locally AND Revoke{Superseded}(W1). The revoke
+    // aborts the receiver's mid-sleep fetch; `handle_revoke(Superseded)` then
+    // terminalizes the row `done`. ──
+    let store2 = Arc::new(CatalogSyncStore::open(&capture_db).unwrap());
+    let engine2 = Arc::new(SyncEngine::spawn(
+        store2 as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_node,
+    ));
+
+    wait_until(|| outbound_state(cdb, id) == "confirmed", WAIT).await;
+    wait_until(|| matches!(inbound_row(pdb, &w1), Some((s, _, _)) if s == "done"), WAIT).await;
+
+    // The superseded revoke closed the row honestly (`done`, "superseded"), nothing
+    // landed, and the received journal records the revoke — proof `handle_revoke`
+    // terminalized the row (not a stray ingest).
+    assert_eq!(
+        inbound_last_error(pdb, &w1).as_deref(),
+        Some("nothing to fetch (superseded by sender)"),
+        "the receiver row terminalizes done («superseded») via the revoke"
+    );
+    assert!(
+        journal_kinds(pdb, "received", in_id).contains(&"revoked".to_string()),
+        "the received journal records the revoke (handle_revoke ran on a non-terminal row)"
+    );
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "the superseded receiver ingested nothing");
+    assert_eq!(landed_count(&designated), 0, "nothing landed on disk");
+    // No stuck announced/fetching row remains; exactly one inbound row, terminal.
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM sync_inbound WHERE state IN ('announced', 'fetching')"),
+        0,
+        "no stuck announced/fetching inbound row remains"
+    );
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 1, "exactly one inbound row (the superseded one)");
+    // The sender emitted the F3-orphan-closing Revoke{Superseded} (crash-resume path).
+    assert!(
+        journal_kinds(cdb, "sent", id).contains(&"revoke_sent".to_string()),
+        "the sender journalled revoke_sent (the superseded revoke)"
+    );
+
+    engine2.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// B8 scenario 4 — **restart mid-resend resumes the SAME row and confirms**. Cancel
+/// (a sender-side cancel toward an OFFLINE peer — pending never `started`, so no
+/// receiver row is cancelled and the resend is free to deliver), then resend
+/// (generation 2), then kill the sender engine after the reset but before any
+/// confirm (the peer is still offline, so nothing CAN confirm — the kill is
+/// unambiguously mid-resend). A fresh engine over the SAME store crash-resumes the
+/// gen-2 row; bringing the receiver online, it delivers and confirms — SAME row id,
+/// generation UNCHANGED by the restart, and the receiver holds exactly ONE row.
+#[tokio::test]
+async fn restart_mid_resend_resumes_same_row_and_confirms() {
+    const N: usize = 4;
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    // Mint the receiver endpoint (node id known) but keep it OFFLINE for now.
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    // Short ack timeout → ms-scale retries against the offline peer.
+    let (engine1, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
+
+    let mut frame_ids = Vec::with_capacity(N);
+    for idx in 0..N {
+        frame_ids.push(insert_capture_frame(&capture_ctx, &capture_files, idx).0);
+    }
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids.clone(),
+        Some("Restart Mid-Resend".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("enqueue toward offline peer");
+    let id = latest_outbound_id(cdb);
+
+    // The package retries against the offline peer (non-terminal); no announce lands.
+    wait_until(|| outbound_attempts(cdb, id) >= 2 && !is_terminal_state(&outbound_state(cdb, id)), WAIT).await;
+    assert_eq!(outbound_generation(cdb, id), 1, "a fresh enqueue is at generation 1");
+
+    // Cancel (sender-side, peer never started → no revoke, no receiver row).
+    cancel_sync_package(&sender, id).await.expect("cancel the offline package");
+    wait_until(|| outbound_state(cdb, id) == "cancelled", WAIT).await;
+
+    // Resend → the SAME row, generation 2, re-driving (still offline).
+    let resend_id = retry_sync_package(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, id, None)
+        .await
+        .expect("resend the cancelled package");
+    assert_eq!(resend_id, id, "resend-as-reset returns the SAME row");
+    wait_until(|| outbound_generation(cdb, id) == 2 && !is_terminal_state(&outbound_state(cdb, id)), WAIT).await;
+    assert_eq!(outbound_generation(cdb, id), 2, "the resend advanced the row to generation 2");
+
+    // Kill the engine mid-resend (peer still offline → nothing has confirmed).
+    engine1.shutdown().await;
+    assert_ne!(outbound_state(cdb, id), "confirmed", "not confirmed at the kill point — the resend is genuinely mid-flight");
+
+    // Bring the receiver online, THEN stand up a fresh engine over the SAME store: its
+    // crash-resume re-drives the persisted gen-2 row and, with the peer now reachable,
+    // delivers and confirms — unattended.
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+    let store2 = Arc::new(CatalogSyncStore::open(&capture_db).unwrap());
+    let engine2 = Arc::new(SyncEngine::spawn(
+        store2 as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_node,
+    ));
+
+    wait_until(|| outbound_state(cdb, id) == "confirmed", WAIT).await;
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
+
+    // SAME row id, generation UNCHANGED by the restart (still 2), and the receiver
+    // holds exactly ONE inbound row.
+    assert_eq!(count(cdb, "SELECT COUNT(*) FROM sync_outbound"), 1, "still exactly one outbound row (resend-as-reset, no new row)");
+    assert_eq!(outbound_generation(cdb, id), 2, "the restart did NOT bump generation (only a resend does)");
+    assert!(outbound_attempts(cdb, id) >= outbound_generation(cdb, id), "attempts >= generation");
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 1, "the receiver holds exactly one inbound row");
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), N as i64, "the peer ingested each frame exactly once");
+    assert_eq!(landed_count(&designated), N, "all frames landed under the designated root");
+
+    engine2.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// B8 scenario 5 — **delete reclaims, scoped to its batch**. After TWO confirmed
+/// transfers, `delete_transfer_history` (both directions) on batch 1 removes its
+/// rows / files / events / history and its sender payload dir, dropping
+/// `get_transfer_storage().packages_bytes`/`packages_count` — while batch 2 (a
+/// foreign batch) survives untouched, the e2e namespace-scoping proof (the blob-tag
+/// namespace survival is the B7 unit `in_flight_tag_list_and_release_honor_the_transfer_namespace`,
+/// unreachable over loopback where the fetch seeds no in-flight tag).
+#[tokio::test]
+async fn delete_transfer_history_reclaims_batch_and_leaves_foreign_batch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    let (engine, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
+
+    // 5 distinct frames: batch 1 = {0,1,2}, batch 2 = {3,4}. No dedup (distinct uuids).
+    let mut frame_ids = Vec::with_capacity(5);
+    for idx in 0..5 {
+        frame_ids.push(insert_capture_frame(&capture_ctx, &capture_files, idx).0);
+    }
+
+    // ── Batch 1 → confirmed. ──
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids[0..3].to_vec(),
+        Some("Batch One".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("batch 1 enqueue");
+    let out_id_1 = latest_outbound_id(cdb);
+    wait_until(|| outbound_state(cdb, out_id_1) == "confirmed", WAIT).await;
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 3, WAIT).await;
+    let wire_1 = latest_inbound_package_id(pdb).expect("batch 1 inbound wire");
+    let in_id_1 = inbound_id_of(pdb, &wire_1).expect("batch 1 inbound row id");
+
+    // ── Batch 2 → confirmed (the foreign batch that must survive). ──
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids[3..5].to_vec(),
+        Some("Batch Two".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("batch 2 enqueue");
+    let out_id_2 = latest_outbound_id(cdb);
+    wait_until(|| outbound_state(cdb, out_id_2) == "confirmed", WAIT).await;
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 5, WAIT).await;
+    let wire_2 = latest_inbound_package_id(pdb).expect("batch 2 inbound wire");
+    let in_id_2 = inbound_id_of(pdb, &wire_2).expect("batch 2 inbound row id");
+
+    // Batch 1's delete key (== the package-dir basename == its batch_uuid, B1 seam).
+    let pkg_ref_1 = outbound_package_ref(cdb, out_id_1);
+    let batch_key_1 =
+        Path::new(&pkg_ref_1).file_name().unwrap().to_string_lossy().to_string();
+    let payload_dir_1 = PathBuf::from(&pkg_ref_1);
+
+    // A foreign-namespace survivor seeded into the sender catalog: a `frames_set`
+    // unrelated to any transfer — the delete must not touch it (DB-namespace scoping).
+    cdb.conn()
+        .execute("INSERT INTO frames_set (id, name) VALUES (777, 'Foreign Keep')", [])
+        .unwrap();
+
+    // Storage before: two manifest-only payload dirs on the sender.
+    let storage_before = get_transfer_storage(&capture_ctx).expect("transfer storage before");
+    assert!(storage_before.packages_count >= 2, "both confirmed transfers keep a (manifest-only) payload dir");
+    assert!(storage_before.packages_bytes > 0, "the manifest-only payload dirs carry bytes");
+    assert!(payload_dir_1.exists(), "batch 1's payload dir is present before the delete");
+
+    // ── Delete batch 1 both directions. ──
+    let del_sync = SyncRuntime::new();
+    let deleted_sent = delete_transfer_history(&capture_ctx, &del_sync, Direction::Sent, batch_key_1.clone())
+        .await
+        .expect("delete sent batch 1");
+    let deleted_recv = delete_transfer_history(&primary_ctx, &del_sync, Direction::Received, batch_key_1.clone())
+        .await
+        .expect("delete received batch 1");
+    assert_eq!(deleted_sent.rows, 1, "one sent row deleted");
+    assert_eq!(deleted_recv.rows, 1, "one received row deleted");
+    assert!(deleted_sent.history >= 3, "batch 1's sent history removed");
+    assert!(deleted_recv.history >= 3, "batch 1's received history removed");
+
+    // Batch 1: rows / files / events / history all gone; sender payload dir removed;
+    // receiver in-flight tags absent.
+    assert_eq!(count(cdb, &format!("SELECT COUNT(*) FROM sync_outbound WHERE id = {out_id_1}")), 0, "sent row gone");
+    assert_eq!(count(pdb, &format!("SELECT COUNT(*) FROM sync_inbound WHERE id = {in_id_1}")), 0, "received row gone");
+    assert_eq!(count(cdb, &format!("SELECT COUNT(*) FROM sync_outbound_files WHERE outbound_id = {out_id_1}")), 0, "sent files gone");
+    assert_eq!(count(pdb, &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {in_id_1}")), 0, "received files gone");
+    assert_eq!(count(cdb, &format!("SELECT COUNT(*) FROM sync_events WHERE direction = 'sent' AND batch_key = '{out_id_1}'")), 0, "sent events gone");
+    assert_eq!(count(pdb, &format!("SELECT COUNT(*) FROM sync_events WHERE direction = 'received' AND batch_key = '{in_id_1}'")), 0, "received events gone");
+    assert_eq!(count(cdb, &format!("SELECT COUNT(*) FROM sync_history WHERE package_id = '{batch_key_1}'")), 0, "sent history gone");
+    assert_eq!(count(pdb, &format!("SELECT COUNT(*) FROM sync_history WHERE package_id = '{batch_key_1}'")), 0, "received history gone");
+    assert!(!payload_dir_1.exists(), "the sender payload dir is REMOVED by the reclaim");
+    assert!(receiver_ep.list_in_flight_tags().await.unwrap().is_empty(), "no receiver in-flight tags remain");
+
+    // Batch 2 (foreign) survives untouched.
+    assert_eq!(count(cdb, &format!("SELECT COUNT(*) FROM sync_outbound WHERE id = {out_id_2}")), 1, "foreign batch's sent row survives");
+    assert_eq!(count(pdb, &format!("SELECT COUNT(*) FROM sync_inbound WHERE id = {in_id_2}")), 1, "foreign batch's received row survives");
+    assert!(
+        count(pdb, "SELECT COUNT(*) FROM sync_history WHERE direction = 'received' AND outcome = 'ingested'") >= 2,
+        "the foreign batch's received history survives"
+    );
+    assert!(PathBuf::from(outbound_package_ref(cdb, out_id_2)).exists(), "the foreign batch's payload dir survives");
+    assert_eq!(count(cdb, "SELECT COUNT(*) FROM frames_set WHERE id = 777"), 1, "the foreign namespace survivor is untouched");
+
+    // Storage dropped by exactly batch 1's payload dir.
+    let storage_after = get_transfer_storage(&capture_ctx).expect("transfer storage after");
+    assert_eq!(storage_after.packages_count, storage_before.packages_count - 1, "one payload dir reclaimed");
+    assert!(storage_after.packages_bytes < storage_before.packages_bytes, "packages_bytes dropped by the reclaimed dir");
 
     engine.shutdown().await;
     receiver.shutdown().await;
