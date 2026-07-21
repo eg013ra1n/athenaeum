@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::events::{emit_event, ProgressEmitter};
@@ -255,11 +256,25 @@ pub struct SyncFinishedEvent {
 /// [`InboundState::Cancelled`] row is the restart-proof twin of this in-memory
 /// set — a cancel survives a restart through the row even though this set does not.
 ///
+/// `revoke_aborts` (Transfers Batch Model §D2, B4-fix) is a SEPARATE signal for the
+/// same abort mechanism, requested by [`request_revoke_abort`] from the receiver's
+/// event-ingress pump (see [`SyncReceiver::spawn`]) the instant a sender
+/// [`Revoke`](crate::sharing::types::RevokeReason) arrives — cross-task, so it can
+/// wake an in-flight fetch even while the serial receive loop is still busy
+/// awaiting an earlier `handle_announce`. Kept distinct from `cancels`
+/// deliberately: a revoke must NOT divert the aborted fetch into the local-decline
+/// [`cancel_epilogue`] (which sends an ack) — the ALREADY-QUEUED `RevokeReceived`
+/// event drives the reason-honest [`handle_revoke`] bookkeeping (no ack) once the
+/// serial loop drains it next. Both signals share the one `notify` — the select
+/// loop just re-checks both flags on every wake, so one `Notify` is sufficient.
+///
 /// [`is_cancelled`]: Self::is_cancelled
 /// [`request_cancel`]: Self::request_cancel
+/// [`request_revoke_abort`]: Self::request_revoke_abort
 #[derive(Default)]
 pub struct InboundControl {
     cancels: std::sync::Mutex<std::collections::HashSet<String>>,
+    revoke_aborts: std::sync::Mutex<std::collections::HashSet<String>>,
     notify: tokio::sync::Notify,
 }
 
@@ -287,9 +302,33 @@ impl InboundControl {
             .contains(package_id)
     }
 
+    /// Request an in-flight-fetch abort for `package_id` because the SENDER
+    /// revoked its announce (B4-fix) — cross-task equivalent of [`request_cancel`]
+    /// but recorded on the separate `revoke_aborts` set so the fetch-abort call
+    /// site can tell the two reasons apart (see the struct doc). Called from the
+    /// receiver's event-ingress pump, never from `handle_revoke` itself (which
+    /// only runs after the fetch has already been dealt with).
+    pub fn request_revoke_abort(&self, package_id: &str) {
+        self.revoke_aborts
+            .lock()
+            .expect("inbound revoke_aborts mutex poisoned")
+            .insert(package_id.to_string());
+        self.notify.notify_waiters();
+    }
+
+    /// Whether `package_id`'s in-flight fetch has been asked to abort for a sender
+    /// revoke (as opposed to a local [`is_cancelled`](Self::is_cancelled) decline).
+    pub fn is_revoke_abort_requested(&self, package_id: &str) -> bool {
+        self.revoke_aborts
+            .lock()
+            .expect("inbound revoke_aborts mutex poisoned")
+            .contains(package_id)
+    }
+
     /// A future that resolves the next time [`request_cancel`](Self::request_cancel)
-    /// is called. The in-flight fetch loop selects on this to learn about a cancel
-    /// without polling. NB the tokio `Notify` registration caveat: the returned
+    /// or [`request_revoke_abort`](Self::request_revoke_abort) is called. The
+    /// in-flight fetch loop selects on this to learn about either without polling.
+    /// NB the tokio `Notify` registration caveat: the returned
     /// [`Notified`](tokio::sync::futures::Notified) only registers the waiter once
     /// polled/`enable`d, so the call site enables it before checking the flag.
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
@@ -347,7 +386,46 @@ impl SyncReceiver {
             request_handler,
         } = project;
 
-        let mut events = transport.events().await;
+        let raw_events = transport.events().await;
+
+        // Ingress pump (Transfers Batch Model §D2, B4-fix): decouples RECEIVING a
+        // transport event from PROCESSING it. The serial loop below stays the sole
+        // processor (no concurrent `handle_announce`/`handle_revoke` — the B2
+        // single-writer invariant `upsert_inbound_attempt` relies on holds), which
+        // means a `RevokeReceived` queued behind a currently-running, blocking
+        // `handle_announce` fetch would otherwise sit unprocessed until that fetch
+        // finishes on its own — the opposite of "revoke stops the download
+        // promptly". This pump task is never blocked by that fetch: it forwards
+        // every event, in order, into a fresh channel the serial loop drains, and
+        // for an AUTHORIZED peer's `RevokeReceived` it ALSO signals
+        // [`InboundControl::request_revoke_abort`] synchronously, right here, the
+        // instant the event arrives — which wakes the fetch-abort select loop
+        // inside `handle_announce` cross-task (the same `Notify`
+        // [`cancel_incoming_package`](crate::api::sync::cancel_incoming_package)
+        // already wakes). The event is still forwarded on to the serial loop so
+        // `handle_revoke` performs the reason-honest bookkeeping (terminal state,
+        // settle files, staging, tags, history, journal — no ack) once it drains
+        // it, strictly after the aborted `handle_announce` call has returned. The
+        // pump re-runs the SAME H1 authorizer the serial loop's arms use (never
+        // trust-then-verify) so an unauthorized peer cannot poison the abort set —
+        // belt-and-suspenders in dev-ticket mode, where there is no connect_gate.
+        // Unbounded so the pump's `send` never itself blocks on a busy consumer.
+        let (forward_tx, mut events) = mpsc::unbounded_channel::<TransportEvent>();
+        let pump_control = Arc::clone(&control);
+        let pump_authorized = Arc::clone(&authorized);
+        tokio::spawn(async move {
+            let mut raw_events = raw_events;
+            while let Some(ev) = raw_events.recv().await {
+                if let TransportEvent::RevokeReceived { from, package_id, .. } = &ev {
+                    if pump_authorized(from) {
+                        pump_control.request_revoke_abort(&package_id.0);
+                    }
+                }
+                if forward_tx.send(ev).is_err() {
+                    break;
+                }
+            }
+        });
 
         // Startup reconcile (zombie-inbound fix): any non-terminal `sync_inbound`
         // row left by a prior process cannot resume — a fetch/ingest never
@@ -501,6 +579,20 @@ impl SyncReceiver {
                     // file rows, release in-flight tags, and write history + journal.
                     // NO ack is sent for a revoke.
                     TransportEvent::RevokeReceived { from, package_id, reason } => {
+                        // H1 belt-and-suspenders (mirrors the `AnnounceReceived`
+                        // arm): the connect_gate covers production, but dev-ticket
+                        // mode installs no gate, so this per-event authorizer check
+                        // must be uniform across every event kind that can touch
+                        // catalog/receiver state. An unauthorized peer's revoke is
+                        // silently dropped before it can terminalize any row.
+                        if !authorized(&from) {
+                            tracing::warn!(
+                                from = %super::node_id_hex(&from),
+                                package_id = %package_id.0,
+                                "sync receiver dropped revoke from an unauthorized peer"
+                            );
+                            continue;
+                        }
                         handle_revoke(
                             &store,
                             loop_transport.as_ref(),
@@ -1054,37 +1146,60 @@ async fn handle_announce(
             }
         })
     };
-    // Wire-in (b) — Task 12: the fetch is abortable. Pin it and race it against a
-    // cancel signal; a cancel drops the fetch future — Task 10's downloader aborts
-    // the in-flight download on drop — and diverts to the cancel epilogue. The
-    // fetch future is scoped so it drops (aborting the download) BEFORE the
-    // epilogue's manifest fetch runs.
+    // Wire-in (b) — Task 12, extended B4-fix: the fetch is abortable on EITHER of
+    // two distinct cross-task signals. Pin the fetch and race it against the
+    // shared notify; a break drops the fetch future — Task 10's downloader aborts
+    // the in-flight download on drop — BEFORE either post-break branch runs. The
+    // two signals resolve differently on break:
+    //  - `is_cancelled` (local decline via `cancel_incoming_package`) → diverts to
+    //    the local `cancel_epilogue` (fetches the manifest, writes Cancelled
+    //    receipts, sends an ack).
+    //  - `is_revoke_abort_requested` (B4-fix: set by the receiver's event-ingress
+    //    pump the instant a sender `RevokeReceived` arrives, cross-task, even
+    //    while this call is still running) → does NOT run the epilogue and sends
+    //    NO ack; it only needs the download stopped. The `RevokeReceived` event
+    //    that set the flag is already queued behind this announce in the serial
+    //    loop's channel (the pump forwards every event it observes), so
+    //    `handle_revoke` runs the full reason-honest bookkeeping (terminal state,
+    //    settle files, staging, tags, history, journal) the moment this call
+    //    returns and the loop drains its next event.
     let fetch_outcome: Option<Result<()>> = {
         let fetch_fut = transport.fetch(from, &announce, &staging, sink);
         tokio::pin!(fetch_fut);
         loop {
-            // Enable the notify waiter BEFORE checking the flag so a cancel that
-            // races in right after the check still wakes us (a tokio `Notified`
-            // only registers the waiter once polled / `enable`d).
+            // Enable the notify waiter BEFORE checking the flags so a cancel/revoke
+            // that races in right after the check still wakes us (a tokio
+            // `Notified` only registers the waiter once polled / `enable`d).
             let notified = control.notified();
             tokio::pin!(notified);
-            // Register the waiter now (a `Notified` only enrolls once polled/enabled)
-            // so a cancel that races in right after the flag check still wakes us.
             let _ = notified.as_mut().enable();
-            if control.is_cancelled(&package_id) {
+            if control.is_cancelled(&package_id) || control.is_revoke_abort_requested(&package_id) {
                 break None;
             }
             tokio::select! {
                 biased;
                 r = &mut fetch_fut => break Some(r),
-                // Woken by a cancel (possibly for another package); loop back and
-                // let the flag re-check at the top decide.
+                // Woken by a cancel or revoke abort (possibly for another
+                // package); loop back and let the flag re-check at the top decide.
                 _ = &mut notified => {}
             }
         }
     };
     let Some(fetch_result) = fetch_outcome else {
-        // Cancelled mid-fetch: the dropped fetch future aborted the download.
+        if control.is_revoke_abort_requested(&package_id) {
+            // Sender-revoked mid-fetch (B4-fix): the fetch is already dropped
+            // above. Do NOT touch row/file state here and send NO ack — the
+            // already-queued `RevokeReceived` event runs `handle_revoke`'s
+            // reason-honest bookkeeping the moment the serial loop drains it next.
+            tracing::info!(
+                package_id = %package_id,
+                peer_device = %peer_device,
+                "sync receiver aborted in-flight fetch for a sender revoke"
+            );
+            return Ok(());
+        }
+        // Cancelled mid-fetch (local decline): the dropped fetch future aborted
+        // the download.
         tracing::info!(package_id = %package_id, peer_device = %peer_device, "sync receiver cancelling in-flight fetch");
         return cancel_epilogue(
             store, transport, emitter.as_ref(), from, &announce, staging_root, inbound_id,
@@ -3494,6 +3609,125 @@ mod tests {
 
         let row = poll_inbound(&store, "wire-live", InboundState::Cancelled).await;
         assert_eq!(row.last_error.as_deref(), Some("by sender"), "the transport revoke drove the row cancelled");
+    }
+
+    /// The REAL concurrency story the ingress-pump fix exists for: a sender
+    /// `Revoke` delivered while the receiver's fetch is GENUINELY blocking (not a
+    /// near-instant loopback copy) aborts it PROMPTLY — well before the fetch
+    /// would have finished on its own. Without the fix, `RevokeReceived` queues
+    /// behind the single-consumer serial loop's in-progress, blocking
+    /// `handle_announce` call and only gets processed (as a no-op, on the
+    /// already-`Done` row) once the fetch completes naturally — exactly the bug
+    /// the review flagged.
+    ///
+    /// Proof, all three required by the review:
+    /// 1. **Bounded deadline, not fetch-completion**: revoke→`Cancelled` lands
+    ///    within 2s of firing, against a fetch that (uninterrupted) blocks for
+    ///    ~2× 1.5s = ~3s.
+    /// 2. **Partial staging cleaned**: the staging dir — proven non-empty
+    ///    mid-fetch (the fetch was genuinely writing into it) — is fully removed
+    ///    after.
+    /// 3. **Reason-honest, ack-free path**: zero `sync_receipts` rows for the wire
+    ///    id and no `cancelled` journal entry prove the FAST `handle_revoke` path
+    ///    ran, never the local-decline `cancel_epilogue` (which would write one
+    ///    `Cancelled` receipt per frame and send an ack — forbidden for a revoke).
+    #[tokio::test]
+    async fn revoke_mid_fetch_aborts_promptly_not_at_fetch_completion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        // Hold every fetch read chunk open for 1.5s: the v2 fixture's two small
+        // files (each under the 8KB copy granularity) complete in ONE read apiece,
+        // so each contributes exactly one 1.5s pause — a genuinely blocking ~3s
+        // fetch if left uninterrupted.
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+        receiver_ep.set_fault(FaultPlan { delay_per_read: Some(DELAY), ..Default::default() });
+
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            { let incoming = incoming.clone(); Arc::new(move || incoming.clone()) as IncomingResolver },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
+        let wire = announce.package_id.0.clone();
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.announce(receiver_node, &announce, "Live Batch", "batch-live", &files).await.unwrap();
+
+        // Wait for the row to actually enter Fetching (the fetch is genuinely under
+        // way), then a short grace so the transport has created the staging dir and
+        // started copying — this is "mid-fetch", not "before the fetch began".
+        poll_inbound(&store, &wire, InboundState::Fetching).await;
+        let inbound_id = { let conn = store.lock_conn(); get_inbound(&conn, &wire).unwrap().unwrap().id };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let staging = sync_dir.join("staging").join(&wire);
+        assert!(staging.exists(), "the fetch has started writing into staging before the revoke: {staging:?}");
+
+        // Fire the revoke mid-fetch and time how long it takes to land.
+        let fired_at = std::time::Instant::now();
+        sender.revoke(receiver_node, &announce.package_id, RevokeReason::Cancelled).await.unwrap();
+
+        let bound = std::time::Duration::from_secs(2);
+        let mut cancelled_row = None;
+        while fired_at.elapsed() < bound {
+            let row = { let conn = store.lock_conn(); get_inbound(&conn, &wire).unwrap() };
+            if matches!(&row, Some(r) if r.state == InboundState::Cancelled) {
+                cancelled_row = row;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let elapsed = fired_at.elapsed();
+        let row = cancelled_row.unwrap_or_else(|| {
+            panic!(
+                "row did not reach Cancelled within {bound:?} of the revoke — the fetch was NOT \
+                 aborted promptly (an uninterrupted fetch needs ~{:?})",
+                DELAY * 2
+            )
+        });
+        assert!(
+            elapsed < bound,
+            "revoke→cancelled took {elapsed:?}, expected well under the ~{:?} uninterrupted fetch duration",
+            DELAY * 2
+        );
+        assert_eq!(row.last_error.as_deref(), Some("by sender"));
+
+        // Partial staging is fully cleaned (handle_revoke's cleanup), not left
+        // behind mid-copy.
+        assert!(!staging.exists(), "the partially-fetched staging dir is removed after the revoke");
+
+        // Zero receipts: proves the FAST revoke-abort path ran (`handle_revoke`),
+        // never the local `cancel_epilogue` (which writes one `Cancelled` receipt
+        // per manifest frame and sends an ack).
+        let receipt_count: i64 = {
+            let conn = store.lock_conn();
+            conn.query_row("SELECT COUNT(*) FROM sync_receipts WHERE package_id = ?1", [&wire], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(receipt_count, 0, "the revoke path sends no ack and writes no receipts");
+
+        // The journal recorded the revoke, never a local cancel-epilogue entry.
+        let kinds = journal_kinds(&store, inbound_id);
+        assert!(kinds.iter().any(|k| k == "revoked"), "journal has the revoke: {kinds:?}");
+        assert!(kinds.iter().all(|k| k != "cancelled"), "the local cancel_epilogue never ran: {kinds:?}");
     }
 
     /// A bare loopback endpoint used purely as a `&dyn SharingTransport` for the
