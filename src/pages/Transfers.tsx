@@ -117,7 +117,10 @@ export default function Transfers() {
     [unified, filter],
   );
 
-  const selected = selectedKey ? (unified.find((u) => u.selKey === selectedKey) ?? null) : null;
+  // Resolve the selected row from the FILTERED list, not the full one: a row the
+  // active filter no longer includes must drop out of the detail pane (it comes
+  // back if the filter widens again — `selectedKey` is preserved, not cleared).
+  const selected = selectedKey ? (filtered.find((u) => u.selKey === selectedKey) ?? null) : null;
 
   // Shared 1s countdown tick — runs ONLY while a `waiting` row with a live
   // deadline is actually on screen (filtered view), and stops on filter change /
@@ -205,7 +208,12 @@ export default function Transfers() {
 
         {selected && (
           <div className="h-72 shrink-0 border-t border-border bg-surface">
-            <TransferDetail item={selected} liveFiles={liveFiles} onClose={() => setSelectedKey(null)} />
+            <TransferDetail
+              key={selected.selKey}
+              item={selected}
+              liveFiles={liveFiles}
+              onClose={() => setSelectedKey(null)}
+            />
           </div>
         )}
       </div>

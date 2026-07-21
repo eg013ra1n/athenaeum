@@ -638,10 +638,10 @@ async fn sent_upload_complete_precedes_confirmed() {
 /// Task 2.2: a successful loopback send surfaces per-FILE upload bars — a
 /// send-side `sync-file-progress` event PER FILE, keyed by the outbound ROW id
 /// (matching the outbound Active row key and the send-side `sync-progress`
-/// convention) with `file` a basename, each reaching its own size. The loopback
-/// mock synthesizes one `ServeFileProgress` per file (mirroring the iroh
-/// provider's per-file, by-index attribution), which the sender engine folds into
-/// `sync-file-progress`.
+/// convention) with `file` the full forward-slash `rel_path`, each reaching its
+/// own size. The loopback mock synthesizes one `ServeFileProgress` per file
+/// (mirroring the iroh provider's per-file, by-index attribution), which the
+/// sender engine folds into `sync-file-progress`.
 #[tokio::test]
 async fn sent_per_file_upload_progress_keyed_by_row_id() {
     let tmp = tempdir().unwrap();
@@ -709,6 +709,72 @@ async fn sent_per_file_upload_progress_keyed_by_row_id() {
             "file {file} must reach its size ({size}) in a per-file tick: {evts:?}"
         );
     }
+    drop(evts);
+
+    engine.shutdown().await;
+}
+
+/// Final-review fix: the send-side `sync-file-progress` `file` field carries the
+/// FULL forward-slash `rel_path`, NOT the basename. The frontend live overlay keys
+/// the per-file bar by the full rel_path (`useTransferQueue` stores by `p.file`,
+/// `FileTree` looks it up by `entry.relPath`), so a nested outbound file (a WBPP
+/// object send with `camera_c/lights/L_001.fits`-style paths) only animates if the
+/// sender emits the full path — reducing to `L_001.fits` would never match.
+#[tokio::test]
+async fn sent_per_file_upload_progress_emits_full_nested_rel_path() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    // A nested rel_path (the object/camera/lights tree a WBPP object send mints)
+    // plus a flat sibling, so the assertion pins the full path, not a basename.
+    let pkg = build_package_multi(
+        &tmp.path().join("src_files"),
+        "nested",
+        &[
+            ("uuid-n1", "camera_c/lights/L_001.fits", "M42", 4096),
+            ("uuid-n2", "flat.fits", "M42", 2048),
+        ],
+    );
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
+    let engine = SyncEngine::spawn_with_emitter(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        Some(emitter),
+    );
+
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+
+    let evts = events.lock().unwrap();
+    // The nested file reaches its size in a per-file tick keyed by the FULL
+    // forward-slash rel_path — a basename reduction (`L_001.fits`) would fail here.
+    let nested_full = evts.iter().any(|(n, p)| {
+        n == "sync-file-progress"
+            && p["file"].as_str() == Some("camera_c/lights/L_001.fits")
+            && p["bytesDone"].as_u64() == Some(4096)
+            && p["bytesTotal"].as_u64() == Some(4096)
+    });
+    assert!(
+        nested_full,
+        "nested file must emit its full rel_path (not the basename) in a per-file tick: {evts:?}"
+    );
+    // And no tick may carry the reduced basename for the nested file.
+    let basename_leaked = evts
+        .iter()
+        .any(|(n, p)| n == "sync-file-progress" && p["file"].as_str() == Some("L_001.fits"));
+    assert!(
+        !basename_leaked,
+        "nested file must NOT be reduced to its basename in any tick: {evts:?}"
+    );
     drop(evts);
 
     engine.shutdown().await;
@@ -2136,6 +2202,11 @@ fn build_package_multi(
     let mut items = Vec::new();
     for (frame_uuid, filename, object, size) in frames {
         let payload = src_root.join(filename);
+        // `filename` doubles as the manifest `rel_path`, so a nested rel_path
+        // (`camera_c/lights/L_001.fits`) needs its parent dirs on disk before write.
+        if let Some(parent) = payload.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
         let bytes: Vec<u8> = (0..*size).map(|i| (i % 251) as u8).collect();
         std::fs::write(&payload, &bytes).unwrap();
         let byte_size = std::fs::metadata(&payload).unwrap().len();

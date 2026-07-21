@@ -850,8 +850,9 @@ impl Worker {
     /// serving (Task 2.2). The direction-agnostic
     /// [`SyncFileProgressEvent`](SyncFileProgressEvent) the receiver already emits
     /// (`sync/receiver.rs`) is reused verbatim — `package_id` is the outbound row id
-    /// (matching the outbound Active row key), `file` a basename. No-op without a
-    /// host emitter; never logs per tick (progress is UI data, not a log).
+    /// (matching the outbound Active row key), `file` the full forward-slash
+    /// `rel_path`. No-op without a host emitter; never logs per tick (progress is UI
+    /// data, not a log).
     fn emit_file_progress(&self, id: i64, file: String, bytes_done: u64, bytes_total: u64) {
         if let Some(em) = &self.emitter {
             emit_event(em.as_ref(), "sync-file-progress", &SyncFileProgressEvent {
@@ -1753,10 +1754,13 @@ impl Worker {
     /// (the same correlation [`on_serve_progress`](Self::on_serve_progress) uses),
     /// then emitted keyed by the outbound row id — matching the outbound Active row
     /// key and the send-side `sync-progress` convention. The transport `file` is a
-    /// forward-slash `rel_path`; it is reduced to its basename so it matches the
-    /// `TransferFileEntry.name` the expanded row lists (also a basename, api layer's
-    /// `detail_filename`). A tick for no live slot (already confirmed / terminal, or
-    /// an unknown package) is dropped at debug.
+    /// forward-slash `rel_path`, emitted VERBATIM (not reduced to a basename): the
+    /// frontend live overlay keys the per-file bar by the FULL rel_path
+    /// (`useTransferQueue` stores by `p.file`, `FileTree` looks it up by
+    /// `entry.relPath`), and the receiver side already emits the full rel_path — so a
+    /// nested outbound file (e.g. a WBPP object send) matches and animates. A tick
+    /// for no live slot (already confirmed / terminal, or an unknown package) is
+    /// dropped at debug.
     fn on_serve_file_progress(
         &mut self,
         package_id: PackageId,
@@ -1813,7 +1817,7 @@ impl Worker {
             }
         }
 
-        self.emit_file_progress(id, filename_of(&file), bytes_done, bytes_total);
+        self.emit_file_progress(id, file, bytes_done, bytes_total);
     }
 
     /// Handle an ack: confirm the package ONLY if every receipt is non-`Rejected`
