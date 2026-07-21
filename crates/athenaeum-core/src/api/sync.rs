@@ -957,6 +957,13 @@ fn package_totals(dir: &Path) -> (u32, u64) {
 /// came from the live poll or the restart-survival read. `device_names` /
 /// `file_counts` are the batch-resolved maps the caller reads once; `now` anchors
 /// the `waiting`-backoff derivation.
+///
+/// `resendable` always comes back `false` here — computing it requires an
+/// fs-stat of the package dir ([`package_has_payload`]), which the cheap 10s
+/// `get_sync_status` poll must never pay (a live, non-terminal row never shows
+/// Resend anyway). Only [`list_terminal_transfers`] overrides it per row, since
+/// that read already knows it's dealing with a terminal row whose payload may
+/// since have been cleaned up by retention.
 fn outbound_summary(
     row: OutboundRow,
     now: chrono::DateTime<chrono::Utc>,
@@ -988,6 +995,7 @@ fn outbound_summary(
         display_state,
         stalled_until,
         file_counts: file_counts.get(&row.id).copied().unwrap_or_default(),
+        resendable: false,
     }
 }
 
@@ -1233,7 +1241,24 @@ pub fn list_terminal_transfers(
     let now = chrono::Utc::now();
     let sent = out_rows
         .into_iter()
-        .map(|row| outbound_summary(row, now, &device_names, &out_counts))
+        .map(|row| {
+            // `resendable` (owner follow-up): Resend would currently succeed only
+            // for a terminal failed/cancelled row whose package dir still has its
+            // manifest + payload — the exact guard `retry_sync_package` enforces
+            // ([`package_has_payload`], reused verbatim, not duplicated). Retention
+            // can delete a package's payload after the fact (most commonly after a
+            // confirm, but a stale failed/cancelled dir can also be swept), leaving
+            // a terminal row whose Resend button would otherwise dead-end in "data
+            // missing on disk" — exactly the dead-button bug this flag closes.
+            // Computed here (not in the shared mapper / the 10s poll) because it
+            // requires an fs-stat of the package dir, paid only on this
+            // user-triggered, capped-at-`limit` read.
+            let resendable = matches!(row.state, OutboundState::Failed | OutboundState::Cancelled)
+                && package_has_payload(Path::new(&row.package_ref));
+            let mut summary = outbound_summary(row, now, &device_names, &out_counts);
+            summary.resendable = resendable;
+            summary
+        })
         .collect();
     let received = in_rows
         .into_iter()
@@ -3459,6 +3484,64 @@ mod tests {
         let confirmed = terminal.sent.iter().find(|s| s.id == id).expect("confirmed row in terminal sent");
         assert_eq!(confirmed.display_state, "confirmed");
         assert_eq!(confirmed.file_count, 2, "the confirmed batch's manifest enriches its terminal summary");
+
+        // Owner follow-up (dead Resend button): `resendable` reflects whether the
+        // package payload is STILL on disk, not just the raw terminal state — a
+        // cancelled row whose payload retention already swept must not offer a
+        // Resend button that dead-ends in "data missing on disk". Two REAL
+        // sibling package dirs (same `build_selection_package` this test already
+        // uses, so `package_has_payload`'s manifest+payload check is genuine, not
+        // a fake path): one left intact, one with its payload cleaned up
+        // (simulated by deleting the dir, exactly what confirm/retention does).
+        let pkg_root2 = tmp.path().join("packages2");
+        let intact_dir = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            build_selection_package(&conn, "origin-dev", &pkg_root2, &[f1, f2], None, None)
+                .unwrap()
+                .pkg_dir
+                .expect("a package was written")
+        };
+        let swept_dir = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            build_selection_package(&conn, "origin-dev", &pkg_root2, &[f1, f2], None, None)
+                .unwrap()
+                .pkg_dir
+                .expect("a package was written")
+        };
+        std::fs::remove_dir_all(&swept_dir).unwrap();
+
+        let peer_hex = node_id_hex(&receiver_id);
+        let (intact_id, swept_id) = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let intact = crate::sync::store::insert_outbound_with_files(
+                &conn,
+                &intact_dir.to_string_lossy(),
+                &peer_hex,
+                Some("Cancelled — payload intact"),
+                &[],
+            )
+            .unwrap();
+            let swept = crate::sync::store::insert_outbound_with_files(
+                &conn,
+                &swept_dir.to_string_lossy(),
+                &peer_hex,
+                Some("Cancelled — payload swept"),
+                &[],
+            )
+            .unwrap();
+            (intact, swept)
+        };
+        set_outbound_terminal(&ctx, intact_id, "cancelled", "2026-07-20T09:00:00.000Z");
+        set_outbound_terminal(&ctx, swept_id, "cancelled", "2026-07-20T09:30:00.000Z");
+
+        let terminal2 = list_terminal_transfers(&ctx, None).unwrap();
+        let intact = terminal2.sent.iter().find(|s| s.id == intact_id).expect("intact cancelled row");
+        assert!(intact.resendable, "a cancelled row with its payload intact on disk is resendable");
+        let swept = terminal2.sent.iter().find(|s| s.id == swept_id).expect("swept cancelled row");
+        assert!(!swept.resendable, "a cancelled row whose payload was cleaned up is NOT resendable");
 
         engine.shutdown().await;
     }

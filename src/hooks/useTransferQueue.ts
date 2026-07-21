@@ -128,6 +128,10 @@ export interface TransferRow {
   nextRetryAt: string | null;
   /** `true` for a lingering failed/cancelled outbound row (Resend, not Cancel/Send-now). */
   terminal: boolean;
+  /** Whether Resend would currently succeed (terminal failed/cancelled AND the
+   *  package payload is still on disk). `false` for every non-terminal/inbound
+   *  row. Gates the Resend button — see `TransferRow.tsx`'s `canResend`. */
+  resendable: boolean;
   /** Latest `sync-progress` `stage` seen for this outbound id (`sent` ticks only),
    * cleared on `sync-finished`. Outbound-only; `null` for inbound/terminal rows. */
   liveStage: string | null;
@@ -337,8 +341,13 @@ export function useTransferQueue(): UseTransferQueue {
           if (p.outcome === 'cancelled' || p.outcome.startsWith('failed')) {
             const outcome: 'failed' | 'cancelled' = p.outcome === 'cancelled' ? 'cancelled' : 'failed';
             const cached = outboundSeenRef.current.get(id);
+            // `resendable: true` unconditionally here (owner follow-up): the
+            // package just finished failing/cancelling THIS session, so its
+            // payload provably existed moments ago — unlike a DB terminal row
+            // (which may be an OLD batch retention has since swept), a
+            // same-session ledger row is safe to always offer Resend on.
             const summary: OutboundSummary = cached
-              ? { ...cached, state: outcome, displayState: outcome }
+              ? { ...cached, state: outcome, displayState: outcome, resendable: true }
               : {
                   id,
                   packageShort: shortId(String(id)),
@@ -363,6 +372,7 @@ export function useTransferQueue(): UseTransferQueue {
                     failed: p.failed.length,
                   },
                   retrying: false,
+                  resendable: true,
                 };
             setTerminalOutbound((prev) => new Map(prev).set(id, { summary, outcome }));
           }
@@ -425,6 +435,7 @@ export function useTransferQueue(): UseTransferQueue {
         lastError: s.lastError,
         nextRetryAt: s.nextRetryAt,
         terminal: false,
+        resendable: false,
         liveStage: liveOutboundStage.get(s.id) ?? null,
         speedBps: s.state === 'transferring' ? (live?.speedBps ?? null) : null,
         isTransferring: s.state === 'transferring',
@@ -472,6 +483,7 @@ export function useTransferQueue(): UseTransferQueue {
         lastError: summary.lastError,
         nextRetryAt: null,
         terminal: true,
+        resendable: summary.resendable,
         liveStage: null,
         speedBps: null,
         isTransferring: false,
@@ -508,6 +520,11 @@ export function useTransferQueue(): UseTransferQueue {
         lastError: s.lastError,
         nextRetryAt: null,
         terminal: true,
+        // Backend-computed (tv2 owner follow-up): terminal failed/cancelled AND
+        // the package dir still has its payload on disk — the exact guard
+        // `retry_sync_package` enforces. `false` for confirmed (never offered)
+        // and for a failed/cancelled row whose payload retention already swept.
+        resendable: s.resendable,
         liveStage: null,
         speedBps: null,
         isTransferring: false,
@@ -540,6 +557,7 @@ export function useTransferQueue(): UseTransferQueue {
         lastError: null,
         nextRetryAt: null,
         terminal: false,
+        resendable: false,
         liveStage: null,
         speedBps: s.state === 'fetching' ? (live?.speedBps ?? null) : null,
         isTransferring: s.state === 'fetching',
@@ -573,6 +591,8 @@ export function useTransferQueue(): UseTransferQueue {
         lastError: null,
         nextRetryAt: null,
         terminal: true,
+        // Inbound rows carry NO actions (no Resend concept for a receive).
+        resendable: false,
         liveStage: null,
         speedBps: null,
         isTransferring: false,

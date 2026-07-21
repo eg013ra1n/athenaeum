@@ -85,6 +85,17 @@ pub struct OutboundSummary {
     /// `waiting` display-state, which additionally requires the deadline to be in
     /// the future.
     pub retrying: bool,
+    /// Whether **Resend** (`retry_sync_package`) would currently succeed for this
+    /// row: terminal `failed`/`cancelled` AND the package dir still has its
+    /// manifest + payload on disk (the same guard `retry_sync_package` itself
+    /// enforces). Always `false` on a live (non-terminal) row from the 10s
+    /// `get_sync_status` poll — that path deliberately never fs-stats the package
+    /// dir to compute this (a live row never shows Resend anyway) — and defaults
+    /// `false` in the shared mapper; only [`crate::api::sync::list_terminal_transfers`]
+    /// sets it per row, since retention can delete a confirmed/old package's
+    /// payload after the fact, leaving a terminal row whose Resend button would
+    /// otherwise dead-end in "data missing on disk".
+    pub resendable: bool,
 }
 
 /// The outbound presentation state (§D5), derived from the raw
