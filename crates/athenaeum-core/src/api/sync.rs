@@ -3092,12 +3092,34 @@ fn referenced_package_keys(ctx: &ServiceContext) -> Result<HashSet<String>, ApiE
 /// "since last restart". See [`sweep_orphan_payload_dirs`].
 const ORPHAN_SWEEP_MIN_AGE: Duration = Duration::from_secs(5 * 60);
 
-/// A path's on-disk modification age (`now - mtime`) — `None` if the mtime is
-/// unreadable (vanished mid-walk / a filesystem without mtime support), in which
-/// case the caller skips rather than guesses.
+/// A directory's on-disk modification age (`now - mtime`), taken from the MOST
+/// RECENTLY modified entry ANYWHERE in its subtree (the dir itself and every file
+/// under it, recursively via `walkdir` — the same walk [`dir_size_bytes`] uses),
+/// not just the top-level dir's own mtime.
+///
+/// The top-level dir's own mtime only advances on ENTRY creation/removal within
+/// it, not on writes to an existing file's content — so a single large in-flight
+/// file (e.g. a multi-GB master FITS copied in over NAS-backed storage) that takes
+/// longer than [`ORPHAN_SWEEP_MIN_AGE`] to finish would freeze the dir's own mtime
+/// while genuinely live write activity continues underneath it, and the sweep
+/// could bite mid-copy. Reading the recursive MAX mtime instead tracks that file's
+/// own mtime directly, which a live write keeps advancing — closing the window
+/// outright rather than merely narrowing it.
+///
+/// `None` only if EVERY entry's mtime is unreadable (vanished mid-walk / a
+/// filesystem without mtime support), in which case the caller skips rather than
+/// guesses.
 fn dir_age(path: &Path) -> Option<Duration> {
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    SystemTime::now().duration_since(modified).ok()
+    let now = SystemTime::now();
+    let mut newest: Option<SystemTime> = None;
+    for entry in walkdir::WalkDir::new(path).into_iter().flatten() {
+        if let Ok(md) = entry.metadata() {
+            if let Ok(modified) = md.modified() {
+                newest = Some(newest.map_or(modified, |cur| cur.max(modified)));
+            }
+        }
+    }
+    newest.and_then(|m| now.duration_since(m).ok())
 }
 
 /// Startup pass 1 — remove ROW-LESS orphan payload dirs under `<sync>/packages/`:
@@ -4133,13 +4155,26 @@ mod tests {
         (ep, runtime)
     }
 
-    /// Test helper: set `path`'s mtime `age` in the past, so a test can put an
-    /// orphan-sweep candidate on either side of [`ORPHAN_SWEEP_MIN_AGE`] without
-    /// sleeping. Works on a directory via `File::open` + the stable
-    /// `set_modified` (no extra crate needed).
-    fn backdate_mtime(path: &Path, age: Duration) {
-        let f = std::fs::File::open(path).expect("open path for mtime backdate");
+    /// Test helper: force `path`'s OWN mtime (no recursion) to `age` in the past.
+    /// Works on a directory via `File::open` + the stable `set_modified` (no extra
+    /// crate needed).
+    fn set_mtime_ago(path: &Path, age: Duration) {
+        let f = std::fs::File::open(path)
+            .unwrap_or_else(|e| panic!("open {} for mtime set: {e}", path.display()));
         f.set_modified(SystemTime::now() - age).expect("set_modified");
+    }
+
+    /// Test helper: set `path` AND every entry recursively under it (files
+    /// included) to `age` in the past, so a test can put a whole orphan-sweep
+    /// candidate subtree on either side of [`ORPHAN_SWEEP_MIN_AGE`] without
+    /// sleeping. Recursive because [`dir_age`] now reads the MAX mtime across the
+    /// whole subtree (hardening fix) — backdating only the top-level dir would
+    /// leave a just-created file's own (fresh) mtime dominating the max, so the
+    /// dir would still read as young.
+    fn backdate_mtime(path: &Path, age: Duration) {
+        for entry in walkdir::WalkDir::new(path).into_iter().flatten() {
+            set_mtime_ago(entry.path(), age);
+        }
     }
 
     /// B7 core contract: the startup sweep removes ONLY row-less orphan payload
@@ -4252,6 +4287,42 @@ mod tests {
             "a fresh row-less dir survives the sweep — never raced as a concurrent enqueue"
         );
         assert!(!old_dir.exists(), "an old row-less dir is a genuine orphan and is removed");
+    }
+
+    /// B7 hardening (recursive max mtime): a dir whose TOP-LEVEL entry mtime is
+    /// old but which contains one FRESH-mtime file — a live in-flight write, e.g.
+    /// a multi-GB master FITS still copying in over slow/NAS-backed storage —
+    /// survives the sweep. `dir_age` must read the recursive MAX mtime across the
+    /// whole subtree, not just the dir's own entry-creation mtime: the dir's own
+    /// mtime only advances on entry creation/removal, so a single file whose copy
+    /// outlives [`ORPHAN_SWEEP_MIN_AGE`] would otherwise freeze the dir's own
+    /// mtime while write activity is still genuinely live underneath it.
+    #[tokio::test]
+    async fn sweep_keeps_a_dir_whose_top_level_mtime_is_old_but_has_a_fresh_file() {
+        let (_tmp, ctx) = test_ctx();
+        let packages_dir = sender_packages_dir(&ctx).unwrap();
+        std::fs::create_dir_all(&packages_dir).unwrap();
+
+        let d = packages_dir.join("slow-copy-uuid");
+        std::fs::create_dir_all(&d).unwrap();
+        // The in-flight file, created first — left at its natural (fresh,
+        // just-written) mtime, simulating a large file still being written into.
+        std::fs::write(d.join("master.fits"), b"still writing...").unwrap();
+        // Explicitly backdate ONLY the dir's own entry past the gate, AFTER the
+        // file write above (which would otherwise have bumped the dir fresh too
+        // via entry-creation) — pins exactly "old top-level mtime, fresh child",
+        // the scenario the pre-hardening top-level-only `dir_age` would have
+        // missed (and would have removed this dir despite the live write).
+        set_mtime_ago(&d, ORPHAN_SWEEP_MIN_AGE + Duration::from_secs(60));
+
+        sweep_transfer_orphans(Arc::new(ctx), Arc::new(SyncRuntime::new())).await;
+
+        assert!(
+            d.exists(),
+            "a dir with one fresh-mtime file survives the sweep even though the dir's \
+             own entry mtime is old — dir_age reads the recursive MAX mtime, not just \
+             the dir's own entry mtime"
+        );
     }
 
     /// B7 cleanup: `cleanup_finished_transfers` removes TERMINAL rows' payloads
