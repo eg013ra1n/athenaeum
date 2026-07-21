@@ -2187,7 +2187,7 @@ async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
     let guard_calls = Arc::new(AtomicUsize::new(0));
     let built_noop = {
         let guard_calls = Arc::clone(&guard_calls);
-        resurrect_pending_senders_with(&capture_db, &sender, move |_peer| {
+        resurrect_pending_senders_with(&capture_db, &sender, None, move |_peer| {
             let guard_calls = Arc::clone(&guard_calls);
             async move {
                 guard_calls.fetch_add(1, Ordering::SeqCst);
@@ -2221,6 +2221,7 @@ async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
     let built = resurrect_pending_senders_with(
         &capture_db,
         &sender2,
+        None,
         loopback_engine_builder(&net, &capture_db, &sender2),
     )
     .await
@@ -2338,6 +2339,7 @@ async fn cancel_succeeds_on_resurrected_sender_row() {
     let built = resurrect_pending_senders_with(
         &capture_db,
         &sender2,
+        None,
         loopback_engine_builder(&net, &capture_db, &sender2),
     )
     .await

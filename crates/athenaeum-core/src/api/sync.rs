@@ -824,6 +824,61 @@ fn distinct_pending_peers(rows: &[OutboundRow]) -> Vec<NodeId> {
     peers
 }
 
+/// Restrict a resurrection peer set to same-account devices (tv2 follow-up,
+/// review fix). `sync_outbound` has no personal/project discriminator — the
+/// dedicated collab sender writes the very same table — so
+/// [`distinct_pending_peers`] can enumerate a peer whose only pending rows are
+/// COLLAB/project rows, including a cross-account collaborator. Resurrection
+/// only ever builds a personal-role engine (see [`resurrect_pending_senders`]),
+/// which such a peer's own receiver would refuse: not a corruption, but a
+/// pointless forever-retry loop this filter avoids by construction. A peer not
+/// present in `authorized_hex` (the cached account-device allow-list) is
+/// dropped and logged at `debug!` — expected/routine, never `warn!`. Pure and
+/// iroh-free so the exact filtering logic is unit-testable without a transport.
+///
+/// Building a COLLAB-role engine for a collab-only orphaned row is deliberately
+/// OUT of scope here — deferred to the collab cycle; this fix's job is only to
+/// stop the wrong (personal) engine from being built for such a peer.
+fn filter_account_peers(peers: Vec<NodeId>, authorized_hex: &HashSet<String>) -> Vec<NodeId> {
+    peers
+        .into_iter()
+        .filter(|peer| {
+            let hex = node_id_hex(peer);
+            let ok = authorized_hex.contains(&hex);
+            if !ok {
+                tracing::debug!(
+                    peer = %hex,
+                    "resurrection skipped: not an account device (likely a collab-only row)"
+                );
+            }
+            ok
+        })
+        .collect()
+}
+
+/// The cached account-device allow-list ([`keys::SYNC_AUTHORIZED_PEERS`]) as a
+/// hex-`NodeId` set — the exact same local cache [`peer_authorizer`] enforces
+/// per-announce, populated by [`refresh_authorized_peers`] (never a hub call
+/// itself; read-only local-DB peek). `ServiceContext`-unavailable or unset reads
+/// as an empty set (fail-closed, matching `peer_authorizer`'s own fail-closed
+/// default): a signed-in node whose cache hasn't populated yet resurrects
+/// nothing until the next refresh, rather than guessing.
+fn cached_authorized_peer_hexes(ctx: &ServiceContext) -> HashSet<String> {
+    let Ok(db) = db(ctx) else {
+        return HashSet::new();
+    };
+    let conn = db.conn();
+    match crate::db::get_setting(&conn, keys::SYNC_AUTHORIZED_PEERS) {
+        Ok(Some(raw)) => raw
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => HashSet::new(),
+    }
+}
+
 /// Resurrect orphaned sender engines after an app restart (tv2 follow-up).
 ///
 /// The ONLY production `SyncEngine` spawn is [`ensure_sender_engine`], reached
@@ -836,21 +891,40 @@ fn distinct_pending_peers(rows: &[OutboundRow]) -> Vec<NodeId> {
 /// peer — the spawned worker then re-drives every non-terminal row scoped to that
 /// peer, identical to the pre-restart in-process behavior.
 ///
+/// `authorized` gates the peer set to same-account devices via
+/// [`filter_account_peers`] — `None` means no gate at all (pure dev-ticket mode
+/// has no account concept, so nothing to intersect against; matches
+/// [`peer_authorizer`]'s own accept-all in that mode), `Some(hexes)` filters to
+/// exactly that cached allow-list (an empty set fails closed: resurrects
+/// nothing, same as `peer_authorizer`). Collab-role resurrection for a
+/// collab-only orphaned row is deliberately deferred to the collab cycle — this
+/// only stops the wrong (personal) engine from being built for such a peer.
+///
 /// `build` is the per-peer engine ensurer: production
 /// ([`resurrect_pending_senders`]) passes [`ensure_sender_engine`]; tests inject a
 /// loopback builder (the same substitution the whole `sync_e2e` harness makes —
 /// `ensure_sender_engine` binds a real iroh transport that has no loopback
 /// stand-in). Best-effort per peer: a build failure (peer unauthorized / hub
 /// unreachable) is `warn!` + continue, never propagated — a restart must resurrect
-/// every peer it can and never fail on one bad peer. The `current_for` guard makes
-/// it idempotent and race-safe: a peer whose engine already exists (a concurrent
-/// user enqueue won the race, or a second startup site already ran) is skipped, so
-/// two engines are never spawned for one peer. Returns the number of engines
-/// actually (re)built.
+/// every peer it can and never fail on one bad peer. **Recovery boundary**: a
+/// failed build is not retried by this function itself — the peer stays orphaned
+/// until the next restart (another `resurrect_pending_senders` run) or a manual
+/// send to that peer (`enqueue_sync_selection` / `retry_sync_package`, which build
+/// their own engine on demand). The `current_for` guard makes it idempotent and
+/// race-safe: a peer whose engine already exists (a concurrent user enqueue won
+/// the race, or a second startup site already ran) is skipped, so two engines are
+/// never spawned for one peer. Returns the number of peers this call *ensured* an
+/// engine exists for — under the same cross-site/user-enqueue race the guard
+/// makes safe, two concurrent callers can each ensure the same peer (one actually
+/// builds, the other's `build` call finds it already there via
+/// `ensure_sender_engine`'s own lock and returns `Ok` immediately), so this count
+/// can exceed the number of engines truly newly spawned process-wide — it is an
+/// "ensured" count, not a strict "newly built" count.
 #[doc(hidden)]
 pub async fn resurrect_pending_senders_with<F, Fut>(
     db_path: &Path,
     sender: &Arc<SyncSenderRuntime>,
+    authorized: Option<&HashSet<String>>,
     build: F,
 ) -> Result<usize, ApiError>
 where
@@ -864,8 +938,11 @@ where
             .non_terminal()
             .map_err(|e| ApiError::Internal(format!("read non-terminal outbound rows: {e:#}")))?
     };
-    let peers = distinct_pending_peers(&rows);
-    let mut resurrected = 0usize;
+    let mut peers = distinct_pending_peers(&rows);
+    if let Some(hexes) = authorized {
+        peers = filter_account_peers(peers, hexes);
+    }
+    let mut ensured = 0usize;
     for peer in peers {
         // Idempotent + race-safe: skip a peer whose engine is already running (a
         // concurrent enqueue, or another startup site, beat us to it).
@@ -873,7 +950,7 @@ where
             continue;
         }
         match build(peer).await {
-            Ok(()) => resurrected += 1,
+            Ok(()) => ensured += 1,
             Err(e) => {
                 // Best-effort: one unbuildable peer never fails the resurrection.
                 tracing::warn!(
@@ -884,14 +961,14 @@ where
             }
         }
     }
-    if resurrected > 0 {
+    if ensured > 0 {
         tracing::info!(
-            peers = resurrected,
+            peers = ensured,
             rows = rows.len(),
             "resurrected pending sender engines"
         );
     }
-    Ok(resurrected)
+    Ok(ensured)
 }
 
 /// Production entry point for [`resurrect_pending_senders_with`]: builds each
@@ -919,6 +996,16 @@ pub async fn resurrect_pending_senders(
             return;
         }
     };
+    // Same-account gate (review fix): `sync_outbound` has no personal/project
+    // discriminator, so the enumeration can surface a peer whose only pending rows
+    // are collab/project rows — resurrection must never build a personal-role
+    // engine for a peer outside this account. Pure dev-ticket mode (no account) has
+    // no allow-list concept, so it resurrects any pending peer unfiltered — the
+    // same accept-all `peer_authorizer` applies in that mode.
+    let authorized = match account_signed_in(&ctx) {
+        Ok(true) => Some(cached_authorized_peer_hexes(&ctx)),
+        _ => None,
+    };
     let build = |peer: NodeId| {
         let ctx = Arc::clone(&ctx);
         let sender = Arc::clone(&sender);
@@ -931,7 +1018,9 @@ pub async fn resurrect_pending_senders(
                 .map(|_| ())
         }
     };
-    if let Err(e) = resurrect_pending_senders_with(&db_path, &sender, build).await {
+    if let Err(e) =
+        resurrect_pending_senders_with(&db_path, &sender, authorized.as_ref(), build).await
+    {
         tracing::warn!(
             error = %format!("{e:#}"),
             "resurrect_pending_senders: enumeration failed"
@@ -2855,6 +2944,68 @@ mod tests {
             peers,
             vec![peer_a, peer_b],
             "distinct non-terminal peers, first-seen order; the all-terminal peer_c is excluded"
+        );
+    }
+
+    /// tv2 follow-up review fix: `sync_outbound` has no personal/project
+    /// discriminator, so a peer whose only pending rows are collab/project rows
+    /// (including a cross-account collaborator) can end up in the enumerated peer
+    /// set alongside real account members. `filter_account_peers` must keep only
+    /// the peer present in the cached account allow-list and drop the rest — pure,
+    /// no DB/iroh involved, so the filtering logic itself is directly testable.
+    #[test]
+    fn filter_account_peers_keeps_only_authorized() {
+        let node = |b: u8| crate::sync::node_id_from_hex(&format!("{b:02x}").repeat(32)).unwrap();
+        let member = node(0xaa);
+        let stranger = node(0xbb);
+        let authorized: HashSet<String> = [node_id_hex(&member)].into_iter().collect();
+
+        let kept = filter_account_peers(vec![member, stranger], &authorized);
+        assert_eq!(kept, vec![member], "only the account member survives the filter");
+    }
+
+    /// tv2 follow-up review fix, end-to-end at the `_with` seam: two peers have
+    /// pending rows — `member` (in the cached `SYNC_AUTHORIZED_PEERS` allow-list)
+    /// and `stranger` (not present — stand-in for a cross-account collaborator's
+    /// node, since `sync_outbound` cannot itself distinguish a personal row from a
+    /// collab row). With `authorized = Some(..)` only `member` is resurrected —
+    /// the builder is invoked exactly once, for `member`, and never for
+    /// `stranger`. No iroh/loopback transport needed: `build` is a plain counting
+    /// closure, proving the enumeration+filter wiring in isolation from the engine
+    /// build itself.
+    #[tokio::test]
+    async fn resurrect_pending_senders_with_skips_non_account_peers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("catalog.db");
+        let node = |b: u8| crate::sync::node_id_from_hex(&format!("{b:02x}").repeat(32)).unwrap();
+        let member = node(0xaa);
+        let stranger = node(0xbb);
+
+        {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            store.enqueue("/pkgs/member", member, None, &[]).unwrap();
+            store.enqueue("/pkgs/stranger", stranger, None, &[]).unwrap();
+        }
+
+        let authorized: HashSet<String> = [node_id_hex(&member)].into_iter().collect();
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let called: Arc<std::sync::Mutex<Vec<NodeId>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let called_in = Arc::clone(&called);
+        let ensured = resurrect_pending_senders_with(&db_path, &sender, Some(&authorized), move |peer| {
+            let called = Arc::clone(&called_in);
+            async move {
+                called.lock().unwrap().push(peer);
+                Ok::<(), ApiError>(())
+            }
+        })
+        .await
+        .expect("resurrect ok");
+
+        assert_eq!(ensured, 1, "only the account member is resurrected");
+        assert_eq!(
+            *called.lock().unwrap(),
+            vec![member],
+            "the builder is invoked only for the authorized peer, never the stranger"
         );
     }
 
