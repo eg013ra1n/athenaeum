@@ -38,7 +38,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use athenaeum_core::api::sync::{
-    cancel_incoming_package, enqueue_sync_selection, retry_sync_package, ResolvedDest,
+    cancel_incoming_package, enqueue_sync_selection, get_status, list_transfer_files,
+    retry_sync_package, ResolvedDest,
 };
 use athenaeum_core::api::retention::{evaluate, AppRetentionConfig};
 use athenaeum_core::db::{insert_file, insert_frame, Database};
@@ -52,8 +53,8 @@ use athenaeum_core::sharing::types::NodeId;
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::{
     allow_all_peers, node_id_hex, CatalogDedupResponder, CatalogSyncStore, DedupResponder,
-    InboundControl, RetentionPolicy, StartedSender, SyncConfig, SyncEngine, SyncEngineHandle,
-    SyncReceiver, SyncRuntime, SyncSenderRuntime, SyncStore,
+    Direction, InboundControl, RetentionPolicy, StartedSender, SyncConfig, SyncEngine,
+    SyncEngineHandle, SyncReceiver, SyncRuntime, SyncSenderRuntime, SyncStore,
 };
 use chrono::Utc;
 
@@ -1620,4 +1621,896 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
     engine_b.shutdown().await;
     receiver_a.shutdown().await;
     receiver_b.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// tv2 Task 8 — per-file resilience e2e suite. Each test drives the WHOLE loopback
+// path (real `enqueue_sync_selection` sender + real `SyncReceiver`, both stores
+// real SQLite) and pins ONE Transfers Status Model v2 cross-component invariant
+// (spec `docs/superpowers/specs/2026-07-20-transfers-status-v2-design.md`,
+// §D1/D2/D4/D5/D6/D7) at the level the T1–T7 unit suites leave uncovered — the
+// full announce→fetch→ingest→ack chain across two catalogs, not one component in
+// isolation.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Write a real single-frame FITS at `abs_path` and insert its `files` + `frames`
+/// rows into `ctx`'s catalog with the given metadata; returns `(frame_id, uuid)`.
+/// The general sibling of [`insert_capture_frame`]: it places a frame at an
+/// arbitrary (nested) path — for source-relative rel_path shaping — and stamps
+/// `instrume`/`imagetyp` for the WBPP object-send shape. A per-path pixel seed
+/// keeps every payload's content hash distinct.
+fn insert_frame_at(
+    ctx: &ServiceContext,
+    abs_path: &Path,
+    object: &str,
+    exptime: f64,
+    imagetyp: ImageType,
+    instrume: Option<&str>,
+) -> (i64, String) {
+    std::fs::create_dir_all(abs_path.parent().unwrap()).unwrap();
+    let filename = abs_path.file_name().unwrap().to_string_lossy().to_string();
+    let kind = match imagetyp {
+        ImageType::Dark => FrameKind::Dark,
+        ImageType::Bias => FrameKind::Bias,
+        ImageType::Flat => FrameKind::Flat,
+        _ => FrameKind::Light,
+    };
+    let mut hb = HeaderBuilder::new(kind).object(object).exptime(exptime).filter("Ha");
+    if let Some(i) = instrume {
+        hb = hb.instrume(i);
+    }
+    let cards = hb.build().expect("build fixture header");
+    // A process-unique seed per frame → distinct pixels → distinct full-content
+    // xxh3, so no two fixture frames are content-deduped on ingest (path length is
+    // NOT unique — `L_001.fits`/`L_002.fits` collide).
+    static SEED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let seed = SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as f32;
+    let data = vec![seed; 8 * 8];
+    write_fits_f32(abs_path, 8, 8, 1, &data, &cards).expect("write fixture fits");
+    let size = std::fs::metadata(abs_path).unwrap().len() as i64;
+
+    let db = ctx.db.get().expect("ctx db");
+    let conn = db.conn();
+    let file = File {
+        id: None,
+        path: abs_path.to_string_lossy().to_string(),
+        filename: filename.clone(),
+        size,
+        modified_at: Utc::now(),
+        format: FileFormat::FITS,
+        created_at: Utc::now(),
+        metadata_hash: None,
+        content_hash: None,
+        archived_in_operation: None,
+        archive_zip_path: None,
+        archive_path_in_zip: None,
+        uuid: None,
+        updated_at: None,
+    };
+    let file_id = insert_file(&conn, &file).expect("insert file");
+    let frame = Frame {
+        file_id,
+        object: Some(object.to_string()),
+        exptime: Some(exptime),
+        imagetyp: Some(imagetyp),
+        instrume: instrume.map(|s| s.to_string()),
+        ..Default::default()
+    };
+    let frame_id = insert_frame(&conn, &frame).expect("insert frame");
+    let uuid: String = conn
+        .query_row("SELECT uuid FROM frames WHERE id = ?1", [frame_id], |r| r.get(0))
+        .expect("trigger uuid");
+    (frame_id, uuid)
+}
+
+/// The durable `sync_inbound` row id for a wire `package_id` (the batch_key its
+/// receiver journal + per-file rows hang off), or `None` before the announce lands.
+fn inbound_id_of(db: &Database, package_id: &str) -> Option<i64> {
+    db.conn()
+        .query_row("SELECT id FROM sync_inbound WHERE package_id = ?1", [package_id], |r| r.get(0))
+        .ok()
+}
+
+/// The persisted `display_name` of the `sync_inbound` row for `package_id`.
+fn inbound_display_name(db: &Database, package_id: &str) -> Option<String> {
+    db.conn()
+        .query_row(
+            "SELECT display_name FROM sync_inbound WHERE package_id = ?1",
+            [package_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+}
+
+/// Rel-path-ordered `(rel_path, byte_size)` of a `sync_inbound_files` set.
+fn inbound_file_manifest(db: &Database, inbound_id: i64) -> Vec<(String, i64)> {
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT rel_path, byte_size FROM sync_inbound_files WHERE inbound_id = {inbound_id} ORDER BY rel_path"
+        ))
+        .unwrap();
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))).unwrap();
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+/// `(state, last_error)` of an outbound row in one read.
+fn outbound_state_error(db: &Database, id: i64) -> (String, Option<String>) {
+    db.conn()
+        .query_row(
+            "SELECT state, last_error FROM sync_outbound WHERE id = ?1",
+            [id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .expect("outbound row present")
+}
+
+/// The `kind`s in a batch's event journal (`sync_events`) for `direction`
+/// (`"sent"`/`"received"`) + `batch_key` (the outbound/inbound row id, stored as
+/// text). Test-controlled inputs, so inlined like the existing `count` probes.
+fn journal_kinds(db: &Database, direction: &str, batch_key: i64) -> Vec<String> {
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT kind FROM sync_events WHERE direction = '{direction}' AND batch_key = '{batch_key}'"
+        ))
+        .unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.filter_map(|r| r.ok()).collect()
+}
+
+/// All regular-file paths under `dir`, forward-slashed — the landing-tree oracle
+/// the structured-layout tests match rel_path suffixes against.
+fn landed_paths(dir: &Path) -> Vec<String> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
+/// Spec §D1/§D2/§D4 — **manifest visible before the payload lands, then a
+/// structured (nested) batch lands correctly**. The sender enqueues a batch with
+/// an explicit name and nested source-relative rel_paths toward a receiver whose
+/// payload fetch is HELD aborting (the one-shot abort fault, re-armed each poll —
+/// the same "hold the fetch" lever the receiver-cancel acceptance test uses). At
+/// that hold point the receiver's `sync_inbound` row already carries the
+/// `display_name` and the FULL `sync_inbound_files` manifest (correct nested
+/// rel_paths + sizes) with `bytes_done == 0` and NOTHING ingested — no file row is
+/// `done`, nothing under the landing root. Releasing the fetch then lands every
+/// file under `<sender_slug>/<batch_slug>/<rel_path>` and settles the rows
+/// `done`/`ingested`.
+///
+/// The literal `announced` file-state is unit-pinned by
+/// `record_inbound_manifest_writes_name_and_announced_rows` (receiver.rs); on the
+/// live single-threaded receiver loop a held fetch churns rows
+/// `announced→fetching→failed` per retry, so this integration test pins the
+/// deterministic, load-bearing properties — the manifest (name + rel_paths + sizes)
+/// is fully known and nothing is ingested BEFORE any payload moves — rather than a
+/// transient state string.
+#[tokio::test]
+async fn manifest_visible_before_payload_then_structured_batch_lands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    // Moderate ack timeout so the held package re-announces on a comfortable cadence
+    // (each retry re-records the manifest, the re-armed abort keeps the payload from
+    // landing). Retries stay far slower than the 25ms poll re-arm, so no fetch can
+    // ever slip through disarmed under CI load — the manifest hold is deterministic.
+    let (engine, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(300)).await;
+
+    // Nested source-relative layout: a common ancestor of `<capture_files>/proj`
+    // with two divergent subtrees → the send derives multi-level rel_paths
+    // (`A/lights/…`, `B/darks/…`), the structured-batch shape the receiver mirrors.
+    let f0 = capture_files.join("proj/A/lights/frame_0.fits");
+    let f1 = capture_files.join("proj/A/lights/frame_1.fits");
+    let f2 = capture_files.join("proj/B/darks/frame_2.fits");
+    let mut frame_ids = Vec::new();
+    for p in [&f0, &f1, &f2] {
+        frame_ids.push(insert_frame_at(&capture_ctx, p, "M31", 120.0, ImageType::Light, None).0);
+    }
+    let expected_rels = ["A/lights/frame_0.fits", "A/lights/frame_1.fits", "B/darks/frame_2.fits"];
+
+    // Hold every fetch aborting BEFORE the enqueue so no payload can complete.
+    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids.clone(),
+        Some("M31 Lights".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("enqueue structured batch");
+
+    // Phase 1 — the announce persists the row + full manifest while the payload is
+    // held; re-arm the one-shot abort each poll so nothing can land in between.
+    let mut wire = String::new();
+    wait_until(
+        || {
+            receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+            match latest_inbound_package_id(pdb) {
+                Some(p) => {
+                    let ready = inbound_id_of(pdb, &p)
+                        .map(|iid| {
+                            count(
+                                pdb,
+                                &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {iid}"),
+                            ) == 3
+                        })
+                        .unwrap_or(false)
+                        && inbound_display_name(pdb, &p).is_some();
+                    if ready {
+                        wire = p;
+                    }
+                    ready
+                }
+                None => false,
+            }
+        },
+        WAIT,
+    )
+    .await;
+
+    let inbound_id = inbound_id_of(pdb, &wire).expect("inbound row id");
+    // The manifest is fully visible: name + every nested rel_path + its size.
+    assert_eq!(
+        inbound_display_name(pdb, &wire).as_deref(),
+        Some("M31 Lights"),
+        "the receiver shows the sender's batch name before any byte lands"
+    );
+    let manifest = inbound_file_manifest(pdb, inbound_id);
+    let rels: Vec<&str> = manifest.iter().map(|(r, _)| r.as_str()).collect();
+    assert_eq!(rels, expected_rels, "the full nested manifest is announced pre-fetch");
+    for (_, sz) in &manifest {
+        assert!(*sz > 0, "each announced file carries its real byte size");
+    }
+    // …and NOTHING has been ingested or landed yet.
+    let (_st, byte_size, bytes_done) = inbound_row(pdb, &wire).expect("inbound row");
+    assert!(byte_size > 0, "the package byte size is known from the announce");
+    assert_eq!(bytes_done, 0, "no payload bytes counted while the fetch is held");
+    assert_eq!(
+        count(pdb, &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {inbound_id} AND state = 'done'")),
+        0,
+        "no file is ingested before the payload moves"
+    );
+    assert_eq!(landed_count(&designated), 0, "nothing on disk in the landing tree yet");
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "no frame ingested before the fetch");
+
+    // Phase 2 — release the fetch: the structured batch lands and settles.
+    receiver_ep.set_fault(FaultPlan::default());
+    wait_until(|| outbound_state(cdb, latest_outbound_id(cdb)) == "confirmed", WAIT).await;
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 3, WAIT).await;
+
+    // Every file landed under `<sender_slug>/M31_Lights/<nested rel_path>`.
+    let landed = landed_paths(&designated);
+    assert_eq!(landed.len(), 3, "all three frames landed: {landed:?}");
+    for rel in expected_rels {
+        let suffix = format!("M31_Lights/{rel}");
+        assert!(
+            landed.iter().any(|p| p.ends_with(&suffix)),
+            "a file landed under the batch/nested tree {suffix}; landed = {landed:?}"
+        );
+    }
+    // Per-file rows settled done/ingested.
+    assert_eq!(
+        count(
+            pdb,
+            &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {inbound_id} AND state = 'done' AND outcome = 'ingested'"),
+        ),
+        3,
+        "every per-file row settled done/ingested after the fetch"
+    );
+    let (final_state, _bs, final_done) = inbound_row(pdb, &wire).expect("inbound row");
+    assert_eq!(final_state, "done", "the inbound row is terminal Done");
+    assert_eq!(final_done, byte_size, "the fetched bytes reached the announced total");
+
+    engine.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// Spec §D4/§D5 — **restart/resume restores the per-file picture, then confirms**.
+/// The peer's ack is delayed so the sender rests in `Delivered` with every
+/// `sync_outbound_files` row persisted `uploaded`; the sender engine is then killed
+/// mid-flight (after serve complete, before the ack) and a FRESH engine over the
+/// SAME catalog re-drives the row to `confirmed`, every file settling
+/// `done`/`ingested`. At the resume point (before completion) `list_transfer_files`
+/// already reflects the persisted per-file states — the picture is not lost across
+/// the restart.
+#[tokio::test]
+async fn restart_resumes_per_file_picture_then_confirms() {
+    const N: usize = 4;
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    // Delay the receiver's ack so the sender rests in Delivered (fetch complete,
+    // not yet confirmed) long enough to snapshot the resume point and kill the
+    // engine before the ack lands.
+    receiver_ep.set_fault(FaultPlan { delay_ack: Some(Duration::from_secs(2)), ..Default::default() });
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    // Long ack timeout: the first engine must NOT time out while the ack is held —
+    // it should rest in Delivered until we kill it.
+    let (engine_a, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
+
+    let mut frame_ids = Vec::with_capacity(N);
+    for idx in 0..N {
+        frame_ids.push(insert_capture_frame(&capture_ctx, &capture_files, idx).0);
+    }
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids.clone(),
+        Some("Resume Batch".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("enqueue");
+    let id = latest_outbound_id(cdb);
+
+    // The peer pulled everything (ServeComplete) but has not acked → the row rests
+    // Delivered with every file row persisted `uploaded`.
+    wait_until(|| outbound_state(cdb, id) == "delivered", WAIT).await;
+    let resume_files = list_transfer_files(&capture_ctx, Direction::Sent, id).expect("list outbound files");
+    assert_eq!(resume_files.len(), N, "all per-file rows present at the resume point");
+    for f in &resume_files {
+        assert_eq!(
+            f.state.as_deref(),
+            Some("uploaded"),
+            "the per-file picture is persisted `uploaded` at the resume point, not lost: {f:?}"
+        );
+    }
+    assert_ne!(outbound_state(cdb, id), "confirmed", "not yet confirmed at the resume point");
+
+    // Kill the engine mid-flight and drop the ack delay so the resumed engine's
+    // replay ack lands promptly.
+    engine_a.shutdown().await;
+    receiver_ep.set_fault(FaultPlan::default());
+
+    // A fresh engine over the SAME catalog re-drives the persisted Delivered row.
+    let store_b = Arc::new(CatalogSyncStore::open(&capture_db).unwrap());
+    let engine_b = Arc::new(SyncEngine::spawn(
+        store_b as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_node,
+    ));
+
+    wait_until(|| outbound_state(cdb, id) == "confirmed", WAIT).await;
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
+
+    let final_files = list_transfer_files(&capture_ctx, Direction::Sent, id).expect("list outbound files");
+    assert_eq!(final_files.len(), N);
+    for f in &final_files {
+        assert_eq!(f.state.as_deref(), Some("done"), "settled done after resume: {f:?}");
+        assert_eq!(f.outcome.as_deref(), Some("ingested"), "settled ingested after resume: {f:?}");
+    }
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), N as i64, "the peer ingested each frame exactly once");
+
+    engine_b.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// Spec §D4/§D6/§D7 — **a receiver decline is recorded on BOTH sides with the v2
+/// bookkeeping**. Complements the existing `receiver_cancel_terminates_sender_then_resend_delivers`
+/// (which pins the sender-terminal + cancelled-receipts + resend legs): this one
+/// pins the parts that acceptance test does NOT assert — the receiver's per-frame
+/// `cancelled` `sync_history` rows (batch-named), the settled `cancelled` per-file
+/// rows, and the `cancelled` entry in BOTH the sent and received event journals.
+#[tokio::test]
+async fn receiver_cancel_records_v2_history_files_and_both_journals() {
+    const N: usize = 4;
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    // Receiver-side cancel signal + a fresh runtime for the command boundary (same
+    // wiring as the acceptance cancel test).
+    let control = Arc::new(InboundControl::new());
+    let primary_sync = SyncRuntime::new();
+
+    // Hold the payload fetch aborting so no ingest can complete before the cancel.
+    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::clone(&control),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    let (engine, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
+
+    let mut frame_ids = Vec::with_capacity(N);
+    for idx in 0..N {
+        frame_ids.push(insert_capture_frame(&capture_ctx, &capture_files, idx).0);
+    }
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids.clone(),
+        Some("Cancel Me".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("enqueue");
+    let out_id = latest_outbound_id(cdb);
+
+    // Learn the wire package_id from the inbound row (re-arming the abort each poll).
+    let mut wire = String::new();
+    wait_until(
+        || {
+            receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+            match latest_inbound_package_id(pdb) {
+                Some(p) => {
+                    wire = p;
+                    true
+                }
+                None => false,
+            }
+        },
+        WAIT,
+    )
+    .await;
+
+    // Decline: the live signal diverts the receiver to its cancel epilogue on the
+    // next announce; the command exercises the command boundary too.
+    control.request_cancel(&wire);
+    cancel_incoming_package(&primary_ctx, &primary_sync, &wire)
+        .await
+        .expect("cancel_incoming_package command");
+
+    // Both sides terminalize cancelled (the acceptance test pins the sender reason
+    // + receipts; here these are the sync points for the v2 bookkeeping below).
+    wait_until(|| outbound_state(cdb, out_id) == "cancelled", WAIT).await;
+    wait_until(
+        || matches!(inbound_row(pdb, &wire), Some((s, _, _)) if s == "cancelled"),
+        WAIT,
+    )
+    .await;
+    let inbound_id = inbound_id_of(pdb, &wire).expect("inbound row id");
+
+    // (1) Receiver history: one `cancelled` row per frame, each batch-named.
+    assert_eq!(
+        count(
+            pdb,
+            "SELECT COUNT(*) FROM sync_history WHERE direction = 'received' AND outcome = 'cancelled' AND batch_name = 'Cancel Me'",
+        ),
+        N as i64,
+        "the receiver logged one batch-named cancelled history row per frame"
+    );
+
+    // (2) Per-file rows settled cancelled.
+    assert_eq!(
+        count(
+            pdb,
+            &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {inbound_id} AND outcome = 'cancelled'"),
+        ),
+        N as i64,
+        "every inbound per-file row settled cancelled"
+    );
+
+    // (3) Both journals carry their `cancelled` entry.
+    assert!(
+        journal_kinds(cdb, "sent", out_id).contains(&"cancelled".to_string()),
+        "the sent journal records the cancel"
+    );
+    assert!(
+        journal_kinds(pdb, "received", inbound_id).contains(&"cancelled".to_string()),
+        "the received journal records the cancel"
+    );
+
+    // No files landed (a declined package lands nothing).
+    assert_eq!(landed_count(&designated), 0, "a declined package lands no files");
+
+    engine.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// Spec §D5/§D7 — **ack-timeout → waiting → recovery leaves no sticky error**. A
+/// silent peer (its fetch aborts once, so no ack) drives one ack timeout: the row
+/// arms `next_retry_at`, sets `last_error`, journals `ack_timeout` + `retry_scheduled`,
+/// and `get_status` reports `displayState == "waiting"` with `stalledUntil`. On the
+/// next attempt the serve tick clears `last_error` at the `Delivered`/serving stage
+/// — BEFORE the confirm ack lands (the T4 Req-5 mechanism the unit suite checked
+/// only at `confirmed`) — and the transfer finally confirms with a clean summary
+/// and `ack_received` + `confirmed` journalled.
+#[tokio::test]
+async fn ack_timeout_waiting_then_recovery_clears_error_at_serving_stage() {
+    const N: usize = 3;
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    // Attempt 1 aborts (one-shot) → no ack → ack timeout. Attempt 2 completes but
+    // holds the ack 300ms (< the 600ms timeout, so no re-timeout) so the row rests
+    // in Delivered with the error already cleared, before it confirms.
+    receiver_ep.set_fault(FaultPlan {
+        abort_after_bytes: Some(1),
+        delay_ack: Some(Duration::from_millis(300)),
+        ..Default::default()
+    });
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    let (engine, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(600)).await;
+
+    let mut frame_ids = Vec::with_capacity(N);
+    for idx in 0..N {
+        frame_ids.push(insert_capture_frame(&capture_ctx, &capture_files, idx).0);
+    }
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids.clone(),
+        Some("Retry Batch".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("enqueue");
+    let id = latest_outbound_id(cdb);
+
+    // Phase 1 — the ack times out: last_error set, next_retry_at armed, journalled.
+    wait_until(
+        || {
+            let (state, err) = outbound_state_error(cdb, id);
+            err.is_some() && outbound_next_retry(cdb, id).is_some() && !is_terminal_state(&state)
+        },
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        outbound_last_error(cdb, id).as_deref(),
+        Some("no ack from peer within timeout"),
+        "the ack timeout is recorded as the (transient) last_error"
+    );
+    let kinds = journal_kinds(cdb, "sent", id);
+    assert!(kinds.contains(&"ack_timeout".to_string()), "ack_timeout journalled: {kinds:?}");
+    assert!(kinds.contains(&"retry_scheduled".to_string()), "retry_scheduled journalled: {kinds:?}");
+
+    // …and `get_status` presents it as a neutral `waiting` with a stall deadline —
+    // polled so it catches the (single) backoff window while it is open.
+    {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let st = get_status(&capture_ctx, &sync, &sender).await.expect("get_status");
+            if let Some(row) = st.sender.active.iter().find(|r| r.id == id) {
+                if row.display_state == "waiting" && row.stalled_until.is_some() {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "never saw displayState waiting with a stall deadline");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    // Phase 2 — recovery: the serve tick clears the stale error at the Delivered
+    // (serving) stage, BEFORE the confirm ack.
+    wait_until(
+        || {
+            let (state, err) = outbound_state_error(cdb, id);
+            state == "delivered" && err.is_none()
+        },
+        WAIT,
+    )
+    .await;
+
+    // …then the transfer confirms with a clean summary + journal.
+    wait_until(|| outbound_state(cdb, id) == "confirmed", WAIT).await;
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
+    assert_eq!(outbound_last_error(cdb, id), None, "a confirmed transfer carries no stale reason");
+    let kinds = journal_kinds(cdb, "sent", id);
+    assert!(kinds.contains(&"ack_received".to_string()), "ack_received journalled: {kinds:?}");
+    assert!(kinds.contains(&"confirmed".to_string()), "confirmed journalled: {kinds:?}");
+    assert_eq!(landed_count(&designated), N, "the recovered transfer delivered every frame");
+
+    engine.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// Spec §D2/§D4 — **WBPP-layout object send, end to end**. A frame set of two
+/// lights that consume a Dark calibration set is object-sent (`frame_set_id` → the
+/// WBPP `rel_path` layout, including the calibration level). The receiver disk tree
+/// mirrors `<batch>/camera_*/DARKS_*/lights/…` (batch = the frame-set name), the
+/// per-file + history rows carry the right filenames, and `list_transfer_files` on
+/// BOTH sides returns the identical rel_path set — sender and receiver agree on the
+/// whole structured tree.
+#[tokio::test]
+async fn wbpp_object_send_lands_identical_tree_on_both_sides() {
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    let (engine, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
+
+    // Two lights (camera "C") + a Dark master they consume — the object-send WBPP
+    // shape. Frame-set membership via session_members; calibration link via
+    // calibration_set_to_frames (same fixture pattern as archive_e2e).
+    let l1 = capture_files.join("M31/L_001.fits");
+    let l2 = capture_files.join("M31/L_002.fits");
+    let dk = capture_files.join("Cal/MasterDark.fits");
+    let (lf1, _u1) = insert_frame_at(&capture_ctx, &l1, "M31", 300.0, ImageType::Light, Some("C"));
+    let (lf2, _u2) = insert_frame_at(&capture_ctx, &l2, "M31", 300.0, ImageType::Light, Some("C"));
+    let (df, _ud) = insert_frame_at(&capture_ctx, &dk, "M31", 300.0, ImageType::Dark, Some("C"));
+    {
+        let db = capture_ctx.db.get().unwrap();
+        let conn = db.conn();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        for fid in [lf1, lf2] {
+            conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)", [fid]).unwrap();
+        }
+        conn.execute("INSERT INTO calibration_set (id, imagetyp, date) VALUES (500, 'Dark', '2025-10-10')", []).unwrap();
+        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (500, ?1)", [df]).unwrap();
+        for fid in [lf1, lf2] {
+            conn.execute(
+                "INSERT INTO calibration_set_to_frames (source_id, source_type, calibration_set_id, calibration_type, matched_at) VALUES (?1, 'frame', 500, 'Dark', '2025-10-12')",
+                [fid],
+            )
+            .unwrap();
+        }
+    }
+
+    // Object send: frame_set_id drives the WBPP layout; include the dark so the
+    // calibration level is actually transferred. No explicit name → auto-name to
+    // the frame-set name "M31".
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        vec![lf1, lf2, df],
+        None,
+        Some(1),
+        None,
+    )
+    .await
+    .expect("object send");
+
+    wait_until(|| outbound_state(cdb, latest_outbound_id(cdb)) == "confirmed", WAIT).await;
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 3, WAIT).await;
+
+    let out_id = latest_outbound_id(cdb);
+    let wire = latest_inbound_package_id(pdb).expect("inbound row");
+    let in_id = inbound_id_of(pdb, &wire).expect("inbound row id");
+
+    // Both sides agree on the exact rel_path set.
+    let mut sent_rels: Vec<String> = list_transfer_files(&capture_ctx, Direction::Sent, out_id)
+        .expect("sent files")
+        .into_iter()
+        .map(|f| f.rel_path)
+        .collect();
+    let mut recv_rels: Vec<String> = list_transfer_files(&primary_ctx, Direction::Received, in_id)
+        .expect("received files")
+        .into_iter()
+        .map(|f| f.rel_path)
+        .collect();
+    sent_rels.sort();
+    recv_rels.sort();
+    assert_eq!(sent_rels, recv_rels, "sender and receiver agree on the whole structured tree");
+
+    // The WBPP object-send layout, including the calibration (DARKS) level.
+    let expected = {
+        let mut e = vec![
+            "camera_c/DARKS_500/MasterDark.fits".to_string(),
+            "camera_c/DARKS_500/lights/L_001.fits".to_string(),
+            "camera_c/DARKS_500/lights/L_002.fits".to_string(),
+        ];
+        e.sort();
+        e
+    };
+    assert_eq!(sent_rels, expected, "WBPP rel_paths carry the camera + calibration + lights levels");
+
+    // The receiver disk tree mirrors `<batch=M31>/camera_C/DARKS_500/…`.
+    let landed = landed_paths(&designated);
+    assert_eq!(landed.len(), 3, "all three frames landed: {landed:?}");
+    for rel in &expected {
+        let suffix = format!("M31/{rel}");
+        assert!(
+            landed.iter().any(|p| p.ends_with(&suffix)),
+            "a file landed under the WBPP tree {suffix}; landed = {landed:?}"
+        );
+    }
+
+    // Per-file rows settled done/ingested; history rows carry the filenames.
+    assert_eq!(
+        count(
+            pdb,
+            &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {in_id} AND state = 'done' AND outcome = 'ingested'"),
+        ),
+        3,
+        "every per-file row settled done/ingested"
+    );
+    for filename in ["L_001.fits", "L_002.fits", "MasterDark.fits"] {
+        assert!(
+            count(
+                pdb,
+                &format!("SELECT COUNT(*) FROM sync_history WHERE direction = 'received' AND filename = '{filename}'"),
+            ) >= 1,
+            "received history carries the frame filename {filename}"
+        );
+    }
+
+    engine.shutdown().await;
+    receiver.shutdown().await;
 }
