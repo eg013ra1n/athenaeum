@@ -197,6 +197,22 @@ pub struct InboundRow {
     /// same tree; written by the receiver.
     #[serde(default)]
     pub landing_dir: Option<String>,
+    /// The durable per-transfer batch identity (Transfers Batch Model, §D1). The
+    /// receiver's row is keyed `(peer, batch_uuid)` — ONE long-lived row across
+    /// every attempt of one transfer — enforced by the `idx_sync_inbound_batch`
+    /// unique index. Carried in a v3 announce; a v1/v2 (legacy) announce has no
+    /// batch identity on the wire, so the receiver falls back to `batch_uuid :=`
+    /// wire package id (B4), and a row created before this column stays `None`.
+    /// New rows always set it via
+    /// [`upsert_inbound_attempt`](super::store::upsert_inbound_attempt).
+    #[serde(default)]
+    pub batch_uuid: Option<String>,
+    /// Collab forward-compat key (Transfers Batch Model, §D6): the `project_id`
+    /// this transfer moves for, distinguishing a collab-swarm transfer from a
+    /// personal one and giving the future planner its key. `None` for a personal
+    /// sync (no project dimension).
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// Direction of a transfer recorded in [`HistoryRow`]. This sender-side task
@@ -277,6 +293,12 @@ pub struct OutboundRow {
     /// path fills it. The raw UUIDs appear only in the Details tab.
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Collab forward-compat key (Transfers Batch Model, §D6): the `project_id`
+    /// this transfer moves for, distinguishing a collab-swarm transfer from a
+    /// personal one and giving the future planner its key. `None` for a personal
+    /// sync; the collab send path (a later wave) fills it.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// One row of `sync_history`: an append-only audit entry for a per-frame

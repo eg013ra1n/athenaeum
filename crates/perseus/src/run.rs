@@ -2036,6 +2036,9 @@ mod retention_tests {
         fn confirm(&self, id: i64, receipts: &[FrameReceipt]) -> Result<()> {
             self.0.confirm(id, receipts)
         }
+        fn reset_outbound_for_resend(&self, id: i64, new_wire_id: &str) -> Result<()> {
+            self.0.reset_outbound_for_resend(id, new_wire_id)
+        }
         fn append_history(&self, _h: HistoryRow) -> Result<()> {
             Err(anyhow::anyhow!("simulated append_history failure"))
         }

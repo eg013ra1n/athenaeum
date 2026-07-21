@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::sharing::types::{AnnounceFileEntry, FrameReceipt, NodeId, PackageId, ReceiptOutcome};
@@ -26,10 +26,11 @@ use super::{node_id_from_hex, node_id_hex, now_iso};
 /// `sync_outbound` — the durable outbound state machine, one row per package.
 ///
 /// The trailing `last_error` (Task 9), `next_retry_at` (Task 2),
-/// `wire_package_id` (zombie-inbound fix) and `display_name` (Transfers Status
-/// Model v2 §D1) columns are created inline for a fresh DB; an existing table
-/// without them is migrated in place by [`ensure_outbound_columns`] (a `CREATE
-/// TABLE IF NOT EXISTS` never adds a column).
+/// `wire_package_id` (zombie-inbound fix), `display_name` (Transfers Status
+/// Model v2 §D1) and `project_id` (Transfers Batch Model, spec §D6 — the collab
+/// forward-compat key) columns are created inline for a fresh DB; an existing
+/// table without them is migrated in place by [`ensure_outbound_columns`] (a
+/// `CREATE TABLE IF NOT EXISTS` never adds a column).
 pub const DDL_OUTBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_outbound (
     id INTEGER PRIMARY KEY,
     package_ref TEXT NOT NULL,
@@ -41,12 +42,14 @@ pub const DDL_OUTBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_outbound (
     last_error TEXT,
     next_retry_at TEXT,
     wire_package_id TEXT,
-    display_name TEXT
+    display_name TEXT,
+    project_id TEXT
 )";
 
 /// Idempotently add the trailing `sync_outbound` columns (`last_error` — Task 9,
 /// `next_retry_at` — Task 2, `wire_package_id` — zombie-inbound fix,
-/// `display_name` — Transfers Status Model v2 §D1) to an existing table.
+/// `display_name` — Transfers Status Model v2 §D1, `project_id` — Transfers Batch
+/// Model §D6) to an existing table.
 ///
 /// The guarded-ALTER twin of [`ensure_history_columns`]: `CREATE TABLE IF NOT
 /// EXISTS` never alters an already-materialised table, so a store opened over a
@@ -69,6 +72,9 @@ pub fn ensure_outbound_columns(conn: &Connection) -> Result<()> {
         ("next_retry_at", "TEXT"),
         ("wire_package_id", "TEXT"),
         ("display_name", "TEXT"),
+        // Transfers Batch Model (spec §D6): the collab forward-compat key —
+        // `NULL` for a personal transfer, the project id for a collab one.
+        ("project_id", "TEXT"),
     ] {
         if !existing.contains(col) {
             conn.execute(&format!("ALTER TABLE sync_outbound ADD COLUMN {col} {ty}"), [])
@@ -159,8 +165,18 @@ pub const DDL_RECEIPTS: &str = "CREATE TABLE IF NOT EXISTS sync_receipts (
 /// the DDL lives here so `db/schema.rs` and both store `open`s share one
 /// definition. `sync_inbound` shipped in beta.3 (Task 11), so a 0.4.x DB already
 /// carries the table WITHOUT the trailing `display_name` column (Transfers Status
-/// Model v2 §D1); that column is created inline for a fresh DB and back-filled on
-/// an existing one by [`ensure_inbound_columns`].
+/// Model v2 §D1) or the `batch_uuid` / `project_id` columns (Transfers Batch Model
+/// §D1/§D6); those columns are created inline for a fresh DB and back-filled on an
+/// existing one by [`ensure_inbound_columns`].
+///
+/// `batch_uuid` is the batch-model row key: one long-lived row per transfer keyed
+/// `(peer, batch_uuid)` across all attempts, enforced by the `idx_sync_inbound_batch`
+/// unique index ([`DDL_INDEXES`]). The legacy `UNIQUE(peer, package_id)` constraint
+/// stays — `package_id` is still per-attempt-unique (now "current attempt's wire
+/// id"). **The ABSENCE of `batch_uuid` doubles as the batch-model upgrade
+/// detector** ([`wipe_transfer_bookkeeping_on_upgrade`]): a fresh DB is born with
+/// it (so it never wipes), a pre-batch DB lacks it (so it wipes once, then gains
+/// it).
 pub const DDL_INBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_inbound (
     id INTEGER PRIMARY KEY,
     peer TEXT NOT NULL,
@@ -174,18 +190,22 @@ pub const DDL_INBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_inbound (
     finished_at TEXT,
     display_name TEXT,
     landing_dir TEXT,
+    batch_uuid TEXT,
+    project_id TEXT,
     UNIQUE(peer, package_id)
 )";
 
-/// Idempotently add the trailing `sync_inbound.display_name` (Transfers Status
-/// Model v2 §D1) and `landing_dir` (§D2) columns to an existing table.
+/// Idempotently add the trailing `sync_inbound` columns (`display_name` — Transfers
+/// Status Model v2 §D1, `landing_dir` — §D2, `batch_uuid` / `project_id` — Transfers
+/// Batch Model §D1/§D6) to an existing table.
 ///
 /// The guarded-ALTER twin of [`ensure_outbound_columns`] / [`ensure_history_columns`]:
-/// `sync_inbound` shipped in beta.3 without either column, so a store opened over
+/// `sync_inbound` shipped in beta.3 without these columns, so a store opened over
 /// a 0.4.x catalog / Perseus DB is migrated in place here. Called by every
 /// `sync_inbound` materialisation site (both store `open`s and `db::schema::init_db`)
-/// right after the DDL. Never breaks an existing DB: an already-present column is
-/// a no-op.
+/// right after the DDL and AFTER [`wipe_transfer_bookkeeping_on_upgrade`] (which
+/// keys on the ABSENCE of `batch_uuid`, so it must run before this adds it). Never
+/// breaks an existing DB: an already-present column is a no-op.
 pub fn ensure_inbound_columns(conn: &Connection) -> Result<()> {
     let existing: HashSet<String> = conn
         .prepare("PRAGMA table_info(sync_inbound)")
@@ -194,12 +214,103 @@ pub fn ensure_inbound_columns(conn: &Connection) -> Result<()> {
         .context("query table_info(sync_inbound)")?
         .filter_map(|c| c.ok())
         .collect();
-    for (col, ty) in [("display_name", "TEXT"), ("landing_dir", "TEXT")] {
+    for (col, ty) in [
+        ("display_name", "TEXT"),
+        ("landing_dir", "TEXT"),
+        // Transfers Batch Model: `batch_uuid` is the durable per-transfer key
+        // (unique `(peer, batch_uuid)` via `idx_sync_inbound_batch`); `project_id`
+        // is the collab forward-compat key (§D6).
+        ("batch_uuid", "TEXT"),
+        ("project_id", "TEXT"),
+    ] {
         if !existing.contains(col) {
             conn.execute(&format!("ALTER TABLE sync_inbound ADD COLUMN {col} {ty}"), [])
                 .with_context(|| format!("add sync_inbound.{col} column"))?;
         }
     }
+    Ok(())
+}
+
+/// The eight transfer-bookkeeping tables the batch-model upgrade wipes
+/// (spec §Migration). Order is irrelevant — the store declares no FKs between
+/// them. A sender-only store ([`StandaloneSyncStore`] / Perseus) never materialises
+/// `sync_receipts` / `sync_sources`, so the wipe skips any table not present.
+const TRANSFER_TABLES: [&str; 8] = [
+    "sync_outbound",
+    "sync_inbound",
+    "sync_outbound_files",
+    "sync_inbound_files",
+    "sync_events",
+    "sync_receipts",
+    "sync_sources",
+    "sync_history",
+];
+
+/// True iff `table` has a column named `col` (via `PRAGMA table_info`). Returns
+/// `false` for a table that does not exist (empty pragma) — deliberately, so the
+/// batch-upgrade detector reads a not-yet-materialised `sync_inbound` as "no
+/// batch_uuid".
+fn column_present(conn: &Connection, table: &str, col: &str) -> Result<bool> {
+    let names: HashSet<String> = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("prepare table_info({table})"))?
+        .query_map([], |r| r.get::<_, String>(1))
+        .with_context(|| format!("query table_info({table})"))?
+        .filter_map(|c| c.ok())
+        .collect();
+    Ok(names.contains(col))
+}
+
+/// True iff a table named `table` exists in this schema.
+fn table_present(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("check table {table} exists"))?;
+    Ok(n > 0)
+}
+
+/// One-shot **clean reset** of ALL transfer bookkeeping on the batch-model upgrade
+/// (spec §Migration, owner decision 2026-07-21: the accumulated records are
+/// smoke-test debris; preserving them buys nothing).
+///
+/// `sync_inbound.batch_uuid` is the migrated-flag. A fresh DB creates the column
+/// inline ([`DDL_INBOUND`]), so by the time this runs — right AFTER `DDL_INBOUND`,
+/// BEFORE [`ensure_inbound_columns`] — the detector sees it and NEVER wipes; a
+/// pre-batch (0.4.x / beta.3) DB lacks it, so the wipe fires exactly once. After
+/// the wipe, `ensure_inbound_columns` adds the column, so every later init sees the
+/// flag and this is a no-op. **The wipe therefore can never fire on a post-upgrade
+/// DB — column presence IS the flag.**
+///
+/// The wipe runs in its OWN transaction: the caller (either store `open` or
+/// `init_db`) holds no open transaction on this connection, matching the
+/// `unchecked_transaction` seam discipline of the other store fns. One tx makes
+/// the wipe all-or-nothing.
+///
+/// Catalog tables (`files` / `frames` / …) are NEVER named — untouched by
+/// construction. A sender-only store lacks `sync_receipts` / `sync_sources`; each
+/// DELETE is guarded by [`table_present`] so a missing table is skipped, never an
+/// error. `info!` records the per-table deleted count.
+pub fn wipe_transfer_bookkeeping_on_upgrade(conn: &Connection) -> Result<()> {
+    if column_present(conn, "sync_inbound", "batch_uuid")? {
+        return Ok(());
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin transfer-bookkeeping wipe")?;
+    for table in TRANSFER_TABLES {
+        if !table_present(&tx, table)? {
+            continue;
+        }
+        let deleted = tx
+            .execute(&format!("DELETE FROM {table}"), [])
+            .with_context(|| format!("wipe {table}"))?;
+        tracing::info!(table, count = deleted, "batch-model upgrade: wiped transfer table");
+    }
+    tx.commit().context("commit transfer-bookkeeping wipe")?;
     Ok(())
 }
 
@@ -291,17 +402,24 @@ pub const DDL_SYNC_SOURCES: &str = "CREATE TABLE IF NOT EXISTS sync_sources (
     PRIMARY KEY (package_ref, path)
 )";
 
-/// Search indexes for [`SyncStore::search_history`], plus the per-batch event-log
+/// Search indexes for [`SyncStore::search_history`], the per-batch event-log
 /// index (Transfers Status Model v2 §D7) that keeps [`list_sync_events`] /
-/// [`append_sync_event`]'s `(direction, batch_key)`-scoped, id-ordered scans fast.
-/// Iterated at every sync-table materialisation site, so a new entry here is
-/// created in the Perseus store, the catalog store, and `db::schema::init_db`
-/// alike.
-pub const DDL_INDEXES: [&str; 4] = [
+/// [`append_sync_event`]'s `(direction, batch_key)`-scoped, id-ordered scans fast,
+/// and the Transfers Batch Model unique `(peer, batch_uuid)` index that anchors the
+/// receiver's one-row-per-transfer key (spec §D1). Iterated at every sync-table
+/// materialisation site, so a new entry here is created in the Perseus store, the
+/// catalog store, and `db::schema::init_db` alike.
+///
+/// `idx_sync_inbound_batch` is UNIQUE but tolerates the multiple-NULL-`batch_uuid`
+/// rows a v1/v2 (legacy-announce) receive still writes — SQLite treats NULLs as
+/// distinct in a unique index — so it constrains only the batch-keyed (v3) rows.
+/// It is created LAST (after [`ensure_inbound_columns`] has added `batch_uuid`).
+pub const DDL_INDEXES: [&str; 5] = [
     "CREATE INDEX IF NOT EXISTS idx_sync_history_filename ON sync_history(filename)",
     "CREATE INDEX IF NOT EXISTS idx_sync_history_object ON sync_history(object)",
     "CREATE INDEX IF NOT EXISTS idx_sync_history_started_at ON sync_history(started_at)",
     "CREATE INDEX IF NOT EXISTS idx_sync_events_batch ON sync_events(direction, batch_key, id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_inbound_batch ON sync_inbound(peer, batch_uuid)",
 ];
 
 /// Durable persistence for the outbound state machine + transfer history.
@@ -418,6 +536,14 @@ pub trait SyncStore: Send + Sync {
     /// rather than a separate table.
     fn confirm(&self, id: i64, receipts: &[FrameReceipt]) -> Result<()>;
 
+    /// Reset an outbound transfer for a **resend attempt** — the SAME row,
+    /// `attempts += 1`, fresh `wire_package_id`, cleared error/retry/confirm fields,
+    /// and every per-file row back to `pending` (Transfers Batch Model, §D1/§D3).
+    /// The bridge B3's engine drives resend through (over `Arc<dyn SyncStore>`);
+    /// delegates to the free [`reset_outbound_for_resend`]. Errors on an absent row;
+    /// terminal-state eligibility is the caller's policy.
+    fn reset_outbound_for_resend(&self, id: i64, new_wire_id: &str) -> Result<()>;
+
     /// Append one audit row.
     fn append_history(&self, h: HistoryRow) -> Result<()>;
 
@@ -439,6 +565,7 @@ type OutboundRaw = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
@@ -454,6 +581,7 @@ fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
         next_retry_at,
         wire_package_id,
         display_name,
+        project_id,
     ) = raw;
     Ok(OutboundRow {
         id,
@@ -467,6 +595,7 @@ fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
         next_retry_at,
         wire_package_id,
         display_name,
+        project_id,
     })
 }
 
@@ -518,7 +647,7 @@ fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
 }
 
 const OUTBOUND_COLS: &str =
-    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at, wire_package_id, display_name";
+    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at, wire_package_id, display_name, project_id";
 const HISTORY_COLS: &str =
     "frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project, package_id, batch_name";
 
@@ -528,7 +657,7 @@ const HISTORY_COLS: &str =
 fn outbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<OutboundRaw> {
     Ok((
         r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
-        r.get(8)?, r.get(9)?, r.get(10)?,
+        r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
     ))
 }
 
@@ -544,7 +673,7 @@ fn history_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<HistoryRaw> {
 fn inbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<InboundRaw> {
     Ok((
         r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
-        r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
+        r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?,
     ))
 }
 
@@ -709,6 +838,57 @@ pub fn outbound_row_by_id(conn: &Connection, id: i64) -> Result<Option<OutboundR
         .optional()
         .context("query sync_outbound by id")?;
     raw.map(to_outbound).transpose()
+}
+
+/// Reset an outbound transfer for a **resend attempt** — the SAME row is reused,
+/// never a new one (Transfers Batch Model, §D1/§D3). In ONE transaction:
+///
+/// - the `sync_outbound` row → state `queued`, `attempts += 1`,
+///   `wire_package_id = new_wire_id`, and `last_error` / `next_retry_at` /
+///   `confirmed_at` cleared;
+/// - EVERY one of the row's `sync_outbound_files` rows → state `pending`,
+///   `bytes_done 0`, `outcome NULL`, `error NULL` (a fresh per-file picture; the
+///   previous attempt's verdicts already live in `sync_history`).
+///
+/// A **fresh per-attempt wire id** is the ack-replay isolation: receipts stay
+/// keyed by per-attempt wire ids, so a prior attempt's receipts can never replay
+/// onto this one (§D1). `attempts` increments so the UI shows "attempt N".
+///
+/// **Errors** if `id` names no row — the caller must have loaded it. The mechanism
+/// is unconditional: **terminal-state eligibility** (only a `failed` / `cancelled`
+/// transfer may resend) is the CALLER's policy — B3's engine / B5's command guard
+/// own it, this fn does not re-check state.
+///
+/// Its own transaction — the caller holds no open tx on this connection (the
+/// `unchecked_transaction` seam discipline shared by [`replace_outbound_files`] et
+/// al.).
+pub fn reset_outbound_for_resend(conn: &Connection, id: i64, new_wire_id: &str) -> Result<()> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin reset_outbound_for_resend")?;
+    let changed = tx
+        .execute(
+            "UPDATE sync_outbound
+             SET state = ?1, attempts = attempts + 1, wire_package_id = ?2,
+                 last_error = NULL, next_retry_at = NULL, confirmed_at = NULL
+             WHERE id = ?3",
+            params![OutboundState::Queued.as_str(), new_wire_id, id],
+        )
+        .with_context(|| format!("reset outbound {id} for resend"))?;
+    if changed == 0 {
+        return Err(anyhow!(
+            "reset_outbound_for_resend: no sync_outbound row with id {id}"
+        ));
+    }
+    tx.execute(
+        "UPDATE sync_outbound_files
+         SET state = ?1, bytes_done = 0, outcome = NULL, error = NULL, updated_at = ?2
+         WHERE outbound_id = ?3",
+        params![OutboundFileState::Pending.as_str(), now_iso(), id],
+    )
+    .with_context(|| format!("reset sync_outbound_files for {id}"))?;
+    tx.commit().context("commit reset_outbound_for_resend")?;
+    Ok(())
 }
 
 /// One `sync_sources` row: a live (or historic) linkage from an app package back
@@ -909,7 +1089,7 @@ pub fn load_receipts(conn: &Connection, package_id: &str) -> Result<Vec<FrameRec
 // package_id)` UNIQUE constraint anchors the upsert.
 
 const INBOUND_COLS: &str =
-    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at, display_name, landing_dir";
+    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at, display_name, landing_dir, batch_uuid, project_id";
 
 /// Raw column tuple for a `sync_inbound` row, parsed into [`InboundRow`] by
 /// [`to_inbound`] so fallible text parsing happens outside the rusqlite closure.
@@ -923,6 +1103,8 @@ type InboundRaw = (
     i64,
     Option<String>,
     String,
+    Option<String>,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<String>,
@@ -942,6 +1124,8 @@ fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
         finished_at,
         display_name,
         landing_dir,
+        batch_uuid,
+        project_id,
     ) = raw;
     Ok(InboundRow {
         id,
@@ -956,6 +1140,8 @@ fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
         finished_at,
         display_name,
         landing_dir,
+        batch_uuid,
+        project_id,
     })
 }
 
@@ -1110,6 +1296,103 @@ pub fn get_inbound_by_row_id(conn: &Connection, id: i64) -> Result<Option<Inboun
         .optional()
         .context("query sync_inbound by id")?;
     raw.map(to_inbound).transpose()
+}
+
+/// Fetch the inbound row for `(peer_hex, batch_uuid)` (`None` if absent) — the
+/// batch-model lookup the receiver uses to correlate a v3 announce / revoke to its
+/// long-lived row (Transfers Batch Model, §D1). Anchored by the
+/// `idx_sync_inbound_batch` unique index.
+pub fn get_inbound_by_batch(
+    conn: &Connection,
+    peer_hex: &str,
+    batch_uuid: &str,
+) -> Result<Option<InboundRow>> {
+    let raw = conn
+        .query_row(
+            &format!("SELECT {INBOUND_COLS} FROM sync_inbound WHERE peer = ?1 AND batch_uuid = ?2"),
+            params![peer_hex, batch_uuid],
+            inbound_raw_from_row,
+        )
+        .optional()
+        .context("query sync_inbound by (peer, batch_uuid)")?;
+    raw.map(to_inbound).transpose()
+}
+
+/// Upsert the inbound row for `(peer_hex, batch_uuid)` at the start of a receive
+/// attempt (Transfers Batch Model, §D1) — the batch-keyed successor to
+/// [`upsert_inbound_announced`]. Keyed on the durable `batch_uuid` (not the
+/// per-attempt wire id), so every attempt of one transfer resolves to ONE
+/// long-lived row.
+///
+/// - **No row** for `(peer, batch_uuid)` → INSERT a fresh `announced` row (bytes 0),
+///   stamping this attempt's `wire_package_id` and the `batch_uuid`.
+/// - **Existing row** → reset it to `announced` with the new `wire_package_id`,
+///   `bytes_done 0`, `last_error` / `finished_at` cleared, `frame_count` /
+///   `byte_size` refreshed. `display_name` and `landing_dir` are PRESERVED — a
+///   resend keeps its name and lands into the same tree.
+/// - **Cancelled is final**: an existing `cancelled` row is left COMPLETELY
+///   untouched and returned with `cancelled_final = true`, so the receiver keeps
+///   Cancelled-is-final semantics (re-ack cancelled rather than re-fetch). Every
+///   other case returns `cancelled_final = false`.
+///
+/// Returns `(id, cancelled_final)`. The `SELECT`-then-write is safe because the
+/// receiver holds the only connection that writes inbound rows and processes
+/// announces serially (same single-writer assumption as [`upsert_inbound_announced`]).
+pub fn upsert_inbound_attempt(
+    conn: &Connection,
+    peer_hex: &str,
+    batch_uuid: &str,
+    wire_package_id: &str,
+    frame_count: u32,
+    byte_size: u64,
+) -> Result<(i64, bool)> {
+    let existing: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT id, state FROM sync_inbound WHERE peer = ?1 AND batch_uuid = ?2",
+            params![peer_hex, batch_uuid],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .context("look up sync_inbound by (peer, batch_uuid)")?;
+    match existing {
+        // Cancelled-is-final: leave the row untouched, signal the caller.
+        Some((id, state)) if state == InboundState::Cancelled.as_str() => Ok((id, true)),
+        Some((id, _)) => {
+            conn.execute(
+                "UPDATE sync_inbound
+                 SET state = ?1, package_id = ?2, frame_count = ?3, byte_size = ?4,
+                     bytes_done = 0, last_error = NULL, finished_at = NULL
+                 WHERE id = ?5",
+                params![
+                    InboundState::Announced.as_str(),
+                    wire_package_id,
+                    frame_count,
+                    byte_size as i64,
+                    id,
+                ],
+            )
+            .with_context(|| format!("reset sync_inbound attempt for {id}"))?;
+            Ok((id, false))
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO sync_inbound
+                 (peer, package_id, batch_uuid, state, frame_count, byte_size, bytes_done, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
+                params![
+                    peer_hex,
+                    wire_package_id,
+                    batch_uuid,
+                    InboundState::Announced.as_str(),
+                    frame_count,
+                    byte_size as i64,
+                    now_iso(),
+                ],
+            )
+            .context("insert sync_inbound attempt")?;
+            Ok((conn.last_insert_rowid(), false))
+        }
+    }
 }
 
 // ── Transfers Status Model v2: display_name, per-file rows, event journal ────
@@ -1824,6 +2107,11 @@ impl StandaloneSyncStore {
         conn.execute(DDL_HISTORY, []).context("create sync_history")?;
         ensure_history_columns(&conn)?;
         conn.execute(DDL_INBOUND, []).context("create sync_inbound")?;
+        // Transfers Batch Model reset (spec §Migration): gated on the ABSENCE of
+        // `sync_inbound.batch_uuid`, so it MUST run after `DDL_INBOUND` (the fresh
+        // DB is born with the column → never wipes) and BEFORE `ensure_inbound_columns`
+        // (which adds it → would hide the flag). A no-op on a fresh / post-upgrade DB.
+        wipe_transfer_bookkeeping_on_upgrade(&conn)?;
         ensure_inbound_columns(&conn)?;
         conn.execute(DDL_OUTBOUND_FILES, []).context("create sync_outbound_files")?;
         conn.execute(DDL_INBOUND_FILES, []).context("create sync_inbound_files")?;
@@ -2024,6 +2312,11 @@ impl SyncStore for StandaloneSyncStore {
         Ok(())
     }
 
+    fn reset_outbound_for_resend(&self, id: i64, new_wire_id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        reset_outbound_for_resend(&conn, id, new_wire_id)
+    }
+
     fn append_history(&self, h: HistoryRow) -> Result<()> {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
         insert_history_row(&conn, &h)
@@ -2074,6 +2367,11 @@ impl CatalogSyncStore {
         conn.execute(DDL_RECEIPTS, []).context("create sync_receipts")?;
         conn.execute(DDL_SYNC_SOURCES, []).context("create sync_sources")?;
         conn.execute(DDL_INBOUND, []).context("create sync_inbound")?;
+        // Transfers Batch Model reset (spec §Migration): after `DDL_INBOUND`,
+        // before `ensure_inbound_columns` — see the standalone `open` for the
+        // detector-placement rationale. Here all eight transfer tables exist on a
+        // legacy catalog, so the wipe reaches receipts/sources too.
+        wipe_transfer_bookkeeping_on_upgrade(&conn)?;
         ensure_inbound_columns(&conn)?;
         conn.execute(DDL_OUTBOUND_FILES, []).context("create sync_outbound_files")?;
         conn.execute(DDL_INBOUND_FILES, []).context("create sync_inbound_files")?;
@@ -2296,6 +2594,11 @@ impl SyncStore for CatalogSyncStore {
         }
         tracing::debug!(package_id = id, receipts = receipts.len(), changed, "catalog sync store confirm");
         Ok(())
+    }
+
+    fn reset_outbound_for_resend(&self, id: i64, new_wire_id: &str) -> Result<()> {
+        let conn = self.lock_conn();
+        reset_outbound_for_resend(&conn, id, new_wire_id)
     }
 
     fn append_history(&self, h: HistoryRow) -> Result<()> {
@@ -3016,5 +3319,183 @@ mod tests {
         delete_sync_events(&conn, Direction::Sent, "7").unwrap();
         assert!(list_sync_events(&conn, Direction::Sent, "7").unwrap().is_empty());
         assert_eq!(list_sync_events(&conn, Direction::Sent, "8").unwrap().len(), 1);
+    }
+
+    // ── Transfers Batch Model (tvb B2) ──────────────────────────────────────
+
+    /// Batch Model §Migration: a FRESH `open` is born with `batch_uuid` /
+    /// `project_id` and the unique `(peer, batch_uuid)` index, so the upgrade wipe
+    /// never fires; a second open is a clean no-op.
+    #[test]
+    fn fresh_open_has_batch_columns_index_and_never_wipes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sync.db");
+        let store = StandaloneSyncStore::open(&path).unwrap();
+        // A row present on the fresh DB must survive a re-open (no spurious wipe).
+        let id = store.enqueue("pkg", PEER, None, &[]).unwrap();
+        drop(store);
+        StandaloneSyncStore::open(&path).unwrap(); // second open — idempotent
+
+        let conn = Connection::open(&path).unwrap();
+        assert!(cols(&conn, "sync_inbound").contains(&"batch_uuid".to_string()));
+        assert!(cols(&conn, "sync_inbound").contains(&"project_id".to_string()));
+        assert!(cols(&conn, "sync_outbound").contains(&"project_id".to_string()));
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_sync_inbound_batch'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "unique (peer, batch_uuid) index present on a fresh open");
+        // The pre-existing outbound row was NOT wiped by the second open.
+        assert!(
+            outbound_row_by_id(&conn, id).unwrap().is_some(),
+            "a fresh DB is born migrated — re-open must not wipe its rows",
+        );
+    }
+
+    /// Batch Model §Migration: the upgrade wipe empties every present transfer
+    /// table when `sync_inbound.batch_uuid` is absent, fires EXACTLY once (the
+    /// column it back-fills is the flag), and skips a sender-only store's missing
+    /// `sync_receipts` / `sync_sources` rather than erroring.
+    #[test]
+    fn upgrade_wipe_clears_present_tables_once_and_tolerates_missing() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Legacy `sync_inbound` (no batch_uuid) + the sender-only table subset —
+        // deliberately NO sync_receipts / sync_sources (Perseus shape).
+        conn.execute(
+            "CREATE TABLE sync_inbound (id INTEGER PRIMARY KEY, peer TEXT, package_id TEXT, state TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute("CREATE TABLE sync_outbound (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE sync_outbound_files (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE sync_inbound_files (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE sync_events (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
+        conn.execute("CREATE TABLE sync_history (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
+        for t in ["sync_inbound", "sync_outbound", "sync_outbound_files", "sync_inbound_files", "sync_events", "sync_history"] {
+            conn.execute(&format!("INSERT INTO {t} DEFAULT VALUES"), []).unwrap();
+        }
+
+        // Absent batch_uuid → wipe fires; no panic on the two missing tables.
+        wipe_transfer_bookkeeping_on_upgrade(&conn).unwrap();
+        for t in ["sync_inbound", "sync_outbound", "sync_outbound_files", "sync_inbound_files", "sync_events", "sync_history"] {
+            let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "{t} wiped");
+        }
+
+        // Add the flag + a fresh row; a second wipe must NOT fire (idempotent flag).
+        conn.execute("ALTER TABLE sync_inbound ADD COLUMN batch_uuid TEXT", []).unwrap();
+        conn.execute("INSERT INTO sync_outbound DEFAULT VALUES", []).unwrap();
+        wipe_transfer_bookkeeping_on_upgrade(&conn).unwrap();
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM sync_outbound", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1, "flag present → second wipe is a no-op");
+    }
+
+    /// Batch Model §D1/§D3: `reset_outbound_for_resend` reuses the SAME row —
+    /// `attempts += 1`, a fresh wire id, cleared error/retry/confirm fields, and
+    /// every per-file row back to `pending`/`bytes_done 0`/cleared verdicts. A
+    /// missing row errors.
+    #[test]
+    fn reset_outbound_for_resend_resets_row_and_files() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_OUTBOUND, []).unwrap();
+        conn.execute(DDL_OUTBOUND_FILES, []).unwrap();
+
+        // A confirmed row (attempts=1) with a stale error/retry + two per-file rows
+        // in non-pending states carrying verdicts.
+        let files = [
+            AnnounceFileEntry { rel_path: "a.fits".into(), byte_size: 100, frame_uuid: "u-a".into() },
+            AnnounceFileEntry { rel_path: "b.fits".into(), byte_size: 200, frame_uuid: "u-b".into() },
+        ];
+        let id = insert_outbound_with_files(&conn, "pkg", &node_id_hex(&PEER), Some("M42"), &files).unwrap();
+        conn.execute("UPDATE sync_outbound SET attempts = 1, wire_package_id = 'wire-old', confirmed_at = 't0', last_error = 'boom', next_retry_at = 't1', state = 'confirmed' WHERE id = ?1", params![id]).unwrap();
+        set_outbound_file_state(&conn, id, "a.fits", OutboundFileState::Done, 100, Some("ingested"), None).unwrap();
+        set_outbound_file_state(&conn, id, "b.fits", OutboundFileState::Uploaded, 200, None, Some("stale")).unwrap();
+
+        reset_outbound_for_resend(&conn, id, "wire-new").unwrap();
+
+        let row = outbound_row_by_id(&conn, id).unwrap().unwrap();
+        assert_eq!(row.state, OutboundState::Queued, "reset to queued");
+        assert_eq!(row.attempts, 2, "attempts incremented");
+        assert_eq!(row.wire_package_id.as_deref(), Some("wire-new"), "fresh wire id");
+        assert_eq!(row.last_error, None, "last_error cleared");
+        assert_eq!(row.next_retry_at, None, "next_retry_at cleared");
+        assert_eq!(row.confirmed_at, None, "confirmed_at cleared");
+        assert_eq!(row.display_name.as_deref(), Some("M42"), "display_name preserved");
+
+        for f in list_outbound_files(&conn, id).unwrap() {
+            assert_eq!(f.state, OutboundFileState::Pending, "{} reset to pending", f.rel_path);
+            assert_eq!(f.bytes_done, 0, "{} bytes_done reset", f.rel_path);
+            assert_eq!(f.outcome, None, "{} outcome cleared", f.rel_path);
+            assert_eq!(f.error, None, "{} error cleared", f.rel_path);
+        }
+
+        // A missing row errors, never silently succeeds.
+        assert!(reset_outbound_for_resend(&conn, 9999, "wire-x").is_err());
+    }
+
+    /// Batch Model §D1: `upsert_inbound_attempt` inserts on first announce, resets
+    /// an existing row to `announced` with the new wire id while PRESERVING
+    /// `display_name`/`landing_dir`, and leaves a `cancelled` row untouched with the
+    /// `cancelled_final` flag. `get_inbound_by_batch` resolves the row; the unique
+    /// `(peer, batch_uuid)` index collapses two attempts of one batch into one row
+    /// while keeping two distinct batches apart.
+    #[test]
+    fn upsert_inbound_attempt_batch_keyed_lifecycle() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_INBOUND, []).unwrap();
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_sync_inbound_batch ON sync_inbound(peer, batch_uuid)",
+            [],
+        )
+        .unwrap();
+        let peer = node_id_hex(&PEER);
+
+        // First announce → INSERT, not cancelled-final.
+        let (id, cancelled) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-1", 3, 300).unwrap();
+        assert!(!cancelled);
+        let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
+        assert_eq!(row.id, id);
+        assert_eq!(row.state, InboundState::Announced);
+        assert_eq!(row.package_id, "wire-1", "wire id stamped");
+        assert_eq!(row.batch_uuid.as_deref(), Some("batch-1"));
+        assert_eq!(row.frame_count, 3);
+
+        // Give the row a name + landing dir + advance it, then a SECOND attempt.
+        set_inbound_display_name(&conn, id, Some("Downloads M42")).unwrap();
+        set_inbound_landing_dir(&conn, id, "/incoming/peer/m42").unwrap();
+        set_inbound_state(&conn, "wire-1", InboundState::Fetching, None).unwrap();
+        set_inbound_bytes_done(&conn, "wire-1", 150).unwrap();
+
+        let (id2, cancelled2) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-2", 4, 400).unwrap();
+        assert!(!cancelled2);
+        assert_eq!(id2, id, "same batch → same row (one row per (peer, batch_uuid))");
+        let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
+        assert_eq!(row.state, InboundState::Announced, "reset to announced");
+        assert_eq!(row.package_id, "wire-2", "new attempt's wire id");
+        assert_eq!(row.bytes_done, 0, "bytes_done reset");
+        assert_eq!(row.frame_count, 4, "counts refreshed");
+        assert_eq!(row.display_name.as_deref(), Some("Downloads M42"), "display_name preserved");
+        assert_eq!(row.landing_dir.as_deref(), Some("/incoming/peer/m42"), "landing_dir preserved");
+
+        // A second, distinct batch from the same peer → a distinct row (index allows it).
+        let (id3, _) = upsert_inbound_attempt(&conn, &peer, "batch-2", "wire-3", 1, 10).unwrap();
+        assert_ne!(id3, id, "distinct batch_uuid → distinct row");
+
+        // Cancelled-is-final: a cancelled row is left untouched, flagged.
+        set_inbound_state(&conn, "wire-2", InboundState::Cancelled, Some("declined")).unwrap();
+        let (id4, cancelled4) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-4", 9, 900).unwrap();
+        assert!(cancelled4, "a cancelled row reports cancelled_final");
+        assert_eq!(id4, id, "same row id returned");
+        let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
+        assert_eq!(row.state, InboundState::Cancelled, "still cancelled — untouched");
+        assert_eq!(row.package_id, "wire-2", "wire id NOT rotated on a cancelled row");
+        assert_eq!(row.frame_count, 4, "counts NOT refreshed on a cancelled row");
+        assert_eq!(row.last_error.as_deref(), Some("declined"), "cancel reason preserved");
+
+        // A lookup for an unknown batch is None, never an error.
+        assert!(get_inbound_by_batch(&conn, &peer, "nope").unwrap().is_none());
     }
 }

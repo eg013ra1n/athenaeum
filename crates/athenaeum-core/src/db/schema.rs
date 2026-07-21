@@ -1718,9 +1718,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // per-frame receipts alongside the catalog it ingests into.
     {
         use crate::sync::store::{
-            ensure_history_columns, ensure_inbound_columns, ensure_outbound_columns, DDL_HISTORY,
-            DDL_INBOUND, DDL_INBOUND_FILES, DDL_INDEXES, DDL_OUTBOUND, DDL_OUTBOUND_FILES,
-            DDL_RECEIPTS, DDL_SYNC_EVENTS, DDL_SYNC_SOURCES,
+            ensure_history_columns, ensure_inbound_columns, ensure_outbound_columns,
+            wipe_transfer_bookkeeping_on_upgrade, DDL_HISTORY, DDL_INBOUND, DDL_INBOUND_FILES,
+            DDL_INDEXES, DDL_OUTBOUND, DDL_OUTBOUND_FILES, DDL_RECEIPTS, DDL_SYNC_EVENTS,
+            DDL_SYNC_SOURCES,
         };
         conn.execute(DDL_OUTBOUND, [])?;
         // `CREATE TABLE IF NOT EXISTS` never adds a column to an already-existing
@@ -1742,6 +1743,14 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         // `display_name` column — back-filled here by the store's own guard (same
         // owned-column-list discipline as the outbound / history guards above).
         conn.execute(DDL_INBOUND, [])?;
+        // Transfers Batch Model reset (spec §Migration, owner decision 2026-07-21):
+        // one-shot wipe of ALL transfer bookkeeping on the batch-model upgrade,
+        // gated on the ABSENCE of `sync_inbound.batch_uuid` (the migrated-flag). Runs
+        // after `DDL_INBOUND` (fresh DB is born with the column → never wipes) and
+        // before `ensure_inbound_columns` (which adds it → would hide the flag). The
+        // store owns the wipe SQL — call its guard here, never an inline copy, so this
+        // third materialisation site can never drift. Catalog tables are never touched.
+        wipe_transfer_bookkeeping_on_upgrade(conn).map_err(sync_migrate_err)?;
         ensure_inbound_columns(conn).map_err(sync_migrate_err)?;
         // Transfers Status Model v2 §D4/§D7: per-file rows + the capped event
         // journal. NEW tables (no legacy shape to migrate), so `CREATE TABLE IF
@@ -2076,16 +2085,20 @@ mod identity_schema_tests {
         init_db(&legacy).unwrap();
 
         // Every cycle-added trailing column is present after migration
-        // (`display_name` / `batch_name` are the Transfers Status Model v2 §D1 adds).
+        // (`display_name` / `batch_name` are the Transfers Status Model v2 §D1 adds;
+        // `project_id` / `batch_uuid` are the Transfers Batch Model §D1/§D6 adds).
         for (table, col) in [
             ("sync_outbound", "last_error"),
             ("sync_outbound", "next_retry_at"),
             ("sync_outbound", "wire_package_id"),
             ("sync_outbound", "display_name"),
+            ("sync_outbound", "project_id"),
             ("sync_history", "project"),
             ("sync_history", "package_id"),
             ("sync_history", "batch_name"),
             ("sync_inbound", "display_name"),
+            ("sync_inbound", "batch_uuid"),
+            ("sync_inbound", "project_id"),
         ] {
             assert!(
                 column_exists(&legacy, table, col).unwrap(),
@@ -2112,6 +2125,155 @@ mod identity_schema_tests {
                 "{table} must be created by init_db",
             );
         }
+    }
+
+    /// Transfers Batch Model (spec §Migration): on the first init with the new
+    /// schema — detected by the ABSENCE of `sync_inbound.batch_uuid` — `init_db`
+    /// wipes ALL transfer bookkeeping in one pass (owner decision 2026-07-21: the
+    /// accumulated records are smoke-test debris), then adds the new columns/index.
+    /// It must (a) empty every transfer table, (b) leave the catalog (`files` /
+    /// `frames`) untouched, and (c) NEVER re-fire on a later init (column presence
+    /// is the migrated-flag).
+    ///
+    /// Built by initialising a correct schema, seeding it, then surgically dropping
+    /// the `batch_uuid` flag (recreating a pre-batch `sync_inbound`) to simulate an
+    /// upgraded 0.4.x/beta.3 DB — cleaner than hand-writing every legacy table shape.
+    #[test]
+    fn batch_upgrade_wipes_transfer_tables_once_and_spares_catalog() {
+        fn count(conn: &Connection, table: &str) -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap()
+        }
+        // Every transfer-bookkeeping table the wipe must empty (spec §Migration).
+        let transfer_tables = [
+            "sync_outbound",
+            "sync_inbound",
+            "sync_outbound_files",
+            "sync_inbound_files",
+            "sync_events",
+            "sync_receipts",
+            "sync_sources",
+            "sync_history",
+        ];
+
+        // 1) A correct, fully-initialised catalog (fresh → batch_uuid present → no wipe).
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // 2) Catalog fixtures that MUST survive the wipe.
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES ('/data/a.fits', 'a.fits', 100, '2026-07-21T00:00:00Z', 'FITS')",
+            [],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE path = '/data/a.fits'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute("INSERT INTO frames (file_id, object) VALUES (?1, 'M42')", rusqlite::params![file_id])
+            .unwrap();
+
+        // 3) Seed a row in every transfer table (all shapes are already correct here).
+        conn.execute(
+            "INSERT INTO sync_outbound (package_ref, peer, state, created_at)
+             VALUES ('pkg-a', 'peerhex', 'confirmed', 't0')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_outbound_files (outbound_id, rel_path, byte_size, frame_uuid, state, updated_at)
+             VALUES (1, 'a.fits', 100, 'u1', 'done', 't0')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_inbound_files (inbound_id, rel_path, byte_size, frame_uuid, state, updated_at)
+             VALUES (1, 'b.fits', 50, 'u2', 'done', 't0')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_events (direction, batch_key, ts, kind) VALUES ('sent', '1', 't0', 'enqueued')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_receipts (package_id, frame_uuid, xxh3, outcome, received_at)
+             VALUES ('pkg-a', 'u1', 'h', 'ingested', 't0')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_sources (package_ref, path, size, mtime, enqueued_at)
+             VALUES ('pkg-a', '/data/a.fits', 100, 0, 't0')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_history (frame_uuid, filename, direction, outcome) VALUES ('u1', 'a.fits', 'sent', 'sent')",
+            [],
+        )
+        .unwrap();
+
+        // 4) Simulate an upgraded (pre-batch) DB: drop the `batch_uuid` flag by
+        //    recreating a legacy `sync_inbound` (no batch_uuid), and seed a row.
+        //    Dropping the table also drops the `idx_sync_inbound_batch` index on it.
+        conn.execute("DROP TABLE sync_inbound", []).unwrap();
+        conn.execute(
+            "CREATE TABLE sync_inbound (
+                id INTEGER PRIMARY KEY, peer TEXT NOT NULL, package_id TEXT NOT NULL,
+                state TEXT NOT NULL, frame_count INTEGER NOT NULL DEFAULT 0,
+                byte_size INTEGER NOT NULL DEFAULT 0, bytes_done INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT, created_at TEXT NOT NULL, finished_at TEXT,
+                display_name TEXT, landing_dir TEXT,
+                UNIQUE(peer, package_id)
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_inbound (peer, package_id, state, created_at)
+             VALUES ('peerhex', 'wire-1', 'done', 't0')",
+            [],
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "sync_inbound", "batch_uuid").unwrap());
+        for t in transfer_tables {
+            assert_eq!(count(&conn, t), 1, "seed: {t} has one row before the upgrade wipe");
+        }
+
+        // 5) Upgrade init: the wipe fires (batch_uuid absent) and empties every
+        //    transfer table; the catalog is untouched.
+        init_db(&conn).unwrap();
+        for t in transfer_tables {
+            assert_eq!(count(&conn, t), 0, "upgrade wipe emptied {t}");
+        }
+        assert_eq!(count(&conn, "files"), 1, "catalog files row survives the wipe");
+        assert_eq!(count(&conn, "frames"), 1, "catalog frames row survives the wipe");
+        // The batch-model columns + unique index now exist.
+        assert!(column_exists(&conn, "sync_inbound", "batch_uuid").unwrap());
+        assert!(column_exists(&conn, "sync_inbound", "project_id").unwrap());
+        assert!(column_exists(&conn, "sync_outbound", "project_id").unwrap());
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_sync_inbound_batch'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "unique (peer, batch_uuid) index created");
+
+        // 6) EXACTLY once: a sentinel transfer row inserted AFTER the wipe must
+        //    survive a second init (batch_uuid now present → detector skips the wipe).
+        conn.execute(
+            "INSERT INTO sync_outbound (package_ref, peer, state, created_at)
+             VALUES ('pkg-sentinel', 'peerhex', 'confirmed', 't1')",
+            [],
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(count(&conn, "sync_outbound"), 1, "second init must NOT re-wipe (sentinel survives)");
+        assert_eq!(count(&conn, "files"), 1, "catalog still intact after the second init");
     }
 
     fn assert_v4_shape(u: &str) {
