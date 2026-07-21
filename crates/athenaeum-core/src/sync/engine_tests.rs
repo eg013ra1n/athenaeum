@@ -27,8 +27,8 @@ use crate::package::{
 use crate::sharing::iroh::proto::{FullHashEntry, OfferEntry};
 use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
 use crate::sharing::types::{
-    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, StartInfo,
-    TransportEvent,
+    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome,
+    RevokeReason, StartInfo, TransportEvent,
 };
 use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
 
@@ -3864,6 +3864,515 @@ async fn mid_transfer_abort_leaves_file_sending_then_resume_uploads() {
     let rows = files_of(&store, id);
     assert_eq!(rows[0].state, OutboundFileState::Done);
     assert_eq!(rows[0].outcome.as_deref(), Some("ingested"));
+
+    engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Transfers Batch Model (B3): resend-as-reset, per-attempt wire ids, Revoke.
+// ---------------------------------------------------------------------------
+
+/// Announce file entries derived from a package's on-disk manifest — the §D4
+/// per-file rows a real send carries into `enqueue_package`.
+fn announce_files_of(pkg: &Path) -> Vec<AnnounceFileEntry> {
+    package::read_manifest(pkg)
+        .unwrap()
+        .into_iter()
+        .map(|r| AnnounceFileEntry {
+            rel_path: r.rel_path,
+            byte_size: r.byte_size,
+            frame_uuid: r.frame_uuid,
+        })
+        .collect()
+}
+
+/// `Ingested` receipts for every frame in a package's manifest.
+fn ingested_receipts_of(pkg: &Path) -> Vec<FrameReceipt> {
+    package::read_manifest(pkg)
+        .unwrap()
+        .into_iter()
+        .map(|r| FrameReceipt {
+            frame_uuid: r.frame_uuid,
+            xxh3: r.xxh3,
+            outcome: ReceiptOutcome::Ingested,
+        })
+        .collect()
+}
+
+/// The persisted per-attempt wire id of outbound row `id`.
+fn wire_of(store: &StandaloneSyncStore, id: i64) -> Option<String> {
+    store.get_outbound(id).unwrap().and_then(|r| r.wire_package_id)
+}
+
+/// Whether `id` has announced + is serving/awaiting-ack — `Transferring` OR the
+/// post-upload `Delivered` (a receiver that fetches advances it to the latter).
+/// The single non-terminal "announce reached the peer" signal the resend/revoke
+/// tests wait on.
+fn is_serving(store: &StandaloneSyncStore, id: i64) -> bool {
+    matches!(
+        state_of(store, id),
+        Some(OutboundState::Transferring) | Some(OutboundState::Delivered)
+    )
+}
+
+/// Shared observation state for the resend/revoke tests: every announce id seen,
+/// every revoke `(package_id, reason)` seen, and a switch to withhold acks.
+#[derive(Clone)]
+struct Recorder {
+    announces: Arc<std::sync::Mutex<Vec<String>>>,
+    revokes: Arc<std::sync::Mutex<Vec<(String, RevokeReason)>>>,
+    ack_enabled: Arc<AtomicBool>,
+}
+
+impl Recorder {
+    fn new(ack_enabled: bool) -> Self {
+        Self {
+            announces: Arc::new(std::sync::Mutex::new(Vec::new())),
+            revokes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            ack_enabled: Arc::new(AtomicBool::new(ack_enabled)),
+        }
+    }
+    fn announces(&self) -> Vec<String> {
+        self.announces.lock().unwrap().clone()
+    }
+    fn revokes(&self) -> Vec<(String, RevokeReason)> {
+        self.revokes.lock().unwrap().clone()
+    }
+}
+
+/// A reactive receiver that records every announce id + revoke and acks `Ingested`
+/// on each announce ONLY while `ack_enabled` (so a test can hold a transfer in
+/// `awaiting-ack` and cancel it, then let the resend confirm).
+fn spawn_recording_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf, rec: Recorder) {
+    tokio::spawn(async move {
+        let mut events = endpoint.events().await;
+        let mut n = 0usize;
+        while let Some(event) = events.recv().await {
+            match event {
+                TransportEvent::AnnounceReceived { from, announce, .. } => {
+                    rec.announces.lock().unwrap().push(announce.package_id.0.clone());
+                    n += 1;
+                    let dest = dest_root.join(format!("fetch-{n}"));
+                    if endpoint.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok()
+                        && rec.ack_enabled.load(SeqCst)
+                    {
+                        if let Ok(records) = package::read_manifest(&dest) {
+                            let receipts: Vec<FrameReceipt> = records
+                                .iter()
+                                .map(|r| FrameReceipt {
+                                    frame_uuid: r.frame_uuid.clone(),
+                                    xxh3: r.xxh3.clone(),
+                                    outcome: ReceiptOutcome::Ingested,
+                                })
+                                .collect();
+                            let _ = endpoint.ack(from, &announce.package_id, receipts).await;
+                        }
+                    }
+                }
+                TransportEvent::RevokeReceived { package_id, reason, .. } => {
+                    rec.revokes.lock().unwrap().push((package_id.0, reason));
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+/// The full one-row resend cycle over loopback (Transfers Batch Model §D1):
+/// enqueue → cancel mid-serve → resend → confirm, ALL on ONE row. Pins that the
+/// row id is constant, the wire id rotates per attempt (and the resend announces
+/// the NEW one — the stale-wire-id regression), the cancel emits
+/// `Revoke{Cancelled}` for the old wire id, per-file rows reset then settle, and
+/// the journal reads cancelled → revoke_sent → resend → confirmed in order.
+#[tokio::test]
+async fn resend_cycle_one_row_cancel_then_confirm() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    // Acks withheld: attempt 1 parks in awaiting-ack so the cancel lands mid-serve.
+    let rec = Recorder::new(false);
+    spawn_recording_receiver(receiver.clone(), tmp.path().join("recv"), rec.clone());
+
+    let pkg = build_package(&tmp.path().join("src"), "uuid-rc", "rc.fits", "M42", 4096);
+    let files = announce_files_of(&pkg);
+    let db_path = tmp.path().join("sync.db");
+    let store = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+
+    let id = engine
+        .enqueue_package(&pkg, Some("RC batch".into()), files)
+        .await
+        .unwrap();
+
+    // Attempt 1 announces (acks withheld) → row parks Transferring; capture w1.
+    wait_until(|| is_serving(&store, id), WAIT).await;
+    let w1 = wire_of(&store, id).expect("attempt 1 persisted a wire id");
+
+    // Cancel mid-serve → Cancelled + Revoke{Cancelled}(w1).
+    engine.cancel(id).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
+    wait_until(
+        || rec.revokes().iter().any(|(pid, r)| *pid == w1 && *r == RevokeReason::Cancelled),
+        WAIT,
+    )
+    .await;
+
+    // Resend: reset the SAME row (fresh wire id) + journal `resend` (as the api
+    // layer does), enable acks, then re-drive.
+    let w2 = uuid::Uuid::new_v4().to_string();
+    store.reset_outbound_for_resend(id, &w2).unwrap();
+    store
+        .append_sync_event(Direction::Sent, &id.to_string(), "resend", None)
+        .unwrap();
+    rec.ack_enabled.store(true, SeqCst);
+    engine.resend(id).await.unwrap();
+
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+
+    // ONE row: same id, attempts advanced, wire rotated to the resend's id.
+    let row = store.get_outbound(id).unwrap().unwrap();
+    assert!(row.attempts >= 2, "attempts advanced past the original, got {}", row.attempts);
+    assert_ne!(w2, w1, "resend rotated the wire id");
+    assert_eq!(
+        row.wire_package_id.as_deref(),
+        Some(w2.as_str()),
+        "the confirmed attempt kept the resend's wire id",
+    );
+
+    // The resend announced the NEW wire id (no stale caching across the reset).
+    let announces = rec.announces();
+    assert!(announces.contains(&w1), "attempt 1 announced w1, got {announces:?}");
+    assert!(announces.contains(&w2), "the resend announced the NEW wire id w2, got {announces:?}");
+
+    // Per-file rows reset then settled to done/ingested on the resend.
+    let rows = files_of(&store, id);
+    assert!(!rows.is_empty(), "the batch has per-file rows");
+    assert!(
+        rows.iter().all(|r| r.state == OutboundFileState::Done && r.outcome.as_deref() == Some("ingested")),
+        "every file settled ingested on the resend, got {rows:?}",
+    );
+
+    // Journal order: cancelled → revoke_sent → resend → confirmed. `sent_event_kinds`
+    // is newest-first; reverse to chronological so `position` reads left-to-right.
+    let mut kinds = sent_event_kinds(&db_path, id);
+    kinds.reverse();
+    let pos = |k: &str| kinds.iter().position(|x| x == k);
+    assert!(pos("cancelled").is_some(), "journal has cancelled, got {kinds:?}");
+    assert!(pos("revoke_sent").is_some(), "journal has revoke_sent, got {kinds:?}");
+    assert!(pos("resend").is_some(), "journal has resend, got {kinds:?}");
+    assert!(pos("confirmed").is_some(), "journal has confirmed, got {kinds:?}");
+    assert!(pos("cancelled") < pos("revoke_sent"), "cancelled before revoke_sent, got {kinds:?}");
+    assert!(pos("revoke_sent") < pos("resend"), "revoke_sent before resend, got {kinds:?}");
+    assert!(pos("resend") < pos("confirmed"), "resend before confirmed, got {kinds:?}");
+
+    engine.shutdown().await;
+}
+
+/// Attempt-isolation (§D1, item 5): a resend mints a fresh wire id, so an ack
+/// carrying the OLD attempt's wire id can NEVER short-circuit the new attempt.
+/// Seeds a stale `Ingested` ack keyed by the cancelled attempt's wire id and
+/// asserts the row does NOT confirm; only an ack on the fresh wire id does.
+#[tokio::test]
+async fn old_attempt_wire_id_ack_does_not_replay_onto_resend() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    // Never auto-acks — this test drives the acks by hand.
+    let rec = Recorder::new(false);
+    spawn_recording_receiver(receiver.clone(), tmp.path().join("recv"), rec.clone());
+
+    let pkg = build_package(&tmp.path().join("src"), "uuid-replay", "r.fits", "M42", 4096);
+    let files = announce_files_of(&pkg);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    // Keep the sender endpoint so we know its node id for the hand-driven acks.
+    let sender_ep = Arc::new(net.endpoint());
+    let sender_node = sender_ep.node_id();
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        sender_ep as Arc<dyn SharingTransport>,
+        receiver_id,
+    );
+
+    let id = engine.enqueue_package(&pkg, None, files).await.unwrap();
+    wait_until(|| is_serving(&store, id), WAIT).await;
+    let w1 = wire_of(&store, id).expect("attempt 1 wire id");
+
+    // Cancel → Cancelled, then resend with a fresh wire id.
+    engine.cancel(id).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
+    let w2 = uuid::Uuid::new_v4().to_string();
+    store.reset_outbound_for_resend(id, &w2).unwrap();
+    engine.resend(id).await.unwrap();
+    // Wait until the resend has re-announced the NEW wire id (slot now holds w2 and
+    // is awaiting the ack — the fetch may have already advanced it to Delivered).
+    wait_until(|| rec.announces().contains(&w2), WAIT).await;
+    wait_until(|| is_serving(&store, id), WAIT).await;
+
+    // STALE ack keyed by the cancelled attempt's wire id: must be ignored.
+    receiver
+        .ack(sender_node, &PackageId(w1.clone()), ingested_receipts_of(&pkg))
+        .await
+        .unwrap();
+    // Give the sender a moment to (not) act on it.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_ne!(
+        state_of(&store, id),
+        Some(OutboundState::Confirmed),
+        "a stale old-wire-id ack must NOT confirm the resent attempt",
+    );
+
+    // FRESH ack on the resend's wire id: confirms.
+    receiver
+        .ack(sender_node, &PackageId(w2.clone()), ingested_receipts_of(&pkg))
+        .await
+        .unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    assert_eq!(wire_of(&store, id).as_deref(), Some(w2.as_str()));
+
+    engine.shutdown().await;
+}
+
+/// A [`DedupResponder`] whose verdict flips on a shared flag: want-all while
+/// `false` (session 1 gets a real announce), all-duplicate while `true` (session
+/// 2's re-negotiate finds the peer already holds every frame).
+struct SwitchableResponder {
+    all_duplicate: Arc<AtomicBool>,
+}
+impl DedupResponder for SwitchableResponder {
+    fn want_for_offer(&self, entries: &[OfferEntry]) -> (Vec<String>, Vec<String>) {
+        if self.all_duplicate.load(SeqCst) {
+            (Vec::new(), entries.iter().map(|e| e.rel_path.clone()).collect())
+        } else {
+            (entries.iter().map(|e| e.rel_path.clone()).collect(), Vec::new())
+        }
+    }
+    fn confirm_full_hashes(&self, _entries: &[FullHashEntry]) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// The superseded race (§F3/§D2): a `Transferring` row whose announce already
+/// reached the peer is re-driven (crash-resume) and this time the dedup handshake
+/// finds the peer holds every frame → all-duplicate confirm. Because a prior
+/// announce for this SAME wire id left the receiver a row, the sender must emit
+/// `Revoke{Superseded}` for it. Constructed via the traced path: session 1
+/// announces (want-all), the engine is killed mid-serve, the peer flips to
+/// all-duplicate, session 2's crash-resume re-negotiates and terminalizes.
+#[tokio::test]
+async fn revoke_superseded_on_all_duplicate_after_prior_announce() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let all_dup = Arc::new(AtomicBool::new(false));
+    let receiver = Arc::new(net.endpoint_with_responder(Arc::new(SwitchableResponder {
+        all_duplicate: all_dup.clone(),
+    })));
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let rec = Recorder::new(false); // no acks: session 1 must stay Transferring.
+    spawn_recording_receiver(receiver.clone(), tmp.path().join("recv"), rec.clone());
+
+    let pkg = build_package(&tmp.path().join("src"), "uuid-sup", "s.fits", "M42", 4096);
+    let files = announce_files_of(&pkg);
+    let db_path = tmp.path().join("sync.db");
+    let store1 = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
+    let engine1 = SyncEngine::spawn(
+        store1.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+
+    // Session 1: want-all → serve + announce → Transferring. Capture the wire id.
+    let id = engine1.enqueue_package(&pkg, None, files).await.unwrap();
+    wait_until(|| is_serving(&store1, id), WAIT).await;
+    let w1 = wire_of(&store1, id).expect("attempt 1 wire id");
+
+    // Peer now holds everything; kill session 1 mid-serve (row stays Transferring).
+    all_dup.store(true, SeqCst);
+    engine1.shutdown().await;
+
+    // Session 2: fresh engine, SAME store → crash-resume re-negotiates → the peer
+    // reports all-duplicate → terminalize as confirmed AND revoke the stuck row.
+    let store2 = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
+    let engine2 = SyncEngine::spawn(
+        store2.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+
+    wait_until(|| state_of(&store2, id) == Some(OutboundState::Confirmed), WAIT).await;
+    wait_until(
+        || rec.revokes().iter().any(|(pid, r)| *pid == w1 && *r == RevokeReason::Superseded),
+        WAIT,
+    )
+    .await;
+
+    // The journal records the superseded revoke.
+    let kinds = sent_event_kinds(&db_path, id);
+    assert!(kinds.iter().any(|k| k == "revoke_sent"), "journal has revoke_sent, got {kinds:?}");
+
+    engine2.shutdown().await;
+}
+
+/// Local terminal failure (§D2): when the package payload vanishes after its
+/// announce reached the peer, the re-drive fails the transfer terminally
+/// (`Failed`) and must best-effort `Revoke{Failed}` the outstanding announce so
+/// the receiver tears down.
+#[tokio::test]
+async fn revoke_failed_on_local_terminal_failure() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let rec = Recorder::new(false); // no acks → stays Transferring after announce.
+    spawn_recording_receiver(receiver.clone(), tmp.path().join("recv"), rec.clone());
+
+    let pkg = build_package(&tmp.path().join("src"), "uuid-fail", "f.fits", "M42", 4096);
+    let files = announce_files_of(&pkg);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+
+    let id = engine.enqueue_package(&pkg, None, files).await.unwrap();
+    wait_until(|| is_serving(&store, id), WAIT).await;
+    let w1 = wire_of(&store, id).expect("attempt 1 wire id");
+
+    // Delete the payload dir, then kick a re-attempt: `attempt` sees the dir gone
+    // and fails the package terminally (the ONE local-unrecoverable case).
+    std::fs::remove_dir_all(&pkg).unwrap();
+    engine.kick(id).await.unwrap();
+
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Failed), WAIT).await;
+    wait_until(
+        || rec.revokes().iter().any(|(pid, r)| *pid == w1 && *r == RevokeReason::Failed),
+        WAIT,
+    )
+    .await;
+
+    engine.shutdown().await;
+}
+
+/// A transport whose `revoke` blocks for a long time (a dead peer's delivery-ack
+/// never comes) but delegates everything else to a working loopback endpoint.
+struct SlowRevokeTransport(Arc<LoopbackTransport>);
+
+#[async_trait::async_trait]
+impl SharingTransport for SlowRevokeTransport {
+    async fn start(&self) -> anyhow::Result<StartInfo> {
+        self.0.start().await
+    }
+    async fn announce(
+        &self,
+        to: NodeId,
+        a: &PackageAnnounce,
+        batch_name: &str,
+        batch_uuid: &str,
+        files: &[AnnounceFileEntry],
+    ) -> anyhow::Result<()> {
+        self.0.announce(to, a, batch_name, batch_uuid, files).await
+    }
+    async fn revoke(
+        &self,
+        _to: NodeId,
+        _package_id: &PackageId,
+        _reason: RevokeReason,
+    ) -> anyhow::Result<()> {
+        // A dead peer: the delivery-acked control never settles. If the cancel
+        // path awaited this, it would stall ~30s — the test proves it does not.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(())
+    }
+    async fn fetch(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest_dir: &Path,
+        sink: FetchSink,
+    ) -> anyhow::Result<()> {
+        self.0.fetch(from, pkg, dest_dir, sink).await
+    }
+    async fn fetch_manifest(
+        &self,
+        from: NodeId,
+        pkg: &PackageAnnounce,
+        dest_dir: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        self.0.fetch_manifest(from, pkg, dest_dir).await
+    }
+    async fn serve(
+        &self,
+        pkg: &PackageAnnounce,
+        src_dir: &Path,
+        want: Option<&HashSet<String>>,
+    ) -> anyhow::Result<()> {
+        self.0.serve(pkg, src_dir, want).await
+    }
+    async fn ack(
+        &self,
+        to: NodeId,
+        package_id: &PackageId,
+        receipts: Vec<FrameReceipt>,
+    ) -> anyhow::Result<()> {
+        self.0.ack(to, package_id, receipts).await
+    }
+    async fn release(&self, package_id: &PackageId) -> anyhow::Result<()> {
+        self.0.release(package_id).await
+    }
+    async fn events(&self) -> mpsc::Receiver<TransportEvent> {
+        self.0.events().await
+    }
+}
+
+/// Cancel latency is independent of the revoke's delivery-ack (B1 seam): the
+/// revoke rides a delivery-acked control that can hang ~30s on a dead peer, but
+/// `cancel_package` spawns it fire-and-forget, so the row reaches `Cancelled`
+/// immediately. Uses a transport whose `revoke` sleeps 30s.
+#[tokio::test]
+async fn cancel_with_dead_peer_revoke_does_not_stall() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let rec = Recorder::new(false); // no acks → stays Transferring after announce.
+    spawn_recording_receiver(receiver.clone(), tmp.path().join("recv"), rec.clone());
+
+    let pkg = build_package(&tmp.path().join("src"), "uuid-dead", "d.fits", "M42", 4096);
+    let files = announce_files_of(&pkg);
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    // The sender's transport delegates announce/serve to a working endpoint but its
+    // revoke sleeps 30s (dead peer).
+    let sender = Arc::new(SlowRevokeTransport(Arc::new(net.endpoint())));
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        sender,
+        receiver_id,
+    );
+
+    let id = engine.enqueue_package(&pkg, None, files).await.unwrap();
+    wait_until(|| is_serving(&store, id), WAIT).await;
+
+    // Cancel and time how long the terminal transition takes: it must NOT wait on
+    // the 30s revoke.
+    let started = Instant::now();
+    engine.cancel(id).await.unwrap();
+    wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "cancel must not stall on the slow revoke (took {elapsed:?})",
+    );
 
     engine.shutdown().await;
 }

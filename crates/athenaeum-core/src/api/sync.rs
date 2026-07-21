@@ -2496,22 +2496,6 @@ fn package_has_payload(dir: &Path) -> bool {
     has_manifest && has_payload
 }
 
-/// Map manifest records to the announce file entries the engine persists as the
-/// §D4 per-file rows. The retry counterpart of [`build_and_enqueue_selection`]'s
-/// tuple mapping and the engine's own announce build (`sync/engine.rs`) — the
-/// three must stay in lockstep so a re-enqueued package carries the same per-file
-/// structure a first-send does.
-fn manifest_to_announce_files(records: &[ManifestRecord]) -> Vec<crate::sharing::types::AnnounceFileEntry> {
-    records
-        .iter()
-        .map(|r| crate::sharing::types::AnnounceFileEntry {
-            rel_path: r.rel_path.clone(),
-            byte_size: r.byte_size,
-            frame_uuid: r.frame_uuid.clone(),
-        })
-        .collect()
-}
-
 /// Resolve the started sender engine that owns the pending (non-terminal) row
 /// `id`, for the send-now / cancel command surfaces. The per-peer engines share
 /// ONE catalog store, so any started engine's non-terminal snapshot lists every
@@ -2544,21 +2528,27 @@ async fn active_engine_for_row(
     Err(ApiError::Invalid("package is not active".into()))
 }
 
-/// Retry a terminal outbound package: re-enqueue a `Failed` / `Cancelled`
-/// package's dir as a NEW durable row — the sanctioned retry model (the receiver
-/// dedups by frame uuid; the original terminal row is left intact). Ported from
-/// Perseus's `api_retry`: the row must be terminal, its payload must still be on
-/// disk, then `enqueue_package` mints the new row id.
+/// Resend a terminal outbound transfer as a **reset of the SAME row** (Transfers
+/// Batch Model §D1/§D3) — the transfers-not-attempts model. No new `sync_outbound`
+/// row is minted: the failed/cancelled row is reset in place (`attempts += 1`, a
+/// fresh per-attempt `wire_package_id`, every `sync_outbound_files` row back to
+/// `pending`, cleared error/retry/confirm fields) and re-driven on its own engine.
+/// It returns the SAME id.
 ///
-/// The re-enqueue MUST run on the engine whose peer matches `row.peer` — the
-/// worker stamps the new row with the ENGINE's peer, so enqueueing on any other
-/// peer's engine would send the package to the wrong device. A started engine for
-/// `row.peer` is reused; otherwise one is built lazily via [`ensure_sender_engine`]
-/// (a restart clears the in-memory engine map while the terminal rows persist, so
-/// a retry after a restart legitimately has no engine yet). The first-attempt dial
-/// hint falls back to our own relay set (`dest_endpoint_addr = None`); the engine's
-/// T8 address refresher re-resolves the peer's real address on retry.
-pub async fn retry_sync_package(
+/// Guards are unchanged from the old row-minting retry: the row must be terminal
+/// (`Failed` / `Cancelled` — a confirmed row is manifest-only after cleanup, a live
+/// row is send-now territory), and its payload must still be on disk (`resendable`
+/// gates the button on exactly this). A fresh wire id is what makes replay-safe: a
+/// cancelled attempt's receipts are keyed by its OWN wire id, so they can never
+/// short-circuit the new attempt (spec §D1; verified at the transport in B0-R3).
+///
+/// The re-drive MUST run on the engine whose peer matches `row.peer` — the row is
+/// stamped with that peer. A started engine is reused and told to re-drive the
+/// reset row ([`SyncEngineHandle::resend`]); otherwise one is built lazily via
+/// [`ensure_sender_engine`] (a restart clears the in-memory engine map while
+/// terminal rows persist), whose crash-resume enumeration re-drives the now-`queued`
+/// row on its own — the explicit `resend` command is idempotent with that.
+pub async fn resend_transfer(
     ctx: &Arc<ServiceContext>,
     sender: &Arc<SyncSenderRuntime>,
     collab_sender: Arc<SyncSenderRuntime>,
@@ -2577,11 +2567,11 @@ pub async fn retry_sync_package(
             .map_err(|e| ApiError::Internal(format!("read outbound row {id}: {e:#}")))?
             .ok_or_else(|| ApiError::Invalid(format!("unknown package id {id}")))?
     };
-    // Only a terminal failed/cancelled row is retryable (a confirmed row is
-    // manifest-only after cleanup; a live row is send-now territory, not retry).
+    // Only a terminal failed/cancelled row is resendable (a confirmed row is
+    // manifest-only after cleanup; a live row is send-now territory, not resend).
     if !matches!(row.state, OutboundState::Failed | OutboundState::Cancelled) {
         return Err(ApiError::Invalid(format!(
-            "package {id} is {} — only failed or cancelled packages can be retried",
+            "package {id} is {} — only failed or cancelled packages can be resent",
             row.state.as_str()
         )));
     }
@@ -2590,10 +2580,29 @@ pub async fn retry_sync_package(
     let dir = PathBuf::from(&row.package_ref);
     if !package_has_payload(&dir) {
         return Err(ApiError::Invalid(format!(
-            "package {id} data is missing on disk; cannot retry"
+            "package {id} data is missing on disk; cannot resend"
         )));
     }
-    // Enqueue on row.peer's engine — reuse a started one or build it lazily.
+    // §D1: mint a fresh per-attempt wire id and reset the SAME row in place (the B2
+    // bridge — attempts++, files → pending, error/retry/confirm cleared). The row
+    // is terminal here (NOT in the engine's `pending` map), so the next drive picks
+    // up the new wire id fresh; nothing is cached across the reset.
+    let new_wire_id = uuid::Uuid::new_v4().to_string();
+    {
+        let store = CatalogSyncStore::open(&db_path)
+            .map_err(|e| ApiError::Internal(format!("open catalog sync store: {e:#}")))?;
+        store
+            .reset_outbound_for_resend(id, &new_wire_id)
+            .map_err(|e| ApiError::Internal(format!("reset outbound {id} for resend: {e:#}")))?;
+        // Journal the resend (§D3/§D7). Best-effort — a log write must never fail
+        // the resend; ordered here after the row's own `cancelled`/`revoke_sent`
+        // (already written by the engine's terminal transition) and before the new
+        // attempt's `announce_sent`/`confirmed`.
+        if let Err(e) = store.append_sync_event(Direction::Sent, &id.to_string(), "resend", None) {
+            tracing::warn!(package_id = id, error = %format!("{e:#}"), "append resend sync_event failed");
+        }
+    }
+    // Re-drive on row.peer's engine — reuse a started one or build it lazily.
     let engine = match sender.current_for(&row.peer).await {
         Some((engine, _)) => engine,
         None => {
@@ -2603,26 +2612,27 @@ pub async fn retry_sync_package(
             engine
         }
     };
-    // Re-enqueue with the SAME structure a first-send has (Transfers Status Model
-    // v2): the on-disk manifest becomes the §D4 per-file rows and the old row's
-    // batch name travels through. A bare `None, Vec::new()` here (the T4 placeholder)
-    // silently regressed both: with zero `sync_outbound_files` rows every per-file
-    // transition during the re-transfer is an UPDATE-only no-op AND `sent_transfer_files`
-    // falls back to the history join keyed on the package dir basename shared with
-    // the cancelled attempt (stale `cancelled` verdicts); `None` also lands the retry
-    // under a UUID-named folder on the receiver. An unreadable manifest is a HARD
-    // error — consistent with the `package_has_payload` gate above; an empty list
-    // would silently reintroduce the bug rather than fail loudly.
-    let records = package::read_manifest(&dir).map_err(|e| {
-        ApiError::Internal(format!("read manifest for retry {}: {e:#}", dir.display()))
-    })?;
-    let files = manifest_to_announce_files(&records);
-    let new_id = engine
-        .enqueue_package(&dir, row.display_name.clone(), files)
+    engine
+        .resend(id)
         .await
-        .map_err(|e| ApiError::Internal(format!("re-enqueue package {id}: {e:#}")))?;
-    tracing::info!(old_id = id, new_id, peer = %node_id_hex(&row.peer), "sync package retried");
-    Ok(new_id)
+        .map_err(|e| ApiError::Internal(format!("re-drive resend {id}: {e:#}")))?;
+    tracing::info!(id, peer = %node_id_hex(&row.peer), "sync transfer resent");
+    Ok(id)
+}
+
+/// Backwards-compatible alias for the command/route layer (Transfers Batch Model
+/// §D3: `retry_sync_package` keeps its name this wave — B5 owns any surface
+/// rename). Delegates to [`resend_transfer`], which resets the SAME row rather than
+/// minting a new one.
+pub async fn retry_sync_package(
+    ctx: &Arc<ServiceContext>,
+    sender: &Arc<SyncSenderRuntime>,
+    collab_sender: Arc<SyncSenderRuntime>,
+    sync: &SyncRuntime,
+    id: i64,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+) -> Result<i64, ApiError> {
+    resend_transfer(ctx, sender, collab_sender, sync, id, emitter).await
 }
 
 /// Send-now a live outbound package: collapse its retry backoff so the owning
@@ -4041,67 +4051,21 @@ mod tests {
         panic!("timed out waiting for outbound {id} to reach {want:?}");
     }
 
-    /// Step 1: enqueue → cancel (terminal `Cancelled`) → `retry_sync_package`
-    /// re-enqueues the SAME package dir as a NEW durable row (new id ≠ old); the
-    /// original terminal row is left untouched and the new row is pending.
+    /// Transfers Batch Model §D1/§D3: `resend_transfer` (aliased by
+    /// `retry_sync_package`) resets the SAME terminal row in place — it does NOT
+    /// mint a new durable row. The row keeps its id + `package_ref` + `display_name`
+    /// (payload dir owns them), `attempts` climbs, the `wire_package_id` rotates to
+    /// a fresh per-attempt id, every `sync_outbound_files` row resets to `pending`,
+    /// and the journal records `resend` after the earlier `cancelled`. The loopback
+    /// peer never starts an endpoint, so the resend's re-announce fails fast and the
+    /// row parks non-terminal (never confirms) — exactly the surface this pins.
     #[tokio::test]
-    async fn retry_reenqueues_terminal_package_as_new_row() {
+    async fn resend_resets_same_terminal_row_in_place() {
         let (tmp, ctx) = test_ctx();
         let pkg_dir = build_one_frame_package(&ctx, tmp.path());
         let ctx = Arc::new(ctx);
         let db_path = db(&ctx).unwrap().path().to_path_buf();
 
-        let (sender, peer) = loopback_sender_for(&db_path).await;
-        let collab_sender = Arc::new(SyncSenderRuntime::new());
-        let sync = SyncRuntime::new();
-
-        // Enqueue on the peer's engine, then cancel it → terminal Cancelled.
-        let (engine, _) = sender.current_for(&peer).await.unwrap();
-        let old_id = engine.enqueue_package(&pkg_dir, None, Vec::new()).await.unwrap();
-        engine.cancel(old_id).await.unwrap();
-        wait_outbound_state(&db_path, old_id, OutboundState::Cancelled).await;
-
-        // Retry re-enqueues the SAME dir as a NEW row on the same peer's engine.
-        let new_id =
-            retry_sync_package(&ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
-                .await
-                .unwrap();
-        assert_ne!(new_id, old_id, "retry mints a new durable row");
-
-        let store = CatalogSyncStore::open(&db_path).unwrap();
-        assert_eq!(
-            store.get_outbound(old_id).unwrap().unwrap().state,
-            OutboundState::Cancelled,
-            "the original terminal row is left untouched",
-        );
-        let new_row = store.get_outbound(new_id).unwrap().expect("new row exists");
-        assert!(!new_row.state.is_terminal(), "the re-enqueued row is pending");
-        assert_eq!(
-            new_row.package_ref,
-            pkg_dir.to_string_lossy(),
-            "the new row points at the same package dir",
-        );
-    }
-
-    /// Regression (owner live-smoke, TV2): a retry must re-enqueue with the OLD
-    /// row's `display_name` AND real manifest-backed per-file rows — not the
-    /// historical `None, Vec::new()` placeholder. Without the file rows the new
-    /// batch gets ZERO `sync_outbound_files` rows, so every per-file transition
-    /// during the re-transfer is a silent UPDATE-only no-op AND `sent_transfer_files`
-    /// falls into the legacy history join keyed on the package DIR BASENAME shared
-    /// with the cancelled attempt — so every file shows the stale `cancelled`
-    /// verdict for the whole re-transfer. Without the name the receiver lands the
-    /// retry under a UUID-named folder.
-    #[tokio::test]
-    async fn retry_carries_display_name_and_manifest_file_rows() {
-        let (tmp, ctx) = test_ctx();
-        let pkg_dir = build_one_frame_package(&ctx, tmp.path());
-        let ctx = Arc::new(ctx);
-        let db_path = db(&ctx).unwrap().path().to_path_buf();
-
-        // The real announce file entries the send path derives from the on-disk
-        // manifest, built inline here (independent of the fix under test) so the
-        // OLD row has genuine per-file rows to inherit.
         let manifest = package::read_manifest(&pkg_dir).unwrap();
         assert!(!manifest.is_empty(), "fixture package has >=1 manifest record");
         let files: Vec<crate::sharing::types::AnnounceFileEntry> = manifest
@@ -4112,73 +4076,111 @@ mod tests {
                 frame_uuid: r.frame_uuid.clone(),
             })
             .collect();
-        let display = "M42 — retry batch".to_string();
+        let display = "M42 — resend batch".to_string();
 
         let (sender, peer) = loopback_sender_for(&db_path).await;
         let collab_sender = Arc::new(SyncSenderRuntime::new());
         let sync = SyncRuntime::new();
 
-        // Enqueue WITH a display name + file rows, then cancel → terminal Cancelled.
-        // `cancel_package`'s epilogue writes a `cancelled` history row per frame
-        // keyed on the package dir basename (`append_terminal_history`) — the stale
-        // verdict the retry must NOT inherit.
+        // Enqueue WITH a name + file rows, then cancel → terminal Cancelled.
         let (engine, _) = sender.current_for(&peer).await.unwrap();
-        let old_id = engine
+        let id = engine
             .enqueue_package(&pkg_dir, Some(display.clone()), files.clone())
             .await
             .unwrap();
-        engine.cancel(old_id).await.unwrap();
-        wait_outbound_state(&db_path, old_id, OutboundState::Cancelled).await;
+        engine.cancel(id).await.unwrap();
+        wait_outbound_state(&db_path, id, OutboundState::Cancelled).await;
 
-        let new_id =
-            retry_sync_package(&ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
+        // Capture the pre-resend row: its wire id + attempts (the negotiate on the
+        // first drive persisted a wire id even though the announce could not reach
+        // the never-started peer).
+        let before = {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            store.get_outbound(id).unwrap().expect("row exists")
+        };
+        let old_wire = before.wire_package_id.clone();
+        assert!(old_wire.is_some(), "the first attempt persisted a wire id");
+
+        // Resend → the SAME id back, NOT a new row.
+        let same_id =
+            resend_transfer(&ctx, &sender, Arc::clone(&collab_sender), &sync, id, None)
                 .await
                 .unwrap();
-        assert_ne!(new_id, old_id, "retry mints a new durable row");
+        assert_eq!(same_id, id, "resend returns the SAME transfer id (no new row)");
 
-        let store = CatalogSyncStore::open(&db_path).unwrap();
-        let new_row = store.get_outbound(new_id).unwrap().expect("new row exists");
-
-        // (c) the display name carries over to the retry.
+        // The reset ran synchronously inside `resend_transfer` before the async
+        // re-drive; read it straight back.
+        let after = {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            store.get_outbound(id).unwrap().expect("row still exists")
+        };
+        assert!(!after.state.is_terminal(), "resend un-terminalizes the SAME row");
+        assert!(
+            after.wire_package_id.is_some() && after.wire_package_id != old_wire,
+            "resend rotates the per-attempt wire id (was {old_wire:?}, now {:?})",
+            after.wire_package_id,
+        );
+        assert!(
+            after.attempts >= before.attempts + 1,
+            "resend increments the attempt counter ({} → {})",
+            before.attempts,
+            after.attempts,
+        );
         assert_eq!(
-            new_row.display_name.as_deref(),
+            after.display_name.as_deref(),
             Some(display.as_str()),
-            "retry carries the old row's display_name",
+            "the row keeps its display_name across the reset",
         );
 
-        // (a) the retry got the full manifest set as fresh `pending` per-file rows,
-        // none carrying a settled outcome.
+        // Exactly ONE outbound row for this peer — no new row was minted.
+        {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            let rows = store.all_outbound(100).unwrap();
+            assert_eq!(rows.len(), 1, "resend mints no new row, got {rows:?}");
+        }
+
+        // Every per-file row is back to `pending` with no settled outcome.
         let file_rows = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            list_outbound_files(&conn, new_id).unwrap()
+            list_outbound_files(&conn, id).unwrap()
         };
-        assert_eq!(
-            file_rows.len(),
-            manifest.len(),
-            "retry re-enqueues every manifest file as a per-file row",
-        );
+        assert_eq!(file_rows.len(), manifest.len(), "every manifest file has a row");
         assert!(
             file_rows
                 .iter()
                 .all(|f| f.state == crate::sync::OutboundFileState::Pending && f.outcome.is_none()),
-            "every retried file row is pending with no settled outcome, got {file_rows:?}",
+            "every file row reset to pending with no outcome, got {file_rows:?}",
         );
 
-        // (b) the Details view for the retry shows NO stale `cancelled` verdict — it
-        // reads the fresh per-file rows, not the shared-basename history join.
-        let detail = sent_transfer_files(&ctx, new_id).unwrap();
-        assert_eq!(detail.len(), manifest.len(), "details covers every manifest file");
+        // The journal records `cancelled` (from the cancel) then `resend`, in order.
+        // `list_sync_events` is newest-first; reverse to chronological.
+        let kinds: Vec<String> = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let mut k: Vec<String> = list_sync_events(&conn, Direction::Sent, &id.to_string())
+                .unwrap()
+                .into_iter()
+                .map(|e| e.kind)
+                .collect();
+            k.reverse();
+            k
+        };
+        let cancelled_at = kinds.iter().position(|k| k == "cancelled");
+        let resend_at = kinds.iter().position(|k| k == "resend");
+        assert!(cancelled_at.is_some(), "journal has a cancelled event, got {kinds:?}");
+        assert!(resend_at.is_some(), "journal has a resend event, got {kinds:?}");
         assert!(
-            detail.iter().all(|f| f.outcome.as_deref() != Some("cancelled")),
-            "no retried file inherits the cancelled attempt's verdict, got {detail:?}",
+            cancelled_at < resend_at,
+            "resend is journaled AFTER cancelled, got {kinds:?}",
         );
     }
 
-    /// Step 1: `retry_sync_package` refuses a non-terminal (pending) package — only
-    /// a `Failed` / `Cancelled` row is a retry candidate.
+    /// §D3: `resend_transfer` refuses a non-terminal (pending) package — only a
+    /// `Failed` / `Cancelled` row is a resend candidate. Pins that the reset never
+    /// fires on a live row (which would corrupt an in-flight transfer).
     #[tokio::test]
-    async fn retry_rejects_pending_package() {
+    async fn resend_rejects_non_terminal_package() {
         let (tmp, ctx) = test_ctx();
         let pkg_dir = build_one_frame_package(&ctx, tmp.path());
         let ctx = Arc::new(ctx);
@@ -4192,12 +4194,12 @@ mod tests {
         let (engine, _) = sender.current_for(&peer).await.unwrap();
         let id = engine.enqueue_package(&pkg_dir, None, Vec::new()).await.unwrap();
 
-        let err = retry_sync_package(&ctx, &sender, collab_sender, &sync, id, None)
+        let err = resend_transfer(&ctx, &sender, collab_sender, &sync, id, None)
             .await
             .unwrap_err();
         assert!(
             matches!(err, ApiError::Invalid(_)),
-            "retry rejects a pending (non-terminal) package, got {err:?}",
+            "resend rejects a pending (non-terminal) package, got {err:?}",
         );
     }
 

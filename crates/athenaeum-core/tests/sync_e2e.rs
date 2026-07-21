@@ -1237,21 +1237,23 @@ async fn receiver_cancel_terminates_sender_then_resend_delivers() {
     // Disarm the fault so the resend can fetch cleanly.
     receiver_ep.set_fault(FaultPlan::default());
 
-    // Resend delivers via the sanctioned retry command (spec §1: "the row stays in
-    // the sender's history and is retryable"; §4's retry payload-presence check
-    // requires the payload to still be on disk after a receiver decline — the
+    // Resend via the sanctioned command (Transfers Batch Model §D1/§D3:
+    // resend-as-reset — the SAME row is reset, NOT a new one; §4's payload-presence
+    // check requires the payload to still be on disk after a receiver decline — the
     // all-cancelled-ack terminal epilogue mirrors `cancel_package` and keeps it,
     // same as a `Failed`/plain-`Cancelled` row).
     let resend_id =
         retry_sync_package(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
             .await
-            .expect("retry_sync_package resends a receiver-cancelled package");
-    assert_ne!(resend_id, old_id, "the resend is a NEW durable row, not the cancelled one");
+            .expect("resend a receiver-cancelled package");
+    assert_eq!(resend_id, old_id, "resend-as-reset returns the SAME row, never a new one");
 
-    wait_until(|| outbound_state(cdb, resend_id) == "confirmed", WAIT).await;
+    wait_until(|| outbound_state(cdb, old_id) == "confirmed", WAIT).await;
     wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
     assert_eq!(landed_count(&designated), N, "the resend delivers all frames to disk");
-    // The declined row stays Cancelled across the resend — final, never resurrected.
+    // The declined inbound row (keyed on the cancelled attempt's wire id) stays
+    // Cancelled — final, never resurrected. (The receiver is not yet batch-keyed —
+    // B4 — so the resend's fresh wire id lands a separate inbound row.)
     assert_eq!(
         inbound_row(pdb, &wire_pkg).map(|(s, _, _)| s).as_deref(),
         Some("cancelled"),

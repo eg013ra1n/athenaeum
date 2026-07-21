@@ -58,7 +58,7 @@ use crate::sharing::iroh::node::BoxFuture;
 use crate::sharing::iroh::proto::OfferEntry;
 use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome,
-    TransportEvent,
+    RevokeReason, TransportEvent,
 };
 use crate::sharing::SharingTransport;
 
@@ -153,6 +153,14 @@ enum Command {
     },
     /// Cancel an in-flight package → `Cancelled` (`cancelled` history outcome).
     Cancel(i64),
+    /// (Re)drive a resent transfer (Transfers Batch Model §D1/§D3). The API layer
+    /// (`resend_transfer`) has already reset the SAME durable row to `Queued`
+    /// (attempts++, fresh per-attempt wire id, per-file rows → `pending`) OUTSIDE
+    /// the worker; the row is NOT in the in-memory `pending` map (its slot was
+    /// dropped on the earlier terminal transition), so a plain [`Kick`](Self::Kick)
+    /// cannot reach it. This tells the worker to read the fresh row and re-drive it
+    /// exactly like a crash-resume.
+    Resend(i64),
     /// Kick one in-flight package: collapse its retry deadline to now and reset
     /// its backoff rung so the next worker pass re-announces immediately (spec §2
     /// wake event / send-now). A no-op for an id with no pending slot.
@@ -561,6 +569,21 @@ impl SyncEngineHandle {
         Ok(())
     }
 
+    /// (Re)drive a resent transfer (Transfers Batch Model §D1/§D3). The caller
+    /// (`resend_transfer`) has already reset the SAME durable row back to `Queued`
+    /// (attempts++, fresh per-attempt wire id, files → `pending`); this asks the
+    /// worker to pick that row up and re-drive it like a crash-resume. Distinct
+    /// from [`kick`](Self::kick), which only collapses the backoff of a row already
+    /// in the worker's `pending` map — a resent row's slot was dropped when it went
+    /// terminal, so kick alone would be a no-op.
+    pub async fn resend(&self, id: i64) -> Result<()> {
+        self.cmd_tx
+            .send(Command::Resend(id))
+            .await
+            .map_err(|_| anyhow!("sync engine worker stopped"))?;
+        Ok(())
+    }
+
     /// Kick one in-flight package (send-now / spec §2 wake event): wake it out of
     /// its backoff so the worker re-announces on the next pass. A no-op on the
     /// worker side if the id has no pending slot (already terminal / unknown).
@@ -740,6 +763,14 @@ impl Worker {
                         match self.store.enqueue(&dir.to_string_lossy(), self.peer, display_name.as_deref(), &files) {
                             Ok(id) => {
                                 tracing::info!(package_id = id, state = "queued", "sync state");
+                                // §D6: stamp the collab `project_id` onto the row at
+                                // the store enqueue path so collab transfers are
+                                // distinguishable from personal ones. The stamp lives
+                                // in the on-disk manifest (a project package's records
+                                // carry it); read it once here, best-effort — a
+                                // personal send finds no stamp and skips the write. No
+                                // behavioral use this wave.
+                                self.persist_project_id(id, &dir);
                                 // Journal the batch's first lifecycle event (§D7).
                                 let byte_size: u64 = files.iter().map(|f| f.byte_size).sum();
                                 self.journal(id, "enqueued", Some(&format!("frames={} bytes={}", files.len(), byte_size)));
@@ -760,6 +791,7 @@ impl Worker {
                             tracing::error!(package_id = id, error = %e, "sync cancel failed");
                         }
                     }
+                    Some(Command::Resend(id)) => self.resend_package(id).await,
                     Some(Command::Kick(id)) => self.kick_one(id),
                     Some(Command::KickAll) => {
                         // Snapshot the ids so no `&self.pending` borrow is held
@@ -1099,10 +1131,13 @@ impl Worker {
         // manifest records, cached on the first build (`negotiate_and_build`), with
         // a fresh on-disk read as a defensive fallback so `files` is never empty
         // when payloads exist.
-        let pkg_basename = dir
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // §D2/B3 (B1 seam): derive the basename through the SAME `package_dir_key`
+        // helper the sender-side history writers and the `outbound_package_key`
+        // reader use (`file_name().and_then(to_str)`), NOT `to_string_lossy` — so
+        // the equivalence `batch_uuid == outbound_package_key(package_ref)` holds by
+        // construction and the receiver keys ONE inbound row on exactly the value
+        // the sent-history / detail joins recover from the outbound row.
+        let pkg_basename = package_dir_key(&dir).unwrap_or_default();
         // Durable batch identity (spec §D2/B3): the package-dir basename IS the
         // final batch_uuid for an outbound transfer, stable across re-attempts, so
         // this is the real value the receiver keys ONE row on — not a placeholder.
@@ -1362,9 +1397,12 @@ impl Worker {
         };
 
         // All-duplicate: the peer already has every frame — terminalize the
-        // package to a confirmed terminal WITHOUT announcing or serving.
+        // package to a confirmed terminal WITHOUT announcing or serving. Pass the
+        // just-minted wire id (== the persisted `wire_package_id` this build
+        // resolved) so a superseded-race revoke can address the receiver's stuck
+        // row (see `terminalize_all_duplicate`).
         if matches!(&want, Some(w) if w.is_empty()) {
-            self.terminalize_all_duplicate(id, &records)?;
+            self.terminalize_all_duplicate(id, &records, &full_announce.package_id)?;
             return Ok(Negotiated::AllDuplicate);
         }
 
@@ -1425,7 +1463,12 @@ impl Worker {
     /// through the [`cleanup_sink`] (so a multi-target coordinator counts this
     /// engine terminal), and the confirmed state stamp — but skips announce /
     /// serve / blob release entirely (nothing was ever served).
-    fn terminalize_all_duplicate(&mut self, id: i64, records: &[ManifestRecord]) -> Result<()> {
+    fn terminalize_all_duplicate(
+        &mut self,
+        id: i64,
+        records: &[ManifestRecord],
+        wire_id: &PackageId,
+    ) -> Result<()> {
         let receipts: Vec<FrameReceipt> = records
             .iter()
             .map(|r| FrameReceipt {
@@ -1439,6 +1482,19 @@ impl Worker {
             .pending
             .remove(&id)
             .ok_or_else(|| anyhow!("all-duplicate terminal for a vanished slot {id}"))?;
+        // Superseded-race revoke (spec §F3/§D2): all-duplicate normally runs on a
+        // FIRST build (fresh enqueue / fresh resend — nothing announced yet, so no
+        // receiver row exists for this wire id). But a re-drive that re-negotiates
+        // AFTER a PRIOR attempt already announced (a crash-resume of a `Transferring`
+        // row) can find the peer now holds every frame — and confirm all-duplicate
+        // locally while the receiver's row for this same wire id sits `announced`
+        // forever. `pending.started` is true exactly in that case (a prior announce
+        // for this transfer reached the peer, at the same persisted wire id this
+        // build resolved), so tell the receiver to drop its stuck row. A fresh
+        // enqueue / fresh resend has `started == false` → no stray revoke.
+        if pending.started {
+            self.spawn_revoke(pending.id, wire_id, RevokeReason::Superseded);
+        }
         // No transfer-start milestone was ever recorded (we never announced), so
         // stamp a start time now for a coherent confirmed history row.
         if pending.started_at.is_empty() {
@@ -1582,6 +1638,102 @@ impl Worker {
                 tracing::warn!(package_id = %package_id.0, error = %format!("{e:#}"), "blob release failed");
             }
         });
+    }
+
+    /// Fire-and-forget best-effort `Revoke` to the peer (spec §D2 / B3). Sent on a
+    /// terminal transition whose CURRENT attempt still had an outstanding announce
+    /// the peer may be acting on: user cancel ([`RevokeReason::Cancelled`]), an
+    /// all-duplicate confirm that raced a prior attempt's announce
+    /// ([`RevokeReason::Superseded`]), or a local terminal failure
+    /// ([`RevokeReason::Failed`]). `wire_id` is that attempt's wire id — the id the
+    /// receiver keyed its inbound row on and correlates acks by.
+    ///
+    /// Revoke IS the stop mechanism (B0 finding): iroh-blobs 0.103 providers serve
+    /// purely by hash, so the sender cannot unilaterally abort an in-flight upload —
+    /// the receiver acting on the revoke (drop fetch → close connection → provider
+    /// write error) is what tears it down. Under the hood `revoke` is a
+    /// delivery-acked `send_control` that waits up to ~30s with NO retry (B1); the
+    /// terminal transition that triggers it MUST NOT block or fail on that, so this
+    /// runs on a DETACHED task over a clone of the transport `Arc` and only ever
+    /// logs on `Err`. The `revoke_sent` journal is written synchronously first (so
+    /// it is ordered before the spawn's own logging and survives a slow send). A
+    /// receiver that never had a row for `wire_id` ignores the revoke — harmless.
+    fn spawn_revoke(&self, id: i64, wire_id: &PackageId, reason: RevokeReason) {
+        let tag = revoke_reason_tag(reason);
+        // Journal on the synchronous worker BEFORE detaching (never-swallow §D7).
+        self.journal(id, "revoke_sent", Some(tag));
+        let transport = Arc::clone(&self.transport);
+        let peer = self.peer;
+        let wire = wire_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = transport.revoke(peer, &wire, reason).await {
+                tracing::warn!(
+                    package_id = %wire.0,
+                    reason = tag,
+                    error = %format!("{e:#}"),
+                    "sync revoke send failed"
+                );
+            }
+        });
+    }
+
+    /// (Re)drive a resent transfer ([`Command::Resend`]). `resend_transfer` (API
+    /// layer) has already reset the SAME durable row back to `Queued` — attempts++,
+    /// a fresh per-attempt wire id, per-file rows → `pending` — while the row was
+    /// terminal, so its slot is NOT in `pending` and a fresh
+    /// [`start_package`](Self::start_package) is what picks the new attempt up
+    /// (reading `wire_package_id` fresh; nothing is cached across the reset). This
+    /// mirrors the crash-resume drive, scoped to this engine's own peer.
+    async fn resend_package(&mut self, id: i64) {
+        // Already live (a fresh-built engine's crash-resume beat this command to the
+        // row): just collapse its backoff so it re-announces now.
+        if self.pending.contains_key(&id) {
+            self.kick_one(id);
+            return;
+        }
+        let row = match self.store.get_outbound(id) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                tracing::warn!(package_id = id, "resend: outbound row vanished; ignoring");
+                return;
+            }
+            Err(e) => {
+                tracing::error!(package_id = id, error = %format!("{e:#}"), "resend: read outbound row failed");
+                return;
+            }
+        };
+        // Scope to this engine's peer (the shared store returns every peer's rows).
+        if row.peer != self.peer {
+            tracing::warn!(package_id = id, "resend: row targets another peer; ignoring");
+            return;
+        }
+        // The API layer guards terminal-state eligibility + does the reset; if the
+        // row is still terminal here the reset never ran — do not re-drive.
+        if row.state.is_terminal() {
+            tracing::warn!(package_id = id, state = row.state.as_str(), "resend: row still terminal; not re-driving");
+            return;
+        }
+        let dir = PathBuf::from(&row.package_ref);
+        if let Err(e) = self.start_package(id, dir, row.state).await {
+            tracing::error!(package_id = id, error = %format!("{e:#}"), "resend: start_package failed");
+        }
+    }
+
+    /// Persist the collab `project_id` onto a freshly-enqueued outbound row (§D6),
+    /// read from the package's on-disk manifest stamp. Best-effort and skipped
+    /// entirely for a personal-sync package (no stamp): so collab rows become
+    /// distinguishable in `sync_outbound` without any behavioral use this wave. A
+    /// manifest-read or store-write failure only `warn!`s — it must never fail the
+    /// enqueue.
+    fn persist_project_id(&self, id: i64, dir: &Path) {
+        let project_id = package::read_manifest(dir)
+            .ok()
+            .and_then(|records| records.iter().find_map(|r| r.project.as_ref().map(|p| p.project_id.clone())));
+        if let Some(pid) = project_id {
+            if let Err(e) = self.store.set_outbound_project_id(id, Some(&pid)) {
+                tracing::warn!(package_id = id, error = %format!("{e:#}"), "persist project_id failed");
+            }
+        }
     }
 
     /// Dispatch a transport event. Synchronous — no `.await` — so a package can
@@ -2238,15 +2390,16 @@ impl Worker {
     /// (not `Failed`, and not routed through here).
     fn fail_package(&mut self, id: i64) -> Result<()> {
         let removed = self.pending.remove(&id);
-        let (dir, last_rejected, pkg_id, project_id, manifest_records) = match removed {
+        let (dir, last_rejected, pkg_id, project_id, manifest_records, started) = match removed {
             Some(p) => (
                 Some(p.dir),
                 p.last_rejected,
                 p.announce.map(|a| a.package_id),
                 p.project_id,
                 p.manifest_records,
+                p.started,
             ),
-            None => (None, Vec::new(), None, None, None),
+            None => (None, Vec::new(), None, None, None, false),
         };
         self.store.set_state(id, OutboundState::Failed)?;
         // Terminal: no retry is pending — clear the persisted countdown (Task 2).
@@ -2255,8 +2408,14 @@ impl Worker {
         self.settle_unsettled_files(id, "failed");
         // Terminal: release any served blobs (fire-and-forget). `pkg_id` is
         // `None` when the package never minted+served an announce (a pre-serve
-        // failure) — nothing to release in that case.
+        // failure) — nothing to release in that case. When an announce for THIS
+        // attempt actually reached the peer (`started`), also best-effort `Revoke`
+        // it so the receiver tears down any in-flight fetch (spec §D2 / B3) —
+        // spawned, so the terminal transition never blocks on it.
         if let Some(pid) = pkg_id {
+            if started {
+                self.spawn_revoke(id, &pid, RevokeReason::Failed);
+            }
             self.spawn_release(pid);
         }
         tracing::error!(package_id = id, state = "failed", rejected = ?last_rejected, "sync state");
@@ -2293,8 +2452,8 @@ impl Worker {
         // in-flight entry also carries the minted announce whose blobs need
         // releasing; a row resolved only from the store was never served this
         // session, so there is nothing to release (`pkg_id` stays `None`).
-        let (dir, pkg_id, project_id) = if let Some(p) = self.pending.remove(&id) {
-            (Some(p.dir), p.announce.map(|a| a.package_id), p.project_id)
+        let (dir, pkg_id, project_id, started) = if let Some(p) = self.pending.remove(&id) {
+            (Some(p.dir), p.announce.map(|a| a.package_id), p.project_id, p.started)
         } else {
             (
                 self.store
@@ -2304,6 +2463,7 @@ impl Worker {
                     .map(|r| PathBuf::from(r.package_ref)),
                 None,
                 None,
+                false,
             )
         };
 
@@ -2317,16 +2477,27 @@ impl Worker {
         self.clear_next_retry(id);
         // §D4: every not-yet-settled per-file row inherits the `cancelled` outcome.
         self.settle_unsettled_files(id, "cancelled");
-        // Terminal: release any served blobs (fire-and-forget).
-        if let Some(pid) = pkg_id {
-            self.spawn_release(pid);
-        }
         tracing::info!(
             package_id = id,
             state = "cancelled",
             "sync state"
         );
+        // Journal the terminal `cancelled` BEFORE any `revoke_sent` so the batch's
+        // Log reads cancelled → revoke_sent (§D3 order).
         self.journal(id, "cancelled", Some("by_user"));
+        // Terminal: release any served blobs (fire-and-forget). When an announce for
+        // THIS attempt actually reached the peer (`started`), also best-effort
+        // `Revoke Cancelled` (spec §D2 / B3) — Revoke IS the stop mechanism (the
+        // receiver drops its fetch → the provider upload tears down). Spawned, so a
+        // dead/slow peer's ≤30s delivery-ack never stalls the cancel. The
+        // store-fallback branch (row not in this session's `pending`) has no
+        // current-attempt announce here → no revoke, only the local terminal stamp.
+        if let Some(pid) = pkg_id {
+            if started {
+                self.spawn_revoke(id, &pid, RevokeReason::Cancelled);
+            }
+            self.spawn_release(pid);
+        }
         self.append_terminal_history(id, &dir, "cancelled", None)?;
         // Multi-target fan-out: a cancelled target is terminal — notify the
         // coordinator so it counts toward the all-targets-terminal cleanup gate.
@@ -2518,6 +2689,17 @@ fn object_of(r: &ManifestRecord) -> Option<String> {
 /// a personal-sync record. Populates `sync_history.project` (Task 11).
 fn project_of(r: &ManifestRecord) -> Option<String> {
     r.project.as_ref().map(|p| p.project_id.clone())
+}
+
+/// Stable snake_case tag for a [`RevokeReason`] — the `revoke_sent` journal detail
+/// (§D7) and the failed-send log field. Frozen alongside the wire enum's variant
+/// order (B1): the strings are a diagnostic contract, not just cosmetics.
+fn revoke_reason_tag(reason: RevokeReason) -> &'static str {
+    match reason {
+        RevokeReason::Cancelled => "cancelled",
+        RevokeReason::Superseded => "superseded",
+        RevokeReason::Failed => "failed",
+    }
 }
 
 /// Short outcome tag for a receipt verdict, stored in `sync_history.outcome`.
