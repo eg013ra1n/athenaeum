@@ -189,6 +189,14 @@ pub struct InboundSummary {
     pub stalled_until: Option<String>,
     /// Per-file rollup for the progress line ("N of M files").
     pub file_counts: TransferFileCounts,
+    /// The terminal failure/cancel reason (`sync_inbound.last_error`, B5b) — e.g.
+    /// `"by sender"` on a sender-revoked cancel, `"sender failed"` on a sender
+    /// failure, `"nothing to fetch (superseded by sender)"` on a supersede, or an
+    /// ingest/fetch/ack failure reason. `None` on a healthy in-flight row. Lets a
+    /// terminal received row (surfaced via
+    /// [`list_terminal_transfers`](crate::api::sync::list_terminal_transfers)) say
+    /// WHY it ended instead of a bare `cancelled`/`failed`.
+    pub last_error: Option<String>,
 }
 
 /// Send-side rollup: live in-flight counts from the engine's non-terminal

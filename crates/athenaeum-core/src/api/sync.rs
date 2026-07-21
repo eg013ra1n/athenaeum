@@ -1286,6 +1286,7 @@ fn inbound_summary(
         display_name: row.display_name.filter(|s| !s.trim().is_empty()),
         device_name: device_names.get(&row.peer).cloned(),
         file_counts: file_counts.get(&row.id).copied().unwrap_or_default(),
+        last_error: row.last_error,
     }
 }
 
@@ -2773,15 +2774,16 @@ pub struct DeletedTransferRecord {
 /// Batch-level, not row-level: every attempt of a batch shares `package_key`, so
 /// all of that batch's rows go together.
 ///
-/// `package_key` is the batch identity the Transfers UI already holds. Post-wipe
-/// (Transfers Batch Model, spec §Migration) there are no pre-batch rows, so the key
-/// IS the transfer's `batch_uuid` in both directions (F6 unified): for
+/// `package_key` is the batch identity the Transfers UI already holds — the
+/// transfer's `batch_uuid` in BOTH directions now (F6 fully unified, B5b): for
 /// [`Sent`](Direction::Sent) it is the package-dir BASENAME
 /// ([`outbound_package_key`], which B3 aligned to equal the wire `batch_uuid` and
-/// which `sync_history.package_id` also carries); for
-/// [`Received`](Direction::Received) it is the wire package uuid
-/// (`sync_inbound.package_id`, == the received history `package_id`), which the
-/// batch-keyed receiver exposes as the current attempt's identity.
+/// which `sync_history.package_id` carries); for [`Received`](Direction::Received)
+/// it is the durable `sync_inbound.batch_uuid` (== the received history
+/// `package_id` since B5b), matched via [`inbound_id_states_by_batch`] with a
+/// NULL-edge fallback to the wire `package_id` so a legacy NULL-batch_uuid row stays
+/// deletable by its wire id. (The wire id still rotates per attempt and is used only
+/// for blob-tag release / the pre-B5b history sweep, not as the batch key.)
 ///
 /// **Terminal-only, atomically.** If ANY matching row is non-terminal (an active
 /// attempt) the whole call refuses with [`ApiError::Invalid`] and deletes NOTHING
@@ -2812,7 +2814,7 @@ pub async fn delete_transfer_history(
     use crate::sync::store::{
         cancel_outbound_row, delete_history_for_package, delete_inbound_files, delete_inbound_row,
         delete_outbound_files, delete_outbound_row, delete_sync_events,
-        inbound_id_states_by_package, outbound_peer_hex, outbound_ref_states,
+        inbound_id_states_by_batch, outbound_peer_hex, outbound_ref_states,
         settle_unsettled_outbound_files,
     };
     use crate::sync::InboundState;
@@ -2934,11 +2936,16 @@ pub async fn delete_transfer_history(
             (DeletedTransferRecord { rows, history }, Reclaim::Payloads(payload_dirs))
         }
         Direction::Received => {
-            let matching: Vec<(i64, InboundState)> =
-                inbound_id_states_by_package(&tx, &package_key)?
-                    .into_iter()
-                    .map(|(id, state)| Ok::<_, ApiError>((id, InboundState::from_db(&state)?)))
-                    .collect::<Result<_, _>>()?;
+            // Batch-keyed on the durable `batch_uuid` (B5b, symmetric with the sent
+            // side keying on the package-dir basename), with a NULL-edge fallback to
+            // the wire `package_id` so a legacy NULL-batch_uuid row stays deletable by
+            // its wire id. Each matched row also yields its CURRENT wire id (for tag
+            // release + the wire-id history sweep below).
+            let matched = inbound_id_states_by_batch(&tx, &package_key)?;
+            let matching: Vec<(i64, InboundState)> = matched
+                .iter()
+                .map(|(id, state, _)| Ok::<_, ApiError>((*id, InboundState::from_db(state)?)))
+                .collect::<Result<_, _>>()?;
             if matching.iter().any(|(_, s)| !s.is_terminal()) {
                 return Err(ApiError::Invalid(
                     "batch has an active attempt — cancel it first".into(),
@@ -2951,12 +2958,22 @@ pub async fn delete_transfer_history(
                 delete_inbound_row(&tx, *id)?;
                 rows += 1;
             }
-            let history = delete_history_for_package(&tx, Direction::Received, &package_key)?;
-            // The matched rows were selected `WHERE package_id = package_key`, so the
-            // batch's current-attempt wire id IS the key — release its blob tags (only
-            // when a row actually matched, else there is no batch to reclaim).
-            let tags = if matching.is_empty() { Vec::new() } else { vec![package_key.clone()] };
-            (DeletedTransferRecord { rows, history }, Reclaim::Tags(tags))
+            // Received history rows now key on the `batch_uuid` (== `package_key`,
+            // B5b). Also sweep by each matched row's CURRENT wire id to catch any
+            // rows written wire-id-keyed before B5b landed in the same dev cycle —
+            // post-wipe there is no data older than this wave, so this is dev-cycle
+            // hygiene only, not a migration.
+            let mut history = delete_history_for_package(&tx, Direction::Received, &package_key)?;
+            let wire_ids: Vec<String> =
+                matched.iter().map(|(_, _, wire)| wire.clone()).collect();
+            for wire in &wire_ids {
+                if *wire != package_key {
+                    history += delete_history_for_package(&tx, Direction::Received, wire)?;
+                }
+            }
+            // Release the matched rows' CURRENT wire ids' blob tags (the batch key is
+            // the stable `batch_uuid` now, which is NOT a tag — the wire id is).
+            (DeletedTransferRecord { rows, history }, Reclaim::Tags(wire_ids))
         }
         };
 
@@ -3281,6 +3298,143 @@ mod tests {
         assert_eq!(count("SELECT COUNT(*) FROM sync_inbound_files"), 0);
         assert_eq!(count("SELECT COUNT(*) FROM sync_events"), 0);
         assert_eq!(count("SELECT COUNT(*) FROM sync_history WHERE direction = 'received'"), 0);
+    }
+
+    /// B5b: a RECEIVED batch deletes by its durable `batch_uuid` (not the rotating
+    /// wire id) — the symmetric-with-sent key. A modern batch-keyed row whose current
+    /// wire id differs from the batch_uuid is removed along with its files, events,
+    /// its batch-keyed history rows AND any wire-id-keyed history left from before
+    /// B5b (the current-wire-id sweep). Its blob tags (the CURRENT wire id) are the
+    /// reclaim targets.
+    #[tokio::test]
+    async fn delete_received_batch_by_batch_uuid_removes_all_attempts_history() {
+        use crate::sync::store::{
+            append_sync_event, insert_history_row, replace_inbound_files, set_inbound_state,
+            upsert_inbound_attempt,
+        };
+        use crate::sync::{InboundFileRow, InboundFileState, InboundState};
+
+        let (_tmp, ctx) = test_ctx();
+        let peer = "cc".repeat(32);
+        const BATCH: &str = "batch-recv-1";
+        let wire = "wire-current-2"; // current attempt's wire id — differs from BATCH
+        let id;
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            // A modern batch-keyed inbound row (batch_uuid = BATCH, wire id = wire).
+            let (rid, _) = upsert_inbound_attempt(&conn, &peer, BATCH, wire, 1, 10).unwrap();
+            id = rid;
+            assert_ne!(wire, BATCH, "wire id must differ from the batch_uuid for this test");
+            replace_inbound_files(
+                &conn,
+                id,
+                &[InboundFileRow {
+                    inbound_id: id,
+                    rel_path: "Lights/r.fits".into(),
+                    byte_size: 10,
+                    frame_uuid: "r".into(),
+                    state: InboundFileState::Done,
+                    bytes_done: 10,
+                    outcome: Some("ingested".into()),
+                    error: None,
+                    updated_at: "t".into(),
+                }],
+            )
+            .unwrap();
+            append_sync_event(&conn, Direction::Received, &id.to_string(), "fetch_done", None).unwrap();
+            set_inbound_state(&conn, wire, InboundState::Done, None).unwrap();
+            // The batch-keyed history row (B5b writers).
+            insert_history_row(
+                &conn,
+                &HistoryRow {
+                    frame_uuid: "r".into(),
+                    filename: "r.fits".into(),
+                    object: None,
+                    peer_device: peer.clone(),
+                    direction: Direction::Received,
+                    bytes: 10,
+                    started_at: "t".into(),
+                    finished_at: Some("t2".into()),
+                    outcome: "ingested".into(),
+                    project: None,
+                    package_id: Some(BATCH.into()),
+                    batch_name: None,
+                },
+            )
+            .unwrap();
+            // A pre-B5b wire-id-keyed history row (same dev cycle) — swept by the
+            // current-wire-id second delete.
+            insert_history_row(
+                &conn,
+                &HistoryRow {
+                    frame_uuid: "r-old".into(),
+                    filename: "r-old.fits".into(),
+                    object: None,
+                    peer_device: peer.clone(),
+                    direction: Direction::Received,
+                    bytes: 10,
+                    started_at: "t".into(),
+                    finished_at: Some("t2".into()),
+                    outcome: "ingested".into(),
+                    project: None,
+                    package_id: Some(wire.into()),
+                    batch_name: None,
+                },
+            )
+            .unwrap();
+        }
+
+        let deleted =
+            delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Received, BATCH.to_string())
+                .await
+                .expect("delete ok");
+        assert_eq!(deleted.rows, 1, "the one batch row deleted (matched by batch_uuid)");
+        assert_eq!(
+            deleted.history, 2,
+            "both the batch-keyed and the current-wire-id-keyed history rows deleted"
+        );
+
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
+        assert_eq!(count("SELECT COUNT(*) FROM sync_inbound"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM sync_inbound_files"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM sync_events"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM sync_history WHERE direction = 'received'"), 0);
+    }
+
+    /// B5b: a terminal received row surfaces its `last_error` on the summary — so a
+    /// sender-revoked transfer can honestly say WHY it ended (e.g. «by sender»)
+    /// instead of a bare `cancelled`. The revoke path already writes the reason via
+    /// `set_inbound_state`; this pins the summary mapper exposing it.
+    #[tokio::test]
+    async fn inbound_summary_exposes_last_error() {
+        use crate::sync::store::{set_inbound_state, upsert_inbound_announced};
+        use crate::sync::InboundState;
+
+        let (_tmp, ctx) = test_ctx();
+        let peer = "bb".repeat(32);
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let _ = upsert_inbound_announced(&conn, &peer, "wire-rev", 1, 10).unwrap();
+            // What `handle_revoke(Cancelled)` stamps: state cancelled + "by sender".
+            set_inbound_state(&conn, "wire-rev", InboundState::Cancelled, Some("by sender")).unwrap();
+        }
+
+        let terminal = list_terminal_transfers(&ctx, None).expect("terminal transfers");
+        let recv = terminal
+            .received
+            .iter()
+            .find(|r| r.package_id == "wire-rev")
+            .expect("received summary present");
+        assert_eq!(recv.state, InboundState::Cancelled);
+        assert_eq!(
+            recv.last_error.as_deref(),
+            Some("by sender"),
+            "the sender-revoke reason surfaces on the inbound summary"
+        );
     }
 
     /// Dead-peer delete (tv2 blocker fix): a SENT batch whose only non-terminal

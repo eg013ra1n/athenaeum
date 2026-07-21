@@ -830,6 +830,14 @@ async fn handle_announce(
     let peer_device = super::node_id_hex(&from);
     let package_id = announce.package_id.0.clone();
 
+    // B5b: received `sync_history` rows key on the durable `batch_uuid` — the same
+    // identity the inbound row is keyed on — so every attempt's rows share ONE key
+    // and an earlier attempt can never render as a phantom faded group. This is
+    // exactly the `batch_uuid` `upsert_inbound_attempt` stores on the row below; an
+    // empty value (never happens post-B4, where v1/v2 fall back to the wire id)
+    // defends by reusing the wire id, matching the summary/detail NULL-edge fallback.
+    let history_key = if batch_uuid.trim().is_empty() { package_id.clone() } else { batch_uuid.clone() };
+
     // v2 announce extras (Transfers Status Model v2): a blank/whitespace batch name
     // is treated as absent (v1-style, no batch landing level), an empty manifest as
     // "no per-file rows". The loopback mock always sends `Some("")`/`Some(vec![])`
@@ -1045,7 +1053,7 @@ async fn handle_announce(
     if cancelled_final || control.is_cancelled(&package_id) {
         return cancel_epilogue(
             store, transport, emitter.as_ref(), from, &announce, staging_root, inbound_id,
-            effective_name.as_deref(),
+            &history_key, effective_name.as_deref(),
         )
         .await;
     }
@@ -1213,7 +1221,7 @@ async fn handle_announce(
         tracing::info!(package_id = %package_id, peer_device = %peer_device, "sync receiver cancelling in-flight fetch");
         return cancel_epilogue(
             store, transport, emitter.as_ref(), from, &announce, staging_root, inbound_id,
-            effective_name.as_deref(),
+            &history_key, effective_name.as_deref(),
         )
         .await;
     };
@@ -1266,6 +1274,7 @@ async fn handle_announce(
         let staging_for_ingest = staging.clone();
         let announce = announce.clone();
         let peer_device = peer_device.clone();
+        let history_key = history_key.clone();
         let batch_name = effective_name.clone();
         let landing_override = landing_override.clone();
         match tokio::task::spawn_blocking(move || -> Result<IngestOutcome> {
@@ -1276,6 +1285,7 @@ async fn handle_announce(
                 &staging_for_ingest,
                 &announce,
                 &peer_device,
+                &history_key,
                 batch_name.as_deref(),
                 landing_override.as_deref(),
             )
@@ -1464,6 +1474,7 @@ async fn cancel_epilogue(
     announce: &PackageAnnounce,
     staging_root: &Path,
     inbound_id: i64,
+    history_key: &str,
     batch_name: Option<&str>,
 ) -> Result<()> {
     let peer_device = super::node_id_hex(&from);
@@ -1501,7 +1512,7 @@ async fn cancel_epilogue(
             outcome: ReceiptOutcome::Cancelled,
         })
         .collect();
-    let history = ingest::cancelled_history_rows(&records, &peer_device, &package_id, batch_name.as_deref());
+    let history = ingest::cancelled_history_rows(&records, &peer_device, history_key, batch_name.as_deref());
     let now = super::now_iso();
     {
         let conn = store.lock_conn();
@@ -1653,6 +1664,14 @@ async fn handle_revoke(
     }
     let inbound_id = row.id;
     let batch_name = row.display_name.clone();
+    // B5b: the revoke's received `sync_history` rows key on the row's durable
+    // `batch_uuid` (fallback to the wire id for a legacy NULL-batch_uuid row),
+    // matching the ingest/cancel writers and the summary/detail NULL-edge fallback.
+    let history_key = row
+        .batch_uuid
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| wire_id.clone());
 
     // Abort any in-flight fetch through the receiver's own cancel signal (the exact
     // mechanism `cancel_incoming_package` uses; see the serial-loop note above).
@@ -1742,7 +1761,7 @@ async fn handle_revoke(
                 finished_at: Some(now.clone()),
                 outcome: history_outcome.to_string(),
                 project: None,
-                package_id: Some(wire_id.clone()),
+                package_id: Some(history_key.clone()),
                 batch_name: batch_name.clone(),
             };
             if let Err(e) = insert_history_row(&conn, &h) {
@@ -3339,6 +3358,89 @@ mod tests {
         assert_eq!(kinds.iter().filter(|k| *k == "fetch_started").count(), 2, "two fetch attempts in the feed: {kinds:?}");
         assert!(kinds.iter().any(|k| k == "fetch_failed"), "attempt 1's failure is journaled: {kinds:?}");
         assert!(kinds.iter().any(|k| k == "ingested"), "attempt 2's ingest is journaled: {kinds:?}");
+    }
+
+    /// B5b: received `sync_history` rows key on the durable `batch_uuid`, never the
+    /// per-attempt wire id — so an earlier attempt's history can never render as a
+    /// phantom faded group the current batch-keyed row fails to dedupe. Runs B4's
+    /// two-attempt harness (attempt 1 fails at the payload fetch; attempt 2, a FRESH
+    /// wire id for the SAME `batch_uuid`, delivers) and asserts every received
+    /// history row's `package_id` equals the row's `batch_uuid` and NONE keys on
+    /// either wire id (both `!= batch_uuid`). Pre-B5b the ingest path stamped the
+    /// wire id, so attempt 2's rows keyed on `resend-wire-2` — red by construction.
+    #[tokio::test]
+    async fn received_history_keys_on_batch_uuid_not_wire_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            { let incoming = incoming.clone(); Arc::new(move || incoming.clone()) as IncomingResolver },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        const BATCH: &str = "batch-m31-lights";
+        let (pkg_dir, announce1, files) = build_v2_fixture(tmp.path());
+        let w1 = announce1.package_id.0.clone();
+        assert_ne!(w1, BATCH, "the fixture wire id must differ from the batch_uuid for this test to discriminate");
+
+        // Attempt 1: fetch armed to abort → nothing lands, no history written.
+        sender.serve(&announce1, &pkg_dir, None).await.unwrap();
+        receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+        sender.announce(receiver_node, &announce1, "M31 Lights", BATCH, &files).await.unwrap();
+        let _ = poll_inbound(&store, &w1, InboundState::Failed).await;
+
+        // Attempt 2 (resend): a FRESH wire id for the SAME batch_uuid; delivers.
+        let announce2 = PackageAnnounce {
+            package_id: PackageId("resend-wire-2".to_string()),
+            root_hash: announce1.root_hash.clone(),
+            byte_size: announce1.byte_size,
+            frame_count: announce1.frame_count,
+        };
+        let w2 = announce2.package_id.0.clone();
+        assert_ne!(w2, BATCH, "the resend wire id must differ from the batch_uuid");
+        sender.serve(&announce2, &pkg_dir, None).await.unwrap();
+        sender.announce(receiver_node, &announce2, "M31 Lights", BATCH, &files).await.unwrap();
+        let row = poll_inbound(&store, &w2, InboundState::Done).await;
+        let batch = row.batch_uuid.clone().expect("the delivered row carries its batch_uuid");
+        assert_eq!(batch, BATCH);
+
+        // Both frames' ingest history exists (proves the writer ran).
+        assert_eq!(
+            count_scalar(&store, "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='ingested'"),
+            2,
+            "both frames' ingest history recorded"
+        );
+        // Every received history row keys on the batch_uuid …
+        assert_eq!(
+            count_scalar(&store, &format!("SELECT COUNT(*) FROM sync_history WHERE direction='received' AND package_id <> '{batch}'")),
+            0,
+            "no received history row keys on anything but the batch_uuid"
+        );
+        // … and the phantom-group condition (a wire-id-keyed row) is impossible.
+        assert_eq!(
+            count_scalar(&store, &format!("SELECT COUNT(*) FROM sync_history WHERE direction='received' AND package_id IN ('{w1}','{w2}')")),
+            0,
+            "no received history row keys on a rotated wire id"
+        );
     }
 
     /// The cancelled-transfer-vs-resend contract (§B4): once the receiver DECLINES a

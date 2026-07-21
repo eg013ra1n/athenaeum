@@ -2074,6 +2074,35 @@ pub fn inbound_id_states_by_package(
     Ok(rows)
 }
 
+/// Every `sync_inbound` row for one batch as `(id, state, wire package_id)` — the
+/// received-half batch-delete scan keyed on the durable `batch_uuid` (Transfers
+/// Batch Model, B5b), the symmetric twin of the sent side keying on the package-dir
+/// basename. Matches `batch_uuid = key`, with a NULL-edge fallback to
+/// `package_id = key` so a legacy row whose `batch_uuid` column is NULL (a v1/v2
+/// receive, or a pre-column row) — whose caller passes the wire id — is still
+/// deletable. Returns the CURRENT wire `package_id` per matched row too, so the
+/// caller can release its blob tags and sweep any history rows written wire-id-keyed
+/// before B5b (post-wipe dev-cycle hygiene). Normally one row (a `batch_uuid` is
+/// effectively unique), but the `UNIQUE(peer, batch_uuid)` schema permits several
+/// across peers, so the delete handles them all.
+pub fn inbound_id_states_by_batch(
+    conn: &Connection,
+    key: &str,
+) -> Result<Vec<(i64, String, String)>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, state, package_id FROM sync_inbound \
+             WHERE batch_uuid = ?1 OR (batch_uuid IS NULL AND package_id = ?1)",
+        )
+        .context("prepare inbound_id_states_by_batch")?;
+    let rows = stmt
+        .query_map(params![key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .context("query inbound_id_states_by_batch")?
+        .collect::<rusqlite::Result<Vec<(i64, String, String)>>>()
+        .context("collect inbound_id_states_by_batch")?;
+    Ok(rows)
+}
+
 /// Delete one `sync_outbound` row by id — the parent-row delete of the batch
 /// record cascade. Pair with [`delete_outbound_files`] + [`delete_sync_events`]
 /// under one transaction (this store has no FK cascades).

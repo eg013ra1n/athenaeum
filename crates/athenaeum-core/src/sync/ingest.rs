@@ -111,7 +111,12 @@ struct FrameVerdict {
 
 /// Ingest one fetched package into the catalog on `conn`, landing accepted
 /// payloads under `incoming_root`. `peer_device` is the sending node id (hex),
-/// stamped as `sync_history.peer_device`. Returns the receipts to ack.
+/// stamped as `sync_history.peer_device`. `history_key` is the durable per-transfer
+/// `batch_uuid` (Transfers Batch Model, B5b) stamped into `sync_history.package_id`
+/// so every attempt's rows share one key that the batch-keyed inbound row can join
+/// and dedupe — distinct from the wire `announce.package_id`, which stays the
+/// `sync_receipts` key (the ack log rotates per attempt). Returns the receipts to
+/// ack.
 ///
 /// Idempotent: re-running against the same catalog produces `Duplicate` receipts
 /// and no new `files`/`frames` rows (the per-frame uuid/content dedup), so a lost
@@ -123,6 +128,7 @@ pub fn ingest_package(
     package_dir: &Path,
     announce: &PackageAnnounce,
     peer_device: &str,
+    history_key: &str,
     batch_name: Option<&str>,
     landing_override: Option<&Path>,
 ) -> Result<IngestOutcome> {
@@ -193,7 +199,7 @@ pub fn ingest_package(
             // — the source may have been repaired since the last attempt.
         }
 
-        let verdict = match process_frame(conn, &landing_base, package_dir, record, package_id, peer_device, &started_at, batch_name) {
+        let verdict = match process_frame(conn, &landing_base, package_dir, record, package_id, history_key, peer_device, &started_at, batch_name) {
             Ok(v) => v,
             Err(e) => {
                 // A processing error (I/O, DB) is surfaced as a Rejected receipt
@@ -213,7 +219,7 @@ pub fn ingest_package(
                 // Best-effort receipt/history so the failure is still durable and
                 // the ack carries a verdict for this frame.
                 let _ = record_receipt_and_history(
-                    conn, package_id, &receipt, record, peer_device, &started_at, "rejected", batch_name,
+                    conn, package_id, history_key, &receipt, record, peer_device, &started_at, "rejected", batch_name,
                 );
                 FrameVerdict { receipt, history_outcome: "rejected" }
             }
@@ -248,6 +254,7 @@ fn process_frame(
     package_dir: &Path,
     record: &ManifestRecord,
     package_id: &str,
+    history_key: &str,
     peer_device: &str,
     started_at: &str,
     batch_name: Option<&str>,
@@ -262,14 +269,14 @@ fn process_frame(
         Ok(h) => h,
         Err(e) => {
             let receipt = rejected_receipt(record, format!("payload unreadable: {e}"));
-            record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, "rejected", batch_name)?;
+            record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, "rejected", batch_name)?;
             return Ok(FrameVerdict { receipt, history_outcome: "rejected" });
         }
     };
     if actual != record.xxh3 {
         tracing::warn!(frame_uuid = %record.frame_uuid, "sync ingest xxh3 mismatch; rejecting");
         let receipt = rejected_receipt(record, format!("xxh3 mismatch: manifest {}, disk {actual}", record.xxh3));
-        record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, "rejected", batch_name)?;
+        record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, "rejected", batch_name)?;
         return Ok(FrameVerdict { receipt, history_outcome: "rejected" });
     }
 
@@ -299,7 +306,7 @@ fn process_frame(
         }
 
         let receipt = duplicate_receipt(record);
-        record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, history_outcome, batch_name)?;
+        record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, history_outcome, batch_name)?;
         tracing::debug!(frame_uuid = %record.frame_uuid, outcome = history_outcome, "sync ingest duplicate by uuid");
         return Ok(FrameVerdict { receipt, history_outcome });
     }
@@ -317,7 +324,7 @@ fn process_frame(
     if full_hash_already_ingested(conn, &record.xxh3)? {
         tracing::debug!(frame_uuid = %record.frame_uuid, "sync ingest duplicate by full content hash");
         let receipt = duplicate_receipt(record);
-        record_receipt_and_history(conn, package_id, &receipt, record, peer_device, started_at, "duplicate", batch_name)?;
+        record_receipt_and_history(conn, package_id, history_key, &receipt, record, peer_device, started_at, "duplicate", batch_name)?;
         return Ok(FrameVerdict { receipt, history_outcome: "duplicate" });
     }
 
@@ -338,7 +345,7 @@ fn process_frame(
         let tx = conn.unchecked_transaction().context("begin ingest tx")?;
         insert_ingested_rows(&tx, &landed, record, &snapshot, &sampling_hash)?;
         insert_receipt(&tx, package_id, &receipt, started_at)?;
-        insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, "ingested", package_id, batch_name))?;
+        insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, "ingested", history_key, batch_name))?;
         tx.commit().context("commit ingest tx")
     })();
     let write_ms = write_started.elapsed().as_millis();
@@ -535,10 +542,14 @@ fn insert_ingested_rows(
 /// Write the receipt + history rows for one frame in a single transaction.
 /// Used by the duplicate/rejected paths (the ingest path writes them inline in
 /// its own transaction alongside the catalog rows).
+///
+/// `package_id` is the wire id (the `sync_receipts` key); `history_key` is the
+/// durable `batch_uuid` stamped into `sync_history.package_id` (B5b).
 #[allow(clippy::too_many_arguments)]
 fn record_receipt_and_history(
     conn: &Connection,
     package_id: &str,
+    history_key: &str,
     receipt: &FrameReceipt,
     record: &ManifestRecord,
     peer_device: &str,
@@ -549,7 +560,7 @@ fn record_receipt_and_history(
     let snapshot: Frame = serde_json::from_value(record.frame_meta.clone()).unwrap_or_default();
     let tx = conn.unchecked_transaction().context("begin receipt tx")?;
     insert_receipt(&tx, package_id, receipt, started_at)?;
-    insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, history_outcome, package_id, batch_name))?;
+    insert_history_row(&tx, &received_history(record, &snapshot, peer_device, started_at, history_outcome, history_key, batch_name))?;
     tx.commit().context("commit receipt tx")?;
     Ok(())
 }
@@ -557,14 +568,15 @@ fn record_receipt_and_history(
 /// Build one `direction = received`, outcome `cancelled` history row per manifest
 /// frame for the receiver's cancel epilogue (Transfers Status Model v2 §D6) — the
 /// receiver-side twin of the sender's "cancelled by receiver" audit. `batch_name`
-/// is the inbound row's `display_name`; each row carries the same per-frame shape
-/// [`received_history`] produces on the ingest path. Deserializes each record's
-/// `frame_meta` for the `object` column (a malformed snapshot defaults, never
-/// panics — the row still records the cancel).
+/// is the inbound row's `display_name`; `history_key` is the row's durable
+/// `batch_uuid` (B5b) stamped into `sync_history.package_id`. Each row carries the
+/// same per-frame shape [`received_history`] produces on the ingest path.
+/// Deserializes each record's `frame_meta` for the `object` column (a malformed
+/// snapshot defaults, never panics — the row still records the cancel).
 pub(crate) fn cancelled_history_rows(
     records: &[ManifestRecord],
     peer_device: &str,
-    package_id: &str,
+    history_key: &str,
     batch_name: Option<&str>,
 ) -> Vec<HistoryRow> {
     let started_at = now_iso();
@@ -572,16 +584,19 @@ pub(crate) fn cancelled_history_rows(
         .iter()
         .map(|record| {
             let snapshot: Frame = serde_json::from_value(record.frame_meta.clone()).unwrap_or_default();
-            received_history(record, &snapshot, peer_device, &started_at, "cancelled", package_id, batch_name)
+            received_history(record, &snapshot, peer_device, &started_at, "cancelled", history_key, batch_name)
         })
         .collect()
 }
 
-/// Build a `direction = received` history row for a frame. `package_id` is the
-/// wire announce `package_id` (== `sync_inbound.package_id`), stamped as the
-/// per-batch key (Task 14) so the received-detail read
-/// ([`list_transfer_files`](crate::api::sync::list_transfer_files)) can join a
-/// terminal inbound package's rows back by `WHERE package_id = ?`.
+/// Build a `direction = received` history row for a frame. `history_key` is the
+/// inbound row's durable `batch_uuid` (Transfers Batch Model, B5b), stamped into
+/// `sync_history.package_id` so every attempt of one transfer shares ONE key the
+/// batch-keyed inbound row can join/dedupe — for a legacy (v1/v2) receive the
+/// `batch_uuid` IS the wire id, so this reproduces the pre-B5b key exactly, and the
+/// received-detail read's legacy fallback
+/// ([`list_transfer_files`](crate::api::sync::list_transfer_files)) still joins it
+/// (`row.package_id == batch_uuid` for those rows).
 #[allow(clippy::too_many_arguments)]
 fn received_history(
     record: &ManifestRecord,
@@ -589,7 +604,7 @@ fn received_history(
     peer_device: &str,
     started_at: &str,
     outcome: &str,
-    package_id: &str,
+    history_key: &str,
     batch_name: Option<&str>,
 ) -> HistoryRow {
     HistoryRow {
@@ -603,7 +618,7 @@ fn received_history(
         finished_at: Some(now_iso()),
         outcome: outcome.to_string(),
         project: record.project.as_ref().map(|p| p.project_id.clone()),
-        package_id: Some(package_id.to_string()),
+        package_id: Some(history_key.to_string()),
         batch_name: batch_name.map(|s| s.to_string()),
     }
 }
