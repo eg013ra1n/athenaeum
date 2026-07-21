@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -3059,8 +3059,18 @@ fn dir_size_bytes(dir: &Path) -> u64 {
 /// NOT a row-less orphan. Basename-keyed, not full-path: every package dir is
 /// minted `<sync>/packages/<uuid>` so the basename is the unique batch identity,
 /// robust against `/Volumes` vs `/private/Volumes` path normalization. Read fresh
-/// at sweep time (not cached at boot) so a package a concurrent resurrection /
-/// user-enqueue just wrote is already protected.
+/// at sweep time (not cached at boot) so a package a concurrent RESURRECTION
+/// needs (it only re-drives EXISTING non-terminal rows, never creates a new dir)
+/// is already protected.
+///
+/// **This does NOT by itself protect a concurrent user ENQUEUE** (review fix,
+/// Critical): `write_package` creates and populates `packages/<uuid>`
+/// incrementally — manifest written LAST, seconds-to-minutes for a multi-GB
+/// batch — and the engine worker inserts the `sync_outbound` row only once that
+/// build is done. A dir can therefore be genuinely row-less (absent from THIS
+/// set, however freshly read) while mid-build, or for the instant between the
+/// row's commit and this read. The age-gate in
+/// [`sweep_orphan_payload_dirs`] is what protects that case — see its doc.
 fn referenced_package_keys(ctx: &ServiceContext) -> Result<HashSet<String>, ApiError> {
     use crate::sync::store::outbound_ref_states;
     let db = db(ctx)?;
@@ -3071,17 +3081,47 @@ fn referenced_package_keys(ctx: &ServiceContext) -> Result<HashSet<String>, ApiE
         .collect())
 }
 
+/// Orphan payload-dir sweep age gate (B7, review fix — Critical). A row-less dir
+/// younger than this is presumed either an in-progress enqueue (dir-before-row:
+/// `write_package` builds `packages/<uuid>` incrementally, manifest written LAST,
+/// seconds-to-minutes for a multi-GB batch, before the engine worker inserts the
+/// `sync_outbound` row) or one whose row just landed after our DB snapshot — never
+/// a genuine orphan. A genuine orphan is leftover from a PRIOR session, so 5
+/// minutes is conservative in both directions: comfortably longer than any
+/// realistic per-file write gap within one package build, and far shorter than
+/// "since last restart". See [`sweep_orphan_payload_dirs`].
+const ORPHAN_SWEEP_MIN_AGE: Duration = Duration::from_secs(5 * 60);
+
+/// A path's on-disk modification age (`now - mtime`) — `None` if the mtime is
+/// unreadable (vanished mid-walk / a filesystem without mtime support), in which
+/// case the caller skips rather than guesses.
+fn dir_age(path: &Path) -> Option<Duration> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    SystemTime::now().duration_since(modified).ok()
+}
+
 /// Startup pass 1 — remove ROW-LESS orphan payload dirs under `<sync>/packages/`:
 /// a dir whose basename matches NO `sync_outbound` row (an interrupted build, or a
 /// dir whose rows were deleted without their reclaim landing). Never touches a dir
 /// referenced by any row (terminal rows keep payload for Resend — only truly
-/// row-less orphans go). Returns `(dirs_removed, bytes_reclaimed)`. Best-effort:
-/// one un-removable dir `warn!`s and the pass continues.
+/// row-less orphans go).
+///
+/// **Age-gated (review fix, Critical).** Row-presence alone is NOT sufficient to
+/// call a dir orphaned: the enqueue path is dir-before-row (see
+/// [`ORPHAN_SWEEP_MIN_AGE`]), so a fresh-at-removal-time DB read
+/// ([`referenced_package_keys`]) can still observe a populated, in-progress send's
+/// dir with no row yet — deleting it would destroy a live send. Every row-less dir
+/// is therefore additionally checked against [`ORPHAN_SWEEP_MIN_AGE`] via
+/// [`dir_age`] and skipped (at `debug!`) if younger; an unreadable mtime is also
+/// skipped (at `warn!`), never guessed at. A genuine orphan simply survives to the
+/// next sweep once it ages past the gate. Returns `(dirs_removed,
+/// bytes_reclaimed)`. Best-effort: one un-removable dir `warn!`s and the pass
+/// continues.
 fn sweep_orphan_payload_dirs(ctx: &ServiceContext) -> Result<(u32, u64), ApiError> {
     let packages_dir = sender_packages_dir(ctx)?;
-    // Fresh DB read AT removal time (the race choice, see [`sweep_transfer_orphans`]):
-    // resurrection never deletes rows, so any dir a resurrected row needs is in this
-    // set → never removed.
+    // Fresh DB read AT removal time: resurrection never deletes rows, so any dir a
+    // resurrected row needs is in this set → never removed. (Does NOT by itself
+    // cover a concurrent enqueue — see the age-gate below and this fn's doc.)
     let referenced = referenced_package_keys(ctx)?;
     let entries = match std::fs::read_dir(&packages_dir) {
         Ok(e) => e,
@@ -3101,6 +3141,24 @@ fn sweep_orphan_payload_dirs(ctx: &ServiceContext) -> Result<(u32, u64), ApiErro
         };
         if referenced.contains(name) {
             continue; // referenced by some row → keep
+        }
+        // Age-gate (review fix, Critical): a row-less dir this young is presumed
+        // in-progress (dir-before-row enqueue window) or just-committed (its row
+        // landed after our `referenced` snapshot) — never treated as an orphan.
+        match dir_age(&path) {
+            Some(age) if age < ORPHAN_SWEEP_MIN_AGE => {
+                tracing::debug!(
+                    path = %path.display(),
+                    age_secs = age.as_secs(),
+                    "orphan sweep: dir too young, skipped (in-progress enqueue guard)"
+                );
+                continue;
+            }
+            Some(_) => {}
+            None => {
+                tracing::warn!(path = %path.display(), "orphan sweep: mtime unreadable, skipped");
+                continue;
+            }
         }
         let sz = dir_size_bytes(&path);
         match std::fs::remove_dir_all(&path) {
@@ -3233,14 +3291,26 @@ async fn release_orphan_in_flight_tags(
 /// in-flight blob tags. Silent when nothing is found; one `info!` with the totals
 /// otherwise. Never fails: each pass is best-effort and a pass error only `warn!`s.
 ///
-/// **Sweep-vs-resurrection ordering (the constraint's race choice):** the two are
-/// both spawned post-`ensure_started` and run concurrently, made safe by *fresh DB
-/// reads at deletion time* rather than by ordering. The payload-dir pass removes
-/// ONLY row-less dirs and re-reads the referenced-basename set fresh
-/// ([`referenced_package_keys`]); resurrection never deletes rows (it re-drives
-/// existing non-terminal rows), so any dir a resurrected row needs is in that set
-/// and is never removed. The in-flight pass keys on non-terminal `sync_inbound`
-/// rows, which resurrection (sender-side) never touches. No lock/ordering needed.
+/// **Concurrent-writer safety (the constraint's race choices):** the sweep runs
+/// concurrently with TWO other writers under `<sync>/packages/` — the resurrection
+/// spawn (also fired post-`ensure_started`) and a live user enqueue
+/// (`write_package` can run at any time, including seconds after boot on the
+/// `get_pairing_ticket` re-run path) — and no lock/ordering is used against
+/// either. They need different protection because they touch the DB/dir
+/// differently:
+/// - **Resurrection** never creates a new dir or deletes a row — it only
+///   re-drives EXISTING non-terminal rows — so the payload-dir pass's
+///   fresh-at-removal-time read ([`referenced_package_keys`]) is sufficient on its
+///   own: any dir a resurrected row needs is already in that set.
+/// - **A concurrent enqueue** DOES create a new row-less dir first
+///   (dir-before-row: `write_package` populates `packages/<uuid>` incrementally,
+///   and the `sync_outbound` row lands only once that build is done), so a fresh
+///   DB read cannot see a row that does not exist yet. The payload-dir pass
+///   additionally age-gates every row-less dir
+///   ([`ORPHAN_SWEEP_MIN_AGE`]/[`dir_age`], see [`sweep_orphan_payload_dirs`])
+///   rather than relying on row-presence alone.
+/// The in-flight-tag pass keys on non-terminal `sync_inbound` rows, which neither
+/// writer touches, so it needs no age gate.
 pub async fn sweep_transfer_orphans(ctx: Arc<ServiceContext>, sync: Arc<SyncRuntime>) {
     let (payload_dirs, bytes_reclaimed) = match sweep_orphan_payload_dirs(&ctx) {
         Ok(v) => v,
@@ -4063,6 +4133,15 @@ mod tests {
         (ep, runtime)
     }
 
+    /// Test helper: set `path`'s mtime `age` in the past, so a test can put an
+    /// orphan-sweep candidate on either side of [`ORPHAN_SWEEP_MIN_AGE`] without
+    /// sleeping. Works on a directory via `File::open` + the stable
+    /// `set_modified` (no extra crate needed).
+    fn backdate_mtime(path: &Path, age: Duration) {
+        let f = std::fs::File::open(path).expect("open path for mtime backdate");
+        f.set_modified(SystemTime::now() - age).expect("set_modified");
+    }
+
     /// B7 core contract: the startup sweep removes ONLY row-less orphan payload
     /// dirs (a terminal-row dir and a non-terminal-row dir are both kept), and
     /// releases ONLY orphan in-flight tags (a tag whose wire id still has a
@@ -4084,6 +4163,9 @@ mod tests {
             d
         };
         let orphan_dir = mk("orphan-uuid"); // (a) NO row → removed
+        // Past the age gate: this dir must read as a genuine prior-session orphan,
+        // not a concurrent enqueue's in-progress dir-before-row window.
+        backdate_mtime(&orphan_dir, ORPHAN_SWEEP_MIN_AGE + Duration::from_secs(60));
         let terminal_dir = mk("terminal-uuid"); // (b) terminal row → kept
         let live_dir = mk("live-uuid"); // (c) non-terminal row → kept
 
@@ -4134,6 +4216,42 @@ mod tests {
             ep.has_in_flight_tag("live-wire"),
             "an in-flight tag whose wire id still has a non-terminal inbound row is kept"
         );
+    }
+
+    /// B7 review fix (Critical): the payload-dir sweep age-gates row-less dirs, so
+    /// it never races a concurrent enqueue. `write_package` is dir-before-row —
+    /// `packages/<uuid>` is created and populated BEFORE the `sync_outbound` row
+    /// lands — so a row-less dir alone is not proof of orphanhood; only its AGE
+    /// is. A fresh row-less dir (indistinguishable from an in-progress build, or
+    /// a row that committed a moment after the sweep's DB snapshot) survives; the
+    /// identical dir, once older than [`ORPHAN_SWEEP_MIN_AGE`], is a genuine
+    /// prior-session orphan and is removed.
+    #[tokio::test]
+    async fn sweep_age_gates_rowless_dirs_never_racing_a_concurrent_enqueue() {
+        let (_tmp, ctx) = test_ctx();
+        let packages_dir = sender_packages_dir(&ctx).unwrap();
+        std::fs::create_dir_all(&packages_dir).unwrap();
+
+        let mk = |name: &str| {
+            let d = packages_dir.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("frame.fits"), b"payload").unwrap();
+            d
+        };
+        // Left at its natural (just-created) mtime — no row references it, but it
+        // is indistinguishable from a live enqueue's dir-before-row window.
+        let fresh_dir = mk("fresh-uuid");
+        // Backdated past the gate — a genuine orphan from a prior session.
+        let old_dir = mk("old-uuid");
+        backdate_mtime(&old_dir, ORPHAN_SWEEP_MIN_AGE + Duration::from_secs(60));
+
+        sweep_transfer_orphans(Arc::new(ctx), Arc::new(SyncRuntime::new())).await;
+
+        assert!(
+            fresh_dir.exists(),
+            "a fresh row-less dir survives the sweep — never raced as a concurrent enqueue"
+        );
+        assert!(!old_dir.exists(), "an old row-less dir is a genuine orphan and is removed");
     }
 
     /// B7 cleanup: `cleanup_finished_transfers` removes TERMINAL rows' payloads
