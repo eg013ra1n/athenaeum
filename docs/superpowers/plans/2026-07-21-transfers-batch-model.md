@@ -135,7 +135,7 @@ Process: SDD — controller-written brief per task, fresh implementer per task (
 
 **Files.** `crates/athenaeum-core/tests/sync_e2e.rs`.
 
-**Scenarios.** (1) sender cancel mid-fetch → receiver stops via Revoke within the harness deadline, honest states both ends; (2) cancel → resend → confirm: ONE row both ends, only missing files travel (dedup asserted), attempts=2; (3) all-duplicate-after-announce race → revoke closes the receiver row; (4) restart mid-resend → same row resumes; (5) delete → payload dir gone, tags released, storage stats drop.
+**Scenarios.** (1) sender cancel mid-fetch → receiver stops via Revoke within the harness deadline, honest states both ends; (2) *(re-specified after B4: cancel→resend→confirm is unreachable under cancelled-is-final)* attempt-1 FAILS (fetch fault / ack loss) → resend on a rotated wire id → confirm into the SAME batch-keyed inbound row (id constant), only missing files travel (dedup asserted); (3) all-duplicate-after-announce race → revoke closes the receiver row; (4) restart mid-resend → same row resumes; (5) delete → payload dir gone, tags released, storage stats drop.
 
 **Acceptance.** suite green and deterministic (3 consecutive runs), runtime bounded.
 
