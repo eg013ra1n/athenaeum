@@ -46,6 +46,16 @@ pub struct OutboundSummary {
     pub package_short: String,
     pub state: OutboundState,
     pub attempts: u32,
+    /// User-facing "attempt N" generation counter (Transfers Batch Model §D5),
+    /// bumped ONLY by a resend — NOT by the engine's internal announce-retries
+    /// (which bump [`attempts`](Self::attempts)). The UI shows "attempt
+    /// {generation}".
+    pub generation: u32,
+    /// The durable per-transfer batch identity (Transfers Batch Model §D1) — the
+    /// package-dir basename, which B3 aligned to equal the wire `batch_uuid`. The
+    /// stable key across resend attempts, and (== `sync_history.package_id` for
+    /// sent rows) the `package_key` `delete_transfer_history` takes.
+    pub batch_uuid: String,
     pub created_at: String,
     /// Destination peer node id (hex), shortened for display.
     pub peer_short: String,
@@ -149,6 +159,15 @@ pub struct InboundSummary {
     /// Sending peer node id (hex), shortened for display.
     pub peer_short: String,
     pub state: InboundState,
+    /// User-facing "attempt N" generation counter (Transfers Batch Model §D5),
+    /// bumped by each receiver re-attempt of the same `(peer, batch_uuid)` — NOT
+    /// by anything else. The UI shows "attempt {generation}".
+    pub generation: u32,
+    /// The durable per-transfer batch identity (Transfers Batch Model §D1) the
+    /// receiver keys its ONE long-lived row on (`sync_inbound.batch_uuid`).
+    /// Falls back to the wire package id for a legacy row whose `batch_uuid`
+    /// column is NULL (a v1/v2 receive, or a row pre-dating the column).
+    pub batch_uuid: String,
     pub frame_count: u32,
     pub byte_size: u64,
     /// Cumulative bytes fetched so far (0 until the fetch stage reports progress).

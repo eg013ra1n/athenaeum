@@ -1226,11 +1226,18 @@ fn outbound_summary(
     } else {
         None
     };
+    // The batch identity the UI keys on: the package-dir basename, which B3
+    // aligned to equal the wire `batch_uuid` and which `sync_history.package_id`
+    // (sent) already carries — so it is exactly the `package_key`
+    // `delete_transfer_history` takes for a sent batch.
+    let batch_uuid = outbound_package_key(&row.package_ref);
     OutboundSummary {
         id: row.id,
         package_short: short_pkg(&row.package_ref),
         state: row.state,
         attempts: row.attempts,
+        generation: row.generation,
+        batch_uuid,
         created_at: row.created_at,
         peer_short: short_id(&peer_hex),
         last_error: row.last_error,
@@ -1258,6 +1265,10 @@ fn inbound_summary(
     device_names: &HashMap<String, String>,
     file_counts: &HashMap<i64, TransferFileCounts>,
 ) -> InboundSummary {
+    // The stable per-transfer key the receiver keys its one long-lived row on;
+    // fall back to the wire package id for a legacy row whose `batch_uuid` is
+    // NULL (a v1/v2 receive, or a row created before the column).
+    let batch_uuid = row.batch_uuid.clone().unwrap_or_else(|| row.package_id.clone());
     InboundSummary {
         id: row.id,
         package_id: row.package_id.clone(),
@@ -1266,6 +1277,8 @@ fn inbound_summary(
         display_state: row.state.as_str().to_string(),
         stalled_until: None,
         state: row.state,
+        generation: row.generation,
+        batch_uuid,
         frame_count: row.frame_count,
         byte_size: row.byte_size,
         bytes_done: row.bytes_done,
@@ -2760,11 +2773,15 @@ pub struct DeletedTransferRecord {
 /// Batch-level, not row-level: every attempt of a batch shares `package_key`, so
 /// all of that batch's rows go together.
 ///
-/// `package_key` is the batch identity the Transfers UI already holds: for
+/// `package_key` is the batch identity the Transfers UI already holds. Post-wipe
+/// (Transfers Batch Model, spec §Migration) there are no pre-batch rows, so the key
+/// IS the transfer's `batch_uuid` in both directions (F6 unified): for
 /// [`Sent`](Direction::Sent) it is the package-dir BASENAME
-/// ([`outbound_package_key`], which is also what `sync_history.package_id`
-/// carries); for [`Received`](Direction::Received) it is the wire package uuid
-/// (`sync_inbound.package_id`, == the received history `package_id`).
+/// ([`outbound_package_key`], which B3 aligned to equal the wire `batch_uuid` and
+/// which `sync_history.package_id` also carries); for
+/// [`Received`](Direction::Received) it is the wire package uuid
+/// (`sync_inbound.package_id`, == the received history `package_id`), which the
+/// batch-keyed receiver exposes as the current attempt's identity.
 ///
 /// **Terminal-only, atomically.** If ANY matching row is non-terminal (an active
 /// attempt) the whole call refuses with [`ApiError::Invalid`] and deletes NOTHING
@@ -2775,17 +2792,23 @@ pub struct DeletedTransferRecord {
 /// commit or roll back), and a refusal — an early `return` before `commit` — rolls
 /// the whole thing back untouched.
 ///
-/// **Records only — never disk data or catalog.** This removes `sync_outbound` /
-/// `sync_inbound` state rows, their per-file (`sync_*_files`) rows, their
-/// `sync_events` journal, and their `sync_history` rows. It does NOT touch the
-/// catalog (`files`/`frames`), the received files on disk, or a sent batch's
-/// on-disk payload directory — retention owns the payload lifecycle, so a
-/// still-present package dir is left exactly as it is.
-pub fn delete_transfer_history(
+/// **Delete = reclaim (Transfers Batch Model §D4).** After the records commit, the
+/// batch's temp data is reclaimed best-effort — a sent batch's on-disk payload
+/// directory (`package_ref`) is removed, and a received batch's `in-flight/` blob
+/// tags are released through the SAME `transport.release` the receiver's
+/// cancel/revoke paths use. Both run OUTSIDE the transaction, AFTER commit, and a
+/// failure only `warn!`s: reclaim never turns a successful record delete into an
+/// error. The sent-dir removal is unconditional-safe because every row sharing the
+/// dir basename (== `package_key`) was just deleted, so no remaining row references
+/// it. It still does NOT touch the catalog (`files`/`frames`) or the received files
+/// on disk.
+pub async fn delete_transfer_history(
     ctx: &ServiceContext,
+    sync: &SyncRuntime,
     direction: Direction,
     package_key: String,
 ) -> Result<DeletedTransferRecord, ApiError> {
+    use crate::sharing::types::PackageId;
     use crate::sync::store::{
         cancel_outbound_row, delete_history_for_package, delete_inbound_files, delete_inbound_row,
         delete_outbound_files, delete_outbound_row, delete_sync_events,
@@ -2794,26 +2817,54 @@ pub fn delete_transfer_history(
     };
     use crate::sync::InboundState;
 
-    let db = db(ctx)?;
-    let mut conn = db.conn();
-    // BEGIN IMMEDIATE: take the reserved write lock up front so the terminal guard
-    // and the deletes are atomic against a concurrently resurrected attempt (the
-    // engine's writer blocks until we commit/rollback). An early `return Err` (the
-    // non-terminal refusal) or any `?` failure drops the tx → rollback → no partial
-    // delete.
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| ApiError::Internal(format!("begin delete_transfer_history tx: {e}")))?;
+    // Temp-data reclaim targets captured during the guarded DB pass and executed
+    // once, AFTER commit (never inside the tx — fs / blob-store ops can't roll
+    // back, so we reclaim only when the records are durably gone).
+    enum Reclaim {
+        /// Sent: on-disk payload directories (`package_ref`) to remove.
+        Payloads(Vec<String>),
+        /// Received: wire ids whose permanent + `in-flight/` blob tags to release.
+        Tags(Vec<String>),
+    }
 
-    let result = match direction {
+    // The whole guarded DB pass runs in an inner block so the pooled connection and
+    // the (`!Send`) transaction are dropped at its closing brace — BEFORE the async
+    // reclaim below — keeping the command's future `Send` (no DB handle is ever held
+    // across an await).
+    let (result, reclaim) = {
+        let db = db(ctx)?;
+        let mut conn = db.conn();
+        // BEGIN IMMEDIATE: take the reserved write lock up front so the terminal
+        // guard and the deletes are atomic against a concurrently resurrected
+        // attempt (the engine's writer blocks until we commit/rollback). An early
+        // `return Err` (the non-terminal refusal) or any `?` failure drops the tx →
+        // rollback → no partial delete.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| ApiError::Internal(format!("begin delete_transfer_history tx: {e}")))?;
+
+        let out = match direction {
         Direction::Sent => {
             // Group this batch's attempts: every outbound row whose package_ref
-            // basename equals the key (Rust-side compare — no LIKE).
-            let matching: Vec<(i64, OutboundState)> = outbound_ref_states(&tx)?
+            // basename equals the key (Rust-side compare — no LIKE). Post-wipe this
+            // is EXACTLY the transfer's own rows (basename == batch_uuid, unique).
+            let matching_full: Vec<(i64, String, OutboundState)> = outbound_ref_states(&tx)?
                 .into_iter()
                 .filter(|(_, package_ref, _)| outbound_package_key(package_ref) == package_key)
-                .map(|(id, _, state)| Ok::<_, ApiError>((id, OutboundState::from_db(&state)?)))
+                .map(|(id, package_ref, state)| {
+                    Ok::<_, ApiError>((id, package_ref, OutboundState::from_db(&state)?))
+                })
                 .collect::<Result<_, _>>()?;
+            let matching: Vec<(i64, OutboundState)> =
+                matching_full.iter().map(|(id, _, state)| (*id, *state)).collect();
+            // The distinct payload dirs to reclaim after commit (deduped — all
+            // attempts of one transfer share one dir post batch-model).
+            let mut payload_dirs: Vec<String> = Vec::new();
+            for (_, package_ref, _) in &matching_full {
+                if !payload_dirs.contains(package_ref) {
+                    payload_dirs.push(package_ref.clone());
+                }
+            }
 
             // Split the non-terminal (active-attempt) rows by peer liveness. A row
             // whose peer has LEFT the account can never complete: the resurrection
@@ -2880,7 +2931,7 @@ pub fn delete_transfer_history(
                 rows += 1;
             }
             let history = delete_history_for_package(&tx, Direction::Sent, &package_key)?;
-            DeletedTransferRecord { rows, history }
+            (DeletedTransferRecord { rows, history }, Reclaim::Payloads(payload_dirs))
         }
         Direction::Received => {
             let matching: Vec<(i64, InboundState)> =
@@ -2901,12 +2952,53 @@ pub fn delete_transfer_history(
                 rows += 1;
             }
             let history = delete_history_for_package(&tx, Direction::Received, &package_key)?;
-            DeletedTransferRecord { rows, history }
+            // The matched rows were selected `WHERE package_id = package_key`, so the
+            // batch's current-attempt wire id IS the key — release its blob tags (only
+            // when a row actually matched, else there is no batch to reclaim).
+            let tags = if matching.is_empty() { Vec::new() } else { vec![package_key.clone()] };
+            (DeletedTransferRecord { rows, history }, Reclaim::Tags(tags))
         }
+        };
+
+        tx.commit()
+            .map_err(|e| ApiError::Internal(format!("commit delete_transfer_history: {e}")))?;
+        out
     };
 
-    tx.commit()
-        .map_err(|e| ApiError::Internal(format!("commit delete_transfer_history: {e}")))?;
+    // Best-effort temp-data reclaim (§D4). NEVER fails the delete: the records are
+    // already durably gone; a reclaim error is logged and swallowed.
+    match reclaim {
+        Reclaim::Payloads(dirs) => {
+            for dir in &dirs {
+                // A confirmed/old batch's payload may already be gone (retention swept
+                // it) — that is the common case and not worth a warning; only a real
+                // removal failure of a still-present dir warns.
+                if std::path::Path::new(dir).exists() {
+                    if let Err(e) = std::fs::remove_dir_all(dir) {
+                        tracing::warn!(package_key = %package_key, path = %dir, error = %e, "delete reclaim: payload dir removal failed");
+                    } else {
+                        tracing::info!(package_key = %package_key, path = %dir, "delete reclaim: payload dir removed");
+                    }
+                }
+            }
+        }
+        Reclaim::Tags(wire_ids) => {
+            // Release the batch's `in-flight/` + permanent blob tags through the live
+            // receive-side transport (the same mechanism the receiver's cancel/revoke
+            // paths use). No live transport (not started) → nothing to release. A
+            // missing/already-released tag is a silent no-op inside `release`.
+            if !wire_ids.is_empty() {
+                if let Some(transport) = sync.transport().await {
+                    for wire in &wire_ids {
+                        if let Err(e) = transport.release(&PackageId(wire.clone())).await {
+                            tracing::warn!(package_key = %package_key, wire_id = %wire, error = %format!("{e:#}"), "delete reclaim: blob-tag release failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     tracing::info!(
         direction = direction.as_str(),
         package_key = %package_key,
@@ -2987,8 +3079,8 @@ mod tests {
     /// for that batch — both attempt rows (sharing a dir basename), their per-file
     /// rows, their event journals, and their history rows — while a sibling batch
     /// is left completely intact.
-    #[test]
-    fn delete_sent_batch_removes_all_records_and_leaves_siblings() {
+    #[tokio::test]
+    async fn delete_sent_batch_removes_all_records_and_leaves_siblings() {
         use crate::sharing::types::AnnounceFileEntry;
         use crate::sync::store::{append_sync_event, insert_history_row, insert_outbound_with_files};
 
@@ -3036,7 +3128,9 @@ mod tests {
         }
 
         let deleted =
-            delete_transfer_history(&ctx, Direction::Sent, "batchA".to_string()).expect("delete ok");
+            delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Sent, "batchA".to_string())
+                .await
+                .expect("delete ok");
         assert_eq!(deleted.rows, 2, "both batchA attempt rows deleted");
         assert_eq!(deleted.history, 2, "both batchA history rows deleted");
 
@@ -3058,8 +3152,8 @@ mod tests {
     /// tv2 UX wave 2: a batch with ANY non-terminal attempt refuses deletion
     /// (`Invalid`) and removes nothing — the terminal guard is atomic with the
     /// deletes, so a mixed terminal+active batch stays completely intact.
-    #[test]
-    fn delete_batch_refuses_when_an_attempt_is_active() {
+    #[tokio::test]
+    async fn delete_batch_refuses_when_an_attempt_is_active() {
         use crate::sharing::types::AnnounceFileEntry;
         use crate::sync::store::{insert_history_row, insert_outbound_with_files};
 
@@ -3098,7 +3192,9 @@ mod tests {
             .unwrap();
         }
 
-        let err = delete_transfer_history(&ctx, Direction::Sent, "live".to_string()).unwrap_err();
+        let err = delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Sent, "live".to_string())
+            .await
+            .unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)), "active attempt refuses with Invalid");
 
         // Nothing deleted — both rows and the history row survive.
@@ -3117,8 +3213,8 @@ mod tests {
     /// tv2 UX wave 2: deleting a cancelled RECEIVED batch (keyed by wire package
     /// uuid) removes the inbound row, its per-file rows, its event journal, and its
     /// received history rows.
-    #[test]
-    fn delete_received_batch_removes_all_records() {
+    #[tokio::test]
+    async fn delete_received_batch_removes_all_records() {
         use crate::sync::store::{
             append_sync_event, insert_history_row, replace_inbound_files, set_inbound_state,
             upsert_inbound_announced,
@@ -3172,7 +3268,9 @@ mod tests {
         }
 
         let deleted =
-            delete_transfer_history(&ctx, Direction::Received, pkg.to_string()).expect("delete ok");
+            delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Received, pkg.to_string())
+                .await
+                .expect("delete ok");
         assert_eq!(deleted.rows, 1, "the inbound row deleted");
         assert_eq!(deleted.history, 1, "the received history row deleted");
 
@@ -3193,8 +3291,8 @@ mod tests {
     /// blocked record deletion forever. With a NON-EMPTY device cache that does
     /// NOT list the peer, the orphan is cancelled in-place and the whole batch
     /// (both attempt rows, their files, events, and history) is removed.
-    #[test]
-    fn delete_sent_batch_cancels_and_removes_dead_peer_orphan() {
+    #[tokio::test]
+    async fn delete_sent_batch_cancels_and_removes_dead_peer_orphan() {
         use crate::sharing::types::AnnounceFileEntry;
         use crate::sync::store::{append_sync_event, insert_history_row, insert_outbound_with_files};
 
@@ -3241,7 +3339,8 @@ mod tests {
             .unwrap();
         }
 
-        let deleted = delete_transfer_history(&ctx, Direction::Sent, "gone".to_string())
+        let deleted = delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Sent, "gone".to_string())
+            .await
             .expect("dead-peer orphan deletes");
         assert_eq!(deleted.rows, 2, "both attempt rows deleted");
         assert_eq!(deleted.history, 1, "the history row deleted");
@@ -3259,8 +3358,8 @@ mod tests {
     /// account device is genuinely in flight — deletion must refuse (deleting
     /// nothing), and the message must name the state so the UI can point the user
     /// at the live row to cancel it there.
-    #[test]
-    fn delete_sent_batch_refuses_when_peer_still_in_account() {
+    #[tokio::test]
+    async fn delete_sent_batch_refuses_when_peer_still_in_account() {
         use crate::sharing::types::AnnounceFileEntry;
         use crate::sync::store::insert_outbound_with_files;
 
@@ -3276,7 +3375,9 @@ mod tests {
             conn.execute("UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1", [live]).unwrap();
         }
 
-        let err = delete_transfer_history(&ctx, Direction::Sent, "live".to_string()).unwrap_err();
+        let err = delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Sent, "live".to_string())
+            .await
+            .unwrap_err();
         match err {
             ApiError::Invalid(msg) => assert!(
                 msg.contains("transferring"),
@@ -3300,8 +3401,8 @@ mod tests {
     /// Dead-peer delete guard: with a COLD device cache (never populated), liveness
     /// is unknowable — the delete must refuse with the retry message rather than
     /// guess the peer left the account, and touch nothing.
-    #[test]
-    fn delete_sent_batch_refuses_when_device_cache_cold() {
+    #[tokio::test]
+    async fn delete_sent_batch_refuses_when_device_cache_cold() {
         use crate::sharing::types::AnnounceFileEntry;
         use crate::sync::store::insert_outbound_with_files;
 
@@ -3316,7 +3417,9 @@ mod tests {
             conn.execute("UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1", [id]).unwrap();
         }
 
-        let err = delete_transfer_history(&ctx, Direction::Sent, "cold".to_string()).unwrap_err();
+        let err = delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Sent, "cold".to_string())
+            .await
+            .unwrap_err();
         match err {
             ApiError::Invalid(msg) => assert!(
                 msg.contains("device list unavailable"),
@@ -3331,6 +3434,158 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/cold'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1, "cold cache never deletes — no guessing about liveness");
+    }
+
+    /// Batch Model §D4 (delete = reclaim, sent): deleting a terminal SENT batch
+    /// removes its on-disk payload directory (`package_ref`) after the records
+    /// commit — best-effort, and the delete itself still succeeds. Uses a real
+    /// tempdir payload so the reclaim's fs removal is observable.
+    #[tokio::test]
+    async fn delete_sent_batch_reclaims_payload_dir() {
+        use crate::sharing::types::AnnounceFileEntry;
+        use crate::sync::store::insert_outbound_with_files;
+
+        let (tmp, ctx) = test_ctx();
+        // A real payload dir whose basename == the batch key.
+        let payload_dir = tmp.path().join("packages").join("batchZ");
+        std::fs::create_dir_all(&payload_dir).unwrap();
+        std::fs::write(payload_dir.join("frame.fits"), b"payload").unwrap();
+        assert!(payload_dir.exists(), "payload dir seeded");
+
+        let peer = "aa".repeat(32);
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let files = vec![AnnounceFileEntry {
+                rel_path: "Lights/frame.fits".into(),
+                byte_size: 7,
+                frame_uuid: "frame".into(),
+            }];
+            let id = insert_outbound_with_files(
+                &conn,
+                payload_dir.to_str().unwrap(),
+                &peer,
+                Some("Batch Z"),
+                &files,
+            )
+            .unwrap();
+            conn.execute("UPDATE sync_outbound SET state = 'confirmed' WHERE id = ?1", [id]).unwrap();
+        }
+
+        let deleted =
+            delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Sent, "batchZ".to_string())
+                .await
+                .expect("delete + reclaim ok");
+        assert_eq!(deleted.rows, 1, "the outbound row deleted");
+        assert!(
+            !payload_dir.exists(),
+            "delete reclaims the sent batch's payload dir"
+        );
+    }
+
+    /// Batch Model §D4 (delete = reclaim, received): deleting a terminal RECEIVED
+    /// batch releases its blob tags through the live receive-side transport (the
+    /// same `transport.release` the receiver's cancel/revoke paths use). Asserted on
+    /// the loopback `served` map (its observable for a released tag).
+    #[tokio::test]
+    async fn delete_received_batch_releases_blob_tags() {
+        use crate::sharing::loopback::LoopbackNetwork;
+        use crate::sharing::types::PackageAnnounce;
+        use crate::sharing::SharingTransport;
+        use crate::sync::receiver::{allow_all_peers, IncomingResolver, InboundControl, SyncReceiver};
+        use crate::sync::store::{upsert_inbound_announced, CatalogSyncStore};
+        use crate::sync::InboundState;
+
+        let (tmp, ctx) = test_ctx();
+        let wire = "wire-recv-reclaim";
+        let peer = "bb".repeat(32);
+
+        // Seed a TERMINAL inbound row (failed → an errored fetch retains its
+        // in-flight tag) in the ctx catalog the delete reads.
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let id = upsert_inbound_announced(&conn, &peer, wire, 1, 10).unwrap();
+            crate::sync::store::set_inbound_state(&conn, wire, InboundState::Failed, Some("boom")).unwrap();
+            let _ = id;
+        }
+
+        // A started receive-side runtime over a loopback endpoint that "serves"
+        // the wire id (the loopback stand-in for the receiver's in-flight tag).
+        let net = LoopbackNetwork::new();
+        let ep = Arc::new(net.endpoint());
+        let recv_store = Arc::new(CatalogSyncStore::open(tmp.path().join("recv.db")).unwrap());
+        let staging = tmp.path().join("recv-staging");
+        let incoming: IncomingResolver = { let p = tmp.path().join("recv-incoming"); Arc::new(move || p.clone()) };
+        let (_info, handle) = SyncReceiver::spawn(
+            recv_store,
+            staging,
+            incoming,
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&ep) as Arc<dyn SharingTransport>,
+            Arc::new(crate::events::NullEmitter),
+        )
+        .await
+        .unwrap();
+        let runtime = SyncRuntime::new();
+        runtime
+            .set_started_for_test(Arc::clone(&ep) as Arc<dyn SharingTransport>, handle, "ticket".into())
+            .await;
+
+        let src = tmp.path().join("served-src");
+        std::fs::create_dir_all(&src).unwrap();
+        let announce = PackageAnnounce {
+            package_id: crate::sharing::types::PackageId(wire.to_string()),
+            root_hash: "0".repeat(64),
+            byte_size: 10,
+            frame_count: 1,
+        };
+        ep.serve(&announce, &src, None).await.unwrap();
+        assert!(ep.is_serving(wire), "the wire id is served before delete");
+
+        let deleted =
+            delete_transfer_history(&ctx, &runtime, Direction::Received, wire.to_string())
+                .await
+                .expect("delete + reclaim ok");
+        assert_eq!(deleted.rows, 1, "the inbound row deleted");
+        assert!(!ep.is_serving(wire), "delete releases the received batch's blob tags");
+    }
+
+    /// Batch Model §D5: the status summaries carry the new `generation` (attempt N)
+    /// and `batch_uuid` fields — sent (basename == batch_uuid) and received (the
+    /// row's column, falling back to the wire id when NULL).
+    #[tokio::test]
+    async fn summaries_carry_generation_and_batch_uuid() {
+        use crate::sharing::types::AnnounceFileEntry;
+        use crate::sync::store::{insert_outbound_with_files, upsert_inbound_announced};
+        use crate::sync::InboundState;
+
+        let (_tmp, ctx) = test_ctx();
+        let peer = "aa".repeat(32);
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            // A terminal sent row whose package_ref basename is the batch key.
+            let files = vec![AnnounceFileEntry { rel_path: "L/a.fits".into(), byte_size: 4, frame_uuid: "a".into() }];
+            let sid = insert_outbound_with_files(&conn, "/pkgs/batch-out", &peer, Some("Out"), &files).unwrap();
+            conn.execute("UPDATE sync_outbound SET state = 'confirmed' WHERE id = ?1", [sid]).unwrap();
+            // A terminal received row with a NULL batch_uuid (upsert_inbound_announced
+            // leaves it NULL) → batch_uuid falls back to the wire id.
+            let rid = upsert_inbound_announced(&conn, &peer, "wire-in", 1, 10).unwrap();
+            crate::sync::store::set_inbound_state(&conn, "wire-in", InboundState::Done, None).unwrap();
+            let _ = rid;
+        }
+
+        let terminal = list_terminal_transfers(&ctx, None).expect("terminal transfers");
+        let sent = terminal.sent.iter().find(|s| s.batch_uuid == "batch-out").expect("sent summary present");
+        assert_eq!(sent.generation, 1, "a fresh sent row is at generation 1");
+        assert_eq!(sent.batch_uuid, "batch-out", "sent batch_uuid == package-dir basename");
+
+        let recv = terminal.received.iter().find(|r| r.package_id == "wire-in").expect("received summary present");
+        assert_eq!(recv.generation, 1, "a fresh received row is at generation 1");
+        assert_eq!(recv.batch_uuid, "wire-in", "a NULL-batch_uuid received row falls back to the wire id");
     }
 
     /// Task 3.3: with NO node bound and NOT signed in, transport health reads

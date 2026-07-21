@@ -3186,6 +3186,7 @@ mod tests {
             wire_package_id: None,
             display_name: None,
             project_id: None,
+            generation: 1,
         }
     }
 

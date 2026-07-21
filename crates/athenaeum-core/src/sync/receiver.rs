@@ -338,15 +338,24 @@ impl InboundControl {
 
 /// Handle to a running [`SyncReceiver`]. Dropping it (or calling
 /// [`shutdown`](Self::shutdown)) stops the event loop.
+///
+/// It owns BOTH background tasks the receiver spawns: the serial fetch→ingest→ack
+/// loop (`join`) AND the event-ingress `pump` (B4-fix) that forwards transport
+/// events into the loop's channel. Both must be aborted on shutdown — the pump is
+/// normally parked in `raw_events.recv().await`, so without an explicit abort it
+/// would linger blocked on the transport stream after the loop stops (B5 §6a).
 pub struct SyncReceiverHandle {
     join: JoinHandle<()>,
+    pump: JoinHandle<()>,
 }
 
 impl SyncReceiverHandle {
-    /// Abort the receiver loop and await its exit.
+    /// Abort both receiver tasks (serial loop + ingress pump) and await their exit.
     pub async fn shutdown(self) {
         self.join.abort();
+        self.pump.abort();
         let _ = self.join.await;
+        let _ = self.pump.await;
     }
 }
 
@@ -413,7 +422,7 @@ impl SyncReceiver {
         let (forward_tx, mut events) = mpsc::unbounded_channel::<TransportEvent>();
         let pump_control = Arc::clone(&control);
         let pump_authorized = Arc::clone(&authorized);
-        tokio::spawn(async move {
+        let pump = tokio::spawn(async move {
             let mut raw_events = raw_events;
             while let Some(ev) = raw_events.recv().await {
                 if let TransportEvent::RevokeReceived { from, package_id, .. } = &ev {
@@ -596,6 +605,7 @@ impl SyncReceiver {
                         handle_revoke(
                             &store,
                             loop_transport.as_ref(),
+                            emitter.as_ref(),
                             &control,
                             &staging_root,
                             from,
@@ -612,7 +622,7 @@ impl SyncReceiver {
             tracing::info!("sync receiver event stream closed; loop stopping");
         });
 
-        Ok((info, SyncReceiverHandle { join }))
+        Ok((info, SyncReceiverHandle { join, pump }))
     }
 }
 
@@ -1586,8 +1596,12 @@ fn filename_of(rel_path: &str) -> String {
 /// [`InboundControl`] the receiver-cancel command uses (reuse, don't fork — see the
 /// serial-loop note below), settle the un-settled per-file rows, remove staging,
 /// release the in-flight blob tags, write one receiver `sync_history` row per known
-/// file (from the announced file rows — a revoke NEVER fetches a manifest), and
-/// journal `revoked`. **NO ack is sent for a revoke.**
+/// file (from the announced file rows — a revoke NEVER fetches a manifest), journal
+/// `revoked`, and emit a single `sync-finished` event so a live receiver's Transfers
+/// widget auto-dismisses the row immediately instead of lagging until the next status
+/// poll (B5 §4). The finished `outcome` is the mapped terminal — `cancelled` / `done`
+/// (superseded) / `failed` — matching the `emit_finished` siblings' payload shape.
+/// **NO ack is sent for a revoke.**
 ///
 /// Serial-loop note: `RevokeReceived` and `AnnounceReceived` share the single
 /// consumer of the receiver event stream, so a revoke is processed only BETWEEN
@@ -1600,6 +1614,7 @@ fn filename_of(rel_path: &str) -> String {
 async fn handle_revoke(
     store: &Arc<CatalogSyncStore>,
     transport: &dyn SharingTransport,
+    emitter: &dyn ProgressEmitter,
     control: &InboundControl,
     staging_root: &Path,
     from: NodeId,
@@ -1757,6 +1772,23 @@ async fn handle_revoke(
         landed,
         "sync receiver applied sender revoke"
     );
+
+    // Live signal (B5 §4): emit a single terminal `sync-finished` so the receiver's
+    // Transfers widget dismisses this row now, not on the next 10s poll. The
+    // `outcome` is the mapped terminal — `row_state.as_str()` is exactly
+    // `cancelled` / `failed` / `done` — and the payload mirrors the other terminal
+    // emits (cancel epilogue / ingest). `ok_count` carries the files that landed.
+    emit_event(emitter, "sync-finished", &SyncFinishedEvent {
+        package_id: wire_id,
+        direction: super::Direction::Received,
+        outcome: row_state.as_str().to_string(),
+        peer_device,
+        ok_count: landed as u32,
+        failed: Vec::new(),
+        new_count: 0,
+        duplicate_count: 0,
+        project_id: None,
+    });
 }
 
 /// Handle one authorized PROJECT announce (collab exchange, slice 4): resolve the
@@ -3465,15 +3497,26 @@ mod tests {
         let staging_root = tmp.path().join("stage");
         let transport = net_endpoint_only();
         let control = InboundControl::new();
+        let emitter = RecordingEmitter::default();
         let peer = "cc".repeat(32);
         let id = seed_announced_row(&store, &peer, "rev-w1");
 
-        handle_revoke(&store, &transport, &control, &staging_root, [9u8; 32], &PackageId("rev-w1".to_string()), RevokeReason::Cancelled).await;
+        handle_revoke(&store, &transport, &emitter, &control, &staging_root, [9u8; 32], &PackageId("rev-w1".to_string()), RevokeReason::Cancelled).await;
 
         let row = { let conn = store.lock_conn(); get_inbound(&conn, "rev-w1").unwrap().unwrap() };
         assert_eq!(row.state, InboundState::Cancelled, "cancelled revoke → cancelled row");
         assert_eq!(row.last_error.as_deref(), Some("by sender"));
         assert!(row.finished_at.is_some(), "a terminal row stamps finished_at");
+
+        // B5 §4: the revoke emits a terminal `sync-finished` (cancelled) so the
+        // receive-side widget dismisses the row immediately.
+        let finished = finished_events(&emitter);
+        assert!(
+            finished.iter().any(|e| e["packageId"] == "rev-w1"
+                && e["outcome"] == "cancelled"
+                && e["direction"] == "received"),
+            "a cancelled revoke emits a received/cancelled sync-finished: {finished:?}"
+        );
         let file_rows = { let conn = store.lock_conn(); list_inbound_files(&conn, id).unwrap() };
         assert!(
             file_rows.iter().all(|r| r.state == InboundFileState::Done && r.outcome.as_deref() == Some("cancelled")),
@@ -3498,14 +3541,19 @@ mod tests {
         let staging_root = tmp.path().join("stage");
         let transport = net_endpoint_only();
         let control = InboundControl::new();
+        let emitter = RecordingEmitter::default();
         let peer = "dd".repeat(32);
         let id = seed_announced_row(&store, &peer, "rev-sup");
 
-        handle_revoke(&store, &transport, &control, &staging_root, [9u8; 32], &PackageId("rev-sup".to_string()), RevokeReason::Superseded).await;
+        handle_revoke(&store, &transport, &emitter, &control, &staging_root, [9u8; 32], &PackageId("rev-sup".to_string()), RevokeReason::Superseded).await;
 
         let row = { let conn = store.lock_conn(); get_inbound(&conn, "rev-sup").unwrap().unwrap() };
         assert_eq!(row.state, InboundState::Done, "superseded revoke → done (not a decline)");
         assert_eq!(row.last_error.as_deref(), Some("nothing to fetch (superseded by sender)"));
+        assert!(
+            finished_events(&emitter).iter().any(|e| e["packageId"] == "rev-sup" && e["outcome"] == "done"),
+            "a superseded revoke emits a `done` sync-finished"
+        );
         let file_rows = { let conn = store.lock_conn(); list_inbound_files(&conn, id).unwrap() };
         assert!(
             file_rows.iter().all(|r| r.state == InboundFileState::Done && r.outcome.as_deref() == Some("superseded")),
@@ -3526,14 +3574,19 @@ mod tests {
         let staging_root = tmp.path().join("stage");
         let transport = net_endpoint_only();
         let control = InboundControl::new();
+        let emitter = RecordingEmitter::default();
         let peer = "ee".repeat(32);
         let id = seed_announced_row(&store, &peer, "rev-fail");
 
-        handle_revoke(&store, &transport, &control, &staging_root, [9u8; 32], &PackageId("rev-fail".to_string()), RevokeReason::Failed).await;
+        handle_revoke(&store, &transport, &emitter, &control, &staging_root, [9u8; 32], &PackageId("rev-fail".to_string()), RevokeReason::Failed).await;
 
         let row = { let conn = store.lock_conn(); get_inbound(&conn, "rev-fail").unwrap().unwrap() };
         assert_eq!(row.state, InboundState::Failed, "failed revoke → failed row");
         assert_eq!(row.last_error.as_deref(), Some("sender failed"));
+        assert!(
+            finished_events(&emitter).iter().any(|e| e["packageId"] == "rev-fail" && e["outcome"] == "failed"),
+            "a failed revoke emits a `failed` sync-finished"
+        );
         let file_rows = { let conn = store.lock_conn(); list_inbound_files(&conn, id).unwrap() };
         assert!(
             file_rows.iter().all(|r| r.state == InboundFileState::Failed && r.error.as_deref() == Some("sender failed")),
@@ -3550,9 +3603,10 @@ mod tests {
         let staging_root = tmp.path().join("stage");
         let transport = net_endpoint_only();
         let control = InboundControl::new();
+        let emitter = RecordingEmitter::default();
 
         // Unknown wire id → no row is created, no history written.
-        handle_revoke(&store, &transport, &control, &staging_root, [9u8; 32], &PackageId("nope".to_string()), RevokeReason::Cancelled).await;
+        handle_revoke(&store, &transport, &emitter, &control, &staging_root, [9u8; 32], &PackageId("nope".to_string()), RevokeReason::Cancelled).await;
         assert_eq!(count_scalar(&store, "SELECT COUNT(*) FROM sync_inbound"), 0, "an unknown revoke creates no row");
         assert_eq!(count_scalar(&store, "SELECT COUNT(*) FROM sync_history"), 0, "an unknown revoke writes no history");
 
@@ -3563,10 +3617,12 @@ mod tests {
             let conn = store.lock_conn();
             set_inbound_state(&conn, "rev-done", InboundState::Done, None).unwrap();
         }
-        handle_revoke(&store, &transport, &control, &staging_root, [9u8; 32], &PackageId("rev-done".to_string()), RevokeReason::Cancelled).await;
+        handle_revoke(&store, &transport, &emitter, &control, &staging_root, [9u8; 32], &PackageId("rev-done".to_string()), RevokeReason::Cancelled).await;
         let row = { let conn = store.lock_conn(); get_inbound(&conn, "rev-done").unwrap().unwrap() };
         assert_eq!(row.state, InboundState::Done, "a terminal row is untouched by a revoke");
         assert!(journal_kinds(&store, id).iter().all(|k| k != "revoked"), "no revoke journal on a terminal row");
+        // A no-op revoke emits nothing (no widget signal for an unknown/terminal row).
+        assert!(finished_events(&emitter).is_empty(), "a no-op revoke emits no sync-finished");
     }
 
     /// Wiring proof: a `RevokeReceived` delivered over the transport's real event
@@ -3609,6 +3665,67 @@ mod tests {
 
         let row = poll_inbound(&store, "wire-live", InboundState::Cancelled).await;
         assert_eq!(row.last_error.as_deref(), Some("by sender"), "the transport revoke drove the row cancelled");
+    }
+
+    /// H1 (deny), the revoke twin of `receiver_drops_announce_from_unauthorized_peer`
+    /// (B5 §6b): a `RevokeReceived` from a peer NOT on the allow-list must be dropped
+    /// on BOTH the ingress pump (no `request_revoke_abort`) AND the serial loop (no
+    /// `handle_revoke`), leaving the seeded non-terminal row and its journal untouched.
+    /// Without the guard the unauthorized revoke would terminalize a stranger's row.
+    #[tokio::test]
+    async fn unauthorized_revoke_is_dropped_leaves_row_and_journal_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+        let sync_dir = tmp.path().join("sync");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        let sender_node = sender.node_id();
+        sender.start().await.unwrap();
+
+        // Allow-list contains a DIFFERENT node, never the actual sender.
+        let allowed_other: NodeId = [9u8; 32];
+        let authorizer: PeerAuthorizer = Arc::new(move |id| *id == allowed_other);
+        // Keep our own handle to the control so we can prove the pump never poisoned
+        // the abort set for this wire id.
+        let control = Arc::new(InboundControl::new());
+
+        let (_info, handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            { let incoming = sync_dir.join("incoming"); Arc::new(move || incoming.clone()) as IncomingResolver },
+            authorizer,
+            Default::default(),
+            Arc::clone(&control),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        // Seed a non-terminal row (after spawn, so the startup reconcile can't touch
+        // it) for the wire id the unauthorized revoke targets.
+        let id = {
+            let conn = store.lock_conn();
+            upsert_inbound_announced(&conn, &node_id_hex(&sender_node), "wire-deny", 1, 10).unwrap()
+        };
+        sender.revoke(receiver_node, &PackageId("wire-deny".to_string()), RevokeReason::Cancelled).await.unwrap();
+
+        // Give the loop ample time to (wrongly) act, then assert it did nothing.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let row = { let conn = store.lock_conn(); get_inbound(&conn, "wire-deny").unwrap().unwrap() };
+        assert_eq!(row.state, InboundState::Announced, "an unauthorized revoke must not terminalize the row");
+        assert!(journal_kinds(&store, id).iter().all(|k| k != "revoked"), "no revoke journal for a dropped revoke");
+        assert!(
+            !control.is_revoke_abort_requested("wire-deny"),
+            "the pump must not request a revoke-abort for an unauthorized peer"
+        );
+
+        handle.shutdown().await;
     }
 
     /// The REAL concurrency story the ingress-pump fix exists for: a sender

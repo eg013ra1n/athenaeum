@@ -213,6 +213,14 @@ pub struct InboundRow {
     /// sync (no project dimension).
     #[serde(default)]
     pub project_id: Option<String>,
+    /// User-facing transfer generation counter (Transfers Batch Model §D5): the
+    /// "attempt N" the UI shows. Starts at `1` on the first announce and is bumped
+    /// ONLY by a receiver re-attempt ([`upsert_inbound_attempt`](super::store::upsert_inbound_attempt)'s
+    /// existing-row reset branch) — NOT by the engine's internal announce-retries
+    /// (which bump the noisy `attempts` column). Distinct from `attempts` so the UI
+    /// has a clean "attempt N" that ignores announce churn.
+    #[serde(default)]
+    pub generation: u32,
 }
 
 /// Direction of a transfer recorded in [`HistoryRow`]. This sender-side task
@@ -299,6 +307,14 @@ pub struct OutboundRow {
     /// sync; the collab send path (a later wave) fills it.
     #[serde(default)]
     pub project_id: Option<String>,
+    /// User-facing transfer generation counter (Transfers Batch Model §D5): the
+    /// "attempt N" the UI shows. Starts at `1` at enqueue and is bumped ONLY by
+    /// [`reset_outbound_for_resend`](super::store::reset_outbound_for_resend) (a
+    /// user-driven resend) — NOT by the engine's internal announce-retries (which
+    /// bump the noisy `attempts` column). Distinct from `attempts` so the UI has a
+    /// clean "attempt N" that ignores announce churn.
+    #[serde(default)]
+    pub generation: u32,
 }
 
 /// One row of `sync_history`: an append-only audit entry for a per-frame

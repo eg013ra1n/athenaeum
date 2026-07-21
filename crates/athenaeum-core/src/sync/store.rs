@@ -43,7 +43,8 @@ pub const DDL_OUTBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_outbound (
     next_retry_at TEXT,
     wire_package_id TEXT,
     display_name TEXT,
-    project_id TEXT
+    project_id TEXT,
+    generation INTEGER NOT NULL DEFAULT 1
 )";
 
 /// Idempotently add the trailing `sync_outbound` columns (`last_error` — Task 9,
@@ -75,6 +76,11 @@ pub fn ensure_outbound_columns(conn: &Connection) -> Result<()> {
         // Transfers Batch Model (spec §D6): the collab forward-compat key —
         // `NULL` for a personal transfer, the project id for a collab one.
         ("project_id", "TEXT"),
+        // Transfers Batch Model (spec §D5): the user-facing "attempt N" generation
+        // counter, bumped only by `reset_outbound_for_resend`. NOT NULL DEFAULT 1
+        // is a constant default, so ALTER ADD COLUMN back-fills every existing row
+        // to generation 1.
+        ("generation", "INTEGER NOT NULL DEFAULT 1"),
     ] {
         if !existing.contains(col) {
             conn.execute(&format!("ALTER TABLE sync_outbound ADD COLUMN {col} {ty}"), [])
@@ -192,6 +198,7 @@ pub const DDL_INBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_inbound (
     landing_dir TEXT,
     batch_uuid TEXT,
     project_id TEXT,
+    generation INTEGER NOT NULL DEFAULT 1,
     UNIQUE(peer, package_id)
 )";
 
@@ -224,6 +231,11 @@ pub fn ensure_inbound_columns(conn: &Connection) -> Result<()> {
         // is the collab forward-compat key (§D6).
         ("batch_uuid", "TEXT"),
         ("project_id", "TEXT"),
+        // Transfers Batch Model (spec §D5): the user-facing "attempt N" generation
+        // counter, bumped only by `upsert_inbound_attempt`'s existing-row reset.
+        // NOT NULL DEFAULT 1 is a constant default, so ALTER ADD COLUMN back-fills
+        // every existing row to generation 1.
+        ("generation", "INTEGER NOT NULL DEFAULT 1"),
     ] {
         if !existing.contains(col) {
             conn.execute(&format!("ALTER TABLE sync_inbound ADD COLUMN {col} {ty}"), [])
@@ -618,6 +630,7 @@ type OutboundRaw = (
     Option<String>,
     Option<String>,
     Option<String>,
+    i64,
 );
 
 fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
@@ -634,6 +647,7 @@ fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
         wire_package_id,
         display_name,
         project_id,
+        generation,
     ) = raw;
     Ok(OutboundRow {
         id,
@@ -648,6 +662,7 @@ fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
         wire_package_id,
         display_name,
         project_id,
+        generation: generation.max(0) as u32,
     })
 }
 
@@ -699,7 +714,7 @@ fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
 }
 
 const OUTBOUND_COLS: &str =
-    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at, wire_package_id, display_name, project_id";
+    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at, wire_package_id, display_name, project_id, generation";
 const HISTORY_COLS: &str =
     "frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project, package_id, batch_name";
 
@@ -709,7 +724,7 @@ const HISTORY_COLS: &str =
 fn outbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<OutboundRaw> {
     Ok((
         r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
-        r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
+        r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?,
     ))
 }
 
@@ -725,7 +740,7 @@ fn history_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<HistoryRaw> {
 fn inbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<InboundRaw> {
     Ok((
         r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
-        r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?,
+        r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?, r.get(14)?,
     ))
 }
 
@@ -896,6 +911,7 @@ pub fn outbound_row_by_id(conn: &Connection, id: i64) -> Result<Option<OutboundR
 /// never a new one (Transfers Batch Model, §D1/§D3). In ONE transaction:
 ///
 /// - the `sync_outbound` row → state `queued`, `attempts += 1`,
+///   `generation += 1` (the user-facing "attempt N" counter — §D5),
 ///   `wire_package_id = new_wire_id`, and `last_error` / `next_retry_at` /
 ///   `confirmed_at` cleared;
 /// - EVERY one of the row's `sync_outbound_files` rows → state `pending`,
@@ -904,7 +920,9 @@ pub fn outbound_row_by_id(conn: &Connection, id: i64) -> Result<Option<OutboundR
 ///
 /// A **fresh per-attempt wire id** is the ack-replay isolation: receipts stay
 /// keyed by per-attempt wire ids, so a prior attempt's receipts can never replay
-/// onto this one (§D1). `attempts` increments so the UI shows "attempt N".
+/// onto this one (§D1). `generation` increments so the UI shows "attempt N" —
+/// `attempts` also bumps but ALSO counts the engine's internal announce-retries,
+/// so it is NOT the user-facing counter (§D5).
 ///
 /// **Errors** if `id` names no row — the caller must have loaded it. The mechanism
 /// is unconditional: **terminal-state eligibility** (only a `failed` / `cancelled`
@@ -921,8 +939,9 @@ pub fn reset_outbound_for_resend(conn: &Connection, id: i64, new_wire_id: &str) 
     let changed = tx
         .execute(
             "UPDATE sync_outbound
-             SET state = ?1, attempts = attempts + 1, wire_package_id = ?2,
-                 last_error = NULL, next_retry_at = NULL, confirmed_at = NULL
+             SET state = ?1, attempts = attempts + 1, generation = generation + 1,
+                 wire_package_id = ?2, last_error = NULL, next_retry_at = NULL,
+                 confirmed_at = NULL
              WHERE id = ?3",
             params![OutboundState::Queued.as_str(), new_wire_id, id],
         )
@@ -1156,7 +1175,7 @@ pub fn load_receipts(conn: &Connection, package_id: &str) -> Result<Vec<FrameRec
 // package_id)` UNIQUE constraint anchors the upsert.
 
 const INBOUND_COLS: &str =
-    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at, display_name, landing_dir, batch_uuid, project_id";
+    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at, display_name, landing_dir, batch_uuid, project_id, generation";
 
 /// Raw column tuple for a `sync_inbound` row, parsed into [`InboundRow`] by
 /// [`to_inbound`] so fallible text parsing happens outside the rusqlite closure.
@@ -1175,6 +1194,7 @@ type InboundRaw = (
     Option<String>,
     Option<String>,
     Option<String>,
+    i64,
 );
 
 fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
@@ -1193,6 +1213,7 @@ fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
         landing_dir,
         batch_uuid,
         project_id,
+        generation,
     ) = raw;
     Ok(InboundRow {
         id,
@@ -1209,6 +1230,7 @@ fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
         landing_dir,
         batch_uuid,
         project_id,
+        generation: generation.max(0) as u32,
     })
 }
 
@@ -1395,7 +1417,8 @@ pub fn get_inbound_by_batch(
 ///   stamping this attempt's `wire_package_id` and the `batch_uuid`.
 /// - **Existing row** → reset it to `announced` with the new `wire_package_id`,
 ///   `bytes_done 0`, `last_error` / `finished_at` cleared, `frame_count` /
-///   `byte_size` refreshed. `display_name` and `landing_dir` are PRESERVED — a
+///   `byte_size` refreshed, and `generation += 1` (the user-facing "attempt N"
+///   counter — §D5). `display_name` and `landing_dir` are PRESERVED — a
 ///   resend keeps its name and lands into the same tree.
 /// - **Cancelled is final**: an existing `cancelled` row is left COMPLETELY
 ///   untouched and returned with `cancelled_final = true`, so the receiver keeps
@@ -1428,7 +1451,8 @@ pub fn upsert_inbound_attempt(
             conn.execute(
                 "UPDATE sync_inbound
                  SET state = ?1, package_id = ?2, frame_count = ?3, byte_size = ?4,
-                     bytes_done = 0, last_error = NULL, finished_at = NULL
+                     bytes_done = 0, last_error = NULL, finished_at = NULL,
+                     generation = generation + 1
                  WHERE id = ?5",
                 params![
                     InboundState::Announced.as_str(),
@@ -3564,11 +3588,19 @@ mod tests {
         set_outbound_file_state(&conn, id, "a.fits", OutboundFileState::Done, 100, Some("ingested"), None).unwrap();
         set_outbound_file_state(&conn, id, "b.fits", OutboundFileState::Uploaded, 200, None, Some("stale")).unwrap();
 
+        // Enqueue → generation 1 (the DEFAULT); the confirmed row above never
+        // resent, so it is still at generation 1 before this reset.
+        assert_eq!(
+            outbound_row_by_id(&conn, id).unwrap().unwrap().generation, 1,
+            "a never-resent row is at generation 1"
+        );
+
         reset_outbound_for_resend(&conn, id, "wire-new").unwrap();
 
         let row = outbound_row_by_id(&conn, id).unwrap().unwrap();
         assert_eq!(row.state, OutboundState::Queued, "reset to queued");
         assert_eq!(row.attempts, 2, "attempts incremented");
+        assert_eq!(row.generation, 2, "generation incremented (attempt N counter)");
         assert_eq!(row.wire_package_id.as_deref(), Some("wire-new"), "fresh wire id");
         assert_eq!(row.last_error, None, "last_error cleared");
         assert_eq!(row.next_retry_at, None, "next_retry_at cleared");
@@ -3584,6 +3616,39 @@ mod tests {
 
         // A missing row errors, never silently succeeds.
         assert!(reset_outbound_for_resend(&conn, 9999, "wire-x").is_err());
+    }
+
+    /// Batch Model §D5: the engine's internal announce-retry (`bump_attempts`)
+    /// advances the noisy `attempts` column but MUST NOT touch the user-facing
+    /// `generation` counter — only a resend (`reset_outbound_for_resend`) bumps
+    /// generation. Pins the double-bump confusion (`attempts` counts BOTH resends
+    /// AND announce-retries, so it is unusable as "attempt N"; `generation` is the
+    /// clean counter).
+    #[test]
+    fn announce_retry_bumps_attempts_but_not_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
+        let id = store.enqueue("pkg", PEER, None, &[]).unwrap();
+
+        // Fresh enqueue → generation 1 (attempt 1), attempts 0.
+        let row = store.get_outbound(id).unwrap().unwrap();
+        assert_eq!(row.generation, 1, "enqueue starts at generation 1");
+        assert_eq!(row.attempts, 0);
+
+        // Three announce-retries advance `attempts` only.
+        store.bump_attempts(id).unwrap();
+        store.bump_attempts(id).unwrap();
+        store.bump_attempts(id).unwrap();
+        let row = store.get_outbound(id).unwrap().unwrap();
+        assert_eq!(row.attempts, 3, "announce-retries advance attempts");
+        assert_eq!(row.generation, 1, "announce-retries do NOT bump generation (still attempt 1)");
+
+        // A resend advances the generation (to attempt 2), even though attempts is
+        // already ahead — the two counters are independent.
+        store.reset_outbound_for_resend(id, "wire-2").unwrap();
+        let row = store.get_outbound(id).unwrap().unwrap();
+        assert_eq!(row.generation, 2, "a resend bumps generation to attempt 2");
+        assert_eq!(row.attempts, 4, "the reset also bumps attempts");
     }
 
     /// Batch Model §D1: `upsert_inbound_attempt` inserts on first announce, resets
@@ -3612,6 +3677,7 @@ mod tests {
         assert_eq!(row.package_id, "wire-1", "wire id stamped");
         assert_eq!(row.batch_uuid.as_deref(), Some("batch-1"));
         assert_eq!(row.frame_count, 3);
+        assert_eq!(row.generation, 1, "first announce → generation 1");
 
         // Give the row a name + landing dir + advance it, then a SECOND attempt.
         set_inbound_display_name(&conn, id, Some("Downloads M42")).unwrap();
@@ -3627,6 +3693,7 @@ mod tests {
         assert_eq!(row.package_id, "wire-2", "new attempt's wire id");
         assert_eq!(row.bytes_done, 0, "bytes_done reset");
         assert_eq!(row.frame_count, 4, "counts refreshed");
+        assert_eq!(row.generation, 2, "a re-attempt upsert bumps generation");
         assert_eq!(row.display_name.as_deref(), Some("Downloads M42"), "display_name preserved");
         assert_eq!(row.landing_dir.as_deref(), Some("/incoming/peer/m42"), "landing_dir preserved");
 
@@ -3643,6 +3710,7 @@ mod tests {
         assert_eq!(row.state, InboundState::Cancelled, "still cancelled — untouched");
         assert_eq!(row.package_id, "wire-2", "wire id NOT rotated on a cancelled row");
         assert_eq!(row.frame_count, 4, "counts NOT refreshed on a cancelled row");
+        assert_eq!(row.generation, 2, "generation NOT bumped on a cancelled-final row");
         assert_eq!(row.last_error.as_deref(), Some("declined"), "cancel reason preserved");
 
         // A lookup for an unknown batch is None, never an error.

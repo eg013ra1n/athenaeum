@@ -373,6 +373,11 @@ export function useTransferQueue(): UseTransferQueue {
                   peerShort: shortPeer(p.peerDevice),
                   state: outcome,
                   attempts: 0,
+                  // Transfers Batch Model §D5 additive fields (B6 consumes them
+                  // fully): a from-scratch synthesized terminal row has no batch
+                  // identity to key on, so fall back to the row id and attempt 1.
+                  generation: 1,
+                  batchUuid: String(id),
                   createdAt: new Date().toISOString(),
                   lastError: null,
                   nextRetryAt: null,

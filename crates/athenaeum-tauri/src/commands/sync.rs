@@ -197,7 +197,9 @@ pub async fn delete_transfer_history(
     direction: Direction,
     package_key: String,
 ) -> Result<DeletedTransferRecord, String> {
-    api::delete_transfer_history(&state.ctx, direction, package_key).map_err(|e| e.to_string())
+    api::delete_transfer_history(&state.ctx, &state.sync, direction, package_key)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Whether full-app capture-node auto mode is enabled.

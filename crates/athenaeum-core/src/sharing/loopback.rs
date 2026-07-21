@@ -162,6 +162,18 @@ impl LoopbackTransport {
             .map(|inbox| inbox.event_tx.clone())
             .ok_or_else(|| anyhow!("peer not started: {}", hex32(&to)))
     }
+
+    /// Test-only: whether this endpoint's `served` map still holds `package_id`.
+    /// [`release`](SharingTransport::release) removes the entry, so a test can use
+    /// this as the loopback observable for "the batch's blob tags were released"
+    /// (the iroh transport's real in-flight/permanent tags have no such peek).
+    #[cfg(test)]
+    pub(crate) fn is_serving(&self, package_id: &str) -> bool {
+        let reg = self.registry.lock().expect("registry mutex poisoned");
+        reg.get(&self.node_id)
+            .map(|inbox| inbox.served.contains_key(package_id))
+            .unwrap_or(false)
+    }
 }
 
 #[async_trait]

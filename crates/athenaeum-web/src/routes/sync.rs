@@ -271,7 +271,8 @@ pub async fn delete_transfer_history(
     State(state): State<WebAppState>,
     Json(args): Json<DeleteTransferHistoryArgs>,
 ) -> Result<Json<DeletedTransferRecord>, (StatusCode, String)> {
-    api::delete_transfer_history(&state.ctx, args.direction, args.package_key)
+    api::delete_transfer_history(&state.ctx, &state.sync, args.direction, args.package_key)
+        .await
         .map(Json)
         .map_err(api_err)
 }
