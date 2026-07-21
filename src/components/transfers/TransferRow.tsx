@@ -156,7 +156,15 @@ function LiveRowBody({
   const canCancel =
     (row.kind === 'outbound' && pending) ||
     (row.kind === 'inbound' && (row.state === 'announced' || row.state === 'fetching'));
-  const canResend = row.kind === 'outbound' && row.terminal;
+  // Resend re-announces the on-disk payload — but a `confirmed` package's payload
+  // was cleaned up after confirm, so Resend on it would always fail "data missing
+  // on disk". Offer it only for a terminal failed/cancelled send (the retry model
+  // `retry_sync_package` accepts). The in-session ledger only ever held
+  // failed/cancelled, but the durable read now also surfaces confirmed rows.
+  const canResend =
+    row.kind === 'outbound' &&
+    row.terminal &&
+    (row.displayState === 'failed' || row.displayState === 'cancelled');
 
   const sendBusy = busy.has(`send:${row.id}`);
   const cancelBusy =

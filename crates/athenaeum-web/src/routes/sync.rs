@@ -7,7 +7,9 @@ use std::sync::Arc;
 use axum::{extract::State, http::StatusCode, Json};
 
 use athenaeum_core::api::sync as api;
-use athenaeum_core::api::sync::{EnqueueSelectionResult, SyncHistoryQuery, TransferEventEntry};
+use athenaeum_core::api::sync::{
+    EnqueueSelectionResult, SyncHistoryQuery, TerminalTransfers, TransferEventEntry,
+};
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
 use serde::Deserialize;
@@ -68,6 +70,28 @@ pub async fn list_sync_history(
     Json(args): Json<ListHistoryArgs>,
 ) -> Result<Json<Vec<HistoryRow>>, (StatusCode, String)> {
     api::list_history(&state.ctx, args.query).map(Json).map_err(api_err)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ListTerminalTransfersArgs {
+    /// Newest-first cap; `None` (omitted body / `{}`) → the core default of 100.
+    pub limit: Option<u32>,
+}
+
+/// POST /api/list_terminal_transfers
+///
+/// The recent window of terminal (settled) transfers the cheap
+/// `get_sync_status` poll omits (tv2 follow-up), so a settled row survives a
+/// restart. Mirrors the Tauri command's optional `limit`.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn list_terminal_transfers(
+    State(state): State<WebAppState>,
+    Json(args): Json<ListTerminalTransfersArgs>,
+) -> Result<Json<TerminalTransfers>, (StatusCode, String)> {
+    api::list_terminal_transfers(&state.ctx, args.limit)
+        .map(Json)
+        .map_err(api_err)
 }
 
 #[derive(Deserialize)]

@@ -4,32 +4,38 @@
 // expanded-row per-file overlay) into one unified, torrent-style Active list,
 // plus the four row actions.
 //
-// Design note (terminal outbound rows / Resend): `SyncSenderStatus.active`
+// Design note (terminal rows / Resend, tv2 follow-up): `SyncSenderStatus.active`
 // NEVER includes a terminal (confirmed/failed/cancelled) row by construction
-// (see `OutboundSummary`'s doc comment) — terminal packages are rolled into
-// counts and land in history. But `retry_sync_package` needs the outbound
-// row's durable i64 id, and history rows carry only a `packageId` STRING (the
-// package dir basename) with no lookup back to that id. So a torrent-style
-// "row stays visible with a Resend button after it fails/gets cancelled" view
-// is only buildable from data this page already held: this hook snapshots
-// every `OutboundSummary` it sees in `active` (`outboundSeenRef`), and on a
-// `sync-finished` event with a non-confirmed outcome, promotes that snapshot
-// (or a degraded fallback built from the event alone, if the row was never
-// seen active — e.g. a near-instant failure) into a page-local terminal
-// ledger. This ledger is intentionally session/page-scoped: it resets on
-// unmount, same as any other purely-client bookkeeping. The full durable
-// audit trail is the History tab (`list_sync_history`), which needs no such
-// ledger since it has no retry affordance.
+// (see `OutboundSummary`'s doc comment) — the cheap `get_sync_status` poll
+// returns only non-terminal rows. Two sources reunite the terminal rows:
+//
+//   1. The DURABLE read (`list_terminal_transfers`): the recent window of
+//      settled sends + receives, straight from `sync_outbound`/`sync_inbound`.
+//      Fetched on mount and re-fetched on every `sync-finished` (NOT on the 10s
+//      poll). These survive a RESTART — the bug this follow-up fixes: before
+//      it, a settled row (and its Resend button + detail) vanished on relaunch.
+//   2. The in-memory LEDGER (`terminalOutbound`): the same-session immediacy
+//      path — on a `sync-finished` with a non-confirmed outcome the hook
+//      promotes the last-seen `OutboundSummary` snapshot (or a degraded
+//      event-only fallback) into a page-local ledger, so the row flips to
+//      "settled + Resend" instantly, before the next durable fetch resolves.
+//
+// The DB rows SUPERSEDE the ledger for the same id (deduped by id in `rows`),
+// so there is never a row+row double. Inbound terminal rows come only from the
+// durable read (there is no inbound ledger) and carry NO actions. The full
+// audit trail remains the History tab (`list_sync_history`).
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import { useTransfers } from '../contexts/TransfersContext';
 import { useNotifications } from '../contexts/NotificationContext';
 import type {
+  InboundSummary,
   OutboundSummary,
   SyncFileProgressEvent,
   SyncFinishedEvent,
   SyncProgressEvent,
+  TerminalTransfers,
 } from '../types/models';
 
 /** Leading chars of a node-id hex, enough to disambiguate (mirrors useSyncStatus/TransfersPanel). */
@@ -155,6 +161,13 @@ export function useTransferQueue(): UseTransferQueue {
     Map<number, { summary: OutboundSummary; outcome: 'failed' | 'cancelled' }>
   >(new Map());
 
+  // Durable terminal rows (tv2 follow-up) — the recent window of settled sends +
+  // receives from `list_terminal_transfers`, which survive a restart. Fetched on
+  // mount and re-fetched on every `sync-finished` (see the dedicated effect
+  // below), never on the 10s status poll.
+  const [dbTerminalSent, setDbTerminalSent] = useState<OutboundSummary[]>([]);
+  const [dbTerminalReceived, setDbTerminalReceived] = useState<InboundSummary[]>([]);
+
   const [liveOutboundBytes, setLiveOutboundBytes] = useState<Map<number, LiveBytes>>(new Map());
   const [liveInboundBytes, setLiveInboundBytes] = useState<Map<string, LiveBytes>>(new Map());
   // Latest send-side `sync-progress` stage per outbound id (Task 2.1). Drives the
@@ -208,6 +221,45 @@ export function useTransferQueue(): UseTransferQueue {
       }
     }
   }, [status, terminalOutbound]);
+
+  // Durable terminal rows: fetch once on mount and re-fetch on every
+  // `sync-finished` (a discrete outcome — NOT the high-frequency poll). This is
+  // what makes a settled transfer's row + Resend button survive a relaunch, when
+  // the in-memory ledger has been wiped. Cancelled-flag listener pattern
+  // (StrictMode-safe): await the unlisten into a flag-guarded variable so a
+  // double-mount can't leak a second listener.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    const fetchTerminal = () => {
+      api
+        .invoke<TerminalTransfers>('list_terminal_transfers', {})
+        .then((t) => {
+          if (cancelled) return;
+          setDbTerminalSent(t.sent);
+          setDbTerminalReceived(t.received);
+        })
+        .catch((err) =>
+          console.error('[useTransferQueue] list_terminal_transfers failed:', err),
+        );
+    };
+    fetchTerminal();
+    api
+      .listen<SyncFinishedEvent>('sync-finished', () => {
+        if (!cancelled) fetchTerminal();
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) =>
+        console.error('[useTransferQueue] terminal sync-finished listen failed:', err),
+      );
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   // Page-scoped live listeners (mounted-only), per CLAUDE.md's cancelled-flag
   // pattern. `sync-progress` feeds row-level bytes + speed; `sync-file-progress`
@@ -379,6 +431,11 @@ export function useTransferQueue(): UseTransferQueue {
         finishNonce: finishNonce.get(`out:${s.id}`) ?? 0,
       });
     }
+    // Ids already covered by the durable read supersede the in-memory ledger:
+    // the DB summary is authoritative (correct display_name/device_name/counts),
+    // so the ledger entry for the same id is dropped to avoid a row+row double.
+    const dbTerminalSentIds = new Set(dbTerminalSent.map((s) => s.id));
+
     // A `sync-finished` outcome lands in `terminalOutbound` synchronously, but
     // the polled `status.sender.active` snapshot only drops the same id on its
     // NEXT resolve — for that transient window both sources agree on the same
@@ -390,6 +447,7 @@ export function useTransferQueue(): UseTransferQueue {
     // `retry_sync_package` always mints a new id).
     for (const { summary, outcome } of terminalOutbound.values()) {
       if (activeOutboundIds.has(summary.id)) continue;
+      if (dbTerminalSentIds.has(summary.id)) continue;
       out.push({
         key: `out:${summary.id}`,
         kind: 'outbound',
@@ -420,7 +478,45 @@ export function useTransferQueue(): UseTransferQueue {
         finishNonce: finishNonce.get(`out:${summary.id}`) ?? 0,
       });
     }
+    // Durable terminal sent rows (survive restart). Skip an id still (momentarily)
+    // `active` — the live row above is authoritative during that transient window.
+    // A confirmed row is INCLUDED here (unlike the ledger, which only ever held
+    // failed/cancelled); `canResend` gates it out of the Resend affordance.
+    for (const s of dbTerminalSent) {
+      if (activeOutboundIds.has(s.id)) continue;
+      out.push({
+        key: `out:${s.id}`,
+        kind: 'outbound',
+        id: s.id,
+        packageId: null,
+        packageShort: s.packageShort,
+        peerShort: s.peerShort,
+        displayName: s.displayName,
+        deviceName: s.deviceName,
+        // The persisted display state IS the settled outcome (`confirmed` /
+        // `failed` / `cancelled`).
+        displayState: s.displayState,
+        stalledUntil: null,
+        retrying: false,
+        fileCounts: s.fileCounts,
+        fileCount: s.fileCount,
+        byteSize: s.byteSize,
+        bytesDone: 0,
+        state: s.state,
+        createdAt: s.createdAt,
+        attempts: s.attempts,
+        lastError: s.lastError,
+        nextRetryAt: null,
+        terminal: true,
+        liveStage: null,
+        speedBps: null,
+        isTransferring: false,
+        finishNonce: finishNonce.get(`out:${s.id}`) ?? 0,
+      });
+    }
+    const activeInboundIds = new Set<number>();
     for (const s of status?.receiver.active ?? []) {
+      activeInboundIds.add(s.id);
       const live = liveInboundBytes.get(s.packageId);
       out.push({
         key: `in:${s.id}`,
@@ -450,10 +546,56 @@ export function useTransferQueue(): UseTransferQueue {
         finishNonce: finishNonce.get(`in:${s.packageId}`) ?? 0,
       });
     }
+    // Durable terminal received rows (survive restart) — detail symmetry with
+    // sent (Files/Log across relaunches). NO actions. Skip an id still active.
+    for (const s of dbTerminalReceived) {
+      if (activeInboundIds.has(s.id)) continue;
+      out.push({
+        key: `in:${s.id}`,
+        kind: 'inbound',
+        id: s.id,
+        packageId: s.packageId,
+        packageShort: s.packageShort,
+        peerShort: s.peerShort,
+        displayName: s.displayName,
+        deviceName: s.deviceName,
+        // `done` / `failed` / `cancelled`.
+        displayState: s.displayState,
+        stalledUntil: null,
+        retrying: false,
+        fileCounts: s.fileCounts,
+        fileCount: s.frameCount,
+        byteSize: s.byteSize,
+        bytesDone: s.bytesDone,
+        state: s.state,
+        createdAt: s.createdAt,
+        attempts: 0,
+        lastError: null,
+        nextRetryAt: null,
+        terminal: true,
+        liveStage: null,
+        speedBps: null,
+        isTransferring: false,
+        finishNonce: finishNonce.get(`in:${s.packageId}`) ?? 0,
+      });
+    }
     return out;
-  }, [status, terminalOutbound, liveOutboundBytes, liveInboundBytes, liveOutboundStage, finishNonce]);
+  }, [
+    status,
+    terminalOutbound,
+    dbTerminalSent,
+    dbTerminalReceived,
+    liveOutboundBytes,
+    liveInboundBytes,
+    liveOutboundStage,
+    finishNonce,
+  ]);
 
-  const activeCount = (status?.sender.queued ?? 0) + (status?.sender.transferring ?? 0) + rows.filter((r) => r.kind === 'inbound').length;
+  // Live-only count (terminal rows excluded) — an inbound row still moving.
+  const activeCount =
+    (status?.sender.queued ?? 0) +
+    (status?.sender.transferring ?? 0) +
+    rows.filter((r) => r.kind === 'inbound' && !r.terminal).length;
 
   const sendNow = useCallback(
     (id: number) =>
@@ -517,12 +659,18 @@ export function useTransferQueue(): UseTransferQueue {
       withBusy(`resend:${id}`, async () => {
         try {
           await api.invoke<number>('retry_sync_package', { id });
+          // Drop the just-resent id from BOTH terminal sources for immediate
+          // feedback (the new in-flight row takes its place). `retry_sync_package`
+          // leaves the original terminal DB row intact and mints a new id, so a
+          // later `fetchTerminal` may legitimately re-surface the old attempt —
+          // an honest record, not a duplicate (different id).
           setTerminalOutbound((prev) => {
             if (!prev.has(id)) return prev;
             const next = new Map(prev);
             next.delete(id);
             return next;
           });
+          setDbTerminalSent((prev) => prev.filter((s) => s.id !== id));
           refresh();
         } catch (err) {
           console.error('[useTransferQueue] retry_sync_package failed:', err);

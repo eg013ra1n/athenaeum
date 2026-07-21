@@ -665,6 +665,36 @@ pub fn all_outbound_rows(conn: &Connection, limit: u32) -> Result<Vec<OutboundRo
     raws.into_iter().map(to_outbound).collect()
 }
 
+/// Load `sync_outbound` rows in a TERMINAL state (`confirmed`/`failed`/
+/// `cancelled`), newest-first, capped at `limit`. The restart-survival companion
+/// to [`SyncStore::non_terminal`](SyncStore::non_terminal): `get_sync_status`
+/// returns only the non-terminal in-flight rows, so a settled send (which the
+/// user can still **Resend** if it failed/was cancelled) would vanish from the
+/// Transfers list after a relaunch — taking its durable row id, and thus the
+/// Resend affordance and the Files/Log detail, with it. This read resurrects the
+/// recent terminal window straight from the durable table (tv2 follow-up).
+///
+/// Ordered by the finished timestamp where present (`confirmed_at`), else
+/// `created_at`, then `id DESC` — newest-first — so the most recently settled
+/// batches come back first; `LIMIT` bounds the response to the recent window
+/// (not a pagination surface).
+pub fn terminal_outbound(conn: &Connection, limit: u32) -> Result<Vec<OutboundRow>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {OUTBOUND_COLS} FROM sync_outbound
+             WHERE state IN ('confirmed', 'failed', 'cancelled')
+             ORDER BY COALESCE(confirmed_at, created_at) DESC, id DESC
+             LIMIT ?1"
+        ))
+        .context("prepare terminal_outbound")?;
+    let raws = stmt
+        .query_map(params![limit], outbound_raw_from_row)
+        .context("query terminal_outbound")?
+        .collect::<rusqlite::Result<Vec<OutboundRaw>>>()
+        .context("collect terminal_outbound")?;
+    raws.into_iter().map(to_outbound).collect()
+}
+
 /// Fetch a single `sync_outbound` row by id (`None` if absent). Defined once here
 /// so both store implementations share the by-id read verbatim; it backs
 /// [`SyncStore::get_outbound`] — the terminal-state read the retry command surface
@@ -1024,6 +1054,30 @@ pub fn inbound_active(conn: &Connection) -> Result<Vec<InboundRow>> {
         .context("query inbound_active")?
         .collect::<rusqlite::Result<Vec<InboundRaw>>>()
         .context("collect inbound_active")?;
+    raws.into_iter().map(to_inbound).collect()
+}
+
+/// Load `sync_inbound` rows in a TERMINAL state (`done`/`failed`/`cancelled`),
+/// newest-first, capped at `limit` — the receive-side mirror of
+/// [`terminal_outbound`]. [`inbound_active`] returns only the in-flight rows, so
+/// a finished inbound batch's durable row id (needed for its Files/Log detail)
+/// would be lost from the Transfers list after a restart; this resurrects the
+/// recent terminal window from the durable table. Ordered by `finished_at` where
+/// present, else `created_at`, then `id DESC`.
+pub fn terminal_inbound(conn: &Connection, limit: u32) -> Result<Vec<InboundRow>> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {INBOUND_COLS} FROM sync_inbound
+             WHERE state IN ('done', 'failed', 'cancelled')
+             ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
+             LIMIT ?1"
+        ))
+        .context("prepare terminal_inbound")?;
+    let raws = stmt
+        .query_map(params![limit], inbound_raw_from_row)
+        .context("query terminal_inbound")?
+        .collect::<rusqlite::Result<Vec<InboundRaw>>>()
+        .context("collect terminal_inbound")?;
     raws.into_iter().map(to_inbound).collect()
 }
 

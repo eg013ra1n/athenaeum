@@ -34,13 +34,13 @@ use crate::sync::status::outbound_display_state;
 use crate::sync::store::{
     get_inbound_by_row_id, inbound_active, inbound_file_counts, list_inbound_files,
     list_outbound_files, list_sync_events, outbound_file_counts, outbound_row_by_id,
-    search_history_rows,
+    search_history_rows, terminal_inbound, terminal_outbound,
 };
 use crate::sync::{
-    node_id_hex, pairing, CatalogSyncStore, Direction, HistoryQuery, HistoryRow, InboundSummary,
-    OutboundRow, OutboundState, OutboundSummary, RefusalRefresher, StartedSender, SyncEngine,
-    SyncEngineHandle, SyncReceiverStatus, SyncRuntime, SyncSenderRuntime, SyncSenderStatus,
-    SyncStatus, SyncStore, TransferFileEntry, TransportHealth,
+    node_id_hex, pairing, CatalogSyncStore, Direction, HistoryQuery, HistoryRow, InboundRow,
+    InboundSummary, OutboundRow, OutboundState, OutboundSummary, RefusalRefresher, StartedSender,
+    SyncEngine, SyncEngineHandle, SyncReceiverStatus, SyncRuntime, SyncSenderRuntime,
+    SyncSenderStatus, SyncStatus, SyncStore, TransferFileCounts, TransferFileEntry, TransportHealth,
 };
 
 /// Request filter for [`list_history`] (mirrors [`HistoryQuery`] over the
@@ -949,6 +949,77 @@ fn package_totals(dir: &Path) -> (u32, u64) {
     }
 }
 
+/// Map one persisted `sync_outbound` row to its display [`OutboundSummary`] —
+/// the SINGLE outbound-row → summary mapping, shared by the live Active-tab
+/// rollup ([`build_sender_status`]) and the terminal-rows read
+/// ([`list_terminal_transfers`]) so a package presents identically
+/// (display_state, display_name, device_name, file_counts, retrying) whether it
+/// came from the live poll or the restart-survival read. `device_names` /
+/// `file_counts` are the batch-resolved maps the caller reads once; `now` anchors
+/// the `waiting`-backoff derivation.
+fn outbound_summary(
+    row: OutboundRow,
+    now: chrono::DateTime<chrono::Utc>,
+    device_names: &HashMap<String, String>,
+    file_counts: &HashMap<i64, TransferFileCounts>,
+) -> OutboundSummary {
+    let (file_count, byte_size) = package_totals(Path::new(&row.package_ref));
+    let peer_hex = node_id_hex(&row.peer);
+    let display_state = outbound_display_state(row.state, row.next_retry_at.as_deref(), now);
+    let stalled_until = if display_state == "waiting" {
+        row.next_retry_at.clone()
+    } else {
+        None
+    };
+    OutboundSummary {
+        id: row.id,
+        package_short: short_pkg(&row.package_ref),
+        state: row.state,
+        attempts: row.attempts,
+        created_at: row.created_at,
+        peer_short: short_id(&peer_hex),
+        last_error: row.last_error,
+        retrying: row.next_retry_at.is_some(),
+        next_retry_at: row.next_retry_at,
+        byte_size,
+        file_count,
+        display_name: row.display_name.filter(|s| !s.trim().is_empty()),
+        device_name: device_names.get(&peer_hex).cloned(),
+        display_state,
+        stalled_until,
+        file_counts: file_counts.get(&row.id).copied().unwrap_or_default(),
+    }
+}
+
+/// Map one persisted `sync_inbound` row to its display [`InboundSummary`] — the
+/// SINGLE inbound-row → summary mapping, shared by the live receive-side Active
+/// rollup ([`active_inbound_summaries`]) and the terminal-rows read
+/// ([`list_terminal_transfers`]). Inbound presentation state mirrors the raw
+/// state (no receiver-side retry/backoff concept yet), so `stalled_until` is
+/// always `None`.
+fn inbound_summary(
+    row: InboundRow,
+    device_names: &HashMap<String, String>,
+    file_counts: &HashMap<i64, TransferFileCounts>,
+) -> InboundSummary {
+    InboundSummary {
+        id: row.id,
+        package_id: row.package_id.clone(),
+        package_short: short_id(&row.package_id),
+        peer_short: short_id(&row.peer),
+        display_state: row.state.as_str().to_string(),
+        stalled_until: None,
+        state: row.state,
+        frame_count: row.frame_count,
+        byte_size: row.byte_size,
+        bytes_done: row.bytes_done,
+        created_at: row.created_at,
+        display_name: row.display_name.filter(|s| !s.trim().is_empty()),
+        device_name: device_names.get(&row.peer).cloned(),
+        file_counts: file_counts.get(&row.id).copied().unwrap_or_default(),
+    }
+}
+
 /// The send-side rollup: live in-flight counts + rows from the engine's
 /// non-terminal snapshot, plus terminal totals counted from `sync_outbound`.
 async fn build_sender_status(
@@ -996,35 +1067,7 @@ async fn build_sender_status(
     let now = chrono::Utc::now();
     let active: Vec<OutboundSummary> = rows
         .into_iter()
-        .map(|row| {
-            let (file_count, byte_size) = package_totals(Path::new(&row.package_ref));
-            let peer_hex = node_id_hex(&row.peer);
-            let display_state =
-                outbound_display_state(row.state, row.next_retry_at.as_deref(), now);
-            let stalled_until = if display_state == "waiting" {
-                row.next_retry_at.clone()
-            } else {
-                None
-            };
-            OutboundSummary {
-                id: row.id,
-                package_short: short_pkg(&row.package_ref),
-                state: row.state,
-                attempts: row.attempts,
-                created_at: row.created_at,
-                peer_short: short_id(&peer_hex),
-                last_error: row.last_error,
-                retrying: row.next_retry_at.is_some(),
-                next_retry_at: row.next_retry_at,
-                byte_size,
-                file_count,
-                display_name: row.display_name.filter(|s| !s.trim().is_empty()),
-                device_name: device_names.get(&peer_hex).cloned(),
-                display_state,
-                stalled_until,
-                file_counts: file_counts.get(&row.id).copied().unwrap_or_default(),
-            }
-        })
+        .map(|row| outbound_summary(row, now, &device_names, &file_counts))
         .collect();
 
     let mut queued = 0u32;
@@ -1060,24 +1103,7 @@ fn active_inbound_summaries(ctx: &ServiceContext) -> Result<Vec<InboundSummary>,
     let device_names = cached_device_names(&conn);
     Ok(rows
         .into_iter()
-        .map(|r| InboundSummary {
-            id: r.id,
-            package_id: r.package_id.clone(),
-            package_short: short_id(&r.package_id),
-            peer_short: short_id(&r.peer),
-            // Inbound presentation state mirrors the raw state (no receiver-side
-            // retry/backoff concept yet), so `stalled_until` is always None.
-            display_state: r.state.as_str().to_string(),
-            stalled_until: None,
-            state: r.state,
-            frame_count: r.frame_count,
-            byte_size: r.byte_size,
-            bytes_done: r.bytes_done,
-            created_at: r.created_at,
-            display_name: r.display_name.filter(|s| !s.trim().is_empty()),
-            device_name: device_names.get(&r.peer).cloned(),
-            file_counts: file_counts.get(&r.id).copied().unwrap_or_default(),
-        })
+        .map(|row| inbound_summary(row, &device_names, &file_counts))
         .collect())
 }
 
@@ -1136,6 +1162,84 @@ pub async fn get_status(
         },
         transport,
     })
+}
+
+/// Default newest-first cap for [`list_terminal_transfers`] when the caller
+/// passes no explicit limit — the recent window that covers a session's worth of
+/// finished batches.
+const TERMINAL_TRANSFERS_DEFAULT_LIMIT: u32 = 100;
+
+/// Hard cap on [`list_terminal_transfers`] regardless of the requested limit: the
+/// restart-survival read is a recent-window read, not a pagination surface, so it
+/// never returns an unbounded backlog (older batches keep rendering as plain
+/// history groups without Resend).
+const TERMINAL_TRANSFERS_MAX_LIMIT: u32 = 500;
+
+/// The recently-settled terminal transfers the cheap [`get_status`] poll
+/// deliberately omits (tv2 follow-up). `get_status` returns only the
+/// `non_terminal()` in-flight rows, so a confirmed/failed/cancelled send — and
+/// its inbound twin — would vanish from the Transfers list after a relaunch,
+/// taking its durable row id (and thus the **Resend** affordance + Files/Log
+/// detail) with it. The frontend re-fetches this on mount and on each
+/// `sync-finished` and merges the rows back in.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalTransfers {
+    /// Terminal outbound rows (`confirmed`/`failed`/`cancelled`), newest-first.
+    pub sent: Vec<OutboundSummary>,
+    /// Terminal inbound rows (`done`/`failed`/`cancelled`), newest-first.
+    pub received: Vec<InboundSummary>,
+}
+
+/// The recent window of terminal (settled) transfers — outbound
+/// (`confirmed`/`failed`/`cancelled`) and inbound (`done`/`failed`/`cancelled`) —
+/// read straight from the durable `sync_outbound` / `sync_inbound` tables so they
+/// survive a restart (tv2 follow-up). `get_status` intentionally stays a
+/// non-terminal, cheap poll; this is the separate, user-action-triggered
+/// (mount + `sync-finished`) read the Transfers page merges in to keep a settled
+/// row — with its id, Resend affordance and detail — on screen across relaunches.
+///
+/// Summaries are built through the SAME [`outbound_summary`] / [`inbound_summary`]
+/// mappers `get_status` uses, so a terminal row presents identically regardless
+/// of which read produced it. Newest-first; `limit` defaults to
+/// [`TERMINAL_TRANSFERS_DEFAULT_LIMIT`] and is hard-capped at
+/// [`TERMINAL_TRANSFERS_MAX_LIMIT`].
+pub fn list_terminal_transfers(
+    ctx: &ServiceContext,
+    limit: Option<u32>,
+) -> Result<TerminalTransfers, ApiError> {
+    let limit = limit
+        .unwrap_or(TERMINAL_TRANSFERS_DEFAULT_LIMIT)
+        .min(TERMINAL_TRANSFERS_MAX_LIMIT);
+    let db = db(ctx)?;
+    let conn = db.conn();
+
+    let out_rows =
+        terminal_outbound(&conn, limit).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    let in_rows =
+        terminal_inbound(&conn, limit).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+
+    // One DB pass for the shared enrichment: the device-name cache (one settings
+    // read, no hub) and ONE grouped per-file-counts query per direction (§D5 —
+    // never a per-row loop).
+    let device_names = cached_device_names(&conn);
+    let out_ids: Vec<i64> = out_rows.iter().map(|r| r.id).collect();
+    let in_ids: Vec<i64> = in_rows.iter().map(|r| r.id).collect();
+    let out_counts =
+        outbound_file_counts(&conn, &out_ids).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    let in_counts =
+        inbound_file_counts(&conn, &in_ids).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+
+    let now = chrono::Utc::now();
+    let sent = out_rows
+        .into_iter()
+        .map(|row| outbound_summary(row, now, &device_names, &out_counts))
+        .collect();
+    let received = in_rows
+        .into_iter()
+        .map(|row| inbound_summary(row, &device_names, &in_counts))
+        .collect();
+    Ok(TerminalTransfers { sent, received })
 }
 
 /// The transfer history (received + sent), newest first.
@@ -3348,6 +3452,14 @@ mod tests {
         );
         assert!(files.iter().all(|f| f.bytes_done.is_none()), "sent entries carry no bytes_done");
 
+        // tv2 follow-up: the confirmed row (a REAL engine terminal row, not a
+        // seeded one) surfaces in `list_terminal_transfers().sent` so it survives
+        // a restart — where the in-memory page ledger would not.
+        let terminal = list_terminal_transfers(&ctx, None).unwrap();
+        let confirmed = terminal.sent.iter().find(|s| s.id == id).expect("confirmed row in terminal sent");
+        assert_eq!(confirmed.display_state, "confirmed");
+        assert_eq!(confirmed.file_count, 2, "the confirmed batch's manifest enriches its terminal summary");
+
         engine.shutdown().await;
     }
 
@@ -3443,6 +3555,115 @@ mod tests {
             list_transfer_files(&ctx, Direction::Received, 4242),
             Err(ApiError::NotFound(_))
         ));
+    }
+
+    // ── Terminal transfers survive restart (tv2 follow-up) ───────────────────
+    //
+    // Bug: `get_sync_status` returns only `non_terminal()` rows, so a
+    // confirmed/failed/cancelled transfer only lingered in the in-memory page
+    // ledger — it vanished on relaunch, taking its Resend button + detail.
+    // `list_terminal_transfers` resurrects the recent terminal window from the
+    // durable tables; the rows + their per-file rows persist regardless of any
+    // in-memory ledger (the restart-survival contract).
+
+    /// Directly stamp a terminal `state` + an explicit `created_at` (and, for
+    /// `confirmed`, a matching `confirmed_at`) onto an outbound row — the
+    /// persisted shape a real engine confirm/fail/cancel leaves behind, seeded
+    /// without spinning up an engine. The explicit timestamp makes the
+    /// newest-first ordering (`COALESCE(confirmed_at, created_at) DESC`)
+    /// deterministic regardless of wall-clock granularity.
+    fn set_outbound_terminal(ctx: &ServiceContext, id: i64, state: &str, ts: &str) {
+        let db = db(ctx).unwrap();
+        let conn = db.conn();
+        let confirmed_at = if state == "confirmed" { Some(ts) } else { None };
+        conn.execute(
+            "UPDATE sync_outbound SET state = ?1, created_at = ?2, confirmed_at = ?3 WHERE id = ?4",
+            rusqlite::params![state, ts, confirmed_at, id],
+        )
+        .unwrap();
+    }
+
+    /// tv2 follow-up: `list_terminal_transfers` returns ONLY terminal rows —
+    /// outbound `confirmed|failed|cancelled`, inbound `done|failed|cancelled` —
+    /// newest-first, honors the limit, and carries display_name + file_counts.
+    /// A cancelled outbound row appears in `sent` with its per-file rows still
+    /// listable by its id (the restart-survival contract, read from the DB with
+    /// no in-memory ledger involved).
+    #[test]
+    fn list_terminal_transfers_returns_only_terminal_rows_newest_first() {
+        use crate::sharing::types::AnnounceFileEntry;
+        use crate::sync::store::{insert_outbound_with_files, set_inbound_state, upsert_inbound_announced};
+        use crate::sync::InboundState;
+
+        let (_tmp, ctx) = test_ctx();
+        let peer = "aa".repeat(32);
+
+        // Seed outbound rows in a known order (ids ascending): a non-terminal
+        // queued row that must be excluded, then confirmed → failed → cancelled.
+        // The cancelled row carries a display_name + 2 per-file rows.
+        let (queued_id, confirmed_id, failed_id, cancelled_id) = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let queued = insert_outbound_with_files(&conn, "/pkg/queued", &peer, Some("Queued batch"), &[]).unwrap();
+            let confirmed = insert_outbound_with_files(&conn, "/pkg/confirmed", &peer, Some("Confirmed batch"), &[]).unwrap();
+            let failed = insert_outbound_with_files(&conn, "/pkg/failed", &peer, Some("Failed batch"), &[]).unwrap();
+            let files = [
+                AnnounceFileEntry { rel_path: "cam/a.fits".into(), byte_size: 100, frame_uuid: "u-a".into() },
+                AnnounceFileEntry { rel_path: "cam/b.fits".into(), byte_size: 200, frame_uuid: "u-b".into() },
+            ];
+            let cancelled = insert_outbound_with_files(&conn, "/pkg/cancelled", &peer, Some("Nightly batch"), &files).unwrap();
+            (queued, confirmed, failed, cancelled)
+        };
+        // Explicit, well-separated finished timestamps → deterministic
+        // newest-first order: cancelled (latest) > failed > confirmed (earliest).
+        set_outbound_terminal(&ctx, confirmed_id, "confirmed", "2026-07-20T10:00:00.000Z");
+        set_outbound_terminal(&ctx, failed_id, "failed", "2026-07-20T11:00:00.000Z");
+        set_outbound_terminal(&ctx, cancelled_id, "cancelled", "2026-07-20T12:00:00.000Z");
+
+        // Seed inbound rows: an announced (non-terminal) one that must be
+        // excluded, then done → failed → cancelled.
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            upsert_inbound_announced(&conn, &peer, "in-announced", 1, 10).unwrap();
+            upsert_inbound_announced(&conn, &peer, "in-done", 1, 10).unwrap();
+            set_inbound_state(&conn, "in-done", InboundState::Done, None).unwrap();
+            upsert_inbound_announced(&conn, &peer, "in-failed", 1, 10).unwrap();
+            set_inbound_state(&conn, "in-failed", InboundState::Failed, Some("boom")).unwrap();
+            upsert_inbound_announced(&conn, &peer, "in-cancelled", 1, 10).unwrap();
+            set_inbound_state(&conn, "in-cancelled", InboundState::Cancelled, None).unwrap();
+        }
+
+        let terminal = list_terminal_transfers(&ctx, None).unwrap();
+
+        // Only terminal rows, newest-first (reverse insertion / finish order).
+        let sent_ids: Vec<i64> = terminal.sent.iter().map(|s| s.id).collect();
+        assert_eq!(sent_ids, vec![cancelled_id, failed_id, confirmed_id], "sent: terminal only, newest-first");
+        assert!(!sent_ids.contains(&queued_id), "a non-terminal queued row must be excluded");
+
+        let recv_states: Vec<&str> = terminal.received.iter().map(|r| r.display_state.as_str()).collect();
+        assert_eq!(recv_states, vec!["cancelled", "failed", "done"], "received: terminal only, newest-first");
+        assert!(
+            !terminal.received.iter().any(|r| r.package_id == "in-announced"),
+            "a non-terminal announced inbound row must be excluded"
+        );
+
+        // The cancelled outbound summary carries its display_name + file_counts.
+        let cancelled = terminal.sent.iter().find(|s| s.id == cancelled_id).unwrap();
+        assert_eq!(cancelled.display_name.as_deref(), Some("Nightly batch"));
+        assert_eq!(cancelled.display_state, "cancelled");
+        assert_eq!(cancelled.file_counts.total, 2, "per-file rows counted into the summary");
+
+        // Limit is honored (newest row only).
+        let one = list_terminal_transfers(&ctx, Some(1)).unwrap();
+        assert_eq!(one.sent.len(), 1);
+        assert_eq!(one.sent[0].id, cancelled_id, "limit keeps the newest terminal row");
+        assert_eq!(one.received.len(), 1);
+
+        // Restart-survival: the cancelled row's per-file rows are still listable
+        // by its durable id, read straight from the DB (no in-memory ledger).
+        let files = list_transfer_files(&ctx, Direction::Sent, cancelled_id).unwrap();
+        assert_eq!(files.len(), 2, "the cancelled batch's per-file rows survive as detail");
     }
 
     // ── Production account-mode autostart (task A7 fix-review; sync 2A) ─────

@@ -447,6 +447,7 @@ pub fn run() {
             commands::get_sync_pairing_ticket,
             commands::get_sync_status,
             commands::list_sync_history,
+            commands::list_terminal_transfers,
             commands::list_transfer_files,
             commands::list_transfer_events,
             commands::enqueue_sync_selection,

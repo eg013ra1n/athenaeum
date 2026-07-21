@@ -158,6 +158,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::sync::status::TransportHealth,
             crate::sync::status::SyncStatus,
             crate::sync::status::TransferFileEntry,
+            crate::api::sync::TerminalTransfers,
             crate::sync::receiver::SyncProgressEvent,
             crate::sync::receiver::SyncFileProgressEvent,
             crate::sync::receiver::SyncFinishedEvent,

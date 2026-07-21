@@ -910,6 +910,16 @@ outcome: string | null,
  */
 error: string | null, };
 
+export type TerminalTransfers = { 
+/**
+ * Terminal outbound rows (`confirmed`/`failed`/`cancelled`), newest-first.
+ */
+sent: Array<OutboundSummary>, 
+/**
+ * Terminal inbound rows (`done`/`failed`/`cancelled`), newest-first.
+ */
+received: Array<InboundSummary>, };
+
 export type SyncProgressEvent = { packageId: string, 
 /**
  * Which half emitted this tick (`received` = inbound, `sent` = outbound).

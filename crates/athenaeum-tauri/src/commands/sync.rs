@@ -7,7 +7,9 @@ use std::sync::Arc;
 use tauri::{AppHandle, State};
 
 use athenaeum_core::api::sync as api;
-use athenaeum_core::api::sync::{EnqueueSelectionResult, SyncHistoryQuery, TransferEventEntry};
+use athenaeum_core::api::sync::{
+    EnqueueSelectionResult, SyncHistoryQuery, TerminalTransfers, TransferEventEntry,
+};
 use athenaeum_core::events::ProgressEmitter;
 use athenaeum_core::sync::{Direction, HistoryRow, SyncStatus, TransferFileEntry};
 
@@ -52,6 +54,20 @@ pub async fn list_sync_history(
     query: SyncHistoryQuery,
 ) -> Result<Vec<HistoryRow>, String> {
     api::list_history(&state.ctx, query).map_err(|e| e.to_string())
+}
+
+/// The recent window of terminal (settled) transfers — sent
+/// (confirmed/failed/cancelled) + received (done/failed/cancelled) — that the
+/// cheap `get_sync_status` poll omits (tv2 follow-up). The Transfers UI fetches
+/// this on mount and on each `sync-finished` so a settled row (and its Resend
+/// affordance + detail) survives a restart. `limit` defaults to 100, capped 500.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn list_terminal_transfers(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+) -> Result<TerminalTransfers, String> {
+    api::list_terminal_transfers(&state.ctx, limit).map_err(|e| e.to_string())
 }
 
 /// Per-file detail for one transfer batch (Task 14): the outbound (`sent`) or
