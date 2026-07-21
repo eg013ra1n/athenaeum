@@ -152,9 +152,16 @@ function LiveRowBody({
   const showReason = !!row.lastError && (row.retrying || row.terminal);
 
   const pending = !row.terminal && (row.state === 'queued' || row.state === 'announced');
-  const canSendNow = row.kind === 'outbound' && pending;
+  // Send-now: a pending row, or one sitting in the `waiting` backoff countdown — a
+  // user staring at "retry in …" wants "try now", and the backend `kick` is exactly
+  // that (collapse the backoff so the next worker pass re-announces).
+  const canSendNow = row.kind === 'outbound' && (pending || waiting);
+  // Cancel: ANY non-terminal outbound row. The backend `engine.cancel(id)` cancels
+  // cooperatively at every stage (transferring/uploaded/waiting included), and after
+  // a restart the resurrected engine holds the slot again — so the button must not be
+  // gated to the narrow `pending` window. Inbound gate is unchanged.
   const canCancel =
-    (row.kind === 'outbound' && pending) ||
+    (row.kind === 'outbound' && !row.terminal) ||
     (row.kind === 'inbound' && (row.state === 'announced' || row.state === 'fetching'));
   // Resend re-announces the on-disk payload — but a package's payload can be gone
   // by the time this renders: a `confirmed` row's payload is always cleaned up

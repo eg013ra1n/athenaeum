@@ -735,7 +735,7 @@ fn account_signed_in(ctx: &ServiceContext) -> Result<bool, ApiError> {
 /// [`SyncRuntime::ensure_started`] only ever builds the transport once.
 pub async fn autostart_if_enabled(
     ctx: Arc<ServiceContext>,
-    sync: &SyncRuntime,
+    sync: Arc<SyncRuntime>,
     sync_sender: Arc<SyncSenderRuntime>,
     collab_sender: Arc<SyncSenderRuntime>,
     emitter: Arc<dyn ProgressEmitter>,
@@ -765,7 +765,7 @@ pub async fn autostart_if_enabled(
     // Periodic authorized-peers refresh (task 7): install the hourly hub re-pull
     // so a machine added to the account later is admitted without a restart
     // (idempotent — once per process across all three startup sites).
-    ensure_peers_refresh_task(&ctx_arc, sync).await;
+    ensure_peers_refresh_task(&ctx_arc, &sync).await;
     // Populate the authorized-peer allow-list (best-effort) before the receiver
     // starts accepting, then enforce it live per-package (finding H1).
     refresh_authorized_peers(ctx).await;
@@ -779,9 +779,24 @@ pub async fn autostart_if_enabled(
             Arc::clone(&emitter),
         )),
     )?;
+    // Clone the emitter for the resurrection spawn before `ensure_started` moves it.
+    let emitter_for_resurrect = Arc::clone(&emitter);
     sync.ensure_started(node, sync_dir, db_path, incoming, authorized, hooks, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    // tv2 follow-up: resurrect orphaned sender engines for every non-terminal
+    // outbound row the previous process left behind, so a pending send resumes
+    // (and becomes cancellable + visible) after a restart. Spawned fire-and-forget
+    // AFTER the receiver is up so autostart latency is unchanged; idempotent via
+    // the per-peer `current_for` guard, so racing a concurrent user enqueue never
+    // double-spawns an engine.
+    tokio::spawn(resurrect_pending_senders(
+        Arc::clone(&ctx_arc),
+        Arc::clone(&sync_sender),
+        Arc::clone(&collab_sender),
+        Arc::clone(&sync),
+        emitter_for_resurrect,
+    ));
     Ok(true)
 }
 
@@ -793,13 +808,144 @@ fn autostart_gate(dev: bool, signed_in: bool) -> bool {
     dev || signed_in
 }
 
+/// The DISTINCT destination peers of a set of non-terminal outbound rows,
+/// first-seen order preserved (tv2 follow-up — sender resurrection). One engine
+/// per peer re-drives every one of that peer's non-terminal rows, so the startup
+/// resurrection only needs the distinct peer set, not the row set. Pure over the
+/// store read so the enumeration is unit-testable without the transport build.
+fn distinct_pending_peers(rows: &[OutboundRow]) -> Vec<NodeId> {
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    let mut peers = Vec::new();
+    for row in rows {
+        if seen.insert(row.peer) {
+            peers.push(row.peer);
+        }
+    }
+    peers
+}
+
+/// Resurrect orphaned sender engines after an app restart (tv2 follow-up).
+///
+/// The ONLY production `SyncEngine` spawn is [`ensure_sender_engine`], reached
+/// from `enqueue_sync_selection` / `retry_sync_package`. After a restart the
+/// in-memory per-peer engine map is empty while non-terminal `sync_outbound` rows
+/// persist, so those rows are orphaned: no engine → no worker re-drive → no
+/// re-announce, they are invisible in `get_status().sender.active` (which iterates
+/// started engines), and `cancel_sync_package` fails "package is not active". This
+/// reads the durable non-terminal rows and (re)builds one engine per distinct
+/// peer — the spawned worker then re-drives every non-terminal row scoped to that
+/// peer, identical to the pre-restart in-process behavior.
+///
+/// `build` is the per-peer engine ensurer: production
+/// ([`resurrect_pending_senders`]) passes [`ensure_sender_engine`]; tests inject a
+/// loopback builder (the same substitution the whole `sync_e2e` harness makes —
+/// `ensure_sender_engine` binds a real iroh transport that has no loopback
+/// stand-in). Best-effort per peer: a build failure (peer unauthorized / hub
+/// unreachable) is `warn!` + continue, never propagated — a restart must resurrect
+/// every peer it can and never fail on one bad peer. The `current_for` guard makes
+/// it idempotent and race-safe: a peer whose engine already exists (a concurrent
+/// user enqueue won the race, or a second startup site already ran) is skipped, so
+/// two engines are never spawned for one peer. Returns the number of engines
+/// actually (re)built.
+#[doc(hidden)]
+pub async fn resurrect_pending_senders_with<F, Fut>(
+    db_path: &Path,
+    sender: &Arc<SyncSenderRuntime>,
+    build: F,
+) -> Result<usize, ApiError>
+where
+    F: Fn(NodeId) -> Fut,
+    Fut: std::future::Future<Output = Result<(), ApiError>>,
+{
+    let rows = {
+        let store = CatalogSyncStore::open(db_path)
+            .map_err(|e| ApiError::Internal(format!("open catalog sync store: {e:#}")))?;
+        store
+            .non_terminal()
+            .map_err(|e| ApiError::Internal(format!("read non-terminal outbound rows: {e:#}")))?
+    };
+    let peers = distinct_pending_peers(&rows);
+    let mut resurrected = 0usize;
+    for peer in peers {
+        // Idempotent + race-safe: skip a peer whose engine is already running (a
+        // concurrent enqueue, or another startup site, beat us to it).
+        if sender.current_for(&peer).await.is_some() {
+            continue;
+        }
+        match build(peer).await {
+            Ok(()) => resurrected += 1,
+            Err(e) => {
+                // Best-effort: one unbuildable peer never fails the resurrection.
+                tracing::warn!(
+                    peer = %node_id_hex(&peer),
+                    error = %format!("{e:#}"),
+                    "resurrect_pending_senders: engine build failed; skipping peer"
+                );
+            }
+        }
+    }
+    if resurrected > 0 {
+        tracing::info!(
+            peers = resurrected,
+            rows = rows.len(),
+            "resurrected pending sender engines"
+        );
+    }
+    Ok(resurrected)
+}
+
+/// Production entry point for [`resurrect_pending_senders_with`]: builds each
+/// orphaned peer's engine through the real [`ensure_sender_engine`] — exactly the
+/// call `retry_sync_package` makes when a restart cleared the engine map while its
+/// terminal rows persisted. Best-effort and self-contained (own error logging), so
+/// the boot path can `tokio::spawn` it fire-and-forget without awaiting or
+/// propagating — autostart latency is unchanged. The first-attempt dial hint falls
+/// back to our own relay set (`dest_endpoint_addr = None`); the engine's T8 address
+/// refresher re-resolves the peer's real address on retry.
+pub async fn resurrect_pending_senders(
+    ctx: Arc<ServiceContext>,
+    sender: Arc<SyncSenderRuntime>,
+    collab_sender: Arc<SyncSenderRuntime>,
+    sync: Arc<SyncRuntime>,
+    emitter: Arc<dyn ProgressEmitter>,
+) {
+    let db_path = match sync_paths(&ctx) {
+        Ok((_sync_dir, db_path)) => db_path,
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "resurrect_pending_senders: cannot resolve sync paths; skipping"
+            );
+            return;
+        }
+    };
+    let build = |peer: NodeId| {
+        let ctx = Arc::clone(&ctx);
+        let sender = Arc::clone(&sender);
+        let collab = Arc::clone(&collab_sender);
+        let sync = Arc::clone(&sync);
+        let emitter = Arc::clone(&emitter);
+        async move {
+            ensure_sender_engine(&ctx, &sender, collab, &sync, peer, None, Some(emitter))
+                .await
+                .map(|_| ())
+        }
+    };
+    if let Err(e) = resurrect_pending_senders_with(&db_path, &sender, build).await {
+        tracing::warn!(
+            error = %format!("{e:#}"),
+            "resurrect_pending_senders: enumeration failed"
+        );
+    }
+}
+
 /// Dev-flagged: lazily start the transport + receiver and return this device's
 /// pairing ticket. `Forbidden` when the dev flag is off. The sync data (device
 /// key, blob store, landed files) lives beside the catalog DB, under a `sync/`
 /// sibling directory.
 pub async fn get_pairing_ticket(
     ctx: Arc<ServiceContext>,
-    sync: &SyncRuntime,
+    sync: Arc<SyncRuntime>,
     sync_sender: Arc<SyncSenderRuntime>,
     collab_sender: Arc<SyncSenderRuntime>,
     emitter: Arc<dyn ProgressEmitter>,
@@ -827,7 +973,7 @@ pub async fn get_pairing_ticket(
     install_node_wake_hook(&node, Arc::clone(&sync_sender), Arc::clone(&collab_sender));
     // Periodic authorized-peers refresh (task 7): install the hourly hub re-pull
     // here too (idempotent — no-ops if autostart already installed it).
-    ensure_peers_refresh_task(&ctx_arc, sync).await;
+    ensure_peers_refresh_task(&ctx_arc, &sync).await;
     // Enforce the authorized-peer allow-list here too (finding H1). In pure
     // dev-ticket mode (no account) this resolves to accept-any; a signed-in
     // primary that also flips the dev flag still enforces its account list.
@@ -843,10 +989,23 @@ pub async fn get_pairing_ticket(
         )),
     )?;
 
+    // Clone the emitter for the resurrection spawn before `ensure_started` moves it.
+    let emitter_for_resurrect = Arc::clone(&emitter);
     let ticket = sync
         .ensure_started(node, sync_dir, db_path, incoming, authorized, hooks, emitter)
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    // tv2 follow-up: resurrect orphaned sender engines here too — this is the
+    // OTHER startup site that runs `ensure_started` for a dev node. Fire-and-forget
+    // AFTER the receiver is up (never blocks the ticket return); idempotent via the
+    // per-peer `current_for` guard, so it no-ops if autostart already resurrected.
+    tokio::spawn(resurrect_pending_senders(
+        Arc::clone(&ctx_arc),
+        Arc::clone(&sync_sender),
+        Arc::clone(&collab_sender),
+        Arc::clone(&sync),
+        emitter_for_resurrect,
+    ));
     Ok(ticket)
 }
 
@@ -2662,6 +2821,43 @@ mod tests {
         assert_eq!(sender.started_peers().await.len(), 2);
     }
 
+    /// tv2 follow-up (sender resurrection): the startup enumeration collects the
+    /// DISTINCT peers of the non-terminal outbound rows. Terminal rows are excluded
+    /// by `non_terminal()` (so a peer whose every row is terminal never appears),
+    /// and a peer with several non-terminal rows appears exactly once, in first-seen
+    /// (id-ascending) order.
+    #[test]
+    fn distinct_pending_peers_dedups_and_excludes_terminal() {
+        use crate::sync::StandaloneSyncStore;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = StandaloneSyncStore::open(tmp.path().join("peers.db")).unwrap();
+        let node = |b: u8| crate::sync::node_id_from_hex(&format!("{b:02x}").repeat(32)).unwrap();
+        let peer_a = node(0xaa);
+        let peer_b = node(0xbb);
+        let peer_c = node(0xcc);
+
+        // peer_a: two non-terminal rows (queued + transferring).
+        store.enqueue("/pkgs/a1", peer_a, None, &[]).unwrap();
+        let a2 = store.enqueue("/pkgs/a2", peer_a, None, &[]).unwrap();
+        store.set_state(a2, OutboundState::Transferring).unwrap();
+        // peer_b: one non-terminal row + one terminal (confirmed).
+        store.enqueue("/pkgs/b1", peer_b, None, &[]).unwrap();
+        let b2 = store.enqueue("/pkgs/b2", peer_b, None, &[]).unwrap();
+        store.set_state(b2, OutboundState::Confirmed).unwrap();
+        // peer_c: every row terminal (failed) → must be excluded entirely.
+        let c1 = store.enqueue("/pkgs/c1", peer_c, None, &[]).unwrap();
+        store.set_state(c1, OutboundState::Failed).unwrap();
+
+        let rows = store.non_terminal().unwrap();
+        let peers = distinct_pending_peers(&rows);
+        assert_eq!(
+            peers,
+            vec![peer_a, peer_b],
+            "distinct non-terminal peers, first-seen order; the all-terminal peer_c is excluded"
+        );
+    }
+
     /// Multi-destination regression (sync 2C / Phase 3): with two started
     /// per-peer engines, `build_sender_status` must NOT N-duplicate the in-flight
     /// rows. Each engine opens its OWN `CatalogSyncStore` over the SAME catalog
@@ -3820,11 +4016,11 @@ mod tests {
         use crate::sync::SyncRuntime;
 
         let (_tmp, ctx) = test_ctx();
-        let sync = SyncRuntime::new();
+        let sync = Arc::new(SyncRuntime::new());
 
         let started = autostart_if_enabled(
             Arc::new(ctx),
-            &sync,
+            Arc::clone(&sync),
             Arc::new(SyncSenderRuntime::new()),
             Arc::new(SyncSenderRuntime::new()),
             Arc::new(crate::events::NullEmitter),
@@ -3860,10 +4056,10 @@ mod tests {
             // Signed in (identity present) — the mesh model has no role gate.
             crate::db::set_setting(&conn, keys::ACCOUNT_DEVICE_ID, "device-1").unwrap();
         }
-        let sync = SyncRuntime::new();
+        let sync = Arc::new(SyncRuntime::new());
         let started = autostart_if_enabled(
             Arc::new(ctx),
-            &sync,
+            Arc::clone(&sync),
             Arc::new(SyncSenderRuntime::new()),
             Arc::new(SyncSenderRuntime::new()),
             Arc::new(crate::events::NullEmitter),

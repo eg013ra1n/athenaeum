@@ -34,13 +34,15 @@
 //! catalog store — is the same public API the desktop/web hosts use.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use athenaeum_core::api::sync::{
-    cancel_incoming_package, enqueue_sync_selection, get_status, list_transfer_files,
-    retry_sync_package, ResolvedDest,
+    cancel_incoming_package, cancel_sync_package, enqueue_sync_selection, get_status,
+    list_transfer_files, resurrect_pending_senders_with, retry_sync_package, ResolvedDest,
 };
+use athenaeum_core::api::ApiError;
 use athenaeum_core::api::retention::{evaluate, AppRetentionConfig};
 use athenaeum_core::db::{insert_file, insert_frame, Database};
 use athenaeum_core::events::{NullEmitter, ProgressEmitter};
@@ -2064,6 +2066,290 @@ async fn restart_resumes_per_file_picture_then_confirms() {
     assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), N as i64, "the peer ingested each frame exactly once");
 
     engine_b.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// A loopback engine builder for `resurrect_pending_senders_with` that stands in
+/// for the production `ensure_sender_engine` (which binds a real iroh transport,
+/// unavailable over loopback) — exactly the same substitution
+/// [`inject_sender_engine`] makes. Each call binds a fresh loopback endpoint on
+/// `net`, opens the shared catalog store at `capture_db`, spawns an engine for
+/// `peer`, and inserts it into `sender` under `peer` — byte-for-byte what
+/// `ensure_sender_engine` does minus the transport build. Returns a closure
+/// suitable as the `build` argument.
+fn loopback_engine_builder<'a>(
+    net: &'a LoopbackNetwork,
+    capture_db: &'a Path,
+    sender: &'a Arc<SyncSenderRuntime>,
+) -> impl Fn(NodeId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ApiError>> + 'a>> + 'a
+{
+    move |peer: NodeId| {
+        let ep = net.endpoint();
+        let sender = Arc::clone(sender);
+        let capture_db = capture_db.to_path_buf();
+        Box::pin(async move {
+            let origin = node_id_hex(&ep.node_id());
+            let store = Arc::new(CatalogSyncStore::open(&capture_db).unwrap());
+            let engine = Arc::new(SyncEngine::spawn(
+                store as Arc<dyn SyncStore>,
+                Arc::new(ep) as Arc<dyn SharingTransport>,
+                peer,
+            ));
+            sender.lock_inner().await.insert(
+                peer,
+                StartedSender { engine, origin_device: origin, peer },
+            );
+            Ok::<(), ApiError>(())
+        })
+    }
+}
+
+/// tv2 follow-up (sender resurrection at app start). Reproduces the owner's live
+/// smoke: a pending send is left non-terminal when the sending app dies. On the
+/// *current* code (no startup resurrection) a relaunched app has an EMPTY sender
+/// runtime, so the orphaned row has no engine — it re-drives nothing, is invisible
+/// in `get_sync_status().sender.active`, and cannot be cancelled. This asserts
+/// `resurrect_pending_senders_with` (the injectable core the boot path spawns)
+/// closes all three gaps: it rebuilds exactly one engine for the orphaned peer,
+/// the row becomes visible-and-active again, and the resumed engine drives it to
+/// `confirmed` once the peer acks. Also pins the no-double-engine guard: run
+/// against a runtime that STILL has the peer's engine, the builder is never
+/// invoked.
+#[tokio::test]
+async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
+    const N: usize = 4;
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    // Hold the ack so the row rests non-terminal (Delivered) while we simulate the
+    // crash + resurrection, then release it so the resumed engine confirms.
+    receiver_ep.set_fault(FaultPlan { delay_ack: Some(Duration::from_secs(3)), ..Default::default() });
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    // The pre-crash engine (long ack timeout so it rests in Delivered, not retry).
+    let (engine_a, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(30)).await;
+
+    let mut frame_ids = Vec::with_capacity(N);
+    for idx in 0..N {
+        frame_ids.push(insert_capture_frame(&capture_ctx, &capture_files, idx).0);
+    }
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids.clone(),
+        Some("Orphan Batch".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("enqueue");
+    let id = latest_outbound_id(cdb);
+    wait_until(|| outbound_state(cdb, id) == "delivered", WAIT).await;
+
+    // ── No-double-engine guard: resurrection over a runtime that STILL owns the
+    // peer's engine must skip it — the builder is never invoked. ──
+    let guard_calls = Arc::new(AtomicUsize::new(0));
+    let built_noop = {
+        let guard_calls = Arc::clone(&guard_calls);
+        resurrect_pending_senders_with(&capture_db, &sender, move |_peer| {
+            let guard_calls = Arc::clone(&guard_calls);
+            async move {
+                guard_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ApiError>(())
+            }
+        })
+        .await
+        .expect("resurrect enumeration ok")
+    };
+    assert_eq!(built_noop, 0, "an already-started peer is not rebuilt");
+    assert_eq!(guard_calls.load(Ordering::SeqCst), 0, "builder must not run for a live peer");
+
+    // ── Simulate process death: kill the old engine, stand up a FRESH empty
+    // sender runtime over the SAME store (exactly what a relaunch does). ──
+    engine_a.shutdown().await;
+    let sender2 = Arc::new(SyncSenderRuntime::new());
+    let sync2 = SyncRuntime::new();
+
+    // Root-cause proof: with no engine the orphaned row is invisible + unreachable.
+    assert!(
+        sender2.current_for(&receiver_node).await.is_none(),
+        "fresh runtime has no engine for the peer"
+    );
+    let pre = get_status(&capture_ctx, &sync2, &sender2).await.expect("status");
+    assert!(
+        !pre.sender.active.iter().any(|r| r.id == id),
+        "orphaned row is invisible in the active list before resurrection"
+    );
+
+    // ── Resurrect: rebuild exactly one engine for the orphaned peer. ──
+    let built = resurrect_pending_senders_with(
+        &capture_db,
+        &sender2,
+        loopback_engine_builder(&net, &capture_db, &sender2),
+    )
+    .await
+    .expect("resurrect ok");
+    assert_eq!(built, 1, "exactly one orphaned peer engine was resurrected");
+    assert!(
+        sender2.current_for(&receiver_node).await.is_some(),
+        "an engine now exists for the peer"
+    );
+
+    // The row is visible-and-active again (the snapshot reads the shared store).
+    let post = get_status(&capture_ctx, &sync2, &sender2).await.expect("status");
+    assert!(
+        post.sender.active.iter().any(|r| r.id == id),
+        "resurrected row is listed active again"
+    );
+
+    // Release the ack: the resumed engine drives the orphaned row to confirmed.
+    receiver_ep.set_fault(FaultPlan::default());
+    wait_until(|| outbound_state(cdb, id) == "confirmed", WAIT).await;
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM files"),
+        N as i64,
+        "the peer ingested each frame exactly once after resurrection"
+    );
+
+    if let Some((engine_b, _)) = sender2.current_for(&receiver_node).await {
+        engine_b.shutdown().await;
+    }
+    receiver.shutdown().await;
+}
+
+/// tv2 follow-up — the cancel leg of the same smoke. After a restart resurrects
+/// the orphaned engine, the user must be able to CANCEL the stuck send (the owner
+/// had "no way to cancel"). `cancel_sync_package` routes through
+/// [`active_engine_for_row`], which only finds the row once an engine is started
+/// for its peer — so this fails on the current code (empty runtime → "package is
+/// not active") and passes once resurrection has rebuilt the engine.
+#[tokio::test]
+async fn cancel_succeeds_on_resurrected_sender_row() {
+    const N: usize = 4;
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    // Hold the ack for the whole test so the row stays non-terminal (never confirms).
+    receiver_ep.set_fault(FaultPlan { delay_ack: Some(Duration::from_secs(60)), ..Default::default() });
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    let (engine_a, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_secs(60)).await;
+
+    let mut frame_ids = Vec::with_capacity(N);
+    for idx in 0..N {
+        frame_ids.push(insert_capture_frame(&capture_ctx, &capture_files, idx).0);
+    }
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids.clone(),
+        Some("Cancel After Restart".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("enqueue");
+    let id = latest_outbound_id(cdb);
+    wait_until(|| outbound_state(cdb, id) == "delivered", WAIT).await;
+
+    // Process death: kill the engine, fresh empty runtime.
+    engine_a.shutdown().await;
+    let sender2 = Arc::new(SyncSenderRuntime::new());
+
+    // Current code: with no engine the row cannot be cancelled at all.
+    assert!(
+        cancel_sync_package(&sender2, id).await.is_err(),
+        "cancel is unreachable before resurrection (no active engine)"
+    );
+
+    // Resurrect, then cancel succeeds and drives the row terminal.
+    let built = resurrect_pending_senders_with(
+        &capture_db,
+        &sender2,
+        loopback_engine_builder(&net, &capture_db, &sender2),
+    )
+    .await
+    .expect("resurrect ok");
+    assert_eq!(built, 1);
+
+    cancel_sync_package(&sender2, id).await.expect("cancel succeeds on the resurrected row");
+    wait_until(|| outbound_state(cdb, id) == "cancelled", WAIT).await;
+
+    if let Some((engine_b, _)) = sender2.current_for(&receiver_node).await {
+        engine_b.shutdown().await;
+    }
     receiver.shutdown().await;
 }
 

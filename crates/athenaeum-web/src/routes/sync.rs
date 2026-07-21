@@ -31,7 +31,7 @@ pub async fn get_sync_pairing_ticket(
     let emitter = Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
     api::get_pairing_ticket(
         Arc::clone(&state.ctx),
-        &state.sync,
+        Arc::clone(&state.sync),
         Arc::clone(&state.sync_sender),
         Arc::clone(&state.collab_sender),
         emitter,
