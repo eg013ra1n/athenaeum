@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
 import { groupHistory, type HistoryGroup } from '../components/transfers/historyGrouping';
-import type { HistoryRow, ProjectCard, SyncHistoryQuery } from '../types/models';
+import type { Direction, HistoryRow, ProjectCard, SyncHistoryQuery } from '../types/models';
 
 const HISTORY_LIMIT = 500;
 const POLL_MS = 5_000;
@@ -22,6 +22,10 @@ export interface UseTransferHistory {
   loading: boolean;
   /** Re-read history now (the page calls this on `sync-finished`). */
   refetch: () => void;
+  /** Optimistically drop a deleted batch's history rows from local state (UX
+   *  wave 2 trash action) — the group vanishes instantly, before the reconciling
+   *  `refetch()`. Keyed on the same `(direction, packageId)` a group is built by. */
+  removeLocal: (direction: Direction, packageKey: string) => void;
 }
 
 export function useTransferHistory(): UseTransferHistory {
@@ -97,7 +101,17 @@ export function useTransferHistory(): UseTransferHistory {
     };
   }, []);
 
+  // Optimistic local removal: drop every history row of the deleted batch. Sent
+  // rows carry the full package-dir basename as `packageId`, received rows the
+  // wire uuid — both equal the `package_key` the delete command targets, so an
+  // exact match cleans the group out of the next `groupHistory` pass.
+  const removeLocal = useCallback((direction: Direction, packageKey: string) => {
+    setHistory((prev) =>
+      prev.filter((r) => !(r.direction === direction && r.packageId === packageKey)),
+    );
+  }, []);
+
   const groups = useMemo(() => groupHistory(history), [history]);
 
-  return { groups, deviceNames, projectNames, loading, refetch };
+  return { groups, deviceNames, projectNames, loading, refetch, removeLocal };
 }

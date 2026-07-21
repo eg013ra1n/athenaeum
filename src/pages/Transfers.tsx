@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowLeftRight } from 'lucide-react';
 import { api } from '../api';
 import { AppDataWarningStrip } from '../components/transfers/AppDataWarningStrip';
 import { TransferRow } from '../components/transfers/TransferRow';
 import { TransferDetail } from '../components/transfers/TransferDetail';
-import { groupHasFailure, groupHasSuccess } from '../components/transfers/historyGrouping';
-import type { TransferFilter, UnifiedRow } from '../components/transfers/types';
+import { groupHasCancel, groupHasFailure, groupHasRealSuccess } from '../components/transfers/historyGrouping';
+import type { DeleteKey, TransferFilter, UnifiedRow } from '../components/transfers/types';
+import type { Direction } from '../types/models';
+import type { TransferRow as TransferRowModel } from '../hooks/useTransferQueue';
 import { useTransferQueue } from '../hooks/useTransferQueue';
 import { useTransferHistory } from '../hooks/useTransferHistory';
 
@@ -18,8 +20,9 @@ import { useTransferHistory } from '../hooks/useTransferHistory';
  * device names everywhere; hex only in the Details tab; `waiting` is benign.
  */
 export default function Transfers() {
-  const { rows, liveFiles, sendNow, cancelOutbound, cancelInbound, resend, busy } = useTransferQueue();
-  const { groups, deviceNames, projectNames, refetch } = useTransferHistory();
+  const { rows, liveFiles, sendNow, cancelOutbound, cancelInbound, resend, deleteTransfer, busy } =
+    useTransferQueue();
+  const { groups, deviceNames, projectNames, refetch, removeLocal } = useTransferHistory();
 
   const [filter, setFilter] = useState<TransferFilter>('all');
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -45,21 +48,81 @@ export default function Transfers() {
     };
   }, [refetch]);
 
-  // Merge live rows + history groups into one list, de-duping any history group
-  // already represented by a live row (a lingering failed/cancelled ledger row
-  // wins — it carries live detail + a Resend action). Live keys: an outbound
-  // row's `packageShort` is the truncated (≤10-char) prefix of the package-dir
-  // basename that a `sent` history row stamps as its full `packageId`; an
-  // inbound row's full `packageId` equals a `received` history row's `packageId`.
+  // Merge live rows + history groups into one list.
+  //
+  // 1. Live rows split into ACTIVE (non-terminal — never collapsed, they own the
+  //    live actions) and TERMINAL (settled). Terminal rows sharing a batch key
+  //    collapse into ONE visible row (UX wave 2, §problem 1): outbound attempts
+  //    share the package-dir basename → the same (truncated) `packageShort`;
+  //    inbound rows share the wire `packageId`. The NEWEST attempt (max id) wins
+  //    its state/chips/detail; `attemptCount` drives the "· N attempts" hint.
+  // 2. History groups fold in behind the live rows, de-duping any group already
+  //    represented by a live row (a lingering failed/cancelled ledger row wins —
+  //    it carries live detail + a Resend action). The dedup keys off the same set
+  //    of live `packageShort`s the collapse produced, so no resurrected duplicate
+  //    appears below a collapsed row. Live keys: an outbound row's `packageShort`
+  //    is the truncated (≤10-char) prefix of the package-dir basename that a
+  //    `sent` history row stamps as its full `packageId`; an inbound row's full
+  //    `packageId` equals a `received` history row's `packageId`.
   const unified = useMemo<UnifiedRow[]>(() => {
+    const activeRows = rows.filter((r) => !r.terminal);
+    const terminalRows = rows.filter((r) => r.terminal);
+
+    // The full sent package-dir basenames live only in history (a live outbound
+    // row carries just the truncated `packageShort`); a collapsed terminal sent
+    // row resolves its delete key by prefix-matching against these.
+    const sentHistoryFullKeys = groups
+      .filter((g) => g.direction === 'sent' && g.packageId != null)
+      .map((g) => g.packageId as string);
+
+    const resolveDeleteKey = (r: TransferRowModel): DeleteKey | null => {
+      if (r.kind === 'inbound') {
+        return r.packageId ? { direction: 'received', packageKey: r.packageId } : null;
+      }
+      const full = sentHistoryFullKeys.find((k) => k.startsWith(r.packageShort));
+      return full ? { direction: 'sent', packageKey: full } : null;
+    };
+
+    // Collapse terminal rows by batch key, preserving first-seen order.
+    const collapseKey = (r: TransferRowModel) =>
+      r.kind === 'outbound' ? `out:${r.packageShort}` : `in:${r.packageId ?? r.id}`;
+    const byBatch = new Map<string, TransferRowModel[]>();
+    const batchOrder: string[] = [];
+    for (const r of terminalRows) {
+      const k = collapseKey(r);
+      if (!byBatch.has(k)) {
+        byBatch.set(k, []);
+        batchOrder.push(k);
+      }
+      byBatch.get(k)!.push(r);
+    }
+
+    const liveUnified: UnifiedRow[] = [];
+    // Active rows first (never collapsed, no delete affordance).
+    for (const r of activeRows) {
+      liveUnified.push({ kind: 'live', selKey: r.key, row: r, attemptCount: 1, deleteKey: null });
+    }
+    // Then one collapsed row per terminal batch (newest attempt wins).
+    for (const k of batchOrder) {
+      const attempts = byBatch.get(k)!;
+      const newest = attempts.reduce((a, b) => (b.id > a.id ? b : a));
+      liveUnified.push({
+        kind: 'live',
+        selKey: newest.key,
+        row: newest,
+        attemptCount: attempts.length,
+        deleteKey: resolveDeleteKey(newest),
+      });
+    }
+
+    // Dedup history groups against every live row's batch key (pre-collapse set
+    // is identical — collapse never adds/removes a `packageShort`/`packageId`).
     const liveSentPrefixes: string[] = [];
     const liveRecvIds = new Set<string>();
     for (const r of rows) {
       if (r.kind === 'outbound') liveSentPrefixes.push(r.packageShort);
       else if (r.packageId) liveRecvIds.add(r.packageId);
     }
-
-    const liveUnified: UnifiedRow[] = rows.map((r) => ({ kind: 'live', selKey: r.key, row: r }));
 
     const historyUnified: UnifiedRow[] = [];
     for (const g of groups) {
@@ -75,6 +138,7 @@ export default function Transfers() {
         group: g,
         deviceName: deviceNames[g.peerDevice] ?? null,
         projectName: g.project ? projectNames[g.project] ?? null : null,
+        deleteKey: g.packageId ? { direction: g.direction, packageKey: g.packageId } : null,
       });
     }
     return [...liveUnified, ...historyUnified];
@@ -82,17 +146,28 @@ export default function Transfers() {
 
   // Filter membership (§D8). A row can match more than one bucket (a mixed
   // history group is both Completed and Failed); counts reflect that honestly.
+  // A settled `cancelled` row and a purely-cancelled history group land in the
+  // new Cancelled bucket (UX wave 2, §problem 4) — out of Completed. A group
+  // mixing success + cancel stays in Completed; Failed is unchanged.
   const bucketsFor = (u: UnifiedRow): Set<TransferFilter> => {
     const s = new Set<TransferFilter>(['all']);
     if (u.kind === 'live') {
       const r = u.row;
       if (r.displayState === 'waiting') s.add('waiting');
-      else if (r.terminal) s.add(r.displayState === 'failed' ? 'failed' : 'completed');
-      else s.add(r.kind === 'outbound' ? 'sending' : 'receiving');
+      else if (r.terminal) {
+        if (r.displayState === 'failed') s.add('failed');
+        else if (r.displayState === 'cancelled') s.add('cancelled');
+        else s.add('completed');
+      } else s.add(r.kind === 'outbound' ? 'sending' : 'receiving');
     } else {
-      if (groupHasSuccess(u.group)) s.add('completed');
-      if (groupHasFailure(u.group)) s.add('failed');
-      if (!groupHasSuccess(u.group) && !groupHasFailure(u.group)) s.add('completed');
+      const success = groupHasRealSuccess(u.group);
+      const failure = groupHasFailure(u.group);
+      const cancel = groupHasCancel(u.group);
+      if (success) s.add('completed');
+      if (failure) s.add('failed');
+      if (cancel && !success && !failure) s.add('cancelled');
+      // A group with no recognized outcome at all still surfaces (as Completed).
+      if (!success && !failure && !cancel) s.add('completed');
     }
     return s;
   };
@@ -104,6 +179,7 @@ export default function Transfers() {
       receiving: 0,
       waiting: 0,
       completed: 0,
+      cancelled: 0,
       failed: 0,
     };
     for (const u of unified) for (const b of bucketsFor(u)) c[b] += 1;
@@ -121,6 +197,20 @@ export default function Transfers() {
   // active filter no longer includes must drop out of the detail pane (it comes
   // back if the filter widens again — `selectedKey` is preserved, not cleared).
   const selected = selectedKey ? (filtered.find((u) => u.selKey === selectedKey) ?? null) : null;
+
+  // Trash a settled batch (UX wave 2, §problem 5): fire the durable delete, then
+  // — only on success (the backend refuses `Invalid` if any attempt is active) —
+  // optimistically clear the batch's history rows and reconcile.
+  const handleDelete = useCallback(
+    (direction: Direction, packageKey: string) => {
+      void deleteTransfer(direction, packageKey).then((ok) => {
+        if (!ok) return;
+        removeLocal(direction, packageKey);
+        refetch();
+      });
+    },
+    [deleteTransfer, removeLocal, refetch],
+  );
 
   // Shared 1s countdown tick — runs ONLY while a `waiting` row with a live
   // deadline is actually on screen (filtered view), and stops on filter change /
@@ -140,6 +230,7 @@ export default function Transfers() {
     { key: 'receiving', label: 'Receiving' },
     { key: 'waiting', label: 'Waiting' },
     { key: 'completed', label: 'Completed' },
+    { key: 'cancelled', label: 'Cancelled' },
     { key: 'failed', label: 'Failed' },
   ];
 
@@ -201,6 +292,7 @@ export default function Transfers() {
                 onCancelOutbound={cancelOutbound}
                 onCancelInbound={cancelInbound}
                 onResend={resend}
+                onDelete={handleDelete}
               />
             ))
           )}

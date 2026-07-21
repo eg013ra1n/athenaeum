@@ -30,6 +30,8 @@ import { api } from '../api';
 import { useTransfers } from '../contexts/TransfersContext';
 import { useNotifications } from '../contexts/NotificationContext';
 import type {
+  DeletedTransferRecord,
+  Direction,
   InboundSummary,
   OutboundSummary,
   SyncFileProgressEvent,
@@ -152,7 +154,12 @@ export interface UseTransferQueue {
   cancelOutbound: (id: number) => void;
   cancelInbound: (packageId: string) => void;
   resend: (id: number) => void;
-  /** Action keys currently in flight (`send:<id>` / `cancel:<id>` / `cancelin:<packageId>` / `resend:<id>`) — disable the triggering button while present. */
+  /** Remove one settled batch's durable records (UX wave 2 trash action).
+   *  Optimistically drops the matching terminal rows on success and re-reads the
+   *  durable window; resolves `true` on success, `false` on a refusal (an active
+   *  attempt — a warning toast is raised) so the caller can also clear history. */
+  deleteTransfer: (direction: Direction, packageKey: string) => Promise<boolean>;
+  /** Action keys currently in flight (`send:<id>` / `cancel:<id>` / `cancelin:<packageId>` / `resend:<id>` / `delete:<direction>:<packageKey>`) — disable the triggering button while present. */
   busy: Set<string>;
 }
 
@@ -196,6 +203,30 @@ export function useTransferQueue(): UseTransferQueue {
     });
   }, []);
 
+  // Guards state-writes from a durable fetch that resolves after unmount (the
+  // listener is torn down on unmount, but an in-flight `list_terminal_transfers`
+  // promise can still settle). Mirrors `useTransferHistory`'s pattern.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // The durable terminal read, hoisted so both the mount/`sync-finished` effect
+  // and the delete action can re-run it.
+  const fetchTerminal = useCallback(() => {
+    api
+      .invoke<TerminalTransfers>('list_terminal_transfers', {})
+      .then((t) => {
+        if (!mountedRef.current) return;
+        setDbTerminalSent(t.sent);
+        setDbTerminalReceived(t.received);
+      })
+      .catch((err) => console.error('[useTransferQueue] list_terminal_transfers failed:', err));
+  }, []);
+
   const [busy, setBusy] = useState<Set<string>>(new Set());
   const withBusy = useCallback((busyKey: string, fn: () => Promise<void>) => {
     setBusy((prev) => new Set(prev).add(busyKey));
@@ -235,18 +266,6 @@ export function useTransferQueue(): UseTransferQueue {
   useEffect(() => {
     let cancelled = false;
     let unlisten: (() => void) | undefined;
-    const fetchTerminal = () => {
-      api
-        .invoke<TerminalTransfers>('list_terminal_transfers', {})
-        .then((t) => {
-          if (cancelled) return;
-          setDbTerminalSent(t.sent);
-          setDbTerminalReceived(t.received);
-        })
-        .catch((err) =>
-          console.error('[useTransferQueue] list_terminal_transfers failed:', err),
-        );
-    };
     fetchTerminal();
     api
       .listen<SyncFinishedEvent>('sync-finished', () => {
@@ -263,7 +282,7 @@ export function useTransferQueue(): UseTransferQueue {
       cancelled = true;
       unlisten?.();
     };
-  }, []);
+  }, [fetchTerminal]);
 
   // Page-scoped live listeners (mounted-only), per CLAUDE.md's cancelled-flag
   // pattern. `sync-progress` feeds row-level bytes + speed; `sync-file-progress`
@@ -705,5 +724,74 @@ export function useTransferQueue(): UseTransferQueue {
     [withBusy, refresh, notify],
   );
 
-  return { rows, activeCount, liveFiles, refresh, sendNow, cancelOutbound, cancelInbound, resend, busy };
+  // Trash a settled batch's durable records (UX wave 2). Terminal-only by
+  // construction — the trash affordance never appears on an active row — but the
+  // backend also refuses (`Invalid`) if any attempt is momentarily active, in
+  // which case we notify and remove nothing. On success we optimistically drop
+  // the batch's terminal rows from both durable sources (a sent batch's attempts
+  // all share the truncated `packageShort`, of which the full `packageKey` is a
+  // prefix; a received batch matches its full `packageId` exactly) and re-read
+  // the durable window to reconcile. Returns success so the page can also clear
+  // the batch's history rows.
+  const deleteTransfer = useCallback(
+    (direction: Direction, packageKey: string): Promise<boolean> => {
+      const busyKey = `delete:${direction}:${packageKey}`;
+      setBusy((prev) => new Set(prev).add(busyKey));
+      return api
+        .invoke<DeletedTransferRecord>('delete_transfer_history', { direction, packageKey })
+        .then(() => {
+          if (direction === 'received') {
+            setDbTerminalReceived((prev) => prev.filter((s) => s.packageId !== packageKey));
+          } else {
+            setDbTerminalSent((prev) =>
+              prev.filter((s) => !packageKey.startsWith(s.packageShort)),
+            );
+            setTerminalOutbound((prev) => {
+              let changed = false;
+              const next = new Map(prev);
+              for (const [id, entry] of prev) {
+                if (packageKey.startsWith(entry.summary.packageShort)) {
+                  next.delete(id);
+                  changed = true;
+                }
+              }
+              return changed ? next : prev;
+            });
+          }
+          fetchTerminal();
+          return true;
+        })
+        .catch((err) => {
+          console.error('[useTransferQueue] delete_transfer_history failed:', err);
+          notify({
+            title: 'Could not remove from history',
+            detail: String(err),
+            kind: 'generic',
+            tone: 'warning',
+          });
+          return false;
+        })
+        .finally(() => {
+          setBusy((prev) => {
+            const next = new Set(prev);
+            next.delete(busyKey);
+            return next;
+          });
+        });
+    },
+    [fetchTerminal, notify],
+  );
+
+  return {
+    rows,
+    activeCount,
+    liveFiles,
+    refresh,
+    sendNow,
+    cancelOutbound,
+    cancelInbound,
+    resend,
+    deleteTransfer,
+    busy,
+  };
 }

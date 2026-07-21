@@ -161,9 +161,19 @@ export function groupHasFailure(g: HistoryGroup): boolean {
   return Object.keys(g.outcomeCounts).some((o) => o.startsWith('failed') || o.startsWith('rejected'));
 }
 
-/** Does a completed group carry any non-failed (delivered/awaiting/cancelled/…)
- *  frame? A group can be BOTH (mixed) — filters are predicates over one list,
- *  so a mixed batch honestly appears under both Completed and Failed. */
-export function groupHasSuccess(g: HistoryGroup): boolean {
-  return Object.keys(g.outcomeCounts).some((o) => !o.startsWith('failed') && !o.startsWith('rejected'));
+/** Does a completed group carry any GENUINE-success frame — delivered / awaiting
+ *  / confirmed / replayed / … — excluding `cancelled` (which is its own bucket,
+ *  UX wave 2)? Drives the `Completed` filter. A group can be BOTH Completed and
+ *  Failed (mixed) — filters are predicates over one list. */
+export function groupHasRealSuccess(g: HistoryGroup): boolean {
+  return Object.keys(g.outcomeCounts).some(
+    (o) => !o.startsWith('failed') && !o.startsWith('rejected') && o !== 'cancelled',
+  );
+}
+
+/** Does a group carry any `cancelled` frame? A group that is PURELY cancelled
+ *  (no real success, no failure) belongs to the `Cancelled` bucket, not
+ *  Completed (UX wave 2). A group mixing success + cancel stays in Completed. */
+export function groupHasCancel(g: HistoryGroup): boolean {
+  return (g.outcomeCounts.cancelled ?? 0) > 0;
 }

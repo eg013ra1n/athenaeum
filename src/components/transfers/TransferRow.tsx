@@ -1,4 +1,4 @@
-import { ArrowUp, ArrowDown, Loader2, RotateCw, Send, X, Clock, Users } from 'lucide-react';
+import { ArrowUp, ArrowDown, Loader2, RotateCw, Send, Trash2, X, Clock, Users } from 'lucide-react';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import {
   displayStateChip,
@@ -7,12 +7,14 @@ import {
   formatCountdown,
   formatEta,
   formatSpeed,
+  isTransientTransferError,
   plainTransferError,
   shortPeer,
   shortProject,
 } from './presentation';
 import { summarizeOutcomeChips } from './historyGrouping';
-import type { UnifiedRow } from './types';
+import type { DeleteKey, UnifiedRow } from './types';
+import type { Direction } from '../../types/models';
 import type { TransferRow as TransferRowModel } from '../../hooks/useTransferQueue';
 
 interface TransferRowProps {
@@ -26,6 +28,8 @@ interface TransferRowProps {
   onCancelOutbound: (id: number) => void;
   onCancelInbound: (packageId: string) => void;
   onResend: (id: number) => void;
+  /** Remove a settled batch from history (trash icon). */
+  onDelete: (direction: Direction, packageKey: string) => void;
 }
 
 /**
@@ -46,6 +50,7 @@ export function TransferRow({
   onCancelOutbound,
   onCancelInbound,
   onResend,
+  onDelete,
 }: TransferRowProps) {
   const selectedRing = selected ? 'border-l-accent bg-surface-hover' : 'border-l-transparent';
   return (
@@ -64,17 +69,49 @@ export function TransferRow({
       {item.kind === 'live' ? (
         <LiveRowBody
           row={item.row}
+          attemptCount={item.attemptCount}
+          deleteKey={item.deleteKey}
           now={now}
           busy={busy}
           onSendNow={onSendNow}
           onCancelOutbound={onCancelOutbound}
           onCancelInbound={onCancelInbound}
           onResend={onResend}
+          onDelete={onDelete}
         />
       ) : (
-        <HistoryRowBody item={item} />
+        <HistoryRowBody item={item} busy={busy} onDelete={onDelete} />
       )}
     </div>
+  );
+}
+
+/** The trash affordance shared by settled live rows and history-only groups.
+ *  Stops propagation so it never toggles row selection. */
+function DeleteButton({
+  deleteKey,
+  busy,
+  onDelete,
+}: {
+  deleteKey: DeleteKey;
+  busy: Set<string>;
+  onDelete: (direction: Direction, packageKey: string) => void;
+}) {
+  const deleteBusy = busy.has(`delete:${deleteKey.direction}:${deleteKey.packageKey}`);
+  return (
+    <button
+      type="button"
+      disabled={deleteBusy}
+      onClick={(e) => {
+        e.stopPropagation();
+        onDelete(deleteKey.direction, deleteKey.packageKey);
+      }}
+      title="Remove from history — files on disk are not affected"
+      aria-label="Remove from history"
+      className="inline-flex items-center rounded border border-border px-1.5 py-1 text-content-muted transition-colors hover:border-error/40 hover:bg-error/10 hover:text-error disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {deleteBusy ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
+    </button>
   );
 }
 
@@ -114,22 +151,30 @@ function stageProgress(
 
 interface LiveRowBodyProps {
   row: TransferRowModel;
+  /** Collapsed-attempt count (≥1); `>1` renders the "· N attempts" hint. */
+  attemptCount: number;
+  /** Batch delete key, or `null` when the row can't be deleted (active row). */
+  deleteKey: DeleteKey | null;
   now: number;
   busy: Set<string>;
   onSendNow: (id: number) => void;
   onCancelOutbound: (id: number) => void;
   onCancelInbound: (packageId: string) => void;
   onResend: (id: number) => void;
+  onDelete: (direction: Direction, packageKey: string) => void;
 }
 
 function LiveRowBody({
   row,
+  attemptCount,
+  deleteKey,
   now,
   busy,
   onSendNow,
   onCancelOutbound,
   onCancelInbound,
   onResend,
+  onDelete,
 }: LiveRowBodyProps) {
   const batchName = row.displayName ?? row.packageShort;
   const deviceLabel = row.deviceName ?? row.peerShort;
@@ -146,10 +191,27 @@ function LiveRowBody({
   const remaining = Math.max(0, row.byteSize - row.bytesDone);
   const eta = row.isTransferring && remaining > 0 ? formatEta(remaining, row.speedBps) : null;
 
+  // Progress-line shape (§problem 3): the detailed "N of M · X / Y" form is for
+  // an ACTIVE row with real per-file counts. A legacy batch (no per-file rows) OR
+  // any settled row (its `bytesDone` is 0 post-settle, so "X / Y" would read
+  // "0 B / …") shows the honest compact "M files · total" instead — no "0 of",
+  // no "0 B /".
+  const compactCounts = row.terminal || row.fileCounts.total === 0;
+  const displayCount = row.fileCounts.total || row.fileCount;
+
   // Reason text is honest, not sticky: it shows only while a retry is genuinely
-  // pending (`retrying`) or on a terminal failure — NEVER gated on the monotonic
-  // `attempts` counter (that was the bug that made errors stick after recovery).
+  // pending (`retrying`) or on a terminal failure/cancel — NEVER gated on the
+  // monotonic `attempts` counter (that was the bug that made errors stick after
+  // recovery). On a terminal row a "will keep retrying" promise is void, so the
+  // transient-family causes render WITHOUT the suffix and in a muted tone; an
+  // explicit terminal cause (cancelled-by-peer, failure) keeps error styling.
   const showReason = !!row.lastError && (row.retrying || row.terminal);
+  const reasonMuted = row.terminal && !!row.lastError && isTransientTransferError(row.lastError);
+  const reasonTone = !row.terminal
+    ? 'text-warning'
+    : reasonMuted
+      ? 'text-content-muted'
+      : 'text-error/80';
 
   const pending = !row.terminal && (row.state === 'queued' || row.state === 'announced');
   // Send-now: a pending row, or one sitting in the `waiting` backoff countdown — a
@@ -204,20 +266,35 @@ function LiveRowBody({
               <span className="inline-flex shrink-0 items-center gap-1 text-[11px] text-content-secondary tabular-nums">
                 <Clock size={11} />
                 retry in {formatCountdown(row.stalledUntil, now)}
+                {row.attempts > 1 && ` · attempt ${row.attempts}`}
               </span>
             )}
           </div>
 
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-content-muted">
             <span title={deviceLabel}>{deviceLabel}</span>
+            {attemptCount > 1 && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className="text-content-muted tabular-nums">{attemptCount} attempts</span>
+              </>
+            )}
             <span aria-hidden="true">·</span>
-            <span className="tabular-nums">
-              {doneFiles} of {totalFiles} file{totalFiles === 1 ? '' : 's'}
-            </span>
-            <span aria-hidden="true">·</span>
-            <span className="tabular-nums">
-              {formatBytes(row.bytesDone)} / {formatBytes(row.byteSize)}
-            </span>
+            {compactCounts ? (
+              <span className="tabular-nums">
+                {displayCount} file{displayCount === 1 ? '' : 's'} · {formatBytes(row.byteSize)}
+              </span>
+            ) : (
+              <>
+                <span className="tabular-nums">
+                  {doneFiles} of {totalFiles} file{totalFiles === 1 ? '' : 's'}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span className="tabular-nums">
+                  {formatBytes(row.bytesDone)} / {formatBytes(row.byteSize)}
+                </span>
+              </>
+            )}
             {speedLabel && (
               <>
                 <span aria-hidden="true">·</span>
@@ -234,12 +311,10 @@ function LiveRowBody({
 
           {showReason && (
             <p
-              className={`mt-0.5 max-w-[36rem] whitespace-normal break-words text-[11px] leading-tight ${
-                row.terminal ? 'text-error/80' : 'text-warning'
-              }`}
+              className={`mt-0.5 max-w-[36rem] whitespace-normal break-words text-[11px] leading-tight ${reasonTone}`}
               title={row.lastError ?? undefined}
             >
-              {plainTransferError(row.lastError as string)}
+              {plainTransferError(row.lastError as string, row.terminal)}
             </p>
           )}
         </div>
@@ -284,6 +359,7 @@ function LiveRowBody({
               Resend
             </button>
           )}
+          {deleteKey && <DeleteButton deleteKey={deleteKey} busy={busy} onDelete={onDelete} />}
         </div>
       </div>
 
@@ -300,8 +376,16 @@ function LiveRowBody({
   );
 }
 
-function HistoryRowBody({ item }: { item: Extract<UnifiedRow, { kind: 'history' }> }) {
-  const { group, deviceName, projectName } = item;
+function HistoryRowBody({
+  item,
+  busy,
+  onDelete,
+}: {
+  item: Extract<UnifiedRow, { kind: 'history' }>;
+  busy: Set<string>;
+  onDelete: (direction: Direction, packageKey: string) => void;
+}) {
+  const { group, deviceName, projectName, deleteKey } = item;
   const batchName =
     group.batchName ?? (group.packageId ? shortPeer(group.packageId) : 'Earlier transfers');
   const deviceLabel = deviceName ?? shortPeer(group.peerDevice);
@@ -344,17 +428,20 @@ function HistoryRowBody({ item }: { item: Extract<UnifiedRow, { kind: 'history' 
           </div>
         </div>
 
-        <div className="flex shrink-0 flex-col items-end gap-0.5">
-          <span className="flex items-center gap-1.5">
-            {chips.map((chip) => (
-              <span key={chip.key} className={`text-[10px] font-medium ${chip.tone}`} title={chip.title}>
-                {chip.label}
-              </span>
-            ))}
-          </span>
-          <span className="text-[10px] text-content-muted tabular-nums">
-            {formatTimestamp(group.finishedAt ?? group.startedAt)}
-          </span>
+        <div className="flex shrink-0 items-start gap-2">
+          <div className="flex flex-col items-end gap-0.5">
+            <span className="flex items-center gap-1.5">
+              {chips.map((chip) => (
+                <span key={chip.key} className={`text-[10px] font-medium ${chip.tone}`} title={chip.title}>
+                  {chip.label}
+                </span>
+              ))}
+            </span>
+            <span className="text-[10px] text-content-muted tabular-nums">
+              {formatTimestamp(group.finishedAt ?? group.startedAt)}
+            </span>
+          </div>
+          {deleteKey && <DeleteButton deleteKey={deleteKey} busy={busy} onDelete={onDelete} />}
         </div>
       </div>
     </div>

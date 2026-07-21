@@ -67,24 +67,48 @@ export function shortProject(id: string): string {
  * anything unrecognized falls through verbatim so an error is never hidden. Keep
  * the raw string on a `title=` hover at the call site. (Moved verbatim from the
  * former `ActiveTransferRow` so both the list and the slide-over share it.)
+ *
+ * `terminal` (UX wave 2): on a SETTLED row a "— will keep retrying" promise is a
+ * lie (nothing is retrying), so the transient-family causes drop that suffix and
+ * render as the plain cause (e.g. «Peer didn't answer»). Explicit terminal causes
+ * (cancelled-by-peer, payload-missing, refused, unknown reasons) are unaffected.
+ * Non-terminal callers keep the full "will keep retrying" wording (default).
  */
-export function plainTransferError(raw: string): string {
+export function plainTransferError(raw: string, terminal = false): string {
   const s = raw.trim().toLowerCase();
-  if (s.startsWith('no ack from peer within timeout'))
-    return "Peer didn't respond — will keep retrying";
+  // The retry promise only holds while a retry is genuinely pending.
+  const retryHint = terminal ? '' : ' — will keep retrying';
+  if (s.startsWith('no ack from peer within timeout')) return `Peer didn't respond${retryHint}`;
   if (s.startsWith('package payload missing on disk')) return 'Local package data is missing';
   if (s.startsWith('cancelled by receiver')) return 'Cancelled by the receiving device';
   // Class-prefixed dial failures the sync engine persists as `<class>: <raw>`.
   // A retryable class is a warning, not a failure — delivery-forever keeps
-  // trying — so the copy says so. `other:` sheds its machine prefix; any unknown
-  // prefix falls through verbatim (the raw string still rides the `title=` hover).
-  if (s.startsWith('no_route:')) return 'No route to peer — will keep retrying';
-  if (s.startsWith('relay_unreachable:')) return 'Peer unreachable via relay — will keep retrying';
+  // trying — so the copy says so (until the row settles, per `terminal`).
+  // `other:` sheds its machine prefix; any unknown prefix falls through verbatim
+  // (the raw string still rides the `title=` hover).
+  if (s.startsWith('no_route:')) return `No route to peer${retryHint}`;
+  if (s.startsWith('relay_unreachable:')) return `Peer unreachable via relay${retryHint}`;
   if (s.startsWith('refused:')) return 'Peer refused the connection';
-  if (s.startsWith('timeout:')) return "Peer didn't answer — will keep retrying";
-  if (s.startsWith('not_started:')) return 'Peer app not running — will keep retrying';
+  if (s.startsWith('timeout:')) return `Peer didn't answer${retryHint}`;
+  if (s.startsWith('not_started:')) return `Peer app not running${retryHint}`;
   if (s.startsWith('other:')) return raw.slice(raw.indexOf(':') + 1).trim() || raw;
   return raw;
+}
+
+/** Whether a raw `last_error` belongs to the transient "— will keep retrying"
+ *  family (a dial/ack cause, not a hard verdict). On a TERMINAL row these render
+ *  in a MUTED tone (the retry promise is void), unlike explicit terminal causes
+ *  (cancelled-by-peer, payload-missing, refused, unknown failures) which keep
+ *  their error styling. Mirrors the prefix set in [`plainTransferError`]. */
+export function isTransientTransferError(raw: string): boolean {
+  const s = raw.trim().toLowerCase();
+  return (
+    s.startsWith('no ack from peer within timeout') ||
+    s.startsWith('no_route:') ||
+    s.startsWith('relay_unreachable:') ||
+    s.startsWith('timeout:') ||
+    s.startsWith('not_started:')
+  );
 }
 
 /** A rendered state chip: a short label + its design-token tone classes. */
