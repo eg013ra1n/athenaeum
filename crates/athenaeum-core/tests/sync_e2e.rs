@@ -1084,11 +1084,15 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
     receiver.shutdown().await;
 }
 
-/// Acceptance §4/§6 — **two-sided cancel, then resend delivers**: a receiver
-/// declining an inbound package drives the sender's row terminal (`cancelled`,
-/// reason "cancelled by receiver"), lands no files, and leaves the receiver row
-/// `cancelled` with a full set of `cancelled` receipts (the replay source). A
-/// subsequent resend then delivers cleanly.
+/// Acceptance §4/§6 (Transfers Batch Model §B4) — **receiver decline is final; a
+/// resend is re-acked cancelled, NOT delivered**: a receiver declining an inbound
+/// package drives the sender's row terminal (`cancelled`, reason "cancelled by
+/// receiver"), lands no files, and leaves the receiver row `cancelled` with a full
+/// set of `cancelled` receipts (the replay source). A subsequent resend maps — via
+/// the durable `batch_uuid` — to the SAME cancelled inbound row: the receiver
+/// answers the resend's fresh wire id with an all-cancelled ack WITHOUT fetching,
+/// so the sender re-terminalizes `cancelled` and nothing lands (pre-B4 this
+/// delivered into a separate wire-keyed row).
 ///
 /// Deterministic mid-transfer cancel: the receiver endpoint's `abort_after_bytes`
 /// fault is held armed so no payload fetch can ever COMPLETE (hence no ingest can
@@ -1097,12 +1101,9 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
 /// [`InboundControl::request_cancel`] — the exact call
 /// [`cancel_incoming_package`] makes internally on a live transport — plus a real
 /// [`cancel_incoming_package`] command invocation to exercise the command boundary
-/// at the two-context level (see the test-2 note in the report: the loopback
-/// receiver is not owned by a public `SyncRuntime`, so the command's live-control
-/// leg is driven through the receiver's real control while its persisted-row leg is
-/// exercised through the command).
+/// at the two-context level.
 #[tokio::test]
-async fn receiver_cancel_terminates_sender_then_resend_delivers() {
+async fn receiver_cancel_is_final_then_resend_reacked_cancelled() {
     const N: usize = 4;
     let tmp = tempfile::tempdir().unwrap();
     let capture_dir = tmp.path().join("capture");
@@ -1234,30 +1235,50 @@ async fn receiver_cancel_terminates_sender_then_resend_delivers() {
         "the receiver logged a cancelled receipt per frame (the replay source)"
     );
 
-    // Disarm the fault so the resend can fetch cleanly.
+    // Disarm the fault so a re-fetch WOULD deliver — proving the resend fetches
+    // NOTHING because the transfer stays declined, not because a fault blocks it.
     receiver_ep.set_fault(FaultPlan::default());
 
     // Resend via the sanctioned command (Transfers Batch Model §D1/§D3:
     // resend-as-reset — the SAME row is reset, NOT a new one; §4's payload-presence
     // check requires the payload to still be on disk after a receiver decline — the
-    // all-cancelled-ack terminal epilogue mirrors `cancel_package` and keeps it,
-    // same as a `Failed`/plain-`Cancelled` row).
+    // all-cancelled-ack terminal epilogue mirrors `cancel_package` and keeps it).
     let resend_id =
         retry_sync_package(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
             .await
             .expect("resend a receiver-cancelled package");
     assert_eq!(resend_id, old_id, "resend-as-reset returns the SAME row, never a new one");
 
-    wait_until(|| outbound_state(cdb, old_id) == "confirmed", WAIT).await;
-    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
-    assert_eq!(landed_count(&designated), N, "the resend delivers all frames to disk");
-    // The declined inbound row (keyed on the cancelled attempt's wire id) stays
-    // Cancelled — final, never resurrected. (The receiver is not yet batch-keyed —
-    // B4 — so the resend's fresh wire id lands a separate inbound row.)
+    // The resend re-announces on a FRESH wire id; the receiver — resolving the SAME
+    // cancelled row by `batch_uuid` — re-acks it all-cancelled, so the sender
+    // re-terminalizes `cancelled` and NOTHING lands. Wait on the fresh wire id's
+    // cancelled receipts (the re-ack proof), then the sender's re-terminalization.
+    let resend_wire: String = cdb
+        .conn()
+        .query_row("SELECT wire_package_id FROM sync_outbound WHERE id = ?1", [old_id], |r| r.get(0))
+        .expect("resend minted a fresh wire id");
+    assert_ne!(resend_wire, wire_pkg, "the resend rotates the wire id");
+    wait_until(
+        || {
+            count(
+                pdb,
+                &format!("SELECT COUNT(*) FROM sync_receipts WHERE package_id = '{resend_wire}' AND outcome = 'cancelled'"),
+            ) == N as i64
+        },
+        WAIT,
+    )
+    .await;
+    wait_until(|| outbound_state(cdb, old_id) == "cancelled", WAIT).await;
+
+    // No delivery: no frames, no files, and STILL exactly one inbound row (batch-
+    // keyed) — the declined transfer, not a second wire-keyed row.
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "a declined transfer delivers no frames on resend");
+    assert_eq!(landed_count(&designated), 0, "the resend of a declined transfer lands no files");
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 1, "the batch keeps ONE inbound row across the resend");
     assert_eq!(
         inbound_row(pdb, &wire_pkg).map(|(s, _, _)| s).as_deref(),
         Some("cancelled"),
-        "the original declined inbound row stays Cancelled"
+        "the batch-keyed inbound row stays Cancelled — final, never resurrected"
     );
 
     engine.shutdown().await;
