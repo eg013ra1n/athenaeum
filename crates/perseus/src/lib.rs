@@ -43,6 +43,7 @@ pub mod batcher;
 pub mod config;
 pub mod config_edit;
 pub mod pending;
+pub mod resend;
 pub mod run;
 pub mod seen;
 pub mod supervisor;

@@ -52,7 +52,9 @@ use axum::{
 };
 use tokio::sync::{watch, Notify, RwLock};
 
-use athenaeum_core::package::{read_manifest, MANIFEST_FILENAME};
+use athenaeum_core::package::read_manifest;
+#[cfg(test)]
+use athenaeum_core::package::MANIFEST_FILENAME;
 use athenaeum_core::sync::store::StandaloneSyncStore;
 use athenaeum_core::sync::{
     node_id_hex, Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState,
@@ -67,6 +69,7 @@ use crate::config_edit::{
     apply_targets_edit, RetentionEdit,
 };
 use crate::pending::{pending_tree, PendingNode};
+use crate::resend::{self, is_declined};
 use crate::run::{delete_confirmed_packages, DeleteReport};
 use crate::seen::SeenStore;
 use crate::supervisor::AgentState;
@@ -122,9 +125,16 @@ pub struct WebState {
     /// page rings this after a sign-in so readiness is picked up at once).
     pub supervisor_wake: Arc<Notify>,
     // ── swapped by attach()/detach() as the engine starts/stops ──────────────
-    /// The running engine (its `status_snapshot` is the live in-flight list;
-    /// `POST /api/retry` re-enqueues through it). `None` while detached (setup).
+    /// The running engine (its `status_snapshot` is the live in-flight list).
+    /// `None` while detached (setup).
     pub engine: RwLock<Option<Arc<SyncEngineHandle>>>,
+    /// Every running target's `(peer hex, engine handle)` pair. Per-row actions
+    /// (`/api/retry`, `/api/kick`, `/api/cancel`, `/api/resend-as-new`) route
+    /// through [`engine_for_peer`](Self::engine_for_peer): the engine worker is
+    /// peer-scoped (it ignores rows bound to another peer), so acting through
+    /// `engines[0]` was a silent no-op for every other target's rows. Empty
+    /// while detached.
+    pub engines: RwLock<Vec<(String, Arc<SyncEngineHandle>)>>,
     /// The shared-payload cleanup coordinator, `Some` only for a ≥2-target
     /// fan-out (the same instance the fanned-out engines were spawned with).
     /// `POST /api/retry` bumps it after a successful re-enqueue so the retried
@@ -200,6 +210,7 @@ impl WebState {
             agent_state,
             supervisor_wake,
             engine: RwLock::new(None),
+            engines: RwLock::new(Vec::new()),
             cleanup: RwLock::new(None),
             peer_device: RwLock::new(String::new()),
             // A placeholder sender with no receivers: `send` is a harmless no-op
@@ -222,9 +233,11 @@ impl WebState {
     /// out of the `&dyn ManagedAgent` synchronously first (the callback is sync;
     /// this is `async` and takes the write locks).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn attach(
         &self,
         engine: Option<Arc<SyncEngineHandle>>,
+        engines: Vec<(String, Arc<SyncEngineHandle>)>,
         cleanup: Option<Arc<SharedPackageCleanup>>,
         peer_device: String,
         retention_tx: watch::Sender<RetentionConfig>,
@@ -236,6 +249,7 @@ impl WebState {
         send_cfg_tx: watch::Sender<SendCfg>,
     ) {
         *self.engine.write().await = engine;
+        *self.engines.write().await = engines;
         *self.cleanup.write().await = cleanup;
         *self.peer_device.write().await = peer_device;
         *self.retention_tx.write().await = retention_tx;
@@ -251,8 +265,27 @@ impl WebState {
     /// or shutdown): the page falls back to its detached behaviour. `retention_tx`
     /// / `retention_log` / `device_names` are left as-is — harmlessly stale reads
     /// until the next attach — while the load-bearing safety bits are cleared.
+    /// The engine bound to `peer`, if the running fan-out has one. Per-row
+    /// actions must reach the row's own peer's engine — the worker ignores
+    /// another peer's rows (peer-scoped resend/kick/cancel), so `engines[0]`
+    /// routing was a silent no-op for every other target. `None` while detached
+    /// or (defensively) for a row whose peer is no longer a configured target.
+    pub async fn engine_for_peer(
+        &self,
+        peer: &athenaeum_core::sharing::types::NodeId,
+    ) -> Option<Arc<SyncEngineHandle>> {
+        let hex = node_id_hex(peer);
+        self.engines
+            .read()
+            .await
+            .iter()
+            .find(|(peer_hex, _)| *peer_hex == hex)
+            .map(|(_, engine)| Arc::clone(engine))
+    }
+
     pub async fn detach(&self) {
         *self.engine.write().await = None;
+        *self.engines.write().await = Vec::new();
         *self.cleanup.write().await = None;
         *self.peer_device.write().await = String::new();
         *self.running_dirs.write().await = Vec::new();
@@ -368,6 +401,16 @@ struct SentDto {
     /// Total on-wire size of the package: the sum of every manifest record's
     /// `byte_size` (Task 9). `0` when the manifest can't be read.
     byte_size: u64,
+    /// True iff the RECEIVER declined this transfer (server-computed from the
+    /// exact all-cancelled-ack detail, so the JS never string-matches errors).
+    /// Renders the "Resend as new transfer" divert instead of Retry.
+    declined: bool,
+    /// True iff the reset-in-place Retry ("Send again" on a confirmed row) is
+    /// offered: any terminal state except a receiver decline. Payload presence
+    /// is deliberately NOT part of this — a cleaned dir is rebuilt from the
+    /// original capture files at retry time, and honesty about missing/changed
+    /// originals arrives in the retry report.
+    resendable: bool,
 }
 
 /// One transfer-history row, for `GET /api/history`.
@@ -431,6 +474,9 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         .route("/api/batches", get(api_batches))
         .route("/api/delete", post(api_delete))
         .route("/api/retry", post(api_retry))
+        // The explicit operator divert for a receiver-declined transfer (a
+        // decline is final per batch_uuid; this mints a NEW transfer).
+        .route("/api/resend-as-new", post(api_resend_as_new))
         // Per-row send-now (wake out of backoff) and user-cancel (Task 9). Both
         // bearer-gated; `/api/send-now` (the batcher flush) is a different route.
         .route("/api/kick", post(api_kick))
@@ -1441,10 +1487,33 @@ struct RetryReport {
     rejected: Vec<RetryRejection>,
 }
 
-/// One re-enqueued package: the original failed row id and its new queued row.
+/// One resent package. v2.1 resets the SAME row in place, so `new_id == old_id`
+/// (the pair shape is kept for the JS contract); `missing_files` /
+/// `changed_files` carry the rebuild honesty report when the payload had to be
+/// restored from the originals (empty and omitted otherwise).
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RetryPair {
+    old_id: i64,
+    new_id: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    missing_files: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    changed_files: Vec<String>,
+}
+
+/// `POST /api/resend-as-new` request: the ONE receiver-declined outbound row to
+/// divert into a new transfer. Single-id by design (see [`api_resend_as_new`]).
+#[derive(serde::Deserialize)]
+struct ResendAsNewRequest {
+    id: i64,
+}
+
+/// `POST /api/resend-as-new` response: the declined row left as history and the
+/// freshly enqueued transfer that replaces it.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResendAsNewReport {
     old_id: i64,
     new_id: i64,
 }
@@ -1471,61 +1540,35 @@ struct KickReport {
     rejected: Vec<RetryRejection>,
 }
 
-/// True iff `dir` holds `manifest.ndjson` AND at least one non-manifest regular
-/// file — i.e. there is real payload left to re-serve. A confirmed-then-cleaned
-/// dir is manifest-only (task 1) and a vanished dir fails `read_dir`; both
-/// return `false` so the retry handler can reject them honestly as "package
-/// data missing" rather than enqueueing an empty package.
-fn package_has_payload(dir: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    let mut has_manifest = false;
-    let mut has_payload = false;
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        if !ft.is_file() {
-            continue;
-        }
-        if entry.file_name() == std::ffi::OsStr::new(MANIFEST_FILENAME) {
-            has_manifest = true;
-        } else {
-            has_payload = true;
-        }
-    }
-    has_manifest && has_payload
-}
-
-/// `POST /api/retry` — re-enqueue terminal packages. For each id: look up the
-/// outbound row, require a terminal `failed` OR `cancelled` state (Task 9 — a
-/// user-cancelled package is retryable just like a failed one), require the
-/// package dir to still hold its manifest + payload, then `enqueue_package` it —
-/// the sanctioned retry model. Re-enqueueing the same package dir mints a NEW
-/// durable row (the receiver dedups by frame uuid); the original terminal row is
-/// left untouched. Unknown / non-terminal / data-missing ids are rejected
-/// per-id, never enqueued.
+/// `POST /api/retry` — reset-in-place resend of terminal packages (Transfers
+/// Batch Model v2.1 §D1). For each id: look up the outbound row, then hand it
+/// to [`resend::resend_in_place`] on the row's OWN peer's engine — eligibility
+/// (`failed` / `cancelled` / `confirmed`; receiver-declined rejected with a
+/// divert hint), payload rebuild from the originals when the dir is
+/// manifest-only, the fan-out cleanup re-arm, the same-row reset
+/// (`generation`+1, fresh wire id) and the re-drive all live there. The row id
+/// never changes (`newId == oldId`); `missingFiles` / `changedFiles` carry the
+/// rebuild honesty report. Unknown / non-terminal / unrebuildable ids are
+/// rejected per-id, never half-acted-on.
 async fn api_retry(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RetryRequest>,
 ) -> Result<Json<RetryReport>, (StatusCode, String)> {
-    // Retry re-enqueues through the live engine; there is nothing to retry into
-    // while the node is still in setup (engine detached). Honest 503, not a crash.
-    let Some(engine) = state.engine.read().await.clone() else {
+    // Retry re-drives through the live engines; there is nothing to retry into
+    // while the node is still in setup (engines detached). Honest 503.
+    if state.engines.read().await.is_empty() {
         tracing::warn!("web retry: sync engine is not running");
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "sync engine is not running — finish setup first".to_string(),
         ));
-    };
+    }
     // The shared-payload cleanup coordinator — present only for a ≥2-target
-    // fan-out. A re-enqueue mints a NEW outbound row against the SAME shared
-    // package dir, so its eventual terminal must raise the coordinator's
-    // `expected` (via `bump`); without that, the retried row's terminal
-    // over-counts against the stale `expected` and frees the payload while a
-    // still-offline target has yet to receive it (the data-loss hole). `None`
-    // for a single-target agent (no shared dir; the engine's in-line cleanup
-    // is unchanged).
+    // fan-out; `resend_in_place` re-arms it so the reset row's SECOND terminal
+    // cannot free a still-pending sibling target's payload (nor stay dead
+    // after a post-confirm cleanup whose payload the rebuild restored).
     let cleanup = state.cleanup.read().await.clone();
+    let config = state.config.read().await.clone();
     let mut report = RetryReport::default();
     for &id in &req.ids {
         // A genuine store read failure is a 500 (the request failed), not a
@@ -1545,51 +1588,103 @@ async fn api_retry(
                 return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
             }
         };
-        // State check first: only a terminal `failed` or `cancelled` row is
-        // retryable (Task 9). (A confirmed id is manifest-only after task-1
-        // cleanup, but it never reaches the payload gate — it is "not terminal"
-        // here.)
-        if !matches!(row.state, OutboundState::Failed | OutboundState::Cancelled) {
+        let Some(engine) = state.engine_for_peer(&row.peer).await else {
             report.rejected.push(RetryRejection {
                 id,
-                reason: "not terminal".to_string(),
+                reason: "no running engine for this package's peer".to_string(),
             });
             continue;
-        }
-        let dir = Path::new(&row.package_ref);
-        if !package_has_payload(dir) {
-            report.rejected.push(RetryRejection {
-                id,
-                reason: "package data missing".to_string(),
-            });
-            continue;
-        }
-        match engine.enqueue_package(dir, None, Vec::new()).await {
-            Ok(new_id) => {
-                tracing::info!(old_id = id, new_id, "failed package re-enqueued via web");
-                // The retry always routes to the sinked engine (`engines[0]`),
-                // regardless of which target failed — per-target retry routing is
-                // a separate follow-up (mis-delivery is a *reported* failure with
-                // a history row, and each target's own engine auto-retries its
-                // non-terminal packages on reconnect, so it is not data loss).
-                // Bump the coordinator so this extra row's terminal cannot
-                // prematurely free the shared payload of a still-offline target.
-                if let Some(coord) = &cleanup {
-                    coord.bump(dir, 1);
-                }
-                report.retried.push(RetryPair { old_id: id, new_id });
+        };
+        match resend::resend_in_place(
+            &state.store,
+            &engine,
+            cleanup.as_deref(),
+            &config,
+            &state.batches,
+            &row,
+        )
+        .await
+        {
+            Ok(done) => {
+                tracing::info!(id, rebuilt = done.rebuilt, "package resent in place via web");
+                report.retried.push(RetryPair {
+                    old_id: id,
+                    new_id: id,
+                    missing_files: done.missing,
+                    changed_files: done.changed,
+                });
             }
             Err(e) => {
                 let msg = format!("{e:#}");
-                tracing::error!(old_id = id, error = %msg, "web retry: re-enqueue failed");
-                report.rejected.push(RetryRejection {
-                    id,
-                    reason: format!("re-enqueue failed: {msg}"),
-                });
+                tracing::error!(id, error = %msg, "web retry: resend rejected");
+                report.rejected.push(RetryRejection { id, reason: msg });
             }
         }
     }
     Ok(Json(report))
+}
+
+/// `POST /api/resend-as-new {id}` — the explicit operator divert for ONE
+/// receiver-declined transfer ([`resend::resend_declined_as_new`]): fresh dir
+/// basename ⇒ fresh wire `batch_uuid` ⇒ a brand-new transfer on both sides,
+/// while the declined row stays as history (its error gains the
+/// `resent as new transfer #N` suffix — a double-click bounces). Deliberately
+/// single-id: this overrides a human decline and must stay a per-transfer
+/// human decision, never a bulk action or an autonomous retry.
+async fn api_resend_as_new(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<ResendAsNewRequest>,
+) -> Result<Json<ResendAsNewReport>, (StatusCode, String)> {
+    if state.engines.read().await.is_empty() {
+        tracing::warn!("web resend-as-new: sync engine is not running");
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sync engine is not running — finish setup first".to_string(),
+        ));
+    }
+    let row = match state.store.get_outbound(req.id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Err((StatusCode::BAD_REQUEST, "unknown package".to_string()));
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::error!(id = req.id, error = %msg, "web resend-as-new: outbound lookup failed");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
+        }
+    };
+    let Some(engine) = state.engine_for_peer(&row.peer).await else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "no running engine for this package's peer".to_string(),
+        ));
+    };
+    let cleanup = state.cleanup.read().await.clone();
+    let config = state.config.read().await.clone();
+    match resend::resend_declined_as_new(
+        &state.store,
+        &engine,
+        cleanup.as_deref(),
+        &config,
+        &state.batches,
+        &state.seen,
+        &row,
+    )
+    .await
+    {
+        Ok(new_id) => {
+            tracing::info!(old_id = req.id, new_id, "declined package diverted via web");
+            Ok(Json(ResendAsNewReport {
+                old_id: req.id,
+                new_id,
+            }))
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::error!(id = req.id, error = %msg, "web resend-as-new rejected");
+            Err((StatusCode::BAD_REQUEST, msg))
+        }
+    }
 }
 
 /// `POST /api/kick` — send-now for one or more pending packages (spec §2 wake
@@ -1603,13 +1698,13 @@ async fn api_kick(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RetryRequest>,
 ) -> Result<Json<KickReport>, (StatusCode, String)> {
-    let Some(engine) = state.engine.read().await.clone() else {
+    if state.engines.read().await.is_empty() {
         tracing::warn!("web kick: sync engine is not running");
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "sync engine is not running — finish setup first".to_string(),
         ));
-    };
+    }
     let mut report = KickReport::default();
     for &id in &req.ids {
         let row = match state.store.get_outbound(id) {
@@ -1636,6 +1731,15 @@ async fn api_kick(
             });
             continue;
         }
+        // Route to the row's OWN peer's engine: a kick only wakes a slot in
+        // that engine's pending map — sent anywhere else it is a silent no-op.
+        let Some(engine) = state.engine_for_peer(&row.peer).await else {
+            report.rejected.push(RetryRejection {
+                id,
+                reason: "no running engine for this package's peer".to_string(),
+            });
+            continue;
+        };
         // The engine's kick channel only errors when the worker has stopped; log
         // it (never swallow) and report it per-id like the retry enqueue path,
         // so one bad id doesn't 500 the whole batch.
@@ -1663,13 +1767,13 @@ async fn api_cancel(
     State(state): State<Arc<WebState>>,
     Json(req): Json<RetryRequest>,
 ) -> Result<Json<KickReport>, (StatusCode, String)> {
-    let Some(engine) = state.engine.read().await.clone() else {
+    if state.engines.read().await.is_empty() {
         tracing::warn!("web cancel: sync engine is not running");
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "sync engine is not running — finish setup first".to_string(),
         ));
-    };
+    }
     let mut report = KickReport::default();
     for &id in &req.ids {
         let row = match state.store.get_outbound(id) {
@@ -1694,6 +1798,15 @@ async fn api_cancel(
             });
             continue;
         }
+        // Route to the row's OWN peer's engine — the worker cancels only its
+        // own pending slots (elsewhere the cancel is silently dropped).
+        let Some(engine) = state.engine_for_peer(&row.peer).await else {
+            report.rejected.push(RetryRejection {
+                id,
+                reason: "no running engine for this package's peer".to_string(),
+            });
+            continue;
+        };
         if let Err(e) = engine.cancel(id).await {
             let msg = format!("{e:#}");
             tracing::error!(id, error = %msg, "web cancel: engine cancel failed");
@@ -1713,6 +1826,11 @@ async fn api_cancel(
 /// safe-to-delete predicate: only `confirmed` packages.
 fn to_sent_dto(r: &OutboundRow) -> SentDto {
     let (files, byte_size) = sent_manifest_summary(&r.package_ref);
+    // The server computes both affordance flags so the JS never has to match
+    // error strings: `declined` keys the divert button, `resendable` the
+    // reset-in-place Retry / "Send again" (payload presence is NOT required —
+    // a manifest-only dir is rebuilt from the originals at retry time).
+    let declined = is_declined(r);
     SentDto {
         id: r.id,
         package_ref: r.package_ref.clone(),
@@ -1725,6 +1843,12 @@ fn to_sent_dto(r: &OutboundRow) -> SentDto {
         files,
         next_retry_at: r.next_retry_at.clone(),
         byte_size,
+        declined,
+        resendable: !declined
+            && matches!(
+                r.state,
+                OutboundState::Failed | OutboundState::Cancelled | OutboundState::Confirmed
+            ),
     }
 }
 
@@ -1880,9 +2004,10 @@ mod tests {
             config: RwLock::new(config.clone()),
             agent_state: state_rx,
             supervisor_wake: Arc::new(Notify::new()),
+            engines: RwLock::new(vec![(node_id_hex(&PEER), Arc::clone(&engine))]),
             engine: RwLock::new(Some(engine)),
-            // Single-target test agent: no fan-out coordinator (the retry-bump
-            // path is exercised by the coordinator's own unit tests).
+            // Single-target test agent: no fan-out coordinator (the retry
+            // re-arm path is exercised by the coordinator's own unit tests).
             cleanup: RwLock::new(None),
             peer_device: RwLock::new(node_id_hex(&PEER)),
             retention_tx: RwLock::new(watch::channel(config.retention.clone()).0),
@@ -3046,13 +3171,159 @@ mod tests {
         body_json(res).await
     }
 
-    /// A failed package whose dir still holds its manifest + payload (task 1
-    /// keeps non-confirmed payloads) re-enqueues: a brand-new outbound row is
-    /// created for the same package dir, the response maps old→new id, and the
-    /// original failed row is left untouched (the sanctioned retry model — the
-    /// old row stays failed, the new row lives its own lifecycle).
+    /// POST `/api/resend-as-new` for one id, returning the raw response (the
+    /// divert rejects with a non-200, which several tests assert on).
+    async fn post_resend_as_new(app: Router, id: i64) -> Response {
+        let body = serde_json::json!({ "id": id });
+        app.oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/api/resend-as-new")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A REAL one-file package dir: payload bytes on disk plus a parseable
+    /// manifest record whose `(byte_size, xxh3)` match them — enough for the
+    /// divert path (manifest read + enqueue) to run for real.
+    fn make_real_package_dir(base: &std::path::Path, name: &str) -> PathBuf {
+        let pkg = base.join(name);
+        std::fs::create_dir_all(&pkg).unwrap();
+        let payload_bytes: &[u8] = b"real-payload-bytes";
+        let payload = pkg.join("frame-0001.fits");
+        std::fs::write(&payload, payload_bytes).unwrap();
+        let rec = serde_json::json!({
+            "v": 1,
+            "frame_uuid": "u-real",
+            "origin_catalog_uuid": "u-real",
+            "origin_device": "aa",
+            "payload_kind": "RawFrame",
+            "rel_path": "frame-0001.fits",
+            "byte_size": payload_bytes.len(),
+            "xxh3": athenaeum_core::package::xxh3_full_file(&payload).unwrap(),
+            "frame_meta": {},
+            "analysis": null,
+            "app_version": "test"
+        });
+        std::fs::write(pkg.join(MANIFEST_FILENAME), format!("{rec}\n")).unwrap();
+        pkg
+    }
+
+    /// `/api/resend-as-new` is ONLY for receiver-declined rows: a plain
+    /// (sender-)cancelled row is rejected — that's `/api/retry` territory.
     #[tokio::test]
-    async fn retry_reenqueues_failed_with_intact_payload() {
+    async fn resend_as_new_rejects_non_declined() {
+        let (state, tmp) = test_state().await;
+        let pkg = make_real_package_dir(tmp.path(), "pkg-plain-cancelled");
+        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        state.store.set_state(id, OutboundState::Cancelled).unwrap();
+
+        let store = Arc::clone(&state.store);
+        let app = build_router(state, None);
+        let res = post_resend_as_new(app, id).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            store.get_outbound(id).unwrap().unwrap().state,
+            OutboundState::Cancelled,
+            "the rejected row is untouched"
+        );
+    }
+
+    /// The happy divert: a declined row mints a NEW transfer (fresh id + fresh
+    /// dir), the old row stays cancelled with the guard suffix, and a second
+    /// click on the same row is rejected (the suffix broke the strict guard).
+    #[tokio::test]
+    async fn resend_as_new_diverts_then_rejects_double_click() {
+        let (state, tmp) = test_state().await;
+        let pkg = make_real_package_dir(tmp.path(), "pkg-declined-divert");
+        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        state.store.set_state(id, OutboundState::Cancelled).unwrap();
+        state
+            .store
+            .set_last_error(id, Some(athenaeum_core::sync::CANCELLED_BY_RECEIVER_DETAIL))
+            .unwrap();
+
+        let store = Arc::clone(&state.store);
+        let app = build_router(Arc::clone(&state), None);
+        let res = post_resend_as_new(app, id).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["oldId"].as_i64().unwrap(), id);
+        let new_id = v["newId"].as_i64().unwrap();
+        assert_ne!(new_id, id, "the divert mints a brand-new transfer");
+
+        let new_row = store.get_outbound(new_id).unwrap().expect("new row exists");
+        assert_ne!(new_row.package_ref, pkg.to_string_lossy(), "fresh dir ⇒ fresh batch_uuid");
+        let old = store.get_outbound(id).unwrap().unwrap();
+        assert_eq!(old.state, OutboundState::Cancelled, "the declined row stays history");
+        assert!(old
+            .last_error
+            .unwrap()
+            .contains(&format!("resent as new transfer #{new_id}")));
+
+        // Double-click: the suffix broke the strict declined guard.
+        let app = build_router(state, None);
+        let res = post_resend_as_new(app, id).await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The server computes the two affordance flags: `declined` only for the
+    /// exact receiver-decline detail; `resendable` for every terminal EXCEPT a
+    /// decline (confirmed included — its payload is rebuilt at retry time).
+    #[tokio::test]
+    async fn sent_dto_flags_declined_and_resendable() {
+        let (state, _tmp) = test_state().await;
+        let failed = state.store.enqueue("pkg-failed", PEER, None, &[]).unwrap();
+        state.store.set_state(failed, OutboundState::Failed).unwrap();
+        let declined = state.store.enqueue("pkg-declined", PEER, None, &[]).unwrap();
+        state.store.set_state(declined, OutboundState::Cancelled).unwrap();
+        state
+            .store
+            .set_last_error(declined, Some(athenaeum_core::sync::CANCELLED_BY_RECEIVER_DETAIL))
+            .unwrap();
+
+        let confirmed_ref = "pkg-confirmed"; // seeded by test_state
+        let transferring_ref = "pkg-transferring"; // seeded by test_state
+        let app = build_router(state, None);
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("GET")
+                    .uri("/api/sent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        let flag_of = |pref: &str| {
+            let row = v
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["packageRef"] == pref)
+                .unwrap_or_else(|| panic!("row for {pref}"));
+            (
+                row["declined"].as_bool().unwrap(),
+                row["resendable"].as_bool().unwrap(),
+            )
+        };
+        assert_eq!(flag_of(confirmed_ref), (false, true), "confirmed → Send again");
+        assert_eq!(flag_of(transferring_ref), (false, false), "live row → neither");
+        assert_eq!(flag_of("pkg-failed"), (false, true), "failed → Retry");
+        assert_eq!(flag_of("pkg-declined"), (true, false), "declined → divert only");
+    }
+
+    /// v2.1 §D1: retrying a failed package resets the SAME row in place —
+    /// `newId == oldId`, `generation` bumps to 2, the row leaves its terminal
+    /// state, and no additional outbound row is minted for the package dir.
+    #[tokio::test]
+    async fn retry_failed_resets_same_row_same_id() {
         let (state, tmp) = test_state().await;
         let pkg = make_package_dir(tmp.path(), "pkg-failed-intact", false);
         let old_id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
@@ -3062,24 +3333,31 @@ mod tests {
             .unwrap();
 
         let store = Arc::clone(&state.store);
+        let before = store.all_outbound(100).unwrap().len();
         let app = build_router(state, None);
         let v = post_retry(app, &[old_id]).await;
 
         let retried = v["retried"].as_array().unwrap();
         assert_eq!(retried.len(), 1);
         assert_eq!(retried[0]["oldId"].as_i64().unwrap(), old_id);
-        let new_id = retried[0]["newId"].as_i64().unwrap();
-        assert_ne!(new_id, old_id, "a brand-new row id, not the old one");
+        assert_eq!(
+            retried[0]["newId"].as_i64().unwrap(),
+            old_id,
+            "reset-in-place: the transfer keeps its row id"
+        );
         assert!(v["rejected"].as_array().unwrap().is_empty());
 
-        // A real new row exists for the same package dir…
-        let new_row = store.get_outbound(new_id).unwrap().expect("new row exists");
-        assert_eq!(new_row.package_ref, pkg.to_string_lossy());
-        // …and the original failed row is untouched.
+        let row = store.get_outbound(old_id).unwrap().expect("row still exists");
+        assert_eq!(row.generation, 2, "attempt counter bumped by the reset");
+        assert!(
+            !row.state.is_terminal(),
+            "the row is live again (re-driven by its peer's engine), got {:?}",
+            row.state
+        );
         assert_eq!(
-            store.get_outbound(old_id).unwrap().unwrap().state,
-            OutboundState::Failed,
-            "the old failed row is left as-is"
+            store.all_outbound(100).unwrap().len(),
+            before,
+            "no extra outbound row minted for the package dir"
         );
     }
 
@@ -3111,11 +3389,10 @@ mod tests {
         );
     }
 
-    /// Task 9: a **cancelled** package (user gave up) is retryable exactly like a
-    /// failed one — provided its payload is still on disk. A brand-new outbound
-    /// row is minted; the original cancelled row is left untouched.
+    /// A **sender-cancelled** package is retryable exactly like a failed one
+    /// (v2.1): the SAME row resets in place and leaves its terminal state.
     #[tokio::test]
-    async fn retry_reenqueues_cancelled_with_intact_payload() {
+    async fn retry_cancelled_resets_same_row_in_place() {
         let (state, tmp) = test_state().await;
         let pkg = make_package_dir(tmp.path(), "pkg-cancelled-intact", false);
         let old_id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
@@ -3131,23 +3408,70 @@ mod tests {
         let retried = v["retried"].as_array().unwrap();
         assert_eq!(retried.len(), 1);
         assert_eq!(retried[0]["oldId"].as_i64().unwrap(), old_id);
-        let new_id = retried[0]["newId"].as_i64().unwrap();
-        assert_ne!(new_id, old_id, "a brand-new row id, not the old one");
+        assert_eq!(retried[0]["newId"].as_i64().unwrap(), old_id, "same row, attempt+1");
         assert!(v["rejected"].as_array().unwrap().is_empty());
-        assert_eq!(
-            store.get_outbound(old_id).unwrap().unwrap().state,
-            OutboundState::Cancelled,
-            "the old cancelled row is left as-is"
-        );
+        let row = store.get_outbound(old_id).unwrap().unwrap();
+        assert!(!row.state.is_terminal(), "the cancelled row is live again");
+        assert_eq!(row.generation, 2);
     }
 
-    /// A failed package whose dir was cleaned to manifest-only (the task-1
-    /// confirmed-then-cleaned shape) has nothing left to re-send: rejected
-    /// "package data missing", honestly — no new row.
+    /// A **receiver-declined** row (`cancelled` + the exact all-cancelled-ack
+    /// detail) is NOT silently retried — a same-batch re-announce would only
+    /// bounce, and an autonomous/casual retry must never override a human
+    /// decline. Rejected with a pointer at the explicit divert action.
     #[tokio::test]
-    async fn retry_rejects_missing_payload() {
+    async fn retry_declined_rejected_with_divert_hint() {
         let (state, tmp) = test_state().await;
-        let pkg = make_package_dir(tmp.path(), "pkg-manifest-only", true);
+        let pkg = make_package_dir(tmp.path(), "pkg-declined", false);
+        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        state.store.set_state(id, OutboundState::Cancelled).unwrap();
+        state
+            .store
+            .set_last_error(id, Some(athenaeum_core::sync::CANCELLED_BY_RECEIVER_DETAIL))
+            .unwrap();
+
+        let store = Arc::clone(&state.store);
+        let app = build_router(state, None);
+        let v = post_retry(app, &[id]).await;
+
+        assert!(v["retried"].as_array().unwrap().is_empty());
+        let rejected = v["rejected"].as_array().unwrap();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0]["id"].as_i64().unwrap(), id);
+        let reason = rejected[0]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("Resend as new transfer"),
+            "the reject points the operator at the divert action, got {reason:?}"
+        );
+        let row = store.get_outbound(id).unwrap().unwrap();
+        assert_eq!(row.state, OutboundState::Cancelled, "the declined row is untouched");
+        assert_eq!(row.generation, 1, "no reset happened");
+    }
+
+    /// A manifest-only dir (post-confirm cleanup) whose ORIGINALS are also gone
+    /// has nothing to rebuild from: the retry is rejected honestly, before any
+    /// row mutation. (`make_package_dir`'s placeholder manifest names no real
+    /// capture file, so the rebuild resolves zero sources.)
+    #[tokio::test]
+    async fn retry_rejects_when_nothing_is_restorable() {
+        let (state, tmp) = test_state().await;
+        let pkg = tmp.path().join("pkg-manifest-only");
+        std::fs::create_dir_all(&pkg).unwrap();
+        // A real (parseable) manifest record whose source file exists nowhere.
+        let rec = serde_json::json!({
+            "v": 1,
+            "frame_uuid": "u-1",
+            "origin_catalog_uuid": "u-1",
+            "origin_device": "aa",
+            "payload_kind": "RawFrame",
+            "rel_path": "gone-forever.fits",
+            "byte_size": 13,
+            "xxh3": "deadbeefdeadbeef",
+            "frame_meta": {},
+            "analysis": null,
+            "app_version": "0.0.0"
+        });
+        std::fs::write(pkg.join(MANIFEST_FILENAME), format!("{rec}\n")).unwrap();
         let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
         state.store.set_state(id, OutboundState::Failed).unwrap();
 
@@ -3160,7 +3484,16 @@ mod tests {
         let rejected = v["rejected"].as_array().unwrap();
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0]["id"].as_i64().unwrap(), id);
-        assert_eq!(rejected[0]["reason"], "package data missing");
+        let reason = rejected[0]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("could be restored"),
+            "the reject names the rebuild failure, got {reason:?}"
+        );
+        assert_eq!(
+            store.get_outbound(id).unwrap().unwrap().generation,
+            1,
+            "no reset for an unrebuildable package"
+        );
         assert_eq!(
             store.all_outbound(100).unwrap().len(),
             before,
@@ -3840,6 +4173,7 @@ mod tests {
             config: RwLock::new(config.clone()),
             agent_state: state_rx,
             supervisor_wake: Arc::new(Notify::new()),
+            engines: RwLock::new(vec![(node_id_hex(&PEER), Arc::clone(&engine))]),
             engine: RwLock::new(Some(engine)),
             cleanup: RwLock::new(None),
             peer_device: RwLock::new(node_id_hex(&PEER)),

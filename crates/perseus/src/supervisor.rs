@@ -78,6 +78,18 @@ pub trait ManagedAgent: Send + 'static {
     fn engine(&self) -> Option<Arc<SyncEngineHandle>>;
     /// The configured sync peer id (hex).
     fn peer_device(&self) -> String;
+    /// Every target's `(peer hex, engine handle)` pair, for the web layer's
+    /// per-peer action routing (the engine worker is peer-scoped: retry / kick /
+    /// cancel must reach the engine that owns the row's peer). Defaults to the
+    /// single [`engine`](Self::engine) + [`peer_device`](Self::peer_device)
+    /// pair so existing single-engine fakes need no change; the production
+    /// impl returns the full fan-out list.
+    fn engines(&self) -> Vec<(String, Arc<SyncEngineHandle>)> {
+        match self.engine() {
+            Some(engine) => vec![(self.peer_device(), engine)],
+            None => Vec::new(),
+        }
+    }
     /// The shared-payload cleanup coordinator (`Some` only for a ≥2-target
     /// fan-out). The web retry bumps it so a re-enqueued row can't prematurely
     /// free an offline target's payload.
@@ -104,6 +116,9 @@ impl ManagedAgent for Agent {
     }
     fn peer_device(&self) -> String {
         self.peer_device()
+    }
+    fn engines(&self) -> Vec<(String, Arc<SyncEngineHandle>)> {
+        self.engines_by_peer()
     }
     fn cleanup(&self) -> Option<Arc<SharedPackageCleanup>> {
         Agent::cleanup(self)
@@ -476,6 +491,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
             match agent {
                 Some(agent) => {
                     let engine = agent.engine();
+                    let engines = agent.engines();
                     let cleanup = agent.cleanup();
                     let peer_device = agent.peer_device();
                     let retention_tx = agent.retention_tx();
@@ -498,6 +514,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
                     tokio::spawn(async move {
                         ws.attach(
                             engine,
+                            engines,
                             cleanup,
                             peer_device,
                             retention_tx,

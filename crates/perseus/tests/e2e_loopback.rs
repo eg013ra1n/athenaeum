@@ -563,3 +563,357 @@ async fn multiple_capture_dirs_are_both_watched() {
 
     agent.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Send-model catch-up (batch model v2.1): reset-in-place resend, confirmed
+// "Send again" with payload rebuild, and the declined-transfer divert.
+// ---------------------------------------------------------------------------
+
+/// True iff `dir` still holds any non-manifest regular file (payload copies).
+/// Local twin of the web layer's payload probe, for asserting cleanup states.
+fn has_payload(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_type().map(|t| t.is_file()).unwrap_or(false)
+            && e.file_name() != std::ffi::OsStr::new("manifest.ndjson")
+    })
+}
+
+/// The standard sender-side rig for the resend e2es: loopback net, one live
+/// ingesting receiver, and an agent watching `capture` with fixtures written
+/// BEFORE start (they land in the initial scan → ONE batch for all of them).
+async fn resend_rig(
+    tmp: &Path,
+    fixtures: &[&str],
+    quiet_secs: u64,
+) -> (Agent, Config, ReceiverStats, PathBuf) {
+    let capture = tmp.join("capture");
+    let data = tmp.join("data");
+    std::fs::create_dir_all(&capture).unwrap();
+    for name in fixtures {
+        write_fixture_fits(&capture.join(name), "M42");
+    }
+
+    let net = LoopbackNetwork::new();
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let stats = spawn_receiver(receiver.clone(), tmp.join("recv"));
+
+    let sender = net.endpoint();
+    let sender_id = sender.node_id();
+    let transport: Arc<dyn SharingTransport> = Arc::new(sender);
+
+    let mut cfg = test_config(&capture, &data);
+    cfg.auto_quiet_secs = quiet_secs;
+    let agent = Agent::start_with_transport(cfg.clone(), transport, receiver_id, sender_id, true)
+        .await
+        .expect("start agent");
+    (agent, cfg, stats, capture)
+}
+
+/// The "receiver deleted its copies, send everything again" cycle for a
+/// CONFIRMED batch: after confirm the sender's payload copies are cleaned
+/// (manifest-only dir), so the operator's "Send again" rebuilds them from the
+/// original capture files, resets the SAME row (generation 2), re-delivers,
+/// re-confirms — and the dir is cleaned once more. The watcher never
+/// re-enqueues anything (the seen store was untouched), and the batch carries
+/// its human display name end to end (T1).
+#[tokio::test]
+async fn confirmed_retry_rebuilds_payloads_and_reconfirms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (agent, cfg, stats, _capture) = resend_rig(tmp.path(), &["frame1.fits"], 1).await;
+
+    wait_until(|| is_confirmed(&history_for(&agent, "frame1.fits")), WAIT).await;
+    let rows = agent.store().all_outbound(10).unwrap();
+    assert_eq!(rows.len(), 1, "one batch, one outbound row");
+    let row = rows[0].clone();
+    assert_eq!(
+        row.display_name.as_deref(),
+        Some("frame1.fits"),
+        "T1: a single-file batch is named after its file"
+    );
+    assert_eq!(
+        agent.store().list_outbound_files(row.id).unwrap().len(),
+        1,
+        "T1: the sender's per-file rows are written at enqueue time"
+    );
+
+    // Single-target engine: the in-line cleanup reclaims the payload copies on
+    // confirm — the dir goes manifest-only, exactly the "can't retry" old shape.
+    let pkg = PathBuf::from(&row.package_ref);
+    wait_until(|| !has_payload(&pkg), WAIT).await;
+
+    // "Send again": rebuild from the originals + reset the same row + re-drive.
+    let batches = perseus::batch_store::BatchStore::open(cfg.db_path()).unwrap();
+    let report = perseus::resend::resend_in_place(
+        agent.store().as_ref(),
+        &agent.engine_handle(),
+        None,
+        &cfg,
+        &batches,
+        &row,
+    )
+    .await
+    .expect("confirmed resend accepted");
+    assert!(report.rebuilt, "the manifest-only dir was rebuilt from the originals");
+    assert!(report.missing.is_empty() && report.changed.is_empty());
+
+    wait_until(
+        || {
+            agent
+                .store()
+                .get_outbound(row.id)
+                .unwrap()
+                .is_some_and(|r| r.state == OutboundState::Confirmed && r.generation == 2)
+        },
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        agent.store().all_outbound(10).unwrap().len(),
+        1,
+        "same row re-confirmed; the watcher re-enqueued nothing"
+    );
+    assert!(
+        stats.attempts.load(SeqCst) >= 2,
+        "the receiver fetched the batch twice (original + resend)"
+    );
+    // The second confirm cleans the rebuilt payload once more.
+    wait_until(|| !has_payload(&pkg), WAIT).await;
+
+    agent.shutdown().await;
+}
+
+/// "Send again" when one ORIGINAL vanished from the observatory disk: the
+/// rebuild honestly reports the missing file, ships the restored subset under
+/// the same row, and the manifest shrinks to what was actually re-sent.
+#[tokio::test]
+async fn confirmed_retry_with_deleted_original_is_partial_and_honest() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Both fixtures pre-exist → the initial scan batches them into ONE package
+    // (2s quiet window comfortably covers their same-tick stabilization).
+    let (agent, cfg, _stats, capture) =
+        resend_rig(tmp.path(), &["frame1.fits", "frame2.fits"], 2).await;
+
+    wait_until(
+        || {
+            is_confirmed(&history_for(&agent, "frame1.fits"))
+                && is_confirmed(&history_for(&agent, "frame2.fits"))
+        },
+        WAIT,
+    )
+    .await;
+    let rows = agent.store().all_outbound(10).unwrap();
+    assert_eq!(rows.len(), 1, "both fixtures coalesced into one batch");
+    let row = rows[0].clone();
+    let pkg = PathBuf::from(&row.package_ref);
+    wait_until(|| !has_payload(&pkg), WAIT).await;
+
+    // One original is gone by the time the operator hits "Send again".
+    std::fs::remove_file(capture.join("frame2.fits")).unwrap();
+
+    let batches = perseus::batch_store::BatchStore::open(cfg.db_path()).unwrap();
+    let report = perseus::resend::resend_in_place(
+        agent.store().as_ref(),
+        &agent.engine_handle(),
+        None,
+        &cfg,
+        &batches,
+        &row,
+    )
+    .await
+    .expect("partial resend accepted");
+    assert!(report.rebuilt);
+    assert_eq!(report.missing, vec!["frame2.fits"], "the lost original is NAMED");
+    assert!(report.changed.is_empty());
+
+    wait_until(
+        || {
+            agent
+                .store()
+                .get_outbound(row.id)
+                .unwrap()
+                .is_some_and(|r| r.state == OutboundState::Confirmed && r.generation == 2)
+        },
+        WAIT,
+    )
+    .await;
+    // The batch honestly shrank to what was restorable.
+    assert_eq!(
+        package::read_manifest(&pkg)
+            .unwrap()
+            .iter()
+            .map(|r| r.rel_path.clone())
+            .collect::<Vec<_>>(),
+        vec!["frame1.fits"],
+        "the manifest was rewritten to the restored subset"
+    );
+
+    agent.shutdown().await;
+}
+
+/// Reactive receiver that DECLINES the first batch identity it sees (fetch +
+/// all-`Cancelled` ack — the deliberate human "no") and ingests every other
+/// batch. The divert mints a NEW batch identity, which is how its re-ask gets
+/// through while any same-batch re-announce keeps bouncing.
+fn spawn_decline_first_batch_receiver(
+    endpoint: Arc<LoopbackTransport>,
+    dest_root: PathBuf,
+) -> Arc<std::sync::Mutex<Option<String>>> {
+    let declined: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+    let declined_task = Arc::clone(&declined);
+    tokio::spawn(async move {
+        let mut events = endpoint.events().await;
+        let mut n = 0usize;
+        while let Some(event) = events.recv().await {
+            let TransportEvent::AnnounceReceived {
+                from,
+                announce,
+                batch_uuid,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            n += 1;
+            let decline = {
+                let mut guard = declined_task.lock().unwrap();
+                match guard.as_ref() {
+                    None => {
+                        *guard = Some(batch_uuid.clone());
+                        true
+                    }
+                    Some(first) => *first == batch_uuid,
+                }
+            };
+            let dest = dest_root.join(format!("fetch-{n}"));
+            if endpoint.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
+                let Ok(records) = package::read_manifest(&dest) else {
+                    continue;
+                };
+                let receipts: Vec<FrameReceipt> = records
+                    .iter()
+                    .map(|r| FrameReceipt {
+                        frame_uuid: r.frame_uuid.clone(),
+                        xxh3: r.xxh3.clone(),
+                        outcome: if decline {
+                            ReceiptOutcome::Cancelled
+                        } else {
+                            ReceiptOutcome::Ingested
+                        },
+                    })
+                    .collect();
+                let _ = endpoint.ack(from, &announce.package_id, receipts).await;
+            }
+        }
+    });
+    declined
+}
+
+/// The operator divert for a receiver-declined batch: the plain retry keeps
+/// bouncing off the declined guard (an autonomous agent must never override a
+/// human "no"), while "Resend as new transfer" mints a NEW batch identity that
+/// the receiver accepts — the old row stays Cancelled with the cross-link
+/// suffix, and the seen-store linkage follows the new package.
+#[tokio::test]
+async fn declined_then_operator_divert_mints_new_batch_and_delivers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let capture = tmp.path().join("capture");
+    let data = tmp.path().join("data");
+    std::fs::create_dir_all(&capture).unwrap();
+    write_fixture_fits(&capture.join("frame1.fits"), "M42");
+
+    let net = LoopbackNetwork::new();
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.start().await.unwrap().node_id;
+    let _declined = spawn_decline_first_batch_receiver(receiver.clone(), tmp.path().join("recv"));
+
+    let sender = net.endpoint();
+    let sender_id = sender.node_id();
+    let transport: Arc<dyn SharingTransport> = Arc::new(sender);
+    let cfg = test_config(&capture, &data);
+    let agent = Agent::start_with_transport(cfg.clone(), transport, receiver_id, sender_id, true)
+        .await
+        .expect("start agent");
+
+    // The receiver declines the batch → Cancelled + the exact by-receiver detail.
+    wait_until(
+        || {
+            agent.store().all_outbound(10).unwrap().first().is_some_and(|r| {
+                r.state == OutboundState::Cancelled
+                    && r.last_error.as_deref()
+                        == Some(athenaeum_core::sync::CANCELLED_BY_RECEIVER_DETAIL)
+            })
+        },
+        WAIT,
+    )
+    .await;
+    let old_row = agent.store().all_outbound(10).unwrap()[0].clone();
+    let old_pkg = PathBuf::from(&old_row.package_ref);
+
+    // The in-place retry (what an autonomous or casual resend would do) bounces.
+    let batches = perseus::batch_store::BatchStore::open(cfg.db_path()).unwrap();
+    let bounced = perseus::resend::resend_in_place(
+        agent.store().as_ref(),
+        &agent.engine_handle(),
+        None,
+        &cfg,
+        &batches,
+        &old_row,
+    )
+    .await;
+    assert!(bounced.is_err(), "a declined transfer is never retried in place");
+
+    // The explicit operator divert mints a NEW transfer and delivers it.
+    let new_id = perseus::resend::resend_declined_as_new(
+        agent.store().as_ref(),
+        &agent.engine_handle(),
+        None,
+        &cfg,
+        &batches,
+        &perseus::seen::SeenStore::open(cfg.db_path()).unwrap(),
+        &old_row,
+    )
+    .await
+    .expect("divert accepted");
+    assert_ne!(new_id, old_row.id);
+
+    wait_until(
+        || {
+            agent
+                .store()
+                .get_outbound(new_id)
+                .unwrap()
+                .is_some_and(|r| r.state == OutboundState::Confirmed)
+        },
+        WAIT,
+    )
+    .await;
+    let new_row = agent.store().get_outbound(new_id).unwrap().unwrap();
+    assert_ne!(
+        PathBuf::from(&new_row.package_ref).file_name(),
+        old_pkg.file_name(),
+        "fresh dir basename ⇒ fresh wire batch identity"
+    );
+
+    // The old row is history with the cross-link; the linkage moved on.
+    let old = agent.store().get_outbound(old_row.id).unwrap().unwrap();
+    assert_eq!(old.state, OutboundState::Cancelled);
+    assert!(old
+        .last_error
+        .unwrap()
+        .contains(&format!("resent as new transfer #{new_id}")));
+    let seen = perseus::seen::SeenStore::open(cfg.db_path()).unwrap();
+    assert!(
+        seen.source_for_package(&new_row.package_ref).unwrap().is_some(),
+        "the live seen linkage follows the diverted package"
+    );
+    assert!(
+        seen.source_for_package(&old_row.package_ref).unwrap().is_none(),
+        "no live linkage remains under the declined package"
+    );
+
+    agent.shutdown().await;
+}

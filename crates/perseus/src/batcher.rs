@@ -174,7 +174,7 @@ async fn flush_once(
         std::mem::take(&mut *guard).into_iter().collect()
     };
 
-    let (pkg_dir, included) = match build_batch_package(config, &files, origin_device) {
+    let built = match build_batch_package(config, &files, origin_device) {
         Ok(built) => built,
         Err(error) => {
             // Every file in the batch vanished / won't parse. There is nothing on
@@ -191,17 +191,24 @@ async fn flush_once(
     // The packaged record count == the number of files that actually shipped.
     // Some drained files may have been dropped at build time (present but
     // unbuildable); those are deliberately absent from `included`.
-    let n = included.len();
+    let n = built.included.len();
 
-    let (first_id, delivered) = enqueue_package_to_all(engines, &pkg_dir).await;
+    let (first_id, delivered) = enqueue_package_to_all(
+        engines,
+        &built.pkg_dir,
+        Some(&built.display_name),
+        &built.files,
+    )
+    .await;
     // Fan-out only: register the delivered target count so the shared payload is
     // freed exactly once, after every target is terminal (mirrors the per-file
     // path). Single-target agents keep the engine's in-line cleanup (`None`).
     // `delivered == 0` registers an expected of 0 → the orphaned copy is cleaned
     // immediately (no target's retry can ever need it).
     if let Some(coord) = cleanup {
-        coord.register(&pkg_dir, delivered);
+        coord.register(&built.pkg_dir, delivered);
     }
+    let pkg_dir = built.pkg_dir.clone();
     let package_ref = pkg_dir.to_string_lossy().into_owned();
 
     match first_id {
@@ -217,13 +224,18 @@ async fn flush_once(
             // `pending` (that would spin a permanently-corrupt file forever
             // in-session); simply not marking it seen matches the legacy per-file
             // behavior exactly.
-            for file in &included {
+            for file in &built.included {
                 record_seen(seen, file, &package_ref);
             }
             if let Err(error) = batches.record(&package_ref, mode_str(mode), &now_rfc3339(), n) {
                 // The files are already durably queued + recorded seen; a failed
                 // history write only loses a status-page row, never a frame.
                 tracing::warn!(%error, package_ref = %package_ref, "failed to record batch row");
+            }
+            // Durable rel_path → source linkage for a later confirmed-package
+            // rebuild. Same best-effort contract as the batch row above.
+            if let Err(error) = batches.record_files(&package_ref, &built.rel_sources) {
+                tracing::warn!(%error, package_ref = %package_ref, "failed to record batch file linkage");
             }
             tracing::info!(
                 package_ref = %package_ref,
@@ -457,6 +469,9 @@ mod tests {
         /// A clone of the batcher's seen store, so a test can assert which files
         /// were (or were not) recorded seen after a flush.
         seen: Arc<SeenStore>,
+        /// The durable sync store the loopback engine writes into, so a test can
+        /// assert the enqueued row's `display_name` and per-file rows.
+        store: Arc<StandaloneSyncStore>,
         stable_tx: mpsc::Sender<(PathBuf, PathBuf)>,
         handle: BatcherHandle,
         _task: JoinHandle<()>,
@@ -529,6 +544,7 @@ mod tests {
                 files,
                 batches,
                 seen,
+                store,
                 stable_tx,
                 handle,
                 _task: task,
@@ -647,6 +663,53 @@ mod tests {
         h.handle.flush_now().await;
         settle().await;
         assert_eq!(h.batch_count(), 1, "an empty manual flush is a no-op");
+    }
+
+    /// A flushed batch enqueues with its derived human `display_name` and the
+    /// full per-file manifest, so the sender's durable `sync_outbound_files`
+    /// rows exist from enqueue time — and the `perseus_batch_files` source
+    /// linkage (for a later confirmed-package rebuild) is recorded beside the
+    /// batch row.
+    #[tokio::test]
+    async fn flush_records_display_name_and_per_file_rows() {
+        let h = Harness::spawn(SendCfg {
+            mode: Mode::Manual,
+            auto_quiet_secs: 60,
+        });
+
+        h.feed(&[0, 1, 2]).await;
+        settle().await;
+        h.handle.flush_now().await;
+        wait_until(|| h.batch_count() == 1).await;
+
+        let rows = h.store.all_outbound(10).unwrap();
+        assert_eq!(rows.len(), 1, "one outbound row for the single target");
+        let row = &rows[0];
+        let name = row.display_name.clone().expect("batch has a display name");
+        assert!(
+            name.ends_with("(3 files)"),
+            "3 flat files derive a dated fallback name, got {name:?}"
+        );
+
+        let files = h.store.list_outbound_files(row.id).unwrap();
+        let mut rels: Vec<String> = files.iter().map(|f| f.rel_path.clone()).collect();
+        rels.sort();
+        assert_eq!(
+            rels,
+            vec!["a.fits", "b.fits", "c.fits"],
+            "per-file rows written at enqueue time"
+        );
+
+        // The rebuild source linkage points every rel_path at its capture file.
+        let package_ref = h.batches.list().unwrap()[0].package_ref.clone();
+        let linkage = h.batches.files_for(&package_ref).unwrap();
+        assert_eq!(linkage.len(), 3);
+        assert!(
+            linkage
+                .iter()
+                .all(|(rel, src)| src == &h.capture.join(rel)),
+            "each rel_path links back to its source capture file"
+        );
     }
 
     /// The current `(size, mtime_ms)` of a file on disk, in the same shape the

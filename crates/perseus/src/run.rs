@@ -31,7 +31,7 @@ use athenaeum_core::package::{
 };
 use athenaeum_core::sharing::iroh::node::{Role, SharedIrohNode};
 use athenaeum_core::sharing::iroh::random_secret;
-use athenaeum_core::sharing::types::NodeId;
+use athenaeum_core::sharing::types::{AnnounceFileEntry, NodeId};
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::engine::AddrRefresher;
 use athenaeum_core::sync::store::{StandaloneSyncStore, SyncStore};
@@ -227,13 +227,80 @@ pub fn build_package_for_file(
     capture_dir: &Path,
     file_path: &Path,
     origin_device: &str,
-) -> Result<PathBuf> {
+) -> Result<BuiltBatch> {
     // One file is just a one-element batch; delegate so the manifest-record shape
     // is defined in exactly one place (Task 3). A single missing/unparseable file
     // means the batch is empty → `build_batch_package` errors, matching the old
     // fail-fast contract `Agent::enqueue_file` relies on.
     let input = [(capture_dir.to_path_buf(), file_path.to_path_buf())];
-    build_batch_package(config, &input, origin_device).map(|(pkg_dir, _)| pkg_dir)
+    build_batch_package(config, &input, origin_device)
+}
+
+/// Everything one package build produces, computed once where the manifest
+/// records are already in hand: the written package dir, the capture files that
+/// actually made it in, the per-file announce manifest for the sync engine, the
+/// `rel_path → source` linkage for [`crate::batch_store::BatchStore::record_files`],
+/// and the derived human batch name.
+pub struct BuiltBatch {
+    /// The written package directory (`<packages_dir>/<uuid>`).
+    pub pkg_dir: PathBuf,
+    /// Capture-file paths whose records made it into the package, in order
+    /// (`included.len()` == packaged record count). The batcher marks exactly
+    /// these as seen — see the [`build_batch_package`] docs.
+    pub included: Vec<PathBuf>,
+    /// Per-file `(rel_path, byte_size, frame_uuid)` manifest handed to
+    /// `enqueue_package`, so the sender's durable `sync_outbound_files` rows are
+    /// written at enqueue time (Transfers Status Model v2 §D4) instead of the
+    /// engine falling back to an announce-time manifest read.
+    pub files: Vec<AnnounceFileEntry>,
+    /// `rel_path → source capture file` pairs — the durable linkage a
+    /// confirmed-package rebuild resolves original sources through.
+    pub rel_sources: Vec<(String, PathBuf)>,
+    /// Human batch name ([`batch_display_name`]) carried in the announce so the
+    /// receiver's Transfers page shows it instead of a raw package UUID.
+    pub display_name: String,
+}
+
+/// Derive the human batch name from the packaged `rel_path`s:
+///
+/// - a single file → its filename;
+/// - several files that all sit under one common first path segment (a shared
+///   object/session directory) → `"<segment> (N files)"`;
+/// - anything else → `"Perseus <date> (N files)"`.
+///
+/// Pure (the date is a parameter) so the naming matrix is unit-testable.
+pub fn batch_display_name(rel_paths: &[String], date: &str) -> String {
+    if let [only] = rel_paths {
+        return only.rsplit('/').next().unwrap_or(only).to_string();
+    }
+    let n = rel_paths.len();
+    // A common first segment only counts when EVERY rel_path is nested (depth
+    // > 1) under the same one — a flat file has no directory to speak for the
+    // batch.
+    let mut common: Option<&str> = None;
+    let mut all_nested = !rel_paths.is_empty();
+    for rel in rel_paths {
+        match rel.split_once('/') {
+            Some((seg, rest)) if !seg.is_empty() && !rest.is_empty() => match common {
+                None => common = Some(seg),
+                Some(c) if c == seg => {}
+                Some(_) => {
+                    all_nested = false;
+                    break;
+                }
+            },
+            _ => {
+                all_nested = false;
+                break;
+            }
+        }
+    }
+    if all_nested {
+        if let Some(seg) = common {
+            return format!("{seg} ({n} files)");
+        }
+    }
+    format!("Perseus {date} ({n} files)")
 }
 
 /// Build ONE package containing a manifest record per `(capture_dir, file)` in
@@ -260,7 +327,7 @@ pub fn build_batch_package(
     config: &Config,
     files: &[(PathBuf /* capture_dir */, PathBuf /* file */)],
     origin_device: &str,
-) -> Result<(PathBuf, Vec<PathBuf>)> {
+) -> Result<BuiltBatch> {
     let mut records: Vec<(PathBuf, ManifestRecord)> = Vec::with_capacity(files.len());
     for (capture_dir, file_path) in files {
         match build_manifest_record(config, capture_dir, file_path, origin_device) {
@@ -277,14 +344,37 @@ pub fn build_batch_package(
         anyhow::bail!("batch has no buildable files");
     }
 
-    // The capture-file paths that actually made it into the package, in order —
-    // captured BEFORE `records` is moved into `write_package`. The caller records
-    // exactly these as seen (see the fn docs).
+    // Everything derived from the surviving records is captured BEFORE `records`
+    // is moved into `write_package`: the included capture paths (the caller
+    // records exactly these as seen — see the fn docs), the per-file announce
+    // manifest, the rebuild source linkage, and the human batch name.
     let included: Vec<PathBuf> = records.iter().map(|(path, _)| path.clone()).collect();
+    let announce_files: Vec<AnnounceFileEntry> = records
+        .iter()
+        .map(|(_, r)| AnnounceFileEntry {
+            rel_path: r.rel_path.clone(),
+            byte_size: r.byte_size,
+            frame_uuid: r.frame_uuid.clone(),
+        })
+        .collect();
+    let rel_sources: Vec<(String, PathBuf)> = records
+        .iter()
+        .map(|(path, r)| (r.rel_path.clone(), path.clone()))
+        .collect();
+    let rel_paths: Vec<String> = records.iter().map(|(_, r)| r.rel_path.clone()).collect();
+    let display_name =
+        batch_display_name(&rel_paths, &Utc::now().format("%Y-%m-%d").to_string());
+
     let pkg_dir = config.packages_dir().join(Uuid::new_v4().to_string());
     write_package(&pkg_dir, records)
         .with_context(|| format!("write batch package {}", pkg_dir.display()))?;
-    Ok((pkg_dir, included))
+    Ok(BuiltBatch {
+        pkg_dir,
+        included,
+        files: announce_files,
+        rel_sources,
+        display_name,
+    })
 }
 
 /// Build the single manifest record for one capture file — the per-file work
@@ -370,7 +460,11 @@ fn to_slash(rel: &Path) -> String {
 /// A capture dir's basename as a single safe path segment: lowercased, with any
 /// character outside `[a-z0-9._-]` replaced by `-`. Empty if the dir has no
 /// usable basename (e.g. the filesystem root).
-fn sanitize_label(capture_dir: &Path) -> String {
+///
+/// `pub(crate)` so [`crate::resend`]'s rebuild can reverse-map a labeled
+/// `rel_path` back onto its capture dir (lossiness is safe there — every
+/// candidate is verified against the manifest's size + hash before use).
+pub(crate) fn sanitize_label(capture_dir: &Path) -> String {
     let base = capture_dir
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
@@ -440,6 +534,12 @@ pub struct Agent {
     config: Config,
     store: Arc<StandaloneSyncStore>,
     seen: Arc<SeenStore>,
+    /// Per-batch send bookkeeping (`perseus_batch` + `perseus_batch_files`),
+    /// another connection into the same `perseus.db` (WAL-safe, like `seen`).
+    /// The batcher records a history row per flushed package; both enqueue
+    /// paths record the per-file source linkage a confirmed-package rebuild
+    /// resolves originals through.
+    batches: Arc<BatchStore>,
     /// One engine per resolved send target (Sync 2C). Always non-empty: target
     /// resolution errors before an agent is built if zero targets resolve, and
     /// the injection seams require at least one transport. The enqueue pipeline
@@ -661,6 +761,14 @@ impl Agent {
             SeenStore::open(config.db_path())
                 .with_context(|| format!("open seen store {}", config.db_path().display()))?,
         );
+        // Per-batch send bookkeeping (Task 2), one more connection into the same
+        // `perseus.db`. Opened unconditionally (not just on the `watch` path):
+        // the enqueue-backlog path records the per-file source linkage too, so a
+        // confirmed backlog package is rebuildable like any batched one.
+        let batches = Arc::new(
+            BatchStore::open(config.db_path())
+                .with_context(|| format!("open batch store {}", config.db_path().display()))?,
+        );
         // Shared-payload cleanup coordinator — ONLY for a true fan-out (≥2
         // targets). With one target there is no shared dir, so the engine's
         // original in-line cleanup is correct and left byte-for-byte unchanged
@@ -780,22 +888,16 @@ impl Agent {
             // Drop our own sender: the batcher's channel now closes precisely
             // when the LAST watcher drops its clone (i.e. all have shut down).
             drop(stable_tx);
-            // Per-batch send bookkeeping (Task 2), opened as another connection
-            // into the same `perseus.db` (WAL-safe, like `seen`). The batcher
-            // writes one row per flushed package; the web history page (Task 6)
-            // lists them.
-            let batches = Arc::new(
-                BatchStore::open(config.db_path())
-                    .with_context(|| format!("open batch store {}", config.db_path().display()))?,
-            );
             // Sync Phase 2: the batcher replaces the per-file consumer —
             // accumulate stable files, flush the whole set as ONE package on the
-            // auto quiet-timer or a manual signal, fan it to every target.
+            // auto quiet-timer or a manual signal, fan it to every target. It
+            // shares the agent's `BatchStore` handle (one row per flushed
+            // package; the web history page lists them).
             let (batcher, batcher_task) = spawn_batcher(
                 stable_rx,
                 engine_handles.clone(),
                 Arc::clone(&seen),
-                batches,
+                Arc::clone(&batches),
                 config.clone(),
                 origin_device.clone(),
                 cleanup.clone(),
@@ -828,6 +930,7 @@ impl Agent {
             config,
             store,
             seen,
+            batches,
             engines,
             cleanup,
             // Injection path: no shared node (loopback transports). `start` sets
@@ -856,10 +959,16 @@ impl Agent {
     /// could not be built at all, or if it reached ZERO targets.
     pub async fn enqueue_file(&self, file_path: &Path) -> Result<i64> {
         let capture_dir = owning_capture_dir(&self.config, file_path);
-        let pkg_dir =
+        let built =
             build_package_for_file(&self.config, &capture_dir, file_path, &self.origin_device)?;
         let engines = self.engine_handles();
-        let (first_id, delivered) = enqueue_package_to_all(&engines, &pkg_dir).await;
+        let (first_id, delivered) = enqueue_package_to_all(
+            &engines,
+            &built.pkg_dir,
+            Some(&built.display_name),
+            &built.files,
+        )
+        .await;
         // Fan-out only: tell the coordinator how many targets actually received
         // this dir, so it frees the shared payload exactly once — after every one
         // of them is terminal. `delivered == 0` (reached no target) registers an
@@ -867,7 +976,7 @@ impl Agent {
         // retry can ever need it). Single-target agents skip this entirely
         // (`cleanup` is `None`) and keep the engine's in-line cleanup.
         if let Some(coord) = &self.cleanup {
-            coord.register(&pkg_dir, delivered);
+            coord.register(&built.pkg_dir, delivered);
         }
         let Some(first_id) = first_id else {
             anyhow::bail!(
@@ -883,13 +992,31 @@ impl Agent {
             path = %file_path.display(),
             "enqueued capture file"
         );
-        record_seen(&self.seen, file_path, &pkg_dir.to_string_lossy());
+        let package_ref = built.pkg_dir.to_string_lossy().into_owned();
+        record_seen(&self.seen, file_path, &package_ref);
+        // Durable rel_path → source linkage for a later confirmed-package
+        // rebuild. Best-effort like `record_seen`: a failed write only degrades
+        // that rebuild to the reverse-mapping fallback, never fails the enqueue.
+        if let Err(error) = self.batches.record_files(&package_ref, &built.rel_sources) {
+            tracing::warn!(%error, package_ref = %package_ref, "failed to record batch file linkage");
+        }
         Ok(first_id)
     }
 
     /// Cheap clones of every target engine handle (fan-out call sites).
     fn engine_handles(&self) -> Vec<Arc<SyncEngineHandle>> {
         self.engines.iter().map(|t| Arc::clone(&t.engine)).collect()
+    }
+
+    /// Every target's `(peer hex, engine handle)` pair. The web layer routes
+    /// per-row actions (retry / kick / cancel) through this: the engine worker
+    /// is peer-scoped (it ignores rows bound to another peer), so an action
+    /// sent to `engines[0]` was a silent no-op for every other target's rows.
+    pub fn engines_by_peer(&self) -> Vec<(String, Arc<SyncEngineHandle>)> {
+        self.engines
+            .iter()
+            .map(|t| (node_id_hex(&t.peer), Arc::clone(&t.engine)))
+            .collect()
     }
 
     /// The number of configured send targets (one engine each). Test/introspection.
@@ -1134,11 +1261,20 @@ pub(crate) fn record_seen(seen: &SeenStore, path: &Path, package_ref: &str) {
 pub(crate) async fn enqueue_package_to_all(
     engines: &[Arc<SyncEngineHandle>],
     pkg_dir: &Path,
+    display_name: Option<&str>,
+    files: &[AnnounceFileEntry],
 ) -> (Option<i64>, usize) {
     let mut first_id: Option<i64> = None;
     let mut delivered = 0usize;
     for (idx, engine) in engines.iter().enumerate() {
-        match engine.enqueue_package(pkg_dir, None, Vec::new()).await {
+        match engine
+            .enqueue_package(
+                pkg_dir,
+                display_name.map(str::to_string),
+                files.to_vec(),
+            )
+            .await
+        {
             Ok(id) => {
                 first_id.get_or_insert(id);
                 delivered += 1;
@@ -2612,8 +2748,13 @@ mod multi_target_tests {
         ));
 
         let pkg = make_pkg(tmp.path(), "uuid-1", "frame.fits");
-        let (first_id, delivered) =
-            enqueue_package_to_all(&[Arc::clone(&engine_a), Arc::clone(&engine_b)], &pkg).await;
+        let (first_id, delivered) = enqueue_package_to_all(
+            &[Arc::clone(&engine_a), Arc::clone(&engine_b)],
+            &pkg,
+            None,
+            &[],
+        )
+        .await;
         assert!(first_id.is_some(), "at least one target accepted the package");
         assert_eq!(delivered, 2, "the package reached both targets");
 
@@ -2672,8 +2813,13 @@ mod multi_target_tests {
         engine_b.shutdown().await;
 
         let pkg = make_pkg(tmp.path(), "uuid-1", "frame.fits");
-        let (first_id, delivered) =
-            enqueue_package_to_all(&[Arc::clone(&engine_a), Arc::clone(&engine_b)], &pkg).await;
+        let (first_id, delivered) = enqueue_package_to_all(
+            &[Arc::clone(&engine_a), Arc::clone(&engine_b)],
+            &pkg,
+            None,
+            &[],
+        )
+        .await;
         assert!(first_id.is_some(), "the live target still accepted the package");
         assert_eq!(delivered, 1, "only the live target accepted it — the dead one is skipped, not fatal");
 
@@ -2749,6 +2895,176 @@ mod multi_target_tests {
             !pkg.join("frame.fits").exists(),
             "once B is terminal too the coordinator frees the shared payload"
         );
+
+        engine_a.shutdown().await;
+        engine_b.shutdown().await;
+    }
+
+    /// A config over `capture_dir` (where [`make_pkg`] leaves its source file)
+    /// plus a batch store on the shared db — the two extras
+    /// [`crate::resend::resend_in_place`] takes beyond the engine harness.
+    fn resend_fixtures(tmp: &Path) -> (Config, crate::batch_store::BatchStore) {
+        let data = tmp.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let toml = format!(
+            "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"auto\"\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            tmp.display(),
+            data.display()
+        );
+        let config = Config::from_toml_str(&toml).unwrap();
+        let batches = crate::batch_store::BatchStore::open(tmp.join("sync.db")).unwrap();
+        (config, batches)
+    }
+
+    /// Fan-out reset-in-place retry: re-sending target A's row re-arms the
+    /// shared gate (+1 for the row's SECOND terminal), so A's re-confirm must
+    /// NOT free the payload while target B is still offline — only B's own
+    /// terminal completes the widened gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fanout_reset_retry_bumps_gate_keeps_sibling_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let net = LoopbackNetwork::new();
+
+        // Target A: live receiver (acks). Target B: no endpoint — offline.
+        let recv_a = Arc::new(net.endpoint());
+        let a_id = recv_a.start().await.unwrap().node_id;
+        spawn_receiver(recv_a.clone(), tmp.path().join("ra"));
+        let b_id = [0xBBu8; 32];
+
+        let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+        let coord = Arc::new(SharedPackageCleanup::new());
+        let engine_a = Arc::new(SyncEngine::spawn_with_sink(
+            Arc::clone(&store) as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()),
+            a_id,
+            Arc::clone(&coord) as Arc<dyn PackageCleanupSink>,
+        ));
+        let engine_b = Arc::new(SyncEngine::spawn_with_sink(
+            Arc::clone(&store) as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()),
+            b_id,
+            Arc::clone(&coord) as Arc<dyn PackageCleanupSink>,
+        ));
+
+        let pkg = make_pkg(tmp.path(), "uuid-retry", "frame.fits");
+        coord.register(&pkg, 2);
+        let id_a = engine_a.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+        let id_b = engine_b.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+
+        // A confirms (terminal 1/2); B stays pending.
+        wait_until(|| {
+            store
+                .get_outbound(id_a)
+                .unwrap()
+                .is_some_and(|r| r.state == OutboundState::Confirmed)
+        })
+        .await;
+
+        // Operator re-sends A's confirmed row in place (payload still on disk —
+        // B's pending row kept the gate open, so no rebuild happens).
+        let (config, batches) = resend_fixtures(tmp.path());
+        let row_a = store.get_outbound(id_a).unwrap().unwrap();
+        let report = crate::resend::resend_in_place(
+            &store, &engine_a, Some(&coord), &config, &batches, &row_a,
+        )
+        .await
+        .expect("fan-out reset retry accepted");
+        assert!(!report.rebuilt, "payload was still on disk — nothing to rebuild");
+
+        // A re-confirms: terminals 2 < widened expected 3 → payload survives for B.
+        wait_until(|| {
+            store
+                .get_outbound(id_a)
+                .unwrap()
+                .is_some_and(|r| r.state == OutboundState::Confirmed && r.generation == 2)
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            pkg.join("frame.fits").exists(),
+            "the reset row's second terminal must not free the still-offline sibling's payload"
+        );
+
+        // B terminalizes → gate 3/3 → cleaned exactly once.
+        engine_b.cancel(id_b).await.unwrap();
+        wait_until(|| !pkg.join("frame.fits").exists()).await;
+
+        engine_a.shutdown().await;
+        engine_b.shutdown().await;
+    }
+
+    /// Fan-out CONFIRMED retry after the all-terminal cleanup: the dir is
+    /// manifest-only, so the resend rebuilds the payload from the original
+    /// capture file, `rearm` re-opens the spent gate, and the re-confirm cleans
+    /// the rebuilt payload exactly once more — the sibling's confirmed row is
+    /// never touched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fanout_confirmed_retry_rearms_gate_and_recleans_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let net = LoopbackNetwork::new();
+
+        let recv_a = Arc::new(net.endpoint());
+        let a_id = recv_a.start().await.unwrap().node_id;
+        spawn_receiver(recv_a.clone(), tmp.path().join("ra"));
+        let recv_b = Arc::new(net.endpoint());
+        let b_id = recv_b.start().await.unwrap().node_id;
+        spawn_receiver(recv_b.clone(), tmp.path().join("rb"));
+
+        let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+        let coord = Arc::new(SharedPackageCleanup::new());
+        let engine_a = Arc::new(SyncEngine::spawn_with_sink(
+            Arc::clone(&store) as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()),
+            a_id,
+            Arc::clone(&coord) as Arc<dyn PackageCleanupSink>,
+        ));
+        let engine_b = Arc::new(SyncEngine::spawn_with_sink(
+            Arc::clone(&store) as Arc<dyn SyncStore>,
+            Arc::new(net.endpoint()),
+            b_id,
+            Arc::clone(&coord) as Arc<dyn PackageCleanupSink>,
+        ));
+
+        // The "original capture file" `make_pkg` copies from lives at the tmp
+        // root == the config's capture dir, so the rebuild reverse-maps to it.
+        let pkg = make_pkg(tmp.path(), "uuid-reclean", "frame.fits");
+        coord.register(&pkg, 2);
+        let id_a = engine_a.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+        let id_b = engine_b.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+
+        // Both confirm → all-terminal → the coordinator cleans (manifest-only).
+        wait_until(|| !pkg.join("frame.fits").exists()).await;
+        for id in [id_a, id_b] {
+            assert_eq!(
+                store.get_outbound(id).unwrap().unwrap().state,
+                OutboundState::Confirmed
+            );
+        }
+
+        // "Send again" on A's confirmed row: rebuild + rearm + reset + resend.
+        let (config, batches) = resend_fixtures(tmp.path());
+        let row_a = store.get_outbound(id_a).unwrap().unwrap();
+        let report = crate::resend::resend_in_place(
+            &store, &engine_a, Some(&coord), &config, &batches, &row_a,
+        )
+        .await
+        .expect("confirmed fan-out retry accepted");
+        assert!(report.rebuilt, "the cleaned dir was rebuilt from the original");
+        assert!(report.missing.is_empty() && report.changed.is_empty());
+
+        // A re-confirms → the re-armed 1-target gate closes → cleaned once more.
+        wait_until(|| {
+            store
+                .get_outbound(id_a)
+                .unwrap()
+                .is_some_and(|r| r.state == OutboundState::Confirmed && r.generation == 2)
+        })
+        .await;
+        wait_until(|| !pkg.join("frame.fits").exists()).await;
+        assert!(pkg.join(package::MANIFEST_FILENAME).exists(), "the manifest survives, as always");
+        let row_b = store.get_outbound(id_b).unwrap().unwrap();
+        assert_eq!(row_b.state, OutboundState::Confirmed);
+        assert_eq!(row_b.generation, 1, "the sibling's row was never touched");
 
         engine_a.shutdown().await;
         engine_b.shutdown().await;
@@ -2907,10 +3223,27 @@ mod batch_package_tests {
     fn build_batch_package_bundles_all_present_files() {
         let (config, cap, files) = three_capture_files();
         let input: Vec<_> = files.iter().map(|f| (cap.clone(), f.clone())).collect();
-        let (pkg_dir, included) = build_batch_package(&config, &input, &"aa".repeat(32)).unwrap();
-        assert_eq!(included, files, "every present file is included, in order");
-        let recs = athenaeum_core::package::read_manifest(&pkg_dir).unwrap();
+        let built = build_batch_package(&config, &input, &"aa".repeat(32)).unwrap();
+        assert_eq!(built.included, files, "every present file is included, in order");
+        let recs = athenaeum_core::package::read_manifest(&built.pkg_dir).unwrap();
         assert_eq!(recs.len(), 3); // one manifest, 3 records
+        // The announce manifest and the rebuild linkage mirror the records 1:1.
+        assert_eq!(built.files.len(), 3);
+        assert_eq!(
+            built.rel_sources,
+            files
+                .iter()
+                .map(|f| (
+                    f.file_name().unwrap().to_string_lossy().into_owned(),
+                    f.clone()
+                ))
+                .collect::<Vec<_>>(),
+            "rel_path → source pairs cover every packaged file"
+        );
+        assert!(
+            built.display_name.ends_with("(3 files)"),
+            "flat multi-file batch derives a dated fallback name"
+        );
     }
 
     #[test]
@@ -2918,13 +3251,61 @@ mod batch_package_tests {
         let (config, cap, files) = three_capture_files();
         std::fs::remove_file(&files[1]).unwrap(); // one gone before build
         let input: Vec<_> = files.iter().map(|f| (cap.clone(), f.clone())).collect();
-        let (pkg_dir, included) = build_batch_package(&config, &input, &"aa".repeat(32)).unwrap();
+        let built = build_batch_package(&config, &input, &"aa".repeat(32)).unwrap();
         // Only the two survivors are included — the vanished file is NOT (so the
         // batcher never marks it seen); order is preserved.
-        assert_eq!(included, vec![files[0].clone(), files[2].clone()]);
+        assert_eq!(built.included, vec![files[0].clone(), files[2].clone()]);
         assert_eq!(
-            athenaeum_core::package::read_manifest(&pkg_dir).unwrap().len(),
+            athenaeum_core::package::read_manifest(&built.pkg_dir).unwrap().len(),
             2
+        );
+    }
+}
+
+/// The human batch-name matrix ([`batch_display_name`]): single file → its
+/// filename; a shared first segment across nested rel_paths → the segment; any
+/// mix → the dated fallback.
+#[cfg(test)]
+mod display_name_tests {
+    use super::batch_display_name;
+
+    #[test]
+    fn batch_display_name_single_file_uses_filename() {
+        assert_eq!(
+            batch_display_name(&["m42/light-0001.fits".into()], "2026-07-22"),
+            "light-0001.fits"
+        );
+        assert_eq!(
+            batch_display_name(&["light-0001.fits".into()], "2026-07-22"),
+            "light-0001.fits"
+        );
+    }
+
+    #[test]
+    fn batch_display_name_common_first_segment_names_the_batch() {
+        let rels: Vec<String> = vec![
+            "m42/light-0001.fits".into(),
+            "m42/light-0002.fits".into(),
+            "m42/cal/dark-0001.fits".into(),
+        ];
+        assert_eq!(batch_display_name(&rels, "2026-07-22"), "m42 (3 files)");
+    }
+
+    #[test]
+    fn batch_display_name_mixed_segments_fall_back_to_date() {
+        let rels: Vec<String> = vec!["m42/a.fits".into(), "m31/b.fits".into()];
+        assert_eq!(
+            batch_display_name(&rels, "2026-07-22"),
+            "Perseus 2026-07-22 (2 files)"
+        );
+    }
+
+    #[test]
+    fn batch_display_name_flat_files_fall_back_to_date() {
+        let rels: Vec<String> = vec!["a.fits".into(), "b.fits".into()];
+        assert_eq!(
+            batch_display_name(&rels, "2026-07-22"),
+            "Perseus 2026-07-22 (2 files)"
         );
     }
 }

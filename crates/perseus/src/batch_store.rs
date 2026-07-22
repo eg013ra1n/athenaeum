@@ -20,7 +20,7 @@
 //! WAL mode (multiple connections to one WAL database are an explicitly supported
 //! SQLite pattern) and this agent is single-process.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
@@ -31,6 +31,20 @@ const DDL: &str = "CREATE TABLE IF NOT EXISTS perseus_batch (
     mode        TEXT NOT NULL,
     created_at  TEXT NOT NULL,
     file_count  INTEGER NOT NULL
+)";
+
+/// Per-file source linkage for a packaged batch: which capture file each
+/// manifest `rel_path` was copied from. This is what a confirmed-package
+/// rebuild ([`crate::resend`]) resolves sources through — after confirm the
+/// payload copies are cleaned and only the manifest survives, so re-sending a
+/// confirmed batch has to re-read the ORIGINAL capture files. Additive table
+/// (`CREATE IF NOT EXISTS`): batches recorded before this shipped simply have
+/// no rows here and fall back to the rebuild's reverse-mapping.
+const DDL_FILES: &str = "CREATE TABLE IF NOT EXISTS perseus_batch_files (
+    package_ref TEXT NOT NULL,
+    rel_path    TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    PRIMARY KEY (package_ref, rel_path)
 )";
 
 /// One recorded send-batch: the package it belongs to, whether it was sent
@@ -64,6 +78,8 @@ impl BatchStore {
         )
         .context("configure batch store pragmas")?;
         conn.execute(DDL, []).context("create perseus_batch")?;
+        conn.execute(DDL_FILES, [])
+            .context("create perseus_batch_files")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -91,6 +107,78 @@ impl BatchStore {
         )
         .context("upsert perseus_batch")?;
         Ok(())
+    }
+
+    /// Record (or refresh) the `rel_path → source capture file` linkage for a
+    /// packaged batch, one row per packaged file, in one transaction. Idempotent
+    /// upsert on `(package_ref, rel_path)` — a batcher retry can't duplicate
+    /// rows. Best-effort at the call sites (a failed write only degrades a
+    /// future rebuild to the reverse-mapping fallback, never fails the send).
+    pub fn record_files(&self, package_ref: &str, files: &[(String, PathBuf)]) -> Result<()> {
+        let conn = self.conn.lock().expect("batch store mutex poisoned");
+        let tx = conn
+            .unchecked_transaction()
+            .context("begin record_files")?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO perseus_batch_files (package_ref, rel_path, source_path)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(package_ref, rel_path) DO UPDATE SET
+                        source_path = excluded.source_path",
+                )
+                .context("prepare upsert perseus_batch_files")?;
+            for (rel_path, source_path) in files {
+                stmt.execute(params![
+                    package_ref,
+                    rel_path,
+                    source_path.to_string_lossy()
+                ])
+                .with_context(|| format!("upsert perseus_batch_files {rel_path}"))?;
+            }
+        }
+        tx.commit().context("commit record_files")
+    }
+
+    /// The recorded `rel_path → source capture file` pairs for `package_ref`,
+    /// ordered by `rel_path`. Empty for a batch recorded before the table
+    /// shipped (the rebuild then reverse-maps against the capture dirs).
+    pub fn files_for(&self, package_ref: &str) -> Result<Vec<(String, PathBuf)>> {
+        let conn = self.conn.lock().expect("batch store mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT rel_path, source_path FROM perseus_batch_files
+                 WHERE package_ref = ?1 ORDER BY rel_path ASC",
+            )
+            .context("prepare files_for")?;
+        let rows = stmt
+            .query_map(params![package_ref], |r| {
+                Ok((r.get::<_, String>(0)?, PathBuf::from(r.get::<_, String>(1)?)))
+            })
+            .context("query perseus_batch_files")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect perseus_batch_files rows")?;
+        Ok(rows)
+    }
+
+    /// Copy every `perseus_batch_files` row of `old_ref` under `new_ref`
+    /// (upsert), returning how many rows were cloned. The old rows are kept —
+    /// the divert path (`resend as new transfer`) leaves the declined batch as
+    /// history, and on a fan-out the old package dir is still live for sibling
+    /// targets.
+    pub fn clone_files(&self, old_ref: &str, new_ref: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("batch store mutex poisoned");
+        let n = conn
+            .execute(
+                "INSERT INTO perseus_batch_files (package_ref, rel_path, source_path)
+                 SELECT ?2, rel_path, source_path FROM perseus_batch_files
+                 WHERE package_ref = ?1
+                 ON CONFLICT(package_ref, rel_path) DO UPDATE SET
+                    source_path = excluded.source_path",
+                params![old_ref, new_ref],
+            )
+            .context("clone perseus_batch_files")?;
+        Ok(n)
     }
 
     /// List every recorded batch newest-first (`created_at` DESC, then
@@ -137,5 +225,49 @@ mod tests {
         // idempotent upsert on the same package_ref
         s.record("pkg-b", "manual", "2026-07-12T02:00:00Z", 5).unwrap();
         assert_eq!(s.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn record_files_roundtrip_and_idempotent_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = BatchStore::open(dir.path().join("perseus.db")).unwrap();
+        let files = vec![
+            ("a/light-1.fits".to_string(), PathBuf::from("/cap/a/light-1.fits")),
+            ("a/light-2.fits".to_string(), PathBuf::from("/cap/a/light-2.fits")),
+        ];
+        s.record_files("/pkg/one", &files).unwrap();
+        assert_eq!(s.files_for("/pkg/one").unwrap(), files);
+        assert!(s.files_for("/pkg/unknown").unwrap().is_empty());
+
+        // Re-record with a moved source: upsert, never a duplicate row.
+        let moved = vec![(
+            "a/light-1.fits".to_string(),
+            PathBuf::from("/cap2/a/light-1.fits"),
+        )];
+        s.record_files("/pkg/one", &moved).unwrap();
+        let rows = s.files_for("/pkg/one").unwrap();
+        assert_eq!(rows.len(), 2, "upsert must not duplicate (package_ref, rel_path)");
+        assert_eq!(rows[0].1, PathBuf::from("/cap2/a/light-1.fits"), "last write wins");
+    }
+
+    #[test]
+    fn clone_files_copies_rows_and_keeps_originals() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = BatchStore::open(dir.path().join("perseus.db")).unwrap();
+        let files = vec![
+            ("x.fits".to_string(), PathBuf::from("/cap/x.fits")),
+            ("y.fits".to_string(), PathBuf::from("/cap/y.fits")),
+        ];
+        s.record_files("/pkg/old", &files).unwrap();
+        assert_eq!(s.clone_files("/pkg/old", "/pkg/new").unwrap(), 2);
+        assert_eq!(s.files_for("/pkg/new").unwrap(), files, "clone carries the linkage");
+        assert_eq!(
+            s.files_for("/pkg/old").unwrap(),
+            files,
+            "the declined batch keeps its rows as history"
+        );
+        // Cloning again is an idempotent upsert.
+        assert_eq!(s.clone_files("/pkg/old", "/pkg/new").unwrap(), 2);
+        assert_eq!(s.files_for("/pkg/new").unwrap().len(), 2);
     }
 }

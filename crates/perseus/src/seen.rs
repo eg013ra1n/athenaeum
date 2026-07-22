@@ -212,6 +212,24 @@ impl SeenStore {
         }))
     }
 
+    /// Re-point every *live* (`deleted_at IS NULL`) linkage from `old_ref` to
+    /// `new_ref`, returning how many rows moved. Used by the divert path
+    /// (`resend declined as a new transfer`): the payload gets a fresh package
+    /// identity, and retention must follow it — a linkage left on the old ref
+    /// would never see the new transfer's confirm. Rows already handled by
+    /// retention (`deleted_at` set) are audit history and stay put.
+    pub fn relink_package(&self, old_ref: &str, new_ref: &str) -> Result<usize> {
+        let conn = self.conn.lock().expect("seen store mutex poisoned");
+        let n = conn
+            .execute(
+                "UPDATE perseus_seen SET package_ref = ?2
+                 WHERE package_ref = ?1 AND deleted_at IS NULL",
+                params![old_ref, new_ref],
+            )
+            .context("relink perseus_seen package_ref")?;
+        Ok(n)
+    }
+
     /// Stamp a source row `deleted_at = now` after retention removed it, so it
     /// never surfaces via [`source_for_package`](Self::source_for_package) again
     /// (the row itself is retained as a durable audit trail).
@@ -331,6 +349,28 @@ mod tests {
             store.source_for_package("/data/packages/uuid-1").unwrap(),
             None,
             "once retention has deleted a source it must never surface again"
+        );
+    }
+
+    #[test]
+    fn relink_package_moves_live_rows_only() {
+        let (_tmp, store) = store();
+        let live = PathBuf::from("/cap/light-0001.fits");
+        let dead = PathBuf::from("/cap/light-0002.fits");
+        store.mark_enqueued(&live, 100, 111, "/pkg/old").unwrap();
+        store.mark_enqueued(&dead, 200, 222, "/pkg/old").unwrap();
+        store.mark_deleted(&dead).unwrap();
+
+        assert_eq!(store.relink_package("/pkg/old", "/pkg/new").unwrap(), 1);
+        assert_eq!(
+            store.source_for_package("/pkg/new").unwrap(),
+            Some(SourceLink { path: live, size: 100, mtime_ms: 111 }),
+            "the live linkage follows the diverted package"
+        );
+        assert_eq!(
+            store.source_for_package("/pkg/old").unwrap(),
+            None,
+            "no live linkage remains on the old ref (the deleted row is audit-only)"
         );
     }
 
