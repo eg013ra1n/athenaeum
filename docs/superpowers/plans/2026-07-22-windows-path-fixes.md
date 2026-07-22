@@ -207,7 +207,7 @@ git commit -m "fix(files): dir-rename hot-sync builds prefixes with the native s
 - Test: both files' test mods
 
 **Interfaces:**
-- `sanitize_for_filename` keeps its signature `pub fn sanitize_for_filename(&str) -> String`; behavior change: trailing `.`/space trimmed, Windows reserved device names suffixed with `_`, `"."`/`".."` collapse to `""` (callers' `sanitized_or`/`token` fallbacks then apply). All existing callers (master/light paths, archive zip names, export folder names, sync slugs) inherit the hardening; `sync/receiver.rs::sanitize_batch_slug`'s own `.trim_matches('.')` becomes redundant but harmless — leave it (minimal scope).
+- `sanitize_for_filename` keeps its signature `pub fn sanitize_for_filename(&str) -> String`; behavior change: trailing `.`/space trimmed, Windows reserved device names suffixed with `_`, `"."`/`".."` collapse to `""` (callers' `sanitized_or`/`token` fallbacks then apply). All existing callers of THIS function (master/light paths, archive zip names, sync slugs) inherit the hardening — export folder names do NOT (they use their own `sanitize_display_folder_name` in `export/models.rs:242`, a separate audit gap left for backlog); `sync/receiver.rs::sanitize_batch_slug`'s own `.trim_matches('.')` becomes redundant but harmless — leave it (minimal scope).
 
 - [ ] **Step 1: Write the failing tests.** In `path_layout.rs` test mod:
 
@@ -762,6 +762,7 @@ git commit -m "fix(ui): Windows-safe coverage-root hint; boundary-safe Black Hol
 - `relinking/mod.rs:57,195` — `LIKE '{root}%'`: add trailing-separator boundary + `ESCAPE` for `%`/`_` (candidates are fingerprint-filtered today, so impact is accounting noise).
 - `db/operations.rs:78` `scan_root_prefix_predicate` (+ callers at `:381`, `:459`) — append the native separator to the root before building the range (sibling-name bleed, both platforms).
 - `DirectoryTree.tsx:49,164,209,217`, `DuplicateGroupCard.tsx:51` — boundary-less `startsWith` (display-level).
+- `export/models.rs:242` `sanitize_display_folder_name` — same trailing-dot/reserved-name gaps as the (now-fixed) shared sanitizer; export folders were NOT covered by Task 3.
 - `PathPolicy::check` case-insensitivity on Windows (dormant: only the web `AllowedRoots` transport, and Docker is Linux).
 - Byte-exact path identity as a design question (`files.path UNIQUE` under BINARY collation vs case-insensitive FS; drive-letter case, 8.3 names) — needs a normalization decision, not a spot fix.
 - Monitor-vs-registration ingest race guard (pause library-root monitor during a build).
