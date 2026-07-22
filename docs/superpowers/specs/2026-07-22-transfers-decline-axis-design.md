@@ -176,22 +176,24 @@ Store units (`store.rs` tests):
 - `declined_at_migration_backfills_receiver_declines` — legacy-shape table: `cancelled`+
   NULL error → backfilled; `cancelled`+`"by sender"` → NOT backfilled; `failed` → NOT;
   re-run is a no-op.
-- `upsert_inbound_attempt_finality_keys_on_declined_at` — revoked-cancelled row
-  (declined_at NULL) resets with generation bump; declined row untouched-final; declined
-  row with state later forced to `failed` still final.
+- Finality matrix — DELIVERED inside `upsert_inbound_attempt_batch_keyed_lifecycle`
+  (not a separate test): revoked-cancelled row (declined_at NULL) resets with
+  generation bump; declined row untouched-final; declined row with state later
+  forced to `failed` still final; re-stamp is first-write-wins.
 
-E2E (loopback harness, `engine_tests.rs` / `receiver.rs` tests):
+E2E (loopback harness, `engine_tests.rs` / `receiver.rs` tests; names as delivered):
 
 - `sender_cancel_then_resend_delivers` — the smoke №7 regression: cancel (revoke lands,
   receiver row `cancelled`/`"by sender"`) → resend → receiver resets (generation+1),
   fetches, ingests; sender confirms; no all-cancelled ack anywhere.
-- `decline_during_fetch_survives_restart_and_refuses_resend` — decline stamps
+- `decline_survives_restart_reconcile_and_refuses_resend` — decline stamps
   `declined_at` while row is `Fetching`; simulate restart (startup reconcile → `failed`);
   resend → all-cancelled ack from epilogue/replay, **no payload fetch**; sender terminal
-  *"cancelled by receiver"*.
-- `resend_of_declined_transfer_writes_history_once` — decline; resend ×2; receiver
-  `sync_history` rows for the batch == frame_count exactly once; second resend answered
-  from the receipt log (journal shows replay, not a second epilogue).
+  *"cancelled by receiver"*; a THIRD attempt replays from the seeded receipt log with
+  no duplicated history (the "history written once" behavior — no separate test by
+  the drafted `resend_of_declined_transfer_writes_history_once` name; the same pin
+  also lives in `cancelled_transfer_resend_is_reacked_cancelled_without_fetch` and
+  the extended `ack_replay_from_receipt_log`).
 
 Existing 18 transfer e2e must stay green unmodified except where they pin the old
 `cancelled_final` name.
