@@ -2924,6 +2924,227 @@ async fn retry_path_re_resolves_and_re_adds_peer_address() {
 }
 
 // ---------------------------------------------------------------------------
+// Item 3: an actively-pulled batch defers the ack-timeout ladder (serve ticks
+// push the deadline out) and a resumed tick disarms a retry armed mid-pull.
+// ---------------------------------------------------------------------------
+
+/// A scripted sender-side transport for the serve-activity test: it ACCEPTS every
+/// announce/serve, NEVER delivers an ack, and hands the worker an event channel
+/// whose sender the test keeps — so the test injects synthetic
+/// [`ServeProgress`](TransportEvent::ServeProgress) ticks and the ack-timeout
+/// ladder is driven purely by the per-package deadline (no real receiver). It
+/// records the announce count so the test can assert the mid-pull re-announce
+/// never fired, and captures the wire `package_id` minted on the first announce so
+/// the test can address its ticks at the live slot.
+struct ServeTickTransport {
+    node_id: NodeId,
+    /// The pre-made event receiver handed to the worker on `events()`. The paired
+    /// sender is retained by the test; no ack is ever sent through it.
+    rx: std::sync::Mutex<Option<mpsc::Receiver<TransportEvent>>>,
+    /// Number of `announce()` calls — 1 means no mid-pull re-announce ran.
+    announce_count: Arc<AtomicUsize>,
+    /// The `package_id` minted on the first announce (== the slot's announce id the
+    /// engine correlates `ServeProgress` against).
+    announced_pid: Arc<std::sync::Mutex<Option<PackageId>>>,
+}
+
+#[async_trait::async_trait]
+impl SharingTransport for ServeTickTransport {
+    async fn start(&self) -> anyhow::Result<StartInfo> {
+        Ok(StartInfo {
+            node_id: self.node_id,
+            pairing_ticket: String::new(),
+        })
+    }
+    async fn announce(
+        &self,
+        _to: NodeId,
+        a: &PackageAnnounce,
+        _batch_name: &str,
+        _batch_uuid: &str,
+        _files: &[AnnounceFileEntry],
+    ) -> anyhow::Result<()> {
+        self.announce_count.fetch_add(1, SeqCst);
+        *self.announced_pid.lock().unwrap() = Some(a.package_id.clone());
+        Ok(())
+    }
+    async fn fetch(
+        &self,
+        _from: NodeId,
+        _pkg: &PackageAnnounce,
+        _dest: &Path,
+        _sink: FetchSink,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn fetch_manifest(
+        &self,
+        _from: NodeId,
+        _pkg: &PackageAnnounce,
+        _dest: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        anyhow::bail!("fetch_manifest not supported by ServeTickTransport")
+    }
+    async fn serve(
+        &self,
+        _pkg: &PackageAnnounce,
+        _src: &Path,
+        _want: Option<&HashSet<String>>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn ack(
+        &self,
+        _to: NodeId,
+        _pid: &PackageId,
+        _r: Vec<FrameReceipt>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn release(&self, _pid: &PackageId) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn events(&self) -> mpsc::Receiver<TransportEvent> {
+        self.rx.lock().unwrap().take().expect("events() called once")
+    }
+}
+
+/// Item 3: while a peer is actively pulling, serve ticks push the ack-timeout
+/// deadline out — so the "waiting · retry in N min" ladder can NEVER fire mid-pull
+/// (no `next_retry_at`, no `ack_timeout` journal, no re-announce). Three phases:
+/// (1) steady ticks suppress the timeout entirely; (2) silence arms the ladder,
+/// then a resumed tick disarms it (countdown cleared, no re-announce); (3) full
+/// silence lets the ladder resume from the last-activity instant.
+#[tokio::test]
+async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
+    let tmp = tempdir().unwrap();
+    let peer: NodeId = *iroh::SecretKey::generate().public().as_bytes();
+
+    // The worker will consume `rx`; the test keeps `tx` to inject synthetic serve
+    // ticks and never sends an ack (the ladder is deadline-driven).
+    let (tx, rx) = mpsc::channel::<TransportEvent>(64);
+    let announce_count = Arc::new(AtomicUsize::new(0));
+    let announced_pid = Arc::new(std::sync::Mutex::new(None::<PackageId>));
+    let transport = Arc::new(ServeTickTransport {
+        node_id: peer,
+        rx: std::sync::Mutex::new(Some(rx)),
+        announce_count: Arc::clone(&announce_count),
+        announced_pid: Arc::clone(&announced_pid),
+    });
+
+    // Short ack timeout so the whole ladder runs in well under a second; every wait
+    // below scales to this base (backoff rung 1 = 2× base = 400ms).
+    let ack_timeout = Duration::from_millis(200);
+    let pkg = build_package(&tmp.path().join("src-serve"), "uuid-serve", "f.fits", "M8", 1024);
+    let db_path = tmp.path().join("sync.db");
+    let store = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
+    let engine = SyncEngine::spawn_inner(
+        store.clone() as Arc<dyn SyncStore>,
+        transport as Arc<dyn SharingTransport>,
+        peer,
+        SyncConfig { ack_timeout },
+        None,
+        None,
+        None,
+    );
+
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+
+    // The first announce mints the wire package_id + arms the ack-wait deadline.
+    wait_until(|| announced_pid.lock().unwrap().is_some(), WAIT).await;
+    let pid = announced_pid.lock().unwrap().clone().unwrap();
+    assert_eq!(announce_count.load(SeqCst), 1, "exactly one announce so far");
+
+    // ---- Phase 1: steady ticks suppress the ack timeout entirely. -------------
+    // Tick every ~40ms (well under the 200ms ack timeout) for > 3× the timeout.
+    // Each tick pushes the deadline out, so the ladder can never fire and the row
+    // never enters the "waiting · retry" presentation (next_retry_at is the
+    // persisted countdown behind that UI state).
+    for i in 0..16u64 {
+        tx.send(TransportEvent::ServeProgress {
+            package_id: pid.clone(),
+            bytes_sent: (i + 1) * 64,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(
+            store.get_outbound(id).unwrap().unwrap().next_retry_at,
+            None,
+            "an actively-pulled batch must never arm a retry countdown (tick {i})"
+        );
+    }
+    let kinds = sent_event_kinds(&db_path, id);
+    assert!(
+        !kinds.contains(&"ack_timeout".to_string()),
+        "steady serve ticks must suppress the ack timeout, got {kinds:?}"
+    );
+    assert_eq!(
+        announce_count.load(SeqCst),
+        1,
+        "no mid-pull re-announce while the peer is actively pulling"
+    );
+
+    // ---- Phase 2: silence arms the ladder; a resumed tick disarms it. ---------
+    // Stop ticking → the last-pushed AwaitAck deadline (200ms) elapses → the ack
+    // timeout fires: next_retry_at is set and a Retry is armed (rung 1, 400ms).
+    wait_until(
+        || store.get_outbound(id).unwrap().unwrap().next_retry_at.is_some(),
+        WAIT,
+    )
+    .await;
+    let kinds = sent_event_kinds(&db_path, id);
+    assert!(
+        kinds.contains(&"ack_timeout".to_string()),
+        "silence must let one ack timeout fire, got {kinds:?}"
+    );
+    // The Retry deadline is 400ms out; the arm itself did not re-announce yet.
+    assert_eq!(
+        announce_count.load(SeqCst),
+        1,
+        "arming the ladder does not itself re-announce"
+    );
+
+    // Resume ticks BEFORE the 400ms backoff elapses: the first tick flips the armed
+    // Retry back to AwaitAck and clears the persisted countdown.
+    let mut cleared = false;
+    for _ in 0..50 {
+        tx.send(TransportEvent::ServeProgress {
+            package_id: pid.clone(),
+            bytes_sent: 4096,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if store.get_outbound(id).unwrap().unwrap().next_retry_at.is_none() {
+            cleared = true;
+            break;
+        }
+    }
+    assert!(cleared, "a resumed serve tick must cancel the armed retry countdown");
+    // The disarmed Retry never fired — the flip pre-empted the re-announce.
+    assert_eq!(
+        announce_count.load(SeqCst),
+        1,
+        "the disarmed retry must not re-announce mid-pull"
+    );
+
+    // ---- Phase 3: full silence resumes the ladder. ----------------------------
+    // With no more ticks, the last-pushed deadline elapses and the ack timeout
+    // fires again — the ladder climbs from the last-activity instant.
+    wait_until(
+        || store.get_outbound(id).unwrap().unwrap().next_retry_at.is_some(),
+        WAIT,
+    )
+    .await;
+    // And the armed Retry eventually re-announces (the FULL ladder resumed once the
+    // peer went quiet, not just the countdown).
+    wait_until(|| announce_count.load(SeqCst) >= 2, WAIT).await;
+
+    engine.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
 // Task 3.6: a classified dial failure + a fresh re-resolve REPLACES (not merges)
 // the peer's stale address-lookup entry, so a dead relay URL can't survive.
 // ---------------------------------------------------------------------------

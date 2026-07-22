@@ -1783,6 +1783,62 @@ impl Worker {
         }
     }
 
+    /// Record that the peer is actively pulling this package's payload and push the
+    /// ack-timeout ladder out to one [`ack_timeout`](SyncConfig::ack_timeout) from
+    /// *this* instant. Called on every serve tick ([`on_serve_progress`](Self::on_serve_progress),
+    /// [`on_serve_file_progress`](Self::on_serve_file_progress),
+    /// [`on_serve_complete`](Self::on_serve_complete)) after the caller has resolved
+    /// the slot `id` from the tick's `package_id`.
+    ///
+    /// Fixes the "waiting · retry in N min" at 7.7 MB/s bug: without this, an
+    /// actively-pulled multi-GB batch hits the ack timeout mid-pull, so
+    /// [`handle_timeouts`](Self::handle_timeouts) climbs a backoff rung, persists
+    /// `next_retry_at` (the UI renders "waiting" + a countdown while bytes are still
+    /// flowing), and the armed [`Retry`](NextAction::Retry) re-announces
+    /// MID-TRANSFER. Resetting the deadline on every tick means the ladder can only
+    /// fire once the peer has genuinely gone quiet for a full `ack_timeout`.
+    ///
+    /// The in-memory deadline reset runs on every tick — serve ticks are throttled
+    /// ≥300ms upstream (`SERVE_PROGRESS_THROTTLE`), so in-memory writes are free. The
+    /// DB write ([`clear_next_retry`](Self::clear_next_retry)) happens ONLY on the
+    /// `Retry → AwaitAck` flip (once per armed cycle), never per tick.
+    ///
+    /// Interactions this deliberately produces:
+    /// - **Post-`ServeComplete` window**: `on_serve_complete` also notes activity, so
+    ///   the ack window stays one `ack_timeout` from the *last* activity. A long
+    ///   receiver ingest can still outlast that window and fire the ladder — its
+    ///   re-announce is harmless: the receiver answers it from its receipt log (the
+    ///   pure-replay guard), no duplicate ingest.
+    /// - **send-now kick during an active pull**: [`kick_one`](Self::kick_one)
+    ///   collapses the deadline to `now` and arms a `Retry`; the very next serve tick
+    ///   deliberately undoes that (flips back to `AwaitAck`, deadline pushed out).
+    ///   Re-announcing to a peer that is already pulling is pointless.
+    /// - **cancelling an ANNOUNCE-failure-armed `Retry`** ([`arm_retry`](Self::arm_retry)):
+    ///   the flip also disarms a retry that was armed by an announce/build/serve
+    ///   failure. Correct by construction — a serve tick proves the peer holds a
+    ///   valid announce for the CURRENT wire id and is pulling it, so a re-announce
+    ///   is pointless; if the ack never comes, the ladder resumes from the last tick.
+    fn note_serve_activity(&mut self, id: i64) {
+        let flipped = if let Some(p) = self.pending.get_mut(&id) {
+            p.deadline = Instant::now() + self.config.ack_timeout;
+            if p.next_action == NextAction::Retry {
+                p.next_action = NextAction::AwaitAck;
+                p.rung = 0;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        // The `&mut self.pending` borrow is dropped above; the persisted-countdown
+        // clear + log run ONLY on the flip (once per armed cycle), never per tick.
+        if flipped {
+            self.clear_next_retry(id);
+            tracing::info!(package_id = id, "armed retry cancelled; peer is actively pulling");
+        }
+    }
+
     /// Turn a transport [`ServeProgress`](TransportEvent::ServeProgress) tick into
     /// a send-side `sync-progress` `transferring` event carrying byte figures
     /// (Task 13). Locates the pending slot whose minted announce carries this
@@ -1805,6 +1861,10 @@ impl Worker {
             tracing::debug!(package_id = %package_id.0, "serve-progress for no pending slot; dropped");
             return;
         };
+
+        // The peer is actively pulling: push the ack-timeout ladder out and disarm
+        // any retry armed mid-pull (item 3 fix) before the byte-figure emit below.
+        self.note_serve_activity(id);
 
         // §D5: the first serve tick after a retry clears the stale `last_error` +
         // resets the attempt class — a transfer actually moving bytes must never
@@ -1862,6 +1922,10 @@ impl Worker {
             tracing::debug!(package_id = %package_id.0, "serve-complete for no pending slot; dropped");
             return;
         };
+
+        // The peer just finished pulling: the post-`ServeComplete` ack window starts
+        // one `ack_timeout` from HERE (item 3 fix); also disarms a mid-pull retry.
+        self.note_serve_activity(id);
 
         // §D4: mark every still-in-flight per-file row `uploaded` (the peer pulled
         // everything it asked for). Rows already settled `done` (a want-subset
@@ -1935,6 +1999,10 @@ impl Worker {
             tracing::debug!(package_id = %package_id.0, "serve-file-progress for no pending slot; dropped");
             return;
         };
+
+        // The peer is actively pulling this file: push the ack-timeout ladder out and
+        // disarm any mid-pull retry (item 3 fix) before the per-file persist below.
+        self.note_serve_activity(id);
 
         // §D4: persist the per-file lifecycle, keyed by `file` (the transport's
         // forward-slash `rel_path`, == the `sync_outbound_files.rel_path` — the
