@@ -660,6 +660,14 @@ pub fn mkdir_in_scan_root(ctx: &ServiceContext, path: String, policy: &PathPolic
     })
 }
 
+/// Directory-rename prefixes for `rename_files_path_prefix`, built with the
+/// path's own native separator (the doc contract there requires a trailing
+/// separator; hardcoding '/' silently matched zero rows on Windows).
+fn dir_rename_prefixes(old_str: &str, new_str: &str) -> (String, String) {
+    let sep = crate::db::native_separator_of(old_str);
+    (format!("{old_str}{sep}"), format!("{new_str}{sep}"))
+}
+
 /// Rename a file or directory in place. Same-folder rename only (i.e., no
 /// path traversal). Hot-syncs the catalog: for a file, updates `files.path`
 /// and `files.filename`; for a directory, updates every `files.path` whose
@@ -733,8 +741,7 @@ pub fn rename_path(
         // Recursively rewire every catalog row under the renamed folder via
         // the SUBSTR-based prefix swap (REPLACE is unsafe — see
         // `rename_files_path_prefix` doc).
-        let prefix_old = format!("{}/", old_str);
-        let prefix_new = format!("{}/", new_str);
+        let (prefix_old, prefix_new) = dir_rename_prefixes(&old_str, &new_str);
         let updated = crate::db::rename_files_path_prefix(&conn, &prefix_old, &prefix_new)?;
         tracing::info!(count = updated, src = %old_str, path = %new_str, "rename hot-synced catalog rows under directory");
     } else {
@@ -871,5 +878,22 @@ mod mkdir_target_tests {
         let policy = PathPolicy::AllowAll;
         let target = root.join("nonexistent-parent").join("child");
         assert!(resolve_mkdir_target(&target.to_string_lossy(), &policy).is_err());
+    }
+}
+
+#[cfg(test)]
+mod dir_rename_prefix_tests {
+    use super::*;
+
+    #[test]
+    fn dir_rename_prefixes_use_native_separator() {
+        assert_eq!(
+            dir_rename_prefixes(r"C:\data\Old", r"C:\data\New"),
+            (r"C:\data\Old\".to_string(), r"C:\data\New\".to_string())
+        );
+        assert_eq!(
+            dir_rename_prefixes("/data/Old", "/data/New"),
+            ("/data/Old/".to_string(), "/data/New/".to_string())
+        );
     }
 }

@@ -4188,6 +4188,27 @@ mod bulk_metadata_tests {
         ]);
     }
 
+    #[test]
+    fn rename_files_path_prefix_windows_backslash() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_frame(&conn, r"C:\data\Old\a.fits", Some("Light"));
+        insert_frame(&conn, r"C:\data\Old\sub\b.fits", Some("Light"));
+        insert_frame(&conn, r"C:\data\Oldextra\c.fits", Some("Light"));
+
+        let n = rename_files_path_prefix(&conn, r"C:\data\Old\", r"C:\data\New\").unwrap();
+        assert_eq!(n, 2, "both descendants rewired, sibling-prefix folder untouched");
+
+        let moved: i64 = conn
+            .query_row(
+                r"SELECT COUNT(*) FROM files WHERE path LIKE 'C:\data\New\%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved, 2);
+    }
+
     /// Stash a believable FITS header text for a frame so the override
     /// recomputation has something to compare against.
     fn insert_fits_header_for_file(conn: &Connection, file_id: i64, header_text: &str) {
