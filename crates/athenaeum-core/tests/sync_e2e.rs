@@ -1292,14 +1292,162 @@ async fn receiver_cancel_is_final_then_resend_reacked_cancelled() {
     wait_until(|| outbound_state(cdb, old_id) == "cancelled", WAIT).await;
 
     // No delivery: no frames, no files, and STILL exactly one inbound row (batch-
-    // keyed) — the declined transfer, not a second wire-keyed row.
+    // keyed) — the declined transfer, not a second wire-keyed row. The row's
+    // `package_id` is the RESEND's wire id (Decline Finality Axis §D5: the receipt
+    // anchor rotates to the newest fully-receipted attempt), its state stays
+    // Cancelled, and the decline is durable on the `declined_at` axis.
     assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "a declined transfer delivers no frames on resend");
     assert_eq!(landed_count(&designated), 0, "the resend of a declined transfer lands no files");
     assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 1, "the batch keeps ONE inbound row across the resend");
     assert_eq!(
-        inbound_row(pdb, &wire_pkg).map(|(s, _, _)| s).as_deref(),
+        inbound_row(pdb, &resend_wire).map(|(s, _, _)| s).as_deref(),
         Some("cancelled"),
-        "the batch-keyed inbound row stays Cancelled — final, never resurrected"
+        "the batch-keyed inbound row stays Cancelled (anchored on the resend's wire id) — final, never resurrected"
+    );
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM sync_inbound WHERE declined_at IS NOT NULL"),
+        1,
+        "the decline is recorded on the transfer-level finality axis"
+    );
+
+    engine.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// Owner smoke №7 (Decline Finality Axis §D3/§D4) — **a sender cancel is NOT a
+/// receiver decline; the sender's own resend delivers**: cancel a live send via
+/// the real command (`cancel_sync_package` → terminal row + `Revoke{Cancelled}`),
+/// then resend via the real command (`retry_sync_package`). The receiver — whose
+/// row was at most attempt-cancelled "by sender", never declined — must reset the
+/// SAME batch-keyed row and ingest, and the sender must reach `confirmed`.
+/// Pre-fix, the receiver hit cancelled-is-final and re-acked all-cancelled
+/// forever: sender showed "cancelled by receiver", receiver "by sender".
+///
+/// The revoke races the engine's retry re-announces (a re-announce may have
+/// stamped the row `failed` before the revoke lands, making the revoke a
+/// no-op on a terminal row) — both interleavings are legitimate, so this test
+/// asserts the interleaving-independent user story: after cancel + resend, the
+/// transfer DELIVERS and nobody records a decline. The deterministic
+/// revoke→cancelled→resend path is pinned by the receiver-level unit e2e
+/// `sender_cancel_then_resend_fetches_and_ingests`.
+#[tokio::test]
+async fn sender_cancel_then_resend_delivers() {
+    const N: usize = 3;
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    // Hold the payload fetch aborting so the cancel always lands before any ingest.
+    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    let (engine, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
+
+    let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
+    for idx in 0..N {
+        let (fid, _uuid, _object, _exptime) = insert_capture_frame(&capture_ctx, &capture_files, idx);
+        frame_ids.push(fid);
+    }
+
+    let _r = enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids.clone(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("enqueue selection");
+    let old_id = latest_outbound_id(cdb);
+
+    // Wait for the announce to surface an inbound row (re-arming the one-shot
+    // abort fault each poll so no fetch completes), then CANCEL via the real
+    // command: terminal `cancelled` + a Revoke{Cancelled} for the live wire id.
+    wait_until(
+        || {
+            receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+            latest_inbound_package_id(pdb).is_some()
+        },
+        WAIT,
+    )
+    .await;
+    // Re-arm once more right before the cancel: the exit iteration's one-shot
+    // fault may have been consumed by a retry fetch in the gap, and a completed
+    // fetch here would flake the landed_count == 0 assertion below.
+    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+    cancel_sync_package(&sender, old_id).await.expect("cancel the live send");
+    wait_until(|| outbound_state(cdb, old_id) == "cancelled", WAIT).await;
+    assert_eq!(landed_count(&designated), 0, "nothing landed before the cancel");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM sync_inbound WHERE declined_at IS NOT NULL"),
+        0,
+        "a sender cancel NEVER records a receiver decline"
+    );
+
+    // Disarm the fault and resend via the sanctioned command: the SAME row resets
+    // and this time the transfer must DELIVER.
+    receiver_ep.set_fault(FaultPlan::default());
+    let resend_id =
+        retry_sync_package(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
+            .await
+            .expect("resend a sender-cancelled package");
+    assert_eq!(resend_id, old_id, "resend-as-reset returns the SAME row");
+
+    wait_until(|| outbound_state(cdb, old_id) == "confirmed", WAIT).await;
+    assert_eq!(
+        outbound_state(cdb, old_id),
+        "confirmed",
+        "the resend of a sender-cancelled transfer confirms — the smoke-№7 brick is gone"
+    );
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), N as i64, "every frame ingested on the resend");
+    assert_eq!(landed_count(&designated), N, "every file landed on the resend");
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 1, "ONE batch-keyed inbound row across cancel + resend");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM sync_inbound WHERE declined_at IS NOT NULL"),
+        0,
+        "delivery never invents a decline"
+    );
+    assert_eq!(
+        outbound_last_error(cdb, old_id).as_deref(),
+        None,
+        "no cross-blame left on the sender row after the confirmed resend"
     );
 
     engine.shutdown().await;

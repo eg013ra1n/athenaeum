@@ -2104,6 +2104,7 @@ mod identity_schema_tests {
             ("sync_inbound", "display_name"),
             ("sync_inbound", "batch_uuid"),
             ("sync_inbound", "project_id"),
+            ("sync_inbound", "declined_at"),
         ] {
             assert!(
                 column_exists(&legacy, table, col).unwrap(),

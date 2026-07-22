@@ -97,8 +97,12 @@ impl OutboundState {
 /// Mirrors [`OutboundState`]'s `as_str`/`from_db`/`is_terminal` shape. The
 /// receiver walks a package `Announced → Fetching → Ingesting → Done` and stamps
 /// `Failed` (with a `last_error`) when a fetch fails or every frame is rejected.
-/// [`Cancelled`](Self::Cancelled) is the receiver-decline terminal (Task 12) and
-/// is **final**: a re-announce never resurrects a cancelled row. Terminal states
+/// [`Cancelled`](Self::Cancelled) is the **attempt-level** cancelled terminal — a
+/// receiver decline OR a sender revoke (`last_error = "by sender"`). Whether the
+/// TRANSFER is final lives on the separate `declined_at` axis
+/// ([`InboundRow::declined_at`], Decline Finality Axis §D3): a declined row
+/// refuses every re-announce; a merely revoke-cancelled row resets on the
+/// sender's resend like any other attempt terminal. Terminal states
 /// ([`Done`](Self::Done), [`Failed`](Self::Failed), [`Cancelled`](Self::Cancelled))
 /// are excluded from [`inbound_active`](super::store::inbound_active).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -115,10 +119,19 @@ pub enum InboundState {
     Done,
     /// Terminal failure: the fetch failed, or every frame was rejected.
     Failed,
-    /// Terminal receiver-decline (Task 12). Final — a re-announce leaves the row
-    /// untouched (the caller checks state before fetching).
+    /// Attempt cancelled — by the receiving user (decline) or by a sender revoke
+    /// (`"by sender"`). NOT the finality signal by itself: transfer-level decline
+    /// finality is `declined_at` (Decline Finality Axis §D3).
     Cancelled,
 }
+
+/// The `last_error` detail `handle_revoke` stamps on a sender-cancelled inbound
+/// row. LOAD-BEARING STRING, single Rust source: the `declined_at` migration
+/// backfill excludes exactly this detail so sender revokes never become receiver
+/// declines (Decline Finality Axis §D1), and the frontend maps it to "Cancelled
+/// by the sending device" (`src/components/transfers/presentation.ts` — keep the
+/// TS literal in sync by hand, it cannot share a Rust const).
+pub const REVOKED_BY_SENDER_DETAIL: &str = "by sender";
 
 impl InboundState {
     /// Stable lowercase text stored in the `state` column.
@@ -221,6 +234,16 @@ pub struct InboundRow {
     /// has a clean "attempt N" that ignores announce churn.
     #[serde(default)]
     pub generation: u32,
+    /// Transfer-level receiver-decline marker (Decline Finality Axis §D1):
+    /// non-NULL ⇔ the receiving user declined this transfer and it is FINAL — every
+    /// re-announce is re-acked all-cancelled without fetching, regardless of what
+    /// the attempt-level [`state`](Self::state) says by now (a restart reconcile
+    /// may overwrite it to `failed`; a sender revoke writes `cancelled` without
+    /// touching this). Stamped first-write-wins by
+    /// [`set_inbound_declined_at`](super::store::set_inbound_declined_at); never
+    /// written by `handle_revoke`.
+    #[serde(default)]
+    pub declined_at: Option<String>,
 }
 
 /// Direction of a transfer recorded in [`HistoryRow`]. This sender-side task

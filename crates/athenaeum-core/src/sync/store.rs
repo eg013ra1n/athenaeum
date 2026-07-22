@@ -199,6 +199,7 @@ pub const DDL_INBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_inbound (
     batch_uuid TEXT,
     project_id TEXT,
     generation INTEGER NOT NULL DEFAULT 1,
+    declined_at TEXT,
     UNIQUE(peer, package_id)
 )";
 
@@ -223,6 +224,26 @@ pub fn ensure_inbound_columns(conn: &Connection) -> Result<()> {
         .context("query table_info(sync_inbound)")?
         .filter_map(|c| c.ok())
         .collect();
+    // One atomic unit: the ALTERs and the declined_at backfill commit together
+    // (SQLite DDL is transactional), so a crash between "column added" and
+    // "backfill ran" can never strand a half-migrated table — the next open
+    // would otherwise see the column present and skip the backfill forever.
+    conn.execute("SAVEPOINT ensure_inbound_cols", [])
+        .context("open ensure_inbound_cols savepoint")?;
+    let result = ensure_inbound_columns_inner(conn, &existing);
+    if result.is_ok() {
+        conn.execute("RELEASE ensure_inbound_cols", [])
+            .context("release ensure_inbound_cols savepoint")?;
+    } else {
+        // Best-effort unwind; the original error is the one worth surfacing.
+        let _ = conn.execute("ROLLBACK TO ensure_inbound_cols", []);
+        let _ = conn.execute("RELEASE ensure_inbound_cols", []);
+    }
+    result
+}
+
+/// The migration body of [`ensure_inbound_columns`], run inside its savepoint.
+fn ensure_inbound_columns_inner(conn: &Connection, existing: &HashSet<String>) -> Result<()> {
     for (col, ty) in [
         ("display_name", "TEXT"),
         ("landing_dir", "TEXT"),
@@ -236,11 +257,32 @@ pub fn ensure_inbound_columns(conn: &Connection) -> Result<()> {
         // NOT NULL DEFAULT 1 is a constant default, so ALTER ADD COLUMN back-fills
         // every existing row to generation 1.
         ("generation", "INTEGER NOT NULL DEFAULT 1"),
+        // Decline Finality Axis (spec §D1): non-NULL ⇔ the receiving user declined
+        // this transfer — the transfer-level finality marker, independent of the
+        // attempt-level `state` column (which sender revokes / restart reconcile /
+        // epilogues legitimately overwrite).
+        ("declined_at", "TEXT"),
     ] {
         if !existing.contains(col) {
             conn.execute(&format!("ALTER TABLE sync_inbound ADD COLUMN {col} {ty}"), [])
                 .with_context(|| format!("add sync_inbound.{col} column"))?;
         }
+    }
+    // One-shot backfill, only when `declined_at` was just created (spec §D1): on a
+    // pre-axis DB the only `cancelled` rows with `last_error` equal to
+    // [`REVOKED_BY_SENDER_DETAIL`] are sender revokes (must NOT become declines);
+    // every other `cancelled` row is a genuine receiver decline. One canonical
+    // statement — `created_at`/`finished_at`/`last_error` are in the base DDL of
+    // every real shape, so there is deliberately NO column-tolerant fallback (a
+    // silently degraded predicate here would reclassify revokes as declines).
+    if !existing.contains("declined_at") {
+        conn.execute(
+            "UPDATE sync_inbound SET declined_at = COALESCE(finished_at, created_at)
+             WHERE state = 'cancelled'
+               AND (last_error IS NULL OR last_error <> ?1)",
+            params![crate::sync::models::REVOKED_BY_SENDER_DETAIL],
+        )
+        .context("backfill sync_inbound.declined_at")?;
     }
     Ok(())
 }
@@ -741,6 +783,7 @@ fn inbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<InboundRaw> {
     Ok((
         r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
         r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?, r.get(14)?,
+        r.get(15)?,
     ))
 }
 
@@ -1175,7 +1218,7 @@ pub fn load_receipts(conn: &Connection, package_id: &str) -> Result<Vec<FrameRec
 // package_id)` UNIQUE constraint anchors the upsert.
 
 const INBOUND_COLS: &str =
-    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at, display_name, landing_dir, batch_uuid, project_id, generation";
+    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at, display_name, landing_dir, batch_uuid, project_id, generation, declined_at";
 
 /// Raw column tuple for a `sync_inbound` row, parsed into [`InboundRow`] by
 /// [`to_inbound`] so fallible text parsing happens outside the rusqlite closure.
@@ -1195,6 +1238,7 @@ type InboundRaw = (
     Option<String>,
     Option<String>,
     i64,
+    Option<String>,
 );
 
 fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
@@ -1214,6 +1258,7 @@ fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
         batch_uuid,
         project_id,
         generation,
+        declined_at,
     ) = raw;
     Ok(InboundRow {
         id,
@@ -1231,16 +1276,23 @@ fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
         batch_uuid,
         project_id,
         generation: generation.max(0) as u32,
+        declined_at,
     })
 }
 
+/// RETIRED from the production announce path (the receiver keys on
+/// [`upsert_inbound_attempt`] since the Batch Model) — kept as a test seeder.
+/// NB its `cancelled`-is-final CASE guard encodes the PRE-axis semantics; live
+/// finality is `declined_at` (Decline Finality Axis §D3), so don't pin new
+/// decline behavior through this helper.
+///
 /// Upsert the inbound row for `(peer_hex, package_id)` to `announced`, returning
 /// its durable id. A first announce inserts a fresh `announced` row; a
 /// re-announce (redelivery) refreshes `frame_count`/`byte_size`, resets the state
 /// back to `announced`, and clears `bytes_done`/`last_error`/`finished_at` so the
 /// row honestly reflects a restarting fetch — **except** when the existing row is
-/// `cancelled`, which is final: a cancelled row is left completely untouched (the
-/// caller checks its state before deciding to fetch). See [`DDL_INBOUND`].
+/// `cancelled`, which is left completely untouched (the caller checks its state
+/// before deciding to fetch). See [`DDL_INBOUND`].
 pub fn upsert_inbound_announced(
     conn: &Connection,
     peer_hex: &str,
@@ -1420,12 +1472,16 @@ pub fn get_inbound_by_batch(
 ///   `byte_size` refreshed, and `generation += 1` (the user-facing "attempt N"
 ///   counter — §D5). `display_name` and `landing_dir` are PRESERVED — a
 ///   resend keeps its name and lands into the same tree.
-/// - **Cancelled is final**: an existing `cancelled` row is left COMPLETELY
-///   untouched and returned with `cancelled_final = true`, so the receiver keeps
-///   Cancelled-is-final semantics (re-ack cancelled rather than re-fetch). Every
-///   other case returns `cancelled_final = false`.
+/// - **Declined is final** (Decline Finality Axis §D3): a row with a non-NULL
+///   `declined_at` is left COMPLETELY untouched and returned with
+///   `declined_final = true`, so the receiver re-acks the decline rather than
+///   re-fetching — regardless of what the attempt-level `state` says by now (a
+///   restart reconcile may have overwritten it to `failed`). A sender-revoked
+///   `cancelled` row has `declined_at` NULL and resets like any other attempt
+///   terminal, so a sender's resend after its own cancel works. Every other case
+///   returns `declined_final = false`.
 ///
-/// Returns `(id, cancelled_final)`. The `SELECT`-then-write is safe because the
+/// Returns `(id, declined_final)`. The `SELECT`-then-write is safe because the
 /// receiver holds the only connection that writes inbound rows and processes
 /// announces serially (same single-writer assumption as [`upsert_inbound_announced`]).
 pub fn upsert_inbound_attempt(
@@ -1436,18 +1492,18 @@ pub fn upsert_inbound_attempt(
     frame_count: u32,
     byte_size: u64,
 ) -> Result<(i64, bool)> {
-    let existing: Option<(i64, String)> = conn
+    let existing: Option<(i64, Option<String>)> = conn
         .query_row(
-            "SELECT id, state FROM sync_inbound WHERE peer = ?1 AND batch_uuid = ?2",
+            "SELECT id, declined_at FROM sync_inbound WHERE peer = ?1 AND batch_uuid = ?2",
             params![peer_hex, batch_uuid],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .context("look up sync_inbound by (peer, batch_uuid)")?;
     match existing {
-        // Cancelled-is-final: leave the row untouched, signal the caller.
-        Some((id, state)) if state == InboundState::Cancelled.as_str() => Ok((id, true)),
-        Some((id, _)) => {
+        // Declined-is-final: leave the row untouched, signal the caller.
+        Some((id, Some(_))) => Ok((id, true)),
+        Some((id, None)) => {
             conn.execute(
                 "UPDATE sync_inbound
                  SET state = ?1, package_id = ?2, frame_count = ?3, byte_size = ?4,
@@ -1503,6 +1559,58 @@ pub fn set_outbound_display_name(conn: &Connection, id: i64, display_name: Optio
         params![display_name, id],
     )
     .with_context(|| format!("set display_name for outbound {id}"))?;
+    Ok(())
+}
+
+/// Stamp the transfer-level receiver-decline marker on an inbound row (Decline
+/// Finality Axis §D2). First-write-wins (`COALESCE`): re-stamping an already
+/// declined row is a no-op, so the earliest decline instant is preserved across
+/// the primary write (`cancel_incoming_package`) and the two repair sites
+/// (cancel epilogue / all-cancelled replay). Keyed by row `id` — deliberately NOT
+/// the `state` column, so this is safe to write while a fetch is live (no race
+/// with the fetch loop's state writes) and survives any later `state` overwrite
+/// (sender revoke, restart reconcile).
+pub fn set_inbound_declined_at(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_inbound SET declined_at = COALESCE(declined_at, ?1) WHERE id = ?2",
+        params![now_iso(), id],
+    )
+    .with_context(|| format!("set declined_at for inbound {id}"))?;
+    Ok(())
+}
+
+/// Rotate a declined row's `package_id` to the wire id of the attempt that holds
+/// (or is about to hold) its authoritative full `Cancelled` receipt set (Decline
+/// Finality Axis §D5). Invariant: a declined row's `package_id` always names the
+/// receipt-anchor wire id, so the resend seeding (`load_receipts(row.package_id)`)
+/// finds the newest set instead of orphaning it — and every downstream
+/// `package_id`-keyed write in the epilogue matches the row again. Keyed by row
+/// `id`; rotating to the already-current wire id is a no-op-shaped write.
+pub fn rotate_inbound_package_id(conn: &Connection, id: i64, wire_package_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_inbound SET package_id = ?1 WHERE id = ?2",
+        params![wire_package_id, id],
+    )
+    .with_context(|| format!("rotate package_id for inbound {id}"))?;
+    Ok(())
+}
+
+/// [`set_inbound_declined_at`] + [`rotate_inbound_package_id`] as ONE statement —
+/// the cancel epilogue's entry write (Decline Finality Axis §D2 repair 1 + §D5),
+/// merged so the serial receiver loop pays one commit instead of two while
+/// holding the store lock.
+pub fn mark_inbound_declined_with_anchor(
+    conn: &Connection,
+    id: i64,
+    wire_package_id: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_inbound
+         SET declined_at = COALESCE(declined_at, ?1), package_id = ?2
+         WHERE id = ?3",
+        params![now_iso(), wire_package_id, id],
+    )
+    .with_context(|| format!("mark inbound {id} declined with anchor"))?;
     Ok(())
 }
 
@@ -2969,6 +3077,7 @@ mod tests {
             conn.execute(
                 "CREATE TABLE sync_inbound (id INTEGER PRIMARY KEY, peer TEXT NOT NULL, \
                  package_id TEXT NOT NULL, state TEXT NOT NULL, batch_uuid TEXT, \
+                 last_error TEXT, created_at TEXT NOT NULL DEFAULT '', finished_at TEXT, \
                  UNIQUE(peer, package_id))",
                 [],
             )
@@ -3024,6 +3133,7 @@ mod tests {
             conn.execute(
                 "CREATE TABLE sync_inbound (id INTEGER PRIMARY KEY, peer TEXT NOT NULL, \
                  package_id TEXT NOT NULL, state TEXT NOT NULL, batch_uuid TEXT, \
+                 last_error TEXT, created_at TEXT NOT NULL DEFAULT '', finished_at TEXT, \
                  UNIQUE(peer, package_id))",
                 [],
             )
@@ -3111,6 +3221,7 @@ mod tests {
             conn.execute(
                 "CREATE TABLE sync_inbound (id INTEGER PRIMARY KEY, peer TEXT NOT NULL, \
                  package_id TEXT NOT NULL, state TEXT NOT NULL, batch_uuid TEXT, \
+                 last_error TEXT, created_at TEXT NOT NULL DEFAULT '', finished_at TEXT, \
                  UNIQUE(peer, package_id))",
                 [],
             )
@@ -3680,12 +3791,14 @@ mod tests {
         assert_eq!(row.attempts, 4, "the reset also bumps attempts");
     }
 
-    /// Batch Model §D1: `upsert_inbound_attempt` inserts on first announce, resets
-    /// an existing row to `announced` with the new wire id while PRESERVING
-    /// `display_name`/`landing_dir`, and leaves a `cancelled` row untouched with the
-    /// `cancelled_final` flag. `get_inbound_by_batch` resolves the row; the unique
-    /// `(peer, batch_uuid)` index collapses two attempts of one batch into one row
-    /// while keeping two distinct batches apart.
+    /// Batch Model §D1 + Decline Finality Axis §D3: `upsert_inbound_attempt`
+    /// inserts on first announce, resets an existing row to `announced` with the
+    /// new wire id while PRESERVING `display_name`/`landing_dir` — including a
+    /// sender-revoked `cancelled` row (the smoke-№7 fix) — and leaves a DECLINED
+    /// row (`declined_at` non-NULL) untouched with the `declined_final` flag,
+    /// regardless of its current attempt-level state. `get_inbound_by_batch`
+    /// resolves the row; the unique `(peer, batch_uuid)` index collapses two
+    /// attempts of one batch into one row while keeping two distinct batches apart.
     #[test]
     fn upsert_inbound_attempt_batch_keyed_lifecycle() {
         let conn = Connection::open_in_memory().unwrap();
@@ -3730,19 +3843,108 @@ mod tests {
         let (id3, _) = upsert_inbound_attempt(&conn, &peer, "batch-2", "wire-3", 1, 10).unwrap();
         assert_ne!(id3, id, "distinct batch_uuid → distinct row");
 
-        // Cancelled-is-final: a cancelled row is left untouched, flagged.
-        set_inbound_state(&conn, "wire-2", InboundState::Cancelled, Some("declined")).unwrap();
-        let (id4, cancelled4) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-4", 9, 900).unwrap();
-        assert!(cancelled4, "a cancelled row reports cancelled_final");
+        // Decline Finality Axis §D3: a SENDER-revoked cancelled row (declined_at
+        // NULL) is NOT final — the sender's resend resets it like any other
+        // attempt terminal (the smoke-№7 fix).
+        set_inbound_state(&conn, "wire-2", InboundState::Cancelled, Some("by sender")).unwrap();
+        let (id4, final4) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-4", 9, 900).unwrap();
+        assert!(!final4, "a revoke-cancelled row (no declined_at) is NOT declined-final");
         assert_eq!(id4, id, "same row id returned");
         let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
+        assert_eq!(row.state, InboundState::Announced, "the resend reset the revoked row");
+        assert_eq!(row.package_id, "wire-4", "the resend's wire id was stamped");
+        assert_eq!(row.generation, 3, "the resend bumped the generation");
+        assert!(row.declined_at.is_none(), "a reset never invents a decline");
+
+        // Declined-is-final: once declined_at is stamped the row refuses every
+        // re-announce untouched…
+        set_inbound_state(&conn, "wire-4", InboundState::Cancelled, None).unwrap();
+        set_inbound_declined_at(&conn, id).unwrap();
+        let declined_stamp = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap().declined_at;
+        assert!(declined_stamp.is_some(), "declined_at stamped");
+        let (id5, final5) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-5", 9, 900).unwrap();
+        assert!(final5, "a declined row reports declined_final");
+        assert_eq!(id5, id, "same row id returned");
+        let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
         assert_eq!(row.state, InboundState::Cancelled, "still cancelled — untouched");
-        assert_eq!(row.package_id, "wire-2", "wire id NOT rotated on a cancelled row");
-        assert_eq!(row.frame_count, 4, "counts NOT refreshed on a cancelled row");
-        assert_eq!(row.generation, 2, "generation NOT bumped on a cancelled-final row");
-        assert_eq!(row.last_error.as_deref(), Some("declined"), "cancel reason preserved");
+        assert_eq!(row.package_id, "wire-4", "wire id NOT rotated by the upsert on a declined row");
+        assert_eq!(row.generation, 3, "generation NOT bumped on a declined-final row");
+        assert_eq!(row.declined_at, declined_stamp, "the decline stamp is first-write-wins");
+        // …and re-stamping is a no-op (first-write-wins).
+        set_inbound_declined_at(&conn, id).unwrap();
+        let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
+        assert_eq!(row.declined_at, declined_stamp, "re-stamp preserves the original instant");
+
+        // …EVEN when the attempt-level state was later overwritten (a restart
+        // reconcile stamps `failed "interrupted by restart"`): the decline survives.
+        set_inbound_state(&conn, "wire-4", InboundState::Failed, Some("interrupted by restart")).unwrap();
+        let (id6, final6) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-6", 9, 900).unwrap();
+        assert!(final6, "a declined row stays final across a state overwrite");
+        assert_eq!(id6, id, "same row id returned");
+        let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
+        assert_eq!(row.state, InboundState::Failed, "untouched — the reconciled state stands");
 
         // A lookup for an unknown batch is None, never an error.
         assert!(get_inbound_by_batch(&conn, &peer, "nope").unwrap().is_none());
+    }
+
+    /// Decline Finality Axis §D1: adding `declined_at` to a pre-axis table
+    /// backfills every receiver-declined `cancelled` row (the only `cancelled`
+    /// rows with `last_error = 'by sender'` are sender revokes — those must NOT
+    /// become declines), and the migration is idempotent.
+    #[test]
+    fn declined_at_migration_backfills_receiver_declines() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Pre-axis table shape: PROVABLY "current DDL minus `declined_at`" —
+        // derived from the canonical constant so a future column add can never
+        // silently stale this fixture.
+        conn.execute(DDL_INBOUND, []).unwrap();
+        conn.execute("ALTER TABLE sync_inbound DROP COLUMN declined_at", []).unwrap();
+        let peer = node_id_hex(&PEER);
+        let mut insert = |pkg: &str, state: &str, err: Option<&str>, finished: Option<&str>| {
+            conn.execute(
+                "INSERT INTO sync_inbound (peer, package_id, batch_uuid, state, last_error, created_at, finished_at)
+                 VALUES (?1, ?2, ?2, ?3, ?4, '2026-07-22T08:00:00Z', ?5)",
+                params![peer, pkg, state, err, finished],
+            )
+            .unwrap();
+        };
+        // Pin the load-bearing literal: the backfill excludes exactly the detail
+        // `handle_revoke` writes — an accidental edit of either side must fail here.
+        assert_eq!(crate::sync::models::REVOKED_BY_SENDER_DETAIL, "by sender");
+        insert("declined-null-err", "cancelled", None, Some("2026-07-22T08:40:00Z"));
+        insert("declined-detail", "cancelled", Some("declined"), None);
+        insert("revoked-by-sender", "cancelled", Some("by sender"), Some("2026-07-22T08:41:00Z"));
+        insert("plain-failed", "failed", Some("sender failed"), Some("2026-07-22T08:42:00Z"));
+        insert("live-fetching", "fetching", None, None);
+
+        ensure_inbound_columns(&conn).unwrap();
+
+        let declined_of = |pkg: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT declined_at FROM sync_inbound WHERE package_id = ?1",
+                params![pkg],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            declined_of("declined-null-err").as_deref(),
+            Some("2026-07-22T08:40:00Z"),
+            "a NULL-error cancelled row backfills declined_at from finished_at"
+        );
+        assert_eq!(
+            declined_of("declined-detail").as_deref(),
+            Some("2026-07-22T08:00:00Z"),
+            "a cancelled row without finished_at falls back to created_at"
+        );
+        assert!(declined_of("revoked-by-sender").is_none(), "a sender revoke never becomes a decline");
+        assert!(declined_of("plain-failed").is_none(), "failed rows are untouched");
+        assert!(declined_of("live-fetching").is_none(), "live rows are untouched");
+
+        // Idempotent: a second pass (column now present) changes nothing.
+        ensure_inbound_columns(&conn).unwrap();
+        assert!(declined_of("revoked-by-sender").is_none(), "re-run stays a no-op");
+        assert_eq!(declined_of("declined-null-err").as_deref(), Some("2026-07-22T08:40:00Z"));
     }
 }

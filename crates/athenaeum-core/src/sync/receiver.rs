@@ -43,9 +43,11 @@ use super::models::Direction;
 use super::store::{
     append_sync_event, get_inbound, get_inbound_by_row_id, inbound_active, insert_history_row,
     landing_dir_claimed_by_active, list_inbound_files, load_receipts, replace_inbound_files,
-    insert_receipt, receipt_outcome_to_db, set_inbound_bytes_done, set_inbound_display_name,
-    set_inbound_file_state, set_inbound_landing_dir, set_inbound_state,
-    settle_unsettled_inbound_files, upsert_inbound_attempt, CatalogSyncStore,
+    insert_receipt, mark_inbound_declined_with_anchor, receipt_outcome_to_db,
+    rotate_inbound_package_id, set_inbound_bytes_done, set_inbound_declined_at,
+    set_inbound_display_name, set_inbound_file_state, set_inbound_landing_dir,
+    set_inbound_state, settle_unsettled_inbound_files, upsert_inbound_attempt,
+    CatalogSyncStore,
 };
 use super::now_iso;
 
@@ -325,6 +327,20 @@ impl InboundControl {
             .contains(package_id)
     }
 
+    /// Consume a [`request_revoke_abort`](Self::request_revoke_abort) entry once
+    /// its revoke has been drained by the serial loop (called at `handle_revoke`
+    /// entry). By then any fetch the flag needed to abort has already returned
+    /// (the loop is serial), and a LINGERING entry would wedge a straggler
+    /// re-announce of the same wire id — under the Decline Finality Axis a
+    /// revoke-cancelled row legitimately resets and re-fetches, and a stale abort
+    /// flag would break that fetch on its first poll with no terminal written.
+    pub fn clear_revoke_abort(&self, package_id: &str) {
+        self.revoke_aborts
+            .lock()
+            .expect("inbound revoke_aborts mutex poisoned")
+            .remove(package_id);
+    }
+
     /// A future that resolves the next time [`request_cancel`](Self::request_cancel)
     /// or [`request_revoke_abort`](Self::request_revoke_abort) is called. The
     /// in-flight fetch loop selects on this to learn about either without polling.
@@ -439,10 +455,11 @@ impl SyncReceiver {
         // Startup reconcile (zombie-inbound fix): any non-terminal `sync_inbound`
         // row left by a prior process cannot resume — a fetch/ingest never
         // survives a restart — so stamp every such row `Failed` BEFORE the event
-        // loop consumes its first announce. A later re-announce upserts the row
-        // back to `announced` (the non-cancelled reset rule), so this is a clean
-        // lifecycle reset, not data loss. Runs on this task, fully before the
-        // spawned loop exists.
+        // loop consumes its first announce. A later re-announce resets the row via
+        // `upsert_inbound_attempt` (declined rows stay final through `declined_at`,
+        // which this reconcile never touches — Decline Finality Axis §D3), so this
+        // is a clean lifecycle reset, not data loss. Runs on this task, fully
+        // before the spawned loop exists.
         reconcile_stale_inbound(&store);
 
         let loop_transport = Arc::clone(&transport);
@@ -648,10 +665,13 @@ impl SyncReceiver {
 /// resend is a new id), leaving this row stuck non-terminal forever and visible
 /// in [`inbound_active`] as a perpetual in-progress transfer. [`inbound_active`]
 /// already excludes the terminal states, so a `Cancelled` row is left untouched.
-/// A later re-announce of the same `(peer, package_id)` upserts the row back to
-/// `announced` (the non-cancelled reset rule in [`upsert_inbound_announced`]),
-/// giving a clean lifecycle. Best-effort: a failed enumeration or per-row write
-/// warns and never blocks receiver startup.
+/// A later re-announce of the same `(peer, batch_uuid)` resets the row via
+/// [`upsert_inbound_attempt`]'s non-declined reset rule — and a DECLINED row
+/// this reconcile stamped `failed` stays final regardless, because finality is
+/// the `declined_at` axis, which this fn never writes (Decline Finality Axis
+/// §D3, pinned by `decline_survives_restart_reconcile_and_refuses_resend`).
+/// Best-effort: a failed enumeration or per-row write warns and never blocks
+/// receiver startup.
 fn reconcile_stale_inbound(store: &CatalogSyncStore) {
     let conn = store.lock_conn();
     let stale = match inbound_active(&conn) {
@@ -879,14 +899,17 @@ async fn handle_announce(
     // transfer resolves to ONE long-lived row. A re-announced attempt (resend or
     // retry) resets the SAME row back to `announced` with THIS attempt's wire id,
     // clearing its byte/finished markers while PRESERVING `display_name` +
-    // `landing_dir` (so attempts land into the same tree). A `cancelled` row is
-    // left untouched and reported via `cancelled_final` — it is final, so we must
+    // `landing_dir` (so attempts land into the same tree). A DECLINED row
+    // (`declined_at` non-NULL — Decline Finality Axis §D3) is left untouched and
+    // reported via `declined_final` — the receiver's refusal is final, so we must
     // never re-fetch it (the seeding + replay-guard below re-ack the sender's new
-    // attempt as all-cancelled without fetching). v1/v2 announces arrive with
-    // `batch_uuid == wire package_id` (B1 fallback), so each attempt's fresh wire
-    // id makes a fresh row — exactly today's per-attempt behavior, now with a
-    // non-NULL key.
-    let (inbound_id, cancelled_final) = {
+    // attempt as all-cancelled without fetching). A row that is merely `cancelled`
+    // by a SENDER revoke has `declined_at` NULL and resets like any other attempt
+    // terminal — a sender's resend after its own cancel fetches normally.
+    // v1/v2 announces arrive with `batch_uuid == wire package_id` (B1 fallback),
+    // so each attempt's fresh wire id makes a fresh row — exactly today's
+    // per-attempt behavior, now with a non-NULL key.
+    let (inbound_id, declined_final) = {
         let conn = store.lock_conn();
         upsert_inbound_attempt(
             &conn,
@@ -902,10 +925,10 @@ async fn handle_announce(
     // Record the v2 manifest onto the row BEFORE any fetch — the receiver knows the
     // whole tree the moment the announce lands. Refreshes name + REPLACES the
     // per-file set on a re-announce (naturally re-keyed to the same batch row);
-    // NEVER touches a `cancelled` row (it is final — `cancelled_final` and the CASE
-    // guard in `upsert_inbound_attempt` keep it inert). Best-effort — a failed write
+    // NEVER touches a DECLINED row (it is final — `declined_final` and the guard
+    // in `upsert_inbound_attempt` keep it inert). Best-effort — a failed write
     // only warns, never blocks the receive.
-    if !cancelled_final && (effective_name.is_some() || has_manifest) {
+    if !declined_final && (effective_name.is_some() || has_manifest) {
         let conn = store.lock_conn();
         if let Err(e) = record_inbound_manifest(&conn, inbound_id, effective_name.as_deref(), &effective_files) {
             tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "record inbound manifest failed");
@@ -934,49 +957,74 @@ async fn handle_announce(
         bytes_total: None,
     });
 
-    // Cancelled-transfer resend re-ack (Transfers Batch Model §D1/B4). A receiver
-    // that DECLINED a transfer keeps it declined: the sender's resend arrives on a
-    // FRESH wire id, `upsert_inbound_attempt` left the `cancelled` row untouched
-    // (`cancelled_final`), and that new wire id carries no receipts — so the
-    // ack-replay guard below would NOT fire and the row would fall through to the
-    // cancel epilogue, which would re-fetch the manifest AND re-write per-frame
-    // history for every resend. Instead we seed THIS attempt's wire id with the
-    // prior attempt's `Cancelled` receipts (re-keyed, no manifest fetch), which
-    // makes the replay guard answer the sender with an all-cancelled ack for the
-    // new wire id WITHOUT fetching and WITHOUT duplicating history. The prior
-    // attempt's wire id is the row's CURRENT `package_id` (a cancelled row's
-    // `package_id` is never rotated), and a cancelled row always carries a full
-    // `Cancelled` receipt set under it once its epilogue has run. When it has NOT
-    // (an `Announced`-then-cancelled row whose epilogue never fired) this seeding
-    // is a no-op and the FIRST cancel announce falls through to the epilogue below
-    // (which writes the receipts + history for the first time). This is the exact
-    // "write the cancelled receipts for the new wire id" mechanism §B4 calls for.
-    if cancelled_final {
+    // Declined-transfer resend re-ack (Transfers Batch Model §D1/B4, Decline
+    // Finality Axis §D5). A receiver that DECLINED a transfer keeps it declined:
+    // the sender's resend arrives on a FRESH wire id, `upsert_inbound_attempt`
+    // left the declined row untouched (`declined_final`), and that new wire id
+    // carries no receipts — so the ack-replay guard below would NOT fire and the
+    // row would fall through to the cancel epilogue, which would re-fetch the
+    // manifest AND re-write per-frame history for every resend. Instead we seed
+    // THIS attempt's wire id with the prior attempt's `Cancelled` receipts
+    // (re-keyed, no manifest fetch), which makes the replay guard answer the
+    // sender with an all-cancelled ack for the new wire id WITHOUT fetching and
+    // WITHOUT duplicating history. The receipt-anchor invariant (§D5) keeps the
+    // declined row's `package_id` pointing at the wire id that holds its newest
+    // full `Cancelled` set (rotated here after a successful seed, and by the
+    // epilogue when it writes a set under a fresh wire id), so this lookup always
+    // finds it. When NO receipts exist yet (a declined row whose epilogue never
+    // fired — decline-then-crash) this seeding is a no-op and the announce falls
+    // through to the epilogue below (which writes the receipts + history for the
+    // first time).
+    if declined_final {
         let conn = store.lock_conn();
-        if let Ok(Some(row)) = get_inbound_by_row_id(&conn, inbound_id) {
-            let prev_wire = row.package_id;
-            if prev_wire != package_id {
-                match load_receipts(&conn, &prev_wire) {
-                    Ok(prior)
-                        if !prior.is_empty()
-                            && prior.iter().all(|r| matches!(r.outcome, ReceiptOutcome::Cancelled)) =>
-                    {
-                        let now = now_iso();
-                        for r in &prior {
-                            if let Err(e) = insert_receipt(&conn, &package_id, r, &now) {
-                                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "seed cancelled receipt for resend failed");
+        match get_inbound_by_row_id(&conn, inbound_id) {
+            Ok(Some(row)) => {
+                let prev_wire = row.package_id;
+                if prev_wire != package_id {
+                    match load_receipts(&conn, &prev_wire) {
+                        Ok(prior)
+                            if !prior.is_empty()
+                                && prior.iter().all(|r| matches!(r.outcome, ReceiptOutcome::Cancelled)) =>
+                        {
+                            let now = now_iso();
+                            let mut seed_failures = 0usize;
+                            for r in &prior {
+                                if let Err(e) = insert_receipt(&conn, &package_id, r, &now) {
+                                    seed_failures += 1;
+                                    tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "seed cancelled receipt for resend failed");
+                                }
                             }
+                            // §D5: rotate the anchor ONLY when the new wire id holds
+                            // the COMPLETE set — anchoring a partial set would orphan
+                            // the full one under `prev_wire` and re-open the
+                            // duplicate-history epilogue on every later resend.
+                            if seed_failures == 0 {
+                                if let Err(e) = rotate_inbound_package_id(&conn, inbound_id, &package_id) {
+                                    tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "rotate receipt anchor after seed failed");
+                                }
+                            }
+                            tracing::info!(
+                                package_id = %package_id,
+                                prev_wire = %prev_wire,
+                                count = prior.len(),
+                                "receiver re-acking a declined transfer's resend from the prior attempt's receipts"
+                            );
                         }
-                        tracing::info!(
-                            package_id = %package_id,
-                            prev_wire = %prev_wire,
-                            count = prior.len(),
-                            "receiver re-acking a cancelled transfer's resend from the prior attempt's receipts"
-                        );
+                        // No receipts (or a non-cancelled set) under the anchor: a
+                        // declined row whose epilogue never completed — fall through
+                        // to the epilogue below, which writes the set first-time.
+                        Ok(_) => {
+                            tracing::debug!(package_id = %package_id, prev_wire = %prev_wire, "no full cancelled receipt set under the anchor; epilogue will write it");
+                        }
+                        Err(e) => tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "load prior cancelled receipts for resend re-ack failed"),
                     }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "load prior cancelled receipts for resend re-ack failed"),
                 }
+            }
+            Ok(None) => {
+                tracing::warn!(package_id = %package_id, inbound_id, "declined row vanished before resend seeding");
+            }
+            Err(e) => {
+                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "read declined row for resend seeding failed");
             }
         }
     }
@@ -1013,16 +1061,21 @@ async fn handle_announce(
         if let Err(e) = transport.release(&announce.package_id).await {
             tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "receiver blob release failed");
         }
-        // Terminal state: an all-cancelled replay is `Cancelled` (final — also
-        // repairs a crash between a prior epilogue's receipt writes and its row
-        // stamp); a normal replay is `Done`, unless the row is already cancelled
-        // (which stays final).
+        // Terminal state: an all-cancelled replay is `Cancelled` + the transfer-level
+        // `declined_at` repair stamp (§D2 repair 2 — a full all-cancelled receipt set
+        // only ever originates from a receiver decline, so this also repairs a crash
+        // between a prior epilogue's receipt writes and its row stamp, and upgrades a
+        // pre-axis row); a normal replay is `Done`, unless the row is declined-final
+        // (which stays untouched).
         if all_cancelled {
             let conn = store.lock_conn();
+            if let Err(e) = set_inbound_declined_at(&conn, inbound_id) {
+                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound declined_at (replay) write failed");
+            }
             if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Cancelled, None) {
                 tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound cancelled (replay) write failed");
             }
-        } else if !cancelled_final {
+        } else if !declined_final {
             let conn = store.lock_conn();
             if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Done, None) {
                 tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound done (replay) write failed");
@@ -1042,15 +1095,15 @@ async fn handle_announce(
         return Ok(());
     }
 
-    // Wire-in (a) — Task 12: a persisted-`Cancelled` inbound row (restart-proof)
-    // OR a control-requested cancel that reached us at/before this announce runs
-    // the cancel epilogue instead of fetching — it fetches only the manifest,
-    // writes a `Cancelled` receipt per frame, acks them, and stamps the row
-    // Cancelled. The replay guard above already handled a package whose epilogue
-    // previously wrote every frame's receipt (later re-announces replay from the
-    // log — cheaper, no manifest fetch), so this only runs on the FIRST cancel
-    // announce, before any receipts exist.
-    if cancelled_final || control.is_cancelled(&package_id) {
+    // Wire-in (a) — Task 12: a persisted DECLINED row (restart-proof via
+    // `declined_at`) OR a control-requested cancel that reached us at/before this
+    // announce runs the cancel epilogue instead of fetching — it fetches only the
+    // manifest, writes a `Cancelled` receipt per frame, acks them, and stamps the
+    // row Cancelled. The replay guard above already handled a package whose
+    // epilogue previously wrote every frame's receipt (later re-announces replay
+    // from the log — cheaper, no manifest fetch), so this only runs on the FIRST
+    // cancel announce, before any receipts exist.
+    if declined_final || control.is_cancelled(&package_id) {
         return cancel_epilogue(
             store, transport, emitter.as_ref(), from, &announce, staging_root, inbound_id,
             &history_key, effective_name.as_deref(),
@@ -1480,6 +1533,24 @@ async fn cancel_epilogue(
     let peer_device = super::node_id_hex(&from);
     let package_id = announce.package_id.0.clone();
 
+    // 0. Decline Finality Axis: stamp the transfer-level decline marker
+    //    (first-write-wins — §D2 repair 1; every path into this fn is
+    //    decline-originated: the local `cancels` flag, which `handle_revoke`
+    //    deliberately never touches, or a declined-final resend) and rotate the
+    //    receipt anchor to THIS attempt's wire id (§D5) — the receipts written
+    //    below land under `package_id`, and rotating FIRST also makes every
+    //    `package_id`-keyed read/write in this fn hit the row even when the row
+    //    still carried an older attempt's wire id (the declined-final resend
+    //    path, where `upsert_inbound_attempt` left the row untouched). One merged
+    //    UPDATE = one commit on the serial loop; rotating to the already-current
+    //    id is a no-op-shaped write.
+    {
+        let conn = store.lock_conn();
+        if let Err(e) = mark_inbound_declined_with_anchor(&conn, inbound_id, &package_id) {
+            tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound declined_at + anchor write failed");
+        }
+    }
+
     // 1. Fetch just the manifest into staging (tiny — no payload frames). We need
     //    the per-frame identities (uuid + xxh3) to build the Cancelled receipts.
     let staging = staging_root.join("staging").join(&package_id);
@@ -1539,9 +1610,10 @@ async fn cancel_epilogue(
     //    a `cancelled` outcome; any file that DID land keeps its own verdict.
     let landed = {
         let conn = store.lock_conn();
-        // Count files that made it (state `done` before this settle) for the journal.
+        // Count files that genuinely made it before this settle for the journal
+        // (§D6 — settled done+cancelled rows from an earlier revoke don't count).
         let landed = list_inbound_files(&conn, inbound_id)
-            .map(|rows| rows.iter().filter(|r| r.state == InboundFileState::Done).count())
+            .map(|rows| count_landed(&rows))
             .unwrap_or(0);
         if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Cancelled, None) {
             tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound cancelled state write failed");
@@ -1579,6 +1651,20 @@ fn filename_of(rel_path: &str) -> String {
     rel_path.rsplit('/').next().unwrap_or(rel_path).to_string()
 }
 
+/// Count of per-file rows that genuinely LANDED on disk (Decline Finality Axis
+/// §D6). A settle (`settle_unsettled_inbound_files`) reuses `state = done` with a
+/// `cancelled`/`superseded` outcome for files that never arrived — those are NOT
+/// landings, only ingest-verdict `done` rows are. Keeps the revoke/cancel journals
+/// honest (`landed=42` on a transfer where nothing arrived was a mislabel).
+fn count_landed(rows: &[InboundFileRow]) -> usize {
+    rows.iter()
+        .filter(|r| {
+            r.state == InboundFileState::Done
+                && !matches!(r.outcome.as_deref(), Some("cancelled") | Some("superseded"))
+        })
+        .count()
+}
+
 /// Apply a sender [`Revoke`](TransportEvent::RevokeReceived) to the matching
 /// inbound transfer (Transfers Batch Model §D2, B4). The sender sends a revoke on
 /// ANY terminal transition with an outstanding un-acked announce — a user cancel,
@@ -1593,14 +1679,16 @@ fn filename_of(rel_path: &str) -> String {
 /// unknown id, or for an already-terminal row, is likewise a `debug!` no-op. For a
 /// non-terminal row:
 ///
-/// - [`Cancelled`](RevokeReason::Cancelled) → row `cancelled` ("by sender").
+/// - [`Cancelled`](RevokeReason::Cancelled) → row `cancelled` ("by sender"). An
+///   ATTEMPT terminal only — `declined_at` is never written here (Decline
+///   Finality Axis §D4), so the sender's own resend of this transfer resets the
+///   row and fetches normally instead of hitting `declined_final`.
 /// - [`Superseded`](RevokeReason::Superseded) → row `done` (a supersede is issued
 ///   only when the peer already holds every frame, so the receiver lacks nothing —
 ///   the honest terminal is success, NOT a decline). Detail "nothing to fetch
 ///   (superseded by sender)" when nothing landed, else "superseded (N of M
 ///   landed)". Deliberately NOT `cancelled`: marking it cancelled would misrender a
-///   benign supersede as a user decline AND make a later re-announce hit
-///   `cancelled_final` and refuse a genuine re-fetch.
+///   benign supersede as a user decline.
 /// - [`Failed`](RevokeReason::Failed) → row `failed` ("sender failed").
 ///
 /// In every non-terminal case: abort any in-flight fetch through the SAME
@@ -1616,11 +1704,14 @@ fn filename_of(rel_path: &str) -> String {
 ///
 /// Serial-loop note: `RevokeReceived` and `AnnounceReceived` share the single
 /// consumer of the receiver event stream, so a revoke is processed only BETWEEN
-/// announces — it can never run concurrently with a fetch on the same loop. The
-/// [`InboundControl::request_cancel`] here is therefore defensive/symmetric with the
-/// command path; it is harmless because no re-announce follows a sender's terminal
-/// revoke (the sender is already terminal), so the flag can never divert a future
-/// fetch of this transfer.
+/// announces — it can never run concurrently with a fetch on the same loop. This
+/// fn touches NEITHER `InboundControl` signal: the in-flight abort was already
+/// requested cross-task by the ingress pump (`request_revoke_abort`), and the
+/// local-decline `cancels` set must never carry a revoked wire id — its entries
+/// are permanent and a straggler re-announce of the same wire id would otherwise
+/// divert into the cancel epilogue and mint a `declined_at` the user never chose.
+/// A sender's RESEND after its own cancel is a legitimate follow-up (Decline
+/// Finality Axis §D4): the resend resets this row and fetches normally.
 #[allow(clippy::too_many_arguments)]
 async fn handle_revoke(
     store: &Arc<CatalogSyncStore>,
@@ -1634,6 +1725,13 @@ async fn handle_revoke(
 ) {
     let peer_device = super::node_id_hex(&from);
     let wire_id = package_id.0.clone();
+
+    // Consume the ingress pump's abort flag FIRST, in every branch: the serial
+    // loop has drained everything queued before this revoke, so any fetch the
+    // flag needed to abort has already returned — and a lingering entry would
+    // break the fetch of a legitimate same-wire straggler re-announce (which the
+    // Decline Finality Axis now resets and re-fetches) with no terminal written.
+    control.clear_revoke_abort(&wire_id);
 
     // Correlate the revoke to the CURRENT attempt's row by its wire id. A revoke
     // for a superseded older wire id (the row has since rotated to a newer id) —
@@ -1673,9 +1771,17 @@ async fn handle_revoke(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| wire_id.clone());
 
-    // Abort any in-flight fetch through the receiver's own cancel signal (the exact
-    // mechanism `cancel_incoming_package` uses; see the serial-loop note above).
-    control.request_cancel(&wire_id);
+    // Deliberately NO `control.request_cancel` here (review fix, Decline Finality
+    // Axis §D2): the `cancels` set is the LOCAL-DECLINE signal and its entries are
+    // never removed, so poisoning it with a revoked wire id would let a straggler
+    // re-announce of that SAME wire id (retry tick racing the cancel; announce and
+    // revoke have no cross-stream ordering guarantee) divert into the cancel
+    // epilogue and mint a permanent `declined_at` the user never chose — turning a
+    // benign sender cancel/supersede/failure into a receiver decline. The in-flight
+    // fetch abort is already handled by the ingress pump's SEPARATE
+    // `request_revoke_abort` signal, and by the time this fn runs on the serial
+    // loop the fetch has been dealt with; every entry in `cancels` must stay
+    // decline-originated so the epilogue's `declined_at` stamp is sound.
 
     // Honest terminal mapping (§D2): (row state, row detail, file state, file
     // outcome, file error, history outcome, reason tag).
@@ -1690,7 +1796,7 @@ async fn handle_revoke(
     ) = match reason {
         RevokeReason::Cancelled => (
             InboundState::Cancelled,
-            "by sender".to_string(),
+            super::models::REVOKED_BY_SENDER_DETAIL.to_string(),
             InboundFileState::Done,
             "cancelled",
             None,
@@ -1713,7 +1819,7 @@ async fn handle_revoke(
             let done_count = {
                 let conn = store.lock_conn();
                 list_inbound_files(&conn, inbound_id)
-                    .map(|rows| rows.iter().filter(|r| r.state == InboundFileState::Done).count())
+                    .map(|rows| count_landed(&rows))
                     .unwrap_or(0)
             };
             let detail = if done_count == 0 {
@@ -1741,7 +1847,7 @@ async fn handle_revoke(
     let landed = {
         let conn = store.lock_conn();
         let file_rows = list_inbound_files(&conn, inbound_id).unwrap_or_default();
-        let landed = file_rows.iter().filter(|r| r.state == InboundFileState::Done).count();
+        let landed = count_landed(&file_rows);
         if let Err(e) = set_inbound_state(&conn, &wire_id, row_state, Some(&row_detail)) {
             tracing::warn!(package_id = %wire_id, error = %format!("{e:#}"), "revoke terminal state write failed");
         }
@@ -2672,6 +2778,20 @@ mod tests {
         panic!("inbound row for {package_id} never reached {want:?}");
     }
 
+    /// Poll until `n` `cancelled` receipts exist under `package_id` (the re-ack /
+    /// seed proof), panicking on timeout with the count actually seen.
+    async fn poll_cancelled_receipts(store: &Arc<CatalogSyncStore>, package_id: &str, n: i64) {
+        let sql =
+            format!("SELECT COUNT(*) FROM sync_receipts WHERE package_id='{package_id}' AND outcome='cancelled'");
+        for _ in 0..400 {
+            if count_scalar(store, &sql) == n {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("never saw {n} cancelled receipts under {package_id} (got {})", count_scalar(store, &sql));
+    }
+
     /// True when no regular files exist under `incoming` (a cancelled package
     /// lands nothing — only the manifest is fetched, into the sync staging dir).
     fn no_files_landed(incoming: &std::path::Path) -> bool {
@@ -3518,26 +3638,17 @@ mod tests {
         // The resend is re-acked cancelled: a Cancelled receipt set now exists under
         // the NEW wire id (the chosen mechanism), and a `cancelled` finished event
         // fired for w2.
-        for _ in 0..400 {
-            let seeded = count_scalar(&store, &format!("SELECT COUNT(*) FROM sync_receipts WHERE package_id='{w2}' AND outcome='cancelled'"));
-            if seeded == n {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            count_scalar(&store, &format!("SELECT COUNT(*) FROM sync_receipts WHERE package_id='{w2}' AND outcome='cancelled'")),
-            n,
-            "the new wire id was seeded with the prior attempt's cancelled receipts (re-ack source)"
-        );
+        poll_cancelled_receipts(&store, &w2, n).await;
 
-        // Still ONE row, still cancelled, wire id NOT rotated (a cancelled row is
-        // untouched), no files landed, and the history was NOT duplicated.
+        // Still ONE row, still declined, receipt anchor rotated to the NEWEST
+        // fully-receipted attempt (§D5 — so the next resend seeds from w2), no
+        // files landed, and the history was NOT duplicated.
         assert_eq!(count_scalar(&store, "SELECT COUNT(*) FROM sync_inbound"), 1, "still exactly one inbound row");
-        let row2 = { let conn = store.lock_conn(); get_inbound(&conn, &w1).unwrap().unwrap() };
-        assert_eq!(row2.id, inbound_id, "the same cancelled row is reused");
+        let row2 = { let conn = store.lock_conn(); get_inbound_by_row_id(&conn, inbound_id).unwrap().unwrap() };
+        assert_eq!(row2.id, inbound_id, "the same declined row is reused");
         assert_eq!(row2.state, InboundState::Cancelled, "the transfer stays declined");
-        assert_eq!(row2.package_id, w1, "a cancelled row's wire id is never rotated");
+        assert!(row2.declined_at.is_some(), "the decline is recorded on the finality axis");
+        assert_eq!(row2.package_id, w2, "the receipt anchor rotated to the resend's wire id");
         assert!(no_files_landed(&incoming), "the resend of a declined transfer fetches nothing");
         assert_eq!(
             count_scalar(&store, "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='cancelled'"),
@@ -3549,6 +3660,268 @@ mod tests {
             finished.iter().any(|e| e["packageId"] == w2 && e["outcome"] == "cancelled"),
             "the resend emitted a cancelled finished event for the new wire id: {finished:?}"
         );
+    }
+
+    /// Owner smoke №7 regression (Decline Finality Axis §D3/§D4): a transfer whose
+    /// first attempt the SENDER revoked (cancel) must accept the sender's resend —
+    /// the revoke-cancelled row (`declined_at` NULL) resets like any attempt
+    /// terminal, the payload is fetched and ingested, and no all-cancelled re-ack
+    /// fires. Pre-fix, the row hit declined-final and both sides blamed each other
+    /// forever.
+    #[tokio::test]
+    async fn sender_cancel_then_resend_fetches_and_ingests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            { let incoming = incoming.clone(); Arc::new(move || incoming.clone()) as IncomingResolver },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        const BATCH: &str = "batch-revoked-then-resent";
+        let (pkg_dir, announce2, files) = build_v2_fixture(tmp.path());
+        let w2 = announce2.package_id.0.clone();
+        let peer_hex = super::super::node_id_hex(&sender.node_id());
+
+        // Attempt 1: an announced row the sender then CANCELS (revoke over the
+        // wire). Seeded directly (deterministic — no fetch to race) exactly as the
+        // announce would have written it, then revoked through the real transport
+        // path so `handle_revoke` does the bookkeeping.
+        let inbound_id = {
+            let conn = store.lock_conn();
+            let (id, declined_final) = upsert_inbound_attempt(
+                &conn, &peer_hex, BATCH, "wire-revoked-1", announce2.frame_count, announce2.byte_size,
+            )
+            .unwrap();
+            assert!(!declined_final);
+            id
+        };
+        sender
+            .revoke(receiver_node, &PackageId("wire-revoked-1".to_string()), RevokeReason::Cancelled)
+            .await
+            .unwrap();
+        let row1 = poll_inbound(&store, "wire-revoked-1", InboundState::Cancelled).await;
+        assert_eq!(row1.id, inbound_id);
+        assert_eq!(row1.last_error.as_deref(), Some("by sender"), "the revoke's attempt terminal");
+        assert!(row1.declined_at.is_none(), "a sender revoke NEVER records a receiver decline");
+
+        // Attempt 2 (the sender's resend): fresh wire id, SAME batch_uuid, fully
+        // served. The receiver must reset the row and deliver — not re-ack cancelled.
+        sender.serve(&announce2, &pkg_dir, None).await.unwrap();
+        sender.announce(receiver_node, &announce2, "M31 Lights", BATCH, &files).await.unwrap();
+
+        let row2 = poll_inbound(&store, &w2, InboundState::Done).await;
+        assert_eq!(row2.id, inbound_id, "one long-lived row per transfer");
+        assert_eq!(row2.package_id, w2, "the resend's wire id was stamped");
+        assert_eq!(row2.generation, 2, "the resend is attempt 2");
+        assert!(row2.declined_at.is_none(), "delivery never invents a decline");
+        assert!(!no_files_landed(&incoming), "the resend fetched and landed the payload");
+        assert_eq!(
+            count_scalar(&store, &format!("SELECT COUNT(*) FROM sync_receipts WHERE package_id='{w2}' AND outcome='cancelled'")),
+            0,
+            "no cancelled receipts on the resend — the pre-fix failure mode"
+        );
+        let kinds = journal_kinds(&store, inbound_id);
+        assert!(kinds.iter().any(|k| k == "revoked"), "attempt 1's revoke is journaled: {kinds:?}");
+        assert!(kinds.iter().any(|k| k == "ingested"), "attempt 2's ingest is journaled: {kinds:?}");
+    }
+
+    /// Review-fix regression (Decline Finality Axis §D2): a straggler re-announce
+    /// of the SAME wire id arriving AFTER the sender's revoke (announce/revoke have
+    /// no cross-stream ordering guarantee; a retry tick can race the cancel) must
+    /// deliver like any reset attempt — `handle_revoke` no longer poisons the
+    /// local-decline `cancels` set, so the straggler cannot divert into the cancel
+    /// epilogue and mint a `declined_at` the user never chose (which would brick
+    /// every future resend with an all-cancelled re-ack).
+    #[tokio::test]
+    async fn revoke_then_same_wire_straggler_announce_delivers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            { let incoming = incoming.clone(); Arc::new(move || incoming.clone()) as IncomingResolver },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        const BATCH: &str = "batch-straggler";
+        let (pkg_dir, announce1, files) = build_v2_fixture(tmp.path());
+        let w1 = announce1.package_id.0.clone();
+        let peer_hex = super::super::node_id_hex(&sender.node_id());
+
+        // Seed the announced attempt, then revoke it over the transport — the row
+        // is now cancelled "by sender" (attempt-terminal, declined_at NULL).
+        let inbound_id = {
+            let conn = store.lock_conn();
+            let (id, _) = upsert_inbound_attempt(
+                &conn, &peer_hex, BATCH, &w1, announce1.frame_count, announce1.byte_size,
+            )
+            .unwrap();
+            id
+        };
+        sender
+            .revoke(receiver_node, &announce1.package_id, RevokeReason::Cancelled)
+            .await
+            .unwrap();
+        let row1 = poll_inbound(&store, &w1, InboundState::Cancelled).await;
+        assert!(row1.declined_at.is_none(), "a sender revoke never declines");
+
+        // The straggler: the SAME wire id re-announced after the revoke (served, so
+        // a wrongly-diverted epilogue would be distinguishable from a delivery).
+        sender.serve(&announce1, &pkg_dir, None).await.unwrap();
+        sender.announce(receiver_node, &announce1, "Straggler", BATCH, &files).await.unwrap();
+
+        let row2 = poll_inbound(&store, &w1, InboundState::Done).await;
+        assert_eq!(row2.id, inbound_id, "same batch-keyed row");
+        assert!(row2.declined_at.is_none(), "the straggler must NOT mint a decline");
+        assert!(!no_files_landed(&incoming), "the straggler announce delivered the payload");
+        assert_eq!(
+            count_scalar(&store, &format!("SELECT COUNT(*) FROM sync_receipts WHERE package_id='{w1}' AND outcome='cancelled'")),
+            0,
+            "no cancelled receipts — the epilogue never ran"
+        );
+    }
+
+    /// Decline durability across a crash (Decline Finality Axis §D2): a decline
+    /// stamped during a live fetch (`declined_at` written immediately by the
+    /// command; the epilogue never ran — crash) survives the startup reconcile's
+    /// `failed "interrupted by restart"` state overwrite, so the sender's resend is
+    /// re-acked all-cancelled by the epilogue WITHOUT landing files — and a THIRD
+    /// attempt replays from the seeded receipt log without duplicating history
+    /// (§D5 receipt-anchor rotation).
+    #[tokio::test]
+    async fn decline_survives_restart_reconcile_and_refuses_resend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        const BATCH: &str = "batch-declined-then-crash";
+        let (pkg_dir, announce2, files) = build_v2_fixture(tmp.path());
+        let w2 = announce2.package_id.0.clone();
+        let n = announce2.frame_count as i64;
+        let peer_hex = super::super::node_id_hex(&sender.node_id());
+
+        // Pre-restart state: a mid-fetch attempt the user declined — the §D2
+        // primary write stamped `declined_at` immediately; the crash meant the
+        // epilogue never ran (no receipts, state still `fetching`).
+        let inbound_id = {
+            let conn = store.lock_conn();
+            let (id, _) = upsert_inbound_attempt(
+                &conn, &peer_hex, BATCH, "wire-declined-1", announce2.frame_count, announce2.byte_size,
+            )
+            .unwrap();
+            set_inbound_state(&conn, "wire-declined-1", InboundState::Fetching, None).unwrap();
+            set_inbound_declined_at(&conn, id).unwrap();
+            id
+        };
+
+        // "Restart": spawning the receiver runs the startup reconcile, which
+        // overwrites the zombie fetching STATE — but not the decline axis.
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            { let incoming = incoming.clone(); Arc::new(move || incoming.clone()) as IncomingResolver },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+        {
+            let conn = store.lock_conn();
+            let row = get_inbound_by_row_id(&conn, inbound_id).unwrap().unwrap();
+            assert_eq!(row.state, InboundState::Failed, "the reconcile stamped the zombie attempt failed");
+            assert_eq!(row.last_error.as_deref(), Some("interrupted by restart"));
+            assert!(row.declined_at.is_some(), "the decline survives the restart reconcile");
+        }
+
+        // The sender's resend (fresh wire id, same batch, fully served): the
+        // declined transfer must be re-acked cancelled by the epilogue — receipts
+        // under w2, anchor rotated, NO files landed.
+        sender.serve(&announce2, &pkg_dir, None).await.unwrap();
+        sender.announce(receiver_node, &announce2, "M31 Lights", BATCH, &files).await.unwrap();
+        let row2 = poll_inbound(&store, &w2, InboundState::Cancelled).await;
+        assert_eq!(row2.id, inbound_id, "one long-lived row per transfer");
+        assert!(row2.declined_at.is_some(), "still declined");
+        assert_eq!(row2.package_id, w2, "the receipt anchor rotated to the epilogue's wire id");
+        assert_eq!(
+            count_scalar(&store, &format!("SELECT COUNT(*) FROM sync_receipts WHERE package_id='{w2}' AND outcome='cancelled'")),
+            n,
+            "the epilogue wrote a cancelled receipt per frame under the resend's wire id"
+        );
+        assert!(no_files_landed(&incoming), "a declined transfer never lands files");
+        let history_after_2 = count_scalar(&store, "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='cancelled'");
+        assert_eq!(history_after_2, n, "one cancelled history row per frame, written once");
+
+        // A THIRD attempt (unserved — a replay needs no fetch at all): answered
+        // from the seeded receipt log; history NOT duplicated; anchor rotated on.
+        let announce3 = PackageAnnounce {
+            package_id: PackageId("wire-declined-3".to_string()),
+            root_hash: announce2.root_hash.clone(),
+            byte_size: announce2.byte_size,
+            frame_count: announce2.frame_count,
+        };
+        let w3 = announce3.package_id.0.clone();
+        sender.announce(receiver_node, &announce3, "M31 Lights", BATCH, &files).await.unwrap();
+        poll_cancelled_receipts(&store, &w3, n).await;
+        let row3 = { let conn = store.lock_conn(); get_inbound_by_row_id(&conn, inbound_id).unwrap().unwrap() };
+        assert_eq!(row3.package_id, w3, "the anchor rotated to the newest fully-receipted attempt");
+        assert_eq!(row3.state, InboundState::Cancelled, "still declined-terminal");
+        assert_eq!(
+            count_scalar(&store, "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='cancelled'"),
+            history_after_2,
+            "the replayed attempt duplicated NO history"
+        );
+        assert!(no_files_landed(&incoming), "still nothing landed");
     }
 
     /// Seed an `announced` inbound row (peer, wire id) with `frames` two-file

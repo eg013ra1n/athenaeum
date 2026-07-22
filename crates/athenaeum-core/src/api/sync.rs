@@ -2707,7 +2707,21 @@ pub async fn cancel_sync_package(sender: &Arc<SyncSenderRuntime>, id: i64) -> Re
 ///   aborts the download, and its epilogue owns the terminal `Cancelled` stamp
 ///   (so this never races the fetch's own state writes).
 /// - no row yet (cancel before the announce arrives) → `request_cancel` so the
-///   very first announce runs the epilogue.
+///   very first announce runs the epilogue. Accepted risk: with no row there is
+///   nothing durable to stamp, so this one decline shape does not survive a
+///   restart — the window is tiny and the user can decline again.
+///
+/// **Decline Finality Axis (§D2 primary write)**: every EXISTING row not in
+/// `ingesting`/`done` additionally gets `declined_at` stamped HERE, immediately —
+/// including a live `Fetching` row (not the `state` column, so it cannot race the
+/// fetch loop's state writes) and a raced `cancelled`/`failed` attempt-terminal
+/// (the decline of a still-resendable transfer survives losing the race to a
+/// sender revoke or fetch failure). The state guard is INSIDE the UPDATE, so a
+/// row that advanced to `ingesting`/`done` while the command waited is atomically
+/// excluded — delivered data never becomes declined-final. This is what makes
+/// the decline crash-durable: even if the epilogue never runs (crash) and a
+/// restart reconcile overwrites `state` to `failed`, the transfer stays
+/// declined-final for every future re-announce.
 ///
 /// When the transport is not started (`inbound_control` is `None`) there is no
 /// live fetch to interrupt; a non-terminal persisted row is still stamped
@@ -2735,7 +2749,31 @@ pub async fn cancel_incoming_package(
     if matches!(&row, Some(r) if r.state == InboundState::Ingesting) {
         return Err(ApiError::Invalid("too late: ingest in progress".to_string()));
     }
-    // Already terminal — no-op.
+    // Decline Finality Axis §D2 (primary write): stamp the transfer-level decline
+    // marker NOW, before any flag or state write — safe even during a live fetch
+    // (not the `state` column), first-write-wins, survives crash + restart
+    // reconcile, and makes every future re-announce of this batch declined-final.
+    // The state guard lives INSIDE the UPDATE so decision and write are one
+    // atomic statement (no TOCTOU on the earlier row read): a row that raced to
+    // `ingesting`/`done` while this command waited must NOT become declined-final
+    // — its frames are landing/landed, and stamping it would tell the sender
+    // "cancelled by receiver" about a delivered transfer on the next resend.
+    // A raced `cancelled` ("by sender") / `failed` attempt-terminal IS stamped:
+    // the user's decline of a still-resendable transfer must survive the race
+    // with a sender revoke or a fetch failure.
+    if let Some(r) = &row {
+        let conn = store.lock_conn();
+        conn.execute(
+            "UPDATE sync_inbound
+             SET declined_at = COALESCE(declined_at, ?1)
+             WHERE id = ?2 AND state NOT IN ('ingesting', 'done')",
+            rusqlite::params![crate::sync::now_iso(), r.id],
+        )
+        .map_err(|e| ApiError::Internal(format!("stamp declined_at for inbound {}: {e:#}", r.id)))?;
+    }
+
+    // Already terminal — the decline (if applicable) is recorded above; nothing
+    // live remains to signal or stamp.
     if matches!(&row, Some(r) if r.state.is_terminal()) {
         return Ok(());
     }
