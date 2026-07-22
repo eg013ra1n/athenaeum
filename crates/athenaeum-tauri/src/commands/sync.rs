@@ -51,7 +51,7 @@ pub async fn get_sync_status(state: State<'_, AppState>) -> Result<SyncStatus, S
 
 /// The transfer history (received + sent), newest first.
 #[tauri::command]
-#[tracing::instrument(skip_all, err)]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn list_sync_history(
     state: State<'_, AppState>,
     query: SyncHistoryQuery,
@@ -65,7 +65,7 @@ pub async fn list_sync_history(
 /// this on mount and on each `sync-finished` so a settled row (and its Resend
 /// affordance + detail) survives a restart. `limit` defaults to 100, capped 500.
 #[tauri::command]
-#[tracing::instrument(skip_all, err)]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn list_terminal_transfers(
     state: State<'_, AppState>,
     limit: Option<u32>,
@@ -77,7 +77,7 @@ pub async fn list_terminal_transfers(
 /// inbound (`received`) package's manifest joined to this node's per-frame
 /// verdicts, for the Transfers UI's expand-a-row detail view.
 #[tauri::command]
-#[tracing::instrument(skip_all, err)]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn list_transfer_files(
     state: State<'_, AppState>,
     direction: Direction,
@@ -89,7 +89,7 @@ pub async fn list_transfer_files(
 /// The event journal for one transfer batch (Transfers Status Model v2 §D7),
 /// newest-first — the detail pane's Log tab. Fired on detail-pane open.
 #[tauri::command]
-#[tracing::instrument(skip_all, err)]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn list_transfer_events(
     state: State<'_, AppState>,
     direction: Direction,
@@ -240,7 +240,7 @@ pub async fn set_sync_auto_mode(state: State<'_, AppState>, enabled: bool) -> Re
 /// Map of peer node-id-hex → hub device name, for showing friendly names in the
 /// transfer history. Best-effort: hub unreachable / signed out → empty map.
 #[tauri::command]
-#[tracing::instrument(skip_all, err)]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn get_sync_device_names(
     state: State<'_, AppState>,
 ) -> Result<std::collections::HashMap<String, String>, String> {

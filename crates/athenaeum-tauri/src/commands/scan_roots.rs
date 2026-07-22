@@ -68,7 +68,7 @@ pub async fn clear_calibration_library_dir(state: State<'_, AppState>) -> Result
 /// The sync-incoming folder (personal-sync receiver write destination), if
 /// configured.
 #[tauri::command]
-#[tracing::instrument(skip_all, err)]
+#[tracing::instrument(skip_all, err, level = "debug")]
 pub async fn get_sync_incoming_dir(state: State<'_, AppState>) -> Result<Option<String>, String> {
     api::get_sync_incoming_dir(&state.ctx).map_err(|e| e.to_string())
 }

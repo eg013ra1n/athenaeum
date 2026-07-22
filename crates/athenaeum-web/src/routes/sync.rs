@@ -68,7 +68,7 @@ pub struct ListHistoryArgs {
 /// Body mirrors the Tauri command's single named `query` param
 /// (`{ "query": { … } }`), so both backends accept the identical
 /// `api.invoke('list_sync_history', { query })` payload.
-#[tracing::instrument(skip_all, err(Debug))]
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn list_sync_history(
     State(state): State<WebAppState>,
     Json(args): Json<ListHistoryArgs>,
@@ -88,7 +88,7 @@ pub struct ListTerminalTransfersArgs {
 /// The recent window of terminal (settled) transfers the cheap
 /// `get_sync_status` poll omits (tv2 follow-up), so a settled row survives a
 /// restart. Mirrors the Tauri command's optional `limit`.
-#[tracing::instrument(skip_all, err(Debug))]
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn list_terminal_transfers(
     State(state): State<WebAppState>,
     Json(args): Json<ListTerminalTransfersArgs>,
@@ -110,7 +110,7 @@ pub struct ListTransferFilesArgs {
 /// Per-file detail for one transfer batch (Task 14): the outbound (`sent`) or
 /// inbound (`received`) package's manifest joined to this node's per-frame
 /// verdicts, for the Transfers UI's expand-a-row detail view.
-#[tracing::instrument(skip_all, err(Debug))]
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn list_transfer_files(
     State(state): State<WebAppState>,
     Json(args): Json<ListTransferFilesArgs>,
@@ -131,7 +131,7 @@ pub struct ListTransferEventsArgs {
 ///
 /// The event journal for one transfer batch (Transfers Status Model v2 §D7),
 /// newest-first — the detail pane's Log tab. Fired on detail-pane open.
-#[tracing::instrument(skip_all, err(Debug))]
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn list_transfer_events(
     State(state): State<WebAppState>,
     Json(args): Json<ListTransferEventsArgs>,
@@ -333,7 +333,7 @@ pub async fn set_sync_auto_mode(
 ///
 /// Map of peer node-id-hex → hub device name for the transfer history. Best-
 /// effort: hub unreachable / signed out → empty map (UI falls back to short hex).
-#[tracing::instrument(skip_all, err(Debug))]
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn get_sync_device_names(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,

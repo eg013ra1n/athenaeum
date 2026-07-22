@@ -153,7 +153,7 @@ pub async fn clear_calibration_library_dir(
 ///
 /// The sync-incoming folder (personal-sync receiver write destination), if
 /// configured.
-#[tracing::instrument(skip_all, err(Debug))]
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn get_sync_incoming_dir(
     State(state): State<WebAppState>,
     _body: Json<serde_json::Value>,
