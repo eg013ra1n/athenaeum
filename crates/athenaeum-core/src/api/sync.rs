@@ -2665,11 +2665,15 @@ pub async fn resend_transfer(
 /// 1. **Sole-owner guard** — refuse if any OTHER outbound row shares this
 ///    `package_ref` (belt-and-suspenders; desktop package dirs are single-owner by
 ///    construction, but a shared dir must never be renamed out from under a sibling).
-/// 2. **Rename** the payload dir to a fresh `uuid` basename → the announce derives
-///    `batch_uuid` from the dir basename at attempt time, so the receiver keys ONE
-///    brand-new inbound row (its old declined row stays declined; receiver code is
-///    untouched). The old row keeps its `package_ref` string (history/delete joins
-///    intact) and its Resend affordance recomputes false (its payload dir is gone).
+/// 2. **Resolve the peer's engine FIRST, then rename** the payload dir to a fresh
+///    `uuid` basename → the announce derives `batch_uuid` from the dir basename at
+///    attempt time, so the receiver keys ONE brand-new inbound row (its old
+///    declined row stays declined; receiver code is untouched). Engine-before-
+///    rename ordering (review fix): engine construction is network/hub-dependent —
+///    failing BEFORE any side effect leaves the old row's Resend fully live,
+///    whereas the only failure after the rename is the enqueue itself, which has a
+///    rename-back. The old row keeps its `package_ref` string (history/delete
+///    joins intact) and its Resend affordance recomputes false (payload dir gone).
 /// 3. **Re-key** the `sync_sources` retention linkage onto the new dir (warn-and-
 ///    continue — a failure only means the new transfer's sources aren't reclaimed,
 ///    the safe direction).
@@ -2740,17 +2744,46 @@ async fn resend_declined_as_new_transfer(
             .collect();
         let display_name = row.display_name.clone().filter(|s| !s.trim().is_empty());
 
-        // (2) Rename the payload dir → a fresh batch identity. Fails cleanly with no
-        // side effects to undo (nothing has been written yet).
-        std::fs::rename(&old_dir, &new_dir).map_err(|e| {
+        (files, display_name)
+    };
+
+    // (5a) Resolve row.peer's engine BEFORE any side effect (review fix): engine
+    // construction is network/hub-dependent and can fail transiently (relay
+    // resolution, node startup, dial address) — if it fails HERE, nothing has been
+    // renamed or re-keyed and the old row's Resend stays fully live. Renaming
+    // first would leave every engine-resolution failure with no rename-back.
+    let engine = match sender.current_for(&row.peer).await {
+        Some((engine, _)) => engine,
+        None => {
+            let (engine, _origin) =
+                ensure_sender_engine(ctx, sender, collab_sender, sync, row.peer, None, emitter)
+                    .await?;
+            engine
+        }
+    };
+
+    // (2) Rename the payload dir → a fresh batch identity. A NotFound here means
+    // the dir is already gone — most likely a concurrent resend of the same row
+    // won the race (the rename is the atomic serialization point) — surface the
+    // same honest wording as the payload guard instead of a raw OS error.
+    if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+        return Err(if e.kind() == std::io::ErrorKind::NotFound {
+            ApiError::Invalid(format!(
+                "package {old_id} data is missing on disk; cannot resend (already resent as a new transfer?)"
+            ))
+        } else {
             ApiError::Internal(format!(
                 "rename declined package dir for resend ({old_ref} → {new_ref}): {e}"
             ))
-        })?;
+        });
+    }
 
-        // (3) Re-key retention linkage onto the new dir. Best-effort: a failure only
-        // means retention can't reclaim the new transfer's sources later (they stay
-        // on disk — the safe direction).
+    // (3) Re-key retention linkage onto the new dir. Best-effort: a failure only
+    // means retention can't reclaim the new transfer's sources later (they stay
+    // on disk — the safe direction).
+    {
+        let database = db(ctx)?;
+        let conn = database.conn();
         match rekey_sync_sources(&conn, &old_ref, &new_ref) {
             Ok(moved) => {
                 tracing::debug!(old_id, moved, "re-keyed sync_sources onto the resent transfer")
@@ -2761,20 +2794,7 @@ async fn resend_declined_as_new_transfer(
                 "re-key sync_sources for resend failed; retention may not reclaim the new transfer"
             ),
         }
-
-        (files, display_name)
-    };
-
-    // (5) Re-drive on row.peer's engine — reuse a started one or build it lazily.
-    let engine = match sender.current_for(&row.peer).await {
-        Some((engine, _)) => engine,
-        None => {
-            let (engine, _origin) =
-                ensure_sender_engine(ctx, sender, collab_sender, sync, row.peer, None, emitter)
-                    .await?;
-            engine
-        }
-    };
+    }
     // The worker inserts the new `sync_outbound` row (+ per-file `pending` rows) in
     // one transaction and replies with its id — do NOT pre-insert here.
     let new_id = match engine.enqueue_package(&new_dir, display_name, files).await {

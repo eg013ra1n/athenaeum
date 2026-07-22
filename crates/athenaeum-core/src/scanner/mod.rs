@@ -1069,6 +1069,13 @@ fn reparse_and_update_in_place(
     };
 
     let metadata_hash = compute_metadata_hash(size, &modified_dt, &filename);
+    // KNOWN TRADE-OFF (smoke №8 review, deferred): this ~1.5MB sampling read runs
+    // inside the caller's phase-2 batch WRITE transaction, so a re-scan with many
+    // changed files extends the exclusive-lock hold and can SQLITE_BUSY concurrent
+    // writers (the content-hash backfill skips-and-retries next launch; UI writes
+    // ride the 5s busy_timeout). Hoisting the hash out of the tx needs a scanner
+    // phase restructure — deliberately deferred; changed-file batches are small in
+    // normal use (mtime/size drift only).
     let content_hash = if use_content_hash {
         Some(
             crate::duplicates::compute_xxhash(path)

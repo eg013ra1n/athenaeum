@@ -3976,3 +3976,161 @@ async fn delete_transfer_history_reclaims_batch_and_leaves_foreign_batch() {
     engine.shutdown().await;
     receiver.shutdown().await;
 }
+
+/// Review fix (smoke №8 final review): the SAME-BATCH bounce at the ENGINE level.
+/// Task D made the desktop UI's Resend divert a declined row into a NEW batch
+/// identity, but Perseus's `/api/retry` still re-enqueues the SAME package dir
+/// (same basename ⇒ same wire `batch_uuid`) — so the live wire path "declined
+/// batch re-announced by a real engine → receiver re-acks all-cancelled without
+/// fetching → sender re-terminalizes `cancelled by receiver`" must stay pinned
+/// end-to-end (the receiver-level unit test drives a raw endpoint, not an
+/// engine). This restores the coverage the Task-D e2e rewrite moved off the
+/// same-batch path: reset-in-place + `engine.resend` here is exactly the
+/// re-announce shape a Perseus-style same-dir re-ask produces.
+#[tokio::test]
+async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
+    const N: usize = 3;
+    let tmp = tempfile::tempdir().unwrap();
+    let capture_dir = tmp.path().join("capture");
+    let primary_dir = tmp.path().join("primary");
+    let capture_files = capture_dir.join("files");
+    std::fs::create_dir_all(&capture_files).unwrap();
+    std::fs::create_dir_all(&primary_dir).unwrap();
+    let capture_db = capture_dir.join("catalog.db");
+    let primary_db = primary_dir.join("catalog.db");
+
+    let capture_ctx = Arc::new(ServiceContext::new_for_tests(capture_db.clone()));
+    let primary_ctx = ServiceContext::new_for_tests(primary_db.clone());
+    let cdb = capture_ctx.db.get().unwrap();
+    let pdb = primary_ctx.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+    let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
+    let receiver_ep = Arc::new(net.endpoint());
+    let receiver_node = receiver_ep.node_id();
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&primary_ctx, &designated);
+    let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
+
+    let control = Arc::new(InboundControl::new());
+    let primary_sync = SyncRuntime::new();
+
+    // Hold the payload fetch aborting so no ingest can complete before the decline.
+    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&primary_store),
+        primary_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::clone(&control),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .expect("spawn primary receiver");
+
+    let (engine, sender, collab_sender, sync) =
+        inject_sender_engine(&net, &capture_db, receiver_node, Duration::from_millis(50)).await;
+
+    let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
+    for idx in 0..N {
+        let (fid, _uuid, _object, _exptime) = insert_capture_frame(&capture_ctx, &capture_files, idx);
+        frame_ids.push(fid);
+    }
+    let _r = enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        frame_ids.clone(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("enqueue selection");
+    let old_id = latest_outbound_id(cdb);
+
+    // Learn the wire id (re-arming the one-shot abort each poll), then decline.
+    let mut wire_pkg = String::new();
+    wait_until(
+        || {
+            receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+            match latest_inbound_package_id(pdb) {
+                Some(p) => {
+                    wire_pkg = p;
+                    true
+                }
+                None => false,
+            }
+        },
+        WAIT,
+    )
+    .await;
+    control.request_cancel(&wire_pkg);
+    cancel_incoming_package(&primary_ctx, &primary_sync, &wire_pkg)
+        .await
+        .expect("cancel_incoming_package command");
+    wait_until(|| outbound_state(cdb, old_id) == "cancelled", WAIT).await;
+    assert_eq!(
+        outbound_last_error(cdb, old_id).as_deref(),
+        Some("cancelled by receiver"),
+        "the sender records the receiver-decline reason"
+    );
+    let history_after_decline =
+        count(pdb, "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='cancelled'");
+    assert_eq!(history_after_decline, N as i64, "one cancelled history row per frame");
+
+    // Disarm the fault so a re-fetch WOULD deliver — proving the bounce below is
+    // decline-driven, not fault-driven.
+    receiver_ep.set_fault(FaultPlan::default());
+
+    // SAME-BATCH re-ask at the engine level (the Perseus `/api/retry` shape,
+    // bypassing the desktop API's new-batch divert): reset the SAME row in place
+    // with a fresh wire id and re-drive it.
+    let capture_store = CatalogSyncStore::open(&capture_db).expect("open capture sync store");
+    let resend_wire = uuid::Uuid::new_v4().to_string();
+    capture_store
+        .reset_outbound_for_resend(old_id, &resend_wire)
+        .expect("reset the declined row in place");
+    engine.resend(old_id).await.expect("re-drive the same-batch row");
+
+    // The receiver — resolving the SAME declined row by batch_uuid — seeds the new
+    // wire id from the receipt anchor and re-acks all-cancelled WITHOUT fetching;
+    // the sender re-terminalizes `cancelled by receiver`.
+    wait_until(
+        || {
+            count(
+                pdb,
+                &format!("SELECT COUNT(*) FROM sync_receipts WHERE package_id = '{resend_wire}' AND outcome = 'cancelled'"),
+            ) == N as i64
+        },
+        WAIT,
+    )
+    .await;
+    wait_until(|| outbound_state(cdb, old_id) == "cancelled", WAIT).await;
+    assert_eq!(
+        outbound_last_error(cdb, old_id).as_deref(),
+        Some("cancelled by receiver"),
+        "the same-batch re-ask re-terminalizes with the decline reason"
+    );
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "nothing ingested on the bounce");
+    assert_eq!(landed_count(&designated), 0, "nothing landed on the bounce");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM sync_inbound"),
+        1,
+        "still ONE batch-keyed inbound row"
+    );
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='cancelled'"),
+        history_after_decline,
+        "the bounce duplicates NO received history"
+    );
+
+    engine.shutdown().await;
+    receiver.shutdown().await;
+}

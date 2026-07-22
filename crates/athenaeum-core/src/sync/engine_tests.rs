@@ -3032,9 +3032,11 @@ async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
         announced_pid: Arc::clone(&announced_pid),
     });
 
-    // Short ack timeout so the whole ladder runs in well under a second; every wait
-    // below scales to this base (backoff rung 1 = 2× base = 400ms).
-    let ack_timeout = Duration::from_millis(200);
+    // Short-but-generous ack timeout (review fix: 200ms flaked under parallel-test
+    // scheduler stalls — a >200ms gap between processed ticks let the timer fire).
+    // 600ms against 100ms ticks gives a 6× margin; every wait below scales to this
+    // base (backoff rung 1 = 2× base = 1.2s).
+    let ack_timeout = Duration::from_millis(600);
     let pkg = build_package(&tmp.path().join("src-serve"), "uuid-serve", "f.fits", "M8", 1024);
     let db_path = tmp.path().join("sync.db");
     let store = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
@@ -3056,18 +3058,31 @@ async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
     assert_eq!(announce_count.load(SeqCst), 1, "exactly one announce so far");
 
     // ---- Phase 1: steady ticks suppress the ack timeout entirely. -------------
-    // Tick every ~40ms (well under the 200ms ack timeout) for > 3× the timeout.
-    // Each tick pushes the deadline out, so the ladder can never fire and the row
-    // never enters the "waiting · retry" presentation (next_retry_at is the
-    // persisted countdown behind that UI state).
-    for i in 0..16u64 {
-        tx.send(TransportEvent::ServeProgress {
-            package_id: pid.clone(),
-            bytes_sent: (i + 1) * 64,
-        })
-        .await
-        .unwrap();
-        tokio::time::sleep(Duration::from_millis(40)).await;
+    // Tick every ~100ms (6× under the 600ms ack timeout) for > 3× the timeout,
+    // ALTERNATING ServeProgress and ServeFileProgress — BOTH handlers must defer
+    // (review fix: the per-file call site was previously untested). Each tick
+    // pushes the deadline out, so the ladder can never fire and the row never
+    // enters the "waiting · retry" presentation (next_retry_at is the persisted
+    // countdown behind that UI state).
+    for i in 0..20u64 {
+        if i % 2 == 0 {
+            tx.send(TransportEvent::ServeProgress {
+                package_id: pid.clone(),
+                bytes_sent: (i + 1) * 64,
+            })
+            .await
+            .unwrap();
+        } else {
+            tx.send(TransportEvent::ServeFileProgress {
+                package_id: pid.clone(),
+                file: "f.fits".to_string(),
+                bytes_done: (i + 1) * 64,
+                bytes_total: 1024,
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
             store.get_outbound(id).unwrap().unwrap().next_retry_at,
             None,
@@ -3128,6 +3143,50 @@ async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
         1,
         "the disarmed retry must not re-announce mid-pull"
     );
+
+    // ---- Phase 2b: a ServeFileProgress tick ALSO disarms an armed retry. ------
+    // (Review fix: pins the on_serve_file_progress call site independently.)
+    wait_until(
+        || store.get_outbound(id).unwrap().unwrap().next_retry_at.is_some(),
+        WAIT,
+    )
+    .await;
+    let mut cleared = false;
+    for _ in 0..50 {
+        tx.send(TransportEvent::ServeFileProgress {
+            package_id: pid.clone(),
+            file: "f.fits".to_string(),
+            bytes_done: 512,
+            bytes_total: 1024,
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        if store.get_outbound(id).unwrap().unwrap().next_retry_at.is_none() {
+            cleared = true;
+            break;
+        }
+    }
+    assert!(cleared, "a per-file serve tick must cancel the armed retry countdown");
+    assert_eq!(announce_count.load(SeqCst), 1, "still no mid-pull re-announce");
+
+    // ---- Phase 2c: ServeComplete ALSO defers/disarms (the post-upload window). -
+    // (Review fix: pins the on_serve_complete call site — the peer finished
+    // pulling; the ack window restarts from HERE, and an armed retry is disarmed.)
+    wait_until(
+        || store.get_outbound(id).unwrap().unwrap().next_retry_at.is_some(),
+        WAIT,
+    )
+    .await;
+    tx.send(TransportEvent::ServeComplete { package_id: pid.clone() })
+        .await
+        .unwrap();
+    wait_until(
+        || store.get_outbound(id).unwrap().unwrap().next_retry_at.is_none(),
+        WAIT,
+    )
+    .await;
+    assert_eq!(announce_count.load(SeqCst), 1, "serve-complete must not re-announce");
 
     // ---- Phase 3: full silence resumes the ladder. ----------------------------
     // With no more ticks, the last-pushed deadline elapses and the ack timeout
