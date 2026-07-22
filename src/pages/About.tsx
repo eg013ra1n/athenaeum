@@ -228,7 +228,7 @@ export default function About() {
           Join the conversation, share images, ask questions, and follow updates.
         </p>
         <div className="flex gap-4">
-          <ExtLink href="https://discord.gg/kfpjaQuc">Discord</ExtLink>
+          <ExtLink href="https://discord.gg/WW22RfruPx">Discord</ExtLink>
           <ExtLink href="https://t.me/athenaeum_astro">Telegram</ExtLink>
         </div>
       </section>
