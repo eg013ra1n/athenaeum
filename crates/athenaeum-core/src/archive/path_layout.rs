@@ -22,7 +22,9 @@ pub fn sanitize_for_filename(s: &str) -> String {
     }
     let out = out.trim_matches('_').trim_end_matches(['.', ' ']).to_string();
     // Windows reserves CON/PRN/AUX/NUL/COM1-9/LPT1-9 as any path segment,
-    // case-insensitive, with or without an extension — suffix to defuse.
+    // case-insensitive, with or without an extension. The device is resolved
+    // from the component BEFORE THE FIRST DOT (`NUL.txt` ≡ `NUL`), so the
+    // underscore must break THAT token — not the tail of the whole string.
     let base = out.split('.').next().unwrap_or("");
     let upper = base.to_ascii_uppercase();
     let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
@@ -30,7 +32,11 @@ pub fn sanitize_for_filename(s: &str) -> String {
             && (upper.starts_with("COM") || upper.starts_with("LPT"))
             && matches!(upper.as_bytes()[3], b'1'..=b'9'));
     if reserved {
-        format!("{out}_")
+        match out.find('.') {
+            // "NUL.txt" → "NUL_.txt": break the pre-first-dot component.
+            Some(i) => format!("{}_{}", &out[..i], &out[i..]),
+            None => format!("{out}_"),
+        }
     } else {
         out
     }
@@ -193,7 +199,8 @@ mod tests {
         assert_eq!(sanitize_for_filename("NUL"), "NUL_");
         assert_eq!(sanitize_for_filename("nul"), "nul_");
         assert_eq!(sanitize_for_filename("COM3"), "COM3_");
-        assert_eq!(sanitize_for_filename("lpt9.fits"), "lpt9.fits_");
+        assert_eq!(sanitize_for_filename("lpt9.fits"), "lpt9_.fits");
+        assert_eq!(sanitize_for_filename("NUL.txt"), "NUL_.txt");
         // Not reserved: COM0, COM10, plain names, inner dots.
         assert_eq!(sanitize_for_filename("COM0"), "COM0");
         assert_eq!(sanitize_for_filename("com10"), "com10");
