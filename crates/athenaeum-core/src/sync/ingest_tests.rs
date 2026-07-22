@@ -905,6 +905,118 @@ fn sampling_collision_is_not_treated_as_duplicate() {
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "both frames land as separate files");
 }
 
+/// Content-dedup (step 3) must consult the LIVE catalog: a receipt only vouches
+/// for content while the frame it ingested still exists in `frames`. Field bug
+/// this pins: a user received a batch (receipts written `ingested`), later
+/// deleted those files properly (disk + `DELETE FROM files` CASCADE → the
+/// `frames` rows are gone too), then had them re-sent from another device. The
+/// pre-handshake correctly *wanted* them and the bytes travelled, but step 3
+/// found the OLD receipts and classified every frame `Duplicate`, discarding the
+/// payload — once-received content banned forever on that machine. After the fix
+/// (join `sync_receipts` to `frames` on `frame_uuid`), a receipt whose frame was
+/// deleted no longer blocks the re-receive.
+#[test]
+fn content_reingest_allowed_after_catalog_delete() {
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let conn = catalog_conn();
+
+    // The resend from another device: a NEW wire package with a fresh package_id
+    // and a fresh frame_uuid.
+    let (pkg_dir, announce) =
+        build_fixture_package(tmp.path(), "frame-reingest-new", "L_0001.fits", "M31", "2026-01-16T10:00:00.000Z");
+    let full_hash = package::xxh3_full_file(&pkg_dir.join("L_0001.fits")).unwrap();
+
+    // Seed a stale `ingested` receipt for an EARLIER package: same full-content
+    // hash H, but its frame was deleted from the catalog (no `frames` row for
+    // that uuid) — so the receipt is history, not live state.
+    insert_receipt(
+        &conn,
+        "earlier-package-id",
+        &FrameReceipt {
+            frame_uuid: "deleted-frame-uuid".into(),
+            xxh3: full_hash.clone(),
+            outcome: ReceiptOutcome::Ingested,
+        },
+        "2026-01-01T00:00:00.000Z",
+    )
+    .unwrap();
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM frames WHERE uuid='deleted-frame-uuid'"),
+        0,
+        "premise: the receipt's frame was deleted from the catalog"
+    );
+
+    let out = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+
+    assert_eq!(
+        out.ingested, 1,
+        "deleted-then-resent content must re-ingest, not dedup against a stale receipt"
+    );
+    assert_eq!(out.duplicate, 0, "not a duplicate");
+    assert!(matches!(out.receipts[0].outcome, ReceiptOutcome::Ingested));
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "catalog file row created");
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1, "catalog frame row created");
+    let landed_path: String = conn
+        .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
+        .unwrap();
+    assert!(Path::new(&landed_path).exists(), "payload landed on disk: {landed_path}");
+}
+
+/// The complement pin (must pass before AND after the fix): while the receipt's
+/// frame is STILL ALIVE in `frames`, content-dedup keeps blocking — a second
+/// frame with the same content hash but a different uuid is a genuine
+/// `Duplicate`, no write. This is also the guarantee that a black-holed frame
+/// (still present in `frames`) keeps dedup-ing as present: the live-catalog join
+/// preserves it automatically.
+#[test]
+fn content_dedup_still_blocks_while_frame_alive() {
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let conn = catalog_conn();
+
+    // A new package (fresh wire id + fresh uuid) whose payload hashes to H.
+    let (pkg_dir, announce) =
+        build_fixture_package(tmp.path(), "frame-dup-new", "L_0002.fits", "M42", "2026-01-16T10:00:00.000Z");
+    let full_hash = package::xxh3_full_file(&pkg_dir.join("L_0002.fits")).unwrap();
+
+    // A LIVE frame the receipt vouches for: files + frames rows present.
+    conn.execute(
+        "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+         VALUES ('/local/alive.fits', 'alive.fits', 100, '2026-01-15T00:00:00Z', 'FITS', '2026-01-15T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+    let file_id: i64 = conn.query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0)).unwrap();
+    conn.execute(
+        "INSERT INTO frames (file_id, imagetyp, uuid, updated_at)
+         VALUES (?1, 'Light', 'alive-frame-uuid', '2026-01-15T00:00:00.000Z')",
+        rusqlite::params![file_id],
+    )
+    .unwrap();
+
+    // The receipt: same full-content hash H, frame_uuid points at the live frame.
+    insert_receipt(
+        &conn,
+        "earlier-package-id",
+        &FrameReceipt {
+            frame_uuid: "alive-frame-uuid".into(),
+            xxh3: full_hash.clone(),
+            outcome: ReceiptOutcome::Ingested,
+        },
+        "2026-01-01T00:00:00.000Z",
+    )
+    .unwrap();
+
+    let out = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+
+    assert_eq!(out.duplicate, 1, "same content while its frame is alive stays a Duplicate");
+    assert_eq!(out.ingested, 0, "no ingest");
+    assert!(matches!(out.receipts[0].outcome, ReceiptOutcome::Duplicate));
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1, "no new frame written");
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "no new file written");
+}
+
 /// Required test #1 (the e2e repair scenario): a two-frame package where one
 /// payload is corrupted post-write. The receiver rejects that frame and
 /// ingests its sibling; the sender must NOT confirm (any Rejected receipt

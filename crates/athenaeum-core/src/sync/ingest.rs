@@ -15,18 +15,28 @@
 //!    `duplicate`. Either way the receipt is [`Duplicate`](ReceiptOutcome::Duplicate)
 //!    and nothing is written to `files`/`frames`. A same-uuid frame whose content
 //!    hash differs is logged at `warn` and still kept (v1 keeps existing).
-//! 3. **Dedup by content hash** — a payload whose full-content xxh3 was already
-//!    recorded as [`Ingested`](ReceiptOutcome::Ingested) in `sync_receipts` for
-//!    some earlier frame is also a `Duplicate`, no write. This compares the
-//!    manifest's *full* xxh3 (already verified in step 1) against previously
-//!    ingested full hashes — **not** `files.content_hash` (`duplicates::compute_xxhash`
-//!    3-position sampling hash, intentional for fast move-verify but wrong for
-//!    a dedupe *decision*: two distinct files can share all three sampled
-//!    windows and differ only outside them, which would falsely mark a
-//!    genuinely new frame `Duplicate` and lose it). Caveat: a frame the
-//!    **scanner** ingested (not via sync) has no full hash recorded anywhere,
-//!    so it is not a secondary-dedupe candidate — `frames.uuid` (step 2)
-//!    remains the primary key for those; acceptable v1.
+//! 3. **Dedup by content hash, gated on the LIVE catalog** — a payload whose
+//!    full-content xxh3 was already recorded as
+//!    [`Ingested`](ReceiptOutcome::Ingested) in `sync_receipts` for some earlier
+//!    frame is a `Duplicate` (no write) **only while that frame still exists in
+//!    `frames`**. The lookup JOINs `sync_receipts` to `frames` on `frame_uuid`
+//!    (step 4 stamps the manifest `frame_uuid` onto `frames.uuid`), so a receipt
+//!    is history, not state: deleting a frame from the catalog (disk +
+//!    `DELETE FROM files` CASCADE, which drops its `frames` row too) frees its
+//!    content to be received again. Without this join a user who properly deleted
+//!    a received batch then had it re-sent from another device saw every frame
+//!    classified `Duplicate` and discarded — once-received content banned forever
+//!    on that machine. A frame that is merely black-holed is still ALIVE in
+//!    `frames`, so it keeps dedup-ing (present-wins) automatically. The
+//!    comparison uses the manifest's *full* xxh3 (already verified in step 1)
+//!    against previously ingested full hashes — **not** `files.content_hash`
+//!    (`duplicates::compute_xxhash` 3-position sampling hash, intentional for
+//!    fast move-verify but wrong for a dedupe *decision*: two distinct files can
+//!    share all three sampled windows and differ only outside them, which would
+//!    falsely mark a genuinely new frame `Duplicate` and lose it). Caveat: a
+//!    frame the **scanner** ingested (not via sync) has no full hash recorded
+//!    anywhere, so it is not a secondary-dedupe candidate — `frames.uuid`
+//!    (step 2) remains the primary key for those; acceptable v1.
 //! 4. **Ingest** — otherwise land the payload (tmp/rename into
 //!    `<incoming_root>/<sender_slug>/<rel_path>`, mirroring the sender's tree
 //!    under a slug that is the *authenticated* peer's CURRENT friendly device
@@ -321,16 +331,19 @@ fn process_frame(
         return Ok(FrameVerdict { receipt, history_outcome });
     }
 
-    // 3. Dedup by FULL content hash (same bytes, different/absent uuid).
-    // Compares the manifest's full-content xxh3 (`record.xxh3`, already
-    // verified against the payload in step 1) against previously *ingested*
-    // full hashes recorded in `sync_receipts` — deliberately NOT
+    // 3. Dedup by FULL content hash (same bytes, different/absent uuid), gated
+    // on the LIVE catalog. Compares the manifest's full-content xxh3
+    // (`record.xxh3`, already verified against the payload in step 1) against
+    // previously *ingested* full hashes in `sync_receipts` WHOSE FRAME IS STILL
+    // ALIVE in `frames` (the fn joins the two on `frame_uuid`) — deliberately NOT
     // `files.content_hash` (the 3-position sampling hash): two distinct files
     // can share every sampled window and differ only outside them, which would
     // falsely mark a genuinely new frame `Duplicate` and lose it (see module
-    // docs). A frame the scanner ingested directly (no full hash on record) is
-    // not a secondary-dedupe candidate here — `frames.uuid` (step 2) remains
-    // the primary key for those; acceptable v1.
+    // docs). Deleting a received frame frees its content for re-receive; a
+    // black-holed frame stays alive so it keeps dedup-ing. A frame the scanner
+    // ingested directly (no full hash on record) is not a secondary-dedupe
+    // candidate here — `frames.uuid` (step 2) remains the primary key for those;
+    // acceptable v1.
     if full_hash_already_ingested(conn, &record.xxh3)? {
         tracing::debug!(frame_uuid = %record.frame_uuid, "sync ingest duplicate by full content hash");
         let receipt = duplicate_receipt(record);
@@ -407,17 +420,29 @@ fn find_frame_by_uuid(conn: &Connection, frame_uuid: &str) -> Result<Option<Exis
     .context("dedup lookup by frames.uuid")
 }
 
-/// True if `xxh3` (a manifest's full-content hash, already verified against
-/// its payload in step 1) was already recorded as
-/// [`Ingested`](ReceiptOutcome::Ingested) for some earlier frame. Queries
-/// `sync_receipts`, deliberately NOT `files.content_hash` — see the module
-/// docs and the step-3 comment at the call site for why the sampling hash is
-/// unsafe to use for this decision.
+/// True if `xxh3` (a manifest's full-content hash, already verified against its
+/// payload in step 1) was already recorded as
+/// [`Ingested`](ReceiptOutcome::Ingested) for some earlier frame that is STILL
+/// ALIVE in the catalog. The query JOINs `sync_receipts` to `frames` on
+/// `frame_uuid` (ingest step 4 stamps the manifest `frame_uuid` onto
+/// `frames.uuid`), so a receipt only vouches for content while the frame it
+/// ingested still exists: a receipt is history, not state. Deleting that frame
+/// (disk + `DELETE FROM files` CASCADE, which drops its `frames` row too) frees
+/// the content to be received again — without the join a user who properly
+/// deleted a received batch then had it re-sent from another device saw every
+/// frame classified `Duplicate` and discarded, banning once-received content
+/// forever on that machine. A frame that is merely black-holed is still present
+/// in `frames`, so the join keeps it dedup-ing (present-wins) automatically.
+/// Queries `sync_receipts`, deliberately NOT `files.content_hash` — see the
+/// module docs and the step-3 comment at the call site for why the sampling hash
+/// is unsafe to use for this decision.
 fn full_hash_already_ingested(conn: &Connection, xxh3: &str) -> Result<bool> {
     let ingested = receipt_outcome_to_db(&ReceiptOutcome::Ingested);
     let n: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM sync_receipts WHERE xxh3 = ?1 AND outcome = ?2",
+            "SELECT COUNT(*) FROM sync_receipts sr
+             JOIN frames fr ON fr.uuid = sr.frame_uuid
+             WHERE sr.xxh3 = ?1 AND sr.outcome = ?2",
             params![xxh3, ingested],
             |r| r.get(0),
         )
