@@ -20,7 +20,20 @@ pub fn sanitize_for_filename(s: &str) -> String {
     while out.contains("__") {
         out = out.replace("__", "_");
     }
-    out.trim_matches('_').to_string()
+    let out = out.trim_matches('_').trim_end_matches(['.', ' ']).to_string();
+    // Windows reserves CON/PRN/AUX/NUL/COM1-9/LPT1-9 as any path segment,
+    // case-insensitive, with or without an extension — suffix to defuse.
+    let base = out.split('.').next().unwrap_or("");
+    let upper = base.to_ascii_uppercase();
+    let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'));
+    if reserved {
+        format!("{out}_")
+    } else {
+        out
+    }
 }
 
 /// Token, with a "Unknown" fallback when the value is None or empty.
@@ -164,6 +177,28 @@ mod tests {
         assert_eq!(sanitize_for_filename("Hello World"), "Hello_World");
         assert_eq!(sanitize_for_filename("foo/bar:baz"), "foo_bar_baz");
         assert_eq!(sanitize_for_filename("a   b"), "a_b");
+    }
+
+    #[test]
+    fn sanitize_trims_trailing_dots_and_guards_reserved_names() {
+        // Windows strips trailing dots at create time; the sanitizer must match,
+        // or DB paths diverge from disk (audit F3).
+        assert_eq!(sanitize_for_filename("Sh2-155."), "Sh2-155");
+        assert_eq!(sanitize_for_filename("NGC 7000 "), "NGC_7000");
+        // Dot-segments must not survive as path components (library-root escape).
+        assert_eq!(sanitize_for_filename("."), "");
+        assert_eq!(sanitize_for_filename(".."), "");
+        // Reserved device names (any case, with or without extension) are illegal
+        // as any Windows path segment — defuse with a trailing underscore.
+        assert_eq!(sanitize_for_filename("NUL"), "NUL_");
+        assert_eq!(sanitize_for_filename("nul"), "nul_");
+        assert_eq!(sanitize_for_filename("COM3"), "COM3_");
+        assert_eq!(sanitize_for_filename("lpt9.fits"), "lpt9.fits_");
+        // Not reserved: COM0, COM10, plain names, inner dots.
+        assert_eq!(sanitize_for_filename("COM0"), "COM0");
+        assert_eq!(sanitize_for_filename("com10"), "com10");
+        assert_eq!(sanitize_for_filename("M31"), "M31");
+        assert_eq!(sanitize_for_filename("DMK 41AU02.AS"), "DMK_41AU02.AS");
     }
 
     #[test]

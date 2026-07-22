@@ -696,14 +696,21 @@ fn source_cards_for_file(
 }
 
 /// YYYY-MM-DD from a DATE-OBS string (`2026-07-05T20:30:00Z` → `2026-07-05`).
-/// Missing/empty → `"UnknownDate"` so the output layout never gets an empty
-/// path segment.
+/// The result becomes a path segment, so it goes through the shared
+/// sanitizer — a malformed non-ISO DATE-OBS must not nest directories ('/')
+/// or hit Windows-illegal chars (':'). Missing/empty/unsalvageable →
+/// `"UnknownDate"` so the layout never gets an empty segment.
 fn date_part(date_obs: Option<&str>) -> String {
-    date_obs
+    let raw: String = date_obs
         .and_then(|d| d.split('T').next())
-        .map(|d| d.chars().take(10).collect::<String>())
-        .filter(|d| !d.is_empty())
-        .unwrap_or_else(|| "UnknownDate".to_string())
+        .map(|d| d.chars().take(10).collect())
+        .unwrap_or_default();
+    let sanitized = crate::archive::path_layout::sanitize_for_filename(&raw);
+    if sanitized.is_empty() {
+        "UnknownDate".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn resolve_frame_inputs(
@@ -2709,6 +2716,16 @@ mod tests {
         seed_set(conn, 100, "MasterDark", true);
         seed_set(conn, 101, "MasterFlat", true);
         seed_set(conn, 102, "MasterBias", true);
+    }
+
+    #[test]
+    fn date_part_sanitizes_non_iso_values() {
+        assert_eq!(date_part(Some("2026-07-05T20:30:00Z")), "2026-07-05");
+        // Malformed locale date: '/' must not become directory nesting, ':' is
+        // Windows-illegal — both map to '_' (audit F6).
+        assert_eq!(date_part(Some("05/07/2026")), "05_07_2026");
+        assert_eq!(date_part(None), "UnknownDate");
+        assert_eq!(date_part(Some("")), "UnknownDate");
     }
 
     #[test]
