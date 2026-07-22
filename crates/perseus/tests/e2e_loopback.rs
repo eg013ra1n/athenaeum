@@ -27,10 +27,14 @@ use athenaeum_core::package;
 use athenaeum_core::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
 use athenaeum_core::sharing::types::{FrameReceipt, ReceiptOutcome, TransportEvent};
 use athenaeum_core::sharing::{noop_fetch_sink, SharingTransport};
+use athenaeum_core::sync::store::StandaloneSyncStore;
 use athenaeum_core::sync::{HistoryQuery, HistoryRow, OutboundState, SyncStore};
 
 use perseus::config::{Config, Mode, RetentionConfig, RetentionPolicy};
 use perseus::run::Agent;
+use perseus::supervisor::AgentState;
+use perseus::web::{build_router, WebState};
+use tower::ServiceExt; // ServiceExt::oneshot drives the router in-process
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -916,4 +920,120 @@ async fn declined_then_operator_divert_mints_new_batch_and_delivers() {
     );
 
     agent.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// Task 5 (Perseus UI v2): obligation-gated source deletion + batch-history
+// delete, driven against a REAL confirmed transfer through the web router.
+// ---------------------------------------------------------------------------
+
+/// Drive the web router in-process (no bound socket) with a JSON POST body.
+async fn web_post(app: &axum::Router, uri: &str, body: serde_json::Value) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Drive the web router in-process with a GET.
+async fn web_get(app: &axum::Router, uri: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn web_body(res: axum::response::Response) -> serde_json::Value {
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Spec §8 happy path against a REAL confirmed transfer: two fixtures land in one
+/// batch, confirm, then a detached `WebState` over the same data dir runs the two
+/// destructive endpoints. `POST /api/delete-files` removes the actual capture
+/// files from disk and stamps the batch (the obligation is met — confirmed);
+/// `POST /api/delete` history-deletes the group so `GET /api/transfers` is empty.
+#[tokio::test]
+async fn delete_files_and_history_after_real_confirm() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Both fixtures pre-exist → the initial scan coalesces them into ONE batch
+    // (2s quiet window covers their same-tick stabilization).
+    let (agent, cfg, _stats, capture) =
+        resend_rig(tmp.path(), &["frame1.fits", "frame2.fits"], 2).await;
+
+    wait_until(
+        || {
+            is_confirmed(&history_for(&agent, "frame1.fits"))
+                && is_confirmed(&history_for(&agent, "frame2.fits"))
+        },
+        WAIT,
+    )
+    .await;
+    let rows = agent.store().all_outbound(10).unwrap();
+    assert_eq!(rows.len(), 1, "both fixtures coalesced into one confirmed batch");
+    let package_ref = rows[0].package_ref.clone();
+
+    // The source capture files are still on disk (retention keeps everything).
+    let src1 = capture.join("frame1.fits");
+    let src2 = capture.join("frame2.fits");
+    assert!(src1.exists() && src2.exists(), "sources present before delete-files");
+
+    // Quiesce the agent, then open a fresh set of stores over the SAME perseus.db
+    // and a detached WebState (the delete paths never touch the engine).
+    agent.shutdown().await;
+    let db = cfg.db_path();
+    let store = Arc::new(StandaloneSyncStore::open(&db).unwrap());
+    let seen = Arc::new(perseus::seen::SeenStore::open(&db).unwrap());
+    let batches = Arc::new(perseus::batch_store::BatchStore::open(&db).unwrap());
+    let (_state_tx, state_rx) = tokio::sync::watch::channel(AgentState::NeedsSetup { needs: vec![] });
+    let state = Arc::new(WebState::detached(
+        store,
+        seen,
+        batches,
+        cfg.clone(),
+        cfg.data_dir.join("perseus.toml"),
+        state_rx,
+        Arc::new(tokio::sync::Notify::new()),
+    ));
+    let app = build_router(Arc::clone(&state), None);
+
+    // delete-files: the batch is confirmed (obligation met) → 200; both REAL
+    // sources are removed from disk and the batch is stamped.
+    let res = web_post(&app, "/api/delete-files", serde_json::json!({ "packageRef": package_ref })).await;
+    assert_eq!(res.status(), axum::http::StatusCode::OK, "a confirmed batch is deletable");
+    let v = web_body(res).await;
+    assert_eq!(
+        v["removed"].as_array().unwrap().len(),
+        2,
+        "both real capture sources removed: {v}"
+    );
+    assert!(!src1.exists() && !src2.exists(), "the capture fixtures are gone from disk");
+    assert!(v["filesDeletedAt"].as_str().is_some(), "the batch was stamped: {v}");
+
+    // history delete: the group is terminal → 200; GET /api/transfers is empty.
+    let res = web_post(&app, "/api/delete", serde_json::json!({ "packageRefs": [package_ref] })).await;
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    let v = web_body(res).await;
+    assert_eq!(
+        v["deleted"].as_array().unwrap().len(),
+        1,
+        "the terminal group was history-deleted: {v}"
+    );
+    let transfers = web_body(web_get(&app, "/api/transfers").await).await;
+    assert!(
+        transfers.as_array().unwrap().is_empty(),
+        "no transfers remain after history delete: {transfers}"
+    );
 }

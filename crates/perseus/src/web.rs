@@ -26,8 +26,15 @@
 //!   rings the supervisor so it applies the edit live (engine restart only, no
 //!   process restart). The watchers keep their spawn-time dirs until that
 //!   engine relaunch, which is the window `restartPending` reports.
-//! - `POST /api/delete` — delete the source capture files of CONFIRMED packages
-//!   through the same confirmed-only deleter retention uses ([`DeleteReport`]).
+//! - `POST /api/delete-files` — obligation-gated deletion of ONE batch's source
+//!   capture files ([`DeleteFilesReport`]): the server re-runs the same
+//!   [`obligation_verdict`] the UI showed and refuses (`409`) unless every
+//!   participation delivered somewhere or the receiver closed it, then removes
+//!   the sources through the shared safety contract and stamps the batch.
+//! - `POST /api/delete` — history-delete whole batch groups ([`HistoryDeleteReport`]):
+//!   drop the sender bookkeeping (outbound rows + per-file rows + journal + the
+//!   `perseus_batch` row) of terminal batches. The `perseus_seen` linkage is kept
+//!   so dedup identity + the retention audit trail survive.
 //!
 //! # Auth
 //!
@@ -70,7 +77,7 @@ use crate::config_edit::{
 };
 use crate::pending::{pending_tree, PendingNode};
 use crate::resend::{self, is_declined};
-use crate::run::{delete_confirmed_packages, DeleteReport};
+use crate::run::delete_package_sources;
 use crate::seen::SeenStore;
 use crate::supervisor::AgentState;
 
@@ -107,10 +114,10 @@ pub struct WebState {
     /// once at supervisor start (a second WAL connection beside the agent's own)
     /// so the page reads even while the engine is detached.
     pub store: Arc<StandaloneSyncStore>,
-    /// Perseus's stat-aware seen store (source-file linkage). The manual-delete
-    /// endpoint (`POST /api/delete`) resolves a confirmed package back to its
-    /// source capture file through this, via the exact same deleter retention
-    /// uses ([`delete_confirmed_packages`](crate::run::delete_confirmed_packages)).
+    /// Perseus's stat-aware seen store (source-file linkage). The obligation-gated
+    /// delete-files endpoint (`POST /api/delete-files`) resolves a batch back to
+    /// its source capture files through this, via the exact same multi-source
+    /// deleter retention uses ([`delete_package_sources`](crate::run::delete_package_sources)).
     pub seen: Arc<SeenStore>,
     /// Path to `perseus.toml` — the retention / capture-dirs edits write it via
     /// [`config_edit`](crate::config_edit).
@@ -144,9 +151,9 @@ pub struct WebState {
     pub cleanup: RwLock<Option<Arc<SharedPackageCleanup>>>,
     /// This node's configured sync peer id (hex) — the same value transfer
     /// history rows carry. Stamped onto the `deleted_manual` audit rows written
-    /// by `POST /api/delete` so the history shows the peer a confirmed package
-    /// was sent to, not this agent's own node id (the manifest's `origin_device`
-    /// is self — the earlier bug). Empty while detached.
+    /// by `POST /api/delete-files` so the history shows the peer a confirmed
+    /// package was sent to, not this agent's own node id (the manifest's
+    /// `origin_device` is self — the earlier bug). Empty while detached.
     pub peer_device: RwLock<String>,
     /// Retention live-edit channel: the PUT-policy handler pushes an edited
     /// [`RetentionConfig`] here so the running retention loop adopts it without a
@@ -478,6 +485,9 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         // log. Read-only; the deletion endpoints are a later task.
         .route("/api/transfers", get(api_transfers))
         .route("/api/transfers/events", get(api_transfer_events))
+        // Obligation-gated source-file deletion (per batch) + batch-history delete
+        // (per group). Both bearer-gated like every other `/api/*` route.
+        .route("/api/delete-files", post(api_delete_files))
         .route("/api/delete", post(api_delete))
         .route("/api/retry", post(api_retry))
         // The explicit operator divert for a receiver-declined transfer (a
@@ -838,13 +848,21 @@ impl PolicyDto {
     }
 }
 
-/// `POST /api/delete` request body.
+/// `POST /api/delete-files` request body: the single batch whose SOURCE capture
+/// files to delete. Obligation-gated — the server re-runs [`obligation_verdict`]
+/// before touching disk.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct DeleteRequest {
-    /// Outbound-row ids to delete. Non-confirmed / unknown ids are rejected
-    /// per-id in the [`DeleteReport`] response, never deleted.
-    ids: Vec<i64>,
+struct DeleteFilesRequest {
+    package_ref: String,
+}
+
+/// `POST /api/delete` (history-group) request body: the batches whose sender
+/// bookkeeping to drop. `perseus_seen` linkage is kept (dedup + audit history).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryDeleteRequest {
+    package_refs: Vec<String>,
 }
 
 /// `GET /api/retention/policy` — current retention config + read-only soak gate.
@@ -1863,22 +1881,242 @@ async fn api_transfer_events(
     Ok(Json(events))
 }
 
-/// `POST /api/delete` — delete the source capture files of the given CONFIRMED
-/// packages. Verifies each id is `confirmed` before touching disk; non-confirmed
-/// / unknown ids come back in `rejected` with a reason. Shares the same
-/// confirmed-only deleter as retention (audit-before-delete, TOCTOU guard).
+/// 200 body for an allowed `POST /api/delete-files`: the per-file deletion
+/// outcome (honest no-ops and failures kept distinct), the batch stamp, and the
+/// verdict fields the UI showed — so the client renders the same delivery
+/// picture the server acted on.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteFilesReport {
+    /// Source files removed from disk (display paths).
+    removed: Vec<String>,
+    /// `(path, reason)` for a source skipped honestly (already gone, or changed
+    /// since confirmation — the TOCTOU guard).
+    skipped: Vec<(String, String)>,
+    /// `(path, error)` for a source whose delete errored — a non-empty list
+    /// leaves the batch **un-stamped** so the operator can retry the stragglers.
+    failed: Vec<(String, String)>,
+    /// RFC3339 UTC stamp of when the batch's sources were deleted — `Some` only
+    /// when `failed` is empty; `None` on a partial failure (still re-deletable).
+    files_deleted_at: Option<String>,
+    /// How many participating targets are `Confirmed` (from the pre-verdict).
+    delivered_targets: u32,
+    /// Receiver-closed target labels (`"<name>: declined"` / `"<name>: cancelled"`)
+    /// carried through from the verdict — informational, never a block.
+    closed: Vec<String>,
+}
+
+/// 409 body for a refused `POST /api/delete-files`: the reasons the delete is
+/// blocked (a still-in-flight/failed participation, an aged-out row window, or
+/// files already deleted). Mirrors [`DeletableDto::blockers`].
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BlockedResponse {
+    blockers: Vec<String>,
+}
+
+/// `POST /api/delete` (history-group) response: the refs whose sender bookkeeping
+/// was dropped, and the refs refused (each with a reason).
+#[derive(serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct HistoryDeleteReport {
+    deleted: Vec<String>,
+    rejected: Vec<HistoryDeleteRejection>,
+}
+
+/// One refused ref from `POST /api/delete`, with a human reason (today: a still
+/// non-terminal transfer in the group).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryDeleteRejection {
+    /// The batch's `package_ref`. Serialized as `ref` — the UI's grouping handle.
+    #[serde(rename = "ref")]
+    package_ref: String,
+    reason: String,
+}
+
+/// `POST /api/delete-files` — obligation-gated deletion of ONE batch's SOURCE
+/// capture files. Looks the batch up (`404` if it has no `perseus_batch` row),
+/// re-runs the SAME [`obligation_verdict`] the read model showed (never trusting
+/// the UI's cached verdict), and refuses `409` with the blockers when the delete
+/// is not permitted. The `files already deleted` guard is applied here caller-side
+/// (the pure verdict does not know `files_deleted_at`), matching [`api_transfers`].
+/// On allow it removes every live source through the shared safety contract
+/// ([`delete_package_sources`] — audit-before-delete, TOCTOU stat guard, honest
+/// no-ops), stamps the batch (only when nothing failed), and returns the full
+/// per-file detail plus the delivery verdict either way.
+async fn api_delete_files(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<DeleteFilesRequest>,
+) -> Response {
+    // Look the batch up: a ref with no recorded `perseus_batch` row is a 404.
+    // `mark_files_deleted` is a silent no-op on an unknown ref, so absence must
+    // be detected from `list()`, never inferred from a write's return.
+    let batches = match state.batches.list() {
+        Ok(b) => b,
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::error!(error = %msg, "web delete-files: list batches failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+        }
+    };
+    let Some(batch) = batches.iter().find(|b| b.package_ref == req.package_ref) else {
+        return (StatusCode::NOT_FOUND, "unknown batch").into_response();
+    };
+
+    // CRITICAL SEAM: re-apply the caller-side `files already deleted` guard the
+    // read model applies — the pure verdict does not know `files_deleted_at`.
+    if batch.files_deleted_at.is_some() {
+        tracing::info!(package_ref = %batch.package_ref, blockers = 1, "web delete-files refused");
+        return (
+            StatusCode::CONFLICT,
+            Json(BlockedResponse {
+                blockers: vec!["files already deleted".to_string()],
+            }),
+        )
+            .into_response();
+    }
+
+    // Re-run the obligation verdict server-side (same participation set as the
+    // read model: this batch plus every batch that re-sends any of its sources).
+    let outbound = match state.store.all_outbound(STATUS_SCAN_LIMIT) {
+        Ok(o) => o,
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::error!(error = %msg, "web delete-files: read outbound failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+        }
+    };
+    let mut by_ref: HashMap<&str, Vec<&OutboundRow>> = HashMap::new();
+    for row in &outbound {
+        by_ref.entry(row.package_ref.as_str()).or_default().push(row);
+    }
+    let participations = match resolve_participations(&state.batches, &batch.package_ref, &by_ref) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::error!(error = %msg, package_ref = %batch.package_ref, "web delete-files: resolve participations failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+        }
+    };
+    let verdict = {
+        let device_names = state.device_names.read().await;
+        obligation_verdict(&participations, &device_names)
+    };
+    if !verdict.allowed {
+        tracing::info!(package_ref = %batch.package_ref, blockers = verdict.blockers.len(), "web delete-files refused");
+        return (
+            StatusCode::CONFLICT,
+            Json(BlockedResponse {
+                blockers: verdict.blockers,
+            }),
+        )
+            .into_response();
+    }
+
+    // Allowed: delete every live source through the shared safety contract.
+    let peer_device = state.peer_device.read().await.clone();
+    let detail = match delete_package_sources(
+        &*state.store,
+        &state.seen,
+        Path::new(&batch.package_ref),
+        "deleted_manual",
+        &peer_device,
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::error!(error = %msg, package_ref = %batch.package_ref, "web delete-files: source delete failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+        }
+    };
+
+    // Stamp the batch ONLY when nothing failed — a partial failure leaves it
+    // re-deletable so the operator can retry the stragglers.
+    let files_deleted_at = if detail.failed.is_empty() {
+        let at = now_rfc3339();
+        if let Err(e) = state.batches.mark_files_deleted(&batch.package_ref, &at) {
+            let msg = format!("{e:#}");
+            tracing::error!(error = %msg, package_ref = %batch.package_ref, "web delete-files: mark files_deleted failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response();
+        }
+        Some(at)
+    } else {
+        None
+    };
+
+    tracing::info!(package_ref = %batch.package_ref, removed = detail.removed.len(), "manual source delete");
+    (
+        StatusCode::OK,
+        Json(DeleteFilesReport {
+            removed: detail.removed,
+            skipped: detail.skipped,
+            failed: detail.failed,
+            files_deleted_at,
+            delivered_targets: verdict.delivered_targets,
+            closed: verdict.closed,
+        }),
+    )
+        .into_response()
+}
+
+/// `POST /api/delete` — history-delete whole batch groups. Per requested ref:
+/// if ANY of its outbound rows is still non-terminal the ref is `rejected`
+/// (nothing touched); otherwise the group's sender bookkeeping — every outbound
+/// row's per-file rows + `Sent` journal + the row itself
+/// ([`delete_outbound_group`](StandaloneSyncStore::delete_outbound_group)) and the
+/// `perseus_batch` row — is dropped, and the ref is `deleted`. The `perseus_seen`
+/// linkage is deliberately KEPT so dedup identity + the retention audit trail
+/// survive a history delete.
 async fn api_delete(
     State(state): State<Arc<WebState>>,
-    Json(req): Json<DeleteRequest>,
-) -> Result<Json<DeleteReport>, (StatusCode, String)> {
-    let peer_device = state.peer_device.read().await.clone();
-    let report = delete_confirmed_packages(&state.store, &state.seen, &req.ids, &peer_device)
-        .map_err(|e| {
+    Json(req): Json<HistoryDeleteRequest>,
+) -> Result<Json<HistoryDeleteReport>, (StatusCode, String)> {
+    let outbound = state.store.all_outbound(STATUS_SCAN_LIMIT).map_err(|e| {
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web history delete: read outbound failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
+    let mut by_ref: HashMap<&str, Vec<&OutboundRow>> = HashMap::new();
+    for row in &outbound {
+        by_ref.entry(row.package_ref.as_str()).or_default().push(row);
+    }
+
+    let mut report = HistoryDeleteReport::default();
+    for pref in &req.package_refs {
+        let rows = by_ref.get(pref.as_str()).map(Vec::as_slice).unwrap_or(&[]);
+        // Refuse while any row of the group is still on the wire — a live transfer
+        // must terminalize (confirm/cancel/fail) before its history is dropped.
+        if let Some(active) = rows.iter().find(|r| !r.state.is_terminal()) {
+            tracing::info!(package_ref = %pref, state = active.state.as_str(), "web history delete refused: active transfer");
+            report.rejected.push(HistoryDeleteRejection {
+                package_ref: pref.clone(),
+                reason: "a transfer of this batch is still active".to_string(),
+            });
+            continue;
+        }
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        state.store.delete_outbound_group(&ids).map_err(|e| {
             let msg = format!("{e:#}");
-            tracing::error!(error = %msg, "web manual delete failed");
+            tracing::error!(error = %msg, package_ref = %pref, "web history delete: delete_outbound_group failed");
             (StatusCode::INTERNAL_SERVER_ERROR, msg)
         })?;
+        state.batches.delete(pref).map_err(|e| {
+            let msg = format!("{e:#}");
+            tracing::error!(error = %msg, package_ref = %pref, "web history delete: batch delete failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg)
+        })?;
+        tracing::info!(package_ref = %pref, rows = ids.len(), "history delete removed batch group");
+        report.deleted.push(pref.clone());
+    }
     Ok(Json(report))
+}
+
+/// RFC3339 UTC (millis, `Z`) — the timestamp form every Perseus store write uses
+/// (`seen::now_iso`, `batcher::now_rfc3339`). Mirrored here for the `files_deleted_at`
+/// batch stamp so all Perseus timestamps read identically.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// `POST /api/retry` request body.
@@ -3150,100 +3388,346 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
-    // ── Task 10: manual delete, retention policy GET/PUT, retention log ───────
+    // ── Task 5 (Perseus UI v2): obligation-gated delete-files + history delete ─
 
-    /// Manual delete is the same confirmed()-only chokepoint retention uses: a
-    /// confirmed package's source is removed (with a `deleted_manual` audit row),
-    /// while a non-confirmed id is rejected with a reason and never touched.
-    #[tokio::test]
-    async fn delete_rejects_non_confirmed() {
-        let (state, tmp) = test_state().await;
-
-        // Register a real on-disk source file for the seeded confirmed package.
-        let source = tmp.path().join("light-A.fits");
-        std::fs::write(&source, b"confirmed-source-bytes").unwrap();
+    /// Write a real capture file on disk and record its seen linkage under
+    /// `package_ref`, returning the path. The delete-files path resolves + removes
+    /// sources through this exact linkage (`seen.sources_for_package`).
+    fn seed_source(
+        tmp: &tempfile::TempDir,
+        state: &WebState,
+        name: &str,
+        package_ref: &str,
+    ) -> PathBuf {
+        let source = tmp.path().join(name);
+        std::fs::write(&source, b"capture-source-bytes").unwrap();
         let meta = std::fs::metadata(&source).unwrap();
         let mtime = crate::seen::mtime_millis(meta.modified().ok());
         state
             .seen
-            .mark_enqueued(&source, meta.len(), mtime, "pkg-confirmed")
+            .mark_enqueued(&source, meta.len(), mtime, package_ref)
             .unwrap();
+        source
+    }
 
-        // Resolve the two seeded outbound ids by state.
-        let rows = state.store.all_outbound(100).unwrap();
-        let a = rows
-            .iter()
-            .find(|r| r.state == OutboundState::Confirmed)
-            .unwrap()
-            .id;
-        let b = rows
-            .iter()
-            .find(|r| r.state == OutboundState::Transferring)
-            .unwrap()
-            .id;
-
-        let store = Arc::clone(&state.store);
-        let app = build_router(state, None);
-        let body = serde_json::json!({ "ids": [a, b] });
-        let res = app
-            .oneshot(
-                HttpRequest::builder()
-                    .method("POST")
-                    .uri("/api/delete")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                    .unwrap(),
-            )
-            .await
+    /// A Confirmed + a still-Announced target: the obligation is unmet (the open
+    /// target has not delivered), so delete-files is refused `409`, the source is
+    /// untouched, and the batch is left un-stamped.
+    #[tokio::test]
+    async fn delete_files_refuses_while_a_target_is_open() {
+        use athenaeum_core::sharing::types::AnnounceFileEntry;
+        let (state, tmp) = test_state().await;
+        const P1: [u8; 32] = [1u8; 32];
+        const P2: [u8; 32] = [2u8; 32];
+        let pref = "/data/packages/open-batch";
+        let files = [AnnounceFileEntry {
+            rel_path: "a.fits".into(),
+            byte_size: 10,
+            frame_uuid: "u-a".into(),
+        }];
+        let c = state.store.enqueue(pref, P1, None, &files).unwrap();
+        state.store.confirm(c, &[]).unwrap();
+        let open = state.store.enqueue(pref, P2, None, &files).unwrap();
+        state.store.set_state(open, OutboundState::Announced).unwrap();
+        state
+            .batches
+            .record(pref, "auto", "2026-07-23T10:00:00Z", 1)
             .unwrap();
+        let source = seed_source(&tmp, &state, "a.fits", pref);
+
+        let app = build_router(Arc::clone(&state), None);
+        let res = post_json(&app, "/api/delete-files", serde_json::json!({ "packageRef": pref }))
+            .await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let v = body_json(res).await;
+        assert!(
+            v["blockers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|b| b.as_str().unwrap().contains("in flight")),
+            "the open target is an in-flight blocker: {v}"
+        );
+        assert!(source.exists(), "a refusal never touches the sources");
+        assert_eq!(
+            state
+                .batches
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|b| b.package_ref == pref)
+                .unwrap()
+                .files_deleted_at,
+            None,
+            "the batch is left un-stamped on a refusal"
+        );
+    }
+
+    /// Two Confirmed targets over two real source files: delete-files removes both
+    /// from disk, stamps the batch, and a follow-up `GET /api/transfers` blocks any
+    /// re-delete (`files already deleted`).
+    #[tokio::test]
+    async fn delete_files_removes_sources_and_stamps_batch() {
+        use athenaeum_core::sharing::types::AnnounceFileEntry;
+        let (state, tmp) = test_state().await;
+        const P1: [u8; 32] = [1u8; 32];
+        const P2: [u8; 32] = [2u8; 32];
+        let pref = "/data/packages/done-batch";
+        let files = [
+            AnnounceFileEntry { rel_path: "a.fits".into(), byte_size: 10, frame_uuid: "u-a".into() },
+            AnnounceFileEntry { rel_path: "b.fits".into(), byte_size: 20, frame_uuid: "u-b".into() },
+        ];
+        let c1 = state.store.enqueue(pref, P1, None, &files).unwrap();
+        state.store.confirm(c1, &[]).unwrap();
+        let c2 = state.store.enqueue(pref, P2, None, &files).unwrap();
+        state.store.confirm(c2, &[]).unwrap();
+        state
+            .batches
+            .record(pref, "auto", "2026-07-23T10:00:00Z", 2)
+            .unwrap();
+        let a = seed_source(&tmp, &state, "a.fits", pref);
+        let b = seed_source(&tmp, &state, "b.fits", pref);
+
+        let app = build_router(Arc::clone(&state), None);
+        let res = post_json(&app, "/api/delete-files", serde_json::json!({ "packageRef": pref }))
+            .await;
         assert_eq!(res.status(), StatusCode::OK);
         let v = body_json(res).await;
-
-        let deleted = v["deleted"].as_array().unwrap();
-        assert_eq!(deleted.len(), 1);
         assert_eq!(
-            deleted[0].as_i64().unwrap(),
-            a,
-            "only the confirmed package is deleted"
+            v["removed"].as_array().unwrap().len(),
+            2,
+            "both live sources removed: {v}"
+        );
+        assert!(v["filesDeletedAt"].as_str().is_some(), "the stamp is in the body: {v}");
+        assert!(!a.exists() && !b.exists(), "both source files are gone from disk");
+        assert!(
+            state
+                .batches
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.package_ref == pref)
+                .unwrap()
+                .files_deleted_at
+                .is_some(),
+            "the batch stamp is persisted"
         );
 
-        let rejected = v["rejected"].as_array().unwrap();
-        assert_eq!(rejected.len(), 1);
-        assert_eq!(rejected[0]["id"].as_i64().unwrap(), b);
-        assert_eq!(rejected[0]["reason"], "not confirmed");
+        // A re-delete is now blocked by the read model's `files already deleted`.
+        let tv = body_json(get(&app, "/api/transfers").await).await;
+        let batch = tv
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["packageRef"] == pref)
+            .unwrap()
+            .clone();
+        assert_eq!(batch["deletable"]["allowed"], false, "re-delete blocked: {batch}");
+        assert!(batch["deletable"]["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b.as_str().unwrap().contains("already deleted")));
+    }
+
+    /// A Confirmed target plus a receiver-declined (Cancelled) one: the obligation
+    /// is met (delivered somewhere; the decline is the receiver's own choice), so
+    /// delete-files is allowed and the 200 body surfaces the delivery verdict.
+    #[tokio::test]
+    async fn delete_files_confirmed_plus_declined_is_allowed_and_reports_delivery() {
+        use athenaeum_core::sharing::types::AnnounceFileEntry;
+        let (state, tmp) = test_state().await;
+        {
+            let mut g = state.device_names.write().await;
+            g.insert(node_id_hex(&[1u8; 32]), "Studio".to_string());
+            g.insert(node_id_hex(&[2u8; 32]), "NAS".to_string());
+        }
+        const P1: [u8; 32] = [1u8; 32];
+        const P2: [u8; 32] = [2u8; 32];
+        let pref = "/data/packages/mixed-batch";
+        let files = [AnnounceFileEntry {
+            rel_path: "a.fits".into(),
+            byte_size: 10,
+            frame_uuid: "u-a".into(),
+        }];
+        let c = state.store.enqueue(pref, P1, None, &files).unwrap();
+        state.store.confirm(c, &[]).unwrap();
+        let d = state.store.enqueue(pref, P2, None, &files).unwrap();
+        state.store.set_state(d, OutboundState::Cancelled).unwrap();
+        state
+            .store
+            .set_last_error(d, Some(CANCELLED_BY_RECEIVER_DETAIL))
+            .unwrap();
+        state
+            .batches
+            .record(pref, "auto", "2026-07-23T10:00:00Z", 1)
+            .unwrap();
+        let source = seed_source(&tmp, &state, "a.fits", pref);
+
+        let app = build_router(Arc::clone(&state), None);
+        let res = post_json(&app, "/api/delete-files", serde_json::json!({ "packageRef": pref }))
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(
+            v["deliveredTargets"], 1,
+            "the one confirmed target is surfaced via the pre-verdict: {v}"
+        );
+        assert!(
+            v["closed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c.as_str().unwrap().contains("declined")),
+            "the decline is recorded (not a block): {v}"
+        );
+        assert!(!source.exists(), "the source was removed");
+    }
+
+    /// Spec §8: a Confirmed batch whose per-file outcomes are all `duplicate` (the
+    /// dedup handshake — nothing traveled) is deletable. Pins dedup-counts-as-
+    /// confirmed against a future per-file verdict refactor.
+    #[tokio::test]
+    async fn delete_files_all_duplicate_confirmed_batch_is_deletable() {
+        use athenaeum_core::sharing::types::AnnounceFileEntry;
+        use athenaeum_core::sync::OutboundFileState;
+        let (state, tmp) = test_state().await;
+        const P1: [u8; 32] = [1u8; 32];
+        let pref = "/data/packages/dup-batch";
+        let files = [AnnounceFileEntry {
+            rel_path: "a.fits".into(),
+            byte_size: 10,
+            frame_uuid: "u-a".into(),
+        }];
+        let c = state.store.enqueue(pref, P1, None, &files).unwrap();
+        // Every per-file outcome is `duplicate` (Done, nothing on the wire), then
+        // the batch confirms.
+        state
+            .store
+            .set_outbound_file_state(c, "a.fits", OutboundFileState::Done, 0, Some("duplicate"), None)
+            .unwrap();
+        state.store.confirm(c, &[]).unwrap();
+        state
+            .batches
+            .record(pref, "auto", "2026-07-23T10:00:00Z", 1)
+            .unwrap();
+        let source = seed_source(&tmp, &state, "a.fits", pref);
+
+        let app = build_router(Arc::clone(&state), None);
+        let res = post_json(&app, "/api/delete-files", serde_json::json!({ "packageRef": pref }))
+            .await;
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "an all-duplicate confirmed batch is deletable"
+        );
+        let v = body_json(res).await;
+        assert_eq!(v["removed"].as_array().unwrap().len(), 1);
+        assert!(!source.exists());
+    }
+
+    /// A terminal group history-deletes cleanly: its outbound rows, per-file rows,
+    /// journal, and the `perseus_batch` row are gone — but the `perseus_seen`
+    /// linkage and the source file on disk are KEPT (dedup identity + audit).
+    #[tokio::test]
+    async fn history_delete_removes_group_keeps_seen() {
+        use athenaeum_core::sharing::types::AnnounceFileEntry;
+        let (state, tmp) = test_state().await;
+        const P1: [u8; 32] = [1u8; 32];
+        let pref = "/data/packages/hist-batch";
+        let files = [AnnounceFileEntry {
+            rel_path: "a.fits".into(),
+            byte_size: 10,
+            frame_uuid: "u-a".into(),
+        }];
+        let id = state.store.enqueue(pref, P1, None, &files).unwrap();
+        state.store.confirm(id, &[]).unwrap();
+        state
+            .store
+            .append_sync_event(Direction::Sent, &id.to_string(), "announce_sent", None)
+            .unwrap();
+        state
+            .batches
+            .record(pref, "auto", "2026-07-23T10:00:00Z", 1)
+            .unwrap();
+        let source = seed_source(&tmp, &state, "a.fits", pref);
+
+        let app = build_router(Arc::clone(&state), None);
+        let res = post_json(&app, "/api/delete", serde_json::json!({ "packageRefs": [pref] }))
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert!(
+            v["deleted"].as_array().unwrap().iter().any(|r| r == pref),
+            "the terminal group was deleted: {v}"
+        );
+        assert!(v["rejected"].as_array().unwrap().is_empty());
 
         assert!(
-            !source.exists(),
-            "the confirmed package's source is removed from disk"
+            state.store.all_outbound(100).unwrap().iter().all(|r| r.package_ref != pref),
+            "outbound rows removed"
         );
-
-        let hist = store
-            .search_history(HistoryQuery {
-                filename: None,
-                object: None,
-                direction: None,
-                peer: None,
-                project: None,
-                package_id: None,
-                limit: 1000,
-            })
-            .unwrap();
-        let audit: Vec<_> = hist
-            .iter()
-            .filter(|h| h.outcome == "deleted_manual")
-            .collect();
+        assert!(
+            state.store.list_outbound_files(id).unwrap().is_empty(),
+            "per-file rows removed"
+        );
+        assert!(
+            state.store.list_sync_events_for(id).unwrap().is_empty(),
+            "journal removed"
+        );
+        assert!(
+            state.batches.list().unwrap().iter().all(|b| b.package_ref != pref),
+            "perseus_batch row removed"
+        );
+        // The dedup linkage + retention audit survive a history delete.
         assert_eq!(
-            audit.len(),
+            state.seen.sources_for_package(pref).unwrap().len(),
             1,
-            "exactly one deleted_manual audit row for the confirmed package"
+            "the perseus_seen linkage is kept"
         );
-        // The audit row stamps the CONFIGURED SYNC PEER (the same hex transfer
-        // rows carry), not this agent's own node id — the earlier bug stamped
-        // the manifest's `origin_device` (self).
-        assert_eq!(
-            audit[0].peer_device,
-            node_id_hex(&PEER),
-            "the deleted_manual row is stamped with the sync peer, not self"
+        assert!(source.exists(), "history delete never touches source files on disk");
+    }
+
+    /// A group with a still-non-terminal (Announced) row is refused: the ref comes
+    /// back in `rejected` with a reason and nothing is deleted.
+    #[tokio::test]
+    async fn history_delete_refuses_active_group() {
+        use athenaeum_core::sharing::types::AnnounceFileEntry;
+        let (state, _tmp) = test_state().await;
+        const P1: [u8; 32] = [1u8; 32];
+        let pref = "/data/packages/active-batch";
+        let files = [AnnounceFileEntry {
+            rel_path: "a.fits".into(),
+            byte_size: 10,
+            frame_uuid: "u-a".into(),
+        }];
+        let id = state.store.enqueue(pref, P1, None, &files).unwrap();
+        state.store.set_state(id, OutboundState::Announced).unwrap();
+        state
+            .batches
+            .record(pref, "auto", "2026-07-23T10:00:00Z", 1)
+            .unwrap();
+
+        let app = build_router(Arc::clone(&state), None);
+        let res = post_json(&app, "/api/delete", serde_json::json!({ "packageRefs": [pref] }))
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert!(
+            v["deleted"].as_array().unwrap().is_empty(),
+            "nothing deleted while a target is active: {v}"
+        );
+        let rej = v["rejected"].as_array().unwrap();
+        assert_eq!(rej.len(), 1);
+        assert_eq!(rej[0]["ref"], pref);
+        assert!(rej[0]["reason"].as_str().unwrap().contains("still active"));
+        assert!(
+            state.store.all_outbound(100).unwrap().iter().any(|r| r.package_ref == pref),
+            "the outbound row is untouched"
+        );
+        assert!(
+            state.batches.list().unwrap().iter().any(|b| b.package_ref == pref),
+            "the batch row is untouched"
         );
     }
 
