@@ -1,0 +1,118 @@
+/* Perseus web UI v2 — Nord palette.
+   Every colour in this file flows from the token block below; there is NO raw
+   colour literal (hex / rgb / named) anywhere outside :root. Light/dark is not a
+   concern here — the operator page is single-theme Nord. */
+:root {
+  --surface: #2e3440;         /* nord0  — page background        */
+  --surface-raised: #3b4252;  /* nord1  — cards, list rows       */
+  --surface-hover: #434c5e;   /* nord2  — hover / selected       */
+  --border: #4c566a;          /* nord3                            */
+  --content: #eceff4;         /* nord6  — primary text            */
+  --content-muted: #d8dee9;   /* nord4  — secondary text          */
+  --accent: #88c0d0;          /* nord8  — interactive / links     */
+  --accent-strong: #5e81ac;   /* nord10 — primary buttons         */
+  --error: #bf616a;           /* nord11 — failed / declined       */
+  --warning: #ebcb8b;         /* nord13 — waiting / attention     */
+  --success: #a3be8c;         /* nord14 — confirmed / delivered   */
+}
+
+* { box-sizing: border-box; }
+body {
+  font-family: system-ui, -apple-system, sans-serif; margin: 0;
+  background: var(--surface); color: var(--content); line-height: 1.5; font-size: 14px;
+}
+
+/* ── header + tabs ── */
+header { padding: 1rem 1.5rem; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 1rem; }
+header h1 { margin: 0; font-size: 1.15rem; }
+header .sub { color: var(--content-muted); font-size: 0.85rem; }
+/* Connection dot, driven by the /api/status poll (grey = unknown, green = up,
+   red = offline). Sits beside the wordmark. */
+.conn-dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: var(--content-muted); display: inline-block; }
+.conn-dot.ok { background: var(--success); }
+.conn-dot.err { background: var(--error); }
+.tabs { display: flex; gap: 0.4rem; margin-left: auto; }
+.tab { background: transparent; border: 1px solid transparent; color: var(--content-muted); padding: 0.4rem 0.9rem; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
+.tab:hover { background: var(--surface-hover); color: var(--content); }
+.tab.active { background: var(--surface-raised); color: var(--accent); border-color: var(--border); }
+
+/* ── layout ── */
+main { max-width: 68rem; margin: 0 auto; padding: 1.5rem; }
+section { background: var(--surface-raised); border: 1px solid var(--border); border-radius: 8px; padding: 1rem 1.25rem; margin-bottom: 1.25rem; }
+section h2 { margin: 0 0 0.75rem; font-size: 0.95rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--content-muted); }
+h2.section-sub { margin-top: 1rem; }
+.divider { margin-top: 0.75rem; border-top: 1px solid var(--border); padding-top: 0.75rem; }
+
+/* ── tables ── */
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); vertical-align: middle; }
+th { color: var(--content-muted); font-weight: 600; font-size: 0.8rem; }
+td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; }
+.tablewrap { overflow-x: auto; }
+
+/* ── chips (state pills; Task 7's transfer list reuses these semantic classes) ── */
+.chip { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 10px; font-size: 0.75rem; font-weight: 600; background: var(--surface-hover); color: var(--content-muted); }
+.chip.queued, .chip.announced, .chip.transferring, .chip.sending { color: var(--accent); }
+.chip.confirmed, .chip.delivered, .chip.safe { color: var(--success); }
+.chip.failed, .chip.declined { color: var(--error); }
+.chip.stalled, .chip.waiting, .chip.manual { color: var(--warning); }
+.chip.cancelled, .chip.auto { color: var(--content-muted); border: 1px solid var(--border); }
+/* Send-target chips: the current target list, each with an inline remove. */
+.chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.chip.target { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--accent); padding: 0.15rem 0.3rem 0.15rem 0.6rem; }
+.chip.target .chipx { background: transparent; border: 0; color: inherit; font-size: 0.95rem; line-height: 1; padding: 0 0.15rem; cursor: pointer; border-radius: 6px; }
+.chip.target .chipx:hover { background: var(--surface-hover); }
+
+/* ── controls ── */
+button { background: var(--accent-strong); color: var(--content); border: 0; border-radius: 6px; padding: 0.35rem 0.75rem; cursor: pointer; font-size: 0.82rem; }
+button.ghost { background: var(--surface-hover); color: var(--content); border: 1px solid var(--border); }
+button.danger { background: var(--error); }
+button.warn { background: var(--warning); color: var(--surface); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+input, select { background: var(--surface); color: var(--content); border: 1px solid var(--border); border-radius: 6px; padding: 0.35rem 0.5rem; font-size: 0.82rem; }
+label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.8rem; color: var(--content-muted); }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: 0.75rem; align-items: end; }
+.row { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; }
+.muted { color: var(--content-muted); }
+.flash { margin-top: 0.5rem; font-size: 0.82rem; min-height: 1.1em; }
+.flash.ok { color: var(--success); }
+.flash.err { color: var(--error); }
+.empty { color: var(--content-muted); font-style: italic; padding: 0.5rem; }
+.spacer { flex: 1; }
+
+/* ── send targets ── */
+.target-intro { margin: -0.25rem 0 0.5rem; }
+.tg-select { min-width: 14rem; }
+.picker-hint { margin-top: 0.25rem; font-size: 0.78rem; }
+details.advanced { margin-top: 0.5rem; }
+details.advanced > summary { cursor: pointer; font-size: 0.8rem; }
+
+/* ── retention ── */
+.indicators { display: flex; gap: 1.5rem; margin: 0.5rem 0 0.75rem; flex-wrap: wrap; }
+.ind { font-size: 0.82rem; }
+.ind b { color: var(--content); }
+.logline { border-bottom: 1px solid var(--border); padding: 0.35rem 0; font-size: 0.8rem; }
+ul.log { list-style: none; margin: 0; padding: 0; max-height: 14rem; overflow-y: auto; }
+
+/* ── lifecycle banner (global to both tabs; app.js inserts it below the header) ── */
+.banner { border-radius: 6px; padding: 0.45rem 0.7rem; margin: 0.75rem auto 0; max-width: 65rem; font-size: 0.82rem; border: 1px solid transparent; background: var(--surface-raised); }
+.banner.warn { color: var(--warning); border-color: var(--warning); }
+.banner.err { color: var(--error); border-color: var(--error); }
+.banner.info { color: var(--accent); border-color: var(--accent); }
+#agent-banner { font-weight: 600; }
+
+/* ── To Sync strip (Transfers tab) ── */
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.seg label { flex-direction: row; align-items: center; gap: 0.3rem; padding: 0.3rem 0.6rem; color: var(--content); cursor: pointer; }
+.seg label:first-child { border-right: 1px solid var(--border); }
+.inline-label { flex-direction: row; align-items: center; gap: 0.4rem; color: var(--content-muted); }
+.qty { width: 6rem; }
+/* The pending counter doubles as the tree toggle (collapsed by default). */
+.counter { background: var(--surface-hover); color: var(--content); border: 1px solid var(--border); border-radius: 6px; padding: 0.3rem 0.7rem; cursor: pointer; font-size: 0.85rem; }
+.counter[aria-expanded="true"] { color: var(--accent); }
+#pendingTree { max-height: 22rem; overflow-y: auto; margin-top: 0.5rem; font-size: 0.85rem; }
+details.tree-node > summary { cursor: pointer; padding: 0.12rem 0.25rem; border-radius: 4px; }
+details.tree-node > summary:hover { background: var(--surface-hover); }
+.tree-body { margin-left: 0.9rem; border-left: 1px solid var(--border); padding-left: 0.6rem; }
+ul.tree-files { list-style: none; margin: 0; padding: 0; }
+ul.tree-files li { padding: 0.12rem 0 0.12rem 1.15rem; color: var(--content-muted); }

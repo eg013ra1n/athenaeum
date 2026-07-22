@@ -2,12 +2,14 @@
 //!
 //! A tiny [`axum`] server, bound to [`Config::web_bind`](crate::config::Config)
 //! (loopback by default), that lets an operator inspect and lightly manage a
-//! headless capture node from a browser. The page ([`index_html`]) renders four
-//! sections — status banner, sent packages, transfer history, and the retention
-//! panel (policy editor + recent-pass log) — over these endpoints:
+//! headless capture node from a browser. The page is a slim two-tab shell
+//! ([`index_html`]) whose Transfers + Settings sections are rendered client-side
+//! by [`app_js`]/[`style_css`], over these endpoints:
 //!
-//! - `GET /` — the static, data-free HTML/JS page shell. **Auth-exempt** (see
+//! - `GET /` — the static, data-free HTML page shell. **Auth-exempt** (see
 //!   below) so a browser can load it and then prompt for the token.
+//! - `GET /app.js`, `GET /style.css` — the shell's static client script +
+//!   stylesheet. **Auth-exempt** for the same reason as `GET /`.
 //! - `GET /api/status` — capture dirs, live in-flight transfers, the current
 //!   retention policy, and coarse package counts ([`StatusDto`]).
 //! - `GET /api/sent` — outbound packages, newest first, optionally filtered by
@@ -509,6 +511,13 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         }));
     Router::new()
         .route("/", get(index_html))
+        // `/app.js` + `/style.css` are the page's static assets. Like `GET /`
+        // they carry no node data, so they are deliberately EXEMPT from the
+        // bearer layer: a browser must fetch them to bootstrap the page before
+        // its JS can supply a token on the `/api/*` calls. Gating them would
+        // 401 the very asset loads that render the token prompt.
+        .route("/app.js", get(app_js))
+        .route("/style.css", get(style_css))
         .merge(api)
         .with_state(state)
 }
@@ -648,9 +657,37 @@ pub(crate) fn apply_host_guard(router: Router, policy: HostPolicy) -> Router {
     }))
 }
 
-/// `GET /` — placeholder status page. The interactive dashboard is Task 10.
+/// `GET /` — the static page shell (Perseus UI v2). A slim two-tab skeleton that
+/// pulls in `/style.css` + `/app.js`, which render the Transfers + Settings tabs.
+/// Auth-exempt (see the exemption note in [`build_router`]).
 async fn index_html() -> Html<&'static str> {
     Html(include_str!("web/index.html"))
+}
+
+/// `GET /app.js` — the page's client script. Like `GET /` it is a static,
+/// data-free asset and is deliberately EXEMPT from the bearer layer: a browser
+/// must fetch it to bootstrap the page before its JS can supply a token on the
+/// `/api/*` calls.
+async fn app_js() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("web/app.js"),
+    )
+}
+
+/// `GET /style.css` — the page's stylesheet. A static, data-free asset, EXEMPT
+/// from the bearer layer for the same reason as `GET /` and `/app.js`.
+async fn style_css() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/css; charset=utf-8",
+        )],
+        include_str!("web/style.css"),
+    )
 }
 
 /// `GET /api/status`
@@ -2861,6 +2898,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(auth.status(), StatusCode::OK);
+    }
+
+    /// The two static assets (`/app.js`, `/style.css`) are served with the right
+    /// content-type AND are bearer-EXEMPT — like `GET /`, they must load without a
+    /// token so the browser can bootstrap the page before its JS supplies one.
+    #[tokio::test]
+    async fn assets_served_ungated_with_content_types() {
+        let (state, _tmp) = test_state().await;
+        // Token-protected router, and NO auth header on either asset request.
+        let app = build_router(state, Some("tok".to_string()));
+
+        let js = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/app.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            js.status(),
+            StatusCode::OK,
+            "/app.js must load without a token"
+        );
+        assert_eq!(
+            js.headers().get("content-type").unwrap(),
+            "application/javascript; charset=utf-8"
+        );
+
+        let css = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/style.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            css.status(),
+            StatusCode::OK,
+            "/style.css must load without a token"
+        );
+        assert_eq!(
+            css.headers().get("content-type").unwrap(),
+            "text/css; charset=utf-8"
+        );
     }
 
     #[tokio::test]
