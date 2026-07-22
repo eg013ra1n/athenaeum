@@ -96,7 +96,9 @@ export function CalibrationFolderSection({ scanRoots, onRootsChanged }: Calibrat
 
   // Coverage hint: which monitored directory contains the folder, if any.
   const coveringRoot = dir
-    ? scanRoots.find(r => r.kind !== 'calibration_library' && (dir === r.path || dir.startsWith(r.path.endsWith('/') ? r.path : r.path + '/')))
+    ? scanRoots.find(r =>
+        r.kind !== 'calibration_library' &&
+        (dir === r.path || dir.startsWith(r.path + '/') || dir.startsWith(r.path + '\\')))
     : undefined;
   const isDedicatedRoot = dir
     ? scanRoots.some(r => r.kind === 'calibration_library' && r.path === dir)

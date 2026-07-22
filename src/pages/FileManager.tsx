@@ -25,6 +25,12 @@ import { SpecialFolderSection } from '../components/SpecialFolderSection';
 type TabMode = 'directories' | 'browse' | 'duplicates' | 'missing-metadata';
 type DuplicatesViewMode = 'files' | 'folders';
 
+// Boundary-safe folder membership: `/data/Set1` must not capture
+// `/data/Set10` (this feeds a move-to-Black-Hole, so a false match
+// relocates real files). Separator detected from the folder path itself.
+const isInFolder = (path: string, folder: string) =>
+  path.startsWith(folder + (folder.includes('\\') ? '\\' : '/'));
+
 export default function FileManager() {
   const { scanRoots, loading: rootsLoading, error: rootsError, clearError: clearRootsError, addScanRoot, deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, toggleMonitorEnabled, relinkScanRoot, refresh: refreshScanRoots } = useScanRootsWithAvailability();
   const { startRescanWithProgress, isScanning } = useScanProgressContext();
@@ -868,7 +874,7 @@ export default function FileManager() {
                                       const folderFileIds: number[] = [];
                                       duplicates.forEach(group => {
                                         group.file_paths.forEach((path, idx) => {
-                                          if (path.startsWith(folder.folder_a)) {
+                                          if (isInFolder(path, folder.folder_a)) {
                                             folderFileIds.push(group.file_ids[idx]);
                                           }
                                         });
@@ -913,7 +919,7 @@ export default function FileManager() {
                                       const folderFileIds: number[] = [];
                                       duplicates.forEach(group => {
                                         group.file_paths.forEach((path, idx) => {
-                                          if (path.startsWith(folder.folder_b)) {
+                                          if (isInFolder(path, folder.folder_b)) {
                                             folderFileIds.push(group.file_ids[idx]);
                                           }
                                         });
