@@ -119,6 +119,41 @@ impl SharedPackageCleanup {
         state.expected = Some(state.expected.unwrap_or(0) + delta);
         maybe_clean(dir, state);
     }
+
+    /// Re-arm `dir`'s cleanup gate for a retry that may follow the once-only
+    /// cleanup (the Perseus reset-in-place resend, which REBUILDS a cleaned
+    /// dir's payloads from the original capture files and re-drives the same
+    /// outbound row):
+    ///
+    /// - not yet cleaned → exactly [`bump`](Self::bump): the reset row will
+    ///   terminalize a second time, so its extra terminal must raise `expected`
+    ///   or it would over-count and free the payload while another target is
+    ///   still pending;
+    /// - already cleaned → the payload is back on disk, so the once-only state
+    ///   is REPLACED with a fresh gate of `expected = delta`, `terminal = 0`:
+    ///   the rebuilt dir again waits for its (new) terminals before the next
+    ///   once-only cleanup.
+    ///
+    /// Distinct from [`bump`], which must stay a no-op after cleanup (its
+    /// callers do NOT restore payloads — resurrecting the gate there would arm
+    /// a second cleanup for a dir that stays manifest-only).
+    pub fn rearm(&self, dir: &Path, delta: usize) {
+        let mut map = self
+            .inner
+            .lock()
+            .expect("cleanup coordinator mutex poisoned");
+        let state = map.entry(dir.to_path_buf()).or_default();
+        if state.cleaned {
+            *state = PackageState {
+                expected: Some(delta),
+                terminal: 0,
+                cleaned: false,
+            };
+            return;
+        }
+        state.expected = Some(state.expected.unwrap_or(0) + delta);
+        maybe_clean(dir, state);
+    }
 }
 
 impl PackageCleanupSink for SharedPackageCleanup {
@@ -343,6 +378,69 @@ mod tests {
             dir.join("late-sentinel.fits").exists(),
             "a bump after the once-only cleanup must be a no-op"
         );
+    }
+
+    /// `rearm` after the once-only cleanup replaces the spent gate with a fresh
+    /// one: the rebuilt payload waits for the reset row's new terminal, then is
+    /// cleaned exactly once more (a further late terminal is again a no-op).
+    #[test]
+    fn rearm_after_clean_reopens_gate_and_cleans_once_more() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_pkg_dir(tmp.path(), "pkg-h");
+
+        let coord = SharedPackageCleanup::new();
+        coord.register(&dir, 1);
+        coord.on_terminal(&dir); // gate met (1/1) → cleaned, manifest-only
+        assert_eq!(entries(&dir), vec![MANIFEST_FILENAME.to_string()]);
+
+        // The resend path rebuilds the payload from the originals, then re-arms.
+        std::fs::write(dir.join("frame.fits"), vec![7u8; 4096]).unwrap();
+        coord.rearm(&dir, 1);
+        assert!(
+            dir.join("frame.fits").exists(),
+            "re-arming must not itself clean the rebuilt payload"
+        );
+
+        // The reset row terminalizes again → the fresh 1-target gate closes.
+        coord.on_terminal(&dir);
+        assert_eq!(
+            entries(&dir),
+            vec![MANIFEST_FILENAME.to_string()],
+            "the rebuilt payload is cleaned once the re-armed gate is met"
+        );
+
+        // And the second cleanup is once-only too.
+        std::fs::write(dir.join("late-sentinel.fits"), b"still here").unwrap();
+        coord.on_terminal(&dir);
+        assert!(
+            dir.join("late-sentinel.fits").exists(),
+            "a late terminal after the re-armed cleanup is a no-op"
+        );
+    }
+
+    /// `rearm` before any cleanup is exactly `bump`: it adds the retry's future
+    /// terminal to `expected` so the retried row's confirm cannot free the
+    /// payload while the sibling target is still pending.
+    #[test]
+    fn rearm_before_clean_behaves_like_bump() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_pkg_dir(tmp.path(), "pkg-i");
+
+        let coord = SharedPackageCleanup::new();
+        coord.register(&dir, 2);
+        coord.on_terminal(&dir); // target A failed; B still pending
+        coord.rearm(&dir, 1); // A is reset-in-place → expected 2 → 3
+
+        // A's retry confirms: terminal=2 < 3 → payload retained for B.
+        coord.on_terminal(&dir);
+        assert!(
+            dir.join("frame.fits").exists(),
+            "the reset row's second terminal must not free B's payload"
+        );
+
+        // B confirms: terminal=3 == expected → cleaned.
+        coord.on_terminal(&dir);
+        assert_eq!(entries(&dir), vec![MANIFEST_FILENAME.to_string()]);
     }
 
     /// A terminal that arrives BEFORE its register is buffered, and the later

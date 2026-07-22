@@ -2390,6 +2390,16 @@ impl StandaloneSyncStore {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
         all_outbound_rows(&conn, limit)
     }
+
+    /// Swap the entire per-file row set for one outbound batch. Delegates to
+    /// [`replace_outbound_files`]; inherent (not on [`SyncStore`]) because only
+    /// the Perseus resend path uses it — a partial payload rebuild rewrites the
+    /// manifest to the restored subset, and the per-file rows must follow it or
+    /// the next announce would offer files no longer on disk.
+    pub fn replace_outbound_files(&self, outbound_id: i64, files: &[OutboundFileRow]) -> Result<()> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        replace_outbound_files(&conn, outbound_id, files)
+    }
 }
 
 impl SyncStore for StandaloneSyncStore {
