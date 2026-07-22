@@ -2400,6 +2400,38 @@ impl StandaloneSyncStore {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
         replace_outbound_files(&conn, outbound_id, files)
     }
+
+    /// The sender-side `sync_events` journal of ONE outbound row (the Perseus web
+    /// Log tab's read). Scoped to `Direction::Sent` and the row id as text —
+    /// the engine's own journaling convention ([`append_sync_event`] stores the
+    /// outbound row id in `batch_key`). Newest-first per [`list_sync_events`].
+    /// Inherent (not on [`SyncStore`]): only the Perseus web layer reads a single
+    /// row's log.
+    pub fn list_sync_events_for(&self, outbound_id: i64) -> Result<Vec<SyncEventRow>> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        list_sync_events(&conn, Direction::Sent, &outbound_id.to_string())
+    }
+
+    /// History-delete a whole batch group's sender bookkeeping — each row's
+    /// per-file rows and `Sent` journal, then the row itself — in ONE
+    /// transaction (this store has no FK cascades, so the three deletes are
+    /// composed here). All-or-nothing: a failure rolls the whole group back.
+    /// Never touches disk payloads or Perseus's `perseus_seen` linkage, so dedup
+    /// identity survives a history delete. An empty `ids` slice is a no-op commit;
+    /// an id naming no row deletes nothing for that id (idempotent). Inherent (not
+    /// on [`SyncStore`]): only the Perseus web batch-history delete calls it.
+    pub fn delete_outbound_group(&self, ids: &[i64]) -> Result<()> {
+        let conn = self.conn.lock().expect("sync store mutex poisoned");
+        let tx = conn
+            .unchecked_transaction()
+            .context("begin delete_outbound_group")?;
+        for &id in ids {
+            delete_outbound_files(&tx, id)?;
+            delete_sync_events(&tx, Direction::Sent, &id.to_string())?;
+            delete_outbound_row(&tx, id)?;
+        }
+        tx.commit().context("commit delete_outbound_group")
+    }
 }
 
 impl SyncStore for StandaloneSyncStore {
@@ -3973,5 +4005,105 @@ mod tests {
         ensure_inbound_columns(&conn).unwrap();
         assert!(declined_of("revoked-by-sender").is_none(), "re-run stays a no-op");
         assert_eq!(declined_of("declined-null-err").as_deref(), Some("2026-07-22T08:40:00Z"));
+    }
+
+    /// Perseus UI v2 (Task 2): `delete_outbound_group` history-deletes a whole
+    /// fan-out batch's sender bookkeeping — each row, its per-file rows, and its
+    /// `sync_events` journal — in ONE transaction, leaving nothing behind. Seeded
+    /// only through the store's own trait/public API (`enqueue` +
+    /// `replace_outbound_files` + `append_sync_event`).
+    #[test]
+    fn delete_outbound_group_removes_rows_files_and_journals_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = StandaloneSyncStore::open(tmp.path().join("s.db")).unwrap();
+
+        // Two rows of one fan-out batch: same package_ref, two distinct peers.
+        let peer2: NodeId = [9u8; 32];
+        let id1 = store.enqueue("pkg-fanout", PEER, Some("M42"), &[]).unwrap();
+        let id2 = store.enqueue("pkg-fanout", peer2, Some("M42"), &[]).unwrap();
+
+        // Two per-file rows on each row (the row id is the parent key).
+        let files_for = |id: i64| {
+            vec![
+                OutboundFileRow {
+                    outbound_id: id,
+                    rel_path: "a.fits".into(),
+                    byte_size: 100,
+                    frame_uuid: "u-a".into(),
+                    state: OutboundFileState::Pending,
+                    bytes_done: 0,
+                    outcome: None,
+                    error: None,
+                    updated_at: now_iso(),
+                },
+                OutboundFileRow {
+                    outbound_id: id,
+                    rel_path: "b.fits".into(),
+                    byte_size: 200,
+                    frame_uuid: "u-b".into(),
+                    state: OutboundFileState::Pending,
+                    bytes_done: 0,
+                    outcome: None,
+                    error: None,
+                    updated_at: now_iso(),
+                },
+            ]
+        };
+        store.replace_outbound_files(id1, &files_for(id1)).unwrap();
+        store.replace_outbound_files(id2, &files_for(id2)).unwrap();
+
+        // …and one journal event each — `batch_key` is the row id as text (the
+        // engine's own journaling convention, mirrored by `list_sync_events_for`).
+        store.append_sync_event(Direction::Sent, &id1.to_string(), "enqueued", None).unwrap();
+        store.append_sync_event(Direction::Sent, &id2.to_string(), "enqueued", None).unwrap();
+
+        // Sanity: everything is present before the delete.
+        assert_eq!(store.list_outbound_files(id1).unwrap().len(), 2);
+        assert_eq!(store.list_sync_events_for(id1).unwrap().len(), 1);
+
+        store.delete_outbound_group(&[id1, id2]).unwrap();
+
+        // Both rows, their per-file rows, and their journals are gone.
+        assert!(store.get_outbound(id1).unwrap().is_none());
+        assert!(store.get_outbound(id2).unwrap().is_none());
+        assert!(store.list_outbound_files(id1).unwrap().is_empty());
+        assert!(store.list_outbound_files(id2).unwrap().is_empty());
+        assert!(store.list_sync_events_for(id1).unwrap().is_empty());
+        assert!(store.list_sync_events_for(id2).unwrap().is_empty());
+    }
+
+    /// Perseus UI v2 (Task 2): `list_sync_events_for` reads exactly one outbound
+    /// row's `Sent` journal (keyed by the row id as text), newest-first per
+    /// [`list_sync_events`], with direction/kind/detail preserved and scoped to
+    /// that single row.
+    #[test]
+    fn list_sync_events_for_reads_the_sent_journal_of_one_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = StandaloneSyncStore::open(tmp.path().join("s.db")).unwrap();
+        let id = store.enqueue("pkg", PEER, None, &[]).unwrap();
+
+        store.append_sync_event(Direction::Sent, &id.to_string(), "enqueued", None).unwrap();
+        store
+            .append_sync_event(Direction::Sent, &id.to_string(), "announce_sent", Some("relay"))
+            .unwrap();
+
+        let events = store.list_sync_events_for(id).unwrap();
+        assert_eq!(events.len(), 2, "both events of this row's journal come back");
+        // `list_sync_events` is newest-first (id DESC), so the later insert leads.
+        assert_eq!(events[0].kind, "announce_sent");
+        assert_eq!(events[0].detail.as_deref(), Some("relay"));
+        assert_eq!(events[1].kind, "enqueued");
+        assert_eq!(events[1].detail, None);
+        assert!(events.iter().all(|e| e.direction == Direction::Sent), "the Sent journal");
+
+        // A different row's journal is never mixed in (scoped to one batch_key).
+        let other = store.enqueue("pkg2", PEER, None, &[]).unwrap();
+        store.append_sync_event(Direction::Sent, &other.to_string(), "enqueued", None).unwrap();
+        assert_eq!(
+            store.list_sync_events_for(id).unwrap().len(),
+            2,
+            "still only this row's two events"
+        );
+        assert_eq!(store.list_sync_events_for(other).unwrap().len(), 1);
     }
 }
