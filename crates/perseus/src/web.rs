@@ -57,8 +57,8 @@ use athenaeum_core::package::read_manifest;
 use athenaeum_core::package::MANIFEST_FILENAME;
 use athenaeum_core::sync::store::StandaloneSyncStore;
 use athenaeum_core::sync::{
-    node_id_hex, Direction, HistoryQuery, HistoryRow, OutboundRow, OutboundState,
-    SharedPackageCleanup, SyncEngineHandle, SyncStore,
+    node_id_hex, Direction, HistoryQuery, HistoryRow, OutboundFileRow, OutboundRow, OutboundState,
+    SharedPackageCleanup, SyncEngineHandle, SyncStore, CANCELLED_BY_RECEIVER_DETAIL,
 };
 
 use crate::batch_store::BatchStore;
@@ -472,6 +472,12 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         )
         .route("/api/send-now", post(api_send_now))
         .route("/api/batches", get(api_batches))
+        // Perseus UI v2 (Task 4): the grouped transfers read model — one element
+        // per batch across every fan-out target, its per-file × per-target matrix,
+        // and the server-computed obligation verdict — plus a batch's merged event
+        // log. Read-only; the deletion endpoints are a later task.
+        .route("/api/transfers", get(api_transfers))
+        .route("/api/transfers/events", get(api_transfer_events))
         .route("/api/delete", post(api_delete))
         .route("/api/retry", post(api_retry))
         // The explicit operator divert for a receiver-declined transfer (a
@@ -1445,6 +1451,416 @@ async fn api_batches(
         })
         .collect();
     Ok(Json(dtos))
+}
+
+// ── Perseus UI v2 (Task 4): grouped /api/transfers read model ────────────────
+
+/// One `GET /api/transfers` element: a `perseus_batch` row grouped across every
+/// fan-out target (one [`sync_outbound`] row per target sharing the batch's
+/// `package_ref`), with a per-file × per-target matrix and the server-computed
+/// obligation verdict. The single source of truth the UI v2 renders — the raw
+/// UUIDs live only in the per-target details.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferDto {
+    /// The batch's package directory path (the grouping key).
+    package_ref: String,
+    /// The wire batch id — the basename of `package_ref` (its `file_name`), the
+    /// stable handle both sides key on. Falls back to the whole ref if it has no
+    /// final component.
+    batch_uuid: String,
+    /// First non-empty per-target `display_name` across the group; `None` → the
+    /// UI shows `batchUuid`.
+    display_name: Option<String>,
+    /// `auto` (watcher quiet-timer) or `manual` (operator "send now").
+    mode: String,
+    created_at: String,
+    file_count: i64,
+    /// Total on-wire size: the summed `byte_size` of the group's richest manifest
+    /// (the target with the most per-file rows — a partial rebuild can shrink an
+    /// attempt's manifest, so the fullest one is authoritative).
+    total_bytes: u64,
+    /// When this batch's source payload copies were deleted from disk, else
+    /// `None`. A set value forces `deletable.allowed = false`.
+    files_deleted_at: Option<String>,
+    /// The batch-level outcome derived from its targets (see [`aggregate_outcome`]).
+    outcome: String,
+    /// The user-facing "attempt N" — the max `generation` across the group's rows.
+    generation: u32,
+    /// One entry per fan-out target (per `sync_outbound` row).
+    targets: Vec<TransferTargetDto>,
+    /// The per-file × per-target matrix (union of every target's manifest).
+    files: Vec<TransferFileDto>,
+    /// The server-computed "may delete source files" verdict (obligation model).
+    deletable: DeletableDto,
+}
+
+/// One fan-out target of a grouped transfer: the `sync_outbound` row's live
+/// state, its friendly name, and its rolled-up byte totals.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferTargetDto {
+    row_id: i64,
+    peer_hex: String,
+    /// Friendly device name (peer hex when unknown).
+    name: String,
+    state: String,
+    generation: u32,
+    last_error: Option<String>,
+    next_retry_at: Option<String>,
+    /// Cumulative bytes served across this target's files.
+    bytes_done: u64,
+    /// Summed `byte_size` across this target's files.
+    byte_size: u64,
+    created_at: String,
+    confirmed_at: Option<String>,
+}
+
+/// One file of a grouped transfer, with its per-target status. A target is
+/// omitted from `targets` when that attempt's manifest never carried this file
+/// (a partial rebuild shrank it).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferFileDto {
+    rel_path: String,
+    byte_size: u64,
+    targets: Vec<TransferFileTargetDto>,
+}
+
+/// One cell of the file × target matrix: how one file fared to one target.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransferFileTargetDto {
+    peer_hex: String,
+    state: String,
+    outcome: Option<String>,
+    error: Option<String>,
+    bytes_done: u64,
+}
+
+/// The server-computed "may delete source files" verdict (obligation model).
+/// Produced by the pure [`obligation_verdict`]; Task 5 re-runs the same function
+/// server-side at delete time so the UI's affordance and the guard never drift.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletableDto {
+    /// The source files are safe to delete: every participation delivered
+    /// somewhere (or was closed by the receiver) and at least one row exists.
+    allowed: bool,
+    /// How many participating rows are `Confirmed` (delivered).
+    delivered_targets: u32,
+    /// Human labels for rows the receiver closed without fulfilling
+    /// (`"<name>: declined"` / `"<name>: cancelled"`) — informational, not a block.
+    closed: Vec<String>,
+    /// Reasons the delete is blocked (a still-in-flight or failed participation,
+    /// an aged-out row window, or files already deleted). Empty ⇒ nothing blocks.
+    blockers: Vec<String>,
+}
+
+/// One `GET /api/transfers/events` entry: a single journal event tagged with the
+/// target device it belongs to.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EventDto {
+    ts: String,
+    kind: String,
+    detail: Option<String>,
+    /// Friendly name of the target whose journal this event came from.
+    target: String,
+}
+
+/// The obligation verdict (spec §3.1/§4.1) — **pure** so Task 5 can re-run it
+/// server-side at delete time and reach the same answer the UI showed.
+///
+/// `participations` are the batches a delete would implicate: this batch plus
+/// every batch that re-sends any of its source files (a divert), each paired with
+/// its visible outbound rows. The rule is **row-granular** — a `Confirmed` row
+/// already guarantees every receipt was non-`Rejected`, so a `cancelled` per-file
+/// receipt inside a confirmed batch is the receiver's own decision, not a blocker:
+///
+/// - `Confirmed` → delivered (fulfils the obligation, counted in `deliveredTargets`).
+/// - `Cancelled` → closed (`"<name>: declined"` when `last_error` starts with the
+///   receiver-decline detail, else `"<name>: cancelled"`) — recorded, not a block.
+/// - `Failed` → blocker `"<name>: failed — <last_error>"`.
+/// - any non-terminal → blocker `"<name>: in flight"`.
+/// - a participation with **no visible rows** (aged out of the scan window) →
+///   blocker `"transfer rows unavailable (aged out)"` — fail closed.
+///
+/// `allowed` = no blockers AND at least one row was seen. The `files already
+/// deleted` blocker is applied by the caller (it is per-batch state, not a
+/// participation input — see [`api_transfers`]).
+fn obligation_verdict(
+    participations: &[(String, Vec<&OutboundRow>)],
+    names: &HashMap<String, String>,
+) -> DeletableDto {
+    let mut delivered_targets = 0u32;
+    let mut closed: Vec<String> = Vec::new();
+    let mut blockers: Vec<String> = Vec::new();
+    let mut total_rows = 0usize;
+
+    for (_package_ref, rows) in participations {
+        if rows.is_empty() {
+            // A participation whose rows aged out of the visible outbound window:
+            // we cannot prove delivery, so fail closed.
+            blockers.push("transfer rows unavailable (aged out)".to_string());
+            continue;
+        }
+        for row in rows {
+            total_rows += 1;
+            let hex = node_id_hex(&row.peer);
+            let name = names.get(&hex).cloned().unwrap_or(hex);
+            match row.state {
+                OutboundState::Confirmed => delivered_targets += 1,
+                OutboundState::Cancelled => {
+                    let declined = row
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with(CANCELLED_BY_RECEIVER_DETAIL));
+                    let label = if declined { "declined" } else { "cancelled" };
+                    closed.push(format!("{name}: {label}"));
+                }
+                OutboundState::Failed => {
+                    let reason = row.last_error.as_deref().unwrap_or("unknown");
+                    blockers.push(format!("{name}: failed — {reason}"));
+                }
+                // Queued / Announced / Transferring / Delivered — still on the wire.
+                _ => blockers.push(format!("{name}: in flight")),
+            }
+        }
+    }
+
+    DeletableDto {
+        allowed: blockers.is_empty() && total_rows >= 1,
+        delivered_targets,
+        closed,
+        blockers,
+    }
+}
+
+/// Resolve the obligation participations for `package_ref`: its own source files
+/// (`files_for`) fan out via [`packages_for_sources`](BatchStore::packages_for_sources)
+/// to every batch that re-sends any of them (a divert), unioned with `package_ref`
+/// itself; each ref is then paired with its visible outbound rows from `by_ref`.
+/// A batch with no recorded source linkage (pre-linkage row) degrades to just
+/// itself. A ref present here but absent from `by_ref` yields an empty row list —
+/// the verdict's aged-out fail-closed signal.
+fn resolve_participations<'a>(
+    batches: &BatchStore,
+    package_ref: &str,
+    by_ref: &HashMap<&str, Vec<&'a OutboundRow>>,
+) -> anyhow::Result<Vec<(String, Vec<&'a OutboundRow>)>> {
+    let sources: Vec<String> = batches
+        .files_for(package_ref)?
+        .into_iter()
+        .map(|(_, path)| path.to_string_lossy().into_owned())
+        .collect();
+    let refs: Vec<String> = if sources.is_empty() {
+        vec![package_ref.to_string()]
+    } else {
+        let mut refs = batches.packages_for_sources(&sources)?;
+        if !refs.iter().any(|r| r == package_ref) {
+            refs.push(package_ref.to_string());
+        }
+        refs
+    };
+    Ok(refs
+        .into_iter()
+        .map(|r| {
+            let rows = by_ref.get(r.as_str()).cloned().unwrap_or_default();
+            (r, rows)
+        })
+        .collect())
+}
+
+/// `GET /api/transfers` — the grouped transfers read model (Perseus UI v2). One
+/// element per recorded `perseus_batch` row (newest-first), joined by
+/// `package_ref` to every fan-out target's outbound row, carrying the per-file ×
+/// per-target matrix and the server-computed obligation verdict. Read-only; the
+/// legacy `/api/batches` stays alive alongside it until the UI cuts over.
+async fn api_transfers(
+    State(state): State<Arc<WebState>>,
+) -> Result<Json<Vec<TransferDto>>, (StatusCode, String)> {
+    let batches = state.batches.list().map_err(|e| {
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web transfers: list batches failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
+    let outbound = state.store.all_outbound(STATUS_SCAN_LIMIT).map_err(|e| {
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web transfers: read outbound failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
+    // Group outbound rows by package_ref (one row per target on a fan-out) — the
+    // same idiom as `api_batches`.
+    let mut by_ref: HashMap<&str, Vec<&OutboundRow>> = HashMap::new();
+    for row in &outbound {
+        by_ref.entry(row.package_ref.as_str()).or_default().push(row);
+    }
+    let device_names = state.device_names.read().await;
+
+    let mut dtos: Vec<TransferDto> = Vec::with_capacity(batches.len());
+    for batch in &batches {
+        let rows: &[&OutboundRow] = by_ref
+            .get(batch.package_ref.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+
+        // Fetch each target's per-file rows once; reused for the target rollups,
+        // the file matrix, and the total-bytes pick.
+        let mut per_target: Vec<(&OutboundRow, Vec<OutboundFileRow>)> = Vec::with_capacity(rows.len());
+        for &row in rows {
+            let files = state.store.list_outbound_files(row.id).map_err(|e| {
+                let msg = format!("{e:#}");
+                tracing::error!(error = %msg, outbound_id = row.id, "web transfers: read outbound files failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, msg)
+            })?;
+            per_target.push((row, files));
+        }
+
+        // Per-target rollups.
+        let targets: Vec<TransferTargetDto> = per_target
+            .iter()
+            .map(|(row, files)| {
+                let hex = node_id_hex(&row.peer);
+                TransferTargetDto {
+                    row_id: row.id,
+                    name: device_names.get(&hex).cloned().unwrap_or_else(|| hex.clone()),
+                    peer_hex: hex,
+                    state: row.state.as_str().to_string(),
+                    generation: row.generation,
+                    last_error: row.last_error.clone(),
+                    next_retry_at: row.next_retry_at.clone(),
+                    bytes_done: files.iter().map(|f| f.bytes_done).sum(),
+                    byte_size: files.iter().map(|f| f.byte_size).sum(),
+                    created_at: row.created_at.clone(),
+                    confirmed_at: row.confirmed_at.clone(),
+                }
+            })
+            .collect();
+
+        // File × target matrix: union of every target's rel_paths (BTreeMap keeps
+        // it rel_path-ordered and deterministic), each carrying only the targets
+        // whose manifest actually held that file.
+        let mut matrix: std::collections::BTreeMap<String, (u64, Vec<TransferFileTargetDto>)> =
+            std::collections::BTreeMap::new();
+        for (row, files) in &per_target {
+            let hex = node_id_hex(&row.peer);
+            for f in files {
+                let entry = matrix.entry(f.rel_path.clone()).or_insert((f.byte_size, Vec::new()));
+                entry.0 = f.byte_size;
+                entry.1.push(TransferFileTargetDto {
+                    peer_hex: hex.clone(),
+                    state: f.state.as_str().to_string(),
+                    outcome: f.outcome.clone(),
+                    error: f.error.clone(),
+                    bytes_done: f.bytes_done,
+                });
+            }
+        }
+        let files: Vec<TransferFileDto> = matrix
+            .into_iter()
+            .map(|(rel_path, (byte_size, targets))| TransferFileDto {
+                rel_path,
+                byte_size,
+                targets,
+            })
+            .collect();
+
+        // Total bytes = the richest manifest's summed byte_size (rows share the
+        // manifest; a partial rebuild can shrink an attempt's, so pick the fullest).
+        let total_bytes = per_target
+            .iter()
+            .max_by_key(|(_, files)| files.len())
+            .map(|(_, files)| files.iter().map(|f| f.byte_size).sum())
+            .unwrap_or(0);
+
+        // Obligation verdict, then the per-batch `files already deleted` override
+        // (per-batch state, not a participation input, so applied here).
+        let participations = resolve_participations(&state.batches, &batch.package_ref, &by_ref)
+            .map_err(|e| {
+                let msg = format!("{e:#}");
+                tracing::error!(error = %msg, package_ref = %batch.package_ref, "web transfers: resolve participations failed");
+                (StatusCode::INTERNAL_SERVER_ERROR, msg)
+            })?;
+        let mut deletable = obligation_verdict(&participations, &device_names);
+        if batch.files_deleted_at.is_some() {
+            deletable.allowed = false;
+            deletable.blockers.push("files already deleted".to_string());
+        }
+
+        let batch_uuid = Path::new(&batch.package_ref)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(batch.package_ref.as_str())
+            .to_string();
+        let display_name = rows
+            .iter()
+            .find_map(|r| r.display_name.as_deref().filter(|s| !s.is_empty()))
+            .map(str::to_string);
+        let generation = rows.iter().map(|r| r.generation).max().unwrap_or(0);
+
+        dtos.push(TransferDto {
+            package_ref: batch.package_ref.clone(),
+            batch_uuid,
+            display_name,
+            mode: batch.mode.clone(),
+            created_at: batch.created_at.clone(),
+            file_count: batch.file_count,
+            total_bytes,
+            files_deleted_at: batch.files_deleted_at.clone(),
+            outcome: aggregate_outcome(rows),
+            generation,
+            targets,
+            files,
+            deletable,
+        });
+    }
+    Ok(Json(dtos))
+}
+
+/// Query string for `GET /api/transfers/events`.
+#[derive(serde::Deserialize)]
+struct TransferEventsQuery {
+    /// The batch's `package_ref` (the grouping key) whose merged journal to read.
+    #[serde(rename = "ref")]
+    package_ref: String,
+}
+
+/// `GET /api/transfers/events?ref=<package_ref>` — the batch's event log: every
+/// fan-out target's sender journal ([`list_sync_events_for`](StandaloneSyncStore::list_sync_events_for),
+/// newest-first per row) tagged with the target's device name, merged, and
+/// re-sorted oldest-first by `ts`. Read-only.
+async fn api_transfer_events(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<TransferEventsQuery>,
+) -> Result<Json<Vec<EventDto>>, (StatusCode, String)> {
+    let outbound = state.store.all_outbound(STATUS_SCAN_LIMIT).map_err(|e| {
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web transfer events: read outbound failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
+    let device_names = state.device_names.read().await;
+    let mut events: Vec<EventDto> = Vec::new();
+    for row in outbound.iter().filter(|r| r.package_ref == q.package_ref) {
+        let hex = node_id_hex(&row.peer);
+        let name = device_names.get(&hex).cloned().unwrap_or(hex);
+        let journal = state.store.list_sync_events_for(row.id).map_err(|e| {
+            let msg = format!("{e:#}");
+            tracing::error!(error = %msg, outbound_id = row.id, "web transfer events: read journal failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg)
+        })?;
+        for e in journal {
+            events.push(EventDto {
+                ts: e.ts,
+                kind: e.kind,
+                detail: e.detail,
+                target: name.clone(),
+            });
+        }
+    }
+    // Merge order is per-row newest-first; the batch log reads oldest-first.
+    events.sort_by(|a, b| a.ts.cmp(&b.ts));
+    Ok(Json(events))
 }
 
 /// `POST /api/delete` — delete the source capture files of the given CONFIRMED
@@ -4264,5 +4680,203 @@ mod tests {
             "no outbound row yet → sending, not an error"
         );
         assert!(rows[1]["targets"].as_array().unwrap().is_empty());
+    }
+
+    // ── Task 4 (Perseus UI v2): grouped /api/transfers + events + verdict ─────
+
+    /// Build a bare [`OutboundRow`] for the pure-verdict unit tests. Only the
+    /// fields the verdict reads (`peer`, `state`, `last_error`) matter; the rest
+    /// carry inert placeholders.
+    fn verdict_row(id: i64, peer: [u8; 32], state: OutboundState, last_error: Option<&str>) -> OutboundRow {
+        OutboundRow {
+            id,
+            package_ref: format!("pkg-{id}"),
+            peer,
+            state,
+            attempts: 0,
+            created_at: "2026-07-23T10:00:00.000Z".into(),
+            confirmed_at: None,
+            last_error: last_error.map(str::to_string),
+            next_retry_at: None,
+            wire_package_id: None,
+            display_name: None,
+            project_id: None,
+            generation: 1,
+        }
+    }
+
+    /// `GET /api/transfers` groups ONE `perseus_batch` row across two fan-out
+    /// targets: a single element carrying two targets, a two-file matrix each
+    /// crossing both targets, the basename as `batchUuid`, and `sending` while
+    /// both rows are still non-terminal.
+    #[tokio::test]
+    async fn transfers_groups_one_batch_across_two_targets() {
+        use athenaeum_core::sharing::types::AnnounceFileEntry;
+        let (state, _tmp) = test_state().await;
+        const P1: [u8; 32] = [1u8; 32];
+        const P2: [u8; 32] = [2u8; 32];
+        let files = [
+            AnnounceFileEntry { rel_path: "a.fits".into(), byte_size: 100, frame_uuid: "u-a".into() },
+            AnnounceFileEntry { rel_path: "b.fits".into(), byte_size: 200, frame_uuid: "u-b".into() },
+        ];
+        // Two outbound rows (one per target) under the same package_ref, each with
+        // the same two-file manifest, plus the batch record that groups them.
+        state.store.enqueue("/data/packages/batch-xyz", P1, None, &files).unwrap();
+        state.store.enqueue("/data/packages/batch-xyz", P2, None, &files).unwrap();
+        state
+            .batches
+            .record("/data/packages/batch-xyz", "auto", "2026-07-23T10:00:00Z", 2)
+            .unwrap();
+
+        let app = build_router(state, None);
+        let v = body_json(get(&app, "/api/transfers").await).await;
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one element per perseus_batch row");
+        assert_eq!(rows[0]["batchUuid"], "batch-xyz");
+        assert_eq!(rows[0]["outcome"], "sending", "both targets still non-terminal");
+        assert_eq!(rows[0]["targets"].as_array().unwrap().len(), 2);
+        let matrix = rows[0]["files"].as_array().unwrap();
+        assert_eq!(matrix.len(), 2, "union of the two rows' rel_paths");
+        assert_eq!(
+            matrix[0]["targets"].as_array().unwrap().len(),
+            2,
+            "each file crosses both targets"
+        );
+    }
+
+    /// A Confirmed row fulfils its files; a receiver-declined Cancelled row is
+    /// `closed` (labelled `declined`) — the batch is deletable with the decline
+    /// recorded, not blocked.
+    #[test]
+    fn verdict_confirmed_plus_declined_allows_with_closed_label() {
+        let names = HashMap::from([(node_id_hex(&[1u8; 32]), "Studio".to_string())]);
+        let confirmed = verdict_row(1, [1u8; 32], OutboundState::Confirmed, None);
+        let declined = verdict_row(
+            2,
+            [1u8; 32],
+            OutboundState::Cancelled,
+            Some(athenaeum_core::sync::CANCELLED_BY_RECEIVER_DETAIL),
+        );
+        let parts = vec![("pkg-a".to_string(), vec![&confirmed, &declined])];
+        let v = obligation_verdict(&parts, &names);
+        assert!(v.allowed, "confirmed + declined → deletable");
+        assert_eq!(v.delivered_targets, 1);
+        assert_eq!(v.closed, vec!["Studio: declined".to_string()]);
+        assert!(v.blockers.is_empty());
+    }
+
+    /// A Failed row blocks (its reason surfaced); a non-terminal (Announced) row
+    /// blocks as `in flight`. Either way `allowed == false`.
+    #[test]
+    fn verdict_failed_or_inflight_blocks() {
+        let names = HashMap::from([(node_id_hex(&[1u8; 32]), "Studio".to_string())]);
+
+        let failed = verdict_row(1, [1u8; 32], OutboundState::Failed, Some("payload gone"));
+        let v = obligation_verdict(&[("pkg-a".to_string(), vec![&failed])], &names);
+        assert!(!v.allowed);
+        assert!(
+            v.blockers.iter().any(|b| b.contains("failed") && b.contains("payload gone")),
+            "failed blocker carries the reason: {:?}",
+            v.blockers
+        );
+
+        let inflight = verdict_row(2, [1u8; 32], OutboundState::Announced, None);
+        let v2 = obligation_verdict(&[("pkg-b".to_string(), vec![&inflight])], &names);
+        assert!(!v2.allowed);
+        assert!(
+            v2.blockers.iter().any(|b| b.contains("in flight")),
+            "non-terminal blocker reads 'in flight': {:?}",
+            v2.blockers
+        );
+    }
+
+    /// A divert: batch A is all-cancelled (closed, deletable on its own), but its
+    /// source file also travels in batch B (linked via `packages_for_sources`).
+    /// While B is in flight, A's obligation is blocked; once B confirms, A's files
+    /// are delivered somewhere and A becomes deletable.
+    #[test]
+    fn verdict_divert_participation_blocks_until_new_batch_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let batches = crate::batch_store::BatchStore::open(dir.path().join("perseus.db")).unwrap();
+        // A and B both carry the same source capture file → shared participation.
+        batches
+            .record_files("pkg-a", &[("a.fits".into(), std::path::PathBuf::from("/cap/a.fits"))])
+            .unwrap();
+        batches
+            .record_files("pkg-b", &[("a.fits".into(), std::path::PathBuf::from("/cap/a.fits"))])
+            .unwrap();
+
+        let names = HashMap::new();
+        let a_row = verdict_row(1, [1u8; 32], OutboundState::Cancelled, Some("cancelled"));
+        let mut b_row = verdict_row(2, [2u8; 32], OutboundState::Announced, None);
+
+        // Resolve A's participations through the real linkage query, then verdict.
+        let by_ref: HashMap<&str, Vec<&OutboundRow>> =
+            HashMap::from([("pkg-a", vec![&a_row]), ("pkg-b", vec![&b_row])]);
+        let parts = resolve_participations(&batches, "pkg-a", &by_ref).unwrap();
+        let refs: Vec<&str> = parts.iter().map(|(r, _)| r.as_str()).collect();
+        assert!(refs.contains(&"pkg-a") && refs.contains(&"pkg-b"), "B is a participation of A: {refs:?}");
+        let blocked = obligation_verdict(&parts, &names);
+        assert!(!blocked.allowed, "B in flight blocks A's obligation");
+
+        // Flip B to Confirmed → A's files are delivered via B → deletable.
+        b_row.state = OutboundState::Confirmed;
+        let by_ref2: HashMap<&str, Vec<&OutboundRow>> =
+            HashMap::from([("pkg-a", vec![&a_row]), ("pkg-b", vec![&b_row])]);
+        let parts2 = resolve_participations(&batches, "pkg-a", &by_ref2).unwrap();
+        let ok = obligation_verdict(&parts2, &names);
+        assert!(ok.allowed, "once B confirms, A becomes deletable");
+        assert_eq!(ok.delivered_targets, 1);
+    }
+
+    /// `GET /api/transfers/events?ref=` merges the per-target journals of every
+    /// row in the group, tags each event with the target's device name, and
+    /// returns them oldest-first.
+    #[tokio::test]
+    async fn transfer_events_merges_rows_sorted_and_named() {
+        let (state, _tmp) = test_state().await;
+        const P1: [u8; 32] = [1u8; 32];
+        const P2: [u8; 32] = [2u8; 32];
+        {
+            let mut g = state.device_names.write().await;
+            g.insert(node_id_hex(&P1), "Studio".to_string());
+            g.insert(node_id_hex(&P2), "NAS".to_string());
+        }
+        let id1 = state.store.enqueue("/data/packages/evt", P1, None, &[]).unwrap();
+        let id2 = state.store.enqueue("/data/packages/evt", P2, None, &[]).unwrap();
+
+        // Interleave the two journals; distinct kinds per target make the
+        // name-attachment assertion independent of the (asserted) ts ordering.
+        // Small sleeps keep the millisecond timestamps strictly increasing.
+        let gap = std::time::Duration::from_millis(5);
+        state.store.append_sync_event(Direction::Sent, &id1.to_string(), "announce_sent", None).unwrap();
+        tokio::time::sleep(gap).await;
+        state.store.append_sync_event(Direction::Sent, &id2.to_string(), "serve_start", None).unwrap();
+        tokio::time::sleep(gap).await;
+        state.store.append_sync_event(Direction::Sent, &id1.to_string(), "ack_received", None).unwrap();
+        tokio::time::sleep(gap).await;
+        state.store.append_sync_event(Direction::Sent, &id2.to_string(), "dial_failed", Some("timeout")).unwrap();
+
+        let app = build_router(state, None);
+        let v = body_json(get(&app, "/api/transfers/events?ref=/data/packages/evt").await).await;
+        let events = v.as_array().unwrap();
+        assert_eq!(events.len(), 4, "both journals merged");
+
+        // ts strictly ascending (oldest-first).
+        let ts: Vec<&str> = events.iter().map(|e| e["ts"].as_str().unwrap()).collect();
+        let mut sorted = ts.clone();
+        sorted.sort_unstable();
+        assert_eq!(ts, sorted, "events oldest-first by ts");
+
+        // Names attached by target: P1's kinds → Studio, P2's kinds → NAS.
+        for e in events {
+            let kind = e["kind"].as_str().unwrap();
+            let target = e["target"].as_str().unwrap();
+            match kind {
+                "announce_sent" | "ack_received" => assert_eq!(target, "Studio", "{kind}"),
+                "serve_start" | "dial_failed" => assert_eq!(target, "NAS", "{kind}"),
+                other => panic!("unexpected kind {other}"),
+            }
+        }
     }
 }
