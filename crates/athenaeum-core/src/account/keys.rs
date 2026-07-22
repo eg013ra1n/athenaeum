@@ -27,6 +27,15 @@ pub fn device_key_path(sync_dir: &Path) -> PathBuf {
     sync_dir.join(DEVICE_KEY_FILENAME)
 }
 
+/// Sidecar lock file guarding the device identity. The lock must NOT be on
+/// `device_key` itself: fd-lock maps to `LockFileEx` on Windows, a MANDATORY
+/// lock that fails every other handle's read of the key (os error 33) —
+/// including account sign-in — for as long as the iroh node holds it. Unix
+/// `flock` is advisory, which is why this only broke on Windows.
+pub fn device_key_lock_path(sync_dir: &Path) -> PathBuf {
+    sync_dir.join("device_key.lock")
+}
+
 /// The persisted device identity. Cheap to clone (32 bytes).
 #[derive(Clone)]
 pub struct DeviceKey {
@@ -90,12 +99,16 @@ fn device_key_in_use_message(path: &Path) -> String {
     )
 }
 
-/// A held, process-lifetime advisory lock on the `device_key` file (iroh
-/// hardening I4). Taken at [`SharedIrohNode`](crate::sharing::iroh::node) bind so
-/// a second install started from a **copied** key — or a double launch of the
-/// same install — fails loudly at startup instead of silently dueling with the
-/// original on the relay (one relay slot per node id). Dropping it (node
-/// shutdown) releases the OS lock so a later re-bind can re-acquire it.
+/// A held, process-lifetime advisory lock on the [`device_key_lock_path`]
+/// sidecar (iroh hardening I4). The lock is on the sidecar, never on
+/// `device_key` itself: fd-lock is `LockFileEx` on Windows — a MANDATORY lock
+/// that would fail every other handle's read of the key (os error 33,
+/// including account sign-in) for as long as the node holds it. Taken at
+/// [`SharedIrohNode`](crate::sharing::iroh::node) bind so a second install
+/// started from a **copied** key — or a double launch of the same install —
+/// fails loudly at startup instead of silently dueling with the original on the
+/// relay (one relay slot per node id). Dropping it (node shutdown) releases the
+/// OS lock so a later re-bind can re-acquire it.
 ///
 /// # How the lock is held
 ///
@@ -108,27 +121,31 @@ fn device_key_in_use_message(path: &Path) -> String {
 /// closes. `fd_lock::RwLock<T>` has no `Drop` of its own, so nothing else can
 /// touch the lock. No `unsafe`, no raw pointers, no leak (the node may re-bind).
 pub struct DeviceKeyLock {
-    /// Owns the open key `File` whose file-description carries the `flock`. The
-    /// lock stays held for as long as this field is alive (its guard was
+    /// Owns the open sidecar `File` whose file-description carries the `flock`.
+    /// The lock stays held for as long as this field is alive (its guard was
     /// `mem::forget`-ted, so no `LOCK_UN` runs); closing the `File` on drop is
     /// what releases the OS lock.
     _lock: fd_lock::RwLock<std::fs::File>,
-    /// The locked key path, for the release log line (no secret material).
+    /// The locked sidecar path, for the release log line (no secret material).
     path: PathBuf,
 }
 
 impl DeviceKeyLock {
-    /// Acquire the exclusive advisory lock on `key_path`, which must already
-    /// exist (the caller creates it via [`DeviceKey::load_or_create`] first). A
-    /// second holder — this process or any other — fails with an actionable,
-    /// key-material-free error (I4/S2). A genuine I/O error (not contention)
-    /// propagates with context, never masquerading as "in use".
-    pub fn acquire(key_path: &Path) -> Result<Self> {
+    /// Acquire the exclusive advisory lock on `lock_path` — the
+    /// [`device_key_lock_path`] sidecar, created here if it does not yet exist
+    /// (the lock is NEVER taken on `device_key` itself, so its bytes stay
+    /// readable while the node runs). A second holder — this process or any
+    /// other — fails with an actionable, key-material-free error (I4/S2). A
+    /// genuine I/O error (not contention) propagates with context, never
+    /// masquerading as "in use".
+    pub fn acquire(lock_path: &Path) -> Result<Self> {
         let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
-            .open(key_path)
-            .with_context(|| format!("open device key for locking {}", key_path.display()))?;
+            .open(lock_path)
+            .with_context(|| format!("open device key lock {}", lock_path.display()))?;
         let mut lock = fd_lock::RwLock::new(file);
         match lock.try_write() {
             Ok(guard) => {
@@ -136,18 +153,18 @@ impl DeviceKeyLock {
                 // its `Drop` (the only caller of `flock(LOCK_UN)`) never runs.
                 // The lock releases when `_lock` closes the file on struct drop.
                 std::mem::forget(guard);
-                tracing::debug!(path = %key_path.display(), "device key lock acquired");
+                tracing::debug!(path = %lock_path.display(), "device key lock acquired");
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                anyhow::bail!(device_key_in_use_message(key_path))
+                anyhow::bail!(device_key_in_use_message(lock_path))
             }
             Err(e) => {
-                return Err(e).with_context(|| format!("lock device key {}", key_path.display()));
+                return Err(e).with_context(|| format!("lock device key {}", lock_path.display()));
             }
         }
         Ok(Self {
             _lock: lock,
-            path: key_path.to_path_buf(),
+            path: lock_path.to_path_buf(),
         })
     }
 }
@@ -482,6 +499,27 @@ mod tests {
             "iroh endpoint id must equal the DeviceKey node id"
         );
         transport.shutdown().await;
+    }
+
+    #[test]
+    fn key_file_stays_readable_while_lock_is_held() {
+        // fd-lock on Windows is LockFileEx — a MANDATORY lock: any other handle's
+        // read of the key file fails with os error 33 while the node holds it
+        // (seen live: account_sign_in_verify in the 2026-07-18 user log). The
+        // lock must therefore live on a sidecar, never on the key file itself.
+        let dir = tempfile::tempdir().unwrap();
+        let key = DeviceKey::load_or_create_in(dir.path()).unwrap();
+
+        let lock_path = device_key_lock_path(dir.path());
+        let _held = DeviceKeyLock::acquire(&lock_path).unwrap();
+        assert!(lock_path.ends_with("device_key.lock"), "lock must be the sidecar");
+
+        // Re-reading the key while the lock is held must work on EVERY platform.
+        let reread = DeviceKey::load_or_create_in(dir.path()).unwrap();
+        assert_eq!(key.secret_bytes(), reread.secret_bytes());
+
+        // Exclusivity is preserved: a second acquire on the sidecar fails.
+        assert!(DeviceKeyLock::acquire(&lock_path).is_err());
     }
 
     #[cfg(unix)]

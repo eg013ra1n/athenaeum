@@ -52,7 +52,7 @@ use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::JoinHandle;
 
-use crate::account::keys::{device_key_path, DeviceKey, DeviceKeyLock};
+use crate::account::keys::{device_key_lock_path, DeviceKey, DeviceKeyLock};
 use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageId,
     RevokeReason, StartInfo, TransportEvent,
@@ -793,10 +793,12 @@ impl SharedIrohNode {
     /// [`RelayMode::Disabled`] for direct-only / in-process tests.
     pub async fn bind(sync_dir: &Path, relay_mode: RelayMode) -> Result<Arc<Self>> {
         // The one device identity (task B4): the endpoint binds this secret and
-        // the advisory lock is on this exact file, so a second install started
-        // from a copied key fails here instead of dueling on the relay (I4).
+        // the advisory lock is on the `device_key.lock` sidecar (NOT the key
+        // file — a mandatory Windows lock there blocks account sign-in, os
+        // error 33), so a second install started from a copied key fails here
+        // instead of dueling on the relay (I4).
         let key = DeviceKey::load_or_create_in(sync_dir).context("load device key")?;
-        let key_lock = DeviceKeyLock::acquire(&device_key_path(sync_dir))?;
+        let key_lock = DeviceKeyLock::acquire(&device_key_lock_path(sync_dir))?;
 
         let demux = EventDemux::new();
         let secret_key = SecretKey::from_bytes(&key.secret_bytes());
