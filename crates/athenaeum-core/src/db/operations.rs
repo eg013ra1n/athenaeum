@@ -66,6 +66,15 @@ pub(crate) fn path_prefix_upper(prefix: &str) -> Option<String> {
     None
 }
 
+/// The native separator a stored catalog path uses. Catalog paths are always
+/// absolute native paths (WalkDir + canonicalized roots): POSIX ones start
+/// with `/`, Windows ones with a drive letter or UNC `\\` — the leading
+/// character decides, not the build OS, which keeps the predicate builders
+/// testable with Windows-shaped fixtures from any host.
+pub(crate) fn native_separator_of(path: &str) -> char {
+    if path.starts_with('/') { '/' } else { '\\' }
+}
+
 /// Build a `(col >= ? AND (? IS NULL OR col < ?)) OR ...` SQL fragment that
 /// matches any row whose `column` falls under one of `roots` as an
 /// exact-case byte-range prefix, plus the values to bind (three per root, in
@@ -2968,7 +2977,8 @@ pub fn get_frame_ids_for_file_ids(conn: &Connection, file_ids: &[i64]) -> Result
 /// Map a set of selected paths (files and/or folders) to the catalog frame
 /// ids they cover. For each `path`, a frame qualifies when its file is either
 /// an exact `files.path` match (the path names a file) or lives under
-/// `"<path>/"` (the path names a folder — matched recursively at any depth).
+/// `"<path>"` + the path's native separator (the path names a folder —
+/// matched recursively at any depth).
 ///
 /// Results are DISTINCT and returned in ascending, stable order: a
 /// `BTreeSet` dedupes across paths, so an overlapping file + parent-folder
@@ -2980,7 +2990,8 @@ pub fn get_frame_ids_for_file_ids(conn: &Connection, file_ids: &[i64]) -> Result
 /// is applied here; the dual-pane browser selects the same path form the
 /// scanner recorded, so an exact/prefix compare against the stored string is
 /// correct. The folder branch uses an exact-case, wildcard-safe byte-range
-/// prefix (`path >= "<path>/" AND path < upper`, via `path_prefix_upper`) —
+/// prefix (`path >= "<path>" + native separator AND path < upper`, via
+/// `path_prefix_upper`) —
 /// the same compare `rename_files_path_prefix` uses. Unlike the
 /// ASCII-case-insensitive `LIKE` it replaced, `>=`/`<` on TEXT are
 /// case-SENSITIVE (so a `/M31` select never sweeps a `/m31` sibling on a
@@ -3005,7 +3016,8 @@ pub fn frame_ids_under_paths(conn: &Connection, paths: &[String]) -> Result<Vec<
         // `prefix` carries the trailing separator and `upper` is its exclusive
         // upper bound (NULL only when the prefix is all `char::MAX` — then the
         // guard falls back to a lower-bound-only match).
-        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let sep = native_separator_of(path);
+        let prefix = format!("{}{}", path.trim_end_matches(sep), sep);
         let upper = path_prefix_upper(&prefix);
         let rows = stmt.query_map(params![path, prefix, upper], |row| row.get::<_, i64>(0))?;
         for r in rows {
@@ -3910,6 +3922,38 @@ mod bulk_metadata_tests {
 
         // empty input → empty
         assert!(frame_ids_under_paths(&conn, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn frame_ids_under_paths_windows_backslash_paths() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let a = insert_frame(&conn, r"C:\Astro\M31\L_0001.fits", Some("Light"));
+        let b = insert_frame(&conn, r"C:\Astro\M31\sub\L_0002.fits", Some("Light"));
+        let sib = insert_frame(&conn, r"C:\Astro\M31extra\L_0003.fits", Some("Light"));
+
+        // Folder select sweeps descendants at any depth — the reported Windows
+        // bug returned an empty list here (hardcoded '/' prefix).
+        let mut got = frame_ids_under_paths(&conn, &[r"C:\Astro\M31".into()]).unwrap();
+        got.sort();
+        let mut expect = vec![a, b];
+        expect.sort();
+        assert_eq!(got, expect);
+
+        // Trailing backslash tolerated (trim_end_matches('/') was a no-op).
+        let mut got = frame_ids_under_paths(&conn, &[r"C:\Astro\M31\".into()]).unwrap();
+        got.sort();
+        assert_eq!(got, expect);
+
+        // Sibling folder sharing a name prefix must not be swept in.
+        assert!(!got.contains(&sib));
+
+        // Exact-file branch unchanged.
+        assert_eq!(
+            frame_ids_under_paths(&conn, &[r"C:\Astro\M31extra\L_0003.fits".into()]).unwrap(),
+            vec![sib]
+        );
     }
 
     #[test]
