@@ -38,7 +38,7 @@ use crate::calibration_library::light_cal::{
 // home is the calibration engine). Also brings them into this module's scope.
 pub use crate::calibration_library::light_cal::{BiasFallback, FlatNormMode, LightCalParams};
 use crate::calibration_library::light_headers::{build_light_cal_cards, LightCalCardInputs};
-use crate::calibration_library::paths::{calibrated_light_relative_path, resolve_collision};
+use crate::calibration_library::paths::{calibrated_light_relative_path, resolve_collision_free};
 use crate::db::calibration_links::get_links_for_frame;
 use crate::db::light_calibrations::{
     derive_status, get_light_calibration_for_frame, upsert_light_calibration, LightCalRow,
@@ -974,7 +974,10 @@ fn calibrate_one_inner(
                 &resolved.date_obs_date,
                 &output_basename_fits(&resolved.source_filename),
             );
-            resolve_collision(&library_dir.join(&rel))
+            let conn = db.conn();
+            resolve_collision_free(&library_dir.join(&rel), &|p| {
+                crate::db::light_calibrations::output_path_exists(&conn, p).unwrap_or(false)
+            })
         }
     };
     if let Some(parent) = output_abs.parent() {

@@ -336,6 +336,17 @@ pub(crate) fn date_obs_matches(want: Option<&str>, got: Option<&str>) -> bool {
     }
 }
 
+/// Whether any tracking row already claims `path` as its output — the
+/// UNIQUE(output_path) domain the light-output collision resolver checks.
+pub fn output_path_exists(conn: &Connection, path: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM light_calibrations WHERE output_path = ?1",
+        params![path],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 /// Repoint a row's `output_path` after the underlying file moved on disk
 /// (scanner "moved file" reconcile branch, design §4.2).
 pub fn update_output_path(conn: &Connection, id: i64, new_path: &str) -> Result<()> {
@@ -568,6 +579,33 @@ mod tests {
             engine_version: LIGHT_CAL_ENGINE_VERSION,
             created_at: "2026-07-05T00:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn output_path_exists_matches_stored_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        assert!(!output_path_exists(&conn, "/lib/M31/c_a.fits").unwrap());
+        let row = LightCalRow {
+            id: 0,
+            frame_id: None,
+            source_uuid: Some("uuid-op-exists".into()),
+            source_filename: Some("a.fits".into()),
+            output_path: "/lib/M31/c_a.fits".into(),
+            dark_set_id: None,
+            flat_set_id: None,
+            bias_set_id: None,
+            calstat: "D".into(),
+            flat_norm_applied: false,
+            flat_norm_mode: "centralThird".into(),
+            output_hash: "h".into(),
+            engine_version: LIGHT_CAL_ENGINE_VERSION,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            cal_params: "{}".into(),
+        };
+        upsert_light_calibration(&conn, &row).unwrap();
+        assert!(output_path_exists(&conn, "/lib/M31/c_a.fits").unwrap());
+        assert!(!output_path_exists(&conn, "/lib/M31/c_b.fits").unwrap());
     }
 
     #[test]

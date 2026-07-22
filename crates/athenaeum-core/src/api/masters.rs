@@ -41,7 +41,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{db, ApiError};
 use crate::calibration_library::headers::{build_master_cards, load_header_inputs};
-use crate::calibration_library::paths::{master_relative_path, resolve_collision, MasterPathParams};
+use crate::calibration_library::paths::{
+    master_relative_path, resolve_collision_free, MasterPathParams,
+};
 use crate::calibration_library::register::{member_hash, register_master};
 use crate::events::{emit_event, ProgressEmitter};
 use crate::fits_writer::write_fits_f32;
@@ -598,9 +600,11 @@ pub fn preview_master_build(
         binning: set.binning.as_deref(),
         date: &set.date,
     });
-    let target_path = resolve_collision(&library_dir.join(&target_rel))
-        .to_string_lossy()
-        .to_string();
+    let target_path = resolve_collision_free(&library_dir.join(&target_rel), &|p| {
+        crate::db::file_exists(&conn, p).unwrap_or(false)
+    })
+    .to_string_lossy()
+    .to_string();
 
     Ok(MasterBuildPreview {
         set_id,
@@ -797,7 +801,9 @@ fn run_build(
                 binning: set.binning.as_deref(),
                 date: &set.date,
             });
-            resolve_collision(&library_dir.join(&target_rel))
+            resolve_collision_free(&library_dir.join(&target_rel), &|p| {
+                crate::db::file_exists(&conn, p).unwrap_or(false)
+            })
         }
         // Same path the master already lives at — no collision resolution:
         // `write_fits_f32` replaces the existing file atomically.
@@ -825,10 +831,15 @@ fn run_build(
         BuildTarget::New => match register_master(&conn, set_id, &target_abs, &recipe_json) {
             Ok(reg) => Ok(reg.master_set_id),
             Err(e) => {
-                // Registration failed AFTER the file was written — remove it
-                // so no orphan master sits in the library unregistered.
-                let _ = std::fs::remove_file(&target_abs);
-                Err(BuildStepError::Other(format!("{e:#}")))
+                // Keep the written master on disk: deleting it on a catalog
+                // conflict re-created the exact divergence that caused the
+                // failure (permanent build loop, audit F4b). The next library
+                // scan ingests it as an imported master instead — visible, not
+                // lost. The path in the error makes user reports actionable.
+                Err(BuildStepError::Other(format!(
+                    "register master at {}: {e:#}",
+                    target_abs.display()
+                )))
             }
         },
         BuildTarget::Rebuild { master_set_id, master_file_id, .. } => {

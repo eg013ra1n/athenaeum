@@ -136,6 +136,28 @@ pub fn resolve_collision(abs: &Path) -> PathBuf {
     unreachable!()
 }
 
+/// Like [`resolve_collision`], but a candidate is free only when it is BOTH
+/// absent on disk AND not claimed by the catalog domain the output registers
+/// into (`is_taken`). A catalog row that outlived its on-disk file otherwise
+/// wedges every future build on a UNIQUE-path constraint (2026-07-22 audit
+/// F4b) — and the failure path used to delete the freshly built file,
+/// making the state permanent.
+pub fn resolve_collision_free(abs: &Path, is_taken: &dyn Fn(&str) -> bool) -> PathBuf {
+    let free = |p: &Path| !p.exists() && !is_taken(&p.to_string_lossy());
+    if free(abs) {
+        return abs.to_path_buf();
+    }
+    let stem = abs.file_stem().and_then(|s| s.to_str()).unwrap_or("master");
+    let ext = abs.extension().and_then(|s| s.to_str()).unwrap_or("fits");
+    for n in 2u32.. {
+        let candidate = abs.with_file_name(format!("{stem}_{n}.{ext}"));
+        if free(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +246,32 @@ mod tests {
         assert_eq!(resolve_collision(&base), dir.path().join("m_2.fits"));
         std::fs::write(dir.path().join("m_2.fits"), b"x").unwrap();
         assert_eq!(resolve_collision(&base), dir.path().join("m_3.fits"));
+    }
+
+    #[test]
+    fn resolve_collision_free_skips_catalog_taken_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join("master_dark_300s.fits");
+
+        // Disk-free + catalog-free → as-is.
+        let taken_none = |_: &str| false;
+        assert_eq!(resolve_collision_free(&abs, &taken_none), abs);
+
+        // Disk-free but a catalog row survived its file (audit F4b): today's
+        // disk-only resolve_collision returns `abs` and registration dies on
+        // UNIQUE files.path forever — the resolver must suffix past it.
+        let phantom = abs.to_string_lossy().to_string();
+        let taken_phantom = move |p: &str| p == phantom;
+        assert_eq!(
+            resolve_collision_free(&abs, &taken_phantom),
+            dir.path().join("master_dark_300s_2.fits")
+        );
+
+        // Disk-taken behaves like resolve_collision.
+        std::fs::write(&abs, b"x").unwrap();
+        assert_eq!(
+            resolve_collision_free(&abs, &taken_none),
+            dir.path().join("master_dark_300s_2.fits")
+        );
     }
 }
