@@ -2165,6 +2165,10 @@ fn resolve_batch_name(
 /// A collision-free package `rel_path` for a payload. Uses the source filename;
 /// on a duplicate basename within one package it disambiguates with the frame id
 /// (and, in the pathological case, a uuid) so no two payloads overwrite.
+/// Sole remaining caller is the render-gated `api::collab` publish path (the
+/// send path moved to structured WBPP rel_paths), so gate it the same way to
+/// keep the headless (`default-features = false`) build warning-free.
+#[cfg(feature = "render")]
 pub(crate) fn unique_rel_path(filename: &str, frame_id: i64, used: &mut HashSet<String>) -> String {
     let base = if filename.trim().is_empty() {
         format!("frame_{frame_id}.fits")
