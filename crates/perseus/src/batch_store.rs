@@ -27,10 +27,11 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 
 const DDL: &str = "CREATE TABLE IF NOT EXISTS perseus_batch (
-    package_ref TEXT PRIMARY KEY,
-    mode        TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    file_count  INTEGER NOT NULL
+    package_ref      TEXT PRIMARY KEY,
+    mode             TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    file_count       INTEGER NOT NULL,
+    files_deleted_at TEXT
 )";
 
 /// Per-file source linkage for a packaged batch: which capture file each
@@ -56,6 +57,9 @@ pub struct BatchRow {
     pub mode: String,
     pub created_at: String,
     pub file_count: i64,
+    /// RFC-3339 timestamp the batch's payload copies were deleted from disk, or
+    /// `None` while the files are still present. Set by [`BatchStore::mark_files_deleted`].
+    pub files_deleted_at: Option<String>,
 }
 
 /// Durable per-batch send record, keyed by `package_ref`.
@@ -80,6 +84,21 @@ impl BatchStore {
         conn.execute(DDL, []).context("create perseus_batch")?;
         conn.execute(DDL_FILES, [])
             .context("create perseus_batch_files")?;
+
+        // files_deleted_at (UI v2 §4.1): guarded ALTER — CREATE IF NOT EXISTS never
+        // adds a column to an existing table. Additive; pre-upgrade rows read NULL.
+        let has_col: bool = conn
+            .prepare("PRAGMA table_info(perseus_batch)")
+            .context("prepare table_info(perseus_batch)")?
+            .query_map([], |r| r.get::<_, String>(1))
+            .context("query table_info(perseus_batch)")?
+            .filter_map(|c| c.ok())
+            .any(|c| c == "files_deleted_at");
+        if !has_col {
+            conn.execute("ALTER TABLE perseus_batch ADD COLUMN files_deleted_at TEXT", [])
+                .context("add perseus_batch.files_deleted_at")?;
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -187,7 +206,7 @@ impl BatchStore {
         let conn = self.conn.lock().expect("batch store mutex poisoned");
         let mut stmt = conn
             .prepare(
-                "SELECT package_ref, mode, created_at, file_count FROM perseus_batch
+                "SELECT package_ref, mode, created_at, file_count, files_deleted_at FROM perseus_batch
                  ORDER BY created_at DESC, package_ref DESC",
             )
             .context("prepare list perseus_batch")?;
@@ -198,6 +217,7 @@ impl BatchStore {
                     mode: r.get(1)?,
                     created_at: r.get(2)?,
                     file_count: r.get(3)?,
+                    files_deleted_at: r.get(4)?,
                 })
             })
             .context("query perseus_batch")?
@@ -205,11 +225,98 @@ impl BatchStore {
             .context("collect perseus_batch rows")?;
         Ok(rows)
     }
+
+    /// Stamp the RFC-3339 `at` timestamp as when `package_ref`'s payload copies
+    /// were deleted from disk. A no-op if the row does not exist.
+    pub fn mark_files_deleted(&self, package_ref: &str, at: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("batch store mutex poisoned");
+        conn.execute(
+            "UPDATE perseus_batch SET files_deleted_at = ?2 WHERE package_ref = ?1",
+            params![package_ref, at],
+        )
+        .context("mark perseus_batch files_deleted_at")?;
+        Ok(())
+    }
+
+    /// Delete the whole batch — its `perseus_batch` row and every
+    /// `perseus_batch_files` linkage row — in one transaction.
+    pub fn delete(&self, package_ref: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("batch store mutex poisoned");
+        let tx = conn.unchecked_transaction().context("begin batch delete")?;
+        tx.execute("DELETE FROM perseus_batch_files WHERE package_ref = ?1", params![package_ref])
+            .context("delete perseus_batch_files")?;
+        tx.execute("DELETE FROM perseus_batch WHERE package_ref = ?1", params![package_ref])
+            .context("delete perseus_batch")?;
+        tx.commit().context("commit batch delete")
+    }
+
+    /// DISTINCT package_refs that reference ANY of `sources` — a file's full set of
+    /// batch participations (original + divert copies), the obligation verdict's
+    /// cross-batch input. Chunked IN-list (999 SQLite param cap).
+    pub fn packages_for_sources(&self, sources: &[String]) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("batch store mutex poisoned");
+        let mut out: Vec<String> = Vec::new();
+        for chunk in sources.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT DISTINCT package_ref FROM perseus_batch_files WHERE source_path IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql).context("prepare packages_for_sources")?;
+            let refs = stmt
+                .query_map(rusqlite::params_from_iter(chunk.iter()), |r| r.get::<_, String>(0))
+                .context("query packages_for_sources")?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("collect packages_for_sources")?;
+            out.extend(refs);
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fresh on-disk store in a throwaway tempdir. The `TempDir` guard is
+    /// returned first so the caller can keep it alive for the test's duration.
+    fn store() -> (tempfile::TempDir, BatchStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BatchStore::open(dir.path().join("perseus.db")).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn files_deleted_at_roundtrips_and_defaults_null() {
+        let (_tmp, store) = store();
+        store.record("/pkg/u1", "auto", "2026-07-23T10:00:00Z", 3).unwrap();
+        assert_eq!(store.list().unwrap()[0].files_deleted_at, None);
+        store.mark_files_deleted("/pkg/u1", "2026-07-23T11:00:00Z").unwrap();
+        assert_eq!(store.list().unwrap()[0].files_deleted_at.as_deref(), Some("2026-07-23T11:00:00Z"));
+    }
+
+    #[test]
+    fn delete_removes_batch_row_and_linkage() {
+        let (_tmp, store) = store();
+        store.record("/pkg/u1", "auto", "2026-07-23T10:00:00Z", 1).unwrap();
+        store.record_files("/pkg/u1", &[("a.fits".into(), PathBuf::from("/cap/a.fits"))]).unwrap();
+        store.delete("/pkg/u1").unwrap();
+        assert!(store.list().unwrap().is_empty());
+        assert!(store.files_for("/pkg/u1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn packages_for_sources_finds_every_participation() {
+        let (_tmp, store) = store();
+        store.record_files("/pkg/u1", &[("a.fits".into(), PathBuf::from("/cap/a.fits"))]).unwrap();
+        store.record_files("/pkg/u2", &[("a.fits".into(), PathBuf::from("/cap/a.fits")),
+                                         ("b.fits".into(), PathBuf::from("/cap/b.fits"))]).unwrap();
+        store.record_files("/pkg/u3", &[("c.fits".into(), PathBuf::from("/cap/c.fits"))]).unwrap();
+        let mut refs = store.packages_for_sources(&["/cap/a.fits".to_string()]).unwrap();
+        refs.sort();
+        assert_eq!(refs, vec!["/pkg/u1".to_string(), "/pkg/u2".to_string()]);
+    }
 
     #[test]
     fn record_and_list_newest_first() {
