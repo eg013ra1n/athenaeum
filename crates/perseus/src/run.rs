@@ -1518,15 +1518,34 @@ fn retention_delete_source(
     outcome: &str,
     peer_device: &str,
 ) -> Result<DeleteOutcome> {
-    let pkg_ref_str = pkg_ref.to_string_lossy();
+    let detail = delete_package_sources(store, seen, pkg_ref, outcome, peer_device)?;
+    if !detail.removed.is_empty() {
+        return Ok(DeleteOutcome::Removed);
+    }
+    if let Some((path, err)) = detail.failed.first() {
+        anyhow::bail!("delete {path}: {err}");
+    }
+    Ok(DeleteOutcome::SkippedNoop)
+}
 
-    let Some(link) = seen.source_for_package(&pkg_ref_str)? else {
-        tracing::debug!(
-            package_ref = %pkg_ref.display(),
-            "retention: no live source linkage for confirmed package; skipping (already deleted or superseded)"
-        );
-        return Ok(DeleteOutcome::SkippedNoop);
-    };
+/// The single-source half of the deleter contract: remove exactly `link`'s file
+/// (audit-before-delete, TOCTOU stat guard, honest no-op) and return `Removed`
+/// vs `SkippedNoop`. The caller ([`delete_package_sources`]) has already
+/// resolved `link` from the seen store as a *live* linkage of `pkg_ref`, so this
+/// takes the link directly — it never looks it up.
+///
+/// The returned `&'static str` is the skip reason (empty for `Removed`),
+/// threaded out so a batch deletion's per-file report keeps "source missing"
+/// and "source changed since confirmation" honestly distinct (controller
+/// resolution). The two `SkippedNoop` branches carry different reasons.
+fn delete_one_source(
+    store: &dyn SyncStore,
+    seen: &SeenStore,
+    pkg_ref: &Path,
+    link: &SourceLink,
+    outcome: &str,
+    peer_device: &str,
+) -> Result<(DeleteOutcome, &'static str)> {
     let source = link.path.clone();
 
     // Out-of-band removal: something other than retention already removed the
@@ -1541,7 +1560,7 @@ fn retention_delete_source(
             "retention: source already gone out-of-band; marking linkage dead"
         );
         seen.mark_deleted(&source)?;
-        return Ok(DeleteOutcome::SkippedNoop);
+        return Ok((DeleteOutcome::SkippedNoop, "source missing since confirmation"));
     }
 
     // TOCTOU last-line guard: re-stat immediately before removal and require an
@@ -1552,13 +1571,13 @@ fn retention_delete_source(
     let current_meta = std::fs::metadata(&source)
         .with_context(|| format!("stat source before delete {}", source.display()))?;
     let current_mtime_ms = crate::seen::mtime_millis(current_meta.modified().ok());
-    if !source_stat_unchanged(&link, current_meta.len(), current_mtime_ms) {
+    if !source_stat_unchanged(link, current_meta.len(), current_mtime_ms) {
         tracing::warn!(
             path = %source.display(),
             package_ref = %pkg_ref.display(),
             "retention skip: source changed since confirmation"
         );
-        return Ok(DeleteOutcome::SkippedNoop);
+        return Ok((DeleteOutcome::SkippedNoop, "source changed since confirmation"));
     }
 
     // ── Audit BEFORE the destructive action ─────────────────────────────────
@@ -1588,7 +1607,46 @@ fn retention_delete_source(
         );
     }
 
-    Ok(DeleteOutcome::Removed)
+    Ok((DeleteOutcome::Removed, ""))
+}
+
+/// Per-file outcome of one whole-package source deletion — the web layer's
+/// honest per-path report (spec §4.1). `skipped`/`failed` carry `(path, reason)`.
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceDeleteDetail {
+    pub removed: Vec<String>,
+    pub skipped: Vec<(String, String)>,
+    pub failed: Vec<(String, String)>,
+}
+
+/// Delete EVERY live source file of `pkg_ref` through the shared safety
+/// contract (audit-before-delete, TOCTOU guard, honest no-ops), capturing a
+/// per-file outcome instead of stopping at the first error — one bad file must
+/// not strand its batch-mates' deletion.
+pub fn delete_package_sources(
+    store: &dyn SyncStore,
+    seen: &SeenStore,
+    pkg_ref: &Path,
+    outcome: &str,
+    peer_device: &str,
+) -> Result<SourceDeleteDetail> {
+    let mut detail = SourceDeleteDetail::default();
+    let links = seen.sources_for_package(&pkg_ref.to_string_lossy())?;
+    for link in &links {
+        let path = link.path.display().to_string();
+        match delete_one_source(store, seen, pkg_ref, link, outcome, peer_device) {
+            Ok((DeleteOutcome::Removed, _)) => detail.removed.push(path),
+            Ok((DeleteOutcome::SkippedNoop, reason)) => {
+                detail.skipped.push((path, format!("skipped: {reason}")))
+            }
+            Err(error) => {
+                tracing::error!(path = %link.path.display(), %error, "package source delete failed");
+                detail.failed.push((path, format!("{error:#}")));
+            }
+        }
+    }
+    Ok(detail)
 }
 
 /// Run one retention pass synchronously: map the config policy onto core's
@@ -2600,6 +2658,90 @@ mod retention_tests {
             None,
             "the dead linkage is stamped so it stops being offered"
         );
+    }
+
+    // ── whole-batch deleter (multi-source packages) ──────────────────────────
+
+    #[test]
+    fn delete_package_sources_removes_every_confirmed_file_and_audits_each() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
+        let seen = SeenStore::open(tmp.path().join("perseus.db")).unwrap();
+        let a = tmp.path().join("a.fits");
+        let b = tmp.path().join("b.fits");
+        std::fs::write(&a, b"aaaa").unwrap();
+        std::fs::write(&b, b"bbbbbb").unwrap();
+        let stat = |p: &std::path::Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.len(), crate::seen::mtime_millis(m.modified().ok()))
+        };
+        let (asz, amt) = stat(&a);
+        let (bsz, bmt) = stat(&b);
+        seen.mark_enqueued(&a, asz, amt, "/pkg/uuid-1").unwrap();
+        seen.mark_enqueued(&b, bsz, bmt, "/pkg/uuid-1").unwrap();
+
+        let detail = delete_package_sources(
+            &store,
+            &seen,
+            std::path::Path::new("/pkg/uuid-1"),
+            "deleted_manual",
+            "peerhex",
+        )
+        .unwrap();
+        assert_eq!(detail.removed.len(), 2, "both files removed: {detail:?}");
+        assert!(detail.failed.is_empty() && detail.skipped.is_empty());
+        assert!(!a.exists() && !b.exists());
+        // Audit rows persisted for BOTH files:
+        assert_eq!(history_outcome_count(&store, "deleted_manual"), 2);
+        // Linkage stamped dead — a second pass is an honest no-op:
+        let again = delete_package_sources(
+            &store,
+            &seen,
+            std::path::Path::new("/pkg/uuid-1"),
+            "deleted_manual",
+            "peerhex",
+        )
+        .unwrap();
+        assert!(again.removed.is_empty());
+    }
+
+    #[test]
+    fn delete_package_sources_toctou_skips_changed_file_but_removes_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
+        let seen = SeenStore::open(tmp.path().join("perseus.db")).unwrap();
+        let a = tmp.path().join("a.fits");
+        let b = tmp.path().join("b.fits");
+        std::fs::write(&a, b"aaaa").unwrap();
+        std::fs::write(&b, b"bbbbbb").unwrap();
+        let stat = |p: &std::path::Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.len(), crate::seen::mtime_millis(m.modified().ok()))
+        };
+        let (asz, amt) = stat(&a);
+        let (bsz, bmt) = stat(&b);
+        seen.mark_enqueued(&a, asz, amt, "/pkg/uuid-1").unwrap();
+        seen.mark_enqueued(&b, bsz, bmt, "/pkg/uuid-1").unwrap();
+        // TOCTOU: `b` was rewritten (new, unconfirmed content) since enqueue.
+        std::fs::write(&b, b"different-and-longer").unwrap();
+
+        let detail = delete_package_sources(
+            &store,
+            &seen,
+            std::path::Path::new("/pkg/uuid-1"),
+            "deleted_manual",
+            "peerhex",
+        )
+        .unwrap();
+        assert_eq!(detail.removed, vec![a.display().to_string()]);
+        assert_eq!(
+            detail.skipped.len(),
+            1,
+            "changed file skipped, not failed: {detail:?}"
+        );
+        assert!(detail.skipped[0].0.contains("b.fits"));
+        assert!(!a.exists(), "unchanged batch-mate still deleted");
+        assert!(b.exists(), "changed file preserved");
     }
 }
 

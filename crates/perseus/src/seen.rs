@@ -212,6 +212,36 @@ impl SeenStore {
         }))
     }
 
+    /// Every *live* (`deleted_at IS NULL`) source linkage of `package_ref`, ordered
+    /// by path. The batcher records one row per packaged file, so a batch package
+    /// resolves to MANY links — [`source_for_package`](Self::source_for_package)
+    /// (singular, `query_row`) sees only the first and exists for the legacy
+    /// one-file-per-package callers.
+    pub fn sources_for_package(&self, package_ref: &str) -> Result<Vec<SourceLink>> {
+        let conn = self.conn.lock().expect("seen store mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT path, size, mtime FROM perseus_seen
+                 WHERE package_ref = ?1 AND deleted_at IS NULL ORDER BY path",
+            )
+            .context("prepare sources_for_package")?;
+        let rows = stmt
+            .query_map(params![package_ref], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+            })
+            .context("query sources_for_package")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("collect sources_for_package")?;
+        Ok(rows
+            .into_iter()
+            .map(|(path, size, mtime_ms)| SourceLink {
+                path: PathBuf::from(path),
+                size: size.max(0) as u64,
+                mtime_ms,
+            })
+            .collect())
+    }
+
     /// Re-point every *live* (`deleted_at IS NULL`) linkage from `old_ref` to
     /// `new_ref`, returning how many rows moved. Used by the divert path
     /// (`resend declined as a new transfer`): the payload gets a fresh package
@@ -325,6 +355,22 @@ mod tests {
             Some(SourceLink { path: p, size: 100, mtime_ms: 111 }),
             "a confirmed package's source capture file (with its recorded stat) must be resolvable"
         );
+    }
+
+    #[test]
+    fn sources_for_package_returns_every_live_file() {
+        let (_tmp, store) = store();
+        store.mark_enqueued(&PathBuf::from("/cap/a.fits"), 10, 1, "/pkg/uuid-1").unwrap();
+        store.mark_enqueued(&PathBuf::from("/cap/b.fits"), 20, 2, "/pkg/uuid-1").unwrap();
+        store.mark_enqueued(&PathBuf::from("/cap/c.fits"), 30, 3, "/pkg/uuid-2").unwrap();
+        store.mark_deleted(&PathBuf::from("/cap/b.fits")).unwrap();
+        let live = store.sources_for_package("/pkg/uuid-1").unwrap();
+        assert_eq!(live.len(), 1, "deleted linkage must be excluded");
+        assert_eq!(live[0].path, PathBuf::from("/cap/a.fits"));
+        // Undelete-free check on the multi-row case:
+        store.mark_enqueued(&PathBuf::from("/cap/d.fits"), 40, 4, "/pkg/uuid-1").unwrap();
+        let live = store.sources_for_package("/pkg/uuid-1").unwrap();
+        assert_eq!(live.len(), 2, "every live row of the package is returned");
     }
 
     #[test]
