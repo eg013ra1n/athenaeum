@@ -369,4 +369,33 @@ mod tests {
         assert_eq!(frames, 1, "the scan still ingests normally with no hook installed");
         assert_eq!(outbound_count(&ctx), 0, "nothing to enqueue with no hook");
     }
+
+    /// Task E: the production scan path (`run_registered_scan`, driven here by
+    /// the monitor cycle) ALWAYS populates `files.content_hash`, even though
+    /// `duplicates.use_content_hash` is unset (default false). That setting now
+    /// governs only the Duplicates-view grouping, never scan-time hashing — so
+    /// the whole scanned library feeds the transfer dedup index.
+    #[test]
+    fn registered_scan_always_populates_content_hash() {
+        let (_tmp, ctx) = test_ctx_with_scan_root(1);
+        let offline_roots = Arc::new(Mutex::new(HashSet::new()));
+
+        run_cycle(&ctx, &NullEmitter, &offline_roots, None);
+
+        let db = ctx.db.get().unwrap();
+        let conn = db.conn();
+
+        // Precondition: the grouping setting is at its default (false), proving
+        // hashing does not depend on it.
+        let use_content_hash = ctx.settings.get_duplicates_use_content_hash(&conn).unwrap();
+        assert!(!use_content_hash, "precondition: duplicates.use_content_hash defaults to false");
+
+        let hash: Option<String> = conn
+            .query_row("SELECT content_hash FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            hash.is_some(),
+            "a newly scanned file must carry a content_hash regardless of the duplicates setting"
+        );
+    }
 }

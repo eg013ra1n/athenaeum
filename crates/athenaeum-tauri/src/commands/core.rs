@@ -156,6 +156,20 @@ pub async fn initialize_database(
         });
     }
 
+    // Task E: one-shot whole-library content-hash backfill. Populates
+    // `files.content_hash` for rows written before the scanner started hashing
+    // unconditionally, so the device-to-device transfer dedup handshake sees the
+    // scanned (never-synced) library, not just sync-ingested files. Single-flight
+    // + gentle IO throttle inside; blocking file IO → a std thread, never fatal.
+    // Placed here (DB guaranteed ready) beside the sync autostart spawn; mirrors
+    // the web host wiring in `main.rs`.
+    if let Some(db) = state.ctx.db.get() {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            athenaeum_core::duplicates::backfill::backfill_content_hashes_once(&db);
+        });
+    }
+
     tracing::info!(path = %db_path.display(), "database initialized");
     Ok(db_path.to_string_lossy().to_string())
 }

@@ -297,10 +297,20 @@ fn process_frame(
         // signal for operators, comparing against the same `files.content_hash`
         // sampling hash the scanner's own Duplicates view already stores.
         if let Ok(incoming_hash) = crate::duplicates::compute_xxhash(&payload) {
-            if existing.content_hash.as_deref() != Some(incoming_hash.as_str()) {
+            if content_mismatch_warns(existing.content_hash.as_deref(), &incoming_hash) {
                 tracing::warn!(
                     frame_uuid = %record.frame_uuid,
                     "sync ingest: same uuid, different content — keeping existing (v1)"
+                );
+            } else if existing.content_hash.is_none() {
+                // NULL existing hash = "unknown", not "different". Before Task E
+                // the scanner left content_hash NULL by default, so the old
+                // `None != Some(hash)` gate fired a false warn on every
+                // scanned-then-resynced frame (52 in the field). Log the unknown
+                // at debug instead of warning.
+                tracing::debug!(
+                    frame_uuid = %record.frame_uuid,
+                    "sync ingest: same uuid, existing content hash unknown"
                 );
             }
         }
@@ -424,6 +434,17 @@ fn primary_wins_outcome(existing: Option<&str>, snapshot: Option<&str>) -> &'sta
         (Some(e), Some(s)) if e > s => "skipped_older",
         _ => "duplicate",
     }
+}
+
+/// Advisory "same uuid, different content" warn predicate (item 5). Fire the
+/// warn ONLY when the existing row carries a KNOWN content hash that differs
+/// from the incoming payload's sampling hash. A NULL existing hash is
+/// "unknown", never "different" — before Task E populated `files.content_hash`
+/// for the whole library, `None != Some(hash)` produced 52 false warns in the
+/// field. Advisory only: this never decides a skip (that would risk the
+/// sampling-collision loss the module header warns about).
+fn content_mismatch_warns(existing_hash: Option<&str>, incoming_hash: &str) -> bool {
+    matches!(existing_hash, Some(h) if h != incoming_hash)
 }
 
 /// Land an accepted payload mirroring the sender's tree under `<landing_base>/<rel_path>`,
@@ -762,4 +783,26 @@ pub(crate) fn unique_path(base: &Path) -> PathBuf {
     // Absurd fallback (10k collisions): append the current nanos.
     let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
     parent.join(format!("{stem}_{ts}"))
+}
+
+#[cfg(test)]
+mod content_warn_tests {
+    use super::content_mismatch_warns;
+
+    #[test]
+    fn null_existing_hash_is_unknown_not_different() {
+        // The field bug: a scanned-then-resynced frame whose row had no
+        // content_hash yet must NOT warn.
+        assert!(!content_mismatch_warns(None, "abc123"));
+    }
+
+    #[test]
+    fn equal_hashes_do_not_warn() {
+        assert!(!content_mismatch_warns(Some("abc123"), "abc123"));
+    }
+
+    #[test]
+    fn known_differing_hash_warns() {
+        assert!(content_mismatch_warns(Some("abc123"), "def456"));
+    }
 }

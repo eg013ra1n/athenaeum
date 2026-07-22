@@ -1,6 +1,8 @@
 // Duplicate detection module
 // Implements xxHash-based duplicate detection
 
+pub mod backfill;
+
 use std::path::Path;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};

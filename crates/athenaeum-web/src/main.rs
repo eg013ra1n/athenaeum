@@ -263,6 +263,19 @@ async fn main() {
         });
     }
 
+    // Task E: one-shot whole-library content-hash backfill (see
+    // core::duplicates::backfill). Populates `files.content_hash` for rows
+    // written before the scanner started hashing unconditionally so the
+    // transfer dedup handshake isn't blind to scanned (never-synced) files.
+    // Single-flight + gentle throttle inside; blocking file IO → a std thread,
+    // never fatal. Mirrors the desktop wiring in `commands/core.rs`.
+    if let Some(db) = state.ctx.db.get() {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            athenaeum_core::duplicates::backfill::backfill_content_hashes_once(&db);
+        });
+    }
+
     // Full-app capture-node retention loop (task M4). Hourly; gated inside the
     // tick (no-op unless this is a signed-in `capture` node with a policy set)
     // and dry-run by default — live deletion needs the explicit

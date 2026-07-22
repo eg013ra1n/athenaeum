@@ -2307,17 +2307,16 @@ pub fn run_registered_scan<E: ProgressEmitter>(
         .find(|r| r.id == Some(root_id))
         .ok_or("Scan root not found")?;
 
-    let use_content_hash = ctx
-        .settings
-        .get_duplicates_use_content_hash(&conn)
-        .unwrap_or(false);
-
+    // Task E: always hash. The scanner populates content_hash for the whole
+    // library so device-to-device transfer dedup isn't blind to scanned
+    // (never-synced) files. `duplicates.use_content_hash` is now purely the
+    // Duplicates-view grouping toggle, decoupled from scan-time hashing.
     let result = scan_directory_parallel(
         Path::new(&root.path),
         root_id,
         &conn,
         emitter,
-        use_content_hash,
+        true,
         cancel_flag,
         root.unique_camera,
     );

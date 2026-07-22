@@ -204,6 +204,60 @@ mod tests {
         );
     }
 
+    /// Task E end-to-end at the responder level: a `files` row created the way
+    /// the scanner now always creates it — `content_hash` = the real
+    /// `duplicates::compute_xxhash` of a payload on disk — must dedup against a
+    /// sender whose `OfferEntry.sampling_hash` is the SAME `compute_xxhash`
+    /// (`engine::build_offer`). `want_for_offer` classifies it a candidate;
+    /// `confirm_full_hashes` drops it on the matching full hash → zero bytes
+    /// travel for a file already in the scanned library.
+    #[tokio::test]
+    async fn scanner_hashed_library_file_dedups_at_responder() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let payload_path = tmp.path().join("light.fits");
+        // Larger than one sampling chunk so compute_xxhash reads all three
+        // positions (matches a real frame, not a single-window file).
+        std::fs::write(&payload_path, vec![0xABu8; 2 * 1024 * 1024]).unwrap();
+
+        // Scanner-style content_hash: the exact fn the scanner now always runs.
+        let sampling_hash = crate::duplicates::compute_xxhash(&payload_path).unwrap();
+        let full_hash = xxh3_full_file(&payload_path).unwrap();
+
+        let catalog_path = tmp.path().join("catalog.db");
+        let db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at, content_hash)
+                 VALUES (?1, 'light.fits', ?2, '2026-07-11T00:00:00Z', 'FITS', '2026-07-11T00:00:00Z', ?3)",
+                rusqlite::params![
+                    payload_path.to_string_lossy().to_string(),
+                    2i64 * 1024 * 1024,
+                    sampling_hash,
+                ],
+            )
+            .unwrap();
+        }
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+        let r = CatalogDedupResponder::new(store);
+
+        // Sampling hash present in the catalog → candidate, never a fresh want.
+        let (want, cands) = r.want_for_offer(&[oe("light.fits", &sampling_hash)]);
+        assert!(want.is_empty(), "a scanned library file must not be re-wanted");
+        assert_eq!(cands, vec!["light.fits".to_string()], "sampling-hash match → candidate");
+
+        // Full-hash confirm with the real full digest drops it → true duplicate.
+        let still = r.confirm_full_hashes(&[FullHashEntry {
+            rel_path: "light.fits".into(),
+            sampling_hash: sampling_hash.clone(),
+            xxh3_full: full_hash,
+        }]);
+        assert!(
+            still.is_empty(),
+            "scanner-hashed library file confirmed as duplicate → dropped, zero bytes transfer"
+        );
+    }
+
     #[tokio::test]
     async fn missing_local_file_keeps_candidate_wanted() {
         let tmp = tempfile::TempDir::new().unwrap();

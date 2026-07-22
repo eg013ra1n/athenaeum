@@ -615,14 +615,13 @@ pub fn start_scan(ctx: &ServiceContext, root_id: i64) -> Result<ScanResultDto, A
         .find(|r| r.id == Some(root_id))
         .ok_or_else(|| ApiError::NotFound("Scan root not found".to_string()))?;
 
-    // Check if content hash should be computed
-    let use_content_hash = ctx.settings
-        .get_duplicates_use_content_hash(&conn)
-        .unwrap_or(false);
-
-    // Perform the scan
+    // Task E: the scanner ALWAYS computes content_hash so the whole scanned
+    // library feeds the device-to-device transfer dedup index (sampling hash vs
+    // `files.content_hash`), not just sync-ingested files. The
+    // `duplicates.use_content_hash` setting now governs ONLY the Duplicates-view
+    // grouping (`find_duplicate_groups`), never whether the scanner hashes.
     let mut result = crate::scanner::scan_directory(
-        Path::new(&root.path), &conn, None, use_content_hash, root.unique_camera, root_id,
+        Path::new(&root.path), &conn, None, true, root.unique_camera, root_id,
     );
 
     // If reconciliation changed frames, wipe and rebuild calibration sets.
