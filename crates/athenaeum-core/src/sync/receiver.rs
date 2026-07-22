@@ -41,13 +41,13 @@ use super::models::{HistoryRow, InboundFileRow, InboundFileState, InboundState};
 use super::refusal::RefusalRefresher;
 use super::models::Direction;
 use super::store::{
-    append_sync_event, get_inbound, get_inbound_by_row_id, inbound_active, insert_history_row,
-    landing_dir_claimed_by_active, list_inbound_files, load_receipts, replace_inbound_files,
-    insert_receipt, mark_inbound_declined_with_anchor, receipt_outcome_to_db,
-    rotate_inbound_package_id, set_inbound_bytes_done, set_inbound_declined_at,
-    set_inbound_display_name, set_inbound_file_state, set_inbound_landing_dir,
-    set_inbound_state, settle_unsettled_inbound_files, upsert_inbound_attempt,
-    CatalogSyncStore,
+    append_sync_event, count_satisfied_receipts, get_inbound, get_inbound_by_batch,
+    get_inbound_by_row_id, inbound_active, insert_history_row, landing_dir_claimed_by_active,
+    list_inbound_files, load_receipts, replace_inbound_files, insert_receipt,
+    mark_inbound_declined_with_anchor, receipt_outcome_to_db, rotate_inbound_package_id,
+    set_inbound_bytes_done, set_inbound_declined_at, set_inbound_display_name,
+    set_inbound_file_state, set_inbound_landing_dir, set_inbound_state,
+    settle_unsettled_inbound_files, upsert_inbound_attempt, CatalogSyncStore,
 };
 use super::now_iso;
 
@@ -670,6 +670,16 @@ impl SyncReceiver {
 /// this reconcile stamped `failed` stays final regardless, because finality is
 /// the `declined_at` axis, which this fn never writes (Decline Finality Axis
 /// §D3, pinned by `decline_survives_restart_reconcile_and_refuses_resend`).
+///
+/// Receipt-log repair (Transfers smoke №8, item 4): before stamping a row
+/// `failed`, if it ALREADY holds a full receipt set under its wire id
+/// (`count_satisfied_receipts == frame_count > 0`), it reached a real terminal
+/// before the restart and its non-terminal `state` is only the residue of a
+/// mid-transfer duplicate announce's `upsert` reset. Such a row is stamped the
+/// HONEST terminal from its receipts (all-`Cancelled` → `Cancelled` + a
+/// `declined_at` repair; else `Done`) rather than a misleading `failed`, healing
+/// the field-stuck row on the next launch.
+///
 /// Best-effort: a failed enumeration or per-row write warns and never blocks
 /// receiver startup.
 fn reconcile_stale_inbound(store: &CatalogSyncStore) {
@@ -682,7 +692,54 @@ fn reconcile_stale_inbound(store: &CatalogSyncStore) {
         }
     };
     let mut count: u32 = 0;
+    let mut repaired: u32 = 0;
     for row in stale {
+        // Receipt-log repair (Transfers smoke №8, item 4): a stale non-terminal row
+        // that ALREADY holds a full receipt set under its wire id reached a real
+        // terminal before the restart — its `state` was only left non-terminal by a
+        // mid-transfer duplicate announce's `upsert` reset (the same defect the
+        // pure-replay guard now prevents at announce time). Stamp the HONEST terminal
+        // from the durable receipts instead of mislabeling it `failed "interrupted by
+        // restart"`: an all-`Cancelled` set is a receiver decline (Cancelled +
+        // `declined_at` repair), else it delivered (Done). This heals a row already
+        // stuck in the field on the next launch.
+        if row.frame_count > 0 {
+            let satisfied = match count_satisfied_receipts(&conn, &row.package_id) {
+                Ok(n) => n,
+                Err(e) => {
+                    // A count read error must not silently mislabel: warn, then let the
+                    // row take the honest zombie fallback (`failed`) below.
+                    tracing::warn!(package_id = %row.package_id, error = %format!("{e:#}"), "inbound reconcile receipt count failed; falling back to failed");
+                    0
+                }
+            };
+            if satisfied == row.frame_count {
+                let receipts = load_receipts(&conn, &row.package_id).unwrap_or_default();
+                let all_cancelled = !receipts.is_empty()
+                    && receipts.iter().all(|r| matches!(r.outcome, ReceiptOutcome::Cancelled));
+                let (terminal, outcome, file_outcome) = if all_cancelled {
+                    if let Err(e) = set_inbound_declined_at(&conn, row.id) {
+                        tracing::warn!(package_id = %row.package_id, error = %format!("{e:#}"), "inbound declined_at (reconcile repair) write failed");
+                    }
+                    (InboundState::Cancelled, "cancelled", Some("cancelled"))
+                } else {
+                    (InboundState::Done, "done", None)
+                };
+                if let Err(e) = set_inbound_state(&conn, &row.package_id, terminal, None) {
+                    tracing::warn!(package_id = %row.package_id, error = %format!("{e:#}"), "inbound reconcile repair state write failed");
+                } else {
+                    repaired += 1;
+                    tracing::info!(package_id = %row.package_id, outcome, "stale inbound repaired from receipt log");
+                }
+                // Settle any per-file rows the reset left unsettled to match the
+                // repaired terminal (a cancelled repair reuses the epilogue's
+                // `done`+`cancelled`, a delivered one plain `done`). Best-effort.
+                if let Err(e) = settle_unsettled_inbound_files(&conn, row.id, InboundFileState::Done, file_outcome, None) {
+                    tracing::warn!(inbound_id = row.id, error = %format!("{e:#}"), "inbound reconcile repair file-row settle failed");
+                }
+                continue;
+            }
+        }
         match set_inbound_state(&conn, &row.package_id, InboundState::Failed, Some("interrupted by restart")) {
             Ok(()) => count += 1,
             Err(e) => tracing::warn!(
@@ -710,6 +767,9 @@ fn reconcile_stale_inbound(store: &CatalogSyncStore) {
     }
     if count > 0 {
         tracing::info!(count, "stale inbound rows reconciled to failed after restart");
+    }
+    if repaired > 0 {
+        tracing::info!(count = repaired, "stale inbound rows repaired to honest terminal from receipt log");
     }
 }
 
@@ -894,6 +954,68 @@ async fn handle_announce(
         return Ok(());
     }
 
+    // Pure-replay guard (Transfers smoke №8, item 4) — placed BEFORE the upsert.
+    // A SAME-WIRE re-announce of an already fully-receipted transfer must NOT reset
+    // the row. Field failure mode: a serve-tick-armed ack-timeout re-announce raced
+    // ahead of the receiver's own inline fetch+ingest; when finally processed, its
+    // wire id still equalled the row's CURRENT attempt wire id AND that attempt had
+    // already reached a terminal with a full receipt set. Letting it fall through to
+    // `upsert_inbound_attempt` reset the Done/Cancelled row back to `announced`
+    // (generation bump, bytes wipe, manifest refresh) BEFORE the post-upsert replay
+    // guard re-acked it — and if that re-ack then FAILED (the sender already
+    // confirmed, so its ack channel may reject), the earlier `?` aborted before the
+    // terminal re-stamp, stranding the row at `announced` forever (owner's live stuck
+    // row id=1). Instead: detect the same-wire fully-receipted case up front, skip the
+    // upsert entirely (no reset / no generation bump / no manifest refresh / no
+    // "received" progress emit), journal the announce for Log-feed continuity, and
+    // replay the ack from the durable receipt log via the shared helper — which
+    // stamps the terminal INDEPENDENT of ack success. A resend on a FRESH wire id
+    // (`row.package_id != this announce`) deliberately falls through to the upsert →
+    // seeding → post-upsert guard, so the declined-resend flow is byte-identical.
+    {
+        let existing = {
+            let conn = store.lock_conn();
+            get_inbound_by_batch(&conn, &peer_device, &batch_uuid).with_context(|| {
+                format!("look up inbound row for replay ({package_id}, batch {batch_uuid})")
+            })?
+        };
+        if let Some(row) = existing {
+            if row.package_id == package_id && announce.frame_count > 0 {
+                let satisfied_count = store.count_satisfied_receipts(&announce.package_id)?;
+                if satisfied_count == announce.frame_count {
+                    let inbound_id = row.id;
+                    // A declined row's receipts are all `Cancelled`, so `all_cancelled`
+                    // inside the helper always takes the Cancelled branch here; passing
+                    // its flag preserves the `!declined_final` Done-stamp guard anyway.
+                    let declined_final = row.declined_at.is_some();
+                    journal(
+                        store,
+                        inbound_id,
+                        "announce_received",
+                        Some(&format!(
+                            "name={} files={} frames={}",
+                            effective_name.as_deref().unwrap_or("-"),
+                            effective_files.len(),
+                            announce.frame_count
+                        )),
+                    );
+                    return replay_ack_from_log(
+                        store,
+                        transport,
+                        emitter.as_ref(),
+                        from,
+                        &announce,
+                        inbound_id,
+                        &peer_device,
+                        declined_final,
+                        satisfied_count,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
     // Persist (or refresh) the inbound row for this transfer, keyed on the durable
     // `(peer, batch_uuid)` (Transfers Batch Model §D1): every attempt of one
     // transfer resolves to ONE long-lived row. A re-announced attempt (resend or
@@ -1033,66 +1155,25 @@ async fn handle_announce(
     // skipping the fetch and ingest entirely. Counts only non-Rejected
     // receipts as "satisfied" — a package with a pending Rejected receipt must
     // fall through to fetch+ingest below so that frame gets a real redelivery
-    // attempt, not a replay of its stale rejection (fix-review finding #1).
+    // attempt, not a replay of its stale rejection (fix-review finding #1). This
+    // post-upsert site still fires for a declined-final resend (whose receipts the
+    // seeding above re-keyed under THIS attempt's fresh wire id) and for a normal
+    // re-delivery whose row the upsert just reset; the pure-replay guard above
+    // handled the same-wire, no-reset case. Both share `replay_ack_from_log`.
     let satisfied_count = store.count_satisfied_receipts(&announce.package_id)?;
     if announce.frame_count > 0 && satisfied_count == announce.frame_count {
-        let receipts = store.load_receipts(&announce.package_id)?;
-        // MANDATORY carry-over item 1 (Task 4 review): a package whose replayed
-        // receipts are ALL `Cancelled` is a receiver-cancel replay — its finished
-        // outcome must be "cancelled", NEVER "ingested" (and the row must stay
-        // Cancelled, not be stamped Done). A `Cancelled` receipt bumps no ingest
-        // counter in `ingest.rs`, so without this the label would drift.
-        let all_cancelled =
-            !receipts.is_empty() && receipts.iter().all(|r| matches!(r.outcome, ReceiptOutcome::Cancelled));
-        transport
-            .ack(from, &announce.package_id, receipts)
-            .await
-            .context("ack (replayed)")?;
-        tracing::info!(package_id = %package_id, count = satisfied_count, all_cancelled, "sync receiver replayed ack from receipt log");
-        journal(
+        return replay_ack_from_log(
             store,
+            transport,
+            emitter.as_ref(),
+            from,
+            &announce,
             inbound_id,
-            if all_cancelled { "cancelled" } else { "replayed" },
-            Some(&format!("count={satisfied_count}")),
-        );
-        // Terminal for the receiver: drop the fetched blobs. A lost-ack resend
-        // may have re-downloaded them; release is idempotent. Never fails the
-        // (successful) receive — log-and-continue on error.
-        if let Err(e) = transport.release(&announce.package_id).await {
-            tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "receiver blob release failed");
-        }
-        // Terminal state: an all-cancelled replay is `Cancelled` + the transfer-level
-        // `declined_at` repair stamp (§D2 repair 2 — a full all-cancelled receipt set
-        // only ever originates from a receiver decline, so this also repairs a crash
-        // between a prior epilogue's receipt writes and its row stamp, and upgrades a
-        // pre-axis row); a normal replay is `Done`, unless the row is declined-final
-        // (which stays untouched).
-        if all_cancelled {
-            let conn = store.lock_conn();
-            if let Err(e) = set_inbound_declined_at(&conn, inbound_id) {
-                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound declined_at (replay) write failed");
-            }
-            if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Cancelled, None) {
-                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound cancelled (replay) write failed");
-            }
-        } else if !declined_final {
-            let conn = store.lock_conn();
-            if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Done, None) {
-                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound done (replay) write failed");
-            }
-        }
-        emit_event(emitter.as_ref(), "sync-finished", &SyncFinishedEvent {
-            package_id,
-            direction: super::Direction::Received,
-            outcome: if all_cancelled { "cancelled" } else { "replayed" }.to_string(),
-            peer_device: peer_device.clone(),
-            ok_count: satisfied_count,
-            failed: Vec::new(),
-            new_count: 0,
-            duplicate_count: 0,
-            project_id: None,
-        });
-        return Ok(());
+            &peer_device,
+            declined_final,
+            satisfied_count,
+        )
+        .await;
     }
 
     // Wire-in (a) — Task 12: a persisted DECLINED row (restart-proof via
@@ -1447,6 +1528,106 @@ async fn handle_announce(
         peer_device,
         ok_count: outcome.ok_count(),
         failed,
+        new_count: 0,
+        duplicate_count: 0,
+        project_id: None,
+    });
+    Ok(())
+}
+
+/// Re-ack a fully-receipted transfer straight from the durable receipt log — the
+/// shared replay path behind BOTH the pure-replay guard (a same-wire re-announce
+/// of an already-terminal row, no upsert reset) AND the post-upsert replay guard
+/// (a declined-final resend whose receipts the seeding re-keyed under this fresh
+/// wire id, or a normal re-delivery whose row the upsert just reset). Factoring
+/// the two into one fn keeps their behaviour from drifting.
+///
+/// Ordering contract (Transfers smoke №8, item 4): the terminal stamp is written
+/// BEFORE — and INDEPENDENT of — the ack. The receipts are the durable answer, so
+/// the ack is best-effort (warn + continue on error; the sender's next retry
+/// re-triggers this replay). The pre-fix code propagated a failed re-ack with `?`,
+/// which aborted before the Done re-stamp and stranded a just-reset row at
+/// `announced` forever. The stamp is CONDITIONAL on the state actually differing so
+/// a genuine no-op re-announce (already Done/Cancelled) writes nothing.
+///
+/// `all_cancelled` (a non-empty, all-`Cancelled` receipt set) is a receiver-decline
+/// replay: the finished outcome is "cancelled", `ok_count` is 0 (item 2 — never
+/// toast an arrival for a decline), and the row is stamped `Cancelled` + the
+/// transfer-level `declined_at` repair (§D2 repair 2 — a full all-cancelled set only
+/// ever originates from a decline, so this also heals a crash between a prior
+/// epilogue's receipts and its row stamp). Otherwise it is a normal `Done` replay
+/// with `ok_count = satisfied_count`, unless `declined_final` (the row stays
+/// untouched — a declined-final row must never be stamped Done).
+#[allow(clippy::too_many_arguments)]
+async fn replay_ack_from_log(
+    store: &Arc<CatalogSyncStore>,
+    transport: &dyn SharingTransport,
+    emitter: &dyn ProgressEmitter,
+    from: NodeId,
+    announce: &PackageAnnounce,
+    inbound_id: i64,
+    peer_device: &str,
+    declined_final: bool,
+    satisfied_count: u32,
+) -> Result<()> {
+    let package_id = announce.package_id.0.clone();
+    let receipts = store.load_receipts(&announce.package_id)?;
+    // MANDATORY carry-over item 1 (Task 4 review): a package whose replayed receipts
+    // are ALL `Cancelled` is a receiver-cancel replay — its finished outcome must be
+    // "cancelled", NEVER "ingested" (and the row stays Cancelled, not stamped Done).
+    let all_cancelled =
+        !receipts.is_empty() && receipts.iter().all(|r| matches!(r.outcome, ReceiptOutcome::Cancelled));
+
+    // Terminal stamp FIRST, ordered before / independent of the ack, and only when
+    // the state actually differs (a no-op re-announce writes nothing — no generation
+    // churn, no finished_at rewrite).
+    {
+        let conn = store.lock_conn();
+        let current_state = get_inbound_by_row_id(&conn, inbound_id)
+            .ok()
+            .flatten()
+            .map(|r| r.state);
+        if all_cancelled {
+            if let Err(e) = set_inbound_declined_at(&conn, inbound_id) {
+                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound declined_at (replay) write failed");
+            }
+            if current_state != Some(InboundState::Cancelled) {
+                if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Cancelled, None) {
+                    tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound cancelled (replay) write failed");
+                }
+            }
+        } else if !declined_final && current_state != Some(InboundState::Done) {
+            if let Err(e) = set_inbound_state(&conn, &package_id, InboundState::Done, None) {
+                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound done (replay) write failed");
+            }
+        }
+    }
+
+    // Re-ack from the receipt log — NON-FATAL. On error, warn and continue: the
+    // receipts are durable and the sender's next retry re-triggers this replay.
+    if let Err(e) = transport.ack(from, &announce.package_id, receipts).await {
+        tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "replay ack failed; sender retry will re-trigger");
+    }
+    tracing::info!(package_id = %package_id, count = satisfied_count, all_cancelled, "sync receiver replayed ack from receipt log");
+    journal(
+        store,
+        inbound_id,
+        if all_cancelled { "cancelled" } else { "replayed" },
+        Some(&format!("count={satisfied_count}")),
+    );
+    // Terminal for the receiver: drop the fetched blobs. A lost-ack resend may have
+    // re-downloaded them; release is idempotent. Never fails the receive.
+    if let Err(e) = transport.release(&announce.package_id).await {
+        tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "receiver blob release failed");
+    }
+    emit_event(emitter, "sync-finished", &SyncFinishedEvent {
+        package_id,
+        direction: super::Direction::Received,
+        outcome: if all_cancelled { "cancelled" } else { "replayed" }.to_string(),
+        peer_device: peer_device.to_string(),
+        // Item 2: a decline replay accepted no frames — never report an arrival count.
+        ok_count: if all_cancelled { 0 } else { satisfied_count },
+        failed: Vec::new(),
         new_count: 0,
         duplicate_count: 0,
         project_id: None,
@@ -2423,6 +2604,87 @@ mod tests {
         );
     }
 
+    /// Transfers smoke №8 (item 4) reconcile repair: a stale non-terminal row that
+    /// ALREADY holds a full receipt set under its wire id reached a real terminal
+    /// before the restart (its non-terminal `state` is only the residue of a
+    /// mid-transfer duplicate announce's upsert reset). The startup reconcile must
+    /// stamp the HONEST terminal from the receipts — an all-Ingested set → `Done`,
+    /// an all-Cancelled set → `Cancelled` + `declined_at` — instead of a misleading
+    /// `failed "interrupted by restart"`. A row with NO receipts is a genuine
+    /// zombie and still goes `failed`. This heals the owner's live stuck row.
+    #[tokio::test]
+    async fn startup_repairs_fully_receipted_stale_inbound_from_receipt_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging_root = tmp.path().join("stage");
+        let store = Arc::new(CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap());
+
+        let peer = "bb".repeat(32);
+        let now = now_iso();
+        {
+            let conn = store.lock_conn();
+            // (1) A stale `fetching` row with a FULL Ingested receipt set → Done.
+            let done_id = upsert_inbound_announced(&conn, &peer, "pkg-done", 2, 2000).unwrap();
+            set_inbound_state(&conn, "pkg-done", InboundState::Fetching, None).unwrap();
+            for uuid in ["d0", "d1"] {
+                insert_receipt(
+                    &conn, "pkg-done",
+                    &FrameReceipt { frame_uuid: uuid.into(), xxh3: "h".into(), outcome: ReceiptOutcome::Ingested },
+                    &now,
+                ).unwrap();
+            }
+            // (2) A stale `fetching` row with a FULL Cancelled receipt set → Cancelled
+            //     + declined_at (a receiver decline whose epilogue crashed mid-way).
+            let _declined_id = upsert_inbound_announced(&conn, &peer, "pkg-declined", 2, 2000).unwrap();
+            set_inbound_state(&conn, "pkg-declined", InboundState::Fetching, None).unwrap();
+            for uuid in ["c0", "c1"] {
+                insert_receipt(
+                    &conn, "pkg-declined",
+                    &FrameReceipt { frame_uuid: uuid.into(), xxh3: "h".into(), outcome: ReceiptOutcome::Cancelled },
+                    &now,
+                ).unwrap();
+            }
+            // (3) A stale `fetching` row with NO receipts → genuine zombie → failed.
+            upsert_inbound_announced(&conn, &peer, "pkg-zombie", 3, 3000).unwrap();
+            set_inbound_state(&conn, "pkg-zombie", InboundState::Fetching, None).unwrap();
+
+            assert!(done_id > 0);
+        }
+
+        // Spawn the receiver: the reconcile runs before the loop consumes an event.
+        let incoming_root = tmp.path().join("incoming");
+        let incoming: IncomingResolver = Arc::new(move || incoming_root.clone());
+        let transport: Arc<dyn SharingTransport> = Arc::new(LoopbackNetwork::new().endpoint());
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            staging_root,
+            incoming,
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            transport,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        let conn = store.lock_conn();
+        // (1) repaired to Done, terminal, NOT a decline.
+        let done = get_inbound(&conn, "pkg-done").unwrap().unwrap();
+        assert_eq!(done.state, InboundState::Done, "a fully-Ingested stale row repairs to Done, not failed");
+        assert!(done.finished_at.is_some(), "the repaired terminal stamps finished_at");
+        assert!(done.declined_at.is_none(), "a delivered repair never invents a decline");
+
+        // (2) repaired to Cancelled + declined_at.
+        let declined = get_inbound(&conn, "pkg-declined").unwrap().unwrap();
+        assert_eq!(declined.state, InboundState::Cancelled, "a fully-Cancelled stale row repairs to Cancelled");
+        assert!(declined.declined_at.is_some(), "an all-cancelled repair stamps the decline axis");
+
+        // (3) no receipts → still the honest zombie failure.
+        let zombie = get_inbound(&conn, "pkg-zombie").unwrap().unwrap();
+        assert_eq!(zombie.state, InboundState::Failed, "a receiptless stale row is still a failed zombie");
+        assert_eq!(zombie.last_error.as_deref(), Some("interrupted by restart"));
+    }
+
     /// Poll until the recorded gate-call log reaches `n` entries (or time out).
     async fn wait_for_calls(seen: &Arc<Mutex<Vec<(NodeId, String)>>>, n: usize) {
         for _ in 0..200 {
@@ -2831,9 +3093,12 @@ mod tests {
     /// (`InboundControl::request_cancel`) must, on that announce, ack every frame
     /// `Cancelled` WITHOUT fetching the payload, land no files, and leave the
     /// inbound row `Cancelled`. A SECOND announce replays the cancel from the
-    /// receipt log without re-fetching — discriminated from the epilogue by the
-    /// finished event's `okCount` (replay = frame_count; epilogue = 0), and the
-    /// outcome is never "ingested" (mandatory carry-over item 1).
+    /// receipt log without re-fetching — after the honest-event fix (Transfers
+    /// smoke №8, item 2) the replay's `okCount` is 0 (a decline accepted no
+    /// frames), so replay-vs-epilogue is discriminated instead by the received
+    /// cancelled `sync_history` count staying EXACTLY `frame_count` (a second
+    /// epilogue would have duplicated the history rows). The outcome is never
+    /// "ingested" (mandatory carry-over item 1).
     #[tokio::test]
     async fn cancel_before_fetch_acks_cancelled_and_replays() {
         use crate::sharing::SharingTransport;
@@ -2914,10 +3179,22 @@ mod tests {
             0,
             "the epilogue accepts no frames"
         );
+        // The epilogue wrote one cancelled received-history row per frame; a second
+        // epilogue on the re-announce would DOUBLE this — the replay must not.
+        let cancelled_history_after_first = count_scalar(
+            &store,
+            "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='cancelled'",
+        );
+        assert_eq!(
+            cancelled_history_after_first, announce.frame_count as i64,
+            "the epilogue wrote one cancelled history row per frame"
+        );
 
         // (d) A second announce replays the cancel from the receipt log WITHOUT
-        //     re-fetching — the replay path emits ok_count == frame_count (the
-        //     epilogue would emit 0), so this discriminates replay from re-fetch.
+        //     re-fetching. Post honest-event fix the replay emits okCount == 0 (a
+        //     decline accepted no frames); the replay-vs-epilogue discriminator is
+        //     now that the cancelled history count is UNCHANGED (a second epilogue
+        //     would have duplicated the rows).
         sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
         let (_pkg2, ack2) = recv_ack(&mut sender_events).await;
         assert!(
@@ -2933,8 +3210,16 @@ mod tests {
         );
         assert_eq!(
             second["okCount"].as_u64().unwrap(),
-            announce.frame_count as u64,
-            "the replay guard (not the epilogue) handled the re-announce — no re-fetch"
+            0,
+            "an all-cancelled replay reports zero arrivals (item 2 — no false arrival toast)"
+        );
+        assert_eq!(
+            count_scalar(
+                &store,
+                "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='cancelled'",
+            ),
+            cancelled_history_after_first,
+            "the replay guard (not a second epilogue) handled the re-announce — history not duplicated"
         );
 
         // Still no files, still Cancelled.

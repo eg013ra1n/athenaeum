@@ -122,8 +122,11 @@ export function notifyFinished(p: SyncFinishedEvent, notify: NotifyLike): void {
   }
 
   // Receive side. `replayed` re-acks an already-received package; its dedupeKey
-  // matches the original arrival, so the duplicate toast is suppressed.
-  if (p.okCount > 0) {
+  // matches the original arrival, so the duplicate toast is suppressed. Gate on an
+  // arrival-shaped outcome (Transfers smoke №8, item 2): a `cancelled` replay of a
+  // declined batch carries `okCount == 0` from the backend, but guard the outcome
+  // explicitly too so a decline can NEVER toast "N frames arrived".
+  if (p.okCount > 0 && ['ingested', 'partial', 'replayed'].includes(p.outcome)) {
     notify({
       title: `${p.okCount} frame${p.okCount === 1 ? '' : 's'} arrived from ${shortPeer(p.peerDevice)}`,
       detail:

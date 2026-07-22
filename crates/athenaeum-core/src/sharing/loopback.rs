@@ -36,12 +36,17 @@ use crate::sync::DedupResponder;
 ///   additive, off by default — the abort knob can only *fail* a fetch, so this
 ///   is what lets a test make two concurrent fetches genuinely overlap (the
 ///   bidirectional e2e's non-serialization proof).
+/// - `fail_ack_once`: one-shot — the next `ack` returns `Err` once, then disarms
+///   so a subsequent ack succeeds. Mirrors the real transport rejecting a re-ack
+///   the sender already confirmed (the Transfers smoke №8 item-4 failure): lets a
+///   test prove a failed replay ack never strands the inbound row non-terminal.
 #[derive(Clone, Debug, Default)]
 pub struct FaultPlan {
     pub abort_after_bytes: Option<u64>,
     pub duplicate_ack: bool,
     pub delay_ack: Option<Duration>,
     pub delay_per_read: Option<Duration>,
+    pub fail_ack_once: bool,
 }
 
 /// Channel depth for an endpoint's event stream. Announce/ack are low-volume
@@ -638,11 +643,24 @@ impl SharingTransport for LoopbackTransport {
     ) -> anyhow::Result<()> {
         let tx = self.peer_tx(to)?;
 
-        // Read fault knobs up front; do not hold the lock across await.
-        let (delay, duplicate) = {
-            let fault = self.fault.lock().expect("fault mutex poisoned");
-            (fault.delay_ack, fault.duplicate_ack)
+        // Read fault knobs up front; do not hold the lock across await. A one-shot
+        // `fail_ack_once` disarms itself as it fires so the next ack succeeds.
+        let (delay, duplicate, fail_once) = {
+            let mut fault = self.fault.lock().expect("fault mutex poisoned");
+            let fail_once = fault.fail_ack_once;
+            if fail_once {
+                fault.fail_ack_once = false;
+            }
+            (fault.delay_ack, fault.duplicate_ack, fail_once)
         };
+        if fail_once {
+            tracing::warn!(
+                to = %hex32(&to),
+                package_id = %package_id.0,
+                "loopback ack failed (injected fault)"
+            );
+            return Err(anyhow!("injected fault: ack rejected"));
+        }
         if let Some(d) = delay {
             tokio::time::sleep(d).await;
         }

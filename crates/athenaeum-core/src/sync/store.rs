@@ -3901,7 +3901,7 @@ mod tests {
         conn.execute(DDL_INBOUND, []).unwrap();
         conn.execute("ALTER TABLE sync_inbound DROP COLUMN declined_at", []).unwrap();
         let peer = node_id_hex(&PEER);
-        let mut insert = |pkg: &str, state: &str, err: Option<&str>, finished: Option<&str>| {
+        let insert = |pkg: &str, state: &str, err: Option<&str>, finished: Option<&str>| {
             conn.execute(
                 "INSERT INTO sync_inbound (peer, package_id, batch_uuid, state, last_error, created_at, finished_at)
                  VALUES (?1, ?2, ?2, ?3, ?4, '2026-07-22T08:00:00Z', ?5)",

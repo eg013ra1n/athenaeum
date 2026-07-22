@@ -23,7 +23,7 @@ use crate::events::NullEmitter;
 use crate::fits_writer::write_fits_f32;
 use crate::models::{Frame, ImageType};
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
-use crate::sharing::loopback::{LoopbackNetwork, LoopbackTransport};
+use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
 use crate::sharing::types::{FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent};
 use crate::sharing::SharingTransport;
 
@@ -662,13 +662,18 @@ async fn ack_replay_from_receipt_log() {
     assert!(matches!(receipts1[0].outcome, ReceiptOutcome::Ingested));
 
     // The first ingest landed exactly one file/frame and wrote one history +
-    // one receipt row.
-    {
+    // one receipt row. Snapshot the inbound row's generation + Done state so the
+    // pure-replay assertions below can prove neither changed.
+    let (gen_after_first, state_after_first) = {
         let c = assert_db.conn();
         assert_eq!(count(&c, "SELECT COUNT(*) FROM files"), 1, "first delivery ingested one file");
         assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_history"), 1, "one history row after first");
         assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_receipts"), 1, "one receipt row after first");
-    }
+        let generation = count(&c, "SELECT generation FROM sync_inbound");
+        let state: String = c.query_row("SELECT state FROM sync_inbound", [], |r| r.get(0)).unwrap();
+        (generation, state)
+    };
+    assert_eq!(state_after_first, "done", "the first delivery left the row Done");
 
     // Second delivery of the SAME announce (same package_id): the receiver must
     // re-ack from the receipt log WITHOUT re-fetching or re-ingesting.
@@ -681,12 +686,121 @@ async fn ack_replay_from_receipt_log() {
     assert_eq!(receipts2[0].xxh3, receipts1[0].xxh3);
 
     // No re-ingest: file/frame count unchanged AND the replay wrote no new
-    // history or receipt rows (replay short-circuits before ingest).
+    // history or receipt rows (replay short-circuits before ingest). Crucially,
+    // the pure-replay guard (Transfers smoke №8, item 4) skips the upsert entirely
+    // on a same-wire re-announce of an already-terminal row, so the generation is
+    // UNCHANGED and the state stays Done — pre-fix the upsert silently reset the
+    // row to `announced` (generation+1) and the post-upsert guard re-stamped it.
     {
         let c = assert_db.conn();
         assert_eq!(count(&c, "SELECT COUNT(*) FROM files"), 1, "replay did not re-ingest a file");
         assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_history"), 1, "replay wrote no history row");
         assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_receipts"), 1, "replay wrote no receipt row");
+        assert_eq!(
+            count(&c, "SELECT generation FROM sync_inbound"),
+            gen_after_first,
+            "the pure-replay guard never bumps generation (no upsert reset)"
+        );
+        let state_after_second: String = c.query_row("SELECT state FROM sync_inbound", [], |r| r.get(0)).unwrap();
+        assert_eq!(state_after_second, "done", "the row stays Done across the pure replay");
+    }
+}
+
+/// Transfers smoke №8 (item 4) regression: a duplicate announce arriving on the
+/// SAME wire id AFTER the transfer is Done — with the re-ack then FAILING — must
+/// leave the inbound row untouched (Done, generation unchanged), write no new
+/// history or receipts, and never strand the row at `announced`. Pre-fix, the
+/// upsert reset the Done row to `announced` and the post-upsert replay guard's `?`
+/// aborted on the failed re-ack before re-stamping Done, freezing the row
+/// `announced` forever (the owner's live stuck row id=1). A THIRD announce (ack
+/// now allowed) replays cleanly.
+#[tokio::test]
+async fn duplicate_announce_after_done_survives_failed_reack() {
+    let tmp = TempDir::new().unwrap();
+    let catalog_path = tmp.path().join("catalog.db");
+    let assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+
+    let sync_dir = tmp.path().join("sync");
+    let incoming = sync_dir.join("incoming");
+    let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+    let net = LoopbackNetwork::new();
+    let sender: Arc<LoopbackTransport> = Arc::new(net.endpoint());
+    let receiver_ep: Arc<LoopbackTransport> = Arc::new(net.endpoint());
+    let receiver_node: NodeId = receiver_ep.node_id();
+
+    sender.start().await.unwrap();
+    let mut sender_events = sender.events().await;
+
+    let (_info, _handle) = SyncReceiver::spawn(
+        Arc::clone(&store),
+        sync_dir.clone(),
+        fixed_resolver(incoming.clone()),
+        super::allow_all_peers(),
+        Default::default(),
+        Arc::new(crate::sync::InboundControl::new()),
+        Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+        Arc::new(NullEmitter),
+    )
+    .await
+    .unwrap();
+
+    let (pkg_dir, announce) =
+        build_fixture_package(tmp.path(), "frame-uuid-dup", "L_0009.fits", "NGC6888", "2026-01-17T10:00:00.000Z");
+    sender.serve(&announce, &pkg_dir, None).await.unwrap();
+
+    // First delivery: fetch → ingest → ack (Done). Snapshot generation + state.
+    sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
+    let receipts1 = wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
+    assert!(matches!(receipts1[0].outcome, ReceiptOutcome::Ingested));
+    let gen_after_first = {
+        let c = assert_db.conn();
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_history"), 1, "one history row after first");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_receipts"), 1, "one receipt row after first");
+        let state: String = c.query_row("SELECT state FROM sync_inbound", [], |r| r.get(0)).unwrap();
+        assert_eq!(state, "done", "first delivery leaves the row Done");
+        count(&c, "SELECT generation FROM sync_inbound")
+    };
+
+    // Arm the one-shot ack fault, then re-announce the SAME wire id. The pure-replay
+    // guard fires; its re-ack FAILS (fault) but is non-fatal, and the terminal stamp
+    // ran first, so the row must stay Done. Poll the journal for the `replayed` entry
+    // (no ack event arrives — the fault ate it) to know the replay finished.
+    receiver_ep.set_fault(FaultPlan { fail_ack_once: true, ..Default::default() });
+    sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
+    {
+        let mut ok = false;
+        for _ in 0..400 {
+            if count(&assert_db.conn(), "SELECT COUNT(*) FROM sync_events WHERE kind='replayed'") == 1 {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ok, "the failed re-ack still journaled the replay");
+        let c = assert_db.conn();
+        let state: String = c.query_row("SELECT state FROM sync_inbound", [], |r| r.get(0)).unwrap();
+        assert_eq!(state, "done", "a FAILED re-ack must never strand the row at announced — it stays Done");
+        assert_eq!(
+            count(&c, "SELECT generation FROM sync_inbound"),
+            gen_after_first,
+            "the pure-replay guard skips the upsert, so generation is unchanged"
+        );
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_history"), 1, "the failed re-ack wrote no new history");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_receipts"), 1, "the failed re-ack wrote no new receipt");
+    }
+
+    // Third announce (fault disarmed): the replay ack now succeeds and the row is
+    // still Done, still generation-stable.
+    sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
+    let receipts3 = wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
+    assert_eq!(receipts3[0].frame_uuid, receipts1[0].frame_uuid, "the third announce replays the same receipts");
+    {
+        let c = assert_db.conn();
+        let state: String = c.query_row("SELECT state FROM sync_inbound", [], |r| r.get(0)).unwrap();
+        assert_eq!(state, "done", "the row stays Done after the successful replay");
+        assert_eq!(count(&c, "SELECT generation FROM sync_inbound"), gen_after_first, "generation still unchanged");
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_history"), 1, "still one history row");
     }
 }
 
