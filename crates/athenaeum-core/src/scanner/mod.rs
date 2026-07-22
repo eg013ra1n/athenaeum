@@ -703,6 +703,22 @@ fn reconcile_calibrated_light(
                 path = %current_path,
                 "calibrated light moved — output_path repaired"
             );
+        } else if std::fs::canonicalize(&row.output_path)
+            .ok()
+            .zip(std::fs::canonicalize(Path::new(current_path)).ok())
+            .is_some_and(|(a, b)| a == b)
+        {
+            // Branch 2b: both spellings resolve to one physical file (Windows
+            // trailing-dot/case normalization, symlinked mounts). Repair the
+            // pointer to the scanned spelling — flagging it as a duplicate would
+            // warn on every scan forever.
+            update_output_path(conn, row.id, current_path)?;
+            tracing::info!(
+                root_id,
+                old_path = %row.output_path,
+                path = %current_path,
+                "calibrated light path spelling normalized — output_path repaired"
+            );
         } else {
             // Branch 3: the tracked file still exists elsewhere, so this is a
             // duplicate copy. Signal it; leave the tracking row untouched.
@@ -3199,6 +3215,75 @@ mod calibrated_light_scan_tests {
             let row = find_by_identity(&conn, Some("uuid-dup"), None).unwrap().unwrap();
             assert_eq!(row.output_path, kept_str, "parallel={parallel}: tracking row unchanged");
         }
+    }
+
+    /// Branch 2b: the stored output_path and the scanned path are lexically
+    /// different but canonicalize to the SAME physical file (Windows
+    /// trailing-dot/case normalization, symlinked mounts). Repair the pointer
+    /// to the scanned spelling — branch 3 would otherwise flag it as a phantom
+    /// duplicate on every scan, forever. Called directly: the normalization is
+    /// a filesystem property a scan walk on a case-sensitive fs can't reproduce.
+    #[test]
+    fn reconcile_repairs_row_when_stored_and_scanned_paths_are_same_file() {
+        // Cross-platform stand-in for Windows normalization: a lexically
+        // different but canonically identical spelling of one path (`M31/../M31/…`).
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("M31");
+        std::fs::create_dir_all(&sub).unwrap();
+        let real = sub.join("c_L_0001.fits");
+        std::fs::write(&real, b"stub").unwrap();
+        let detoured = dir.path().join("M31").join("..").join("M31").join("c_L_0001.fits");
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        upsert_light_calibration(
+            &conn,
+            &LightCalRow {
+                id: 0,
+                frame_id: None,
+                source_uuid: Some("uuid-same-file".into()),
+                source_filename: Some("L_0001.fits".into()),
+                output_path: detoured.to_string_lossy().to_string(),
+                dark_set_id: None,
+                flat_set_id: None,
+                bias_set_id: None,
+                calstat: "D".into(),
+                flat_norm_applied: false,
+                flat_norm_mode: "centralThird".into(),
+                output_hash: "h".into(),
+                engine_version: LIGHT_CAL_ENGINE_VERSION,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                cal_params: "{}".into(),
+            },
+        )
+        .unwrap();
+
+        let identity = CalibratedIdentity {
+            source_uuid: Some("uuid-same-file".into()),
+            source_filename: Some("L_0001.fits".into()),
+            source_object: None,
+            source_date_obs: None,
+            calstat: "D".into(),
+            dark: None,
+            flat: None,
+            bias: None,
+            flat_norm_divisor: None,
+            engine_version: None,
+            project_id: None,
+        };
+        let current = real.to_string_lossy().to_string();
+        let mut dups = Vec::new();
+        reconcile_calibrated_light(&conn, &real, &current, &identity, 1, &mut dups).unwrap();
+
+        assert!(dups.is_empty(), "same physical file must not be flagged duplicate");
+        let stored: String = conn
+            .query_row(
+                "SELECT output_path FROM light_calibrations WHERE source_uuid = 'uuid-same-file'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, current, "output_path repaired to the scanned spelling");
     }
 
     /// Branch 4 (resolved): no tracking row, but the source frame is cataloged
