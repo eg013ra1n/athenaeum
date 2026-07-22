@@ -450,6 +450,19 @@ fn landed_count(dir: &Path) -> usize {
         .count()
 }
 
+/// Count *live* (`deleted_at IS NULL`) `sync_sources` retention rows keyed on
+/// `package_ref` — the oracle for "retention follows the payload" across a
+/// declined-resend re-key. Parameterised so a tempdir path with odd chars is safe.
+fn sync_sources_live_count(db: &Database, package_ref: &str) -> i64 {
+    db.conn()
+        .query_row(
+            "SELECT COUNT(*) FROM sync_sources WHERE package_ref = ?1 AND deleted_at IS NULL",
+            [package_ref],
+            |r| r.get(0),
+        )
+        .expect("count sync_sources")
+}
+
 #[tokio::test]
 async fn two_instance_sync_e2e() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1105,15 +1118,18 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
     receiver.shutdown().await;
 }
 
-/// Acceptance §4/§6 (Transfers Batch Model §B4) — **receiver decline is final; a
-/// resend is re-acked cancelled, NOT delivered**: a receiver declining an inbound
-/// package drives the sender's row terminal (`cancelled`, reason "cancelled by
-/// receiver"), lands no files, and leaves the receiver row `cancelled` with a full
-/// set of `cancelled` receipts (the replay source). A subsequent resend maps — via
-/// the durable `batch_uuid` — to the SAME cancelled inbound row: the receiver
-/// answers the resend's fresh wire id with an all-cancelled ack WITHOUT fetching,
-/// so the sender re-terminalizes `cancelled` and nothing lands (pre-B4 this
-/// delivered into a separate wire-keyed row).
+/// Acceptance (Decline Finality Axis §6.1 / smoke №8 Task D) — **receiver decline
+/// is final per its `batch_uuid`, but a deliberate sender Resend mints a NEW
+/// transfer that delivers**. First half (unchanged from the finality proof): a
+/// receiver declining an inbound package drives the sender's row terminal
+/// (`cancelled`, reason "cancelled by receiver"), lands no files, and leaves the
+/// receiver row `cancelled` + `declined_at` with a full set of `cancelled`
+/// receipts. Second half (the new behaviour): the sender's Resend of that declined
+/// row does NOT bounce — it renames the payload dir to a fresh basename (⇒ new wire
+/// `batch_uuid`) and enqueues a brand-NEW `sync_outbound` row that confirms; the
+/// receiver keys a SECOND inbound row on the new batch and ingests, while the old
+/// declined row stays declined and untouched. Retention (`sync_sources`) follows
+/// the renamed dir.
 ///
 /// Deterministic mid-transfer cancel: the receiver endpoint's `abort_after_bytes`
 /// fault is held armed so no payload fetch can ever COMPLETE (hence no ingest can
@@ -1124,7 +1140,7 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
 /// [`cancel_incoming_package`] command invocation to exercise the command boundary
 /// at the two-context level.
 #[tokio::test]
-async fn receiver_cancel_is_final_then_resend_reacked_cancelled() {
+async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
     const N: usize = 4;
     let tmp = tempfile::tempdir().unwrap();
     let capture_dir = tmp.path().join("capture");
@@ -1195,6 +1211,13 @@ async fn receiver_cancel_is_final_then_resend_reacked_cancelled() {
     .await
     .expect("enqueue selection");
     let old_id = latest_outbound_id(cdb);
+    // The declined transfer's payload dir + its N retention rows — the re-key oracle.
+    let old_pkg_ref = outbound_package_ref(cdb, old_id);
+    assert_eq!(
+        sync_sources_live_count(cdb, &old_pkg_ref),
+        N as i64,
+        "the send records one sync_sources retention row per frame"
+    );
 
     // Learn the wire package_id from the inbound row the announce created, re-arming
     // the one-shot abort fault each poll so every retry's payload fetch keeps
@@ -1256,59 +1279,60 @@ async fn receiver_cancel_is_final_then_resend_reacked_cancelled() {
         "the receiver logged a cancelled receipt per frame (the replay source)"
     );
 
-    // Disarm the fault so a re-fetch WOULD deliver — proving the resend fetches
-    // NOTHING because the transfer stays declined, not because a fault blocks it.
+    // Disarm the fault so the resend's NEW transfer can fetch and deliver — proving
+    // delivery is genuine, and that the OLD batch stayed declined by the axis, not
+    // because a fault blocked it.
     receiver_ep.set_fault(FaultPlan::default());
 
-    // Resend via the sanctioned command (Transfers Batch Model §D1/§D3:
-    // resend-as-reset — the SAME row is reset, NOT a new one; §4's payload-presence
-    // check requires the payload to still be on disk after a receiver decline — the
-    // all-cancelled-ack terminal epilogue mirrors `cancel_package` and keeps it).
-    let resend_id =
+    // Resend via the sanctioned command. The declined row carries
+    // `last_error = "cancelled by receiver"`, so this diverts into
+    // `resend_declined_as_new_transfer`: a NEW `sync_outbound` row (new dir basename
+    // ⇒ new wire `batch_uuid`) rather than a reset of the SAME row.
+    let new_id =
         retry_sync_package(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
             .await
-            .expect("resend a receiver-cancelled package");
-    assert_eq!(resend_id, old_id, "resend-as-reset returns the SAME row, never a new one");
+            .expect("resend a receiver-declined package as a new transfer");
+    assert_ne!(new_id, old_id, "a receiver-declined resend mints a NEW transfer row");
 
-    // The resend re-announces on a FRESH wire id; the receiver — resolving the SAME
-    // cancelled row by `batch_uuid` — re-acks it all-cancelled, so the sender
-    // re-terminalizes `cancelled` and NOTHING lands. Wait on the fresh wire id's
-    // cancelled receipts (the re-ack proof), then the sender's re-terminalization.
-    let resend_wire: String = cdb
-        .conn()
-        .query_row("SELECT wire_package_id FROM sync_outbound WHERE id = ?1", [old_id], |r| r.get(0))
-        .expect("resend minted a fresh wire id");
-    assert_ne!(resend_wire, wire_pkg, "the resend rotates the wire id");
-    wait_until(
-        || {
-            count(
-                pdb,
-                &format!("SELECT COUNT(*) FROM sync_receipts WHERE package_id = '{resend_wire}' AND outcome = 'cancelled'"),
-            ) == N as i64
-        },
-        WAIT,
-    )
-    .await;
-    wait_until(|| outbound_state(cdb, old_id) == "cancelled", WAIT).await;
+    // The NEW transfer confirms; N frames ingest; N files land — the whole point.
+    wait_until(|| outbound_state(cdb, new_id) == "confirmed", WAIT).await;
+    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), N as i64, "every frame ingested on the new transfer");
+    assert_eq!(landed_count(&designated), N, "every file landed on the new transfer");
 
-    // No delivery: no frames, no files, and STILL exactly one inbound row (batch-
-    // keyed) — the declined transfer, not a second wire-keyed row. The row's
-    // `package_id` is the RESEND's wire id (Decline Finality Axis §D5: the receipt
-    // anchor rotates to the newest fully-receipted attempt), its state stays
-    // Cancelled, and the decline is durable on the `declined_at` axis.
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "a declined transfer delivers no frames on resend");
-    assert_eq!(landed_count(&designated), 0, "the resend of a declined transfer lands no files");
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 1, "the batch keeps ONE inbound row across the resend");
+    // TWO inbound rows on the receiver: the old DECLINED one (still `cancelled` with
+    // `declined_at` set — untouched by the new batch) and the new DONE one.
+    assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 2, "the new batch identity created a SECOND inbound row");
     assert_eq!(
-        inbound_row(pdb, &resend_wire).map(|(s, _, _)| s).as_deref(),
-        Some("cancelled"),
-        "the batch-keyed inbound row stays Cancelled (anchored on the resend's wire id) — final, never resurrected"
-    );
-    assert_eq!(
-        count(pdb, "SELECT COUNT(*) FROM sync_inbound WHERE declined_at IS NOT NULL"),
+        count(pdb, "SELECT COUNT(*) FROM sync_inbound WHERE declined_at IS NOT NULL AND state = 'cancelled'"),
         1,
-        "the decline is recorded on the transfer-level finality axis"
+        "the old declined inbound row stays declined + cancelled — decline final per its batch_uuid"
     );
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM sync_inbound WHERE state = 'done'"),
+        1,
+        "the new batch's inbound row reaches Done"
+    );
+
+    // The old SENDER row is kept as history — still Cancelled, reason intact.
+    assert_eq!(outbound_state(cdb, old_id), "cancelled", "the declined sender row is kept as history");
+    assert_eq!(
+        outbound_last_error(cdb, old_id).as_deref(),
+        Some("cancelled by receiver"),
+        "the declined row keeps its receiver-decline reason"
+    );
+
+    // Retention followed the payload: the N `sync_sources` rows now key on the NEW
+    // transfer's package_ref, none on the old one.
+    let new_pkg_ref = outbound_package_ref(cdb, new_id);
+    assert_ne!(new_pkg_ref, old_pkg_ref, "the new transfer owns a fresh payload dir");
+    assert_eq!(sync_sources_live_count(cdb, &new_pkg_ref), N as i64, "sync_sources re-keyed onto the new transfer");
+    assert_eq!(sync_sources_live_count(cdb, &old_pkg_ref), 0, "no sync_sources remain under the old package_ref");
+
+    // The old payload dir was renamed away (gone from disk); the new dir is present
+    // (post-confirm cleanup leaves it manifest-only, but the dir itself survives).
+    assert!(!PathBuf::from(&old_pkg_ref).exists(), "the declined transfer's payload dir was renamed away");
+    assert!(PathBuf::from(&new_pkg_ref).exists(), "the new transfer's payload dir is present");
 
     engine.shutdown().await;
     receiver.shutdown().await;
@@ -3284,10 +3308,11 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
 
 /// B8 scenario 2 — **failure → resend → confirm into ONE batch-keyed row**. The
 /// route (documented): a receiver fetch-abort never terminalizes the sender
-/// (delivery-forever), and a SENDER cancel would leave the receiver row `cancelled`
-/// (cancelled-is-final ⇒ a resend is re-acked cancelled, never delivered — pinned by
-/// `receiver_cancel_is_final_then_resend_reacked_cancelled`). So the ONLY honest
-/// route to a delivering resend is the **fail path**: the payload dir is renamed away
+/// (delivery-forever), and a receiver DECLINE is final per its `batch_uuid` (a
+/// deliberate resend of a declined transfer mints a NEW transfer rather than
+/// reviving the declined one — pinned by
+/// `receiver_decline_then_resend_mints_new_transfer_and_delivers`). So the route
+/// to a delivering resend into the SAME row is the **fail path**: the payload dir is renamed away
 /// so the sender's next attempt hits the missing-payload terminal (`Revoke{Failed}` →
 /// the receiver's already-`failed` row is a terminal no-op, staying non-cancelled and
 /// re-drivable). The payload is restored, `resend_transfer` rotates the wire id

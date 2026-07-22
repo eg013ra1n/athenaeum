@@ -82,6 +82,18 @@ pub type AddrRefresher =
 /// Default per-attempt wait for the peer's ack before retrying.
 pub const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The exact `last_error` string the sender stamps on an outbound row when the
+/// receiver DECLINES a transfer (a non-empty ack whose receipts are all
+/// `Cancelled`). LOAD-BEARING STRING, single Rust source:
+/// - the UI renders it as "Cancelled by the receiving device"
+///   (`src/components/transfers/presentation.ts:83` — keep the TS literal in sync
+///   by hand, it cannot share a Rust const);
+/// - the api layer's declined-resend branch
+///   (`crate::api::sync::resend_declined_as_new_transfer`) keys on it to divert a
+///   Resend into a NEW batch identity (decline stays final per the old
+///   `batch_uuid`; the re-ask mints a fresh one).
+pub const CANCELLED_BY_RECEIVER_DETAIL: &str = "cancelled by receiver";
+
 /// Far-future sleep target used when nothing is in flight (any command/event
 /// wakes the worker before it elapses).
 const IDLE_SLEEP: Duration = Duration::from_secs(3600);
@@ -2141,11 +2153,12 @@ impl Worker {
                 .set_state(pending.id, OutboundState::Cancelled)
                 .context("cancel outbound (all-cancelled ack)")?;
             // The exact reason string the Perseus/UI surface renders as "cancelled
-            // by receiver". Best-effort diagnostic write — never fail the terminal
-            // transition on it.
+            // by receiver" (single Rust source: [`CANCELLED_BY_RECEIVER_DETAIL`];
+            // the api resend path keys the declined-resend divert on it too).
+            // Best-effort diagnostic write — never fail the terminal transition on it.
             if let Err(se) = self
                 .store
-                .set_last_error(pending.id, Some("cancelled by receiver"))
+                .set_last_error(pending.id, Some(CANCELLED_BY_RECEIVER_DETAIL))
             {
                 tracing::warn!(package_id = pending.id, error = %se, "record last_error (cancelled by receiver) failed");
             }

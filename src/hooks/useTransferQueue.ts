@@ -731,20 +731,44 @@ export function useTransferQueue(): UseTransferQueue {
     (id: number) =>
       withBusy(`resend:${id}`, async () => {
         try {
-          await api.invoke<number>('retry_sync_package', { id });
-          // Batch model (§D1): resend REUSES the same row — `retry_sync_package`
-          // resets `sync_outbound` id `id` in place (state → queued, generation++)
-          // and returns the SAME id. Drop it from both terminal sources so it stops
-          // rendering as settled; the next `get_sync_status` poll returns the same
-          // id in `sender.active` and the row flips back to live IN PLACE (one row,
-          // "attempt N"). No new id is minted, so `fetchTerminal` won't re-surface it.
-          setTerminalOutbound((prev) => {
-            if (!prev.has(id)) return prev;
-            const next = new Map(prev);
-            next.delete(id);
-            return next;
-          });
-          setDbTerminalSent((prev) => prev.filter((s) => s.id !== id));
+          const newId = await api.invoke<number>('retry_sync_package', { id });
+          // Batch model (§D1): resend USUALLY REUSES the same row —
+          // `retry_sync_package` resets `sync_outbound` id `id` in place (state →
+          // queued, generation++) and returns the SAME id. Drop it from both
+          // terminal sources so it stops rendering as settled; the next
+          // `get_sync_status` poll returns the same id in `sender.active` and the row
+          // flips back to live IN PLACE (one row, "attempt N").
+          //
+          // Decline exception (Task D): a transfer the RECEIVER declined is final per
+          // its `batch_uuid`, so a deliberate re-ask mints a NEW transfer (new dir
+          // basename ⇒ new batch identity) and returns a DIFFERENT id. Keep the old
+          // declined row as history — just flip its Resend affordance off — and let
+          // the new live row arrive via the normal status poll.
+          if (newId === id) {
+            setTerminalOutbound((prev) => {
+              if (!prev.has(id)) return prev;
+              const next = new Map(prev);
+              next.delete(id);
+              return next;
+            });
+            setDbTerminalSent((prev) => prev.filter((s) => s.id !== id));
+          } else {
+            // Do NOT remove the old id from the terminal ledgers (it stays as a
+            // declined-history row); flip its session-ledger entry's `resendable` to
+            // false so the button disappears, and re-read the durable terminal window
+            // so the persisted old row reflects its now-dead Resend affordance.
+            setTerminalOutbound((prev) => {
+              const entry = prev.get(id);
+              if (!entry) return prev;
+              const next = new Map(prev);
+              next.set(id, {
+                ...entry,
+                summary: { ...entry.summary, resendable: false },
+              });
+              return next;
+            });
+            fetchTerminal();
+          }
           refresh();
         } catch (err) {
           console.error('[useTransferQueue] retry_sync_package failed:', err);
@@ -756,7 +780,7 @@ export function useTransferQueue(): UseTransferQueue {
           });
         }
       }),
-    [withBusy, refresh, notify],
+    [withBusy, refresh, fetchTerminal, notify],
   );
 
   // Trash a settled batch's durable records (UX wave 2). Terminal-only by

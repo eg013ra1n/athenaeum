@@ -41,6 +41,7 @@ use crate::sync::{
     InboundSummary, OutboundRow, OutboundState, OutboundSummary, RefusalRefresher, StartedSender,
     SyncEngine, SyncEngineHandle, SyncReceiverStatus, SyncRuntime, SyncSenderRuntime,
     SyncSenderStatus, SyncStatus, SyncStore, TransferFileCounts, TransferFileEntry, TransportHealth,
+    CANCELLED_BY_RECEIVER_DETAIL,
 };
 
 /// Request filter for [`list_history`] (mirrors [`HistoryQuery`] over the
@@ -2606,6 +2607,19 @@ pub async fn resend_transfer(
             "package {id} data is missing on disk; cannot resend"
         )));
     }
+    // Decline exception (Task D): a transfer the RECEIVER declined is final per its
+    // `batch_uuid` — re-announcing the same batch just bounces (all-cancelled
+    // re-ack). A deliberate sender re-ask therefore mints a NEW transfer with a
+    // fresh batch identity (new dir basename ⇒ new wire `batch_uuid`), leaving the
+    // declined row as history. Keyed on the exact `last_error` the all-cancelled ack
+    // stamps (single Rust source). Every other terminal (sender-cancel, failed)
+    // resets the SAME row in place below.
+    if row.state == OutboundState::Cancelled
+        && row.last_error.as_deref() == Some(CANCELLED_BY_RECEIVER_DETAIL)
+    {
+        return resend_declined_as_new_transfer(ctx, sender, collab_sender, sync, &row, emitter)
+            .await;
+    }
     // §D1: mint a fresh per-attempt wire id and reset the SAME row in place (the B2
     // bridge — attempts++, files → pending, error/retry/confirm cleared). The row
     // is terminal here (NOT in the engine's `pending` map), so the next drive picks
@@ -2641,6 +2655,180 @@ pub async fn resend_transfer(
         .map_err(|e| ApiError::Internal(format!("re-drive resend {id}: {e:#}")))?;
     tracing::info!(id, peer = %node_id_hex(&row.peer), "sync transfer resent");
     Ok(id)
+}
+
+/// Resend a **receiver-declined** transfer as a brand-NEW transfer (Task D) — the
+/// deliberate-re-ask path. A decline is final per the transfer's `batch_uuid`, so
+/// re-announcing the same batch only bounces (all-cancelled re-ack). Instead we
+/// give the payload a fresh batch identity and enqueue it as a new row:
+///
+/// 1. **Sole-owner guard** — refuse if any OTHER outbound row shares this
+///    `package_ref` (belt-and-suspenders; desktop package dirs are single-owner by
+///    construction, but a shared dir must never be renamed out from under a sibling).
+/// 2. **Rename** the payload dir to a fresh `uuid` basename → the announce derives
+///    `batch_uuid` from the dir basename at attempt time, so the receiver keys ONE
+///    brand-new inbound row (its old declined row stays declined; receiver code is
+///    untouched). The old row keeps its `package_ref` string (history/delete joins
+///    intact) and its Resend affordance recomputes false (its payload dir is gone).
+/// 3. **Re-key** the `sync_sources` retention linkage onto the new dir (warn-and-
+///    continue — a failure only means the new transfer's sources aren't reclaimed,
+///    the safe direction).
+/// 4. **Clone** the manifest (`list_outbound_files`) + `display_name`.
+/// 5. **Enqueue** on `row.peer`'s engine — the WORKER inserts the new row (no API
+///    pre-insert). On enqueue error, best-effort rename the dir back (and re-key the
+///    sources back) so the old row's Resend stays live, then surface `Internal`.
+///
+///    Crash window (verified vs `dir_age` — recursive max mtime; payload mtimes stay
+///    OLD through a rename): a hard crash between the rename and the worker's row
+///    insert leaves a row-less dir that the NEXT startup's orphan sweep legitimately
+///    reclaims — acceptable degradation (payload dirs are copies; the sources are the
+///    user's catalog files; the old row's Resend affordance goes dead and the user
+///    re-sends from the library). Documented, not engineered around.
+/// 6. **Journal** cross-links on both ids (old: `resend as_new_transfer=<new>`; new:
+///    `resend of_declined=<old>`), best-effort.
+/// 7. The old declined row is **kept as history**; return the NEW id.
+async fn resend_declined_as_new_transfer(
+    ctx: &Arc<ServiceContext>,
+    sender: &Arc<SyncSenderRuntime>,
+    collab_sender: Arc<SyncSenderRuntime>,
+    sync: &SyncRuntime,
+    row: &OutboundRow,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+) -> Result<i64, ApiError> {
+    use crate::sharing::types::AnnounceFileEntry;
+    use crate::sync::store::{append_sync_event, outbound_ref_states, rekey_sync_sources};
+
+    let old_id = row.id;
+    let old_ref = row.package_ref.clone();
+    let old_dir = PathBuf::from(&old_ref);
+    let parent = old_dir
+        .parent()
+        .ok_or_else(|| {
+            ApiError::Internal(format!("package {old_id} dir has no parent: {old_ref}"))
+        })?
+        .to_path_buf();
+    let new_dir = parent.join(uuid::Uuid::new_v4().to_string());
+    let new_ref = new_dir.to_string_lossy().to_string();
+
+    // Steps 1–4 under ONE pooled connection, dropped before the async enqueue (no DB
+    // handle is ever held across an `.await`).
+    let (files, display_name) = {
+        let database = db(ctx)?;
+        let conn = database.conn();
+
+        // (1) Sole-owner guard.
+        let shared = outbound_ref_states(&conn)
+            .map_err(|e| ApiError::Internal(format!("scan outbound rows: {e:#}")))?
+            .into_iter()
+            .any(|(other_id, pref, _)| other_id != old_id && pref == old_ref);
+        if shared {
+            return Err(ApiError::Invalid(format!(
+                "package {old_id} shares its payload directory with another transfer; cannot resend as a new transfer"
+            )));
+        }
+
+        // (4, read before the rename) Clone the manifest for the new row's announce.
+        let file_rows = list_outbound_files(&conn, old_id)
+            .map_err(|e| ApiError::Internal(format!("list outbound files {old_id}: {e:#}")))?;
+        let files: Vec<AnnounceFileEntry> = file_rows
+            .iter()
+            .map(|r| AnnounceFileEntry {
+                rel_path: r.rel_path.clone(),
+                byte_size: r.byte_size,
+                frame_uuid: r.frame_uuid.clone(),
+            })
+            .collect();
+        let display_name = row.display_name.clone().filter(|s| !s.trim().is_empty());
+
+        // (2) Rename the payload dir → a fresh batch identity. Fails cleanly with no
+        // side effects to undo (nothing has been written yet).
+        std::fs::rename(&old_dir, &new_dir).map_err(|e| {
+            ApiError::Internal(format!(
+                "rename declined package dir for resend ({old_ref} → {new_ref}): {e}"
+            ))
+        })?;
+
+        // (3) Re-key retention linkage onto the new dir. Best-effort: a failure only
+        // means retention can't reclaim the new transfer's sources later (they stay
+        // on disk — the safe direction).
+        match rekey_sync_sources(&conn, &old_ref, &new_ref) {
+            Ok(moved) => {
+                tracing::debug!(old_id, moved, "re-keyed sync_sources onto the resent transfer")
+            }
+            Err(e) => tracing::warn!(
+                old_id,
+                error = %format!("{e:#}"),
+                "re-key sync_sources for resend failed; retention may not reclaim the new transfer"
+            ),
+        }
+
+        (files, display_name)
+    };
+
+    // (5) Re-drive on row.peer's engine — reuse a started one or build it lazily.
+    let engine = match sender.current_for(&row.peer).await {
+        Some((engine, _)) => engine,
+        None => {
+            let (engine, _origin) =
+                ensure_sender_engine(ctx, sender, collab_sender, sync, row.peer, None, emitter)
+                    .await?;
+            engine
+        }
+    };
+    // The worker inserts the new `sync_outbound` row (+ per-file `pending` rows) in
+    // one transaction and replies with its id — do NOT pre-insert here.
+    let new_id = match engine.enqueue_package(&new_dir, display_name, files).await {
+        Ok(id) => id,
+        Err(e) => {
+            // Best-effort undo so the old row's Resend affordance stays live: rename
+            // the dir back and re-key the sources back to `old_ref`. (See the crash-
+            // window note above — a hard crash inside this window is handled by the
+            // startup orphan sweep, so this undo is a courtesy, never a correctness
+            // dependency.)
+            if std::fs::rename(&new_dir, &old_dir).is_ok() {
+                if let Ok(database) = db(ctx) {
+                    let conn = database.conn();
+                    if let Err(re) = rekey_sync_sources(&conn, &new_ref, &old_ref) {
+                        tracing::warn!(old_id, error = %format!("{re:#}"), "re-key sync_sources back after failed resend enqueue");
+                    }
+                }
+            } else {
+                tracing::warn!(old_id, "could not rename package dir back after failed resend enqueue");
+            }
+            return Err(ApiError::Internal(format!("enqueue resent transfer: {e:#}")));
+        }
+    };
+
+    // (6) Journal cross-links on both ids (best-effort — a log write must never fail
+    // the resend). The old row's own terminal `cancelled` is already journaled; the
+    // new row's `enqueued`/`announce_sent`/`confirmed` follow from the worker.
+    {
+        if let Ok(database) = db(ctx) {
+            let conn = database.conn();
+            if let Err(e) = append_sync_event(
+                &conn,
+                Direction::Sent,
+                &old_id.to_string(),
+                "resend",
+                Some(&format!("as_new_transfer={new_id}")),
+            ) {
+                tracing::warn!(package_id = old_id, error = %format!("{e:#}"), "append resend cross-link (old) failed");
+            }
+            if let Err(e) = append_sync_event(
+                &conn,
+                Direction::Sent,
+                &new_id.to_string(),
+                "resend",
+                Some(&format!("of_declined={old_id}")),
+            ) {
+                tracing::warn!(package_id = new_id, error = %format!("{e:#}"), "append resend cross-link (new) failed");
+            }
+        }
+    }
+
+    // (7) Old declined row kept as history; the new transfer is now driving.
+    tracing::info!(old_id, new_id, peer = %node_id_hex(&row.peer), "declined transfer resent as new");
+    Ok(new_id)
 }
 
 /// Backwards-compatible alias for the command/route layer (Transfers Batch Model
@@ -5350,6 +5538,170 @@ mod tests {
         assert!(
             matches!(err, ApiError::Invalid(_)),
             "resend rejects a pending (non-terminal) package, got {err:?}",
+        );
+    }
+
+    /// Task D: `resend_transfer` on a RECEIVER-DECLINED row (terminal `Cancelled`
+    /// with `last_error = CANCELLED_BY_RECEIVER_DETAIL`) mints a NEW transfer instead
+    /// of resetting the same row — the deliberate re-ask. Pins the mechanics:
+    /// - a NEW `sync_outbound` id is returned (≠ the declined id);
+    /// - the payload dir is renamed to a fresh uuid sibling (old path gone, new dir
+    ///   present WITH its payload); the declined row keeps its now-stale `package_ref`;
+    /// - the manifest (`sync_outbound_files`) is cloned onto the new row;
+    /// - `sync_sources` retention is re-keyed onto the new dir (old ref → 0, new → N);
+    /// - both journals carry the cross-link (`as_new_transfer=` / `of_declined=`);
+    /// - a SECOND Resend of the OLD id now errors honestly (its payload dir is gone).
+    ///
+    /// The declined row is seeded DIRECTLY (not driven by the engine) so its
+    /// `last_error` cannot be raced by an announce-failure re-stamp — a durable
+    /// `Cancelled` + the exact receiver-decline reason mirrors the engine's
+    /// all-cancelled ack terminal.
+    #[tokio::test]
+    async fn resend_of_declined_mints_new_transfer() {
+        use crate::sharing::types::AnnounceFileEntry;
+        use crate::sync::store::{insert_outbound_with_files, live_sources_for_package};
+
+        let (tmp, ctx) = test_ctx();
+        let pkg_dir = build_one_frame_package(&ctx, tmp.path());
+        let old_ref = pkg_dir.to_string_lossy().to_string();
+        let ctx = Arc::new(ctx);
+        let db_path = db(&ctx).unwrap().path().to_path_buf();
+
+        let manifest = package::read_manifest(&pkg_dir).unwrap();
+        assert!(!manifest.is_empty(), "fixture package has >=1 manifest record");
+        let n = manifest.len();
+        let files: Vec<AnnounceFileEntry> = manifest
+            .iter()
+            .map(|r| AnnounceFileEntry {
+                rel_path: r.rel_path.clone(),
+                byte_size: r.byte_size,
+                frame_uuid: r.frame_uuid.clone(),
+            })
+            .collect();
+        let display = "M42 — declined batch".to_string();
+
+        let (sender, peer) = loopback_sender_for(&db_path).await;
+        let collab_sender = Arc::new(SyncSenderRuntime::new());
+        let sync = SyncRuntime::new();
+
+        // Seed the declined row DIRECTLY under the loopback peer, then stamp the
+        // durable `Cancelled` + receiver-decline reason.
+        let old_id = {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let id = insert_outbound_with_files(&conn, &old_ref, &node_id_hex(&peer), Some(&display), &files)
+                .unwrap();
+            conn.execute(
+                "UPDATE sync_outbound SET state = 'cancelled', last_error = ?2 WHERE id = ?1",
+                rusqlite::params![id, CANCELLED_BY_RECEIVER_DETAIL],
+            )
+            .unwrap();
+            id
+        };
+        // The fixture package wrote one retention row per frame, keyed on old_ref.
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            assert_eq!(
+                live_sources_for_package(&conn, &old_ref).unwrap().len(),
+                n,
+                "fixture seeded sync_sources on the old ref"
+            );
+        }
+
+        // Resend → a NEW transfer.
+        let new_id = resend_transfer(&ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
+            .await
+            .unwrap();
+        assert_ne!(new_id, old_id, "a receiver-declined resend mints a NEW transfer");
+
+        // The new row owns a fresh dir; the old dir was renamed away.
+        let new_ref = {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            store.get_outbound(new_id).unwrap().expect("new row exists").package_ref
+        };
+        assert_ne!(new_ref, old_ref, "the new transfer has a fresh package_ref");
+        assert!(!pkg_dir.exists(), "the declined payload dir was renamed away");
+        let new_dir = PathBuf::from(&new_ref);
+        assert!(new_dir.exists(), "the new payload dir is present");
+        assert!(package_has_payload(&new_dir), "the new dir carries the manifest + payload");
+
+        // The declined row is kept as history — same id, still Cancelled + reason,
+        // with its now-stale package_ref string.
+        {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            let old = store.get_outbound(old_id).unwrap().expect("declined row kept");
+            assert_eq!(old.state, OutboundState::Cancelled, "declined row kept as history");
+            assert_eq!(
+                old.last_error.as_deref(),
+                Some(CANCELLED_BY_RECEIVER_DETAIL),
+                "declined row keeps its receiver-decline reason"
+            );
+            assert_eq!(old.package_ref, old_ref, "declined row keeps its (now-stale) package_ref");
+        }
+
+        // The manifest was cloned onto the new row (same rel_paths).
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let new_files = list_outbound_files(&conn, new_id).unwrap();
+            assert_eq!(new_files.len(), n, "every manifest file cloned onto the new row");
+            let mut got: Vec<String> = new_files.iter().map(|f| f.rel_path.clone()).collect();
+            let mut want: Vec<String> = files.iter().map(|f| f.rel_path.clone()).collect();
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "cloned file rel_paths match the declined manifest");
+        }
+
+        // Retention followed the payload: N on the new ref, 0 on the old.
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            assert_eq!(
+                live_sources_for_package(&conn, &new_ref).unwrap().len(),
+                n,
+                "sync_sources re-keyed onto the new ref"
+            );
+            assert_eq!(
+                live_sources_for_package(&conn, &old_ref).unwrap().len(),
+                0,
+                "no sync_sources remain on the old ref"
+            );
+        }
+
+        // Both journals carry the cross-link.
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            let old_details: Vec<String> = list_sync_events(&conn, Direction::Sent, &old_id.to_string())
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == "resend")
+                .filter_map(|e| e.detail)
+                .collect();
+            assert!(
+                old_details.iter().any(|d| d == &format!("as_new_transfer={new_id}")),
+                "old journal cross-links to the new id, got {old_details:?}"
+            );
+            let new_details: Vec<String> = list_sync_events(&conn, Direction::Sent, &new_id.to_string())
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == "resend")
+                .filter_map(|e| e.detail)
+                .collect();
+            assert!(
+                new_details.iter().any(|d| d == &format!("of_declined={old_id}")),
+                "new journal cross-links to the old id, got {new_details:?}"
+            );
+        }
+
+        // A SECOND Resend of the OLD id now errors honestly — its payload is gone.
+        let err = resend_transfer(&ctx, &sender, collab_sender, &sync, old_id, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ApiError::Invalid(m) if m.contains("missing on disk")),
+            "a re-resend of the emptied declined row reports missing data, got {err:?}",
         );
     }
 

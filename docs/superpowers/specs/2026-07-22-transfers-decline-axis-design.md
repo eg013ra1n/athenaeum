@@ -242,3 +242,24 @@ plain failure (needs TS + UI); batch-uuid-keyed decline command (today a decline
 against a stale wire id no-ops with Ok); `delete_transfer_history` leaves
 `sync_receipts`, so a deleted declined transfer can resurrect as a fresh row on
 a retrying announce (pre-existing).
+
+### §6.1 Addendum — deliberate re-ask of a declined transfer (smoke №8, Task D)
+
+The decline is final **per `batch_uuid`** — re-announcing the SAME batch is
+correctly bounced (all-cancelled re-ack, no fetch), which is what the §3 matrix
+row "Receiver decline → Resend" pins. Owner smoke №8 wanted a deliberate re-ask
+to actually deliver. Resolution (no change to receiver-side finality): the
+SENDER's Resend of a row stamped `last_error = "cancelled by receiver"`
+(the shared `CANCELLED_BY_RECEIVER_DETAIL` const, engine.rs — single Rust source;
+TS mirror `presentation.ts:83`) mints a **new batch identity** instead of
+resetting in place. `api::sync::resend_declined_as_new_transfer` renames the
+payload dir to a fresh uuid basename (the announce derives `batch_uuid` from the
+dir basename at attempt time, so the rename alone yields a new wire batch), re-keys
+`sync_sources` retention onto the new dir, clones the manifest, and enqueues a new
+`sync_outbound` row (the worker inserts it). The old declined row is kept as
+history; the receiver keys a brand-new `(peer, batch_uuid)` inbound row for the new
+transfer while its old declined row stays declined and untouched. So decline
+finality per the old `batch_uuid` is intact, and the new batch is a fresh,
+un-declined transfer that fetches normally. **Perseus resend is unchanged** — it
+re-uses the same package dir/basename and still bounces all-cancelled: an
+autonomous capture agent must not override a human's decline. Zero wire changes.

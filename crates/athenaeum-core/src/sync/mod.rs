@@ -83,7 +83,7 @@ pub use cleanup_coord::SharedPackageCleanup;
 pub use dedup::{confirm_candidates, partition_offer, WantSplit};
 pub use engine::{
     retry_backoff, PackageCleanupSink, SyncConfig, SyncEngine, SyncEngineHandle,
-    DEFAULT_ACK_TIMEOUT,
+    CANCELLED_BY_RECEIVER_DETAIL, DEFAULT_ACK_TIMEOUT,
 };
 pub use ingest::{ingest_package, IngestOutcome};
 pub use pairing::{node_id_from_ticket, relay_mode_for, resolve_relays, RelayResolution};
@@ -108,7 +108,7 @@ pub use status::{
 };
 pub use store::{
     ensure_history_columns, insert_sync_source, live_sources_for_package, mark_sync_source_deleted,
-    CatalogSyncStore, StandaloneSyncStore, SyncSourceRow, SyncStore,
+    rekey_sync_sources, CatalogSyncStore, StandaloneSyncStore, SyncSourceRow, SyncStore,
 };
 
 /// Canonical timestamp rendering for the sync tables: RFC3339 UTC, millisecond

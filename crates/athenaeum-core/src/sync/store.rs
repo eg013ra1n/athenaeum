@@ -1104,6 +1104,23 @@ pub fn mark_sync_source_deleted(conn: &Connection, package_ref: &str, path: &str
     Ok(())
 }
 
+/// Re-key every `sync_sources` row from `old_ref` to `new_ref` and return the
+/// number of rows moved. Used by the declined-resend path (Transfers Batch Model,
+/// Task D): a receiver-declined transfer's Resend renames its package dir to a
+/// fresh uuid basename (a new wire `batch_uuid`), so the retention linkage must
+/// follow the renamed dir or the new transfer's confirmed sources would never be
+/// reclaimed. The `(package_ref, path)` primary key stays unique by construction —
+/// `new_ref` is a freshly-minted uuid dir that has never held any of these paths.
+pub fn rekey_sync_sources(conn: &Connection, old_ref: &str, new_ref: &str) -> Result<usize> {
+    let n = conn
+        .execute(
+            "UPDATE sync_sources SET package_ref = ?2 WHERE package_ref = ?1",
+            params![old_ref, new_ref],
+        )
+        .context("re-key sync_sources")?;
+    Ok(n)
+}
+
 /// Stable text encoding of a [`ReceiptOutcome`] for the `sync_receipts.outcome`
 /// column: `ingested` / `duplicate` / `cancelled` / `rejected:<reason>`.
 pub fn receipt_outcome_to_db(o: &ReceiptOutcome) -> String {
