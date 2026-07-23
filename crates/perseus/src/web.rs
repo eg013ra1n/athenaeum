@@ -1730,7 +1730,11 @@ struct DeleteFilesReport {
     /// leaves the batch **un-stamped** so the operator can retry the stragglers.
     failed: Vec<(String, String)>,
     /// RFC3339 UTC stamp of when the batch's sources were deleted — `Some` only
-    /// when `failed` is empty; `None` on a partial failure (still re-deletable).
+    /// when `failed` is empty AND `removed` is non-empty (a pass that actually
+    /// removed something cleanly); `None` on a partial failure OR a zero-work
+    /// pass (e.g. a divert-relinked batch whose live source linkage now points
+    /// at a different package — nothing to remove here is not "files deleted"),
+    /// either way still re-deletable.
     files_deleted_at: Option<String>,
     /// How many participating targets are `Confirmed` (from the pre-verdict).
     delivered_targets: u32,
@@ -1776,8 +1780,12 @@ struct HistoryDeleteRejection {
 /// (the pure verdict does not know `files_deleted_at`), matching [`api_transfers`].
 /// On allow it removes every live source through the shared safety contract
 /// ([`delete_package_sources`] — audit-before-delete, TOCTOU stat guard, honest
-/// no-ops), stamps the batch (only when nothing failed), and returns the full
-/// per-file detail plus the delivery verdict either way.
+/// no-ops), stamps the batch **only when the pass both failed nothing AND
+/// actually removed at least one source** (never on a zero-work pass — e.g. a
+/// divert-relinked batch whose live `perseus_seen` linkage now points at a
+/// different package, or sources already gone/changed out-of-band — which must
+/// stay re-deletable rather than claim a false "files deleted"), and returns the
+/// full per-file detail plus the delivery verdict either way.
 async fn api_delete_files(
     State(state): State<Arc<WebState>>,
     Json(req): Json<DeleteFilesRequest>,
@@ -1864,9 +1872,20 @@ async fn api_delete_files(
         }
     };
 
-    // Stamp the batch ONLY when nothing failed — a partial failure leaves it
-    // re-deletable so the operator can retry the stragglers.
-    let files_deleted_at = if detail.failed.is_empty() {
+    // Stamp the batch ONLY when the pass actually removed something cleanly —
+    // `failed.is_empty()` alone is not enough: a divert-relinked batch (its live
+    // `perseus_seen` linkage was repointed onto a NEW package ref by the operator
+    // divert) or a batch whose sources are already gone/changed out-of-band
+    // resolves to ZERO live sources, so `delete_package_sources` legitimately
+    // returns empty `removed`/`skipped`/`failed` — an honest no-op, not a
+    // deletion. Stamping `files_deleted_at` on that zero-work pass would be a
+    // FALSE "files deleted" marker: the files are still on disk (owned by the new
+    // batch, in the divert case), yet the old batch would claim they're gone and
+    // become permanently un-re-deletable. Requiring `!detail.removed.is_empty()`
+    // keeps a zero-work pass an idempotent no-op — `filesDeletedAt: null`, the
+    // batch stays re-deletable — while a partial failure (some failed) still
+    // correctly leaves it un-stamped so the operator can retry the stragglers.
+    let files_deleted_at = if detail.failed.is_empty() && !detail.removed.is_empty() {
         let at = now_rfc3339();
         if let Err(e) = state.batches.mark_files_deleted(&batch.package_ref, &at) {
             let msg = format!("{e:#}");
@@ -3312,6 +3331,64 @@ mod tests {
         let v = body_json(res).await;
         assert_eq!(v["removed"].as_array().unwrap().len(), 1);
         assert!(!source.exists());
+    }
+
+    /// Review fix pin: a divert-relinked batch (its live `perseus_seen` linkage
+    /// was repointed onto a NEW package ref — exactly what the declined→resend-
+    /// as-new divert does) resolves to ZERO live sources under the OLD ref, so
+    /// `delete_package_sources` legitimately returns empty `removed`/`skipped`/
+    /// `failed`. That zero-work pass must be an honest no-op — `filesDeletedAt:
+    /// null`, the batch row stays un-stamped/re-deletable — never a false "files
+    /// deleted" marker (the file is untouched on disk, now owned by the new batch).
+    #[tokio::test]
+    async fn delete_files_divert_relinked_batch_is_a_noop_not_a_false_stamp() {
+        use athenaeum_core::sharing::types::AnnounceFileEntry;
+        let (state, tmp) = test_state().await;
+        const P1: [u8; 32] = [1u8; 32];
+        let pref = "/data/packages/old-batch";
+        let new_pref = "/data/packages/new-batch";
+        let files = [AnnounceFileEntry {
+            rel_path: "a.fits".into(),
+            byte_size: 10,
+            frame_uuid: "u-a".into(),
+        }];
+        let c = state.store.enqueue(pref, P1, None, &files).unwrap();
+        state.store.confirm(c, &[]).unwrap();
+        state
+            .batches
+            .record(pref, "auto", "2026-07-23T10:00:00Z", 1)
+            .unwrap();
+        let source = seed_source(&tmp, &state, "a.fits", pref);
+        // Simulate the divert: the live linkage is repointed onto a NEW package
+        // ref (the same call `resend_declined_as_new` makes), so the OLD ref now
+        // resolves to zero live sources.
+        state.seen.relink_package(pref, new_pref).unwrap();
+
+        let app = build_router(Arc::clone(&state), None);
+        let res = post_json(&app, "/api/delete-files", serde_json::json!({ "packageRef": pref }))
+            .await;
+        assert_eq!(res.status(), StatusCode::OK, "a zero-work pass is still a 200, not an error");
+        let v = body_json(res).await;
+        assert!(v["removed"].as_array().unwrap().is_empty(), "nothing live under the old ref: {v}");
+        assert!(v["skipped"].as_array().unwrap().is_empty());
+        assert!(v["failed"].as_array().unwrap().is_empty());
+        assert!(
+            v["filesDeletedAt"].is_null(),
+            "a zero-work pass must never claim files were deleted: {v}"
+        );
+        assert!(source.exists(), "the file is untouched — still owned by the new batch");
+        assert_eq!(
+            state
+                .batches
+                .list()
+                .unwrap()
+                .into_iter()
+                .find(|b| b.package_ref == pref)
+                .unwrap()
+                .files_deleted_at,
+            None,
+            "the old batch stays un-stamped and re-deletable"
+        );
     }
 
     /// A terminal group history-deletes cleanly: its outbound rows, per-file rows,
