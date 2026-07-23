@@ -197,6 +197,16 @@ pub struct InboundSummary {
     /// [`list_terminal_transfers`](crate::api::sync::list_terminal_transfers)) say
     /// WHY it ended instead of a bare `cancelled`/`failed`.
     pub last_error: Option<String>,
+    /// The sending peer's device capability — `"athenaeum"` (a full peer) or
+    /// `"perseus"` (a send-only capture agent) — for the Transfers UI's
+    /// per-transfer origin badge (Perseus UI v2). Resolved by the
+    /// [`inbound_summary`](crate::api::sync) mapper: the value stamped onto the
+    /// `sync_inbound` row at announce time (`peer_capability`, Task 9) wins; a
+    /// legacy row whose stamp is NULL falls back to the cached
+    /// `SYNC_PEER_CAPABILITIES` hex→kind map keyed on the sending peer. `None`
+    /// when neither source knows the peer. Informational only — never gates a
+    /// transfer.
+    pub peer_kind: Option<String>,
 }
 
 /// Send-side rollup: live in-flight counts from the engine's non-terminal

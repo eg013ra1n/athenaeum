@@ -215,15 +215,7 @@ fn account_device_capabilities(
 ) -> HashMap<String, String> {
     devices
         .iter()
-        .filter_map(|d| {
-            pubkey_b64_to_hex(&d.pubkey).map(|hex| {
-                let cap = match d.capability {
-                    crate::account::DeviceCapability::Perseus => "perseus",
-                    crate::account::DeviceCapability::Athenaeum => "athenaeum",
-                };
-                (hex, cap.to_string())
-            })
-        })
+        .filter_map(|d| pubkey_b64_to_hex(&d.pubkey).map(|hex| (hex, d.capability.as_str().to_string())))
         .collect()
 }
 
@@ -1210,6 +1202,31 @@ fn cached_device_names(conn: &rusqlite::Connection) -> HashMap<String, String> {
     }
 }
 
+/// The cached node-id-hex → device-capability (`"athenaeum"` / `"perseus"`) map
+/// (`SYNC_PEER_CAPABILITIES`), read ONCE per receive-side read — a plain settings
+/// read with NO hub round-trip, the capability sibling of [`cached_device_names`]
+/// (written by [`refresh_authorized_peers`]). It's the fallback the
+/// [`inbound_summary`] mapper consults for a legacy inbound row whose stamped
+/// `peer_capability` is NULL. Best-effort: an absent setting or malformed JSON
+/// yields an empty map (warned, never fatal), so such a row simply gets no
+/// `peer_kind`.
+fn cached_device_kind_map(conn: &rusqlite::Connection) -> HashMap<String, String> {
+    match crate::db::get_setting(conn, keys::SYNC_PEER_CAPABILITIES) {
+        Ok(Some(raw)) => match serde_json::from_str::<HashMap<String, String>>(&raw) {
+            Ok(map) => map,
+            Err(e) => {
+                tracing::warn!(error = %e, "sync status: capability cache parse failed; no peer_kind");
+                HashMap::new()
+            }
+        },
+        Ok(None) => HashMap::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "sync status: capability cache read failed; no peer_kind");
+            HashMap::new()
+        }
+    }
+}
+
 /// Dedup in-flight rows by durable `sync_outbound` id, keeping the first
 /// occurrence and ordering ascending by id.
 ///
@@ -1315,12 +1332,20 @@ fn outbound_summary(
 fn inbound_summary(
     row: InboundRow,
     device_names: &HashMap<String, String>,
+    device_kinds: &HashMap<String, String>,
     file_counts: &HashMap<i64, TransferFileCounts>,
 ) -> InboundSummary {
     // The stable per-transfer key the receiver keys its one long-lived row on;
     // fall back to the wire package id for a legacy row whose `batch_uuid` is
     // NULL (a v1/v2 receive, or a row created before the column).
     let batch_uuid = row.batch_uuid.clone().unwrap_or_else(|| row.package_id.clone());
+    // Origin capability (Perseus UI v2, Task 10): the value stamped on the row at
+    // announce time (Task 9) wins; a legacy row whose stamp is NULL falls back to
+    // the cached `SYNC_PEER_CAPABILITIES` hex→kind map keyed on the sending peer.
+    let peer_kind = row
+        .peer_capability
+        .clone()
+        .or_else(|| device_kinds.get(&row.peer).cloned());
     InboundSummary {
         id: row.id,
         package_id: row.package_id.clone(),
@@ -1339,6 +1364,7 @@ fn inbound_summary(
         device_name: device_names.get(&row.peer).cloned(),
         file_counts: file_counts.get(&row.id).copied().unwrap_or_default(),
         last_error: row.last_error,
+        peer_kind,
     }
 }
 
@@ -1423,9 +1449,10 @@ fn active_inbound_summaries(ctx: &ServiceContext) -> Result<Vec<InboundSummary>,
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
     let file_counts = inbound_file_counts(&conn, &ids).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     let device_names = cached_device_names(&conn);
+    let device_kinds = cached_device_kind_map(&conn);
     Ok(rows
         .into_iter()
-        .map(|row| inbound_summary(row, &device_names, &file_counts))
+        .map(|row| inbound_summary(row, &device_names, &device_kinds, &file_counts))
         .collect())
 }
 
@@ -1545,6 +1572,7 @@ pub fn list_terminal_transfers(
     // read, no hub) and ONE grouped per-file-counts query per direction (§D5 —
     // never a per-row loop).
     let device_names = cached_device_names(&conn);
+    let device_kinds = cached_device_kind_map(&conn);
     let out_ids: Vec<i64> = out_rows.iter().map(|r| r.id).collect();
     let in_ids: Vec<i64> = in_rows.iter().map(|r| r.id).collect();
     let out_counts =
@@ -1576,7 +1604,7 @@ pub fn list_terminal_transfers(
         .collect();
     let received = in_rows
         .into_iter()
-        .map(|row| inbound_summary(row, &device_names, &in_counts))
+        .map(|row| inbound_summary(row, &device_names, &device_kinds, &in_counts))
         .collect();
     Ok(TerminalTransfers { sent, received })
 }
@@ -1850,6 +1878,35 @@ pub async fn get_sync_device_names(
     for d in devices {
         if let Ok(id) = pairing::node_id_from_pubkey_b64(&d.pubkey) {
             map.insert(node_id_hex(&id), d.name.clone());
+        }
+    }
+    Ok(map)
+}
+
+/// Map of node-id-hex → device capability (`"athenaeum"` / `"perseus"`) — the
+/// capability sibling of [`get_sync_device_names`], for the Transfers UI's
+/// per-transfer origin badge (Perseus UI v2, Task 10). Reads the hub's live
+/// device list and keys each device by its decoded node id (hex), mapping the
+/// device's [`DeviceCapability`](crate::account::DeviceCapability) to its
+/// lowercase wire string. Best-effort: a hub that is unreachable or a signed-out
+/// device yields an empty map (logged at `debug`, never an error) — the UI simply
+/// shows no capability. (The receive-side badge reads the persisted
+/// `peer_kind`/`SYNC_PEER_CAPABILITIES` cache; this hub-live map is for the
+/// send-side device picker Task 11 also drives.)
+pub async fn get_sync_device_capabilities(
+    ctx: &ServiceContext,
+) -> Result<HashMap<String, String>, ApiError> {
+    let devices = match crate::api::account::list_devices(ctx).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!(error = %format!("{e:?}"), "device capabilities unavailable; falling back to empty");
+            return Ok(HashMap::new());
+        }
+    };
+    let mut map = HashMap::new();
+    for d in devices {
+        if let Ok(id) = pairing::node_id_from_pubkey_b64(&d.pubkey) {
+            map.insert(node_id_hex(&id), d.capability.as_str().to_string());
         }
     }
     Ok(map)
@@ -4137,6 +4194,54 @@ mod tests {
             Some("by sender"),
             "the sender-revoke reason surfaces on the inbound summary"
         );
+    }
+
+    /// Perseus UI v2 (Task 10): the inbound mapper resolves `peer_kind` with a
+    /// stamp-wins-over-cache precedence — the value stamped on the row at announce
+    /// time (Task 9) wins; a legacy row whose stamp is NULL falls back to the
+    /// cached `SYNC_PEER_CAPABILITIES` hex→kind map keyed on the sending peer;
+    /// neither present → `None`.
+    #[test]
+    fn inbound_summary_resolves_peer_kind_stamp_then_cache_then_none() {
+        use crate::sync::InboundState;
+
+        let peer = "cc".repeat(32);
+        let row = |peer_capability: Option<&str>| InboundRow {
+            id: 1,
+            peer: peer.clone(),
+            package_id: "wire-1".into(),
+            state: InboundState::Done,
+            frame_count: 1,
+            byte_size: 10,
+            bytes_done: 10,
+            last_error: None,
+            created_at: "2026-07-22T00:00:00Z".into(),
+            finished_at: None,
+            display_name: None,
+            landing_dir: None,
+            batch_uuid: Some("batch-1".into()),
+            project_id: None,
+            generation: 1,
+            declined_at: None,
+            peer_capability: peer_capability.map(str::to_string),
+        };
+        let names: HashMap<String, String> = HashMap::new();
+        let counts: HashMap<i64, TransferFileCounts> = HashMap::new();
+
+        // 1) A stamped row wins even when the cache says otherwise.
+        let mut kinds = HashMap::new();
+        kinds.insert(peer.clone(), "athenaeum".to_string());
+        let s = inbound_summary(row(Some("perseus")), &names, &kinds, &counts);
+        assert_eq!(s.peer_kind.as_deref(), Some("perseus"), "stamped capability wins over cache");
+
+        // 2) A NULL-stamped row + a cache hit → the cache value.
+        let s = inbound_summary(row(None), &names, &kinds, &counts);
+        assert_eq!(s.peer_kind.as_deref(), Some("athenaeum"), "NULL stamp falls back to the cache");
+
+        // 3) Neither a stamp nor a cache entry → None.
+        let empty: HashMap<String, String> = HashMap::new();
+        let s = inbound_summary(row(None), &names, &empty, &counts);
+        assert_eq!(s.peer_kind, None, "neither stamp nor cache → None");
     }
 
     /// Dead-peer delete (tv2 blocker fix): a SENT batch whose only non-terminal

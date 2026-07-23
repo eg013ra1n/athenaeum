@@ -246,3 +246,14 @@ pub async fn get_sync_device_names(
 ) -> Result<std::collections::HashMap<String, String>, String> {
     api::get_sync_device_names(&state.ctx).await.map_err(|e| e.to_string())
 }
+
+/// Map of peer node-id-hex → device capability (`"athenaeum"` / `"perseus"`),
+/// for the Transfers UI's per-transfer origin badge. Best-effort: hub
+/// unreachable / signed out → empty map.
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn get_sync_device_capabilities(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    api::get_sync_device_capabilities(&state.ctx).await.map_err(|e| e.to_string())
+}

@@ -340,3 +340,16 @@ pub async fn get_sync_device_names(
 ) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
     api::get_sync_device_names(&state.ctx).await.map(Json).map_err(api_err)
 }
+
+/// POST /api/get_sync_device_capabilities
+///
+/// Map of peer node-id-hex → device capability (`"athenaeum"` / `"perseus"`) for
+/// the Transfers UI's per-transfer origin badge. Best-effort: hub unreachable /
+/// signed out → empty map (UI shows no capability).
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
+pub async fn get_sync_device_capabilities(
+    State(state): State<WebAppState>,
+    _body: Json<serde_json::Value>,
+) -> Result<Json<std::collections::HashMap<String, String>>, (StatusCode, String)> {
+    api::get_sync_device_capabilities(&state.ctx).await.map(Json).map_err(api_err)
+}
