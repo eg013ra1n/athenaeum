@@ -6,8 +6,9 @@
 // Settings section (account/OTP, device name, capture dirs, send targets,
 // retention) is ported behaviour-for-behaviour from the v1 page; only the DOM
 // structure + class names changed. The Transfers tab ships its "To Sync" strip
-// here; `window.PerseusApp.refreshTransfers` is the seam a later task fills with
-// the unified transfer list.
+// plus the unified one-row-per-batch transfer list (filter chips, the shared
+// bottom detail pane with Files / Targets / Log sub-tabs, and the two delete
+// actions), rendered by `refreshTransfers` off GET /api/transfers.
 
 // ── shared helpers (token, fetch, formatters) ───────────────────────────────
 // Bearer token kept in sessionStorage, not localStorage (finding L4): it is
@@ -50,11 +51,15 @@ function fmtCountdown(iso) {
 // the panels + an `active` class on the buttons — no router, no history.
 function setTab(name) {
   const transfers = name !== 'settings';
+  activeTab = transfers ? 'transfers' : 'settings';
   $('tab-transfers').hidden = !transfers;
   $('tab-settings').hidden = transfers;
   $('tabBtnTransfers').classList.toggle('active', transfers);
   $('tabBtnSettings').classList.toggle('active', !transfers);
   try { localStorage.setItem('perseus.tab', transfers ? 'transfers' : 'settings'); } catch (e) { /* private mode */ }
+  // Entering the Transfers tab: refresh at once (the /api/transfers poll is
+  // gated to this tab, so it is idle while Settings is showing).
+  if (transfers && window.PerseusApp) window.PerseusApp.refreshTransfers();
 }
 
 function wireTabs() {
@@ -70,7 +75,9 @@ function renderTransfersTab() {
   // by default, expanded by clicking the counter), the live Auto↔Manual toggle,
   // the auto quiet-window input, and the manual "Send N pending" button. Polled
   // on the 2 s tick; the toggle/quiet input are not clobbered while focused.
-  // `#transferList` is the placeholder a later task fills with the unified list.
+  // Below it, the `#transfers` section holds the unified one-row-per-batch list:
+  // filter chips (with live counts), the list body, and the shared bottom detail
+  // pane. Its body/chips/pane are re-rendered by refreshTransfers().
   $('tab-transfers').innerHTML = `
     <section id="tosync">
       <h2>To Sync</h2>
@@ -92,7 +99,15 @@ function renderTransfersTab() {
       <div class="flash" id="tosyncFlash"></div>
       <div id="pendingTree" hidden><div class="empty">nothing pending — all captures sent</div></div>
     </section>
-    <div id="transferList"></div>`;
+    <section id="transfers">
+      <div class="transfers-head">
+        <h2>Transfers</h2>
+        <div id="transferChips" class="tchips" role="tablist" aria-label="Filter transfers"></div>
+      </div>
+      <div class="flash" id="transferFlash"></div>
+      <div id="transferListBody"></div>
+      <div id="transferDetail" class="tdetail" hidden></div>
+    </section>`;
 }
 
 function renderSettingsTab() {
@@ -746,14 +761,467 @@ function wireTosync() {
   });
 }
 
+// ── transfers: unified one-row-per-batch list + detail pane + delete actions ──
+// The Transfers tab's list, filled from GET /api/transfers (Task 4 DTO). It is
+// pure read-model rendering off `transfersData`; every mutation (per-target
+// retry/kick/cancel/resend, source-file delete, history delete) POSTs then calls
+// refreshTransfers() so the server truth drives the next render. State lives in a
+// handful of module vars so a 2 s poll can re-render without losing the operator's
+// filter selection or open detail pane, and a JSON signature skips the re-render
+// (and its reflow) when nothing changed.
+const TERMINAL_STATES = new Set(['confirmed', 'failed', 'cancelled']);
+const TRANSFER_FILTERS = [
+  ['all', 'All'], ['sending', 'Sending'], ['waiting', 'Waiting'],
+  ['completed', 'Completed'], ['cancelled', 'Cancelled'], ['failed', 'Failed'],
+];
+let activeTab = 'transfers';        // gates the /api/transfers poll to its tab
+let transfersData = [];             // last GET /api/transfers payload
+let transferFilter = 'all';         // active filter chip
+let openTransferRef = null;         // packageRef of the open detail pane (or null)
+let openTransferSubTab = 'files';   // 'files' | 'targets' | 'log'
+const transferEvents = {};          // packageRef -> events (cached until pane closes)
+let transferDialogOpen = false;     // an in-page confirm is showing → suspend re-render
+let lastTransferSig = null;         // last render signature (skip unchanged reflows)
+
+// A receiver-declined target: cancelled AND the last error is the receiver's own
+// decline (the divert-eligibility key the resend-as-new button needs).
+const isDeclinedTarget = (t) => t.state === 'cancelled' && !!t.lastError && t.lastError.startsWith('cancelled by receiver');
+// `waiting` membership: any target non-terminal with an armed retry deadline.
+const batchIsWaiting = (b) => (b.targets || []).some((t) => !TERMINAL_STATES.has(t.state) && t.nextRetryAt);
+// Every visible outbound row terminal (or none in the window) → history-deletable.
+const batchAllTerminal = (b) => (b.targets || []).every((t) => TERMINAL_STATES.has(t.state));
+const transferName = (b) => (b.displayName && b.displayName.trim()) ? b.displayName : shortHex(b.batchUuid);
+
+function transferFlash(msg, ok) {
+  const f = $('transferFlash');
+  if (!f) return;
+  f.textContent = msg;
+  f.className = 'flash ' + (ok ? 'ok' : 'err');
+}
+
+function batchInFilter(b, f) {
+  switch (f) {
+    case 'sending': return b.outcome === 'sending';
+    case 'waiting': return batchIsWaiting(b);
+    case 'completed': return b.outcome === 'confirmed';
+    case 'cancelled': return b.outcome === 'cancelled';
+    case 'failed': return b.outcome === 'failed';
+    default: return true; // 'all'
+  }
+}
+
+// ── render: filter chips ──
+function renderTransferChips() {
+  $('transferChips').innerHTML = TRANSFER_FILTERS.map(([key, label]) => {
+    const n = transfersData.filter((b) => batchInFilter(b, key)).length;
+    const active = key === transferFilter;
+    return `<button class="tfilter${active ? ' active' : ''}" data-filter="${key}" role="tab" aria-selected="${active}">`
+      + `${label}<span class="tfilter-n">${n}</span></button>`;
+  }).join('');
+}
+
+// ── render: one batch row ──
+// State colours ride the shared `.chip.<state>` classes (accent for in-flight,
+// success for confirmed/delivered, warning for waiting, error for declined,
+// muted for cancelled). A waiting target's countdown lives in a `data-countdown`
+// span updated in place every tick (no full re-render).
+function targetChipHtml(t) {
+  const declined = isDeclinedTarget(t);
+  const nonTerminal = !TERMINAL_STATES.has(t.state);
+  const waiting = nonTerminal && t.nextRetryAt;
+  let cls, inner;
+  if (declined) {
+    cls = 'declined'; inner = `${esc(t.name)} · declined`;
+  } else if (waiting) {
+    cls = 'waiting';
+    inner = `${esc(t.name)} · retry <span class="cd" data-countdown="${esc(t.nextRetryAt)}">${esc(fmtCountdown(t.nextRetryAt) || '…')}</span>`;
+  } else {
+    let label = t.state;
+    if (nonTerminal && t.byteSize > 0 && ['announced', 'transferring', 'delivered'].includes(t.state)) {
+      label += ' ' + Math.floor(100 * t.bytesDone / t.byteSize) + '%';
+    }
+    cls = t.state; inner = `${esc(t.name)} · ${esc(label)}`;
+  }
+  return `<span class="chip ${cls}">${inner}</span>`;
+}
+
+function transferRowHtml(b) {
+  const open = b.packageRef === openTransferRef;
+  const markers = [];
+  if (b.generation > 1) markers.push(`<span class="tmarker">attempt ${b.generation}</span>`);
+  if (b.filesDeletedAt) markers.push(`<span class="tmarker files-deleted">files deleted</span>`);
+  const targetChips = (b.targets || []).map(targetChipHtml).join(' ');
+  const d = b.deletable || {};
+  const dfTitle = d.allowed
+    ? 'Delete the source capture files for this batch from disk'
+    : ('Cannot delete files: ' + (d.blockers || []).join('; '));
+  const dfBtn = `<button class="ghost" data-act="delete-files" data-ref="${esc(b.packageRef)}"`
+    + `${d.allowed ? '' : ' disabled'} title="${esc(dfTitle)}">Delete files</button>`;
+  const dhBtn = batchAllTerminal(b)
+    ? `<button class="ghost" data-act="delete-history" data-ref="${esc(b.packageRef)}" title="Remove this batch from the transfer history">Delete history</button>`
+    : '';
+  const files = `${b.fileCount} file${b.fileCount === 1 ? '' : 's'}`;
+  return `<div class="trow${open ? ' open' : ''}" data-batch-toggle data-ref="${esc(b.packageRef)}">
+    <div class="trow-main">
+      <span class="trow-name">${esc(transferName(b))}</span>
+      ${markers.join(' ')}
+      <span class="spacer"></span>
+      <span class="trow-actions">${dfBtn}${dhBtn}</span>
+    </div>
+    <div class="trow-sub">
+      <span class="muted mono">${esc(b.createdAt)}</span>
+      <span class="muted">· ${files} · ${esc(fmtSize(b.totalBytes))}</span>
+      <span class="trow-targets">${targetChips}</span>
+    </div>
+  </div>`;
+}
+
+function renderTransferListBody() {
+  const body = $('transferListBody');
+  if (!transfersData.length) { body.innerHTML = '<div class="empty">No transfers yet</div>'; return; }
+  const visible = transfersData.filter((b) => batchInFilter(b, transferFilter));
+  if (!visible.length) { body.innerHTML = '<div class="empty">No transfers match this filter</div>'; return; }
+  body.innerHTML = visible.map(transferRowHtml).join('');
+}
+
+// ── render: detail pane (Files / Targets / Log) ──
+function transferFilesHtml(b) {
+  const targets = b.targets || [];
+  const files = b.files || [];
+  if (!files.length) return '<div class="empty">no file manifest recorded for this batch</div>';
+  const rows = files.map((f) => {
+    const cells = new Map((f.targets || []).map((c) => [c.peerHex, c]));
+    // Compact "N/N confirmed" only when every target plainly confirmed this file
+    // (no dedup, none missing); otherwise a per-target breakdown.
+    let uniform = targets.length > 0;
+    for (const t of targets) {
+      const c = cells.get(t.peerHex);
+      if (!c || c.state !== 'confirmed' || c.outcome === 'duplicate') { uniform = false; break; }
+    }
+    let delivery;
+    if (!targets.length) {
+      delivery = '<span class="muted">—</span>';
+    } else if (uniform) {
+      delivery = `<span class="chip confirmed">${targets.length}/${targets.length} confirmed</span>`;
+    } else {
+      delivery = targets.map((t) => {
+        const c = cells.get(t.peerHex);
+        if (!c) return `<span class="chip cancelled">missing on ${esc(t.name)}</span>`;
+        if (c.outcome === 'duplicate') return `<span class="chip confirmed">${esc(t.name)}: confirmed (dedup)</span>`;
+        return `<span class="chip ${c.state}">${esc(t.name)}: ${esc(c.state)}</span>`;
+      }).join(' ');
+    }
+    return `<tr><td class="mono">${esc(f.relPath)}</td><td>${esc(fmtSize(f.byteSize))}</td><td class="tdelivery">${delivery}</td></tr>`;
+  }).join('');
+  return `<div class="tablewrap"><table>
+    <thead><tr><th>file</th><th>size</th><th>delivery</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+}
+
+function transferTargetsHtml(b) {
+  const targets = b.targets || [];
+  if (!targets.length) return '<div class="empty">no targets — this batch has no outbound rows in the current window</div>';
+  return targets.map((t) => {
+    const declined = isDeclinedTarget(t);
+    const nonTerminal = !TERMINAL_STATES.has(t.state);
+    const waiting = nonTerminal && t.nextRetryAt;
+    const cls = declined ? 'declined' : (waiting ? 'waiting' : t.state);
+    const label = declined ? 'declined' : t.state;
+    const pct = t.byteSize > 0 ? Math.floor(100 * t.bytesDone / t.byteSize) : 0;
+    const waitNote = waiting
+      ? ` · retry in <span class="cd" data-countdown="${esc(t.nextRetryAt)}">${esc(fmtCountdown(t.nextRetryAt) || '…')}</span>`
+      : '';
+    const err = t.lastError ? `<div class="terr${t.state === 'failed' ? ' err' : ''}">${esc(t.lastError)}</div>` : '';
+    const acts = [
+      `<button class="ghost" data-act="kick" data-id="${t.rowId}"${nonTerminal ? '' : ' disabled'} title="Announce / serve this transfer now">Send now</button>`,
+      `<button class="ghost" data-act="cancel" data-id="${t.rowId}"${nonTerminal ? '' : ' disabled'} title="Cancel this transfer">Cancel</button>`,
+      `<button class="ghost" data-act="retry" data-id="${t.rowId}"${(!nonTerminal && !declined) ? '' : ' disabled'} title="Resend this package in place">Retry</button>`,
+    ];
+    if (declined) acts.push(`<button data-act="resend-as-new" data-id="${t.rowId}" title="Divert into a brand-new transfer">Resend as new</button>`);
+    return `<div class="ttrow">
+      <div class="ttrow-head">
+        <span class="chip ${cls}">${esc(t.name)}: ${esc(label)}</span>
+        ${t.generation > 1 ? `<span class="tmarker">attempt ${t.generation}</span>` : ''}
+        <span class="spacer"></span>
+        <span class="ttrow-acts">${acts.join('')}</span>
+      </div>
+      <div class="ttrow-prog">
+        <div class="tbar"><div class="tbar-fill" style="width:${pct}%"></div></div>
+        <span class="muted">${esc(fmtSize(t.bytesDone))} / ${esc(fmtSize(t.byteSize))} (${pct}%)${waitNote}</span>
+      </div>
+      ${err}
+    </div>`;
+  }).join('');
+}
+
+function transferLogHtml(b) {
+  const evs = transferEvents[b.packageRef];
+  if (evs === undefined) return '<div class="empty">loading events…</div>';
+  if (!evs.length) return '<div class="empty">no events recorded for this batch</div>';
+  return '<ul class="tlog">' + evs.map((e) => {
+    const detail = e.detail ? ` — ${esc(e.detail)}` : '';
+    return `<li><span class="mono muted">${esc(e.ts)}</span> <span class="chip">${esc(e.target)}</span> <b>${esc(e.kind)}</b>${detail}</li>`;
+  }).join('') + '</ul>';
+}
+
+function renderTransferDetail() {
+  const pane = $('transferDetail');
+  const b = transfersData.find((x) => x.packageRef === openTransferRef);
+  if (!b) { pane.hidden = true; pane.innerHTML = ''; return; }
+  pane.hidden = false;
+  const tab = openTransferSubTab;
+  const subBtn = (key, label) => `<button class="tsub${key === tab ? ' active' : ''}" data-subtab="${key}">${label}</button>`;
+  const bodyHtml = tab === 'targets' ? transferTargetsHtml(b)
+    : tab === 'log' ? transferLogHtml(b)
+      : transferFilesHtml(b);
+  pane.innerHTML = `
+    <div class="tdetail-head">
+      <div><b>${esc(transferName(b))}</b> <span class="muted mono">${esc(b.batchUuid)}</span></div>
+      <div class="tdetail-tabs">${subBtn('files', 'Files')}${subBtn('targets', 'Targets')}${subBtn('log', 'Log')}</div>
+      <button class="ghost tdetail-close" data-detail-close title="Close">&times;</button>
+    </div>
+    <div class="tdetail-body">${bodyHtml}</div>`;
+}
+
+// A JSON fingerprint of everything the render depends on; identical fingerprint →
+// skip the re-render so a 2 s poll of unchanged data never reflows the list (nor
+// resets the log scroll). Excludes the live countdown text, which is patched in
+// place by updateTransferCountdowns() so waiting deadlines stay honest.
+function transferSignature() {
+  return JSON.stringify({
+    d: transfersData,
+    f: transferFilter,
+    o: openTransferRef,
+    s: openTransferSubTab,
+    e: (openTransferSubTab === 'log' && openTransferRef) ? (transferEvents[openTransferRef] || null) : 0,
+  });
+}
+
+function renderTransfers() {
+  if (transferDialogOpen) return; // never reshuffle the list under an open confirm
+  const sig = transferSignature();
+  if (sig === lastTransferSig) return;
+  lastTransferSig = sig;
+  renderTransferChips();
+  renderTransferListBody();
+  renderTransferDetail();
+}
+
+// Patch every armed-retry countdown in place each tick — cheap, and it keeps the
+// deadlines live without the full-list reflow renderTransfers() guards against.
+function updateTransferCountdowns() {
+  document.querySelectorAll('#transfers [data-countdown]').forEach((el) => {
+    el.textContent = fmtCountdown(el.dataset.countdown) || '…';
+  });
+}
+
+// ── detail pane open/close + sub-tabs ──
+function toggleTransferDetail(ref) {
+  if (openTransferRef === ref) { closeTransferDetail(); return; }
+  openTransferRef = ref;
+  openTransferSubTab = 'files';
+  renderTransfers();
+}
+
+function closeTransferDetail() {
+  if (openTransferRef) delete transferEvents[openTransferRef]; // re-fetch on next open
+  openTransferRef = null;
+  renderTransfers();
+}
+
+function setTransferSubTab(tab) {
+  openTransferSubTab = tab;
+  // Events are read ONLY when the Log tab is opened, and cached until the pane
+  // closes (one fetch per open, not per poll).
+  if (tab === 'log' && openTransferRef && transferEvents[openTransferRef] === undefined) {
+    loadTransferEvents(openTransferRef);
+  }
+  renderTransfers();
+}
+
+async function loadTransferEvents(ref) {
+  try {
+    const evs = await getJson('/api/transfers/events?ref=' + encodeURIComponent(ref));
+    transferEvents[ref] = Array.isArray(evs) ? evs : [];
+  } catch (e) {
+    transferEvents[ref] = [];
+    transferFlash('could not load events: ' + e.message, false);
+  }
+  if (openTransferRef === ref && openTransferSubTab === 'log') renderTransfers();
+}
+
+// ── per-target actions (kick / cancel / retry / resend-as-new) ──
+async function onTransferAction(btn) {
+  const act = btn.dataset.act;
+  if (act === 'delete-files') { confirmDeleteFiles(btn.dataset.ref); return; }
+  if (act === 'delete-history') { confirmDeleteHistory(btn.dataset.ref); return; }
+  const id = Number(btn.dataset.id);
+  const dispatch = {
+    kick: ['/api/kick', { ids: [id] }, 'send requested'],
+    cancel: ['/api/cancel', { ids: [id] }, 'cancel requested'],
+    retry: ['/api/retry', { ids: [id] }, 'resent'],
+    'resend-as-new': ['/api/resend-as-new', { id }, 'diverted to a new transfer'],
+  }[act];
+  if (!dispatch) return;
+  const [path, body, verb] = dispatch;
+  btn.disabled = true;
+  try {
+    const r = await api(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (!r.ok) throw new Error(await r.text());
+    const rep = await r.json();
+    // retry/kick/cancel report per-id rejections; resend-as-new 400s on failure
+    // (caught above), so a 200 there is always success.
+    const rej = (rep.rejected || [])[0];
+    if (rej) transferFlash(`${act}: ${rej.reason}`, false);
+    else transferFlash(verb, true);
+  } catch (e) {
+    transferFlash(`${act} failed: ${e.message}`, false);
+  }
+  refreshTransfers();
+}
+
+// ── in-page confirm dialog (no window.confirm / alert) ──
+// The OK handler closes the dialog BEFORE running onConfirm so the action's
+// follow-up refreshTransfers()/renderTransfers() are not suppressed by the
+// dialog-open guard.
+function openConfirm({ title, bodyHtml, confirmLabel, danger, onConfirm }) {
+  transferDialogOpen = true;
+  const overlay = document.createElement('div');
+  overlay.className = 'tconfirm-overlay';
+  overlay.innerHTML = `
+    <div class="tconfirm" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+      <h3>${esc(title)}</h3>
+      <div class="tconfirm-body">${bodyHtml}</div>
+      <div class="tconfirm-actions">
+        <button class="ghost" data-cd-cancel>Cancel</button>
+        <button class="${danger ? 'danger' : ''}" data-cd-ok>${esc(confirmLabel)}</button>
+      </div>
+    </div>`;
+  const close = () => { transferDialogOpen = false; overlay.remove(); };
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay || e.target.closest('[data-cd-cancel]')) { close(); return; }
+    if (e.target.closest('[data-cd-ok]')) { close(); onConfirm(); }
+  });
+  document.body.appendChild(overlay);
+  overlay.querySelector('[data-cd-ok]').focus();
+}
+
+// ── delete source files (obligation-gated) ──
+function confirmDeleteFiles(ref) {
+  const b = transfersData.find((x) => x.packageRef === ref);
+  if (!b) return;
+  const d = b.deletable || {};
+  const delivered = d.deliveredTargets || 0;
+  const closed = d.closed || [];
+  let body = `<p>Delete <b>${b.fileCount}</b> source capture file${b.fileCount === 1 ? '' : 's'} for this batch from disk?</p>`;
+  body += `<p class="muted">Delivered to ${delivered} target${delivered === 1 ? '' : 's'}.</p>`;
+  if (closed.length) body += `<p class="muted">Closed by receiver: ${closed.map(esc).join(', ')}</p>`;
+  if (delivered === 0) body += `<p class="tconfirm-warn">No target confirmed this batch — these files exist nowhere else.</p>`;
+  openConfirm({ title: 'Delete source files', bodyHtml: body, confirmLabel: 'Delete files', danger: true, onConfirm: () => doDeleteFiles(ref) });
+}
+
+async function doDeleteFiles(ref) {
+  try {
+    const r = await api('/api/delete-files', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ packageRef: ref }) });
+    if (r.status === 409) {
+      const j = await r.json();
+      transferFlash('delete refused: ' + (j.blockers || []).join('; '), false);
+    } else if (r.status === 404) {
+      transferFlash('delete failed: unknown batch', false);
+    } else if (!r.ok) {
+      throw new Error(await r.text());
+    } else {
+      const rep = await r.json();
+      const parts = [`removed ${rep.removed.length}`];
+      if (rep.skipped.length) parts.push(`skipped ${rep.skipped.length}`);
+      if (rep.failed.length) parts.push(`failed ${rep.failed.length}`);
+      transferFlash(parts.join(', '), rep.failed.length === 0);
+    }
+  } catch (e) {
+    transferFlash('delete failed: ' + e.message, false);
+  }
+  refreshTransfers();
+}
+
+// ── delete history (whole batch group; kept only for all-terminal batches) ──
+function confirmDeleteHistory(ref) {
+  const b = transfersData.find((x) => x.packageRef === ref);
+  if (!b) return;
+  openConfirm({
+    title: 'Delete from history',
+    bodyHtml: `<p>Remove <b>${esc(transferName(b))}</b> from the transfer history?</p>`
+      + `<p class="muted">This drops the sender bookkeeping only — the source files on disk are not touched.</p>`,
+    confirmLabel: 'Delete history',
+    danger: true,
+    onConfirm: () => doDeleteHistory(ref),
+  });
+}
+
+async function doDeleteHistory(ref) {
+  try {
+    const r = await api('/api/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ packageRefs: [ref] }) });
+    if (!r.ok) throw new Error(await r.text());
+    const rep = await r.json();
+    const rej = (rep.rejected || []).find((x) => x.ref === ref);
+    if (rej) {
+      transferFlash('not deleted: ' + rej.reason, false);
+    } else {
+      // Remove the row locally for instant feedback; the refetch confirms it.
+      transfersData = transfersData.filter((b) => b.packageRef !== ref);
+      if (openTransferRef === ref) openTransferRef = null;
+      transferFlash('removed from history', true);
+      renderTransfers();
+    }
+  } catch (e) {
+    transferFlash('history delete failed: ' + e.message, false);
+  }
+  refreshTransfers();
+}
+
+// ── delegated click handler + poll ──
+async function onTransfersClick(e) {
+  const filterBtn = e.target.closest('[data-filter]');
+  if (filterBtn) { transferFilter = filterBtn.dataset.filter; renderTransfers(); return; }
+  const subBtn = e.target.closest('[data-subtab]');
+  if (subBtn) { setTransferSubTab(subBtn.dataset.subtab); return; }
+  if (e.target.closest('[data-detail-close]')) { closeTransferDetail(); return; }
+  // Action buttons before the row toggle so a click on them never opens the pane.
+  const actBtn = e.target.closest('[data-act]');
+  if (actBtn) { e.stopPropagation(); onTransferAction(actBtn); return; }
+  const row = e.target.closest('[data-batch-toggle]');
+  if (row) toggleTransferDetail(row.dataset.ref);
+}
+
+function wireTransfers() {
+  $('transfers').addEventListener('click', onTransfersClick);
+}
+
+async function refreshTransfers() {
+  // The list poll is gated to its own tab — Settings never fetches transfers.
+  if (activeTab !== 'transfers') return;
+  try {
+    const data = await getJson('/api/transfers');
+    transfersData = Array.isArray(data) ? data : [];
+    // Drop the detail pane if its batch vanished (e.g. history-deleted elsewhere).
+    if (openTransferRef && !transfersData.some((b) => b.packageRef === openTransferRef)) {
+      openTransferRef = null;
+    }
+  } catch (e) {
+    // Offline is surfaced by the connection dot (refreshStatus); keep the last
+    // render rather than blanking the list on a transient poll hiccup.
+    return;
+  }
+  renderTransfers();
+  updateTransferCountdowns();
+}
+
 // ── boot ────────────────────────────────────────────────────────────────────
-// Task 7 assigns the real Transfers-list renderer onto PerseusApp.refreshTransfers
-// (the poll tick + a manual flush call it); the shared helpers are exposed for it
-// to reuse. Until then refreshTransfers is a no-op so this shell ships working.
+// The shared helpers + the live refreshTransfers renderer are exposed on
+// PerseusApp so the poll tick and the To-Sync manual flush can drive the list.
 window.PerseusApp = {
   api, getJson, $, esc, shortHex, fmtSize, fmtDur, fmtCountdown,
   setTab,
-  refreshTransfers() {},
+  refreshTransfers,
 };
 
 function tick() {
@@ -771,6 +1239,7 @@ function boot() {
   mountBanner();
   wireTabs();
   wireTosync();
+  wireTransfers();
   wireCaptureDirs();
   wireTargets();
   wireDeviceName();

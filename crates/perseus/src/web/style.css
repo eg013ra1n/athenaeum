@@ -14,6 +14,7 @@
   --error: #bf616a;           /* nord11 — failed / declined       */
   --warning: #ebcb8b;         /* nord13 — waiting / attention     */
   --success: #a3be8c;         /* nord14 — confirmed / delivered   */
+  --scrim: rgba(46, 52, 64, 0.78); /* nord0 @ alpha — modal backdrop */
 }
 
 * { box-sizing: border-box; }
@@ -116,3 +117,56 @@ details.tree-node > summary:hover { background: var(--surface-hover); }
 .tree-body { margin-left: 0.9rem; border-left: 1px solid var(--border); padding-left: 0.6rem; }
 ul.tree-files { list-style: none; margin: 0; padding: 0; }
 ul.tree-files li { padding: 0.12rem 0 0.12rem 1.15rem; color: var(--content-muted); }
+
+/* ── Transfers list: filter chips, one-row-per-batch, detail pane ── */
+.transfers-head { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 0.4rem; }
+.transfers-head h2 { margin: 0; }
+.tchips { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-left: auto; }
+.tfilter { background: var(--surface-hover); color: var(--content-muted); border: 1px solid var(--border); border-radius: 14px; padding: 0.2rem 0.7rem; font-size: 0.8rem; cursor: pointer; display: inline-flex; align-items: center; gap: 0.35rem; }
+.tfilter:hover { color: var(--content); }
+.tfilter.active { color: var(--accent); border-color: var(--accent); }
+.tfilter-n { background: var(--surface); border-radius: 8px; padding: 0 0.35rem; font-size: 0.72rem; color: var(--content-muted); }
+.tfilter.active .tfilter-n { color: var(--accent); }
+
+.trow { border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem 0.7rem; margin-bottom: 0.4rem; cursor: pointer; background: var(--surface); }
+.trow:hover { background: var(--surface-hover); }
+.trow.open { border-color: var(--accent); background: var(--surface-hover); }
+.trow-main { display: flex; align-items: center; gap: 0.5rem; }
+.trow-name { font-weight: 600; }
+.trow-actions { display: inline-flex; gap: 0.35rem; }
+.trow-sub { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; margin-top: 0.3rem; font-size: 0.8rem; }
+.trow-targets { display: inline-flex; gap: 0.3rem; flex-wrap: wrap; margin-left: 0.25rem; }
+.tmarker { font-size: 0.72rem; padding: 0.05rem 0.4rem; border-radius: 8px; border: 1px solid var(--border); color: var(--content-muted); }
+.tmarker.files-deleted { color: var(--warning); border-color: var(--warning); }
+
+.tdetail { border: 1px solid var(--accent); border-radius: 8px; margin-top: 0.5rem; background: var(--surface); }
+.tdetail-head { display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 0.7rem; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.tdetail-tabs { display: inline-flex; gap: 0.25rem; margin-left: auto; }
+.tsub { background: transparent; color: var(--content-muted); border: 1px solid transparent; border-radius: 6px; padding: 0.25rem 0.7rem; font-size: 0.82rem; cursor: pointer; }
+.tsub:hover { background: var(--surface-hover); color: var(--content); }
+.tsub.active { background: var(--surface-raised); color: var(--accent); border-color: var(--border); }
+.tdetail-close { padding: 0.2rem 0.5rem; }
+.tdetail-body { padding: 0.6rem 0.7rem; }
+.tdelivery { display: flex; gap: 0.3rem; flex-wrap: wrap; }
+
+.ttrow { border-bottom: 1px solid var(--border); padding: 0.5rem 0; }
+.ttrow:last-child { border-bottom: 0; }
+.ttrow-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.ttrow-acts { display: inline-flex; gap: 0.35rem; flex-wrap: wrap; }
+.ttrow-prog { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.3rem; font-size: 0.78rem; flex-wrap: wrap; }
+.tbar { flex: 1; min-width: 6rem; max-width: 16rem; height: 0.4rem; background: var(--surface-hover); border-radius: 4px; overflow: hidden; }
+.tbar-fill { height: 100%; background: var(--accent); }
+.terr { margin-top: 0.25rem; font-size: 0.78rem; color: var(--content-muted); word-break: break-word; }
+.terr.err { color: var(--error); }
+
+ul.tlog { list-style: none; margin: 0; padding: 0; max-height: 18rem; overflow-y: auto; }
+ul.tlog li { border-bottom: 1px solid var(--border); padding: 0.3rem 0; font-size: 0.8rem; display: flex; gap: 0.4rem; align-items: baseline; flex-wrap: wrap; }
+ul.tlog li:last-child { border-bottom: 0; }
+
+/* In-page confirm dialog — no window.confirm / alert() anywhere. */
+.tconfirm-overlay { position: fixed; inset: 0; background: var(--scrim); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 1rem; }
+.tconfirm { background: var(--surface-raised); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.25rem; max-width: 30rem; width: 100%; }
+.tconfirm h3 { margin: 0 0 0.6rem; font-size: 1rem; }
+.tconfirm-body p { margin: 0.35rem 0; }
+.tconfirm-warn { color: var(--error); font-weight: 600; }
+.tconfirm-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.9rem; }
