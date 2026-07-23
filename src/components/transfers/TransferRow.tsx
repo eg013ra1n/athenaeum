@@ -1,4 +1,4 @@
-import { ArrowUp, ArrowDown, Loader2, RotateCw, Send, Trash2, X, Clock, Users } from 'lucide-react';
+import { ArrowUp, ArrowDown, Loader2, RotateCw, Send, Trash2, X, Clock, Users, Telescope } from 'lucide-react';
 import { formatTimestamp } from '../../utils/dateFormatting';
 import {
   displayStateChip,
@@ -112,6 +112,23 @@ function DeleteButton({
     >
       {deleteBusy ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
     </button>
+  );
+}
+
+/** Sender-kind origin badge (Perseus UI v2) — a small chip next to the device
+ *  name that renders ONLY when a received transfer came from a Perseus capture
+ *  agent. Athenaeum senders and unknown kinds render nothing, so the common
+ *  case stays clean. Accent-muted via design tokens (never raw colors). */
+function SenderKindBadge({ kind }: { kind: string | null }) {
+  if (kind !== 'perseus') return null;
+  return (
+    <span
+      className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border bg-surface px-1 py-0.5 text-[9px] font-medium text-content-muted"
+      title="Sent by a Perseus capture agent"
+    >
+      <Telescope size={9} />
+      Perseus
+    </span>
   );
 }
 
@@ -277,6 +294,7 @@ function LiveRowBody({
 
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-content-muted">
             <span title={deviceLabel}>{deviceLabel}</span>
+            {row.kind === 'inbound' && <SenderKindBadge kind={row.peerKind} />}
             {/* User-facing "attempt N" (§D5), from `generation` (bumped only by a
                 resend — never the engine's internal announce-retries). Shown on
                 active AND terminal rows; suppressed while `waiting`, where the
@@ -429,6 +447,7 @@ function HistoryRowBody({
           </div>
           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-[11px] text-content-muted">
             <span title={deviceLabel}>{deviceLabel}</span>
+            {group.direction === 'received' && <SenderKindBadge kind={item.deviceKind} />}
             <span aria-hidden="true">·</span>
             <span className="tabular-nums">
               {group.rows.length} file{group.rows.length === 1 ? '' : 's'} · {formatBytes(group.totalBytes)}

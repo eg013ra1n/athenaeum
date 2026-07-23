@@ -1,6 +1,16 @@
 import { formatTimestamp } from '../../utils/dateFormatting';
-import { formatBytes } from './presentation';
+import { formatBytes, shortPeer } from './presentation';
 import type { UnifiedRow } from './types';
+
+/** The `Sender` detail line (Perseus UI v2) — `<device name or short hex> ·
+ *  Perseus agent` / `· Athenaeum` for a RECEIVED transfer whose sender kind is
+ *  known. Returns `null` (line omitted entirely) for an unknown kind or a sent
+ *  transfer, matching the received-row badge's "common case stays clean" rule. */
+function senderRow(deviceLabel: string, kind: string | null): { label: string; value: string } | null {
+  const kindLabel = kind === 'perseus' ? 'Perseus agent' : kind === 'athenaeum' ? 'Athenaeum' : null;
+  if (!kindLabel) return null;
+  return { label: 'Sender', value: `${deviceLabel} · ${kindLabel}` };
+}
 
 /**
  * Detail-pane Details tab (§D8) — the raw identifiers a batch name/device name
@@ -30,10 +40,13 @@ export function TransferDetails({ item }: { item: UnifiedRow }) {
 
 function liveRows(item: Extract<UnifiedRow, { kind: 'live' }>): Array<{ label: string; value: string; mono?: boolean }> {
   const r = item.row;
+  // Sender kind (Perseus UI v2) — inbound rows only; `null` (line omitted) when unknown.
+  const sender = r.kind === 'inbound' ? senderRow(r.deviceName ?? r.peerShort, r.peerKind) : null;
   const rows: Array<{ label: string; value: string; mono?: boolean }> = [
     { label: 'Direction', value: r.kind === 'outbound' ? 'Sending' : 'Receiving' },
     { label: 'Batch name', value: r.displayName ?? '—' },
     { label: 'Device name', value: r.deviceName ?? '—' },
+    ...(sender ? [sender] : []),
     { label: 'Package handle', value: r.packageShort, mono: true },
   ];
   if (r.packageId) rows.push({ label: 'Package id', value: r.packageId, mono: true });
@@ -56,10 +69,16 @@ function historyRows(
   item: Extract<UnifiedRow, { kind: 'history' }>,
 ): Array<{ label: string; value: string; mono?: boolean }> {
   const g = item.group;
+  // Sender kind (Perseus UI v2) — received groups only; `null` (line omitted) when unknown.
+  const sender =
+    g.direction === 'received'
+      ? senderRow(item.deviceName ?? shortPeer(g.peerDevice), item.deviceKind)
+      : null;
   const rows: Array<{ label: string; value: string; mono?: boolean }> = [
     { label: 'Direction', value: g.direction === 'sent' ? 'Sent' : 'Received' },
     { label: 'Batch name', value: g.batchName ?? '—' },
     { label: 'Device name', value: item.deviceName ?? '—' },
+    ...(sender ? [sender] : []),
     { label: 'Package id', value: g.packageId ?? '— (legacy)', mono: true },
     { label: 'Peer (node id)', value: g.peerDevice, mono: true },
   ];

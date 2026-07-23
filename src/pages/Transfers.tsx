@@ -22,7 +22,8 @@ import { useTransferHistory } from '../hooks/useTransferHistory';
 export default function Transfers() {
   const { rows, liveFiles, sendNow, cancelOutbound, cancelInbound, resend, deleteTransfer, busy } =
     useTransferQueue();
-  const { groups, deviceNames, projectNames, refetch, removeLocal } = useTransferHistory();
+  const { groups, deviceNames, deviceKinds, projectNames, refetch, removeLocal } =
+    useTransferHistory();
 
   const [filter, setFilter] = useState<TransferFilter>('all');
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -106,6 +107,10 @@ export default function Transfers() {
         selKey: g.groupKey,
         group: g,
         deviceName: deviceNames[g.peerDevice] ?? null,
+        // Sender-kind badge (Perseus UI v2) — a RECEIVED group's origin, by peer
+        // hex. `null` for a sent group (the peer is the recipient, not a sender)
+        // so no badge shows there.
+        deviceKind: g.direction === 'received' ? (deviceKinds[g.peerDevice] ?? null) : null,
         projectName: g.project ? projectNames[g.project] ?? null : null,
         // A history group's `packageId` IS its delete key — `batchUuid` in both
         // directions since B5b. `null` for a legacy "Earlier transfers" bucket with
@@ -114,7 +119,7 @@ export default function Transfers() {
       });
     }
     return [...liveUnified, ...historyUnified];
-  }, [rows, groups, deviceNames, projectNames]);
+  }, [rows, groups, deviceNames, deviceKinds, projectNames]);
 
   // Filter membership (§D8). A row can match more than one bucket (a mixed
   // history group is both Completed and Failed); counts reflect that honestly.

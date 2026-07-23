@@ -17,6 +17,10 @@ export interface UseTransferHistory {
   groups: HistoryGroup[];
   /** hub node-id (hex) → friendly device name; empty when signed out / hub down. */
   deviceNames: Record<string, string>;
+  /** peer node-id (hex) → device capability (`"athenaeum"` | `"perseus"`);
+   *  empty when signed out / hub down. Resolves the sender-kind badge on a
+   *  received HISTORY group (a live inbound row carries `peerKind` directly). */
+  deviceKinds: Record<string, string>;
   /** collab project id → title. */
   projectNames: Record<string, string>;
   loading: boolean;
@@ -31,6 +35,7 @@ export interface UseTransferHistory {
 export function useTransferHistory(): UseTransferHistory {
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [deviceNames, setDeviceNames] = useState<Record<string, string>>({});
+  const [deviceKinds, setDeviceKinds] = useState<Record<string, string>>({});
   const [projectNames, setProjectNames] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(false);
   const mounted = useRef(true);
@@ -86,6 +91,24 @@ export function useTransferHistory(): UseTransferHistory {
     };
   }, []);
 
+  // Device-capability map (peer node-id → "athenaeum" | "perseus"). Feeds the
+  // sender-kind badge on received history groups; a live inbound row resolves it
+  // from `peerKind` directly. Degrades to no badge on any failure.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .invoke<Record<string, string>>('get_sync_device_capabilities')
+      .then((kinds) => {
+        if (!cancelled && mounted.current) setDeviceKinds(kinds ?? {});
+      })
+      .catch((err) =>
+        console.error('[useTransferHistory] get_sync_device_capabilities failed:', err),
+      );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Project id → title (collab rows only). Degrades to a short id.
   useEffect(() => {
     let cancelled = false;
@@ -113,5 +136,5 @@ export function useTransferHistory(): UseTransferHistory {
 
   const groups = useMemo(() => groupHistory(history), [history]);
 
-  return { groups, deviceNames, projectNames, loading, refetch, removeLocal };
+  return { groups, deviceNames, deviceKinds, projectNames, loading, refetch, removeLocal };
 }

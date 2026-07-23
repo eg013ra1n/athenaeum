@@ -51,6 +51,10 @@ export type UnifiedRow =
       group: HistoryGroup;
       /** Resolved friendly device name, or `null` → fall back to short hex. */
       deviceName: string | null;
+      /** Resolved sender device capability (`"athenaeum"` | `"perseus"`) for a
+       *  RECEIVED group's origin badge, or `null` (unknown / a sent group → no
+       *  badge). A live inbound row uses `TransferRow.peerKind` instead. */
+      deviceKind: string | null;
       /** Resolved collab project title, or `null`. */
       projectName: string | null;
       /** Batch delete key (trash action), or `null` for a legacy null-key

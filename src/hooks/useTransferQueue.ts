@@ -109,6 +109,11 @@ export interface TransferRow {
   displayName: string | null;
   /** Friendly peer device name (§D5), or `null` when the peer isn't in the cache. */
   deviceName: string | null;
+  /** Sending peer's device capability — `"athenaeum"` | `"perseus"` | `null`
+   *  (Perseus UI v2). Populated for INBOUND rows only (threaded straight from
+   *  `InboundSummary.peerKind`); always `null` on outbound rows. Drives the
+   *  received-row "Perseus" origin badge. Informational — never gates anything. */
+  peerKind: string | null;
   /** Backend-derived presentation state (§D5): outbound
    *  `queued|preparing|transferring|uploaded|waiting|confirmed|cancelled|failed`,
    *  inbound `announced|fetching|ingesting|done|failed|cancelled`. */
@@ -460,6 +465,7 @@ export function useTransferQueue(): UseTransferQueue {
         peerShort: s.peerShort,
         displayName: s.displayName,
         deviceName: s.deviceName,
+        peerKind: null,
         displayState: s.displayState,
         stalledUntil: s.stalledUntil,
         retrying: s.retrying,
@@ -509,6 +515,7 @@ export function useTransferQueue(): UseTransferQueue {
         peerShort: summary.peerShort,
         displayName: summary.displayName,
         deviceName: summary.deviceName,
+        peerKind: null,
         // A terminal ledger row is settled — its display state IS the outcome,
         // never a stale `transferring`/`waiting` from before it finished.
         displayState: outcome,
@@ -548,6 +555,7 @@ export function useTransferQueue(): UseTransferQueue {
         peerShort: s.peerShort,
         displayName: s.displayName,
         deviceName: s.deviceName,
+        peerKind: null,
         // The persisted display state IS the settled outcome (`confirmed` /
         // `failed` / `cancelled`).
         displayState: s.displayState,
@@ -589,6 +597,7 @@ export function useTransferQueue(): UseTransferQueue {
         peerShort: s.peerShort,
         displayName: s.displayName,
         deviceName: s.deviceName,
+        peerKind: s.peerKind,
         displayState: s.displayState,
         stalledUntil: s.stalledUntil,
         retrying: false,
@@ -626,6 +635,7 @@ export function useTransferQueue(): UseTransferQueue {
         peerShort: s.peerShort,
         displayName: s.displayName,
         deviceName: s.deviceName,
+        peerKind: s.peerKind,
         // `done` / `failed` / `cancelled`.
         displayState: s.displayState,
         stalledUntil: null,
