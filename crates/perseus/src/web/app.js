@@ -842,7 +842,7 @@ function targetChipHtml(t) {
     }
     cls = t.state; inner = `${esc(t.name)} · ${esc(label)}`;
   }
-  return `<span class="chip ${cls}">${inner}</span>`;
+  return `<span class="chip ${esc(cls)}">${inner}</span>`;
 }
 
 function transferRowHtml(b) {
@@ -891,12 +891,15 @@ function transferFilesHtml(b) {
   if (!files.length) return '<div class="empty">no file manifest recorded for this batch</div>';
   const rows = files.map((f) => {
     const cells = new Map((f.targets || []).map((c) => [c.peerHex, c]));
-    // Compact "N/N confirmed" only when every target plainly confirmed this file
-    // (no dedup, none missing); otherwise a per-target breakdown.
+    // Compact "N/N confirmed" when every target's per-file cell reached `done`
+    // (the per-file OutboundFileState — NOT the target-level `confirmed`
+    // OutboundState, which per-file cells never carry). A dedup delivery also
+    // lands at `done`, so it counts as uniform here; the "(dedup)" label only
+    // shows in the breakdown branch below, for a mixed-state file.
     let uniform = targets.length > 0;
     for (const t of targets) {
       const c = cells.get(t.peerHex);
-      if (!c || c.state !== 'confirmed' || c.outcome === 'duplicate') { uniform = false; break; }
+      if (!c || c.state !== 'done') { uniform = false; break; }
     }
     let delivery;
     if (!targets.length) {
@@ -908,7 +911,7 @@ function transferFilesHtml(b) {
         const c = cells.get(t.peerHex);
         if (!c) return `<span class="chip cancelled">missing on ${esc(t.name)}</span>`;
         if (c.outcome === 'duplicate') return `<span class="chip confirmed">${esc(t.name)}: confirmed (dedup)</span>`;
-        return `<span class="chip ${c.state}">${esc(t.name)}: ${esc(c.state)}</span>`;
+        return `<span class="chip ${esc(c.state)}">${esc(t.name)}: ${esc(c.state)}</span>`;
       }).join(' ');
     }
     return `<tr><td class="mono">${esc(f.relPath)}</td><td>${esc(fmtSize(f.byteSize))}</td><td class="tdelivery">${delivery}</td></tr>`;
@@ -940,7 +943,7 @@ function transferTargetsHtml(b) {
     if (declined) acts.push(`<button data-act="resend-as-new" data-id="${t.rowId}" title="Divert into a brand-new transfer">Resend as new</button>`);
     return `<div class="ttrow">
       <div class="ttrow-head">
-        <span class="chip ${cls}">${esc(t.name)}: ${esc(label)}</span>
+        <span class="chip ${esc(cls)}">${esc(t.name)}: ${esc(label)}</span>
         ${t.generation > 1 ? `<span class="tmarker">attempt ${t.generation}</span>` : ''}
         <span class="spacer"></span>
         <span class="ttrow-acts">${acts.join('')}</span>
@@ -1018,6 +1021,10 @@ function updateTransferCountdowns() {
 // ── detail pane open/close + sub-tabs ──
 function toggleTransferDetail(ref) {
   if (openTransferRef === ref) { closeTransferDetail(); return; }
+  // Switching directly row A -> row B (no close in between): evict A's cached
+  // journal too, not only on an explicit close, so a later reopen of A re-fetches
+  // rather than showing a stale Log tab.
+  if (openTransferRef) delete transferEvents[openTransferRef];
   openTransferRef = ref;
   openTransferSubTab = 'files';
   renderTransfers();

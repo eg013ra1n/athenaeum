@@ -58,6 +58,11 @@ td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; fo
 .chip.failed, .chip.declined { color: var(--error); }
 .chip.stalled, .chip.waiting, .chip.manual { color: var(--warning); }
 .chip.cancelled, .chip.auto { color: var(--content-muted); border: 1px solid var(--border); }
+/* Per-file delivery states (OutboundFileState, distinct from the target-level
+   OutboundState above): the Files sub-tab's breakdown chips read these raw. */
+.chip.done { color: var(--success); }
+.chip.uploaded { color: var(--accent); }
+.chip.pending { color: var(--content-muted); }
 /* Send-target chips: the current target list, each with an inline remove. */
 .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
 .chip.target { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--accent); padding: 0.15rem 0.3rem 0.15rem 0.6rem; }
