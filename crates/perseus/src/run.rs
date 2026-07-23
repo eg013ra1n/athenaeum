@@ -37,8 +37,7 @@ use athenaeum_core::sync::engine::AddrRefresher;
 use athenaeum_core::sync::store::{StandaloneSyncStore, SyncStore};
 use athenaeum_core::sync::{
     evaluate_and_apply, node_id_hex, DeleteOutcome, Direction, HistoryRow, OutboundRow,
-    OutboundState, PackageCleanupSink, RetentionOutcome, SharedPackageCleanup, SyncEngine,
-    SyncEngineHandle,
+    PackageCleanupSink, RetentionOutcome, SharedPackageCleanup, SyncEngine, SyncEngineHandle,
 };
 use chrono::{DateTime, Utc};
 use iroh_tickets::endpoint::EndpointTicket;
@@ -1397,9 +1396,9 @@ fn source_stat_unchanged(link: &SourceLink, current_size: u64, current_mtime_ms:
 /// beats no audit at all, but there is always at least one row to persist.
 ///
 /// `outcome` is the audit tag stamped on every row — `retention_deleted` for an
-/// automatic retention pass, `deleted_manual` for the web "Delete selected"
-/// action ([`delete_confirmed_packages`]). Both take the exact same deletion
-/// path; only this tag distinguishes them in the history log.
+/// automatic retention pass, `deleted_manual` for the web batch-delete action
+/// ([`delete_package_sources`]). Both take the exact same deletion path; only
+/// this tag distinguishes them in the history log.
 ///
 /// `peer_device` is the CONFIGURED SYNC PEER id (hex) — the same value transfer
 /// history rows carry ([`SyncEngine`]'s sender stamps `node_id_hex(&peer)`).
@@ -1670,89 +1669,6 @@ pub fn run_retention_once(
         retention_delete_source(store, seen, pkg_ref, "retention_deleted", peer_device)
     };
     evaluate_and_apply(store, &policy, dry_run, now, disk_probe, &mut deleter)
-}
-
-/// The outcome of a manual [`delete_confirmed_packages`] call: the ids actually
-/// deleted, and the ids rejected (each with a human reason). Serialized directly
-/// as the `POST /api/delete` response (task 10).
-#[derive(Debug, Default, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteReport {
-    /// Outbound-row ids whose source capture file was removed from disk.
-    pub deleted: Vec<i64>,
-    /// Ids that were not deleted, each with the reason (not confirmed, unknown,
-    /// no live source, or a delete error).
-    pub rejected: Vec<DeleteRejection>,
-}
-
-/// One rejected id from [`delete_confirmed_packages`], with a human-readable
-/// reason for the web UI to surface next to the row.
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeleteRejection {
-    pub id: i64,
-    pub reason: String,
-}
-
-/// Delete the source capture files for a set of CONFIRMED outbound packages, by
-/// outbound-row id — the web "Delete selected" action's chokepoint (task 10).
-///
-/// Shares the EXACT per-package deleter retention uses
-/// ([`retention_delete_source`]); the only difference is the audit outcome tag
-/// (`deleted_manual` here vs `retention_deleted`). Each id is verified to be in
-/// state `confirmed` BEFORE anything is touched — an unknown or non-confirmed id
-/// is rejected with a reason and never reaches disk. Deletion of anything not
-/// `confirmed` is impossible by construction: the same invariant retention
-/// relies on, enforced here at the id-lookup gate. Every safety property of the
-/// shared deleter (audit-before-delete, TOCTOU stat guard, honest no-op vs real
-/// removal) applies unchanged.
-pub fn delete_confirmed_packages(
-    store: &StandaloneSyncStore,
-    seen: &SeenStore,
-    ids: &[i64],
-    peer_device: &str,
-) -> Result<DeleteReport> {
-    let mut report = DeleteReport::default();
-    for &id in ids {
-        let Some(row) = store.get_outbound(id)? else {
-            report.rejected.push(DeleteRejection {
-                id,
-                reason: "unknown package".to_string(),
-            });
-            continue;
-        };
-        if row.state != OutboundState::Confirmed {
-            report.rejected.push(DeleteRejection {
-                id,
-                reason: "not confirmed".to_string(),
-            });
-            continue;
-        }
-        let pkg_ref = PathBuf::from(&row.package_ref);
-        match retention_delete_source(store, seen, &pkg_ref, "deleted_manual", peer_device) {
-            Ok(DeleteOutcome::Removed) => {
-                tracing::info!(id, package_ref = %row.package_ref, "manual delete removed confirmed source");
-                report.deleted.push(id);
-            }
-            Ok(DeleteOutcome::SkippedNoop) => {
-                // The row is confirmed, but there is no live source to remove
-                // (already deleted, superseded by a re-enqueue, or gone
-                // out-of-band). Honest no-op, surfaced as a per-id reject.
-                report.rejected.push(DeleteRejection {
-                    id,
-                    reason: "no live source to delete (already removed or superseded)".to_string(),
-                });
-            }
-            Err(error) => {
-                tracing::error!(id, %error, "manual delete failed for confirmed package");
-                report.rejected.push(DeleteRejection {
-                    id,
-                    reason: format!("delete failed: {error}"),
-                });
-            }
-        }
-    }
-    Ok(report)
 }
 
 /// Spawn the config-driven retention timer. Each tick runs a full

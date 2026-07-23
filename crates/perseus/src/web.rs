@@ -12,10 +12,8 @@
 //!   stylesheet. **Auth-exempt** for the same reason as `GET /`.
 //! - `GET /api/status` — capture dirs, live in-flight transfers, the current
 //!   retention policy, and coarse package counts ([`StatusDto`]).
-//! - `GET /api/sent` — outbound packages, newest first, optionally filtered by
-//!   `?state=` ([`SentDto`]).
-//! - `GET /api/history` — the transfer audit log, optionally filtered by
-//!   `?query=` (filename) and `?direction=` ([`HistoryDto`]).
+//! - `GET /api/transfers` — the grouped read model (one element per batch across
+//!   every fan-out target) + `GET /api/transfers/events` for a batch's merged log.
 //! - `GET`/`PUT /api/retention/policy` — read the live retention config +
 //!   read-only soak gate ([`PolicyDto`]); a whitelisted [`RetentionEdit`] is
 //!   applied to `perseus.toml` and adopted live. Live deletion can never be
@@ -66,9 +64,14 @@ use athenaeum_core::package::read_manifest;
 use athenaeum_core::package::MANIFEST_FILENAME;
 use athenaeum_core::sync::store::StandaloneSyncStore;
 use athenaeum_core::sync::{
-    node_id_hex, Direction, HistoryQuery, HistoryRow, OutboundFileRow, OutboundRow, OutboundState,
-    SharedPackageCleanup, SyncEngineHandle, SyncStore, CANCELLED_BY_RECEIVER_DETAIL,
+    node_id_hex, OutboundFileRow, OutboundRow, OutboundState, SharedPackageCleanup,
+    SyncEngineHandle, SyncStore, CANCELLED_BY_RECEIVER_DETAIL,
 };
+// `Direction` + `HistoryRow` are referenced only by the test harness now that the
+// `/api/history` read endpoint has been retired (the store still records history;
+// no live web route reads it back).
+#[cfg(test)]
+use athenaeum_core::sync::{Direction, HistoryRow};
 
 use crate::batch_store::BatchStore;
 use crate::batcher::BatcherHandle;
@@ -86,13 +89,9 @@ use crate::supervisor::AgentState;
 mod account_api;
 use account_api::*;
 
-/// Default cap for `GET /api/sent` when the caller supplies no `?limit=`.
-const DEFAULT_SENT_LIMIT: u32 = 500;
-/// Default cap for `GET /api/history` when the caller supplies no `?limit=`.
-const DEFAULT_HISTORY_LIMIT: u32 = 500;
-/// Max filenames `GET /api/sent` returns per row (read from the package
-/// manifest). The client renders the first 5; a present 6th is the "there is at
-/// least one more" signal, shown as a "+ more" marker. Perseus packages are
+/// Max filenames each in-flight row on the status page reports (read from the
+/// package manifest). The client renders the first 5; a present 6th is the "there
+/// is at least one more" signal, shown as a "+ more" marker. Perseus packages are
 /// one-file-per-frame today, so the cap is defensive.
 const SENT_FILES_CAP: usize = 6;
 /// Row window `GET /api/status` tallies its terminal counts over. The status
@@ -184,7 +183,7 @@ pub struct WebState {
     pub batcher: RwLock<Option<BatcherHandle>>,
     /// Durable per-batch send record (`perseus_batch`). Opened once at web start
     /// beside `store`/`seen` (a second WAL connection to the same `perseus.db`),
-    /// so `GET /api/batches` lists recorded batches engine-attached or not.
+    /// so `GET /api/transfers` lists recorded batches engine-attached or not.
     pub batches: Arc<BatchStore>,
     /// The running batcher's live send-config channel, threaded in from the agent
     /// on attach (a clone of [`Agent::send_cfg_tx`](crate::run::Agent::send_cfg_tx)).
@@ -379,8 +378,7 @@ struct CountsDto {
     queued: u64,
 }
 
-/// One outbound package row, for `GET /api/sent` and the status page's
-/// in-flight list.
+/// One outbound package row, for the status page's in-flight list.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SentDto {
@@ -422,25 +420,6 @@ struct SentDto {
     resendable: bool,
 }
 
-/// One transfer-history row, for `GET /api/history`.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HistoryDto {
-    filename: String,
-    object: Option<String>,
-    peer_device: String,
-    /// Friendly name for `peer_device`, when known (Task 11); else `None`.
-    peer_name: Option<String>,
-    direction: String,
-    bytes: u64,
-    started_at: String,
-    finished_at: Option<String>,
-    /// `finished - started` in seconds when both stamps parse as RFC3339; else
-    /// `None` (never a panic).
-    duration_secs: Option<f64>,
-    outcome: String,
-}
-
 /// Build the status-page router. `token` is snapshotted from
 /// [`Config::web_token`](crate::config::Config) at spawn time — an auth change
 /// needs an agent restart, which keeps [`auth_layer`] free of shared mutable
@@ -454,8 +433,6 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
     // carries actual node data) stays behind [`auth_layer`].
     let api = Router::new()
         .route("/api/status", get(api_status))
-        .route("/api/sent", get(api_sent))
-        .route("/api/history", get(api_history))
         .route(
             "/api/retention/policy",
             get(api_get_retention_policy).put(api_put_retention_policy),
@@ -480,7 +457,6 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
             get(api_get_send_mode).put(api_put_send_mode),
         )
         .route("/api/send-now", post(api_send_now))
-        .route("/api/batches", get(api_batches))
         // Perseus UI v2 (Task 4): the grouped transfers read model — one element
         // per batch across every fan-out target, its per-file × per-target matrix,
         // and the server-computed obligation verdict — plus a batch's merged event
@@ -768,85 +744,6 @@ async fn api_status(
             queued,
         },
     }))
-}
-
-/// Query string for `GET /api/sent`.
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SentQuery {
-    /// Restrict to one state (`queued`/`announced`/`transferring`/`confirmed`/
-    /// `failed`). Absent → every state.
-    state: Option<String>,
-    /// Row cap; defaults to [`DEFAULT_SENT_LIMIT`].
-    limit: Option<u32>,
-}
-
-/// `GET /api/sent`
-async fn api_sent(
-    State(state): State<Arc<WebState>>,
-    Query(q): Query<SentQuery>,
-) -> Result<Json<Vec<SentDto>>, (StatusCode, String)> {
-    let limit = q.limit.unwrap_or(DEFAULT_SENT_LIMIT);
-    let rows = state.store.all_outbound(limit).map_err(|e| {
-        tracing::error!(error = %e, "web sent: read outbound failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-    let filter = q.state.as_deref().filter(|s| !s.is_empty());
-    let dtos: Vec<SentDto> = rows
-        .iter()
-        .filter(|r| filter.is_none_or(|s| r.state.as_str() == s))
-        .map(to_sent_dto)
-        .collect();
-    Ok(Json(dtos))
-}
-
-/// Query string for `GET /api/history`.
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HistoryQ {
-    /// Exact filename to filter on. `search_history` AND-combines its filters,
-    /// so a single free-text box maps to filename (the most useful axis), not
-    /// filename-and-object (which would require both columns to equal it).
-    query: Option<String>,
-    /// Restrict to one direction (`sent`/`received`). Invalid → `400`.
-    direction: Option<String>,
-    /// Row cap; defaults to [`DEFAULT_HISTORY_LIMIT`].
-    limit: Option<u32>,
-}
-
-/// `GET /api/history`
-async fn api_history(
-    State(state): State<Arc<WebState>>,
-    Query(q): Query<HistoryQ>,
-) -> Result<Json<Vec<HistoryDto>>, (StatusCode, String)> {
-    let direction = match q.direction.as_deref().filter(|d| !d.is_empty()) {
-        None => None,
-        Some(d) => Some(Direction::from_db(d).map_err(|e| {
-            tracing::error!(error = %e, direction = d, "web history: bad direction filter");
-            (StatusCode::BAD_REQUEST, e.to_string())
-        })?),
-    };
-    let hq = HistoryQuery {
-        filename: q.query.filter(|s| !s.is_empty()),
-        object: None,
-        direction,
-        peer: None,
-        // Perseus's web status page has no project dimension (personal sync).
-        project: None,
-        // No per-batch detail surface on the Perseus agent (Task 14).
-        package_id: None,
-        limit: q.limit.unwrap_or(DEFAULT_HISTORY_LIMIT),
-    };
-    let rows = state.store.search_history(hq).map_err(|e| {
-        tracing::error!(error = %e, "web history: search failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-    })?;
-    let device_names = state.device_names.read().await;
-    let dtos = rows
-        .iter()
-        .map(|r| to_history_dto(r, &device_names))
-        .collect();
-    Ok(Json(dtos))
 }
 
 /// `GET`/`PUT /api/retention/policy` payload: the writable retention knobs plus
@@ -1283,41 +1180,6 @@ struct SendNowDto {
     flushed: usize,
 }
 
-/// One `GET /api/batches` row: a recorded send-batch ([`crate::batch_store::BatchRow`])
-/// joined with the sync engine's per-target outbound state.
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BatchDto {
-    package_ref: String,
-    /// `auto` (watcher quiet-timer) or `manual` (operator "send now").
-    mode: String,
-    created_at: String,
-    file_count: i64,
-    /// Frames actually transferred vs. dropped as the peer's duplicates. These
-    /// are the sender's ephemeral `sync-finished` dedup outcome — NOT persisted in
-    /// `sync_outbound` and not carried on [`OutboundRow`] — so they are reported as
-    /// `0` here (the honest "not tracked post-flight" value). Wired as named
-    /// fields so a future durable source can fill them without a shape change.
-    #[serde(rename = "new")]
-    new_count: u32,
-    #[serde(rename = "duplicate")]
-    duplicate_count: u32,
-    /// One entry per target the package was fanned to (friendly name + live
-    /// outbound state). Empty for a batch whose outbound rows aren't visible yet.
-    targets: Vec<BatchTargetDto>,
-    /// The batch-level outcome derived from its targets (see [`aggregate_outcome`]).
-    outcome: String,
-}
-
-/// One send target of a batch: the friendly device name (peer hex when unknown)
-/// and its current outbound state string.
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BatchTargetDto {
-    name: String,
-    state: String,
-}
-
 /// Parse a wire `mode` string into a [`Mode`]. `None` for any unknown value — the
 /// handler maps that to a `400`.
 fn parse_mode(s: &str) -> Option<Mode> {
@@ -1441,71 +1303,6 @@ fn aggregate_outcome(rows: &[&OutboundRow]) -> String {
         return "confirmed".to_string();
     }
     "sending".to_string()
-}
-
-/// `GET /api/batches` — every recorded send-batch (newest-first), each joined by
-/// `package_ref` with the sync engine's outbound rows so the operator sees where
-/// a package went (per target) and how it fared. Read-only.
-///
-/// A fan-out writes one outbound row per target, so the join groups them by
-/// `package_ref`. [`all_outbound`](StandaloneSyncStore::all_outbound) (every
-/// state, unlike the non-terminal-only `status_snapshot`) is used so a `confirmed`
-/// batch still resolves its targets. `{new, duplicate}` are the sender's ephemeral
-/// dedup outcome and are not persisted, so they are reported as `0` (see
-/// [`BatchDto`]). A batch with no matching outbound row (just recorded, or aged
-/// past the scan window) degrades to `outcome: "sending"` with no targets.
-async fn api_batches(
-    State(state): State<Arc<WebState>>,
-) -> Result<Json<Vec<BatchDto>>, (StatusCode, String)> {
-    let rows = state.batches.list().map_err(|e| {
-        let msg = format!("{e:#}");
-        tracing::error!(error = %msg, "web batches: list failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, msg)
-    })?;
-    let outbound = state.store.all_outbound(STATUS_SCAN_LIMIT).map_err(|e| {
-        let msg = format!("{e:#}");
-        tracing::error!(error = %msg, "web batches: read outbound failed");
-        (StatusCode::INTERNAL_SERVER_ERROR, msg)
-    })?;
-    // Group outbound rows by package_ref (one row per target on a fan-out).
-    let mut by_ref: HashMap<&str, Vec<&OutboundRow>> = HashMap::new();
-    for row in &outbound {
-        by_ref
-            .entry(row.package_ref.as_str())
-            .or_default()
-            .push(row);
-    }
-    let device_names = state.device_names.read().await;
-    let dtos = rows
-        .iter()
-        .map(|b| {
-            let matched: &[&OutboundRow] = by_ref
-                .get(b.package_ref.as_str())
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let targets = matched
-                .iter()
-                .map(|r| {
-                    let hex = node_id_hex(&r.peer);
-                    BatchTargetDto {
-                        name: device_names.get(&hex).cloned().unwrap_or(hex),
-                        state: r.state.as_str().to_string(),
-                    }
-                })
-                .collect();
-            BatchDto {
-                package_ref: b.package_ref.clone(),
-                mode: b.mode.clone(),
-                created_at: b.created_at.clone(),
-                file_count: b.file_count,
-                new_count: 0,
-                duplicate_count: 0,
-                targets,
-                outcome: aggregate_outcome(matched),
-            }
-        })
-        .collect();
-    Ok(Json(dtos))
 }
 
 // ── Perseus UI v2 (Task 4): grouped /api/transfers read model ────────────────
@@ -1731,7 +1528,7 @@ fn resolve_participations<'a>(
 /// element per recorded `perseus_batch` row (newest-first), joined by
 /// `package_ref` to every fan-out target's outbound row, carrying the per-file ×
 /// per-target matrix and the server-computed obligation verdict. Read-only; the
-/// legacy `/api/batches` stays alive alongside it until the UI cuts over.
+/// sole batch read surface since the legacy `/api/batches` was retired.
 async fn api_transfers(
     State(state): State<Arc<WebState>>,
 ) -> Result<Json<Vec<TransferDto>>, (StatusCode, String)> {
@@ -1745,8 +1542,7 @@ async fn api_transfers(
         tracing::error!(error = %msg, "web transfers: read outbound failed");
         (StatusCode::INTERNAL_SERVER_ERROR, msg)
     })?;
-    // Group outbound rows by package_ref (one row per target on a fan-out) — the
-    // same idiom as `api_batches`.
+    // Group outbound rows by package_ref (one row per target on a fan-out).
     let mut by_ref: HashMap<&str, Vec<&OutboundRow>> = HashMap::new();
     for row in &outbound {
         by_ref.entry(row.package_ref.as_str()).or_default().push(row);
@@ -2544,13 +2340,13 @@ fn to_sent_dto(r: &OutboundRow) -> SentDto {
 }
 
 /// Read a package's manifest ONCE and derive both the operator-facing filenames
-/// and the package's total byte size, for the `Sent` row. `files` are the
-/// file-name component of each record's `rel_path`, capped at [`SENT_FILES_CAP`];
-/// `byte_size` is the sum of EVERY record's `byte_size` (the full manifest, not
-/// just the capped names). An unreadable or missing manifest yields
-/// `(vec![], 0)` — never an error, so `/api/sent` still lists the row and the UI
-/// falls back to the dir basename. T1 keeps the manifest alive through payload
-/// cleanup, so a confirmed row still resolves its names + size.
+/// and the package's total byte size, for a [`SentDto`] in-flight row. `files` are
+/// the file-name component of each record's `rel_path`, capped at
+/// [`SENT_FILES_CAP`]; `byte_size` is the sum of EVERY record's `byte_size` (the
+/// full manifest, not just the capped names). An unreadable or missing manifest
+/// yields `(vec![], 0)` — never an error, so the status page still lists the row
+/// and the UI falls back to the dir basename. T1 keeps the manifest alive through
+/// payload cleanup, so a confirmed row still resolves its names + size.
 fn sent_manifest_summary(package_ref: &str) -> (Vec<String>, u64) {
     match read_manifest(Path::new(package_ref)) {
         Ok(records) => {
@@ -2573,32 +2369,6 @@ fn sent_manifest_summary(package_ref: &str) -> (Vec<String>, u64) {
             (Vec::new(), 0)
         }
     }
-}
-
-/// Map a [`HistoryRow`] to its wire DTO, resolving a friendly peer name (when
-/// known) and computing the transfer duration.
-fn to_history_dto(r: &HistoryRow, device_names: &HashMap<String, String>) -> HistoryDto {
-    HistoryDto {
-        filename: r.filename.clone(),
-        object: r.object.clone(),
-        peer_device: r.peer_device.clone(),
-        peer_name: device_names.get(&r.peer_device).cloned(),
-        direction: r.direction.as_str().to_string(),
-        bytes: r.bytes,
-        started_at: r.started_at.clone(),
-        finished_at: r.finished_at.clone(),
-        duration_secs: duration_secs(&r.started_at, r.finished_at.as_deref()),
-        outcome: r.outcome.clone(),
-    }
-}
-
-/// `finished - started` in seconds, or `None` when the row is unfinished or
-/// either stamp fails to parse as RFC3339. Never panics.
-fn duration_secs(started: &str, finished: Option<&str>) -> Option<f64> {
-    let finished = finished?;
-    let s = chrono::DateTime::parse_from_rfc3339(started).ok()?;
-    let f = chrono::DateTime::parse_from_rfc3339(finished).ok()?;
-    Some((f - s).num_milliseconds() as f64 / 1000.0)
 }
 
 #[cfg(test)]
@@ -3245,222 +3015,54 @@ mod tests {
         assert_eq!(ok.status(), StatusCode::OK, "a loopback Host passes through");
     }
 
+    /// Migrated from the retired `/api/sent` tests: `to_sent_dto` +
+    /// `sent_manifest_summary` now live on only because `/api/status`'s in-flight
+    /// list reuses the same mapper. A non-terminal (queued) row surfaces its
+    /// manifest filenames (dir stripped, capped at `SENT_FILES_CAP`), the summed
+    /// `byteSize` over the FULL manifest (not just the capped names), and
+    /// `nextRetryAt` straight off the row; a row whose package has no readable
+    /// manifest reports empty `files` (never an error).
     #[tokio::test]
-    async fn sent_lists_all_states_and_filters_by_state() {
-        let (state, _tmp) = test_state().await;
-        let app = build_router(state, None);
-
-        // Unfiltered → both rows, with their state strings + deletable flag.
-        let res = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/sent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let v = body_json(res).await;
-        let rows = v.as_array().unwrap();
-        assert_eq!(rows.len(), 2);
-        let states: Vec<&str> = rows.iter().map(|r| r["state"].as_str().unwrap()).collect();
-        assert!(states.contains(&"confirmed"));
-        assert!(states.contains(&"transferring"));
-        // deletable is exactly `state == confirmed`.
-        for r in rows {
-            let expect = r["state"] == "confirmed";
-            assert_eq!(r["deletable"], expect);
-        }
-
-        // Filtered → only the confirmed one.
-        let res = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/sent?state=confirmed")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let v = body_json(res).await;
-        let rows = v.as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["state"], "confirmed");
-        assert_eq!(rows[0]["deletable"], true);
-    }
-
-    /// Write a real package dir: a `manifest.ndjson` with one record per
-    /// `rel_path`, no payload files (we only read the manifest). Returns the dir.
-    fn write_manifest_package(dir: &std::path::Path, rel_paths: &[&str]) -> PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
-        let mut ndjson = String::new();
-        for (i, rp) in rel_paths.iter().enumerate() {
-            let rec = ManifestRecord {
-                v: MANIFEST_VERSION,
-                frame_uuid: format!("uuid-{i}"),
-                origin_catalog_uuid: format!("uuid-{i}"),
-                origin_device: "self-node".to_string(),
-                payload_kind: PayloadKind::RawFrame,
-                rel_path: rp.to_string(),
-                byte_size: 0,
-                xxh3: "0".repeat(16),
-                frame_meta: serde_json::json!({}),
-                analysis: None,
-                app_version: "test".to_string(),
-                project: None,
-            };
-            ndjson.push_str(&serde_json::to_string(&rec).unwrap());
-            ndjson.push('\n');
-        }
-        std::fs::write(dir.join(MANIFEST_FILENAME), ndjson).unwrap();
-        dir.to_path_buf()
-    }
-
-    /// `/api/sent` surfaces the package's filenames (the file-name component of
-    /// each manifest `rel_path`), capped at `SENT_FILES_CAP`; a row whose
-    /// package dir has no readable manifest reports an empty `files` (never an
-    /// error — the row still lists).
-    #[tokio::test]
-    async fn sent_reports_manifest_filenames_capped_and_empty_when_unreadable() {
+    async fn status_in_flight_reports_manifest_files_capped_bytes_and_next_retry() {
         let (state, tmp) = test_state().await;
-
-        // A real one-file package → its filename surfaces (dir stripped).
-        let pkg = write_manifest_package(&tmp.path().join("pkg-real"), &["frames/light-0009.fits"]);
-        state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
-
-        // Seven files → capped at SENT_FILES_CAP (6).
-        let many: Vec<String> = (0..7).map(|i| format!("f-{i}.fits")).collect();
-        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
-        let big = write_manifest_package(&tmp.path().join("pkg-many"), &refs);
-        state.store.enqueue(&big.to_string_lossy(), PEER, None, &[]).unwrap();
+        // Eight sized records (one path carrying a directory) → files cap at
+        // SENT_FILES_CAP with the file-name component only; byteSize sums all eight.
+        let sized: Vec<(String, u64)> = (0..8)
+            .map(|i| (format!("frames/f-{i}.fits"), 1000 * (i as u64 + 1)))
+            .collect();
+        let refs: Vec<(&str, u64)> = sized.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+        let pkg = write_sized_manifest_package(&tmp.path().join("pkg-sized"), &refs);
+        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        state
+            .store
+            .set_next_retry_at(id, Some("2026-07-16T12:00:00Z"))
+            .unwrap();
 
         let app = build_router(state, None);
-        let res = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/sent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let v = body_json(res).await;
-        let rows = v.as_array().unwrap();
+        let v = body_json(get(&app, "/api/status").await).await;
+        let in_flight = v["inFlight"].as_array().unwrap();
 
-        let real = rows
+        let sized_row = in_flight
             .iter()
-            .find(|r| r["packageRef"].as_str().unwrap().ends_with("pkg-real"))
-            .unwrap();
-        assert_eq!(real["files"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            real["files"][0], "light-0009.fits",
-            "file-name component only"
-        );
+            .find(|r| r["packageRef"].as_str().unwrap().ends_with("pkg-sized"))
+            .expect("the queued sized package is in flight");
+        let files = sized_row["files"].as_array().unwrap();
+        assert_eq!(files.len(), SENT_FILES_CAP, "filenames capped at SENT_FILES_CAP");
+        assert_eq!(files[0], "f-0.fits", "file-name component only (dir stripped)");
+        // byteSize = 1000·(1+2+…+8) = 36000 — the full manifest, not the capped files.
+        assert_eq!(sized_row["byteSize"].as_u64().unwrap(), 36000, "sum of every record");
+        assert_eq!(sized_row["nextRetryAt"], "2026-07-16T12:00:00Z");
 
-        let big_row = rows
+        // The seeded `pkg-transferring` row has no manifest on disk → empty files,
+        // never an error row.
+        let bogus = in_flight
             .iter()
-            .find(|r| r["packageRef"].as_str().unwrap().ends_with("pkg-many"))
-            .unwrap();
-        assert_eq!(
-            big_row["files"].as_array().unwrap().len(),
-            SENT_FILES_CAP,
-            "the server caps filenames at SENT_FILES_CAP"
-        );
-
-        // The seeded bogus-ref rows have no manifest on disk → empty files.
-        let bogus = rows
-            .iter()
-            .find(|r| r["packageRef"] == "pkg-confirmed")
-            .unwrap();
+            .find(|r| r["packageRef"] == "pkg-transferring")
+            .expect("the seeded transferring row is in flight");
         assert!(
             bogus["files"].as_array().unwrap().is_empty(),
             "an unreadable manifest yields empty files, not an error row"
         );
-    }
-
-    #[tokio::test]
-    async fn history_filters_and_computes_duration_and_peer_name() {
-        let (state, _tmp) = test_state().await;
-        let app = build_router(state, None);
-
-        // Unfiltered → both rows.
-        let res = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/history")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let v = body_json(res).await;
-        assert_eq!(v.as_array().unwrap().len(), 2);
-        // The finished 'sent' row carries a 2.5s duration; peerName is None
-        // (no device-name cache until Task 11).
-        let sent = v
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["direction"] == "sent")
-            .unwrap();
-        assert_eq!(sent["filename"], "frame-0001.fits");
-        assert_eq!(sent["durationSecs"], 2.5);
-        assert!(sent["peerName"].is_null());
-        // The unfinished 'received' row has no duration.
-        let recv = v
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["direction"] == "received")
-            .unwrap();
-        assert!(recv["durationSecs"].is_null());
-
-        // Exact-filename filter.
-        let res = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/history?query=frame-0001.fits")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let v = body_json(res).await;
-        let rows = v.as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["filename"], "frame-0001.fits");
-
-        // Direction filter.
-        let res = app
-            .clone()
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/history?direction=received")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let v = body_json(res).await;
-        let rows = v.as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["direction"], "received");
-
-        // Bad direction → 400.
-        let res = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/api/history?direction=sideways")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -4257,54 +3859,6 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// The server computes the two affordance flags: `declined` only for the
-    /// exact receiver-decline detail; `resendable` for every terminal EXCEPT a
-    /// decline (confirmed included — its payload is rebuilt at retry time).
-    #[tokio::test]
-    async fn sent_dto_flags_declined_and_resendable() {
-        let (state, _tmp) = test_state().await;
-        let failed = state.store.enqueue("pkg-failed", PEER, None, &[]).unwrap();
-        state.store.set_state(failed, OutboundState::Failed).unwrap();
-        let declined = state.store.enqueue("pkg-declined", PEER, None, &[]).unwrap();
-        state.store.set_state(declined, OutboundState::Cancelled).unwrap();
-        state
-            .store
-            .set_last_error(declined, Some(athenaeum_core::sync::CANCELLED_BY_RECEIVER_DETAIL))
-            .unwrap();
-
-        let confirmed_ref = "pkg-confirmed"; // seeded by test_state
-        let transferring_ref = "pkg-transferring"; // seeded by test_state
-        let app = build_router(state, None);
-        let res = app
-            .oneshot(
-                HttpRequest::builder()
-                    .method("GET")
-                    .uri("/api/sent")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let v = body_json(res).await;
-        let flag_of = |pref: &str| {
-            let row = v
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|r| r["packageRef"] == pref)
-                .unwrap_or_else(|| panic!("row for {pref}"));
-            (
-                row["declined"].as_bool().unwrap(),
-                row["resendable"].as_bool().unwrap(),
-            )
-        };
-        assert_eq!(flag_of(confirmed_ref), (false, true), "confirmed → Send again");
-        assert_eq!(flag_of(transferring_ref), (false, false), "live row → neither");
-        assert_eq!(flag_of("pkg-failed"), (false, true), "failed → Retry");
-        assert_eq!(flag_of("pkg-declined"), (true, false), "declined → divert only");
-    }
-
     /// v2.1 §D1: retrying a failed package resets the SAME row in place —
     /// `newId == oldId`, `generation` bumps to 2, the row leaves its terminal
     /// state, and no additional outbound row is minted for the package dir.
@@ -4579,33 +4133,6 @@ mod tests {
         }
         std::fs::write(dir.join(MANIFEST_FILENAME), ndjson).unwrap();
         dir.to_path_buf()
-    }
-
-    /// `/api/sent` surfaces `nextRetryAt` (straight from the row) and `byteSize`
-    /// (sum over the FULL manifest, not just the capped `files`) — Task 9.
-    #[tokio::test]
-    async fn sent_reports_next_retry_at_and_byte_size() {
-        let (state, tmp) = test_state().await;
-        let pkg = write_sized_manifest_package(
-            &tmp.path().join("pkg-sized"),
-            &[("a.fits", 1000), ("b.fits", 2000), ("c.fits", 3000)],
-        );
-        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
-        state
-            .store
-            .set_next_retry_at(id, Some("2026-07-16T12:00:00Z"))
-            .unwrap();
-
-        let app = build_router(state, None);
-        let v = body_json(get(&app, "/api/sent").await).await;
-        let row = v
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|r| r["packageRef"].as_str().unwrap().ends_with("pkg-sized"))
-            .unwrap();
-        assert_eq!(row["byteSize"].as_u64().unwrap(), 6000, "sum of every record");
-        assert_eq!(row["nextRetryAt"], "2026-07-16T12:00:00Z");
     }
 
     async fn post_ids(app: Router, uri: &str, ids: &[i64]) -> serde_json::Value {
@@ -5208,48 +4735,6 @@ mod tests {
         assert_eq!(v["tree"]["count"], 0);
         assert!(v["tree"]["children"].as_array().unwrap().is_empty());
         assert_eq!(v["mode"], "auto", "the send mode still surfaces");
-    }
-
-    /// `GET /api/batches` lists recorded batches (newest-first) joined with the
-    /// engine's outbound state: a batch whose package has a confirmed outbound row
-    /// reads `outcome: confirmed`; one with no outbound row degrades to `sending`.
-    #[tokio::test]
-    async fn batches_lists_and_joins_outbound_state() {
-        let (state, _tmp) = test_state().await;
-        // The seeded confirmed outbound row is `pkg-confirmed`; record a batch for
-        // it plus one for a package with no outbound row at all.
-        state
-            .batches
-            .record("pkg-confirmed", "manual", "2026-07-12T02:00:00Z", 3)
-            .unwrap();
-        state
-            .batches
-            .record("pkg-orphan", "auto", "2026-07-12T01:00:00Z", 1)
-            .unwrap();
-        let app = build_router(state, None);
-
-        let v = body_json(get(&app, "/api/batches").await).await;
-        let rows = v.as_array().unwrap();
-        assert_eq!(rows.len(), 2);
-        // Newest-first: pkg-confirmed (02:00) before pkg-orphan (01:00).
-        assert_eq!(rows[0]["packageRef"], "pkg-confirmed");
-        assert_eq!(rows[0]["mode"], "manual");
-        assert_eq!(rows[0]["fileCount"], 3);
-        assert_eq!(rows[0]["new"], 0, "new/duplicate are not persisted → 0");
-        assert_eq!(rows[0]["duplicate"], 0);
-        assert_eq!(
-            rows[0]["outcome"], "confirmed",
-            "its outbound row is confirmed"
-        );
-        assert_eq!(rows[0]["targets"].as_array().unwrap().len(), 1);
-        assert_eq!(rows[0]["targets"][0]["state"], "confirmed");
-
-        assert_eq!(rows[1]["packageRef"], "pkg-orphan");
-        assert_eq!(
-            rows[1]["outcome"], "sending",
-            "no outbound row yet → sending, not an error"
-        );
-        assert!(rows[1]["targets"].as_array().unwrap().is_empty());
     }
 
     // ── Task 4 (Perseus UI v2): grouped /api/transfers + events + verdict ─────
