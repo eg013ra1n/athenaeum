@@ -200,6 +200,7 @@ pub const DDL_INBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_inbound (
     project_id TEXT,
     generation INTEGER NOT NULL DEFAULT 1,
     declined_at TEXT,
+    peer_capability TEXT,
     UNIQUE(peer, package_id)
 )";
 
@@ -262,6 +263,11 @@ fn ensure_inbound_columns_inner(conn: &Connection, existing: &HashSet<String>) -
         // attempt-level `state` column (which sender revokes / restart reconcile /
         // epilogues legitimately overwrite).
         ("declined_at", "TEXT"),
+        // Perseus UI v2 (Task 9): the announcing peer's device capability
+        // (`"athenaeum"` / `"perseus"`), stamped at announce time from the cached
+        // device-list capability map so it survives a later device revocation.
+        // Informational only — never gates a transfer.
+        ("peer_capability", "TEXT"),
     ] {
         if !existing.contains(col) {
             conn.execute(&format!("ALTER TABLE sync_inbound ADD COLUMN {col} {ty}"), [])
@@ -783,7 +789,7 @@ fn inbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<InboundRaw> {
     Ok((
         r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
         r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?, r.get(14)?,
-        r.get(15)?,
+        r.get(15)?, r.get(16)?,
     ))
 }
 
@@ -1235,7 +1241,7 @@ pub fn load_receipts(conn: &Connection, package_id: &str) -> Result<Vec<FrameRec
 // package_id)` UNIQUE constraint anchors the upsert.
 
 const INBOUND_COLS: &str =
-    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at, display_name, landing_dir, batch_uuid, project_id, generation, declined_at";
+    "id, peer, package_id, state, frame_count, byte_size, bytes_done, last_error, created_at, finished_at, display_name, landing_dir, batch_uuid, project_id, generation, declined_at, peer_capability";
 
 /// Raw column tuple for a `sync_inbound` row, parsed into [`InboundRow`] by
 /// [`to_inbound`] so fallible text parsing happens outside the rusqlite closure.
@@ -1255,6 +1261,7 @@ type InboundRaw = (
     Option<String>,
     Option<String>,
     i64,
+    Option<String>,
     Option<String>,
 );
 
@@ -1276,6 +1283,7 @@ fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
         project_id,
         generation,
         declined_at,
+        peer_capability,
     ) = raw;
     Ok(InboundRow {
         id,
@@ -1294,6 +1302,7 @@ fn to_inbound(raw: InboundRaw) -> Result<InboundRow> {
         project_id,
         generation: generation.max(0) as u32,
         declined_at,
+        peer_capability,
     })
 }
 
@@ -1640,6 +1649,22 @@ pub fn set_inbound_display_name(conn: &Connection, id: i64, display_name: Option
         params![display_name, id],
     )
     .with_context(|| format!("set display_name for inbound {id}"))?;
+    Ok(())
+}
+
+/// Stamp the announcing peer's device capability (`"athenaeum"` / `"perseus"`)
+/// onto an inbound row (Perseus UI v2, Task 9). The receiver writes this at
+/// announce time from the cached device-list capability map so the Transfers UI
+/// can show whether a received transfer came from a full Athenaeum peer or a
+/// send-only Perseus agent — and, by living on the row, the stamp survives a
+/// later device revocation that empties that cache. Keyed by row `id`;
+/// best-effort at the call site (a cache miss simply leaves the column `NULL`).
+pub fn set_inbound_peer_capability(conn: &Connection, id: i64, cap: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_inbound SET peer_capability = ?2 WHERE id = ?1",
+        params![id, cap],
+    )
+    .context("set sync_inbound.peer_capability")?;
     Ok(())
 }
 
@@ -3041,6 +3066,32 @@ mod tests {
         assert_eq!(row.frame_count, 5, "a cancelled row is a full no-op — counts not refreshed");
         assert_eq!(row.byte_size, 1000);
         assert_eq!(row.last_error.as_deref(), Some("declined"), "cancel reason preserved");
+    }
+
+    /// Perseus UI v2 (Task 9): a fresh inbound row has a NULL `peer_capability`;
+    /// [`set_inbound_peer_capability`] persists the announcing peer's capability
+    /// and it round-trips through the `INBOUND_COLS` read path.
+    #[test]
+    fn peer_capability_roundtrips_and_defaults_null() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_INBOUND, []).unwrap();
+        let peer = "aa".repeat(32);
+        let pkg = "pkg-cap-1";
+
+        let id = upsert_inbound_announced(&conn, &peer, pkg, 2, 200).unwrap();
+        let row = get_inbound(&conn, pkg).unwrap().unwrap();
+        assert_eq!(row.peer_capability, None, "a fresh row has no capability stamp");
+
+        set_inbound_peer_capability(&conn, id, "perseus").unwrap();
+        let row = get_inbound(&conn, pkg).unwrap().unwrap();
+        assert_eq!(row.peer_capability.as_deref(), Some("perseus"), "capability persisted");
+
+        // Re-stamp overwrites in place (an attempt from a since-reclassified device).
+        set_inbound_peer_capability(&conn, id, "athenaeum").unwrap();
+        assert_eq!(
+            get_inbound(&conn, pkg).unwrap().unwrap().peer_capability.as_deref(),
+            Some("athenaeum"),
+        );
     }
 
     /// `next_retry_at` round-trips through a write + read and clears with `None`

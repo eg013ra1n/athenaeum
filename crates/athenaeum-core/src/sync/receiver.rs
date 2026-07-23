@@ -1044,6 +1044,23 @@ async fn handle_announce(
         .with_context(|| format!("record inbound announce {package_id} (batch {batch_uuid})"))?
     };
 
+    // Stamp the announcing peer's device capability onto the row (Perseus UI v2,
+    // Task 9) so the Transfers UI can later show whether this transfer came from a
+    // full Athenaeum peer or a send-only Perseus agent. Read from the cached
+    // account-device capability map — persisting it onto the row means the label
+    // survives a later device revocation that empties that cache. Best-effort and
+    // strictly informational: a cache miss leaves the column NULL and a write
+    // failure only warns; neither ever affects the transfer. Skipped on a DECLINED
+    // (final) row — it was already stamped on its first attempt and must stay inert.
+    if !declined_final {
+        let conn = store.lock_conn();
+        if let Some(cap) = super::ingest::cached_device_capability(&conn, &peer_device) {
+            if let Err(error) = super::store::set_inbound_peer_capability(&conn, inbound_id, &cap) {
+                tracing::warn!(%error, inbound_id, "failed to stamp peer capability");
+            }
+        }
+    }
+
     // Record the v2 manifest onto the row BEFORE any fetch — the receiver knows the
     // whole tree the moment the announce lands. Refreshes name + REPLACES the
     // per-file set on a re-announce (naturally re-keyed to the same batch row);
@@ -2916,6 +2933,144 @@ mod tests {
         assert!(fetch_with_bytes, "a fetching progress tick carried bytes: {events:?}");
         let file_ticks = events.iter().filter(|(n, _)| n == "sync-file-progress").count();
         assert!(file_ticks >= 1, "at least one sync-file-progress event: {events:?}");
+    }
+
+    /// Perseus UI v2 (Task 9): when the announcing peer is in the cached
+    /// capability map, the receiver stamps that capability onto the inbound row at
+    /// announce time. Seeds `SYNC_PEER_CAPABILITIES` with `sender_hex → "perseus"`,
+    /// drives a full announce, and asserts the persisted row carries
+    /// `peer_capability == Some("perseus")`.
+    #[tokio::test]
+    async fn announce_stamps_peer_capability_from_cache() {
+        use crate::sharing::SharingTransport;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        // Seed the capability cache for the SENDING node (the `from` the receiver
+        // stamps). Written through the store's own connection so the receiver reads
+        // exactly what we wrote.
+        let sender_hex = node_id_hex(&sender.node_id());
+        {
+            let conn = store.lock_conn();
+            let map: std::collections::HashMap<String, String> =
+                [(sender_hex.clone(), "perseus".to_string())].into_iter().collect();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::SYNC_PEER_CAPABILITIES,
+                &serde_json::to_string(&map).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let recorder = Arc::new(RecordingEmitter::default());
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            Arc::new(move || incoming.clone()) as IncomingResolver,
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
+
+        let mut final_row = None;
+        for _ in 0..400 {
+            let row = {
+                let conn = store.lock_conn();
+                get_inbound(&conn, &announce.package_id.0).unwrap()
+            };
+            if let Some(r) = row {
+                if r.state == InboundState::Done {
+                    final_row = Some(r);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let row = final_row.expect("inbound row reached Done");
+        assert_eq!(
+            row.peer_capability.as_deref(),
+            Some("perseus"),
+            "the announcing peer's cached capability is stamped onto the row",
+        );
+    }
+
+    /// Perseus UI v2 (Task 9): with NO capability cache seeded, the stamp is a
+    /// silent no-op (`peer_capability` stays NULL) and the transfer still lands
+    /// end-to-end — proving the stamp is strictly best-effort/informational.
+    #[tokio::test]
+    async fn announce_without_capability_cache_leaves_null_and_still_lands() {
+        use crate::sharing::SharingTransport;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        let recorder = Arc::new(RecordingEmitter::default());
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            Arc::new(move || incoming.clone()) as IncomingResolver,
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
+
+        let mut final_row = None;
+        for _ in 0..400 {
+            let row = {
+                let conn = store.lock_conn();
+                get_inbound(&conn, &announce.package_id.0).unwrap()
+            };
+            if let Some(r) = row {
+                if r.state == InboundState::Done {
+                    final_row = Some(r);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let row = final_row.expect("inbound row reached Done even with no capability cache");
+        assert_eq!(row.peer_capability, None, "no cache ⇒ no capability stamp");
     }
 
     /// Reviewer finding (Task 11 follow-up): an ingest failure AFTER the row is

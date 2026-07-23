@@ -202,6 +202,31 @@ fn account_device_names(
         .collect()
 }
 
+/// A node-id-hex → device-capability (`"athenaeum"` / `"perseus"`) map over the
+/// account device list — the capability sibling of [`account_device_names`]. The
+/// receiver reads this cache at announce time to stamp the announcing peer's
+/// capability onto its `sync_inbound` row (Perseus UI v2, Task 9), so the
+/// Transfers UI can show whether a received transfer came from a full Athenaeum
+/// peer or a send-only Perseus agent. Undecodable pubkeys are skipped. Serialized
+/// to [`SYNC_PEER_CAPABILITIES`](keys::SYNC_PEER_CAPABILITIES) by
+/// [`refresh_authorized_peers`].
+fn account_device_capabilities(
+    devices: &[crate::account::AccountDevice],
+) -> HashMap<String, String> {
+    devices
+        .iter()
+        .filter_map(|d| {
+            pubkey_b64_to_hex(&d.pubkey).map(|hex| {
+                let cap = match d.capability {
+                    crate::account::DeviceCapability::Perseus => "perseus",
+                    crate::account::DeviceCapability::Athenaeum => "athenaeum",
+                };
+                (hex, cap.to_string())
+            })
+        })
+        .collect()
+}
+
 /// Build the receiver's live peer-authorization gate (finding H1). A signed-in
 /// node enforces the cached allow-list (`SYNC_AUTHORIZED_PEERS`), re-read from
 /// settings on **every** announce so a hub refresh takes effect on the next
@@ -419,6 +444,7 @@ pub async fn refresh_authorized_peers(ctx: &ServiceContext) {
     };
     let hexes = account_peer_hexes(&devices);
     let names = account_device_names(&devices);
+    let capabilities = account_device_capabilities(&devices);
     if let Ok(db) = db(ctx) {
         let conn = db.conn();
         if let Err(e) = crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &hexes.join("\n"))
@@ -440,6 +466,22 @@ pub async fn refresh_authorized_peers(ctx: &ServiceContext) {
                 }
             }
             Err(e) => tracing::warn!(error = %e, "failed to serialize device names cache"),
+        }
+        // Cache the hex → device-capability map too (best-effort, informational):
+        // the receiver reads it at announce time to stamp the announcing peer's
+        // capability onto its inbound row (Perseus UI v2, Task 9), which is how the
+        // Transfers UI later shows "from a Perseus agent" vs "from an Athenaeum
+        // peer". A serialize/write failure only leaves rows unstamped — never
+        // blocks the allow-list.
+        match serde_json::to_string(&capabilities) {
+            Ok(json) => {
+                if let Err(e) = crate::db::set_setting(&conn, keys::SYNC_PEER_CAPABILITIES, &json) {
+                    tracing::warn!(error = %e, "failed to cache device capabilities");
+                } else {
+                    tracing::debug!(count = capabilities.len(), "refreshed cached device capabilities");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to serialize device capabilities cache"),
         }
     }
 }
@@ -5007,6 +5049,40 @@ mod tests {
         assert_eq!(names.get(&"01".repeat(32)).map(String::as_str), Some("n1"));
         assert_eq!(names.get(&"02".repeat(32)).map(String::as_str), Some("n2"));
         assert_eq!(names.get(&"03".repeat(32)).map(String::as_str), Some("n3"));
+    }
+
+    /// Perseus UI v2 (Task 9): the capability cache maps each decodable pubkey's
+    /// hex → its device capability string — the source the receiver reads to stamp
+    /// an inbound row so the Transfers UI can tell an Athenaeum peer from a Perseus
+    /// agent. Undecodable pubkeys are skipped, same as the names/hex maps.
+    #[test]
+    fn account_device_capabilities_maps_hex_to_capability_string() {
+        use base64::Engine;
+        use crate::account::{AccountDevice, DeviceCapability};
+        let b64 = |bytes: [u8; 32]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let dev = |seed: u8, capability: DeviceCapability| AccountDevice {
+            id: format!("dev-{seed}"),
+            name: format!("n{seed}"),
+            pubkey: b64([seed; 32]),
+            capability,
+            created_at: "2026-07-22T00:00:00Z".into(),
+            last_seen_at: None,
+            endpoint_addr: None,
+        };
+        let devices = vec![
+            dev(1, DeviceCapability::Athenaeum),
+            dev(2, DeviceCapability::Perseus),
+        ];
+        let caps = account_device_capabilities(&devices);
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps.get(&"01".repeat(32)).map(String::as_str), Some("athenaeum"));
+        assert_eq!(caps.get(&"02".repeat(32)).map(String::as_str), Some("perseus"));
+
+        // An undecodable pubkey is skipped, never a partial/garbage entry.
+        let mut bad = dev(3, DeviceCapability::Perseus);
+        bad.pubkey = "not-base64!!".into();
+        let caps = account_device_capabilities(&[bad]);
+        assert!(caps.is_empty(), "an undecodable pubkey yields no capability entry");
     }
 
     /// The relay-map cache round-trips through settings the same way.

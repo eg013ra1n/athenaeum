@@ -244,6 +244,16 @@ pub struct InboundRow {
     /// written by `handle_revoke`.
     #[serde(default)]
     pub declined_at: Option<String>,
+    /// The announcing peer's device capability (`"athenaeum"` / `"perseus"`),
+    /// stamped at announce time from the cached account-device capability map
+    /// (Perseus UI v2, Task 9). Lets the Transfers UI show whether a received
+    /// transfer came from a full Athenaeum peer or a send-only Perseus agent.
+    /// Persisted onto the row (not looked up live) so it survives a later device
+    /// revocation that empties the cache. `None` when the announcing peer was not
+    /// in the cached capability map at announce time (or a row created before this
+    /// column). Informational only — never gates a transfer.
+    #[serde(default)]
+    pub peer_capability: Option<String>,
 }
 
 /// Direction of a transfer recorded in [`HistoryRow`]. This sender-side task

@@ -174,6 +174,16 @@ pub mod keys {
     /// ⇒ the receiver falls back to the hex-derived slug. Purely cosmetic (folder
     /// naming); never gates a transfer.
     pub const SYNC_DEVICE_NAMES: &str = "sync.device_names";
+    /// Cached node-id-hex → device capability map (JSON object, values
+    /// `"athenaeum"` / `"perseus"`), refreshed alongside [`SYNC_AUTHORIZED_PEERS`]
+    /// from the hub device list. The receiver reads this at announce time to stamp
+    /// the announcing peer's capability onto its `sync_inbound` row (so the
+    /// Transfers UI can show whether a received transfer came from a full
+    /// Athenaeum peer or a send-only Perseus agent). Persisting the stamp onto the
+    /// row means it survives a later device revocation that empties this cache.
+    /// Absent / a hex not in the map ⇒ no stamp (the row's `peer_capability` stays
+    /// `NULL`); purely informational, never gates a transfer.
+    pub const SYNC_PEER_CAPABILITIES: &str = "sync.peer_capabilities";
 }
 
 /// Runtime overrides for settings (session-specific)

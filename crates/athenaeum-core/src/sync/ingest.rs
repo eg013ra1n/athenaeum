@@ -745,6 +745,32 @@ fn cached_device_name(conn: &Connection, peer_hex: &str) -> Option<String> {
     }
 }
 
+/// Look up `peer_hex` in the cached node-id-hex → device-capability map
+/// ([`SYNC_PEER_CAPABILITIES`](crate::settings::keys::SYNC_PEER_CAPABILITIES), a
+/// JSON object with `"athenaeum"` / `"perseus"` values). A cheap settings read
+/// (no hub round-trip), the capability sibling of [`cached_device_name`]. The
+/// receiver reads it at announce time to stamp the announcing peer's capability
+/// onto its `sync_inbound` row (Perseus UI v2, Task 9). Best-effort: an absent
+/// setting, an unreadable settings row, or malformed JSON all yield `None`
+/// (logged at `warn`, never swallowed) so the row simply gets no capability stamp.
+pub(crate) fn cached_device_capability(conn: &Connection, peer_hex: &str) -> Option<String> {
+    let raw = match crate::db::get_setting(conn, crate::settings::keys::SYNC_PEER_CAPABILITIES) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(error = %e, "sync ingest: capability cache read failed; no capability stamp");
+            return None;
+        }
+    };
+    match serde_json::from_str::<HashMap<String, String>>(&raw) {
+        Ok(map) => map.get(peer_hex).cloned(),
+        Err(e) => {
+            tracing::warn!(error = %e, "sync ingest: capability cache parse failed; no capability stamp");
+            None
+        }
+    }
+}
+
 /// A filesystem-safe single path segment derived from a display string (the
 /// per-sender landing-folder prefix). Lowercase; any char outside
 /// `[a-z0-9._-]` → `-`; runs of `-` collapse; leading/trailing `-`/`.` trimmed;
