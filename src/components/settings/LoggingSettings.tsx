@@ -15,11 +15,16 @@ const LEVELS: Array<{ value: string; label: string }> = [
 
 /** UI module keys — must match `MODULE_TARGETS` in
  *  `athenaeum-core/src/logging/config.rs`. */
-const MODULES: Array<{ key: string; label: string }> = [
+const MODULES: Array<{ key: string; label: string; hint?: string }> = [
   { key: 'scanner', label: 'Scanner' },
   { key: 'solver', label: 'Plate Solver' },
   { key: 'calibration', label: 'Calibration' },
   { key: 'archive', label: 'Archive / File Ops' },
+  {
+    key: 'transport',
+    label: 'Transport (iroh / relays)',
+    hint: 'Relay, hole-punching and blob-transfer internals. Very verbose at Debug — turn it on to diagnose a transfer or relay problem, then back to Inherit.',
+  },
 ];
 
 /** Sentinel select value meaning "key absent from `modules`" — falls back to
@@ -165,6 +170,7 @@ export default function LoggingSettings() {
                   </option>
                 ))}
               </select>
+              {m.hint && <p className="text-xs text-content-muted mt-1">{m.hint}</p>}
             </div>
           ))}
         </div>

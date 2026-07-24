@@ -24,13 +24,35 @@ const THIRD_PARTY_QUIET: [&str; 7] = [
 ];
 
 /// UI module key -> tracing filter targets.
-const MODULE_TARGETS: [(&str, &[&str]); 4] = [
+const MODULE_TARGETS: [(&str, &[&str]); 5] = [
     ("scanner", &["athenaeum_core::scanner"]),
     ("solver", &["athenaeum_core::plate_solve", "solvemyastro"]),
     ("calibration", &["athenaeum_core::calibration"]),
     (
         "archive",
         &["athenaeum_core::archive", "athenaeum_core::file_op"],
+    ),
+    // The one switch that lifts the iroh transport back out of the
+    // `THIRD_PARTY_QUIET` baseline: that baseline is appended BEFORE the module
+    // overrides and `EnvFilter` is last-directive-wins, so these win. Without it
+    // a transport fault is only reachable through `ATHENAEUM_LOG` — which is how
+    // a fleet-wide NAT-traversal outage stayed invisible for months (every QUIC
+    // address-discovery probe was timing out at DEBUG under `iroh=warn`). Every
+    // quieted target is repeated here (a subset would leave part of the transport
+    // silent) plus our own side of the seam, so one switch covers both;
+    // `transport_module_covers_every_quieted_target` fails if the lists drift.
+    (
+        "transport",
+        &[
+            "iroh",
+            "iroh_relay",
+            "iroh_blobs",
+            "net_report",
+            "portmapper",
+            "netwatch",
+            "noq_udp",
+            "athenaeum_core::sharing::iroh",
+        ],
     ),
 ];
 
@@ -169,6 +191,40 @@ mod tests {
             )
         );
     }
+    #[test]
+    fn transport_module_overrides_the_third_party_quiet_baseline() {
+        // The baseline quiets `iroh` & friends to warn; the `transport` override
+        // must come AFTER it in the directive string, because EnvFilter resolves
+        // duplicates last-directive-wins. Order is the whole mechanism here.
+        let mut cfg = LoggingConfig::default();
+        cfg.modules.insert("transport".into(), "debug".into());
+        let d = cfg.to_directives();
+        let quiet_at = d.find("iroh=warn").expect("baseline quiets iroh");
+        let debug_at = d.find("iroh=debug").expect("transport override raises iroh");
+        assert!(
+            quiet_at < debug_at,
+            "the override must follow the baseline, got {d:?}"
+        );
+        assert!(d.parse::<tracing_subscriber::EnvFilter>().is_ok(), "{d:?}");
+    }
+
+    #[test]
+    fn transport_module_covers_every_quieted_target() {
+        // Drift guard: a target quieted by the baseline but missing from the
+        // `transport` module would stay silent with no way to raise it from the
+        // UI — exactly the blind spot this module exists to remove.
+        let (_, targets) = MODULE_TARGETS
+            .iter()
+            .find(|(k, _)| *k == "transport")
+            .expect("transport module key");
+        for t in THIRD_PARTY_QUIET {
+            assert!(
+                targets.contains(&t),
+                "{t} is quieted by the baseline but not raisable via the transport module"
+            );
+        }
+    }
+
     #[test]
     fn unknown_module_key_is_skipped_not_fatal() {
         let mut cfg = LoggingConfig::default();

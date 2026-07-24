@@ -267,14 +267,108 @@ pub fn peer_dial_addr(
 /// can't spam the hub.
 const ADDRESS_REPORT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How many consecutive relay-less snapshots the reporter withholds after a
+/// report that DID carry a relay, before it publishes the relay-less truth.
+///
+/// The hub PUT overwrites both fields at once, so publishing a relay-less
+/// snapshot nulls a perfectly good `homeRelayUrl`. That is what used to happen
+/// mid re-home (observed: `relay_url=relay2` at 22:30:28, `relay_url=none` at
+/// 22:30:51), leaving peers that rely on the reported relay — a peer with a
+/// different relay map, or a cross-account collaborator whose direct addrs we
+/// withhold by design — with nothing to dial for a while. Two cycles ≈ 60 s of
+/// grace covers a re-home; a device that genuinely lost its relay for longer must
+/// still be able to say so, so the withholding is bounded, never permanent.
+const RELAYLESS_GRACE_CYCLES: u8 = 2;
+
 /// Extract the reportable `(home_relay_url, direct_addrs)` from a node's current
-/// endpoint address. `home_relay_url` is the first relay url (iroh has at most
-/// one home relay in practice); `direct_addrs` are the IP socket addresses, as
-/// strings the hub round-trips back to peers verbatim.
+/// endpoint address. `home_relay_url` is the first relay url of the addr — a
+/// SORTED SET, so this is the alphabetically-first entry, not necessarily the
+/// live one; [`address_report`] prefers the connected relay and falls back here.
+/// `direct_addrs` are the IP socket addresses, as strings the hub round-trips
+/// back to peers verbatim.
 pub fn endpoint_addr_report_parts(addr: &iroh::EndpointAddr) -> (Option<String>, Vec<String>) {
     let home_relay_url = addr.relay_urls().next().map(|u| u.to_string());
     let direct_addrs = addr.ip_addrs().map(|a| a.to_string()).collect();
     (home_relay_url, direct_addrs)
+}
+
+/// One address snapshot as the hub stores it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AddressReport {
+    /// The home relay to advertise — the one the node is actually CONNECTED to
+    /// when known, else the last one its endpoint address still carries.
+    relay: Option<String>,
+    /// The endpoint's direct addresses.
+    direct: Vec<String>,
+}
+
+/// Take the current snapshot for `node`.
+///
+/// Relay preference matters: `EndpointAddr::relay_urls()` iterates a sorted set,
+/// and iroh 1.x can hold more than one home relay while re-homing, so `.next()`
+/// can name a relay we are not on. The node's [`RelayHealth`]-backed
+/// `transport_health()` is the aggregate the watcher maintains, so ask it first
+/// and keep the addr as the last-known fallback.
+///
+/// [`RelayHealth`]: crate::sharing::iroh::node::RelayHealth
+fn address_report(node: &SharedIrohNode) -> AddressReport {
+    let (addr_relay, direct) = endpoint_addr_report_parts(&node.endpoint_addr());
+    let health = node.transport_health();
+    let relay = preferred_relay(&health.status, health.relay_url, addr_relay);
+    AddressReport { relay, direct }
+}
+
+/// The relay to advertise: the connected one when the health surface reports one,
+/// else the last one the endpoint address still carries. Split out from
+/// [`address_report`] so the preference is testable without binding a node.
+fn preferred_relay(
+    health_status: &str,
+    health_relay: Option<String>,
+    addr_relay: Option<String>,
+) -> Option<String> {
+    match health_status {
+        "relay_connected" => health_relay,
+        _ => None,
+    }
+    .or(addr_relay)
+}
+
+/// What the reporter should do with the snapshot it just took.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportDecision {
+    /// PUT it to the hub.
+    Publish,
+    /// Nothing to say: empty, or identical to the last successful report.
+    Skip,
+    /// Relay-less snapshot taken while a relay was previously reported — withheld
+    /// so it can't null a good `homeRelayUrl` at the hub (see
+    /// [`RELAYLESS_GRACE_CYCLES`]).
+    WithholdRelayGap,
+}
+
+/// Pure decision behind the reporter loop. `relayless_streak` is how many
+/// consecutive snapshots so far have carried no relay.
+fn decide_report(
+    last: Option<&AddressReport>,
+    current: &AddressReport,
+    relayless_streak: u8,
+) -> ReportDecision {
+    if current.relay.is_none() && current.direct.is_empty() {
+        return ReportDecision::Skip; // nothing addressable to say
+    }
+    if last == Some(current) {
+        return ReportDecision::Skip; // unchanged since the last successful report
+    }
+    // A direct-addr change during the gap is withheld too: the PUT carries both
+    // fields, so there is no way to refresh the addrs without nulling the relay.
+    // It rides along on the next tick that has a relay again.
+    if current.relay.is_none()
+        && last.is_some_and(|l| l.relay.is_some())
+        && relayless_streak < RELAYLESS_GRACE_CYCLES
+    {
+        return ReportDecision::WithholdRelayGap;
+    }
+    ReportDecision::Publish
 }
 
 /// Spawn the fire-and-forget endpoint-address reporter (finding H1, T7).
@@ -304,31 +398,45 @@ pub fn spawn_endpoint_address_reporter(
                 return;
             }
         };
-        let mut last: Option<(Option<String>, Vec<String>)> = None;
+        let mut last: Option<AddressReport> = None;
+        let mut relayless_streak: u8 = 0;
         loop {
             // Snapshot without holding the node across the await/sleep.
             let current = match weak.upgrade() {
-                Some(node) => endpoint_addr_report_parts(&node.endpoint_addr()),
+                Some(node) => address_report(&node),
                 None => return, // node gone (host shutdown) → stop reporting
             };
-            let (relay, direct) = &current;
-            let has_addr = relay.is_some() || !direct.is_empty();
-            if has_addr && last.as_ref() != Some(&current) {
-                match client.put_device_address(&token, relay.as_deref(), direct).await {
-                    Ok(()) => {
-                        tracing::info!(
-                            relay_url = relay.as_deref().unwrap_or("none"),
-                            direct = direct.len(),
-                            "reported endpoint address to hub"
-                        );
-                        last = Some(current);
+            match decide_report(last.as_ref(), &current, relayless_streak) {
+                ReportDecision::Publish => {
+                    match client
+                        .put_device_address(&token, current.relay.as_deref(), &current.direct)
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                relay_url = current.relay.as_deref().unwrap_or("none"),
+                                direct = current.direct.len(),
+                                "reported endpoint address to hub"
+                            );
+                            last = Some(current.clone());
+                        }
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "endpoint-address report failed; will retry on the next change"
+                        ),
                     }
-                    Err(error) => tracing::warn!(
-                        %error,
-                        "endpoint-address report failed; will retry on the next change"
-                    ),
                 }
+                ReportDecision::WithholdRelayGap => tracing::debug!(
+                    count = relayless_streak + 1,
+                    "endpoint-address report withheld; no home relay this tick"
+                ),
+                ReportDecision::Skip => {}
             }
+            relayless_streak = if current.relay.is_none() {
+                relayless_streak.saturating_add(1)
+            } else {
+                0
+            };
             tokio::time::sleep(ADDRESS_REPORT_INTERVAL).await;
         }
     })
@@ -340,6 +448,97 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn report(relay: Option<&str>, direct: &[&str]) -> AddressReport {
+        AddressReport {
+            relay: relay.map(str::to_string),
+            direct: direct.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn connected_relay_wins_over_the_addr_fallback() {
+        // `relay_urls()` is a sorted set, so the addr's first entry can name a
+        // relay we are not on while re-homing; the health surface is the truth.
+        assert_eq!(
+            preferred_relay(
+                "relay_connected",
+                Some("https://relay2.example".into()),
+                Some("https://a-relay.example".into())
+            )
+            .as_deref(),
+            Some("https://relay2.example")
+        );
+    }
+
+    #[test]
+    fn addr_relay_is_the_fallback_when_no_relay_is_connected() {
+        assert_eq!(
+            preferred_relay("direct_only", None, Some("https://last-known.example".into()))
+                .as_deref(),
+            Some("https://last-known.example")
+        );
+        assert_eq!(preferred_relay("direct_only", None, None), None);
+    }
+
+    #[test]
+    fn first_report_without_a_relay_yet_is_published() {
+        // Startup: the relay handshake has not landed. There is no good value to
+        // protect, and the direct addrs are worth publishing.
+        let current = report(None, &["192.168.1.5:1234"]);
+        assert_eq!(decide_report(None, &current, 0), ReportDecision::Publish);
+    }
+
+    #[test]
+    fn unchanged_and_empty_snapshots_are_skipped() {
+        let r = report(Some("https://relay1.example"), &["192.168.1.5:1234"]);
+        assert_eq!(decide_report(Some(&r), &r, 0), ReportDecision::Skip);
+        assert_eq!(
+            decide_report(Some(&r), &report(None, &[]), 0),
+            ReportDecision::Skip
+        );
+    }
+
+    #[test]
+    fn relay_change_publishes_immediately() {
+        let last = report(Some("https://relay1.example"), &["192.168.1.5:1234"]);
+        let current = report(Some("https://relay2.example"), &["192.168.1.5:1234"]);
+        assert_eq!(
+            decide_report(Some(&last), &current, 0),
+            ReportDecision::Publish
+        );
+    }
+
+    #[test]
+    fn relayless_snapshot_after_a_good_one_is_withheld_then_published() {
+        let last = report(Some("https://relay1.example"), &["192.168.1.5:1234"]);
+        let current = report(None, &["192.168.1.5:1234"]);
+        // Within the grace window: withheld, so the hub keeps the good relay.
+        for streak in 0..RELAYLESS_GRACE_CYCLES {
+            assert_eq!(
+                decide_report(Some(&last), &current, streak),
+                ReportDecision::WithholdRelayGap,
+                "streak {streak} is still inside the grace window"
+            );
+        }
+        // Past it, a device that genuinely lost its relay says so.
+        assert_eq!(
+            decide_report(Some(&last), &current, RELAYLESS_GRACE_CYCLES),
+            ReportDecision::Publish
+        );
+    }
+
+    #[test]
+    fn direct_addr_change_during_the_relay_gap_is_withheld_too() {
+        // The PUT carries both fields, so refreshing the addrs mid-gap would null
+        // the relay. The change rides along on the next tick that has one.
+        let last = report(Some("https://relay1.example"), &["192.168.1.5:1234"]);
+        let current = report(None, &["10.0.0.7:5555"]);
+        assert_eq!(
+            decide_report(Some(&last), &current, 0),
+            ReportDecision::WithholdRelayGap
+        );
+    }
 
     /// A 32-byte pubkey with a recognizable pattern, plus its base64 the hub
     /// would return and the `NodeId` it must decode to.

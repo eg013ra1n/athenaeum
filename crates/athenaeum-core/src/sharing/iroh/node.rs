@@ -62,6 +62,7 @@ use crate::sync::status::TransportHealth;
 use crate::sync::DedupResponder;
 
 use super::proto::{self, Msg, OfferEntry};
+use super::telemetry::{peer_conn_path, TransportCounters};
 use super::{
     blobs, build_router, hex32, spawn_conn_path_diagnostics, ConnectGate, Delivery, EventSink,
     ServeFileResolver, ServeRootResolver, SharedConnectGate, SharedResponder, CONTROL_SEND_TIMEOUT,
@@ -72,6 +73,12 @@ use super::{
 /// close lets peers see a QUIC close instead of a reset and clears the relay
 /// registration promptly; if it stalls we log and move on rather than hang exit.
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the transport-telemetry sampler logs a traffic window. Long on
+/// purpose: these are cumulative counters, so a coarse tick loses nothing but
+/// keeps an all-day session down to a handful of lines — and a window with no
+/// traffic and no re-home is skipped entirely, so an idle app stays silent.
+const TELEMETRY_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Threshold (ms) above which handing a decoded inbound event to its consumer's
 /// channel is logged as delayed (Task 4.1, candidate (a) — a receive stalling
@@ -173,25 +180,33 @@ pub type RelayResolver =
 /// hook — reads the CURRENT hook at fire time rather than a stale clone at spawn.
 pub type WakeHook = Arc<dyn Fn() + Send + Sync>;
 
-/// The node's last-known home-relay connectivity (Task 3.3). Written by the
-/// home-relay watcher on every transition (the same values it already computes
-/// for its log lines) and read by [`SharedIrohNode::transport_health`] on the
-/// status poll. Held behind an `Arc<RwLock<…>>` on the OUTER layer of the node
-/// (like [`WakeHook`]) — the watcher writes into this cell and a status poll reads
-/// it, so a poll always sees the current picture. The initial value is
-/// disconnected; the successful one-shot
-/// `online()` wait seeds it connected as a bridge, and the watcher overwrites it
-/// on every later transition — so it is the sole connected-ness authority and a
-/// dropped relay always flips the surface back to `direct_only`.
+/// The node's current home-relay connectivity (Task 3.3), read by
+/// [`SharedIrohNode::transport_health`] on the status poll. Held behind an
+/// `Arc<RwLock<…>>` on the OUTER layer of the node (like [`WakeHook`]) — the
+/// watcher writes into this cell and a status poll reads it, so a poll always
+/// sees the current picture. The initial value is disconnected; the successful
+/// one-shot `online()` wait seeds it connected as a bridge, and the watcher
+/// keeps it current — so it is the sole connected-ness authority and a dropped
+/// relay flips the surface back to `direct_only`.
+///
+/// **Aggregate, not last-transition.** The watcher recomputes this from the WHOLE
+/// home-relay status set (connected iff ANY relay is connected — the rule
+/// [`iroh::Endpoint::online`] uses), because iroh 1.x can hold more than one home
+/// relay and does re-home between them. Writing the cell from whichever entry
+/// changed last made a secondary relay's drop report `direct_only` while another
+/// relay was up.
 #[derive(Debug, Clone)]
 pub struct RelayHealth {
-    /// Whether a home relay is currently connected (last transition seen).
+    /// Whether ANY home relay is currently connected.
     pub connected: bool,
-    /// The relay URL of the last transition (connect or disconnect), if any.
+    /// The connected relay's URL when [`connected`](Self::connected); otherwise
+    /// the URL of the relay whose failure is reported in
+    /// [`last_error`](Self::last_error), if any is known.
     pub url: Option<String>,
-    /// The relay error from the last disconnect transition, if any.
+    /// The relay error explaining the current disconnected state, if any.
     pub last_error: Option<String>,
-    /// When this snapshot was recorded.
+    /// When this snapshot was recorded — only advanced when the picture actually
+    /// changes, so it reads as "in this state since".
     pub since: Instant,
 }
 
@@ -682,6 +697,9 @@ struct NetLayer {
     /// keeps the watcher alive until the last endpoint clone drops). A relay-map
     /// hot-swap re-homes the SAME endpoint, so this one watcher observes it.
     relay_watcher: Option<JoinHandle<()>>,
+    /// Transport-telemetry sampler task on this endpoint; aborted at shutdown
+    /// alongside the relay watcher (same reason — it holds an endpoint clone).
+    telemetry_sampler: Option<JoinHandle<()>>,
     /// The relay URLs the endpoint currently carries (H1 reporting groundwork, T7);
     /// updated in place by a relay-map hot-swap.
     relay_urls: Vec<String>,
@@ -779,6 +797,9 @@ pub struct SharedIrohNode {
     /// so [`transport_health`](Self::transport_health) always reads the current
     /// picture. Read under the lock and cloned out; never held across an await.
     relay_health: Arc<RwLock<RelayHealth>>,
+    /// Transport counters as they stood at bind — the baseline the shutdown line
+    /// subtracts to report the whole session's relay-vs-direct split.
+    counters_at_bind: TransportCounters,
 }
 
 impl SharedIrohNode {
@@ -913,6 +934,10 @@ impl SharedIrohNode {
             Arc::clone(&wake_hook),
             Arc::clone(&relay_health),
         );
+        // Transport telemetry: the bind-time baseline for the session total, plus
+        // the periodic window sampler.
+        let counters_at_bind = TransportCounters::snapshot(&endpoint);
+        let telemetry_sampler = spawn_transport_telemetry(endpoint.clone());
 
         tracing::debug!(node_id = %endpoint.id().fmt_short(), "shared iroh node bound");
         Ok(Arc::new(Self {
@@ -921,6 +946,7 @@ impl SharedIrohNode {
                 router,
                 control_pool,
                 relay_watcher: Some(relay_watcher),
+                telemetry_sampler: Some(telemetry_sampler),
                 relay_urls: relay_urls.clone(),
                 uses_relay,
             }),
@@ -945,6 +971,7 @@ impl SharedIrohNode {
             responder,
             wake_hook,
             relay_health,
+            counters_at_bind,
         }))
     }
 
@@ -1210,16 +1237,29 @@ impl SharedIrohNode {
         // Take the router + endpoint + relay watcher out of the network layer.
         // `Router` is `Clone` (shared accept task), so cloning it out of the lock
         // and shutting the clone down tears the one accept task down.
-        let (router, endpoint, watcher) = {
+        let (router, endpoint, watcher, sampler) = {
             let mut net = self.net.lock().expect("net mutex poisoned");
-            (net.router.clone(), net.endpoint.clone(), net.relay_watcher.take())
+            (
+                net.router.clone(),
+                net.endpoint.clone(),
+                net.relay_watcher.take(),
+                net.telemetry_sampler.take(),
+            )
         };
         // Abort the relay watcher: iroh keeps the `home_relay_status` watcher alive
         // until the last endpoint clone drops (closing the endpoint does NOT stop
-        // it), so it must be aborted explicitly.
+        // it), so it must be aborted explicitly. Same for the telemetry sampler.
         if let Some(handle) = watcher {
             handle.abort();
         }
+        if let Some(handle) = sampler {
+            handle.abort();
+        }
+        // Session total BEFORE the endpoint closes — the one line that answers
+        // "how much of this run's traffic rode a relay?" without log arithmetic.
+        TransportCounters::snapshot(&endpoint)
+            .delta(&self.counters_at_bind)
+            .log("session");
         if let Err(e) = router.shutdown().await {
             tracing::warn!(error = %e, "shared iroh node router shutdown");
         }
@@ -1732,7 +1772,18 @@ impl SharedIrohNode {
         )
         .await?;
 
-        tracing::debug!(from = %hex32(&from), package_id = %pkg.package_id.0, "iroh fetch complete");
+        // Promoted from debug to info WITH the path the payload actually took:
+        // this fires once per package (operation lifecycle, not a hot path), and
+        // it is the only place the app can state whether a transfer went direct
+        // or rode the relay — the bulk of it runs inside iroh-blobs' own
+        // connection pool, which never hands us a `Connection` to instrument.
+        let conn_path = peer_conn_path(&endpoint, from).await;
+        tracing::info!(
+            from = %hex32(&from),
+            package_id = %pkg.package_id.0,
+            conn_path,
+            "iroh fetch complete"
+        );
         Ok(())
     }
 
@@ -2154,19 +2205,89 @@ fn relay_set_diff(old: &[String], new: &[String]) -> (Vec<String>, Vec<String>) 
     (added, removed)
 }
 
+/// Spawn the transport-telemetry sampler: every [`TELEMETRY_INTERVAL`] it logs
+/// the traffic of the window just closed (relay vs direct bytes, paths opened,
+/// hole-punch attempts, home-relay changes) and skips the line entirely when
+/// nothing happened, so an idle app writes nothing. Holds an endpoint clone, so
+/// the node aborts it at shutdown like the relay watcher.
+fn spawn_transport_telemetry(endpoint: Endpoint) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut previous = TransportCounters::snapshot(&endpoint);
+        loop {
+            tokio::time::sleep(TELEMETRY_INTERVAL).await;
+            let now = TransportCounters::snapshot(&endpoint);
+            let window = now.delta(&previous);
+            previous = now;
+            if !window.is_quiet() {
+                window.log("tick");
+            }
+        }
+    })
+}
+
+/// One home-relay status reduced to the three fields the watcher reasons about.
+/// iroh's `RelayStatus` has no public constructor, so the decisions below are
+/// pure functions over THIS shape and a test can build them directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RelayStatusView {
+    url: String,
+    connected: bool,
+    last_error: Option<String>,
+}
+
+/// Reduce the whole home-relay status set to the node's reachability picture:
+/// `(connected, url, last_error)`, connected iff ANY home relay is connected —
+/// the same rule [`iroh::Endpoint::online`] applies. When nothing is connected
+/// the reported url/error come from the first entry that carries an error, else
+/// the first entry at all. See [`RelayHealth`] for why this is an aggregate.
+fn aggregate_health(views: &[RelayStatusView]) -> (bool, Option<String>, Option<String>) {
+    if let Some(up) = views.iter().find(|v| v.connected) {
+        return (true, Some(up.url.clone()), None);
+    }
+    let down = views
+        .iter()
+        .find(|v| v.last_error.is_some())
+        .or_else(|| views.first());
+    (
+        false,
+        down.map(|v| v.url.clone()),
+        down.and_then(|v| v.last_error.clone()),
+    )
+}
+
+/// Whether a per-relay "not connected" observation deserves a `warn!`.
+///
+/// A relay that WAS connected and dropped is an anomaly, and so is one reporting
+/// an error the very first time we see it (a relay refusing this device's key
+/// lands exactly there — that must stay loud). What is NOT an anomaly is the
+/// first, error-free sighting of a relay that simply has not finished connecting:
+/// the watcher treats every first status as a transition, so that case used to
+/// emit `WARN home relay disconnected` on every single app start and read as a
+/// fault in a beta user's log.
+fn disconnect_is_anomalous(prev: Option<bool>, connected: bool, has_error: bool) -> bool {
+    !connected && (prev == Some(true) || has_error)
+}
+
 /// Spawn the home-relay status watcher (spec §1, minor #4). iroh's
 /// [`home_relay_status`](iroh::Endpoint::home_relay_status) watcher surfaces relay
 /// connectivity transitions — a relay eviction (`SameEndpointIdConnected`, the C1
 /// symptom) shows up here as a disconnect instead of generic downstream timeouts.
-/// We log only *transitions* (`info!` on connect, `warn!` on disconnect) so a
-/// steady state is silent. The task ends when the last endpoint clone drops; the
-/// node aborts it at shutdown (closing the endpoint alone does not stop it).
+/// We log only *transitions* (`info!` on connect, `warn!` on an anomalous
+/// disconnect, `debug!` on a relay that has not connected yet) so a steady state
+/// is silent. The task ends when the last endpoint clone drops; the node aborts it
+/// at shutdown (closing the endpoint alone does not stop it).
 ///
-/// A relay **connect** transition is a wake event (Task 6): the node just (re)came
-/// online, so it fires the installed [`WakeHook`] to kick every pending outbound
-/// package out of its backoff. `wake_hook` is the node's shared hook lock — read
-/// (and cloned out from under) at FIRE time, never captured here at spawn — so a
-/// hook installed after this task spawned is always the one that fires. A
+/// The [`RelayHealth`] cell is recomputed from the WHOLE status set on every
+/// update (see that type's docs), not from whichever entry changed — and only
+/// written when the picture actually changes, so `since` keeps its meaning.
+///
+/// Coming online is a wake event (Task 6): the node just (re)became reachable, so
+/// it fires the installed [`WakeHook`] to kick every pending outbound package out
+/// of its backoff. The edge is taken on the AGGREGATE (no home relay → some home
+/// relay), so re-homing between two live relays — which iroh does on its own — no
+/// longer fires a redundant kick. `wake_hook` is the node's shared hook lock —
+/// read (and cloned out from under) at FIRE time, never captured here at spawn —
+/// so a hook installed after this task spawned is always the one that fires. A
 /// relay-map hot-swap re-homes the SAME endpoint, so this one watcher observes
 /// every relay-set change without being respawned.
 fn spawn_home_relay_watcher(
@@ -2178,37 +2299,65 @@ fn spawn_home_relay_watcher(
         use n0_future::StreamExt as _;
         let mut stream = endpoint.home_relay_status().stream();
         let mut last: HashMap<String, bool> = HashMap::new();
+        let mut last_aggregate: Option<bool> = None;
         while let Some(statuses) = stream.next().await {
-            for st in &statuses {
-                let url = st.url().to_string();
-                let connected = st.is_connected();
-                if last.get(&url).copied() == Some(connected) {
+            let views: Vec<RelayStatusView> = statuses
+                .iter()
+                .map(|st| RelayStatusView {
+                    url: st.url().to_string(),
+                    connected: st.is_connected(),
+                    last_error: st.last_error().map(|e| e.to_string()),
+                })
+                .collect();
+
+            // Health surface (Task 3.3): aggregate over the whole set, rewritten
+            // only when it differs from what the cell already holds. Written under
+            // the lock, no await held; a poll reads the current picture.
+            let (connected, url, last_error) = aggregate_health(&views);
+            {
+                let mut cell = relay_health.write().expect("relay_health lock poisoned");
+                if cell.connected != connected || cell.url != url || cell.last_error != last_error {
+                    *cell = RelayHealth {
+                        connected,
+                        url: url.clone(),
+                        last_error: last_error.clone(),
+                        since: Instant::now(),
+                    };
+                }
+            }
+
+            // Per-relay transition logging — the granularity that makes a relay
+            // eviction or a refused key readable in the log.
+            for v in &views {
+                let prev = last.get(&v.url).copied();
+                if prev == Some(v.connected) {
                     continue;
                 }
-                // Record the transition for the queryable health surface (Task
-                // 3.3) — the same values these log lines carry. Written under the
-                // lock, no await held; a poll reads the current picture.
-                let last_error = if connected { None } else { st.last_error().map(|e| e.to_string()) };
-                *relay_health.write().expect("relay_health lock poisoned") = RelayHealth {
-                    connected,
-                    url: Some(url.clone()),
-                    last_error: last_error.clone(),
-                    since: Instant::now(),
-                };
-                if connected {
-                    tracing::info!(relay_url = %url, "home relay connected");
-                    // Wake event: clone the hook out from under the lock, then
-                    // invoke it with no lock held (no reentrant deadlock).
-                    let hook = wake_hook.read().expect("wake_hook lock poisoned").clone();
-                    if let Some(h) = hook {
-                        h();
+                if v.connected {
+                    tracing::info!(relay_url = %v.url, "home relay connected");
+                } else if disconnect_is_anomalous(prev, v.connected, v.last_error.is_some()) {
+                    match v.last_error.as_deref() {
+                        Some(err) => {
+                            tracing::warn!(relay_url = %v.url, error = %err, "home relay disconnected")
+                        }
+                        None => tracing::warn!(relay_url = %v.url, "home relay disconnected"),
                     }
-                } else if let Some(err) = last_error.as_deref() {
-                    tracing::warn!(relay_url = %url, error = %err, "home relay disconnected");
                 } else {
-                    tracing::warn!(relay_url = %url, "home relay disconnected");
+                    tracing::debug!(relay_url = %v.url, "home relay not connected yet");
                 }
-                last.insert(url, connected);
+                last.insert(v.url.clone(), v.connected);
+            }
+
+            // Wake on the aggregate edge into "reachable".
+            let became_reachable = connected && last_aggregate != Some(true);
+            last_aggregate = Some(connected);
+            if became_reachable {
+                // Clone the hook out from under the lock, then invoke it with no
+                // lock held (no reentrant deadlock).
+                let hook = wake_hook.read().expect("wake_hook lock poisoned").clone();
+                if let Some(h) = hook {
+                    h();
+                }
             }
         }
     })
@@ -2479,6 +2628,75 @@ mod tests {
             "the same device key must yield the same node id across a re-bind"
         );
         node2.shutdown().await;
+    }
+
+    fn view(url: &str, connected: bool, err: Option<&str>) -> RelayStatusView {
+        RelayStatusView {
+            url: url.to_string(),
+            connected,
+            last_error: err.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn health_is_connected_when_any_relay_is_connected() {
+        let (connected, url, err) = aggregate_health(&[
+            view("https://a.example", false, Some("timeout")),
+            view("https://b.example", true, None),
+        ]);
+        assert!(connected);
+        assert_eq!(url.as_deref(), Some("https://b.example"));
+        assert_eq!(err, None, "a connected node reports no failure");
+    }
+
+    #[test]
+    fn secondary_relay_drop_does_not_flip_health_to_direct_only() {
+        // iroh re-homes between relays on its own; the drop of the one we are
+        // leaving must not report the node unreachable while the other is up.
+        let (connected, url, _) = aggregate_health(&[
+            view("https://relay-ams.example", false, Some("closed")),
+            view("https://relay2.example", true, None),
+        ]);
+        assert!(connected, "another home relay is connected");
+        assert_eq!(url.as_deref(), Some("https://relay2.example"));
+    }
+
+    #[test]
+    fn health_reports_the_failing_relay_when_nothing_is_connected() {
+        let (connected, url, err) = aggregate_health(&[
+            view("https://a.example", false, None),
+            view("https://b.example", false, Some("refused")),
+        ]);
+        assert!(!connected);
+        assert_eq!(url.as_deref(), Some("https://b.example"));
+        assert_eq!(err.as_deref(), Some("refused"));
+    }
+
+    #[test]
+    fn health_of_an_empty_status_set_is_disconnected_without_a_url() {
+        let (connected, url, err) = aggregate_health(&[]);
+        assert!(!connected);
+        assert_eq!(url, None);
+        assert_eq!(err, None);
+    }
+
+    #[test]
+    fn first_error_free_disconnected_status_is_not_a_warning() {
+        // The startup case: a relay we have never seen connected yet, with no
+        // error — it is simply still connecting.
+        assert!(!disconnect_is_anomalous(None, false, false));
+    }
+
+    #[test]
+    fn drop_after_a_connect_is_a_warning() {
+        assert!(disconnect_is_anomalous(Some(true), false, false));
+    }
+
+    #[test]
+    fn first_status_carrying_an_error_is_a_warning() {
+        // A relay refusing this device's key shows up as a first-sighting
+        // disconnect WITH an error — that must stay loud.
+        assert!(disconnect_is_anomalous(None, false, true));
     }
 
     // Task 3.3: a relay-disabled node has no home relay, so its transport health

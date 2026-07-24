@@ -70,6 +70,7 @@ use crate::sync::DedupResponder;
 pub mod blobs;
 pub mod node;
 pub mod proto;
+pub(crate) mod telemetry;
 
 #[cfg(test)]
 mod tests;
