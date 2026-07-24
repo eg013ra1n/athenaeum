@@ -151,6 +151,22 @@ type SharedConnectGate = Arc<Mutex<Option<ConnectGate>>>;
 /// offers are answered want-all (nothing silently withheld).
 pub(crate) type SharedResponder = Arc<Mutex<Option<Arc<dyn DedupResponder>>>>;
 
+/// Host callback fired when a peer announces its presence (D1 §3.2).
+///
+/// Called with the **authenticated** sender id — the connection's `remote_id`,
+/// never anything self-reported (the message has no payload). The host decides
+/// what it means; the transport's only job is to hand it over. It runs on the
+/// control accept loop, so an implementation must return promptly and do any real
+/// work on its own task.
+pub type PresenceHook = Arc<dyn Fn(NodeId) + Send + Sync>;
+
+/// Shared, late-bindable slot for the [`PresenceHook`]. Same shape and lifetime
+/// story as [`SharedResponder`]: cloned into [`SyncControlProtocol`] at
+/// construction so an already-spawned router can have its hook installed
+/// afterwards, via
+/// [`set_presence_hook`](node::SharedIrohNode::set_presence_hook).
+pub(crate) type SharedPresenceHook = Arc<Mutex<Option<PresenceHook>>>;
+
 /// Resolves a served collection's root hash back to the [`PackageId`] whose
 /// [`serve`](SharingTransport::serve) registered it — so the provider-upload-events
 /// consumer (Task 13) can label an outgoing [`ServeProgress`](TransportEvent::ServeProgress).
@@ -492,12 +508,14 @@ fn connect_gate_admits(gate: &SharedConnectGate, from: &NodeId) -> bool {
 /// is byte-identical to the three inlined copies it replaces.
 ///
 /// [`rebuild`]: node::SharedIrohNode
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_router(
     endpoint: Endpoint,
     store: &Store,
     gate: &SharedConnectGate,
     sink: EventSink,
     responder: SharedResponder,
+    presence: SharedPresenceHook,
     flush_store_on_shutdown: bool,
     serve_resolver: ServeRootResolver,
     serve_file_resolver: ServeFileResolver,
@@ -708,6 +726,7 @@ pub(crate) fn build_router(
 
     let control = SyncControlProtocol {
         sink,
+        presence,
         responder,
         gate: Arc::clone(gate),
     };
@@ -872,6 +891,10 @@ impl IrohTransport {
             &connect_gate,
             EventSink::Direct(event_tx.clone()),
             Arc::new(Mutex::new(responder)),
+            // The legacy single-stream transport is test-only and has no host to
+            // install a presence hook; an empty slot means an inbound beacon is
+            // acknowledged and dropped, which is the correct no-op here.
+            Arc::new(Mutex::new(None)),
             true,
             serve_resolver,
             serve_file_resolver,
@@ -1522,6 +1545,11 @@ struct SyncControlProtocol {
     /// Where decoded inbound `Announce`/`Ack`/`Project*` events are routed
     /// (legacy single stream, or the shared node's demux — see [`EventSink`]).
     sink: EventSink,
+    /// Fired when a peer announces its presence (D1), in a late-bindable shared
+    /// slot like [`responder`](Self::responder) — the host installs it after the
+    /// router is spawned. Empty ⇒ the beacon is acknowledged and dropped at
+    /// debug, which is what a send-only endpoint or a not-yet-wired host wants.
+    presence: SharedPresenceHook,
     /// Answers the dedup handshake, in a late-bindable shared slot (so the shared
     /// node can install it after the router is spawned). Empty ⇒ a send-only
     /// endpoint or a peer with no catalog wired, in which case offers are
@@ -1719,14 +1747,28 @@ impl ProtocolHandler for SyncControlProtocol {
                     continue;
                 }
                 // Peer reachability (D1): a presence beacon is not a package event
-                // — it never enters the demux. It is acknowledged like any other
-                // control message so the beacon's sender sees delivery, then the
-                // loop takes the next stream. The host hook that turns it into a
-                // queue resume is installed in the next task; until then this is a
-                // deliberate no-op rather than an error, so a peer already running
-                // the new build is never told its beacon failed.
+                // — it never enters the demux (there is no package to claim and no
+                // Recv consumer to route to), so it fires the host hook directly
+                // and is acknowledged like any other control message. With no hook
+                // installed it is a deliberate no-op rather than an error: a
+                // send-only endpoint, or a host that has not wired up yet, must
+                // never tell a well-behaved peer its beacon failed.
                 Msg::Presence => {
-                    tracing::debug!(from = %hex32(&from), "peer presence received");
+                    let hook = self
+                        .presence
+                        .lock()
+                        .expect("presence hook mutex poisoned")
+                        .clone();
+                    match hook {
+                        Some(h) => {
+                            tracing::debug!(from = %hex32(&from), "peer presence received");
+                            h(from);
+                        }
+                        None => tracing::debug!(
+                            from = %hex32(&from),
+                            "peer presence received; no hook installed"
+                        ),
+                    }
                     let _ = tx.write_all(b"1").await;
                     let _ = tx.finish();
                     continue;

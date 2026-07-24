@@ -235,6 +235,20 @@ pub trait SharingTransport: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Tell `to` that we are online and listening (D1 presence beacon).
+    ///
+    /// Sent by a RECEIVER when it becomes reachable, so a sender parked on a
+    /// retry resumes at once instead of waiting out its schedule. Best-effort by
+    /// contract: the caller logs a failure and moves on, because the sender's
+    /// retry schedule is the fallback for every peer that never beacons (an older
+    /// build, or a route that broke without either side restarting).
+    ///
+    /// The default is a no-op so a transport with no control channel — the
+    /// in-process loopback mock, a test double — need not implement it.
+    async fn send_presence(&self, _to: NodeId) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Attach a best-effort dial hint for an inbound peer `from` right before we
     /// pull its blobs (finding H1 / I2, iroh hardening T7).
     ///

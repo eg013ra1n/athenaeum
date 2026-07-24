@@ -65,14 +65,21 @@ use super::proto::{self, Msg, OfferEntry};
 use super::telemetry::{peer_conn_path, TransportCounters};
 use super::{
     blobs, build_router, hex32, spawn_conn_path_diagnostics, ConnectGate, Delivery, EventSink,
-    ServeFileResolver, ServeRootResolver, SharedConnectGate, SharedResponder, CONTROL_SEND_TIMEOUT,
-    EVENT_CHANNEL_CAPACITY, GC_INTERVAL, MAX_CONTROL_BYTES, ONLINE_TIMEOUT, SYNC_ALPN,
+    PresenceHook, ServeFileResolver, ServeRootResolver, SharedConnectGate, SharedPresenceHook,
+    SharedResponder, CONTROL_SEND_TIMEOUT, EVENT_CHANNEL_CAPACITY, GC_INTERVAL, MAX_CONTROL_BYTES,
+    ONLINE_TIMEOUT, SYNC_ALPN,
 };
 
 /// Upper bound on the graceful `endpoint.close()` at shutdown (I1). A clean
 /// close lets peers see a QUIC close instead of a reset and clears the relay
 /// registration promptly; if it stalls we log and move on rather than hang exit.
 const SHUTDOWN_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cap on one presence beacon (connect + write + delivery ack). Deliberately far
+/// shorter than [`CONTROL_SEND_TIMEOUT`]: a beacon fan-out runs across every
+/// account device at startup, and a peer that is switched off must not make the
+/// live ones wait behind it.
+const PRESENCE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How often the transport-telemetry sampler logs a traffic window. Long on
 /// purpose: these are cumulative counters, so a coarse tick loses nothing but
@@ -800,6 +807,10 @@ pub struct SharedIrohNode {
     /// Transport counters as they stood at bind — the baseline the shutdown line
     /// subtracts to report the whole session's relay-vs-direct split.
     counters_at_bind: TransportCounters,
+    /// Late-bindable host hook for inbound presence beacons (D1). Shared with the
+    /// control protocol handler, so installing it after `bind` takes effect on the
+    /// already-spawned router.
+    presence: SharedPresenceHook,
 }
 
 impl SharedIrohNode {
@@ -883,6 +894,10 @@ impl SharedIrohNode {
         // Task 3). Empty ⇒ offers are answered want-all, so nothing is ever
         // silently withheld before the receiver wires its catalog responder.
         let responder: SharedResponder = Arc::new(Mutex::new(None));
+        // Presence-hook slot (D1): empty until the host installs one, so a beacon
+        // arriving before the host wires up is acknowledged and dropped at debug
+        // rather than queued against a consumer that does not exist yet.
+        let presence: SharedPresenceHook = Arc::new(Mutex::new(None));
         // The served map lives behind an `Arc` so the provider-upload-events
         // consumer (Task 13) can resolve a served collection's root hash back to its
         // package id. Created here — before `Self` — and shared into both the
@@ -914,6 +929,7 @@ impl SharedIrohNode {
             &connect_gate,
             EventSink::Demux(Arc::clone(&demux)),
             Arc::clone(&responder),
+            Arc::clone(&presence),
             false,
             serve_resolver,
             serve_file_resolver,
@@ -972,6 +988,7 @@ impl SharedIrohNode {
             wake_hook,
             relay_health,
             counters_at_bind,
+            presence,
         }))
     }
 
@@ -1122,6 +1139,48 @@ impl SharedIrohNode {
     /// control handler on the next inbound offer.
     pub fn set_dedup_responder(&self, responder: Arc<dyn DedupResponder>) {
         *self.responder.lock().expect("responder mutex poisoned") = Some(responder);
+    }
+
+    /// Install the host's inbound-presence callback (D1). Overwrites any previous
+    /// hook and is picked up live by the already-spawned control handler; left
+    /// unset, inbound beacons are acknowledged and dropped at debug.
+    pub fn set_presence_hook(&self, hook: PresenceHook) {
+        *self.presence.lock().expect("presence hook mutex poisoned") = Some(hook);
+    }
+
+    /// Announce to `to` that we are online and listening (D1 §3.1).
+    ///
+    /// Rides a DEDICATED connection, never the pooled control channel. A peer on
+    /// an older build cannot decode this variant, and its accept loop breaks the
+    /// whole connection on a decode failure — so the only casualty must be the
+    /// beacon's own connection, leaving the pooled channel that carries announces
+    /// untouched. The delivery ack is read but not required: a beacon is a hint,
+    /// and the sender's retry schedule is the fallback.
+    pub async fn send_presence(&self, to: NodeId) -> Result<()> {
+        let target = self.dial_target(to)?;
+        if target.is_empty() {
+            // No addressing at all: nothing to dial, and spending the timeout on it
+            // would only slow a fan-out down.
+            anyhow::bail!("no known address for {}", hex32(&to));
+        }
+        let bytes = Msg::Presence.encode()?;
+        let endpoint = self.endpoint();
+        let send = async {
+            let conn = endpoint
+                .connect(target, SYNC_ALPN)
+                .await
+                .context("connect presence channel")?;
+            let (mut tx, mut rx) = conn.open_bi().await.context("open presence stream")?;
+            tx.write_all(&bytes).await.context("write presence")?;
+            tx.finish().context("finish presence stream")?;
+            let _ = rx.read_to_end(8).await;
+            conn.close(0u32.into(), b"ok");
+            anyhow::Ok(())
+        };
+        tokio::time::timeout(PRESENCE_SEND_TIMEOUT, send)
+            .await
+            .map_err(|_| anyhow!("presence beacon to {} timed out", hex32(&to)))??;
+        Ok(())
     }
 
     /// Install the transport-level [`WakeHook`] (Task 6): fired on a home-relay
@@ -2024,6 +2083,12 @@ impl SharingTransport for RoleHandle {
         self.node.role_start(self.role).await
     }
 
+    /// Role-independent: a presence beacon says "this DEVICE is reachable", not
+    /// "this role is", so every handle delegates to the one node.
+    async fn send_presence(&self, to: NodeId) -> Result<()> {
+        self.node.send_presence(to).await
+    }
+
     async fn announce(
         &self,
         to: NodeId,
@@ -2531,6 +2596,78 @@ mod tests {
             "a foreign role's tag (collab/pkg/c) must survive the Out sweep"
         );
 
+        node.shutdown().await;
+    }
+
+    /// D1: a presence beacon reaches the peer's installed hook, carrying the
+    /// AUTHENTICATED sender id. The message has no payload precisely so that the
+    /// identity can only come from the connection — this asserts that path.
+    #[tokio::test]
+    async fn presence_beacon_fires_the_peers_hook_with_the_authenticated_id() {
+        let dir = tempdir().unwrap();
+        // The SENDER installs the hook: it is the side parked on a retry, waiting
+        // to hear that its peer is back.
+        let sender = SharedIrohNode::bind(&dir.path().join("sender"), RelayMode::Disabled)
+            .await
+            .unwrap();
+        let receiver = SharedIrohNode::bind(&dir.path().join("receiver"), RelayMode::Disabled)
+            .await
+            .unwrap();
+
+        let seen: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            sender.set_presence_hook(Arc::new(move |from| {
+                seen.lock().expect("seen mutex poisoned").push(from);
+            }));
+        }
+
+        // Relay-disabled endpoints have no discovery, so each side needs the
+        // other's address out of band — the same ticket exchange the transport
+        // tests use.
+        let sender_info = sender.handle(Role::Out).start().await.unwrap();
+        let receiver_info = receiver.handle(Role::Recv).start().await.unwrap();
+        sender.add_peer_ticket(&receiver_info.pairing_ticket).unwrap();
+        receiver.add_peer_ticket(&sender_info.pairing_ticket).unwrap();
+
+        receiver.send_presence(sender.node_id()).await.expect("beacon delivers");
+
+        for _ in 0..200 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[receiver.node_id()],
+            "the hook fires exactly once, with the beacon sender's authenticated id"
+        );
+
+        sender.shutdown().await;
+        receiver.shutdown().await;
+    }
+
+    /// A beacon to a peer we have no address for must fail FAST rather than spend
+    /// the timeout — a fan-out runs across every account device, and one
+    /// unaddressable peer must not hold up the rest.
+    #[tokio::test]
+    async fn presence_to_an_unknown_peer_fails_without_spending_the_timeout() {
+        let dir = tempdir().unwrap();
+        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled).await.unwrap();
+
+        let started = Instant::now();
+        let err = node.send_presence([9u8; 32]).await.expect_err("no address, no beacon");
+
+        assert!(
+            started.elapsed() < PRESENCE_SEND_TIMEOUT,
+            "an unaddressable peer must not cost the full beacon timeout, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            format!("{err:#}").contains("no known address"),
+            "the error names the cause: {err:#}"
+        );
         node.shutdown().await;
     }
 

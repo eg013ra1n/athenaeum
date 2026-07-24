@@ -114,7 +114,7 @@ git commit -m "feat(sync): Msg::Presence wire variant (appended, indices frozen)
   - `pub type PresenceHook = Arc<dyn Fn(NodeId) + Send + Sync>;`
   - `SharedIrohNode::set_presence_hook(&self, hook: PresenceHook)` — Task 6 installs the host closure here.
 
-- [ ] **Step 1: Write the failing transport test**
+- [x] **Step 1: Write the failing transport test**
 
 Add to `crates/athenaeum-core/src/sharing/iroh/tests.rs` (two real endpoints, relay disabled — the file's existing pattern):
 
@@ -159,12 +159,12 @@ async fn presence_beacon_fires_the_peers_hook() {
 }
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cargo test -q -p athenaeum-core --lib presence_beacon_fires_the_peers_hook`
 Expected: FAIL — `no method named set_presence_hook` / `send_presence`.
 
-- [ ] **Step 3: Add the trait method with a default**
+- [x] **Step 3: Add the trait method with a default**
 
 In `crates/athenaeum-core/src/sharing/mod.rs`, inside `trait SharingTransport`, next to `list_in_flight_tags` (the file's existing defaulted-method pattern):
 
@@ -180,7 +180,7 @@ In `crates/athenaeum-core/src/sharing/mod.rs`, inside `trait SharingTransport`, 
     }
 ```
 
-- [ ] **Step 4: Add the hook slot and the accept-loop dispatch**
+- [x] **Step 4: Add the hook slot and the accept-loop dispatch**
 
 In `crates/athenaeum-core/src/sharing/iroh/mod.rs`, beside `SharedConnectGate`/`SharedResponder`:
 
@@ -220,7 +220,7 @@ In the accept loop's `match msg`, add an arm BEFORE the fallthrough. Presence is
                 }
 ```
 
-- [ ] **Step 5: Implement `set_presence_hook` + `send_presence` on the node**
+- [x] **Step 5: Implement `set_presence_hook` + `send_presence` on the node**
 
 In `crates/athenaeum-core/src/sharing/iroh/node.rs`, add the field `presence: SharedPresenceHook` to `SharedIrohNode` (created in `bind` and passed to `build_router`), plus:
 
@@ -272,12 +272,12 @@ const PRESENCE_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 Wire `RoleHandle`'s `SharingTransport::send_presence` to `self.node.send_presence(to)`.
 
-- [ ] **Step 6: Run the test**
+- [x] **Step 6: Run the test**
 
 Run: `cargo test -q -p athenaeum-core --lib presence_beacon_fires_the_peers_hook`
 Expected: PASS.
 
-- [ ] **Step 7: Full gates + commit**
+- [x] **Step 7: Full gates + commit**
 
 ```bash
 cargo build -q --workspace --all-targets && cargo build -q -p perseus --no-default-features
