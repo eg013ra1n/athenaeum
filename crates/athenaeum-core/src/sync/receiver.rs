@@ -1381,6 +1381,24 @@ async fn handle_announce(
         // the receiver loop logs it too.
         journal(store, inbound_id, "fetch_failed", Some(&format!("{e:#}")));
         stamp_inbound_failed(store, &package_id, &e);
+        // …and announce the terminal, like every other ending does. Without this
+        // the row DISAPPEARS from a live Transfers screen (owner smoke
+        // 2026-07-24, "closed the sender mid-transfer"): a Failed row is excluded
+        // from `inbound_active`, so the status poll drops it from the Active list,
+        // while the durable terminal list that should then carry it is re-fetched
+        // only on `sync-finished`. Emitted AFTER the state stamp so the refetch it
+        // triggers reads the settled row.
+        emit_event(emitter.as_ref(), "sync-finished", &SyncFinishedEvent {
+            package_id: package_id.clone(),
+            direction: super::Direction::Received,
+            outcome: "failed".to_string(),
+            peer_device: peer_device.to_string(),
+            ok_count: 0,
+            failed: Vec::new(),
+            new_count: 0,
+            duplicate_count: 0,
+            project_id: None,
+        });
         return Err(e).with_context(|| format!("fetch package {package_id}"));
     }
 
@@ -3829,6 +3847,68 @@ mod tests {
     fn count_scalar(store: &Arc<CatalogSyncStore>, sql: &str) -> i64 {
         let conn = store.lock_conn();
         conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// A fetch that FAILS must emit a terminal `sync-finished`, exactly like every
+    /// other terminal path (cancel epilogue, revoke, ingest done).
+    ///
+    /// Owner smoke 2026-07-24: closing the SENDER mid-transfer made the row vanish
+    /// from the receiver's Transfers screen entirely. Root cause is here, not in the
+    /// UI: the failed row leaves `inbound_active` (which excludes done/failed/
+    /// cancelled), so the 10 s status poll drops it from the Active list — and the
+    /// durable terminal list that should then carry it (`list_terminal_transfers`)
+    /// is only re-fetched on `sync-finished`, which this path never emitted. The row
+    /// was in neither list until the page remounted.
+    #[tokio::test]
+    async fn failed_fetch_emits_a_terminal_finished_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        let recorder = Arc::new(RecordingEmitter::default());
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            { let incoming = incoming.clone(); Arc::new(move || incoming.clone()) as IncomingResolver },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
+        let wire = announce.package_id.0.clone();
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        // Kill the payload transfer mid-flight — the loopback stand-in for "the
+        // sender's app was closed while we were downloading".
+        receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+        sender
+            .announce(receiver_node, &announce, "M31 Lights", "batch-finished-on-failure", &files)
+            .await
+            .unwrap();
+
+        let row = poll_inbound(&store, &wire, InboundState::Failed).await;
+        assert!(no_files_landed(&incoming), "the aborted fetch lands no files");
+
+        wait_for_finished(&recorder, 1).await;
+        let ev = finished_events(&recorder).pop().expect("a terminal finished event");
+        assert_eq!(ev["outcome"], "failed", "the event carries the terminal outcome: {ev}");
+        assert_eq!(ev["direction"], "received", "receive-side event: {ev}");
+        assert_eq!(ev["packageId"], wire, "keyed on the attempt's wire id: {ev}");
+        assert_eq!(row.state, InboundState::Failed, "and the row is terminal");
     }
 
     /// The primary batch-model contract (the TDD driver): a transfer whose FIRST
