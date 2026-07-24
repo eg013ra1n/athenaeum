@@ -88,6 +88,8 @@ Measured 2026-07-24: receiver back online 21:45:24; sender noticed the ack timeo
 
 ---
 
+**F8 — A retry attempt re-hashes the whole payload before it learns the peer is absent.** `attempt()` calls `serve()` on every try (`engine.rs:1193`), and `role_serve` has no short-circuit (`node.rs:1806`): it re-imports the package directory through `add_path` per file each time. The dedup handshake, by contrast, runs once and is cached — so the expensive half repeats and the cheap half does not. Measured indirectly on the smoke: ~3 s for a 1.98 GB package on SSD (BLAKE3 is fast), which would be minutes on network or spinning storage. This finding constrains every other one: it is why "just retry more often" is not free, and why any fix must separate a cheap reachability check from a committed attempt.
+
 ## 4. What the model needs (framing, not yet design)
 
 1. **A reachability notion for the sender** — per peer, not per package: is this peer dialable right now, and what changed when it became so.
