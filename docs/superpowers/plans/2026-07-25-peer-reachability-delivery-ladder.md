@@ -46,7 +46,7 @@
 **Interfaces:**
 - Produces: `Msg::Presence` — a unit variant, no payload. Task 2 encodes and decodes it.
 
-- [ ] **Step 1: Write the failing golden test**
+- [x] **Step 1: Write the failing golden test**
 
 Add to `crates/athenaeum-core/src/sharing/wire_golden_tests.rs`, following the file's existing pin style:
 
@@ -57,7 +57,7 @@ Add to `crates/athenaeum-core/src/sharing/wire_golden_tests.rs`, following the f
 #[test]
 fn presence_golden_bytes() {
     let bytes = Msg::Presence.encode().expect("encode presence");
-    assert_eq!(bytes, vec![9], "presence is variant index 9 with no payload");
+    assert_eq!(bytes, vec![10], "presence is variant index 10 with no payload");
     assert!(
         matches!(Msg::decode(&bytes).expect("decode presence"), Msg::Presence),
         "presence round-trips"
@@ -65,12 +65,12 @@ fn presence_golden_bytes() {
 }
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cargo test -q -p athenaeum-core --lib presence_golden_bytes`
 Expected: FAIL — `no variant named Presence found for enum Msg`.
 
-- [ ] **Step 3: Append the variant**
+- [x] **Step 3: Append the variant**
 
 At the very END of `pub enum Msg` in `proto.rs`, after `Revoke { .. }`:
 
@@ -85,12 +85,12 @@ At the very END of `pub enum Msg` in `proto.rs`, after `Revoke { .. }`:
     Presence,
 ```
 
-- [ ] **Step 4: Verify the pin passes and no other pin moved**
+- [x] **Step 4: Verify the pin passes and no other pin moved**
 
 Run: `cargo test -q -p athenaeum-core --lib wire_golden`
 Expected: PASS, every pre-existing golden test included. **If any OTHER golden test fails, stop** — the variant was not appended at the end.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/athenaeum-core/src/sharing/iroh/proto.rs crates/athenaeum-core/src/sharing/wire_golden_tests.rs

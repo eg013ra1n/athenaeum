@@ -137,6 +137,18 @@ pub enum Msg {
         package_id: PackageId,
         reason: RevokeReason,
     },
+    // Peer reachability (D1) — appended AFTER `Revoke` as the LAST variant; every
+    // index above stays frozen (same append-only rule as the blocks above). A
+    // receiver sends this to its authorized ACCOUNT devices when it comes online,
+    // so a sender parked on a retry resumes at once instead of waiting out its
+    // schedule.
+    //
+    // Carries NO payload on purpose: the announcing peer's identity is the
+    // authenticated `remote_id` of the connection it arrives on, and anything
+    // self-reported here would be unverified peer input for a signal whose only
+    // job is "someone you already trust is reachable again".
+    /// Receiver announces that it is online and listening.
+    Presence,
 }
 
 /// Map a decoded *announce* control message — `Announce` (v1), `Announce2` (v2),

@@ -286,6 +286,10 @@ fn golden_cases() -> Vec<(&'static str, Vec<u8>, &'static str)> {
             .unwrap(),
             "090a706b672d757569642d3101",
         ),
+        // Peer reachability (D1): appended `Presence` (disc 0a). A unit variant, so
+        // its whole byte image IS its discriminant — which makes this the cheapest
+        // possible drift alarm for the tail of the enum.
+        ("msg_presence", Msg::Presence.encode().unwrap(), "0a"),
     ]
 }
 
@@ -309,8 +313,8 @@ fn wire_format_is_frozen() {
 /// deliberately when adding a new wire type + its golden (never to silence it).
 #[test]
 fn all_wire_types_are_pinned() {
-    // 12 embedded/standalone samples + 10 Msg variants = 22.
-    assert_eq!(golden_cases().len(), 22, "add a golden case for every new wire type");
+    // 12 embedded/standalone samples + 11 Msg variants = 23.
+    assert_eq!(golden_cases().len(), 23, "add a golden case for every new wire type");
 }
 
 /// Migration guard (spec §D2): the FROZEN v1/v2 announce byte-pins still decode,

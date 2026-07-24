@@ -1718,6 +1718,19 @@ impl ProtocolHandler for SyncControlProtocol {
                     tracing::warn!(from = %hex32(&from), "unexpected inbound Want on control accept; ignoring");
                     continue;
                 }
+                // Peer reachability (D1): a presence beacon is not a package event
+                // — it never enters the demux. It is acknowledged like any other
+                // control message so the beacon's sender sees delivery, then the
+                // loop takes the next stream. The host hook that turns it into a
+                // queue resume is installed in the next task; until then this is a
+                // deliberate no-op rather than an error, so a peer already running
+                // the new build is never told its beacon failed.
+                Msg::Presence => {
+                    tracing::debug!(from = %hex32(&from), "peer presence received");
+                    let _ = tx.write_all(b"1").await;
+                    let _ = tx.finish();
+                    continue;
+                }
             };
             // Deliver in-process, then ack IFF a consumer received it. The
             // shared node's demux routes by `(peer, package)` ack-claim / Recv
