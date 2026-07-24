@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status (2026-07-25):** Tasks 1–5 implemented and committed (athenaeum `b2ff649d`, athenaeum-hub `050fc96`); all gates green (`cargo build --workspace --all-targets`, `cargo build -p perseus --no-default-features`, `cargo test -p athenaeum-core --lib` 1137 passed, `npx tsc --noEmit`). **Task 6 (owner verification) is open** — nothing here has been observed against a live two-device transfer yet.
+
 **Goal:** Close the transport-layer findings left open by the 2026-07-24 transfers/iroh audit — make the iroh transport observable (which is why a fleet-wide NAT-traversal outage went unseen for months), stop the hub address reporter from publishing a degraded address, and fix the home-relay watcher's health surface.
 
 **Context — what the audit already fixed (do NOT redo):**
