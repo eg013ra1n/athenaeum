@@ -65,9 +65,11 @@ A beacon that passes both is debounced per peer (`PRESENCE_DEBOUNCE = 10 s`) so 
 
 | Class | Meaning | Schedule |
 | ---- | ---- | ---- |
-| `no_route`, `timeout`, `relay_unreachable` | the peer looks absent | **flat `ABSENT_RETRY_INTERVAL` = 120 s**, rung not climbed |
+| `no_route`, `timeout`, `relay_unreachable`, `not_started` | the peer looks absent | **flat `ack_timeout × 4` = 120 s at the default base**, rung not climbed |
 | `refused` | the peer is up and declines us | current escalating ladder — this needs a human, not persistence |
-| `not_started`, `other`, local faults | our side, or unknown | current escalating ladder, unchanged |
+| `other`, local faults | our side, or unknown | current escalating ladder, unchanged |
+
+`not_started` belongs with the absent classes even though its doc reads "the local **or** remote endpoint is not started". Both readings want the same schedule: a remote endpoint that has not started is precisely an absent peer, and a local one is transient — our own start fires the wake hook, which releases the queue before the flat interval matters. Escalating on it would punish the commonest shape of "the other side's app is not running", and it is what the loopback tests produce.
 
 The rung additionally resets to 0 on **any** successful contact with the peer — an ack, a serve tick, or a presence beacon — not only on a serve tick as today.
 
@@ -147,4 +149,4 @@ Deliberately excluded, with reasons: a Perseus-specific tuning profile (the obse
 - **Old-peer noise**: one warn and one dropped incoming connection per beacon, bounded by the two edges. Accepted.
 - **Beacon storm** from a peer whose relay flaps: bounded by the sender-side debounce.
 - **A stale absent mark** (peer returned but nothing contacted it) resolves within one flat interval.
-- **`ABSENT_RETRY_INTERVAL = 120 s` is a judgement call**, chosen so an unattended overnight outage costs ~30 idle dials/hour per peer rather than 2 at the old cap; if field logs show that is too eager for Perseus fan-out, it is one constant.
+- **The flat interval (`ack_timeout × 4` = 120 s) is a judgement call**, chosen so an unattended overnight outage costs ~30 idle dials/hour per peer rather than 2 at the old cap; if field logs show that is too eager for Perseus fan-out, it is one multiplier. Expressing it as a multiple of the base — rather than an absolute duration — follows the convention `retry_backoff` already uses, so a test configured with a millisecond `ack_timeout` observes the flat path without waiting two minutes.
