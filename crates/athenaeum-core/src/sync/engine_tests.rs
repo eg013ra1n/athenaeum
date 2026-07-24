@@ -1066,6 +1066,148 @@ async fn ack_lost_then_duplicate_ack_confirms_once() {
     engine.shutdown().await;
 }
 
+/// D1 §3.4: while the peer is absent exactly ONE package probes. Otherwise a
+/// three-package queue against a shut laptop dials three times every window — and
+/// a fifty-package queue fifty times, each paying a full payload re-hash.
+/// A presence beacon then releases the whole queue at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absent_peer_probes_with_one_package_then_presence_releases_all() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+    // Minted but not started → every announce fails as `not_started`, an absent
+    // class.
+    let receiver = Arc::new(net.endpoint());
+    let receiver_id = receiver.node_id();
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync_coalesce.db")).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig { ack_timeout: Duration::from_millis(150) },
+    );
+
+    let mut ids = Vec::new();
+    for tag in ["a", "b", "c"] {
+        let pkg = build_package(
+            &tmp.path().join(format!("src_{tag}")),
+            &format!("uuid-{tag}"),
+            &format!("frame_{tag}.fits"),
+            "M101",
+            1024,
+        );
+        ids.push(engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap());
+    }
+
+    // Every package makes its OWN first attempt — an enqueue is user intent and
+    // the peer state may be stale — and then parks behind the head.
+    wait_until(|| ids.iter().all(|id| attempts_of(&store, *id) >= 1), WAIT).await;
+    // Give the head several flat windows (150ms * 4 = 600ms each) to probe again.
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+
+    let counts: Vec<u32> = ids.iter().map(|id| attempts_of(&store, *id)).collect();
+    let head_attempts = counts[0];
+    assert!(
+        head_attempts >= 2,
+        "the head keeps probing the absent peer, got {counts:?}"
+    );
+    assert_eq!(
+        (counts[1], counts[2]),
+        (1, 1),
+        "the queue-mates park after their first attempt instead of dialing too: {counts:?}"
+    );
+
+    // The peer comes to life and announces itself: everything parked goes.
+    receiver.start().await.unwrap();
+    let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv_coalesce"));
+    engine.peer_present().await.unwrap();
+
+    for id in &ids {
+        wait_until(|| state_of(&store, *id) == Some(OutboundState::Confirmed), WAIT).await;
+    }
+    engine.shutdown().await;
+}
+
+/// The head is re-elected when it leaves `pending`, so a queue whose probing
+/// package terminalizes does not go silent forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn absent_head_is_re_elected_when_it_terminalizes() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+    let receiver_id = net.endpoint().node_id();
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync_head.db")).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        SyncConfig { ack_timeout: Duration::from_millis(150) },
+    );
+
+    // NOTE: `build_package` returns the PACKAGE dir (`pkg-<uuid>`, a sibling of the
+    // source root) — that is what the engine serves and what must vanish to
+    // terminalize the package. Removing the source root would leave the engine
+    // happily re-announcing an intact package.
+    let pkg_head = build_package(&tmp.path().join("src_head"), "uuid-head", "head.fits", "M101", 1024);
+    let pkg_tail = build_package(&tmp.path().join("src_tail"), "uuid-tail", "tail.fits", "M101", 1024);
+    let head = engine.enqueue_package(&pkg_head, None, Vec::new()).await.unwrap();
+    let tail = engine.enqueue_package(&pkg_tail, None, Vec::new()).await.unwrap();
+
+    wait_until(
+        || attempts_of(&store, head) >= 1 && attempts_of(&store, tail) >= 1,
+        WAIT,
+    )
+    .await;
+    let tail_parked_at = attempts_of(&store, tail);
+
+    // Terminalize the head the one way delivery-forever allows: its payload is
+    // gone from disk, so re-announcing can never succeed (spec §1).
+    std::fs::remove_dir_all(&pkg_head).unwrap();
+    wait_until(|| state_of(&store, head) == Some(OutboundState::Failed), WAIT).await;
+
+    // The tail must now BE the head: its attempts start climbing again.
+    wait_until(|| attempts_of(&store, tail) > tail_parked_at, WAIT).await;
+    engine.shutdown().await;
+}
+
+/// Presence must not disturb a live pull: a package awaiting its ack while the
+/// peer is actively fetching keeps its deadline and issues no re-announce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn presence_does_not_re_announce_a_package_awaiting_ack() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+    // Started receiver that never acks: the package reaches AwaitAck and stays
+    // there, which is exactly the "mid-pull" shape presence must not disturb.
+    let receiver = Arc::new(net.endpoint());
+    receiver.start().await.unwrap();
+    let receiver_id = receiver.node_id();
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync_await.db")).unwrap());
+    let engine = SyncEngine::spawn_with_config(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+        // Long ack timeout: the package must still be awaiting its ack when the
+        // beacon lands, not already backed off.
+        SyncConfig { ack_timeout: Duration::from_secs(30) },
+    );
+
+    let pkg = build_package(&tmp.path().join("src_await"), "uuid-await", "await.fits", "M101", 1024);
+    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    wait_until(|| attempts_of(&store, id) >= 1, WAIT).await;
+    let attempts_before = attempts_of(&store, id);
+
+    engine.peer_present().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        attempts_of(&store, id),
+        attempts_before,
+        "a package awaiting its ack must not be re-announced by a presence beacon"
+    );
+    engine.shutdown().await;
+}
+
 #[test]
 fn backoff_schedule_multiplies_base_and_caps() {
     use std::time::Duration;
@@ -3738,11 +3880,12 @@ async fn kick_all_resets_every_pending_package() {
     let id_a = engine.enqueue_package(&pkg_a, None, Vec::new()).await.unwrap();
     let id_b = engine.enqueue_package(&pkg_b, None, Vec::new()).await.unwrap();
 
-    // Park BOTH in a long backoff window: climbed a couple of rungs AND
-    // next_retry_at parses to comfortably (>1.2s) in the future. Without a kick
-    // the next natural re-announce is that far off, so a fast confirmation below
-    // can only be the kick's doing.
-    let parked_long = |id: i64| {
+    // Park both against the absent peer. Under D1 coalescing only the HEAD (the
+    // lowest pending id) keeps a live countdown; its queue-mate parks with no
+    // deadline at all and waits for a signal. Either way, neither re-announces on
+    // its own inside the window below, so a fast confirmation can only be the
+    // kick's doing.
+    let countdown_beyond_1200ms = |id: i64| {
         store
             .get_outbound(id)
             .unwrap()
@@ -3754,8 +3897,19 @@ async fn kick_all_resets_every_pending_package() {
             })
             .unwrap_or(false)
     };
-    wait_until(|| attempts_of(&store, id_a) >= 2 && attempts_of(&store, id_b) >= 2, WAIT).await;
-    wait_until(|| parked_long(id_a) && parked_long(id_b), WAIT).await;
+    let parked_without_countdown = |id: i64| {
+        store
+            .get_outbound(id)
+            .unwrap()
+            .map(|r| r.next_retry_at.is_none())
+            .unwrap_or(false)
+    };
+    wait_until(|| attempts_of(&store, id_a) >= 1 && attempts_of(&store, id_b) >= 1, WAIT).await;
+    wait_until(
+        || countdown_beyond_1200ms(id_a) && parked_without_countdown(id_b),
+        WAIT,
+    )
+    .await;
     assert_ne!(
         state_of(&store, id_a),
         Some(OutboundState::Confirmed),

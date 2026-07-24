@@ -217,6 +217,10 @@ enum Command {
     /// its backoff rung so the next worker pass re-announces immediately (spec §2
     /// wake event / send-now). A no-op for an id with no pending slot.
     Kick(i64),
+    /// This engine's peer announced itself online (D1 presence beacon). Clears
+    /// the absence mark and releases every PARKED package — never touches one
+    /// that is mid-pull awaiting its ack.
+    PeerPresent,
     /// Kick **every** in-flight package (a relay-online / authorized-peer
     /// refresh nudge): the same immediate-retry reset applied to all pending
     /// slots.
@@ -555,6 +559,7 @@ impl SyncEngine {
             emitter,
             cleanup_sink,
             addr_refresher,
+            peer_state: PeerReachability::default(),
         };
         let join = tokio::spawn(async move {
             if let Err(e) = worker.run(cmd_rx).await {
@@ -648,6 +653,18 @@ impl SyncEngineHandle {
         Ok(())
     }
 
+    /// Tell the worker its peer just announced itself online (D1 presence
+    /// beacon). Clears the absence mark and releases every PARKED package; a
+    /// package mid-pull is deliberately untouched. Idempotent and cheap — the
+    /// host debounces per peer before calling.
+    pub async fn peer_present(&self) -> Result<()> {
+        self.cmd_tx
+            .send(Command::PeerPresent)
+            .await
+            .map_err(|_| anyhow!("sync engine worker stopped"))?;
+        Ok(())
+    }
+
     /// Kick every in-flight package (a relay-online / authorized-peer refresh
     /// nudge): the immediate-retry wake applied to all pending slots. The worker
     /// resets each slot's deadline; delivery follows on the next pass.
@@ -679,6 +696,22 @@ impl SyncEngineHandle {
 /// The worker: owns the transport endpoint, the in-flight map, and the store
 /// handle. All state mutation happens on this single task, so ack idempotence
 /// and history de-duplication fall out of sequential processing for free.
+/// The engine's in-memory view of ITS peer's reachability (D1 §3.4).
+///
+/// One engine is one peer, so nothing here needs keying. Not persisted on
+/// purpose: after a restart the first attempt re-establishes the truth in
+/// seconds, and a stale "absent since" restored from disk would be worse than
+/// none — it would name a time the peer may have been back for hours.
+#[derive(Debug, Default)]
+struct PeerReachability {
+    /// When the peer first looked absent, stamped only on the transition into
+    /// absence (so it reads as "in this state since", not "last seen failing").
+    absent_since: Option<Instant>,
+    /// The package currently carrying the live probe deadline while absent. Every
+    /// other pending package parks with no deadline and waits for a signal.
+    head: Option<i64>,
+}
+
 struct Worker {
     store: Arc<dyn SyncStore>,
     transport: Arc<dyn SharingTransport>,
@@ -701,6 +734,9 @@ struct Worker {
     /// before re-attempting. `None` for tests + single-shot spawners → retries use
     /// the address already known to the transport (unchanged behavior).
     addr_refresher: Option<AddrRefresher>,
+    /// This peer's reachability (D1). Drives the coalescing that keeps a flat
+    /// retry affordable: while the peer is absent exactly one package probes.
+    peer_state: PeerReachability,
 }
 
 impl Worker {
@@ -784,6 +820,11 @@ impl Worker {
         }
 
         loop {
+            // Before deciding how long to sleep: if the absent peer's probing head
+            // has left the queue, elect and wake its successor (D1 §3.4). Doing it
+            // here rather than on each removal path means no future terminal path
+            // can silently park a whole queue for an hour.
+            self.ensure_absent_head_alive();
             let next = self.next_deadline();
             let sleep = tokio::time::sleep_until(next);
             tokio::pin!(sleep);
@@ -844,6 +885,7 @@ impl Worker {
                         }
                     }
                     Some(Command::Resend(id)) => self.resend_package(id).await,
+                    Some(Command::PeerPresent) => self.peer_reachable("presence"),
                     Some(Command::Kick(id)) => self.kick_one(id),
                     Some(Command::KickAll) => {
                         // Snapshot the ids so no `&self.pending` borrow is held
@@ -1333,6 +1375,11 @@ impl Worker {
             // an ack timeout must not treat proven-good addressing as dead.
             p.last_attempt_class = None;
         }
+        // Reaching the peer IS proof it is back (D1 §3.4): release anything the
+        // absence parked, so a queue behind the probing head drains at once
+        // instead of waiting for a beacon that may never come (an older peer
+        // never sends one).
+        self.peer_reachable("announce");
         // The serve/announce succeeded — clear any stale attempt-error so a package
         // now awaiting its ack no longer shows the previous failure (Task 9).
         // Best-effort: a diagnostic write must never fail the send.
@@ -1590,40 +1637,159 @@ impl Worker {
         Ok(())
     }
 
+    /// The package that probes an absent peer: the lowest pending row id, so the
+    /// choice is deterministic (no "whichever failed last" churn) and stable
+    /// across passes. Re-elected whenever the previous head leaves `pending` —
+    /// confirmed, cancelled, or terminalized by a local fault — so a queue whose
+    /// probing package dies never goes silent.
+    fn elect_absent_head(&mut self) -> Option<i64> {
+        let head = self
+            .peer_state
+            .head
+            .filter(|id| self.pending.contains_key(id))
+            .or_else(|| self.pending.keys().min().copied());
+        self.peer_state.head = head;
+        head
+    }
+
+    /// Keep the absent peer's probe alive across the head leaving `pending`.
+    ///
+    /// The head can vanish without any failure of its own — it confirms, gets
+    /// cancelled, or terminalizes on a local fault (a payload deleted off disk).
+    /// Its queue-mates are parked with no deadline, so unless a new head is
+    /// elected AND woken here, the whole queue would sleep out `IDLE_SLEEP` — an
+    /// hour of silence for a peer we are supposed to be probing every two minutes.
+    /// Called once per worker pass, so no removal path can forget it.
+    fn ensure_absent_head_alive(&mut self) {
+        if self.peer_state.absent_since.is_none() {
+            return;
+        }
+        let head_alive = self
+            .peer_state
+            .head
+            .is_some_and(|id| self.pending.contains_key(&id));
+        if head_alive {
+            return;
+        }
+        let Some(new_head) = self.elect_absent_head() else {
+            return; // nothing pending for this peer at all
+        };
+        if let Some(p) = self.pending.get_mut(&new_head) {
+            p.deadline = Instant::now();
+            tracing::debug!(
+                package_id = new_head,
+                peer = %super::node_id_hex(&self.peer),
+                "absent-peer probe re-elected after the previous head left the queue"
+            );
+        }
+    }
+
+    /// Mark this engine's peer absent (idempotent) and return whether `id` is the
+    /// package that should carry the live probe deadline.
+    ///
+    /// Coalescing is what makes the flat schedule affordable (D1 §3.4): without
+    /// it, fifty packages queued to one shut laptop would each dial every window.
+    fn note_peer_absent(&mut self, id: i64) -> bool {
+        if self.peer_state.absent_since.is_none() {
+            self.peer_state.absent_since = Some(Instant::now());
+            tracing::info!(
+                peer = %super::node_id_hex(&self.peer),
+                pending = self.pending.len(),
+                "peer looks absent; parking its queue behind one probe"
+            );
+        }
+        self.elect_absent_head() == Some(id)
+    }
+
+    /// The peer is reachable: forget the absence and release everything parked on
+    /// it. `reason` names what proved it (a presence beacon, an ack, a serve
+    /// tick) and rides the log line.
+    ///
+    /// Only PARKED packages are touched. A package in [`NextAction::AwaitAck`] is
+    /// mid-pull — collapsing its deadline would fire a pointless re-announce at a
+    /// peer that is already reading our bytes.
+    fn peer_reachable(&mut self, reason: &'static str) {
+        let was_absent = self.peer_state.absent_since.take().is_some();
+        self.peer_state.head = None;
+        let mut released = 0usize;
+        for p in self.pending.values_mut() {
+            if p.next_action == NextAction::Retry {
+                p.deadline = Instant::now();
+                p.rung = 0;
+                released += 1;
+            }
+        }
+        if was_absent || released > 0 {
+            tracing::info!(
+                peer = %super::node_id_hex(&self.peer),
+                reason,
+                count = released,
+                "peer reachable; releasing its parked queue"
+            );
+        }
+    }
+
     /// Arm a backoff deadline on a still-pending package after a failed
     /// build/serve/announce attempt: climb one rung and wait out
     /// [`retry_backoff`] before the next announce (spec §2). Leaves the milestone
     /// untouched — the row stays `Queued` until an announce actually succeeds, and
     /// is never terminalized from a network condition.
     fn arm_retry(&mut self, id: i64) {
+        // Read what the decision needs, then drop the borrow: electing an absent
+        // head takes `&mut self`.
+        let Some(class) = self.pending.get(&id).map(|p| p.last_attempt_class) else {
+            return; // slot gone (confirmed/cancelled concurrently)
+        };
+        let absent = class_is_absent(class);
+        // While the peer is absent exactly ONE package carries a live deadline;
+        // the rest park and wait for a signal instead of a clock (D1 §3.4).
+        let is_head = !absent || self.note_peer_absent(id);
+
         let armed = if let Some(p) = self.pending.get_mut(&id) {
             // An absent peer does not climb: the rung indexes an escalation that
             // only makes sense when repeated failure says something about US or
             // about a peer that is up and unhappy (D1 §3.3).
-            if !class_is_absent(p.last_attempt_class) {
+            if !absent {
                 p.rung = p.rung.saturating_add(1);
             }
             p.next_action = NextAction::Retry;
-            let delay = retry_backoff(self.config.ack_timeout, p.rung, p.last_attempt_class);
-            p.deadline = Instant::now() + delay;
             // §D5: a retry is now pending — the next serve tick (if bytes resume
             // flowing) must clear the stale reason.
             p.clear_error_on_next_serve = true;
-            let class = p.last_attempt_class.map(|c| c.tag());
-            Some((p.rung, delay, class))
+            let delay = retry_backoff(self.config.ack_timeout, p.rung, class);
+            if is_head {
+                p.deadline = Instant::now() + delay;
+                Some((p.rung, delay, class.map(|c| c.tag())))
+            } else {
+                // Parked behind the head: no deadline of its own. `IDLE_SLEEP`
+                // keeps it out of `next_deadline()`'s way; what releases it is
+                // `peer_reachable` — a presence beacon, or the head getting through.
+                p.deadline = Instant::now() + IDLE_SLEEP;
+                None
+            }
         } else {
             None
         };
+
         // Persist the wall-clock retry deadline (Task 2) + journal it (§D7) once the
         // `&mut pending` borrow is dropped, so the UI can render a countdown and a
         // restart re-arms honestly.
-        if let Some((rung, delay, class)) = armed {
-            self.persist_next_retry(id, delay);
-            let detail = match class {
-                Some(c) => format!("rung={rung} delay_ms={} class={c}", delay.as_millis() as u64),
-                None => format!("rung={rung} delay_ms={}", delay.as_millis() as u64),
-            };
-            self.journal(id, "retry_scheduled", Some(&detail));
+        match armed {
+            Some((rung, delay, class)) => {
+                self.persist_next_retry(id, delay);
+                let detail = match class {
+                    Some(c) => format!("rung={rung} delay_ms={} class={c}", delay.as_millis() as u64),
+                    None => format!("rung={rung} delay_ms={}", delay.as_millis() as u64),
+                };
+                self.journal(id, "retry_scheduled", Some(&detail));
+            }
+            None => {
+                // A parked package has no countdown to show: clearing the persisted
+                // deadline is what stops the UI rendering a number that means
+                // nothing (it is waiting for a signal, not for that instant).
+                self.clear_next_retry(id);
+                self.journal(id, "parked_peer_absent", None);
+            }
         }
     }
 
@@ -1940,6 +2106,10 @@ impl Worker {
                 log_serve_started = true;
             }
         }
+        // Bytes are flowing from this peer, so it is unambiguously reachable —
+        // release anything its absence had parked (D1 §3.4). `note_serve_activity`
+        // above already handled THIS package; this is about its queue-mates.
+        self.peer_reachable("serve");
         if clear_error {
             if let Err(e) = self.store.set_last_error(id, None) {
                 tracing::warn!(package_id = id, error = %e, "clear last_error on serve tick failed");
@@ -2141,8 +2311,13 @@ impl Worker {
         });
         let Some(key) = key else {
             tracing::debug!(package_id = %package_id.0, "duplicate/late ack ignored");
+            // Even a late ack is proof of life from the peer — release whatever its
+            // absence had parked before returning (D1 §3.4).
+            self.peer_reachable("ack");
             return Ok(());
         };
+        // An ack from the paired peer is the strongest possible reachability proof.
+        self.peer_reachable("ack");
 
         // §D4/§D7: settle each per-file row named in the receipts with the
         // receiver's verdict (`ingested`/`duplicate`/`cancelled`/`rejected:<reason>`,
@@ -2474,12 +2649,12 @@ impl Worker {
                                 if addressing_dead {
                                     self.transport.remove_peer_addr(self.peer);
                                     tracing::info!(
-                                        peer = %node_id_hex(&self.peer),
+                                        peer = %super::node_id_hex(&self.peer),
                                         "retry: invalidated stale peer addressing before refresh"
                                     );
                                 }
                                 tracing::info!(
-                                    peer = %node_id_hex(&self.peer),
+                                    peer = %super::node_id_hex(&self.peer),
                                     "retry: re-resolved peer address"
                                 );
                                 self.transport.add_peer_addr(addr);
@@ -2488,7 +2663,7 @@ impl Worker {
                                 // (hub blip / peer gone). Keep-last-good is correct;
                                 // log the fallback so a stuck retry is not silent.
                                 tracing::warn!(
-                                    peer = %node_id_hex(&self.peer),
+                                    peer = %super::node_id_hex(&self.peer),
                                     "retry: address refresh unavailable; dialing last-known address"
                                 );
                             }

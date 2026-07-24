@@ -417,7 +417,7 @@ git commit -m "feat(sync): retry schedule distinguishes an absent peer from a re
 - Consumes: `retry_backoff(base, rung, class)`, `class_is_absent` (Task 3).
 - Produces: `SyncEngineHandle::peer_present(&self) -> anyhow::Result<()>` — Task 6 calls it.
 
-- [ ] **Step 1: Write the failing coalescing test**
+- [x] **Step 1: Write the failing coalescing test**
 
 In `engine_tests.rs`, in the idiom of the existing `peer_offline_backs_off_and_stays_pending` (line ~1441): a loopback endpoint that is minted but never started makes every announce fail, and that failure classifies as `not_started` — an absent class. `spawn_receiver` (line ~90) is what brings the peer to life afterwards.
 
@@ -508,12 +508,12 @@ async fn absent_head_is_re_elected_when_it_terminalizes() {
 
 `WAIT` and the helpers (`wait_until`, `attempts_of`, `state_of`, `build_package`, `spawn_receiver`) already exist at the top of `engine_tests.rs`.
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cargo test -q -p athenaeum-core --lib absent_peer_probes_with_one_package`
 Expected: FAIL — `no method named peer_present`.
 
-- [ ] **Step 3: Implement the peer state**
+- [x] **Step 3: Implement the peer state**
 
 Add to the engine struct:
 
@@ -603,12 +603,12 @@ Add the command + handle method:
     }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -q -p athenaeum-core --lib sync::engine`
 Expected: PASS, including the pre-existing engine suite.
 
-- [ ] **Step 5: Add the non-disturbance test, run, commit**
+- [x] **Step 5: Add the non-disturbance test, run, commit**
 
 ```rust
 /// Presence must not interrupt a live pull: a package in `AwaitAck` whose peer is
