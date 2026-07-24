@@ -645,7 +645,7 @@ git commit -m "feat(sync): per-peer absence with one probing head; presence rele
 **Interfaces:**
 - Produces: no new public API. `role_serve` keeps its signature; the change is internal short-circuiting.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 /// Re-serving the same package must not re-import it. Audit F8: every retry
@@ -672,12 +672,12 @@ async fn re_serving_the_same_package_skips_the_import() {
 }
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cargo test -q -p athenaeum-core --lib re_serving_the_same_package`
 Expected: FAIL — the blob count grows, because the mutated file is re-imported.
 
-- [ ] **Step 3: Implement the short-circuit**
+- [x] **Step 3: Implement the short-circuit**
 
 Record the want fingerprint alongside the hash, and skip on an exact match:
 
@@ -708,12 +708,12 @@ In `role_serve`, before importing:
 
 Update the two readers of `served` (`resolve_served_root_in`, `resolve_served_file_in`) for the new tuple shape.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -q -p athenaeum-core --lib sharing::iroh`
 Expected: PASS, whole module.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/athenaeum-core/src/sharing/iroh/node.rs crates/athenaeum-core/src/sharing/iroh/tests.rs

@@ -285,13 +285,37 @@ fn recv_in_flight_package_id(tag: &str) -> Option<&str> {
 /// foreign hash — the provider-events consumer still drains those, it just emits
 /// no progress for them. Backs both [`SharedIrohNode::resolve_served_root`] and the
 /// [`ServeRootResolver`] closure the consumer holds.
+/// What a `serve` recorded for one package tag: the imported collection's root
+/// hash plus the fingerprint of the want-subset it was built from.
+///
+/// The fingerprint is what makes the re-serve short-circuit safe (D1 §3.5): two
+/// serves of the same package with DIFFERENT subsets are different collections,
+/// so reusing the first hash for the second would advertise a collection missing
+/// the frames the peer just asked for.
+#[derive(Debug, Clone)]
+struct ServedCollection {
+    hash: Hash,
+    want_fingerprint: Option<String>,
+}
+
+/// Stable fingerprint of a serve's want-subset: `None` for a full package, else
+/// the sorted rel_paths joined. Sorted because the subset arrives as a `HashSet`,
+/// whose iteration order would otherwise make an identical subset look different.
+fn want_fingerprint(want: Option<&HashSet<String>>) -> Option<String> {
+    want.map(|w| {
+        let mut v: Vec<&str> = w.iter().map(String::as_str).collect();
+        v.sort_unstable();
+        v.join("\n")
+    })
+}
+
 fn resolve_served_root_in(
-    served: &Mutex<HashMap<String, Hash>>,
+    served: &Mutex<HashMap<String, ServedCollection>>,
     hash: Hash,
 ) -> Option<PackageId> {
     let map = served.lock().expect("served mutex poisoned");
-    map.iter().find_map(|(tag, h)| {
-        if *h == hash {
+    map.iter().find_map(|(tag, entry)| {
+        if entry.hash == hash {
             tag.split("/pkg/").nth(1).map(|id| PackageId(id.to_string()))
         } else {
             None
@@ -310,7 +334,7 @@ fn resolve_served_root_in(
 /// their own `rel_path`. Backs the [`ServeFileResolver`] closure the consumer
 /// holds; spawned before `Self` exists, so it works over the shared maps directly.
 fn resolve_served_file_in(
-    served: &Mutex<HashMap<String, Hash>>,
+    served: &Mutex<HashMap<String, ServedCollection>>,
     served_files: &Mutex<HashMap<String, Vec<(String, u64)>>>,
     root: Hash,
     hash_seq_index: u64,
@@ -322,7 +346,7 @@ fn resolve_served_file_in(
     let tag = {
         let map = served.lock().expect("served mutex poisoned");
         map.iter()
-            .find_map(|(tag, h)| (*h == root).then(|| tag.clone()))
+            .find_map(|(tag, entry)| (entry.hash == root).then(|| tag.clone()))
     }?;
     let files = served_files.lock().expect("served_files mutex poisoned");
     files.get(&tag).and_then(|entries| entries.get(entry_idx).cloned())
@@ -738,7 +762,7 @@ pub struct SharedIrohNode {
     /// so two roles serving the same package id never collide. Behind an `Arc` so
     /// the provider-upload-events consumer's [`ServeRootResolver`] (Task 13) can
     /// share it — the consumer is spawned at router build, before `Self` exists.
-    served: Arc<Mutex<HashMap<String, Hash>>>,
+    served: Arc<Mutex<HashMap<String, ServedCollection>>>,
     /// Prefixed package tag (`<role>/pkg/<id>`) → the served collection's ORDERED
     /// entries `(rel_path, byte_size)` (Task 2.2), in the exact order the provider
     /// iterates the hash-seq (collection order — the SUBSET order for a want-subset
@@ -902,7 +926,8 @@ impl SharedIrohNode {
         // consumer (Task 13) can resolve a served collection's root hash back to its
         // package id. Created here — before `Self` — and shared into both the
         // resolver and the struct field below.
-        let served: Arc<Mutex<HashMap<String, Hash>>> = Arc::new(Mutex::new(HashMap::new()));
+        let served: Arc<Mutex<HashMap<String, ServedCollection>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         // Ordered per-package collection entries for per-file attribution (Task
         // 2.2); shared into the file resolver the same way `served` is into the
         // root resolver.
@@ -1022,6 +1047,22 @@ impl SharedIrohNode {
     /// consumer resolves via a [`ServeRootResolver`] closure over the SAME shared
     /// map (it is spawned before `Self` exists, so it can't hold `&self`). `None`
     /// for a child blob / hash-seq-internal / foreign hash.
+    /// Test hook (D1 Task 5): the collection hash currently recorded for a role's
+    /// package tag, so a test can prove a re-serve reused it instead of importing.
+    #[cfg(test)]
+    pub(crate) fn resolve_served_hash_for_test(
+        &self,
+        role: Role,
+        package_id: &PackageId,
+    ) -> Option<Hash> {
+        let tag = role_package_tag(role.prefix(), package_id);
+        self.served
+            .lock()
+            .expect("served mutex poisoned")
+            .get(&tag)
+            .map(|e| e.hash)
+    }
+
     #[allow(dead_code)] // exposed contract; the consumer resolves via the shared closure
     pub(crate) fn resolve_served_root(&self, hash: Hash) -> Option<PackageId> {
         resolve_served_root_in(&self.served, hash)
@@ -1701,7 +1742,7 @@ impl SharedIrohNode {
         {
             let served = self.served.lock().expect("served mutex poisoned");
             match served.get(&tag) {
-                Some(hash) => wire.root_hash = hash.to_string(),
+                Some(entry) => wire.root_hash = entry.hash.to_string(),
                 None => tracing::warn!(
                     package_id = %a.package_id.0,
                     "announce without a served collection; forwarding placeholder root_hash"
@@ -1758,7 +1799,7 @@ impl SharedIrohNode {
         {
             let served = self.served.lock().expect("served mutex poisoned");
             match served.get(&tag) {
-                Some(hash) => wire.root_hash = hash.to_string(),
+                Some(entry) => wire.root_hash = entry.hash.to_string(),
                 None => tracing::warn!(
                     package_id = %a.package_id.0,
                     "project announce without a served collection; forwarding placeholder root_hash"
@@ -1873,14 +1914,38 @@ impl SharedIrohNode {
         // The import returns the collection hash PLUS the ordered `(rel_path, size)`
         // entries in provider-iteration order — recorded in `served_files` for
         // per-file upload attribution by hash-seq index (Task 2.2).
+        // Audit F8: every retry calls `serve` first, and importing re-hashes the
+        // whole package directory — a multi-GB re-read paid before the announce
+        // even discovers the peer is absent. Reuse what THIS process already
+        // imported for the same (tag, want-subset); `role_release` clears the entry,
+        // so a rebuilt payload (a Perseus resend) still imports for real, and after
+        // a restart the map is empty so the first serve imports again — correct,
+        // because the blob store's tags may have been swept meanwhile.
+        let fingerprint = want_fingerprint(want);
+        {
+            let served = self.served.lock().expect("served mutex poisoned");
+            if let Some(entry) = served.get(&tag) {
+                if entry.want_fingerprint == fingerprint {
+                    tracing::debug!(
+                        package_id = %pkg.package_id.0,
+                        root_hash = %entry.hash,
+                        "serve reuses the already-imported collection"
+                    );
+                    return Ok(());
+                }
+            }
+        }
         let (hash, entries) = match want {
             None => blobs::import_package_collection(&self.store, src_dir, &tag).await?,
             Some(w) => blobs::import_subset_collection(&self.store, src_dir, w, &tag).await?,
         };
-        self.served
-            .lock()
-            .expect("served mutex poisoned")
-            .insert(tag.clone(), hash);
+        self.served.lock().expect("served mutex poisoned").insert(
+            tag.clone(),
+            ServedCollection {
+                hash,
+                want_fingerprint: fingerprint,
+            },
+        );
         self.served_files
             .lock()
             .expect("served_files mutex poisoned")
@@ -2594,6 +2659,93 @@ mod tests {
         assert!(
             tag_present(node.store(), "collab/pkg/c").await,
             "a foreign role's tag (collab/pkg/c) must survive the Out sweep"
+        );
+
+        node.shutdown().await;
+    }
+
+    /// D1 / audit F8: re-serving the same package must NOT re-import it. Every
+    /// retry called `serve` first, and `role_serve` re-hashed the whole payload
+    /// through `add_path` before the announce discovered the peer was absent —
+    /// which is what made a frequent retry schedule unaffordable.
+    ///
+    /// Mutating the file on disk between the two serves is the proof: a real
+    /// re-import would hash the NEW bytes and land a second blob.
+    #[tokio::test]
+    async fn re_serving_the_same_package_skips_the_import() {
+        let dir = tempdir().unwrap();
+        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled).await.unwrap();
+        let (pkg_dir, announce) = build_one_frame_package(dir.path());
+        let handle = node.role_handle(Role::Out);
+
+        handle.serve(&announce, &pkg_dir, None).await.unwrap();
+        let first_hash = node
+            .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+            .expect("the first serve records a collection hash");
+
+        std::fs::write(pkg_dir.join("frame.fits"), b"completely different bytes").unwrap();
+        handle.serve(&announce, &pkg_dir, None).await.unwrap();
+        let second_hash = node
+            .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+            .expect("the second serve keeps a collection hash");
+
+        assert_eq!(
+            first_hash, second_hash,
+            "the second serve reused the already-imported collection instead of \
+             re-hashing the (now different) payload"
+        );
+
+        // Releasing forgets the collection, so a rebuilt payload — Perseus's resend
+        // path — imports for real again rather than serving stale bytes.
+        handle.release(&announce.package_id).await.unwrap();
+        handle.serve(&announce, &pkg_dir, None).await.unwrap();
+        let after_release = node
+            .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+            .expect("the post-release serve records a hash");
+        assert_ne!(
+            after_release, first_hash,
+            "after release the changed payload must be imported for real"
+        );
+
+        node.shutdown().await;
+    }
+
+    /// The short-circuit keys on the want-subset too, not the tag alone: a second
+    /// serve of the SAME package with a DIFFERENT negotiated subset is a different
+    /// collection, and reusing the first one would advertise a root missing the
+    /// frames the peer just asked for.
+    #[tokio::test]
+    async fn a_different_want_subset_is_imported_rather_than_reused() {
+        let dir = tempdir().unwrap();
+        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled).await.unwrap();
+        let (pkg_dir, announce) = build_two_frame_package(dir.path(), 1024, 2048);
+        let handle = node.role_handle(Role::Out);
+
+        let full = HashSet::from(["frame_a.fits".to_string(), "frame_b.fits".to_string()]);
+        handle.serve(&announce, &pkg_dir, Some(&full)).await.unwrap();
+        let full_hash = node
+            .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+            .expect("full-subset serve records a hash");
+
+        let subset = HashSet::from(["frame_a.fits".to_string()]);
+        handle.serve(&announce, &pkg_dir, Some(&subset)).await.unwrap();
+        let subset_hash = node
+            .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+            .expect("subset serve records a hash");
+
+        assert_ne!(
+            full_hash, subset_hash,
+            "a narrower want must produce its own collection, never reuse the wider one"
+        );
+
+        // And the SAME subset again does reuse — the fingerprint compares by
+        // content, not by the HashSet's iteration order.
+        let same_subset_again = HashSet::from(["frame_a.fits".to_string()]);
+        handle.serve(&announce, &pkg_dir, Some(&same_subset_again)).await.unwrap();
+        assert_eq!(
+            node.resolve_served_hash_for_test(Role::Out, &announce.package_id),
+            Some(subset_hash),
+            "an identical subset reuses the import"
         );
 
         node.shutdown().await;
