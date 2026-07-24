@@ -17,6 +17,21 @@
 //! older connection and the app re-establishes it automatically. Prefer
 //! running this with the app closed.
 //!
+//! It ALSO gates QUIC address discovery (QAD), which is what makes hole punching
+//! possible at all: after the handshake it waits up to [`QAD_SETTLE`] for a
+//! PUBLIC address to appear in `endpoint.addr()`. Only QAD (or a router port
+//! mapping) can put one there, so "private addresses only" means the relay is not
+//! answering QAD and every peer behind NAT is stuck relaying. The check exists
+//! because that exact failure shipped unnoticed: the relays served QAD on UDP
+//! 8443 while every client probes iroh's `DEFAULT_RELAY_QUIC_PORT` (7842), which
+//! this example could not see because it only asserted the websocket handshake.
+//! A QAD failure fails the run (exit != 0). Skip it with `--no-qad`.
+//!
+//! **Caveat:** run this from a machine behind NAT (the normal user situation). On
+//! a host whose own NIC carries a public address the check passes trivially — the
+//! public addr is then a local address, not a QAD discovery, and the public API
+//! exposes no way to tell the two apart (`Endpoint::net_report` is feature-gated).
+//!
 //! With `--paths` it additionally prints, per relay, the node's live self-reported
 //! addresses after the handshake — its home relay(s) + direct addrs, read straight
 //! off `endpoint.addr()`, which is exactly what the H1 reporter (Task 7) publishes
@@ -30,11 +45,13 @@
 //!   cargo run -p athenaeum-core --example relay_check
 //!   cargo run -p athenaeum-core --example relay_check -- --ephemeral
 //!   cargo run -p athenaeum-core --example relay_check -- --paths
+//!   cargo run -p athenaeum-core --example relay_check -- --no-qad
 //!   cargo run -p athenaeum-core --example relay_check -- --paths \
 //!       --expect-relay https://relay1.artfrom.space:8443
 //!   cargo run -p athenaeum-core --example relay_check -- --sync-dir /path/sync \
 //!       https://relay-ams.artfrom.space:8443
 
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -51,6 +68,38 @@ const DEFAULT_RELAYS: [&str; 5] = [
 ];
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// How long to wait, after the home relay is up, for a QAD-discovered public
+/// address to land in `endpoint.addr()`. A working relay answers the first QAD
+/// probe within a second or two (the probe itself times out at 3 s and is
+/// retried), so this is generous headroom, not a tuning knob.
+const QAD_SETTLE: Duration = Duration::from_secs(8);
+
+/// Poll step while waiting for [`QAD_SETTLE`].
+const QAD_POLL: Duration = Duration::from_millis(500);
+
+/// Whether `ip` is unroutable from the public internet — RFC1918, CGNAT,
+/// loopback/link-local, IPv6 ULA. A direct address that is NOT one of these can
+/// only have come from QAD or a router port mapping (or a genuinely public NIC —
+/// see the caveat in the module docs).
+fn is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || (o[0] == 100 && (64..128).contains(&o[1])) // CGNAT 100.64/10
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local
+        }
+    }
+}
 
 /// Per-OS default for the desktop app's sync dir (`<app-data>/sync`, where the
 /// device key lives), mirroring Tauri's app-data resolution for our identifier:
@@ -89,6 +138,7 @@ fn default_sync_dir() -> Result<std::path::PathBuf> {
 async fn main() -> Result<()> {
     let mut ephemeral = false;
     let mut paths = false;
+    let mut qad_gate = true;
     let mut expect_relay: Option<String> = None;
     let mut sync_dir: Option<std::path::PathBuf> = None;
     let mut relays: Vec<String> = Vec::new();
@@ -98,6 +148,7 @@ async fn main() -> Result<()> {
         match arg.as_str() {
             "--ephemeral" => ephemeral = true,
             "--paths" => paths = true,
+            "--no-qad" => qad_gate = false,
             "--expect-relay" => {
                 expect_relay = Some(args.next().context("--expect-relay needs a url")?);
             }
@@ -141,7 +192,12 @@ async fn main() -> Result<()> {
     };
     println!();
 
+    // The QAD gate only makes sense for a key the relays actually accept — an
+    // ephemeral run is expected to be refused before any probe matters.
+    let qad_gate = qad_gate && !ephemeral;
+
     let mut failures = 0usize;
+    let mut qad_failures = 0usize;
     for url in &relays {
         let map = RelayMap::try_from_iter([url.as_str()])
             .with_context(|| format!("invalid relay url {url}"))?;
@@ -162,13 +218,52 @@ async fn main() -> Result<()> {
                     .map(|u| u.to_string())
                     .unwrap_or_else(|| "<none>".into());
                 println!("OK   {url}  home_relay={home}  in {:?}", started.elapsed());
+
+                // QAD gate: wait for a public address to show up. Re-read
+                // `endpoint.addr()` each poll — the first net report can land
+                // after `online()` returns.
+                if qad_gate {
+                    let mut public: Option<String>;
+                    let deadline = Instant::now() + QAD_SETTLE;
+                    loop {
+                        public = endpoint
+                            .addr()
+                            .ip_addrs()
+                            .find(|sa| !is_private(sa.ip()))
+                            .map(|sa| sa.to_string());
+                        if public.is_some() || Instant::now() >= deadline {
+                            break;
+                        }
+                        tokio::time::sleep(QAD_POLL).await;
+                    }
+                    match &public {
+                        Some(a) => println!("     qad OK   public addr {a}"),
+                        None => {
+                            qad_failures += 1;
+                            println!(
+                                "     qad FAIL no public address within {QAD_SETTLE:?} — \
+                                 this relay is not answering QUIC address discovery \
+                                 (check `enable_quic_addr_discovery` + that UDP/7842 is \
+                                 open at the cloud edge AND host-side). Peers behind NAT \
+                                 cannot hole-punch through it; everything falls back to relaying."
+                            );
+                        }
+                    }
+                }
+
                 if paths {
                     // The node's live self-reported address (== what the H1 reporter
                     // publishes to the hub): home relay(s) + direct addrs.
+                    let addr = endpoint.addr();
                     let reported_relays: Vec<String> =
                         addr.relay_urls().map(|u| u.to_string()).collect();
-                    let direct_addrs: Vec<String> =
-                        addr.ip_addrs().map(|a| a.to_string()).collect();
+                    let direct_addrs: Vec<String> = addr
+                        .ip_addrs()
+                        .map(|a| {
+                            let kind = if is_private(a.ip()) { "priv" } else { "PUBLIC" };
+                            format!("{a} [{kind}]")
+                        })
+                        .collect();
                     println!("     reported home relays : {reported_relays:?}");
                     println!("     reported direct addrs: {direct_addrs:?}");
                     if let Some(exp) = &expect_relay {
@@ -194,11 +289,21 @@ async fn main() -> Result<()> {
     println!();
     if ephemeral {
         println!("ephemeral run: FAILs above mean the access-control gate is working.");
-        Ok(())
-    } else if failures == 0 {
+        return Ok(());
+    }
+    if failures == 0 {
         println!("all {} relays accepted this device.", relays.len());
-        Ok(())
-    } else {
-        bail!("{failures} relay(s) failed with the registered device key");
+    }
+    if qad_gate && qad_failures == 0 && failures == 0 {
+        println!("all {} relays answer QUIC address discovery.", relays.len());
+    }
+    match (failures, qad_failures) {
+        (0, 0) => Ok(()),
+        (0, q) => bail!(
+            "{q} relay(s) accepted this device but answer no QUIC address discovery — \
+             hole punching is dead through them"
+        ),
+        (f, 0) => bail!("{f} relay(s) failed with the registered device key"),
+        (f, q) => bail!("{f} relay(s) failed the handshake; {q} answer no QUIC address discovery"),
     }
 }
