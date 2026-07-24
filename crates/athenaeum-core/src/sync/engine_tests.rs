@@ -26,6 +26,7 @@ use crate::package::{
 };
 use crate::sharing::iroh::proto::{FullHashEntry, OfferEntry};
 use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
+use crate::sync::diagnostics::ConnectClass;
 use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome,
     RevokeReason, StartInfo, TransportEvent,
@@ -1069,13 +1070,68 @@ async fn ack_lost_then_duplicate_ack_confirms_once() {
 fn backoff_schedule_multiplies_base_and_caps() {
     use std::time::Duration;
     let base = Duration::from_secs(30);
-    // 30s → 1m → 5m → 15m → 30m → 30m (cap), spec §2
-    assert_eq!(retry_backoff(base, 0), Duration::from_secs(30));
-    assert_eq!(retry_backoff(base, 1), Duration::from_secs(60));
-    assert_eq!(retry_backoff(base, 2), Duration::from_secs(300));
-    assert_eq!(retry_backoff(base, 3), Duration::from_secs(900));
-    assert_eq!(retry_backoff(base, 4), Duration::from_secs(1800));
-    assert_eq!(retry_backoff(base, 99), Duration::from_secs(1800));
+    // 30s → 1m → 5m → 15m → 30m → 30m (cap), spec §2. `None` is the historical
+    // schedule: no failed dial to classify (an ack timeout), so nothing says the
+    // peer is absent.
+    assert_eq!(retry_backoff(base, 0, None), Duration::from_secs(30));
+    assert_eq!(retry_backoff(base, 1, None), Duration::from_secs(60));
+    assert_eq!(retry_backoff(base, 2, None), Duration::from_secs(300));
+    assert_eq!(retry_backoff(base, 3, None), Duration::from_secs(900));
+    assert_eq!(retry_backoff(base, 4, None), Duration::from_secs(1800));
+    assert_eq!(retry_backoff(base, 99, None), Duration::from_secs(1800));
+}
+
+/// D1: a peer that is not there gets a FLAT schedule. Escalation exists to spare
+/// a loaded peer, and an absent peer is not loaded — climbing to the 30-minute cap
+/// only means an overnight outage costs half an hour of idleness after the peer is
+/// already back.
+#[test]
+fn absent_classes_retry_flat_and_never_escalate() {
+    use std::time::Duration;
+    let base = Duration::from_secs(30);
+    // `not_started` is here on purpose: its doc covers "local OR remote endpoint
+    // not started", and the remote reading IS an absent peer. A local one is
+    // transient — our own start fires the wake hook long before the flat interval
+    // matters.
+    for class in [
+        ConnectClass::NoRoute,
+        ConnectClass::Timeout,
+        ConnectClass::RelayUnreachable,
+        ConnectClass::NotStarted,
+    ] {
+        for rung in 0..6 {
+            assert_eq!(
+                retry_backoff(base, rung, Some(class)),
+                Duration::from_secs(120),
+                "{class:?} at rung {rung} must stay flat at 4x the base"
+            );
+        }
+    }
+}
+
+/// The flat interval is a MULTIPLE of the base, like every other rung — so an
+/// engine configured with a millisecond timeout (every loopback test) observes the
+/// flat path in milliseconds instead of waiting two minutes.
+#[test]
+fn the_flat_interval_scales_with_the_configured_base() {
+    use std::time::Duration;
+    assert_eq!(
+        retry_backoff(Duration::from_millis(50), 3, Some(ConnectClass::NotStarted)),
+        Duration::from_millis(200)
+    );
+}
+
+/// A peer that is UP and declining us is a different fact from a peer that is
+/// gone: it needs a human, so it keeps the escalating schedule.
+#[test]
+fn a_refusing_peer_still_escalates() {
+    use std::time::Duration;
+    let base = Duration::from_secs(30);
+    assert_eq!(retry_backoff(base, 0, Some(ConnectClass::Refused)), Duration::from_secs(30));
+    assert_eq!(retry_backoff(base, 1, Some(ConnectClass::Refused)), Duration::from_secs(60));
+    assert_eq!(retry_backoff(base, 4, Some(ConnectClass::Refused)), Duration::from_secs(1800));
+    // As does an unclassifiable failure — we do not know it is the peer's fault.
+    assert_eq!(retry_backoff(base, 2, Some(ConnectClass::Other)), Duration::from_secs(300));
 }
 
 /// Spec §2: a peer that never acks must NOT terminalize the package. Every ack
@@ -3498,19 +3554,25 @@ async fn park_in_long_backoff(
         Arc::new(net.endpoint()),
         receiver_id,
         SyncConfig {
-            ack_timeout: Duration::from_millis(100),
+            // 400 ms base, not 100: an unstarted peer classifies as `not_started`,
+            // which D1 puts on the FLAT absent schedule (`base * 4`) instead of the
+            // escalating rungs. The window these tests need — one long enough that a
+            // fast confirmation can only be the kick's doing — is therefore set by
+            // the base, and 400 ms * 4 = 1.6 s clears the >1.2 s bar below. The
+            // point of the test is unchanged; only what produces the long window is.
+            ack_timeout: Duration::from_millis(400),
         },
     );
 
     let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
 
-    // Backoff climbing: a couple of failed announce attempts (spec §2).
+    // A couple of failed announce attempts against the absent peer (spec §2).
     wait_until(|| attempts_of(&store, id) >= 2, WAIT).await;
 
     // Wait until the engine is parked in a LONG backoff window: next_retry_at
-    // parses to comfortably (>1.2s) in the future — a rung-3+ window. Without a
-    // kick the next natural re-announce is that far off, so a fast confirmation
-    // below can only be the kick's doing.
+    // parses to comfortably (>1.2s) in the future. Without a kick the next natural
+    // re-announce is that far off, so a fast confirmation below can only be the
+    // kick's doing.
     wait_until(
         || {
             store
@@ -3666,7 +3728,10 @@ async fn kick_all_resets_every_pending_package() {
         Arc::new(net.endpoint()),
         receiver_id,
         SyncConfig {
-            ack_timeout: Duration::from_millis(100),
+            // 400 ms for the same reason as `park_in_long_backoff`: an unstarted
+            // peer is the FLAT absent schedule (`base * 4`), so the base is what
+            // sets the >1.2 s window this test needs.
+            ack_timeout: Duration::from_millis(400),
         },
     );
 

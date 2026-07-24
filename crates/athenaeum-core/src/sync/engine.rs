@@ -103,12 +103,52 @@ const IDLE_SLEEP: Duration = Duration::from_secs(3600);
 /// 30s → 1m → 5m → 15m → 30m with the default 30s base.
 const BACKOFF_MULTIPLIERS: [u32; 5] = [1, 2, 10, 30, 60];
 
-/// The backoff window for a given `rung`, as `base * multiplier[rung]` with the
-/// last multiplier held as the cap. Delivery is retried forever (spec §2): a
-/// network-unreachable peer never terminalizes a package, it just sits at the
-/// 30-minute cap. `base` is the engine's [`SyncConfig::ack_timeout`] so a test
-/// with a millisecond timeout gets a proportionally short schedule.
-pub fn retry_backoff(base: Duration, rung: u32) -> Duration {
+/// Flat retry interval while the peer looks ABSENT, as a multiple of the base
+/// rung — 4 x the default 30 s `ack_timeout` = 2 minutes (D1 §3.3).
+///
+/// A multiple rather than an absolute for the same reason [`BACKOFF_MULTIPLIERS`]
+/// is one: an engine configured with a millisecond timeout (every loopback test)
+/// then observes the flat path in milliseconds instead of waiting two minutes.
+const ABSENT_RETRY_MULTIPLIER: u32 = 4;
+
+/// Whether this failure class says "the peer is not there", as opposed to "the
+/// peer refuses us" or "our own side is broken" (D1 §3.3).
+///
+/// `NotStarted` counts as absent even though its doc reads "the local **or**
+/// remote endpoint is not started": the remote reading IS an absent peer, and the
+/// local one is transient — our own start fires the transport wake hook, which
+/// releases the queue long before a flat interval matters. Escalating on it would
+/// punish the commonest shape of "the other side's app is not running".
+pub(crate) fn class_is_absent(class: Option<ConnectClass>) -> bool {
+    matches!(
+        class,
+        Some(
+            ConnectClass::NoRoute
+                | ConnectClass::Timeout
+                | ConnectClass::RelayUnreachable
+                | ConnectClass::NotStarted
+        )
+    )
+}
+
+/// The backoff window for a given `rung` and failure `class`.
+///
+/// An ABSENT peer (see [`class_is_absent`]) gets a FLAT
+/// `base * ABSENT_RETRY_MULTIPLIER` and never climbs: escalation exists to spare a
+/// loaded peer, and an absent peer is not loaded — the only thing a 30-minute cap
+/// buys against a switched-off laptop is half an hour of idleness after it is
+/// already back. Everything else — a peer that is up and REFUSING us, an
+/// unclassifiable failure, or an ack timeout that has no failed dial to classify
+/// (`class = None`) — keeps `base * multiplier[rung]` with the last multiplier
+/// held as the cap.
+///
+/// Delivery is retried forever either way (spec §2): a network condition never
+/// terminalizes a package. `base` is the engine's [`SyncConfig::ack_timeout`] so
+/// a test with a millisecond timeout gets a proportionally short schedule.
+pub fn retry_backoff(base: Duration, rung: u32, class: Option<ConnectClass>) -> Duration {
+    if class_is_absent(class) {
+        return base * ABSENT_RETRY_MULTIPLIER;
+    }
     let m = BACKOFF_MULTIPLIERS[(rung as usize).min(BACKOFF_MULTIPLIERS.len() - 1)];
     base * m
 }
@@ -1557,9 +1597,14 @@ impl Worker {
     /// is never terminalized from a network condition.
     fn arm_retry(&mut self, id: i64) {
         let armed = if let Some(p) = self.pending.get_mut(&id) {
-            p.rung = p.rung.saturating_add(1);
+            // An absent peer does not climb: the rung indexes an escalation that
+            // only makes sense when repeated failure says something about US or
+            // about a peer that is up and unhappy (D1 §3.3).
+            if !class_is_absent(p.last_attempt_class) {
+                p.rung = p.rung.saturating_add(1);
+            }
             p.next_action = NextAction::Retry;
-            let delay = retry_backoff(self.config.ack_timeout, p.rung);
+            let delay = retry_backoff(self.config.ack_timeout, p.rung, p.last_attempt_class);
             p.deadline = Instant::now() + delay;
             // §D5: a retry is now pending — the next serve tick (if bytes resume
             // flowing) must clear the stale reason.
@@ -2363,12 +2408,19 @@ impl Worker {
                         tracing::warn!(package_id = id, error = %se, "record last_error (ack timeout) failed");
                     }
                     let retry_info = if let Some(p) = self.pending.get_mut(&id) {
-                        p.rung = p.rung.saturating_add(1);
+                        // An ack timeout carries NO class: the announce itself
+                        // succeeded, so there is no failed dial to classify and
+                        // nothing observed says the peer is absent. It therefore
+                        // takes the escalating schedule — the right default for a
+                        // peer whose ingest may simply be busy (D1 §3.3).
+                        if !class_is_absent(p.last_attempt_class) {
+                            p.rung = p.rung.saturating_add(1);
+                        }
                         p.next_action = NextAction::Retry;
                         // §D5: a retry is pending — the next serve tick (if the peer
                         // is still pulling) must wipe this stale "no ack" reason.
                         p.clear_error_on_next_serve = true;
-                        let delay = retry_backoff(self.config.ack_timeout, p.rung);
+                        let delay = retry_backoff(self.config.ack_timeout, p.rung, p.last_attempt_class);
                         p.deadline = Instant::now() + delay;
                         // Compute the wall-clock retry stamp ONCE and reuse it for
                         // both the diagnostic log and the persisted countdown

@@ -298,7 +298,7 @@ git commit -m "feat(sync): presence beacon transport — dedicated connection, h
 - Consumes: `crate::sync::diagnostics::ConnectClass` (already exists).
 - Produces: `pub fn retry_backoff(base: Duration, rung: u32, class: Option<ConnectClass>) -> Duration` — Task 4 calls it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
 #[test]
@@ -339,12 +339,12 @@ fn refused_and_local_faults_still_escalate() {
 }
 ```
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
 Run: `cargo test -q -p athenaeum-core --lib retry_flat`
 Expected: FAIL — `this function takes 2 arguments but 3 were supplied`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 /// Flat retry interval while the peer looks ABSENT, as a multiple of the base
@@ -393,12 +393,12 @@ Do not climb the rung when the class is absent — in `arm_retry` and the ack-ti
             }
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test -q -p athenaeum-core --lib retry_ && cargo test -q -p athenaeum-core --lib sync::engine`
 Expected: PASS. Existing backoff tests that call `retry_backoff(base, rung)` must be updated to pass `None` — that is the historical behaviour.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/athenaeum-core/src/sync/engine.rs
