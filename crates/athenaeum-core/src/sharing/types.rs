@@ -259,3 +259,68 @@ pub enum FetchEvent {
         bytes_total: u64,
     },
 }
+
+/// Wraps a fetch error that originated in LOCAL work — writing the collection out
+/// of the blob store onto our own disk — rather than in the transfer itself
+/// (D2 §3.2).
+///
+/// The receiver needs this distinction and cannot derive it: a vanished peer and a
+/// full disk both surface as one `anyhow::Error` out of
+/// [`SharingTransport::fetch`](crate::sharing::SharingTransport::fetch), because
+/// `create_dir_all(dest_dir)` lives inside the same `Result` as the download. Text
+/// matching cannot separate them; the failing call site can. `Display` forwards to
+/// the inner error so the marker never appears in the `last_error` the user reads.
+///
+/// **Default is transport.** An unmarked error is treated as a peer absence, which
+/// is the safer error: a local fault mislabeled as waiting retries and stays
+/// visible, while a vanished peer mislabeled as failed is the lie D2 exists to
+/// remove.
+#[derive(Debug)]
+pub struct LocalFault(pub anyhow::Error);
+
+impl std::fmt::Display for LocalFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+
+impl std::error::Error for LocalFault {}
+
+/// True when `err` carries a [`LocalFault`] anywhere in its context chain.
+pub fn is_local_fault(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<LocalFault>().is_some()
+}
+
+#[cfg(test)]
+mod local_fault_tests {
+    use super::*;
+    use anyhow::Context;
+
+    #[test]
+    fn local_fault_survives_context_wrapping_and_keeps_the_original_message() {
+        let inner = anyhow::anyhow!("No space left on device");
+        let marked: anyhow::Error = LocalFault(inner).into();
+        // A caller adding its own context must not hide the marker…
+        let wrapped = Err::<(), _>(marked)
+            .context("create dest dir /x/y")
+            .context("fetch package pkg-1")
+            .unwrap_err();
+        assert!(
+            is_local_fault(&wrapped),
+            "the marker is found anywhere in the chain"
+        );
+        // …and must not garble what the user reads in `last_error`.
+        let text = format!("{wrapped:#}");
+        assert!(text.contains("No space left on device"), "got: {text}");
+        assert!(
+            !text.contains("LocalFault"),
+            "the marker is invisible in Display: {text}"
+        );
+    }
+
+    #[test]
+    fn an_unmarked_error_is_not_a_local_fault() {
+        let e = anyhow::anyhow!("Unable to download collection abc123");
+        assert!(!is_local_fault(&e), "a transport error carries no marker");
+    }
+}

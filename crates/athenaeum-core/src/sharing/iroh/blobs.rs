@@ -23,7 +23,7 @@ use iroh_blobs::{Hash, HashAndFormat};
 use n0_future::StreamExt as _;
 
 use crate::package::{read_manifest, validate_rel_path, ManifestRecord, MANIFEST_FILENAME};
-use crate::sharing::types::FetchEvent;
+use crate::sharing::types::{FetchEvent, LocalFault};
 use crate::sharing::FetchSink;
 
 /// Minimum wall-clock gap between two throttled [`FetchEvent`]s from the same
@@ -474,6 +474,15 @@ pub async fn fetch_collection_to_dir(
         bytes_total: byte_size,
     });
 
+    // ── D2 §3.2: everything BELOW this line is LOCAL work on data we already
+    // hold — store bookkeeping and writing the collection out to our own disk.
+    // Failures here are wrapped in `LocalFault`, so the receiver stamps the row
+    // `Failed` ("we cannot accept this"); everything ABOVE is the transfer itself
+    // and stays unmarked, so a failure there reads as a vanished peer and the row
+    // parks `Waiting`. The receiver cannot make this distinction from the error
+    // text — the two causes share one `Result` — so it is made here, where the
+    // failing call is known.
+    //
     // Pin the downloaded collection until the caller releases it (post-ack). The
     // in-flight tag has protected the data continuously since phase 1, so there is
     // NO untagged window here — set the permanent tag, THEN drop the in-flight one.
@@ -481,7 +490,7 @@ pub async fn fetch_collection_to_dir(
         .tags()
         .set(tag, HashAndFormat::hash_seq(root_hash))
         .await
-        .context("tag fetched collection")?;
+        .map_err(|e| LocalFault(anyhow::Error::new(e).context("tag fetched collection")))?;
 
     // Success: the permanent tag now protects the collection, so retire the
     // in-flight tag (this is the ONE path that deletes it — see the set site).
@@ -498,22 +507,28 @@ pub async fn fetch_collection_to_dir(
     }
 
     // Reconstruct the package directory from the downloaded collection.
-    tokio::fs::create_dir_all(dest_dir)
-        .await
-        .with_context(|| format!("create dest dir {}", dest_dir.display()))?;
+    tokio::fs::create_dir_all(dest_dir).await.map_err(|e| {
+        LocalFault(anyhow::Error::new(e).context(format!("create dest dir {}", dest_dir.display())))
+    })?;
 
     for (name, blob_hash) in collection.iter() {
         let target = dest_dir.join(name);
         if let Some(parent) = target.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("create dir {}", parent.display()))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                LocalFault(
+                    anyhow::Error::new(e).context(format!("create dir {}", parent.display())),
+                )
+            })?;
         }
         store
             .blobs()
             .export(*blob_hash, &target)
             .await
-            .with_context(|| format!("export {name} -> {}", target.display()))?;
+            .map_err(|e| {
+                LocalFault(
+                    anyhow::Error::new(e).context(format!("export {name} -> {}", target.display())),
+                )
+            })?;
     }
 
     tracing::debug!(
@@ -570,7 +585,10 @@ pub async fn fetch_manifest_to_dir(
 
     // Download just the manifest blob (single-hash raw request), then export it.
     downloader
-        .download(HashAndFormat::raw(manifest_hash), Shuffled::new(vec![provider]))
+        .download(
+            HashAndFormat::raw(manifest_hash),
+            Shuffled::new(vec![provider]),
+        )
         .await
         .with_context(|| format!("download manifest blob {manifest_hash}"))?;
 
