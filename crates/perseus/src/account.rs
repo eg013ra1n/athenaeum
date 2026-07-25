@@ -1045,6 +1045,7 @@ mod tests {
             poll_interval_secs: 1,
             web_bind: String::new(),
             web_token: None,
+            max_upload_mbps: 0,
         }
     }
 

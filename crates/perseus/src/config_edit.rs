@@ -320,6 +320,47 @@ pub fn apply_send_mode_edit(
     Ok(cfg)
 }
 
+/// Rewrite the top-level `max_upload_mbps` key in `config_path`, preserving all
+/// comments/layout ([`toml_edit`]), then re-parse + validate the whole file and
+/// atomically replace it. Returns the freshly re-validated [`Config`] so the
+/// caller can apply the new rate to the running node
+/// ([`SharedIrohNode::set_upload_limit`](athenaeum_core::sharing::iroh::node::SharedIrohNode::set_upload_limit))
+/// — this edit applies live, no engine restart.
+///
+/// `mbps` is in decimal MB/s; `0` means unlimited and is written explicitly (the
+/// key is never removed, so the knob stays visible in the file). One root key is
+/// touched. Edit-on-copy, write-after-validate: on **any** error the file is left
+/// byte-identical, with no partial or orphaned tmp file.
+pub fn apply_upload_limit_edit(config_path: &Path, mbps: u32) -> Result<Config> {
+    let original = std::fs::read_to_string(config_path)
+        .with_context(|| format!("read {}", config_path.display()))?;
+    let mut doc: toml_edit::DocumentMut = original
+        .parse()
+        .with_context(|| format!("parse {}", config_path.display()))?;
+
+    doc["max_upload_mbps"] = toml_edit::value(i64::from(mbps));
+
+    let candidate = doc.to_string();
+    // Re-validate the whole edited document at the PARSE-VALID tier (see the
+    // module docs): `from_toml_str_lenient` runs `validate_structure` only, so
+    // every field-level constraint (incl. the soak gate + capture-dir existence)
+    // still fires, but run-readiness (`validate_ready`: needs a capture dir + send
+    // target) is NOT demanded — an unrelated field edit must not be blocked by a
+    // config that is merely mid-setup.
+    let cfg = Config::from_toml_str_lenient(&candidate).context("re-parse edited config")?;
+
+    // Atomic replace: write the validated candidate to a sibling tmp, then rename
+    // over the original. Only reached once validation has passed.
+    let tmp = config_path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &candidate)
+        .with_context(|| format!("write tmp config {}", tmp.display()))?;
+    std::fs::rename(&tmp, config_path)
+        .with_context(|| format!("replace config {}", config_path.display()))?;
+
+    tracing::info!(max_upload_mbps = mbps, "upload limit edited via web");
+    Ok(cfg)
+}
+
 /// The snake_case TOML string for a [`Mode`] variant. Kept in lock-step with the
 /// enum's `#[serde(rename_all = "snake_case")]` so a round-trip through the file
 /// re-parses to the same variant. `pub(crate)` so the web status page renders the
@@ -598,6 +639,66 @@ i_have_verified_the_soak = false
         assert!(text.contains("device_name = \"old-name\""), "unrelated key preserved");
         assert!(text.contains("mode = \"manual\""), "mode is rewritten");
         assert!(text.contains("auto_quiet_secs = 45"), "quiet window is written");
+    }
+
+    /// W1 T1.6 (the brief's RED test): an upload-limit edit writes the single
+    /// root key, re-parses, persists, and leaves every unrelated comment and key
+    /// byte-intact — including the two soak keys it must never touch.
+    #[test]
+    fn upload_limit_edit_preserves_comments_and_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("perseus.toml");
+        std::fs::write(&p, with_comments()).unwrap();
+
+        let cfg = apply_upload_limit_edit(&p, 8).unwrap();
+        assert_eq!(cfg.max_upload_mbps, 8);
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            text.contains("max_upload_mbps = 8"),
+            "the cap is written: {text}"
+        );
+        assert!(
+            text.contains("# my precious comment"),
+            "top comment preserved"
+        );
+        assert!(
+            text.contains("# inline comment"),
+            "inline comment preserved"
+        );
+        assert!(
+            text.contains("pairing_ticket = \"ticket-abc\""),
+            "unrelated key preserved"
+        );
+        assert!(
+            text.contains("i_have_verified_the_soak = false"),
+            "soak key untouched"
+        );
+        // The write-back persisted and re-parses from disk.
+        let reloaded = Config::load_lenient(&p).unwrap();
+        assert_eq!(reloaded.max_upload_mbps, 8);
+        assert!(
+            !p.with_extension("toml.tmp").exists(),
+            "no orphan tmp file after a successful edit"
+        );
+    }
+
+    /// Clearing the cap back to `0` (unlimited) is a normal edit, not a removal —
+    /// the key stays in the file with an explicit `0` so the operator can see the
+    /// knob is there.
+    #[test]
+    fn upload_limit_edit_zero_means_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+        apply_upload_limit_edit(&path, 12).unwrap();
+        let cfg = apply_upload_limit_edit(&path, 0).unwrap();
+        assert_eq!(cfg.max_upload_mbps, 0);
+        assert_eq!(cfg.upload_limit_bytes_per_sec(), 0);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("max_upload_mbps = 0"),
+            "0 is written explicitly: {text}"
+        );
     }
 
     /// A device-name edit writes the trimmed name, re-parses, and persists.

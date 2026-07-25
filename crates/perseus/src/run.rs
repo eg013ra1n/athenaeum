@@ -639,6 +639,11 @@ impl Agent {
         let node = SharedIrohNode::bind(&config.data_dir, resolved.relay_mode.clone())
             .await
             .context("bind shared iroh node")?;
+        // Apply the configured upload cap to the freshly bound node (W1 T1.6).
+        // Unconditional: `0` is a valid "unlimited" apply, and the node logs the
+        // rate it adopted either way. One budget for the whole device — every
+        // target's engine rides this same node.
+        node.set_upload_limit(config.upload_limit_bytes_per_sec());
         let node_id = node.node_id();
 
         // Report THIS agent's dialable endpoint address to the hub (finding H1,
@@ -1100,6 +1105,15 @@ impl Agent {
     /// a `send` is a harmless no-op.
     pub fn send_cfg_tx(&self) -> watch::Sender<SendCfg> {
         self.send_cfg_tx.clone()
+    }
+
+    /// A clone of the shared iroh node handle (W1 T1.6), `Some` only on the
+    /// production [`start`](Self::start) path — the injection seams supply
+    /// loopback transports and bind no node. The web settings page calls
+    /// [`SharedIrohNode::set_upload_limit`] on it so an upload-cap edit takes
+    /// effect on the next offered chunk, mid-transfer included, with no restart.
+    pub fn node(&self) -> Option<Arc<SharedIrohNode>> {
+        self.node.clone()
     }
 
     /// Gracefully stop the watcher, drain the batcher, and shut the engine down

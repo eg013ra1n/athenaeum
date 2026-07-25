@@ -10,6 +10,8 @@ auto_quiet_secs = 60     # auto: flush after N seconds with no new file
 # Optional friendly name for this node in your account (defaults to the hostname).
 # device_name = "Observatory Pi"
 
+# max_upload_mbps = 8   # cap sync upload speed (decimal MB/s); 0 or absent = unlimited. Keeps SSH usable during big syncs.
+
 # Folders watched for new FITS/XISF captures. Add them from the web page,
 # or here: capture_dirs = ["/path/to/captures"]
 capture_dirs = []

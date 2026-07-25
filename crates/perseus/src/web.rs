@@ -62,6 +62,7 @@ use tokio::sync::{watch, Notify, RwLock};
 use athenaeum_core::package::read_manifest;
 #[cfg(test)]
 use athenaeum_core::package::MANIFEST_FILENAME;
+use athenaeum_core::sharing::iroh::node::SharedIrohNode;
 use athenaeum_core::sync::store::StandaloneSyncStore;
 use athenaeum_core::sync::{
     node_id_hex, OutboundFileRow, OutboundRow, OutboundState, SharedPackageCleanup,
@@ -78,7 +79,7 @@ use crate::batcher::BatcherHandle;
 use crate::config::{Config, Mode, RetentionConfig, SendCfg};
 use crate::config_edit::{
     apply_capture_dirs_edit, apply_device_name_edit, apply_retention_edit, apply_send_mode_edit,
-    apply_targets_edit, RetentionEdit,
+    apply_targets_edit, apply_upload_limit_edit, RetentionEdit,
 };
 use crate::pending::{pending_tree, PendingNode};
 use crate::resend::{self, is_declined};
@@ -192,6 +193,14 @@ pub struct WebState {
     /// A placeholder (no receivers) while detached — sends are harmless no-ops —
     /// and, like `retention_tx`, left as-is on detach rather than cleared.
     pub send_cfg_tx: RwLock<watch::Sender<SendCfg>>,
+    /// The running agent's shared iroh node, threaded in on attach (W1 T1.6).
+    /// `PUT /api/upload-limit` calls
+    /// [`SharedIrohNode::set_upload_limit`] on it so an upload-cap edit takes
+    /// effect on the next offered chunk — mid-transfer included — with no engine
+    /// restart. `None` while detached (and on the loopback injection path, which
+    /// binds no node): the edit still persists to `perseus.toml` and is applied by
+    /// the startup path when the engine next comes up.
+    pub node: RwLock<Option<Arc<SharedIrohNode>>>,
 }
 
 impl WebState {
@@ -233,6 +242,9 @@ impl WebState {
             // Placeholder send-config channel (no receivers) until `attach` swaps
             // in the running batcher's real sender — mirrors `retention_tx`.
             send_cfg_tx: RwLock::new(watch::channel(send_cfg).0),
+            // No node until the agent binds one (`attach`); an upload-limit edit
+            // meanwhile is persisted and applied at the next startup.
+            node: RwLock::new(None),
         }
     }
 
@@ -255,6 +267,7 @@ impl WebState {
         running_targets: Vec<String>,
         batcher: Option<BatcherHandle>,
         send_cfg_tx: watch::Sender<SendCfg>,
+        node: Option<Arc<SharedIrohNode>>,
     ) {
         *self.engine.write().await = engine;
         *self.engines.write().await = engines;
@@ -267,6 +280,7 @@ impl WebState {
         *self.running_targets.write().await = running_targets;
         *self.batcher.write().await = batcher;
         *self.send_cfg_tx.write().await = send_cfg_tx;
+        *self.node.write().await = node;
     }
 
     /// Drop the engine-dependent bits as the engine stops (setup lost, restart,
@@ -302,6 +316,10 @@ impl WebState {
         // a detached page's send-now is an honest no-op. `send_cfg_tx` is left
         // as-is (a harmless stale sender) exactly like `retention_tx`.
         *self.batcher.write().await = None;
+        // The node dies with the agent (its endpoint + device-key lock are torn
+        // down on shutdown): drop our handle so a detached upload-limit edit is an
+        // honest file-only write, applied when the next agent binds.
+        *self.node.write().await = None;
     }
 }
 
@@ -447,6 +465,13 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         .route(
             "/api/device-name",
             get(api_get_device_name).put(api_put_device_name),
+        )
+        // The sync upload-speed cap (W1 T1.6): read + live edit. Applies to the
+        // running node immediately, so a big sync stops starving the observatory's
+        // uplink without stopping the agent.
+        .route(
+            "/api/upload-limit",
+            get(api_get_upload_limit).put(api_put_upload_limit),
         )
         // Sync Phase 2 (send workflow): the pending "To sync" tree, the live
         // Auto↔Manual send-mode toggle, the manual "send now" trigger, and the
@@ -1131,6 +1156,83 @@ async fn api_put_device_name(
     Ok(Json(DeviceNameDto {
         device_name,
         hub_error,
+    }))
+}
+
+// ── W1 T1.6: sync upload-speed cap ───────────────────────────────────────────
+
+/// `GET`/`PUT /api/upload-limit` payload: the sync upload cap in decimal MB/s
+/// (`0` = unlimited). Also the applied-value echo a successful `PUT` returns.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadLimitDto {
+    max_upload_mbps: u32,
+    /// Whether the value was applied to a RUNNING node as well as written to
+    /// `perseus.toml`. `false` while the engine is detached (setup/restart): the
+    /// edit is saved and takes effect when the agent next binds, which the UI says
+    /// out loud rather than implying an instant cap that did not happen.
+    applied_live: bool,
+}
+
+/// `PUT /api/upload-limit` request body. Decimal MB/s; `0` = unlimited.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UploadLimitEdit {
+    max_upload_mbps: u32,
+}
+
+/// `GET /api/upload-limit` — the configured sync upload cap (MB/s, `0` =
+/// unlimited). Read-only.
+async fn api_get_upload_limit(State(state): State<Arc<WebState>>) -> Json<UploadLimitDto> {
+    let max_upload_mbps = state.config.read().await.max_upload_mbps;
+    Json(UploadLimitDto {
+        max_upload_mbps,
+        applied_live: state.node.read().await.is_some(),
+    })
+}
+
+/// `PUT /api/upload-limit` — cap the sync upload rate, **live**.
+/// [`apply_upload_limit_edit`] rewrites `perseus.toml` (comment-preserving,
+/// re-validated, atomic — a rejected edit leaves the file byte-identical and
+/// returns `422`), the live config is swapped, and the new rate is pushed onto the
+/// running [`SharedIrohNode`] so it takes effect on the next offered chunk,
+/// mid-transfer included. With no node attached (engine in setup/restart) the edit
+/// is file-only and the response says so via `appliedLive: false`; the startup path
+/// applies it when the agent next binds. The supervisor is woken so its config view
+/// refreshes at once. Returns the applied `{maxUploadMbps, appliedLive}`.
+async fn api_put_upload_limit(
+    State(state): State<Arc<WebState>>,
+    Json(edit): Json<UploadLimitEdit>,
+) -> Result<Json<UploadLimitDto>, (StatusCode, String)> {
+    let new_cfg =
+        apply_upload_limit_edit(&state.config_path, edit.max_upload_mbps).map_err(|e| {
+            let msg = format!("{e:#}");
+            tracing::error!(error = %msg, "web upload-limit edit rejected");
+            (StatusCode::UNPROCESSABLE_ENTITY, msg)
+        })?;
+    let max_upload_mbps = new_cfg.max_upload_mbps;
+    let bytes_per_sec = new_cfg.upload_limit_bytes_per_sec();
+    *state.config.write().await = new_cfg;
+    // Live-apply: the pacer is shared by every role handle / peer / concurrent
+    // GET on this node, so one call caps the whole device — no engine restart.
+    let applied_live = match state.node.read().await.as_ref() {
+        Some(node) => {
+            node.set_upload_limit(bytes_per_sec);
+            true
+        }
+        None => {
+            tracing::warn!(
+                max_upload_mbps,
+                "upload limit saved but no node attached — applies at next start"
+            );
+            false
+        }
+    };
+    // Wake the supervisor so its per-pass config view refreshes immediately.
+    state.supervisor_wake.notify_one();
+    Ok(Json(UploadLimitDto {
+        max_upload_mbps,
+        applied_live,
     }))
 }
 
@@ -2501,6 +2603,9 @@ mod tests {
             batcher: RwLock::new(None),
             batches,
             send_cfg_tx: RwLock::new(watch::channel(config.send_cfg()).0),
+            // No iroh node in the harness (loopback transports bind none): an
+            // upload-limit edit is file-only here, `appliedLive: false`.
+            node: RwLock::new(None),
         });
         (state, tmp)
     }
@@ -4346,6 +4451,7 @@ mod tests {
             poll_interval_secs: 1,
             web_bind: String::new(),
             web_token: None,
+            max_upload_mbps: 0,
         };
         let config_path = tmp.path().join("perseus.toml");
         let (_tx, rx) = watch::channel(AgentState::NeedsSetup {
@@ -4688,6 +4794,52 @@ mod tests {
         assert_eq!(v["autoQuietSecs"], 45);
     }
 
+    /// W1 T1.6: `PUT /api/upload-limit` rewrites `perseus.toml`, swaps the live
+    /// config, and a follow-up `GET` reflects it. This harness binds no iroh node,
+    /// so the response reports `appliedLive: false` (saved, applies at next start)
+    /// rather than claiming a live cap that never happened.
+    #[tokio::test]
+    async fn put_upload_limit_applies_and_get_reflects() {
+        let (state, _tmp) = test_state().await; // sample config: no max_upload_mbps
+        let config_path = state.config_path.clone();
+        let app = build_router(state, None);
+
+        // GET reflects the unlimited default.
+        let v = body_json(get(&app, "/api/upload-limit").await).await;
+        assert_eq!(v["maxUploadMbps"], 0, "absent key reads as unlimited");
+
+        let body = serde_json::json!({ "maxUploadMbps": 8 });
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/upload-limit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["maxUploadMbps"], 8, "the PUT echoes the applied cap");
+        assert_eq!(
+            v["appliedLive"], false,
+            "no node attached in the harness — saved, applied at next start"
+        );
+
+        // The on-disk config carries the cap, and the conversion is decimal MB/s.
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded = Config::from_toml_str(&text).unwrap();
+        assert_eq!(reloaded.max_upload_mbps, 8, "written to disk: {text}");
+        assert_eq!(reloaded.upload_limit_bytes_per_sec(), 8_000_000);
+
+        // A follow-up GET reflects the adopted cap.
+        let v = body_json(get(&app, "/api/upload-limit").await).await;
+        assert_eq!(v["maxUploadMbps"], 8);
+    }
+
     /// An unknown `mode` string is a clean `400` (not a `422` extractor error nor
     /// a silent no-op) and leaves the config byte-identical.
     #[tokio::test]
@@ -4775,6 +4927,7 @@ mod tests {
             batcher: RwLock::new(Some(batcher)),
             batches: Arc::clone(&batches),
             send_cfg_tx: RwLock::new(send_cfg_tx),
+            node: RwLock::new(None),
         });
 
         let app = build_router(state, None);

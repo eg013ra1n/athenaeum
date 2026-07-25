@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use athenaeum_core::sharing::iroh::node::SharedIrohNode;
 use athenaeum_core::sync::{SharedPackageCleanup, SyncEngineHandle};
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
@@ -104,6 +105,15 @@ pub trait ManagedAgent: Send + 'static {
     /// The send-config live-edit sender (the web `PUT /api/send-mode` writes here
     /// so the running batcher live-applies an Auto↔Manual / quiet-window change).
     fn send_cfg_tx(&self) -> watch::Sender<SendCfg>;
+    /// The running agent's shared iroh node (W1 T1.6). The web
+    /// `PUT /api/upload-limit` calls
+    /// [`set_upload_limit`](athenaeum_core::sharing::iroh::node::SharedIrohNode::set_upload_limit)
+    /// on it so an upload-cap edit applies live. Defaults to `None` — like
+    /// [`engines`](Self::engines), so fakes and the loopback injection path (which
+    /// bind no node) need no change; the production impl returns the bound node.
+    fn node(&self) -> Option<Arc<SharedIrohNode>> {
+        None
+    }
     /// The live in-flight (non-terminal) outbound package count.
     fn in_flight(&self) -> anyhow::Result<usize>;
     /// Gracefully stop the agent, returning a handle that completes on shutdown.
@@ -134,6 +144,9 @@ impl ManagedAgent for Agent {
     }
     fn send_cfg_tx(&self) -> watch::Sender<SendCfg> {
         Agent::send_cfg_tx(self)
+    }
+    fn node(&self) -> Option<Arc<SharedIrohNode>> {
+        Agent::node(self)
     }
     fn in_flight(&self) -> anyhow::Result<usize> {
         Ok(self.status_snapshot()?.len())
@@ -498,6 +511,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
                     let retention_log = agent.retention_log();
                     let batcher = agent.batcher();
                     let send_cfg_tx = agent.send_cfg_tx();
+                    let node = agent.node();
                     let device_names = PairingCache::load(&data_dir).device_names;
                     // The dirs + targets the engine was launched over — read from
                     // the same config file the launcher just used (authoritative,
@@ -524,6 +538,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
                             running_targets,
                             batcher,
                             send_cfg_tx,
+                            node,
                         )
                         .await;
                     });

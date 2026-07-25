@@ -5,7 +5,8 @@
 // the empty <main> panels, wires their controls, and drives the 2 s poll. Every
 // Settings section (account/OTP, device name, capture dirs, send targets,
 // retention) is ported behaviour-for-behaviour from the v1 page; only the DOM
-// structure + class names changed. The Transfers tab ships its "To Sync" strip
+// structure + class names changed. The upload-speed cap is the one section with
+// no v1 ancestor (W1 T1.6). The Transfers tab ships its "To Sync" strip
 // plus the unified one-row-per-batch transfer list (filter chips, the shared
 // bottom detail pane with Files / Targets / Log sub-tabs, and the two delete
 // actions), rendered by `refreshTransfers` off GET /api/transfers.
@@ -184,6 +185,18 @@ function renderSettingsTab() {
         <button id="tgSave">Save</button>
       </div>
       <div class="flash" id="tgFlash"></div>
+    </section>
+
+    <section id="upload-limit">
+      <h2>Upload Speed</h2>
+      <div class="muted target-intro">Caps the total sync upload rate so a big transfer leaves the site's uplink usable (SSH, remote desktop). 0 = unlimited. Applies immediately, mid-transfer included.</div>
+      <div class="row">
+        <label class="inline-label">Upload speed limit (MB/s)
+          <input id="ulLimit" type="number" min="0" class="qty" aria-label="Upload speed limit in megabytes per second, 0 for unlimited" />
+        </label>
+        <button id="ulSave">Save</button>
+      </div>
+      <div class="flash" id="ulFlash"></div>
     </section>
 
     <section id="retention">
@@ -521,6 +534,38 @@ async function saveDeviceName() {
 function wireDeviceName() {
   $('devNameSave').addEventListener('click', saveDeviceName);
   $('devName').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveDeviceName(); });
+}
+
+// ── upload speed limit (decimal MB/s; 0 = unlimited) ────────────────────────
+// Loaded once at boot (nothing else moves it) and never clobbered while the
+// operator is typing. The PUT applies live on the running node; when the engine
+// is detached the server reports appliedLive:false and the flash says so rather
+// than implying a cap that did not take effect yet.
+async function loadUploadLimit() {
+  try {
+    const d = await getJson('/api/upload-limit');
+    if (document.activeElement !== $('ulLimit')) $('ulLimit').value = d.maxUploadMbps;
+  } catch (e) { /* offline surfaced by refreshStatus() */ }
+}
+
+async function saveUploadLimit() {
+  const f = $('ulFlash');
+  const mbps = Math.max(0, Math.floor(Number($('ulLimit').value) || 0));
+  try {
+    const r = await api('/api/upload-limit', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ maxUploadMbps: mbps }) });
+    if (r.status === 422) { f.textContent = 'rejected: ' + (await r.text()); f.className = 'flash err'; return; }
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    $('ulLimit').value = d.maxUploadMbps;
+    const what = d.maxUploadMbps ? `capped at ${d.maxUploadMbps} MB/s` : 'unlimited';
+    f.textContent = d.appliedLive ? `saved — ${what}` : `saved — ${what} (applies when the sync engine starts)`;
+    f.className = 'flash ok';
+  } catch (e) { f.textContent = 'save failed: ' + e.message; f.className = 'flash err'; }
+}
+
+function wireUploadLimit() {
+  $('ulSave').addEventListener('click', saveUploadLimit);
+  $('ulLimit').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveUploadLimit(); });
 }
 
 // ── account (email → OTP sign-in) ───────────────────────────────────────────
@@ -1250,12 +1295,13 @@ function boot() {
   wireCaptureDirs();
   wireTargets();
   wireDeviceName();
+  wireUploadLimit();
   wireAccount();
   wireRetention();
   // Initial load; the 2 s tick then polls status + retention log + account +
-  // device name + pending. The policy form, targets list and device-name field
-  // are on demand / load-once (not clobbered while editing).
-  loadPolicy(); loadCaptureDirs(); loadTargets(); loadDeviceName(); refreshAccount();
+  // device name + pending. The policy form, targets list, device-name field and
+  // upload cap are on demand / load-once (not clobbered while editing).
+  loadPolicy(); loadCaptureDirs(); loadTargets(); loadDeviceName(); loadUploadLimit(); refreshAccount();
   tick(); setInterval(tick, 2000);
 }
 

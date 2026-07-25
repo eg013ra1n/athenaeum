@@ -81,6 +81,8 @@ fn test_config(capture_dir: &Path, data_dir: &Path) -> Config {
         // spawns the server).
         web_bind: String::new(),
         web_token: None,
+        // Unlimited upload: the loopback e2e must not be paced.
+        max_upload_mbps: 0,
     }
 }
 
@@ -110,6 +112,8 @@ fn test_config_multi(capture_dirs: &[&Path], data_dir: &Path) -> Config {
         // spawns the server).
         web_bind: String::new(),
         web_token: None,
+        // Unlimited upload: the loopback e2e must not be paced.
+        max_upload_mbps: 0,
     }
 }
 

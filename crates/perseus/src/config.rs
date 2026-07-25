@@ -11,6 +11,7 @@
 //! mode = "auto"                             # "auto" or "manual" (Phase 2)
 //! auto_quiet_secs = 60                       # auto: flush after N idle seconds
 //! device_name = "Observatory Pi"            # optional; defaults to the hostname
+//! max_upload_mbps = 8                        # cap sync upload (MB/s); 0/absent = unlimited
 //!
 //! # Route A — account (recommended). Sign in with `perseus login`; the device
 //! # token lands in a 0600 file in data_dir (NEVER in this TOML). `targets` names
@@ -338,6 +339,17 @@ pub struct Config {
     /// loopback, where it becomes mandatory (validation-enforced).
     #[serde(default)]
     pub web_token: Option<String>,
+    /// Cap on this node's total sync UPLOAD rate, in **decimal MB/s** (1 MB/s =
+    /// 1_000_000 bytes/sec). `0` (or an absent key) = unlimited.
+    ///
+    /// The observatory case this exists for: a big sync saturates the site's
+    /// uplink and the operator's SSH session dies. One budget for the whole
+    /// device — every target, every concurrent transfer draws on it — applied at
+    /// startup and live-updatable from the web page (see
+    /// [`crate::config_edit::apply_upload_limit_edit`]). Additive/defaulted, so a
+    /// config written before this knob existed keeps the unlimited behaviour.
+    #[serde(default)]
+    pub max_upload_mbps: u32,
 }
 
 impl Config {
@@ -607,6 +619,15 @@ impl Config {
         }
     }
 
+    /// The upload cap as the bytes/sec rate
+    /// [`SharedIrohNode::set_upload_limit`](athenaeum_core::sharing::iroh::node::SharedIrohNode::set_upload_limit)
+    /// takes, on the decimal MB/s convention (1 MB/s = 1_000_000 bytes/sec).
+    /// `0` stays `0` — the node reads that as unlimited. Every caller (startup
+    /// apply, live web edit) converts through here, never with its own literal.
+    pub fn upload_limit_bytes_per_sec(&self) -> u64 {
+        u64::from(self.max_upload_mbps) * 1_000_000
+    }
+
     /// Write-stability quiet window as a [`Duration`].
     pub fn stability(&self) -> Duration {
         Duration::from_secs(self.stability_secs)
@@ -661,6 +682,7 @@ impl Config {
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
             web_bind: default_web_bind(),
             web_token: None,
+            max_upload_mbps: 0,
         }
     }
 }
@@ -1008,6 +1030,36 @@ mode = "auto"
         assert_eq!(cfg.auto_quiet_secs, 15);
         assert_eq!(cfg.send_cfg().auto_quiet_secs, 15);
         assert_eq!(cfg.send_cfg().mode, Mode::Auto);
+    }
+
+    /// W1 T1.6: the upload cap is additive — a config written before the knob
+    /// existed (no `max_upload_mbps` key) parses to `0`, i.e. unlimited, which is
+    /// exactly the pre-feature behaviour.
+    #[test]
+    fn max_upload_mbps_defaults_to_zero_when_absent() {
+        let capture = tempfile::tempdir().unwrap();
+        let cfg = Config::from_toml_str(&good_toml(capture.path())).expect("valid config");
+        assert_eq!(
+            cfg.max_upload_mbps, 0,
+            "an absent max_upload_mbps means unlimited"
+        );
+        assert_eq!(
+            cfg.upload_limit_bytes_per_sec(),
+            0,
+            "0 MB/s converts to the unlimited rate"
+        );
+    }
+
+    /// W1 T1.6: the key parses when present and converts on the decimal MB/s
+    /// convention (8 MB/s → 8_000_000 bytes/sec).
+    #[test]
+    fn max_upload_mbps_parses_when_present() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = good_toml(capture.path())
+            .replace("mode = \"auto\"", "mode = \"auto\"\nmax_upload_mbps = 8");
+        let cfg = Config::from_toml_str(&text).expect("valid config");
+        assert_eq!(cfg.max_upload_mbps, 8);
+        assert_eq!(cfg.upload_limit_bytes_per_sec(), 8_000_000);
     }
 
     #[test]
