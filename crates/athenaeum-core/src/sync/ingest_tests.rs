@@ -24,14 +24,16 @@ use crate::fits_writer::write_fits_f32;
 use crate::models::{Frame, ImageType};
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
-use crate::sharing::types::{FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent};
+use crate::sharing::types::{
+    FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
+};
 use crate::sharing::SharingTransport;
 
 use super::ingest::{ingest_package, IngestConn};
 use super::node_id_hex;
-use super::store::{count_satisfied_receipts, insert_receipt, CatalogSyncStore, SyncStore};
 use super::receiver::{IncomingResolver, SyncReceiver};
-use super::{SyncConfig, SyncEngine, StandaloneSyncStore};
+use super::store::{count_satisfied_receipts, insert_receipt, CatalogSyncStore, SyncStore};
+use super::{StandaloneSyncStore, SyncConfig, SyncEngine};
 
 const ORIGIN_DEVICE: &str = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
 const PEER_HEX: &str = "1122334455667788112233445566778811223344556677881122334455667788";
@@ -137,7 +139,12 @@ fn build_nested_package(
         // A full, valid Frame snapshot (the receiver deserializes frame_meta into
         // `models::Frame`, which requires more than a bare `object`); object is
         // "M31" for readability but the landing path is driven by `rel_path`.
-        frame_meta: serde_json::to_value(fixture_frame(frame_uuid, "M31", "2026-01-16T10:00:00.000Z")).unwrap(),
+        frame_meta: serde_json::to_value(fixture_frame(
+            frame_uuid,
+            "M31",
+            "2026-01-16T10:00:00.000Z",
+        ))
+        .unwrap(),
         analysis: None,
         app_version: "test".to_string(),
         project: None,
@@ -185,15 +192,28 @@ async fn ingest_mirrors_rel_path_under_authenticated_peer_slug() {
         "deadbeefdeadbeefdeadbeefdeadbeef", // decoy origin_device
     );
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
-    sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
-    let receipts =
-        wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
+    sender
+        .announce(receiver_node, &announce, "", "", &[])
+        .await
+        .unwrap();
+    let receipts = wait_for_ack(
+        &mut sender_events,
+        &announce.package_id.0,
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(matches!(receipts[0].outcome, ReceiptOutcome::Ingested));
 
     // The slug is the authenticated sender node id, sanitized (NOT the decoy).
     let slug = super::ingest::sanitize_slug(&node_id_hex(&sender_node));
-    let expected = incoming.join(&slug).join("M31/2026-07-10/lights/L_0001.fits");
-    assert!(expected.exists(), "file must mirror rel_path under the peer slug: {}", expected.display());
+    let expected = incoming
+        .join(&slug)
+        .join("M31/2026-07-10/lights/L_0001.fits");
+    assert!(
+        expected.exists(),
+        "file must mirror rel_path under the peer slug: {}",
+        expected.display()
+    );
 
     // The decoy origin_device must NOT be a folder anywhere under incoming.
     let decoy_slug = super::ingest::sanitize_slug("deadbeefdeadbeefdeadbeefdeadbeef");
@@ -207,13 +227,16 @@ async fn ingest_mirrors_rel_path_under_authenticated_peer_slug() {
     let path: String = c
         .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
         .unwrap();
-    assert!(path.ends_with("M31/2026-07-10/lights/L_0001.fits"), "catalog path mirrors rel_path: {path}");
+    assert!(
+        path.ends_with("M31/2026-07-10/lights/L_0001.fits"),
+        "catalog path mirrors rel_path: {path}"
+    );
 }
 
 #[test]
 fn sanitize_slug_is_path_safe() {
     assert_eq!(super::ingest::sanitize_slug("Studio Mac"), "studio-mac");
-    assert_eq!(super::ingest::sanitize_slug("../../etc"), "etc");   // separators/dots → safe
+    assert_eq!(super::ingest::sanitize_slug("../../etc"), "etc"); // separators/dots → safe
     assert_eq!(super::ingest::sanitize_slug("a/b\\c:d"), "a-b-c-d");
     assert_eq!(super::ingest::sanitize_slug(""), "node");
     assert_eq!(super::ingest::sanitize_slug("!!!"), "node");
@@ -225,8 +248,10 @@ fn sanitize_slug_is_path_safe() {
 /// Set the cached node-id-hex → device-name map on `conn` (the source
 /// [`resolve_sender_slug`] reads).
 fn set_device_names(conn: &Connection, pairs: &[(&str, &str)]) {
-    let map: std::collections::HashMap<String, String> =
-        pairs.iter().map(|(h, n)| (h.to_string(), n.to_string())).collect();
+    let map: std::collections::HashMap<String, String> = pairs
+        .iter()
+        .map(|(h, n)| (h.to_string(), n.to_string()))
+        .collect();
     crate::db::set_setting(
         conn,
         crate::settings::keys::SYNC_DEVICE_NAMES,
@@ -249,7 +274,10 @@ fn resolve_sender_slug_prefers_cached_device_name() {
     );
 
     // Cache the peer's friendly name → slug becomes the exact sanitized form.
-    set_device_names(&conn, &[(PEER_HEX, "My Mac Book"), (&"ff".repeat(32), "Other")]);
+    set_device_names(
+        &conn,
+        &[(PEER_HEX, "My Mac Book"), (&"ff".repeat(32), "Other")],
+    );
     assert_eq!(
         super::ingest::resolve_sender_slug(&conn, PEER_HEX),
         "My_Mac_Book",
@@ -290,14 +318,26 @@ fn resolve_sender_slug_rejects_dot_only_names() {
     for dotty in ["..", ".", "  ..  ", "...", "  .  "] {
         set_device_names(&conn, &[(PEER_HEX, dotty)]);
         let slug = super::ingest::resolve_sender_slug(&conn, PEER_HEX);
-        assert_eq!(slug, hex_slug, "device name {dotty:?} must fall back to the hex slug, got {slug:?}");
-        assert_ne!(slug, "..", "slug must never be the literal parent-dir component");
-        assert_ne!(slug, ".", "slug must never be the literal current-dir component");
+        assert_eq!(
+            slug, hex_slug,
+            "device name {dotty:?} must fall back to the hex slug, got {slug:?}"
+        );
+        assert_ne!(
+            slug, "..",
+            "slug must never be the literal parent-dir component"
+        );
+        assert_ne!(
+            slug, ".",
+            "slug must never be the literal current-dir component"
+        );
     }
 
     // A normal name that merely contains a dot (not dot-only) is unaffected.
     set_device_names(&conn, &[(PEER_HEX, "My.Mac")]);
-    assert_eq!(super::ingest::resolve_sender_slug(&conn, PEER_HEX), "My.Mac");
+    assert_eq!(
+        super::ingest::resolve_sender_slug(&conn, PEER_HEX),
+        "My.Mac"
+    );
 }
 
 /// End to end through `ingest_package`: a resolver-cached ".." device name must
@@ -308,13 +348,28 @@ fn resolve_sender_slug_rejects_dot_only_names() {
 fn ingest_dot_only_device_name_lands_under_hex_slug_not_above_incoming_root() {
     let tmp = TempDir::new().unwrap();
     let incoming = tmp.path().join("incoming");
-    let (pkg_dir, announce) =
-        build_fixture_package(tmp.path(), "frame-uuid-dotty", "L_dotty.fits", "M31", "2026-01-16T10:00:00.000Z");
+    let (pkg_dir, announce) = build_fixture_package(
+        tmp.path(),
+        "frame-uuid-dotty",
+        "L_dotty.fits",
+        "M31",
+        "2026-01-16T10:00:00.000Z",
+    );
 
     let conn = catalog_conn();
     set_device_names(&conn, &[(PEER_HEX, "..")]);
 
-    let outcome = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+    let outcome = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg_dir,
+        &announce,
+        PEER_HEX,
+        &announce.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(outcome.ingested, 1);
 
     let landed_path: String = conn
@@ -344,19 +399,37 @@ fn ingest_dot_only_device_name_lands_under_hex_slug_not_above_incoming_root() {
 fn ingest_lands_under_resolved_device_name() {
     let tmp = TempDir::new().unwrap();
     let incoming = tmp.path().join("incoming");
-    let (pkg_dir, announce) =
-        build_fixture_package(tmp.path(), "frame-uuid-named", "L_named.fits", "M31", "2026-01-16T10:00:00.000Z");
+    let (pkg_dir, announce) = build_fixture_package(
+        tmp.path(),
+        "frame-uuid-named",
+        "L_named.fits",
+        "M31",
+        "2026-01-16T10:00:00.000Z",
+    );
 
     let conn = catalog_conn();
     set_device_names(&conn, &[(PEER_HEX, "My Mac Book")]);
 
-    let outcome = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+    let outcome = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg_dir,
+        &announce,
+        PEER_HEX,
+        &announce.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(outcome.ingested, 1);
 
     let landed_path: String = conn
         .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
         .unwrap();
-    assert!(Path::new(&landed_path).exists(), "landed file exists on disk");
+    assert!(
+        Path::new(&landed_path).exists(),
+        "landed file exists on disk"
+    );
     assert!(
         landed_path.ends_with("My_Mac_Book/L_named.fits"),
         "lands under the sanitized device name, not the hex slug: {landed_path}"
@@ -394,7 +467,8 @@ fn build_two_frame_package(root: &Path) -> (PathBuf, [String; 2], PathBuf) {
         rel_path: path.file_name().unwrap().to_str().unwrap().to_string(),
         byte_size: std::fs::metadata(path).unwrap().len(),
         xxh3: package::xxh3_full_file(path).unwrap(),
-        frame_meta: serde_json::to_value(&fixture_frame(uuid, object, "2026-01-16T10:00:00.000Z")).unwrap(),
+        frame_meta: serde_json::to_value(&fixture_frame(uuid, object, "2026-01-16T10:00:00.000Z"))
+            .unwrap(),
         analysis: None,
         app_version: "test".to_string(),
         project: None,
@@ -421,7 +495,12 @@ fn corrupt_at(path: &Path, offset: u64) {
 /// FITS file) — used by the sampling-hash-collision test, which only cares
 /// about byte layout, not FITS structure. Header extraction on ingest is
 /// tolerant of non-FITS content (logs a warning, inserts an empty header row).
-fn build_raw_package(root: &Path, frame_uuid: &str, filename: &str, bytes: &[u8]) -> (PathBuf, PackageAnnounce) {
+fn build_raw_package(
+    root: &Path,
+    frame_uuid: &str,
+    filename: &str,
+    bytes: &[u8],
+) -> (PathBuf, PackageAnnounce) {
     let src_dir = root.join(format!("src-{frame_uuid}"));
     std::fs::create_dir_all(&src_dir).unwrap();
     let src = src_dir.join(filename);
@@ -464,16 +543,43 @@ fn catalog_conn() -> Connection {
 fn ingest_lands_files_and_rows() {
     let tmp = TempDir::new().unwrap();
     let incoming = tmp.path().join("incoming");
-    let (pkg_dir, announce) =
-        build_fixture_package(tmp.path(), "frame-uuid-1", "L_0001.fits", "M31", "2026-01-16T10:00:00.000Z");
+    let (pkg_dir, announce) = build_fixture_package(
+        tmp.path(),
+        "frame-uuid-1",
+        "L_0001.fits",
+        "M31",
+        "2026-01-16T10:00:00.000Z",
+    );
 
     let conn = catalog_conn();
-    let outcome = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+    let outcome = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg_dir,
+        &announce,
+        PEER_HEX,
+        &announce.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
 
     // Catalog rows created from manifest metadata.
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "one files row");
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1, "one frames row");
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM fits_header"), 1, "one fits_header row");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM files"),
+        1,
+        "one files row"
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM frames"),
+        1,
+        "one frames row"
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM fits_header"),
+        1,
+        "one fits_header row"
+    );
 
     // frames.uuid carries the manifest frame_uuid (so a redelivery dedups).
     let uuid: String = conn
@@ -492,8 +598,14 @@ fn ingest_lands_files_and_rows() {
     let landed_path: String = conn
         .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
         .unwrap();
-    assert!(Path::new(&landed_path).exists(), "landed file exists on disk");
-    assert!(landed_path.contains("incoming"), "under incoming root: {landed_path}");
+    assert!(
+        Path::new(&landed_path).exists(),
+        "landed file exists on disk"
+    );
+    assert!(
+        landed_path.contains("incoming"),
+        "under incoming root: {landed_path}"
+    );
     let slug = super::ingest::sanitize_slug(PEER_HEX);
     assert!(
         landed_path.ends_with(&format!("{slug}/L_0001.fits")),
@@ -502,29 +614,54 @@ fn ingest_lands_files_and_rows() {
 
     // History + receipt written.
     assert_eq!(
-        count(&conn, "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='ingested'"),
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='ingested'"
+        ),
         1,
         "one received/ingested history row"
     );
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM sync_receipts"), 1, "one receipt row");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM sync_receipts"),
+        1,
+        "one receipt row"
+    );
 
     // Receipt reflects an ingest.
     assert_eq!(outcome.ingested, 1);
     assert_eq!(outcome.receipts.len(), 1);
-    assert!(matches!(outcome.receipts[0].outcome, ReceiptOutcome::Ingested));
+    assert!(matches!(
+        outcome.receipts[0].outcome,
+        ReceiptOutcome::Ingested
+    ));
 }
 
 #[test]
 fn duplicate_delivery_single_row_but_acked() {
     let tmp = TempDir::new().unwrap();
     let incoming = tmp.path().join("incoming");
-    let (pkg_dir, announce1) =
-        build_fixture_package(tmp.path(), "frame-uuid-2", "L_0002.fits", "M42", "2026-01-16T10:00:00.000Z");
+    let (pkg_dir, announce1) = build_fixture_package(
+        tmp.path(),
+        "frame-uuid-2",
+        "L_0002.fits",
+        "M42",
+        "2026-01-16T10:00:00.000Z",
+    );
 
     let conn = catalog_conn();
 
     // First delivery ingests.
-    let out1 = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce1, PEER_HEX, &announce1.package_id.0, None, None).unwrap();
+    let out1 = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg_dir,
+        &announce1,
+        PEER_HEX,
+        &announce1.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(out1.ingested, 1);
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
 
@@ -535,16 +672,40 @@ fn duplicate_delivery_single_row_but_acked() {
         package_id: crate::sharing::types::PackageId("second-delivery".to_string()),
         ..announce1.clone()
     };
-    let out2 = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce2, PEER_HEX, &announce2.package_id.0, None, None).unwrap();
+    let out2 = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg_dir,
+        &announce2,
+        PEER_HEX,
+        &announce2.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
 
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "still one files row");
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1, "still one frames row");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM files"),
+        1,
+        "still one files row"
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM frames"),
+        1,
+        "still one frames row"
+    );
     assert_eq!(out2.duplicate, 1, "second delivery deduped");
-    assert!(matches!(out2.receipts[0].outcome, ReceiptOutcome::Duplicate), "receipt says Duplicate");
+    assert!(
+        matches!(out2.receipts[0].outcome, ReceiptOutcome::Duplicate),
+        "receipt says Duplicate"
+    );
     // The ack still carries a full receipt set (one per frame) so the sender confirms.
     assert_eq!(out2.receipts.len(), 1);
     assert_eq!(
-        count(&conn, "SELECT COUNT(*) FROM sync_history WHERE outcome='duplicate'"),
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM sync_history WHERE outcome='duplicate'"
+        ),
         1,
         "duplicate history recorded"
     );
@@ -564,7 +725,9 @@ fn primary_wins_metadata() {
         [],
     )
     .unwrap();
-    let file_id: i64 = conn.query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0)).unwrap();
+    let file_id: i64 = conn
+        .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+        .unwrap();
     conn.execute(
         "INSERT INTO frames (file_id, object, imagetyp, uuid, updated_at)
          VALUES (?1, 'EDITED_ON_PRIMARY', 'Light', 'frame-uuid-3', '2030-01-01T00:00:00.000Z')",
@@ -573,20 +736,46 @@ fn primary_wins_metadata() {
     .unwrap();
 
     // Deliver an OLDER snapshot for the same uuid.
-    let (pkg_dir, announce) =
-        build_fixture_package(tmp.path(), "frame-uuid-3", "L_0003.fits", "ORIGINAL_NAME", "2020-01-01T00:00:00.000Z");
-    let out = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+    let (pkg_dir, announce) = build_fixture_package(
+        tmp.path(),
+        "frame-uuid-3",
+        "L_0003.fits",
+        "ORIGINAL_NAME",
+        "2020-01-01T00:00:00.000Z",
+    );
+    let out = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg_dir,
+        &announce,
+        PEER_HEX,
+        &announce.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
 
     // Not overwritten: still one frame, object unchanged, receipt Duplicate.
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1, "no new frame inserted");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM frames"),
+        1,
+        "no new frame inserted"
+    );
     let object: String = conn
-        .query_row("SELECT object FROM frames WHERE uuid='frame-uuid-3'", [], |r| r.get(0))
+        .query_row(
+            "SELECT object FROM frames WHERE uuid='frame-uuid-3'",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     assert_eq!(object, "EDITED_ON_PRIMARY", "primary edit preserved");
     assert_eq!(out.skipped_older, 1, "counted as skipped_older");
     assert!(matches!(out.receipts[0].outcome, ReceiptOutcome::Duplicate));
     assert_eq!(
-        count(&conn, "SELECT COUNT(*) FROM sync_history WHERE outcome='skipped_older'"),
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM sync_history WHERE outcome='skipped_older'"
+        ),
         1,
         "history notes skipped_older"
     );
@@ -607,7 +796,12 @@ async fn wait_for_ack(
             .await
             .unwrap_or_else(|_| panic!("timed out waiting for ack of {package_id}"))
             .expect("sender event stream closed");
-        if let TransportEvent::AckReceived { package_id: id, receipts, .. } = ev {
+        if let TransportEvent::AckReceived {
+            package_id: id,
+            receipts,
+            ..
+        } = ev
+        {
             if id.0 == package_id {
                 return receipts;
             }
@@ -651,13 +845,26 @@ async fn ack_replay_from_receipt_log() {
     .unwrap();
 
     // Build + serve a fixture package.
-    let (pkg_dir, announce) =
-        build_fixture_package(tmp.path(), "frame-uuid-4", "L_0004.fits", "NGC7000", "2026-01-16T10:00:00.000Z");
+    let (pkg_dir, announce) = build_fixture_package(
+        tmp.path(),
+        "frame-uuid-4",
+        "L_0004.fits",
+        "NGC7000",
+        "2026-01-16T10:00:00.000Z",
+    );
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
 
     // First delivery: announce → receiver fetches, ingests, acks.
-    sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
-    let receipts1 = wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
+    sender
+        .announce(receiver_node, &announce, "", "", &[])
+        .await
+        .unwrap();
+    let receipts1 = wait_for_ack(
+        &mut sender_events,
+        &announce.package_id.0,
+        Duration::from_secs(5),
+    )
+    .await;
     assert_eq!(receipts1.len(), 1);
     assert!(matches!(receipts1[0].outcome, ReceiptOutcome::Ingested));
 
@@ -666,19 +873,44 @@ async fn ack_replay_from_receipt_log() {
     // pure-replay assertions below can prove neither changed.
     let (gen_after_first, state_after_first) = {
         let c = assert_db.conn();
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM files"), 1, "first delivery ingested one file");
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_history"), 1, "one history row after first");
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_receipts"), 1, "one receipt row after first");
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM files"),
+            1,
+            "first delivery ingested one file"
+        );
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM sync_history"),
+            1,
+            "one history row after first"
+        );
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM sync_receipts"),
+            1,
+            "one receipt row after first"
+        );
         let generation = count(&c, "SELECT generation FROM sync_inbound");
-        let state: String = c.query_row("SELECT state FROM sync_inbound", [], |r| r.get(0)).unwrap();
+        let state: String = c
+            .query_row("SELECT state FROM sync_inbound", [], |r| r.get(0))
+            .unwrap();
         (generation, state)
     };
-    assert_eq!(state_after_first, "done", "the first delivery left the row Done");
+    assert_eq!(
+        state_after_first, "done",
+        "the first delivery left the row Done"
+    );
 
     // Second delivery of the SAME announce (same package_id): the receiver must
     // re-ack from the receipt log WITHOUT re-fetching or re-ingesting.
-    sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
-    let receipts2 = wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
+    sender
+        .announce(receiver_node, &announce, "", "", &[])
+        .await
+        .unwrap();
+    let receipts2 = wait_for_ack(
+        &mut sender_events,
+        &announce.package_id.0,
+        Duration::from_secs(5),
+    )
+    .await;
 
     // Identical receipts, replayed straight from the log.
     assert_eq!(receipts2.len(), 1);
@@ -693,16 +925,33 @@ async fn ack_replay_from_receipt_log() {
     // row to `announced` (generation+1) and the post-upsert guard re-stamped it.
     {
         let c = assert_db.conn();
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM files"), 1, "replay did not re-ingest a file");
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_history"), 1, "replay wrote no history row");
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_receipts"), 1, "replay wrote no receipt row");
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM files"),
+            1,
+            "replay did not re-ingest a file"
+        );
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM sync_history"),
+            1,
+            "replay wrote no history row"
+        );
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM sync_receipts"),
+            1,
+            "replay wrote no receipt row"
+        );
         assert_eq!(
             count(&c, "SELECT generation FROM sync_inbound"),
             gen_after_first,
             "the pure-replay guard never bumps generation (no upsert reset)"
         );
-        let state_after_second: String = c.query_row("SELECT state FROM sync_inbound", [], |r| r.get(0)).unwrap();
-        assert_eq!(state_after_second, "done", "the row stays Done across the pure replay");
+        let state_after_second: String = c
+            .query_row("SELECT state FROM sync_inbound", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            state_after_second, "done",
+            "the row stays Done across the pure replay"
+        );
     }
 }
 
@@ -745,19 +994,42 @@ async fn duplicate_announce_after_done_survives_failed_reack() {
     .await
     .unwrap();
 
-    let (pkg_dir, announce) =
-        build_fixture_package(tmp.path(), "frame-uuid-dup", "L_0009.fits", "NGC6888", "2026-01-17T10:00:00.000Z");
+    let (pkg_dir, announce) = build_fixture_package(
+        tmp.path(),
+        "frame-uuid-dup",
+        "L_0009.fits",
+        "NGC6888",
+        "2026-01-17T10:00:00.000Z",
+    );
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
 
     // First delivery: fetch → ingest → ack (Done). Snapshot generation + state.
-    sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
-    let receipts1 = wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
+    sender
+        .announce(receiver_node, &announce, "", "", &[])
+        .await
+        .unwrap();
+    let receipts1 = wait_for_ack(
+        &mut sender_events,
+        &announce.package_id.0,
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(matches!(receipts1[0].outcome, ReceiptOutcome::Ingested));
     let gen_after_first = {
         let c = assert_db.conn();
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_history"), 1, "one history row after first");
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_receipts"), 1, "one receipt row after first");
-        let state: String = c.query_row("SELECT state FROM sync_inbound", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM sync_history"),
+            1,
+            "one history row after first"
+        );
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM sync_receipts"),
+            1,
+            "one receipt row after first"
+        );
+        let state: String = c
+            .query_row("SELECT state FROM sync_inbound", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(state, "done", "first delivery leaves the row Done");
         count(&c, "SELECT generation FROM sync_inbound")
     };
@@ -766,12 +1038,22 @@ async fn duplicate_announce_after_done_survives_failed_reack() {
     // guard fires; its re-ack FAILS (fault) but is non-fatal, and the terminal stamp
     // ran first, so the row must stay Done. Poll the journal for the `replayed` entry
     // (no ack event arrives — the fault ate it) to know the replay finished.
-    receiver_ep.set_fault(FaultPlan { fail_ack_once: true, ..Default::default() });
-    sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
+    receiver_ep.set_fault(FaultPlan {
+        fail_ack_once: true,
+        ..Default::default()
+    });
+    sender
+        .announce(receiver_node, &announce, "", "", &[])
+        .await
+        .unwrap();
     {
         let mut ok = false;
         for _ in 0..400 {
-            if count(&assert_db.conn(), "SELECT COUNT(*) FROM sync_events WHERE kind='replayed'") == 1 {
+            if count(
+                &assert_db.conn(),
+                "SELECT COUNT(*) FROM sync_events WHERE kind='replayed'",
+            ) == 1
+            {
                 ok = true;
                 break;
             }
@@ -779,28 +1061,65 @@ async fn duplicate_announce_after_done_survives_failed_reack() {
         }
         assert!(ok, "the failed re-ack still journaled the replay");
         let c = assert_db.conn();
-        let state: String = c.query_row("SELECT state FROM sync_inbound", [], |r| r.get(0)).unwrap();
-        assert_eq!(state, "done", "a FAILED re-ack must never strand the row at announced — it stays Done");
+        let state: String = c
+            .query_row("SELECT state FROM sync_inbound", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            state, "done",
+            "a FAILED re-ack must never strand the row at announced — it stays Done"
+        );
         assert_eq!(
             count(&c, "SELECT generation FROM sync_inbound"),
             gen_after_first,
             "the pure-replay guard skips the upsert, so generation is unchanged"
         );
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_history"), 1, "the failed re-ack wrote no new history");
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_receipts"), 1, "the failed re-ack wrote no new receipt");
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM sync_history"),
+            1,
+            "the failed re-ack wrote no new history"
+        );
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM sync_receipts"),
+            1,
+            "the failed re-ack wrote no new receipt"
+        );
     }
 
     // Third announce (fault disarmed): the replay ack now succeeds and the row is
     // still Done, still generation-stable.
-    sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
-    let receipts3 = wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
-    assert_eq!(receipts3[0].frame_uuid, receipts1[0].frame_uuid, "the third announce replays the same receipts");
+    sender
+        .announce(receiver_node, &announce, "", "", &[])
+        .await
+        .unwrap();
+    let receipts3 = wait_for_ack(
+        &mut sender_events,
+        &announce.package_id.0,
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(
+        receipts3[0].frame_uuid, receipts1[0].frame_uuid,
+        "the third announce replays the same receipts"
+    );
     {
         let c = assert_db.conn();
-        let state: String = c.query_row("SELECT state FROM sync_inbound", [], |r| r.get(0)).unwrap();
-        assert_eq!(state, "done", "the row stays Done after the successful replay");
-        assert_eq!(count(&c, "SELECT generation FROM sync_inbound"), gen_after_first, "generation still unchanged");
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM sync_history"), 1, "still one history row");
+        let state: String = c
+            .query_row("SELECT state FROM sync_inbound", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            state, "done",
+            "the row stays Done after the successful replay"
+        );
+        assert_eq!(
+            count(&c, "SELECT generation FROM sync_inbound"),
+            gen_after_first,
+            "generation still unchanged"
+        );
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM sync_history"),
+            1,
+            "still one history row"
+        );
     }
 }
 
@@ -821,34 +1140,69 @@ fn replay_guard_excludes_rejected_receipts() {
     {
         let conn = store.lock_conn();
         insert_receipt(
-            &conn, package_id,
-            &FrameReceipt { frame_uuid: "f1".into(), xxh3: "h1".into(), outcome: ReceiptOutcome::Ingested },
+            &conn,
+            package_id,
+            &FrameReceipt {
+                frame_uuid: "f1".into(),
+                xxh3: "h1".into(),
+                outcome: ReceiptOutcome::Ingested,
+            },
             "2026-01-01T00:00:00.000Z",
-        ).unwrap();
+        )
+        .unwrap();
         insert_receipt(
-            &conn, package_id,
-            &FrameReceipt { frame_uuid: "f2".into(), xxh3: "h2".into(), outcome: ReceiptOutcome::Rejected("xxh3 mismatch".into()) },
+            &conn,
+            package_id,
+            &FrameReceipt {
+                frame_uuid: "f2".into(),
+                xxh3: "h2".into(),
+                outcome: ReceiptOutcome::Rejected("xxh3 mismatch".into()),
+            },
             "2026-01-01T00:00:00.000Z",
-        ).unwrap();
+        )
+        .unwrap();
     }
-    let total = store.count_receipts(&PackageId(package_id.to_string())).unwrap();
+    let total = store
+        .count_receipts(&PackageId(package_id.to_string()))
+        .unwrap();
     assert_eq!(total, 2, "both receipts recorded");
-    let satisfied = { let conn = store.lock_conn(); count_satisfied_receipts(&conn, package_id).unwrap() };
-    assert_eq!(satisfied, 1, "a Rejected receipt must not count as satisfied");
-    assert_ne!(satisfied, frame_count, "guard must NOT short-circuit while a rejection is pending");
+    let satisfied = {
+        let conn = store.lock_conn();
+        count_satisfied_receipts(&conn, package_id).unwrap()
+    };
+    assert_eq!(
+        satisfied, 1,
+        "a Rejected receipt must not count as satisfied"
+    );
+    assert_ne!(
+        satisfied, frame_count,
+        "guard must NOT short-circuit while a rejection is pending"
+    );
 
     // Upgrade f2's receipt to Ingested (simulating a successful redelivery) —
     // the package is now fully satisfied.
     {
         let conn = store.lock_conn();
         insert_receipt(
-            &conn, package_id,
-            &FrameReceipt { frame_uuid: "f2".into(), xxh3: "h2".into(), outcome: ReceiptOutcome::Ingested },
+            &conn,
+            package_id,
+            &FrameReceipt {
+                frame_uuid: "f2".into(),
+                xxh3: "h2".into(),
+                outcome: ReceiptOutcome::Ingested,
+            },
             "2026-01-01T00:01:00.000Z",
-        ).unwrap();
+        )
+        .unwrap();
     }
-    let satisfied2 = { let conn = store.lock_conn(); count_satisfied_receipts(&conn, package_id).unwrap() };
-    assert_eq!(satisfied2, frame_count, "once every receipt is non-rejected, the guard IS satisfied");
+    let satisfied2 = {
+        let conn = store.lock_conn();
+        count_satisfied_receipts(&conn, package_id).unwrap()
+    };
+    assert_eq!(
+        satisfied2, frame_count,
+        "once every receipt is non-rejected, the guard IS satisfied"
+    );
 }
 
 /// Required test #3: two distinct 4MB payloads whose 3-position *sampling*
@@ -885,24 +1239,57 @@ fn sampling_collision_is_not_treated_as_duplicate() {
     // for the wrong reason.
     let sampling_a = crate::duplicates::compute_xxhash(&pkg_a.join("A.bin")).unwrap();
     let sampling_b = crate::duplicates::compute_xxhash(&pkg_b.join("B.bin")).unwrap();
-    assert_eq!(sampling_a, sampling_b, "test premise: sampling hashes must collide");
-    assert_ne!(announce_a.root_hash, announce_b.root_hash, "sanity: packages are not identical");
+    assert_eq!(
+        sampling_a, sampling_b,
+        "test premise: sampling hashes must collide"
+    );
+    assert_ne!(
+        announce_a.root_hash, announce_b.root_hash,
+        "sanity: packages are not identical"
+    );
     assert_ne!(
         package::xxh3_full_file(&pkg_a.join("A.bin")).unwrap(),
         package::xxh3_full_file(&pkg_b.join("B.bin")).unwrap(),
         "test premise: full content hash must differ"
     );
 
-    let out_a = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_a, &announce_a, PEER_HEX, &announce_a.package_id.0, None, None).unwrap();
+    let out_a = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg_a,
+        &announce_a,
+        PEER_HEX,
+        &announce_a.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(out_a.ingested, 1);
 
-    let out_b = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_b, &announce_b, PEER_HEX, &announce_b.package_id.0, None, None).unwrap();
+    let out_b = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg_b,
+        &announce_b,
+        PEER_HEX,
+        &announce_b.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
     assert_eq!(
         out_b.ingested, 1,
         "distinct content must ingest despite a sampling-hash collision with an already-ingested frame"
     );
-    assert!(matches!(out_b.receipts[0].outcome, ReceiptOutcome::Ingested));
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "both frames land as separate files");
+    assert!(matches!(
+        out_b.receipts[0].outcome,
+        ReceiptOutcome::Ingested
+    ));
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM files"),
+        2,
+        "both frames land as separate files"
+    );
 }
 
 /// Content-dedup (step 3) must consult the LIVE catalog: a receipt only vouches
@@ -923,8 +1310,13 @@ fn content_reingest_allowed_after_catalog_delete() {
 
     // The resend from another device: a NEW wire package with a fresh package_id
     // and a fresh frame_uuid.
-    let (pkg_dir, announce) =
-        build_fixture_package(tmp.path(), "frame-reingest-new", "L_0001.fits", "M31", "2026-01-16T10:00:00.000Z");
+    let (pkg_dir, announce) = build_fixture_package(
+        tmp.path(),
+        "frame-reingest-new",
+        "L_0001.fits",
+        "M31",
+        "2026-01-16T10:00:00.000Z",
+    );
     let full_hash = package::xxh3_full_file(&pkg_dir.join("L_0001.fits")).unwrap();
 
     // Seed a stale `ingested` receipt for an EARLIER package: same full-content
@@ -942,12 +1334,25 @@ fn content_reingest_allowed_after_catalog_delete() {
     )
     .unwrap();
     assert_eq!(
-        count(&conn, "SELECT COUNT(*) FROM frames WHERE uuid='deleted-frame-uuid'"),
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM frames WHERE uuid='deleted-frame-uuid'"
+        ),
         0,
         "premise: the receipt's frame was deleted from the catalog"
     );
 
-    let out = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+    let out = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg_dir,
+        &announce,
+        PEER_HEX,
+        &announce.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
 
     assert_eq!(
         out.ingested, 1,
@@ -955,12 +1360,23 @@ fn content_reingest_allowed_after_catalog_delete() {
     );
     assert_eq!(out.duplicate, 0, "not a duplicate");
     assert!(matches!(out.receipts[0].outcome, ReceiptOutcome::Ingested));
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "catalog file row created");
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1, "catalog frame row created");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM files"),
+        1,
+        "catalog file row created"
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM frames"),
+        1,
+        "catalog frame row created"
+    );
     let landed_path: String = conn
         .query_row("SELECT path FROM files LIMIT 1", [], |r| r.get(0))
         .unwrap();
-    assert!(Path::new(&landed_path).exists(), "payload landed on disk: {landed_path}");
+    assert!(
+        Path::new(&landed_path).exists(),
+        "payload landed on disk: {landed_path}"
+    );
 }
 
 /// The complement pin (must pass before AND after the fix): while the receipt's
@@ -976,8 +1392,13 @@ fn content_dedup_still_blocks_while_frame_alive() {
     let conn = catalog_conn();
 
     // A new package (fresh wire id + fresh uuid) whose payload hashes to H.
-    let (pkg_dir, announce) =
-        build_fixture_package(tmp.path(), "frame-dup-new", "L_0002.fits", "M42", "2026-01-16T10:00:00.000Z");
+    let (pkg_dir, announce) = build_fixture_package(
+        tmp.path(),
+        "frame-dup-new",
+        "L_0002.fits",
+        "M42",
+        "2026-01-16T10:00:00.000Z",
+    );
     let full_hash = package::xxh3_full_file(&pkg_dir.join("L_0002.fits")).unwrap();
 
     // A LIVE frame the receipt vouches for: files + frames rows present.
@@ -987,7 +1408,9 @@ fn content_dedup_still_blocks_while_frame_alive() {
         [],
     )
     .unwrap();
-    let file_id: i64 = conn.query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0)).unwrap();
+    let file_id: i64 = conn
+        .query_row("SELECT id FROM files LIMIT 1", [], |r| r.get(0))
+        .unwrap();
     conn.execute(
         "INSERT INTO frames (file_id, imagetyp, uuid, updated_at)
          VALUES (?1, 'Light', 'alive-frame-uuid', '2026-01-15T00:00:00.000Z')",
@@ -1008,13 +1431,34 @@ fn content_dedup_still_blocks_while_frame_alive() {
     )
     .unwrap();
 
-    let out = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+    let out = ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg_dir,
+        &announce,
+        PEER_HEX,
+        &announce.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
 
-    assert_eq!(out.duplicate, 1, "same content while its frame is alive stays a Duplicate");
+    assert_eq!(
+        out.duplicate, 1,
+        "same content while its frame is alive stays a Duplicate"
+    );
     assert_eq!(out.ingested, 0, "no ingest");
     assert!(matches!(out.receipts[0].outcome, ReceiptOutcome::Duplicate));
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1, "no new frame written");
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "no new file written");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM frames"),
+        1,
+        "no new frame written"
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM files"),
+        1,
+        "no new file written"
+    );
 }
 
 /// Required test #1 (the e2e repair scenario): a two-frame package where one
@@ -1063,10 +1507,15 @@ async fn transit_corruption_repaired_then_redelivery_confirms() {
         sync_store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
         receiver_node,
-        SyncConfig { ack_timeout: Duration::from_millis(60) },
+        SyncConfig {
+            ack_timeout: Duration::from_millis(60),
+        },
     );
 
-    let id = engine.enqueue_package(&pkg_dir, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg_dir, None, Vec::new())
+        .await
+        .unwrap();
 
     // First delivery: frame A ingests, frame B is rejected (corrupted) — the
     // sender must NOT confirm. Wait for the good frame to land, then assert the
@@ -1099,14 +1548,25 @@ async fn transit_corruption_repaired_then_redelivery_confirms() {
         Duration::from_secs(10),
     )
     .await;
-    assert_eq!(state_of(&sync_store, id), Some(super::OutboundState::Confirmed));
+    assert_eq!(
+        state_of(&sync_store, id),
+        Some(super::OutboundState::Confirmed)
+    );
 
     // Single catalog row per frame — the good frame was never reprocessed, and
     // the repaired frame was ingested exactly once on the redelivery attempt
     // that finally verified.
     let conn = assert_db.conn();
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 2, "one files row per frame, no duplicates");
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 2, "one frames row per frame, no duplicates");
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM files"),
+        2,
+        "one files row per frame, no duplicates"
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM frames"),
+        2,
+        "one frames row per frame, no duplicates"
+    );
 
     // Receipt for the repaired frame was upserted from Rejected to Ingested.
     let b_outcome: String = conn
@@ -1116,7 +1576,10 @@ async fn transit_corruption_repaired_then_redelivery_confirms() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(b_outcome, "ingested", "the repaired frame's receipt was upserted to ingested");
+    assert_eq!(
+        b_outcome, "ingested",
+        "the repaired frame's receipt was upserted to ingested"
+    );
 
     // History shows the reject-then-ingest trail for the repaired frame, and
     // exactly one ingested row for the never-touched-again good frame.
@@ -1145,7 +1608,10 @@ async fn transit_corruption_repaired_then_redelivery_confirms() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(a_history_count, 1, "the good frame's history is not touched again on redelivery");
+    assert_eq!(
+        a_history_count, 1,
+        "the good frame's history is not touched again on redelivery"
+    );
 
     engine.shutdown().await;
 }
@@ -1155,7 +1621,11 @@ fn state_of(store: &StandaloneSyncStore, id: i64) -> Option<super::OutboundState
 }
 
 fn attempts_of(store: &StandaloneSyncStore, id: i64) -> u32 {
-    store.get_outbound(id).unwrap().map(|r| r.attempts).unwrap_or(0)
+    store
+        .get_outbound(id)
+        .unwrap()
+        .map(|r| r.attempts)
+        .unwrap_or(0)
 }
 
 /// A resolver that always lands under a single fixed `root` — the pre-task-5
@@ -1261,11 +1731,27 @@ async fn landing_root_is_resolved_live_per_package() {
     let (pkg1, announce1) =
         build_fixture_package_val(tmp.path(), "frame-live-a", "L_live_a.fits", "M42", 0.0);
     sender.serve(&announce1, &pkg1, None).await.unwrap();
-    sender.announce(receiver_node, &announce1, "", "", &[]).await.unwrap();
-    let r1 = wait_for_ack(&mut sender_events, &announce1.package_id.0, Duration::from_secs(5)).await;
+    sender
+        .announce(receiver_node, &announce1, "", "", &[])
+        .await
+        .unwrap();
+    let r1 = wait_for_ack(
+        &mut sender_events,
+        &announce1.package_id.0,
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(matches!(r1[0].outcome, ReceiptOutcome::Ingested));
-    assert_eq!(count_files(&dir_a), 1, "package 1 landed under the first resolver target");
-    assert_eq!(count_files(&dir_b), 0, "package 1 did not land under the second target");
+    assert_eq!(
+        count_files(&dir_a),
+        1,
+        "package 1 landed under the first resolver target"
+    );
+    assert_eq!(
+        count_files(&dir_b),
+        0,
+        "package 1 did not land under the second target"
+    );
 
     // Swap the resolver's target: package 2 must land under dir_b, no restart.
     *target.lock().unwrap() = dir_b.clone();
@@ -1273,11 +1759,27 @@ async fn landing_root_is_resolved_live_per_package() {
     let (pkg2, announce2) =
         build_fixture_package_val(tmp.path(), "frame-live-b", "L_live_b.fits", "NGC7000", 1.0);
     sender.serve(&announce2, &pkg2, None).await.unwrap();
-    sender.announce(receiver_node, &announce2, "", "", &[]).await.unwrap();
-    let r2 = wait_for_ack(&mut sender_events, &announce2.package_id.0, Duration::from_secs(5)).await;
+    sender
+        .announce(receiver_node, &announce2, "", "", &[])
+        .await
+        .unwrap();
+    let r2 = wait_for_ack(
+        &mut sender_events,
+        &announce2.package_id.0,
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(matches!(r2[0].outcome, ReceiptOutcome::Ingested));
-    assert_eq!(count_files(&dir_b), 1, "package 2 landed under the NEW resolver target (live per-package)");
-    assert_eq!(count_files(&dir_a), 1, "package 2 did not re-land under the first target");
+    assert_eq!(
+        count_files(&dir_b),
+        1,
+        "package 2 landed under the NEW resolver target (live per-package)"
+    );
+    assert_eq!(
+        count_files(&dir_a),
+        1,
+        "package 2 did not re-land under the first target"
+    );
 }
 
 /// Poll a sync predicate every 10ms until true, panicking after `timeout`.
@@ -1341,7 +1843,10 @@ async fn receiver_drops_announce_from_unauthorized_peer() {
         "2026-01-16T10:00:00.000Z",
     );
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
-    sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
+    sender
+        .announce(receiver_node, &announce, "", "", &[])
+        .await
+        .unwrap();
 
     // Give the receiver ample time to (wrongly) ingest, then assert it did not.
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1401,10 +1906,17 @@ async fn receiver_ingests_from_authorized_peer() {
         "2026-01-16T10:00:00.000Z",
     );
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
-    sender.announce(receiver_node, &announce, "", "", &[]).await.unwrap();
+    sender
+        .announce(receiver_node, &announce, "", "", &[])
+        .await
+        .unwrap();
 
-    let receipts =
-        wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
+    let receipts = wait_for_ack(
+        &mut sender_events,
+        &announce.package_id.0,
+        Duration::from_secs(5),
+    )
+    .await;
     assert_eq!(receipts.len(), 1);
     assert!(matches!(receipts[0].outcome, ReceiptOutcome::Ingested));
     let c = assert_db.conn();
@@ -1425,7 +1937,10 @@ struct EventRecorder {
 }
 impl crate::events::ProgressEmitter for EventRecorder {
     fn emit_json(&self, name: &str, payload: serde_json::Value) {
-        self.events.lock().unwrap().push((name.to_string(), payload));
+        self.events
+            .lock()
+            .unwrap()
+            .push((name.to_string(), payload));
     }
 }
 
@@ -1568,8 +2083,13 @@ async fn project_package_lands_contributions_and_acks() {
     let assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
 
     // Node A builds a stamped package; capture its manifest anchor.
-    let (pkg_dir, announce, anchor) =
-        build_stamped_project_package(tmp.path(), "pf-1", "L_0001.fits", PROJECT_ID, HUB_PACKAGE_ID);
+    let (pkg_dir, announce, anchor) = build_stamped_project_package(
+        tmp.path(),
+        "pf-1",
+        "L_0001.fits",
+        PROJECT_ID,
+        HUB_PACKAGE_ID,
+    );
 
     // Seed B: project (slug) + hub-anchored package row + collaboration landing root.
     let landing = tmp.path().join("collab_landing");
@@ -1623,8 +2143,12 @@ async fn project_package_lands_contributions_and_acks() {
         .unwrap();
 
     // A receives the ack with an Ingested receipt ("receipts flowed", B confirmed).
-    let receipts =
-        wait_for_ack(&mut sender_events, &announce.package_id.0, Duration::from_secs(5)).await;
+    let receipts = wait_for_ack(
+        &mut sender_events,
+        &announce.package_id.0,
+        Duration::from_secs(5),
+    )
+    .await;
     assert_eq!(receipts.len(), 1);
     assert!(matches!(receipts[0].outcome, ReceiptOutcome::Ingested));
 
@@ -1638,8 +2162,16 @@ async fn project_package_lands_contributions_and_acks() {
     // in files/frames.
     let rows = {
         let c = assert_db.conn();
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM files"), 0, "contributions never enter files");
-        assert_eq!(count(&c, "SELECT COUNT(*) FROM frames"), 0, "contributions never enter frames");
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM files"),
+            0,
+            "contributions never enter files"
+        );
+        assert_eq!(
+            count(&c, "SELECT COUNT(*) FROM frames"),
+            0,
+            "contributions never enter frames"
+        );
         crate::db::collab_exchange::contributions_for_package(&c, HUB_PACKAGE_ID).unwrap()
     };
     assert_eq!(rows.len(), 1, "one contribution landed");
@@ -1654,10 +2186,15 @@ async fn project_package_lands_contributions_and_acks() {
     // The package is marked complete and its manifest retained (Д2 re-serve).
     let pkg = {
         let c = assert_db.conn();
-        crate::db::collab_exchange::get_package(&c, HUB_PACKAGE_ID).unwrap().unwrap()
+        crate::db::collab_exchange::get_package(&c, HUB_PACKAGE_ID)
+            .unwrap()
+            .unwrap()
     };
     assert_eq!(pkg.local_status, "complete");
-    assert!(pkg.manifest_ndjson.is_some(), "retained manifest bytes for re-serving");
+    assert!(
+        pkg.manifest_ndjson.is_some(),
+        "retained manifest bytes for re-serving"
+    );
 }
 
 // ── W2 T2.1: per-frame connection locking (IngestConn) ──────────────────────
@@ -1665,7 +2202,7 @@ async fn project_package_lands_contributions_and_acks() {
 /// Frames per package for the two `IngestConn` tests: enough gaps between frames
 /// for a competing thread to win the mutex at least twice, few enough to keep the
 /// whole test well under a second of real work.
-const CONN_TEST_FRAMES: usize = 8;
+const CONN_TEST_FRAMES: usize = 16;
 
 /// Build an `n`-frame fixture package whose payloads are real FITS files of
 /// `dim`×`dim` f32 pixels (≈ `dim`²·4 bytes each) with a distinct fill value per
@@ -1690,7 +2227,12 @@ fn build_multi_frame_package(root: &Path, n: usize, dim: usize) -> (PathBuf, Pac
             rel_path: filename,
             byte_size: std::fs::metadata(&src).unwrap().len(),
             xxh3: package::xxh3_full_file(&src).unwrap(),
-            frame_meta: serde_json::to_value(fixture_frame(&uuid, "MULTI", "2026-01-16T10:00:00.000Z")).unwrap(),
+            frame_meta: serde_json::to_value(fixture_frame(
+                &uuid,
+                "MULTI",
+                "2026-01-16T10:00:00.000Z",
+            ))
+            .unwrap(),
             analysis: None,
             app_version: "test".to_string(),
             project: None,
@@ -1720,6 +2262,12 @@ fn midpackage_observations(
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let done = AtomicBool::new(false);
+    // Warm-up handshake: ingest must not start until the probe thread has
+    // completed one full acquire-read-write cycle. Without it, a heavily loaded
+    // machine (the full --workspace run keeps every core busy with sibling
+    // tests) can finish the whole package before the probe thread is ever
+    // scheduled — observed once as a 0-observation flake.
+    let probe_warm = AtomicBool::new(false);
     let observations = AtomicUsize::new(0);
 
     std::thread::scope(|scope| {
@@ -1737,11 +2285,15 @@ fn midpackage_observations(
                         observations.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                probe_warm.store(true, Ordering::Relaxed);
                 i += 1;
                 std::thread::yield_now();
             }
         });
 
+        while !probe_warm.load(Ordering::Relaxed) {
+            std::thread::yield_now();
+        }
         run_ingest();
         done.store(true, Ordering::Relaxed);
         probe.join().unwrap();
@@ -1812,8 +2364,13 @@ fn ingest_releases_conn_between_frames() {
         control_observed, 0,
         "control premise: a whole-package guard makes a partial catalog unobservable"
     );
+    // >= 1, deliberately: ONE observation of a partial catalog already proves
+    // the guard is released between frames — the control above proves a
+    // whole-package guard makes even one observation impossible. Requiring more
+    // only re-introduces scheduler-load sensitivity (the full --workspace run
+    // saturates every core), which is what flaked here once.
     assert!(
-        shared_observed >= 2,
+        shared_observed >= 1,
         "a competing thread must acquire the store connection mid-package \
          (partial-catalog acquisitions: {shared_observed} with Shared, \
          {control_observed} with a whole-package guard)"
@@ -1867,8 +2424,13 @@ fn ingest_shared_conn_matches_borrowed_outcome() {
 
     // Same aggregate outcome.
     assert_eq!(shared_out.ingested, 3, "premise: every frame ingests");
-    let counts = |o: &super::ingest::IngestOutcome| (o.ingested, o.duplicate, o.skipped_older, o.rejected);
-    assert_eq!(counts(&borrowed_out), counts(&shared_out), "outcome counts identical");
+    let counts =
+        |o: &super::ingest::IngestOutcome| (o.ingested, o.duplicate, o.skipped_older, o.rejected);
+    assert_eq!(
+        counts(&borrowed_out),
+        counts(&shared_out),
+        "outcome counts identical"
+    );
     assert_eq!(
         receipt_fingerprint(&borrowed_out.receipts),
         receipt_fingerprint(&shared_out.receipts),
@@ -1907,7 +2469,11 @@ fn ingest_shared_conn_matches_borrowed_outcome() {
         landed_rel_paths(&shared_conn, &shared_incoming),
         "landed layout identical"
     );
-    assert_eq!(landed_rel_paths(&shared_conn, &shared_incoming).len(), 3, "premise: three files landed");
+    assert_eq!(
+        landed_rel_paths(&shared_conn, &shared_incoming).len(),
+        3,
+        "premise: three files landed"
+    );
 }
 
 /// Stable text form of a receipt list (order-independent), for cross-run equality.
@@ -1939,7 +2505,9 @@ fn rows_as_strings(conn: &Connection, sql: &str, cols: usize) -> Vec<String> {
 
 /// Every `files.path`, relative to `incoming` and asserted to exist on disk.
 fn landed_rel_paths(conn: &Connection, incoming: &Path) -> Vec<String> {
-    let mut stmt = conn.prepare("SELECT path FROM files ORDER BY path").unwrap();
+    let mut stmt = conn
+        .prepare("SELECT path FROM files ORDER BY path")
+        .unwrap();
     let mut out: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(0))
         .unwrap()
