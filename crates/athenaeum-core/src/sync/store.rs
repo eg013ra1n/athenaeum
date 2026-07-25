@@ -2102,9 +2102,14 @@ pub fn outbound_file_counts(
 }
 
 /// The receive-side twin of [`outbound_file_counts`] — ONE grouped query over
-/// `sync_inbound_files`. `state = 'uploaded'` never occurs inbound (a file walks
-/// `announced → fetching → done|failed`), so inbound `done` reduces to
-/// `state = 'done'`.
+/// `sync_inbound_files`.
+///
+/// Both directions share the same "done" predicate because they share the same
+/// rung: the sender's `uploaded` and the receiver's `fetched` both mean "bytes
+/// complete, verdict pending" (D2 §3.4), so both counters climb during a transfer
+/// for the same reason and through the same statement. `state = 'uploaded'` never
+/// occurs inbound and `state = 'fetched'` never occurs outbound; the shared CASE
+/// simply admits both.
 pub fn inbound_file_counts(
     conn: &Connection,
     ids: &[i64],
@@ -2115,8 +2120,9 @@ pub fn inbound_file_counts(
 /// Shared implementation for [`outbound_file_counts`] / [`inbound_file_counts`]:
 /// one `GROUP BY` over the parent-id `IN (…)` set. `COALESCE(outcome,'')` keeps
 /// the `rejected%` predicate boolean (a NULL `outcome` must not poison the
-/// `done` CASE via three-valued logic), so an `uploaded` file with no outcome
-/// still counts as done.
+/// `done` CASE via three-valued logic), so an `uploaded`/`fetched` file with no
+/// outcome still counts as done — that pair is the same rung on the two sides
+/// (D2 §3.4), which is why one CASE serves both directions.
 fn grouped_file_counts(
     conn: &Connection,
     table: &str,
@@ -2135,7 +2141,7 @@ fn grouped_file_counts(
                 COUNT(*), \
                 SUM(CASE WHEN state = 'failed' OR COALESCE(outcome,'') LIKE 'rejected%' \
                          THEN 1 ELSE 0 END), \
-                SUM(CASE WHEN (state = 'done' OR state = 'uploaded') \
+                SUM(CASE WHEN (state = 'done' OR state = 'uploaded' OR state = 'fetched') \
                           AND NOT (state = 'failed' OR COALESCE(outcome,'') LIKE 'rejected%') \
                          THEN 1 ELSE 0 END) \
          FROM {table} WHERE {id_col} IN ({placeholders}) GROUP BY {id_col}"
@@ -4082,6 +4088,89 @@ mod tests {
 
         // Empty id set → no query, empty map.
         assert!(outbound_file_counts(&conn, &[]).unwrap().is_empty());
+    }
+
+    /// D2 §3.4: the shared predicate must make the RECEIVE side climb too. The pin
+    /// above is outbound-only, so a `fetched` term added without this test would
+    /// pass while never being exercised inbound — which is exactly how the receiver
+    /// ended up with a counter stuck at 0 of 38 while bytes visibly flowed.
+    #[test]
+    fn grouped_file_counts_classifies_mixed_inbound_states() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_INBOUND_FILES, []).unwrap();
+
+        let ins = |rel: &str, state: &str, outcome: Option<&str>| {
+            conn.execute(
+                "INSERT INTO sync_inbound_files
+                    (inbound_id, rel_path, byte_size, frame_uuid, state, bytes_done, outcome, updated_at)
+                 VALUES (1, ?1, 10, ?2, ?3, 0, ?4, '2026-07-25T00:00:00.000Z')",
+                params![rel, format!("u-{rel}"), state, outcome],
+            )
+            .unwrap();
+        };
+        ins("announced.fits", "announced", None);
+        ins("fetching.fits", "fetching", None);
+        // The new rung: bytes complete, verdict pending — the receive-side twin of
+        // the sender's `uploaded`, counted through the same CASE.
+        ins("fetched.fits", "fetched", None);
+        ins("ingested.fits", "done", Some("ingested"));
+        ins("failed.fits", "failed", None);
+        ins("rejected.fits", "done", Some("rejected:bad hash"));
+
+        let counts = inbound_file_counts(&conn, &[1]).unwrap();
+        let c = counts.get(&1).expect("parent present");
+        assert_eq!(c.total, 6);
+        assert_eq!(
+            c.done, 2,
+            "fetched + ingested — a rejected done is not done"
+        );
+        assert_eq!(c.failed, 2, "the failed row and the rejected-outcome row");
+        assert_eq!(
+            c.total - c.done - c.failed,
+            2,
+            "announced + fetching remain in flight"
+        );
+    }
+
+    /// D2 §3.4: `settle_unsettled_inbound_files` keys on `state <> 'done'`, so a
+    /// `fetched` row settles at a terminal exactly like a `fetching` one — no
+    /// change needed there. Pinned so a later edit cannot silently strand the new
+    /// rung outside the batch-level closer.
+    #[test]
+    fn a_fetched_row_settles_at_terminal_like_a_fetching_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_INBOUND_FILES, []).unwrap();
+        for (rel, st, outcome) in [
+            ("a.fits", "fetching", None),
+            ("b.fits", "fetched", None),
+            ("c.fits", "done", Some("ingested")),
+        ] {
+            conn.execute(
+                "INSERT INTO sync_inbound_files
+                    (inbound_id, rel_path, byte_size, frame_uuid, state, bytes_done, outcome, updated_at)
+                 VALUES (1, ?1, 10, ?2, ?3, 0, ?4, '2026-07-25T00:00:00.000Z')",
+                params![rel, format!("u-{rel}"), st, outcome],
+            )
+            .unwrap();
+        }
+
+        settle_unsettled_inbound_files(&conn, 1, InboundFileState::Done, Some("cancelled"), None)
+            .unwrap();
+
+        let rows = list_inbound_files(&conn, 1).unwrap();
+        assert!(
+            rows.iter().all(|r| r.state == InboundFileState::Done),
+            "fetching AND fetched both settle: {:?}",
+            rows.iter()
+                .map(|r| (r.rel_path.clone(), r.state))
+                .collect::<Vec<_>>()
+        );
+        let already_done = rows.iter().find(|r| r.rel_path == "c.fits").unwrap();
+        assert_eq!(
+            already_done.outcome.as_deref(),
+            Some("ingested"),
+            "an already-done row keeps its own verdict"
+        );
     }
 
     /// tv2 §D7: `append_sync_event` prunes each batch's journal to the newest

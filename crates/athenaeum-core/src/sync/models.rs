@@ -492,7 +492,8 @@ impl OutboundFileState {
 
 /// Receiver-side lifecycle of one file within an inbound batch (`sync_inbound_files`,
 /// §D4). Mirrors [`InboundState`]'s `as_str`/`from_db` shape: a file walks
-/// `Announced → Fetching → Done`, or lands `Failed` when its fetch/ingest fails.
+/// `Announced → Fetching → Fetched → Done`, or lands `Failed` when its fetch/ingest
+/// fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
 pub enum InboundFileState {
@@ -500,6 +501,12 @@ pub enum InboundFileState {
     Announced,
     /// Pulling this file's bytes (live `bytes_done` updates here).
     Fetching,
+    /// Bytes complete, verdict pending — the receive-side twin of
+    /// [`OutboundFileState::Uploaded`] (D2 §3.4). Counted as done by
+    /// [`grouped_file_counts`](super::store::grouped_file_counts) through the same
+    /// predicate, which is what makes the receiver's file counter climb DURING a
+    /// transfer instead of sitting at zero until the whole batch is ingested.
+    Fetched,
     /// Fetched + ingested — terminal success.
     Done,
     /// The fetch or ingest of this file failed — terminal failure (the batch as a
@@ -513,6 +520,7 @@ impl InboundFileState {
         match self {
             InboundFileState::Announced => "announced",
             InboundFileState::Fetching => "fetching",
+            InboundFileState::Fetched => "fetched",
             InboundFileState::Done => "done",
             InboundFileState::Failed => "failed",
         }
@@ -524,6 +532,7 @@ impl InboundFileState {
         Ok(match s {
             "announced" => InboundFileState::Announced,
             "fetching" => InboundFileState::Fetching,
+            "fetched" => InboundFileState::Fetched,
             "done" => InboundFileState::Done,
             "failed" => InboundFileState::Failed,
             other => return Err(anyhow!("unknown inbound file state: {other}")),

@@ -221,6 +221,9 @@ export function fileStateChipClass(state: string): string {
   switch (state) {
     case 'done':
     case 'uploaded':
+    // D2: the receive-side twin of `uploaded` — bytes in, verdict pending. Same
+    // rung, same tone, and the shared counter treats them identically.
+    case 'fetched':
       return CHIP_ACCENT;
     case 'sending':
     case 'fetching':

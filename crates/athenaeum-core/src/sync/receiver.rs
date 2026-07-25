@@ -814,6 +814,113 @@ fn reconcile_stale_inbound(store: &CatalogSyncStore) {
     }
 }
 
+/// Build the receiver's live fetch sink (Task 11; per-file shape reshaped by
+/// D2 §3.4).
+///
+/// Each batch tick persists live `bytes_done` and emits a `fetching` progress
+/// carrying the byte figures; each per-file tick persists that file's state
+/// transition and emits a `sync-file-progress`. DB writes are best-effort — a
+/// failed write warns and never aborts the fetch. Ticks arrive throttled (≤ every
+/// 300 ms per stream), so writing at that cadence is fine.
+///
+/// Extracted from `handle_announce` so the per-file transition rule is directly
+/// testable: it is the one piece of receive-side progress logic with a real
+/// state machine in it, and the bug it had (a first tick that already carried
+/// full bytes could never reach the terminal rung) was invisible end-to-end
+/// because ingest overwrites every file row moments later.
+#[allow(clippy::too_many_arguments)]
+fn build_fetch_sink(
+    store: &Arc<CatalogSyncStore>,
+    emitter: &Arc<dyn ProgressEmitter>,
+    pkg: String,
+    peer_device: String,
+    frame_count: u32,
+    inbound_id: i64,
+    track_files: bool,
+) -> FetchSink {
+    let emitter = Arc::clone(emitter);
+    let store = Arc::clone(store);
+    // Per-file transition tracker (Transfers Status Model v2 §D4, reshaped by
+    // D2 §3.4): remembers the last state WRITTEN for each file so the sink can
+    // write on transitions only, never per byte-tick. Only populated when the
+    // v2 manifest gave us per-file rows (`has_manifest`); a v1/nameless batch
+    // has none, so the writes are skipped.
+    let file_seen: Arc<std::sync::Mutex<HashMap<String, InboundFileState>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    Arc::new(move |ev| match ev {
+        FetchEvent::Batch {
+            bytes_done,
+            bytes_total,
+        } => {
+            {
+                let conn = store.lock_conn();
+                if let Err(e) = set_inbound_bytes_done(&conn, &pkg, bytes_done) {
+                    tracing::warn!(package_id = %pkg, error = %format!("{e:#}"), "inbound bytes_done update failed");
+                }
+            }
+            emit_event(
+                emitter.as_ref(),
+                "sync-progress",
+                &SyncProgressEvent {
+                    package_id: pkg.clone(),
+                    direction: super::Direction::Received,
+                    stage: "fetching".to_string(),
+                    peer_device: peer_device.clone(),
+                    frame_count,
+                    project_id: None,
+                    bytes_done: Some(bytes_done),
+                    bytes_total: Some(bytes_total),
+                },
+            );
+        }
+        FetchEvent::File {
+            name,
+            bytes_done,
+            bytes_total,
+        } => {
+            // Persist the per-file row transition (best-effort) BEFORE emitting
+            // the live progress event — the live bar stays the event stream; the
+            // DB row is the restart checkpoint and the file counter's evidence.
+            //
+            // D2 §3.4: the target state is computed from THIS tick and written
+            // whenever it differs from what was last written — the sender's
+            // shape. The previous scheme keyed the write on WHICH ARM ran: the
+            // first tick for a file always wrote `Fetching`, even when that tick
+            // already carried full bytes, after which the completion arm could
+            // never fire. Resumed, dedup'd, one-tick and zero-byte files were
+            // therefore stranded mid-transfer and never counted.
+            if track_files {
+                let target = if bytes_done >= bytes_total {
+                    InboundFileState::Fetched
+                } else {
+                    InboundFileState::Fetching
+                };
+                let mut map = file_seen.lock().expect("inbound file_seen mutex poisoned");
+                if map.get(&name).copied() != Some(target) {
+                    map.insert(name.clone(), target);
+                    let conn = store.lock_conn();
+                    if let Err(e) = set_inbound_file_state(
+                        &conn, inbound_id, &name, target, bytes_done, None, None,
+                    ) {
+                        tracing::warn!(inbound_id, rel_path = %name, state = target.as_str(), error = %format!("{e:#}"), "inbound file state write failed");
+                    }
+                }
+            }
+            emit_event(
+                emitter.as_ref(),
+                "sync-file-progress",
+                &SyncFileProgressEvent {
+                    package_id: pkg.clone(),
+                    peer_device: peer_device.clone(),
+                    file: name,
+                    bytes_done,
+                    bytes_total,
+                },
+            );
+        }
+    })
+}
+
 /// Stamp `package_id`'s inbound row [`Failed`](InboundState::Failed) AND settle its
 /// un-settled per-file rows to `failed` (Transfers Status Model v2 §D4 — a
 /// batch-level fetch/ingest/ack failure closes every not-yet-`done` file row).
@@ -1343,97 +1450,15 @@ async fn handle_announce(
     // emits a `sync-file-progress`. DB writes are best-effort — a failed byte
     // update warns and never aborts the fetch. Ticks arrive throttled (≤ every
     // 300ms per stream), so a write at that cadence is fine.
-    let sink: FetchSink = {
-        let emitter = Arc::clone(&emitter);
-        let store = Arc::clone(store);
-        let pkg = package_id.clone();
-        let peer_device = peer_device.clone();
-        let frame_count = announce.frame_count;
-        // Per-file transition tracker (Transfers Status Model v2 §D4): only WRITE the
-        // `sync_inbound_files` row on the first tick of a file (announced → fetching)
-        // and on its completion (full bytes), never per byte-tick. `completed` marks
-        // the second write done. Only populated when the v2 manifest gave us per-file
-        // rows (`has_manifest`); a v1/nameless batch has none, so the writes are skipped.
-        let track_files = has_manifest;
-        let file_seen: Arc<std::sync::Mutex<HashMap<String, bool>>> =
-            Arc::new(std::sync::Mutex::new(HashMap::new()));
-        Arc::new(move |ev| match ev {
-            FetchEvent::Batch {
-                bytes_done,
-                bytes_total,
-            } => {
-                {
-                    let conn = store.lock_conn();
-                    if let Err(e) = set_inbound_bytes_done(&conn, &pkg, bytes_done) {
-                        tracing::warn!(package_id = %pkg, error = %format!("{e:#}"), "inbound bytes_done update failed");
-                    }
-                }
-                emit_event(
-                    emitter.as_ref(),
-                    "sync-progress",
-                    &SyncProgressEvent {
-                        package_id: pkg.clone(),
-                        direction: super::Direction::Received,
-                        stage: "fetching".to_string(),
-                        peer_device: peer_device.clone(),
-                        frame_count,
-                        project_id: None,
-                        bytes_done: Some(bytes_done),
-                        bytes_total: Some(bytes_total),
-                    },
-                );
-            }
-            FetchEvent::File {
-                name,
-                bytes_done,
-                bytes_total,
-            } => {
-                // Persist the per-file row transition (best-effort) BEFORE emitting the
-                // live progress event. A write happens only on the first tick (→
-                // `fetching`) and on completion (bytes reach the total) — the live bar
-                // stays the event stream; the DB row is the restart checkpoint.
-                if track_files {
-                    let mut map = file_seen.lock().expect("inbound file_seen mutex poisoned");
-                    let write = match map.get(&name).copied() {
-                        None => {
-                            map.insert(name.clone(), false);
-                            true // transition write
-                        }
-                        Some(false) if bytes_total > 0 && bytes_done >= bytes_total => {
-                            map.insert(name.clone(), true);
-                            true // completion write
-                        }
-                        _ => false,
-                    };
-                    if write {
-                        let conn = store.lock_conn();
-                        if let Err(e) = set_inbound_file_state(
-                            &conn,
-                            inbound_id,
-                            &name,
-                            InboundFileState::Fetching,
-                            bytes_done,
-                            None,
-                            None,
-                        ) {
-                            tracing::warn!(inbound_id, rel_path = %name, error = %format!("{e:#}"), "inbound file fetching write failed");
-                        }
-                    }
-                }
-                emit_event(
-                    emitter.as_ref(),
-                    "sync-file-progress",
-                    &SyncFileProgressEvent {
-                        package_id: pkg.clone(),
-                        peer_device: peer_device.clone(),
-                        file: name,
-                        bytes_done,
-                        bytes_total,
-                    },
-                );
-            }
-        })
-    };
+    let sink: FetchSink = build_fetch_sink(
+        store,
+        &emitter,
+        package_id.clone(),
+        peer_device.clone(),
+        announce.frame_count,
+        inbound_id,
+        has_manifest,
+    );
     // Wire-in (b) — Task 12, extended B4-fix: the fetch is abortable on EITHER of
     // two distinct cross-task signals. Pin the fetch and race it against the
     // shared notify; a break drops the fetch future — Task 10's downloader aborts
@@ -3915,6 +3940,134 @@ mod tests {
             byte_size: size,
             frame_uuid: uuid.to_string(),
         }
+    }
+
+    /// A store with one announced inbound row carrying `files`, plus the live fetch
+    /// sink that row's fetch would use. Lets the D2 §3.4 per-file transition rule be
+    /// driven tick by tick — end-to-end it is unobservable, because ingest
+    /// overwrites every file row moments after the fetch returns.
+    fn fetch_sink_fixture(
+        tmp: &tempfile::TempDir,
+        files: &[AnnounceFileEntry],
+    ) -> (Arc<CatalogSyncStore>, i64, FetchSink) {
+        let store = Arc::new(CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap());
+        let id = {
+            let conn = store.lock_conn();
+            let id = upsert_inbound_announced(
+                &conn,
+                &"aa".repeat(32),
+                "wire-1",
+                files.len() as u32,
+                100,
+            )
+            .unwrap();
+            record_inbound_manifest(&conn, id, Some("Sink Batch"), files).unwrap();
+            id
+        };
+        let emitter: Arc<dyn ProgressEmitter> = Arc::new(RecordingEmitter::default());
+        let sink = build_fetch_sink(
+            &store,
+            &emitter,
+            "wire-1".to_string(),
+            "peer".to_string(),
+            files.len() as u32,
+            id,
+            true,
+        );
+        (store, id, sink)
+    }
+
+    fn file_state(store: &Arc<CatalogSyncStore>, id: i64, rel: &str) -> InboundFileRow {
+        let conn = store.lock_conn();
+        list_inbound_files(&conn, id)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.rel_path == rel)
+            .unwrap_or_else(|| panic!("no file row for {rel}"))
+    }
+
+    /// D2 §3.4: a file whose FIRST progress tick already carries full bytes must
+    /// still reach `fetched`. The old sink keyed its write on which arm ran — the
+    /// first tick always wrote `fetching`, after which the completion arm could
+    /// never fire — so resumed, dedup'd, one-tick and zero-byte files were stranded
+    /// mid-transfer and never counted. Invisible end-to-end, because ingest
+    /// overwrites the row right afterwards; visible to the user as a counter stuck
+    /// below the real figure.
+    #[test]
+    fn a_file_that_completes_in_one_tick_still_reaches_fetched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![
+            afe("sub/frame1.fits", "u1", 500),
+            afe("sub/empty.txt", "u2", 0),
+        ];
+        let (store, id, sink) = fetch_sink_fixture(&tmp, &files);
+
+        // One and only one tick each, both already complete.
+        sink(FetchEvent::File {
+            name: "sub/frame1.fits".to_string(),
+            bytes_done: 500,
+            bytes_total: 500,
+        });
+        sink(FetchEvent::File {
+            name: "sub/empty.txt".to_string(),
+            bytes_done: 0,
+            bytes_total: 0,
+        });
+
+        assert_eq!(
+            file_state(&store, id, "sub/frame1.fits").state,
+            InboundFileState::Fetched,
+            "a file complete on its first tick is fetched, not stuck fetching"
+        );
+        assert_eq!(
+            file_state(&store, id, "sub/empty.txt").state,
+            InboundFileState::Fetched,
+            "zero-byte files complete too — the old `bytes_total > 0` guard stranded them"
+        );
+    }
+
+    /// And the ordinary path still walks both rungs, writing once per transition
+    /// rather than once per tick.
+    #[test]
+    fn a_file_walks_fetching_then_fetched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![afe("a.fits", "u1", 500)];
+        let (store, id, sink) = fetch_sink_fixture(&tmp, &files);
+
+        sink(FetchEvent::File {
+            name: "a.fits".to_string(),
+            bytes_done: 100,
+            bytes_total: 500,
+        });
+        assert_eq!(
+            file_state(&store, id, "a.fits").state,
+            InboundFileState::Fetching
+        );
+
+        // A second partial tick changes nothing — same state, no rewrite.
+        sink(FetchEvent::File {
+            name: "a.fits".to_string(),
+            bytes_done: 300,
+            bytes_total: 500,
+        });
+        let mid = file_state(&store, id, "a.fits");
+        assert_eq!(mid.state, InboundFileState::Fetching);
+        assert_eq!(
+            mid.bytes_done, 100,
+            "a same-state tick is not written — checkpoints ride transitions, not bytes"
+        );
+
+        sink(FetchEvent::File {
+            name: "a.fits".to_string(),
+            bytes_done: 500,
+            bytes_total: 500,
+        });
+        let done = file_state(&store, id, "a.fits");
+        assert_eq!(done.state, InboundFileState::Fetched);
+        assert_eq!(
+            done.bytes_done, 500,
+            "the terminal rung checkpoints full bytes"
+        );
     }
 
     /// Build a TWO-file v2 fixture package (one flat, one nested `rel_path`) with
