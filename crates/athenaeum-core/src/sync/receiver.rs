@@ -956,6 +956,10 @@ async fn process_receiver_event(ev: TransportEvent, deps: &ReceiverLaneDeps) {
                 staging_root,
                 transport.as_ref(),
                 emitter.as_ref(),
+                // Only the gate, not the whole control: the project path has no
+                // cancel/revoke surface of its own, so it borrows the one signal it
+                // actually uses.
+                &control.receive_gate,
                 announcements_refresher.as_ref(),
                 on_project_ingested.as_ref(),
                 from,
@@ -1842,6 +1846,34 @@ async fn handle_announce(
         )
         .await;
     }
+
+    // ── Receive gate (W2 T2.4) ──────────────────────────────────────────────
+    //
+    // THIS line is where "this transfer will actually move bytes" becomes true, and
+    // that is why the permit is taken HERE and nowhere earlier. Everything above
+    // returns without touching the network payload or the disk: the pure-replay
+    // guard, the declined-final resend seeding, the post-upsert ack replay, and the
+    // cancel/decline epilogue diversion. Those paths must NEVER wait on a permit —
+    // a receiver sitting at its concurrency cap still has to re-ack a replayed
+    // package instantly (otherwise a benign lost-ack retry turns into minutes of
+    // silence and another ack-timeout re-announce on the sender) and bounce a
+    // declined one instantly (a decline is final; making the sender wait for a
+    // fetch slot to be told "no" is the exact opposite of what the cap is for).
+    //
+    // The permit is held to the end of the function — fetch, ingest AND ack all run
+    // under it. Ingest is the disk-heavy half, so releasing after the fetch would
+    // cap the wrong stage.
+    //
+    // Both abort signals stay live across the wait, because the fetch select loop
+    // below re-checks them BEFORE its first poll of the fetch future (the
+    // `is_cancelled || is_revoke_abort_requested` check at the top of the loop, ahead
+    // of `select!`): a sender revoke that lands while this lane is parked here is
+    // recorded cross-task by the ingress pump, and a local decline while parked is
+    // recorded by `request_cancel` — either way the flag wins on the first pass and
+    // no byte moves. The revoke branch returns ack-free (its queued `RevokeReceived`
+    // does the bookkeeping next on this same lane); the cancel branch runs the local
+    // epilogue, which is a manifest-only fetch and legitimately holds the permit.
+    let _receive_permit = control.receive_gate.acquire().await;
 
     // Fetch the package into a per-package staging dir under the staging root
     // (out of the user-visible landing tree, so a half-fetched package never
@@ -2804,6 +2836,7 @@ async fn handle_project_announce(
     staging_root: &Path,
     transport: &dyn SharingTransport,
     emitter: &dyn ProgressEmitter,
+    receive_gate: &ReceiveGate,
     announcements_refresher: Option<&super::ProjectAnnouncementsRefresher>,
     on_project_ingested: Option<&super::ProjectIngestedHook>,
     from: NodeId,
@@ -2862,6 +2895,14 @@ async fn handle_project_announce(
             bytes_total: None,
         },
     );
+
+    // Receive gate (W2 T2.4) — same placement rule as personal sync: taken only
+    // once this announce is committed to moving bytes, i.e. AFTER both cheap
+    // fail-closed gates above (the unknown-hub-row drop, which may poll the hub, and
+    // the wire-id validation) and before the fetch. A project push shares the one
+    // disk with personal transfers, so it shares the one cap; held through ingest and
+    // ack, released on return.
+    let _receive_permit = receive_gate.acquire().await;
 
     // Fetch into a per-package staging dir keyed by the WIRE id (mirrors personal
     // sync — out of the user-visible landing tree).
@@ -7446,6 +7487,317 @@ mod tests {
         assert!(
             kinds.iter().all(|k| k != "cancelled"),
             "the local cancel_epilogue never ran: {kinds:?}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    // ─── ReceiveGate wiring (W2 T2.4) ───────────────────────────────────────
+
+    /// The headline of W2 T2.4: per-peer lanes (T2.3) removed the head-of-line
+    /// block but left inbound concurrency bounded only by PEER COUNT — on a busy
+    /// night that is "every device at once, all seeking the same disk". The
+    /// [`ReceiveGate`] bounds the expensive phase (fetch + ingest) instead.
+    ///
+    /// Three peers, gate at its shipped default of 2, every fetch paced so it
+    /// genuinely blocks for seconds. The store is sampled throughout the run and
+    /// three things must hold:
+    ///
+    /// 1. At NO sample are more than 2 rows in `fetching|ingesting` — the cap holds
+    ///    across both the fetch and the ingest stage, not just the download.
+    /// 2. The third row leaves `announced` only AFTER one of the first two reached
+    ///    a terminal. That is the difference between "parked on the gate" and
+    ///    "merely slow to start", and it is what makes assertion 1 meaningful.
+    /// 3. All three still finish. A cap that dropped or wedged the third transfer
+    ///    would be worse than no cap at all.
+    ///
+    /// RED before the wiring: nothing acquired the gate, so all three fetched at
+    /// once and both (1) and (2) failed.
+    #[tokio::test]
+    async fn third_transfer_waits_for_receive_permit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+
+        // 2 payloads + the manifest ⇒ 3 paced reads ⇒ a ~2.1s fetch each, so the
+        // run is two gate rounds (~4.2s) — far longer than the 50ms sampler's
+        // resolution, which is what makes the phase sampling robust.
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+        receiver_ep.set_fault(FaultPlan {
+            delay_per_read: Some(DELAY),
+            ..Default::default()
+        });
+
+        let control = Arc::new(InboundControl::new());
+        assert_eq!(
+            control.receive_gate.limit(),
+            2,
+            "this test pins the SHIPPED default, not a test-only limit"
+        );
+
+        let (_info, handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            {
+                let incoming = incoming.clone();
+                Arc::new(move || incoming.clone()) as IncomingResolver
+            },
+            allow_all_peers(),
+            Default::default(),
+            Arc::clone(&control),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        // Announce in a deterministic order: each of the first two is waited onto
+        // `Fetching` before the next goes out, so "the third" is a fact about the
+        // test rather than a race the assertions have to tolerate. The endpoints
+        // are kept alive in a vec — dropping a sender would take its serve with it.
+        let mut senders = Vec::new();
+        let mut wires: Vec<String> = Vec::new();
+        for tag in ["one", "two", "three"] {
+            let sender = Arc::new(net.endpoint());
+            sender.start().await.unwrap();
+            let (dir, ann, files) = build_lane_fixture(tmp.path(), tag, 2);
+            let wire = ann.package_id.0.clone();
+            sender.serve(&ann, &dir, None).await.unwrap();
+            sender
+                .announce(
+                    receiver_node,
+                    &ann,
+                    &format!("Batch {tag}"),
+                    &format!("batch-{tag}"),
+                    &files,
+                )
+                .await
+                .unwrap();
+            // Only the first two are waited onto their lane; the third is the one
+            // under test and must NOT be expected to start.
+            if wires.len() < 2 {
+                poll_inbound(&store, &wire, InboundState::Fetching).await;
+            }
+            wires.push(wire);
+            senders.push(sender);
+        }
+
+        let active = |s: &Option<InboundState>| {
+            matches!(
+                s,
+                Some(InboundState::Fetching) | Some(InboundState::Ingesting)
+            )
+        };
+        let terminal = |s: &Option<InboundState>| {
+            matches!(
+                s,
+                Some(InboundState::Done)
+                    | Some(InboundState::Failed)
+                    | Some(InboundState::Cancelled)
+            )
+        };
+
+        let mut max_active = 0usize;
+        let mut first_terminal_at: Option<std::time::Instant> = None;
+        let mut started_at: std::collections::HashMap<String, std::time::Instant> =
+            std::collections::HashMap::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let now = std::time::Instant::now();
+            let states: Vec<Option<InboundState>> = {
+                let conn = store.lock_conn();
+                wires
+                    .iter()
+                    .map(|w| get_inbound(&conn, w).unwrap().map(|r| r.state))
+                    .collect()
+            };
+            max_active = max_active.max(states.iter().filter(|s| active(s)).count());
+            for (wire, state) in wires.iter().zip(&states) {
+                // A terminal row necessarily started, so record both from the same
+                // snapshot — otherwise a transfer that ran to completion entirely
+                // between two samples would look like it never started at all.
+                if active(state) || terminal(state) {
+                    started_at.entry(wire.clone()).or_insert(now);
+                }
+                if terminal(state) {
+                    first_terminal_at.get_or_insert(now);
+                }
+            }
+            if states.iter().all(|s| matches!(s, Some(InboundState::Done))) {
+                break;
+            }
+            assert!(
+                now < deadline,
+                "not every transfer finished under the gate: {states:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            max_active <= 2,
+            "{max_active} transfers were in fetch/ingest at once — the receive gate \
+             (limit {}) is not bounding the expensive phase",
+            control.receive_gate.limit()
+        );
+
+        let first_terminal = first_terminal_at.expect("some transfer reached a terminal");
+        let third_start = *started_at
+            .get(&wires[2])
+            .expect("the third transfer eventually started");
+        assert!(
+            third_start >= first_terminal,
+            "the third transfer started fetching before any earlier one finished — \
+             it was never parked on the gate"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// The other half of the placement contract: a CHEAP path must never queue
+    /// behind the gate. A receiver already at its concurrency cap still owes a
+    /// replayed sender its ack instantly — the answer comes from the durable
+    /// receipt log, costs no bytes and no disk, and making it wait would turn a
+    /// benign lost-ack retry into a minutes-long silence (and, on the sender, into
+    /// another ack-timeout re-announce).
+    ///
+    /// Peer A completes a transfer, then peers B and C saturate the gate with paced
+    /// fetches, then A re-announces the SAME wire id. The pure-replay guard must
+    /// re-ack it while B and C are still mid-fetch.
+    ///
+    /// Green both before and after the wiring by construction — its job is to fail
+    /// the day someone hoists the `acquire` to the top of `handle_announce`.
+    #[tokio::test]
+    async fn replay_ack_bypasses_the_receive_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+
+        let control = Arc::new(InboundControl::new());
+        let recorder = Arc::new(RecordingEmitter::default());
+        let (_info, handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            {
+                let incoming = incoming.clone();
+                Arc::new(move || incoming.clone()) as IncomingResolver
+            },
+            allow_all_peers(),
+            Default::default(),
+            Arc::clone(&control),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+        )
+        .await
+        .unwrap();
+
+        // Peer A, un-paced, runs to a full receipt set — the precondition the
+        // pure-replay guard keys on.
+        let sender_a = Arc::new(net.endpoint());
+        sender_a.start().await.unwrap();
+        let (dir_a, ann_a, files_a) = build_lane_fixture(tmp.path(), "replay", 1);
+        let wire_a = ann_a.package_id.0.clone();
+        sender_a.serve(&ann_a, &dir_a, None).await.unwrap();
+        sender_a
+            .announce(
+                receiver_node,
+                &ann_a,
+                "Replay Batch",
+                "batch-replay",
+                &files_a,
+            )
+            .await
+            .unwrap();
+        poll_inbound(&store, &wire_a, InboundState::Done).await;
+
+        // Now saturate the gate: two paced transfers from two other peers.
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+        receiver_ep.set_fault(FaultPlan {
+            delay_per_read: Some(DELAY),
+            ..Default::default()
+        });
+        let mut hogs = Vec::new();
+        let mut hog_wires = Vec::new();
+        for tag in ["hog-a", "hog-b"] {
+            let sender = Arc::new(net.endpoint());
+            sender.start().await.unwrap();
+            let (dir, ann, files) = build_lane_fixture(tmp.path(), tag, 3);
+            let wire = ann.package_id.0.clone();
+            sender.serve(&ann, &dir, None).await.unwrap();
+            sender
+                .announce(
+                    receiver_node,
+                    &ann,
+                    &format!("Batch {tag}"),
+                    &format!("batch-{tag}"),
+                    &files,
+                )
+                .await
+                .unwrap();
+            poll_inbound(&store, &wire, InboundState::Fetching).await;
+            hog_wires.push(wire);
+            hogs.push(sender);
+        }
+
+        // The replayed announce: same wire id, same batch, nothing to fetch.
+        sender_a
+            .announce(
+                receiver_node,
+                &ann_a,
+                "Replay Batch",
+                "batch-replay",
+                &files_a,
+            )
+            .await
+            .unwrap();
+
+        let budget = std::time::Duration::from_millis(1200);
+        let started = std::time::Instant::now();
+        let mut replayed = false;
+        while started.elapsed() < budget {
+            if finished_events(&recorder)
+                .iter()
+                .any(|e| e["packageId"] == wire_a && e["outcome"] == "replayed")
+            {
+                replayed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            replayed,
+            "the replayed ack did not land within {budget:?} while the gate was \
+             saturated — a cheap re-ack is waiting on a receive permit"
+        );
+
+        // The proof it BYPASSED the gate rather than being handed a freed permit:
+        // both saturating transfers are still mid-fetch, so no permit came free.
+        let hog_states: Vec<Option<InboundState>> = {
+            let conn = store.lock_conn();
+            hog_wires
+                .iter()
+                .map(|w| get_inbound(&conn, w).unwrap().map(|r| r.state))
+                .collect()
+        };
+        assert!(
+            hog_states
+                .iter()
+                .all(|s| matches!(s, Some(InboundState::Fetching))),
+            "both gate-holding transfers must still be fetching when the replay \
+             lands, or this proves nothing: {hog_states:?}"
         );
 
         handle.shutdown().await;
