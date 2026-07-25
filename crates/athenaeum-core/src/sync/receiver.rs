@@ -740,6 +740,13 @@ impl SyncReceiver {
         // revoke-abort flag BEFORE routing, so a revoke still aborts an in-flight
         // fetch cross-task regardless of which lane the fetch is on, and only the
         // bookkeeping is ordered behind that peer's own announce.
+        //
+        // A lane that PANICS costs its peer exactly the event it panicked on:
+        // `route_to_lane` re-mints the lane and resends the next event rather than
+        // dropping it (W2 review — a dropped `RevokeReceived` leaks the pump's abort
+        // flag, whose only clear site is inside `handle_revoke`). The panicked event
+        // itself is unrecoverable; if it was a revoke, that flag leak persists until
+        // the next restart's reconcile — named, not fixed, in `route_to_lane`'s doc.
         let join = tokio::spawn(async move {
             tracing::info!(staging_root = %staging_root.display(), "sync receiver online");
             let mut lanes: HashMap<NodeId, mpsc::UnboundedSender<TransportEvent>> = HashMap::new();
@@ -753,7 +760,7 @@ impl SyncReceiver {
                     continue;
                 };
 
-                let lane = lanes.entry(from).or_insert_with(|| {
+                route_to_lane(&mut lanes, from, ev, || {
                     let (tx, rx) = mpsc::unbounded_channel::<TransportEvent>();
                     lane_tasks.spawn(run_peer_lane(rx, deps.clone()));
                     tracing::debug!(
@@ -763,19 +770,6 @@ impl SyncReceiver {
                     );
                     tx
                 });
-                if lane.send(ev).is_err() {
-                    // The only way a lane channel closes while we still hold its
-                    // sender is the lane task being gone — i.e. it panicked. Drop
-                    // the entry so the NEXT event from this peer mints a fresh lane
-                    // (self-healing: one peer's panic costs it one event, never its
-                    // whole future traffic). The dropped event is not retried — the
-                    // lane that would have run it just died mid-work.
-                    tracing::warn!(
-                        from = %super::node_id_hex(&from),
-                        "sync receiver lane is gone; dropping this event and reopening on the next"
-                    );
-                    lanes.remove(&from);
-                }
                 // Reap eagerly so a lane panic is LOUD when it happens, not only at
                 // shutdown (a lane never finishes on its own while we hold its
                 // sender, so this only ever yields panicked tasks).
@@ -841,6 +835,70 @@ fn event_peer(ev: &TransportEvent) -> Option<NodeId> {
         TransportEvent::ServeProgress { .. } => None,
         TransportEvent::ServeComplete { .. } => None,
         TransportEvent::ServeFileProgress { .. } => None,
+    }
+}
+
+/// Hand `ev` to `from`'s lane, minting one via `open_lane` when the peer has none
+/// yet — and RE-minting, then resending that same event, when the peer's lane
+/// turns out to be dead.
+///
+/// A lane channel can only be closed while the router still holds its sender if
+/// the lane task is gone, i.e. it panicked. Re-mint-and-resend (rather than
+/// dropping the event) is not politeness — it is what keeps the self-heal from
+/// leaking state:
+///
+/// - the ingress pump sets `request_revoke_abort(wire_id)` BEFORE routing, and the
+///   ONLY production site that clears it is inside `handle_revoke`. A dropped
+///   `RevokeReceived` therefore leaks that flag until the next restart's reconcile:
+///   the row never terminalizes, and a straggler re-announce of the same wire id
+///   breaks on its first fetch poll with no terminal written and no ack — the very
+///   wedge [`InboundControl::clear_revoke_abort`]'s doc warns about.
+/// - an announce would survive being dropped (the sender re-announces on ack
+///   timeout), so the failure is silent and ASYMMETRIC across event kinds. Resending
+///   removes the asymmetry instead of reasoning about it per variant.
+///
+/// The resend cannot fail: the fresh lane's receiver is alive (its task has been
+/// spawned but not yet polled), and the channel is unbounded. It is still handled
+/// rather than `unwrap`ped — the router must never panic, or one bad event takes
+/// down every peer's routing. Should the fresh lane panic on this same event, the
+/// peer's NEXT event repeats the cycle: bounded, and loud (`report_lane_exit`).
+///
+/// What this does NOT close, stated plainly: the event that PANICKED the lane is
+/// lost with the task. If that event was itself a revoke (i.e. `handle_revoke`
+/// panicked mid-handling), the abort flag still leaks and still heals only at the
+/// next restart's reconcile. That case is rarer — it needs a panic inside the
+/// revoke handler, not merely a dead lane — and is deliberately out of scope here.
+///
+/// `open_lane` is a closure so the routing decision is testable without spawning
+/// real lane tasks (`a_dead_lane_is_reminted_and_the_event_resent`); production
+/// passes one that spawns [`run_peer_lane`] into the router's `JoinSet`.
+fn route_to_lane<F>(
+    lanes: &mut HashMap<NodeId, mpsc::UnboundedSender<TransportEvent>>,
+    from: NodeId,
+    ev: TransportEvent,
+    mut open_lane: F,
+) where
+    F: FnMut() -> mpsc::UnboundedSender<TransportEvent>,
+{
+    let lane = lanes.entry(from).or_insert_with(&mut open_lane);
+    let ev = match lane.send(ev) {
+        Ok(()) => return,
+        // `SendError` hands the event back — that is what makes the resend possible.
+        Err(mpsc::error::SendError(ev)) => ev,
+    };
+
+    tracing::warn!(
+        from = %super::node_id_hex(&from),
+        "sync receiver lane is gone (its task panicked); re-minting it and resending the event"
+    );
+    let fresh = open_lane();
+    let send_result = fresh.send(ev);
+    lanes.insert(from, fresh);
+    if send_result.is_err() {
+        tracing::error!(
+            from = %super::node_id_hex(&from),
+            "sync receiver could not deliver into a freshly minted lane; event dropped"
+        );
     }
 }
 
@@ -7329,6 +7387,92 @@ mod tests {
             }),
             None
         );
+    }
+
+    /// A lane whose task has PANICKED must not cost the event that discovers it.
+    /// The router re-mints the lane and resends that very event into the fresh one.
+    ///
+    /// Why this is not cosmetic (W2 review): the ingress pump sets
+    /// `request_revoke_abort(wire_id)` BEFORE routing, and the only production site
+    /// that ever clears it is inside `handle_revoke`. Dropping a `RevokeReceived`
+    /// therefore leaks the abort flag until the next restart's reconcile — the row
+    /// never terminalizes, and a straggler re-announce of that wire id breaks on its
+    /// first fetch poll with no terminal and no ack (exactly the wedge
+    /// `clear_revoke_abort`'s own doc warns about). An announce would have been
+    /// re-sent by the peer on ack timeout; a revoke has no such retry.
+    ///
+    /// `open_lane` is injected so this pins the ROUTING decision without spawning
+    /// real lane tasks: each "lane" here is a bare channel whose receiving half the
+    /// test keeps, so "which lane got the event" is directly observable, and
+    /// dropping a receiver is a faithful stand-in for a panicked lane task (that is
+    /// precisely what a panic does to the channel).
+    #[test]
+    fn a_dead_lane_is_reminted_and_the_event_resent() {
+        let from: NodeId = [3u8; 32];
+        let mut lanes: HashMap<NodeId, mpsc::UnboundedSender<TransportEvent>> = HashMap::new();
+        // Every lane ever minted, in order; `None` = its task is gone (panicked).
+        let mut minted: Vec<Option<mpsc::UnboundedReceiver<TransportEvent>>> = Vec::new();
+
+        fn revoke(wire: &str) -> TransportEvent {
+            TransportEvent::RevokeReceived {
+                from: [3u8; 32],
+                package_id: PackageId(wire.into()),
+                reason: RevokeReason::Cancelled,
+            }
+        }
+        fn wire_of(ev: &TransportEvent) -> String {
+            match ev {
+                TransportEvent::RevokeReceived { package_id, .. } => package_id.0.clone(),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+
+        // 1. First event from this peer: mint lane #0 and deliver.
+        route_to_lane(&mut lanes, from, revoke("wire-1"), || {
+            let (tx, rx) = mpsc::unbounded_channel();
+            minted.push(Some(rx));
+            tx
+        });
+        assert_eq!(
+            minted.len(),
+            1,
+            "the peer's first event opens exactly one lane"
+        );
+        let got = minted[0]
+            .as_mut()
+            .unwrap()
+            .try_recv()
+            .expect("lane #0 got it");
+        assert_eq!(wire_of(&got), "wire-1");
+
+        // 2. The lane task panics — its receiving half goes away while the router
+        //    still holds the sender. The next event must NOT be lost.
+        minted[0] = None;
+        route_to_lane(&mut lanes, from, revoke("wire-2"), || {
+            let (tx, rx) = mpsc::unbounded_channel();
+            minted.push(Some(rx));
+            tx
+        });
+        assert_eq!(minted.len(), 2, "the dead lane is re-minted on the spot");
+        let got = minted[1].as_mut().unwrap().try_recv().expect(
+            "the revoke that found the lane dead is RESENT into the fresh lane, not dropped",
+        );
+        assert_eq!(
+            wire_of(&got),
+            "wire-2",
+            "the resent event is the same one, not a replacement"
+        );
+        assert_eq!(lanes.len(), 1, "the fresh sender replaced the dead entry");
+
+        // 3. The peer keeps its new lane — a healthy lane is never re-minted.
+        route_to_lane(&mut lanes, from, revoke("wire-3"), || {
+            let (tx, rx) = mpsc::unbounded_channel();
+            minted.push(Some(rx));
+            tx
+        });
+        assert_eq!(minted.len(), 2, "no needless mint while the lane is alive");
+        let got = minted[1].as_mut().unwrap().try_recv().unwrap();
+        assert_eq!(wire_of(&got), "wire-3");
     }
 
     /// Build a package fixture of `count` distinct FITS payloads under
