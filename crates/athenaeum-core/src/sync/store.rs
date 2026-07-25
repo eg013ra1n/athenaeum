@@ -1571,8 +1571,11 @@ pub fn get_inbound_by_batch(
 ///   returns `declined_final = false`.
 ///
 /// Returns `(id, declined_final)`. The `SELECT`-then-write is safe because the
-/// receiver holds the only connection that writes inbound rows and processes
-/// announces serially (same single-writer assumption as [`upsert_inbound_announced`]).
+/// receiver holds the only connection that writes inbound rows and processes each
+/// PEER's announces serially on that peer's lane (W2) — the row key is
+/// `(peer, batch_uuid)`, so per-peer FIFO is exactly the single-writer guarantee
+/// this needs; two different peers can only ever touch two different rows (same
+/// assumption as [`upsert_inbound_announced`]).
 pub fn upsert_inbound_attempt(
     conn: &Connection,
     peer_hex: &str,
