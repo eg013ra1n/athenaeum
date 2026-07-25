@@ -245,6 +245,161 @@ pub struct SyncFinishedEvent {
     pub project_id: Option<String>,
 }
 
+/// Shipped cap on simultaneous incoming transfers (W2). Two, not more: the
+/// fetch+ingest phase is bound by DISK and connection contention (hash + copy out
+/// of staging into the incoming tree), not by the network — a third concurrent
+/// lane mostly buys head-of-line seek thrash on a spinning archive volume. Two is
+/// enough to keep a small transfer from queueing behind a large one, which is the
+/// whole point of the per-peer lanes.
+pub const DEFAULT_MAX_CONCURRENT_RECEIVES: usize = 2;
+
+/// Inclusive clamp for the receive-concurrency limit. Below 1 the receiver would
+/// deadlock; above 8 the lanes fight over the same disk with nothing to gain.
+const MIN_CONCURRENT_RECEIVES: usize = 1;
+const MAX_CONCURRENT_RECEIVES: usize = 8;
+
+/// The resizable half of [`ReceiveGate`], behind one lock so a `set_limit` racing
+/// an `acquire` can never split the pair.
+#[derive(Debug)]
+struct GateState {
+    /// The limit currently in force (already clamped).
+    limit: usize,
+    /// Permits a shrink still has to reclaim because they were IN USE at the time
+    /// (see [`ReceiveGate`]'s doc — the debt-counter recipe).
+    debt: usize,
+}
+
+/// Live-resizable concurrency gate for the fetch+ingest phase (W2 T2.2): at most
+/// `limit` inbound transfers hold a permit at once, and the limit can be changed
+/// from the settings UI WITHOUT restarting the receiver.
+///
+/// # Why a debt counter
+///
+/// Growing is trivial ([`Semaphore::add_permits`]). Shrinking is not:
+/// [`Semaphore::forget_permits`] can only take permits that are AVAILABLE right
+/// now, and it reports how many it actually got. Lowering the cap from 3 to 1
+/// while all three lanes are busy therefore removes nothing at the moment of the
+/// call — the permits are out in the world and tokio has no way to claw them back.
+///
+/// So the un-forgotten remainder is recorded as `debt`, and payment is deferred to
+/// [`acquire`](Self::acquire): every successful acquire re-checks the debt and, if
+/// any is outstanding, decrements it, [`forget`](tokio::sync::OwnedSemaphorePermit::forget)s
+/// its own permit (so the permit is destroyed rather than returned) and loops to
+/// wait again instead of proceeding. The shrink thus takes effect as the busy
+/// lanes finish, one release at a time, and it never interrupts an in-flight
+/// transfer — exactly the semantics a live setting change wants.
+///
+/// # Debt vs. grow
+///
+/// A grow that lands while debt is outstanding pays the debt down FIRST and only
+/// adds real permits with what is left over (`grow -= min(grow, debt)`). Shrinking
+/// 3→1 and then growing 1→3 is a full round trip: it cancels 2 debt units and adds
+/// 0 permits, leaving the gate exactly where it started. Blindly calling
+/// `add_permits(2)` instead would leave a 2-permit surplus AND the 2-unit debt that
+/// eats it; total capacity converges to the same number either way (each debt unit
+/// destroys exactly one permit), so it does not over-ADMIT — but it does inflate
+/// `available_permits` with phantom capacity and forces the next acquirer through
+/// two pointless acquire→forget→re-queue rounds, each landing it at the back of
+/// the semaphore's FIFO queue behind later arrivals. Pay first; keep the books
+/// honest.
+///
+/// # Invariant
+///
+/// At quiescence (no `acquire` mid-loop, no `set_limit` mid-flight):
+/// `available + in_use - debt == limit`. Every mutation preserves it:
+/// `add_permits(k)` raises `available` and `limit` by `k`; a shrink of `cut` lowers
+/// `limit` by `cut` and lowers `available + in_use` and raises `debt` by exactly
+/// `cut` between them; a debt payment lowers both `available + in_use` and `debt`
+/// by 1.
+pub struct ReceiveGate {
+    /// Arc'd because [`acquire`](Self::acquire) hands out owned permits, which
+    /// outlive the borrow of the gate.
+    sem: Arc<tokio::sync::Semaphore>,
+    state: std::sync::Mutex<GateState>,
+}
+
+impl ReceiveGate {
+    /// A gate admitting `limit` concurrent receives, clamped to
+    /// `MIN_CONCURRENT_RECEIVES..=MAX_CONCURRENT_RECEIVES`.
+    pub fn new(limit: usize) -> Self {
+        let limit = limit.clamp(MIN_CONCURRENT_RECEIVES, MAX_CONCURRENT_RECEIVES);
+        Self {
+            sem: Arc::new(tokio::sync::Semaphore::new(limit)),
+            state: std::sync::Mutex::new(GateState { limit, debt: 0 }),
+        }
+    }
+
+    /// Wait for a lane. The returned permit holds the slot until it is dropped, so
+    /// the caller keeps it alive for the whole fetch+ingest phase.
+    ///
+    /// Cancel-safe: dropping the future while it waits leaves the gate untouched
+    /// (tokio hands a permit only to a live waiter, and the debt bookkeeping runs
+    /// entirely between await points).
+    pub async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
+        loop {
+            let permit = Arc::clone(&self.sem)
+                .acquire_owned()
+                .await
+                // `close()` is never called on this semaphore — it is private to
+                // the gate, which lives as long as the `InboundControl` owning it,
+                // and nothing here closes it. `AcquireError` is therefore
+                // unreachable rather than a case to handle.
+                .expect("receive gate semaphore is never closed");
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("receive gate state mutex poisoned");
+                if state.debt == 0 {
+                    return permit;
+                }
+                // This permit belongs to a shrink that could not take effect when
+                // it was requested. Pay one unit and go back to waiting.
+                state.debt -= 1;
+            }
+            // Outside the lock: destroy the permit instead of releasing it, so the
+            // semaphore's total shrinks by one for good.
+            permit.forget();
+        }
+    }
+
+    /// Change the cap live (clamped as in [`new`](Self::new)). Never blocks and
+    /// never interrupts a transfer already holding a permit: a grow wakes parked
+    /// waiters immediately, a shrink lands as debt that the in-flight lanes pay off
+    /// as they finish.
+    pub fn set_limit(&self, limit: usize) {
+        let limit = limit.clamp(MIN_CONCURRENT_RECEIVES, MAX_CONCURRENT_RECEIVES);
+        let mut state = self
+            .state
+            .lock()
+            .expect("receive gate state mutex poisoned");
+        if limit > state.limit {
+            let mut grow = limit - state.limit;
+            // Debt first — see "Debt vs. grow" on the struct.
+            let paid = grow.min(state.debt);
+            state.debt -= paid;
+            grow -= paid;
+            if grow > 0 {
+                self.sem.add_permits(grow);
+            }
+        } else if limit < state.limit {
+            let cut = state.limit - limit;
+            // Takes only what is available right now; the rest becomes debt.
+            let forgotten = self.sem.forget_permits(cut);
+            state.debt += cut - forgotten;
+        }
+        state.limit = limit;
+    }
+
+    /// The cap currently in force (post-clamp) — for status reporting and tests.
+    pub fn limit(&self) -> usize {
+        self.state
+            .lock()
+            .expect("receive gate state mutex poisoned")
+            .limit
+    }
+}
+
 /// Receiver-side cancellation control (Task 12): the shared signal the command
 /// layer uses to cancel an inbound package the receiver is about to fetch or is
 /// already fetching. One instance per started receiver, threaded into
@@ -273,15 +428,39 @@ pub struct SyncFinishedEvent {
 /// [`is_cancelled`]: Self::is_cancelled
 /// [`request_cancel`]: Self::request_cancel
 /// [`request_revoke_abort`]: Self::request_revoke_abort
-#[derive(Default)]
+/// `receive_gate` (W2 T2.2) is a third, unrelated signal riding this struct: the
+/// live-resizable cap on simultaneous fetch+ingest phases. It sits here because it
+/// shares the control's lifetime and reach — one instance per started receiver,
+/// already threaded to both the receive loop and the command layer, which is
+/// exactly what "resize without restarting the receiver" needs.
 pub struct InboundControl {
     cancels: std::sync::Mutex<std::collections::HashSet<String>>,
     revoke_aborts: std::sync::Mutex<std::collections::HashSet<String>>,
     notify: tokio::sync::Notify,
+    /// Concurrency gate for the fetch+ingest phase — see [`ReceiveGate`]. Public
+    /// because the receive lanes acquire it directly and the settings command
+    /// layer resizes it; it carries no cross-field invariant with the cancel sets.
+    pub receive_gate: ReceiveGate,
+}
+
+/// Hand-written rather than derived: `receive_gate` defaults to
+/// [`DEFAULT_MAX_CONCURRENT_RECEIVES`], not to a `Default` impl on
+/// [`ReceiveGate`] — the gate deliberately has no `Default`, so the shipped cap
+/// has exactly one definition and cannot be silently conjured elsewhere.
+impl Default for InboundControl {
+    fn default() -> Self {
+        Self {
+            cancels: Default::default(),
+            revoke_aborts: Default::default(),
+            notify: Default::default(),
+            receive_gate: ReceiveGate::new(DEFAULT_MAX_CONCURRENT_RECEIVES),
+        }
+    }
 }
 
 impl InboundControl {
-    /// A fresh control with no cancellations requested.
+    /// A fresh control with no cancellations requested and the receive gate at
+    /// [`DEFAULT_MAX_CONCURRENT_RECEIVES`].
     pub fn new() -> Self {
         Self::default()
     }
@@ -6439,5 +6618,167 @@ mod tests {
     /// direct `handle_revoke` matrix (release is a best-effort no-op on it).
     fn net_endpoint_only() -> crate::sharing::loopback::LoopbackTransport {
         LoopbackNetwork::new().endpoint()
+    }
+
+    // ─── ReceiveGate (W2 T2.2) ──────────────────────────────────────────────
+    //
+    // Behavioural pins for the live-resizable receive-concurrency gate. Sequencing
+    // rides `tokio::time::timeout` around acquires and permit drops instead of raw
+    // sleeps: "must block" is a timeout that ELAPSES, "must be admitted" is one
+    // that resolves far inside its bound. A blocked acquire is also a DROPPED
+    // acquire future, so every such assertion doubles as a cancel-safety check —
+    // an abandoned wait must not strand a permit or a debt unit.
+
+    /// Bound for "this acquire must NOT be admitted". Small: it is paid in real
+    /// wall time on every negative assertion.
+    const GATE_BLOCKED: std::time::Duration = std::time::Duration::from_millis(50);
+    /// Bound for "this acquire must be admitted". Generous: blowing it means the
+    /// gate deadlocked, not that the machine was busy.
+    const GATE_ADMITTED: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Admit one receive through `gate`, failing loudly (not hanging) if the gate
+    /// wrongly blocks it.
+    async fn gate_admit(gate: &ReceiveGate, what: &str) -> tokio::sync::OwnedSemaphorePermit {
+        match tokio::time::timeout(GATE_ADMITTED, gate.acquire()).await {
+            Ok(permit) => permit,
+            Err(_) => panic!("{what}: acquire must be admitted, but the gate blocked it"),
+        }
+    }
+
+    /// Assert `gate` refuses another receive right now.
+    async fn gate_blocks(gate: &ReceiveGate, what: &str) {
+        assert!(
+            tokio::time::timeout(GATE_BLOCKED, gate.acquire())
+                .await
+                .is_err(),
+            "{what}: acquire must block"
+        );
+    }
+
+    #[tokio::test]
+    async fn receive_gate_admits_up_to_limit_and_blocks_next() {
+        let gate = ReceiveGate::new(2);
+        assert_eq!(gate.limit(), 2);
+
+        let p1 = gate_admit(&gate, "first of two").await;
+        let _p2 = gate_admit(&gate, "second of two").await;
+
+        gate_blocks(&gate, "third while both permits are held").await;
+
+        drop(p1);
+        let _p3 = gate_admit(&gate, "third after a release").await;
+    }
+
+    #[tokio::test]
+    async fn receive_gate_grow_wakes_waiter() {
+        let gate = Arc::new(ReceiveGate::new(1));
+        let _held = gate_admit(&gate, "the single permit at limit 1").await;
+
+        let waiting_gate = Arc::clone(&gate);
+        let mut waiter = tokio::spawn(async move {
+            let _permit = waiting_gate.acquire().await;
+        });
+        assert!(
+            tokio::time::timeout(GATE_BLOCKED, &mut waiter)
+                .await
+                .is_err(),
+            "the second receive parks while the only permit is held"
+        );
+
+        gate.set_limit(2);
+        assert_eq!(gate.limit(), 2);
+        tokio::time::timeout(GATE_ADMITTED, &mut waiter)
+            .await
+            .expect("growing the limit must wake the parked waiter — no restart, no re-poll nudge")
+            .expect("waiter task panicked");
+    }
+
+    /// The debt mechanics, pinned step by step: `forget_permits` can only take
+    /// AVAILABLE permits, so a shrink under load lands as debt that the next
+    /// releases pay off before anyone is admitted again.
+    #[tokio::test]
+    async fn receive_gate_shrink_takes_effect_as_permits_release() {
+        let gate = ReceiveGate::new(3);
+        let p1 = gate_admit(&gate, "first of three").await;
+        let p2 = gate_admit(&gate, "second of three").await;
+        let p3 = gate_admit(&gate, "third of three").await;
+
+        // Nothing is available, so this shrink is 100% debt (2 units).
+        gate.set_limit(1);
+        assert_eq!(gate.limit(), 1);
+
+        drop(p1);
+        gate_blocks(&gate, "first release pays a debt unit, admits nobody").await;
+
+        drop(p2);
+        gate_blocks(&gate, "second release pays the last debt unit").await;
+
+        drop(p3);
+        let _p4 = gate_admit(&gate, "debt cleared: the third release is a real permit").await;
+        gate_blocks(&gate, "only one concurrent receive at limit 1").await;
+    }
+
+    /// A shrink/grow round trip must leave no surplus: after 3→1→3 the gate still
+    /// admits exactly 3.
+    ///
+    /// NB what this does and does not pin, established by mutation rather than by
+    /// argument. Deleting the debt bookkeeping from the shrink (`state.debt +=
+    /// cut - forgotten`) FAILS this test at the "fourth while all three are still
+    /// held" assertion — real over-provision. Deleting only the pay-first step from
+    /// the grow (minting `add_permits(2)` on top of a 2-unit debt) still PASSES:
+    /// each debt unit destroys exactly one permit whenever it is paid, so total
+    /// capacity converges to the same 3 either way. Pay-first is therefore chosen
+    /// for the interim state — an honest `available_permits` and no needless
+    /// acquire→forget→re-queue trips to the back of the FIFO — and no test here
+    /// can tell the two apart. Do not read a green run as a pay-first guard.
+    #[tokio::test]
+    async fn receive_gate_grow_pays_debt_first() {
+        let gate = ReceiveGate::new(3);
+        let p1 = gate_admit(&gate, "first of three").await;
+        let p2 = gate_admit(&gate, "second of three").await;
+        let p3 = gate_admit(&gate, "third of three").await;
+
+        gate.set_limit(1); // debt 2 — nothing available to forget
+        gate.set_limit(3); // pays the debt down instead of adding permits
+        assert_eq!(gate.limit(), 3);
+
+        // Still three in flight against a limit of three: at capacity.
+        gate_blocks(&gate, "fourth while all three are still held").await;
+
+        drop(p1);
+        drop(p2);
+        drop(p3);
+
+        let _a = gate_admit(&gate, "first of three after the round trip").await;
+        let _b = gate_admit(&gate, "second of three after the round trip").await;
+        let _c = gate_admit(&gate, "third of three after the round trip").await;
+        gate_blocks(&gate, "fourth — the round trip minted no surplus").await;
+    }
+
+    #[test]
+    fn receive_gate_clamps_limit_to_one_through_eight() {
+        assert_eq!(ReceiveGate::new(0).limit(), 1, "0 clamps up to 1");
+        assert_eq!(ReceiveGate::new(99).limit(), 8, "99 clamps down to 8");
+
+        let gate = ReceiveGate::new(4);
+        gate.set_limit(0);
+        assert_eq!(gate.limit(), 1, "set_limit clamps up to 1");
+        gate.set_limit(usize::MAX);
+        assert_eq!(gate.limit(), 8, "set_limit clamps down to 8");
+    }
+
+    #[test]
+    fn inbound_control_default_gate_limit_is_two() {
+        assert_eq!(DEFAULT_MAX_CONCURRENT_RECEIVES, 2);
+        assert_eq!(
+            InboundControl::new().receive_gate.limit(),
+            DEFAULT_MAX_CONCURRENT_RECEIVES,
+            "a fresh control gates receives at the shipped default"
+        );
+        assert_eq!(
+            InboundControl::default().receive_gate.limit(),
+            DEFAULT_MAX_CONCURRENT_RECEIVES,
+            "`new()` and `default()` agree — `new()` still just forwards"
+        );
     }
 }
