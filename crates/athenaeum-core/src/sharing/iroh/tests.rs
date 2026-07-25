@@ -1843,3 +1843,84 @@ async fn throttle_intercept_zero_rate_transfer_completes() {
     provider.shutdown().await;
     receiver.shutdown().await;
 }
+
+/// END-TO-END PIN that a delayed Throttle reply genuinely SLOWS a transfer —
+/// not just that it survives one.
+///
+/// Coverage split, stated honestly:
+/// - the loopback e2e harness (`sharing::tests`) bypasses iroh-blobs entirely,
+///   so it can never exercise the throttle hook at all;
+/// - the pacer unit tests (`super::pacer`) pin the delay ARITHMETIC over a
+///   virtual clock, but never sleep and never touch a provider;
+/// - [`throttle_intercept_zero_rate_transfer_completes`] pins the *other*
+///   direction — unlimited still completes (the deadly-drop regression).
+///
+/// THIS test is the only place where the whole chain is real: a rate is set on
+/// the provider, the consumer loop sleeps the pacer's delay before replying to
+/// the `Throttle` rpc, and the provider's writer — which awaits that reply
+/// inline per ~16 KiB chunk — is therefore actually paused. If the sleep were
+/// dropped, or the reply sent eagerly, or the pacer never consulted, the
+/// transfer would finish at localhost speed and this test would fail.
+#[tokio::test]
+async fn upload_pacer_limits_real_transfer_wall_clock() {
+    let provider = mem_transport().await;
+    let receiver = mem_transport().await;
+    let (provider_info, receiver_info) = start_and_pair(&provider, &receiver).await;
+    let mut receiver_events = receiver.events().await;
+
+    let tmp = tempdir().unwrap();
+    let (pkg_dir, announce) = build_package(
+        &tmp.path().join("src-paced"),
+        "uuid-paced",
+        "frame_paced.fits",
+        "M42",
+        3 * 1024 * 1024,
+    );
+
+    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .announce(receiver_info.node_id, &announce, "", "", &[])
+        .await
+        .unwrap();
+    let wire = match recv_next(&mut receiver_events).await {
+        TransportEvent::AnnounceReceived { announce, .. } => announce,
+        other => panic!("expected AnnounceReceived, got {other:?}"),
+    };
+
+    let dest = tempdir().unwrap();
+
+    // 1 MB/s, armed on the PROVIDER before the receiver pulls a single byte —
+    // the pacer only governs the upload side.
+    provider.set_upload_limit(1_000_000);
+
+    // Time ONLY the fetch: serve, announce and pairing above are unpaced setup
+    // whose cost would muddy the floor below.
+    let t0 = std::time::Instant::now();
+    receiver
+        .fetch(provider_info.node_id, &wire, dest.path(), noop_fetch_sink())
+        .await
+        .expect("a paced transfer must still COMPLETE, only slower");
+    let elapsed = t0.elapsed();
+
+    assert_eq!(
+        xxh3_of(&pkg_dir.join("frame_paced.fits")),
+        xxh3_of(&dest.path().join("frame_paced.fits")),
+        "pacing must not corrupt or truncate the payload"
+    );
+
+    // 3 MiB at 1 MB/s ⇒ ~3.1 s in theory. The floor is 2 s — two thirds of
+    // that — so pacing jitter, chunk-size variance and the first (unpaced)
+    // chunk can never flake it, while an unthrottled localhost transfer of the
+    // same package (well under a second) still fails it decisively.
+    //
+    // Deliberately NO upper bound: wall-clock ceilings flake under CI and
+    // parallel-test load. The completion direction is already pinned by
+    // `throttle_intercept_zero_rate_transfer_completes`.
+    assert!(
+        elapsed >= Duration::from_secs(2),
+        "paced 3 MiB transfer at 1 MB/s finished in {elapsed:?} — the throttle is not slowing the provider"
+    );
+
+    provider.shutdown().await;
+    receiver.shutdown().await;
+}
