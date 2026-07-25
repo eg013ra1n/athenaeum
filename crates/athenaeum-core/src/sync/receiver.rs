@@ -3538,6 +3538,98 @@ mod tests {
             active_empty,
             "a Failed row drops out of the active set — never stuck non-terminal"
         );
+        // D2 §3.2: a terminal must announce itself. This path emitted nothing
+        // before, so the row left the Active list with nothing to carry it into the
+        // terminal list — the same vanishing row the fetch path had.
+        wait_for_finished(&recorder, 1).await;
+        let ev = finished_events(&recorder)
+            .pop()
+            .expect("a terminal finished event");
+        assert_eq!(
+            ev["outcome"], "failed",
+            "the ingest error is announced: {ev}"
+        );
+        assert_eq!(ev["direction"], "received", "receive-side event: {ev}");
+    }
+
+    /// D2 §3.2: an ack failure stays terminal even though a dead connection is what
+    /// caused it — the ONE place where that is true, so it is pinned explicitly.
+    /// Every frame is landed and catalogued by this point, so nothing is
+    /// outstanding on our side; only the verdict is undelivered, and the ack-replay
+    /// guard hands it back whole on the sender's next announce. Treating this as
+    /// `Waiting` would park a transfer that has, from our side, already happened.
+    #[tokio::test]
+    async fn an_ack_failure_stays_failed_and_emits_its_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        let recorder = Arc::new(RecordingEmitter::default());
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            {
+                let incoming = incoming.clone();
+                Arc::new(move || incoming.clone()) as IncomingResolver
+            },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
+        let wire = announce.package_id.0.clone();
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        // Fetch and ingest both succeed; only the receipt hand-back fails.
+        receiver_ep.set_fault(FaultPlan {
+            fail_ack_once: true,
+            ..Default::default()
+        });
+        sender
+            .announce(
+                receiver_node,
+                &announce,
+                "M31 Lights",
+                "batch-ack-failure",
+                &files,
+            )
+            .await
+            .unwrap();
+
+        let row = poll_inbound(&store, &wire, InboundState::Failed).await;
+        assert_eq!(
+            row.state,
+            InboundState::Failed,
+            "the receive happened; only the verdict did not"
+        );
+        assert!(row.finished_at.is_some(), "a terminal stamps finished_at");
+
+        wait_for_finished(&recorder, 1).await;
+        let ev = finished_events(&recorder)
+            .pop()
+            .expect("a terminal finished event");
+        assert_eq!(
+            ev["outcome"], "failed",
+            "the ack failure is announced: {ev}"
+        );
+        assert_eq!(
+            ev["packageId"], wire,
+            "keyed on the attempt's wire id: {ev}"
+        );
     }
 
     // ── Task 12: receiver-side cancel ───────────────────────────────────────
