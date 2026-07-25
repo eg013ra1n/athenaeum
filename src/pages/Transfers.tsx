@@ -132,14 +132,20 @@ export default function Transfers() {
     const s = new Set<TransferFilter>(['all']);
     if (u.kind === 'live') {
       const r = u.row;
-      // D1: both parked shapes belong in the Waiting chip — the countdown one and
-      // the peer-absent one. NOT the queued family: `queued_at_receiver` (variant
-      // A), a slot-parked inbound `queued` (variant C) and a lane-queue ghost
-      // (variant B) are all active-and-automatic — the peer is right there and the
-      // transfer starts by itself — so they fall through to Sending/Receiving by
-      // direction, alongside the transfers they are queued behind. Waiting is for
-      // "something is in the way", which is precisely what these are not.
-      if (r.displayState === 'waiting' || r.displayState === 'waiting_peer') s.add('waiting');
+      // D1's own rule, taken at its word: EVERY parked shape belongs in the
+      // Waiting chip — the countdown one, the peer-absent one, and (owner review)
+      // the queued family: `queued_at_receiver` (parked on the RECEIVER's queue),
+      // an inbound `queued` (parked on a receive slot or a busy lane — the ghost
+      // rows carry the same displayState). All of them are "not moving right now,
+      // resumes by itself", which is exactly what a user filtering Waiting is
+      // asking to see. The ONE queued shape that stays out is the OUTBOUND local
+      // `queued` — a millisecond pipeline stage between enqueue and announce, not
+      // a park on anything external; it stays in Sending.
+      const parkedQueued =
+        r.displayState === 'queued_at_receiver' ||
+        (r.kind === 'inbound' && r.displayState === 'queued');
+      if (r.displayState === 'waiting' || r.displayState === 'waiting_peer' || parkedQueued)
+        s.add('waiting');
       else if (r.terminal) {
         if (r.displayState === 'failed') s.add('failed');
         else if (r.displayState === 'cancelled') s.add('cancelled');
