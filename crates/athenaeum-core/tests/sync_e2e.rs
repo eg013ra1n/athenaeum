@@ -243,6 +243,50 @@ impl RecordingEmitter {
             .map(|(t, _, _)| *t)
     }
 
+    /// Per-peer variant of [`first_received_stage_at`](Self::first_received_stage_at):
+    /// the FIRST received-direction `sync-progress` tick whose coarse `stage` matches
+    /// AND whose `peerDevice` is `peer` (the SENDING node's id hex, per
+    /// `SyncProgressEvent::peer_device`).
+    ///
+    /// The unfiltered sibling is only unambiguous when one emitter sees one
+    /// transfer — the bidirectional e2e's shape, where each side has its own
+    /// receiver. The W2 T2.5 shape is the opposite: ONE receiver, hence one
+    /// emitter, carrying BOTH senders' stage ticks interleaved, so every timing
+    /// read has to be keyed on the peer it came from. Additive: the unfiltered
+    /// method is untouched.
+    fn first_received_stage_at_for(&self, peer: &str, stage: &str) -> Option<Instant> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, name, p)| {
+                name == "sync-progress"
+                    && p["direction"] == "received"
+                    && p["stage"] == stage
+                    && p["peerDevice"] == peer
+            })
+            .map(|(t, _, _)| *t)
+    }
+
+    /// The `Instant` of the FIRST received-direction `sync-finished` from `peer`
+    /// carrying `outcome` — the per-peer terminal stamp (`ingested` for a clean
+    /// ingest, `cancelled` for the revoke path). The receive-side twin of
+    /// [`first_received_stage_at_for`](Self::first_received_stage_at_for), and the
+    /// oracle W2 T2.5 compares one transfer's terminal against another's.
+    fn first_received_finished_at_for(&self, peer: &str, outcome: &str) -> Option<Instant> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, name, p)| {
+                name == "sync-finished"
+                    && p["direction"] == "received"
+                    && p["outcome"] == outcome
+                    && p["peerDevice"] == peer
+            })
+            .map(|(t, _, _)| *t)
+    }
+
     /// Every `sync-file-progress` tick as `(file, bytes_done, bytes_total)` in emit
     /// order — the per-file byte trail the Transfers UI renders as live bars.
     fn file_progress(&self) -> Vec<(String, u64, u64)> {
@@ -5133,5 +5177,624 @@ async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
     );
 
     engine.shutdown().await;
+    receiver.shutdown().await;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// W2 T2.5 — receiver parallelism at FULL-STACK level. The in-crate receiver
+// suites pin the lane router and the [`ReceiveGate`] against mock fixtures; the
+// two tests below pin the same headline through the whole shipping pipeline:
+// real `enqueue_sync_selection` sender engines (one per sender catalog), the real
+// `SyncReceiver`, real ingest into a real catalog — everything except the network,
+// which the loopback transport stands in for.
+//
+// Both are timing tests, and both take their teeth from the SAME mechanism the
+// donor `bidirectional_simultaneous_transfers_both_complete` uses: `FaultPlan
+// { delay_per_read }` on the FETCHING endpoint (the receiver's — the pacing sits
+// in `LoopbackTransport::fetch`'s copy loop, which runs on the node doing the
+// fetching) stretches every fetch to a controllable, unmistakable duration, and
+// the `RecordingEmitter` stamps each stage tick with an `Instant` off the one
+// process clock so windows can be intersected. The margins are deliberately
+// lopsided: every "prompt" bound is a small multiple of the 25ms poll step, every
+// "would have serialized" bound is a whole paced fetch (≥1.5s / ≥3s).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The distinct first-level directory names under `dir` that actually contain a
+/// landed file. The receiver lands every transfer under
+/// `<incoming>/<sender_slug>/<batch_slug>/<rel_path>` (sender slug = the peer's
+/// device name, else its sanitized node hex), so with two senders this set is the
+/// two per-sender trees — the on-disk proof that two peers' payloads land apart
+/// rather than colliding in one tree.
+fn landed_sender_prefixes(dir: &Path) -> std::collections::BTreeSet<String> {
+    walkdir::WalkDir::new(dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| {
+            let rel = e.path().strip_prefix(dir).ok()?.to_path_buf();
+            rel.components()
+                .next()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+        })
+        .collect()
+}
+
+/// The sending peer's node-id hex (`sync_inbound.peer`) for a wire `package_id` —
+/// the key both `RecordingEmitter` per-peer readers filter on, read back from the
+/// receiver's own row so the test never has to reach inside `inject_sender_engine`
+/// for the endpoint it minted.
+fn inbound_peer(db: &Database, package_id: &str) -> Option<String> {
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare("SELECT peer FROM sync_inbound WHERE package_id = ?1")
+        .unwrap();
+    let mut rows = stmt.query([package_id]).unwrap();
+    rows.next().unwrap().map(|r| r.get(0).unwrap())
+}
+
+/// W2 T2.5 scenario 1 — **two senders, one receiver: the fetch windows OVERLAP.**
+///
+/// The headline of the per-peer receive lanes (T2.3) and the receive gate (T2.4),
+/// end to end: TWO independent sender instances (own catalog, own files, own
+/// engine, own node id) push a batch each at ONE receiver at the same time, and the
+/// receiver works both at once instead of making the second wait out the first.
+///
+/// Both packages are paced to ~`N × DELAY_PER_READ` (≈1.5s) of fetch, so the
+/// serialized alternative is not a matter of milliseconds — it is a second and a
+/// half of dead time that no scheduling jitter can imitate. What is asserted:
+///
+/// 1. **Both land completely** — N frames from each sender in the receiver's
+///    catalog, both inbound rows `done`, both senders `confirmed`.
+/// 2. **Two landing trees** — the files sit under two DIFFERENT `<sender_slug>`
+///    prefixes (the receiver never merges two peers into one tree).
+/// 3. **Overlap** — the two `[fetching .. ingesting]` fetch windows intersect, and
+///    so do the wider `[fetching .. sync-finished]` windows.
+/// 4. **Non-serialization** — each transfer's announce→its-own-first-fetch-tick gap
+///    is far below the OTHER transfer's whole fetch duration (a fetch queued behind
+///    the other would have paid exactly that), and below a generous absolute
+///    ceiling.
+///
+/// TEETH (this test cannot be run against the pre-lane serial receiver — the lanes
+/// are already merged — so its bite was proven by mutation instead): setting
+/// `control.receive_gate.set_limit(1)` before spawning the receiver reproduces the
+/// serialized shape at the phase that matters. The `received` tick still lands
+/// promptly for both (the permit is taken AFTER the announce bookkeeping, by
+/// design), but the second transfer's `fetching` tick cannot be emitted until the
+/// first releases its permit — and assertion 3 fails, loudly, with two disjoint
+/// windows. Reverted immediately; the shipped test runs at the default cap of 2.
+#[tokio::test]
+async fn two_senders_one_receiver_fetch_windows_overlap() {
+    /// Frames per sender. With the 8KiB loopback copy chunk each fixture FITS is a
+    /// single read, so a package's fetch costs ≈ N × DELAY_PER_READ.
+    const N: usize = 10;
+    /// ⇒ ~1.5s per fetch: long enough that a serialized second fetch is a chasm,
+    /// short enough to stay far under the 30s WAIT budget.
+    const DELAY_PER_READ: Duration = Duration::from_millis(150);
+    /// Absolute ceiling for announce→fetching: 12× the harness poll step (25ms),
+    /// i.e. well above concurrent scheduling jitter and ~5× below the ≈1.5s a fetch
+    /// serialized behind its peer would have waited.
+    const ANNOUNCE_FETCH_CEILING: Duration = Duration::from_millis(300);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let s1_dir = tmp.path().join("sender1");
+    let s2_dir = tmp.path().join("sender2");
+    let recv_dir = tmp.path().join("receiver");
+    let s1_files = s1_dir.join("files");
+    let s2_files = s2_dir.join("files");
+    std::fs::create_dir_all(&s1_files).unwrap();
+    std::fs::create_dir_all(&s2_files).unwrap();
+    std::fs::create_dir_all(&recv_dir).unwrap();
+    let s1_db = s1_dir.join("catalog.db");
+    let s2_db = s2_dir.join("catalog.db");
+    let recv_db = recv_dir.join("catalog.db");
+
+    let ctx_s1 = Arc::new(ServiceContext::new_for_tests(s1_db.clone()));
+    let ctx_s2 = Arc::new(ServiceContext::new_for_tests(s2_db.clone()));
+    let ctx_recv = ServiceContext::new_for_tests(recv_db.clone());
+    let db1 = ctx_s1.db.get().unwrap();
+    let db2 = ctx_s2.db.get().unwrap();
+    let rdb = ctx_recv.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+
+    // ── ONE receiver. The fault sits on ITS endpoint: `fetch` reads the pacing off
+    // the fetching node's own plan, so this one setting paces BOTH inbound
+    // transfers (each fetch loop sleeps on its own timeline, and `.await` hands the
+    // runtime to the other, so the two genuinely interleave). ───────────────────
+    let recv_store = Arc::new(CatalogSyncStore::open(&recv_db).unwrap());
+    let recv_ep = Arc::new(net.endpoint());
+    let recv_node = recv_ep.node_id();
+    recv_ep.set_fault(FaultPlan {
+        delay_per_read: Some(DELAY_PER_READ),
+        ..Default::default()
+    });
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&ctx_recv, &designated);
+    let incoming = incoming_resolver_for(&ctx_recv, recv_dir.join("incoming"));
+
+    let recorder = Arc::new(RecordingEmitter::default());
+    // Held so the mutation proof can dial the gate down to 1 in place (see TEETH on
+    // the doc comment); shipped runs leave it at DEFAULT_MAX_CONCURRENT_RECEIVES.
+    let control = Arc::new(InboundControl::new());
+    assert_eq!(
+        control.receive_gate.limit(),
+        2,
+        "the shipped receive cap admits both transfers at once"
+    );
+
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&recv_store),
+        recv_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::clone(&control),
+        Arc::clone(&recv_ep) as Arc<dyn SharingTransport>,
+        Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+    )
+    .await
+    .expect("spawn the receiver");
+
+    // Two independent senders, each its own engine on its own loopback endpoint (⇒
+    // its own node id ⇒ its own receive lane). Long ack timeout: both peers are
+    // online, the paced fetch must not trip a premature re-announce.
+    let (engine1, sender1, collab1, sync1) =
+        inject_sender_engine(&net, &s1_db, recv_node, Duration::from_secs(30)).await;
+    let (engine2, sender2, collab2, sync2) =
+        inject_sender_engine(&net, &s2_db, recv_node, Duration::from_secs(30)).await;
+
+    // Disjoint index ranges ⇒ distinct uuids (per-catalog trigger), distinct
+    // filenames AND distinct pixel content. Content matters: the pre-announce dedup
+    // handshake keys on sampling/full xxh3, so byte-identical fixtures from two
+    // senders would have the second transfer confirm as "already on peer" without
+    // ever fetching — and there would be no second fetch window to overlap.
+    let mut ids1: Vec<i64> = Vec::with_capacity(N);
+    let mut ids2: Vec<i64> = Vec::with_capacity(N);
+    for idx in 0..N {
+        ids1.push(insert_capture_frame(&ctx_s1, &s1_files, idx).0);
+        ids2.push(insert_capture_frame(&ctx_s2, &s2_files, 1000 + idx).0);
+    }
+
+    // ── Fire both, back to back. Each enqueue hands off to its engine worker, so
+    // both packages are announced and in flight long before either paced fetch
+    // finishes. ─────────────────────────────────────────────────────────────────
+    let r1 = enqueue_sync_selection(
+        &ctx_s1,
+        &sender1,
+        Arc::clone(&collab1),
+        &sync1,
+        ResolvedDest {
+            node: recv_node,
+            endpoint_addr: None,
+        },
+        ids1.clone(),
+        Some("Sender One".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("sender 1 enqueue");
+    let r2 = enqueue_sync_selection(
+        &ctx_s2,
+        &sender2,
+        Arc::clone(&collab2),
+        &sync2,
+        ResolvedDest {
+            node: recv_node,
+            endpoint_addr: None,
+        },
+        ids2.clone(),
+        Some("Sender Two".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("sender 2 enqueue");
+    assert_eq!(r1.enqueued_count, N as u32);
+    assert_eq!(r2.enqueued_count, N as u32);
+
+    let out1 = latest_outbound_id(db1);
+    let out2 = latest_outbound_id(db2);
+
+    // ── (1) Both transfers land completely. ─────────────────────────────────────
+    wait_until(|| outbound_state(db1, out1) == "confirmed", WAIT).await;
+    wait_until(|| outbound_state(db2, out2) == "confirmed", WAIT).await;
+    wait_until(
+        || {
+            count(rdb, "SELECT COUNT(*) FROM sync_history WHERE direction = 'received' AND outcome = 'ingested'")
+                == 2 * N as i64
+        },
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        count(rdb, "SELECT COUNT(*) FROM frames"),
+        2 * N as i64,
+        "both senders' frames are in the receiver catalog"
+    );
+    assert_eq!(
+        count(rdb, "SELECT COUNT(*) FROM files"),
+        2 * N as i64,
+        "both senders' files are in the receiver catalog"
+    );
+    assert_eq!(
+        landed_count(&designated),
+        2 * N,
+        "both senders' payloads landed on disk"
+    );
+
+    // Map each transfer to its inbound row: the sender's own wire id IS the
+    // receiver's `package_id`.
+    let wire1 = outbound_wire_id(db1, out1);
+    let wire2 = outbound_wire_id(db2, out2);
+    assert_ne!(wire1, wire2, "two transfers, two wire ids");
+    wait_until(
+        || matches!(inbound_row(rdb, &wire1), Some((s, _, _)) if s == "done"),
+        WAIT,
+    )
+    .await;
+    wait_until(
+        || matches!(inbound_row(rdb, &wire2), Some((s, _, _)) if s == "done"),
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        count(rdb, "SELECT COUNT(*) FROM sync_inbound"),
+        2,
+        "one inbound row per transfer — two senders never share a row"
+    );
+
+    let peer1 = inbound_peer(rdb, &wire1).expect("sender 1 peer hex");
+    let peer2 = inbound_peer(rdb, &wire2).expect("sender 2 peer hex");
+    assert_ne!(peer1, peer2, "the two senders are distinct peers");
+
+    // ── (2) Two landing trees, one per sender. The slug is the sanitized node hex
+    // (no device name is cached in this harness), truncated to 24 chars. ────────
+    let prefixes = landed_sender_prefixes(&designated);
+    assert_eq!(
+        prefixes.len(),
+        2,
+        "the two senders landed under two DIFFERENT trees: {prefixes:?}"
+    );
+    let expected: std::collections::BTreeSet<String> = [&peer1, &peer2]
+        .iter()
+        .map(|hex| hex.to_ascii_lowercase().chars().take(24).collect())
+        .collect();
+    assert_eq!(
+        prefixes, expected,
+        "each landing tree is its own sender's slug"
+    );
+
+    // ── (3) Overlap. Every timing read is keyed on the peer it came from — one
+    // emitter now carries both transfers. `fetching` is stamped just before
+    // `transport.fetch()`, `ingesting` just after it returns. ───────────────────
+    let f1_start = recorder
+        .first_received_stage_at_for(&peer1, "fetching")
+        .expect("sender 1 fetching tick");
+    let f1_end = recorder
+        .first_received_stage_at_for(&peer1, "ingesting")
+        .expect("sender 1 ingesting tick");
+    let f2_start = recorder
+        .first_received_stage_at_for(&peer2, "fetching")
+        .expect("sender 2 fetching tick");
+    let f2_end = recorder
+        .first_received_stage_at_for(&peer2, "ingesting")
+        .expect("sender 2 ingesting tick");
+    assert!(f1_start < f1_end, "sender 1's fetch window is well-formed");
+    assert!(f2_start < f2_end, "sender 2's fetch window is well-formed");
+    assert!(
+        f1_start < f2_end && f2_start < f1_end,
+        "the two senders' fetch windows overlap (genuine concurrency): \
+         sender 1 [{f1_start:?} .. {f1_end:?}], sender 2 [{f2_start:?} .. {f2_end:?}]"
+    );
+
+    // The same intersection on the wider window the brief names — first fetch tick
+    // to the transfer's terminal `sync-finished`. Implied by the tight windows
+    // above; asserted anyway because it is the window a user actually perceives
+    // ("both transfers were running at the same time").
+    let done1 = recorder
+        .first_received_finished_at_for(&peer1, "ingested")
+        .expect("sender 1 terminal sync-finished");
+    let done2 = recorder
+        .first_received_finished_at_for(&peer2, "ingested")
+        .expect("sender 2 terminal sync-finished");
+    assert!(
+        f1_start < done2 && f2_start < done1,
+        "the two senders' whole [fetching .. finished] windows overlap: \
+         sender 1 [{f1_start:?} .. {done1:?}], sender 2 [{f2_start:?} .. {done2:?}]"
+    );
+
+    // ── (4) Non-serialization: neither transfer paid the other's fetch. ─────────
+    let recv1 = recorder
+        .first_received_stage_at_for(&peer1, "received")
+        .expect("sender 1 received tick");
+    let recv2 = recorder
+        .first_received_stage_at_for(&peer2, "received")
+        .expect("sender 2 received tick");
+    let gap1 = f1_start.duration_since(recv1);
+    let gap2 = f2_start.duration_since(recv2);
+    let fetch1 = f1_end.duration_since(f1_start);
+    let fetch2 = f2_end.duration_since(f2_start);
+
+    assert!(
+        gap1 < fetch2,
+        "sender 1's fetch did not serialize behind sender 2's \
+         (announce→fetching {gap1:?} < peer fetch {fetch2:?})"
+    );
+    assert!(
+        gap2 < fetch1,
+        "sender 2's fetch did not serialize behind sender 1's \
+         (announce→fetching {gap2:?} < peer fetch {fetch1:?})"
+    );
+    assert!(
+        gap1 < ANNOUNCE_FETCH_CEILING,
+        "sender 1's announce→fetching gap is within the generous ceiling ({gap1:?} < {ANNOUNCE_FETCH_CEILING:?})"
+    );
+    assert!(
+        gap2 < ANNOUNCE_FETCH_CEILING,
+        "sender 2's announce→fetching gap is within the generous ceiling ({gap2:?} < {ANNOUNCE_FETCH_CEILING:?})"
+    );
+
+    engine1.shutdown().await;
+    engine2.shutdown().await;
+    receiver.shutdown().await;
+}
+
+/// W2 T2.5 scenario 2 — **a revoke is processed while another peer's fetch runs.**
+///
+/// The original pain, pinned end to end: on the pre-lane serial receiver every
+/// inbound event — announces, revokes, everything — walked ONE queue, so peer B's
+/// `Revoke` could not be acted on until peer A's whole fetch + ingest had finished.
+/// A sender that cancelled a 30-second transfer left the receiver dutifully pulling
+/// bytes nobody wanted, and the row only went `cancelled` minutes later.
+///
+/// Shape: peer A starts a long paced transfer (`N_A × DELAY` ≈ 3s of fetch); peer B
+/// announces its own, and the moment B is fetching its sender cancels — which fires
+/// `Revoke{Cancelled}` on the wire, the same mechanism
+/// `sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both` drives. Asserted:
+///
+/// 1. B's inbound row terminalizes `cancelled` / `"by sender"`, and it does so
+///    **before A's transfer finishes, by a whole margin** — the timestamp
+///    comparison IS the teeth: on the serial loop B's terminal could not land until
+///    after A's entire fetch+ingest, i.e. strictly after A's `sync-finished`.
+/// 2. B's cancel costs A nothing: A completes cleanly afterwards — all N_A frames
+///    ingested, row `done`, sender `confirmed` — and B contributes no frames and no
+///    files.
+#[tokio::test]
+async fn revoke_processes_promptly_while_other_peer_transfer_runs() {
+    /// Peer A: the long transfer. ≈3s of paced fetch, so B has a wide runway to
+    /// announce, be cancelled and terminalize inside it.
+    const N_A: usize = 30;
+    /// Peer B: long enough (≈1.2s of paced fetch) that the cancel reliably lands
+    /// mid-fetch rather than racing B's own completion.
+    const N_B: usize = 12;
+    const DELAY_PER_READ: Duration = Duration::from_millis(100);
+    /// How far ahead of A's terminal B's terminal must land. A still owes ≈2s of
+    /// paced fetch at that point, so 1s is a bound the serial loop could never
+    /// satisfy (there B terminalizes strictly AFTER A) yet no jitter can break.
+    const TERMINAL_LEAD: Duration = Duration::from_secs(1);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let a_dir = tmp.path().join("peer_a");
+    let b_dir = tmp.path().join("peer_b");
+    let recv_dir = tmp.path().join("receiver");
+    let a_files = a_dir.join("files");
+    let b_files = b_dir.join("files");
+    std::fs::create_dir_all(&a_files).unwrap();
+    std::fs::create_dir_all(&b_files).unwrap();
+    std::fs::create_dir_all(&recv_dir).unwrap();
+    let a_db = a_dir.join("catalog.db");
+    let b_db = b_dir.join("catalog.db");
+    let recv_db = recv_dir.join("catalog.db");
+
+    let ctx_a = Arc::new(ServiceContext::new_for_tests(a_db.clone()));
+    let ctx_b = Arc::new(ServiceContext::new_for_tests(b_db.clone()));
+    let ctx_recv = ServiceContext::new_for_tests(recv_db.clone());
+    let dba = ctx_a.db.get().unwrap();
+    let dbb = ctx_b.db.get().unwrap();
+    let rdb = ctx_recv.db.get().unwrap();
+
+    let net = LoopbackNetwork::new();
+    let recv_store = Arc::new(CatalogSyncStore::open(&recv_db).unwrap());
+    let recv_ep = Arc::new(net.endpoint());
+    let recv_node = recv_ep.node_id();
+    recv_ep.set_fault(FaultPlan {
+        delay_per_read: Some(DELAY_PER_READ),
+        ..Default::default()
+    });
+
+    let designated = tmp.path().join("designated_incoming");
+    designate_incoming(&ctx_recv, &designated);
+    let incoming = incoming_resolver_for(&ctx_recv, recv_dir.join("incoming"));
+
+    let recorder = Arc::new(RecordingEmitter::default());
+    let (_info, receiver) = SyncReceiver::spawn(
+        Arc::clone(&recv_store),
+        recv_dir.clone(),
+        incoming,
+        allow_all_peers(),
+        Default::default(),
+        Arc::new(InboundControl::new()),
+        Arc::clone(&recv_ep) as Arc<dyn SharingTransport>,
+        Arc::clone(&recorder) as Arc<dyn ProgressEmitter>,
+    )
+    .await
+    .expect("spawn the receiver");
+
+    let (engine_a, sender_a, collab_a, sync_a) =
+        inject_sender_engine(&net, &a_db, recv_node, Duration::from_secs(30)).await;
+    let (engine_b, sender_b, collab_b, sync_b) =
+        inject_sender_engine(&net, &b_db, recv_node, Duration::from_secs(30)).await;
+
+    // Disjoint index ranges ⇒ distinct content, so B's payload is never dedup'd
+    // against A's already-landing one (which would confirm B without a fetch).
+    let mut ids_a: Vec<i64> = Vec::with_capacity(N_A);
+    let mut ids_b: Vec<i64> = Vec::with_capacity(N_B);
+    for idx in 0..N_A {
+        ids_a.push(insert_capture_frame(&ctx_a, &a_files, idx).0);
+    }
+    for idx in 0..N_B {
+        ids_b.push(insert_capture_frame(&ctx_b, &b_files, 1000 + idx).0);
+    }
+
+    // ── Peer A: the long transfer. Wait until it is genuinely fetching. ─────────
+    enqueue_sync_selection(
+        &ctx_a,
+        &sender_a,
+        Arc::clone(&collab_a),
+        &sync_a,
+        ResolvedDest {
+            node: recv_node,
+            endpoint_addr: None,
+        },
+        ids_a.clone(),
+        Some("Peer A Long".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("peer A enqueue");
+    let out_a = latest_outbound_id(dba);
+    let mut wire_a = String::new();
+    wait_until(
+        || {
+            let w = outbound_wire_id(dba, out_a);
+            match inbound_row(rdb, &w) {
+                Some((s, _, _)) if s == "fetching" => {
+                    wire_a = w;
+                    true
+                }
+                _ => false,
+            }
+        },
+        WAIT,
+    )
+    .await;
+
+    // ── Peer B: announce a second transfer while A is mid-fetch, then cancel it on
+    // the SENDER — the wire `Revoke{Cancelled}` path. ──────────────────────────
+    enqueue_sync_selection(
+        &ctx_b,
+        &sender_b,
+        Arc::clone(&collab_b),
+        &sync_b,
+        ResolvedDest {
+            node: recv_node,
+            endpoint_addr: None,
+        },
+        ids_b.clone(),
+        Some("Peer B Revoked".to_string()),
+        None,
+        None,
+    )
+    .await
+    .expect("peer B enqueue");
+    let out_b = latest_outbound_id(dbb);
+    let mut wire_b = String::new();
+    wait_until(
+        || {
+            let w = outbound_wire_id(dbb, out_b);
+            match inbound_row(rdb, &w) {
+                Some((s, _, _)) if s == "fetching" => {
+                    wire_b = w;
+                    true
+                }
+                _ => false,
+            }
+        },
+        WAIT,
+    )
+    .await;
+    assert_ne!(wire_a, wire_b, "two transfers, two wire ids");
+
+    // A is still mid-fetch: its row has not left `fetching`, and nothing of A's is
+    // in the catalog yet (ingest runs only after the whole fetch).
+    assert!(
+        matches!(inbound_row(rdb, &wire_a), Some((s, _, _)) if s == "fetching"),
+        "peer A is still fetching when peer B's revoke is fired"
+    );
+    assert_eq!(
+        count(rdb, "SELECT COUNT(*) FROM frames"),
+        0,
+        "no frame ingested yet — both fetches are paced"
+    );
+
+    let fired = Instant::now();
+    cancel_sync_package(&sender_b, out_b)
+        .await
+        .expect("cancel peer B's transfer on the sender");
+
+    // ── (1) B terminalizes — while A's fetch is still running. ─────────────────
+    wait_until(
+        || matches!(inbound_row(rdb, &wire_b), Some((s, _, _)) if s == "cancelled"),
+        WAIT,
+    )
+    .await;
+    let b_terminal_elapsed = fired.elapsed();
+    assert_eq!(
+        inbound_last_error(rdb, &wire_b).as_deref(),
+        Some("by sender"),
+        "peer B's row carries the sender-revoke reason"
+    );
+    assert!(
+        matches!(inbound_row(rdb, &wire_a), Some((s, _, _)) if s == "fetching"),
+        "peer B's revoke was processed WHILE peer A's fetch was still in flight \
+         (B terminalized {b_terminal_elapsed:?} after the cancel)"
+    );
+
+    // ── (2) A completes cleanly afterwards. ────────────────────────────────────
+    wait_until(|| outbound_state(dba, out_a) == "confirmed", WAIT).await;
+    wait_until(
+        || matches!(inbound_row(rdb, &wire_a), Some((s, _, _)) if s == "done"),
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        count(rdb, "SELECT COUNT(*) FROM frames"),
+        N_A as i64,
+        "peer A's frames all ingested; peer B contributed none"
+    );
+    assert_eq!(
+        landed_count(&designated),
+        N_A,
+        "only peer A's payload is on disk"
+    );
+    wait_until(|| outbound_state(dbb, out_b) == "cancelled", WAIT).await;
+
+    // ── The teeth: B's terminal instant precedes A's by a whole margin. On the
+    // serial receive loop the order was necessarily the reverse — B's revoke
+    // bookkeeping sat behind A's entire fetch+ingest. ─────────────────────────
+    let peer_a_hex = inbound_peer(rdb, &wire_a).expect("peer A hex");
+    let peer_b_hex = inbound_peer(rdb, &wire_b).expect("peer B hex");
+    assert_ne!(peer_a_hex, peer_b_hex, "A and B are distinct peers");
+    let b_terminal = recorder
+        .first_received_finished_at_for(&peer_b_hex, "cancelled")
+        .expect("peer B terminal sync-finished (cancelled)");
+    let a_finished = recorder
+        .first_received_finished_at_for(&peer_a_hex, "ingested")
+        .expect("peer A terminal sync-finished (ingested)");
+    assert!(
+        b_terminal < a_finished,
+        "peer B's revoke terminalized BEFORE peer A's transfer finished"
+    );
+    let lead = a_finished.duration_since(b_terminal);
+    assert!(
+        lead > TERMINAL_LEAD,
+        "peer B's revoke did not queue behind peer A's fetch: it terminalized {lead:?} \
+         ahead of A's finish (> {TERMINAL_LEAD:?}); serialized, it could only have landed after"
+    );
+
+    // Peer B's staging is cleaned and its files never reached the landing tree.
+    let staging_b = recv_dir.join("staging").join(&wire_b);
+    wait_until(|| !staging_b.exists(), WAIT).await;
+    assert_eq!(
+        landed_sender_prefixes(&designated).len(),
+        1,
+        "only peer A ever landed a tree"
+    );
+
+    engine_a.shutdown().await;
+    engine_b.shutdown().await;
     receiver.shutdown().await;
 }
