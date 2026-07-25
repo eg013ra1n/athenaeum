@@ -100,6 +100,38 @@ impl SyncSenderRuntime {
         }
     }
 
+    /// Tell ONE peer's engine that its peer just announced itself online (D1),
+    /// if an engine for that peer is started.
+    ///
+    /// Fire-and-forget and log-and-continue, like [`kick_all`](Self::kick_all).
+    /// This deliberately does NOT build an engine: whether there is anything worth
+    /// resuming for that peer is a question about durable rows and the account
+    /// allow-list, which this dumb holder cannot answer —
+    /// `api::sync::handle_peer_presence` gates that and builds the engine first.
+    pub async fn kick_peer(&self, peer: &NodeId) {
+        let engine = self
+            .inner
+            .lock()
+            .await
+            .get(peer)
+            .map(|s| Arc::clone(&s.engine));
+        match engine {
+            Some(engine) => {
+                if let Err(e) = engine.peer_present().await {
+                    tracing::warn!(
+                        error = %e,
+                        peer = %crate::sync::node_id_hex(peer),
+                        "peer-present kick failed"
+                    );
+                }
+            }
+            None => tracing::debug!(
+                peer = %crate::sync::node_id_hex(peer),
+                "peer-present kick: no engine for this peer"
+            ),
+        }
+    }
+
     /// Lock the per-peer map for the ensure critical section. The orchestration
     /// in [`crate::api::sync::ensure_sender_engine`] holds this guard across the
     /// transport build so a second concurrent enqueue to the SAME peer can never

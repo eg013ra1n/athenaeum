@@ -733,7 +733,7 @@ git commit -m "perf(sync): serve reuses an already-imported package instead of r
 - Consumes: `SharedIrohNode::set_presence_hook` (Task 2), `SyncEngineHandle::peer_present` (Task 4).
 - Produces: `SyncSenderRuntime::kick_peer(&self, peer: &NodeId)`; `api::sync::broadcast_presence(ctx, node)`.
 
-- [ ] **Step 1: Write the failing gate tests**
+- [x] **Step 1: Write the failing gate tests**
 
 ```rust
 /// A presence beacon must never make us allocate an engine for a stranger: both
@@ -762,12 +762,12 @@ async fn presence_with_no_pending_rows_builds_no_engine() {
 }
 ```
 
-- [ ] **Step 2: Run them and watch them fail**
+- [x] **Step 2: Run them and watch them fail**
 
 Run: `cargo test -q -p athenaeum-core --lib presence_from_an_unauthorized_peer`
 Expected: FAIL — `cannot find function handle_peer_presence`.
 
-- [ ] **Step 3: Implement `kick_peer`**
+- [x] **Step 3: Implement `kick_peer`**
 
 In `crates/athenaeum-core/src/sync/sender.rs`, beside `kick_all`:
 
@@ -786,7 +786,7 @@ In `crates/athenaeum-core/src/sync/sender.rs`, beside `kick_all`:
     }
 ```
 
-- [ ] **Step 4: Implement the gated handler + beacon**
+- [x] **Step 4: Implement the gated handler + beacon**
 
 In `crates/athenaeum-core/src/api/sync.rs`:
 
@@ -877,12 +877,12 @@ pub async fn broadcast_presence(ctx: &Arc<ServiceContext>, node: &Arc<SharedIroh
 
 Install the hook where the wake hook is installed (`install_node_wake_hook`), applying the debounce there, and call `broadcast_presence` from the two edges: right after the receiver is spawned in the autostart path, and inside the wake hook itself (relay reconnect).
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test -q -p athenaeum-core --lib api::sync`
 Expected: PASS.
 
-- [ ] **Step 6: Full gates + commit**
+- [x] **Step 6: Full gates + commit**
 
 ```bash
 cargo build -q --workspace --all-targets && cargo build -q -p perseus --no-default-features

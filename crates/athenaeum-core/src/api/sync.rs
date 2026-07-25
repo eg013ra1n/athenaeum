@@ -617,18 +617,210 @@ fn start_node_relay_refresh(ctx: Arc<ServiceContext>, node: &Arc<SharedIrohNode>
 /// `kick_all` fan-out so the hook itself returns promptly (it runs on the node's
 /// relay-watcher / refresh task, which must not block).
 fn install_node_wake_hook(
+    ctx: &Arc<ServiceContext>,
     node: &Arc<SharedIrohNode>,
     sync_sender: Arc<SyncSenderRuntime>,
     collab_sender: Arc<SyncSenderRuntime>,
 ) {
+    let ctx = Arc::clone(ctx);
+    let node_for_beacon = Arc::clone(node);
     node.set_wake_hook(Arc::new(move || {
         let sync_sender = Arc::clone(&sync_sender);
         let collab_sender = Arc::clone(&collab_sender);
+        let ctx = Arc::clone(&ctx);
+        let node = Arc::clone(&node_for_beacon);
         tokio::spawn(async move {
             sync_sender.kick_all().await;
             collab_sender.kick_all().await;
+            // Edge 2 of 2 (D1 §3.1): our relay just reconnected, which is the same
+            // fact as "we are reachable again" — so tell the peers that may be
+            // parked waiting for us. Costs one beacon per account device per
+            // reconnect, and only ever on a transition.
+            broadcast_presence(&ctx, &node).await;
         });
     }));
+}
+
+/// Debounce window for INBOUND presence beacons, per peer (D1 §3.2). A peer whose
+/// relay flaps would otherwise fan a burst of beacons into a burst of attempts.
+const PRESENCE_DEBOUNCE: Duration = Duration::from_secs(10);
+
+/// How many presence beacons a fan-out keeps in flight (D1 §3.1). The fan-out
+/// runs at startup across every account device, so it must not serialize behind
+/// switched-off machines — nor open an unbounded number of connections at once.
+const PRESENCE_FANOUT_CONCURRENCY: usize = 4;
+
+/// Last time we ACTED on a presence beacon from each peer (the debounce state).
+static PRESENCE_SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<NodeId, std::time::Instant>>> =
+    std::sync::OnceLock::new();
+
+/// Whether this beacon is outside the debounce window, stamping it if so.
+fn presence_debounce_admits(peer: NodeId) -> bool {
+    let map = PRESENCE_SEEN.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("presence debounce mutex poisoned");
+    let now = std::time::Instant::now();
+    match guard.get(&peer) {
+        Some(last) if now.duration_since(*last) < PRESENCE_DEBOUNCE => false,
+        _ => {
+            guard.insert(peer, now);
+            true
+        }
+    }
+}
+
+/// Whether we hold at least one non-terminal outbound row for `peer` — i.e.
+/// whether a presence beacon from it has anything to resume.
+fn has_pending_rows_for(ctx: &ServiceContext, peer: NodeId) -> bool {
+    let Ok((_sync_dir, db_path)) = sync_paths(ctx) else {
+        return false;
+    };
+    let Ok(store) = CatalogSyncStore::open(&db_path) else {
+        return false;
+    };
+    match store.non_terminal() {
+        Ok(rows) => rows.iter().any(|r| r.peer == peer),
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "presence: pending-row lookup failed");
+            false
+        }
+    }
+}
+
+/// Handle one inbound presence beacon (D1 §3.2): ensure-then-kick, behind two
+/// gates evaluated from LOCAL state only.
+///
+/// The gates matter because this is a remote message that ALLOCATES: without the
+/// first, any node that can reach our control channel could make us build sender
+/// engines; without the second, a beacon from an idle device would build one for
+/// nothing. Neither gate consults the network, so a beacon is cheap to refuse.
+///
+/// Ensure-then-kick rather than kick: a beacon that beats
+/// `resurrect_pending_senders` — or lands on a signed-in device whose cached
+/// allow-list was empty when resurrection ran, so every peer was filtered out —
+/// would otherwise find no engine and be silently wasted, which is exactly the
+/// case the beacon exists for.
+pub async fn handle_peer_presence(
+    ctx: &Arc<ServiceContext>,
+    sender: &Arc<SyncSenderRuntime>,
+    collab_sender: &Arc<SyncSenderRuntime>,
+    sync: &SyncRuntime,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+    from: NodeId,
+) {
+    let hex = node_id_hex(&from);
+    if !cached_authorized_peer_hexes(ctx).contains(&hex) {
+        tracing::warn!(peer = %hex, "presence from an unauthorized peer; ignored");
+        return;
+    }
+    if !has_pending_rows_for(ctx, from) {
+        tracing::debug!(peer = %hex, "presence from an authorized peer with nothing pending");
+        return;
+    }
+    if !presence_debounce_admits(from) {
+        tracing::debug!(peer = %hex, "presence within the debounce window; ignored");
+        return;
+    }
+    if sender.current_for(&from).await.is_none() {
+        if let Err(e) = ensure_sender_engine(
+            ctx,
+            sender,
+            Arc::clone(collab_sender),
+            sync,
+            from,
+            // No reported address needed: the beacon just proved the peer is
+            // dialable on the path it arrived by.
+            None,
+            emitter,
+        )
+        .await
+        {
+            tracing::warn!(peer = %hex, error = %format!("{e:#}"), "presence: engine build failed");
+            return;
+        }
+    }
+    tracing::info!(peer = %hex, "peer presence; resuming its queue");
+    sender.kick_peer(&from).await;
+    collab_sender.kick_peer(&from).await;
+}
+
+/// Announce our presence to every authorized ACCOUNT device (D1 §3.1).
+///
+/// Account devices only: collab holders belong to other accounts, and telling
+/// them when we come online would leak a presence signal nobody asked for. Our
+/// own devices learn nothing they are not already entitled to know.
+///
+/// Fire-and-forget by contract — a beacon that does not land costs nothing,
+/// because the sender's retry schedule is the fallback for every peer that never
+/// hears one.
+pub async fn broadcast_presence(ctx: &Arc<ServiceContext>, node: &Arc<SharedIrohNode>) {
+    let peers = cached_authorized_peer_hexes(ctx);
+    let self_id = node.node_id();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut sent = 0usize;
+    for hex in peers {
+        let Ok(peer) = crate::sync::node_id_from_hex(&hex) else {
+            continue;
+        };
+        if peer == self_id {
+            continue; // never beacon ourselves
+        }
+        let node = Arc::clone(node);
+        tasks.spawn(async move {
+            if let Err(e) = node.send_presence(peer).await {
+                tracing::debug!(peer = %hex, error = %format!("{e:#}"), "presence beacon undelivered");
+            }
+        });
+        sent += 1;
+        while tasks.len() >= PRESENCE_FANOUT_CONCURRENCY {
+            let _ = tasks.join_next().await;
+        }
+    }
+    while tasks.join_next().await.is_some() {}
+    if sent > 0 {
+        tracing::info!(count = sent, "presence beacon fan-out complete");
+    }
+}
+
+/// Install the inbound-presence hook and fire the first beacon (D1 §3.1/§3.2).
+///
+/// Called from the same three sites as [`install_node_wake_hook`], so a
+/// sender-first bind is wired exactly like a receiver-first one. Installing is
+/// idempotent (the last hook wins and they are identical); the beacon is fired on
+/// a detached task so no startup path waits on the network.
+fn install_presence_wiring(
+    ctx: &Arc<ServiceContext>,
+    node: &Arc<SharedIrohNode>,
+    sync: &Arc<SyncRuntime>,
+    sync_sender: &Arc<SyncSenderRuntime>,
+    collab_sender: &Arc<SyncSenderRuntime>,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+) {
+    {
+        let ctx = Arc::clone(ctx);
+        let sync = Arc::clone(sync);
+        let sync_sender = Arc::clone(sync_sender);
+        let collab_sender = Arc::clone(collab_sender);
+        let emitter = emitter.clone();
+        node.set_presence_hook(Arc::new(move |from| {
+            let ctx = Arc::clone(&ctx);
+            let sync = Arc::clone(&sync);
+            let sync_sender = Arc::clone(&sync_sender);
+            let collab_sender = Arc::clone(&collab_sender);
+            let emitter = emitter.clone();
+            // The hook runs on the control accept loop: hand the work to its own
+            // task so a beacon can never stall the loop that receives announces.
+            tokio::spawn(async move {
+                handle_peer_presence(&ctx, &sync_sender, &collab_sender, &sync, emitter, from).await;
+            });
+        }));
+    }
+    // Edge 1 of 2: we just came online. (Edge 2 — our own relay reconnecting —
+    // rides the wake hook.)
+    let ctx = Arc::clone(ctx);
+    let node = Arc::clone(node);
+    tokio::spawn(async move {
+        broadcast_presence(&ctx, &node).await;
+    });
 }
 
 /// Build the T8 retry-time peer-address refresher for a personal-sync sender
@@ -796,7 +988,17 @@ pub async fn autostart_if_enabled(
     start_node_relay_refresh(Arc::clone(&ctx_arc), &node);
     // Wake event → kick pending packages (T6): relay reconnect / relay-map change
     // fans a fire-and-forget kick_all over the personal + collab sender maps.
-    install_node_wake_hook(&node, Arc::clone(&sync_sender), Arc::clone(&collab_sender));
+    install_node_wake_hook(&ctx_arc, &node, Arc::clone(&sync_sender), Arc::clone(&collab_sender));
+    // Peer reachability (D1): install the inbound-beacon hook and fire our own
+    // first beacon — edge 1 of 2, "we just came online".
+    install_presence_wiring(
+        &ctx_arc,
+        &node,
+        &sync,
+        &sync_sender,
+        &collab_sender,
+        Some(Arc::clone(&emitter)),
+    );
     // Periodic authorized-peers refresh (task 7): install the hourly hub re-pull
     // so a machine added to the account later is admitted without a restart
     // (idempotent — once per process across all three startup sites).
@@ -1099,7 +1301,17 @@ pub async fn get_pairing_ticket(
     start_node_relay_refresh(Arc::clone(&ctx_arc), &node);
     // Wake event → kick pending packages (T6): relay reconnect / relay-map change
     // fans a fire-and-forget kick_all over the personal + collab sender maps.
-    install_node_wake_hook(&node, Arc::clone(&sync_sender), Arc::clone(&collab_sender));
+    install_node_wake_hook(&ctx_arc, &node, Arc::clone(&sync_sender), Arc::clone(&collab_sender));
+    // Peer reachability (D1): install the inbound-beacon hook and fire our own
+    // first beacon — edge 1 of 2, "we just came online".
+    install_presence_wiring(
+        &ctx_arc,
+        &node,
+        &sync,
+        &sync_sender,
+        &collab_sender,
+        Some(Arc::clone(&emitter)),
+    );
     // Periodic authorized-peers refresh (task 7): install the hourly hub re-pull
     // here too (idempotent — no-ops if autostart already installed it).
     ensure_peers_refresh_task(&ctx_arc, &sync).await;
@@ -2023,7 +2235,15 @@ pub async fn ensure_sender_engine(
     // Wake event → kick pending packages (T6): install here too so a sender-first
     // bind (send before the receiver autostarted) still wakes both sender maps on
     // a relay reconnect / relay-map change.
-    install_node_wake_hook(&node, Arc::clone(sender), Arc::clone(&collab_sender));
+    install_node_wake_hook(ctx, &node, Arc::clone(sender), Arc::clone(&collab_sender));
+    // Peer reachability (D1) is deliberately NOT installed here. This path holds
+    // `sync` as a borrow, and the hook needs a `'static` handle — but more to the
+    // point it would be dead wiring: a process that reached a sender-first bind
+    // without `autostart_if_enabled` having run is one that is not signed in
+    // (that is the autostart gate), and an unsigned device has no cached
+    // authorized-peer set, so `handle_peer_presence`'s first gate would refuse
+    // every beacon anyway. The two sites that DO have the account are the two that
+    // install it.
     // Periodic authorized-peers refresh (task 7): install here too so a
     // sender-first process still runs the hourly hub re-pull (idempotent — no-ops
     // if a receiver-start site already installed it, which it always has for a
@@ -3811,6 +4031,78 @@ mod tests {
     /// A minimal real-`Database` [`ServiceContext`] (tempdir SQLite, no keychain
     /// involved anywhere) for exercising the settings-backed sync caches
     /// directly. Mirrors the construction pattern in `api::masters` tests.
+    /// D1 §3.2 gate 1: a presence beacon must never make us ALLOCATE for a peer
+    /// outside the account. This is a remote message, so the gate is checked from
+    /// local state only — no hub round-trip, nothing to stall on.
+    #[tokio::test]
+    async fn presence_from_an_unauthorized_peer_builds_no_engine() {
+        let (_tmp, ctx) = test_ctx();
+        let ctx = Arc::new(ctx);
+        {
+            let conn = db(&ctx).unwrap().conn();
+            // One authorized device — and the beacon below is NOT it.
+            crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &"aa".repeat(32)).unwrap();
+        }
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let sync = Arc::new(SyncRuntime::default());
+        let stranger: NodeId = [0x77; 32];
+
+        handle_peer_presence(&ctx, &sender, &sender, &sync, None, stranger).await;
+
+        assert!(
+            sender.started_peers().await.is_empty(),
+            "a stranger's beacon must not build an engine"
+        );
+        // The observable that proves the GATE stopped it, rather than the engine
+        // build merely failing for want of a bound transport: the debounce is
+        // stamped only after both gates pass, so an untouched stamp means the
+        // handler returned before ever getting there.
+        assert!(
+            presence_debounce_admits(stranger),
+            "a refused beacon must not have reached the debounce stamp"
+        );
+    }
+
+    /// D1 §3.2 gate 2: an authorized peer with nothing pending is a no-op too —
+    /// presence is a RESUME signal, not an engine-construction trigger.
+    #[tokio::test]
+    async fn presence_with_no_pending_rows_builds_no_engine() {
+        let (_tmp, ctx) = test_ctx();
+        let ctx = Arc::new(ctx);
+        let peer: NodeId = [0xbb; 32];
+        {
+            let conn = db(&ctx).unwrap().conn();
+            crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &node_id_hex(&peer)).unwrap();
+        }
+        let sender = Arc::new(SyncSenderRuntime::new());
+        let sync = Arc::new(SyncRuntime::default());
+
+        handle_peer_presence(&ctx, &sender, &sender, &sync, None, peer).await;
+
+        assert!(
+            sender.started_peers().await.is_empty(),
+            "an authorized peer with no non-terminal rows has nothing to resume"
+        );
+        assert!(
+            presence_debounce_admits(peer),
+            "the pending-rows gate must stop the beacon before the debounce stamp"
+        );
+    }
+
+    /// The debounce is per peer and bounded: a flapping relay on the peer's side
+    /// must not turn one restart into a burst of resumes.
+    #[test]
+    fn presence_debounce_admits_once_per_window_per_peer() {
+        let a: NodeId = [0x01; 32];
+        let b: NodeId = [0x02; 32];
+        assert!(presence_debounce_admits(a), "first beacon from a peer is admitted");
+        assert!(!presence_debounce_admits(a), "a second beacon inside the window is not");
+        assert!(
+            presence_debounce_admits(b),
+            "the window is per peer — another device is unaffected"
+        );
+    }
+
     fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
         use crate::cache::MemoryImageCache;
         use crate::services::compute_queue::ComputeQueue;
