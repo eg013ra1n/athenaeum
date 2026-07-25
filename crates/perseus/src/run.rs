@@ -2780,7 +2780,12 @@ mod multi_target_tests {
     }
 
     async fn wait_until<F: FnMut() -> bool>(mut pred: F) {
-        for _ in 0..500 {
+        // 20s, not 5s: under a full --workspace run this binary's 220 tests share
+        // the cores with paced loopback fixtures, and the fan-out test (2 engines
+        // + 2 receivers on 2 workers, flake history: audit TEST-9) occasionally
+        // needed more than 5s of wall clock. A green run is unaffected — the poll
+        // returns the moment the condition holds; only a genuine failure waits.
+        for _ in 0..2000 {
             if pred() {
                 return;
             }
