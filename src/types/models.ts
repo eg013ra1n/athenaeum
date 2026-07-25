@@ -592,7 +592,7 @@ export type Direction = "sent" | "received";
 
 export type OutboundState = "queued" | "announced" | "transferring" | "delivered" | "confirmed" | "failed" | "cancelled";
 
-export type InboundState = "announced" | "fetching" | "ingesting" | "done" | "failed" | "cancelled";
+export type InboundState = "announced" | "fetching" | "ingesting" | "waiting" | "done" | "failed" | "cancelled";
 
 export type HistoryRow = { frameUuid: string, filename: string, object: string | null, 
 /**

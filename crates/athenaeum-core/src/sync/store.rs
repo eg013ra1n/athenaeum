@@ -83,8 +83,11 @@ pub fn ensure_outbound_columns(conn: &Connection) -> Result<()> {
         ("generation", "INTEGER NOT NULL DEFAULT 1"),
     ] {
         if !existing.contains(col) {
-            conn.execute(&format!("ALTER TABLE sync_outbound ADD COLUMN {col} {ty}"), [])
-                .with_context(|| format!("add sync_outbound.{col} column"))?;
+            conn.execute(
+                &format!("ALTER TABLE sync_outbound ADD COLUMN {col} {ty}"),
+                [],
+            )
+            .with_context(|| format!("add sync_outbound.{col} column"))?;
         }
     }
     Ok(())
@@ -133,10 +136,17 @@ pub fn ensure_history_columns(conn: &Connection) -> Result<()> {
         .context("query table_info(sync_history)")?
         .filter_map(|c| c.ok())
         .collect();
-    for (col, ty) in [("project", "TEXT"), ("package_id", "TEXT"), ("batch_name", "TEXT")] {
+    for (col, ty) in [
+        ("project", "TEXT"),
+        ("package_id", "TEXT"),
+        ("batch_name", "TEXT"),
+    ] {
         if !existing.contains(col) {
-            conn.execute(&format!("ALTER TABLE sync_history ADD COLUMN {col} {ty}"), [])
-                .with_context(|| format!("add sync_history.{col} column"))?;
+            conn.execute(
+                &format!("ALTER TABLE sync_history ADD COLUMN {col} {ty}"),
+                [],
+            )
+            .with_context(|| format!("add sync_history.{col} column"))?;
         }
     }
     Ok(())
@@ -270,8 +280,11 @@ fn ensure_inbound_columns_inner(conn: &Connection, existing: &HashSet<String>) -
         ("peer_capability", "TEXT"),
     ] {
         if !existing.contains(col) {
-            conn.execute(&format!("ALTER TABLE sync_inbound ADD COLUMN {col} {ty}"), [])
-                .with_context(|| format!("add sync_inbound.{col} column"))?;
+            conn.execute(
+                &format!("ALTER TABLE sync_inbound ADD COLUMN {col} {ty}"),
+                [],
+            )
+            .with_context(|| format!("add sync_inbound.{col} column"))?;
         }
     }
     // One-shot backfill, only when `declined_at` was just created (spec §D1): on a
@@ -405,7 +418,11 @@ pub fn wipe_transfer_bookkeeping_on_upgrade(conn: &Connection) -> Result<()> {
         let deleted = tx
             .execute(&format!("DELETE FROM {table}"), [])
             .with_context(|| format!("wipe {table}"))?;
-        tracing::info!(table, count = deleted, "batch-model upgrade: wiped transfer table");
+        tracing::info!(
+            table,
+            count = deleted,
+            "batch-model upgrade: wiped transfer table"
+        );
     }
     tx.commit().context("commit transfer-bookkeeping wipe")?;
     Ok(())
@@ -771,25 +788,60 @@ const HISTORY_COLS: &str =
 /// new trailing column is threaded through exactly once (`display_name` was).
 fn outbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<OutboundRaw> {
     Ok((
-        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
-        r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?,
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+        r.get(10)?,
+        r.get(11)?,
+        r.get(12)?,
     ))
 }
 
 /// Decode one `HistoryRaw` tuple from a query row (the single `HISTORY_COLS` read point).
 fn history_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<HistoryRaw> {
     Ok((
-        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
-        r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+        r.get(10)?,
+        r.get(11)?,
     ))
 }
 
 /// Decode one `InboundRaw` tuple from a query row (the single `INBOUND_COLS` read point).
 fn inbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<InboundRaw> {
     Ok((
-        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
-        r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?, r.get(13)?, r.get(14)?,
-        r.get(15)?, r.get(16)?,
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+        r.get(10)?,
+        r.get(11)?,
+        r.get(12)?,
+        r.get(13)?,
+        r.get(14)?,
+        r.get(15)?,
+        r.get(16)?,
     ))
 }
 
@@ -1071,7 +1123,10 @@ pub fn insert_sync_source(
 /// Every *live* (`deleted_at IS NULL`) source linkage for `package_ref`, ordered
 /// by path for a deterministic pass. Retention resolves a confirmed package to
 /// exactly the source files it may reclaim through this call.
-pub fn live_sources_for_package(conn: &Connection, package_ref: &str) -> Result<Vec<SyncSourceRow>> {
+pub fn live_sources_for_package(
+    conn: &Connection,
+    package_ref: &str,
+) -> Result<Vec<SyncSourceRow>> {
     let mut stmt = conn
         .prepare(
             "SELECT package_ref, file_id, path, size, mtime FROM sync_sources
@@ -1149,7 +1204,9 @@ pub fn receipt_outcome_from_db(s: &str) -> ReceiptOutcome {
         // via the `rejected:` catch-all below (which would strand it as a pending
         // rejection). Kept ABOVE the catch-all so `cancelled` never falls through.
         "cancelled" => ReceiptOutcome::Cancelled,
-        other => ReceiptOutcome::Rejected(other.strip_prefix("rejected:").unwrap_or(other).to_string()),
+        other => {
+            ReceiptOutcome::Rejected(other.strip_prefix("rejected:").unwrap_or(other).to_string())
+        }
     }
 }
 
@@ -1167,7 +1224,13 @@ pub fn insert_receipt(
          VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(package_id, frame_uuid) DO UPDATE SET
              xxh3 = excluded.xxh3, outcome = excluded.outcome, received_at = excluded.received_at",
-        params![package_id, r.frame_uuid, r.xxh3, receipt_outcome_to_db(&r.outcome), received_at],
+        params![
+            package_id,
+            r.frame_uuid,
+            r.xxh3,
+            receipt_outcome_to_db(&r.outcome),
+            received_at
+        ],
     )
     .context("insert sync_receipts")?;
     Ok(())
@@ -1579,7 +1642,11 @@ pub fn upsert_inbound_attempt(
 /// Persist (or clear with `None`) the human batch name on an outbound row
 /// (Transfers Status Model v2 §D1). The send path (T3) writes the auto-derived
 /// name here after enqueue; keyed by row `id`.
-pub fn set_outbound_display_name(conn: &Connection, id: i64, display_name: Option<&str>) -> Result<()> {
+pub fn set_outbound_display_name(
+    conn: &Connection,
+    id: i64,
+    display_name: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "UPDATE sync_outbound SET display_name = ?1 WHERE id = ?2",
         params![display_name, id],
@@ -1643,7 +1710,11 @@ pub fn mark_inbound_declined_with_anchor(
 /// Persist (or clear with `None`) the human batch name on an inbound row
 /// (Transfers Status Model v2 §D1). The receiver (T5) writes the v2 announce's
 /// `batch_name` here; keyed by row `id`.
-pub fn set_inbound_display_name(conn: &Connection, id: i64, display_name: Option<&str>) -> Result<()> {
+pub fn set_inbound_display_name(
+    conn: &Connection,
+    id: i64,
+    display_name: Option<&str>,
+) -> Result<()> {
     conn.execute(
         "UPDATE sync_inbound SET display_name = ?1 WHERE id = ?2",
         params![display_name, id],
@@ -1674,10 +1745,19 @@ pub fn set_inbound_peer_capability(conn: &Connection, id: i64, cap: &str) -> Res
 /// honoured) — the whole swap is one transaction so a reader never sees a partial
 /// set. Called once at package-build time; a resend that rebuilds the manifest
 /// re-runs it. Idempotent by the swap.
-pub fn replace_outbound_files(conn: &Connection, outbound_id: i64, files: &[OutboundFileRow]) -> Result<()> {
-    let tx = conn.unchecked_transaction().context("begin replace_outbound_files")?;
-    tx.execute("DELETE FROM sync_outbound_files WHERE outbound_id = ?1", params![outbound_id])
-        .context("clear sync_outbound_files")?;
+pub fn replace_outbound_files(
+    conn: &Connection,
+    outbound_id: i64,
+    files: &[OutboundFileRow],
+) -> Result<()> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin replace_outbound_files")?;
+    tx.execute(
+        "DELETE FROM sync_outbound_files WHERE outbound_id = ?1",
+        params![outbound_id],
+    )
+    .context("clear sync_outbound_files")?;
     {
         let mut stmt = tx
             .prepare(
@@ -1708,10 +1788,19 @@ pub fn replace_outbound_files(conn: &Connection, outbound_id: i64, files: &[Outb
 /// Replace the entire per-file row set for an inbound batch (Transfers Status
 /// Model v2 §D4). The receive-side twin of [`replace_outbound_files`]; called
 /// once at announce time from the v2 manifest.
-pub fn replace_inbound_files(conn: &Connection, inbound_id: i64, files: &[InboundFileRow]) -> Result<()> {
-    let tx = conn.unchecked_transaction().context("begin replace_inbound_files")?;
-    tx.execute("DELETE FROM sync_inbound_files WHERE inbound_id = ?1", params![inbound_id])
-        .context("clear sync_inbound_files")?;
+pub fn replace_inbound_files(
+    conn: &Connection,
+    inbound_id: i64,
+    files: &[InboundFileRow],
+) -> Result<()> {
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin replace_inbound_files")?;
+    tx.execute(
+        "DELETE FROM sync_inbound_files WHERE inbound_id = ?1",
+        params![inbound_id],
+    )
+    .context("clear sync_inbound_files")?;
     {
         let mut stmt = tx
             .prepare(
@@ -1758,14 +1847,27 @@ pub fn set_outbound_file_state(
             "UPDATE sync_outbound_files
              SET state = ?1, bytes_done = ?2, outcome = ?3, error = ?4, updated_at = ?5
              WHERE outbound_id = ?6 AND rel_path = ?7",
-            params![state.as_str(), bytes_done as i64, outcome, error, now_iso(), outbound_id, rel_path],
+            params![
+                state.as_str(),
+                bytes_done as i64,
+                outcome,
+                error,
+                now_iso(),
+                outbound_id,
+                rel_path
+            ],
         )
         .with_context(|| format!("set outbound file state for {outbound_id}/{rel_path}"))?;
     if changed == 0 {
         // An unknown rel_path (e.g. a served `manifest.ndjson`, or a Perseus batch
         // enqueued with no per-file rows). Not an error — the setter is a no-op
         // upsert-in-place; log at debug so a genuinely missing row is discoverable.
-        tracing::debug!(outbound_id, rel_path, state = state.as_str(), "set_outbound_file_state matched 0 rows");
+        tracing::debug!(
+            outbound_id,
+            rel_path,
+            state = state.as_str(),
+            "set_outbound_file_state matched 0 rows"
+        );
     }
     Ok(())
 }
@@ -1787,14 +1889,27 @@ pub fn set_inbound_file_state(
             "UPDATE sync_inbound_files
              SET state = ?1, bytes_done = ?2, outcome = ?3, error = ?4, updated_at = ?5
              WHERE inbound_id = ?6 AND rel_path = ?7",
-            params![state.as_str(), bytes_done as i64, outcome, error, now_iso(), inbound_id, rel_path],
+            params![
+                state.as_str(),
+                bytes_done as i64,
+                outcome,
+                error,
+                now_iso(),
+                inbound_id,
+                rel_path
+            ],
         )
         .with_context(|| format!("set inbound file state for {inbound_id}/{rel_path}"))?;
     if changed == 0 {
         // Same discoverability guard as the outbound twin: a v1/manifest-less batch
         // has no rows, so the no-op is legitimate — but a missing row on a v2 batch
         // must be findable in the logs, never silent.
-        tracing::debug!(inbound_id, rel_path, state = state.as_str(), "set_inbound_file_state matched 0 rows");
+        tracing::debug!(
+            inbound_id,
+            rel_path,
+            state = state.as_str(),
+            "set_inbound_file_state matched 0 rows"
+        );
     }
     Ok(())
 }
@@ -1873,13 +1988,30 @@ type FileRaw = (
 
 fn file_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<FileRaw> {
     Ok((
-        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
         r.get(8)?,
     ))
 }
 
 fn to_outbound_file(raw: FileRaw) -> Result<OutboundFileRow> {
-    let (outbound_id, rel_path, byte_size, frame_uuid, state, bytes_done, outcome, error, updated_at) = raw;
+    let (
+        outbound_id,
+        rel_path,
+        byte_size,
+        frame_uuid,
+        state,
+        bytes_done,
+        outcome,
+        error,
+        updated_at,
+    ) = raw;
     Ok(OutboundFileRow {
         outbound_id,
         rel_path,
@@ -1894,7 +2026,17 @@ fn to_outbound_file(raw: FileRaw) -> Result<OutboundFileRow> {
 }
 
 fn to_inbound_file(raw: FileRaw) -> Result<InboundFileRow> {
-    let (inbound_id, rel_path, byte_size, frame_uuid, state, bytes_done, outcome, error, updated_at) = raw;
+    let (
+        inbound_id,
+        rel_path,
+        byte_size,
+        frame_uuid,
+        state,
+        bytes_done,
+        outcome,
+        error,
+        updated_at,
+    ) = raw;
     Ok(InboundFileRow {
         inbound_id,
         rel_path,
@@ -1984,7 +2126,10 @@ fn grouped_file_counts(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let placeholders = (1..=ids.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",");
+    let placeholders = (1..=ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
         "SELECT {id_col}, \
                 COUNT(*), \
@@ -2027,8 +2172,11 @@ fn grouped_file_counts(
 /// delete path exists in the store today (retention deletes source files, never
 /// the outbound rows), so this is currently unwired but ready.
 pub fn delete_outbound_files(conn: &Connection, outbound_id: i64) -> Result<()> {
-    conn.execute("DELETE FROM sync_outbound_files WHERE outbound_id = ?1", params![outbound_id])
-        .with_context(|| format!("delete sync_outbound_files for {outbound_id}"))?;
+    conn.execute(
+        "DELETE FROM sync_outbound_files WHERE outbound_id = ?1",
+        params![outbound_id],
+    )
+    .with_context(|| format!("delete sync_outbound_files for {outbound_id}"))?;
     Ok(())
 }
 
@@ -2037,8 +2185,11 @@ pub fn delete_outbound_files(conn: &Connection, outbound_id: i64) -> Result<()> 
 /// [`delete_sync_events`] for the `Received` journal when an inbound-row delete
 /// path is added.
 pub fn delete_inbound_files(conn: &Connection, inbound_id: i64) -> Result<()> {
-    conn.execute("DELETE FROM sync_inbound_files WHERE inbound_id = ?1", params![inbound_id])
-        .with_context(|| format!("delete sync_inbound_files for {inbound_id}"))?;
+    conn.execute(
+        "DELETE FROM sync_inbound_files WHERE inbound_id = ?1",
+        params![inbound_id],
+    )
+    .with_context(|| format!("delete sync_inbound_files for {inbound_id}"))?;
     Ok(())
 }
 
@@ -2058,7 +2209,9 @@ pub fn append_sync_event(
     detail: Option<&str>,
 ) -> Result<()> {
     let dir = direction.as_str();
-    let tx = conn.unchecked_transaction().context("begin append_sync_event")?;
+    let tx = conn
+        .unchecked_transaction()
+        .context("begin append_sync_event")?;
     tx.execute(
         "INSERT INTO sync_events (direction, batch_key, ts, kind, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![dir, batch_key, now_iso(), kind, detail],
@@ -2082,7 +2235,11 @@ pub fn append_sync_event(
 
 /// Every event in a batch's journal, newest-first (Transfers Status Model v2 §D7 —
 /// the detail pane's **Log** tab). Scoped to one `(direction, batch_key)` pair.
-pub fn list_sync_events(conn: &Connection, direction: Direction, batch_key: &str) -> Result<Vec<SyncEventRow>> {
+pub fn list_sync_events(
+    conn: &Connection,
+    direction: Direction,
+    batch_key: &str,
+) -> Result<Vec<SyncEventRow>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, direction, ts, kind, detail FROM sync_events
@@ -2163,9 +2320,13 @@ pub fn outbound_ref_states(conn: &Connection) -> Result<Vec<(i64, String, String
 ///
 /// [`delete_transfer_history`]: crate::api::sync::delete_transfer_history
 pub fn outbound_peer_hex(conn: &Connection, id: i64) -> Result<Option<String>> {
-    conn.query_row("SELECT peer FROM sync_outbound WHERE id = ?1", params![id], |r| r.get(0))
-        .optional()
-        .with_context(|| format!("read peer hex for outbound {id}"))
+    conn.query_row(
+        "SELECT peer FROM sync_outbound WHERE id = ?1",
+        params![id],
+        |r| r.get(0),
+    )
+    .optional()
+    .with_context(|| format!("read peer hex for outbound {id}"))
 }
 
 /// Force one `sync_outbound` row to terminal `cancelled` on an arbitrary
@@ -2199,7 +2360,12 @@ pub fn settle_unsettled_outbound_files(
         "UPDATE sync_outbound_files
          SET state = ?1, outcome = ?2, error = NULL, updated_at = ?3
          WHERE outbound_id = ?4 AND state <> 'done'",
-        params![OutboundFileState::Done.as_str(), outcome, now_iso(), outbound_id],
+        params![
+            OutboundFileState::Done.as_str(),
+            outcome,
+            now_iso(),
+            outbound_id
+        ],
     )
     .with_context(|| format!("settle unsettled outbound files for {outbound_id}"))?;
     Ok(())
@@ -2285,7 +2451,12 @@ pub fn delete_history_for_package(
             "DELETE FROM sync_history WHERE direction = ?1 AND package_id = ?2",
             params![direction.as_str(), package_id],
         )
-        .with_context(|| format!("delete sync_history for {}/{package_id}", direction.as_str()))?;
+        .with_context(|| {
+            format!(
+                "delete sync_history for {}/{package_id}",
+                direction.as_str()
+            )
+        })?;
     Ok(n as u32)
 }
 
@@ -2363,8 +2534,8 @@ impl StandaloneSyncStore {
     /// pragmas, and create the tables/indexes idempotently.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let conn = Connection::open(path)
-            .with_context(|| format!("open sync db {}", path.display()))?;
+        let conn =
+            Connection::open(path).with_context(|| format!("open sync db {}", path.display()))?;
         conn.execute_batch(
             "PRAGMA busy_timeout = 5000;
              PRAGMA journal_mode = WAL;
@@ -2383,13 +2554,18 @@ impl StandaloneSyncStore {
         conn.execute(DDL_OUTBOUND, [])
             .context("create sync_outbound")?;
         ensure_outbound_columns(&conn)?;
-        conn.execute(DDL_HISTORY, []).context("create sync_history")?;
+        conn.execute(DDL_HISTORY, [])
+            .context("create sync_history")?;
         ensure_history_columns(&conn)?;
-        conn.execute(DDL_INBOUND, []).context("create sync_inbound")?;
+        conn.execute(DDL_INBOUND, [])
+            .context("create sync_inbound")?;
         ensure_inbound_columns(&conn)?;
-        conn.execute(DDL_OUTBOUND_FILES, []).context("create sync_outbound_files")?;
-        conn.execute(DDL_INBOUND_FILES, []).context("create sync_inbound_files")?;
-        conn.execute(DDL_SYNC_EVENTS, []).context("create sync_events")?;
+        conn.execute(DDL_OUTBOUND_FILES, [])
+            .context("create sync_outbound_files")?;
+        conn.execute(DDL_INBOUND_FILES, [])
+            .context("create sync_inbound_files")?;
+        conn.execute(DDL_SYNC_EVENTS, [])
+            .context("create sync_events")?;
         for idx in DDL_INDEXES {
             conn.execute(idx, []).context("create sync index")?;
         }
@@ -2421,7 +2597,11 @@ impl StandaloneSyncStore {
     /// the Perseus resend path uses it — a partial payload rebuild rewrites the
     /// manifest to the restored subset, and the per-file rows must follow it or
     /// the next announce would offer files no longer on disk.
-    pub fn replace_outbound_files(&self, outbound_id: i64, files: &[OutboundFileRow]) -> Result<()> {
+    pub fn replace_outbound_files(
+        &self,
+        outbound_id: i64,
+        files: &[OutboundFileRow],
+    ) -> Result<()> {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
         replace_outbound_files(&conn, outbound_id, files)
     }
@@ -2491,7 +2671,15 @@ impl SyncStore for StandaloneSyncStore {
         error: Option<&str>,
     ) -> Result<()> {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
-        set_outbound_file_state(&conn, outbound_id, rel_path, state, bytes_done, outcome, error)
+        set_outbound_file_state(
+            &conn,
+            outbound_id,
+            rel_path,
+            state,
+            bytes_done,
+            outcome,
+            error,
+        )
     }
 
     fn append_sync_event(
@@ -2617,7 +2805,11 @@ impl SyncStore for StandaloneSyncStore {
             .with_context(|| format!("confirm outbound {id}"))?;
         let write_ms = write_started.elapsed().as_millis();
         if write_ms > crate::sync::SLOW_STORE_WRITE_MS {
-            tracing::warn!(op = "confirm", duration_ms = write_ms as u64, "sync store write slow");
+            tracing::warn!(
+                op = "confirm",
+                duration_ms = write_ms as u64,
+                "sync store write slow"
+            );
         }
         tracing::debug!(
             package_id = id,
@@ -2690,17 +2882,25 @@ impl CatalogSyncStore {
         // the pooled connection; this is defense-in-depth for this store's own
         // second connection.)
         wipe_transfer_bookkeeping_on_upgrade(&conn)?;
-        conn.execute(DDL_OUTBOUND, []).context("create sync_outbound")?;
+        conn.execute(DDL_OUTBOUND, [])
+            .context("create sync_outbound")?;
         ensure_outbound_columns(&conn)?;
-        conn.execute(DDL_HISTORY, []).context("create sync_history")?;
+        conn.execute(DDL_HISTORY, [])
+            .context("create sync_history")?;
         ensure_history_columns(&conn)?;
-        conn.execute(DDL_RECEIPTS, []).context("create sync_receipts")?;
-        conn.execute(DDL_SYNC_SOURCES, []).context("create sync_sources")?;
-        conn.execute(DDL_INBOUND, []).context("create sync_inbound")?;
+        conn.execute(DDL_RECEIPTS, [])
+            .context("create sync_receipts")?;
+        conn.execute(DDL_SYNC_SOURCES, [])
+            .context("create sync_sources")?;
+        conn.execute(DDL_INBOUND, [])
+            .context("create sync_inbound")?;
         ensure_inbound_columns(&conn)?;
-        conn.execute(DDL_OUTBOUND_FILES, []).context("create sync_outbound_files")?;
-        conn.execute(DDL_INBOUND_FILES, []).context("create sync_inbound_files")?;
-        conn.execute(DDL_SYNC_EVENTS, []).context("create sync_events")?;
+        conn.execute(DDL_OUTBOUND_FILES, [])
+            .context("create sync_outbound_files")?;
+        conn.execute(DDL_INBOUND_FILES, [])
+            .context("create sync_inbound_files")?;
+        conn.execute(DDL_SYNC_EVENTS, [])
+            .context("create sync_events")?;
         for idx in DDL_INDEXES {
             conn.execute(idx, []).context("create sync index")?;
         }
@@ -2792,7 +2992,15 @@ impl SyncStore for CatalogSyncStore {
         error: Option<&str>,
     ) -> Result<()> {
         let conn = self.lock_conn();
-        set_outbound_file_state(&conn, outbound_id, rel_path, state, bytes_done, outcome, error)
+        set_outbound_file_state(
+            &conn,
+            outbound_id,
+            rel_path,
+            state,
+            bytes_done,
+            outcome,
+            error,
+        )
     }
 
     fn append_sync_event(
@@ -2915,9 +3123,18 @@ impl SyncStore for CatalogSyncStore {
             .with_context(|| format!("confirm outbound {id}"))?;
         let write_ms = write_started.elapsed().as_millis();
         if write_ms > crate::sync::SLOW_STORE_WRITE_MS {
-            tracing::warn!(op = "confirm", duration_ms = write_ms as u64, "sync store write slow");
+            tracing::warn!(
+                op = "confirm",
+                duration_ms = write_ms as u64,
+                "sync store write slow"
+            );
         }
-        tracing::debug!(package_id = id, receipts = receipts.len(), changed, "catalog sync store confirm");
+        tracing::debug!(
+            package_id = id,
+            receipts = receipts.len(),
+            changed,
+            "catalog sync store confirm"
+        );
         Ok(())
     }
 
@@ -2959,7 +3176,9 @@ mod tests {
         let queued = store.enqueue("pkg-queued", PEER, None, &[]).unwrap();
         let transferring = store.enqueue("pkg-transferring", PEER, None, &[]).unwrap();
         let confirmed = store.enqueue("pkg-confirmed", PEER, None, &[]).unwrap();
-        store.set_state(transferring, OutboundState::Transferring).unwrap();
+        store
+            .set_state(transferring, OutboundState::Transferring)
+            .unwrap();
         store.confirm(confirmed, &[]).unwrap();
 
         let rows = store.all_outbound(100).unwrap();
@@ -3039,7 +3258,11 @@ mod tests {
         assert_eq!(row.byte_size, 1000);
         assert_eq!(row.bytes_done, 0);
         assert!(row.finished_at.is_none());
-        assert_eq!(inbound_active(&conn).unwrap().len(), 1, "announced is active");
+        assert_eq!(
+            inbound_active(&conn).unwrap().len(),
+            1,
+            "announced is active"
+        );
 
         // Fetching + a live byte update.
         set_inbound_state(&conn, pkg, InboundState::Fetching, None).unwrap();
@@ -3048,24 +3271,45 @@ mod tests {
         assert_eq!(row.state, InboundState::Fetching);
         assert_eq!(row.bytes_done, 100);
         assert!(row.finished_at.is_none());
-        assert_eq!(inbound_active(&conn).unwrap().len(), 1, "fetching is still active");
+        assert_eq!(
+            inbound_active(&conn).unwrap().len(),
+            1,
+            "fetching is still active"
+        );
 
         // Done → finished_at stamped, gone from the active set.
         set_inbound_state(&conn, pkg, InboundState::Done, None).unwrap();
         let row = get_inbound(&conn, pkg).unwrap().unwrap();
         assert_eq!(row.state, InboundState::Done);
-        assert!(row.finished_at.is_some(), "a terminal state stamps finished_at");
-        assert!(inbound_active(&conn).unwrap().is_empty(), "done is not active");
+        assert!(
+            row.finished_at.is_some(),
+            "a terminal state stamps finished_at"
+        );
+        assert!(
+            inbound_active(&conn).unwrap().is_empty(),
+            "done is not active"
+        );
 
         // Cancel, then re-announce: the cancelled row is untouched (final).
         set_inbound_state(&conn, pkg, InboundState::Cancelled, Some("declined")).unwrap();
         let id2 = upsert_inbound_announced(&conn, peer, pkg, 9, 2000).unwrap();
         assert_eq!(id2, id, "re-announce hits the same row");
         let row = get_inbound(&conn, pkg).unwrap().unwrap();
-        assert_eq!(row.state, InboundState::Cancelled, "a cancelled row never resets to announced");
-        assert_eq!(row.frame_count, 5, "a cancelled row is a full no-op — counts not refreshed");
+        assert_eq!(
+            row.state,
+            InboundState::Cancelled,
+            "a cancelled row never resets to announced"
+        );
+        assert_eq!(
+            row.frame_count, 5,
+            "a cancelled row is a full no-op — counts not refreshed"
+        );
         assert_eq!(row.byte_size, 1000);
-        assert_eq!(row.last_error.as_deref(), Some("declined"), "cancel reason preserved");
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("declined"),
+            "cancel reason preserved"
+        );
     }
 
     /// Perseus UI v2 (Task 9): a fresh inbound row has a NULL `peer_capability`;
@@ -3080,16 +3324,27 @@ mod tests {
 
         let id = upsert_inbound_announced(&conn, &peer, pkg, 2, 200).unwrap();
         let row = get_inbound(&conn, pkg).unwrap().unwrap();
-        assert_eq!(row.peer_capability, None, "a fresh row has no capability stamp");
+        assert_eq!(
+            row.peer_capability, None,
+            "a fresh row has no capability stamp"
+        );
 
         set_inbound_peer_capability(&conn, id, "perseus").unwrap();
         let row = get_inbound(&conn, pkg).unwrap().unwrap();
-        assert_eq!(row.peer_capability.as_deref(), Some("perseus"), "capability persisted");
+        assert_eq!(
+            row.peer_capability.as_deref(),
+            Some("perseus"),
+            "capability persisted"
+        );
 
         // Re-stamp overwrites in place (an attempt from a since-reclassified device).
         set_inbound_peer_capability(&conn, id, "athenaeum").unwrap();
         assert_eq!(
-            get_inbound(&conn, pkg).unwrap().unwrap().peer_capability.as_deref(),
+            get_inbound(&conn, pkg)
+                .unwrap()
+                .unwrap()
+                .peer_capability
+                .as_deref(),
             Some("athenaeum"),
         );
     }
@@ -3103,11 +3358,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = StandaloneSyncStore::open(tmp.path().join("s.db")).unwrap();
         let id = store.enqueue("/tmp/pkg", [7u8; 32], None, &[]).unwrap();
-        store.set_next_retry_at(id, Some("2026-07-15T12:00:00Z")).unwrap();
+        store
+            .set_next_retry_at(id, Some("2026-07-15T12:00:00Z"))
+            .unwrap();
         let row = store.non_terminal().unwrap().pop().unwrap();
         assert_eq!(row.next_retry_at.as_deref(), Some("2026-07-15T12:00:00Z"));
         store.set_next_retry_at(id, None).unwrap();
-        assert!(store.non_terminal().unwrap().pop().unwrap().next_retry_at.is_none());
+        assert!(store
+            .non_terminal()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .next_retry_at
+            .is_none());
     }
 
     /// `last_error` round-trips (Task 9): a fresh row carries `None`; a failed
@@ -3126,9 +3389,16 @@ mod tests {
         );
 
         // Written on a failed attempt.
-        store.set_last_error(id, Some("serve package: peer not started")).unwrap();
+        store
+            .set_last_error(id, Some("serve package: peer not started"))
+            .unwrap();
         assert_eq!(
-            store.get_outbound(id).unwrap().unwrap().last_error.as_deref(),
+            store
+                .get_outbound(id)
+                .unwrap()
+                .unwrap()
+                .last_error
+                .as_deref(),
             Some("serve package: peer not started"),
         );
 
@@ -3138,9 +3408,16 @@ mod tests {
 
         // Re-write, then confirm clears it in the same UPDATE — a confirmed row
         // never carries a stale error.
-        store.set_last_error(id, Some("no ack from peer within timeout")).unwrap();
+        store
+            .set_last_error(id, Some("no ack from peer within timeout"))
+            .unwrap();
         assert_eq!(
-            store.get_outbound(id).unwrap().unwrap().last_error.as_deref(),
+            store
+                .get_outbound(id)
+                .unwrap()
+                .unwrap()
+                .last_error
+                .as_deref(),
             Some("no ack from peer within timeout"),
         );
         store.confirm(id, &[]).unwrap();
@@ -3198,12 +3475,20 @@ mod tests {
         let store = StandaloneSyncStore::open(&db_path).unwrap();
         let rows = store.all_outbound(10).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].last_error, None, "legacy row's last_error migrated to NULL");
+        assert_eq!(
+            rows[0].last_error, None,
+            "legacy row's last_error migrated to NULL"
+        );
 
         // The new column accepts a write + reads it back.
         store.set_last_error(rows[0].id, Some("boom")).unwrap();
         assert_eq!(
-            store.get_outbound(rows[0].id).unwrap().unwrap().last_error.as_deref(),
+            store
+                .get_outbound(rows[0].id)
+                .unwrap()
+                .unwrap()
+                .last_error
+                .as_deref(),
             Some("boom"),
         );
     }
@@ -3255,10 +3540,17 @@ mod tests {
 
         // … a legacy row now reads back with project = NULL …
         let legacy = store
-            .search_history(HistoryQuery { filename: Some("old.fits".into()), limit: 10, ..Default::default() })
+            .search_history(HistoryQuery {
+                filename: Some("old.fits".into()),
+                limit: 10,
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(legacy.len(), 1);
-        assert_eq!(legacy[0].project, None, "legacy row's project migrated to NULL");
+        assert_eq!(
+            legacy[0].project, None,
+            "legacy row's project migrated to NULL"
+        );
 
         // … and a fresh insert carrying a project value round-trips + filters.
         store
@@ -3279,15 +3571,27 @@ mod tests {
             .unwrap();
 
         let by_project = store
-            .search_history(HistoryQuery { project: Some("proj-42".into()), limit: 10, ..Default::default() })
+            .search_history(HistoryQuery {
+                project: Some("proj-42".into()),
+                limit: 10,
+                ..Default::default()
+            })
             .unwrap();
-        assert_eq!(by_project.len(), 1, "project filter matches exactly the collab row");
+        assert_eq!(
+            by_project.len(),
+            1,
+            "project filter matches exactly the collab row"
+        );
         assert_eq!(by_project[0].frame_uuid, "u-new");
         assert_eq!(by_project[0].project.as_deref(), Some("proj-42"));
 
         // A project filter that matches nothing returns empty (never the legacy row).
         assert!(store
-            .search_history(HistoryQuery { project: Some("proj-none".into()), limit: 10, ..Default::default() })
+            .search_history(HistoryQuery {
+                project: Some("proj-none".into()),
+                limit: 10,
+                ..Default::default()
+            })
             .unwrap()
             .is_empty());
     }
@@ -3342,10 +3646,17 @@ mod tests {
         // loads with package_id = None.
         let store = StandaloneSyncStore::open(&db_path).unwrap();
         let legacy = store
-            .search_history(HistoryQuery { filename: Some("old.fits".into()), limit: 10, ..Default::default() })
+            .search_history(HistoryQuery {
+                filename: Some("old.fits".into()),
+                limit: 10,
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(legacy.len(), 1);
-        assert_eq!(legacy[0].package_id, None, "legacy row's package_id migrated to NULL");
+        assert_eq!(
+            legacy[0].package_id, None,
+            "legacy row's package_id migrated to NULL"
+        );
 
         // A fresh insert carrying a package_id round-trips …
         store
@@ -3368,14 +3679,26 @@ mod tests {
         // … and the new package_id filter matches exactly that batch, never the
         // legacy NULL row.
         let by_pkg = store
-            .search_history(HistoryQuery { package_id: Some("pkg-abc".into()), limit: 10, ..Default::default() })
+            .search_history(HistoryQuery {
+                package_id: Some("pkg-abc".into()),
+                limit: 10,
+                ..Default::default()
+            })
             .unwrap();
-        assert_eq!(by_pkg.len(), 1, "package_id filter matches exactly the tagged row");
+        assert_eq!(
+            by_pkg.len(),
+            1,
+            "package_id filter matches exactly the tagged row"
+        );
         assert_eq!(by_pkg[0].frame_uuid, "u-new");
         assert_eq!(by_pkg[0].package_id.as_deref(), Some("pkg-abc"));
 
         assert!(store
-            .search_history(HistoryQuery { package_id: Some("pkg-none".into()), limit: 10, ..Default::default() })
+            .search_history(HistoryQuery {
+                package_id: Some("pkg-none".into()),
+                limit: 10,
+                ..Default::default()
+            })
             .unwrap()
             .is_empty());
     }
@@ -3420,7 +3743,10 @@ mod tests {
 
         let conn = Connection::open(&path).unwrap();
         for t in ["sync_outbound_files", "sync_inbound_files", "sync_events"] {
-            assert!(table_exists(&conn, t), "{t} must be created on a fresh open");
+            assert!(
+                table_exists(&conn, t),
+                "{t} must be created on a fresh open"
+            );
         }
         assert!(cols(&conn, "sync_outbound").contains(&"display_name".to_string()));
         assert!(cols(&conn, "sync_inbound").contains(&"display_name".to_string()));
@@ -3502,20 +3828,43 @@ mod tests {
         )
         .unwrap();
         let oid = conn.last_insert_rowid();
-        assert_eq!(outbound_row_by_id(&conn, oid).unwrap().unwrap().display_name, None);
+        assert_eq!(
+            outbound_row_by_id(&conn, oid)
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None
+        );
         set_outbound_display_name(&conn, oid, Some("M42 — 12 lights")).unwrap();
         assert_eq!(
-            outbound_row_by_id(&conn, oid).unwrap().unwrap().display_name.as_deref(),
+            outbound_row_by_id(&conn, oid)
+                .unwrap()
+                .unwrap()
+                .display_name
+                .as_deref(),
             Some("M42 — 12 lights"),
         );
         set_outbound_display_name(&conn, oid, None).unwrap();
-        assert_eq!(outbound_row_by_id(&conn, oid).unwrap().unwrap().display_name, None);
+        assert_eq!(
+            outbound_row_by_id(&conn, oid)
+                .unwrap()
+                .unwrap()
+                .display_name,
+            None
+        );
 
         let iid = upsert_inbound_announced(&conn, &node_id_hex(&PEER), "pkg-1", 3, 300).unwrap();
-        assert_eq!(get_inbound(&conn, "pkg-1").unwrap().unwrap().display_name, None);
+        assert_eq!(
+            get_inbound(&conn, "pkg-1").unwrap().unwrap().display_name,
+            None
+        );
         set_inbound_display_name(&conn, iid, Some("Downloads batch")).unwrap();
         assert_eq!(
-            get_inbound(&conn, "pkg-1").unwrap().unwrap().display_name.as_deref(),
+            get_inbound(&conn, "pkg-1")
+                .unwrap()
+                .unwrap()
+                .display_name
+                .as_deref(),
             Some("Downloads batch"),
         );
     }
@@ -3541,7 +3890,10 @@ mod tests {
         };
         replace_outbound_files(&conn, 42, &[mk("a/y.fits", 200), mk("a/x.fits", 100)]).unwrap();
         // A sibling parent, to prove scoping.
-        let sib = OutboundFileRow { outbound_id: 99, ..mk("z.fits", 5) };
+        let sib = OutboundFileRow {
+            outbound_id: 99,
+            ..mk("z.fits", 5)
+        };
         replace_outbound_files(&conn, 99, &[sib]).unwrap();
 
         let rows = list_outbound_files(&conn, 42).unwrap();
@@ -3554,15 +3906,27 @@ mod tests {
         assert_eq!(rows[0].bytes_done, 0);
 
         // Per-file state upsert touches only a/x.fits.
-        set_outbound_file_state(&conn, 42, "a/x.fits", OutboundFileState::Uploaded, 100, Some("ingested"), None)
-            .unwrap();
+        set_outbound_file_state(
+            &conn,
+            42,
+            "a/x.fits",
+            OutboundFileState::Uploaded,
+            100,
+            Some("ingested"),
+            None,
+        )
+        .unwrap();
         let rows = list_outbound_files(&conn, 42).unwrap();
         let x = rows.iter().find(|r| r.rel_path == "a/x.fits").unwrap();
         assert_eq!(x.state, OutboundFileState::Uploaded);
         assert_eq!(x.bytes_done, 100);
         assert_eq!(x.outcome.as_deref(), Some("ingested"));
         let y = rows.iter().find(|r| r.rel_path == "a/y.fits").unwrap();
-        assert_eq!(y.state, OutboundFileState::Pending, "sibling file untouched");
+        assert_eq!(
+            y.state,
+            OutboundFileState::Pending,
+            "sibling file untouched"
+        );
 
         // Replace overwrites the whole set for parent 42.
         replace_outbound_files(&conn, 42, &[mk("only.fits", 7)]).unwrap();
@@ -3573,7 +3937,11 @@ mod tests {
         // Delete-with-parent removes parent 42's rows; parent 99 untouched.
         delete_outbound_files(&conn, 42).unwrap();
         assert!(list_outbound_files(&conn, 42).unwrap().is_empty());
-        assert_eq!(list_outbound_files(&conn, 99).unwrap().len(), 1, "sibling parent unaffected");
+        assert_eq!(
+            list_outbound_files(&conn, 99).unwrap().len(),
+            1,
+            "sibling parent unaffected"
+        );
     }
 
     /// tv2 §D4: inbound per-file CRUD — the receive-side twin of the outbound
@@ -3595,15 +3963,31 @@ mod tests {
             updated_at: "2026-07-20T00:00:00.000Z".into(),
         };
         replace_inbound_files(&conn, 7, &[mk("f2.fits", 20), mk("f1.fits", 10)]).unwrap();
-        replace_inbound_files(&conn, 8, &[InboundFileRow { inbound_id: 8, ..mk("other.fits", 1) }]).unwrap();
+        replace_inbound_files(
+            &conn,
+            8,
+            &[InboundFileRow {
+                inbound_id: 8,
+                ..mk("other.fits", 1)
+            }],
+        )
+        .unwrap();
 
         let rows = list_inbound_files(&conn, 7).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].rel_path, "f1.fits");
         assert_eq!(rows[0].state, InboundFileState::Announced);
 
-        set_inbound_file_state(&conn, 7, "f1.fits", InboundFileState::Failed, 3, None, Some("hash mismatch"))
-            .unwrap();
+        set_inbound_file_state(
+            &conn,
+            7,
+            "f1.fits",
+            InboundFileState::Failed,
+            3,
+            None,
+            Some("hash mismatch"),
+        )
+        .unwrap();
         let rows = list_inbound_files(&conn, 7).unwrap();
         let f1 = rows.iter().find(|r| r.rel_path == "f1.fits").unwrap();
         assert_eq!(f1.state, InboundFileState::Failed);
@@ -3612,7 +3996,11 @@ mod tests {
 
         delete_inbound_files(&conn, 7).unwrap();
         assert!(list_inbound_files(&conn, 7).unwrap().is_empty());
-        assert_eq!(list_inbound_files(&conn, 8).unwrap().len(), 1, "sibling parent unaffected");
+        assert_eq!(
+            list_inbound_files(&conn, 8).unwrap().len(),
+            1,
+            "sibling parent unaffected"
+        );
     }
 
     /// tv2 §D5: the grouped file-counts rollup — one query over a mixed table
@@ -3647,18 +4035,37 @@ mod tests {
                 // Uploaded with no outcome yet → counts as done (NULL outcome
                 // must not poison the CASE).
                 row(1, "uploaded.fits", OutboundFileState::Uploaded, None),
-                row(1, "ingested.fits", OutboundFileState::Done, Some("ingested")),
+                row(
+                    1,
+                    "ingested.fits",
+                    OutboundFileState::Done,
+                    Some("ingested"),
+                ),
                 // Rejected receipt lands state=done + outcome=rejected:… → failed,
                 // NOT done (mutual exclusivity).
-                row(1, "rejected.fits", OutboundFileState::Done, Some("rejected:bad hash")),
+                row(
+                    1,
+                    "rejected.fits",
+                    OutboundFileState::Done,
+                    Some("rejected:bad hash"),
+                ),
                 // Cancelled is terminal-but-not-error → done.
-                row(1, "cancelled.fits", OutboundFileState::Done, Some("cancelled")),
+                row(
+                    1,
+                    "cancelled.fits",
+                    OutboundFileState::Done,
+                    Some("cancelled"),
+                ),
             ],
         )
         .unwrap();
         // Parent 2: a sibling, to prove IN-set scoping.
-        replace_outbound_files(&conn, 2, &[row(2, "only.fits", OutboundFileState::Pending, None)])
-            .unwrap();
+        replace_outbound_files(
+            &conn,
+            2,
+            &[row(2, "only.fits", OutboundFileState::Pending, None)],
+        )
+        .unwrap();
 
         let counts = outbound_file_counts(&conn, &[1, 2, 999]).unwrap();
         let p1 = counts.get(&1).expect("parent 1 present");
@@ -3686,8 +4093,14 @@ mod tests {
         conn.execute(DDL_SYNC_EVENTS, []).unwrap();
 
         for i in 0..205 {
-            append_sync_event(&conn, Direction::Sent, "7", "serve_start", Some(&format!("n{i}")))
-                .unwrap();
+            append_sync_event(
+                &conn,
+                Direction::Sent,
+                "7",
+                "serve_start",
+                Some(&format!("n{i}")),
+            )
+            .unwrap();
         }
         // Different journals (direction differs / batch_key differs) — unaffected
         // by the prune of (Sent, "7").
@@ -3695,20 +4108,41 @@ mod tests {
         append_sync_event(&conn, Direction::Sent, "8", "serve_start", None).unwrap();
 
         let sent7 = list_sync_events(&conn, Direction::Sent, "7").unwrap();
-        assert_eq!(sent7.len(), SYNC_EVENTS_CAP as usize, "cap keeps exactly the newest 200");
+        assert_eq!(
+            sent7.len(),
+            SYNC_EVENTS_CAP as usize,
+            "cap keeps exactly the newest 200"
+        );
         // Newest-first ordering; n0..n4 (the oldest 5) were pruned.
         assert_eq!(sent7[0].detail.as_deref(), Some("n204"), "newest first");
         assert_eq!(sent7[0].direction, Direction::Sent);
         assert_eq!(sent7[0].kind, "serve_start");
-        assert_eq!(sent7.last().unwrap().detail.as_deref(), Some("n5"), "oldest survivor is n5");
+        assert_eq!(
+            sent7.last().unwrap().detail.as_deref(),
+            Some("n5"),
+            "oldest survivor is n5"
+        );
 
-        assert_eq!(list_sync_events(&conn, Direction::Received, "7").unwrap().len(), 1);
-        assert_eq!(list_sync_events(&conn, Direction::Sent, "8").unwrap().len(), 1);
+        assert_eq!(
+            list_sync_events(&conn, Direction::Received, "7")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_sync_events(&conn, Direction::Sent, "8").unwrap().len(),
+            1
+        );
 
         // Delete-with-parent clears one journal only.
         delete_sync_events(&conn, Direction::Sent, "7").unwrap();
-        assert!(list_sync_events(&conn, Direction::Sent, "7").unwrap().is_empty());
-        assert_eq!(list_sync_events(&conn, Direction::Sent, "8").unwrap().len(), 1);
+        assert!(list_sync_events(&conn, Direction::Sent, "7")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            list_sync_events(&conn, Direction::Sent, "8").unwrap().len(),
+            1
+        );
     }
 
     // ── Transfers Batch Model (tvb B2) ──────────────────────────────────────
@@ -3737,7 +4171,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(idx, 1, "unique (peer, batch_uuid) index present on a fresh open");
+        assert_eq!(
+            idx, 1,
+            "unique (peer, batch_uuid) index present on a fresh open"
+        );
         // The pre-existing outbound row was NOT wiped by the second open.
         assert!(
             outbound_row_by_id(&conn, id).unwrap().is_some(),
@@ -3759,27 +4196,68 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute("CREATE TABLE sync_outbound (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
-        conn.execute("CREATE TABLE sync_outbound_files (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
-        conn.execute("CREATE TABLE sync_inbound_files (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
-        conn.execute("CREATE TABLE sync_events (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
-        conn.execute("CREATE TABLE sync_history (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
-        for t in ["sync_inbound", "sync_outbound", "sync_outbound_files", "sync_inbound_files", "sync_events", "sync_history"] {
-            conn.execute(&format!("INSERT INTO {t} DEFAULT VALUES"), []).unwrap();
+        conn.execute(
+            "CREATE TABLE sync_outbound (id INTEGER PRIMARY KEY, x TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE sync_outbound_files (id INTEGER PRIMARY KEY, x TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE sync_inbound_files (id INTEGER PRIMARY KEY, x TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE sync_events (id INTEGER PRIMARY KEY, x TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE sync_history (id INTEGER PRIMARY KEY, x TEXT)",
+            [],
+        )
+        .unwrap();
+        for t in [
+            "sync_inbound",
+            "sync_outbound",
+            "sync_outbound_files",
+            "sync_inbound_files",
+            "sync_events",
+            "sync_history",
+        ] {
+            conn.execute(&format!("INSERT INTO {t} DEFAULT VALUES"), [])
+                .unwrap();
         }
 
         // Absent batch_uuid → wipe fires; no panic on the two missing tables.
         wipe_transfer_bookkeeping_on_upgrade(&conn).unwrap();
-        for t in ["sync_inbound", "sync_outbound", "sync_outbound_files", "sync_inbound_files", "sync_events", "sync_history"] {
-            let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0)).unwrap();
+        for t in [
+            "sync_inbound",
+            "sync_outbound",
+            "sync_outbound_files",
+            "sync_inbound_files",
+            "sync_events",
+            "sync_history",
+        ] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap();
             assert_eq!(n, 0, "{t} wiped");
         }
 
         // Add the flag + a fresh row; a second wipe must NOT fire (idempotent flag).
-        conn.execute("ALTER TABLE sync_inbound ADD COLUMN batch_uuid TEXT", []).unwrap();
-        conn.execute("INSERT INTO sync_outbound DEFAULT VALUES", []).unwrap();
+        conn.execute("ALTER TABLE sync_inbound ADD COLUMN batch_uuid TEXT", [])
+            .unwrap();
+        conn.execute("INSERT INTO sync_outbound DEFAULT VALUES", [])
+            .unwrap();
         wipe_transfer_bookkeeping_on_upgrade(&conn).unwrap();
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM sync_outbound", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_outbound", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1, "flag present → second wipe is a no-op");
     }
 
@@ -3798,23 +4276,49 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         // The pre-Task-11 shape: sync_outbound / sync_history exist with rows;
         // sync_inbound does not exist AT ALL.
-        conn.execute("CREATE TABLE sync_outbound (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
-        conn.execute("CREATE TABLE sync_history (id INTEGER PRIMARY KEY, x TEXT)", []).unwrap();
-        conn.execute("INSERT INTO sync_outbound DEFAULT VALUES", []).unwrap();
-        conn.execute("INSERT INTO sync_history DEFAULT VALUES", []).unwrap();
-        assert!(!table_present(&conn, "sync_inbound").unwrap(), "sanity: no sync_inbound table (beta.1 shape)");
+        conn.execute(
+            "CREATE TABLE sync_outbound (id INTEGER PRIMARY KEY, x TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TABLE sync_history (id INTEGER PRIMARY KEY, x TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sync_outbound DEFAULT VALUES", [])
+            .unwrap();
+        conn.execute("INSERT INTO sync_history DEFAULT VALUES", [])
+            .unwrap();
+        assert!(
+            !table_present(&conn, "sync_inbound").unwrap(),
+            "sanity: no sync_inbound table (beta.1 shape)"
+        );
 
         wipe_transfer_bookkeeping_on_upgrade(&conn).unwrap();
 
-        let n_out: i64 = conn.query_row("SELECT COUNT(*) FROM sync_outbound", [], |r| r.get(0)).unwrap();
-        let n_hist: i64 = conn.query_row("SELECT COUNT(*) FROM sync_history", [], |r| r.get(0)).unwrap();
-        assert_eq!(n_out, 0, "sync_outbound wiped even though sync_inbound never existed");
-        assert_eq!(n_hist, 0, "sync_history wiped even though sync_inbound never existed");
+        let n_out: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_outbound", [], |r| r.get(0))
+            .unwrap();
+        let n_hist: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n_out, 0,
+            "sync_outbound wiped even though sync_inbound never existed"
+        );
+        assert_eq!(
+            n_hist, 0,
+            "sync_history wiped even though sync_inbound never existed"
+        );
 
         // A truly empty DB (neither sync_inbound nor sync_outbound nor sync_history)
         // must NOT be flagged — guaranteed no-op, not skipped by flag-purity.
         let empty = Connection::open_in_memory().unwrap();
-        assert!(!transfer_wipe_needed(&empty).unwrap(), "a genuinely fresh DB never needs a wipe");
+        assert!(
+            !transfer_wipe_needed(&empty).unwrap(),
+            "a genuinely fresh DB never needs a wipe"
+        );
     }
 
     /// Batch Model §D1/§D3: `reset_outbound_for_resend` reuses the SAME row —
@@ -3830,18 +4334,46 @@ mod tests {
         // A confirmed row (attempts=1) with a stale error/retry + two per-file rows
         // in non-pending states carrying verdicts.
         let files = [
-            AnnounceFileEntry { rel_path: "a.fits".into(), byte_size: 100, frame_uuid: "u-a".into() },
-            AnnounceFileEntry { rel_path: "b.fits".into(), byte_size: 200, frame_uuid: "u-b".into() },
+            AnnounceFileEntry {
+                rel_path: "a.fits".into(),
+                byte_size: 100,
+                frame_uuid: "u-a".into(),
+            },
+            AnnounceFileEntry {
+                rel_path: "b.fits".into(),
+                byte_size: 200,
+                frame_uuid: "u-b".into(),
+            },
         ];
-        let id = insert_outbound_with_files(&conn, "pkg", &node_id_hex(&PEER), Some("M42"), &files).unwrap();
+        let id = insert_outbound_with_files(&conn, "pkg", &node_id_hex(&PEER), Some("M42"), &files)
+            .unwrap();
         conn.execute("UPDATE sync_outbound SET attempts = 1, wire_package_id = 'wire-old', confirmed_at = 't0', last_error = 'boom', next_retry_at = 't1', state = 'confirmed' WHERE id = ?1", params![id]).unwrap();
-        set_outbound_file_state(&conn, id, "a.fits", OutboundFileState::Done, 100, Some("ingested"), None).unwrap();
-        set_outbound_file_state(&conn, id, "b.fits", OutboundFileState::Uploaded, 200, None, Some("stale")).unwrap();
+        set_outbound_file_state(
+            &conn,
+            id,
+            "a.fits",
+            OutboundFileState::Done,
+            100,
+            Some("ingested"),
+            None,
+        )
+        .unwrap();
+        set_outbound_file_state(
+            &conn,
+            id,
+            "b.fits",
+            OutboundFileState::Uploaded,
+            200,
+            None,
+            Some("stale"),
+        )
+        .unwrap();
 
         // Enqueue → generation 1 (the DEFAULT); the confirmed row above never
         // resent, so it is still at generation 1 before this reset.
         assert_eq!(
-            outbound_row_by_id(&conn, id).unwrap().unwrap().generation, 1,
+            outbound_row_by_id(&conn, id).unwrap().unwrap().generation,
+            1,
             "a never-resent row is at generation 1"
         );
 
@@ -3850,15 +4382,31 @@ mod tests {
         let row = outbound_row_by_id(&conn, id).unwrap().unwrap();
         assert_eq!(row.state, OutboundState::Queued, "reset to queued");
         assert_eq!(row.attempts, 2, "attempts incremented");
-        assert_eq!(row.generation, 2, "generation incremented (attempt N counter)");
-        assert_eq!(row.wire_package_id.as_deref(), Some("wire-new"), "fresh wire id");
+        assert_eq!(
+            row.generation, 2,
+            "generation incremented (attempt N counter)"
+        );
+        assert_eq!(
+            row.wire_package_id.as_deref(),
+            Some("wire-new"),
+            "fresh wire id"
+        );
         assert_eq!(row.last_error, None, "last_error cleared");
         assert_eq!(row.next_retry_at, None, "next_retry_at cleared");
         assert_eq!(row.confirmed_at, None, "confirmed_at cleared");
-        assert_eq!(row.display_name.as_deref(), Some("M42"), "display_name preserved");
+        assert_eq!(
+            row.display_name.as_deref(),
+            Some("M42"),
+            "display_name preserved"
+        );
 
         for f in list_outbound_files(&conn, id).unwrap() {
-            assert_eq!(f.state, OutboundFileState::Pending, "{} reset to pending", f.rel_path);
+            assert_eq!(
+                f.state,
+                OutboundFileState::Pending,
+                "{} reset to pending",
+                f.rel_path
+            );
             assert_eq!(f.bytes_done, 0, "{} bytes_done reset", f.rel_path);
             assert_eq!(f.outcome, None, "{} outcome cleared", f.rel_path);
             assert_eq!(f.error, None, "{} error cleared", f.rel_path);
@@ -3891,7 +4439,10 @@ mod tests {
         store.bump_attempts(id).unwrap();
         let row = store.get_outbound(id).unwrap().unwrap();
         assert_eq!(row.attempts, 3, "announce-retries advance attempts");
-        assert_eq!(row.generation, 1, "announce-retries do NOT bump generation (still attempt 1)");
+        assert_eq!(
+            row.generation, 1,
+            "announce-retries do NOT bump generation (still attempt 1)"
+        );
 
         // A resend advances the generation (to attempt 2), even though attempts is
         // already ahead — the two counters are independent.
@@ -3921,9 +4472,12 @@ mod tests {
         let peer = node_id_hex(&PEER);
 
         // First announce → INSERT, not cancelled-final.
-        let (id, cancelled) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-1", 3, 300).unwrap();
+        let (id, cancelled) =
+            upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-1", 3, 300).unwrap();
         assert!(!cancelled);
-        let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
+        let row = get_inbound_by_batch(&conn, &peer, "batch-1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.id, id);
         assert_eq!(row.state, InboundState::Announced);
         assert_eq!(row.package_id, "wire-1", "wire id stamped");
@@ -3937,17 +4491,31 @@ mod tests {
         set_inbound_state(&conn, "wire-1", InboundState::Fetching, None).unwrap();
         set_inbound_bytes_done(&conn, "wire-1", 150).unwrap();
 
-        let (id2, cancelled2) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-2", 4, 400).unwrap();
+        let (id2, cancelled2) =
+            upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-2", 4, 400).unwrap();
         assert!(!cancelled2);
-        assert_eq!(id2, id, "same batch → same row (one row per (peer, batch_uuid))");
-        let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
+        assert_eq!(
+            id2, id,
+            "same batch → same row (one row per (peer, batch_uuid))"
+        );
+        let row = get_inbound_by_batch(&conn, &peer, "batch-1")
+            .unwrap()
+            .unwrap();
         assert_eq!(row.state, InboundState::Announced, "reset to announced");
         assert_eq!(row.package_id, "wire-2", "new attempt's wire id");
         assert_eq!(row.bytes_done, 0, "bytes_done reset");
         assert_eq!(row.frame_count, 4, "counts refreshed");
         assert_eq!(row.generation, 2, "a re-attempt upsert bumps generation");
-        assert_eq!(row.display_name.as_deref(), Some("Downloads M42"), "display_name preserved");
-        assert_eq!(row.landing_dir.as_deref(), Some("/incoming/peer/m42"), "landing_dir preserved");
+        assert_eq!(
+            row.display_name.as_deref(),
+            Some("Downloads M42"),
+            "display_name preserved"
+        );
+        assert_eq!(
+            row.landing_dir.as_deref(),
+            Some("/incoming/peer/m42"),
+            "landing_dir preserved"
+        );
 
         // A second, distinct batch from the same peer → a distinct row (index allows it).
         let (id3, _) = upsert_inbound_attempt(&conn, &peer, "batch-2", "wire-3", 1, 10).unwrap();
@@ -3957,11 +4525,21 @@ mod tests {
         // NULL) is NOT final — the sender's resend resets it like any other
         // attempt terminal (the smoke-№7 fix).
         set_inbound_state(&conn, "wire-2", InboundState::Cancelled, Some("by sender")).unwrap();
-        let (id4, final4) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-4", 9, 900).unwrap();
-        assert!(!final4, "a revoke-cancelled row (no declined_at) is NOT declined-final");
+        let (id4, final4) =
+            upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-4", 9, 900).unwrap();
+        assert!(
+            !final4,
+            "a revoke-cancelled row (no declined_at) is NOT declined-final"
+        );
         assert_eq!(id4, id, "same row id returned");
-        let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
-        assert_eq!(row.state, InboundState::Announced, "the resend reset the revoked row");
+        let row = get_inbound_by_batch(&conn, &peer, "batch-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state,
+            InboundState::Announced,
+            "the resend reset the revoked row"
+        );
         assert_eq!(row.package_id, "wire-4", "the resend's wire id was stamped");
         assert_eq!(row.generation, 3, "the resend bumped the generation");
         assert!(row.declined_at.is_none(), "a reset never invents a decline");
@@ -3970,32 +4548,74 @@ mod tests {
         // re-announce untouched…
         set_inbound_state(&conn, "wire-4", InboundState::Cancelled, None).unwrap();
         set_inbound_declined_at(&conn, id).unwrap();
-        let declined_stamp = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap().declined_at;
+        let declined_stamp = get_inbound_by_batch(&conn, &peer, "batch-1")
+            .unwrap()
+            .unwrap()
+            .declined_at;
         assert!(declined_stamp.is_some(), "declined_at stamped");
-        let (id5, final5) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-5", 9, 900).unwrap();
+        let (id5, final5) =
+            upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-5", 9, 900).unwrap();
         assert!(final5, "a declined row reports declined_final");
         assert_eq!(id5, id, "same row id returned");
-        let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
-        assert_eq!(row.state, InboundState::Cancelled, "still cancelled — untouched");
-        assert_eq!(row.package_id, "wire-4", "wire id NOT rotated by the upsert on a declined row");
-        assert_eq!(row.generation, 3, "generation NOT bumped on a declined-final row");
-        assert_eq!(row.declined_at, declined_stamp, "the decline stamp is first-write-wins");
+        let row = get_inbound_by_batch(&conn, &peer, "batch-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state,
+            InboundState::Cancelled,
+            "still cancelled — untouched"
+        );
+        assert_eq!(
+            row.package_id, "wire-4",
+            "wire id NOT rotated by the upsert on a declined row"
+        );
+        assert_eq!(
+            row.generation, 3,
+            "generation NOT bumped on a declined-final row"
+        );
+        assert_eq!(
+            row.declined_at, declined_stamp,
+            "the decline stamp is first-write-wins"
+        );
         // …and re-stamping is a no-op (first-write-wins).
         set_inbound_declined_at(&conn, id).unwrap();
-        let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
-        assert_eq!(row.declined_at, declined_stamp, "re-stamp preserves the original instant");
+        let row = get_inbound_by_batch(&conn, &peer, "batch-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.declined_at, declined_stamp,
+            "re-stamp preserves the original instant"
+        );
 
         // …EVEN when the attempt-level state was later overwritten (a restart
         // reconcile stamps `failed "interrupted by restart"`): the decline survives.
-        set_inbound_state(&conn, "wire-4", InboundState::Failed, Some("interrupted by restart")).unwrap();
-        let (id6, final6) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-6", 9, 900).unwrap();
-        assert!(final6, "a declined row stays final across a state overwrite");
+        set_inbound_state(
+            &conn,
+            "wire-4",
+            InboundState::Failed,
+            Some("interrupted by restart"),
+        )
+        .unwrap();
+        let (id6, final6) =
+            upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-6", 9, 900).unwrap();
+        assert!(
+            final6,
+            "a declined row stays final across a state overwrite"
+        );
         assert_eq!(id6, id, "same row id returned");
-        let row = get_inbound_by_batch(&conn, &peer, "batch-1").unwrap().unwrap();
-        assert_eq!(row.state, InboundState::Failed, "untouched — the reconciled state stands");
+        let row = get_inbound_by_batch(&conn, &peer, "batch-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.state,
+            InboundState::Failed,
+            "untouched — the reconciled state stands"
+        );
 
         // A lookup for an unknown batch is None, never an error.
-        assert!(get_inbound_by_batch(&conn, &peer, "nope").unwrap().is_none());
+        assert!(get_inbound_by_batch(&conn, &peer, "nope")
+            .unwrap()
+            .is_none());
     }
 
     /// Decline Finality Axis §D1: adding `declined_at` to a pre-axis table
@@ -4009,7 +4629,8 @@ mod tests {
         // derived from the canonical constant so a future column add can never
         // silently stale this fixture.
         conn.execute(DDL_INBOUND, []).unwrap();
-        conn.execute("ALTER TABLE sync_inbound DROP COLUMN declined_at", []).unwrap();
+        conn.execute("ALTER TABLE sync_inbound DROP COLUMN declined_at", [])
+            .unwrap();
         let peer = node_id_hex(&PEER);
         let insert = |pkg: &str, state: &str, err: Option<&str>, finished: Option<&str>| {
             conn.execute(
@@ -4022,10 +4643,25 @@ mod tests {
         // Pin the load-bearing literal: the backfill excludes exactly the detail
         // `handle_revoke` writes — an accidental edit of either side must fail here.
         assert_eq!(crate::sync::models::REVOKED_BY_SENDER_DETAIL, "by sender");
-        insert("declined-null-err", "cancelled", None, Some("2026-07-22T08:40:00Z"));
+        insert(
+            "declined-null-err",
+            "cancelled",
+            None,
+            Some("2026-07-22T08:40:00Z"),
+        );
         insert("declined-detail", "cancelled", Some("declined"), None);
-        insert("revoked-by-sender", "cancelled", Some("by sender"), Some("2026-07-22T08:41:00Z"));
-        insert("plain-failed", "failed", Some("sender failed"), Some("2026-07-22T08:42:00Z"));
+        insert(
+            "revoked-by-sender",
+            "cancelled",
+            Some("by sender"),
+            Some("2026-07-22T08:41:00Z"),
+        );
+        insert(
+            "plain-failed",
+            "failed",
+            Some("sender failed"),
+            Some("2026-07-22T08:42:00Z"),
+        );
         insert("live-fetching", "fetching", None, None);
 
         ensure_inbound_columns(&conn).unwrap();
@@ -4048,14 +4684,29 @@ mod tests {
             Some("2026-07-22T08:00:00Z"),
             "a cancelled row without finished_at falls back to created_at"
         );
-        assert!(declined_of("revoked-by-sender").is_none(), "a sender revoke never becomes a decline");
-        assert!(declined_of("plain-failed").is_none(), "failed rows are untouched");
-        assert!(declined_of("live-fetching").is_none(), "live rows are untouched");
+        assert!(
+            declined_of("revoked-by-sender").is_none(),
+            "a sender revoke never becomes a decline"
+        );
+        assert!(
+            declined_of("plain-failed").is_none(),
+            "failed rows are untouched"
+        );
+        assert!(
+            declined_of("live-fetching").is_none(),
+            "live rows are untouched"
+        );
 
         // Idempotent: a second pass (column now present) changes nothing.
         ensure_inbound_columns(&conn).unwrap();
-        assert!(declined_of("revoked-by-sender").is_none(), "re-run stays a no-op");
-        assert_eq!(declined_of("declined-null-err").as_deref(), Some("2026-07-22T08:40:00Z"));
+        assert!(
+            declined_of("revoked-by-sender").is_none(),
+            "re-run stays a no-op"
+        );
+        assert_eq!(
+            declined_of("declined-null-err").as_deref(),
+            Some("2026-07-22T08:40:00Z")
+        );
     }
 
     /// Perseus UI v2 (Task 2): `delete_outbound_group` history-deletes a whole
@@ -4071,7 +4722,9 @@ mod tests {
         // Two rows of one fan-out batch: same package_ref, two distinct peers.
         let peer2: NodeId = [9u8; 32];
         let id1 = store.enqueue("pkg-fanout", PEER, Some("M42"), &[]).unwrap();
-        let id2 = store.enqueue("pkg-fanout", peer2, Some("M42"), &[]).unwrap();
+        let id2 = store
+            .enqueue("pkg-fanout", peer2, Some("M42"), &[])
+            .unwrap();
 
         // Two per-file rows on each row (the row id is the parent key).
         let files_for = |id: i64| {
@@ -4105,8 +4758,12 @@ mod tests {
 
         // …and one journal event each — `batch_key` is the row id as text (the
         // engine's own journaling convention, mirrored by `list_sync_events_for`).
-        store.append_sync_event(Direction::Sent, &id1.to_string(), "enqueued", None).unwrap();
-        store.append_sync_event(Direction::Sent, &id2.to_string(), "enqueued", None).unwrap();
+        store
+            .append_sync_event(Direction::Sent, &id1.to_string(), "enqueued", None)
+            .unwrap();
+        store
+            .append_sync_event(Direction::Sent, &id2.to_string(), "enqueued", None)
+            .unwrap();
 
         // Sanity: everything is present before the delete.
         assert_eq!(store.list_outbound_files(id1).unwrap().len(), 2);
@@ -4133,28 +4790,106 @@ mod tests {
         let store = StandaloneSyncStore::open(tmp.path().join("s.db")).unwrap();
         let id = store.enqueue("pkg", PEER, None, &[]).unwrap();
 
-        store.append_sync_event(Direction::Sent, &id.to_string(), "enqueued", None).unwrap();
         store
-            .append_sync_event(Direction::Sent, &id.to_string(), "announce_sent", Some("relay"))
+            .append_sync_event(Direction::Sent, &id.to_string(), "enqueued", None)
+            .unwrap();
+        store
+            .append_sync_event(
+                Direction::Sent,
+                &id.to_string(),
+                "announce_sent",
+                Some("relay"),
+            )
             .unwrap();
 
         let events = store.list_sync_events_for(id).unwrap();
-        assert_eq!(events.len(), 2, "both events of this row's journal come back");
+        assert_eq!(
+            events.len(),
+            2,
+            "both events of this row's journal come back"
+        );
         // `list_sync_events` is newest-first (id DESC), so the later insert leads.
         assert_eq!(events[0].kind, "announce_sent");
         assert_eq!(events[0].detail.as_deref(), Some("relay"));
         assert_eq!(events[1].kind, "enqueued");
         assert_eq!(events[1].detail, None);
-        assert!(events.iter().all(|e| e.direction == Direction::Sent), "the Sent journal");
+        assert!(
+            events.iter().all(|e| e.direction == Direction::Sent),
+            "the Sent journal"
+        );
 
         // A different row's journal is never mixed in (scoped to one batch_key).
         let other = store.enqueue("pkg2", PEER, None, &[]).unwrap();
-        store.append_sync_event(Direction::Sent, &other.to_string(), "enqueued", None).unwrap();
+        store
+            .append_sync_event(Direction::Sent, &other.to_string(), "enqueued", None)
+            .unwrap();
         assert_eq!(
             store.list_sync_events_for(id).unwrap().len(),
             2,
             "still only this row's two events"
         );
         assert_eq!(store.list_sync_events_for(other).unwrap().len(), 1);
+    }
+
+    /// D2 §3.1/§4: `Waiting` is a NON-terminal end-of-attempt, and every
+    /// membership test must answer for it. The three terminal-state lists are
+    /// hand-duplicated SQL literals rather than derivations of `is_terminal()`, so
+    /// "a new non-terminal state is admitted automatically" is correct only by
+    /// duplication — this test is what makes that claim checkable.
+    #[test]
+    fn waiting_is_non_terminal_and_lands_in_every_active_membership_test() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(DDL_INBOUND, []).unwrap();
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_sync_inbound_batch ON sync_inbound(peer, batch_uuid)",
+            [],
+        )
+        .unwrap();
+        let peer = node_id_hex(&PEER);
+
+        assert!(!InboundState::Waiting.is_terminal());
+        assert_eq!(InboundState::Waiting.as_str(), "waiting");
+        assert_eq!(
+            InboundState::from_db("waiting").unwrap(),
+            InboundState::Waiting
+        );
+
+        let (id, _) = upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-1", 3, 999).unwrap();
+        set_inbound_state(&conn, "wire-1", InboundState::Waiting, Some("peer gone")).unwrap();
+
+        // Active, not terminal, and still holding its landing-dir claim.
+        let active = inbound_active(&conn).unwrap();
+        assert_eq!(active.len(), 1, "a waiting row is an active row");
+        assert_eq!(active[0].state, InboundState::Waiting);
+        assert!(
+            active[0].finished_at.is_none(),
+            "a non-terminal state stamps no finished_at"
+        );
+        assert_eq!(
+            active[0].last_error.as_deref(),
+            Some("peer gone"),
+            "the reason is preserved"
+        );
+
+        assert!(
+            terminal_inbound(&conn, 50).unwrap().is_empty(),
+            "and absent from the terminal window"
+        );
+
+        set_inbound_landing_dir(&conn, id, "/incoming/dev/batch").unwrap();
+        assert!(
+            landing_dir_claimed_by_active(&conn, "/incoming/dev/batch", id + 1).unwrap(),
+            "a waiting row keeps claiming its landing dir — the sender redelivers into the same tree"
+        );
+
+        // A re-announce revives it into a fresh attempt (no state list to teach).
+        let (again, declined) =
+            upsert_inbound_attempt(&conn, &peer, "batch-1", "wire-2", 3, 999).unwrap();
+        assert_eq!(again, id, "same durable row");
+        assert!(!declined);
+        let revived = get_inbound(&conn, "wire-2").unwrap().unwrap();
+        assert_eq!(revived.state, InboundState::Announced);
+        assert_eq!(revived.generation, 2);
+        assert!(revived.last_error.is_none(), "the revive clears the reason");
     }
 }

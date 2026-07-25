@@ -95,8 +95,12 @@ impl OutboundState {
 /// Receiver-side lifecycle of one inbound package (`sync_inbound`, Task 11).
 ///
 /// Mirrors [`OutboundState`]'s `as_str`/`from_db`/`is_terminal` shape. The
-/// receiver walks a package `Announced → Fetching → Ingesting → Done` and stamps
-/// `Failed` (with a `last_error`) when a fetch fails or every frame is rejected.
+/// receiver walks a package `Announced → Fetching → Ingesting → Done`. An attempt
+/// that ends short of that splits two ways (D2 §3.2): [`Waiting`](Self::Waiting)
+/// when the SENDING DEVICE went away — non-terminal, because delivery-forever
+/// obliges the sender to redeliver — and [`Failed`](Self::Failed) when WE cannot
+/// accept the package (every frame rejected, a local fault, an ack we could not
+/// hand back). Both carry the reason in `last_error`.
 /// [`Cancelled`](Self::Cancelled) is the **attempt-level** cancelled terminal — a
 /// receiver decline OR a sender revoke (`last_error = "by sender"`). Whether the
 /// TRANSFER is final lives on the separate `declined_at` axis
@@ -114,6 +118,15 @@ pub enum InboundState {
     Fetching,
     /// Fetched; landing + cataloguing the frames.
     Ingesting,
+    /// NON-TERMINAL: an attempt ended because the sending device went away, and
+    /// under delivery-forever the sender owes us another (D2 §3.1). Distinct from
+    /// [`Failed`](Self::Failed), which means "we cannot accept this". The reason
+    /// lives in `last_error`; the row stays in
+    /// [`inbound_active`](super::store::inbound_active) so the status poll keeps it
+    /// on screen without needing an event, and
+    /// [`upsert_inbound_attempt`](super::store::upsert_inbound_attempt) revives it
+    /// on the next announce like any other non-declined row.
+    Waiting,
     /// Terminal success: all frames ingested (or a partial ingest with some
     /// rejections), or re-acked from the receipt log.
     Done,
@@ -140,6 +153,7 @@ impl InboundState {
             InboundState::Announced => "announced",
             InboundState::Fetching => "fetching",
             InboundState::Ingesting => "ingesting",
+            InboundState::Waiting => "waiting",
             InboundState::Done => "done",
             InboundState::Failed => "failed",
             InboundState::Cancelled => "cancelled",
@@ -153,6 +167,7 @@ impl InboundState {
             "announced" => InboundState::Announced,
             "fetching" => InboundState::Fetching,
             "ingesting" => InboundState::Ingesting,
+            "waiting" => InboundState::Waiting,
             "done" => InboundState::Done,
             "failed" => InboundState::Failed,
             "cancelled" => InboundState::Cancelled,
@@ -165,6 +180,11 @@ impl InboundState {
     /// [`inbound_active`](super::store::inbound_active) excludes and that
     /// [`set_inbound_state`](super::store::set_inbound_state) stamps `finished_at`
     /// for.
+    ///
+    /// [`Waiting`](Self::Waiting) is deliberately NOT among them (D2 §3.1): an
+    /// attempt that ended because the peer vanished leaves the TRANSFER
+    /// outstanding, so the row must stay active, keep its landing-dir claim, and
+    /// revive on the sender's next announce.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
