@@ -1649,9 +1649,11 @@ async fn handle_announce(
         let batch_name = effective_name.clone();
         let landing_override = landing_override.clone();
         match tokio::task::spawn_blocking(move || -> Result<IngestOutcome> {
-            let conn = store.lock_conn();
+            // Per-frame connection locking (W2 T2.1): ingest acquires the store
+            // guard for the prologue and then once per frame, never across the
+            // whole package — a concurrent lane waits one frame, not minutes.
             ingest::ingest_package(
-                &conn,
+                ingest::IngestConn::Shared(store.as_ref()),
                 &incoming_root,
                 &staging_for_ingest,
                 &announce,
@@ -2523,9 +2525,9 @@ async fn handle_project_announce(
         let hub_package_id = hub_package_id.clone();
         let peer_device = peer_device.clone();
         tokio::task::spawn_blocking(move || -> Result<super::ProjectIngestOutcome> {
-            let conn = store.lock_conn();
+            // Per-frame connection locking (W2 T2.1), same as personal ingest.
             super::project_ingest::ingest_project_package(
-                &conn,
+                super::ingest::IngestConn::Shared(store.as_ref()),
                 &staging_for_ingest,
                 &project_id,
                 &hub_package_id,

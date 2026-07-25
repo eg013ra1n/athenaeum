@@ -49,7 +49,7 @@ use crate::db::collab_exchange::ContributionRow;
 use crate::package::{self, ManifestRecord};
 use crate::sharing::types::{FrameReceipt, ReceiptOutcome};
 
-use super::ingest::{sanitize_slug, unique_path};
+use super::ingest::{sanitize_slug, unique_path, IngestConn};
 use super::models::{Direction, HistoryRow};
 use super::now_iso;
 use super::store::insert_history_row;
@@ -75,7 +75,7 @@ pub struct ProjectIngestOutcome {
 ///   `sync_history` only; it is NOT the landing slug (the publisher slug is
 ///   hub-anchored, Д5).
 pub fn ingest_project_package(
-    conn: &Connection,
+    conn: IngestConn<'_>,
     staging_dir: &Path,
     project_id: &str,
     package_id: &str,
@@ -83,11 +83,16 @@ pub fn ingest_project_package(
 ) -> Result<ProjectIngestOutcome> {
     // 1. Load the project (slug) and the hub-anchored package row. Missing either
     //    is a hard error — the receiver arm refreshes announcements first, so an
-    //    unknown row here means a genuinely unknown package (fail-closed).
-    let project = crate::db::collab::get_project(conn, project_id)?
-        .ok_or_else(|| anyhow!("unknown collaboration project {project_id}"))?;
-    let package = crate::db::collab_exchange::get_package(conn, package_id)?
-        .ok_or_else(|| anyhow!("unknown collaboration package {package_id}"))?;
+    //    unknown row here means a genuinely unknown package (fail-closed). Both
+    //    reads share ONE connection acquisition (W2 T2.1), released before the
+    //    manifest anchoring below (pure file I/O) runs.
+    let (project, package) = conn.with(|c| -> Result<_> {
+        let project = crate::db::collab::get_project(c, project_id)?
+            .ok_or_else(|| anyhow!("unknown collaboration project {project_id}"))?;
+        let package = crate::db::collab_exchange::get_package(c, package_id)?
+            .ok_or_else(|| anyhow!("unknown collaboration package {package_id}"))?;
+        Ok((project, package))
+    })?;
 
     // A hub-rejected package must never re-land: a rejected contributor could
     // otherwise re-push the rejected content onto the coordinator (the poll
@@ -124,7 +129,7 @@ pub fn ingest_project_package(
     //    `<sync_dir>/collaboration` fallback derived from the staging path
     //    (`<sync_dir>/staging/<wire_package_id>`), mirroring the incoming-resolver
     //    fallback idiom.
-    let landing_root = match crate::db::scan_root_path_of_kind(conn, "collaboration")? {
+    let landing_root = match conn.with(|c| crate::db::scan_root_path_of_kind(c, "collaboration"))? {
         Some(p) => PathBuf::from(p),
         None => staging_dir
             .parent()
@@ -148,33 +153,39 @@ pub fn ingest_project_package(
     let mut failed: Vec<String> = Vec::new();
 
     for record in &records {
-        let receipt = match process_project_frame(
-            conn,
-            &landing_root,
-            staging_dir,
-            record,
-            &project.slug,
-            &package.publisher_display,
-            project_id,
-            package_id,
-            peer_device,
-            &started_at,
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                // A processing error (I/O, DB) becomes a Rejected receipt rather
-                // than aborting the batch — one bad frame must not strand its
-                // siblings. Logged, never swallowed.
-                tracing::error!(
-                    project_id,
-                    package_id,
-                    frame_uuid = %record.frame_uuid,
-                    error = %format!("{e:#}"),
-                    "project ingest frame failed"
-                );
-                rejected_receipt(record, format!("{e:#}"))
+        // ONE connection acquisition per frame (W2 T2.1): the guard spans this
+        // frame whole — dedup lookup → hash → supersede → land → contribution
+        // transaction — and is released before the next frame, so a concurrent
+        // lane waits one frame, never the whole (multi-GB) package.
+        let receipt = conn.with(|c| {
+            match process_project_frame(
+                c,
+                &landing_root,
+                staging_dir,
+                record,
+                &project.slug,
+                &package.publisher_display,
+                project_id,
+                package_id,
+                peer_device,
+                &started_at,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    // A processing error (I/O, DB) becomes a Rejected receipt rather
+                    // than aborting the batch — one bad frame must not strand its
+                    // siblings. Logged, never swallowed.
+                    tracing::error!(
+                        project_id,
+                        package_id,
+                        frame_uuid = %record.frame_uuid,
+                        error = %format!("{e:#}"),
+                        "project ingest frame failed"
+                    );
+                    rejected_receipt(record, format!("{e:#}"))
+                }
             }
-        };
+        });
         match &receipt.outcome {
             ReceiptOutcome::Ingested => {
                 ingested_count += 1;
@@ -194,13 +205,17 @@ pub fn ingest_project_package(
     // 4. On ≥1 landed frame, retain the (already anchor-verified) manifest bytes
     //    so this node can re-serve the package byte-identically (Д2). The local
     //    status reflects whether every frame was accepted.
-    if ingested_count >= 1 {
-        crate::db::collab_exchange::set_manifest(conn, package_id, &manifest_bytes)
-            .with_context(|| format!("retain manifest for package {package_id}"))?;
-    }
+    //    Epilogue: both writes under ONE final connection acquisition (W2 T2.1).
     let status = if failed.is_empty() { "complete" } else { "failed" };
-    crate::db::collab_exchange::set_local_status(conn, package_id, status)
-        .with_context(|| format!("set local status for package {package_id}"))?;
+    conn.with(|c| -> Result<()> {
+        if ingested_count >= 1 {
+            crate::db::collab_exchange::set_manifest(c, package_id, &manifest_bytes)
+                .with_context(|| format!("retain manifest for package {package_id}"))?;
+        }
+        crate::db::collab_exchange::set_local_status(c, package_id, status)
+            .with_context(|| format!("set local status for package {package_id}"))?;
+        Ok(())
+    })?;
 
     tracing::info!(
         project_id,
@@ -682,7 +697,7 @@ mod tests {
         assert_ne!(anchor, "deadbeefdeadbeef");
         seed_package(&conn, Some("deadbeefdeadbeef"));
 
-        let err = ingest_project_package(&conn, &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER)
+        let err = ingest_project_package(IngestConn::Borrowed(&conn), &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER)
             .expect_err("anchor mismatch must be a hard error");
         let msg = format!("{err:#}");
         assert!(msg.contains("manifest anchor mismatch"), "names the failure: {msg}");
@@ -706,7 +721,7 @@ mod tests {
         let rec = record("u-1", "a.fits", &hash_bytes(bytes), Some(default_stamp()));
         stage(&staging, vec![rec], &[("a.fits", bytes)]);
 
-        let err = ingest_project_package(&conn, &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER)
+        let err = ingest_project_package(IngestConn::Borrowed(&conn), &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER)
             .expect_err("null anchor must be a hard error");
         assert!(format!("{err:#}").contains("announcement carries no manifest anchor"));
     }
@@ -733,7 +748,7 @@ mod tests {
         row.state = "rejected".to_string();
         crate::db::collab_exchange::upsert_package(&conn, &row).unwrap();
 
-        let err = ingest_project_package(&conn, &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER)
+        let err = ingest_project_package(IngestConn::Borrowed(&conn), &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER)
             .expect_err("a rejected package must be refused");
         assert!(
             format!("{err:#}").contains("rejected"),
@@ -766,7 +781,7 @@ mod tests {
         seed_package(&conn, Some(&anchor));
 
         let out =
-            ingest_project_package(&conn, &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
+            ingest_project_package(IngestConn::Borrowed(&conn), &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
         assert_eq!(out.ok_count, 1);
         assert_eq!(out.failed, vec!["u-bad".to_string()]);
         let by_uuid = |u: &str| out.receipts.iter().find(|r| r.frame_uuid == u).unwrap();
@@ -804,7 +819,7 @@ mod tests {
         let anchor = stage(&staging, vec![rec], &[("sub/L_0001.fits", bytes)]);
         seed_package(&conn, Some(&anchor));
 
-        ingest_project_package(&conn, &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
+        ingest_project_package(IngestConn::Borrowed(&conn), &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
 
         let rows = contributions_for_package(&conn, HUB_PACKAGE_ID).unwrap();
         assert_eq!(rows.len(), 1);
@@ -841,7 +856,7 @@ mod tests {
         let rec1 = record("u-1", "L.fits", &hash_bytes(v1), Some(default_stamp()));
         let anchor1 = stage(&staging1, vec![rec1], &[("L.fits", v1)]);
         seed_package(&conn, Some(&anchor1));
-        ingest_project_package(&conn, &staging1, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
+        ingest_project_package(IngestConn::Borrowed(&conn), &staging1, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
 
         let first = contributions_for_package(&conn, HUB_PACKAGE_ID).unwrap();
         assert_eq!(first.len(), 1);
@@ -864,7 +879,7 @@ mod tests {
         )
         .unwrap();
         let out =
-            ingest_project_package(&conn, &staging2, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
+            ingest_project_package(IngestConn::Borrowed(&conn), &staging2, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
         assert!(matches!(out.receipts[0].outcome, ReceiptOutcome::Ingested));
 
         // Exactly one contribution row (the old was superseded), pointing at v2.
@@ -899,13 +914,13 @@ mod tests {
 
         // First delivery ingests.
         let out1 =
-            ingest_project_package(&conn, &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
+            ingest_project_package(IngestConn::Borrowed(&conn), &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
         assert!(matches!(out1.receipts[0].outcome, ReceiptOutcome::Ingested));
         assert_eq!(landed_files(&landing).len(), 1);
 
         // Second delivery of the exact same package ⇒ Duplicate, nothing new.
         let out2 =
-            ingest_project_package(&conn, &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
+            ingest_project_package(IngestConn::Borrowed(&conn), &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
         assert!(matches!(out2.receipts[0].outcome, ReceiptOutcome::Duplicate));
         assert_eq!(out2.ok_count, 1);
         assert!(out2.failed.is_empty());
@@ -940,7 +955,7 @@ mod tests {
         seed_package(&conn, Some(&anchor));
 
         let out =
-            ingest_project_package(&conn, &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
+            ingest_project_package(IngestConn::Borrowed(&conn), &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
         assert!(matches!(out.receipts[0].outcome, ReceiptOutcome::Rejected(_)));
         assert_eq!(out.ok_count, 0);
         assert_eq!(out.failed, vec!["u-1".to_string()]);
@@ -970,7 +985,7 @@ mod tests {
         let anchor = stage(&staging, vec![rec], &[("L.fits", bytes)]);
         seed_package(&conn, Some(&anchor));
 
-        ingest_project_package(&conn, &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
+        ingest_project_package(IngestConn::Borrowed(&conn), &staging, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
 
         let rows = contributions_for_package(&conn, HUB_PACKAGE_ID).unwrap();
         assert_eq!(rows.len(), 1);
@@ -1009,7 +1024,7 @@ mod tests {
         );
         seed_package(&conn, Some(&anchor1));
         let out1 =
-            ingest_project_package(&conn, &staging1, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
+            ingest_project_package(IngestConn::Borrowed(&conn), &staging1, PROJECT_ID, HUB_PACKAGE_ID, PEER).unwrap();
         assert_eq!(out1.ok_count, 2);
 
         // ── pkg2: A re-included unchanged (Duplicate), B changed (v2), C new. ─
@@ -1027,7 +1042,7 @@ mod tests {
             &[("A.fits", a), ("B.fits", b2), ("C.fits", c)],
         );
         seed_named_package(&conn, PKG2, &anchor2);
-        let out2 = ingest_project_package(&conn, &staging2, PROJECT_ID, PKG2, PEER).unwrap();
+        let out2 = ingest_project_package(IngestConn::Borrowed(&conn), &staging2, PROJECT_ID, PKG2, PEER).unwrap();
 
         // A is a byte-identical re-delivery ⇒ Duplicate; B(v2) + C ingest.
         let by_uuid = |u: &str| out2.receipts.iter().find(|r| r.frame_uuid == u).unwrap();

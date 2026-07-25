@@ -85,7 +85,7 @@ pub use engine::{
     retry_backoff, PackageCleanupSink, SyncConfig, SyncEngine, SyncEngineHandle,
     CANCELLED_BY_RECEIVER_DETAIL, DEFAULT_ACK_TIMEOUT,
 };
-pub use ingest::{ingest_package, IngestOutcome};
+pub use ingest::{ingest_package, IngestConn, IngestOutcome};
 pub use pairing::{node_id_from_ticket, relay_mode_for, resolve_relays, RelayResolution};
 pub use models::{
     Direction, HistoryQuery, HistoryRow, InboundFileRow, InboundFileState, InboundRow,

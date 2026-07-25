@@ -84,8 +84,66 @@ use crate::package::{self, ManifestRecord};
 use crate::sharing::types::{FrameReceipt, PackageAnnounce, ReceiptOutcome};
 
 use super::now_iso;
-use super::store::{insert_history_row, insert_receipt, load_receipts, receipt_outcome_to_db};
+use super::store::{
+    insert_history_row, insert_receipt, load_receipts, receipt_outcome_to_db, CatalogSyncStore,
+};
 use super::models::{Direction, HistoryRow};
+
+/// How an ingest reaches the catalog connection (W2 T2.1).
+///
+/// [`ingest_package`] (and [`ingest_project_package`](super::project_ingest::ingest_project_package))
+/// acquire the connection **per unit of work** — the prologue reads, then one
+/// acquisition per frame, then the epilogue — instead of borrowing it once for the
+/// whole package. Every other user of the store (a second transfer's fetch-sink
+/// state writes, its own ingest, the receiver's own bookkeeping) therefore waits at
+/// most ONE frame's hash + copy + transaction, not the minutes a multi-GB package
+/// takes. Per-frame atomicity is unchanged: the guard spans a whole frame, so the
+/// hash → dedup queries → land → per-frame transaction sequence still runs without
+/// another writer interleaving inside it, and two lanes carrying identical bytes
+/// still order correctly (the second's `full_hash_already_ingested` check runs
+/// strictly after the first's commit for that frame).
+///
+/// - [`Borrowed`](Self::Borrowed) — the caller already owns the connection (tests,
+///   and any single-guard caller). No locking happens here.
+/// - [`Shared`](Self::Shared) — production: lock the store's connection for just
+///   the current unit of work.
+#[derive(Clone, Copy)]
+pub enum IngestConn<'a> {
+    /// Tests / single-guard callers: the caller owns the connection.
+    Borrowed(&'a Connection),
+    /// Production: lock the store's connection per unit of work, never across
+    /// the whole package.
+    Shared(&'a CatalogSyncStore),
+}
+
+impl IngestConn<'_> {
+    /// Run one unit of work against the catalog connection. For
+    /// [`Shared`](Self::Shared) the store mutex is acquired for the duration of
+    /// `f` and released as soon as it returns — so callers must keep `f` to a
+    /// single frame (or the prologue/epilogue), never a whole package.
+    pub(crate) fn with<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
+        match self {
+            IngestConn::Borrowed(conn) => f(conn),
+            IngestConn::Shared(store) => {
+                let out = {
+                    let conn = store.lock_conn();
+                    f(&conn)
+                };
+                // Release is not enough on its own: `std::sync::Mutex` is not fair,
+                // and an ingest loop that unlocks and immediately re-locks for the
+                // next frame BARGES — a thread already blocked on the guard loses
+                // every hand-off and ends up waiting the whole package anyway
+                // (measured: 16.7ms of a 17.3ms 8-frame package before this yield).
+                // Yielding once per unit of work lets the waiting thread take the
+                // guard it was woken for, which is what actually makes the wait
+                // bounded by one frame. Costs one `sched_yield` per frame — noise
+                // next to a frame's hash + copy + transaction.
+                std::thread::yield_now();
+                out
+            }
+        }
+    }
+}
 
 /// Aggregate result of ingesting one package: the per-frame receipts to ack back
 /// to the sender, plus a breakdown by outcome for the `sync-finished` event.
@@ -133,7 +191,7 @@ struct FrameVerdict {
 /// ack that triggers a resend is safe even without the receiver's package-level
 /// replay guard.
 pub fn ingest_package(
-    conn: &Connection,
+    conn: IngestConn<'_>,
     incoming_root: &Path,
     package_dir: &Path,
     announce: &PackageAnnounce,
@@ -166,24 +224,33 @@ pub fn ingest_package(
     // AUTHENTICATED node id (hex) the receiver verified — preferring that peer's
     // CURRENT friendly device name (cached names map, no hub round-trip), falling
     // back to the hex slug. This keeps the v1 landing layout byte-identical.
-    let landing_base: PathBuf = match landing_override {
-        Some(dir) => dir.to_path_buf(),
-        None => incoming_root.join(resolve_sender_slug(conn, peer_device)),
-    };
+    //
+    // Prologue: every pre-loop DB read under ONE connection acquisition (W2 T2.1),
+    // released before the first frame runs.
+    let (landing_base, existing_receipts): (PathBuf, HashMap<String, FrameReceipt>) =
+        conn.with(|c| -> Result<_> {
+            let landing_base: PathBuf = match landing_override {
+                Some(dir) => dir.to_path_buf(),
+                None => incoming_root.join(resolve_sender_slug(c, peer_device)),
+            };
 
-    // Redelivery optimization: load whatever this package already has on
-    // record and reuse any non-Rejected receipt verbatim instead of
-    // reprocessing. This avoids needless re-hash I/O AND avoids a subtle
-    // correctness trap: reprocessing an already-Ingested frame would re-run
-    // the uuid dedup, find the frame it itself inserted, and reclassify it as
-    // `Duplicate` — losing the original `Ingested` receipt for no reason. Only
-    // a frame with no receipt yet, or a prior `Rejected` one, is reprocessed.
-    let existing_receipts: HashMap<String, FrameReceipt> = load_receipts(conn, package_id)?
-        .into_iter()
-        .map(|r| (r.frame_uuid.clone(), r))
-        .collect();
+            // Redelivery optimization: load whatever this package already has on
+            // record and reuse any non-Rejected receipt verbatim instead of
+            // reprocessing. This avoids needless re-hash I/O AND avoids a subtle
+            // correctness trap: reprocessing an already-Ingested frame would re-run
+            // the uuid dedup, find the frame it itself inserted, and reclassify it as
+            // `Duplicate` — losing the original `Ingested` receipt for no reason. Only
+            // a frame with no receipt yet, or a prior `Rejected` one, is reprocessed.
+            let existing_receipts: HashMap<String, FrameReceipt> = load_receipts(c, package_id)?
+                .into_iter()
+                .map(|r| (r.frame_uuid.clone(), r))
+                .collect();
+
+            Ok((landing_base, existing_receipts))
+        })?;
 
     for record in &records {
+        // The redelivery-skip branch needs no connection at all.
         if let Some(prior) = existing_receipts.get(&record.frame_uuid) {
             if !matches!(prior.outcome, ReceiptOutcome::Rejected(_)) {
                 tracing::debug!(
@@ -209,31 +276,37 @@ pub fn ingest_package(
             // — the source may have been repaired since the last attempt.
         }
 
-        let verdict = match process_frame(conn, &landing_base, package_dir, record, package_id, history_key, peer_device, &started_at, batch_name) {
-            Ok(v) => v,
-            Err(e) => {
-                // A processing error (I/O, DB) is surfaced as a Rejected receipt
-                // rather than aborting the whole batch — one bad frame must not
-                // strand its siblings. Logged, never swallowed.
-                tracing::error!(
-                    package_id = %package_id,
-                    frame_uuid = %record.frame_uuid,
-                    error = %format!("{e:#}"),
-                    "sync ingest frame failed"
-                );
-                let receipt = FrameReceipt {
-                    frame_uuid: record.frame_uuid.clone(),
-                    xxh3: record.xxh3.clone(),
-                    outcome: ReceiptOutcome::Rejected(format!("{e:#}")),
-                };
-                // Best-effort receipt/history so the failure is still durable and
-                // the ack carries a verdict for this frame.
-                let _ = record_receipt_and_history(
-                    conn, package_id, history_key, &receipt, record, peer_device, &started_at, "rejected", batch_name,
-                );
-                FrameVerdict { receipt, history_outcome: "rejected" }
+        // ONE connection acquisition per frame (W2 T2.1): the guard spans this
+        // frame whole — hash → dedup queries → land → per-frame transaction (plus
+        // the failure path's best-effort receipt) — and is released before the
+        // next frame, so a concurrent lane waits one frame, never the package.
+        let verdict = conn.with(|c| {
+            match process_frame(c, &landing_base, package_dir, record, package_id, history_key, peer_device, &started_at, batch_name) {
+                Ok(v) => v,
+                Err(e) => {
+                    // A processing error (I/O, DB) is surfaced as a Rejected receipt
+                    // rather than aborting the whole batch — one bad frame must not
+                    // strand its siblings. Logged, never swallowed.
+                    tracing::error!(
+                        package_id = %package_id,
+                        frame_uuid = %record.frame_uuid,
+                        error = %format!("{e:#}"),
+                        "sync ingest frame failed"
+                    );
+                    let receipt = FrameReceipt {
+                        frame_uuid: record.frame_uuid.clone(),
+                        xxh3: record.xxh3.clone(),
+                        outcome: ReceiptOutcome::Rejected(format!("{e:#}")),
+                    };
+                    // Best-effort receipt/history so the failure is still durable and
+                    // the ack carries a verdict for this frame.
+                    let _ = record_receipt_and_history(
+                        c, package_id, history_key, &receipt, record, peer_device, &started_at, "rejected", batch_name,
+                    );
+                    FrameVerdict { receipt, history_outcome: "rejected" }
+                }
             }
-        };
+        });
 
         match verdict.history_outcome {
             "ingested" => outcome.ingested += 1,

@@ -2918,6 +2918,13 @@ impl CatalogSyncStore {
     /// Borrow the underlying connection for a synchronous unit of work (the
     /// receiver's per-frame ingest transaction). The guard must never be held
     /// across an `.await` — ingest is fully synchronous, so it isn't.
+    ///
+    /// It must also never be held across a whole *package*: ingest takes it
+    /// **per frame** via [`IngestConn::Shared`](crate::sync::ingest::IngestConn)
+    /// (W2 T2.1), so every other user of this connection — a concurrent
+    /// transfer's fetch-sink state writes, its own ingest, the receiver's
+    /// bookkeeping — waits at most one frame's hash + copy + transaction rather
+    /// than the minutes a multi-GB package takes.
     pub fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("catalog sync store mutex poisoned")
     }

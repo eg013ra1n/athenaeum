@@ -27,7 +27,7 @@ use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
 use crate::sharing::types::{FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent};
 use crate::sharing::SharingTransport;
 
-use super::ingest::ingest_package;
+use super::ingest::{ingest_package, IngestConn};
 use super::node_id_hex;
 use super::store::{count_satisfied_receipts, insert_receipt, CatalogSyncStore, SyncStore};
 use super::receiver::{IncomingResolver, SyncReceiver};
@@ -314,7 +314,7 @@ fn ingest_dot_only_device_name_lands_under_hex_slug_not_above_incoming_root() {
     let conn = catalog_conn();
     set_device_names(&conn, &[(PEER_HEX, "..")]);
 
-    let outcome = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+    let outcome = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
     assert_eq!(outcome.ingested, 1);
 
     let landed_path: String = conn
@@ -350,7 +350,7 @@ fn ingest_lands_under_resolved_device_name() {
     let conn = catalog_conn();
     set_device_names(&conn, &[(PEER_HEX, "My Mac Book")]);
 
-    let outcome = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+    let outcome = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
     assert_eq!(outcome.ingested, 1);
 
     let landed_path: String = conn
@@ -468,7 +468,7 @@ fn ingest_lands_files_and_rows() {
         build_fixture_package(tmp.path(), "frame-uuid-1", "L_0001.fits", "M31", "2026-01-16T10:00:00.000Z");
 
     let conn = catalog_conn();
-    let outcome = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+    let outcome = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
 
     // Catalog rows created from manifest metadata.
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "one files row");
@@ -524,7 +524,7 @@ fn duplicate_delivery_single_row_but_acked() {
     let conn = catalog_conn();
 
     // First delivery ingests.
-    let out1 = ingest_package(&conn, &incoming, &pkg_dir, &announce1, PEER_HEX, &announce1.package_id.0, None, None).unwrap();
+    let out1 = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce1, PEER_HEX, &announce1.package_id.0, None, None).unwrap();
     assert_eq!(out1.ingested, 1);
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1);
 
@@ -535,7 +535,7 @@ fn duplicate_delivery_single_row_but_acked() {
         package_id: crate::sharing::types::PackageId("second-delivery".to_string()),
         ..announce1.clone()
     };
-    let out2 = ingest_package(&conn, &incoming, &pkg_dir, &announce2, PEER_HEX, &announce2.package_id.0, None, None).unwrap();
+    let out2 = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce2, PEER_HEX, &announce2.package_id.0, None, None).unwrap();
 
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM files"), 1, "still one files row");
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1, "still one frames row");
@@ -575,7 +575,7 @@ fn primary_wins_metadata() {
     // Deliver an OLDER snapshot for the same uuid.
     let (pkg_dir, announce) =
         build_fixture_package(tmp.path(), "frame-uuid-3", "L_0003.fits", "ORIGINAL_NAME", "2020-01-01T00:00:00.000Z");
-    let out = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+    let out = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
 
     // Not overwritten: still one frame, object unchanged, receipt Duplicate.
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM frames"), 1, "no new frame inserted");
@@ -893,10 +893,10 @@ fn sampling_collision_is_not_treated_as_duplicate() {
         "test premise: full content hash must differ"
     );
 
-    let out_a = ingest_package(&conn, &incoming, &pkg_a, &announce_a, PEER_HEX, &announce_a.package_id.0, None, None).unwrap();
+    let out_a = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_a, &announce_a, PEER_HEX, &announce_a.package_id.0, None, None).unwrap();
     assert_eq!(out_a.ingested, 1);
 
-    let out_b = ingest_package(&conn, &incoming, &pkg_b, &announce_b, PEER_HEX, &announce_b.package_id.0, None, None).unwrap();
+    let out_b = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_b, &announce_b, PEER_HEX, &announce_b.package_id.0, None, None).unwrap();
     assert_eq!(
         out_b.ingested, 1,
         "distinct content must ingest despite a sampling-hash collision with an already-ingested frame"
@@ -947,7 +947,7 @@ fn content_reingest_allowed_after_catalog_delete() {
         "premise: the receipt's frame was deleted from the catalog"
     );
 
-    let out = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+    let out = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
 
     assert_eq!(
         out.ingested, 1,
@@ -1008,7 +1008,7 @@ fn content_dedup_still_blocks_while_frame_alive() {
     )
     .unwrap();
 
-    let out = ingest_package(&conn, &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
+    let out = ingest_package(IngestConn::Borrowed(&conn), &incoming, &pkg_dir, &announce, PEER_HEX, &announce.package_id.0, None, None).unwrap();
 
     assert_eq!(out.duplicate, 1, "same content while its frame is alive stays a Duplicate");
     assert_eq!(out.ingested, 0, "no ingest");
@@ -1658,4 +1658,301 @@ async fn project_package_lands_contributions_and_acks() {
     };
     assert_eq!(pkg.local_status, "complete");
     assert!(pkg.manifest_ndjson.is_some(), "retained manifest bytes for re-serving");
+}
+
+// ── W2 T2.1: per-frame connection locking (IngestConn) ──────────────────────
+
+/// Frames per package for the two `IngestConn` tests: enough gaps between frames
+/// for a competing thread to win the mutex at least twice, few enough to keep the
+/// whole test well under a second of real work.
+const CONN_TEST_FRAMES: usize = 8;
+
+/// Build an `n`-frame fixture package whose payloads are real FITS files of
+/// `dim`×`dim` f32 pixels (≈ `dim`²·4 bytes each) with a distinct fill value per
+/// frame, so every frame has a genuinely distinct full-content hash and per-frame
+/// ingest work (hash + copy + header extract + tx) has measurable duration.
+fn build_multi_frame_package(root: &Path, n: usize, dim: usize) -> (PathBuf, PackageAnnounce) {
+    let src_dir = root.join("src-multi");
+    std::fs::create_dir_all(&src_dir).unwrap();
+
+    let mut entries = Vec::with_capacity(n);
+    for i in 0..n {
+        let filename = format!("L_{i:04}.fits");
+        let src = src_dir.join(&filename);
+        write_fits_f32(&src, dim, dim, 1, &vec![i as f32 + 1.0; dim * dim], &[]).unwrap();
+        let uuid = format!("frame-multi-{i}");
+        let record = ManifestRecord {
+            v: MANIFEST_VERSION,
+            frame_uuid: uuid.clone(),
+            origin_catalog_uuid: "catalog-uuid".to_string(),
+            origin_device: ORIGIN_DEVICE.to_string(),
+            payload_kind: PayloadKind::RawFrame,
+            rel_path: filename,
+            byte_size: std::fs::metadata(&src).unwrap().len(),
+            xxh3: package::xxh3_full_file(&src).unwrap(),
+            frame_meta: serde_json::to_value(fixture_frame(&uuid, "MULTI", "2026-01-16T10:00:00.000Z")).unwrap(),
+            analysis: None,
+            app_version: "test".to_string(),
+            project: None,
+        };
+        entries.push((src, record));
+    }
+
+    let pkg_dir = root.join("pkg-multi");
+    let announce = package::write_package(&pkg_dir, entries).unwrap();
+    (pkg_dir, announce)
+}
+
+/// Run `run_ingest` while a competing thread hammers `store.lock_conn()`, and
+/// return how many of the competitor's acquisitions observed a **partially
+/// ingested** catalog (`0 < files < total_frames`).
+///
+/// That predicate is the whole point: an ingest that holds the guard for the
+/// entire package commits every frame's transaction before any other thread can
+/// read, so a competitor can only ever observe 0 (before) or `total_frames`
+/// (after) — never a partial count. A non-zero result therefore *proves* the
+/// guard was released between frames.
+fn midpackage_observations(
+    store: &CatalogSyncStore,
+    total_frames: i64,
+    run_ingest: impl FnOnce() + Send,
+) -> usize {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let done = AtomicBool::new(false);
+    let observations = AtomicUsize::new(0);
+
+    std::thread::scope(|scope| {
+        let probe = scope.spawn(|| {
+            let mut i = 0u64;
+            while !done.load(Ordering::Relaxed) {
+                {
+                    // One competing unit of work: lock, read, trivial write, drop.
+                    let conn = store.lock_conn();
+                    let files: i64 = conn
+                        .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+                        .unwrap();
+                    crate::db::set_setting(&conn, "test.conn_probe", &i.to_string()).unwrap();
+                    if files > 0 && files < total_frames {
+                        observations.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                i += 1;
+                std::thread::yield_now();
+            }
+        });
+
+        run_ingest();
+        done.store(true, Ordering::Relaxed);
+        probe.join().unwrap();
+    });
+
+    observations.load(Ordering::Relaxed)
+}
+
+/// W2 T2.1 — the bounded-wait pin. Ingesting a multi-frame package must release
+/// the store connection between frames so a concurrent lane (another transfer's
+/// fetch-sink state writes, or its own ingest) waits at most ONE frame, not the
+/// whole multi-GB package.
+#[test]
+fn ingest_releases_conn_between_frames() {
+    let tmp = TempDir::new().unwrap();
+    let (pkg_dir, announce) = build_multi_frame_package(tmp.path(), CONN_TEST_FRAMES, 384);
+    let frames = CONN_TEST_FRAMES as i64;
+
+    // The pin: `IngestConn::Shared` locks per frame, so the competitor gets in
+    // between frames and sees a partially-ingested catalog.
+    let shared_catalog = tmp.path().join("catalog_shared.db");
+    let _shared_db = crate::db::Database::new(shared_catalog.clone()).unwrap();
+    let shared_store = CatalogSyncStore::open(&shared_catalog).unwrap();
+    let shared_incoming = tmp.path().join("incoming_shared");
+
+    let shared_observed = midpackage_observations(&shared_store, frames, || {
+        let out = ingest_package(
+            IngestConn::Shared(&shared_store),
+            &shared_incoming,
+            &pkg_dir,
+            &announce,
+            PEER_HEX,
+            &announce.package_id.0,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.ingested, CONN_TEST_FRAMES as u32, "all frames ingested");
+    });
+
+    // The control (and the RED this test was written against): the pre-W2-T2.1
+    // shape, where the CALLER holds `lock_conn()` for the whole package and hands
+    // ingest a `Borrowed` connection. The competitor is then blocked from the
+    // first frame to the last, so it can never observe a partial catalog — 0 by
+    // construction, whatever the machine's timing.
+    let control_catalog = tmp.path().join("catalog_control.db");
+    let _control_db = crate::db::Database::new(control_catalog.clone()).unwrap();
+    let control_store = CatalogSyncStore::open(&control_catalog).unwrap();
+    let control_incoming = tmp.path().join("incoming_control");
+
+    let control_observed = midpackage_observations(&control_store, frames, || {
+        let conn = control_store.lock_conn();
+        let out = ingest_package(
+            IngestConn::Borrowed(&conn),
+            &control_incoming,
+            &pkg_dir,
+            &announce,
+            PEER_HEX,
+            &announce.package_id.0,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(out.ingested, CONN_TEST_FRAMES as u32, "all frames ingested");
+    });
+
+    assert_eq!(
+        control_observed, 0,
+        "control premise: a whole-package guard makes a partial catalog unobservable"
+    );
+    assert!(
+        shared_observed >= 2,
+        "a competing thread must acquire the store connection mid-package \
+         (partial-catalog acquisitions: {shared_observed} with Shared, \
+         {control_observed} with a whole-package guard)"
+    );
+}
+
+/// Behavior-neutrality pin for W2 T2.1: the same multi-frame package ingested
+/// through `IngestConn::Borrowed` (one caller-owned connection) and through
+/// `IngestConn::Shared` (the store locked per frame) must produce the same
+/// outcome counts, the same receipts, and the same catalog/landing rows.
+#[test]
+fn ingest_shared_conn_matches_borrowed_outcome() {
+    let tmp = TempDir::new().unwrap();
+    let (pkg_dir, announce) = build_multi_frame_package(tmp.path(), 3, 64);
+
+    // A — Borrowed, against a plain caller-owned catalog connection.
+    let borrowed_catalog = tmp.path().join("catalog_borrowed.db");
+    let borrowed_db = crate::db::Database::new(borrowed_catalog.clone()).unwrap();
+    let borrowed_incoming = tmp.path().join("incoming_borrowed");
+    let borrowed_out = {
+        let conn = borrowed_db.conn();
+        ingest_package(
+            IngestConn::Borrowed(&conn),
+            &borrowed_incoming,
+            &pkg_dir,
+            &announce,
+            PEER_HEX,
+            &announce.package_id.0,
+            None,
+            None,
+        )
+        .unwrap()
+    };
+
+    // B — Shared, against a real store that locks per frame.
+    let shared_catalog = tmp.path().join("catalog_shared.db");
+    let _shared_db = crate::db::Database::new(shared_catalog.clone()).unwrap();
+    let shared_store = CatalogSyncStore::open(&shared_catalog).unwrap();
+    let shared_incoming = tmp.path().join("incoming_shared");
+    let shared_out = ingest_package(
+        IngestConn::Shared(&shared_store),
+        &shared_incoming,
+        &pkg_dir,
+        &announce,
+        PEER_HEX,
+        &announce.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+
+    // Same aggregate outcome.
+    assert_eq!(shared_out.ingested, 3, "premise: every frame ingests");
+    let counts = |o: &super::ingest::IngestOutcome| (o.ingested, o.duplicate, o.skipped_older, o.rejected);
+    assert_eq!(counts(&borrowed_out), counts(&shared_out), "outcome counts identical");
+    assert_eq!(
+        receipt_fingerprint(&borrowed_out.receipts),
+        receipt_fingerprint(&shared_out.receipts),
+        "receipts identical"
+    );
+
+    // Same catalog rows (meaningful columns only — ids/created_at are per-run).
+    let borrowed_conn = borrowed_db.conn();
+    let shared_conn = shared_store.lock_conn();
+    for (sql, cols, what) in [
+        ("SELECT filename, size, format, content_hash FROM files ORDER BY filename", 4, "files"),
+        (
+            "SELECT uuid, object, imagetyp, exptime, filter, instrume, telescop, gain, \"offset\", \
+             binning, naxis1, naxis2, date_obs, updated_at FROM frames ORDER BY uuid",
+            14,
+            "frames",
+        ),
+        ("SELECT frame_uuid, xxh3, outcome FROM sync_receipts ORDER BY frame_uuid", 3, "sync_receipts"),
+        (
+            "SELECT frame_uuid, filename, object, peer_device, direction, bytes, outcome \
+             FROM sync_history ORDER BY frame_uuid",
+            7,
+            "sync_history",
+        ),
+    ] {
+        assert_eq!(
+            rows_as_strings(&borrowed_conn, sql, cols),
+            rows_as_strings(&shared_conn, sql, cols),
+            "{what} rows must be identical across IngestConn variants"
+        );
+    }
+
+    // Same landed files, at the same paths relative to each incoming root.
+    assert_eq!(
+        landed_rel_paths(&borrowed_conn, &borrowed_incoming),
+        landed_rel_paths(&shared_conn, &shared_incoming),
+        "landed layout identical"
+    );
+    assert_eq!(landed_rel_paths(&shared_conn, &shared_incoming).len(), 3, "premise: three files landed");
+}
+
+/// Stable text form of a receipt list (order-independent), for cross-run equality.
+fn receipt_fingerprint(receipts: &[FrameReceipt]) -> Vec<String> {
+    let mut out: Vec<String> = receipts
+        .iter()
+        .map(|r| format!("{}|{}|{:?}", r.frame_uuid, r.xxh3, r.outcome))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Render `cols` columns of every row of `sql` as `Value`-debug text — a
+/// schema-agnostic row fingerprint for comparing two catalogs.
+fn rows_as_strings(conn: &Connection, sql: &str, cols: usize) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    let rows = stmt
+        .query_map([], |r| {
+            let mut parts = Vec::with_capacity(cols);
+            for i in 0..cols {
+                let v: rusqlite::types::Value = r.get(i)?;
+                parts.push(format!("{v:?}"));
+            }
+            Ok(parts.join("|"))
+        })
+        .unwrap();
+    rows.map(|r| r.unwrap()).collect()
+}
+
+/// Every `files.path`, relative to `incoming` and asserted to exist on disk.
+fn landed_rel_paths(conn: &Connection, incoming: &Path) -> Vec<String> {
+    let mut stmt = conn.prepare("SELECT path FROM files ORDER BY path").unwrap();
+    let mut out: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|p| {
+            let p = p.unwrap();
+            let path = Path::new(&p);
+            assert!(path.exists(), "landed file must exist on disk: {p}");
+            path.strip_prefix(incoming)
+                .unwrap_or_else(|_| panic!("landed file must be under the incoming root: {p}"))
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    out.sort();
+    out
 }
