@@ -57,7 +57,7 @@ use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageId,
     RevokeReason, StartInfo, TransportEvent,
 };
-use crate::sharing::{FetchSink, SharingTransport};
+use crate::sharing::{FetchSink, ProviderTelemetrySink, SharingTransport};
 use crate::sync::status::TransportHealth;
 use crate::sync::DedupResponder;
 
@@ -1979,6 +1979,79 @@ impl SharedIrohNode {
         Ok(())
     }
 
+    /// The swarm counterpart of [`role_fetch`](Self::role_fetch) (D3 Task 1):
+    /// one collection, the whole holder set, split per child blob.
+    ///
+    /// **Tag derivation.** `role_fetch` names its tag after the announce's
+    /// package id; a swarm fetch has no announce — the hub's `root_hash` IS the
+    /// subject — so the tag is the same `<role>/pkg/<id>` shape keyed by the
+    /// collection hash's canonical lowercase hex: `<role>/pkg/<root_hash>`. A hex
+    /// hash is a single path segment, exactly like a package uuid, so every
+    /// existing namespace rule keeps working unchanged: the role-prefixed startup
+    /// sweep still scopes the permanent tag, and
+    /// [`role_release`](Self::role_release) reclaims BOTH it and its
+    /// `in-flight/` derivative when called with `PackageId(root_hash_hex)`. It is
+    /// also idempotent under content addressing: two members fetching the same
+    /// collection reuse one tag name, and a re-fetch overwrites rather than
+    /// leaking a second.
+    ///
+    /// **B7 sweep interaction (role-dependent).** The swarm fetch's caller is the
+    /// collab exchange, i.e. [`Role::Collab`], so its in-flight tag is
+    /// `in-flight/collab/pkg/<root_hash>` — outside the `in-flight/recv/pkg/`
+    /// prefix the receiver's orphan sweep enumerates, so the contract holds by
+    /// exclusion. Were a `Role::Recv` caller ever added, its in-flight tag WOULD
+    /// fall inside that prefix and the sweep would reclaim it as an orphan (no
+    /// `sync_inbound` row is ever keyed by a collection hash). That costs a
+    /// resume, never integrity — but it is the reason to keep swarm fetches on
+    /// the Collab handle.
+    async fn role_fetch_multi(
+        &self,
+        role: Role,
+        providers: Vec<NodeId>,
+        root_hash: &str,
+        byte_size: u64,
+        dest_dir: &Path,
+        sink: FetchSink,
+        telemetry: ProviderTelemetrySink,
+    ) -> Result<()> {
+        let hash: Hash = root_hash
+            .parse()
+            .with_context(|| format!("parse collection hash {root_hash:?}"))?;
+        if providers.is_empty() {
+            anyhow::bail!("multi-source fetch of {hash} has no providers");
+        }
+        let ids = providers
+            .iter()
+            .map(|p| {
+                EndpointId::from_bytes(p).map_err(|e| anyhow!("invalid provider node id: {e}"))
+            })
+            .collect::<Result<Vec<EndpointId>>>()?;
+        let tag = role_package_tag(role.prefix(), &PackageId(hash.to_hex()));
+        // Clone the endpoint out of the `net` lock so it is not held across the
+        // download awaits below (same discipline as `role_fetch`).
+        let endpoint = self.endpoint();
+        let count = ids.len();
+        blobs::fetch_collection_multi(
+            &self.store,
+            &endpoint,
+            ids,
+            hash,
+            &tag,
+            dest_dir,
+            byte_size,
+            sink,
+            telemetry,
+        )
+        .await?;
+
+        tracing::info!(
+            providers = count,
+            root_hash = %hash,
+            "iroh multi-source fetch complete"
+        );
+        Ok(())
+    }
+
     async fn role_fetch_manifest(
         &self,
         from: NodeId,
@@ -2295,6 +2368,22 @@ impl SharingTransport for RoleHandle {
     ) -> Result<()> {
         self.node
             .role_fetch(self.role, from, pkg, dest_dir, sink)
+            .await
+    }
+
+    async fn fetch_collection_multi(
+        &self,
+        providers: Vec<NodeId>,
+        root_hash: &str,
+        byte_size: u64,
+        dest_dir: &Path,
+        sink: FetchSink,
+        telemetry: ProviderTelemetrySink,
+    ) -> Result<()> {
+        self.node
+            .role_fetch_multi(
+                self.role, providers, root_hash, byte_size, dest_dir, sink, telemetry,
+            )
             .await
     }
 

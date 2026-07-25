@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use iroh::{Endpoint, EndpointId};
-use iroh_blobs::api::downloader::{DownloadProgressItem, Shuffled};
+use iroh_blobs::api::downloader::{DownloadProgressItem, DownloadRequest, Shuffled, SplitStrategy};
 use iroh_blobs::api::{Store, TempTag};
 use iroh_blobs::format::collection::Collection;
 use iroh_blobs::protocol::{ChunkRanges, GetRequest};
@@ -24,7 +24,7 @@ use n0_future::StreamExt as _;
 
 use crate::package::{read_manifest, validate_rel_path, ManifestRecord, MANIFEST_FILENAME};
 use crate::sharing::types::{FetchEvent, LocalFault};
-use crate::sharing::FetchSink;
+use crate::sharing::{FetchSink, ProviderEvent, ProviderTelemetrySink};
 
 /// Minimum wall-clock gap between two throttled [`FetchEvent`]s from the same
 /// source — applied per-file (each observer) AND to the aggregate batch stream.
@@ -322,6 +322,17 @@ pub(crate) fn in_flight_tag(permanent_tag: &str) -> String {
 /// `dest_dir` (not even created) so a malicious entry (`../x`, an absolute
 /// path) can neither escape `dest_dir` nor overwrite an arbitrary path; the
 /// whole fetch errors instead.
+///
+/// ## Intentional sibling of [`fetch_collection_multi`]
+///
+/// [`fetch_collection_multi`] (D3 Task 1) is a deliberate COPY of this function,
+/// not a refactor of it, and the two are meant to be read side by side. THIS one
+/// is the load-bearing path: every personal-sync transfer and every project
+/// package whose announcement predates real collection hashes falls back to it.
+/// Folding both into one parameterized function would put that fallback one edit
+/// away from every swarm change — the duplication IS the isolation. A fix here
+/// should be considered for the sibling on purpose, with both test sets run;
+/// never assume one inherits the other.
 pub async fn fetch_collection_to_dir(
     store: &Store,
     endpoint: &Endpoint,
@@ -541,6 +552,267 @@ pub async fn fetch_collection_to_dir(
         count = collection.len(),
         path = %dest_dir.display(),
         "collection fetched to package dir"
+    );
+    Ok(())
+}
+
+/// Download the collection identified by `root_hash` from MANY `providers` at
+/// once into `store`, then export every entry to its `rel_path` under
+/// `dest_dir` — the swarm counterpart of [`fetch_collection_to_dir`] (D3 §3.1).
+///
+/// ## Intentional sibling, not a refactor
+///
+/// This is a considered COPY of [`fetch_collection_to_dir`]; see that function's
+/// doc for why the two stay apart (it is the fallback path, and entangling them
+/// risks both). Read them side by side; fix them side by side.
+///
+/// ## What differs from the scalar fetch
+///
+/// - **Phase 1** (root hash-seq + collection meta) goes to the FULL provider set
+///   under the default `SplitStrategy::None`. It is one tiny request, and
+///   [`Shuffled`] already gives it sequential failover across every provider, so
+///   splitting it buys nothing. Its per-provider attempts are therefore not
+///   surfaced to `telemetry` — if every provider fails phase 1 the returned
+///   `Err` is the honest signal, and a single successful meta fetch says nothing
+///   useful about swarm width.
+/// - **Phase 2** runs `SplitStrategy::Split`, which turns the hash-sequence into
+///   one request per child blob (up to 32 in flight), each handed the full,
+///   re-shuffled provider set. A child whose provider dies is re-asked of the
+///   next provider for only the bytes still missing — byte-level resume, per
+///   child, for free.
+/// - The progress stream's per-provider items — dropped by the scalar fetch —
+///   are routed into `telemetry` as [`ProviderEvent`]s.
+///
+/// Everything else is identical on purpose: entry-name validation before a
+/// single byte touches `dest_dir`, the per-file observer tasks and their
+/// abort-on-drop guard, the throttled batch progress sink, the in-flight tag
+/// lifecycle (set once after phase 1, deleted ONLY on success so a killed
+/// transfer resumes), and the [`LocalFault`] boundary below the permanent tag.
+///
+/// `providers` must be non-empty; an empty set is a caller error, not a fetch
+/// that quietly succeeds against nobody.
+pub async fn fetch_collection_multi(
+    store: &Store,
+    endpoint: &Endpoint,
+    providers: Vec<EndpointId>,
+    root_hash: Hash,
+    tag: &str,
+    dest_dir: &Path,
+    byte_size: u64,
+    sink: FetchSink,
+    telemetry: ProviderTelemetrySink,
+) -> Result<()> {
+    if providers.is_empty() {
+        anyhow::bail!("fetch_collection_multi {root_hash} called with an empty provider set");
+    }
+    let provider_count = providers.len();
+
+    // ONE downloader reused across phase 1 + phase 2: each `store.downloader`
+    // spins up a fresh actor + connection pool, so reusing it keeps the
+    // connections phase 1 opened warm for the fan-out below.
+    let downloader = store.downloader(endpoint);
+
+    // Phase 1: fetch only the hash-seq (root) + collection meta (child 0) so we
+    // learn the entry names and per-child hashes before the bulk transfer. Full
+    // provider set, default strategy — see the doc above.
+    let meta_req = GetRequest::builder()
+        .root(ChunkRanges::all())
+        .child(0, ChunkRanges::all())
+        .build(root_hash);
+    downloader
+        .download(meta_req, Shuffled::new(providers.clone()))
+        .await
+        .with_context(|| format!("download collection meta {root_hash}"))?;
+
+    let collection = Collection::load(root_hash, store)
+        .await
+        .with_context(|| format!("load collection {root_hash}"))?;
+
+    // GC-protect the in-flight download from here on — identical contract to the
+    // scalar fetch (see its long comment at the same site): a `hash_seq`-format
+    // tag on the root so the GC mark phase retains every child (partials
+    // included), set ONCE and deleted ONLY on the success path below, so every
+    // non-success exit keeps the verified partial bytes for the next attempt.
+    // Content addressing makes those bytes interchangeable across holders, so a
+    // resumed swarm fetch can complete from an entirely different provider set.
+    let in_flight = in_flight_tag(tag);
+    store
+        .tags()
+        .set(&in_flight, HashAndFormat::hash_seq(root_hash))
+        .await
+        .with_context(|| format!("set in-flight download tag {in_flight}"))?;
+
+    // Validate every entry name before writing anything at all — `dest_dir`
+    // isn't even created yet, so a rejected entry leaves no trace on disk.
+    for (name, _) in collection.iter() {
+        validate_rel_path(name)
+            .with_context(|| format!("collection entry name failed validation: {name}"))?;
+    }
+
+    // Per-file observers: one task per child hash, throttled (>=300 ms) with the
+    // terminal event always emitted. Held in `AbortObserversOnDrop` from spawn
+    // time so every exit path below aborts them instead of leaking.
+    let mut observers = AbortObserversOnDrop(Vec::with_capacity(collection.len()));
+    for (name, hash) in collection.iter() {
+        let sink = sink.clone();
+        let name = name.clone();
+        let hash = *hash;
+        let blobs = store.blobs().clone();
+        observers.0.push(tokio::spawn(async move {
+            // Seed `last` in the past so the first update emits immediately.
+            let mut last = Instant::now()
+                .checked_sub(FETCH_PROGRESS_MIN_INTERVAL)
+                .unwrap_or_else(Instant::now);
+            let stream = match blobs.observe(hash).stream().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let mut stream = Box::pin(stream);
+            while let Some(bf) = stream.next().await {
+                let bytes_done = bf.total_bytes();
+                let bytes_total = bf.size();
+                let complete = bf.is_complete();
+                if complete || last.elapsed() >= FETCH_PROGRESS_MIN_INTERVAL {
+                    last = Instant::now();
+                    sink(FetchEvent::File {
+                        name: name.clone(),
+                        bytes_done,
+                        bytes_total,
+                        complete,
+                    });
+                }
+                if complete {
+                    break;
+                }
+            }
+        }));
+    }
+
+    // Phase 2: the fan-out. `SplitStrategy::Split` splits the hash-sequence into
+    // one `GetRequest` per child and runs them buffered-unordered, each against
+    // the full provider set; `Shuffled` re-shuffles per child request, which
+    // load-spreads across holders for free. `Progress` is cumulative request
+    // bytes (incl. locally-present) and can exceed the payload `byte_size`, so
+    // clamp it; the terminal batch event below pins the total.
+    let progress = downloader.download_with_opts(DownloadRequest::new(
+        HashAndFormat::hash_seq(root_hash),
+        Shuffled::new(providers),
+        SplitStrategy::Split,
+    ));
+    let mut stream = progress
+        .stream()
+        .await
+        .with_context(|| format!("open collection download stream {root_hash}"))?;
+    let mut last = Instant::now();
+    while let Some(item) = stream.next().await {
+        match item {
+            DownloadProgressItem::Progress(done) => {
+                if last.elapsed() >= FETCH_PROGRESS_MIN_INTERVAL {
+                    last = Instant::now();
+                    sink(FetchEvent::Batch {
+                        bytes_done: done.min(byte_size),
+                        bytes_total: byte_size,
+                    });
+                }
+            }
+            // The whole point of the sibling: these two are `_ => {}` in the
+            // scalar fetch. `TryProvider` fires once per (child, provider)
+            // attempt — including the attempt that then finds the child already
+            // local — and `ProviderFailed` once per dial/transfer failure, after
+            // which the downloader moves to the next provider for that child with
+            // byte-level resume. Neither is a fetch outcome; both are the raw
+            // material for the "downloading from N sources" figure and the
+            // per-provider journal.
+            DownloadProgressItem::TryProvider { id, .. } => {
+                telemetry(ProviderEvent::Trying(*id.as_bytes()));
+            }
+            DownloadProgressItem::ProviderFailed { id, .. } => {
+                telemetry(ProviderEvent::Failed(*id.as_bytes()));
+            }
+            // The `AbortObserversOnDrop` guard aborts every observer as
+            // `observers` drops on this early return/bail — no manual abort loop.
+            DownloadProgressItem::Error(e) => return Err(e.into()),
+            // In Split mode this arrives when a CHILD exhausted every provider.
+            // Bail on the first one: the collection is incomplete and no later
+            // child can repair it.
+            DownloadProgressItem::DownloadError => {
+                anyhow::bail!("multi-source download of collection {root_hash} failed")
+            }
+            // `PartComplete` — one child finished; the per-file observers already
+            // report completion with names the caller understands.
+            _ => {}
+        }
+    }
+    // Happy path: drain (await) each observer so its terminal completion event
+    // is emitted — then the now-empty guard drops harmlessly.
+    for h in observers.0.drain(..) {
+        let _ = h.await;
+    }
+    // The final batch event always fires, at exactly the announced total.
+    sink(FetchEvent::Batch {
+        bytes_done: byte_size,
+        bytes_total: byte_size,
+    });
+
+    // ── D2 §3.2: everything BELOW this line is LOCAL work on data we already
+    // hold — store bookkeeping and writing the collection out to our own disk.
+    // Failures here are wrapped in `LocalFault` ("we cannot accept this");
+    // everything ABOVE is the transfer itself and stays unmarked, so a failure
+    // there reads as vanished peers. Identical boundary, identical reasoning, as
+    // the scalar sibling.
+    //
+    // Pin the downloaded collection until the caller releases it. The in-flight
+    // tag has protected the data continuously since phase 1, so there is NO
+    // untagged window here — set the permanent tag, THEN drop the in-flight one.
+    store
+        .tags()
+        .set(tag, HashAndFormat::hash_seq(root_hash))
+        .await
+        .map_err(|e| LocalFault(anyhow::Error::new(e).context("tag fetched collection")))?;
+
+    // Success: the permanent tag now protects the collection, so retire the
+    // in-flight tag (the ONE path that deletes it). Best-effort — a delete
+    // failure must not fail an otherwise-complete fetch. Never swallow: log.
+    if let Err(e) = store.tags().delete(in_flight.as_bytes()).await {
+        tracing::warn!(
+            in_flight_tag = %in_flight,
+            root_hash = %root_hash,
+            error = %format!("{e:#}"),
+            "delete in-flight download tag after successful fetch failed"
+        );
+    }
+
+    // Reconstruct the package directory from the downloaded collection.
+    tokio::fs::create_dir_all(dest_dir).await.map_err(|e| {
+        LocalFault(anyhow::Error::new(e).context(format!("create dest dir {}", dest_dir.display())))
+    })?;
+
+    for (name, blob_hash) in collection.iter() {
+        let target = dest_dir.join(name);
+        if let Some(parent) = target.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                LocalFault(
+                    anyhow::Error::new(e).context(format!("create dir {}", parent.display())),
+                )
+            })?;
+        }
+        store
+            .blobs()
+            .export(*blob_hash, &target)
+            .await
+            .map_err(|e| {
+                LocalFault(
+                    anyhow::Error::new(e).context(format!("export {name} -> {}", target.display())),
+                )
+            })?;
+    }
+
+    tracing::debug!(
+        providers = provider_count,
+        root_hash = %root_hash,
+        count = collection.len(),
+        path = %dest_dir.display(),
+        "collection fetched from multiple providers to package dir"
     );
     Ok(())
 }

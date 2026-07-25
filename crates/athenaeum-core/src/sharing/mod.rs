@@ -49,6 +49,48 @@ pub fn noop_fetch_sink() -> FetchSink {
     Arc::new(|_| {})
 }
 
+/// A per-provider telemetry event from a multi-source (swarm) fetch —
+/// [`fetch_collection_multi`](SharingTransport::fetch_collection_multi), D3 §3.1.3.
+///
+/// A swarm fetch runs one request per collection child across the whole provider
+/// set, and the downloader's progress stream is the ONLY place that says which
+/// provider a given child is being pulled from. The scalar [`fetch`] drops those
+/// items on the floor; the swarm fetch routes them here, so a caller can journal
+/// per-provider transitions and drive a live "downloading from N sources" figure.
+///
+/// Advisory telemetry, never control flow: a provider reported [`Failed`] is
+/// retried against the next provider by the downloader's own failover, and a
+/// caller that discards every event changes nothing about the transfer.
+///
+/// [`fetch`]: SharingTransport::fetch
+/// [`Failed`]: ProviderEvent::Failed
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderEvent {
+    /// The downloader is about to ask this provider for one child request.
+    /// Emitted once per (child, provider) attempt — *including* the attempt that
+    /// then finds the child already complete locally — so `Trying` proves the
+    /// provider entered the rotation, not that bytes moved.
+    Trying(NodeId),
+    /// This provider could not be dialed, or its transfer errored, for one child
+    /// request. The downloader moves on to the next provider for that child and
+    /// asks it only for the bytes still missing, so a `Failed` is a provider
+    /// switch, NOT a failed fetch.
+    Failed(NodeId),
+}
+
+/// A callback receiving live [`ProviderEvent`]s while a multi-source fetch is in
+/// flight — the per-provider counterpart of [`FetchSink`], threaded the same way
+/// and for the same reason (the caller awaits the fetch inline and drains no
+/// channel meanwhile, so a callback avoids the backpressure a shared channel
+/// would risk).
+pub type ProviderTelemetrySink = Arc<dyn Fn(ProviderEvent) + Send + Sync>;
+
+/// A [`ProviderTelemetrySink`] that discards every event — for call sites that
+/// do not surface per-provider detail.
+pub fn noop_provider_telemetry() -> ProviderTelemetrySink {
+    Arc::new(|_| {})
+}
+
 /// A bidirectional peer-to-peer transport for sharing frame packages.
 ///
 /// Implementors move [`PackageAnnounce`]s, package blobs, and [`FrameReceipt`]
@@ -115,6 +157,39 @@ pub trait SharingTransport: Send + Sync {
         dest_dir: &Path,
         sink: FetchSink,
     ) -> anyhow::Result<()>;
+
+    /// Pull one collection, identified by its `root_hash`, from MANY `providers`
+    /// at once into `dest_dir` — the swarm fetch (D3 §3.1).
+    ///
+    /// Unlike [`fetch`](Self::fetch), which pulls a package announced by ONE
+    /// peer, this takes the holder set as given (the hub's holder list, minus
+    /// self) and lets the blob layer split the collection across it: one request
+    /// per child blob, each with the full provider set behind it, so a holder
+    /// that dies mid-transfer costs its children a provider switch with
+    /// byte-level resume instead of costing the fetch. `providers` is a
+    /// snapshot: no live re-discovery mid-fetch.
+    ///
+    /// `sink` receives the same per-file/batch [`FetchEvent`]s as `fetch`;
+    /// `telemetry` receives the per-provider [`ProviderEvent`]s only a
+    /// multi-source fetch can produce (pass [`noop_provider_telemetry`] when
+    /// they are not consumed).
+    ///
+    /// The default bails: the in-process loopback mock and Perseus have no
+    /// swarm to fetch from, and a transport without multi-source support must
+    /// fail loudly rather than silently degrade to a single provider — the
+    /// caller's fallback is an explicit code path, not an accident.
+    async fn fetch_collection_multi(
+        &self,
+        providers: Vec<NodeId>,
+        root_hash: &str,
+        byte_size: u64,
+        dest_dir: &Path,
+        sink: FetchSink,
+        telemetry: ProviderTelemetrySink,
+    ) -> anyhow::Result<()> {
+        let _ = (providers, root_hash, byte_size, dest_dir, sink, telemetry);
+        anyhow::bail!("transport does not support multi-source fetch")
+    }
 
     /// Pull ONLY the package manifest (`manifest.ndjson`) from `from` into
     /// `dest_dir`, returning its path. The real transport fetches just the

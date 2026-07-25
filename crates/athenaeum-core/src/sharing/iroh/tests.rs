@@ -30,11 +30,14 @@
 //! very same announce through unchanged.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::{EndpointId, RelayMode};
+use iroh_blobs::api::Store;
 use iroh_blobs::format::collection::Collection;
+use iroh_blobs::Hash;
 use tempfile::tempdir;
 use tokio::sync::mpsc::Receiver;
 use tokio::time::Instant;
@@ -43,9 +46,12 @@ use crate::package::{self, write_package, ManifestRecord, PayloadKind, MANIFEST_
 use crate::sharing::types::{
     FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
 };
-use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
+use crate::sharing::{
+    noop_fetch_sink, FetchSink, ProviderEvent, ProviderTelemetrySink, SharingTransport,
+};
 use crate::sync::{HistoryQuery, OutboundState, StandaloneSyncStore, SyncEngine, SyncStore};
 
+use super::node::{Role, SharedIrohNode};
 use super::{random_secret, BlobStore, IrohTransport};
 
 /// A [`FetchSink`] that appends every event into a shared vec, plus the vec so a
@@ -1923,4 +1929,357 @@ async fn upload_pacer_limits_real_transfer_wall_clock() {
 
     provider.shutdown().await;
     receiver.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// D3 Task 1 — `fetch_collection_multi`: one collection, MANY providers.
+//
+// Three real `SharedIrohNode`s on localhost with the relay disabled. Providers
+// A and B serve the SAME package directory — identical bytes ⇒ identical
+// collection hash, because the import is a deterministic sorted-name walk — and
+// puller C pulls it from both at once with `SplitStrategy::Split`, which issues
+// one request per collection child across the full (re-shuffled) provider set.
+// Per-provider telemetry is the oracle: it is the only thing that can say a
+// child actually went to a given provider.
+// ---------------------------------------------------------------------------
+
+/// A [`ProviderTelemetrySink`] that records every event, plus the vec to inspect
+/// after the fetch — the per-provider counterpart of [`recording_sink`].
+fn recording_telemetry() -> (ProviderTelemetrySink, Arc<Mutex<Vec<ProviderEvent>>>) {
+    let events: Arc<Mutex<Vec<ProviderEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_events = Arc::clone(&events);
+    let sink: ProviderTelemetrySink = Arc::new(move |ev| {
+        sink_events
+            .lock()
+            .expect("telemetry mutex poisoned")
+            .push(ev);
+    });
+    (sink, events)
+}
+
+/// The set of provider ids the downloader actually tried, from a telemetry log.
+fn tried_providers(events: &Arc<Mutex<Vec<ProviderEvent>>>) -> std::collections::HashSet<NodeId> {
+    events
+        .lock()
+        .expect("telemetry mutex poisoned")
+        .iter()
+        .filter_map(|e| match e {
+            ProviderEvent::Trying(id) => Some(*id),
+            ProviderEvent::Failed(_) => None,
+        })
+        .collect()
+}
+
+async fn bind_disabled(dir: &Path) -> Arc<SharedIrohNode> {
+    SharedIrohNode::bind(dir, RelayMode::Disabled)
+        .await
+        .expect("bind relay-disabled node")
+}
+
+async fn tag_present(store: &Store, name: &str) -> bool {
+    store
+        .tags()
+        .get(name.as_bytes())
+        .await
+        .expect("tags().get")
+        .is_some()
+}
+
+/// Write an N-payload package and return `(pkg_dir, announce)`.
+///
+/// The swarm tests need MANY collection children: `SplitStrategy::Split` issues
+/// one request per child and re-shuffles the provider list for EACH of them, so
+/// the chance that a given provider is never tried falls off as 2^-children.
+/// With a dozen-plus payloads a "both providers were used" assertion is not a
+/// coin flip.
+fn build_many_file_package(
+    src_root: &Path,
+    prefix: &str,
+    files: usize,
+    size: usize,
+) -> (PathBuf, PackageAnnounce) {
+    std::fs::create_dir_all(src_root).unwrap();
+    let mut records = Vec::with_capacity(files);
+    for i in 0..files {
+        let name = format!("frame_{i:02}.fits");
+        let payload = src_root.join(&name);
+        // Distinct, non-repeating content per file so a wrong-blob mixup fails
+        // the hash check, not merely a size check.
+        let bytes: Vec<u8> = (0..size).map(|j| ((j + i * 97) % 251) as u8).collect();
+        std::fs::write(&payload, &bytes).unwrap();
+        let byte_size = std::fs::metadata(&payload).unwrap().len();
+        let xxh3 = package::xxh3_full_file(&payload).unwrap();
+        records.push((
+            payload,
+            ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: format!("{prefix}-uuid-{i:02}"),
+                origin_catalog_uuid: "catalog-uuid".to_string(),
+                origin_device: "origin-device".to_string(),
+                payload_kind: PayloadKind::RawFrame,
+                rel_path: name,
+                byte_size,
+                xxh3,
+                frame_meta: serde_json::json!({ "object": "M42" }),
+                analysis: None,
+                app_version: "test".to_string(),
+                project: None,
+            },
+        ));
+    }
+    let pkg_dir = src_root.parent().unwrap().join(format!("pkg-{prefix}"));
+    let announce = write_package(&pkg_dir, records).unwrap();
+    (pkg_dir, announce)
+}
+
+/// Assert every payload of `pkg_dir` landed byte-identical under `dest_dir`.
+fn assert_package_landed(pkg_dir: &Path, dest_dir: &Path, files: usize) {
+    for i in 0..files {
+        let name = format!("frame_{i:02}.fits");
+        let landed = dest_dir.join(&name);
+        assert!(
+            landed.exists(),
+            "swarm fetch must land every collection entry, {name} is missing"
+        );
+        assert_eq!(
+            xxh3_of(&pkg_dir.join(&name)),
+            xxh3_of(&landed),
+            "{name} must land byte-identical (a mis-attributed child would differ)"
+        );
+    }
+    assert!(
+        dest_dir.join("manifest.ndjson").exists(),
+        "the manifest entry must land alongside the payloads"
+    );
+}
+
+/// Two providers serve the same package; the puller's Split fan-out uses BOTH.
+#[tokio::test]
+async fn multi_fetch_uses_both_providers() {
+    let da = tempdir().unwrap();
+    let db = tempdir().unwrap();
+    let dc = tempdir().unwrap();
+    let src = tempdir().unwrap();
+
+    let a = bind_disabled(da.path()).await;
+    let b = bind_disabled(db.path()).await;
+    let c = bind_disabled(dc.path()).await;
+
+    let a_out = a.handle(Role::Out);
+    let b_out = b.handle(Role::Out);
+    let c_recv = c.handle(Role::Recv);
+    let a_info = a_out.start().await.unwrap();
+    let b_info = b_out.start().await.unwrap();
+    let c_info = c_recv.start().await.unwrap();
+
+    // Relay-disabled endpoints have no discovery, so the puller needs BOTH
+    // providers' addresses out of band (in production those are the holder dial
+    // hints); the providers get the puller's address for symmetry with pairing.
+    c.add_peer_ticket(&a_info.pairing_ticket).unwrap();
+    c.add_peer_ticket(&b_info.pairing_ticket).unwrap();
+    a.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+    b.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+
+    // ONE package dir, served by BOTH: the swarm's load-bearing invariant is
+    // that identical bytes yield the identical collection hash on every holder.
+    const FILES: usize = 14;
+    let (pkg_dir, announce) =
+        build_many_file_package(&src.path().join("src"), "swarm", FILES, 96 * 1024);
+    a_out.serve(&announce, &pkg_dir, None).await.unwrap();
+    b_out.serve(&announce, &pkg_dir, None).await.unwrap();
+
+    let root_a = a
+        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+        .expect("provider A recorded a served collection hash");
+    let root_b = b
+        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+        .expect("provider B recorded a served collection hash");
+    assert_eq!(
+        root_a, root_b,
+        "the same package bytes must import to the same collection hash on both \
+         holders — without that there is no swarm to fetch from"
+    );
+
+    let (telemetry, seen) = recording_telemetry();
+    let dest = tempdir().unwrap();
+    c_recv
+        .fetch_collection_multi(
+            vec![a_info.node_id, b_info.node_id],
+            &root_a.to_string(),
+            announce.byte_size,
+            dest.path(),
+            noop_fetch_sink(),
+            telemetry,
+        )
+        .await
+        .expect("the swarm fetch must complete");
+
+    assert_package_landed(&pkg_dir, dest.path(), FILES);
+
+    let tried = tried_providers(&seen);
+    assert!(
+        tried.contains(&a_info.node_id) && tried.contains(&b_info.node_id),
+        "Split must spread the collection's children over BOTH providers — \
+         telemetry saw {} of 2 (a={}, b={})",
+        tried.len(),
+        tried.contains(&a_info.node_id),
+        tried.contains(&b_info.node_id)
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+/// A provider killed mid-transfer costs its in-flight children a provider
+/// switch, not the fetch: the survivor finishes the package.
+#[tokio::test]
+async fn multi_fetch_survives_a_provider_dying_mid_transfer() {
+    let da = tempdir().unwrap();
+    let db = tempdir().unwrap();
+    let dc = tempdir().unwrap();
+    let src = tempdir().unwrap();
+
+    let a = bind_disabled(da.path()).await;
+    let b = bind_disabled(db.path()).await;
+    let c = bind_disabled(dc.path()).await;
+
+    let a_out = a.handle(Role::Out);
+    let b_out = b.handle(Role::Out);
+    let c_recv = c.handle(Role::Recv);
+    let a_info = a_out.start().await.unwrap();
+    let b_info = b_out.start().await.unwrap();
+    let c_info = c_recv.start().await.unwrap();
+
+    c.add_peer_ticket(&a_info.pairing_ticket).unwrap();
+    c.add_peer_ticket(&b_info.pairing_ticket).unwrap();
+    a.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+    b.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+
+    const FILES: usize = 16;
+    let (pkg_dir, announce) =
+        build_many_file_package(&src.path().join("src"), "dying", FILES, 512 * 1024);
+    a_out.serve(&announce, &pkg_dir, None).await.unwrap();
+    b_out.serve(&announce, &pkg_dir, None).await.unwrap();
+    let root = a
+        .resolve_served_hash_for_test(Role::Out, &announce.package_id)
+        .expect("provider A recorded a served collection hash");
+
+    // Sizing note: 8 MiB paced at 2 MB/s PER PROVIDER (~4 MB/s combined) puts the
+    // transfer in the multi-second range, so the 150 ms kill below lands solidly
+    // mid-fetch on any machine. Pacing rather than a huge package keeps the test
+    // I/O small; the assertion right before the kill is what makes "mid-transfer"
+    // a fact rather than a hope — if it ever fails, lower the rate.
+    a.set_upload_limit(2_000_000);
+    b.set_upload_limit(2_000_000);
+
+    let (telemetry, seen) = recording_telemetry();
+    let dest = tempdir().unwrap();
+    let fetch_done = Arc::new(AtomicBool::new(false));
+    let task = {
+        let c_recv = Arc::clone(&c_recv);
+        let done = Arc::clone(&fetch_done);
+        let dest_path = dest.path().to_path_buf();
+        let hash = root.to_string();
+        let providers = vec![a_info.node_id, b_info.node_id];
+        let byte_size = announce.byte_size;
+        tokio::spawn(async move {
+            let res = c_recv
+                .fetch_collection_multi(
+                    providers,
+                    &hash,
+                    byte_size,
+                    &dest_path,
+                    noop_fetch_sink(),
+                    telemetry,
+                )
+                .await;
+            done.store(true, Ordering::SeqCst);
+            res
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !fetch_done.load(Ordering::SeqCst),
+        "the fetch finished before the provider could be killed — the kill would \
+         prove nothing; lower the upload limit or grow the package"
+    );
+    a.shutdown().await;
+
+    let res = tokio::time::timeout(Duration::from_secs(120), task)
+        .await
+        .expect("the fetch must not hang after a provider dies")
+        .expect("fetch task panicked");
+    res.expect("the surviving provider must finish the package");
+
+    assert_package_landed(&pkg_dir, dest.path(), FILES);
+
+    // A is only PROBABLY recorded as failed (the kill may land after its last
+    // child settled), but it must certainly have been in the rotation.
+    let tried = tried_providers(&seen);
+    assert!(
+        tried.contains(&a_info.node_id),
+        "the provider we killed must have been tried before it died"
+    );
+    assert!(
+        tried.contains(&b_info.node_id),
+        "the surviving provider must have served children"
+    );
+
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
+/// Every provider dead ⇒ a bounded, clean failure — and no in-flight GC tag,
+/// because phase 1 never landed the root that tag would protect.
+#[tokio::test]
+async fn multi_fetch_with_all_dead_providers_fails_cleanly() {
+    let dc = tempdir().unwrap();
+    let c = bind_disabled(dc.path()).await;
+    let c_recv = c.handle(Role::Recv);
+    c_recv.start().await.unwrap();
+
+    // Well-formed ids nobody ever bound: the puller holds no address for either,
+    // so both fail at the dial.
+    let dead_a: NodeId = *iroh::SecretKey::generate().public().as_bytes();
+    let dead_b: NodeId = *iroh::SecretKey::generate().public().as_bytes();
+    let root = Hash::new(b"a collection nobody serves");
+
+    let (telemetry, _seen) = recording_telemetry();
+    let dest = tempdir().unwrap();
+    let dest_dir = dest.path().join("landing");
+    let res = tokio::time::timeout(
+        Duration::from_secs(60),
+        c_recv.fetch_collection_multi(
+            vec![dead_a, dead_b],
+            &root.to_string(),
+            1024,
+            &dest_dir,
+            noop_fetch_sink(),
+            telemetry,
+        ),
+    )
+    .await
+    .expect("an all-dead provider set must fail, never hang");
+    assert!(
+        res.is_err(),
+        "a fetch whose every provider is unreachable must return Err"
+    );
+
+    // The in-flight GC tag is set only AFTER phase 1 lands the root hash-seq —
+    // the very thing that failed here — so nothing was tagged. (Had phase 1
+    // succeeded and phase 2 failed, the tag would deliberately be RETAINED so a
+    // retry resumes from the verified partial bytes; that asymmetry is the
+    // scalar fetch's documented contract and this sibling keeps it.)
+    assert!(
+        !tag_present(c.store(), &format!("in-flight/recv/pkg/{}", root.to_hex())).await,
+        "a fetch that never got past phase 1 must leave no in-flight tag behind"
+    );
+    assert!(
+        !dest_dir.exists(),
+        "a failed fetch must not even create the destination directory"
+    );
+
+    c.shutdown().await;
 }
