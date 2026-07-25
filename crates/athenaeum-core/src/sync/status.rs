@@ -84,6 +84,12 @@ pub struct OutboundSummary {
     /// [`state`](Self::state) when a retry is armed for the future; the raw
     /// `state` field stays for compatibility. See
     /// [`outbound_display_state`].
+    // NOTE (plain comment on purpose — a `///` line here regenerates
+    // `src/types/models.ts` through ts-rs, and the TS/presentation half is a
+    // separate dispatch): the vocabulary above is NOT exhaustive. It predates
+    // `waiting_peer` (D1) and `queued_at_receiver` (variant A), both of which this
+    // field can carry. [`outbound_display_state`] is the canonical list and the
+    // full precedence; keep reading there, not here.
     pub display_state: String,
     /// RFC3339 deadline of the armed retry when [`display_state`](Self::display_state)
     /// is `waiting`, else `None` — the countdown target.
@@ -123,24 +129,65 @@ pub fn peer_looks_absent(last_error: Option<&str>) -> bool {
 }
 
 /// The outbound presentation state (§D5), derived from the raw
-/// [`OutboundState`], the armed-retry deadline, and the recorded failure class.
+/// [`OutboundState`], the armed-retry deadline, the recorded failure class, and
+/// whether the destination peer is busy pulling a SIBLING batch of ours right now.
 ///
-/// `waiting_peer` (D1) wins first: a package parked because its peer is absent is
-/// waiting for a SIGNAL, not for an instant, so rendering a countdown would put a
-/// number on the screen that means nothing — the transfer resumes the moment the
-/// peer announces itself, which may be seconds or hours from now. `waiting` (a
-/// live backoff window — neutral, not an error) then wins over the raw state when
-/// the package is non-terminal AND `next_retry_at` is set AND that deadline is
-/// still in the future; an armed-but-past deadline falls through to the raw state.
+/// Precedence, non-terminal rows only:
+///
+/// 1. **`waiting_peer`** (D1) wins first: a package parked because its peer is
+///    absent is waiting for a SIGNAL, not for an instant, so rendering a countdown
+///    would put a number on the screen that means nothing — the transfer resumes
+///    the moment the peer announces itself, which may be seconds or hours from now.
+///    It also beats `receiver_busy`, which is the weaker (and possibly stale) fact:
+///    "queued at the receiver" claims the receiver is alive and working, and a
+///    peer-absent dial says it is not.
+/// 2. **`queued_at_receiver`** (variant A) when `receiver_busy`: the receiver runs
+///    ONE transfer per peer at a time, so a second batch's announce succeeds (it
+///    lands in the peer's lane queue) and then sits there — durable state cannot
+///    tell that apart from trouble, since both batches read `Transferring`. Without
+///    this the row hits the 30s ack timeout, arms `next_retry_at`, and renders
+///    "waiting · retry in N" — a countdown that reads like connectivity failure
+///    while the receiver is in fact actively pulling our other batch.
+/// 3. **`waiting`** (a live backoff window — neutral, not an error) then wins over
+///    the raw state when `next_retry_at` is set AND that deadline is still in the
+///    future; an armed-but-past deadline falls through to the raw state.
+///
+/// `receiver_busy` means: a sibling package addressed to this row's peer is being
+/// served BY US right now, and this row is not that package (the api layer enforces
+/// the "not that package" half — see `crate::api::sync::row_receiver_busy`). It is
+/// a live, decaying signal: once the peer stops pulling it goes false and the
+/// ack-timeout ladder takes over exactly as it does today.
+///
+/// Which raw states it may relabel, and why:
+/// - `Transferring` — **yes**, the classic case: announced, in the peer's lane,
+///   waiting its turn behind a sibling.
+/// - `Announced` — **yes**: the announce is out and the peer has it; the reason no
+///   pull has started is the same serial lane.
+/// - `Queued` — **no**: nothing has been announced yet, so the receiver has never
+///   heard of this batch and cannot be queueing it. The queue is ours, and plain
+///   `queued` already says so.
+/// - `Delivered` — **no**: the bytes are fully uploaded and we are awaiting the
+///   confirmation. `uploaded` is strictly more informative than "queued", and the
+///   receiver being busy elsewhere doesn't change what has already left.
+/// - terminal states — **no**, like every other non-raw label here.
 pub fn outbound_display_state(
     state: OutboundState,
     next_retry_at: Option<&str>,
     last_error: Option<&str>,
+    receiver_busy: bool,
     now: DateTime<Utc>,
 ) -> String {
     if !state.is_terminal() {
         if peer_looks_absent(last_error) {
             return "waiting_peer".to_string();
+        }
+        if receiver_busy
+            && matches!(
+                state,
+                OutboundState::Announced | OutboundState::Transferring
+            )
+        {
+            return "queued_at_receiver".to_string();
         }
         if let Some(ts) = next_retry_at {
             if let Ok(deadline) = DateTime::parse_from_rfc3339(ts) {
@@ -396,17 +443,115 @@ mod tests {
             "not_started: peer not started",
         ] {
             assert_eq!(
-                outbound_display_state(OutboundState::Queued, None, Some(err), now),
+                outbound_display_state(OutboundState::Queued, None, Some(err), false, now),
                 "waiting_peer",
                 "{err}"
             );
             // Even with a countdown persisted (the probing head has one), the peer
             // fact wins: the row says who it is waiting for, not when it will try.
             assert_eq!(
-                outbound_display_state(OutboundState::Announced, Some(&future), Some(err), now),
+                outbound_display_state(
+                    OutboundState::Announced,
+                    Some(&future),
+                    Some(err),
+                    false,
+                    now
+                ),
                 "waiting_peer",
                 "{err}"
             );
+        }
+    }
+
+    /// Variant A, the whole point: a second batch to a receiver that is busy pulling
+    /// a SIBLING says so, instead of counting down a retry the user reads as trouble.
+    /// The countdown is armed (the ack timed out — the receiver's lane is serial and
+    /// this batch is behind another), and `queued_at_receiver` beats it.
+    #[test]
+    fn queued_at_receiver_wins_over_the_countdown_when_a_sibling_is_served() {
+        let now = Utc::now();
+        let future = offset(now, 90);
+        for state in [OutboundState::Announced, OutboundState::Transferring] {
+            assert_eq!(
+                outbound_display_state(state, Some(&future), None, true, now),
+                "queued_at_receiver",
+                "{state:?} behind a served sibling must not read as a countdown"
+            );
+            // With no retry armed at all it is still the honest label.
+            assert_eq!(
+                outbound_display_state(state, None, None, true, now),
+                "queued_at_receiver",
+                "{state:?}"
+            );
+        }
+    }
+
+    /// Honest-labeling guard: the package the receiver is ACTUALLY pulling is never
+    /// the one queued behind something. The api layer encodes that by passing
+    /// `receiver_busy = false` for the active row (see
+    /// `crate::api::sync::row_receiver_busy`); here we pin the pure half — the same
+    /// row reads as its raw/waiting self the moment the flag is off.
+    #[test]
+    fn the_actively_served_package_never_reads_queued() {
+        let now = Utc::now();
+        let future = offset(now, 90);
+        assert_eq!(
+            outbound_display_state(OutboundState::Transferring, None, None, false, now),
+            "transferring",
+            "the moving package reads as moving"
+        );
+        assert_eq!(
+            outbound_display_state(OutboundState::Transferring, Some(&future), None, false, now),
+            "waiting",
+            "and with a retry armed it keeps today's countdown exactly"
+        );
+    }
+
+    /// A stale busy signal must never overwrite the stronger fact that the peer is
+    /// gone: "queued at the receiver" claims the receiver is alive and working, and
+    /// a peer-absent dial says it is not.
+    #[test]
+    fn peer_absent_beats_receiver_busy() {
+        let now = Utc::now();
+        assert_eq!(
+            outbound_display_state(
+                OutboundState::Transferring,
+                None,
+                Some("no_route: no known addresses"),
+                true,
+                now
+            ),
+            "waiting_peer"
+        );
+    }
+
+    /// The label describes a queue at the RECEIVER, so it only applies to a batch we
+    /// have actually announced and not yet finished uploading. `Queued` is our own
+    /// local queue (nothing announced — the receiver has never heard of it) and
+    /// `Delivered` means the bytes are fully uploaded ("uploaded — awaiting
+    /// confirmation" is strictly more informative than "queued"). Neither is
+    /// relabeled, busy sibling or not.
+    #[test]
+    fn local_queue_and_uploaded_states_are_not_relabeled() {
+        let now = Utc::now();
+        assert_eq!(
+            outbound_display_state(OutboundState::Queued, None, None, true, now),
+            "queued",
+            "not announced yet — the receiver has nothing of ours to queue"
+        );
+        assert_eq!(
+            outbound_display_state(OutboundState::Delivered, None, None, true, now),
+            "uploaded",
+            "bytes are up; 'uploaded' says more than 'queued'"
+        );
+        // Terminal rows are untouched by the flag as well.
+        for state in [
+            OutboundState::Confirmed,
+            OutboundState::Failed,
+            OutboundState::Cancelled,
+        ] {
+            let s = outbound_display_state(state, None, None, true, now);
+            assert_ne!(s, "queued_at_receiver", "{state:?} is terminal");
         }
     }
 
@@ -421,12 +566,19 @@ mod tests {
                 OutboundState::Queued,
                 Some(&future),
                 Some("refused: not on the peer's allow-list"),
+                false,
                 now
             ),
             "waiting"
         );
         assert_eq!(
-            outbound_display_state(OutboundState::Queued, Some(&future), Some("other: disk full"), now),
+            outbound_display_state(
+                OutboundState::Queued,
+                Some(&future),
+                Some("other: disk full"),
+                false,
+                now
+            ),
             "waiting"
         );
     }
@@ -437,7 +589,7 @@ mod tests {
     fn a_terminal_row_ignores_a_stale_absent_reason() {
         let now = Utc::now();
         for state in [OutboundState::Failed, OutboundState::Cancelled, OutboundState::Confirmed] {
-            let s = outbound_display_state(state, None, Some("no_route: gone"), now);
+            let s = outbound_display_state(state, None, Some("no_route: gone"), false, now);
             assert_ne!(s, "waiting_peer", "{state:?} is terminal");
         }
     }
@@ -484,7 +636,11 @@ mod tests {
             (OutboundState::Cancelled, "cancelled"),
         ];
         for (state, expected) in cases {
-            assert_eq!(outbound_display_state(state, None, None, now), expected, "{state:?}");
+            assert_eq!(
+                outbound_display_state(state, None, None, false, now),
+                expected,
+                "{state:?}"
+            );
         }
     }
 
@@ -500,7 +656,7 @@ mod tests {
             OutboundState::Delivered,
         ] {
             assert_eq!(
-                outbound_display_state(state, Some(&future), None, now),
+                outbound_display_state(state, Some(&future), None, false, now),
                 "waiting",
                 "{state:?} with a future retry should be waiting"
             );
@@ -511,8 +667,14 @@ mod tests {
     fn armed_past_retry_does_not_win() {
         let now = Utc::now();
         let past = offset(now, -30);
-        assert_eq!(outbound_display_state(OutboundState::Transferring, Some(&past), None, now), "transferring");
-        assert_eq!(outbound_display_state(OutboundState::Announced, Some(&past), None, now), "preparing");
+        assert_eq!(
+            outbound_display_state(OutboundState::Transferring, Some(&past), None, false, now),
+            "transferring"
+        );
+        assert_eq!(
+            outbound_display_state(OutboundState::Announced, Some(&past), None, false, now),
+            "preparing"
+        );
     }
 
     #[test]
@@ -520,16 +682,31 @@ mod tests {
         let now = Utc::now();
         let future = offset(now, 30);
         // A terminal row never shows waiting, even if a stale next_retry_at lingers.
-        assert_eq!(outbound_display_state(OutboundState::Confirmed, Some(&future), None, now), "confirmed");
-        assert_eq!(outbound_display_state(OutboundState::Failed, Some(&future), None, now), "failed");
-        assert_eq!(outbound_display_state(OutboundState::Cancelled, Some(&future), None, now), "cancelled");
+        assert_eq!(
+            outbound_display_state(OutboundState::Confirmed, Some(&future), None, false, now),
+            "confirmed"
+        );
+        assert_eq!(
+            outbound_display_state(OutboundState::Failed, Some(&future), None, false, now),
+            "failed"
+        );
+        assert_eq!(
+            outbound_display_state(OutboundState::Cancelled, Some(&future), None, false, now),
+            "cancelled"
+        );
     }
 
     #[test]
     fn unparseable_retry_deadline_falls_through_to_raw_state() {
         let now = Utc::now();
         assert_eq!(
-            outbound_display_state(OutboundState::Transferring, Some("not-a-date"), None, now),
+            outbound_display_state(
+                OutboundState::Transferring,
+                Some("not-a-date"),
+                None,
+                false,
+                now
+            ),
             "transferring"
         );
     }

@@ -4110,6 +4110,98 @@ async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
     engine.shutdown().await;
 }
 
+/// Variant A: the live "this peer is pulling package N right now" signal the status
+/// layer reads to tell a batch queued BEHIND a sibling ("queued at receiver") from
+/// a batch whose peer has gone quiet ("waiting · retry in N"). Durable state cannot
+/// tell them apart — both sit in `Transferring` — so the signal has to be live.
+///
+/// Two halves, both timing-robust (no sleeps raced against a real window):
+/// - a serve tick publishes the package id, readable with a generous freshness;
+/// - the SAME tick reads as absent at zero freshness, which is the decay property
+///   the display chain leans on: a stale signal must fall back to today's behavior,
+///   never freeze a countdown-less label onto a peer that stopped pulling.
+#[tokio::test]
+async fn actively_serving_reports_within_freshness_and_decays() {
+    let tmp = tempdir().unwrap();
+    let peer: NodeId = *iroh::SecretKey::generate().public().as_bytes();
+
+    let (tx, rx) = mpsc::channel::<TransportEvent>(64);
+    let announce_count = Arc::new(AtomicUsize::new(0));
+    let announced_pid = Arc::new(std::sync::Mutex::new(None::<PackageId>));
+    let transport = Arc::new(ServeTickTransport {
+        node_id: peer,
+        rx: std::sync::Mutex::new(Some(rx)),
+        announce_count: Arc::clone(&announce_count),
+        announced_pid: Arc::clone(&announced_pid),
+    });
+
+    let pkg = build_package(
+        &tmp.path().join("src-active"),
+        "uuid-active",
+        "f.fits",
+        "M8",
+        1024,
+    );
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_inner(
+        store.clone() as Arc<dyn SyncStore>,
+        transport as Arc<dyn SharingTransport>,
+        peer,
+        // Long ack timeout: this test is about the serve signal, not the ladder.
+        SyncConfig {
+            ack_timeout: Duration::from_secs(30),
+        },
+        None,
+        None,
+        None,
+    );
+
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+
+    // Nothing has been pulled yet — an announced-but-untouched package is not being
+    // served, however generous the window.
+    assert_eq!(
+        engine.actively_serving(Duration::from_secs(3600)),
+        None,
+        "no serve tick has arrived; nothing is being served"
+    );
+
+    wait_until(|| announced_pid.lock().unwrap().is_some(), WAIT).await;
+    let pid = announced_pid.lock().unwrap().clone().unwrap();
+
+    tx.send(TransportEvent::ServeProgress {
+        package_id: pid.clone(),
+        bytes_sent: 256,
+    })
+    .await
+    .unwrap();
+
+    wait_until(
+        || engine.actively_serving(Duration::from_secs(3600)) == Some(id),
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        engine.actively_serving(Duration::from_secs(3600)),
+        Some(id),
+        "a serve tick must publish the package the peer is pulling"
+    );
+
+    // Decay: the very same recorded tick is already outside a zero-width window, so
+    // a peer that stops pulling stops marking its siblings queued and the ack-timeout
+    // ladder takes over exactly as it does today.
+    assert_eq!(
+        engine.actively_serving(Duration::ZERO),
+        None,
+        "a stale serve signal must decay instead of pinning a label forever"
+    );
+
+    engine.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Task 3.6: a classified dial failure + a fresh re-resolve REPLACES (not merges)
 // the peer's stale address-lookup entry, so a dead relay URL can't survive.

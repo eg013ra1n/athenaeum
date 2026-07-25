@@ -97,6 +97,34 @@ pub const CANCELLED_BY_RECEIVER_DETAIL: &str = "cancelled by receiver";
 /// wakes the worker before it elapses).
 const IDLE_SLEEP: Duration = Duration::from_secs(3600);
 
+/// How recent the last serve tick must be for
+/// [`actively_serving`](SyncEngineHandle::actively_serving) to still call the peer
+/// "pulling right now" (variant A).
+///
+/// Sized against the upstream serve-tick cadence: ticks are throttled to ≥300ms
+/// (`SERVE_PROGRESS_THROTTLE`) and a live pull emits them continuously, so 10s is
+/// ~30 missed ticks — comfortably past a stall or a scheduler hiccup, and well
+/// inside the 30s [`DEFAULT_ACK_TIMEOUT`] so the signal cannot outlive the window
+/// it explains.
+///
+/// The signal MUST decay to today's behavior: once it goes stale, sibling packages
+/// stop reading `queued_at_receiver` and the ordinary ack-timeout ladder (armed
+/// countdown, "waiting · retry in N") takes over exactly as it does now. A label
+/// that never decayed would freeze "queued at receiver" onto a peer that quietly
+/// went away — the same dishonesty in the other direction.
+pub const SERVE_ACTIVITY_FRESHNESS: Duration = Duration::from_secs(10);
+
+/// The live "this peer is pulling package N as of instant T" slot (variant A):
+/// written by the worker on every serve tick, read by the handle without a
+/// round-trip through the worker (the status poll must never queue behind a busy
+/// worker). `None` until the peer's first pull of the session.
+///
+/// A live signal is the only thing that can answer this question: a batch queued
+/// behind a sibling in the receiver's serial per-peer lane and a batch whose peer
+/// went quiet are INDISTINGUISHABLE in durable state — both sit in `Transferring`,
+/// stamped at announce success.
+type ServeActivity = Arc<Mutex<Option<(i64, Instant)>>>;
+
 /// Spec §2: capped exponential backoff, expressed as multiples of the base
 /// rung (ack_timeout) so tests with short timeouts scale down naturally.
 /// 30s → 1m → 5m → 15m → 30m with the default 30s base.
@@ -591,6 +619,9 @@ impl SyncEngine {
         addr_refresher: Option<AddrRefresher>,
     ) -> SyncEngineHandle {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
+        // The one slot both halves see: the worker writes it on every serve tick,
+        // the handle reads it for the status poll (variant A).
+        let serve_activity: ServeActivity = Arc::new(Mutex::new(None));
         let worker = Worker {
             store: Arc::clone(&store),
             transport,
@@ -601,6 +632,7 @@ impl SyncEngine {
             cleanup_sink,
             addr_refresher,
             peer_state: PeerReachability::default(),
+            serve_activity: Arc::clone(&serve_activity),
         };
         let join = tokio::spawn(async move {
             if let Err(e) = worker.run(cmd_rx).await {
@@ -611,6 +643,7 @@ impl SyncEngine {
             store,
             cmd_tx,
             join: Mutex::new(Some(join)),
+            serve_activity,
         }
     }
 }
@@ -621,6 +654,9 @@ pub struct SyncEngineHandle {
     store: Arc<dyn SyncStore>,
     cmd_tx: mpsc::Sender<Command>,
     join: Mutex<Option<JoinHandle<()>>>,
+    /// Shared with the worker: the package this engine's peer is currently pulling
+    /// (variant A). Read by [`actively_serving`](Self::actively_serving).
+    serve_activity: ServeActivity,
 }
 
 impl SyncEngineHandle {
@@ -723,6 +759,25 @@ impl SyncEngineHandle {
         self.store.non_terminal()
     }
 
+    /// The durable row id of the package this engine's peer is pulling RIGHT NOW,
+    /// or `None` when the last serve tick is older than `freshness` (or none has
+    /// arrived). The status layer's answer to "is the receiver busy with a sibling
+    /// of this batch?" — see
+    /// [`outbound_display_state`](crate::sync::status::outbound_display_state).
+    ///
+    /// Reads the shared slot directly, like [`status_snapshot`](Self::status_snapshot)
+    /// reads the store: a status poll must never queue behind a worker that is busy
+    /// serving. Pass [`SERVE_ACTIVITY_FRESHNESS`] unless a test needs another window;
+    /// a stale signal deliberately reads as `None` so the display falls back to the
+    /// ack-timeout ladder's ordinary countdown.
+    pub fn actively_serving(&self, freshness: Duration) -> Option<i64> {
+        let slot = self
+            .serve_activity
+            .lock()
+            .expect("serve activity mutex poisoned");
+        slot.and_then(|(id, at)| (at.elapsed() < freshness).then_some(id))
+    }
+
     /// Ask the worker to stop and await its exit. (Dropping the handle without
     /// calling this also stops the worker, just without the join.)
     pub async fn shutdown(&self) {
@@ -799,6 +854,11 @@ struct Worker {
     /// This peer's reachability (D1). Drives the coalescing that keeps a flat
     /// retry affordable: while the peer is absent exactly one package probes.
     peer_state: PeerReachability,
+    /// The live "which package is this peer pulling, and when did we last see it
+    /// pull" slot, shared with [`SyncEngineHandle`] (variant A). Written on every
+    /// serve tick by [`note_serve_activity`](Self::note_serve_activity) — the one
+    /// place all three tick handlers funnel through.
+    serve_activity: ServeActivity,
 }
 
 impl Worker {
@@ -2189,9 +2249,11 @@ impl Worker {
         }
     }
 
-    /// Record that the peer is actively pulling this package's payload and push the
-    /// ack-timeout ladder out to one [`ack_timeout`](SyncConfig::ack_timeout) from
-    /// *this* instant. Called on every serve tick ([`on_serve_progress`](Self::on_serve_progress),
+    /// Record that the peer is actively pulling this package's payload — publishing
+    /// it to the shared [`ServeActivity`] slot the status layer reads (variant A) —
+    /// and push the ack-timeout ladder out to one
+    /// [`ack_timeout`](SyncConfig::ack_timeout) from *this* instant.
+    /// Called on every serve tick ([`on_serve_progress`](Self::on_serve_progress),
     /// [`on_serve_file_progress`](Self::on_serve_file_progress),
     /// [`on_serve_complete`](Self::on_serve_complete)) after the caller has resolved
     /// the slot `id` from the tick's `package_id`.
@@ -2225,6 +2287,16 @@ impl Worker {
     ///   valid announce for the CURRENT wire id and is pulling it, so a re-announce
     ///   is pointless; if the ack never comes, the ladder resumes from the last tick.
     fn note_serve_activity(&mut self, id: i64) {
+        // Publish the live signal FIRST, unconditionally — it is about the peer's
+        // behavior, not about this slot's retry bookkeeping, and every tick handler
+        // funnels through here (that is why the write lives here and not at the three
+        // call sites). Siblings of this package to the same peer read it as
+        // `queued_at_receiver` instead of counting down a retry (variant A).
+        *self
+            .serve_activity
+            .lock()
+            .expect("serve activity mutex poisoned") = Some((id, Instant::now()));
+
         let flipped = if let Some(p) = self.pending.get_mut(&id) {
             p.deadline = Instant::now() + self.config.ack_timeout;
             if p.next_action == NextAction::Retry {

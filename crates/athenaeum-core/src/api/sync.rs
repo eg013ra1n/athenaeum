@@ -30,6 +30,7 @@ use crate::settings::{defaults, keys};
 use crate::sharing::iroh::node::{RelayResolver, Role, SharedIrohNode};
 use crate::sharing::types::NodeId;
 use crate::sharing::SharingTransport;
+use crate::sync::engine::SERVE_ACTIVITY_FRESHNESS;
 use crate::sync::status::outbound_display_state;
 use crate::sync::store::{
     get_inbound_by_row_id, inbound_active, inbound_file_counts, list_inbound_files,
@@ -1607,6 +1608,18 @@ fn package_totals(dir: &Path) -> (u32, u64) {
     }
 }
 
+/// Whether `row_id` is waiting on its peer's serial lane rather than on the
+/// network: true iff that peer is pulling something from us right now
+/// (`peer_active`) and that something is a DIFFERENT package (variant A).
+///
+/// The honest-labeling guard lives here: the package actually moving is never
+/// described as queued behind anything — it IS the thing everything else is queued
+/// behind. `peer_active = None` (idle peer, or the serve signal decayed past
+/// [`SERVE_ACTIVITY_FRESHNESS`]) leaves every row on today's behavior.
+fn row_receiver_busy(row_id: i64, peer_active: Option<i64>) -> bool {
+    matches!(peer_active, Some(active) if active != row_id)
+}
+
 /// Map one persisted `sync_outbound` row to its display [`OutboundSummary`] —
 /// the SINGLE outbound-row → summary mapping, shared by the live Active-tab
 /// rollup ([`build_sender_status`]) and the terminal-rows read
@@ -1614,7 +1627,11 @@ fn package_totals(dir: &Path) -> (u32, u64) {
 /// (display_state, display_name, device_name, file_counts, retrying) whether it
 /// came from the live poll or the restart-survival read. `device_names` /
 /// `file_counts` are the batch-resolved maps the caller reads once; `now` anchors
-/// the `waiting`-backoff derivation.
+/// the `waiting`-backoff derivation; `receiver_busy` (variant A) says this row's
+/// peer is pulling a SIBLING batch of ours right now, which reads as
+/// `queued_at_receiver` instead of a countdown. Only the live rollup can know that
+/// (it is the one holding the engines) — [`list_terminal_transfers`] passes
+/// `false`, which costs nothing: the display chain never relabels a terminal row.
 ///
 /// `resendable` always comes back `false` here — computing it requires an
 /// fs-stat of the package dir ([`package_has_payload`]), which the cheap 10s
@@ -1627,6 +1644,7 @@ fn outbound_summary(
     now: chrono::DateTime<chrono::Utc>,
     device_names: &HashMap<String, String>,
     file_counts: &HashMap<i64, TransferFileCounts>,
+    receiver_busy: bool,
 ) -> OutboundSummary {
     let (file_count, byte_size) = package_totals(Path::new(&row.package_ref));
     let peer_hex = node_id_hex(&row.peer);
@@ -1634,6 +1652,7 @@ fn outbound_summary(
         row.state,
         row.next_retry_at.as_deref(),
         row.last_error.as_deref(),
+        receiver_busy,
         now,
     );
     let stalled_until = if display_state == "waiting" {
@@ -1732,19 +1751,28 @@ async fn build_sender_status(
     sender: &SyncSenderRuntime,
 ) -> Result<SyncSenderStatus, ApiError> {
     // Roll up the live snapshot of EVERY started peer engine (per-peer map,
-    // sync 2C) under one lock so the in-flight view spans all destinations.
-    let (started, active_rows) = {
+    // sync 2C) under one lock so the in-flight view spans all destinations. The
+    // same pass collects each peer's live serve signal (variant A): which package
+    // that peer is pulling from us right now, if any. It is read here, under the
+    // lock we already hold, because the map is keyed by peer and a row's peer is
+    // what associates it with an engine — `dedup_active_rows` below collapses rows
+    // by id but every surviving row keeps its `peer`, so the association holds.
+    let (started, active_rows, serving_by_peer) = {
         let guard = sender.lock_inner().await;
         let started = !guard.is_empty();
         let mut active_rows: Vec<OutboundRow> = Vec::new();
-        for s in guard.values() {
+        let mut serving_by_peer: HashMap<NodeId, i64> = HashMap::new();
+        for (peer, s) in guard.iter() {
             active_rows.extend(
                 s.engine
                     .status_snapshot()
                     .map_err(|e| ApiError::Internal(format!("sender status snapshot: {e:#}")))?,
             );
+            if let Some(active) = s.engine.actively_serving(SERVE_ACTIVITY_FRESHNESS) {
+                serving_by_peer.insert(*peer, active);
+            }
         }
-        (started, active_rows)
+        (started, active_rows, serving_by_peer)
     };
 
     // Every engine's `non_terminal()` reads the same peer-unfiltered store, so
@@ -1772,7 +1800,14 @@ async fn build_sender_status(
     let now = chrono::Utc::now();
     let active: Vec<OutboundSummary> = rows
         .into_iter()
-        .map(|row| outbound_summary(row, now, &device_names, &file_counts))
+        .map(|row| {
+            // A row is "queued at the receiver" iff ITS peer is serving something
+            // right now and that something is a different package — the package
+            // being served is the one everything else is queued behind, never queued
+            // itself.
+            let receiver_busy = row_receiver_busy(row.id, serving_by_peer.get(&row.peer).copied());
+            outbound_summary(row, now, &device_names, &file_counts, receiver_busy)
+        })
         .collect();
 
     let mut queued = 0u32;
@@ -1955,7 +1990,10 @@ pub fn list_terminal_transfers(
             // user-triggered, capped-at-`limit` read.
             let resendable = matches!(row.state, OutboundState::Failed | OutboundState::Cancelled)
                 && package_has_payload(Path::new(&row.package_ref));
-            let mut summary = outbound_summary(row, now, &device_names, &out_counts);
+            // `receiver_busy = false`: this read has no engines in hand (it is a
+            // pure DB read, deliberately), and every row it returns is TERMINAL —
+            // the display chain never relabels one, so there is nothing to lose.
+            let mut summary = outbound_summary(row, now, &device_names, &out_counts, false);
             summary.resendable = resendable;
             summary
         })
@@ -6494,6 +6532,23 @@ mod tests {
         assert_eq!(status.queued, 1, "one Queued row, counted once");
         assert_eq!(status.transferring, 1, "one Transferring row, counted once");
         assert_eq!(status.queued + status.transferring, 2);
+    }
+
+    /// Variant A honest-labeling guard, api half: the package the receiver is
+    /// ACTUALLY pulling is never the one described as queued behind something. Only
+    /// its SIBLINGS to that same peer are.
+    #[test]
+    fn only_the_siblings_of_the_served_package_are_queued_at_the_receiver() {
+        // The package being served right now.
+        assert!(
+            !row_receiver_busy(7, Some(7)),
+            "the moving package must never read as queued behind itself"
+        );
+        // A sibling to the same peer, waiting its turn in that peer's serial lane.
+        assert!(row_receiver_busy(8, Some(7)));
+        // A peer with no live serve signal (idle, or the signal decayed) leaves every
+        // row on today's behavior.
+        assert!(!row_receiver_busy(8, None));
     }
 
     /// The receiver's allow-list is now every device in the account (mesh model,
