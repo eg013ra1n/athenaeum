@@ -724,6 +724,11 @@ export function useTransferQueue(): UseTransferQueue {
         try {
           await api.invoke('cancel_incoming_package', { packageId });
           refresh();
+          // D2: the cancel terminalizes the row but emits no event, and terminal
+          // rows are otherwise re-fetched only on mount and on `sync-finished`.
+          // Without this the row leaves the Active list with nothing to carry it
+          // into Completed — from the user's side it just vanishes.
+          fetchTerminal();
         } catch (err) {
           console.error('[useTransferQueue] cancel_incoming_package failed:', err);
           notify({
@@ -734,7 +739,7 @@ export function useTransferQueue(): UseTransferQueue {
           });
         }
       }),
-    [withBusy, refresh, notify],
+    [withBusy, refresh, fetchTerminal, notify],
   );
 
   const resend = useCallback(

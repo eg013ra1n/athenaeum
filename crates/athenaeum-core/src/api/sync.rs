@@ -40,8 +40,8 @@ use crate::sync::{
     node_id_hex, pairing, CatalogSyncStore, Direction, HistoryQuery, HistoryRow, InboundRow,
     InboundSummary, OutboundRow, OutboundState, OutboundSummary, RefusalRefresher, StartedSender,
     SyncEngine, SyncEngineHandle, SyncReceiverStatus, SyncRuntime, SyncSenderRuntime,
-    SyncSenderStatus, SyncStatus, SyncStore, TransferFileCounts, TransferFileEntry, TransportHealth,
-    CANCELLED_BY_RECEIVER_DETAIL,
+    SyncSenderStatus, SyncStatus, SyncStore, TransferFileCounts, TransferFileEntry,
+    TransportHealth, CANCELLED_BY_RECEIVER_DETAIL,
 };
 
 /// Request filter for [`list_history`] (mirrors [`HistoryQuery`] over the
@@ -95,9 +95,11 @@ pub struct EnqueueSelectionResult {
 fn dev_pairing_enabled(ctx: &ServiceContext) -> Result<bool, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    let v = ctx
-        .settings
-        .get_with_precedence(&conn, keys::SYNC_DEV_TICKET_PAIRING, defaults::SYNC_DEV_TICKET_PAIRING)?;
+    let v = ctx.settings.get_with_precedence(
+        &conn,
+        keys::SYNC_DEV_TICKET_PAIRING,
+        defaults::SYNC_DEV_TICKET_PAIRING,
+    )?;
     Ok(v.eq_ignore_ascii_case("true"))
 }
 
@@ -153,7 +155,12 @@ fn cached_relays(ctx: &ServiceContext) -> Result<Vec<String>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
     let raw = crate::db::get_setting(&conn, keys::SYNC_CACHED_RELAYS)?.unwrap_or_default();
-    Ok(raw.lines().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string).collect())
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 /// Persist a freshly-resolved relay map (best-effort; a failure only weakens the
@@ -184,7 +191,10 @@ fn pubkey_b64_to_hex(pubkey_b64: &str) -> Option<String> {
 /// in the mesh model (finding H1, updated for sync Phase 1): any device in my
 /// account is trusted. Order is preserved; undecodable pubkeys are skipped.
 fn account_peer_hexes(devices: &[crate::account::AccountDevice]) -> Vec<String> {
-    devices.iter().filter_map(|d| pubkey_b64_to_hex(&d.pubkey)).collect()
+    devices
+        .iter()
+        .filter_map(|d| pubkey_b64_to_hex(&d.pubkey))
+        .collect()
 }
 
 /// A node-id-hex → current-device-name map over the account device list — the
@@ -193,9 +203,7 @@ fn account_peer_hexes(devices: &[crate::account::AccountDevice]) -> Vec<String> 
 /// Undecodable pubkeys are skipped; the same map `get_sync_device_names` builds,
 /// but persisted so the receiver can resolve offline. Serialized to
 /// [`SYNC_DEVICE_NAMES`](keys::SYNC_DEVICE_NAMES) by [`refresh_authorized_peers`].
-fn account_device_names(
-    devices: &[crate::account::AccountDevice],
-) -> HashMap<String, String> {
+fn account_device_names(devices: &[crate::account::AccountDevice]) -> HashMap<String, String> {
     devices
         .iter()
         .filter_map(|d| pubkey_b64_to_hex(&d.pubkey).map(|hex| (hex, d.name.clone())))
@@ -215,7 +223,9 @@ fn account_device_capabilities(
 ) -> HashMap<String, String> {
     devices
         .iter()
-        .filter_map(|d| pubkey_b64_to_hex(&d.pubkey).map(|hex| (hex, d.capability.as_str().to_string())))
+        .filter_map(|d| {
+            pubkey_b64_to_hex(&d.pubkey).map(|hex| (hex, d.capability.as_str().to_string()))
+        })
         .collect()
 }
 
@@ -306,7 +316,9 @@ fn connect_gate(
 /// ([`collab::authz::may_accept_announce`](crate::collab::authz::may_accept_announce)),
 /// re-read live per announce. Always installed and fail-closed by construction —
 /// a node with no matching membership row simply drops every project announce.
-fn project_announce_gate(ctx: &ServiceContext) -> Result<crate::sync::ProjectAnnounceGate, ApiError> {
+fn project_announce_gate(
+    ctx: &ServiceContext,
+) -> Result<crate::sync::ProjectAnnounceGate, ApiError> {
     let db = db(ctx)?.clone();
     Ok(Arc::new(move |from: &NodeId, project_id: &str| {
         let conn = db.conn();
@@ -391,20 +403,27 @@ fn project_request_handler(
     collab_sender: Arc<SyncSenderRuntime>,
     emitter: Arc<dyn ProgressEmitter>,
 ) -> crate::sync::ProjectRequestHandler {
-    Arc::new(move |from: NodeId, project_id: String, package_id: String| {
-        let ctx = Arc::clone(&ctx);
-        let sender = Arc::clone(&collab_sender);
-        let emitter = Arc::clone(&emitter);
-        tokio::spawn(async move {
-            if let Err(e) = crate::api::collab_exchange::handle_project_request(
-                &ctx, &sender, from, project_id, package_id, Some(emitter),
-            )
-            .await
-            {
-                tracing::error!(error = %format!("{e:#}"), "collab request-to-serve failed");
-            }
-        });
-    })
+    Arc::new(
+        move |from: NodeId, project_id: String, package_id: String| {
+            let ctx = Arc::clone(&ctx);
+            let sender = Arc::clone(&collab_sender);
+            let emitter = Arc::clone(&emitter);
+            tokio::spawn(async move {
+                if let Err(e) = crate::api::collab_exchange::handle_project_request(
+                    &ctx,
+                    &sender,
+                    from,
+                    project_id,
+                    package_id,
+                    Some(emitter),
+                )
+                .await
+                {
+                    tracing::error!(error = %format!("{e:#}"), "collab request-to-serve failed");
+                }
+            });
+        },
+    )
 }
 
 /// Refresh the cached authorized-peer allow-list from the hub device list
@@ -439,7 +458,8 @@ pub async fn refresh_authorized_peers(ctx: &ServiceContext) {
     let capabilities = account_device_capabilities(&devices);
     if let Ok(db) = db(ctx) {
         let conn = db.conn();
-        if let Err(e) = crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &hexes.join("\n"))
+        if let Err(e) =
+            crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &hexes.join("\n"))
         {
             tracing::warn!(error = %e, "failed to cache authorized peers");
         } else {
@@ -470,7 +490,10 @@ pub async fn refresh_authorized_peers(ctx: &ServiceContext) {
                 if let Err(e) = crate::db::set_setting(&conn, keys::SYNC_PEER_CAPABILITIES, &json) {
                     tracing::warn!(error = %e, "failed to cache device capabilities");
                 } else {
-                    tracing::debug!(count = capabilities.len(), "refreshed cached device capabilities");
+                    tracing::debug!(
+                        count = capabilities.len(),
+                        "refreshed cached device capabilities"
+                    );
                 }
             }
             Err(e) => tracing::warn!(error = %e, "failed to serialize device capabilities cache"),
@@ -510,7 +533,10 @@ async fn ensure_peers_refresh_task(ctx: &Arc<ServiceContext>, sync: &SyncRuntime
         }
     });
     *guard = Some(handle);
-    tracing::debug!(interval_secs = PEERS_REFRESH_INTERVAL.as_secs(), "authorized-peers refresh timer installed");
+    tracing::debug!(
+        interval_secs = PEERS_REFRESH_INTERVAL.as_secs(),
+        "authorized-peers refresh timer installed"
+    );
 }
 
 /// On refusing an UNKNOWN peer from either receiver gate, kick a debounced hub
@@ -559,7 +585,9 @@ fn allow_default_relays(signed_in: bool, dev_flag: bool) -> bool {
 /// signed out ([`allow_default_relays`]) — otherwise this returns an
 /// actionable error rather than silently starting the transport on public
 /// infrastructure (or, worse, mixed relay networks with a signed-in peer).
-pub(crate) async fn resolve_relay_mode(ctx: &ServiceContext) -> Result<(iroh::RelayMode, Vec<String>), ApiError> {
+pub(crate) async fn resolve_relay_mode(
+    ctx: &ServiceContext,
+) -> Result<(iroh::RelayMode, Vec<String>), ApiError> {
     let creds = crate::api::account::hub_credentials(ctx).unwrap_or(None);
     let cached = cached_relays(ctx).unwrap_or_default();
     let account = creds.as_ref().map(|(u, t)| (u.as_str(), t.as_str()));
@@ -831,7 +859,8 @@ fn install_presence_wiring(
             // The hook runs on the control accept loop: hand the work to its own
             // task so a beacon can never stall the loop that receives announces.
             tokio::spawn(async move {
-                handle_peer_presence(&ctx, &sync_sender, &collab_sender, &sync, emitter, from).await;
+                handle_peer_presence(&ctx, &sync_sender, &collab_sender, &sync, emitter, from)
+                    .await;
             });
         }));
     }
@@ -864,12 +893,13 @@ fn sender_addr_refresher(ctx: Arc<ServiceContext>) -> crate::sync::engine::AddrR
             };
             // The peer's CURRENT hub-reported address (may have moved relays).
             let reported = match crate::api::account::list_devices(&ctx).await {
-                Ok(devices) => devices.into_iter().find_map(|d| {
-                    match pairing::node_id_from_pubkey_b64(&d.pubkey) {
+                Ok(devices) => devices
+                    .into_iter()
+                    .find_map(|d| match pairing::node_id_from_pubkey_b64(&d.pubkey) {
                         Ok(id) if id == peer => Some(d.endpoint_addr),
                         _ => None,
-                    }
-                }).flatten(),
+                    })
+                    .flatten(),
                 Err(e) => {
                     tracing::warn!(error = %format!("{e:?}"), "retry addr refresh: device list unavailable");
                     None
@@ -900,7 +930,9 @@ fn sender_addr_refresher(ctx: Arc<ServiceContext>) -> crate::sync::engine::AddrR
 /// first callers can't bind two endpoints from the same device key (the second
 /// blocks, then sees the populated slot). It is never held while acquiring the
 /// `SyncRuntime`/`SyncSenderRuntime` locks, so there is no lock-ordering cycle.
-pub(crate) async fn ensure_iroh_node(ctx: &ServiceContext) -> Result<Arc<SharedIrohNode>, ApiError> {
+pub(crate) async fn ensure_iroh_node(
+    ctx: &ServiceContext,
+) -> Result<Arc<SharedIrohNode>, ApiError> {
     let mut guard = ctx.iroh_node.lock().await;
     if let Some(node) = guard.as_ref() {
         return Ok(Arc::clone(node));
@@ -1009,7 +1041,12 @@ pub async fn autostart_if_enabled(
     start_node_relay_refresh(Arc::clone(&ctx_arc), &node);
     // Wake event → kick pending packages (T6): relay reconnect / relay-map change
     // fans a fire-and-forget kick_all over the personal + collab sender maps.
-    install_node_wake_hook(&ctx_arc, &node, Arc::clone(&sync_sender), Arc::clone(&collab_sender));
+    install_node_wake_hook(
+        &ctx_arc,
+        &node,
+        Arc::clone(&sync_sender),
+        Arc::clone(&collab_sender),
+    );
     // Peer reachability (D1): install the inbound-beacon hook and fire our own
     // first beacon — edge 1 of 2, "we just came online".
     install_presence_wiring(
@@ -1039,9 +1076,11 @@ pub async fn autostart_if_enabled(
     )?;
     // Clone the emitter for the resurrection spawn before `ensure_started` moves it.
     let emitter_for_resurrect = Arc::clone(&emitter);
-    sync.ensure_started(node, sync_dir, db_path, incoming, authorized, hooks, emitter)
-        .await
-        .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    sync.ensure_started(
+        node, sync_dir, db_path, incoming, authorized, hooks, emitter,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     // tv2 follow-up: resurrect orphaned sender engines for every non-terminal
     // outbound row the previous process left behind, so a pending send resumes
     // (and becomes cancellable + visible) after a restart. Spawned fire-and-forget
@@ -1059,7 +1098,10 @@ pub async fn autostart_if_enabled(
     // receiver in-flight blob tags). Fire-and-forget AFTER `ensure_started`, same
     // placement as the resurrection spawn; race-safe against it by construction
     // (see `sweep_transfer_orphans`), so autostart latency is unchanged.
-    tokio::spawn(sweep_transfer_orphans(Arc::clone(&ctx_arc), Arc::clone(&sync)));
+    tokio::spawn(sweep_transfer_orphans(
+        Arc::clone(&ctx_arc),
+        Arc::clone(&sync),
+    ));
     Ok(true)
 }
 
@@ -1322,7 +1364,12 @@ pub async fn get_pairing_ticket(
     start_node_relay_refresh(Arc::clone(&ctx_arc), &node);
     // Wake event → kick pending packages (T6): relay reconnect / relay-map change
     // fans a fire-and-forget kick_all over the personal + collab sender maps.
-    install_node_wake_hook(&ctx_arc, &node, Arc::clone(&sync_sender), Arc::clone(&collab_sender));
+    install_node_wake_hook(
+        &ctx_arc,
+        &node,
+        Arc::clone(&sync_sender),
+        Arc::clone(&collab_sender),
+    );
     // Peer reachability (D1): install the inbound-beacon hook and fire our own
     // first beacon — edge 1 of 2, "we just came online".
     install_presence_wiring(
@@ -1354,7 +1401,9 @@ pub async fn get_pairing_ticket(
     // Clone the emitter for the resurrection spawn before `ensure_started` moves it.
     let emitter_for_resurrect = Arc::clone(&emitter);
     let ticket = sync
-        .ensure_started(node, sync_dir, db_path, incoming, authorized, hooks, emitter)
+        .ensure_started(
+            node, sync_dir, db_path, incoming, authorized, hooks, emitter,
+        )
         .await
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     // tv2 follow-up: resurrect orphaned sender engines here too — this is the
@@ -1371,7 +1420,10 @@ pub async fn get_pairing_ticket(
     // B7: reclaim leftover transfer temp data here too — the OTHER startup site
     // that runs `ensure_started`. Fire-and-forget, race-safe against resurrection
     // (see `sweep_transfer_orphans`); never blocks the ticket return.
-    tokio::spawn(sweep_transfer_orphans(Arc::clone(&ctx_arc), Arc::clone(&sync)));
+    tokio::spawn(sweep_transfer_orphans(
+        Arc::clone(&ctx_arc),
+        Arc::clone(&sync),
+    ));
     Ok(ticket)
 }
 
@@ -1398,7 +1450,11 @@ fn short_pkg(package_ref: &str) -> String {
 /// Count `sync_outbound` rows in a given terminal `state`.
 fn count_outbound_state(conn: &rusqlite::Connection, state: &str) -> Result<u32, ApiError> {
     let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM sync_outbound WHERE state = ?1", [state], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM sync_outbound WHERE state = ?1",
+            [state],
+            |r| r.get(0),
+        )
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(n.max(0) as u32)
 }
@@ -1408,7 +1464,11 @@ fn received_total(ctx: &ServiceContext) -> Result<u32, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
     let n: i64 = conn
-        .query_row("SELECT COUNT(*) FROM sync_history WHERE direction = 'received'", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM sync_history WHERE direction = 'received'",
+            [],
+            |r| r.get(0),
+        )
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(n.max(0) as u32)
 }
@@ -1576,7 +1636,10 @@ fn inbound_summary(
     // The stable per-transfer key the receiver keys its one long-lived row on;
     // fall back to the wire package id for a legacy row whose `batch_uuid` is
     // NULL (a v1/v2 receive, or a row created before the column).
-    let batch_uuid = row.batch_uuid.clone().unwrap_or_else(|| row.package_id.clone());
+    let batch_uuid = row
+        .batch_uuid
+        .clone()
+        .unwrap_or_else(|| row.package_id.clone());
     // Origin capability (Perseus UI v2, Task 10): the value stamped on the row at
     // announce time (Task 9) wins; a legacy row whose stamp is NULL falls back to
     // the cached `SYNC_PEER_CAPABILITIES` hex→kind map keyed on the sending peer.
@@ -1685,7 +1748,8 @@ fn active_inbound_summaries(ctx: &ServiceContext) -> Result<Vec<InboundSummary>,
     // ONE grouped per-file-counts query for the whole active set (§D5), plus the
     // device-name cache (one settings read, no hub).
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-    let file_counts = inbound_file_counts(&conn, &ids).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    let file_counts =
+        inbound_file_counts(&conn, &ids).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     let device_names = cached_device_names(&conn);
     let device_kinds = cached_device_kind_map(&conn);
     Ok(rows
@@ -1848,8 +1912,15 @@ pub fn list_terminal_transfers(
 }
 
 /// The transfer history (received + sent), newest first.
-pub fn list_history(ctx: &ServiceContext, query: SyncHistoryQuery) -> Result<Vec<HistoryRow>, ApiError> {
-    let limit = if query.limit == 0 { DEFAULT_HISTORY_LIMIT } else { query.limit };
+pub fn list_history(
+    ctx: &ServiceContext,
+    query: SyncHistoryQuery,
+) -> Result<Vec<HistoryRow>, ApiError> {
+    let limit = if query.limit == 0 {
+        DEFAULT_HISTORY_LIMIT
+    } else {
+        query.limit
+    };
     let q = HistoryQuery {
         filename: query.filename,
         object: query.object,
@@ -1925,7 +1996,8 @@ fn sent_transfer_files(ctx: &ServiceContext, id: i64) -> Result<Vec<TransferFile
         .ok_or_else(|| ApiError::NotFound(format!("outbound package {id} not found")))?;
 
     // Primary source: the per-file rows (present from enqueue onward).
-    let file_rows = list_outbound_files(&conn, id).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    let file_rows =
+        list_outbound_files(&conn, id).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     if !file_rows.is_empty() {
         return Ok(file_rows
             .into_iter()
@@ -1991,7 +2063,8 @@ fn received_transfer_files(
 
     // Primary source: the per-file rows written at announce time (§D4) —
     // available at every stage (announced / fetching / terminal).
-    let file_rows = list_inbound_files(&conn, id).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
+    let file_rows =
+        list_inbound_files(&conn, id).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     if !file_rows.is_empty() {
         return Ok(file_rows
             .into_iter()
@@ -2094,7 +2167,11 @@ pub fn list_transfer_events(
         .map_err(|e| ApiError::Internal(format!("{e:#}")))?;
     Ok(rows
         .into_iter()
-        .map(|e| TransferEventEntry { ts: e.ts, kind: e.kind, detail: e.detail })
+        .map(|e| TransferEventEntry {
+            ts: e.ts,
+            kind: e.kind,
+            detail: e.detail,
+        })
         .collect())
 }
 
@@ -2181,7 +2258,10 @@ pub struct ResolvedDest {
 /// (never a valid destination: a Perseus node has no receiver, so a package sent
 /// to it would never land). The device's `endpoint_addr` is carried through so
 /// [`ensure_sender_engine`] can dial the peer's real relay (T7).
-pub async fn resolve_dest_node(ctx: &ServiceContext, device_id: &str) -> Result<ResolvedDest, ApiError> {
+pub async fn resolve_dest_node(
+    ctx: &ServiceContext,
+    device_id: &str,
+) -> Result<ResolvedDest, ApiError> {
     let devices = crate::api::account::list_devices(ctx).await?;
     let Some(device) = devices.iter().find(|d| d.id == device_id) else {
         return Err(ApiError::Invalid(format!(
@@ -2194,9 +2274,14 @@ pub async fn resolve_dest_node(ctx: &ServiceContext, device_id: &str) -> Result<
         )));
     }
     let node = pairing::node_id_from_pubkey_b64(&device.pubkey).map_err(|e| {
-        ApiError::Invalid(format!("destination device {device_id} has an invalid pubkey: {e:#}"))
+        ApiError::Invalid(format!(
+            "destination device {device_id} has an invalid pubkey: {e:#}"
+        ))
     })?;
-    Ok(ResolvedDest { node, endpoint_addr: device.endpoint_addr.clone() })
+    Ok(ResolvedDest {
+        node,
+        endpoint_addr: device.endpoint_addr.clone(),
+    })
 }
 
 /// The directory the app writes outgoing packages into (`<sync_dir>/packages`).
@@ -2354,7 +2439,10 @@ fn common_ancestor(paths: &[PathBuf]) -> Option<PathBuf> {
         }
     }
     // A prefix with no Normal component is `/` (or a bare prefix) → treat as none.
-    if !prefix.components().any(|c| matches!(c, std::path::Component::Normal(_))) {
+    if !prefix
+        .components()
+        .any(|c| matches!(c, std::path::Component::Normal(_)))
+    {
         return None;
     }
     Some(prefix)
@@ -2614,13 +2702,19 @@ fn build_selection_package(
 
         let path = Path::new(&file.path);
         if !path.exists() {
-            ineligible.push(IneligibleFrame { frame_id, reason: "file missing on disk".to_string() });
+            ineligible.push(IneligibleFrame {
+                frame_id,
+                reason: "file missing on disk".to_string(),
+            });
             continue;
         }
         let meta = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
-                ineligible.push(IneligibleFrame { frame_id, reason: format!("cannot stat file: {e}") });
+                ineligible.push(IneligibleFrame {
+                    frame_id,
+                    reason: format!("cannot stat file: {e}"),
+                });
                 continue;
             }
         };
@@ -2629,14 +2723,20 @@ fn build_selection_package(
         let xxh3 = match package::xxh3_full_file(path) {
             Ok(h) => h,
             Err(e) => {
-                ineligible.push(IneligibleFrame { frame_id, reason: format!("cannot read file: {e:#}") });
+                ineligible.push(IneligibleFrame {
+                    frame_id,
+                    reason: format!("cannot read file: {e:#}"),
+                });
                 continue;
             }
         };
         let frame_meta = match serde_json::to_value(frame) {
             Ok(v) => v,
             Err(e) => {
-                ineligible.push(IneligibleFrame { frame_id, reason: format!("serialize frame_meta: {e}") });
+                ineligible.push(IneligibleFrame {
+                    frame_id,
+                    reason: format!("serialize frame_meta: {e}"),
+                });
                 continue;
             }
         };
@@ -2703,8 +2803,13 @@ fn build_selection_package(
 
     // Resolve the batch's human name (§D1) and snapshot the per-file rows for the
     // `sync_outbound_files` write, before `records` is moved into the writer.
-    let display_name =
-        resolve_batch_name(batch_name, conn, frame_set_id, ancestor.as_deref(), records.len());
+    let display_name = resolve_batch_name(
+        batch_name,
+        conn,
+        frame_set_id,
+        ancestor.as_deref(),
+        records.len(),
+    );
     let files: Vec<(String, u64, String)> = records
         .iter()
         .map(|(_, r)| (r.rel_path.clone(), r.byte_size, r.frame_uuid.clone()))
@@ -2755,7 +2860,14 @@ async fn build_and_enqueue_selection(
     let built = {
         let db = db(ctx)?;
         let conn = db.conn();
-        build_selection_package(&conn, origin_device, packages_dir, frame_ids, batch_name, frame_set_id)?
+        build_selection_package(
+            &conn,
+            origin_device,
+            packages_dir,
+            frame_ids,
+            batch_name,
+            frame_set_id,
+        )?
     };
     if let Some(dir) = &built.pkg_dir {
         // §D1/§D4: the batch name + per-file `pending` rows travel WITH the enqueue
@@ -2765,11 +2877,13 @@ async fn build_and_enqueue_selection(
         let files: Vec<crate::sharing::types::AnnounceFileEntry> = built
             .files
             .iter()
-            .map(|(rel_path, byte_size, frame_uuid)| crate::sharing::types::AnnounceFileEntry {
-                rel_path: rel_path.clone(),
-                byte_size: *byte_size,
-                frame_uuid: frame_uuid.clone(),
-            })
+            .map(
+                |(rel_path, byte_size, frame_uuid)| crate::sharing::types::AnnounceFileEntry {
+                    rel_path: rel_path.clone(),
+                    byte_size: *byte_size,
+                    frame_uuid: frame_uuid.clone(),
+                },
+            )
             .collect();
         engine
             .enqueue_package(dir, built.display_name.clone(), files)
@@ -3135,7 +3249,11 @@ async fn resend_declined_as_new_transfer(
         let conn = database.conn();
         match rekey_sync_sources(&conn, &old_ref, &new_ref) {
             Ok(moved) => {
-                tracing::debug!(old_id, moved, "re-keyed sync_sources onto the resent transfer")
+                tracing::debug!(
+                    old_id,
+                    moved,
+                    "re-keyed sync_sources onto the resent transfer"
+                )
             }
             Err(e) => tracing::warn!(
                 old_id,
@@ -3162,9 +3280,14 @@ async fn resend_declined_as_new_transfer(
                     }
                 }
             } else {
-                tracing::warn!(old_id, "could not rename package dir back after failed resend enqueue");
+                tracing::warn!(
+                    old_id,
+                    "could not rename package dir back after failed resend enqueue"
+                );
             }
-            return Err(ApiError::Internal(format!("enqueue resent transfer: {e:#}")));
+            return Err(ApiError::Internal(format!(
+                "enqueue resent transfer: {e:#}"
+            )));
         }
     };
 
@@ -3220,7 +3343,10 @@ pub async fn retry_sync_package(
 /// `kick`). Only a package currently in flight has a slot to kick —
 /// [`active_engine_for_row`] returns `Invalid("package is not active")` for a
 /// terminal / unknown id (retry, not send-now, is the terminal-row action).
-pub async fn send_now_sync_package(sender: &Arc<SyncSenderRuntime>, id: i64) -> Result<(), ApiError> {
+pub async fn send_now_sync_package(
+    sender: &Arc<SyncSenderRuntime>,
+    id: i64,
+) -> Result<(), ApiError> {
     let engine = active_engine_for_row(sender, id).await?;
     engine
         .kick(id)
@@ -3304,7 +3430,9 @@ pub async fn cancel_incoming_package(
 
     // Ingest already underway — refuse (spec §4): no clean abort once frames land.
     if matches!(&row, Some(r) if r.state == InboundState::Ingesting) {
-        return Err(ApiError::Invalid("too late: ingest in progress".to_string()));
+        return Err(ApiError::Invalid(
+            "too late: ingest in progress".to_string(),
+        ));
     }
     // Decline Finality Axis §D2 (primary write): stamp the transfer-level decline
     // marker NOW, before any flag or state write — safe even during a live fetch
@@ -3326,7 +3454,9 @@ pub async fn cancel_incoming_package(
              WHERE id = ?2 AND state NOT IN ('ingesting', 'done')",
             rusqlite::params![crate::sync::now_iso(), r.id],
         )
-        .map_err(|e| ApiError::Internal(format!("stamp declined_at for inbound {}: {e:#}", r.id)))?;
+        .map_err(|e| {
+            ApiError::Internal(format!("stamp declined_at for inbound {}: {e:#}", r.id))
+        })?;
     }
 
     // Already terminal — the decline (if applicable) is recorded above; nothing
@@ -3347,13 +3477,19 @@ pub async fn cancel_incoming_package(
     // epilogue so this never races the fetch's own writes.
     let stamp_now = match row.as_ref().map(|r| r.state) {
         Some(InboundState::Announced) => true,
+        // D2 §4: a parked row has no live fetch to interrupt and no guaranteed
+        // announce coming, so nothing else would ever close it. Stamped here or it
+        // keeps `declined_at` and sits `waiting` forever — and a non-terminal row is
+        // refused by `delete_transfer_history`, so the user could not get rid of it.
+        Some(InboundState::Waiting) => true,
         Some(InboundState::Fetching) => control.is_none(),
         _ => false,
     };
     if stamp_now {
         let conn = store.lock_conn();
-        set_inbound_state(&conn, package_id, InboundState::Cancelled, None)
-            .map_err(|e| ApiError::Internal(format!("stamp inbound cancelled {package_id}: {e:#}")))?;
+        set_inbound_state(&conn, package_id, InboundState::Cancelled, None).map_err(|e| {
+            ApiError::Internal(format!("stamp inbound cancelled {package_id}: {e:#}"))
+        })?;
     }
     tracing::info!(package_id = %package_id, "sync inbound cancel requested");
     Ok(())
@@ -3417,9 +3553,8 @@ pub async fn delete_transfer_history(
     use crate::sharing::types::PackageId;
     use crate::sync::store::{
         cancel_outbound_row, delete_history_for_package, delete_inbound_files, delete_inbound_row,
-        delete_outbound_files, delete_outbound_row, delete_sync_events,
-        inbound_id_states_by_batch, outbound_peer_hex, outbound_ref_states,
-        settle_unsettled_outbound_files,
+        delete_outbound_files, delete_outbound_row, delete_sync_events, inbound_id_states_by_batch,
+        outbound_peer_hex, outbound_ref_states, settle_unsettled_outbound_files,
     };
     use crate::sync::InboundState;
 
@@ -3450,135 +3585,145 @@ pub async fn delete_transfer_history(
             .map_err(|e| ApiError::Internal(format!("begin delete_transfer_history tx: {e}")))?;
 
         let out = match direction {
-        Direction::Sent => {
-            // Group this batch's attempts: every outbound row whose package_ref
-            // basename equals the key (Rust-side compare — no LIKE). Post-wipe this
-            // is EXACTLY the transfer's own rows (basename == batch_uuid, unique).
-            let matching_full: Vec<(i64, String, OutboundState)> = outbound_ref_states(&tx)?
-                .into_iter()
-                .filter(|(_, package_ref, _)| outbound_package_key(package_ref) == package_key)
-                .map(|(id, package_ref, state)| {
-                    Ok::<_, ApiError>((id, package_ref, OutboundState::from_db(&state)?))
-                })
-                .collect::<Result<_, _>>()?;
-            let matching: Vec<(i64, OutboundState)> =
-                matching_full.iter().map(|(id, _, state)| (*id, *state)).collect();
-            // The distinct payload dirs to reclaim after commit (deduped — all
-            // attempts of one transfer share one dir post batch-model).
-            let mut payload_dirs: Vec<String> = Vec::new();
-            for (_, package_ref, _) in &matching_full {
-                if !payload_dirs.contains(package_ref) {
-                    payload_dirs.push(package_ref.clone());
+            Direction::Sent => {
+                // Group this batch's attempts: every outbound row whose package_ref
+                // basename equals the key (Rust-side compare — no LIKE). Post-wipe this
+                // is EXACTLY the transfer's own rows (basename == batch_uuid, unique).
+                let matching_full: Vec<(i64, String, OutboundState)> = outbound_ref_states(&tx)?
+                    .into_iter()
+                    .filter(|(_, package_ref, _)| outbound_package_key(package_ref) == package_key)
+                    .map(|(id, package_ref, state)| {
+                        Ok::<_, ApiError>((id, package_ref, OutboundState::from_db(&state)?))
+                    })
+                    .collect::<Result<_, _>>()?;
+                let matching: Vec<(i64, OutboundState)> = matching_full
+                    .iter()
+                    .map(|(id, _, state)| (*id, *state))
+                    .collect();
+                // The distinct payload dirs to reclaim after commit (deduped — all
+                // attempts of one transfer share one dir post batch-model).
+                let mut payload_dirs: Vec<String> = Vec::new();
+                for (_, package_ref, _) in &matching_full {
+                    if !payload_dirs.contains(package_ref) {
+                        payload_dirs.push(package_ref.clone());
+                    }
                 }
-            }
 
-            // Split the non-terminal (active-attempt) rows by peer liveness. A row
-            // whose peer has LEFT the account can never complete: the resurrection
-            // account-gate (1a645e17) skips it, so it has no engine, is invisible in
-            // the active list, and cannot be cancelled — the old terminal-only guard
-            // then blocked this batch's record deletion forever. Read each
-            // non-terminal row's peer as the RAW stored hex (no `NodeId` parse) so a
-            // malformed legacy row can't abort the delete.
-            let mut non_terminal: Vec<(i64, OutboundState, String)> = Vec::new();
-            for (id, state) in &matching {
-                if !state.is_terminal() {
-                    let peer_hex = outbound_peer_hex(&tx, *id)?.unwrap_or_default();
-                    non_terminal.push((*id, *state, peer_hex));
+                // Split the non-terminal (active-attempt) rows by peer liveness. A row
+                // whose peer has LEFT the account can never complete: the resurrection
+                // account-gate (1a645e17) skips it, so it has no engine, is invisible in
+                // the active list, and cannot be cancelled — the old terminal-only guard
+                // then blocked this batch's record deletion forever. Read each
+                // non-terminal row's peer as the RAW stored hex (no `NodeId` parse) so a
+                // malformed legacy row can't abort the delete.
+                let mut non_terminal: Vec<(i64, OutboundState, String)> = Vec::new();
+                for (id, state) in &matching {
+                    if !state.is_terminal() {
+                        let peer_hex = outbound_peer_hex(&tx, *id)?.unwrap_or_default();
+                        non_terminal.push((*id, *state, peer_hex));
+                    }
                 }
+                if !non_terminal.is_empty() {
+                    // Reuse the EXACT cached hex allow-list the resurrection gate reads
+                    // (a local-DB peek — NO hub call). This grabs a second pooled
+                    // connection; in WAL mode its read never blocks on our `IMMEDIATE`
+                    // write lock, and `settings` is untouched by this tx.
+                    let authorized = cached_authorized_peer_hexes(ctx);
+                    if authorized.is_empty() {
+                        // No device data at all — a cold/never-populated cache. Never
+                        // guess about liveness with no data: refuse and retry later.
+                        return Err(ApiError::Invalid(
+                            "device list unavailable — retry after the account refreshes".into(),
+                        ));
+                    }
+                    // Any non-terminal row whose peer is STILL a live account device is a
+                    // genuine in-flight attempt — refuse and name the state so the UI can
+                    // point the user at the live row. Check ALL before cancelling ANY
+                    // (all-or-refuse, atomic inside this tx).
+                    if let Some((_, state, _)) = non_terminal
+                        .iter()
+                        .find(|(_, _, peer)| authorized.contains(peer))
+                    {
+                        return Err(ApiError::Invalid(format!(
+                            "batch has an active attempt ({}) — cancel it in Sending/Waiting first",
+                            state.as_str()
+                        )));
+                    }
+                    // Every remaining non-terminal row is a dead-peer orphan (peer absent
+                    // from a NON-EMPTY account set) → transition each to `cancelled`
+                    // in-place before the batch delete below. The state write + file
+                    // settle are moot on their own (both rows are deleted a few lines down
+                    // in THIS tx) but keep the honest cancel-then-delete semantic; the
+                    // `sync_events` journal write is deliberately SKIPPED — the immediate
+                    // `delete_sync_events` below would erase it in the same tx — while the
+                    // durable audit trail is the `info!` here.
+                    for (id, _, peer_hex) in &non_terminal {
+                        cancel_outbound_row(&tx, *id)?;
+                        settle_unsettled_outbound_files(&tx, *id, Some("cancelled"))?;
+                        tracing::info!(
+                            package_key = %package_key,
+                            peer = %peer_hex,
+                            "orphaned attempt cancelled during delete (peer left account)"
+                        );
+                    }
+                }
+                let mut rows = 0u32;
+                for (id, _) in &matching {
+                    delete_outbound_files(&tx, *id)?;
+                    delete_sync_events(&tx, Direction::Sent, &id.to_string())?;
+                    delete_outbound_row(&tx, *id)?;
+                    rows += 1;
+                }
+                let history = delete_history_for_package(&tx, Direction::Sent, &package_key)?;
+                (
+                    DeletedTransferRecord { rows, history },
+                    Reclaim::Payloads(payload_dirs),
+                )
             }
-            if !non_terminal.is_empty() {
-                // Reuse the EXACT cached hex allow-list the resurrection gate reads
-                // (a local-DB peek — NO hub call). This grabs a second pooled
-                // connection; in WAL mode its read never blocks on our `IMMEDIATE`
-                // write lock, and `settings` is untouched by this tx.
-                let authorized = cached_authorized_peer_hexes(ctx);
-                if authorized.is_empty() {
-                    // No device data at all — a cold/never-populated cache. Never
-                    // guess about liveness with no data: refuse and retry later.
+            Direction::Received => {
+                // Batch-keyed on the durable `batch_uuid` (B5b, symmetric with the sent
+                // side keying on the package-dir basename), with a NULL-edge fallback to
+                // the wire `package_id` so a legacy NULL-batch_uuid row stays deletable by
+                // its wire id. Each matched row also yields its CURRENT wire id (for tag
+                // release + the wire-id history sweep below).
+                let matched = inbound_id_states_by_batch(&tx, &package_key)?;
+                let matching: Vec<(i64, InboundState)> = matched
+                    .iter()
+                    .map(|(id, state, _)| Ok::<_, ApiError>((*id, InboundState::from_db(state)?)))
+                    .collect::<Result<_, _>>()?;
+                if matching.iter().any(|(_, s)| !s.is_terminal()) {
                     return Err(ApiError::Invalid(
-                        "device list unavailable — retry after the account refreshes".into(),
+                        "batch has an active attempt — cancel it first".into(),
                     ));
                 }
-                // Any non-terminal row whose peer is STILL a live account device is a
-                // genuine in-flight attempt — refuse and name the state so the UI can
-                // point the user at the live row. Check ALL before cancelling ANY
-                // (all-or-refuse, atomic inside this tx).
-                if let Some((_, state, _)) =
-                    non_terminal.iter().find(|(_, _, peer)| authorized.contains(peer))
-                {
-                    return Err(ApiError::Invalid(format!(
-                        "batch has an active attempt ({}) — cancel it in Sending/Waiting first",
-                        state.as_str()
-                    )));
+                let mut rows = 0u32;
+                for (id, _) in &matching {
+                    delete_inbound_files(&tx, *id)?;
+                    delete_sync_events(&tx, Direction::Received, &id.to_string())?;
+                    delete_inbound_row(&tx, *id)?;
+                    rows += 1;
                 }
-                // Every remaining non-terminal row is a dead-peer orphan (peer absent
-                // from a NON-EMPTY account set) → transition each to `cancelled`
-                // in-place before the batch delete below. The state write + file
-                // settle are moot on their own (both rows are deleted a few lines down
-                // in THIS tx) but keep the honest cancel-then-delete semantic; the
-                // `sync_events` journal write is deliberately SKIPPED — the immediate
-                // `delete_sync_events` below would erase it in the same tx — while the
-                // durable audit trail is the `info!` here.
-                for (id, _, peer_hex) in &non_terminal {
-                    cancel_outbound_row(&tx, *id)?;
-                    settle_unsettled_outbound_files(&tx, *id, Some("cancelled"))?;
-                    tracing::info!(
-                        package_key = %package_key,
-                        peer = %peer_hex,
-                        "orphaned attempt cancelled during delete (peer left account)"
-                    );
+                // Received history rows now key on the `batch_uuid` (== `package_key`,
+                // B5b). Also sweep by each matched row's CURRENT wire id to catch any
+                // rows written wire-id-keyed before B5b landed in the same dev cycle —
+                // post-wipe there is no data older than this wave, so this is dev-cycle
+                // hygiene only, not a migration.
+                let mut history =
+                    delete_history_for_package(&tx, Direction::Received, &package_key)?;
+                let wire_ids: Vec<String> =
+                    matched.iter().map(|(_, _, wire)| wire.clone()).collect();
+                for wire in &wire_ids {
+                    if *wire != package_key {
+                        history += delete_history_for_package(&tx, Direction::Received, wire)?;
+                    }
                 }
+                // Release the matched rows' CURRENT wire ids' blob tags (the batch key is
+                // the stable `batch_uuid` now, which is NOT a tag — the wire id is).
+                (
+                    DeletedTransferRecord { rows, history },
+                    Reclaim::Tags(wire_ids),
+                )
             }
-            let mut rows = 0u32;
-            for (id, _) in &matching {
-                delete_outbound_files(&tx, *id)?;
-                delete_sync_events(&tx, Direction::Sent, &id.to_string())?;
-                delete_outbound_row(&tx, *id)?;
-                rows += 1;
-            }
-            let history = delete_history_for_package(&tx, Direction::Sent, &package_key)?;
-            (DeletedTransferRecord { rows, history }, Reclaim::Payloads(payload_dirs))
-        }
-        Direction::Received => {
-            // Batch-keyed on the durable `batch_uuid` (B5b, symmetric with the sent
-            // side keying on the package-dir basename), with a NULL-edge fallback to
-            // the wire `package_id` so a legacy NULL-batch_uuid row stays deletable by
-            // its wire id. Each matched row also yields its CURRENT wire id (for tag
-            // release + the wire-id history sweep below).
-            let matched = inbound_id_states_by_batch(&tx, &package_key)?;
-            let matching: Vec<(i64, InboundState)> = matched
-                .iter()
-                .map(|(id, state, _)| Ok::<_, ApiError>((*id, InboundState::from_db(state)?)))
-                .collect::<Result<_, _>>()?;
-            if matching.iter().any(|(_, s)| !s.is_terminal()) {
-                return Err(ApiError::Invalid(
-                    "batch has an active attempt — cancel it first".into(),
-                ));
-            }
-            let mut rows = 0u32;
-            for (id, _) in &matching {
-                delete_inbound_files(&tx, *id)?;
-                delete_sync_events(&tx, Direction::Received, &id.to_string())?;
-                delete_inbound_row(&tx, *id)?;
-                rows += 1;
-            }
-            // Received history rows now key on the `batch_uuid` (== `package_key`,
-            // B5b). Also sweep by each matched row's CURRENT wire id to catch any
-            // rows written wire-id-keyed before B5b landed in the same dev cycle —
-            // post-wipe there is no data older than this wave, so this is dev-cycle
-            // hygiene only, not a migration.
-            let mut history = delete_history_for_package(&tx, Direction::Received, &package_key)?;
-            let wire_ids: Vec<String> =
-                matched.iter().map(|(_, _, wire)| wire.clone()).collect();
-            for wire in &wire_ids {
-                if *wire != package_key {
-                    history += delete_history_for_package(&tx, Direction::Received, wire)?;
-                }
-            }
-            // Release the matched rows' CURRENT wire ids' blob tags (the batch key is
-            // the stable `batch_uuid` now, which is NOT a tag — the wire id is).
-            (DeletedTransferRecord { rows, history }, Reclaim::Tags(wire_ids))
-        }
         };
 
         tx.commit()
@@ -3944,7 +4089,12 @@ pub async fn sweep_transfer_orphans(ctx: Arc<ServiceContext>, sync: Arc<SyncRunt
         }
     };
     if payload_dirs > 0 || bytes_reclaimed > 0 || tags_released > 0 {
-        tracing::info!(payload_dirs, bytes_reclaimed, tags_released, "transfer orphan sweep");
+        tracing::info!(
+            payload_dirs,
+            bytes_reclaimed,
+            tags_released,
+            "transfer orphan sweep"
+        );
     }
 }
 
@@ -3986,7 +4136,11 @@ pub fn get_transfer_storage(ctx: &ServiceContext) -> Result<TransferStorage, Api
         }
     }
     let blobs_bytes = dir_size_bytes(&blobs_dir);
-    Ok(TransferStorage { packages_bytes, packages_count, blobs_bytes })
+    Ok(TransferStorage {
+        packages_bytes,
+        packages_count,
+        blobs_bytes,
+    })
 }
 
 /// The reclaim totals returned by [`cleanup_finished_transfers`] — for the
@@ -4028,16 +4182,20 @@ pub async fn cleanup_finished_transfers(
         tags_released,
         "finished-transfer cleanup"
     );
-    Ok(TransferCleanup { payload_dirs, payload_bytes, tags_released })
+    Ok(TransferCleanup {
+        payload_dirs,
+        payload_bytes,
+        tags_released,
+    })
 }
 
 /// Whether full-app capture-node auto mode is enabled (`sync.auto_mode`).
 pub fn get_sync_auto_mode(ctx: &ServiceContext) -> Result<bool, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    let v = ctx
-        .settings
-        .get_with_precedence(&conn, keys::SYNC_AUTO_MODE, defaults::SYNC_AUTO_MODE)?;
+    let v =
+        ctx.settings
+            .get_with_precedence(&conn, keys::SYNC_AUTO_MODE, defaults::SYNC_AUTO_MODE)?;
     Ok(v.eq_ignore_ascii_case("true"))
 }
 
@@ -4045,7 +4203,11 @@ pub fn get_sync_auto_mode(ctx: &ServiceContext) -> Result<bool, ApiError> {
 pub fn set_sync_auto_mode(ctx: &ServiceContext, enabled: bool) -> Result<(), ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
-    crate::db::set_setting(&conn, keys::SYNC_AUTO_MODE, if enabled { "true" } else { "false" })?;
+    crate::db::set_setting(
+        &conn,
+        keys::SYNC_AUTO_MODE,
+        if enabled { "true" } else { "false" },
+    )?;
     tracing::info!(enabled, "sync auto mode set");
     Ok(())
 }
@@ -4057,6 +4219,96 @@ mod tests {
     /// A minimal real-`Database` [`ServiceContext`] (tempdir SQLite, no keychain
     /// involved anywhere) for exercising the settings-backed sync caches
     /// directly. Mirrors the construction pattern in `api::masters` tests.
+    /// Seed one inbound row in `state` in the ctx's own sync store, returning its
+    /// wire package id. The D2 cancel/delete tests need a durable row without a
+    /// running receiver.
+    fn seed_inbound(
+        ctx: &ServiceContext,
+        batch: &str,
+        wire: &str,
+        state: crate::sync::InboundState,
+        reason: Option<&str>,
+    ) -> i64 {
+        use crate::sync::store::{set_inbound_state, upsert_inbound_attempt, CatalogSyncStore};
+        let (_sync_dir, db_path) = sync_paths(ctx).unwrap();
+        let store = CatalogSyncStore::open(&db_path).unwrap();
+        let conn = store.lock_conn();
+        let (id, _) = upsert_inbound_attempt(&conn, &"ee".repeat(32), batch, wire, 2, 100).unwrap();
+        set_inbound_state(&conn, wire, state, reason).unwrap();
+        id
+    }
+
+    fn read_inbound(ctx: &ServiceContext, wire: &str) -> crate::sync::models::InboundRow {
+        use crate::sync::store::{get_inbound, CatalogSyncStore};
+        let (_sync_dir, db_path) = sync_paths(ctx).unwrap();
+        let store = CatalogSyncStore::open(&db_path).unwrap();
+        let conn = store.lock_conn();
+        get_inbound(&conn, wire).unwrap().unwrap()
+    }
+
+    /// D2 §4: declining a `Waiting` row must close it THERE AND THEN. There is no
+    /// live fetch whose epilogue would stamp it and no announce is guaranteed to
+    /// ever arrive, so without an explicit arm in the `stamp_now` match the row
+    /// keeps `declined_at` and sits `waiting` forever — permanently undeletable,
+    /// since `delete_transfer_history` refuses a non-terminal row.
+    #[tokio::test]
+    async fn cancelling_a_waiting_inbound_row_terminalizes_it_immediately() {
+        let (_tmp, ctx) = test_ctx();
+        let sync = SyncRuntime::default();
+        seed_inbound(
+            &ctx,
+            "batch-1",
+            "wire-1",
+            crate::sync::InboundState::Waiting,
+            Some("peer gone"),
+        );
+
+        cancel_incoming_package(&ctx, &sync, "wire-1")
+            .await
+            .unwrap();
+
+        let row = read_inbound(&ctx, "wire-1");
+        assert_eq!(
+            row.state,
+            crate::sync::InboundState::Cancelled,
+            "closed on the spot — nothing else would ever close it"
+        );
+        assert!(row.declined_at.is_some(), "and the decline is final");
+        assert!(row.finished_at.is_some(), "a terminal stamps finished_at");
+    }
+
+    /// D2 §4, the other side of the same user story: history deletion refuses a
+    /// parked row, deliberately and symmetrically with the sent side. Cancel first,
+    /// then delete — which is why the Cancel affordance is not optional.
+    #[tokio::test]
+    async fn delete_transfer_history_refuses_a_waiting_received_batch() {
+        let (_tmp, ctx) = test_ctx();
+        let sync = SyncRuntime::default();
+        seed_inbound(
+            &ctx,
+            "batch-1",
+            "wire-1",
+            crate::sync::InboundState::Waiting,
+            Some("peer gone"),
+        );
+
+        let err = delete_transfer_history(&ctx, &sync, Direction::Received, "batch-1".to_string())
+            .await
+            .expect_err("a non-terminal row refuses deletion");
+        let text = format!("{err:?}").to_lowercase();
+        assert!(
+            text.contains("active") || text.contains("progress"),
+            "the refusal names the live attempt: {err:?}"
+        );
+
+        let row = read_inbound(&ctx, "wire-1");
+        assert_eq!(
+            row.state,
+            crate::sync::InboundState::Waiting,
+            "and the row survives the refusal untouched"
+        );
+    }
+
     /// D1 §3.2 gate 1: a presence beacon must never make us ALLOCATE for a peer
     /// outside the account. This is a remote message, so the gate is checked from
     /// local state only — no hub round-trip, nothing to stall on.
@@ -4098,7 +4350,8 @@ mod tests {
         let peer: NodeId = [0xbb; 32];
         {
             let conn = db(&ctx).unwrap().conn();
-            crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &node_id_hex(&peer)).unwrap();
+            crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &node_id_hex(&peer))
+                .unwrap();
         }
         let sender = Arc::new(SyncSenderRuntime::new());
         let sync = Arc::new(SyncRuntime::default());
@@ -4121,8 +4374,14 @@ mod tests {
     fn presence_debounce_admits_once_per_window_per_peer() {
         let a: NodeId = [0x01; 32];
         let b: NodeId = [0x02; 32];
-        assert!(presence_debounce_admits(a), "first beacon from a peer is admitted");
-        assert!(!presence_debounce_admits(a), "a second beacon inside the window is not");
+        assert!(
+            presence_debounce_admits(a),
+            "first beacon from a peer is admitted"
+        );
+        assert!(
+            !presence_debounce_admits(a),
+            "a second beacon inside the window is not"
+        );
         assert!(
             presence_debounce_admits(b),
             "the window is per peer — another device is unaffected"
@@ -4135,9 +4394,9 @@ mod tests {
         use crate::services::operation_queue::OperationQueue;
         use crate::settings::SettingsManager;
         use std::collections::HashMap;
-        use std::sync::{Mutex, OnceLock};
         #[cfg(all(feature = "render", feature = "solver"))]
         use std::sync::RwLock;
+        use std::sync::{Mutex, OnceLock};
 
         let tmp = tempfile::tempdir().unwrap();
         let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
@@ -4161,7 +4420,12 @@ mod tests {
             star_cache: Arc::new(RwLock::new(None)),
             #[cfg(feature = "solver")]
             bright_cache: Arc::new(RwLock::new(None)),
-            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -4176,7 +4440,9 @@ mod tests {
     #[tokio::test]
     async fn delete_sent_batch_removes_all_records_and_leaves_siblings() {
         use crate::sharing::types::AnnounceFileEntry;
-        use crate::sync::store::{append_sync_event, insert_history_row, insert_outbound_with_files};
+        use crate::sync::store::{
+            append_sync_event, insert_history_row, insert_outbound_with_files,
+        };
 
         let (_tmp, ctx) = test_ctx();
         let peer = "aa".repeat(32);
@@ -4209,11 +4475,36 @@ mod tests {
                     frame_uuid: uuid.to_string(),
                 }]
             };
-            a1 = insert_outbound_with_files(&conn, "/pkgs/batchA", &peer, Some("Batch A"), &files("f1")).unwrap();
-            a2 = insert_outbound_with_files(&conn, "/pkgs/batchA", &peer, Some("Batch A"), &files("f2")).unwrap();
-            let b1 = insert_outbound_with_files(&conn, "/pkgs/batchB", &peer, Some("Batch B"), &files("g1")).unwrap();
+            a1 = insert_outbound_with_files(
+                &conn,
+                "/pkgs/batchA",
+                &peer,
+                Some("Batch A"),
+                &files("f1"),
+            )
+            .unwrap();
+            a2 = insert_outbound_with_files(
+                &conn,
+                "/pkgs/batchA",
+                &peer,
+                Some("Batch A"),
+                &files("f2"),
+            )
+            .unwrap();
+            let b1 = insert_outbound_with_files(
+                &conn,
+                "/pkgs/batchB",
+                &peer,
+                Some("Batch B"),
+                &files("g1"),
+            )
+            .unwrap();
             for id in [a1, a2, b1] {
-                conn.execute("UPDATE sync_outbound SET state = 'cancelled' WHERE id = ?1", [id]).unwrap();
+                conn.execute(
+                    "UPDATE sync_outbound SET state = 'cancelled' WHERE id = ?1",
+                    [id],
+                )
+                .unwrap();
                 append_sync_event(&conn, Direction::Sent, &id.to_string(), "cancel", None).unwrap();
             }
             insert_history_row(&conn, &hist("f1", "batchA")).unwrap();
@@ -4221,10 +4512,14 @@ mod tests {
             insert_history_row(&conn, &hist("g1", "batchB")).unwrap();
         }
 
-        let deleted =
-            delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Sent, "batchA".to_string())
-                .await
-                .expect("delete ok");
+        let deleted = delete_transfer_history(
+            &ctx,
+            &SyncRuntime::new(),
+            Direction::Sent,
+            "batchA".to_string(),
+        )
+        .await
+        .expect("delete ok");
         assert_eq!(deleted.rows, 2, "both batchA attempt rows deleted");
         assert_eq!(deleted.history, 2, "both batchA history rows deleted");
 
@@ -4232,15 +4527,45 @@ mod tests {
         let conn = db.conn();
         let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
         // batchA fully gone across all four record tables.
-        assert_eq!(count("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/batchA'"), 0);
-        assert_eq!(count(&format!("SELECT COUNT(*) FROM sync_outbound_files WHERE outbound_id IN ({a1},{a2})")), 0);
-        assert_eq!(count(&format!("SELECT COUNT(*) FROM sync_events WHERE batch_key IN ('{a1}','{a2}')")), 0);
-        assert_eq!(count("SELECT COUNT(*) FROM sync_history WHERE package_id = 'batchA'"), 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/batchA'"),
+            0
+        );
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM sync_outbound_files WHERE outbound_id IN ({a1},{a2})"
+            )),
+            0
+        );
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM sync_events WHERE batch_key IN ('{a1}','{a2}')"
+            )),
+            0
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sync_history WHERE package_id = 'batchA'"),
+            0
+        );
         // batchB intact — exactly its one file row, event, history row, and outbound row.
-        assert_eq!(count("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/batchB'"), 1);
-        assert_eq!(count("SELECT COUNT(*) FROM sync_outbound_files"), 1, "only batchB's file row remains");
-        assert_eq!(count("SELECT COUNT(*) FROM sync_events"), 1, "only batchB's event remains");
-        assert_eq!(count("SELECT COUNT(*) FROM sync_history WHERE package_id = 'batchB'"), 1);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/batchB'"),
+            1
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sync_outbound_files"),
+            1,
+            "only batchB's file row remains"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sync_events"),
+            1,
+            "only batchB's event remains"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sync_history WHERE package_id = 'batchB'"),
+            1
+        );
     }
 
     /// tv2 UX wave 2: a batch with ANY non-terminal attempt refuses deletion
@@ -4262,10 +4587,20 @@ mod tests {
                 frame_uuid: "x".into(),
             }];
             // Attempt 1 cancelled (terminal); attempt 2 transferring (non-terminal).
-            let done = insert_outbound_with_files(&conn, "/pkgs/live", &peer, None, &files).unwrap();
-            conn.execute("UPDATE sync_outbound SET state = 'cancelled' WHERE id = ?1", [done]).unwrap();
-            let live = insert_outbound_with_files(&conn, "/pkgs/live", &peer, None, &files).unwrap();
-            conn.execute("UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1", [live]).unwrap();
+            let done =
+                insert_outbound_with_files(&conn, "/pkgs/live", &peer, None, &files).unwrap();
+            conn.execute(
+                "UPDATE sync_outbound SET state = 'cancelled' WHERE id = ?1",
+                [done],
+            )
+            .unwrap();
+            let live =
+                insert_outbound_with_files(&conn, "/pkgs/live", &peer, None, &files).unwrap();
+            conn.execute(
+                "UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1",
+                [live],
+            )
+            .unwrap();
             insert_history_row(
                 &conn,
                 &HistoryRow {
@@ -4286,20 +4621,36 @@ mod tests {
             .unwrap();
         }
 
-        let err = delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Sent, "live".to_string())
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ApiError::Invalid(_)), "active attempt refuses with Invalid");
+        let err = delete_transfer_history(
+            &ctx,
+            &SyncRuntime::new(),
+            Direction::Sent,
+            "live".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Invalid(_)),
+            "active attempt refuses with Invalid"
+        );
 
         // Nothing deleted — both rows and the history row survive.
         let db = db(&ctx).unwrap();
         let conn = db.conn();
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/live'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/live'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(n, 2, "both attempt rows still present");
         let h: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sync_history WHERE package_id = 'live'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sync_history WHERE package_id = 'live'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(h, 1, "history untouched");
     }
@@ -4339,7 +4690,14 @@ mod tests {
                 }],
             )
             .unwrap();
-            append_sync_event(&conn, Direction::Received, &id.to_string(), "fetch_done", None).unwrap();
+            append_sync_event(
+                &conn,
+                Direction::Received,
+                &id.to_string(),
+                "fetch_done",
+                None,
+            )
+            .unwrap();
             set_inbound_state(&conn, pkg, InboundState::Cancelled, None).unwrap();
             insert_history_row(
                 &conn,
@@ -4361,10 +4719,14 @@ mod tests {
             .unwrap();
         }
 
-        let deleted =
-            delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Received, pkg.to_string())
-                .await
-                .expect("delete ok");
+        let deleted = delete_transfer_history(
+            &ctx,
+            &SyncRuntime::new(),
+            Direction::Received,
+            pkg.to_string(),
+        )
+        .await
+        .expect("delete ok");
         assert_eq!(deleted.rows, 1, "the inbound row deleted");
         assert_eq!(deleted.history, 1, "the received history row deleted");
 
@@ -4374,7 +4736,10 @@ mod tests {
         assert_eq!(count("SELECT COUNT(*) FROM sync_inbound"), 0);
         assert_eq!(count("SELECT COUNT(*) FROM sync_inbound_files"), 0);
         assert_eq!(count("SELECT COUNT(*) FROM sync_events"), 0);
-        assert_eq!(count("SELECT COUNT(*) FROM sync_history WHERE direction = 'received'"), 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sync_history WHERE direction = 'received'"),
+            0
+        );
     }
 
     /// B5b: a RECEIVED batch deletes by its durable `batch_uuid` (not the rotating
@@ -4402,7 +4767,10 @@ mod tests {
             // A modern batch-keyed inbound row (batch_uuid = BATCH, wire id = wire).
             let (rid, _) = upsert_inbound_attempt(&conn, &peer, BATCH, wire, 1, 10).unwrap();
             id = rid;
-            assert_ne!(wire, BATCH, "wire id must differ from the batch_uuid for this test");
+            assert_ne!(
+                wire, BATCH,
+                "wire id must differ from the batch_uuid for this test"
+            );
             replace_inbound_files(
                 &conn,
                 id,
@@ -4419,7 +4787,14 @@ mod tests {
                 }],
             )
             .unwrap();
-            append_sync_event(&conn, Direction::Received, &id.to_string(), "fetch_done", None).unwrap();
+            append_sync_event(
+                &conn,
+                Direction::Received,
+                &id.to_string(),
+                "fetch_done",
+                None,
+            )
+            .unwrap();
             set_inbound_state(&conn, wire, InboundState::Done, None).unwrap();
             // The batch-keyed history row (B5b writers).
             insert_history_row(
@@ -4462,11 +4837,18 @@ mod tests {
             .unwrap();
         }
 
-        let deleted =
-            delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Received, BATCH.to_string())
-                .await
-                .expect("delete ok");
-        assert_eq!(deleted.rows, 1, "the one batch row deleted (matched by batch_uuid)");
+        let deleted = delete_transfer_history(
+            &ctx,
+            &SyncRuntime::new(),
+            Direction::Received,
+            BATCH.to_string(),
+        )
+        .await
+        .expect("delete ok");
+        assert_eq!(
+            deleted.rows, 1,
+            "the one batch row deleted (matched by batch_uuid)"
+        );
         assert_eq!(
             deleted.history, 2,
             "both the batch-keyed and the current-wire-id-keyed history rows deleted"
@@ -4478,7 +4860,10 @@ mod tests {
         assert_eq!(count("SELECT COUNT(*) FROM sync_inbound"), 0);
         assert_eq!(count("SELECT COUNT(*) FROM sync_inbound_files"), 0);
         assert_eq!(count("SELECT COUNT(*) FROM sync_events"), 0);
-        assert_eq!(count("SELECT COUNT(*) FROM sync_history WHERE direction = 'received'"), 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sync_history WHERE direction = 'received'"),
+            0
+        );
     }
 
     /// B5b: a terminal received row surfaces its `last_error` on the summary — so a
@@ -4497,7 +4882,13 @@ mod tests {
             let conn = db.conn();
             let _ = upsert_inbound_announced(&conn, &peer, "wire-rev", 1, 10).unwrap();
             // What `handle_revoke(Cancelled)` stamps: state cancelled + "by sender".
-            set_inbound_state(&conn, "wire-rev", InboundState::Cancelled, Some("by sender")).unwrap();
+            set_inbound_state(
+                &conn,
+                "wire-rev",
+                InboundState::Cancelled,
+                Some("by sender"),
+            )
+            .unwrap();
         }
 
         let terminal = list_terminal_transfers(&ctx, None).expect("terminal transfers");
@@ -4550,11 +4941,19 @@ mod tests {
         let mut kinds = HashMap::new();
         kinds.insert(peer.clone(), "athenaeum".to_string());
         let s = inbound_summary(row(Some("perseus")), &names, &kinds, &counts);
-        assert_eq!(s.peer_kind.as_deref(), Some("perseus"), "stamped capability wins over cache");
+        assert_eq!(
+            s.peer_kind.as_deref(),
+            Some("perseus"),
+            "stamped capability wins over cache"
+        );
 
         // 2) A NULL-stamped row + a cache hit → the cache value.
         let s = inbound_summary(row(None), &names, &kinds, &counts);
-        assert_eq!(s.peer_kind.as_deref(), Some("athenaeum"), "NULL stamp falls back to the cache");
+        assert_eq!(
+            s.peer_kind.as_deref(),
+            Some("athenaeum"),
+            "NULL stamp falls back to the cache"
+        );
 
         // 3) Neither a stamp nor a cache entry → None.
         let empty: HashMap<String, String> = HashMap::new();
@@ -4573,7 +4972,9 @@ mod tests {
     #[tokio::test]
     async fn delete_sent_batch_cancels_and_removes_dead_peer_orphan() {
         use crate::sharing::types::AnnounceFileEntry;
-        use crate::sync::store::{append_sync_event, insert_history_row, insert_outbound_with_files};
+        use crate::sync::store::{
+            append_sync_event, insert_history_row, insert_outbound_with_files,
+        };
 
         let (_tmp, ctx) = test_ctx();
         let dead_peer = "de".repeat(32); // absent from the seeded account cache
@@ -4592,12 +4993,24 @@ mod tests {
                 }]
             };
             // Terminal sibling + a non-terminal orphan sharing the dir basename.
-            term = insert_outbound_with_files(&conn, "/pkgs/gone", &dead_peer, None, &files("f1")).unwrap();
-            orphan = insert_outbound_with_files(&conn, "/pkgs/gone", &dead_peer, None, &files("f2")).unwrap();
-            conn.execute("UPDATE sync_outbound SET state = 'cancelled' WHERE id = ?1", [term]).unwrap();
-            conn.execute("UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1", [orphan]).unwrap();
+            term = insert_outbound_with_files(&conn, "/pkgs/gone", &dead_peer, None, &files("f1"))
+                .unwrap();
+            orphan =
+                insert_outbound_with_files(&conn, "/pkgs/gone", &dead_peer, None, &files("f2"))
+                    .unwrap();
+            conn.execute(
+                "UPDATE sync_outbound SET state = 'cancelled' WHERE id = ?1",
+                [term],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1",
+                [orphan],
+            )
+            .unwrap();
             append_sync_event(&conn, Direction::Sent, &term.to_string(), "cancel", None).unwrap();
-            append_sync_event(&conn, Direction::Sent, &orphan.to_string(), "attempt", None).unwrap();
+            append_sync_event(&conn, Direction::Sent, &orphan.to_string(), "attempt", None)
+                .unwrap();
             insert_history_row(
                 &conn,
                 &HistoryRow {
@@ -4618,19 +5031,40 @@ mod tests {
             .unwrap();
         }
 
-        let deleted = delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Sent, "gone".to_string())
-            .await
-            .expect("dead-peer orphan deletes");
+        let deleted = delete_transfer_history(
+            &ctx,
+            &SyncRuntime::new(),
+            Direction::Sent,
+            "gone".to_string(),
+        )
+        .await
+        .expect("dead-peer orphan deletes");
         assert_eq!(deleted.rows, 2, "both attempt rows deleted");
         assert_eq!(deleted.history, 1, "the history row deleted");
 
         let db = db(&ctx).unwrap();
         let conn = db.conn();
         let count = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap() };
-        assert_eq!(count("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/gone'"), 0);
-        assert_eq!(count(&format!("SELECT COUNT(*) FROM sync_outbound_files WHERE outbound_id IN ({term},{orphan})")), 0);
-        assert_eq!(count(&format!("SELECT COUNT(*) FROM sync_events WHERE batch_key IN ('{term}','{orphan}')")), 0);
-        assert_eq!(count("SELECT COUNT(*) FROM sync_history WHERE package_id = 'gone'"), 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/gone'"),
+            0
+        );
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM sync_outbound_files WHERE outbound_id IN ({term},{orphan})"
+            )),
+            0
+        );
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM sync_events WHERE batch_key IN ('{term}','{orphan}')"
+            )),
+            0
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sync_history WHERE package_id = 'gone'"),
+            0
+        );
     }
 
     /// Dead-peer delete guard: a non-terminal attempt whose peer IS still a live
@@ -4649,14 +5083,28 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             crate::db::set_setting(&conn, keys::SYNC_AUTHORIZED_PEERS, &live_peer).unwrap();
-            let files = vec![AnnounceFileEntry { rel_path: "Lights/x.fits".into(), byte_size: 4, frame_uuid: "x".into() }];
-            live = insert_outbound_with_files(&conn, "/pkgs/live", &live_peer, None, &files).unwrap();
-            conn.execute("UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1", [live]).unwrap();
+            let files = vec![AnnounceFileEntry {
+                rel_path: "Lights/x.fits".into(),
+                byte_size: 4,
+                frame_uuid: "x".into(),
+            }];
+            live =
+                insert_outbound_with_files(&conn, "/pkgs/live", &live_peer, None, &files).unwrap();
+            conn.execute(
+                "UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1",
+                [live],
+            )
+            .unwrap();
         }
 
-        let err = delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Sent, "live".to_string())
-            .await
-            .unwrap_err();
+        let err = delete_transfer_history(
+            &ctx,
+            &SyncRuntime::new(),
+            Direction::Sent,
+            "live".to_string(),
+        )
+        .await
+        .unwrap_err();
         match err {
             ApiError::Invalid(msg) => assert!(
                 msg.contains("transferring"),
@@ -4668,11 +5116,22 @@ mod tests {
         let db = db(&ctx).unwrap();
         let conn = db.conn();
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/live'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/live'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(n, 1, "nothing deleted while the peer is still an account device");
+        assert_eq!(
+            n, 1,
+            "nothing deleted while the peer is still an account device"
+        );
         let state: String = conn
-            .query_row("SELECT state FROM sync_outbound WHERE id = ?1", [live], |r| r.get(0))
+            .query_row(
+                "SELECT state FROM sync_outbound WHERE id = ?1",
+                [live],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(state, "transferring", "the live attempt is left untouched");
     }
@@ -4691,14 +5150,27 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             // Deliberately DO NOT seed SYNC_AUTHORIZED_PEERS — cold cache.
-            let files = vec![AnnounceFileEntry { rel_path: "Lights/x.fits".into(), byte_size: 4, frame_uuid: "x".into() }];
+            let files = vec![AnnounceFileEntry {
+                rel_path: "Lights/x.fits".into(),
+                byte_size: 4,
+                frame_uuid: "x".into(),
+            }];
             let id = insert_outbound_with_files(&conn, "/pkgs/cold", &peer, None, &files).unwrap();
-            conn.execute("UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1", [id]).unwrap();
+            conn.execute(
+                "UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
         }
 
-        let err = delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Sent, "cold".to_string())
-            .await
-            .unwrap_err();
+        let err = delete_transfer_history(
+            &ctx,
+            &SyncRuntime::new(),
+            Direction::Sent,
+            "cold".to_string(),
+        )
+        .await
+        .unwrap_err();
         match err {
             ApiError::Invalid(msg) => assert!(
                 msg.contains("device list unavailable"),
@@ -4710,9 +5182,16 @@ mod tests {
         let db = db(&ctx).unwrap();
         let conn = db.conn();
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/cold'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM sync_outbound WHERE package_ref = '/pkgs/cold'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(n, 1, "cold cache never deletes — no guessing about liveness");
+        assert_eq!(
+            n, 1,
+            "cold cache never deletes — no guessing about liveness"
+        );
     }
 
     /// Batch Model §D4 (delete = reclaim, sent): deleting a terminal SENT batch
@@ -4748,13 +5227,21 @@ mod tests {
                 &files,
             )
             .unwrap();
-            conn.execute("UPDATE sync_outbound SET state = 'confirmed' WHERE id = ?1", [id]).unwrap();
+            conn.execute(
+                "UPDATE sync_outbound SET state = 'confirmed' WHERE id = ?1",
+                [id],
+            )
+            .unwrap();
         }
 
-        let deleted =
-            delete_transfer_history(&ctx, &SyncRuntime::new(), Direction::Sent, "batchZ".to_string())
-                .await
-                .expect("delete + reclaim ok");
+        let deleted = delete_transfer_history(
+            &ctx,
+            &SyncRuntime::new(),
+            Direction::Sent,
+            "batchZ".to_string(),
+        )
+        .await
+        .expect("delete + reclaim ok");
         assert_eq!(deleted.rows, 1, "the outbound row deleted");
         assert!(
             !payload_dir.exists(),
@@ -4771,7 +5258,9 @@ mod tests {
         use crate::sharing::loopback::LoopbackNetwork;
         use crate::sharing::types::PackageAnnounce;
         use crate::sharing::SharingTransport;
-        use crate::sync::receiver::{allow_all_peers, IncomingResolver, InboundControl, SyncReceiver};
+        use crate::sync::receiver::{
+            allow_all_peers, InboundControl, IncomingResolver, SyncReceiver,
+        };
         use crate::sync::store::{upsert_inbound_announced, CatalogSyncStore};
         use crate::sync::InboundState;
 
@@ -4785,7 +5274,8 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             let id = upsert_inbound_announced(&conn, &peer, wire, 1, 10).unwrap();
-            crate::sync::store::set_inbound_state(&conn, wire, InboundState::Failed, Some("boom")).unwrap();
+            crate::sync::store::set_inbound_state(&conn, wire, InboundState::Failed, Some("boom"))
+                .unwrap();
             let _ = id;
         }
 
@@ -4795,7 +5285,10 @@ mod tests {
         let ep = Arc::new(net.endpoint());
         let recv_store = Arc::new(CatalogSyncStore::open(tmp.path().join("recv.db")).unwrap());
         let staging = tmp.path().join("recv-staging");
-        let incoming: IncomingResolver = { let p = tmp.path().join("recv-incoming"); Arc::new(move || p.clone()) };
+        let incoming: IncomingResolver = {
+            let p = tmp.path().join("recv-incoming");
+            Arc::new(move || p.clone())
+        };
         let (_info, handle) = SyncReceiver::spawn(
             recv_store,
             staging,
@@ -4810,7 +5303,11 @@ mod tests {
         .unwrap();
         let runtime = SyncRuntime::new();
         runtime
-            .set_started_for_test(Arc::clone(&ep) as Arc<dyn SharingTransport>, handle, "ticket".into())
+            .set_started_for_test(
+                Arc::clone(&ep) as Arc<dyn SharingTransport>,
+                handle,
+                "ticket".into(),
+            )
             .await;
 
         let src = tmp.path().join("served-src");
@@ -4829,7 +5326,10 @@ mod tests {
                 .await
                 .expect("delete + reclaim ok");
         assert_eq!(deleted.rows, 1, "the inbound row deleted");
-        assert!(!ep.is_serving(wire), "delete releases the received batch's blob tags");
+        assert!(
+            !ep.is_serving(wire),
+            "delete releases the received batch's blob tags"
+        );
     }
 
     /// B7 helper: a started receive-side [`SyncRuntime`] over a loopback endpoint
@@ -4838,9 +5338,14 @@ mod tests {
     /// pass. Returns the endpoint (to seed/observe in-flight tags) + the runtime.
     async fn started_loopback_runtime(
         tmp: &tempfile::TempDir,
-    ) -> (Arc<crate::sharing::loopback::LoopbackTransport>, Arc<SyncRuntime>) {
+    ) -> (
+        Arc<crate::sharing::loopback::LoopbackTransport>,
+        Arc<SyncRuntime>,
+    ) {
         use crate::sharing::loopback::LoopbackNetwork;
-        use crate::sync::receiver::{allow_all_peers, IncomingResolver, InboundControl, SyncReceiver};
+        use crate::sync::receiver::{
+            allow_all_peers, InboundControl, IncomingResolver, SyncReceiver,
+        };
         use crate::sync::store::CatalogSyncStore;
 
         let net = LoopbackNetwork::new();
@@ -4865,7 +5370,11 @@ mod tests {
         .unwrap();
         let runtime = Arc::new(SyncRuntime::new());
         runtime
-            .set_started_for_test(Arc::clone(&ep) as Arc<dyn SharingTransport>, handle, "t".into())
+            .set_started_for_test(
+                Arc::clone(&ep) as Arc<dyn SharingTransport>,
+                handle,
+                "t".into(),
+            )
             .await;
         (ep, runtime)
     }
@@ -4876,7 +5385,8 @@ mod tests {
     fn set_mtime_ago(path: &Path, age: Duration) {
         let f = std::fs::File::open(path)
             .unwrap_or_else(|e| panic!("open {} for mtime set: {e}", path.display()));
-        f.set_modified(SystemTime::now() - age).expect("set_modified");
+        f.set_modified(SystemTime::now() - age)
+            .expect("set_modified");
     }
 
     /// Test helper: set `path` AND every entry recursively under it (files
@@ -4913,8 +5423,8 @@ mod tests {
             d
         };
         let orphan_dir = mk("orphan-uuid"); // (a) NO row → removed
-        // Past the age gate: this dir must read as a genuine prior-session orphan,
-        // not a concurrent enqueue's in-progress dir-before-row window.
+                                            // Past the age gate: this dir must read as a genuine prior-session orphan,
+                                            // not a concurrent enqueue's in-progress dir-before-row window.
         backdate_mtime(&orphan_dir, ORPHAN_SWEEP_MIN_AGE + Duration::from_secs(60));
         let terminal_dir = mk("terminal-uuid"); // (b) terminal row → kept
         let live_dir = mk("live-uuid"); // (c) non-terminal row → kept
@@ -4937,10 +5447,20 @@ mod tests {
                 &files,
             )
             .unwrap();
-            conn.execute("UPDATE sync_outbound SET state = 'confirmed' WHERE id = ?1", [tid]).unwrap();
+            conn.execute(
+                "UPDATE sync_outbound SET state = 'confirmed' WHERE id = ?1",
+                [tid],
+            )
+            .unwrap();
             // (c) non-terminal (announced) row referencing live_dir.
-            insert_outbound_with_files(&conn, live_dir.to_str().unwrap(), &peer, Some("live"), &files)
-                .unwrap();
+            insert_outbound_with_files(
+                &conn,
+                live_dir.to_str().unwrap(),
+                &peer,
+                Some("live"),
+                &files,
+            )
+            .unwrap();
             // A non-terminal inbound row pins its in-flight tag ("live-wire").
             upsert_inbound_announced(&conn, &peer, "live-wire", 1, 10).unwrap();
         }
@@ -4954,8 +5474,14 @@ mod tests {
 
         // Payload dirs: only the row-less orphan is gone.
         assert!(!orphan_dir.exists(), "row-less orphan payload dir removed");
-        assert!(terminal_dir.exists(), "a terminal-row payload dir is kept for Resend");
-        assert!(live_dir.exists(), "a non-terminal-row payload dir is kept for its live attempt");
+        assert!(
+            terminal_dir.exists(),
+            "a terminal-row payload dir is kept for Resend"
+        );
+        assert!(
+            live_dir.exists(),
+            "a non-terminal-row payload dir is kept for its live attempt"
+        );
 
         // In-flight tags: only the orphan is released; the live-row tag survives.
         assert!(
@@ -5001,7 +5527,10 @@ mod tests {
             fresh_dir.exists(),
             "a fresh row-less dir survives the sweep — never raced as a concurrent enqueue"
         );
-        assert!(!old_dir.exists(), "an old row-less dir is a genuine orphan and is removed");
+        assert!(
+            !old_dir.exists(),
+            "an old row-less dir is a genuine orphan and is removed"
+        );
     }
 
     /// B7 hardening (recursive max mtime): a dir whose TOP-LEVEL entry mtime is
@@ -5081,9 +5610,19 @@ mod tests {
                 &files,
             )
             .unwrap();
-            conn.execute("UPDATE sync_outbound SET state = 'failed' WHERE id = ?1", [fid]).unwrap();
-            insert_outbound_with_files(&conn, live_dir.to_str().unwrap(), &peer, Some("live"), &files)
-                .unwrap();
+            conn.execute(
+                "UPDATE sync_outbound SET state = 'failed' WHERE id = ?1",
+                [fid],
+            )
+            .unwrap();
+            insert_outbound_with_files(
+                &conn,
+                live_dir.to_str().unwrap(),
+                &peer,
+                Some("live"),
+                &files,
+            )
+            .unwrap();
         }
 
         // Before: the failed row is resendable (payload present); stats see 2 dirs.
@@ -5093,20 +5632,35 @@ mod tests {
             .iter()
             .find(|s| s.batch_uuid == "failed-uuid")
             .expect("failed summary present");
-        assert!(failed_summary.resendable, "a failed row with payload is resendable before cleanup");
+        assert!(
+            failed_summary.resendable,
+            "a failed row with payload is resendable before cleanup"
+        );
         let stats_before = get_transfer_storage(&ctx).expect("stats before");
-        assert_eq!(stats_before.packages_count, 2, "two package dirs before cleanup");
+        assert_eq!(
+            stats_before.packages_count, 2,
+            "two package dirs before cleanup"
+        );
 
         let result = cleanup_finished_transfers(&ctx, &SyncRuntime::new())
             .await
             .expect("cleanup ok");
         assert_eq!(result.payload_dirs, 1, "one terminal payload dir reclaimed");
         assert!(result.payload_bytes > 0, "reclaimed some bytes");
-        assert_eq!(result.tags_released, 0, "no transport started → no tags released");
+        assert_eq!(
+            result.tags_released, 0,
+            "no transport started → no tags released"
+        );
 
         // After: terminal payload gone, live payload kept, resendable flipped false.
-        assert!(!failed_dir.exists(), "cleanup removed the terminal payload dir");
-        assert!(live_dir.exists(), "cleanup kept the non-terminal payload dir");
+        assert!(
+            !failed_dir.exists(),
+            "cleanup removed the terminal payload dir"
+        );
+        assert!(
+            live_dir.exists(),
+            "cleanup kept the non-terminal payload dir"
+        );
         let after = list_terminal_transfers(&ctx, None).expect("terminal transfers after");
         let failed_after = after
             .sent
@@ -5118,7 +5672,10 @@ mod tests {
             "resendable honestly flips false once the payload is reclaimed"
         );
         let stats_after = get_transfer_storage(&ctx).expect("stats after");
-        assert_eq!(stats_after.packages_count, 1, "one package dir remains after cleanup");
+        assert_eq!(
+            stats_after.packages_count, 1,
+            "one package dir remains after cleanup"
+        );
         assert!(
             stats_after.packages_bytes < stats_before.packages_bytes,
             "packages_bytes drops after cleanup"
@@ -5140,24 +5697,52 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             // A terminal sent row whose package_ref basename is the batch key.
-            let files = vec![AnnounceFileEntry { rel_path: "L/a.fits".into(), byte_size: 4, frame_uuid: "a".into() }];
-            let sid = insert_outbound_with_files(&conn, "/pkgs/batch-out", &peer, Some("Out"), &files).unwrap();
-            conn.execute("UPDATE sync_outbound SET state = 'confirmed' WHERE id = ?1", [sid]).unwrap();
+            let files = vec![AnnounceFileEntry {
+                rel_path: "L/a.fits".into(),
+                byte_size: 4,
+                frame_uuid: "a".into(),
+            }];
+            let sid =
+                insert_outbound_with_files(&conn, "/pkgs/batch-out", &peer, Some("Out"), &files)
+                    .unwrap();
+            conn.execute(
+                "UPDATE sync_outbound SET state = 'confirmed' WHERE id = ?1",
+                [sid],
+            )
+            .unwrap();
             // A terminal received row with a NULL batch_uuid (upsert_inbound_announced
             // leaves it NULL) → batch_uuid falls back to the wire id.
             let rid = upsert_inbound_announced(&conn, &peer, "wire-in", 1, 10).unwrap();
-            crate::sync::store::set_inbound_state(&conn, "wire-in", InboundState::Done, None).unwrap();
+            crate::sync::store::set_inbound_state(&conn, "wire-in", InboundState::Done, None)
+                .unwrap();
             let _ = rid;
         }
 
         let terminal = list_terminal_transfers(&ctx, None).expect("terminal transfers");
-        let sent = terminal.sent.iter().find(|s| s.batch_uuid == "batch-out").expect("sent summary present");
+        let sent = terminal
+            .sent
+            .iter()
+            .find(|s| s.batch_uuid == "batch-out")
+            .expect("sent summary present");
         assert_eq!(sent.generation, 1, "a fresh sent row is at generation 1");
-        assert_eq!(sent.batch_uuid, "batch-out", "sent batch_uuid == package-dir basename");
+        assert_eq!(
+            sent.batch_uuid, "batch-out",
+            "sent batch_uuid == package-dir basename"
+        );
 
-        let recv = terminal.received.iter().find(|r| r.package_id == "wire-in").expect("received summary present");
-        assert_eq!(recv.generation, 1, "a fresh received row is at generation 1");
-        assert_eq!(recv.batch_uuid, "wire-in", "a NULL-batch_uuid received row falls back to the wire id");
+        let recv = terminal
+            .received
+            .iter()
+            .find(|r| r.package_id == "wire-in")
+            .expect("received summary present");
+        assert_eq!(
+            recv.generation, 1,
+            "a fresh received row is at generation 1"
+        );
+        assert_eq!(
+            recv.batch_uuid, "wire-in",
+            "a NULL-batch_uuid received row falls back to the wire id"
+        );
     }
 
     /// Task 3.3: with NO node bound and NOT signed in, transport health reads
@@ -5222,7 +5807,9 @@ mod tests {
         taken.shutdown().await;
 
         // Next ensure re-binds a fresh node (different Arc) over the same dir.
-        let node3 = ensure_iroh_node(&ctx).await.expect("re-bind after shutdown");
+        let node3 = ensure_iroh_node(&ctx)
+            .await
+            .expect("re-bind after shutdown");
         assert!(
             !Arc::ptr_eq(&node1, &node3),
             "an ensure after shutdown must bind a fresh node, not the shut-down one"
@@ -5255,7 +5842,11 @@ mod tests {
                 Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
                 peer,
             ));
-            StartedSender { engine, origin_device: node_id_hex(&peer), peer }
+            StartedSender {
+                engine,
+                origin_device: node_id_hex(&peer),
+                peer,
+            }
         };
 
         let sender = SyncSenderRuntime::new();
@@ -5269,7 +5860,10 @@ mod tests {
         assert!(sender.current_for(&a).await.is_some());
         assert!(sender.current_for(&b).await.is_some());
         let c: NodeId = node_id_from_hex(&"cc".repeat(32));
-        assert!(sender.current_for(&c).await.is_none(), "unknown peer has no engine");
+        assert!(
+            sender.current_for(&c).await.is_none(),
+            "unknown peer has no engine"
+        );
         assert_eq!(sender.started_peers().await.len(), 2);
     }
 
@@ -5324,7 +5918,11 @@ mod tests {
         let authorized: HashSet<String> = [node_id_hex(&member)].into_iter().collect();
 
         let kept = filter_account_peers(vec![member, stranger], &authorized);
-        assert_eq!(kept, vec![member], "only the account member survives the filter");
+        assert_eq!(
+            kept,
+            vec![member],
+            "only the account member survives the filter"
+        );
     }
 
     /// tv2 follow-up review fix, end-to-end at the `_with` seam: two peers have
@@ -5347,22 +5945,26 @@ mod tests {
         {
             let store = CatalogSyncStore::open(&db_path).unwrap();
             store.enqueue("/pkgs/member", member, None, &[]).unwrap();
-            store.enqueue("/pkgs/stranger", stranger, None, &[]).unwrap();
+            store
+                .enqueue("/pkgs/stranger", stranger, None, &[])
+                .unwrap();
         }
 
         let authorized: HashSet<String> = [node_id_hex(&member)].into_iter().collect();
         let sender = Arc::new(SyncSenderRuntime::new());
-        let called: Arc<std::sync::Mutex<Vec<NodeId>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let called: Arc<std::sync::Mutex<Vec<NodeId>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         let called_in = Arc::clone(&called);
-        let ensured = resurrect_pending_senders_with(&db_path, &sender, Some(&authorized), move |peer| {
-            let called = Arc::clone(&called_in);
-            async move {
-                called.lock().unwrap().push(peer);
-                Ok::<(), ApiError>(())
-            }
-        })
-        .await
-        .expect("resurrect ok");
+        let ensured =
+            resurrect_pending_senders_with(&db_path, &sender, Some(&authorized), move |peer| {
+                let called = Arc::clone(&called_in);
+                async move {
+                    called.lock().unwrap().push(peer);
+                    Ok::<(), ApiError>(())
+                }
+            })
+            .await
+            .expect("resurrect ok");
 
         assert_eq!(ensured, 1, "only the account member is resurrected");
         assert_eq!(
@@ -5414,7 +6016,11 @@ mod tests {
                 Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
                 peer,
             ));
-            StartedSender { engine, origin_device: node_id_hex(&peer), peer }
+            StartedSender {
+                engine,
+                origin_device: node_id_hex(&peer),
+                peer,
+            }
         };
         let peer_a = node(0xaa);
         let peer_b = node(0xbb);
@@ -5426,7 +6032,11 @@ mod tests {
         }
 
         let status = build_sender_status(&ctx, &sender).await.unwrap();
-        assert_eq!(status.active.len(), 2, "2 distinct rows, not 4 (deduped across the 2 peers)");
+        assert_eq!(
+            status.active.len(),
+            2,
+            "2 distinct rows, not 4 (deduped across the 2 peers)"
+        );
         assert_eq!(
             status.active.iter().map(|s| s.id).collect::<Vec<_>>(),
             vec![1, 2],
@@ -5442,8 +6052,8 @@ mod tests {
     /// capability (full Athenaeum peer or send-only Perseus agent).
     #[test]
     fn account_peer_hexes_includes_every_device_regardless_of_role() {
-        use base64::Engine;
         use crate::account::{AccountDevice, DeviceCapability};
+        use base64::Engine;
         let b64 = |bytes: [u8; 32]| base64::engine::general_purpose::STANDARD.encode(bytes);
         let dev = |seed: u8, capability: DeviceCapability| AccountDevice {
             id: format!("dev-{seed}"),
@@ -5460,7 +6070,11 @@ mod tests {
             dev(3, DeviceCapability::Athenaeum),
         ];
         let hexes = account_peer_hexes(&devices);
-        assert_eq!(hexes.len(), 3, "every account device is authorized, not just paired captures");
+        assert_eq!(
+            hexes.len(),
+            3,
+            "every account device is authorized, not just paired captures"
+        );
         assert!(hexes.contains(&"01".repeat(32)));
         assert!(hexes.contains(&"02".repeat(32)));
         assert!(hexes.contains(&"03".repeat(32)));
@@ -5480,8 +6094,8 @@ mod tests {
     /// agent. Undecodable pubkeys are skipped, same as the names/hex maps.
     #[test]
     fn account_device_capabilities_maps_hex_to_capability_string() {
-        use base64::Engine;
         use crate::account::{AccountDevice, DeviceCapability};
+        use base64::Engine;
         let b64 = |bytes: [u8; 32]| base64::engine::general_purpose::STANDARD.encode(bytes);
         let dev = |seed: u8, capability: DeviceCapability| AccountDevice {
             id: format!("dev-{seed}"),
@@ -5498,14 +6112,23 @@ mod tests {
         ];
         let caps = account_device_capabilities(&devices);
         assert_eq!(caps.len(), 2);
-        assert_eq!(caps.get(&"01".repeat(32)).map(String::as_str), Some("athenaeum"));
-        assert_eq!(caps.get(&"02".repeat(32)).map(String::as_str), Some("perseus"));
+        assert_eq!(
+            caps.get(&"01".repeat(32)).map(String::as_str),
+            Some("athenaeum")
+        );
+        assert_eq!(
+            caps.get(&"02".repeat(32)).map(String::as_str),
+            Some("perseus")
+        );
 
         // An undecodable pubkey is skipped, never a partial/garbage entry.
         let mut bad = dev(3, DeviceCapability::Perseus);
         bad.pubkey = "not-base64!!".into();
         let caps = account_device_capabilities(&[bad]);
-        assert!(caps.is_empty(), "an undecodable pubkey yields no capability entry");
+        assert!(
+            caps.is_empty(),
+            "an undecodable pubkey yields no capability entry"
+        );
     }
 
     /// The relay-map cache round-trips through settings the same way.
@@ -5514,7 +6137,10 @@ mod tests {
         let (_tmp, ctx) = test_ctx();
         assert_eq!(cached_relays(&ctx).unwrap(), Vec::<String>::new());
 
-        let urls = vec!["https://relay1.example.org".to_string(), "https://relay2.example.org".to_string()];
+        let urls = vec![
+            "https://relay1.example.org".to_string(),
+            "https://relay2.example.org".to_string(),
+        ];
         store_cached_relays(&ctx, &urls);
         assert_eq!(cached_relays(&ctx).unwrap(), urls);
     }
@@ -5530,10 +6156,14 @@ mod tests {
         {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            crate::db::set_setting(&conn, keys::ACCOUNT_HUB_URL, "http://sync-test.invalid").unwrap();
+            crate::db::set_setting(&conn, keys::ACCOUNT_HUB_URL, "http://sync-test.invalid")
+                .unwrap();
         }
         let names = get_sync_device_names(&ctx).await.unwrap();
-        assert!(names.is_empty(), "a signed-out device resolves to an empty map, not an error");
+        assert!(
+            names.is_empty(),
+            "a signed-out device resolves to an empty map, not an error"
+        );
     }
 
     /// tv2 §D5/§D8: the status path resolves device names from the cached
@@ -5548,18 +6178,27 @@ mod tests {
         let peer_z = "99".repeat(32);
 
         // Absent setting → empty map (falls back to hex at the call site).
-        assert!(cached_device_names(&conn).is_empty(), "no cache yet → empty");
+        assert!(
+            cached_device_names(&conn).is_empty(),
+            "no cache yet → empty"
+        );
 
         // Present → hex→name lookups; an uncached hex is absent.
         let json = format!(r#"{{"{peer_a}":"My Mac"}}"#);
         crate::db::set_setting(&conn, keys::SYNC_DEVICE_NAMES, &json).unwrap();
         let map = cached_device_names(&conn);
         assert_eq!(map.get(&peer_a).map(String::as_str), Some("My Mac"));
-        assert!(map.get(&peer_z).is_none(), "an uncached peer resolves to None");
+        assert!(
+            map.get(&peer_z).is_none(),
+            "an uncached peer resolves to None"
+        );
 
         // Malformed JSON → empty map, never a panic/error.
         crate::db::set_setting(&conn, keys::SYNC_DEVICE_NAMES, "not json").unwrap();
-        assert!(cached_device_names(&conn).is_empty(), "malformed cache → empty, best-effort");
+        assert!(
+            cached_device_names(&conn).is_empty(),
+            "malformed cache → empty, best-effort"
+        );
     }
 
     /// tv2 §D4: `list_transfer_files` reads the persisted per-file tables as its
@@ -5576,8 +6215,8 @@ mod tests {
         let v2_id = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            let id =
-                crate::sync::store::upsert_inbound_announced(&conn, &peer, "pkg-v2", 2, 300).unwrap();
+            let id = crate::sync::store::upsert_inbound_announced(&conn, &peer, "pkg-v2", 2, 300)
+                .unwrap();
             let mk = |rel: &str, size: u64| InboundFileRow {
                 inbound_id: id,
                 rel_path: rel.into(),
@@ -5598,7 +6237,11 @@ mod tests {
             id
         };
         let files = list_transfer_files(&ctx, Direction::Received, v2_id).unwrap();
-        assert_eq!(files.len(), 2, "both announced rows surface before any fetch");
+        assert_eq!(
+            files.len(),
+            2,
+            "both announced rows surface before any fetch"
+        );
         // Ordered by rel_path; forward-slash rel_path preserved, basename in `name`.
         assert_eq!(files[0].rel_path, "cam/lights/a.fits");
         assert_eq!(files[0].name, "a.fits");
@@ -5612,8 +6255,10 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             let id =
-                crate::sync::store::upsert_inbound_announced(&conn, &peer, "pkg-legacy", 1, 50).unwrap();
-            crate::sync::store::set_inbound_state(&conn, "pkg-legacy", InboundState::Done, None).unwrap();
+                crate::sync::store::upsert_inbound_announced(&conn, &peer, "pkg-legacy", 1, 50)
+                    .unwrap();
+            crate::sync::store::set_inbound_state(&conn, "pkg-legacy", InboundState::Done, None)
+                .unwrap();
             crate::sync::store::insert_history_row(
                 &conn,
                 &HistoryRow {
@@ -5637,9 +6282,15 @@ mod tests {
         let legacy = list_transfer_files(&ctx, Direction::Received, legacy_id).unwrap();
         assert_eq!(legacy.len(), 1, "falls back to received history");
         assert_eq!(legacy[0].name, "old.fits");
-        assert_eq!(legacy[0].rel_path, "old.fits", "no rel_path in history → basename");
+        assert_eq!(
+            legacy[0].rel_path, "old.fits",
+            "no rel_path in history → basename"
+        );
         assert_eq!(legacy[0].outcome.as_deref(), Some("ingested"));
-        assert!(legacy[0].state.is_none(), "legacy fallback has no per-file state");
+        assert!(
+            legacy[0].state.is_none(),
+            "legacy fallback has no per-file state"
+        );
     }
 
     /// tv2 §D7: `list_transfer_events` returns a batch's journal newest-first, in
@@ -5650,13 +6301,17 @@ mod tests {
         {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            for (kind, detail) in
-                [("enqueued", Some("frames=2")), ("announce_sent", None), ("uploaded", Some("bytes=300"))]
-            {
-                crate::sync::store::append_sync_event(&conn, Direction::Sent, "7", kind, detail).unwrap();
+            for (kind, detail) in [
+                ("enqueued", Some("frames=2")),
+                ("announce_sent", None),
+                ("uploaded", Some("bytes=300")),
+            ] {
+                crate::sync::store::append_sync_event(&conn, Direction::Sent, "7", kind, detail)
+                    .unwrap();
             }
             // A different batch's journal must not leak into batch 7.
-            crate::sync::store::append_sync_event(&conn, Direction::Sent, "8", "enqueued", None).unwrap();
+            crate::sync::store::append_sync_event(&conn, Direction::Sent, "8", "enqueued", None)
+                .unwrap();
         }
         let events = list_transfer_events(&ctx, Direction::Sent, 7).unwrap();
         assert_eq!(events.len(), 3, "only batch 7's events");
@@ -5700,7 +6355,11 @@ mod tests {
             updated_at: None,
         };
         let file_id = crate::db::insert_file(&conn, &file).unwrap();
-        let frame = Frame { file_id, object: Some(object.to_string()), ..Default::default() };
+        let frame = Frame {
+            file_id,
+            object: Some(object.to_string()),
+            ..Default::default()
+        };
         let frame_id = crate::db::insert_frame(&conn, &frame).unwrap();
         if analyze {
             let a = FrameAnalysis {
@@ -5756,17 +6415,33 @@ mod tests {
 
         let dir = built.pkg_dir.expect("a package was written");
         let records = crate::package::read_manifest(&dir).unwrap();
-        assert_eq!(records.len(), 2, "exactly the selection, not the unselected f3");
+        assert_eq!(
+            records.len(),
+            2,
+            "exactly the selection, not the unselected f3"
+        );
         for r in &records {
             let f: crate::models::Frame = serde_json::from_value(r.frame_meta.clone()).unwrap();
-            assert_eq!(f.object.as_deref(), Some("M42"), "frame_meta is the catalog Frame");
+            assert_eq!(
+                f.object.as_deref(),
+                Some("M42"),
+                "frame_meta is the catalog Frame"
+            );
         }
         let analyzed: Vec<&crate::package::ManifestRecord> =
             records.iter().filter(|r| r.analysis.is_some()).collect();
-        assert_eq!(analyzed.len(), 1, "analysis summary included only when present");
+        assert_eq!(
+            analyzed.len(),
+            1,
+            "analysis summary included only when present"
+        );
         let af: crate::models::Frame =
             serde_json::from_value(analyzed[0].frame_meta.clone()).unwrap();
-        assert_eq!(af.id, Some(f1), "the analysis is attached to the analyzed frame");
+        assert_eq!(
+            af.id,
+            Some(f1),
+            "the analysis is attached to the analyzed frame"
+        );
     }
 
     /// Task M4: building a selection package records the retention linkage in
@@ -5786,15 +6461,38 @@ mod tests {
         let pkg_root = tmp.path().join("packages");
         let db = db(&ctx).unwrap();
         let conn = db.conn();
-        let built = build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2], None, None).unwrap();
-        let pkg_ref = built.pkg_dir.clone().expect("a package was written").to_string_lossy().to_string();
+        let built =
+            build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2], None, None).unwrap();
+        let pkg_ref = built
+            .pkg_dir
+            .clone()
+            .expect("a package was written")
+            .to_string_lossy()
+            .to_string();
 
         let sources = crate::sync::live_sources_for_package(&conn, &pkg_ref).unwrap();
-        assert_eq!(sources.len(), 1, "one linkage row for the single eligible frame (f2 was missing)");
+        assert_eq!(
+            sources.len(),
+            1,
+            "one linkage row for the single eligible frame (f2 was missing)"
+        );
         let row = &sources[0];
-        assert_eq!(row.path, dir.join("light-0001.fits").to_string_lossy(), "linkage points at the source path");
-        assert!(row.file_id.is_some(), "the catalog file_id is recorded for a catalog-consistent delete");
-        assert_eq!(row.size, std::fs::metadata(dir.join("light-0001.fits")).unwrap().len(), "recorded size matches disk");
+        assert_eq!(
+            row.path,
+            dir.join("light-0001.fits").to_string_lossy(),
+            "linkage points at the source path"
+        );
+        assert!(
+            row.file_id.is_some(),
+            "the catalog file_id is recorded for a catalog-consistent delete"
+        );
+        assert_eq!(
+            row.size,
+            std::fs::metadata(dir.join("light-0001.fits"))
+                .unwrap()
+                .len(),
+            "recorded size matches disk"
+        );
     }
 
     /// Step 1: ineligible files (missing on disk, or an unknown id) are reported
@@ -5813,15 +6511,35 @@ mod tests {
         let built = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            build_selection_package(&conn, "origin-dev", &pkg_root, &[f1, f2, unknown], None, None)
-                .unwrap()
+            build_selection_package(
+                &conn,
+                "origin-dev",
+                &pkg_root,
+                &[f1, f2, unknown],
+                None,
+                None,
+            )
+            .unwrap()
         };
-        assert_eq!(built.eligible, vec![f1], "only the present file is eligible");
+        assert_eq!(
+            built.eligible,
+            vec![f1],
+            "only the present file is eligible"
+        );
         assert_eq!(built.total, 3);
-        let reasons: HashMap<i64, String> =
-            built.ineligible.iter().map(|i| (i.frame_id, i.reason.clone())).collect();
-        assert!(reasons.get(&f2).unwrap().contains("missing"), "f2 reported missing");
-        assert!(reasons.get(&unknown).unwrap().contains("not found"), "unknown id reported");
+        let reasons: HashMap<i64, String> = built
+            .ineligible
+            .iter()
+            .map(|i| (i.frame_id, i.reason.clone()))
+            .collect();
+        assert!(
+            reasons.get(&f2).unwrap().contains("missing"),
+            "f2 reported missing"
+        );
+        assert!(
+            reasons.get(&unknown).unwrap().contains("not found"),
+            "unknown id reported"
+        );
 
         let records = crate::package::read_manifest(&built.pkg_dir.unwrap()).unwrap();
         assert_eq!(records.len(), 1, "the eligible frame still enqueues");
@@ -5842,18 +6560,36 @@ mod tests {
         let sender = Arc::new(SyncSenderRuntime::new());
         let collab_sender = Arc::new(SyncSenderRuntime::new());
         let sync = SyncRuntime::new();
-        let dest = ResolvedDest { node: [7u8; 32], endpoint_addr: None };
+        let dest = ResolvedDest {
+            node: [7u8; 32],
+            endpoint_addr: None,
+        };
 
-        let result =
-            enqueue_sync_selection(&ctx, &sender, collab_sender, &sync, dest, Vec::new(), None, None, None)
-                .await
-                .unwrap();
+        let result = enqueue_sync_selection(
+            &ctx,
+            &sender,
+            collab_sender,
+            &sync,
+            dest,
+            Vec::new(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.enqueued_count, 0);
         assert_eq!(result.eligible_count, 0);
         assert_eq!(result.total_count, 0);
         assert!(result.ineligible.is_empty());
-        assert!(!sender.is_started().await, "no engine started for an empty selection");
-        assert!(sender.started_peers().await.is_empty(), "no peer engine for an empty selection");
+        assert!(
+            !sender.is_started().await,
+            "no engine started for an empty selection"
+        );
+        assert!(
+            sender.started_peers().await.is_empty(),
+            "no peer engine for an empty selection"
+        );
     }
 
     // ── Retry / send-now / cancel command surface (Task 8) ───────────────────
@@ -5890,13 +6626,19 @@ mod tests {
             store as Arc<dyn SyncStore>,
             Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
             peer,
-            SyncConfig { ack_timeout: Duration::from_secs(60) },
+            SyncConfig {
+                ack_timeout: Duration::from_secs(60),
+            },
         ));
         let sender = Arc::new(SyncSenderRuntime::new());
-        sender
-            .lock_inner()
-            .await
-            .insert(peer, StartedSender { engine, origin_device: node_id_hex(&peer), peer });
+        sender.lock_inner().await.insert(
+            peer,
+            StartedSender {
+                engine,
+                origin_device: node_id_hex(&peer),
+                peer,
+            },
+        );
         (sender, peer)
     }
 
@@ -5928,7 +6670,10 @@ mod tests {
         let db_path = db(&ctx).unwrap().path().to_path_buf();
 
         let manifest = package::read_manifest(&pkg_dir).unwrap();
-        assert!(!manifest.is_empty(), "fixture package has >=1 manifest record");
+        assert!(
+            !manifest.is_empty(),
+            "fixture package has >=1 manifest record"
+        );
         let files: Vec<crate::sharing::types::AnnounceFileEntry> = manifest
             .iter()
             .map(|r| crate::sharing::types::AnnounceFileEntry {
@@ -5963,11 +6708,13 @@ mod tests {
         assert!(old_wire.is_some(), "the first attempt persisted a wire id");
 
         // Resend → the SAME id back, NOT a new row.
-        let same_id =
-            resend_transfer(&ctx, &sender, Arc::clone(&collab_sender), &sync, id, None)
-                .await
-                .unwrap();
-        assert_eq!(same_id, id, "resend returns the SAME transfer id (no new row)");
+        let same_id = resend_transfer(&ctx, &sender, Arc::clone(&collab_sender), &sync, id, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            same_id, id,
+            "resend returns the SAME transfer id (no new row)"
+        );
 
         // The reset ran synchronously inside `resend_transfer` before the async
         // re-drive; read it straight back.
@@ -5975,7 +6722,10 @@ mod tests {
             let store = CatalogSyncStore::open(&db_path).unwrap();
             store.get_outbound(id).unwrap().expect("row still exists")
         };
-        assert!(!after.state.is_terminal(), "resend un-terminalizes the SAME row");
+        assert!(
+            !after.state.is_terminal(),
+            "resend un-terminalizes the SAME row"
+        );
         assert!(
             after.wire_package_id.is_some() && after.wire_package_id != old_wire,
             "resend rotates the per-attempt wire id (was {old_wire:?}, now {:?})",
@@ -6006,7 +6756,11 @@ mod tests {
             let conn = db.conn();
             list_outbound_files(&conn, id).unwrap()
         };
-        assert_eq!(file_rows.len(), manifest.len(), "every manifest file has a row");
+        assert_eq!(
+            file_rows.len(),
+            manifest.len(),
+            "every manifest file has a row"
+        );
         assert!(
             file_rows
                 .iter()
@@ -6029,8 +6783,14 @@ mod tests {
         };
         let cancelled_at = kinds.iter().position(|k| k == "cancelled");
         let resend_at = kinds.iter().position(|k| k == "resend");
-        assert!(cancelled_at.is_some(), "journal has a cancelled event, got {kinds:?}");
-        assert!(resend_at.is_some(), "journal has a resend event, got {kinds:?}");
+        assert!(
+            cancelled_at.is_some(),
+            "journal has a cancelled event, got {kinds:?}"
+        );
+        assert!(
+            resend_at.is_some(),
+            "journal has a resend event, got {kinds:?}"
+        );
         assert!(
             cancelled_at < resend_at,
             "resend is journaled AFTER cancelled, got {kinds:?}",
@@ -6053,7 +6813,10 @@ mod tests {
 
         // Enqueue but do NOT cancel — the row is non-terminal (Queued/Announced).
         let (engine, _) = sender.current_for(&peer).await.unwrap();
-        let id = engine.enqueue_package(&pkg_dir, None, Vec::new()).await.unwrap();
+        let id = engine
+            .enqueue_package(&pkg_dir, None, Vec::new())
+            .await
+            .unwrap();
 
         let err = resend_transfer(&ctx, &sender, collab_sender, &sync, id, None)
             .await
@@ -6091,7 +6854,10 @@ mod tests {
         let db_path = db(&ctx).unwrap().path().to_path_buf();
 
         let manifest = package::read_manifest(&pkg_dir).unwrap();
-        assert!(!manifest.is_empty(), "fixture package has >=1 manifest record");
+        assert!(
+            !manifest.is_empty(),
+            "fixture package has >=1 manifest record"
+        );
         let n = manifest.len();
         let files: Vec<AnnounceFileEntry> = manifest
             .iter()
@@ -6112,8 +6878,14 @@ mod tests {
         let old_id = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            let id = insert_outbound_with_files(&conn, &old_ref, &node_id_hex(&peer), Some(&display), &files)
-                .unwrap();
+            let id = insert_outbound_with_files(
+                &conn,
+                &old_ref,
+                &node_id_hex(&peer),
+                Some(&display),
+                &files,
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE sync_outbound SET state = 'cancelled', last_error = ?2 WHERE id = ?1",
                 rusqlite::params![id, CANCELLED_BY_RECEIVER_DETAIL],
@@ -6133,34 +6905,64 @@ mod tests {
         }
 
         // Resend → a NEW transfer.
-        let new_id = resend_transfer(&ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
-            .await
-            .unwrap();
-        assert_ne!(new_id, old_id, "a receiver-declined resend mints a NEW transfer");
+        let new_id = resend_transfer(
+            &ctx,
+            &sender,
+            Arc::clone(&collab_sender),
+            &sync,
+            old_id,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            new_id, old_id,
+            "a receiver-declined resend mints a NEW transfer"
+        );
 
         // The new row owns a fresh dir; the old dir was renamed away.
         let new_ref = {
             let store = CatalogSyncStore::open(&db_path).unwrap();
-            store.get_outbound(new_id).unwrap().expect("new row exists").package_ref
+            store
+                .get_outbound(new_id)
+                .unwrap()
+                .expect("new row exists")
+                .package_ref
         };
         assert_ne!(new_ref, old_ref, "the new transfer has a fresh package_ref");
-        assert!(!pkg_dir.exists(), "the declined payload dir was renamed away");
+        assert!(
+            !pkg_dir.exists(),
+            "the declined payload dir was renamed away"
+        );
         let new_dir = PathBuf::from(&new_ref);
         assert!(new_dir.exists(), "the new payload dir is present");
-        assert!(package_has_payload(&new_dir), "the new dir carries the manifest + payload");
+        assert!(
+            package_has_payload(&new_dir),
+            "the new dir carries the manifest + payload"
+        );
 
         // The declined row is kept as history — same id, still Cancelled + reason,
         // with its now-stale package_ref string.
         {
             let store = CatalogSyncStore::open(&db_path).unwrap();
-            let old = store.get_outbound(old_id).unwrap().expect("declined row kept");
-            assert_eq!(old.state, OutboundState::Cancelled, "declined row kept as history");
+            let old = store
+                .get_outbound(old_id)
+                .unwrap()
+                .expect("declined row kept");
+            assert_eq!(
+                old.state,
+                OutboundState::Cancelled,
+                "declined row kept as history"
+            );
             assert_eq!(
                 old.last_error.as_deref(),
                 Some(CANCELLED_BY_RECEIVER_DETAIL),
                 "declined row keeps its receiver-decline reason"
             );
-            assert_eq!(old.package_ref, old_ref, "declined row keeps its (now-stale) package_ref");
+            assert_eq!(
+                old.package_ref, old_ref,
+                "declined row keeps its (now-stale) package_ref"
+            );
         }
 
         // The manifest was cloned onto the new row (same rel_paths).
@@ -6168,12 +6970,19 @@ mod tests {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             let new_files = list_outbound_files(&conn, new_id).unwrap();
-            assert_eq!(new_files.len(), n, "every manifest file cloned onto the new row");
+            assert_eq!(
+                new_files.len(),
+                n,
+                "every manifest file cloned onto the new row"
+            );
             let mut got: Vec<String> = new_files.iter().map(|f| f.rel_path.clone()).collect();
             let mut want: Vec<String> = files.iter().map(|f| f.rel_path.clone()).collect();
             got.sort();
             want.sort();
-            assert_eq!(got, want, "cloned file rel_paths match the declined manifest");
+            assert_eq!(
+                got, want,
+                "cloned file rel_paths match the declined manifest"
+            );
         }
 
         // Retention followed the payload: N on the new ref, 0 on the old.
@@ -6196,24 +7005,30 @@ mod tests {
         {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            let old_details: Vec<String> = list_sync_events(&conn, Direction::Sent, &old_id.to_string())
-                .unwrap()
-                .into_iter()
-                .filter(|e| e.kind == "resend")
-                .filter_map(|e| e.detail)
-                .collect();
+            let old_details: Vec<String> =
+                list_sync_events(&conn, Direction::Sent, &old_id.to_string())
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.kind == "resend")
+                    .filter_map(|e| e.detail)
+                    .collect();
             assert!(
-                old_details.iter().any(|d| d == &format!("as_new_transfer={new_id}")),
+                old_details
+                    .iter()
+                    .any(|d| d == &format!("as_new_transfer={new_id}")),
                 "old journal cross-links to the new id, got {old_details:?}"
             );
-            let new_details: Vec<String> = list_sync_events(&conn, Direction::Sent, &new_id.to_string())
-                .unwrap()
-                .into_iter()
-                .filter(|e| e.kind == "resend")
-                .filter_map(|e| e.detail)
-                .collect();
+            let new_details: Vec<String> =
+                list_sync_events(&conn, Direction::Sent, &new_id.to_string())
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.kind == "resend")
+                    .filter_map(|e| e.detail)
+                    .collect();
             assert!(
-                new_details.iter().any(|d| d == &format!("of_declined={old_id}")),
+                new_details
+                    .iter()
+                    .any(|d| d == &format!("of_declined={old_id}")),
                 "new journal cross-links to the old id, got {new_details:?}"
             );
         }
@@ -6328,7 +7143,11 @@ mod tests {
                     };
                     n += 1;
                     let dest = recv_root.join(format!("fetch-{n}"));
-                    if receiver.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
+                    if receiver
+                        .fetch(from, &announce, &dest, noop_fetch_sink())
+                        .await
+                        .is_ok()
+                    {
                         if let Ok(records) = crate::package::read_manifest(&dest) {
                             let receipts: Vec<FrameReceipt> = records
                                 .iter()
@@ -6351,39 +7170,59 @@ mod tests {
             Arc::new(net.endpoint()) as Arc<dyn SharingTransport>,
             receiver_id,
         );
-        let id = engine.enqueue_package(&pkg_dir, None, Vec::new()).await.unwrap();
+        let id = engine
+            .enqueue_package(&pkg_dir, None, Vec::new())
+            .await
+            .unwrap();
 
         // Poll until confirmed (bounded).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let confirmed = store.get_outbound(id).unwrap().map(|r| r.state)
-                == Some(OutboundState::Confirmed);
+            let confirmed =
+                store.get_outbound(id).unwrap().map(|r| r.state) == Some(OutboundState::Confirmed);
             if confirmed {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "package never confirmed");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "package never confirmed"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
         let files = list_transfer_files(&ctx, Direction::Sent, id).unwrap();
         assert_eq!(files.len(), 2, "one entry per manifest frame");
         assert!(
-            files.iter().all(|f| f.outcome.as_deref() == Some("ingested")),
+            files
+                .iter()
+                .all(|f| f.outcome.as_deref() == Some("ingested")),
             "confirmed frames report the peer's ingested verdict: {files:?}"
         );
         assert!(
-            files.iter().any(|f| f.name == "light-0001.fits" && f.bytes_total > 0),
+            files
+                .iter()
+                .any(|f| f.name == "light-0001.fits" && f.bytes_total > 0),
             "the manifest supplies name + bytes: {files:?}"
         );
-        assert!(files.iter().all(|f| f.bytes_done.is_none()), "sent entries carry no bytes_done");
+        assert!(
+            files.iter().all(|f| f.bytes_done.is_none()),
+            "sent entries carry no bytes_done"
+        );
 
         // tv2 follow-up: the confirmed row (a REAL engine terminal row, not a
         // seeded one) surfaces in `list_terminal_transfers().sent` so it survives
         // a restart — where the in-memory page ledger would not.
         let terminal = list_terminal_transfers(&ctx, None).unwrap();
-        let confirmed = terminal.sent.iter().find(|s| s.id == id).expect("confirmed row in terminal sent");
+        let confirmed = terminal
+            .sent
+            .iter()
+            .find(|s| s.id == id)
+            .expect("confirmed row in terminal sent");
         assert_eq!(confirmed.display_state, "confirmed");
-        assert_eq!(confirmed.file_count, 2, "the confirmed batch's manifest enriches its terminal summary");
+        assert_eq!(
+            confirmed.file_count, 2,
+            "the confirmed batch's manifest enriches its terminal summary"
+        );
 
         // Owner follow-up (dead Resend button): `resendable` reflects whether the
         // package payload is STILL on disk, not just the raw terminal state — a
@@ -6438,10 +7277,24 @@ mod tests {
         set_outbound_terminal(&ctx, swept_id, "cancelled", "2026-07-20T09:30:00.000Z");
 
         let terminal2 = list_terminal_transfers(&ctx, None).unwrap();
-        let intact = terminal2.sent.iter().find(|s| s.id == intact_id).expect("intact cancelled row");
-        assert!(intact.resendable, "a cancelled row with its payload intact on disk is resendable");
-        let swept = terminal2.sent.iter().find(|s| s.id == swept_id).expect("swept cancelled row");
-        assert!(!swept.resendable, "a cancelled row whose payload was cleaned up is NOT resendable");
+        let intact = terminal2
+            .sent
+            .iter()
+            .find(|s| s.id == intact_id)
+            .expect("intact cancelled row");
+        assert!(
+            intact.resendable,
+            "a cancelled row with its payload intact on disk is resendable"
+        );
+        let swept = terminal2
+            .sent
+            .iter()
+            .find(|s| s.id == swept_id)
+            .expect("swept cancelled row");
+        assert!(
+            !swept.resendable,
+            "a cancelled row whose payload was cleaned up is NOT resendable"
+        );
 
         engine.shutdown().await;
     }
@@ -6460,21 +7313,31 @@ mod tests {
         let (pkg_dir, id) = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            let pkg_dir = build_selection_package(&conn, "origin-dev", &pkg_root, &[f1], None, None)
-                .unwrap()
-                .pkg_dir
-                .expect("a package was written");
+            let pkg_dir =
+                build_selection_package(&conn, "origin-dev", &pkg_root, &[f1], None, None)
+                    .unwrap()
+                    .pkg_dir
+                    .expect("a package was written");
             drop(conn);
             let store = CatalogSyncStore::open(&db_path).unwrap();
-            let id = store.enqueue(&pkg_dir.to_string_lossy(), [9u8; 32], None, &[]).unwrap();
+            let id = store
+                .enqueue(&pkg_dir.to_string_lossy(), [9u8; 32], None, &[])
+                .unwrap();
             (pkg_dir, id)
         };
         let _ = pkg_dir;
 
         let files = list_transfer_files(&ctx, Direction::Sent, id).unwrap();
-        assert_eq!(files.len(), 1, "manifest lists the one frame even with no ack yet");
+        assert_eq!(
+            files.len(),
+            1,
+            "manifest lists the one frame even with no ack yet"
+        );
         assert_eq!(files[0].name, "light-0001.fits");
-        assert!(files[0].outcome.is_none(), "no verdict while the send is in flight");
+        assert!(
+            files[0].outcome.is_none(),
+            "no verdict while the send is in flight"
+        );
     }
 
     /// Task 14: a terminal inbound package lists its received frames from history
@@ -6519,10 +7382,19 @@ mod tests {
 
         let files = list_transfer_files(&ctx, Direction::Received, inbound_id).unwrap();
         assert_eq!(files.len(), 2, "one entry per received frame from history");
-        assert!(files.iter().all(|f| f.outcome.as_deref() == Some("ingested")));
-        let a = files.iter().find(|f| f.name == "a.fits").expect("a.fits present");
+        assert!(files
+            .iter()
+            .all(|f| f.outcome.as_deref() == Some("ingested")));
+        let a = files
+            .iter()
+            .find(|f| f.name == "a.fits")
+            .expect("a.fits present");
         assert_eq!(a.bytes_total, 100);
-        assert_eq!(a.bytes_done, Some(100), "terminal received: bytes_done reflects received bytes");
+        assert_eq!(
+            a.bytes_done,
+            Some(100),
+            "terminal received: bytes_done reflects received bytes"
+        );
     }
 
     /// Task 14: `list_transfer_files` surfaces a clean `NotFound` for an unknown
@@ -6575,7 +7447,9 @@ mod tests {
     #[test]
     fn list_terminal_transfers_returns_only_terminal_rows_newest_first() {
         use crate::sharing::types::AnnounceFileEntry;
-        use crate::sync::store::{insert_outbound_with_files, set_inbound_state, upsert_inbound_announced};
+        use crate::sync::store::{
+            insert_outbound_with_files, set_inbound_state, upsert_inbound_announced,
+        };
         use crate::sync::InboundState;
 
         let (_tmp, ctx) = test_ctx();
@@ -6587,14 +7461,40 @@ mod tests {
         let (queued_id, confirmed_id, failed_id, cancelled_id) = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            let queued = insert_outbound_with_files(&conn, "/pkg/queued", &peer, Some("Queued batch"), &[]).unwrap();
-            let confirmed = insert_outbound_with_files(&conn, "/pkg/confirmed", &peer, Some("Confirmed batch"), &[]).unwrap();
-            let failed = insert_outbound_with_files(&conn, "/pkg/failed", &peer, Some("Failed batch"), &[]).unwrap();
+            let queued =
+                insert_outbound_with_files(&conn, "/pkg/queued", &peer, Some("Queued batch"), &[])
+                    .unwrap();
+            let confirmed = insert_outbound_with_files(
+                &conn,
+                "/pkg/confirmed",
+                &peer,
+                Some("Confirmed batch"),
+                &[],
+            )
+            .unwrap();
+            let failed =
+                insert_outbound_with_files(&conn, "/pkg/failed", &peer, Some("Failed batch"), &[])
+                    .unwrap();
             let files = [
-                AnnounceFileEntry { rel_path: "cam/a.fits".into(), byte_size: 100, frame_uuid: "u-a".into() },
-                AnnounceFileEntry { rel_path: "cam/b.fits".into(), byte_size: 200, frame_uuid: "u-b".into() },
+                AnnounceFileEntry {
+                    rel_path: "cam/a.fits".into(),
+                    byte_size: 100,
+                    frame_uuid: "u-a".into(),
+                },
+                AnnounceFileEntry {
+                    rel_path: "cam/b.fits".into(),
+                    byte_size: 200,
+                    frame_uuid: "u-b".into(),
+                },
             ];
-            let cancelled = insert_outbound_with_files(&conn, "/pkg/cancelled", &peer, Some("Nightly batch"), &files).unwrap();
+            let cancelled = insert_outbound_with_files(
+                &conn,
+                "/pkg/cancelled",
+                &peer,
+                Some("Nightly batch"),
+                &files,
+            )
+            .unwrap();
             (queued, confirmed, failed, cancelled)
         };
         // Explicit, well-separated finished timestamps → deterministic
@@ -6621,13 +7521,31 @@ mod tests {
 
         // Only terminal rows, newest-first (reverse insertion / finish order).
         let sent_ids: Vec<i64> = terminal.sent.iter().map(|s| s.id).collect();
-        assert_eq!(sent_ids, vec![cancelled_id, failed_id, confirmed_id], "sent: terminal only, newest-first");
-        assert!(!sent_ids.contains(&queued_id), "a non-terminal queued row must be excluded");
-
-        let recv_states: Vec<&str> = terminal.received.iter().map(|r| r.display_state.as_str()).collect();
-        assert_eq!(recv_states, vec!["cancelled", "failed", "done"], "received: terminal only, newest-first");
+        assert_eq!(
+            sent_ids,
+            vec![cancelled_id, failed_id, confirmed_id],
+            "sent: terminal only, newest-first"
+        );
         assert!(
-            !terminal.received.iter().any(|r| r.package_id == "in-announced"),
+            !sent_ids.contains(&queued_id),
+            "a non-terminal queued row must be excluded"
+        );
+
+        let recv_states: Vec<&str> = terminal
+            .received
+            .iter()
+            .map(|r| r.display_state.as_str())
+            .collect();
+        assert_eq!(
+            recv_states,
+            vec!["cancelled", "failed", "done"],
+            "received: terminal only, newest-first"
+        );
+        assert!(
+            !terminal
+                .received
+                .iter()
+                .any(|r| r.package_id == "in-announced"),
             "a non-terminal announced inbound row must be excluded"
         );
 
@@ -6635,18 +7553,28 @@ mod tests {
         let cancelled = terminal.sent.iter().find(|s| s.id == cancelled_id).unwrap();
         assert_eq!(cancelled.display_name.as_deref(), Some("Nightly batch"));
         assert_eq!(cancelled.display_state, "cancelled");
-        assert_eq!(cancelled.file_counts.total, 2, "per-file rows counted into the summary");
+        assert_eq!(
+            cancelled.file_counts.total, 2,
+            "per-file rows counted into the summary"
+        );
 
         // Limit is honored (newest row only).
         let one = list_terminal_transfers(&ctx, Some(1)).unwrap();
         assert_eq!(one.sent.len(), 1);
-        assert_eq!(one.sent[0].id, cancelled_id, "limit keeps the newest terminal row");
+        assert_eq!(
+            one.sent[0].id, cancelled_id,
+            "limit keeps the newest terminal row"
+        );
         assert_eq!(one.received.len(), 1);
 
         // Restart-survival: the cancelled row's per-file rows are still listable
         // by its durable id, read straight from the DB (no in-memory ledger).
         let files = list_transfer_files(&ctx, Direction::Sent, cancelled_id).unwrap();
-        assert_eq!(files.len(), 2, "the cancelled batch's per-file rows survive as detail");
+        assert_eq!(
+            files.len(),
+            2,
+            "the cancelled batch's per-file rows survive as detail"
+        );
     }
 
     // ── Production account-mode autostart (task A7 fix-review; sync 2A) ─────
@@ -6667,7 +7595,10 @@ mod tests {
         assert!(autostart_gate(true, false), "dev flag alone must start");
         assert!(autostart_gate(false, true), "signed-in alone must start");
         assert!(autostart_gate(true, true), "both true still starts");
-        assert!(!autostart_gate(false, false), "neither condition: must not start");
+        assert!(
+            !autostart_gate(false, false),
+            "neither condition: must not start"
+        );
     }
 
     /// Sync Phase 2A, task 2: the gate opens for ANY signed-in node — no
@@ -6692,21 +7623,30 @@ mod tests {
     #[test]
     fn account_signed_in_matrix() {
         let (_tmp, ctx) = test_ctx();
-        assert!(!account_signed_in(&ctx).unwrap(), "no identity yet -> not signed in");
+        assert!(
+            !account_signed_in(&ctx).unwrap(),
+            "no identity yet -> not signed in"
+        );
 
         {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             crate::db::set_setting(&conn, keys::ACCOUNT_DEVICE_ID, "device-1").unwrap();
         }
-        assert!(account_signed_in(&ctx).unwrap(), "identity present -> signed in");
+        assert!(
+            account_signed_in(&ctx).unwrap(),
+            "identity present -> signed in"
+        );
 
         {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
             crate::db::delete_setting(&conn, keys::ACCOUNT_DEVICE_ID).unwrap();
         }
-        assert!(!account_signed_in(&ctx).unwrap(), "identity cleared (sign-out) -> not signed in");
+        assert!(
+            !account_signed_in(&ctx).unwrap(),
+            "identity cleared (sign-out) -> not signed in"
+        );
     }
 
     /// `autostart_if_enabled`'s one remaining negative path never touches relay
@@ -6783,10 +7723,22 @@ mod tests {
     /// mode) may fall back to Default.
     #[test]
     fn allow_default_relays_signed_in_always_refuses_even_with_dev_flag() {
-        assert!(!allow_default_relays(true, true), "signed-in + dev flag: still refused");
-        assert!(!allow_default_relays(true, false), "signed-in, no dev flag: refused");
-        assert!(allow_default_relays(false, true), "signed-out + dev flag: pure dev/ticket mode allowed");
-        assert!(!allow_default_relays(false, false), "signed-out, no dev flag: refused");
+        assert!(
+            !allow_default_relays(true, true),
+            "signed-in + dev flag: still refused"
+        );
+        assert!(
+            !allow_default_relays(true, false),
+            "signed-in, no dev flag: refused"
+        );
+        assert!(
+            allow_default_relays(false, true),
+            "signed-out + dev flag: pure dev/ticket mode allowed"
+        );
+        assert!(
+            !allow_default_relays(false, false),
+            "signed-out, no dev flag: refused"
+        );
     }
 
     /// Fix-review addendum, pinned end to end: dev flag ON + signed in + the
@@ -6801,9 +7753,11 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v1/relay-map"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "relays": ["https://relay1.example.org"]
-            })))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "relays": ["https://relay1.example.org"]
+                })),
+            )
             .mount(&server)
             .await;
 
@@ -6815,7 +7769,10 @@ mod tests {
         // must be refused regardless — composing exactly what `resolve_relay_mode`
         // does internally.
         let allow_default = allow_default_relays(true, true);
-        assert!(!allow_default, "a signed-in device must never get the Default-relay opt-in");
+        assert!(
+            !allow_default,
+            "a signed-in device must never get the Default-relay opt-in"
+        );
 
         let mode = pairing::relay_mode_for(&res.urls, allow_default).unwrap();
         assert!(
@@ -6854,7 +7811,10 @@ mod tests {
             PathBuf::from("/data/M31/lights/a.fits"),
             PathBuf::from("/data/M31/flats/b.fits"),
         ];
-        assert_eq!(common_ancestor(&under_one), Some(PathBuf::from("/data/M31")));
+        assert_eq!(
+            common_ancestor(&under_one),
+            Some(PathBuf::from("/data/M31"))
+        );
 
         // Same directory → that directory (rel_paths become flat basenames).
         let same = vec![
@@ -6907,11 +7867,21 @@ mod tests {
         let layout = RelPathLayout::SourceRelative(Some(PathBuf::from("/data/M31")));
         let mut used: HashMap<String, HashSet<String>> = HashMap::new();
         assert_eq!(
-            assign_rel_path(&layout, 1, &file_at("/data/M31/lights/a.fits", "a.fits"), &mut used),
+            assign_rel_path(
+                &layout,
+                1,
+                &file_at("/data/M31/lights/a.fits", "a.fits"),
+                &mut used
+            ),
             "lights/a.fits"
         );
         assert_eq!(
-            assign_rel_path(&layout, 2, &file_at("/data/M31/b.fits", "b.fits"), &mut used),
+            assign_rel_path(
+                &layout,
+                2,
+                &file_at("/data/M31/b.fits", "b.fits"),
+                &mut used
+            ),
             "b.fits"
         );
 
@@ -6919,11 +7889,21 @@ mod tests {
         let flat = RelPathLayout::SourceRelative(None);
         let mut used2: HashMap<String, HashSet<String>> = HashMap::new();
         assert_eq!(
-            assign_rel_path(&flat, 1, &file_at("/vol_a/x/dup.fits", "dup.fits"), &mut used2),
+            assign_rel_path(
+                &flat,
+                1,
+                &file_at("/vol_a/x/dup.fits", "dup.fits"),
+                &mut used2
+            ),
             "dup.fits"
         );
         assert_eq!(
-            assign_rel_path(&flat, 2, &file_at("/vol_b/y/dup.fits", "dup.fits"), &mut used2),
+            assign_rel_path(
+                &flat,
+                2,
+                &file_at("/vol_b/y/dup.fits", "dup.fits"),
+                &mut used2
+            ),
             "dup_2.fits"
         );
     }
@@ -6972,7 +7952,10 @@ mod tests {
             "Andromeda Core"
         );
         // 2) Object send → frame-set name.
-        assert_eq!(resolve_batch_name(None, &conn, Some(7), None, 3), "Andromeda Core");
+        assert_eq!(
+            resolve_batch_name(None, &conn, Some(7), None, 3),
+            "Andromeda Core"
+        );
         // 3) Browser folder → common-ancestor basename.
         assert_eq!(
             resolve_batch_name(None, &conn, None, Some(Path::new("/data/M31_lights")), 4),
@@ -7055,13 +8038,23 @@ mod tests {
         let conn = db.conn();
         let rows = crate::sync::store::all_outbound_rows(&conn, 10).unwrap();
         let row = rows.first().expect("an outbound row exists");
-        assert_eq!(row.display_name.as_deref(), Some("M31_data"), "auto name = ancestor basename");
+        assert_eq!(
+            row.display_name.as_deref(),
+            Some("M31_data"),
+            "auto name = ancestor basename"
+        );
 
         let files = crate::sync::store::list_outbound_files(&conn, row.id).unwrap();
         assert_eq!(files.len(), 2, "one row per manifest record");
         let rel: HashSet<&str> = files.iter().map(|f| f.rel_path.as_str()).collect();
-        assert!(rel.contains("lights/light1.fits"), "subdir preserved: {rel:?}");
-        assert!(rel.contains("flats/flat1.fits"), "subdir preserved: {rel:?}");
+        assert!(
+            rel.contains("lights/light1.fits"),
+            "subdir preserved: {rel:?}"
+        );
+        assert!(
+            rel.contains("flats/flat1.fits"),
+            "subdir preserved: {rel:?}"
+        );
         for f in &files {
             assert_eq!(f.state, crate::sync::OutboundFileState::Pending);
             assert_eq!(f.bytes_done, 0);
@@ -7119,7 +8112,11 @@ mod tests {
         if let Some(parent) = abs_path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
-        std::fs::write(abs_path, format!("payload-{}", abs_path.display()).as_bytes()).unwrap();
+        std::fs::write(
+            abs_path,
+            format!("payload-{}", abs_path.display()).as_bytes(),
+        )
+        .unwrap();
         let size = std::fs::metadata(abs_path).unwrap().len() as i64;
         let filename = abs_path.file_name().unwrap().to_string_lossy().into_owned();
 
@@ -7142,7 +8139,11 @@ mod tests {
             updated_at: None,
         };
         let file_id = crate::db::insert_file(&conn, &file).unwrap();
-        let frame = Frame { file_id, object: Some(object.to_string()), ..Default::default() };
+        let frame = Frame {
+            file_id,
+            object: Some(object.to_string()),
+            ..Default::default()
+        };
         crate::db::insert_frame(&conn, &frame).unwrap()
     }
 }
