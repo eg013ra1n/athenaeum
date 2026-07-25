@@ -112,14 +112,25 @@ export default function SyncSection() {
     setCleaning(true);
     try {
       const result = await api.invoke<TransferCleanup>('cleanup_finished_transfers');
-      const pkgs = `${result.payloadDirs} package${result.payloadDirs === 1 ? '' : 's'}`;
+      // D2: payload dirs are the SEND side, staging trees the RECEIVE side — a
+      // receive-only device only ever has the latter, so both are reported. Freed
+      // bytes are the two together; released downloads are the delayed half.
+      const freedBytes = result.payloadBytes + result.stagingBytes;
+      const parts: string[] = [];
+      if (result.payloadDirs > 0) {
+        parts.push(`${result.payloadDirs} package${result.payloadDirs === 1 ? '' : 's'}`);
+      }
+      if (result.stagingDirs > 0) {
+        parts.push(`${result.stagingDirs} received batch${result.stagingDirs === 1 ? '' : 'es'}`);
+      }
+      const what = parts.length > 0 ? ` (${parts.join(', ')})` : '';
       const tags =
         result.tagsReleased > 0
-          ? `, released ${result.tagsReleased} download${result.tagsReleased === 1 ? '' : 's'}`
+          ? `, released ${result.tagsReleased} partial download${result.tagsReleased === 1 ? '' : 's'} — those bytes return within about 15 minutes`
           : '';
       notify({
         title: 'Finished transfers cleaned up',
-        detail: `Freed ${formatBytes(result.payloadBytes)} (${pkgs})${tags}`,
+        detail: `Freed ${formatBytes(freedBytes)}${what}${tags}`,
         kind: 'sync',
         tone: 'success',
       });
@@ -251,8 +262,9 @@ export default function SyncSection() {
                 <span className="text-content-secondary">{storage.packagesCount}</span> package
                 {storage.packagesCount === 1 ? '' : 's'} ·{' '}
                 <span className="text-content-secondary">{formatBytes(storage.packagesBytes)}</span> on
-                disk · blobs{' '}
-                <span className="text-content-secondary">{formatBytes(storage.blobsBytes)}</span>
+                disk · received{' '}
+                <span className="text-content-secondary">{formatBytes(storage.stagingBytes)}</span> ·
+                blobs <span className="text-content-secondary">{formatBytes(storage.blobsBytes)}</span>
               </>
             ) : (
               'Calculating…'

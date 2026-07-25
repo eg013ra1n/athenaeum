@@ -3986,6 +3986,69 @@ fn remove_terminal_payload_dirs(ctx: &ServiceContext) -> Result<(u32, u64), ApiE
     Ok((dirs, bytes))
 }
 
+/// Cleanup pass 2 — remove the RECEIVE-side staging trees of finished batches
+/// (D2 §3.5).
+///
+/// [`remove_terminal_payload_dirs`] walks `sync_outbound`, so on a receive-only
+/// device the Clean-up button had nothing in scope BY CONSTRUCTION — while three
+/// receiver failure paths (fetch, ingest, ack) return without removing
+/// `<sync>/staging/<wire_id>`, leaving a full second copy of the batch on disk with
+/// nothing to reclaim it. This is that reclaimer.
+///
+/// A directory is removed when its wire id belongs to a TERMINAL `sync_inbound`
+/// row or to no row at all. A non-terminal row's staging is kept — INCLUDING a
+/// [`Waiting`](crate::sync::InboundState::Waiting) row's, which is precisely its
+/// resume target. (That is the opposite of the in-flight TAG rule in
+/// [`release_orphan_in_flight_tags`], and deliberately so: the tag is a GC root
+/// pinning blob bytes we can re-fetch, the staging tree is the landed data itself.)
+///
+/// Returns `(dirs_removed, bytes_reclaimed)` — freed-now bytes, unlike released
+/// tags. Best-effort: one un-removable dir `warn!`s and the pass continues.
+fn remove_terminal_staging_dirs(ctx: &ServiceContext) -> Result<(u32, u64), ApiError> {
+    let (sync_dir, _db_path) = sync_paths(ctx)?;
+    let staging_root = sync_dir.join("staging");
+    let entries = match std::fs::read_dir(&staging_root) {
+        Ok(e) => e,
+        // Never materialized (nothing ever received) → nothing to reclaim.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(e) => return Err(ApiError::Internal(format!("read staging dir: {e}"))),
+    };
+    let live: HashSet<String> = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        inbound_active(&conn)?
+            .into_iter()
+            .map(|r| r.package_id)
+            .collect()
+    };
+    let mut dirs = 0u32;
+    let mut bytes = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(wire) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if live.contains(wire) {
+            continue; // a live or parked attempt owns this tree
+        }
+        let sz = dir_size_bytes(&path);
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                dirs += 1;
+                bytes += sz;
+                tracing::info!(path = %path.display(), "terminal staging tree removed");
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "staging tree removal failed")
+            }
+        }
+    }
+    Ok((dirs, bytes))
+}
+
 /// Release receiver-side `in-flight/recv/pkg/<id>` download tags whose transfer is
 /// no longer non-terminal, so GC can reclaim the verified partial blobs (Batch
 /// Model §D4; B0 findings Q4/R2). Shared by the startup sweep and the cleanup
@@ -4128,6 +4191,12 @@ pub struct TransferStorage {
     pub packages_count: u32,
     /// Total bytes under the blob store dir `<sync>/blobs/` (directory walk).
     pub blobs_bytes: u64,
+    /// Total bytes under `<sync>/staging/` — the RECEIVE side's in-progress and
+    /// abandoned batch trees (D2 §3.5). Counted separately from `packages_bytes`,
+    /// which is the SEND side's payloads, so the figure the Clean-up button sits
+    /// next to includes what that button can actually move: on a receive-only
+    /// device the payload pass has nothing in scope by construction.
+    pub staging_bytes: u64,
 }
 
 /// Compute the [`TransferStorage`] footprint (see its doc). Pure fs walk — never
@@ -4148,10 +4217,12 @@ pub fn get_transfer_storage(ctx: &ServiceContext) -> Result<TransferStorage, Api
         }
     }
     let blobs_bytes = dir_size_bytes(&blobs_dir);
+    let staging_bytes = dir_size_bytes(&sync_dir.join("staging"));
     Ok(TransferStorage {
         packages_bytes,
         packages_count,
         blobs_bytes,
+        staging_bytes,
     })
 }
 
@@ -4174,23 +4245,36 @@ pub struct TransferCleanup {
     /// Orphan receiver in-flight blob tags released (blob bytes reclaimed by the
     /// next periodic GC sweep, ~15 min — see the type doc).
     pub tags_released: u32,
+    /// Receive-side staging trees of finished batches removed from
+    /// `<sync>/staging/` (D2 §3.5). Freed immediately, like `payload_dirs`.
+    pub staging_dirs: u32,
+    /// Bytes reclaimed by removing those staging trees (freed immediately).
+    pub staging_bytes: u64,
 }
 
-/// Reclaim finished transfers' temp data on demand (Batch Model §D4, B7) — the
-/// Settings "Clean up finished transfers" action. Removes TERMINAL outbound rows'
-/// payload dirs (never a non-terminal row's — a live attempt's payload is kept)
-/// and releases orphan receiver in-flight blob tags (same discrimination as the
-/// startup sweep). Records are untouched — this reclaims disk only. See
-/// [`TransferCleanup`] for the GC-window caveat on `tags_released`.
+/// Reclaim finished transfers' temp data on demand (Batch Model §D4, B7; receive
+/// side added by D2 §3.5) — the Settings "Clean up finished transfers" action.
+/// Three passes: TERMINAL outbound rows' payload dirs (never a non-terminal row's
+/// — a live attempt's payload is kept), terminal/row-less receive-side staging
+/// trees, and orphan receiver in-flight blob tags. Records are untouched — this
+/// reclaims disk only.
+///
+/// Payload and staging bytes are freed immediately; only `tags_released` is
+/// delayed by the store's GC window — see [`TransferCleanup`]. The staging pass is
+/// what makes this button do anything at all on a RECEIVE-ONLY device, where the
+/// payload pass has nothing in scope by construction (it reads `sync_outbound`).
 pub async fn cleanup_finished_transfers(
     ctx: &ServiceContext,
     sync: &SyncRuntime,
 ) -> Result<TransferCleanup, ApiError> {
     let (payload_dirs, payload_bytes) = remove_terminal_payload_dirs(ctx)?;
+    let (staging_dirs, staging_bytes) = remove_terminal_staging_dirs(ctx)?;
     let tags_released = release_orphan_in_flight_tags(ctx, sync).await?;
     tracing::info!(
         payload_dirs,
         payload_bytes,
+        staging_dirs,
+        staging_bytes,
         tags_released,
         "finished-transfer cleanup"
     );
@@ -4198,6 +4282,8 @@ pub async fn cleanup_finished_transfers(
         payload_dirs,
         payload_bytes,
         tags_released,
+        staging_dirs,
+        staging_bytes,
     })
 }
 
@@ -5578,6 +5664,79 @@ mod tests {
             "a dir with one fresh-mtime file survives the sweep even though the dir's \
              own entry mtime is old — dir_age reads the recursive MAX mtime, not just \
              the dir's own entry mtime"
+        );
+    }
+
+    /// D2 §3.5: the button's receive-side half, which never existed. A terminal or
+    /// row-less staging tree is dead weight — three receiver failure paths leave
+    /// one behind and nothing has ever removed it, so a receiver whose ingest fails
+    /// keeps a full second copy of the batch on disk forever. A live or parked
+    /// row's staging is untouched: it is the resume target.
+    #[tokio::test]
+    async fn cleanup_removes_terminal_staging_trees_and_keeps_live_ones() {
+        use crate::sync::store::{set_inbound_state, upsert_inbound_announced, CatalogSyncStore};
+
+        let (_tmp, ctx) = test_ctx();
+        let sync = SyncRuntime::default();
+        let (sync_dir, db_path) = sync_paths(&ctx).unwrap();
+        let staging = sync_dir.join("staging");
+        let mk = |wire: &str| {
+            let d = staging.join(wire);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("payload.fits"), vec![0u8; 1024]).unwrap();
+            d
+        };
+        let done_dir = mk("wire-done");
+        let waiting_dir = mk("wire-waiting");
+        let orphan_dir = mk("wire-orphan"); // no row at all — a prior session's leak
+        {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            let conn = store.lock_conn();
+            let peer = "ff".repeat(32);
+            upsert_inbound_announced(&conn, &peer, "wire-done", 1, 10).unwrap();
+            set_inbound_state(&conn, "wire-done", crate::sync::InboundState::Done, None).unwrap();
+            upsert_inbound_announced(&conn, &peer, "wire-waiting", 1, 10).unwrap();
+            set_inbound_state(
+                &conn,
+                "wire-waiting",
+                crate::sync::InboundState::Waiting,
+                Some("peer gone"),
+            )
+            .unwrap();
+        }
+
+        // The storage figure must see the staging cost BEFORE the sweep, or the
+        // button would still be sitting next to a number it cannot move.
+        let before = get_transfer_storage(&ctx).unwrap();
+        assert!(
+            before.staging_bytes >= 3072,
+            "staging bytes are part of the footprint: {}",
+            before.staging_bytes
+        );
+
+        let result = cleanup_finished_transfers(&ctx, &sync).await.unwrap();
+
+        assert!(
+            !done_dir.exists(),
+            "a terminal row's staging is dead weight"
+        );
+        assert!(
+            !orphan_dir.exists(),
+            "so is a staging tree with no row at all"
+        );
+        assert!(
+            waiting_dir.exists(),
+            "a parked row's staging is its resume target — unlike its blob tag"
+        );
+        assert_eq!(result.staging_dirs, 2);
+        assert!(
+            result.staging_bytes >= 2048,
+            "freed now, not on a GC window: {}",
+            result.staging_bytes
+        );
+        assert!(
+            get_transfer_storage(&ctx).unwrap().staging_bytes < before.staging_bytes,
+            "and the figure the button sits next to actually moves"
         );
     }
 

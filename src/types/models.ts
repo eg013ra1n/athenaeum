@@ -1147,7 +1147,15 @@ packagesCount: number,
 /**
  * Total bytes under the blob store dir `<sync>/blobs/` (directory walk).
  */
-blobsBytes: number, };
+blobsBytes: number, 
+/**
+ * Total bytes under `<sync>/staging/` — the RECEIVE side's in-progress and
+ * abandoned batch trees (D2 §3.5). Counted separately from `packages_bytes`,
+ * which is the SEND side's payloads, so the figure the Clean-up button sits
+ * next to includes what that button can actually move: on a receive-only
+ * device the payload pass has nothing in scope by construction.
+ */
+stagingBytes: number, };
 
 export type TransferCleanup = { 
 /**
@@ -1162,7 +1170,16 @@ payloadBytes: number,
  * Orphan receiver in-flight blob tags released (blob bytes reclaimed by the
  * next periodic GC sweep, ~15 min — see the type doc).
  */
-tagsReleased: number, };
+tagsReleased: number, 
+/**
+ * Receive-side staging trees of finished batches removed from
+ * `<sync>/staging/` (D2 §3.5). Freed immediately, like `payload_dirs`.
+ */
+stagingDirs: number, 
+/**
+ * Bytes reclaimed by removing those staging trees (freed immediately).
+ */
+stagingBytes: number, };
 
 export type DeviceCapability = "athenaeum" | "perseus";
 
