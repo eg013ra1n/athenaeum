@@ -1,6 +1,6 @@
 # D3 — Multi-source project distribution
 
-**Status:** design approved 2026-07-26 (brainstorm with owner: auto-replication confirmed; per-project toggle default ON; pending on-demand only; hub carries root hash via have-with-hash) · **Audit:** `docs/superpowers/research/2026-07-25-delivery-model-audit.md` (F6) · **Predecessors:** D1 (peer reachability), D2 (receive-side waiting), W1 (upload cap), W2 (parallel receiving + queued vocabulary).
+**Status:** design approved 2026-07-26 (brainstorm with owner: auto-replication confirmed; per-project toggle default ON; pending on-demand only; hub carries root hash — delivered at publish, see §3.2 amendment) · **Audit:** `docs/superpowers/research/2026-07-25-delivery-model-audit.md` (F6) · **Predecessors:** D1 (peer reachability), D2 (receive-side waiting), W1 (upload cap), W2 (parallel receiving + queued vocabulary).
 
 ## 1. Problem
 
