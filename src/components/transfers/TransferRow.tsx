@@ -243,13 +243,18 @@ function LiveRowBody({
   // user staring at "retry in …" wants "try now", and the backend `kick` is exactly
   // that (collapse the backoff so the next worker pass re-announces).
   const canSendNow = row.kind === 'outbound' && (pending || waiting);
-  // Cancel: ANY non-terminal outbound row. The backend `engine.cancel(id)` cancels
-  // cooperatively at every stage (transferring/uploaded/waiting included), and after
-  // a restart the resurrected engine holds the slot again — so the button must not be
-  // gated to the narrow `pending` window. Inbound gate is unchanged.
-  const canCancel =
-    (row.kind === 'outbound' && !row.terminal) ||
-    (row.kind === 'inbound' && (row.state === 'announced' || row.state === 'fetching'));
+  // Cancel: ANY non-terminal row, both directions. The backend cancels
+  // cooperatively at every stage — `engine.cancel(id)` for a send
+  // (transferring/uploaded/waiting included), `cancel_incoming_package` for a
+  // receive — and after a restart the resurrected engine holds the slot again, so
+  // the button must not be gated to a narrow window.
+  //
+  // D2: the inbound arm used to enumerate its two live states. A third
+  // non-terminal one (`waiting`) then left a parked row with no Cancel button
+  // while `delete_transfer_history` refuses to delete a non-terminal row — a row
+  // the user could not get rid of at all. `row.terminal` is structural (which list
+  // the row came from), not a state list, so it cannot go stale the same way.
+  const canCancel = !row.terminal;
   // Resend re-announces the on-disk payload — but a package's payload can be gone
   // by the time this renders: a `confirmed` row's payload is always cleaned up
   // after confirm, AND retention can sweep an old failed/cancelled row's payload

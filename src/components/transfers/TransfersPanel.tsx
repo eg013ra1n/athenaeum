@@ -375,6 +375,10 @@ function ActiveTab({ active, incoming }: { active: OutboundSummary[]; incoming: 
       })}
       {incoming.map((row) => {
         const chip = displayStateChip(row.displayState);
+        // D2: received rows can now be parked too (`waiting_peer`), so this branch
+        // needs the same subline the outbound one has — otherwise the panel shows
+        // a chip with no explanation of why nothing is moving.
+        const subline = displayStateSubline(row.displayState);
         const total = row.fileCounts.total || row.frameCount;
         return (
           <li key={`in-${row.id}`} className="flex items-start justify-between gap-2 px-4 py-3">
@@ -390,6 +394,7 @@ function ActiveTab({ active, incoming }: { active: OutboundSummary[]; incoming: 
                   {row.fileCounts.done} of {total}
                 </span>
               </p>
+              {subline && <p className="mt-0.5 text-[10px] text-content-muted">{subline}</p>}
             </div>
             <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${chip.className}`}>
               {chip.label}

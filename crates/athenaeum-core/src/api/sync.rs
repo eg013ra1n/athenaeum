@@ -1652,7 +1652,15 @@ fn inbound_summary(
         package_id: row.package_id.clone(),
         package_short: short_id(&row.package_id),
         peer_short: short_id(&row.peer),
-        display_state: row.state.as_str().to_string(),
+        // D2 §3.6: one chip for both directions. The send side derives
+        // `waiting_peer` from an error-class prefix; the receive side has it as a
+        // stored state. Same words to the user — the device is unreachable and this
+        // resumes when it is back — even though the mechanics beneath differ. Every
+        // other state still echoes raw.
+        display_state: match row.state {
+            crate::sync::InboundState::Waiting => "waiting_peer".to_string(),
+            other => other.as_str().to_string(),
+        },
         stalled_until: None,
         state: row.state,
         generation: row.generation,
@@ -5000,6 +5008,65 @@ mod tests {
             recv.last_error.as_deref(),
             Some("by sender"),
             "the sender-revoke reason surfaces on the inbound summary"
+        );
+    }
+
+    /// D2 §3.6: the two sides meet in one chip. A parked received row renders as
+    /// `waiting_peer` — the same label, subline and filter bucket D1 gave the send
+    /// side — even though the mechanics beneath differ (stored here, derived
+    /// there). Every other state still echoes raw: the mapping is one arm, not a
+    /// rewrite.
+    #[tokio::test]
+    async fn a_waiting_inbound_row_displays_as_waiting_peer() {
+        use crate::sync::store::{set_inbound_state, upsert_inbound_announced, CatalogSyncStore};
+        use crate::sync::InboundState;
+
+        let (_tmp, ctx) = test_ctx();
+        let (_sync_dir, db_path) = sync_paths(&ctx).unwrap();
+        let peer = "cc".repeat(32);
+        {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            let conn = store.lock_conn();
+            upsert_inbound_announced(&conn, &peer, "wire-wait", 2, 100).unwrap();
+            set_inbound_state(
+                &conn,
+                "wire-wait",
+                InboundState::Waiting,
+                Some("peer gone: connection lost"),
+            )
+            .unwrap();
+            // A sibling still fetching, to prove the mapping is one arm.
+            upsert_inbound_announced(&conn, &peer, "wire-live", 2, 100).unwrap();
+            set_inbound_state(&conn, "wire-live", InboundState::Fetching, None).unwrap();
+        }
+
+        let active = active_inbound_summaries(&ctx).expect("active inbound summaries");
+        let parked = active
+            .iter()
+            .find(|r| r.package_id == "wire-wait")
+            .expect("the parked row is ACTIVE — that is the point of non-terminality");
+        assert_eq!(
+            parked.display_state, "waiting_peer",
+            "one chip for both directions"
+        );
+        assert_eq!(
+            parked.state,
+            InboundState::Waiting,
+            "the raw state still ships alongside for the frontend's own gating"
+        );
+        assert_eq!(
+            parked.last_error.as_deref(),
+            Some("peer gone: connection lost"),
+            "and the reason is readable in Details"
+        );
+
+        let live = active
+            .iter()
+            .find(|r| r.package_id == "wire-live")
+            .expect("the fetching row");
+        assert_eq!(
+            live.display_state, "fetching",
+            "every other state still echoes raw"
         );
     }
 
