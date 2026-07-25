@@ -2800,7 +2800,59 @@ mod tests {
         receiver.shutdown().await;
     }
 
-    /// A beacon to a peer we have no address for must fail FAST rather than spend
+    /// Review finding (critical): the fan-out must supply its own dial hint.
+    ///
+    /// `node.peers` is populated only on the SEND path (`ensure_sender_engine`
+    /// registers the destination when it builds an engine). A beacon goes out from
+    /// the RECEIVING half, to devices we may never have sent to — so with no hint
+    /// of its own `send_presence` bails locally on "no known address" and the
+    /// beacon never leaves the machine. This pins the contract at the transport
+    /// level: given a registered address, an UNSEEN peer is dialable.
+    #[tokio::test]
+    async fn a_registered_hint_makes_an_otherwise_unknown_peer_dialable() {
+        let dir = tempdir().unwrap();
+        let sender = SharedIrohNode::bind(&dir.path().join("s"), RelayMode::Disabled)
+            .await
+            .unwrap();
+        let receiver = SharedIrohNode::bind(&dir.path().join("r"), RelayMode::Disabled)
+            .await
+            .unwrap();
+
+        let seen: Arc<Mutex<Vec<NodeId>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let seen = Arc::clone(&seen);
+            sender.set_presence_hook(Arc::new(move |from| {
+                seen.lock().expect("seen mutex poisoned").push(from);
+            }));
+        }
+        let sender_info = sender.handle(Role::Out).start().await.unwrap();
+        receiver.handle(Role::Recv).start().await.unwrap();
+
+        // The receiver has NEVER sent to this peer, so its peer book is empty:
+        // exactly the production shape the beacon runs in.
+        assert!(
+            receiver.send_presence(sender.node_id()).await.is_err(),
+            "without a hint the beacon cannot dial — this is the bug the fan-out fix addresses"
+        );
+
+        // Registering the address — what `broadcast_presence` now does before every
+        // beacon — makes the same call succeed.
+        receiver.add_peer_ticket(&sender_info.pairing_ticket).unwrap();
+        receiver.send_presence(sender.node_id()).await.expect("beacon delivers with a hint");
+
+        for _ in 0..200 {
+            if !seen.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(seen.lock().unwrap().len(), 1, "the beacon arrived once");
+
+        sender.shutdown().await;
+        receiver.shutdown().await;
+    }
+
+    /// A beacon to a peer we have no address for must fail FAST rather than spend    /// A beacon to a peer we have no address for must fail FAST rather than spend
     /// the timeout — a fan-out runs across every account device, and one
     /// unaddressable peer must not hold up the rest.
     #[tokio::test]

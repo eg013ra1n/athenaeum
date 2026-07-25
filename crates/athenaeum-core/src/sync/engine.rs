@@ -131,6 +131,28 @@ pub(crate) fn class_is_absent(class: Option<ConnectClass>) -> bool {
     )
 }
 
+/// Which pending packages a reachability proof releases (D1 §3.4, hardened after
+/// review): a BEACON releases everything armed, because the peer has just
+/// (re)started and even an ack-timeout-parked package is waiting on exactly that;
+/// ordinary CONTACT releases only what the absence parked, because a sibling whose
+/// ack timed out while the peer was busy must keep its escalating ladder — zeroing
+/// it would re-announce at a saturated peer every ack_timeout for the whole
+/// transfer.
+pub(crate) fn ids_to_release(
+    proof: ReachabilityProof,
+    pending: &[i64],
+    absence_parked: &HashSet<i64>,
+) -> Vec<i64> {
+    match proof {
+        ReachabilityProof::Beacon => pending.to_vec(),
+        ReachabilityProof::Contact => pending
+            .iter()
+            .copied()
+            .filter(|id| absence_parked.contains(id))
+            .collect(),
+    }
+}
+
 /// The backoff window for a given `rung` and failure `class`.
 ///
 /// An ABSENT peer (see [`class_is_absent`]) gets a FLAT
@@ -710,6 +732,27 @@ struct PeerReachability {
     /// The package currently carrying the live probe deadline while absent. Every
     /// other pending package parks with no deadline and waits for a signal.
     head: Option<i64>,
+    /// The packages THIS absence parked. Tracked explicitly because a parked
+    /// package and an ack-timeout-armed one are both `NextAction::Retry`, and only
+    /// the former may be released by ordinary contact — releasing the latter would
+    /// zero the ladder of a package whose peer is up and simply busy.
+    parked: HashSet<i64>,
+}
+
+/// What proved the peer reachable, and therefore how much of its queue to release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReachabilityProof {
+    /// The peer announced itself (D1 beacon). It has just (re)started, so EVERY
+    /// armed package goes — including one whose ack timed out because the peer died
+    /// mid-ingest (audit F7), for which spec §6 makes the beacon the only rescue.
+    Beacon,
+    /// We reached the peer in the course of ordinary work: an announce accepted, a
+    /// serve tick, an ack. This proves an absence is over, but says NOTHING about a
+    /// sibling whose ack timed out while the peer was busy ingesting — that one
+    /// keeps its ladder. Releasing it too would re-announce at a saturated peer
+    /// every ack_timeout for the whole length of the transfer, which is exactly
+    /// what §3.3 reserves the escalating schedule to prevent.
+    Contact,
 }
 
 struct Worker {
@@ -885,7 +928,9 @@ impl Worker {
                         }
                     }
                     Some(Command::Resend(id)) => self.resend_package(id).await,
-                    Some(Command::PeerPresent) => self.peer_reachable("presence"),
+                    Some(Command::PeerPresent) => {
+                        self.peer_reachable("presence", ReachabilityProof::Beacon)
+                    }
                     Some(Command::Kick(id)) => self.kick_one(id),
                     Some(Command::KickAll) => {
                         // Snapshot the ids so no `&self.pending` borrow is held
@@ -1379,7 +1424,7 @@ impl Worker {
         // absence parked, so a queue behind the probing head drains at once
         // instead of waiting for a beacon that may never come (an older peer
         // never sends one).
-        self.peer_reachable("announce");
+        self.peer_reachable("announce", ReachabilityProof::Contact);
         // The serve/announce succeeded — clear any stale attempt-error so a package
         // now awaiting its ack no longer shows the previous failure (Task 9).
         // Best-effort: a diagnostic write must never fail the send.
@@ -1701,22 +1746,27 @@ impl Worker {
         self.elect_absent_head() == Some(id)
     }
 
-    /// The peer is reachable: forget the absence and release everything parked on
-    /// it. `reason` names what proved it (a presence beacon, an ack, a serve
-    /// tick) and rides the log line.
+    /// The peer is reachable: forget the absence and release what this proof
+    /// entitles us to release (see [`ReachabilityProof`]). `reason` names what
+    /// proved it and rides the log line.
     ///
-    /// Only PARKED packages are touched. A package in [`NextAction::AwaitAck`] is
-    /// mid-pull — collapsing its deadline would fire a pointless re-announce at a
-    /// peer that is already reading our bytes.
-    fn peer_reachable(&mut self, reason: &'static str) {
+    /// Only packages in [`NextAction::Retry`] are ever touched. One in `AwaitAck`
+    /// is mid-pull — collapsing its deadline would fire a pointless re-announce at
+    /// a peer that is already reading our bytes.
+    fn peer_reachable(&mut self, reason: &'static str, proof: ReachabilityProof) {
         let was_absent = self.peer_state.absent_since.take().is_some();
         self.peer_state.head = None;
+        let parked = std::mem::take(&mut self.peer_state.parked);
+        let all: Vec<i64> = self.pending.keys().copied().collect();
+        let ids = ids_to_release(proof, &all, &parked);
         let mut released = 0usize;
-        for p in self.pending.values_mut() {
-            if p.next_action == NextAction::Retry {
-                p.deadline = Instant::now();
-                p.rung = 0;
-                released += 1;
+        for id in ids {
+            if let Some(p) = self.pending.get_mut(&id) {
+                if p.next_action == NextAction::Retry {
+                    p.deadline = Instant::now();
+                    p.rung = 0;
+                    released += 1;
+                }
             }
         }
         if was_absent || released > 0 {
@@ -1770,6 +1820,14 @@ impl Worker {
         } else {
             None
         };
+        // Record (or clear) the absence-parked marker outside the borrow: this is
+        // what lets ordinary contact release exactly the packages the absence
+        // parked, and nothing else.
+        if absent && !is_head {
+            self.peer_state.parked.insert(id);
+        } else {
+            self.peer_state.parked.remove(&id);
+        }
 
         // Persist the wall-clock retry deadline (Task 2) + journal it (§D7) once the
         // `&mut pending` borrow is dropped, so the UI can render a countdown and a
@@ -2109,7 +2167,7 @@ impl Worker {
         // Bytes are flowing from this peer, so it is unambiguously reachable —
         // release anything its absence had parked (D1 §3.4). `note_serve_activity`
         // above already handled THIS package; this is about its queue-mates.
-        self.peer_reachable("serve");
+        self.peer_reachable("serve", ReachabilityProof::Contact);
         if clear_error {
             if let Err(e) = self.store.set_last_error(id, None) {
                 tracing::warn!(package_id = id, error = %e, "clear last_error on serve tick failed");
@@ -2313,11 +2371,11 @@ impl Worker {
             tracing::debug!(package_id = %package_id.0, "duplicate/late ack ignored");
             // Even a late ack is proof of life from the peer — release whatever its
             // absence had parked before returning (D1 §3.4).
-            self.peer_reachable("ack");
+            self.peer_reachable("ack", ReachabilityProof::Contact);
             return Ok(());
         };
         // An ack from the paired peer is the strongest possible reachability proof.
-        self.peer_reachable("ack");
+        self.peer_reachable("ack", ReachabilityProof::Contact);
 
         // §D4/§D7: settle each per-file row named in the receipts with the
         // receiver's verdict (`ingested`/`duplicate`/`cancelled`/`rejected:<reason>`,

@@ -383,7 +383,6 @@ mod tests {
         (base + Duration::seconds(secs)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     }
 
-    #[test]
     /// D1: a package parked because its peer is absent reads as `waiting_peer` and
     /// carries NO countdown — it resumes on a signal, and a number would be a lie.
     #[test]

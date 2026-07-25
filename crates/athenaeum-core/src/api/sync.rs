@@ -755,6 +755,19 @@ pub async fn handle_peer_presence(
 pub async fn broadcast_presence(ctx: &Arc<ServiceContext>, node: &Arc<SharedIrohNode>) {
     let peers = cached_authorized_peer_hexes(ctx);
     let self_id = node.node_id();
+    // The node binds with `presets::Minimal` (no discovery), so a bare node id is
+    // NOT dialable: without a hint `send_presence` has nothing to connect to. The
+    // send path registers an address per peer when it builds an engine
+    // (`ensure_sender_engine`), but a beacon goes out from the RECEIVING half to
+    // devices we may never have sent to — so the fan-out has to supply its own
+    // hint, or every beacon dies locally with "no known address". Our own relay
+    // set is the right hint: same-account devices home onto the same hub-served
+    // relays, which is why `peer_addr_with_relays` exists.
+    let relay_urls = node.relay_urls();
+    if relay_urls.is_empty() {
+        tracing::debug!("presence fan-out skipped: no relays configured");
+        return;
+    }
     let mut tasks = tokio::task::JoinSet::new();
     let mut sent = 0usize;
     for hex in peers {
@@ -763,6 +776,14 @@ pub async fn broadcast_presence(ctx: &Arc<ServiceContext>, node: &Arc<SharedIroh
         };
         if peer == self_id {
             continue; // never beacon ourselves
+        }
+        match pairing::peer_addr_with_relays(peer, &relay_urls) {
+            Ok(addr) if !addr.is_empty() => node.add_peer(addr),
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::debug!(peer = %hex, error = %format!("{e:#}"), "presence: dial hint build failed");
+                continue;
+            }
         }
         let node = Arc::clone(node);
         tasks.spawn(async move {

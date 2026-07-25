@@ -1084,7 +1084,11 @@ async fn absent_peer_probes_with_one_package_then_presence_releases_all() {
         store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
         receiver_id,
-        SyncConfig { ack_timeout: Duration::from_millis(150) },
+        // 700ms base -> a 2.8s flat window. Long enough that the delivery assertion
+        // below (well under a second after the beacon) CANNOT be satisfied by the
+        // head's own next probe — otherwise the presence half of this test would
+        // pass with the beacon removed entirely.
+        SyncConfig { ack_timeout: Duration::from_millis(700) },
     );
 
     let mut ids = Vec::new();
@@ -1102,8 +1106,9 @@ async fn absent_peer_probes_with_one_package_then_presence_releases_all() {
     // Every package makes its OWN first attempt — an enqueue is user intent and
     // the peer state may be stale — and then parks behind the head.
     wait_until(|| ids.iter().all(|id| attempts_of(&store, *id) >= 1), WAIT).await;
-    // Give the head several flat windows (150ms * 4 = 600ms each) to probe again.
-    tokio::time::sleep(Duration::from_millis(1400)).await;
+    // One flat window (700ms * 4 = 2.8s) plus slack: the head probes again, the
+    // parked pair must not.
+    tokio::time::sleep(Duration::from_millis(3200)).await;
 
     let counts: Vec<u32> = ids.iter().map(|id| attempts_of(&store, *id)).collect();
     let head_attempts = counts[0];
@@ -1117,18 +1122,68 @@ async fn absent_peer_probes_with_one_package_then_presence_releases_all() {
         "the queue-mates park after their first attempt instead of dialing too: {counts:?}"
     );
 
-    // The peer comes to life and announces itself: everything parked goes.
+    // The peer comes to life and announces itself: everything parked goes — and it
+    // goes NOW, not on the head's next 2.8s probe. The tight bound is what makes
+    // this half of the test fail if the beacon stops releasing the queue.
     receiver.start().await.unwrap();
     let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv_coalesce"));
+    let beacon_at = tokio::time::Instant::now();
     engine.peer_present().await.unwrap();
 
     for id in &ids {
-        wait_until(|| state_of(&store, *id) == Some(OutboundState::Confirmed), WAIT).await;
+        wait_until(
+            || state_of(&store, *id) == Some(OutboundState::Confirmed),
+            Duration::from_millis(1200),
+        )
+        .await;
     }
+    assert!(
+        beacon_at.elapsed() < Duration::from_millis(2000),
+        "the queue drained on the beacon, not on the head's next flat probe"
+    );
     engine.shutdown().await;
 }
 
-/// The head is re-elected when it leaves `pending`, so a queue whose probing
+/// Review finding (critical): ordinary contact with the peer must NOT reset the
+/// ladder of a sibling whose ack merely timed out.
+///
+/// The everyday multi-batch shape: two packages to one peer, both announced; the
+/// receiver ingests serially, so while it pulls A, B's ack times out and arms an
+/// escalating retry. Every serve tick for A calls `peer_reachable` — and before
+/// this rule it zeroed B's rung and collapsed its deadline, so B re-announced once
+/// per ack_timeout forever at a peer that is demonstrably up and saturated, which
+/// is exactly what the escalating schedule exists to prevent.
+#[test]
+fn ordinary_contact_releases_only_what_the_absence_parked() {
+    use crate::sync::engine::{ids_to_release, ReachabilityProof};
+    let pending = [1i64, 2, 3];
+    // 2 was parked by an absence; 3 is armed by its own ack timeout.
+    let parked: HashSet<i64> = [2i64].into_iter().collect();
+
+    assert_eq!(
+        ids_to_release(ReachabilityProof::Contact, &pending, &parked),
+        vec![2],
+        "a serve tick / announce / ack releases the absence-parked package only"
+    );
+}
+
+/// The beacon is the other half of the rule: a peer that just announced itself has
+/// restarted, so an ack-timeout-parked package — the receiver died mid-ingest,
+/// audit F7 — is released too. Spec §6 makes the beacon its ONLY rescue.
+#[test]
+fn a_beacon_releases_every_armed_package_including_ack_timeouts() {
+    use crate::sync::engine::{ids_to_release, ReachabilityProof};
+    let pending = [1i64, 2, 3];
+    let parked: HashSet<i64> = [2i64].into_iter().collect();
+
+    assert_eq!(
+        ids_to_release(ReachabilityProof::Beacon, &pending, &parked),
+        vec![1, 2, 3],
+        "a presence beacon releases the whole armed queue"
+    );
+}
+
+/// The head is re-elected when it leaves `pending`, so a queue whose probing/// The head is re-elected when it leaves `pending`, so a queue whose probing
 /// package terminalizes does not go silent forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn absent_head_is_re_elected_when_it_terminalizes() {
@@ -3921,7 +3976,22 @@ async fn kick_all_resets_every_pending_package() {
         "package b must not deliver while the peer is offline"
     );
 
-    // Peer online (mailbox empty), acking. A single kick_all resets EVERY slot.
+    // Reach: a single kick_all must collapse BOTH deadlines — including the parked
+    // queue-mate, which has no deadline of its own and is released by nothing else
+    // while the peer stays absent. Asserted BEFORE the peer comes online, so the
+    // proof cannot be confused with the head's success releasing its queue.
+    let attempts_before = (attempts_of(&store, id_a), attempts_of(&store, id_b));
+    engine.kick_all().await.unwrap();
+    wait_until(
+        || {
+            attempts_of(&store, id_a) > attempts_before.0
+                && attempts_of(&store, id_b) > attempts_before.1
+        },
+        Duration::from_millis(800),
+    )
+    .await;
+
+    // Peer online (mailbox empty), acking. A second kick_all delivers both.
     receiver.start().await.unwrap();
     let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv_multi"));
     engine.kick_all().await.unwrap();
