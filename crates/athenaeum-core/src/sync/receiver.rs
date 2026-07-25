@@ -617,13 +617,16 @@ impl InboundControl {
     /// [`first_seen`](QueuedAnnounce::first_seen) survives, so the ghost dates from
     /// when the batch started waiting rather than from the latest retry.
     ///
-    /// Deliberately NOT gated on the peer authorizer here: the lane arm clears the
-    /// entry at its very top, BEFORE its authorization gate, so an unauthorized
-    /// peer's announce is removed on the same pass that drops it. The only window
-    /// where an unauthorized announce could be visible is a peer that loses
-    /// authorization mid-transfer while its own lane is still busy — bounded by that
-    /// lane's next event, and not worth a second (side-effecting, refusal-refresh-
-    /// kicking) authorizer call per announce in the router.
+    /// The ROUTER gates the insert on the peer authorizer (review fix — the
+    /// original ungated design claimed the visible window was bounded by "that
+    /// lane's next event", which was wrong: connection admission is wider than
+    /// personal authorization, so a verified collab-project member — never
+    /// personal-authorized at all — can deliver an announce while its lane is
+    /// busy for minutes with a project ingest, rendering a phantom row with
+    /// peer-chosen text the lane will silently drop). The lane arm still clears
+    /// the entry at its very top, BEFORE its own authorization gate, so even a
+    /// peer de-authorized between insert and processing is removed on the pass
+    /// that drops it.
     pub fn note_queued_announce(
         &self,
         peer: NodeId,
@@ -987,6 +990,15 @@ impl SyncReceiver {
                 // `AnnounceReceived` ONLY, deliberately: this feeds the PERSONAL
                 // transfers list. `ProjectAnnounceReceived` is the collab-exchange
                 // path with its own rows and its own surface — out of scope here.
+                //
+                // AUTHORIZED peers only (review fix). Connection admission is wider
+                // than personal authorization — a verified collab-project member can
+                // deliver an `Announce3` too, and its lane can be busy for MINUTES
+                // with a project ingest — so an ungated insert would render a
+                // phantom row with PEER-CHOSEN text (batch name) for a transfer the
+                // lane will silently drop. The authorizer's only side effect on
+                // refusal is the debounced hub refresh, which is the same kick the
+                // lane's own check fires when it drops the announce.
                 if let TransportEvent::AnnounceReceived {
                     announce,
                     batch_name,
@@ -994,13 +1006,15 @@ impl SyncReceiver {
                     ..
                 } = &ev
                 {
-                    deps.control.note_queued_announce(
-                        from,
-                        batch_uuid,
-                        batch_name.clone().filter(|n| !n.trim().is_empty()),
-                        announce.frame_count,
-                        announce.byte_size,
-                    );
+                    if (deps.authorized)(&from) {
+                        deps.control.note_queued_announce(
+                            from,
+                            batch_uuid,
+                            batch_name.clone().filter(|n| !n.trim().is_empty()),
+                            announce.frame_count,
+                            announce.byte_size,
+                        );
+                    }
                 }
 
                 route_to_lane(&mut lanes, from, ev, || {

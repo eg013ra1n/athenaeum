@@ -799,9 +799,11 @@ displayName: string | null,
  */
 deviceName: string | null, 
 /**
- * Backend-derived presentation state (§D5): `announced` | `fetching` |
- * `ingesting` | `done` | `cancelled` | `failed`. Currently mirrors the raw
- * [`state`](Self::state) (the receiver has no `waiting`/backoff concept yet).
+ * Backend-derived presentation state (§D5). Mirrors the raw
+ * [`state`](Self::state) except: `Waiting` renders `waiting_peer` (D2 — one
+ * chip for both directions) and an `Announced` row parked for a receive slot
+ * renders `queued` (variant C). The vocabulary is NOT exhaustive here — the
+ * mapper in `api::sync::inbound_summary` is canonical.
  */
 displayState: string, 
 /**

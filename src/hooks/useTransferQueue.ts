@@ -124,8 +124,10 @@ export interface TransferRow {
    *  received-row "Perseus" origin badge. Informational — never gates anything. */
   peerKind: string | null;
   /** Backend-derived presentation state (§D5): outbound
-   *  `queued|preparing|transferring|uploaded|waiting|confirmed|cancelled|failed`,
-   *  inbound `announced|fetching|ingesting|done|failed|cancelled`. */
+   *  `queued|preparing|transferring|uploaded|waiting|waiting_peer|queued_at_receiver|confirmed|cancelled|failed`,
+   *  inbound `announced|queued|fetching|ingesting|waiting_peer|done|failed|cancelled`.
+   *  Non-exhaustive by design — `displayStateChip`'s default renders any new
+   *  string verbatim in a muted chip. */
   displayState: string;
   /** RFC3339 retry deadline while `displayState === 'waiting'`, else `null` — the countdown target. */
   stalledUntil: string | null;

@@ -375,7 +375,11 @@ function ActiveTab({
               {subline && <p className="mt-0.5 text-[10px] text-content-muted">{subline}</p>}
               {/* Reason shows only while a retry is genuinely pending — never
                   gated on the monotonic attempts counter. */}
-              {row.retrying && row.lastError && (
+              {/* Suppressed under `queued_at_receiver` (variant A, review fix —
+                  the page row already does this): the ack-ladder's stale "Peer
+                  didn't respond" under a chip that SAYS the receiver is alive and
+                  busy is the exact misreading the state exists to remove. */}
+              {row.retrying && row.lastError && row.displayState !== 'queued_at_receiver' && (
                 <p className="mt-0.5 truncate text-[10px] text-warning" title={row.lastError}>
                   {plainTransferError(row.lastError)}
                 </p>

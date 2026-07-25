@@ -119,8 +119,12 @@ pub struct OutboundSummary {
 /// (D1 §3.3). Kept in step with the engine's own set by
 /// `absent_prefixes_match_the_engine_classes` — they are the same fact spelled
 /// twice, on opposite sides of the store.
-const PEER_ABSENT_PREFIXES: [&str; 4] =
-    ["no_route:", "timeout:", "relay_unreachable:", "not_started:"];
+const PEER_ABSENT_PREFIXES: [&str; 4] = [
+    "no_route:",
+    "timeout:",
+    "relay_unreachable:",
+    "not_started:",
+];
 
 /// Whether this row's recorded failure says the PEER is absent, as opposed to
 /// refusing us or our own side being broken.
@@ -250,9 +254,11 @@ pub struct InboundSummary {
     /// The sending peer's friendly device name, resolved from the cached
     /// `SYNC_DEVICE_NAMES` hex→name map (no hub round-trip). `None` when unknown.
     pub device_name: Option<String>,
-    /// Backend-derived presentation state (§D5): `announced` | `fetching` |
-    /// `ingesting` | `done` | `cancelled` | `failed`. Currently mirrors the raw
-    /// [`state`](Self::state) (the receiver has no `waiting`/backoff concept yet).
+    /// Backend-derived presentation state (§D5). Mirrors the raw
+    /// [`state`](Self::state) except: `Waiting` renders `waiting_peer` (D2 — one
+    /// chip for both directions) and an `Announced` row parked for a receive slot
+    /// renders `queued` (variant C). The vocabulary is NOT exhaustive here — the
+    /// mapper in `api::sync::inbound_summary` is canonical.
     pub display_state: String,
     /// Always `None` for inbound in v2 (no receiver-side retry backoff yet);
     /// present for shape-parity with [`OutboundSummary`].
@@ -412,24 +418,40 @@ pub struct TransportHealth {
 impl TransportHealth {
     /// No transport has been bound yet this session.
     pub fn not_started() -> Self {
-        Self { status: "not_started".into(), relay_url: None, last_error: None }
+        Self {
+            status: "not_started".into(),
+            relay_url: None,
+            last_error: None,
+        }
     }
 
     /// Signed in, but no relay configuration was resolved or cached — a bound
     /// transport could not reach remote peers.
     pub fn no_relay_map() -> Self {
-        Self { status: "no_relay_map".into(), relay_url: None, last_error: None }
+        Self {
+            status: "no_relay_map".into(),
+            relay_url: None,
+            last_error: None,
+        }
     }
 
     /// A home relay is connected; remote peers can reach this node.
     pub fn relay_connected(relay_url: Option<String>) -> Self {
-        Self { status: "relay_connected".into(), relay_url, last_error: None }
+        Self {
+            status: "relay_connected".into(),
+            relay_url,
+            last_error: None,
+        }
     }
 
     /// Direct addresses only — the relay is disabled or its wait timed out, so
     /// peers behind NAT may be unreachable.
     pub fn direct_only(relay_url: Option<String>, last_error: Option<String>) -> Self {
-        Self { status: "direct_only".into(), relay_url, last_error }
+        Self {
+            status: "direct_only".into(),
+            relay_url,
+            last_error,
+        }
     }
 }
 
@@ -627,7 +649,11 @@ mod tests {
     #[test]
     fn a_terminal_row_ignores_a_stale_absent_reason() {
         let now = Utc::now();
-        for state in [OutboundState::Failed, OutboundState::Cancelled, OutboundState::Confirmed] {
+        for state in [
+            OutboundState::Failed,
+            OutboundState::Cancelled,
+            OutboundState::Confirmed,
+        ] {
             let s = outbound_display_state(state, None, Some("no_route: gone"), false, now);
             assert_ne!(s, "waiting_peer", "{state:?} is terminal");
         }
