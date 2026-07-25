@@ -40,6 +40,12 @@ use crate::sync::DedupResponder;
 ///   so a subsequent ack succeeds. Mirrors the real transport rejecting a re-ack
 ///   the sender already confirmed (the Transfers smoke №8 item-4 failure): lets a
 ///   test prove a failed replay ack never strands the inbound row non-terminal.
+/// - `fetch_local_fault_once`: one-shot — the next `fetch` transfers everything
+///   and THEN fails with a [`LocalFault`], mirroring the real transport's
+///   materialize phase (D2 §3.2: the transfer succeeded, writing it to our own
+///   disk did not). This is the knob that distinguishes "we cannot accept this"
+///   from `abort_after_bytes`' "the peer went away" — the two land the inbound row
+///   in different states.
 #[derive(Clone, Debug, Default)]
 pub struct FaultPlan {
     pub abort_after_bytes: Option<u64>,
@@ -47,6 +53,7 @@ pub struct FaultPlan {
     pub delay_ack: Option<Duration>,
     pub delay_per_read: Option<Duration>,
     pub fail_ack_once: bool,
+    pub fetch_local_fault_once: bool,
 }
 
 /// Channel depth for an endpoint's event stream. Announce/ack are low-volume
@@ -117,10 +124,7 @@ impl LoopbackNetwork {
     /// in-process stand-in for a running receiver's `CatalogDedupResponder`. Its
     /// send-only counterpart is [`endpoint`](Self::endpoint), whose peers get a
     /// want-all (dedup-free) response.
-    pub fn endpoint_with_responder(
-        &self,
-        responder: Arc<dyn DedupResponder>,
-    ) -> LoopbackTransport {
+    pub fn endpoint_with_responder(&self, responder: Arc<dyn DedupResponder>) -> LoopbackTransport {
         let mut ep = self.endpoint();
         ep.responder = Some(responder);
         ep
@@ -462,7 +466,10 @@ impl SharingTransport for LoopbackTransport {
                     if bytes_done >= threshold {
                         writer.flush().await.ok();
                         // One-shot: disarm so the next fetch completes.
-                        self.fault.lock().expect("fault mutex poisoned").abort_after_bytes = None;
+                        self.fault
+                            .lock()
+                            .expect("fault mutex poisoned")
+                            .abort_after_bytes = None;
                         tracing::warn!(
                             from = %hex32(&from),
                             package_id = %pkg.package_id.0,
@@ -510,6 +517,28 @@ impl SharingTransport for LoopbackTransport {
             bytes_done: pkg.byte_size,
             bytes_total: pkg.byte_size,
         });
+
+        // Injected LOCAL fault (D2 §3.2): the transfer itself finished — every byte
+        // arrived and the terminal events fired — and it is writing the result to
+        // our own disk that failed. Mirrors the iroh transport's materialize phase
+        // (permanent tag / dest-dir creation / blob export), which is exactly where
+        // the real `LocalFault` is attached. One-shot, so a resend completes.
+        {
+            let mut f = self.fault.lock().expect("fault mutex poisoned");
+            if f.fetch_local_fault_once {
+                f.fetch_local_fault_once = false;
+                drop(f);
+                tracing::warn!(
+                    from = %hex32(&from),
+                    package_id = %pkg.package_id.0,
+                    "loopback fetch failed locally after transfer (injected fault)"
+                );
+                return Err(crate::sharing::types::LocalFault(anyhow!(
+                    "injected fault: No space left on device"
+                ))
+                .into());
+            }
+        }
 
         // Synthetic upload-complete to the SERVING endpoint's event stream (Task
         // 2.1): the iroh provider routes `ServeComplete` on the terminal

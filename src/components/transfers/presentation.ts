@@ -251,6 +251,9 @@ export function humanizeEventKind(kind: string): string {
     announce_received: 'Announce received',
     fetch_started: 'Fetch started',
     fetch_failed: 'Fetch failed',
+    // D2: the attempt ended because the sending device went away — not a failure,
+    // and the transfer resumes when it returns.
+    fetch_waiting: 'Sender went away — waiting',
     ingest_started: 'Ingest started',
     ingested: 'Ingested',
     replayed: 'Replayed (already received)',
