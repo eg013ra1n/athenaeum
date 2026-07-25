@@ -927,34 +927,71 @@ fn build_fetch_sink(
     })
 }
 
-/// Stamp `package_id`'s inbound row [`Failed`](InboundState::Failed) AND settle its
-/// un-settled per-file rows to `failed` (Transfers Status Model v2 §D4 — a
-/// batch-level fetch/ingest/ack failure closes every not-yet-`done` file row).
+/// Close `package_id`'s inbound row as [`Failed`](InboundState::Failed): stamp the
+/// state with the reason, settle its un-settled per-file rows to `failed`
+/// (Transfers Status Model v2 §D4 — a batch-level fetch/ingest/ack failure closes
+/// every not-yet-`done` file row), AND announce the terminal.
+///
+/// **The announce is part of the operation, not the caller's job.** A terminal row
+/// leaves [`inbound_active`], so the 10 s status poll drops it, and the durable
+/// terminal list that must then carry it is only re-fetched on `sync-finished` —
+/// a stamp without an emit makes the row vanish from a live Transfers screen
+/// (owner smoke 2026-07-24). That is why the two halves live in one function:
+/// this used to be a stamp plus a hand-copied eleven-line emit at each of three
+/// call sites, and two of those three had no emit at all.
+///
+/// The full rule and its two deliberate exemptions are pinned by the
+/// `every_terminal_writer_announces_or_is_a_named_exemption` guard test below.
+///
 /// Best-effort throughout: the caller is already on its own error path, so a failed
 /// write only warns.
-fn stamp_inbound_failed(store: &CatalogSyncStore, package_id: &str, error: &anyhow::Error) {
+fn terminalize_inbound_failed(
+    store: &CatalogSyncStore,
+    emitter: &dyn ProgressEmitter,
+    package_id: &str,
+    peer_device: &str,
+    error: &anyhow::Error,
+) {
     let reason = format!("{error:#}");
-    let conn = store.lock_conn();
-    if let Err(e) = set_inbound_state(&conn, package_id, InboundState::Failed, Some(&reason)) {
-        tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound failed state write failed");
-    }
-    if let Some(row) = get_inbound(&conn, package_id).ok().flatten() {
-        if let Err(e) = settle_unsettled_inbound_files(
-            &conn,
-            row.id,
-            InboundFileState::Failed,
-            None,
-            Some(&reason),
-        ) {
-            tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound failed file-row settle failed");
+    {
+        let conn = store.lock_conn();
+        if let Err(e) = set_inbound_state(&conn, package_id, InboundState::Failed, Some(&reason)) {
+            tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound failed state write failed");
+        }
+        if let Some(row) = get_inbound(&conn, package_id).ok().flatten() {
+            if let Err(e) = settle_unsettled_inbound_files(
+                &conn,
+                row.id,
+                InboundFileState::Failed,
+                None,
+                Some(&reason),
+            ) {
+                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "inbound failed file-row settle failed");
+            }
         }
     }
+    // Emitted AFTER the writes so the refetch this triggers reads the settled row.
+    emit_event(
+        emitter,
+        "sync-finished",
+        &SyncFinishedEvent {
+            package_id: package_id.to_string(),
+            direction: super::Direction::Received,
+            outcome: "failed".to_string(),
+            peer_device: peer_device.to_string(),
+            ok_count: 0,
+            failed: Vec::new(),
+            new_count: 0,
+            duplicate_count: 0,
+            project_id: None,
+        },
+    );
 }
 
 /// Stamp `package_id`'s inbound row [`Waiting`](InboundState::Waiting) with the
 /// reason — and DELIBERATELY leave its per-file rows alone (D2 §3.3).
 ///
-/// The twin of [`stamp_inbound_failed`], minus the settle. This ATTEMPT ended, but
+/// The twin of [`terminalize_inbound_failed`], minus the settle and the announce. This ATTEMPT ended, but
 /// the TRANSFER did not: delivery-forever obliges the sender to redeliver, so the
 /// per-file rows are the resume checkpoint. Settling them `failed` here would reset
 /// the counter D2 §3.4 exists to make honest — the row would report zero received
@@ -1543,35 +1580,13 @@ async fn handle_announce(
         // failed is the lie this design removes.
         if crate::sharing::types::is_local_fault(&e) {
             journal(store, inbound_id, "fetch_failed", Some(&format!("{e:#}")));
-            stamp_inbound_failed(store, &package_id, &e);
-            // …and announce the terminal, like every other ending does. Without this
-            // the row DISAPPEARS from a live Transfers screen (owner smoke
-            // 2026-07-24, "closed the sender mid-transfer"): a Failed row is excluded
-            // from `inbound_active`, so the status poll drops it from the Active list,
-            // while the durable terminal list that should then carry it is re-fetched
-            // only on `sync-finished`. Emitted AFTER the state stamp so the refetch it
-            // triggers reads the settled row.
-            emit_event(
-                emitter.as_ref(),
-                "sync-finished",
-                &SyncFinishedEvent {
-                    package_id: package_id.clone(),
-                    direction: super::Direction::Received,
-                    outcome: "failed".to_string(),
-                    peer_device: peer_device.to_string(),
-                    ok_count: 0,
-                    failed: Vec::new(),
-                    new_count: 0,
-                    duplicate_count: 0,
-                    project_id: None,
-                },
-            );
+            terminalize_inbound_failed(store, emitter.as_ref(), &package_id, &peer_device, &e);
         } else {
             // The peer went away. Non-terminal, so the row stays in
-            // `inbound_active` and the 10 s status poll keeps it visible on its own
-            // — which is exactly what the emission above was compensating for on
-            // this path. No event here: there is no terminal to announce, and the
-            // per-file rows stay as the resume checkpoint (§3.3).
+            // `inbound_active` and the 10 s status poll keeps it visible on its
+            // own — which is what the D1-era `sync-finished` on this path was
+            // compensating for. No event here: there is no terminal to announce,
+            // and the per-file rows stay as the resume checkpoint (§3.3).
             journal(store, inbound_id, "fetch_waiting", Some(&format!("{e:#}")));
             stamp_inbound_waiting(store, &package_id, &e);
         }
@@ -1659,26 +1674,7 @@ async fn handle_announce(
             // task itself panicking) is terminal for this row (Failed + reason);
             // propagate so the receiver loop logs it too.
             journal(store, inbound_id, "failed", Some(&format!("{e:#}")));
-            stamp_inbound_failed(store, &package_id, &e);
-            // D2 §3.2: this path emitted nothing before — the row was terminal but
-            // silent, so a live Transfers screen dropped it from Active with nothing
-            // to trigger the terminal-list refetch. Same vanishing-row bug the fetch
-            // path had; same fix.
-            emit_event(
-                emitter.as_ref(),
-                "sync-finished",
-                &SyncFinishedEvent {
-                    package_id: package_id.clone(),
-                    direction: super::Direction::Received,
-                    outcome: "failed".to_string(),
-                    peer_device: peer_device.to_string(),
-                    ok_count: 0,
-                    failed: Vec::new(),
-                    new_count: 0,
-                    duplicate_count: 0,
-                    project_id: None,
-                },
-            );
+            terminalize_inbound_failed(store, emitter.as_ref(), &package_id, &peer_device, &e);
             return Err(e).with_context(|| format!("ingest package {package_id}"));
         }
     };
@@ -1709,25 +1705,7 @@ async fn handle_announce(
         // Only the verdict is undelivered, and the ack-replay guard hands it back
         // whole on the sender's next announce.
         journal(store, inbound_id, "failed", Some(&format!("{e:#}")));
-        stamp_inbound_failed(store, &package_id, &e);
-        // Emitted for the same reason as the ingest path above: without it a
-        // terminal row leaves Active with nothing to carry it into the terminal
-        // list.
-        emit_event(
-            emitter.as_ref(),
-            "sync-finished",
-            &SyncFinishedEvent {
-                package_id: package_id.clone(),
-                direction: super::Direction::Received,
-                outcome: "failed".to_string(),
-                peer_device: peer_device.to_string(),
-                ok_count: 0,
-                failed: Vec::new(),
-                new_count: 0,
-                duplicate_count: 0,
-                project_id: None,
-            },
-        );
+        terminalize_inbound_failed(store, emitter.as_ref(), &package_id, &peer_device, &e);
         return Err(e).with_context(|| format!("ack package {package_id}"));
     }
 
@@ -4686,6 +4664,83 @@ mod tests {
                 "a re-announce restores the file rows to announced: {rows:?}"
             );
         }
+    }
+
+    /// F5 (delivery-model audit): "every terminal path emits" was a CONVENTION,
+    /// and a convention is exactly what let one of six paths forget. The row left
+    /// [`inbound_active`], the durable terminal list is re-fetched only on
+    /// `sync-finished`, and it appeared in neither — it simply vanished from a live
+    /// Transfers screen (owner smoke 2026-07-24). Two MORE silent paths turned up
+    /// when D2 re-audited the set, which is how a convention fails: quietly, one
+    /// path at a time.
+    ///
+    /// The rule this guards:
+    ///
+    /// > Every write that puts a `sync_inbound` row into a TERMINAL state on the
+    /// > receiver's LIVE path also announces it with `sync-finished`.
+    ///
+    /// The live-path writers, all of which announce:
+    ///
+    /// | Writer | Terminal | Where the announce lives |
+    /// | ---- | ---- | ---- |
+    /// | `terminalize_inbound_failed` | `Failed` | inside the helper — the fetch local-fault, ingest-error and ack-error paths all route through it, so none of them can forget |
+    /// | `handle_announce` ingest terminal | `Done` / `Failed` | the single emit at the end of the ingest arm |
+    /// | `replay_ack_from_log` | `Done` / `Cancelled` | its own emit |
+    /// | `cancel_epilogue` | `Cancelled` | its own emit |
+    /// | `handle_revoke` | `Failed` / `Cancelled` | its own emit |
+    ///
+    /// TWO deliberate exemptions, both OUTSIDE the live path. Neither is an
+    /// oversight: `sync-finished` is what raises a user notification
+    /// (`notifyFinished`, `src/hooks/useSyncStatus.ts`), so emitting from either
+    /// would produce a FALSE one.
+    ///
+    /// - the startup receipt-repair in [`reconcile_stale_inbound`] settles rows
+    ///   that reached their terminal in a PREVIOUS session; announcing would toast
+    ///   "N frames arrived" at every launch. The frontend's mount fetch already
+    ///   carries those rows.
+    /// - `api::sync::cancel_incoming_package` — the user just performed the action,
+    ///   so a notification about it is noise; its caller re-fetches the terminal
+    ///   list instead (`useTransferQueue`'s `cancelInbound`).
+    ///
+    /// A drift guard, not a proof. It fails when the number of `sync_inbound` state
+    /// writers changes — which is precisely the moment to re-read the table above
+    /// and decide which column the new one belongs in.
+    #[test]
+    fn every_terminal_writer_announces_or_is_a_named_exemption() {
+        /// Count state-write call sites in a file's PRODUCTION half, ignoring
+        /// comment lines (so prose mentioning the function never moves the number).
+        fn write_sites(src: &str) -> usize {
+            src.split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .unwrap_or(src)
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && t.contains("set_inbound_state(")
+                })
+                .count()
+        }
+
+        assert_eq!(
+            write_sites(include_str!("receiver.rs")),
+            12,
+            "the set of `sync_inbound` state writers in the receiver changed. \
+             If the new one puts a row in a TERMINAL state on the live path, it \
+             MUST announce it — route it through `terminalize_inbound_failed`, or \
+             emit `sync-finished` yourself after the write. A terminal row leaves \
+             `inbound_active`, so without the announce it disappears from the \
+             Transfers screen entirely. See this test's doc comment for the table \
+             and the two exemptions."
+        );
+        assert_eq!(
+            write_sites(include_str!("../api/sync.rs")),
+            1,
+            "the only `sync_inbound` state write outside the receiver is \
+             `cancel_incoming_package`'s Cancelled stamp, which is a NAMED \
+             exemption from the announce rule (the user took the action; its \
+             caller re-fetches). A second one here needs the same justification \
+             written down, or it belongs on the receiver's live path."
+        );
     }
 
     /// D2 §4: a `Waiting` row is non-terminal, so it comes back from
