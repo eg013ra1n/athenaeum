@@ -1346,6 +1346,20 @@ impl Worker {
                 pkg_basename
             }
         };
+        // The announce describes THIS ATTEMPT, and every part of it must describe
+        // the same thing. `announce.frame_count` and `announce.byte_size` are
+        // already the negotiated subset (see `negotiate`), so the file list is
+        // filtered to match: the receiver then writes one `sync_inbound_files` row
+        // per file that will actually travel.
+        //
+        // Sending the FULL manifest alongside a subset count left the receiver with
+        // rows for files the sender had already decided not to send. They could
+        // never be settled — no fetch tick, no receipt — so they sat `announced`
+        // forever and the receive-side counter could not reach its own total: a
+        // delivered transfer read "3 of 5". The excluded files are duplicates the
+        // peer already holds, so it loses nothing by not hearing about them; the
+        // SENDER's own rows still carry them, settled `done`/`duplicate` (§D4), which
+        // is where "38 sent, 35 already there" is legible.
         let announce_files: Vec<AnnounceFileEntry> = {
             let cached = self
                 .pending
@@ -1357,6 +1371,7 @@ impl Worker {
             };
             records
                 .iter()
+                .filter(|r| want.as_ref().is_none_or(|w| w.contains(&r.rel_path)))
                 .map(|r| AnnounceFileEntry {
                     rel_path: r.rel_path.clone(),
                     byte_size: r.byte_size,

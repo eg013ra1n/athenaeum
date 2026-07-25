@@ -38,13 +38,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use athenaeum_core::api::retention::{evaluate, AppRetentionConfig};
 use athenaeum_core::api::sync::{
     cancel_incoming_package, cancel_sync_package, delete_transfer_history, enqueue_sync_selection,
     get_status, get_transfer_storage, list_terminal_transfers, list_transfer_files,
     resurrect_pending_senders_with, retry_sync_package, ResolvedDest,
 };
 use athenaeum_core::api::ApiError;
-use athenaeum_core::api::retention::{evaluate, AppRetentionConfig};
 use athenaeum_core::db::{insert_file, insert_frame, Database};
 use athenaeum_core::events::{NullEmitter, ProgressEmitter};
 use athenaeum_core::fits_writer::keywords::{FrameKind, HeaderBuilder};
@@ -150,7 +150,9 @@ fn insert_capture_frame(
     let frame_id = insert_frame(&conn, &frame).expect("insert frame");
     // The `frames_identity` AFTER INSERT trigger fills uuid + updated_at.
     let uuid: String = conn
-        .query_row("SELECT uuid FROM frames WHERE id = ?1", [frame_id], |r| r.get(0))
+        .query_row("SELECT uuid FROM frames WHERE id = ?1", [frame_id], |r| {
+            r.get(0)
+        })
         .expect("read trigger-assigned uuid");
     (frame_id, uuid, object.to_string(), exptime)
 }
@@ -206,7 +208,9 @@ impl RecordingEmitter {
             .map(|(_, _, p)| {
                 (
                     p["newCount"].as_u64().expect("newCount is a number"),
-                    p["duplicateCount"].as_u64().expect("duplicateCount is a number"),
+                    p["duplicateCount"]
+                        .as_u64()
+                        .expect("duplicateCount is a number"),
                 )
             })
             .collect()
@@ -384,31 +388,49 @@ fn is_terminal_state(s: &str) -> bool {
 /// second). Panics if no row exists — every caller reads it after an enqueue.
 fn latest_outbound_id(db: &Database) -> i64 {
     db.conn()
-        .query_row("SELECT id FROM sync_outbound ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+        .query_row(
+            "SELECT id FROM sync_outbound ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
         .expect("an outbound row exists")
 }
 
 fn outbound_state(db: &Database, id: i64) -> String {
     db.conn()
-        .query_row("SELECT state FROM sync_outbound WHERE id = ?1", [id], |r| r.get(0))
+        .query_row("SELECT state FROM sync_outbound WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
         .expect("outbound row present")
 }
 
 fn outbound_attempts(db: &Database, id: i64) -> i64 {
     db.conn()
-        .query_row("SELECT attempts FROM sync_outbound WHERE id = ?1", [id], |r| r.get(0))
+        .query_row(
+            "SELECT attempts FROM sync_outbound WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
         .expect("outbound row present")
 }
 
 fn outbound_next_retry(db: &Database, id: i64) -> Option<String> {
     db.conn()
-        .query_row("SELECT next_retry_at FROM sync_outbound WHERE id = ?1", [id], |r| r.get(0))
+        .query_row(
+            "SELECT next_retry_at FROM sync_outbound WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
         .expect("outbound row present")
 }
 
 fn outbound_last_error(db: &Database, id: i64) -> Option<String> {
     db.conn()
-        .query_row("SELECT last_error FROM sync_outbound WHERE id = ?1", [id], |r| r.get(0))
+        .query_row(
+            "SELECT last_error FROM sync_outbound WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
         .expect("outbound row present")
 }
 
@@ -589,24 +611,56 @@ async fn two_instance_sync_e2e() {
     assert!(keeper_path.exists(), "keeper file written");
 
     // ── (1) First enqueue → primary ingests ALL 50 with metadata ─────────────
-    let r1 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, frame_ids.clone(), None, None, None)
-        .await
-        .expect("first enqueue");
+    let r1 = enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
+        frame_ids.clone(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("first enqueue");
     assert_eq!(r1.enqueued_count, N as u32);
     assert_eq!(r1.eligible_count, N as u32);
     assert_eq!(r1.total_count, N as u32);
-    assert!(r1.ineligible.is_empty(), "all 50 fixture frames are eligible");
+    assert!(
+        r1.ineligible.is_empty(),
+        "all 50 fixture frames are eligible"
+    );
 
-    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
     wait_until(
-        || count(cdb, "SELECT COUNT(*) FROM sync_outbound WHERE state = 'confirmed'") == 1,
+        || count(pdb, "SELECT COUNT(*) FROM frames") == N as i64,
+        WAIT,
+    )
+    .await;
+    wait_until(
+        || {
+            count(
+                cdb,
+                "SELECT COUNT(*) FROM sync_outbound WHERE state = 'confirmed'",
+            ) == 1
+        },
         WAIT,
     )
     .await;
 
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), N as i64, "50 files ingested");
     assert_eq!(
-        count(pdb, "SELECT COUNT(*) FROM frames WHERE uuid IS NOT NULL AND uuid != ''"),
+        count(pdb, "SELECT COUNT(*) FROM files"),
+        N as i64,
+        "50 files ingested"
+    );
+    assert_eq!(
+        count(
+            pdb,
+            "SELECT COUNT(*) FROM frames WHERE uuid IS NOT NULL AND uuid != ''"
+        ),
         N as i64,
         "every ingested frame carries its catalog uuid"
     );
@@ -629,7 +683,10 @@ async fn two_instance_sync_e2e() {
         "receiver logged 50 ingests"
     );
     assert_eq!(
-        count(cdb, "SELECT COUNT(*) FROM sync_history WHERE direction = 'sent' AND outcome = 'ingested'"),
+        count(
+            cdb,
+            "SELECT COUNT(*) FROM sync_history WHERE direction = 'sent' AND outcome = 'ingested'"
+        ),
         N as i64,
         "sender logged 50 confirmed sends"
     );
@@ -641,12 +698,19 @@ async fn two_instance_sync_e2e() {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .collect();
-    assert_eq!(landed.len(), N, "all frames land under the designated sync_incoming root");
+    assert_eq!(
+        landed.len(),
+        N,
+        "all frames land under the designated sync_incoming root"
+    );
 
     // …and every one lives under the sender's FRIENDLY-name folder (2C), not a
     // hex slug: the ingest resolver read the cached device-names map above.
     let named_dir = designated.join("Studio_iMac");
-    assert!(named_dir.is_dir(), "landing folder is named by the sender's current device name");
+    assert!(
+        named_dir.is_dir(),
+        "landing folder is named by the sender's current device name"
+    );
     for e in &landed {
         assert!(
             e.path().starts_with(&named_dir),
@@ -656,13 +720,31 @@ async fn two_instance_sync_e2e() {
     }
 
     // ── (2) Re-run the identical enqueue → dedupe-safe ───────────────────────
-    let r2 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, frame_ids.clone(), None, None, None)
-        .await
-        .expect("second enqueue");
+    let r2 = enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
+        frame_ids.clone(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("second enqueue");
     assert_eq!(r2.enqueued_count, N as u32, "the same 50 frames re-enqueue");
 
     wait_until(
-        || count(cdb, "SELECT COUNT(*) FROM sync_outbound WHERE state = 'confirmed'") == 2,
+        || {
+            count(
+                cdb,
+                "SELECT COUNT(*) FROM sync_outbound WHERE state = 'confirmed'",
+            ) == 2
+        },
         WAIT,
     )
     .await;
@@ -676,12 +758,23 @@ async fn two_instance_sync_e2e() {
     .await;
 
     // Row counts stable on the primary: no new files/frames from the redelivery.
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), N as i64, "redelivery created no new files");
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), N as i64, "redelivery created no new frames");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM files"),
+        N as i64,
+        "redelivery created no new files"
+    );
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM frames"),
+        N as i64,
+        "redelivery created no new frames"
+    );
     // The second ack's receipts are ALL Duplicate — proven from the sender's own
     // confirm history for the second package.
     assert_eq!(
-        count(cdb, "SELECT COUNT(*) FROM sync_history WHERE direction = 'sent' AND outcome = 'duplicate'"),
+        count(
+            cdb,
+            "SELECT COUNT(*) FROM sync_history WHERE direction = 'sent' AND outcome = 'duplicate'"
+        ),
         N as i64,
         "every second-delivery ack receipt is Duplicate"
     );
@@ -702,11 +795,19 @@ async fn two_instance_sync_e2e() {
     };
     let outcome = evaluate(&ret_store, &cfg, Utc::now(), &|| 0u8).expect("retention evaluate");
     assert!(!outcome.dry_run, "dry_run=false + opt-in goes live");
-    assert_eq!(outcome.eligible.len(), 2, "both confirmed packages are retention candidates");
+    assert_eq!(
+        outcome.eligible.len(),
+        2,
+        "both confirmed packages are retention candidates"
+    );
     // The two packages link the SAME 50 files; whichever is processed first
     // deletes them, the second finds them gone and is a no-op → exactly one
     // package reports a real removal.
-    assert_eq!(outcome.deleted.len(), 1, "one package did the real deletion; its twin was a no-op");
+    assert_eq!(
+        outcome.deleted.len(),
+        1,
+        "one package did the real deletion; its twin was a no-op"
+    );
 
     // Every confirmed source is gone from disk AND its catalog rows are removed…
     for idx in 0..N {
@@ -716,19 +817,36 @@ async fn two_instance_sync_e2e() {
         );
     }
     // …while the never-synced keeper survives, on disk and in the catalog.
-    assert!(keeper_path.exists(), "the never-synced keeper file is untouched by retention");
-    assert_eq!(count(cdb, "SELECT COUNT(*) FROM files"), 1, "only the never-synced keeper survives");
-    assert_eq!(count(cdb, "SELECT COUNT(*) FROM frames"), 1, "keeper's frame survives (CASCADE removed the rest)");
+    assert!(
+        keeper_path.exists(),
+        "the never-synced keeper file is untouched by retention"
+    );
+    assert_eq!(
+        count(cdb, "SELECT COUNT(*) FROM files"),
+        1,
+        "only the never-synced keeper survives"
+    );
+    assert_eq!(
+        count(cdb, "SELECT COUNT(*) FROM frames"),
+        1,
+        "keeper's frame survives (CASCADE removed the rest)"
+    );
 
     // Both history events are searchable for the deleted frames: the transfer
     // ('ingested') AND the retention audit ('retention_deleted').
     assert_eq!(
-        count(cdb, "SELECT COUNT(*) FROM sync_history WHERE outcome = 'retention_deleted'"),
+        count(
+            cdb,
+            "SELECT COUNT(*) FROM sync_history WHERE outcome = 'retention_deleted'"
+        ),
         N as i64,
         "one retention_deleted audit per confirmed source"
     );
     assert_eq!(
-        count(cdb, "SELECT COUNT(*) FROM sync_history WHERE direction = 'sent' AND outcome = 'ingested'"),
+        count(
+            cdb,
+            "SELECT COUNT(*) FROM sync_history WHERE direction = 'sent' AND outcome = 'ingested'"
+        ),
         N as i64,
         "the transfer events survive retention (both events searchable)"
     );
@@ -884,15 +1002,29 @@ async fn resend_transfers_only_new_frames() {
     // are genuinely different, so it stays wanted.
     let mut frame_ids: Vec<i64> = Vec::with_capacity(4);
     for idx in 0..4 {
-        let (fid, _uuid, _object, _exptime) = insert_capture_frame(&capture_ctx, &capture_files, idx);
+        let (fid, _uuid, _object, _exptime) =
+            insert_capture_frame(&capture_ctx, &capture_files, idx);
         frame_ids.push(fid);
     }
 
     // ── (1) First batch: 3 frames → B ingests all 3, all reported new ──────────
     let batch1: Vec<i64> = frame_ids[0..3].to_vec();
-    let r1 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, batch1, None, None, None)
-        .await
-        .expect("first enqueue");
+    let r1 = enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
+        batch1,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("first enqueue");
     assert_eq!(r1.enqueued_count, 3, "the first 3 frames enqueue");
 
     wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 3, WAIT).await;
@@ -902,11 +1034,18 @@ async fn resend_transfers_only_new_frames() {
         (3, 0),
         "the first batch is all new: {{new:3, duplicate:0}}"
     );
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), 3, "B holds the 3 first-batch files");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM files"),
+        3,
+        "B holds the 3 first-batch files"
+    );
     // B's ingest populated `files.content_hash` for all 3 — the sampling hash the
     // responder diffs the next offer against.
     assert_eq!(
-        count(pdb, "SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL"),
+        count(
+            pdb,
+            "SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL"
+        ),
         3,
         "every ingested file carries its sampling content_hash"
     );
@@ -915,10 +1054,26 @@ async fn resend_transfers_only_new_frames() {
     // Only the 1 new frame is transferred; the 3 B already holds are dropped by
     // the negotiate handshake before any announce/serve of them.
     let batch2: Vec<i64> = frame_ids[0..4].to_vec();
-    let r2 = enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, batch2, None, None, None)
-        .await
-        .expect("second enqueue");
-    assert_eq!(r2.enqueued_count, 4, "all 4 frames re-enqueue at the app layer");
+    let r2 = enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
+        batch2,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("second enqueue");
+    assert_eq!(
+        r2.enqueued_count, 4,
+        "all 4 frames re-enqueue at the app layer"
+    );
 
     wait_until(|| emitter.sent_finished().len() == 2, WAIT).await;
     wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 4, WAIT).await;
@@ -928,8 +1083,16 @@ async fn resend_transfers_only_new_frames() {
         (1, 3),
         "the overlapping re-send moves only the 1 new frame; the 3 dupes are dropped"
     );
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), 4, "B holds exactly 4 files after the re-send");
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 4, "B holds exactly 4 frames after the re-send");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM files"),
+        4,
+        "B holds exactly 4 files after the re-send"
+    );
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM frames"),
+        4,
+        "B holds exactly 4 frames after the re-send"
+    );
     assert_eq!(
         count(pdb, "SELECT COUNT(DISTINCT uuid) FROM frames"),
         4,
@@ -941,9 +1104,22 @@ async fn resend_transfers_only_new_frames() {
     // want and the package terminalizes confirmed WITHOUT announcing or serving —
     // B never even sees an announce, and its catalog is untouched.
     let batch3: Vec<i64> = frame_ids[0..4].to_vec();
-    enqueue_sync_selection(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, ResolvedDest { node: receiver_node, endpoint_addr: None }, batch3, None, None, None)
-        .await
-        .expect("third enqueue");
+    enqueue_sync_selection(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
+        batch3,
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("third enqueue");
 
     wait_until(|| emitter.sent_finished().len() == 3, WAIT).await;
     assert_eq!(
@@ -951,8 +1127,16 @@ async fn resend_transfers_only_new_frames() {
         (0, 4),
         "a fully-overlapping re-send transfers nothing: {{new:0, duplicate:4}}"
     );
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), 4, "B unchanged by the all-duplicate re-send");
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 4, "B unchanged by the all-duplicate re-send");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM files"),
+        4,
+        "B unchanged by the all-duplicate re-send"
+    );
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM frames"),
+        4,
+        "B unchanged by the all-duplicate re-send"
+    );
 
     // Clean shutdown of the background tasks (tidy; tempdir drop handles the rest).
     engine.shutdown().await;
@@ -1017,7 +1201,8 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
     // Seed 6 fixture frames on the capture node.
     let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
     for idx in 0..N {
-        let (fid, _uuid, _object, _exptime) = insert_capture_frame(&capture_ctx, &capture_files, idx);
+        let (fid, _uuid, _object, _exptime) =
+            insert_capture_frame(&capture_ctx, &capture_files, idx);
         frame_ids.push(fid);
     }
 
@@ -1028,7 +1213,10 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         None,
         None,
@@ -1083,11 +1271,22 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
 
     // Unattended delivery: Confirmed on the sender, 6 frames ingested on the primary.
     wait_until(|| outbound_state(cdb, id) == "confirmed", WAIT).await;
-    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
+    wait_until(
+        || count(pdb, "SELECT COUNT(*) FROM frames") == N as i64,
+        WAIT,
+    )
+    .await;
 
-    assert_eq!(landed_count(&designated), N, "all frames land under the designated root");
     assert_eq!(
-        count(cdb, "SELECT COUNT(*) FROM sync_outbound WHERE state = 'confirmed'"),
+        landed_count(&designated),
+        N,
+        "all frames land under the designated root"
+    );
+    assert_eq!(
+        count(
+            cdb,
+            "SELECT COUNT(*) FROM sync_outbound WHERE state = 'confirmed'"
+        ),
         1,
         "exactly one package, and it is confirmed"
     );
@@ -1099,7 +1298,10 @@ async fn offline_peer_delivers_after_reconnect_without_user_action() {
         "receiver logged 6 ingests"
     );
     assert_eq!(
-        count(cdb, "SELECT COUNT(*) FROM sync_history WHERE direction = 'sent' AND outcome = 'ingested'"),
+        count(
+            cdb,
+            "SELECT COUNT(*) FROM sync_history WHERE direction = 'sent' AND outcome = 'ingested'"
+        ),
         N as i64,
         "sender logged 6 confirmed sends"
     );
@@ -1173,7 +1375,10 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
     let primary_sync = SyncRuntime::new();
 
     // Hold the payload fetch aborting so no ingest can complete before we cancel.
-    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+    receiver_ep.set_fault(FaultPlan {
+        abort_after_bytes: Some(1),
+        ..Default::default()
+    });
 
     let (_info, receiver) = SyncReceiver::spawn(
         Arc::clone(&primary_store),
@@ -1193,7 +1398,8 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
 
     let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
     for idx in 0..N {
-        let (fid, _uuid, _object, _exptime) = insert_capture_frame(&capture_ctx, &capture_files, idx);
+        let (fid, _uuid, _object, _exptime) =
+            insert_capture_frame(&capture_ctx, &capture_files, idx);
         frame_ids.push(fid);
     }
 
@@ -1202,7 +1408,10 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         None,
         None,
@@ -1225,7 +1434,10 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
     let mut wire_pkg = String::new();
     wait_until(
         || {
-            receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+            receiver_ep.set_fault(FaultPlan {
+                abort_after_bytes: Some(1),
+                ..Default::default()
+            });
             match latest_inbound_package_id(pdb) {
                 Some(p) => {
                     wire_pkg = p;
@@ -1237,7 +1449,10 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
         WAIT,
     )
     .await;
-    assert!(!wire_pkg.is_empty(), "an inbound row surfaced the wire package_id");
+    assert!(
+        !wire_pkg.is_empty(),
+        "an inbound row surfaced the wire package_id"
+    );
 
     // Cancel: the live signal (identical to the command's internal call on a started
     // transport) diverts the receiver to its cancel epilogue on the next announce…
@@ -1267,7 +1482,11 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
         WAIT,
     )
     .await;
-    assert_eq!(landed_count(&designated), 0, "a declined package lands no files");
+    assert_eq!(
+        landed_count(&designated),
+        0,
+        "a declined package lands no files"
+    );
     assert_eq!(
         count(
             pdb,
@@ -1288,34 +1507,66 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
     // `last_error = "cancelled by receiver"`, so this diverts into
     // `resend_declined_as_new_transfer`: a NEW `sync_outbound` row (new dir basename
     // ⇒ new wire `batch_uuid`) rather than a reset of the SAME row.
-    let new_id =
-        retry_sync_package(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
-            .await
-            .expect("resend a receiver-declined package as a new transfer");
-    assert_ne!(new_id, old_id, "a receiver-declined resend mints a NEW transfer row");
+    let new_id = retry_sync_package(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        old_id,
+        None,
+    )
+    .await
+    .expect("resend a receiver-declined package as a new transfer");
+    assert_ne!(
+        new_id, old_id,
+        "a receiver-declined resend mints a NEW transfer row"
+    );
 
     // The NEW transfer confirms; N frames ingest; N files land — the whole point.
     wait_until(|| outbound_state(cdb, new_id) == "confirmed", WAIT).await;
-    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), N as i64, "every frame ingested on the new transfer");
-    assert_eq!(landed_count(&designated), N, "every file landed on the new transfer");
+    wait_until(
+        || count(pdb, "SELECT COUNT(*) FROM frames") == N as i64,
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM frames"),
+        N as i64,
+        "every frame ingested on the new transfer"
+    );
+    assert_eq!(
+        landed_count(&designated),
+        N,
+        "every file landed on the new transfer"
+    );
 
     // TWO inbound rows on the receiver: the old DECLINED one (still `cancelled` with
     // `declined_at` set — untouched by the new batch) and the new DONE one.
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 2, "the new batch identity created a SECOND inbound row");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM sync_inbound"),
+        2,
+        "the new batch identity created a SECOND inbound row"
+    );
     assert_eq!(
         count(pdb, "SELECT COUNT(*) FROM sync_inbound WHERE declined_at IS NOT NULL AND state = 'cancelled'"),
         1,
         "the old declined inbound row stays declined + cancelled — decline final per its batch_uuid"
     );
     assert_eq!(
-        count(pdb, "SELECT COUNT(*) FROM sync_inbound WHERE state = 'done'"),
+        count(
+            pdb,
+            "SELECT COUNT(*) FROM sync_inbound WHERE state = 'done'"
+        ),
         1,
         "the new batch's inbound row reaches Done"
     );
 
     // The old SENDER row is kept as history — still Cancelled, reason intact.
-    assert_eq!(outbound_state(cdb, old_id), "cancelled", "the declined sender row is kept as history");
+    assert_eq!(
+        outbound_state(cdb, old_id),
+        "cancelled",
+        "the declined sender row is kept as history"
+    );
     assert_eq!(
         outbound_last_error(cdb, old_id).as_deref(),
         Some("cancelled by receiver"),
@@ -1325,14 +1576,31 @@ async fn receiver_decline_then_resend_mints_new_transfer_and_delivers() {
     // Retention followed the payload: the N `sync_sources` rows now key on the NEW
     // transfer's package_ref, none on the old one.
     let new_pkg_ref = outbound_package_ref(cdb, new_id);
-    assert_ne!(new_pkg_ref, old_pkg_ref, "the new transfer owns a fresh payload dir");
-    assert_eq!(sync_sources_live_count(cdb, &new_pkg_ref), N as i64, "sync_sources re-keyed onto the new transfer");
-    assert_eq!(sync_sources_live_count(cdb, &old_pkg_ref), 0, "no sync_sources remain under the old package_ref");
+    assert_ne!(
+        new_pkg_ref, old_pkg_ref,
+        "the new transfer owns a fresh payload dir"
+    );
+    assert_eq!(
+        sync_sources_live_count(cdb, &new_pkg_ref),
+        N as i64,
+        "sync_sources re-keyed onto the new transfer"
+    );
+    assert_eq!(
+        sync_sources_live_count(cdb, &old_pkg_ref),
+        0,
+        "no sync_sources remain under the old package_ref"
+    );
 
     // The old payload dir was renamed away (gone from disk); the new dir is present
     // (post-confirm cleanup leaves it manifest-only, but the dir itself survives).
-    assert!(!PathBuf::from(&old_pkg_ref).exists(), "the declined transfer's payload dir was renamed away");
-    assert!(PathBuf::from(&new_pkg_ref).exists(), "the new transfer's payload dir is present");
+    assert!(
+        !PathBuf::from(&old_pkg_ref).exists(),
+        "the declined transfer's payload dir was renamed away"
+    );
+    assert!(
+        PathBuf::from(&new_pkg_ref).exists(),
+        "the new transfer's payload dir is present"
+    );
 
     engine.shutdown().await;
     receiver.shutdown().await;
@@ -1381,7 +1649,10 @@ async fn sender_cancel_then_resend_delivers() {
     let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
 
     // Hold the payload fetch aborting so the cancel always lands before any ingest.
-    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+    receiver_ep.set_fault(FaultPlan {
+        abort_after_bytes: Some(1),
+        ..Default::default()
+    });
 
     let (_info, receiver) = SyncReceiver::spawn(
         Arc::clone(&primary_store),
@@ -1401,7 +1672,8 @@ async fn sender_cancel_then_resend_delivers() {
 
     let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
     for idx in 0..N {
-        let (fid, _uuid, _object, _exptime) = insert_capture_frame(&capture_ctx, &capture_files, idx);
+        let (fid, _uuid, _object, _exptime) =
+            insert_capture_frame(&capture_ctx, &capture_files, idx);
         frame_ids.push(fid);
     }
 
@@ -1410,7 +1682,10 @@ async fn sender_cancel_then_resend_delivers() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         None,
         None,
@@ -1425,7 +1700,10 @@ async fn sender_cancel_then_resend_delivers() {
     // command: terminal `cancelled` + a Revoke{Cancelled} for the live wire id.
     wait_until(
         || {
-            receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+            receiver_ep.set_fault(FaultPlan {
+                abort_after_bytes: Some(1),
+                ..Default::default()
+            });
             latest_inbound_package_id(pdb).is_some()
         },
         WAIT,
@@ -1434,12 +1712,24 @@ async fn sender_cancel_then_resend_delivers() {
     // Re-arm once more right before the cancel: the exit iteration's one-shot
     // fault may have been consumed by a retry fetch in the gap, and a completed
     // fetch here would flake the landed_count == 0 assertion below.
-    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
-    cancel_sync_package(&sender, old_id).await.expect("cancel the live send");
+    receiver_ep.set_fault(FaultPlan {
+        abort_after_bytes: Some(1),
+        ..Default::default()
+    });
+    cancel_sync_package(&sender, old_id)
+        .await
+        .expect("cancel the live send");
     wait_until(|| outbound_state(cdb, old_id) == "cancelled", WAIT).await;
-    assert_eq!(landed_count(&designated), 0, "nothing landed before the cancel");
     assert_eq!(
-        count(pdb, "SELECT COUNT(*) FROM sync_inbound WHERE declined_at IS NOT NULL"),
+        landed_count(&designated),
+        0,
+        "nothing landed before the cancel"
+    );
+    assert_eq!(
+        count(
+            pdb,
+            "SELECT COUNT(*) FROM sync_inbound WHERE declined_at IS NOT NULL"
+        ),
         0,
         "a sender cancel NEVER records a receiver decline"
     );
@@ -1447,10 +1737,16 @@ async fn sender_cancel_then_resend_delivers() {
     // Disarm the fault and resend via the sanctioned command: the SAME row resets
     // and this time the transfer must DELIVER.
     receiver_ep.set_fault(FaultPlan::default());
-    let resend_id =
-        retry_sync_package(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, old_id, None)
-            .await
-            .expect("resend a sender-cancelled package");
+    let resend_id = retry_sync_package(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        old_id,
+        None,
+    )
+    .await
+    .expect("resend a sender-cancelled package");
     assert_eq!(resend_id, old_id, "resend-as-reset returns the SAME row");
 
     wait_until(|| outbound_state(cdb, old_id) == "confirmed", WAIT).await;
@@ -1459,12 +1755,31 @@ async fn sender_cancel_then_resend_delivers() {
         "confirmed",
         "the resend of a sender-cancelled transfer confirms — the smoke-№7 brick is gone"
     );
-    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), N as i64, "every frame ingested on the resend");
-    assert_eq!(landed_count(&designated), N, "every file landed on the resend");
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 1, "ONE batch-keyed inbound row across cancel + resend");
+    wait_until(
+        || count(pdb, "SELECT COUNT(*) FROM frames") == N as i64,
+        WAIT,
+    )
+    .await;
     assert_eq!(
-        count(pdb, "SELECT COUNT(*) FROM sync_inbound WHERE declined_at IS NOT NULL"),
+        count(pdb, "SELECT COUNT(*) FROM frames"),
+        N as i64,
+        "every frame ingested on the resend"
+    );
+    assert_eq!(
+        landed_count(&designated),
+        N,
+        "every file landed on the resend"
+    );
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM sync_inbound"),
+        1,
+        "ONE batch-keyed inbound row across cancel + resend"
+    );
+    assert_eq!(
+        count(
+            pdb,
+            "SELECT COUNT(*) FROM sync_inbound WHERE declined_at IS NOT NULL"
+        ),
         0,
         "delivery never invents a decline"
     );
@@ -1537,7 +1852,8 @@ async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
 
     let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
     for idx in 0..N {
-        let (fid, _uuid, _object, _exptime) = insert_capture_frame(&capture_ctx, &capture_files, idx);
+        let (fid, _uuid, _object, _exptime) =
+            insert_capture_frame(&capture_ctx, &capture_files, idx);
         frame_ids.push(fid);
     }
 
@@ -1546,7 +1862,10 @@ async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         None,
         None,
@@ -1556,7 +1875,11 @@ async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
     .expect("enqueue selection");
 
     // Wait for the transfer to land, then read the inbound row.
-    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
+    wait_until(
+        || count(pdb, "SELECT COUNT(*) FROM frames") == N as i64,
+        WAIT,
+    )
+    .await;
     let wire_pkg = latest_inbound_package_id(pdb).expect("an inbound row exists");
     // The row reaches Done (the terminal stamp is written after the ack).
     wait_until(
@@ -1567,11 +1890,18 @@ async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
     let (state, byte_size, bytes_done) = inbound_row(pdb, &wire_pkg).expect("inbound row present");
     assert_eq!(state, "done", "the inbound row is terminal Done");
     assert!(byte_size > 0, "the package carries a non-zero byte size");
-    assert_eq!(bytes_done, byte_size, "the fetched bytes reached the announced total");
+    assert_eq!(
+        bytes_done, byte_size,
+        "the fetched bytes reached the announced total"
+    );
 
     // Wait until the receiver's captured trail is complete (the ingesting stage tick
     // is emitted just before the terminal ack).
-    wait_until(|| recorder.received_stages().iter().any(|s| s == "ingesting"), WAIT).await;
+    wait_until(
+        || recorder.received_stages().iter().any(|s| s == "ingesting"),
+        WAIT,
+    )
+    .await;
 
     // Stage trail: the row WAS in Fetching — received → fetching → ingesting, in
     // that relative order (the honest mid-transfer observation).
@@ -1579,9 +1909,18 @@ async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
     let idx_received = stages.iter().position(|s| s == "received");
     let idx_fetching = stages.iter().position(|s| s == "fetching");
     let idx_ingesting = stages.iter().position(|s| s == "ingesting");
-    assert!(idx_received.is_some(), "a received stage tick was emitted; saw {stages:?}");
-    assert!(idx_fetching.is_some(), "a fetching stage tick was emitted; saw {stages:?}");
-    assert!(idx_ingesting.is_some(), "an ingesting stage tick was emitted; saw {stages:?}");
+    assert!(
+        idx_received.is_some(),
+        "a received stage tick was emitted; saw {stages:?}"
+    );
+    assert!(
+        idx_fetching.is_some(),
+        "a fetching stage tick was emitted; saw {stages:?}"
+    );
+    assert!(
+        idx_ingesting.is_some(),
+        "an ingesting stage tick was emitted; saw {stages:?}"
+    );
     assert!(
         idx_received < idx_fetching && idx_fetching < idx_ingesting,
         "the inbound row walked received → fetching → ingesting; saw {stages:?}"
@@ -1593,12 +1932,19 @@ async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
     for (file, done, total) in recorder.file_progress() {
         by_file.entry(file).or_default().push((done, total));
     }
-    assert_eq!(by_file.len(), N, "one per-file progress stream per package file");
+    assert_eq!(
+        by_file.len(),
+        N,
+        "one per-file progress stream per package file"
+    );
     for (file, ticks) in &by_file {
         assert!(!ticks.is_empty(), "file {file} emitted progress ticks");
         let mut prev = 0u64;
         for (done, total) in ticks {
-            assert!(*done >= prev, "file {file} bytes_done is monotonic non-decreasing");
+            assert!(
+                *done >= prev,
+                "file {file} bytes_done is monotonic non-decreasing"
+            );
             assert!(*done <= *total, "file {file} never exceeds its total");
             prev = *done;
         }
@@ -1609,10 +1955,19 @@ async fn per_file_progress_is_monotonic_and_inbound_visible_while_fetching() {
 
     // The cumulative fetch tick reaches the package byte size.
     let fetch_ticks = recorder.fetching_byte_ticks();
-    assert!(!fetch_ticks.is_empty(), "at least one byte-carrying fetch tick was emitted");
+    assert!(
+        !fetch_ticks.is_empty(),
+        "at least one byte-carrying fetch tick was emitted"
+    );
     let (final_done, final_total) = *fetch_ticks.last().unwrap();
-    assert_eq!(final_total, byte_size, "the fetch tick total equals the package byte size");
-    assert_eq!(final_done, byte_size, "the cumulative fetch reached the package byte size");
+    assert_eq!(
+        final_total, byte_size,
+        "the fetch tick total equals the package byte size"
+    );
+    assert_eq!(
+        final_done, byte_size,
+        "the cumulative fetch reached the package byte size"
+    );
 
     engine.shutdown().await;
     receiver.shutdown().await;
@@ -1683,8 +2038,14 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
     let node_b_recv = recv_ep_b.node_id();
 
     // Pace BOTH receivers' fetch so the two directions overlap in wall-clock time.
-    recv_ep_a.set_fault(FaultPlan { delay_per_read: Some(DELAY_PER_READ), ..Default::default() });
-    recv_ep_b.set_fault(FaultPlan { delay_per_read: Some(DELAY_PER_READ), ..Default::default() });
+    recv_ep_a.set_fault(FaultPlan {
+        delay_per_read: Some(DELAY_PER_READ),
+        ..Default::default()
+    });
+    recv_ep_b.set_fault(FaultPlan {
+        delay_per_read: Some(DELAY_PER_READ),
+        ..Default::default()
+    });
 
     let designated_a = tmp.path().join("incoming_a");
     let designated_b = tmp.path().join("incoming_b");
@@ -1747,7 +2108,10 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
         &sender_a,
         Arc::clone(&collab_a),
         &sync_a,
-        ResolvedDest { node: node_b_recv, endpoint_addr: None },
+        ResolvedDest {
+            node: node_b_recv,
+            endpoint_addr: None,
+        },
         ids_a.clone(),
         None,
         None,
@@ -1760,7 +2124,10 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
         &sender_b,
         Arc::clone(&collab_b),
         &sync_b,
-        ResolvedDest { node: node_a_recv, endpoint_addr: None },
+        ResolvedDest {
+            node: node_a_recv,
+            endpoint_addr: None,
+        },
         ids_b.clone(),
         None,
         None,
@@ -1772,8 +2139,26 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
     assert_eq!(rb.enqueued_count, N as u32);
 
     // ── (1) Both packages reach Confirmed; each catalog ingests the peer's N frames.
-    wait_until(|| count(dba, "SELECT COUNT(*) FROM sync_outbound WHERE state = 'confirmed'") == 1, WAIT).await;
-    wait_until(|| count(dbb, "SELECT COUNT(*) FROM sync_outbound WHERE state = 'confirmed'") == 1, WAIT).await;
+    wait_until(
+        || {
+            count(
+                dba,
+                "SELECT COUNT(*) FROM sync_outbound WHERE state = 'confirmed'",
+            ) == 1
+        },
+        WAIT,
+    )
+    .await;
+    wait_until(
+        || {
+            count(
+                dbb,
+                "SELECT COUNT(*) FROM sync_outbound WHERE state = 'confirmed'",
+            ) == 1
+        },
+        WAIT,
+    )
+    .await;
     wait_until(
         || count(dba, "SELECT COUNT(*) FROM sync_history WHERE direction = 'received' AND outcome = 'ingested'") == N as i64,
         WAIT,
@@ -1785,17 +2170,33 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
     )
     .await;
 
-    assert_eq!(landed_count(&designated_a), N, "B → A delivered all N frames to A's incoming root");
-    assert_eq!(landed_count(&designated_b), N, "A → B delivered all N frames to B's incoming root");
+    assert_eq!(
+        landed_count(&designated_a),
+        N,
+        "B → A delivered all N frames to A's incoming root"
+    );
+    assert_eq!(
+        landed_count(&designated_b),
+        N,
+        "A → B delivered all N frames to B's incoming root"
+    );
 
     // ── (2) Genuine overlap: the two fetch windows intersect in wall-clock time.
     // recorder_b captured the A → B fetch (B is the receiver); recorder_a captured
     // the B → A fetch. The window is [fetching-start, ingesting] — `fetching` is
     // stamped just before `transport.fetch()`, `ingesting` just after it returns. ─
-    let a2b_start = recorder_b.first_received_stage_at("fetching").expect("A→B fetching tick");
-    let a2b_end = recorder_b.first_received_stage_at("ingesting").expect("A→B ingesting tick");
-    let b2a_start = recorder_a.first_received_stage_at("fetching").expect("B→A fetching tick");
-    let b2a_end = recorder_a.first_received_stage_at("ingesting").expect("B→A ingesting tick");
+    let a2b_start = recorder_b
+        .first_received_stage_at("fetching")
+        .expect("A→B fetching tick");
+    let a2b_end = recorder_b
+        .first_received_stage_at("ingesting")
+        .expect("A→B ingesting tick");
+    let b2a_start = recorder_a
+        .first_received_stage_at("fetching")
+        .expect("B→A fetching tick");
+    let b2a_end = recorder_a
+        .first_received_stage_at("ingesting")
+        .expect("B→A ingesting tick");
 
     assert!(a2b_start < a2b_end, "A→B fetch window is well-formed");
     assert!(b2a_start < b2a_end, "B→A fetch window is well-formed");
@@ -1809,8 +2210,12 @@ async fn bidirectional_simultaneous_transfers_both_complete() {
     // the OTHER direction's full fetch duration — had it serialized behind that
     // fetch, the gap would be ≥ that duration — and under a generous absolute
     // ceiling. ───────────────────────────────────────────────────────────────────
-    let a2b_recv = recorder_b.first_received_stage_at("received").expect("A→B received tick");
-    let b2a_recv = recorder_a.first_received_stage_at("received").expect("B→A received tick");
+    let a2b_recv = recorder_b
+        .first_received_stage_at("received")
+        .expect("A→B received tick");
+    let b2a_recv = recorder_a
+        .first_received_stage_at("received")
+        .expect("B→A received tick");
     let a2b_gap = a2b_start.duration_since(a2b_recv);
     let b2a_gap = b2a_start.duration_since(b2a_recv);
     let a2b_fetch = a2b_end.duration_since(a2b_start);
@@ -1873,7 +2278,10 @@ fn insert_frame_at(
         ImageType::Flat => FrameKind::Flat,
         _ => FrameKind::Light,
     };
-    let mut hb = HeaderBuilder::new(kind).object(object).exptime(exptime).filter("Ha");
+    let mut hb = HeaderBuilder::new(kind)
+        .object(object)
+        .exptime(exptime)
+        .filter("Ha");
     if let Some(i) = instrume {
         hb = hb.instrume(i);
     }
@@ -1916,7 +2324,9 @@ fn insert_frame_at(
     };
     let frame_id = insert_frame(&conn, &frame).expect("insert frame");
     let uuid: String = conn
-        .query_row("SELECT uuid FROM frames WHERE id = ?1", [frame_id], |r| r.get(0))
+        .query_row("SELECT uuid FROM frames WHERE id = ?1", [frame_id], |r| {
+            r.get(0)
+        })
         .expect("trigger uuid");
     (frame_id, uuid)
 }
@@ -1925,7 +2335,11 @@ fn insert_frame_at(
 /// receiver journal + per-file rows hang off), or `None` before the announce lands.
 fn inbound_id_of(db: &Database, package_id: &str) -> Option<i64> {
     db.conn()
-        .query_row("SELECT id FROM sync_inbound WHERE package_id = ?1", [package_id], |r| r.get(0))
+        .query_row(
+            "SELECT id FROM sync_inbound WHERE package_id = ?1",
+            [package_id],
+            |r| r.get(0),
+        )
         .ok()
 }
 
@@ -1949,7 +2363,9 @@ fn inbound_file_manifest(db: &Database, inbound_id: i64) -> Vec<(String, i64)> {
             "SELECT rel_path, byte_size FROM sync_inbound_files WHERE inbound_id = {inbound_id} ORDER BY rel_path"
         ))
         .unwrap();
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))).unwrap();
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .unwrap();
     rows.filter_map(|r| r.ok()).collect()
 }
 
@@ -2063,16 +2479,26 @@ async fn manifest_visible_before_payload_then_structured_batch_lands() {
     for p in [&f0, &f1, &f2] {
         frame_ids.push(insert_frame_at(&capture_ctx, p, "M31", 120.0, ImageType::Light, None).0);
     }
-    let expected_rels = ["A/lights/frame_0.fits", "A/lights/frame_1.fits", "B/darks/frame_2.fits"];
+    let expected_rels = [
+        "A/lights/frame_0.fits",
+        "A/lights/frame_1.fits",
+        "B/darks/frame_2.fits",
+    ];
 
     // Hold every fetch aborting BEFORE the enqueue so no payload can complete.
-    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+    receiver_ep.set_fault(FaultPlan {
+        abort_after_bytes: Some(1),
+        ..Default::default()
+    });
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         Some("M31 Lights".to_string()),
         None,
@@ -2119,25 +2545,46 @@ async fn manifest_visible_before_payload_then_structured_batch_lands() {
     );
     let manifest = inbound_file_manifest(pdb, inbound_id);
     let rels: Vec<&str> = manifest.iter().map(|(r, _)| r.as_str()).collect();
-    assert_eq!(rels, expected_rels, "the full nested manifest is announced pre-fetch");
+    assert_eq!(
+        rels, expected_rels,
+        "the full nested manifest is announced pre-fetch"
+    );
     for (_, sz) in &manifest {
         assert!(*sz > 0, "each announced file carries its real byte size");
     }
     // …and NOTHING has been ingested or landed yet.
     let (_st, byte_size, bytes_done) = inbound_row(pdb, &wire).expect("inbound row");
-    assert!(byte_size > 0, "the package byte size is known from the announce");
-    assert_eq!(bytes_done, 0, "no payload bytes counted while the fetch is held");
+    assert!(
+        byte_size > 0,
+        "the package byte size is known from the announce"
+    );
+    assert_eq!(
+        bytes_done, 0,
+        "no payload bytes counted while the fetch is held"
+    );
     assert_eq!(
         count(pdb, &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {inbound_id} AND state = 'done'")),
         0,
         "no file is ingested before the payload moves"
     );
-    assert_eq!(landed_count(&designated), 0, "nothing on disk in the landing tree yet");
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "no frame ingested before the fetch");
+    assert_eq!(
+        landed_count(&designated),
+        0,
+        "nothing on disk in the landing tree yet"
+    );
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM frames"),
+        0,
+        "no frame ingested before the fetch"
+    );
 
     // Phase 2 — release the fetch: the structured batch lands and settles.
     receiver_ep.set_fault(FaultPlan::default());
-    wait_until(|| outbound_state(cdb, latest_outbound_id(cdb)) == "confirmed", WAIT).await;
+    wait_until(
+        || outbound_state(cdb, latest_outbound_id(cdb)) == "confirmed",
+        WAIT,
+    )
+    .await;
     wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 3, WAIT).await;
 
     // Every file landed under `<sender_slug>/M31_Lights/<nested rel_path>`.
@@ -2161,7 +2608,10 @@ async fn manifest_visible_before_payload_then_structured_batch_lands() {
     );
     let (final_state, _bs, final_done) = inbound_row(pdb, &wire).expect("inbound row");
     assert_eq!(final_state, "done", "the inbound row is terminal Done");
-    assert_eq!(final_done, byte_size, "the fetched bytes reached the announced total");
+    assert_eq!(
+        final_done, byte_size,
+        "the fetched bytes reached the announced total"
+    );
 
     engine.shutdown().await;
     receiver.shutdown().await;
@@ -2204,7 +2654,10 @@ async fn restart_resumes_per_file_picture_then_confirms() {
     // Delay the receiver's ack so the sender rests in Delivered (fetch complete,
     // not yet confirmed) long enough to snapshot the resume point and kill the
     // engine before the ack lands.
-    receiver_ep.set_fault(FaultPlan { delay_ack: Some(Duration::from_secs(2)), ..Default::default() });
+    receiver_ep.set_fault(FaultPlan {
+        delay_ack: Some(Duration::from_secs(2)),
+        ..Default::default()
+    });
 
     let (_info, receiver) = SyncReceiver::spawn(
         Arc::clone(&primary_store),
@@ -2233,7 +2686,10 @@ async fn restart_resumes_per_file_picture_then_confirms() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         Some("Resume Batch".to_string()),
         None,
@@ -2246,8 +2702,13 @@ async fn restart_resumes_per_file_picture_then_confirms() {
     // The peer pulled everything (ServeComplete) but has not acked → the row rests
     // Delivered with every file row persisted `uploaded`.
     wait_until(|| outbound_state(cdb, id) == "delivered", WAIT).await;
-    let resume_files = list_transfer_files(&capture_ctx, Direction::Sent, id).expect("list outbound files");
-    assert_eq!(resume_files.len(), N, "all per-file rows present at the resume point");
+    let resume_files =
+        list_transfer_files(&capture_ctx, Direction::Sent, id).expect("list outbound files");
+    assert_eq!(
+        resume_files.len(),
+        N,
+        "all per-file rows present at the resume point"
+    );
     for f in &resume_files {
         assert_eq!(
             f.state.as_deref(),
@@ -2255,7 +2716,11 @@ async fn restart_resumes_per_file_picture_then_confirms() {
             "the per-file picture is persisted `uploaded` at the resume point, not lost: {f:?}"
         );
     }
-    assert_ne!(outbound_state(cdb, id), "confirmed", "not yet confirmed at the resume point");
+    assert_ne!(
+        outbound_state(cdb, id),
+        "confirmed",
+        "not yet confirmed at the resume point"
+    );
 
     // Kill the engine mid-flight and drop the ack delay so the resumed engine's
     // replay ack lands promptly.
@@ -2271,15 +2736,32 @@ async fn restart_resumes_per_file_picture_then_confirms() {
     ));
 
     wait_until(|| outbound_state(cdb, id) == "confirmed", WAIT).await;
-    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
+    wait_until(
+        || count(pdb, "SELECT COUNT(*) FROM frames") == N as i64,
+        WAIT,
+    )
+    .await;
 
-    let final_files = list_transfer_files(&capture_ctx, Direction::Sent, id).expect("list outbound files");
+    let final_files =
+        list_transfer_files(&capture_ctx, Direction::Sent, id).expect("list outbound files");
     assert_eq!(final_files.len(), N);
     for f in &final_files {
-        assert_eq!(f.state.as_deref(), Some("done"), "settled done after resume: {f:?}");
-        assert_eq!(f.outcome.as_deref(), Some("ingested"), "settled ingested after resume: {f:?}");
+        assert_eq!(
+            f.state.as_deref(),
+            Some("done"),
+            "settled done after resume: {f:?}"
+        );
+        assert_eq!(
+            f.outcome.as_deref(),
+            Some("ingested"),
+            "settled ingested after resume: {f:?}"
+        );
     }
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), N as i64, "the peer ingested each frame exactly once");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM files"),
+        N as i64,
+        "the peer ingested each frame exactly once"
+    );
 
     engine_b.shutdown().await;
     receiver.shutdown().await;
@@ -2297,8 +2779,8 @@ fn loopback_engine_builder<'a>(
     net: &'a LoopbackNetwork,
     capture_db: &'a Path,
     sender: &'a Arc<SyncSenderRuntime>,
-) -> impl Fn(NodeId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ApiError>> + 'a>> + 'a
-{
+) -> impl Fn(NodeId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ApiError>> + 'a>>
+       + 'a {
     move |peer: NodeId| {
         let ep = net.endpoint();
         let sender = Arc::clone(sender);
@@ -2313,7 +2795,11 @@ fn loopback_engine_builder<'a>(
             ));
             sender.lock_inner().await.insert(
                 peer,
-                StartedSender { engine, origin_device: origin, peer },
+                StartedSender {
+                    engine,
+                    origin_device: origin,
+                    peer,
+                },
             );
             Ok::<(), ApiError>(())
         })
@@ -2359,7 +2845,10 @@ async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
 
     // Hold the ack so the row rests non-terminal (Delivered) while we simulate the
     // crash + resurrection, then release it so the resumed engine confirms.
-    receiver_ep.set_fault(FaultPlan { delay_ack: Some(Duration::from_secs(3)), ..Default::default() });
+    receiver_ep.set_fault(FaultPlan {
+        delay_ack: Some(Duration::from_secs(3)),
+        ..Default::default()
+    });
 
     let (_info, receiver) = SyncReceiver::spawn(
         Arc::clone(&primary_store),
@@ -2387,7 +2876,10 @@ async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         Some("Orphan Batch".to_string()),
         None,
@@ -2414,7 +2906,11 @@ async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
         .expect("resurrect enumeration ok")
     };
     assert_eq!(built_noop, 0, "an already-started peer is not rebuilt");
-    assert_eq!(guard_calls.load(Ordering::SeqCst), 0, "builder must not run for a live peer");
+    assert_eq!(
+        guard_calls.load(Ordering::SeqCst),
+        0,
+        "builder must not run for a live peer"
+    );
 
     // ── Simulate process death: kill the old engine, stand up a FRESH empty
     // sender runtime over the SAME store (exactly what a relaunch does). ──
@@ -2427,7 +2923,9 @@ async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
         sender2.current_for(&receiver_node).await.is_none(),
         "fresh runtime has no engine for the peer"
     );
-    let pre = get_status(&capture_ctx, &sync2, &sender2).await.expect("status");
+    let pre = get_status(&capture_ctx, &sync2, &sender2)
+        .await
+        .expect("status");
     assert!(
         !pre.sender.active.iter().any(|r| r.id == id),
         "orphaned row is invisible in the active list before resurrection"
@@ -2449,7 +2947,9 @@ async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
     );
 
     // The row is visible-and-active again (the snapshot reads the shared store).
-    let post = get_status(&capture_ctx, &sync2, &sender2).await.expect("status");
+    let post = get_status(&capture_ctx, &sync2, &sender2)
+        .await
+        .expect("status");
     assert!(
         post.sender.active.iter().any(|r| r.id == id),
         "resurrected row is listed active again"
@@ -2458,7 +2958,11 @@ async fn resurrect_rebuilds_orphaned_sender_then_lists_active_and_confirms() {
     // Release the ack: the resumed engine drives the orphaned row to confirmed.
     receiver_ep.set_fault(FaultPlan::default());
     wait_until(|| outbound_state(cdb, id) == "confirmed", WAIT).await;
-    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
+    wait_until(
+        || count(pdb, "SELECT COUNT(*) FROM frames") == N as i64,
+        WAIT,
+    )
+    .await;
     assert_eq!(
         count(pdb, "SELECT COUNT(*) FROM files"),
         N as i64,
@@ -2503,7 +3007,10 @@ async fn cancel_succeeds_on_resurrected_sender_row() {
     let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
 
     // Hold the ack for the whole test so the row stays non-terminal (never confirms).
-    receiver_ep.set_fault(FaultPlan { delay_ack: Some(Duration::from_secs(60)), ..Default::default() });
+    receiver_ep.set_fault(FaultPlan {
+        delay_ack: Some(Duration::from_secs(60)),
+        ..Default::default()
+    });
 
     let (_info, receiver) = SyncReceiver::spawn(
         Arc::clone(&primary_store),
@@ -2530,7 +3037,10 @@ async fn cancel_succeeds_on_resurrected_sender_row() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         Some("Cancel After Restart".to_string()),
         None,
@@ -2562,7 +3072,9 @@ async fn cancel_succeeds_on_resurrected_sender_row() {
     .expect("resurrect ok");
     assert_eq!(built, 1);
 
-    cancel_sync_package(&sender2, id).await.expect("cancel succeeds on the resurrected row");
+    cancel_sync_package(&sender2, id)
+        .await
+        .expect("cancel succeeds on the resurrected row");
     wait_until(|| outbound_state(cdb, id) == "cancelled", WAIT).await;
 
     if let Some((engine_b, _)) = sender2.current_for(&receiver_node).await {
@@ -2609,7 +3121,10 @@ async fn receiver_cancel_records_v2_history_files_and_both_journals() {
     let primary_sync = SyncRuntime::new();
 
     // Hold the payload fetch aborting so no ingest can complete before the cancel.
-    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+    receiver_ep.set_fault(FaultPlan {
+        abort_after_bytes: Some(1),
+        ..Default::default()
+    });
 
     let (_info, receiver) = SyncReceiver::spawn(
         Arc::clone(&primary_store),
@@ -2636,7 +3151,10 @@ async fn receiver_cancel_records_v2_history_files_and_both_journals() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         Some("Cancel Me".to_string()),
         None,
@@ -2650,7 +3168,10 @@ async fn receiver_cancel_records_v2_history_files_and_both_journals() {
     let mut wire = String::new();
     wait_until(
         || {
-            receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+            receiver_ep.set_fault(FaultPlan {
+                abort_after_bytes: Some(1),
+                ..Default::default()
+            });
             match latest_inbound_package_id(pdb) {
                 Some(p) => {
                     wire = p;
@@ -2711,7 +3232,11 @@ async fn receiver_cancel_records_v2_history_files_and_both_journals() {
     );
 
     // No files landed (a declined package lands nothing).
-    assert_eq!(landed_count(&designated), 0, "a declined package lands no files");
+    assert_eq!(
+        landed_count(&designated),
+        0,
+        "a declined package lands no files"
+    );
 
     engine.shutdown().await;
     receiver.shutdown().await;
@@ -2785,7 +3310,10 @@ async fn ack_timeout_waiting_then_recovery_clears_error_at_serving_stage() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         Some("Retry Batch".to_string()),
         None,
@@ -2810,21 +3338,32 @@ async fn ack_timeout_waiting_then_recovery_clears_error_at_serving_stage() {
         "the ack timeout is recorded as the (transient) last_error"
     );
     let kinds = journal_kinds(cdb, "sent", id);
-    assert!(kinds.contains(&"ack_timeout".to_string()), "ack_timeout journalled: {kinds:?}");
-    assert!(kinds.contains(&"retry_scheduled".to_string()), "retry_scheduled journalled: {kinds:?}");
+    assert!(
+        kinds.contains(&"ack_timeout".to_string()),
+        "ack_timeout journalled: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"retry_scheduled".to_string()),
+        "retry_scheduled journalled: {kinds:?}"
+    );
 
     // …and `get_status` presents it as a neutral `waiting` with a stall deadline —
     // polled so it catches the (single) backoff window while it is open.
     {
         let deadline = Instant::now() + WAIT;
         loop {
-            let st = get_status(&capture_ctx, &sync, &sender).await.expect("get_status");
+            let st = get_status(&capture_ctx, &sync, &sender)
+                .await
+                .expect("get_status");
             if let Some(row) = st.sender.active.iter().find(|r| r.id == id) {
                 if row.display_state == "waiting" && row.stalled_until.is_some() {
                     break;
                 }
             }
-            assert!(Instant::now() < deadline, "never saw displayState waiting with a stall deadline");
+            assert!(
+                Instant::now() < deadline,
+                "never saw displayState waiting with a stall deadline"
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -2842,12 +3381,30 @@ async fn ack_timeout_waiting_then_recovery_clears_error_at_serving_stage() {
 
     // …then the transfer confirms with a clean summary + journal.
     wait_until(|| outbound_state(cdb, id) == "confirmed", WAIT).await;
-    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
-    assert_eq!(outbound_last_error(cdb, id), None, "a confirmed transfer carries no stale reason");
+    wait_until(
+        || count(pdb, "SELECT COUNT(*) FROM frames") == N as i64,
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        outbound_last_error(cdb, id),
+        None,
+        "a confirmed transfer carries no stale reason"
+    );
     let kinds = journal_kinds(cdb, "sent", id);
-    assert!(kinds.contains(&"ack_received".to_string()), "ack_received journalled: {kinds:?}");
-    assert!(kinds.contains(&"confirmed".to_string()), "confirmed journalled: {kinds:?}");
-    assert_eq!(landed_count(&designated), N, "the recovered transfer delivered every frame");
+    assert!(
+        kinds.contains(&"ack_received".to_string()),
+        "ack_received journalled: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"confirmed".to_string()),
+        "confirmed journalled: {kinds:?}"
+    );
+    assert_eq!(
+        landed_count(&designated),
+        N,
+        "the recovered transfer delivered every frame"
+    );
 
     engine.shutdown().await;
     receiver.shutdown().await;
@@ -2913,18 +3470,35 @@ async fn wbpp_object_send_lands_identical_tree_on_both_sides() {
     {
         let db = capture_ctx.db.get().unwrap();
         let conn = db.conn();
-        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", []).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'M31')", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time) VALUES (10, 1, '2025-10-12', '2025-10-13')",
             [],
         )
         .unwrap();
-        conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')",
+            [],
+        )
+        .unwrap();
         for fid in [lf1, lf2] {
-            conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)", [fid]).unwrap();
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (100, ?1)",
+                [fid],
+            )
+            .unwrap();
         }
-        conn.execute("INSERT INTO calibration_set (id, imagetyp, date) VALUES (500, 'Dark', '2025-10-10')", []).unwrap();
-        conn.execute("INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (500, ?1)", [df]).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date) VALUES (500, 'Dark', '2025-10-10')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (500, ?1)",
+            [df],
+        )
+        .unwrap();
         for fid in [lf1, lf2] {
             conn.execute(
                 "INSERT INTO calibration_set_to_frames (source_id, source_type, calibration_set_id, calibration_type, matched_at) VALUES (?1, 'frame', 500, 'Dark', '2025-10-12')",
@@ -2942,7 +3516,10 @@ async fn wbpp_object_send_lands_identical_tree_on_both_sides() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         vec![lf1, lf2, df],
         None,
         Some(1),
@@ -2951,7 +3528,11 @@ async fn wbpp_object_send_lands_identical_tree_on_both_sides() {
     .await
     .expect("object send");
 
-    wait_until(|| outbound_state(cdb, latest_outbound_id(cdb)) == "confirmed", WAIT).await;
+    wait_until(
+        || outbound_state(cdb, latest_outbound_id(cdb)) == "confirmed",
+        WAIT,
+    )
+    .await;
     wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 3, WAIT).await;
 
     let out_id = latest_outbound_id(cdb);
@@ -2971,7 +3552,10 @@ async fn wbpp_object_send_lands_identical_tree_on_both_sides() {
         .collect();
     sent_rels.sort();
     recv_rels.sort();
-    assert_eq!(sent_rels, recv_rels, "sender and receiver agree on the whole structured tree");
+    assert_eq!(
+        sent_rels, recv_rels,
+        "sender and receiver agree on the whole structured tree"
+    );
 
     // The WBPP object-send layout, including the calibration (DARKS) level.
     let expected = {
@@ -2983,7 +3567,10 @@ async fn wbpp_object_send_lands_identical_tree_on_both_sides() {
         e.sort();
         e
     };
-    assert_eq!(sent_rels, expected, "WBPP rel_paths carry the camera + calibration + lights levels");
+    assert_eq!(
+        sent_rels, expected,
+        "WBPP rel_paths carry the camera + calibration + lights levels"
+    );
 
     // The receiver disk tree mirrors `<batch=M31>/camera_C/DARKS_500/…`.
     let landed = landed_paths(&designated);
@@ -3043,9 +3630,15 @@ struct SwitchableResponder {
 impl DedupResponder for SwitchableResponder {
     fn want_for_offer(&self, entries: &[OfferEntry]) -> (Vec<String>, Vec<String>) {
         if self.all_duplicate.load(Ordering::SeqCst) {
-            (Vec::new(), entries.iter().map(|e| e.rel_path.clone()).collect())
+            (
+                Vec::new(),
+                entries.iter().map(|e| e.rel_path.clone()).collect(),
+            )
         } else {
-            (entries.iter().map(|e| e.rel_path.clone()).collect(), Vec::new())
+            (
+                entries.iter().map(|e| e.rel_path.clone()).collect(),
+                Vec::new(),
+            )
         }
     }
     fn confirm_full_hashes(&self, _entries: &[FullHashEntry]) -> Vec<String> {
@@ -3057,7 +3650,11 @@ impl DedupResponder for SwitchableResponder {
 /// bumped ONLY by a resend (never by an announce-retry, which bumps `attempts`).
 fn outbound_generation(db: &Database, id: i64) -> i64 {
     db.conn()
-        .query_row("SELECT generation FROM sync_outbound WHERE id = ?1", [id], |r| r.get(0))
+        .query_row(
+            "SELECT generation FROM sync_outbound WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
         .expect("outbound row present")
 }
 
@@ -3065,7 +3662,11 @@ fn outbound_generation(db: &Database, id: i64) -> i64 {
 /// the same `(peer, batch_uuid)`.
 fn inbound_generation(db: &Database, inbound_id: i64) -> i64 {
     db.conn()
-        .query_row("SELECT generation FROM sync_inbound WHERE id = ?1", [inbound_id], |r| r.get(0))
+        .query_row(
+            "SELECT generation FROM sync_inbound WHERE id = ?1",
+            [inbound_id],
+            |r| r.get(0),
+        )
         .expect("inbound row present")
 }
 
@@ -3073,9 +3674,11 @@ fn inbound_generation(db: &Database, inbound_id: i64) -> i64 {
 /// receiver holds one long-lived row on (constant across a resend's wire rotation).
 fn inbound_batch_uuid(db: &Database, inbound_id: i64) -> Option<String> {
     db.conn()
-        .query_row("SELECT batch_uuid FROM sync_inbound WHERE id = ?1", [inbound_id], |r| {
-            r.get::<_, Option<String>>(0)
-        })
+        .query_row(
+            "SELECT batch_uuid FROM sync_inbound WHERE id = ?1",
+            [inbound_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
         .ok()
         .flatten()
 }
@@ -3085,9 +3688,11 @@ fn inbound_batch_uuid(db: &Database, inbound_id: i64) -> Option<String> {
 /// `InboundSummary.last_error` surfaces (B5b).
 fn inbound_last_error(db: &Database, package_id: &str) -> Option<String> {
     db.conn()
-        .query_row("SELECT last_error FROM sync_inbound WHERE package_id = ?1", [package_id], |r| {
-            r.get::<_, Option<String>>(0)
-        })
+        .query_row(
+            "SELECT last_error FROM sync_inbound WHERE package_id = ?1",
+            [package_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
         .ok()
         .flatten()
 }
@@ -3095,7 +3700,11 @@ fn inbound_last_error(db: &Database, package_id: &str) -> Option<String> {
 /// The on-disk payload dir (`sync_outbound.package_ref`) for an outbound row.
 fn outbound_package_ref(db: &Database, id: i64) -> String {
     db.conn()
-        .query_row("SELECT package_ref FROM sync_outbound WHERE id = ?1", [id], |r| r.get(0))
+        .query_row(
+            "SELECT package_ref FROM sync_outbound WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
         .expect("outbound row present")
 }
 
@@ -3103,7 +3712,11 @@ fn outbound_package_ref(db: &Database, id: i64) -> String {
 /// per-attempt id a resend rotates.
 fn outbound_wire_id(db: &Database, id: i64) -> String {
     db.conn()
-        .query_row("SELECT wire_package_id FROM sync_outbound WHERE id = ?1", [id], |r| r.get(0))
+        .query_row(
+            "SELECT wire_package_id FROM sync_outbound WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
         .expect("outbound row present")
 }
 
@@ -3116,7 +3729,12 @@ async fn inject_sender_engine_with_emitter(
     peer: NodeId,
     ack_timeout: Duration,
     emitter: Arc<dyn ProgressEmitter>,
-) -> (Arc<SyncEngineHandle>, Arc<SyncSenderRuntime>, Arc<SyncSenderRuntime>, SyncRuntime) {
+) -> (
+    Arc<SyncEngineHandle>,
+    Arc<SyncSenderRuntime>,
+    Arc<SyncSenderRuntime>,
+    SyncRuntime,
+) {
     let sender_ep = net.endpoint();
     let sender_node = sender_ep.node_id();
     let engine_store = Arc::new(CatalogSyncStore::open(capture_db).unwrap());
@@ -3134,7 +3752,11 @@ async fn inject_sender_engine_with_emitter(
         let mut guard = sender.lock_inner().await;
         guard.insert(
             peer,
-            StartedSender { engine: Arc::clone(&engine), origin_device: node_id_hex(&sender_node), peer },
+            StartedSender {
+                engine: Arc::clone(&engine),
+                origin_device: node_id_hex(&sender_node),
+                peer,
+            },
         );
     }
     (engine, sender, collab_sender, sync)
@@ -3183,7 +3805,10 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
     let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
 
     // Pace the fetch so it is genuinely mid-flight when we fire the sender cancel.
-    receiver_ep.set_fault(FaultPlan { delay_per_read: Some(DELAY), ..Default::default() });
+    receiver_ep.set_fault(FaultPlan {
+        delay_per_read: Some(DELAY),
+        ..Default::default()
+    });
 
     // A recording emitter on the RECEIVER: the revoke path's terminal `sync-finished`
     // is the observable the Transfers widget dismisses a row on.
@@ -3215,7 +3840,10 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         Some("Cancel Mid-Fetch".to_string()),
         None,
@@ -3243,11 +3871,17 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
         WAIT,
     )
     .await;
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "no frame ingested while the fetch is paced");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM frames"),
+        0,
+        "no frame ingested while the fetch is paced"
+    );
 
     // Fire the SENDER cancel.
     let fired = Instant::now();
-    cancel_sync_package(&sender, out_id).await.expect("cancel the sending package");
+    cancel_sync_package(&sender, out_id)
+        .await
+        .expect("cancel the sending package");
 
     // The receiver's in-flight fetch aborts and its row terminalizes `cancelled`
     // ("by sender") WITHIN the deadline — well under the uninterrupted fetch time.
@@ -3267,8 +3901,16 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
         Some("by sender"),
         "the receiver records the sender-revoke reason"
     );
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "a sender-cancelled transfer lands no frames");
-    assert_eq!(landed_count(&designated), 0, "nothing on disk in the landing tree");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM frames"),
+        0,
+        "a sender-cancelled transfer lands no frames"
+    );
+    assert_eq!(
+        landed_count(&designated),
+        0,
+        "nothing on disk in the landing tree"
+    );
 
     // Staging cleaned (handle_revoke teardown) + in-flight tags released. The
     // loopback fetch never SEEDS an in-flight tag (only the cfg(test) seeder does, out
@@ -3277,7 +3919,10 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
     // the B7 unit `in_flight_tag_list_and_release_honor_the_transfer_namespace`.
     let staging = primary_dir.join("staging").join(&wire);
     wait_until(|| !staging.exists(), ABORT_DEADLINE).await;
-    assert!(!staging.exists(), "the partially-fetched staging dir is fully cleaned on revoke");
+    assert!(
+        !staging.exists(),
+        "the partially-fetched staging dir is fully cleaned on revoke"
+    );
     assert!(
         receiver_ep.list_in_flight_tags().await.unwrap().is_empty(),
         "no receiver in-flight tags remain after the revoke release"
@@ -3288,14 +3933,29 @@ async fn sender_cancel_aborts_receiver_fetch_promptly_and_revokes_both() {
 
     // Both journals carry the revoke crumbs: sent → revoke_sent, received → revoked.
     let sent_kinds = journal_kinds(cdb, "sent", out_id);
-    assert!(sent_kinds.contains(&"revoke_sent".to_string()), "sent journal records revoke_sent: {sent_kinds:?}");
+    assert!(
+        sent_kinds.contains(&"revoke_sent".to_string()),
+        "sent journal records revoke_sent: {sent_kinds:?}"
+    );
     let in_id = inbound_id_of(pdb, &wire).expect("inbound row id");
     let recv_kinds = journal_kinds(pdb, "received", in_id);
-    assert!(recv_kinds.contains(&"revoked".to_string()), "received journal records revoked: {recv_kinds:?}");
+    assert!(
+        recv_kinds.contains(&"revoked".to_string()),
+        "received journal records revoked: {recv_kinds:?}"
+    );
 
     // The revoke path emitted a single terminal `sync-finished` whose outcome matches
     // the row (`cancelled`).
-    wait_until(|| recorder.received_finished().iter().any(|(o, _)| o == "cancelled"), WAIT).await;
+    wait_until(
+        || {
+            recorder
+                .received_finished()
+                .iter()
+                .any(|(o, _)| o == "cancelled")
+        },
+        WAIT,
+    )
+    .await;
     let rf = recorder.received_finished();
     assert!(
         rf.iter().any(|(o, _)| o == "cancelled"),
@@ -3389,7 +4049,10 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids[0..2].to_vec(),
         Some("Pre-seed".to_string()),
         None,
@@ -3398,17 +4061,32 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
     .await
     .expect("pre-seed enqueue");
     wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == 2, WAIT).await;
-    wait_until(|| count(pdb, "SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL") == 2, WAIT).await;
+    wait_until(
+        || {
+            count(
+                pdb,
+                "SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL",
+            ) == 2
+        },
+        WAIT,
+    )
+    .await;
 
     // ── The batch: {0,1,2,3,4}. Negotiate drops {0,1} (dupes) → Want {2,3,4}. Arm a
     // one-shot abort so attempt-1's fetch of that subset aborts → inbound row failed. ──
-    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+    receiver_ep.set_fault(FaultPlan {
+        abort_after_bytes: Some(1),
+        ..Default::default()
+    });
     enqueue_sync_selection(
         &capture_ctx,
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         Some("Resend Into One Row".to_string()),
         None,
@@ -3432,14 +4110,21 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
     let wire_attempt1 = latest_inbound_package_id(pdb).expect("batch inbound wire (attempt 1)");
     let in_id = inbound_id_of(pdb, &wire_attempt1).expect("batch inbound row id");
     let batch_uuid = inbound_batch_uuid(pdb, in_id).expect("batch inbound batch_uuid");
-    assert_eq!(inbound_generation(pdb, in_id), 1, "the batch inbound row is at generation 1 after attempt 1");
+    assert_eq!(
+        inbound_generation(pdb, in_id),
+        1,
+        "the batch inbound row is at generation 1 after attempt 1"
+    );
 
     // ── Drive the sender terminal via the fail path: rename the payload away, kick a
     // re-attempt (missing-payload → `Failed`), then restore it. ──
     let pkg_ref = outbound_package_ref(cdb, out_id);
     let stashed = format!("{pkg_ref}.stashed");
     std::fs::rename(&pkg_ref, &stashed).expect("stash the payload dir");
-    engine.kick(out_id).await.expect("kick a re-attempt onto the missing payload");
+    engine
+        .kick(out_id)
+        .await
+        .expect("kick a re-attempt onto the missing payload");
     wait_until(|| outbound_state(cdb, out_id) == "failed", WAIT).await;
     assert_eq!(
         outbound_last_error(cdb, out_id).as_deref(),
@@ -3461,15 +4146,29 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
         Some("sender failed"),
         "the revoke's reason is recorded, not a stale fetch error"
     );
-    assert_eq!(inbound_generation(pdb, in_id), 1, "no stray re-announce bumped the inbound generation before the resend");
+    assert_eq!(
+        inbound_generation(pdb, in_id),
+        1,
+        "no stray re-announce bumped the inbound generation before the resend"
+    );
     std::fs::rename(&stashed, &pkg_ref).expect("restore the payload dir");
 
     // ── Resend: rotates the wire id (generation 2) and re-drives; the one-shot abort
     // already fired, so this fetch delivers. ──
-    let resend_id = retry_sync_package(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, out_id, None)
-        .await
-        .expect("resend the failed transfer");
-    assert_eq!(resend_id, out_id, "resend-as-reset returns the SAME outbound row");
+    let resend_id = retry_sync_package(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        out_id,
+        None,
+    )
+    .await
+    .expect("resend the failed transfer");
+    assert_eq!(
+        resend_id, out_id,
+        "resend-as-reset returns the SAME outbound row"
+    );
     let wire_resend = outbound_wire_id(cdb, out_id);
     assert_ne!(wire_resend, wire_attempt1, "the resend rotates the wire id");
 
@@ -3478,11 +4177,30 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
 
     // ── The batch delivered into the SAME inbound row (id + batch_uuid constant),
     // generation 2, only the missing subset travelled. ──
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 2, "still just the pre-seed row + the ONE batch row");
-    assert_eq!(inbound_id_of(pdb, &wire_resend), Some(in_id), "the resend maps onto the SAME inbound row id");
-    assert_eq!(inbound_batch_uuid(pdb, in_id).as_deref(), Some(batch_uuid.as_str()), "batch_uuid is constant across attempts");
-    assert_eq!(inbound_generation(pdb, in_id), 2, "the receiver row is at generation 2 (reset exactly once, by the resend)");
-    assert!(matches!(inbound_row(pdb, &wire_resend), Some((s, _, _)) if s == "done"), "the batch inbound row is terminal Done");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM sync_inbound"),
+        2,
+        "still just the pre-seed row + the ONE batch row"
+    );
+    assert_eq!(
+        inbound_id_of(pdb, &wire_resend),
+        Some(in_id),
+        "the resend maps onto the SAME inbound row id"
+    );
+    assert_eq!(
+        inbound_batch_uuid(pdb, in_id).as_deref(),
+        Some(batch_uuid.as_str()),
+        "batch_uuid is constant across attempts"
+    );
+    assert_eq!(
+        inbound_generation(pdb, in_id),
+        2,
+        "the receiver row is at generation 2 (reset exactly once, by the resend)"
+    );
+    assert!(
+        matches!(inbound_row(pdb, &wire_resend), Some((s, _, _)) if s == "done"),
+        "the batch inbound row is terminal Done"
+    );
 
     // Only the 3 MISSING frames travelled: exactly the {2,3,4} per-file rows settled
     // done/ingested, and the 2 pre-seeded {0,1} were dedup-dropped by the sender
@@ -3511,6 +4229,33 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
         );
     }
 
+    // The announce describes THIS ATTEMPT and nothing else: the file list, the
+    // frame_count and the byte_size all cover the negotiated subset, so the
+    // receiver's counter can actually reach its own total. Before this held, the
+    // manifest went out in FULL while frame_count was already the subset, and the
+    // deduped rows sat `announced` forever — a finished transfer read "3 of 5".
+    assert_eq!(
+        count(
+            pdb,
+            &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {in_id}")
+        ),
+        3,
+        "one row per file of the attempt, not of the full manifest"
+    );
+    assert_eq!(
+        count(pdb, &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {in_id} AND state = 'announced'")),
+        0,
+        "nothing is left stranded `announced` — every announced file travelled"
+    );
+    assert_eq!(
+        count(
+            pdb,
+            &format!("SELECT frame_count FROM sync_inbound WHERE id = {in_id}")
+        ),
+        3,
+        "and the row's frame_count agrees with its file rows"
+    );
+
     // B5b at e2e: every received history row keys on the durable batch_uuid, NONE on a
     // wire id (no phantom wire-keyed groups across the resend).
     assert_eq!(
@@ -3524,15 +4269,42 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
     );
 
     // Generation 2 in BOTH summaries (list_terminal_transfers), attempts >= generation.
-    assert_eq!(outbound_generation(cdb, out_id), 2, "sender outbound at generation 2");
-    assert!(outbound_attempts(cdb, out_id) >= outbound_generation(cdb, out_id), "attempts >= generation");
-    let terminal_sent = list_terminal_transfers(&capture_ctx, None).expect("sender terminal transfers");
-    let sent_sum = terminal_sent.sent.iter().find(|s| s.id == out_id).expect("sender summary present");
-    assert_eq!(sent_sum.state.as_str(), "confirmed", "sender summary is confirmed");
-    assert_eq!(sent_sum.generation, 2, "sender summary carries generation 2");
-    let terminal_recv = list_terminal_transfers(&primary_ctx, None).expect("receiver terminal transfers");
-    let recv_sum = terminal_recv.received.iter().find(|s| s.id == in_id).expect("receiver summary present");
-    assert_eq!(recv_sum.generation, 2, "receiver summary carries generation 2");
+    assert_eq!(
+        outbound_generation(cdb, out_id),
+        2,
+        "sender outbound at generation 2"
+    );
+    assert!(
+        outbound_attempts(cdb, out_id) >= outbound_generation(cdb, out_id),
+        "attempts >= generation"
+    );
+    let terminal_sent =
+        list_terminal_transfers(&capture_ctx, None).expect("sender terminal transfers");
+    let sent_sum = terminal_sent
+        .sent
+        .iter()
+        .find(|s| s.id == out_id)
+        .expect("sender summary present");
+    assert_eq!(
+        sent_sum.state.as_str(),
+        "confirmed",
+        "sender summary is confirmed"
+    );
+    assert_eq!(
+        sent_sum.generation, 2,
+        "sender summary carries generation 2"
+    );
+    let terminal_recv =
+        list_terminal_transfers(&primary_ctx, None).expect("receiver terminal transfers");
+    let recv_sum = terminal_recv
+        .received
+        .iter()
+        .find(|s| s.id == in_id)
+        .expect("receiver summary present");
+    assert_eq!(
+        recv_sum.generation, 2,
+        "receiver summary carries generation 2"
+    );
 
     // The resend's send-side `sync-finished` shows the strict-subset split (new=3,
     // dup=2); it is the LAST finished (the middle (0,0) is the fail's terminal emit).
@@ -3590,8 +4362,9 @@ async fn all_duplicate_after_announce_supersedes_stuck_receiver_row() {
     let net = LoopbackNetwork::new();
     let primary_store = Arc::new(CatalogSyncStore::open(&primary_db).unwrap());
     let all_dup = Arc::new(AtomicBool::new(false));
-    let responder: Arc<dyn DedupResponder> =
-        Arc::new(SwitchableResponder { all_duplicate: Arc::clone(&all_dup) });
+    let responder: Arc<dyn DedupResponder> = Arc::new(SwitchableResponder {
+        all_duplicate: Arc::clone(&all_dup),
+    });
     let receiver_ep = Arc::new(net.endpoint_with_responder(responder));
     let receiver_node = receiver_ep.node_id();
 
@@ -3600,7 +4373,10 @@ async fn all_duplicate_after_announce_supersedes_stuck_receiver_row() {
     let incoming = incoming_resolver_for(&primary_ctx, primary_dir.join("incoming"));
 
     // Hold every fetch so session 1's row rests `fetching`, nothing ingests.
-    receiver_ep.set_fault(FaultPlan { delay_per_read: Some(HOLD), ..Default::default() });
+    receiver_ep.set_fault(FaultPlan {
+        delay_per_read: Some(HOLD),
+        ..Default::default()
+    });
 
     let (_info, receiver) = SyncReceiver::spawn(
         Arc::clone(&primary_store),
@@ -3628,7 +4404,10 @@ async fn all_duplicate_after_announce_supersedes_stuck_receiver_row() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         Some("Superseded Race".to_string()),
         None,
@@ -3661,7 +4440,10 @@ async fn all_duplicate_after_announce_supersedes_stuck_receiver_row() {
     // kept the payload present) and resting inside the long per-read sleep — the safe
     // kill point where the superseded revoke's abort lands mid-sleep, before the next
     // file-open would trip over the payload engine2 cleans.
-    let staged_file0 = primary_dir.join("staging").join(&w1).join("light_0000.fits");
+    let staged_file0 = primary_dir
+        .join("staging")
+        .join(&w1)
+        .join("light_0000.fits");
     wait_until(|| staged_file0.exists(), WAIT).await;
 
     // Peer now holds everything; kill session 1 (row stays non-terminal; the fetch is
@@ -3681,7 +4463,11 @@ async fn all_duplicate_after_announce_supersedes_stuck_receiver_row() {
     ));
 
     wait_until(|| outbound_state(cdb, id) == "confirmed", WAIT).await;
-    wait_until(|| matches!(inbound_row(pdb, &w1), Some((s, _, _)) if s == "done"), WAIT).await;
+    wait_until(
+        || matches!(inbound_row(pdb, &w1), Some((s, _, _)) if s == "done"),
+        WAIT,
+    )
+    .await;
 
     // The superseded revoke closed the row honestly (`done`, "superseded"), nothing
     // landed, and the received journal records the revoke — proof `handle_revoke`
@@ -3695,15 +4481,26 @@ async fn all_duplicate_after_announce_supersedes_stuck_receiver_row() {
         journal_kinds(pdb, "received", in_id).contains(&"revoked".to_string()),
         "the received journal records the revoke (handle_revoke ran on a non-terminal row)"
     );
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "the superseded receiver ingested nothing");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM frames"),
+        0,
+        "the superseded receiver ingested nothing"
+    );
     assert_eq!(landed_count(&designated), 0, "nothing landed on disk");
     // No stuck announced/fetching row remains; exactly one inbound row, terminal.
     assert_eq!(
-        count(pdb, "SELECT COUNT(*) FROM sync_inbound WHERE state IN ('announced', 'fetching')"),
+        count(
+            pdb,
+            "SELECT COUNT(*) FROM sync_inbound WHERE state IN ('announced', 'fetching')"
+        ),
         0,
         "no stuck announced/fetching inbound row remains"
     );
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 1, "exactly one inbound row (the superseded one)");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM sync_inbound"),
+        1,
+        "exactly one inbound row (the superseded one)"
+    );
     // The sender emitted the F3-orphan-closing Revoke{Superseded} (crash-resume path).
     assert!(
         journal_kinds(cdb, "sent", id).contains(&"revoke_sent".to_string()),
@@ -3762,7 +4559,10 @@ async fn restart_mid_resend_resumes_same_row_and_confirms() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         Some("Restart Mid-Resend".to_string()),
         None,
@@ -3773,24 +4573,53 @@ async fn restart_mid_resend_resumes_same_row_and_confirms() {
     let id = latest_outbound_id(cdb);
 
     // The package retries against the offline peer (non-terminal); no announce lands.
-    wait_until(|| outbound_attempts(cdb, id) >= 2 && !is_terminal_state(&outbound_state(cdb, id)), WAIT).await;
-    assert_eq!(outbound_generation(cdb, id), 1, "a fresh enqueue is at generation 1");
+    wait_until(
+        || outbound_attempts(cdb, id) >= 2 && !is_terminal_state(&outbound_state(cdb, id)),
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        outbound_generation(cdb, id),
+        1,
+        "a fresh enqueue is at generation 1"
+    );
 
     // Cancel (sender-side, peer never started → no revoke, no receiver row).
-    cancel_sync_package(&sender, id).await.expect("cancel the offline package");
+    cancel_sync_package(&sender, id)
+        .await
+        .expect("cancel the offline package");
     wait_until(|| outbound_state(cdb, id) == "cancelled", WAIT).await;
 
     // Resend → the SAME row, generation 2, re-driving (still offline).
-    let resend_id = retry_sync_package(&capture_ctx, &sender, Arc::clone(&collab_sender), &sync, id, None)
-        .await
-        .expect("resend the cancelled package");
+    let resend_id = retry_sync_package(
+        &capture_ctx,
+        &sender,
+        Arc::clone(&collab_sender),
+        &sync,
+        id,
+        None,
+    )
+    .await
+    .expect("resend the cancelled package");
     assert_eq!(resend_id, id, "resend-as-reset returns the SAME row");
-    wait_until(|| outbound_generation(cdb, id) == 2 && !is_terminal_state(&outbound_state(cdb, id)), WAIT).await;
-    assert_eq!(outbound_generation(cdb, id), 2, "the resend advanced the row to generation 2");
+    wait_until(
+        || outbound_generation(cdb, id) == 2 && !is_terminal_state(&outbound_state(cdb, id)),
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        outbound_generation(cdb, id),
+        2,
+        "the resend advanced the row to generation 2"
+    );
 
     // Kill the engine mid-resend (peer still offline → nothing has confirmed).
     engine1.shutdown().await;
-    assert_ne!(outbound_state(cdb, id), "confirmed", "not confirmed at the kill point — the resend is genuinely mid-flight");
+    assert_ne!(
+        outbound_state(cdb, id),
+        "confirmed",
+        "not confirmed at the kill point — the resend is genuinely mid-flight"
+    );
 
     // Bring the receiver online, THEN stand up a fresh engine over the SAME store: its
     // crash-resume re-drives the persisted gen-2 row and, with the peer now reachable,
@@ -3815,16 +4644,43 @@ async fn restart_mid_resend_resumes_same_row_and_confirms() {
     ));
 
     wait_until(|| outbound_state(cdb, id) == "confirmed", WAIT).await;
-    wait_until(|| count(pdb, "SELECT COUNT(*) FROM frames") == N as i64, WAIT).await;
+    wait_until(
+        || count(pdb, "SELECT COUNT(*) FROM frames") == N as i64,
+        WAIT,
+    )
+    .await;
 
     // SAME row id, generation UNCHANGED by the restart (still 2), and the receiver
     // holds exactly ONE inbound row.
-    assert_eq!(count(cdb, "SELECT COUNT(*) FROM sync_outbound"), 1, "still exactly one outbound row (resend-as-reset, no new row)");
-    assert_eq!(outbound_generation(cdb, id), 2, "the restart did NOT bump generation (only a resend does)");
-    assert!(outbound_attempts(cdb, id) >= outbound_generation(cdb, id), "attempts >= generation");
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM sync_inbound"), 1, "the receiver holds exactly one inbound row");
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM files"), N as i64, "the peer ingested each frame exactly once");
-    assert_eq!(landed_count(&designated), N, "all frames landed under the designated root");
+    assert_eq!(
+        count(cdb, "SELECT COUNT(*) FROM sync_outbound"),
+        1,
+        "still exactly one outbound row (resend-as-reset, no new row)"
+    );
+    assert_eq!(
+        outbound_generation(cdb, id),
+        2,
+        "the restart did NOT bump generation (only a resend does)"
+    );
+    assert!(
+        outbound_attempts(cdb, id) >= outbound_generation(cdb, id),
+        "attempts >= generation"
+    );
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM sync_inbound"),
+        1,
+        "the receiver holds exactly one inbound row"
+    );
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM files"),
+        N as i64,
+        "the peer ingested each frame exactly once"
+    );
+    assert_eq!(
+        landed_count(&designated),
+        N,
+        "all frames landed under the designated root"
+    );
 
     engine2.shutdown().await;
     receiver.shutdown().await;
@@ -3890,7 +4746,10 @@ async fn delete_transfer_history_reclaims_batch_and_leaves_foreign_batch() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids[0..3].to_vec(),
         Some("Batch One".to_string()),
         None,
@@ -3910,7 +4769,10 @@ async fn delete_transfer_history_reclaims_batch_and_leaves_foreign_batch() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids[3..5].to_vec(),
         Some("Batch Two".to_string()),
         None,
@@ -3926,62 +4788,166 @@ async fn delete_transfer_history_reclaims_batch_and_leaves_foreign_batch() {
 
     // Batch 1's delete key (== the package-dir basename == its batch_uuid, B1 seam).
     let pkg_ref_1 = outbound_package_ref(cdb, out_id_1);
-    let batch_key_1 =
-        Path::new(&pkg_ref_1).file_name().unwrap().to_string_lossy().to_string();
+    let batch_key_1 = Path::new(&pkg_ref_1)
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     let payload_dir_1 = PathBuf::from(&pkg_ref_1);
 
     // A foreign-namespace survivor seeded into the sender catalog: a `frames_set`
     // unrelated to any transfer — the delete must not touch it (DB-namespace scoping).
     cdb.conn()
-        .execute("INSERT INTO frames_set (id, name) VALUES (777, 'Foreign Keep')", [])
+        .execute(
+            "INSERT INTO frames_set (id, name) VALUES (777, 'Foreign Keep')",
+            [],
+        )
         .unwrap();
 
     // Storage before: two manifest-only payload dirs on the sender.
     let storage_before = get_transfer_storage(&capture_ctx).expect("transfer storage before");
-    assert!(storage_before.packages_count >= 2, "both confirmed transfers keep a (manifest-only) payload dir");
-    assert!(storage_before.packages_bytes > 0, "the manifest-only payload dirs carry bytes");
-    assert!(payload_dir_1.exists(), "batch 1's payload dir is present before the delete");
+    assert!(
+        storage_before.packages_count >= 2,
+        "both confirmed transfers keep a (manifest-only) payload dir"
+    );
+    assert!(
+        storage_before.packages_bytes > 0,
+        "the manifest-only payload dirs carry bytes"
+    );
+    assert!(
+        payload_dir_1.exists(),
+        "batch 1's payload dir is present before the delete"
+    );
 
     // ── Delete batch 1 both directions. ──
     let del_sync = SyncRuntime::new();
-    let deleted_sent = delete_transfer_history(&capture_ctx, &del_sync, Direction::Sent, batch_key_1.clone())
-        .await
-        .expect("delete sent batch 1");
-    let deleted_recv = delete_transfer_history(&primary_ctx, &del_sync, Direction::Received, batch_key_1.clone())
-        .await
-        .expect("delete received batch 1");
+    let deleted_sent = delete_transfer_history(
+        &capture_ctx,
+        &del_sync,
+        Direction::Sent,
+        batch_key_1.clone(),
+    )
+    .await
+    .expect("delete sent batch 1");
+    let deleted_recv = delete_transfer_history(
+        &primary_ctx,
+        &del_sync,
+        Direction::Received,
+        batch_key_1.clone(),
+    )
+    .await
+    .expect("delete received batch 1");
     assert_eq!(deleted_sent.rows, 1, "one sent row deleted");
     assert_eq!(deleted_recv.rows, 1, "one received row deleted");
     assert!(deleted_sent.history >= 3, "batch 1's sent history removed");
-    assert!(deleted_recv.history >= 3, "batch 1's received history removed");
+    assert!(
+        deleted_recv.history >= 3,
+        "batch 1's received history removed"
+    );
 
     // Batch 1: rows / files / events / history all gone; sender payload dir removed;
     // receiver in-flight tags absent.
-    assert_eq!(count(cdb, &format!("SELECT COUNT(*) FROM sync_outbound WHERE id = {out_id_1}")), 0, "sent row gone");
-    assert_eq!(count(pdb, &format!("SELECT COUNT(*) FROM sync_inbound WHERE id = {in_id_1}")), 0, "received row gone");
-    assert_eq!(count(cdb, &format!("SELECT COUNT(*) FROM sync_outbound_files WHERE outbound_id = {out_id_1}")), 0, "sent files gone");
-    assert_eq!(count(pdb, &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {in_id_1}")), 0, "received files gone");
+    assert_eq!(
+        count(
+            cdb,
+            &format!("SELECT COUNT(*) FROM sync_outbound WHERE id = {out_id_1}")
+        ),
+        0,
+        "sent row gone"
+    );
+    assert_eq!(
+        count(
+            pdb,
+            &format!("SELECT COUNT(*) FROM sync_inbound WHERE id = {in_id_1}")
+        ),
+        0,
+        "received row gone"
+    );
+    assert_eq!(
+        count(
+            cdb,
+            &format!("SELECT COUNT(*) FROM sync_outbound_files WHERE outbound_id = {out_id_1}")
+        ),
+        0,
+        "sent files gone"
+    );
+    assert_eq!(
+        count(
+            pdb,
+            &format!("SELECT COUNT(*) FROM sync_inbound_files WHERE inbound_id = {in_id_1}")
+        ),
+        0,
+        "received files gone"
+    );
     assert_eq!(count(cdb, &format!("SELECT COUNT(*) FROM sync_events WHERE direction = 'sent' AND batch_key = '{out_id_1}'")), 0, "sent events gone");
     assert_eq!(count(pdb, &format!("SELECT COUNT(*) FROM sync_events WHERE direction = 'received' AND batch_key = '{in_id_1}'")), 0, "received events gone");
-    assert_eq!(count(cdb, &format!("SELECT COUNT(*) FROM sync_history WHERE package_id = '{batch_key_1}'")), 0, "sent history gone");
-    assert_eq!(count(pdb, &format!("SELECT COUNT(*) FROM sync_history WHERE package_id = '{batch_key_1}'")), 0, "received history gone");
-    assert!(!payload_dir_1.exists(), "the sender payload dir is REMOVED by the reclaim");
-    assert!(receiver_ep.list_in_flight_tags().await.unwrap().is_empty(), "no receiver in-flight tags remain");
+    assert_eq!(
+        count(
+            cdb,
+            &format!("SELECT COUNT(*) FROM sync_history WHERE package_id = '{batch_key_1}'")
+        ),
+        0,
+        "sent history gone"
+    );
+    assert_eq!(
+        count(
+            pdb,
+            &format!("SELECT COUNT(*) FROM sync_history WHERE package_id = '{batch_key_1}'")
+        ),
+        0,
+        "received history gone"
+    );
+    assert!(
+        !payload_dir_1.exists(),
+        "the sender payload dir is REMOVED by the reclaim"
+    );
+    assert!(
+        receiver_ep.list_in_flight_tags().await.unwrap().is_empty(),
+        "no receiver in-flight tags remain"
+    );
 
     // Batch 2 (foreign) survives untouched.
-    assert_eq!(count(cdb, &format!("SELECT COUNT(*) FROM sync_outbound WHERE id = {out_id_2}")), 1, "foreign batch's sent row survives");
-    assert_eq!(count(pdb, &format!("SELECT COUNT(*) FROM sync_inbound WHERE id = {in_id_2}")), 1, "foreign batch's received row survives");
+    assert_eq!(
+        count(
+            cdb,
+            &format!("SELECT COUNT(*) FROM sync_outbound WHERE id = {out_id_2}")
+        ),
+        1,
+        "foreign batch's sent row survives"
+    );
+    assert_eq!(
+        count(
+            pdb,
+            &format!("SELECT COUNT(*) FROM sync_inbound WHERE id = {in_id_2}")
+        ),
+        1,
+        "foreign batch's received row survives"
+    );
     assert!(
         count(pdb, "SELECT COUNT(*) FROM sync_history WHERE direction = 'received' AND outcome = 'ingested'") >= 2,
         "the foreign batch's received history survives"
     );
-    assert!(PathBuf::from(outbound_package_ref(cdb, out_id_2)).exists(), "the foreign batch's payload dir survives");
-    assert_eq!(count(cdb, "SELECT COUNT(*) FROM frames_set WHERE id = 777"), 1, "the foreign namespace survivor is untouched");
+    assert!(
+        PathBuf::from(outbound_package_ref(cdb, out_id_2)).exists(),
+        "the foreign batch's payload dir survives"
+    );
+    assert_eq!(
+        count(cdb, "SELECT COUNT(*) FROM frames_set WHERE id = 777"),
+        1,
+        "the foreign namespace survivor is untouched"
+    );
 
     // Storage dropped by exactly batch 1's payload dir.
     let storage_after = get_transfer_storage(&capture_ctx).expect("transfer storage after");
-    assert_eq!(storage_after.packages_count, storage_before.packages_count - 1, "one payload dir reclaimed");
-    assert!(storage_after.packages_bytes < storage_before.packages_bytes, "packages_bytes dropped by the reclaimed dir");
+    assert_eq!(
+        storage_after.packages_count,
+        storage_before.packages_count - 1,
+        "one payload dir reclaimed"
+    );
+    assert!(
+        storage_after.packages_bytes < storage_before.packages_bytes,
+        "packages_bytes dropped by the reclaimed dir"
+    );
 
     engine.shutdown().await;
     receiver.shutdown().await;
@@ -4027,7 +4993,10 @@ async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
     let primary_sync = SyncRuntime::new();
 
     // Hold the payload fetch aborting so no ingest can complete before the decline.
-    receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+    receiver_ep.set_fault(FaultPlan {
+        abort_after_bytes: Some(1),
+        ..Default::default()
+    });
 
     let (_info, receiver) = SyncReceiver::spawn(
         Arc::clone(&primary_store),
@@ -4047,7 +5016,8 @@ async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
 
     let mut frame_ids: Vec<i64> = Vec::with_capacity(N);
     for idx in 0..N {
-        let (fid, _uuid, _object, _exptime) = insert_capture_frame(&capture_ctx, &capture_files, idx);
+        let (fid, _uuid, _object, _exptime) =
+            insert_capture_frame(&capture_ctx, &capture_files, idx);
         frame_ids.push(fid);
     }
     let _r = enqueue_sync_selection(
@@ -4055,7 +5025,10 @@ async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
         &sender,
         Arc::clone(&collab_sender),
         &sync,
-        ResolvedDest { node: receiver_node, endpoint_addr: None },
+        ResolvedDest {
+            node: receiver_node,
+            endpoint_addr: None,
+        },
         frame_ids.clone(),
         None,
         None,
@@ -4069,7 +5042,10 @@ async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
     let mut wire_pkg = String::new();
     wait_until(
         || {
-            receiver_ep.set_fault(FaultPlan { abort_after_bytes: Some(1), ..Default::default() });
+            receiver_ep.set_fault(FaultPlan {
+                abort_after_bytes: Some(1),
+                ..Default::default()
+            });
             match latest_inbound_package_id(pdb) {
                 Some(p) => {
                     wire_pkg = p;
@@ -4091,9 +5067,14 @@ async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
         Some("cancelled by receiver"),
         "the sender records the receiver-decline reason"
     );
-    let history_after_decline =
-        count(pdb, "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='cancelled'");
-    assert_eq!(history_after_decline, N as i64, "one cancelled history row per frame");
+    let history_after_decline = count(
+        pdb,
+        "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='cancelled'",
+    );
+    assert_eq!(
+        history_after_decline, N as i64,
+        "one cancelled history row per frame"
+    );
 
     // Disarm the fault so a re-fetch WOULD deliver — proving the bounce below is
     // decline-driven, not fault-driven.
@@ -4107,7 +5088,10 @@ async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
     capture_store
         .reset_outbound_for_resend(old_id, &resend_wire)
         .expect("reset the declined row in place");
-    engine.resend(old_id).await.expect("re-drive the same-batch row");
+    engine
+        .resend(old_id)
+        .await
+        .expect("re-drive the same-batch row");
 
     // The receiver — resolving the SAME declined row by batch_uuid — seeds the new
     // wire id from the receipt anchor and re-acks all-cancelled WITHOUT fetching;
@@ -4128,7 +5112,11 @@ async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
         Some("cancelled by receiver"),
         "the same-batch re-ask re-terminalizes with the decline reason"
     );
-    assert_eq!(count(pdb, "SELECT COUNT(*) FROM frames"), 0, "nothing ingested on the bounce");
+    assert_eq!(
+        count(pdb, "SELECT COUNT(*) FROM frames"),
+        0,
+        "nothing ingested on the bounce"
+    );
     assert_eq!(landed_count(&designated), 0, "nothing landed on the bounce");
     assert_eq!(
         count(pdb, "SELECT COUNT(*) FROM sync_inbound"),
@@ -4136,7 +5124,10 @@ async fn same_batch_reannounce_of_declined_transfer_still_bounces() {
         "still ONE batch-keyed inbound row"
     );
     assert_eq!(
-        count(pdb, "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='cancelled'"),
+        count(
+            pdb,
+            "SELECT COUNT(*) FROM sync_history WHERE direction='received' AND outcome='cancelled'"
+        ),
         history_after_decline,
         "the bounce duplicates NO received history"
     );
