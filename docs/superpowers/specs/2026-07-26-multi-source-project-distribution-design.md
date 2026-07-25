@@ -20,7 +20,7 @@ iroh-blobs 0.103 already ships the machinery (a) needs, unused: `SplitStrategy::
 | The need list | **Computed locally as a diff** — `published ∧ ¬superseded ∧ ¬mine ∧ local_status ≠ complete`. Nothing travels; the hub's announcement list is already the shared truth |
 | Auto-replication scope | **Per-project toggle, default ON**, with the project's published byte total shown next to it. Local preference (column on `collab_projects`), never hub state |
 | Pending packages (coordinator) | **On-demand only** — moderation metrics already arrive hub-side without a download; frames-by-eye is an explicit button. Rejected work never costs disk |
-| Root hash to the hub | **(а): `report_have` carries the collection root hash**; the hub stores it on the announcement and serves it back in the announcements list. Accepted **only from the publisher** (see §6). Fallback (б) — today's request-to-one — remains for hash-less announcements |
+| Root hash to the hub | **(а), implemented at PUBLISH — zero hub-side work.** Plan-time verification found the entire pipe already exists (`package_announcements.root_hash` NOT NULL on the hub, POST field, list field, `AnnouncementWire.root_hash`, `project_packages.root_hash` synced at poll) but carries a manifest-bytes IDENTIFIER (`api/collab.rs:1299-1303` says so itself). The fix is the VALUE: publish imports the collection first (which is also its first seed, §3.4) and sends the REAL collection hash. Publisher attestation holds by construction — only the publisher can create the announcement. Fallback (б) remains for legacy-value announcements |
 | Multi-source fetch | `SplitStrategy::Split` over the hub holder list (minus self), phantoms tolerated by failover |
 | Seeding | Downloaded packages re-serve under the reserved `project/…` tag namespace, imported with **`ImportMode::TryReference`** (verified present and honored by the fs store) — the blobs reference the landed files in place, no double storage |
 | `send`-role devices | Auto-replication does not apply (authz already forbids them pulling, `collab_exchange.rs:911-914`); they seed their own packages only |
@@ -40,13 +40,14 @@ iroh-blobs 0.103 already ships the machinery (a) needs, unused: `SplitStrategy::
 
 **Not changed:** `handle_project_announce`/`ProjectRequest` (the push-shaped path) stays intact — it IS the fallback, and the push-seed at publish still uses it.
 
-### 3.2 Root hash on the hub (the only hub-side work)
+### 3.2 The real root hash at publish (no hub-side work)
 
-- `report_have` (`hub_client.rs:381-401`) gains an optional `rootHash` (and `byteSize`) field. The hub stores it on the announcement **only when the reporting member is the announcement's publisher**; other members' values are ignored (integrity: a malicious holder must not be able to poison the hash every downloader will trust — see §6).
-- `GET /projects/{id}/announcements` returns `rootHash: Option<String>` (and total `byteSize`) per announcement; `AnnouncementWire` mirrors it; `project_packages` gains `root_hash` + `byte_size` columns filled at poll time.
-- **Publisher reports have.** New small step after push-seed's first serve (the import that computes the hash was going to run for the serve anyway): `report_have(announcement_id, root_hash, byte_size)`. Until it lands, the announcement is hash-less and downloaders take fallback (б) — a window of seconds, self-closing.
-- Old app versions never report a hash → their packages stay on fallback (б) forever. Accepted and honest: that population shrinks with updates, and (б) is exactly today's behavior, not a regression.
-- Hub deploy per the owner's standing procedure: hub repo change → test-hub → owner smoke → prod. The API change is backward-compatible in both directions (old clients omit the field; old hub ignores it).
+Plan-time verification overturned the brainstorm's premise that the hub lacked a hash field. The full pipe exists: hub `package_announcements.root_hash` (NOT NULL, 64-hex-validated), required on the create POST, returned by the announcements list, mirrored in `AnnouncementWire.root_hash` (`hub_client.rs:144`), persisted into `project_packages.root_hash` at poll (`api/collab_exchange.rs:615`). Today's value is a BLAKE3 of the manifest bytes — an identifier, explicitly not the collection hash (`api/collab.rs:1299-1303`: "This is an IDENTIFIER only; the wire transfer substitutes the real iroh collection hash per serve").
+
+- **Publish changes the value, not the pipe**: import the written package dir as a collection FIRST (`ImportMode::TryReference` under `project/<project_id>/<package_id>` — this is the publisher's first-seed step from §3.4, just moved before the hub POST), then send the returned collection hash as `root_hash`. The announcement is born swarm-capable; no window, no follow-up report.
+- **Attestation by construction**: only the publisher can create the announcement (hub auth on POST), so the hash every downloader verifies against is publisher-controlled — the same trust surface as the content itself. No hub-side acceptance rule needed.
+- **Legacy discrimination**: an old announcement's `root_hash` is a manifest identifier that no provider's blob store contains. The swarm path simply TRIES it — every provider fails the GET within one connect round — then falls back to (б) and caches a per-package "swarm-unfit" verdict in memory for the rest of the session, so legacy packages cost one cheap failed round per app run, not per retry.
+- The hub's `valid_root_hash` (64 hex) accepts a real collection hash unchanged. **No hub commit, no hub deploy** — D3 ships entirely app-side.
 
 ### 3.3 The auto-replication worker
 
@@ -92,7 +93,7 @@ After a successful ingest (and after own publish), the device imports the packag
 
 ## 6. Security
 
-- **Root hash is publisher-attested only.** The hub accepts `rootHash` solely from the member who created the announcement. Rationale: every downloader will fetch whatever content the hash names and verify AGAINST THAT HASH — BLAKE3 verification makes the transfer tamper-proof, but the hash itself must name the right content. The publisher already controls the content (they published it), so publisher-attested adds zero new trust surface; holder-attested would let any member redirect the whole project's downloads.
+- **Root hash is publisher-attested by construction.** It travels only in the announcement-create POST, which the hub already authenticates as the publisher. Every downloader fetches whatever content the hash names and verifies AGAINST THAT HASH — BLAKE3 makes the transfer tamper-proof, and the hash naming the right content reduces to trusting the publisher, who already controls the content. Holder-attested hashes (the rejected have-carrier variant) would have let any member redirect the whole project's downloads.
 - Relay-only dial hints for cross-account holders (S1) — unchanged, and the swarm path uses the same rule per holder.
 - The connect gate (`node_in_any_project`) and serve-side role checks (`authz.rs:83-94`) already govern who can pull blobs; the swarm changes how many sources a puller uses, not who may be one.
 
@@ -105,7 +106,7 @@ Perseus. Un-have on the wire (hub follow-up, unchanged). Seeding retention/clean
 - **Need diff**: pure-fn unit tests — superseded excluded, mine excluded, failed re-enters, role-gated, toggle-gated.
 - **Multi-provider fetch**: real-QUIC localhost harness (the `sharing/iroh/tests.rs` two-endpoint pattern, extended to three): two providers serve the same package, one puller fetches with Split — assert completion + content hash + BOTH providers saw traffic (per-provider telemetry is the oracle). The failover pin: kill one provider mid-transfer (drop its transport) → fetch completes from the survivor; assert wall-clock stays far under the old 90 s window.
 - **TryReference seeding**: import a landed dir, assert the store serves the collection AND the blob dir did not grow by the payload size; assert the `project/…` tag survives the orphan sweep (extends the existing foreign-tag pin).
-- **Have-with-hash**: publisher's report fills the column; a non-publisher's report is ignored (hub-repo test); hash-less announcement takes fallback (б) (app-side test with a hub fixture).
+- **Real hash at publish**: the POSTed `root_hash` equals the imported collection hash (pinned by comparing against a direct `import_package_collection` of the same dir); a LEGACY-value announcement (providers lack the hash) falls back to (б) cleanly and caches the swarm-unfit verdict (second attempt in the same session goes straight to fallback).
 - **Worker**: auto-enabled project with 2 missing packages downloads both serially and reports have; toggle off → no downloads; `send`-role → no downloads.
 - Existing collab e2e (slice tests) stay green — the fallback path is byte-identical to today.
 
@@ -113,4 +114,4 @@ Perseus. Un-have on the wire (hub follow-up, unchanged). Seeding retention/clean
 
 - **TryReference's immutability assumption** is load-bearing: if anything ever rewrites a landed contribution in place, seeds serve garbage that fails BLAKE3 verification at every downloader (fail-loud, not silent corruption — but the seed looks like a phantom). The collab root is app-managed; the risk is a user hand-editing files there. Accepted: verification makes it a availability problem, never an integrity one.
 - **Auto-replication default ON** means joining a project starts downloads. Mitigated by the visible byte total, the per-project toggle, and the fact that invited members joined precisely to get the data. The ReceiveGate + upload pacer bound the resource impact.
-- **Hub coupling**: D3's full value needs the hub deploy; the app degrades to fallback (б) against an old hub with zero breakage — the two can ship independently, app first.
+- **No hub coupling at all** (the brainstorm expected some): the hub pipe pre-exists and validates only the hash's shape. The one cross-version seam is legacy announcements carrying identifier values — handled by try-then-fallback with a cached verdict, one cheap failed round per package per session.
