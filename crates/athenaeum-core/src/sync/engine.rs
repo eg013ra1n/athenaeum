@@ -76,8 +76,7 @@ use super::{node_id_hex, now_iso};
 /// before a re-attempt so a stale cached address doesn't doom every retry to the
 /// same dead path; on `Some(addr)` the engine re-registers it on the transport
 /// ([`SharingTransport::add_peer_addr`]). `None` for tests + single-shot spawners.
-pub type AddrRefresher =
-    Arc<dyn Fn(NodeId) -> BoxFuture<Option<iroh::EndpointAddr>> + Send + Sync>;
+pub type AddrRefresher = Arc<dyn Fn(NodeId) -> BoxFuture<Option<iroh::EndpointAddr>> + Send + Sync>;
 
 /// Default per-attempt wait for the peer's ack before retrying.
 pub const DEFAULT_ACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -336,6 +335,26 @@ struct Pending {
     /// actually moving bytes must never carry a stale reason). Exactly one
     /// clear-write per retry cycle, only when bytes resume flowing.
     clear_error_on_next_serve: bool,
+    /// Bytes already delivered by EARLIER pull sessions of this same transfer, the
+    /// base the current session's figure is added to.
+    ///
+    /// The provider's byte counter is scoped to ONE GET request: the iroh consumer
+    /// builds a fresh `UploadAccumulator` per `GetRequestReceivedNotify`. When a
+    /// connection drops mid-transfer the receiver re-requests only the ranges it
+    /// still lacks, so the next session's ticks start from ~0 — and emitting them
+    /// raw made the sender's overall progress bar fall back to the start and count
+    /// the remainder as if it were the whole batch (owner smoke 2026-07-25).
+    ///
+    /// Recomputed from the durable per-file rows (the transfer's real memory)
+    /// whenever a new session is detected, never accumulated from the ticks
+    /// themselves — so it is also correct after an app restart, and self-corrects
+    /// if a peer genuinely re-pulls a file (that row walks back to `sending` and
+    /// leaves the base).
+    served_base: u64,
+    /// The previous [`ServeProgress`](TransportEvent::ServeProgress) figure of the
+    /// current session. A tick BELOW it means the provider started a new request,
+    /// which is the only signal available that a session boundary was crossed.
+    last_serve_tick: u64,
 }
 
 /// Outcome of the first-build dedup handshake
@@ -973,18 +992,22 @@ impl Worker {
             // package is a project exchange. Read from the live slot (present for
             // every progress tick); `None` for personal sync.
             let project_id = self.pending.get(&id).and_then(|p| p.project_id.clone());
-            emit_event(em.as_ref(), "sync-progress", &SyncProgressEvent {
-                package_id: id.to_string(),
-                direction: Direction::Sent,
-                stage: stage.to_string(),
-                peer_device: node_id_hex(&self.peer),
-                frame_count,
-                project_id,
-                // Sender-side ticks carry no byte figure (Task 11 fetch bytes are
-                // a receive-side concern).
-                bytes_done: None,
-                bytes_total: None,
-            });
+            emit_event(
+                em.as_ref(),
+                "sync-progress",
+                &SyncProgressEvent {
+                    package_id: id.to_string(),
+                    direction: Direction::Sent,
+                    stage: stage.to_string(),
+                    peer_device: node_id_hex(&self.peer),
+                    frame_count,
+                    project_id,
+                    // Sender-side ticks carry no byte figure (Task 11 fetch bytes are
+                    // a receive-side concern).
+                    bytes_done: None,
+                    bytes_total: None,
+                },
+            );
         }
     }
 
@@ -1004,16 +1027,20 @@ impl Worker {
     ) {
         if let Some(em) = &self.emitter {
             let project_id = self.pending.get(&id).and_then(|p| p.project_id.clone());
-            emit_event(em.as_ref(), "sync-progress", &SyncProgressEvent {
-                package_id: id.to_string(),
-                direction: Direction::Sent,
-                stage: stage.to_string(),
-                peer_device: node_id_hex(&self.peer),
-                frame_count,
-                project_id,
-                bytes_done: Some(bytes_done),
-                bytes_total: Some(bytes_total),
-            });
+            emit_event(
+                em.as_ref(),
+                "sync-progress",
+                &SyncProgressEvent {
+                    package_id: id.to_string(),
+                    direction: Direction::Sent,
+                    stage: stage.to_string(),
+                    peer_device: node_id_hex(&self.peer),
+                    frame_count,
+                    project_id,
+                    bytes_done: Some(bytes_done),
+                    bytes_total: Some(bytes_total),
+                },
+            );
         }
     }
 
@@ -1026,13 +1053,17 @@ impl Worker {
     /// data, not a log).
     fn emit_file_progress(&self, id: i64, file: String, bytes_done: u64, bytes_total: u64) {
         if let Some(em) = &self.emitter {
-            emit_event(em.as_ref(), "sync-file-progress", &SyncFileProgressEvent {
-                package_id: id.to_string(),
-                peer_device: node_id_hex(&self.peer),
-                file,
-                bytes_done,
-                bytes_total,
-            });
+            emit_event(
+                em.as_ref(),
+                "sync-file-progress",
+                &SyncFileProgressEvent {
+                    package_id: id.to_string(),
+                    peer_device: node_id_hex(&self.peer),
+                    file,
+                    bytes_done,
+                    bytes_total,
+                },
+            );
         }
     }
 
@@ -1050,17 +1081,21 @@ impl Worker {
         project_id: Option<String>,
     ) {
         if let Some(em) = &self.emitter {
-            emit_event(em.as_ref(), "sync-finished", &SyncFinishedEvent {
-                package_id: id.to_string(),
-                direction: Direction::Sent,
-                outcome: outcome.to_string(),
-                peer_device: node_id_hex(&self.peer),
-                ok_count,
-                failed,
-                new_count,
-                duplicate_count,
-                project_id,
-            });
+            emit_event(
+                em.as_ref(),
+                "sync-finished",
+                &SyncFinishedEvent {
+                    package_id: id.to_string(),
+                    direction: Direction::Sent,
+                    outcome: outcome.to_string(),
+                    peer_device: node_id_hex(&self.peer),
+                    ok_count,
+                    failed,
+                    new_count,
+                    duplicate_count,
+                    project_id,
+                },
+            );
         }
     }
 
@@ -1069,7 +1104,10 @@ impl Worker {
     /// text. Best-effort: a journal-write failure `warn!`s and never fails the
     /// transfer (§D7 — the log is a diagnostic, not delivery truth).
     fn journal(&self, id: i64, kind: &str, detail: Option<&str>) {
-        if let Err(e) = self.store.append_sync_event(Direction::Sent, &id.to_string(), kind, detail) {
+        if let Err(e) = self
+            .store
+            .append_sync_event(Direction::Sent, &id.to_string(), kind, detail)
+        {
             tracing::warn!(package_id = id, kind, error = %format!("{e:#}"), "append sync_event failed");
         }
     }
@@ -1081,7 +1119,12 @@ impl Worker {
     /// per-file `error`. Best-effort per row (a write failure `warn!`s, never
     /// fails the ack). A receipt whose `frame_uuid` isn't in the manifest, or a
     /// row that doesn't exist (a Perseus batch with no per-file rows), is a no-op.
-    fn settle_files_from_receipts(&self, id: i64, records: &[ManifestRecord], receipts: &[FrameReceipt]) {
+    fn settle_files_from_receipts(
+        &self,
+        id: i64,
+        records: &[ManifestRecord],
+        receipts: &[FrameReceipt],
+    ) {
         let by_uuid: HashMap<&str, &ManifestRecord> =
             records.iter().map(|r| (r.frame_uuid.as_str(), r)).collect();
         for rec in receipts {
@@ -1151,7 +1194,11 @@ impl Worker {
     ) -> Result<()> {
         // A prior engine already recorded the transfer-start milestone iff the
         // row is past Queued/Announced (crash-resume of a `Transferring` row).
-        let started = !matches!(prior_state, OutboundState::Queued | OutboundState::Announced);
+        let started = !matches!(
+            prior_state,
+            OutboundState::Queued | OutboundState::Announced
+        );
+        let delivered_base = self.delivered_bytes_base(id);
         self.pending.insert(
             id,
             Pending {
@@ -1176,6 +1223,12 @@ impl Worker {
                 file_states: HashMap::new(),
                 serve_started_logged: false,
                 clear_error_on_next_serve: false,
+                // Seeded from the durable rows, not zero: a resurrected engine
+                // installs this slot mid-transfer, and the peer then resumes with a
+                // fresh per-request counter. A brand-new enqueue has no delivered
+                // rows yet, so this reads 0 there.
+                served_base: delivered_base,
+                last_serve_tick: 0,
             },
         );
         self.attempt(id).await
@@ -1256,12 +1309,13 @@ impl Worker {
         // `negotiate_and_build` (set on the first build, persisted across
         // retries). `Some((project_id, hub_package_id))` ⇒ the announce goes out
         // as a project advertisement; `None` ⇒ the personal-sync announce.
-        let project = self.pending.get(&id).and_then(|p| {
-            match (&p.project_id, &p.hub_package_id) {
-                (Some(pid), Some(hub)) => Some((pid.clone(), hub.clone())),
-                _ => None,
-            }
-        });
+        let project =
+            self.pending
+                .get(&id)
+                .and_then(|p| match (&p.project_id, &p.hub_package_id) {
+                    (Some(pid), Some(hub)) => Some((pid.clone(), hub.clone())),
+                    _ => None,
+                });
 
         // The personal-sync announce goes out as v2 (batch name + file manifest).
         // Batch name = the outbound row's `display_name` (set by the send path),
@@ -1328,7 +1382,13 @@ impl Worker {
                     .context("announce project package"),
                 None => self
                     .transport
-                    .announce(self.peer, &announce, &batch_name, &batch_uuid, &announce_files)
+                    .announce(
+                        self.peer,
+                        &announce,
+                        &batch_name,
+                        &batch_uuid,
+                        &announce_files,
+                    )
                     .await
                     .context("announce package"),
             }
@@ -1399,7 +1459,11 @@ impl Worker {
             // per-byte.
             self.emit_progress(id, "transferring", announce.frame_count);
         } else {
-            tracing::info!(package_id = id, state = "transferring", "sync resume/retry re-announce");
+            tracing::info!(
+                package_id = id,
+                state = "transferring",
+                "sync resume/retry re-announce"
+            );
         }
         // The announce reached the peer — journal it (§D7). Fires on every
         // successful announce (first + every resume/retry re-announce).
@@ -1486,13 +1550,19 @@ impl Worker {
             Ok(Some(row)) => match row.wire_package_id {
                 Some(persisted) => full_announce.package_id = PackageId(persisted),
                 None => {
-                    if let Err(e) = self.store.set_wire_package_id(id, &full_announce.package_id.0) {
+                    if let Err(e) = self
+                        .store
+                        .set_wire_package_id(id, &full_announce.package_id.0)
+                    {
                         tracing::warn!(package_id = id, error = %format!("{e:#}"), "persist wire_package_id failed");
                     }
                 }
             },
             Ok(None) => {
-                tracing::warn!(package_id = id, "outbound row gone while building announce; wire id not persisted");
+                tracing::warn!(
+                    package_id = id,
+                    "outbound row gone while building announce; wire id not persisted"
+                );
             }
             Err(e) => {
                 tracing::warn!(package_id = id, error = %format!("{e:#}"), "read outbound row for wire id failed");
@@ -1516,7 +1586,10 @@ impl Worker {
         // handshake for the whole package → full send (`want = None`). A project
         // package skips the handshake entirely and full-sends.
         let want: Option<HashSet<String>> = if stamp.is_some() {
-            tracing::debug!(package_id = id, "project package; skipping dedup negotiation (full send)");
+            tracing::debug!(
+                package_id = id,
+                "project package; skipping dedup negotiation (full send)"
+            );
             None
         } else {
             match build_offer(dir, &records) {
@@ -1527,7 +1600,12 @@ impl Worker {
                 Ok((offer, full_by_rel)) => {
                     match self
                         .transport
-                        .negotiate_want(self.peer, full_announce.package_id.clone(), offer, full_by_rel)
+                        .negotiate_want(
+                            self.peer,
+                            full_announce.package_id.clone(),
+                            offer,
+                            full_by_rel,
+                        )
                         .await
                     {
                         Ok(w) => Some(w),
@@ -1596,7 +1674,11 @@ impl Worker {
                 }
             }
         }
-        self.journal(id, "negotiated", Some(&format!("new={new_count} duplicate={duplicate_count}")));
+        self.journal(
+            id,
+            "negotiated",
+            Some(&format!("new={new_count} duplicate={duplicate_count}")),
+        );
         Ok(Negotiated::Send { announce, want })
     }
 
@@ -1652,7 +1734,11 @@ impl Worker {
         self.clear_next_retry(pending.id);
         // §D4/§D7: every file was a duplicate — settle each row `done`/`duplicate`
         // and journal the negotiated + confirmed outcome.
-        self.journal(pending.id, "negotiated", Some(&format!("new=0 duplicate={}", records.len())));
+        self.journal(
+            pending.id,
+            "negotiated",
+            Some(&format!("new=0 duplicate={}", records.len())),
+        );
         self.settle_files_from_receipts(pending.id, records, &receipts);
         self.journal(pending.id, "confirmed", Some("all_duplicate"));
         self.append_confirmed_history(&pending, &receipts)?;
@@ -1662,14 +1748,23 @@ impl Worker {
             Some(sink) => sink.on_terminal(&pending.dir),
             None => match cleanup_package_payloads(&pending.dir) {
                 Ok(freed_bytes) => {
-                    tracing::info!(package_id = pending.id, freed_bytes, "package payloads cleaned");
+                    tracing::info!(
+                        package_id = pending.id,
+                        freed_bytes,
+                        "package payloads cleaned"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(package_id = pending.id, error = %format!("{e:#}"), "package payload cleanup failed");
                 }
             },
         }
-        tracing::info!(package_id = pending.id, state = "confirmed", reason = "all_duplicate", "sync state");
+        tracing::info!(
+            package_id = pending.id,
+            state = "confirmed",
+            reason = "all_duplicate",
+            "sync state"
+        );
         self.emit_finished(
             pending.id,
             "confirmed",
@@ -1836,7 +1931,10 @@ impl Worker {
             Some((rung, delay, class)) => {
                 self.persist_next_retry(id, delay);
                 let detail = match class {
-                    Some(c) => format!("rung={rung} delay_ms={} class={c}", delay.as_millis() as u64),
+                    Some(c) => format!(
+                        "rung={rung} delay_ms={} class={c}",
+                        delay.as_millis() as u64
+                    ),
                     None => format!("rung={rung} delay_ms={}", delay.as_millis() as u64),
                 };
                 self.journal(id, "retry_scheduled", Some(&detail));
@@ -1985,13 +2083,20 @@ impl Worker {
         };
         // Scope to this engine's peer (the shared store returns every peer's rows).
         if row.peer != self.peer {
-            tracing::warn!(package_id = id, "resend: row targets another peer; ignoring");
+            tracing::warn!(
+                package_id = id,
+                "resend: row targets another peer; ignoring"
+            );
             return;
         }
         // The API layer guards terminal-state eligibility + does the reset; if the
         // row is still terminal here the reset never ran — do not re-drive.
         if row.state.is_terminal() {
-            tracing::warn!(package_id = id, state = row.state.as_str(), "resend: row still terminal; not re-driving");
+            tracing::warn!(
+                package_id = id,
+                state = row.state.as_str(),
+                "resend: row still terminal; not re-driving"
+            );
             return;
         }
         let dir = PathBuf::from(&row.package_ref);
@@ -2007,9 +2112,11 @@ impl Worker {
     /// manifest-read or store-write failure only `warn!`s — it must never fail the
     /// enqueue.
     fn persist_project_id(&self, id: i64, dir: &Path) {
-        let project_id = package::read_manifest(dir)
-            .ok()
-            .and_then(|records| records.iter().find_map(|r| r.project.as_ref().map(|p| p.project_id.clone())));
+        let project_id = package::read_manifest(dir).ok().and_then(|records| {
+            records
+                .iter()
+                .find_map(|r| r.project.as_ref().map(|p| p.project_id.clone()))
+        });
         if let Some(pid) = project_id {
             if let Err(e) = self.store.set_outbound_project_id(id, Some(&pid)) {
                 tracing::warn!(package_id = id, error = %format!("{e:#}"), "persist project_id failed");
@@ -2038,7 +2145,10 @@ impl Worker {
             | TransportEvent::ProjectRequestReceived { .. } => Ok(()),
             // Upload progress for a package we are serving (Task 13): fold it into
             // a send-side `transferring` tick carrying byte figures.
-            TransportEvent::ServeProgress { package_id, bytes_sent } => {
+            TransportEvent::ServeProgress {
+                package_id,
+                bytes_sent,
+            } => {
                 self.on_serve_progress(package_id, bytes_sent);
                 Ok(())
             }
@@ -2116,7 +2226,10 @@ impl Worker {
         // clear + log run ONLY on the flip (once per armed cycle), never per tick.
         if flipped {
             self.clear_next_retry(id);
-            tracing::info!(package_id = id, "armed retry cancelled; peer is actively pulling");
+            tracing::info!(
+                package_id = id,
+                "armed retry cancelled; peer is actively pulling"
+            );
         }
     }
 
@@ -2177,7 +2290,75 @@ impl Worker {
             self.journal(id, "serve_started", None);
         }
 
-        self.emit_progress_bytes(id, "transferring", frame_count, bytes_sent.min(byte_size), byte_size);
+        // The provider's counter is per-GET, so it restarts every time the peer
+        // opens a new request — after a dropped connection it re-asks only for the
+        // ranges it still lacks. Adding the base of what earlier sessions already
+        // delivered is what keeps the overall bar from falling back to the start and
+        // re-counting the remainder as the whole batch.
+        //
+        // A session boundary shows up as a tick BELOW the previous one — within one
+        // request the provider's figure only grows. (The slot's opening base is
+        // seeded at creation instead of here: re-reading it on the first tick would
+        // double-count, because per-file ticks of the SAME session may already have
+        // marked files uploaded whose bytes this session's counter also includes.)
+        // The base comes from the durable per-file rows, not from summing ticks: it
+        // is then correct across restarts, and a peer genuinely re-pulling a file
+        // walks that row back to `sending` on its next partial tick, which removes
+        // it from the base.
+        let opens_session = self
+            .pending
+            .get(&id)
+            .map(|p| bytes_sent < p.last_serve_tick)
+            .unwrap_or(false);
+        if opens_session {
+            let base = self.delivered_bytes_base(id);
+            if let Some(p) = self.pending.get_mut(&id) {
+                p.served_base = base;
+            }
+        }
+        let cumulative = if let Some(p) = self.pending.get_mut(&id) {
+            p.last_serve_tick = bytes_sent;
+            p.served_base.saturating_add(bytes_sent)
+        } else {
+            bytes_sent
+        };
+
+        self.emit_progress_bytes(
+            id,
+            "transferring",
+            frame_count,
+            cumulative.min(byte_size),
+            byte_size,
+        );
+    }
+
+    /// Bytes of this package the peer has ALREADY taken, read from the durable
+    /// per-file rows: every row that reached [`Uploaded`](OutboundFileState::Uploaded)
+    /// or `Done` counts its `bytes_done`.
+    ///
+    /// The base for [`on_serve_progress`](Self::on_serve_progress)'s per-session
+    /// figure. Deliberately sourced from the rows rather than from a running sum of
+    /// ticks — the rows survive a restart, and a row that walks back to `sending`
+    /// (the peer really is re-pulling that file) drops out of the base on its own.
+    /// A read failure warns and yields 0, which degrades to the old
+    /// per-session-only figure rather than blocking the tick.
+    fn delivered_bytes_base(&self, id: i64) -> u64 {
+        match self.store.list_outbound_files(id) {
+            Ok(rows) => rows
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.state,
+                        OutboundFileState::Uploaded | OutboundFileState::Done
+                    )
+                })
+                .map(|r| r.bytes_done)
+                .sum(),
+            Err(e) => {
+                tracing::warn!(package_id = id, error = %format!("{e:#}"), "read delivered-bytes base failed");
+                0
+            }
+        }
     }
 
     /// Turn a transport [`ServeComplete`](TransportEvent::ServeComplete) into the
@@ -2218,7 +2399,10 @@ impl Worker {
         match self.store.list_outbound_files(id) {
             Ok(rows) => {
                 for row in rows {
-                    if matches!(row.state, OutboundFileState::Pending | OutboundFileState::Sending) {
+                    if matches!(
+                        row.state,
+                        OutboundFileState::Pending | OutboundFileState::Sending
+                    ) {
                         if let Err(e) = self.store.set_outbound_file_state(
                             id,
                             &row.rel_path,
@@ -2230,12 +2414,15 @@ impl Worker {
                             tracing::warn!(package_id = id, rel_path = %row.rel_path, error = %format!("{e:#}"), "mark uploaded outbound file failed");
                         }
                         if let Some(p) = self.pending.get_mut(&id) {
-                            p.file_states.insert(row.rel_path, OutboundFileState::Uploaded);
+                            p.file_states
+                                .insert(row.rel_path, OutboundFileState::Uploaded);
                         }
                     }
                 }
             }
-            Err(e) => tracing::warn!(package_id = id, error = %format!("{e:#}"), "list outbound files at serve-complete failed"),
+            Err(e) => {
+                tracing::warn!(package_id = id, error = %format!("{e:#}"), "list outbound files at serve-complete failed")
+            }
         }
 
         // §D4/§D5: persist the batch `uploaded` stage as `Delivered` (non-terminal,
@@ -2314,14 +2501,10 @@ impl Worker {
             } else {
                 bytes_done
             };
-            if let Err(e) = self.store.set_outbound_file_state(
-                id,
-                &file,
-                target,
-                persist_bytes,
-                None,
-                None,
-            ) {
+            if let Err(e) =
+                self.store
+                    .set_outbound_file_state(id, &file, target, persist_bytes, None, None)
+            {
                 tracing::warn!(package_id = id, rel_path = %file, error = %format!("{e:#}"), "set per-file serve state failed");
             }
             if let Some(p) = self.pending.get_mut(&id) {
@@ -2344,7 +2527,12 @@ impl Worker {
     ///
     /// Idempotent for a fully-accepted ack: one for a package no longer in the
     /// in-flight map (already confirmed, or unknown) is dropped at debug.
-    fn on_ack(&mut self, from: NodeId, package_id: PackageId, receipts: Vec<FrameReceipt>) -> Result<()> {
+    fn on_ack(
+        &mut self,
+        from: NodeId,
+        package_id: PackageId,
+        receipts: Vec<FrameReceipt>,
+    ) -> Result<()> {
         // Peer-binding (finding M3): an ack is only trustworthy from the
         // package's intended destination. The remote node id is cryptographically
         // authenticated by the transport (iroh QUIC / loopback), so a `from` that
@@ -2385,7 +2573,10 @@ impl Worker {
         // the latest verdict — even while a partial/rejected ack keeps the batch in
         // flight for a redelivery.
         let records = {
-            let cached = self.pending.get(&key).and_then(|p| p.manifest_records.clone());
+            let cached = self
+                .pending
+                .get(&key)
+                .and_then(|p| p.manifest_records.clone());
             match cached {
                 Some(r) => r,
                 None => {
@@ -2406,7 +2597,13 @@ impl Worker {
                     ReceiptOutcome::Cancelled => can += 1,
                 }
             }
-            self.journal(key, "ack_received", Some(&format!("ingested={ing} duplicate={dup} rejected={rej} cancelled={can}")));
+            self.journal(
+                key,
+                "ack_received",
+                Some(&format!(
+                    "ingested={ing} duplicate={dup} rejected={rej} cancelled={can}"
+                )),
+            );
         }
 
         // Cancelled-by-receiver (Task 4): a non-empty ack whose receipts are ALL
@@ -2480,7 +2677,9 @@ impl Worker {
 
         let rejected: Vec<&str> = receipts
             .iter()
-            .filter_map(|r| matches!(r.outcome, ReceiptOutcome::Rejected(_)).then_some(r.frame_uuid.as_str()))
+            .filter_map(|r| {
+                matches!(r.outcome, ReceiptOutcome::Rejected(_)).then_some(r.frame_uuid.as_str())
+            })
             .collect();
 
         if !rejected.is_empty() {
@@ -2574,7 +2773,11 @@ impl Worker {
             Some(sink) => sink.on_terminal(&pending.dir),
             None => match cleanup_package_payloads(&pending.dir) {
                 Ok(freed_bytes) => {
-                    tracing::info!(package_id = pending.id, freed_bytes, "package payloads cleaned");
+                    tracing::info!(
+                        package_id = pending.id,
+                        freed_bytes,
+                        "package payloads cleaned"
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(package_id = pending.id, error = %format!("{e:#}"), "package payload cleanup failed");
@@ -2653,7 +2856,8 @@ impl Worker {
                         // §D5: a retry is pending — the next serve tick (if the peer
                         // is still pulling) must wipe this stale "no ack" reason.
                         p.clear_error_on_next_serve = true;
-                        let delay = retry_backoff(self.config.ack_timeout, p.rung, p.last_attempt_class);
+                        let delay =
+                            retry_backoff(self.config.ack_timeout, p.rung, p.last_attempt_class);
                         p.deadline = Instant::now() + delay;
                         // Compute the wall-clock retry stamp ONCE and reuse it for
                         // both the diagnostic log and the persisted countdown
@@ -2677,7 +2881,11 @@ impl Worker {
                     if let Some((stamp, rung, delay_ms)) = retry_info {
                         self.persist_next_retry_at(id, &stamp);
                         self.journal(id, "ack_timeout", None);
-                        self.journal(id, "retry_scheduled", Some(&format!("rung={rung} delay_ms={delay_ms}")));
+                        self.journal(
+                            id,
+                            "retry_scheduled",
+                            Some(&format!("rung={rung} delay_ms={delay_ms}")),
+                        );
                     }
                 }
                 NextAction::Retry => {
@@ -2819,7 +3027,12 @@ impl Worker {
         // releasing; a row resolved only from the store was never served this
         // session, so there is nothing to release (`pkg_id` stays `None`).
         let (dir, pkg_id, project_id, started) = if let Some(p) = self.pending.remove(&id) {
-            (Some(p.dir), p.announce.map(|a| a.package_id), p.project_id, p.started)
+            (
+                Some(p.dir),
+                p.announce.map(|a| a.package_id),
+                p.project_id,
+                p.started,
+            )
         } else {
             (
                 self.store
@@ -2834,7 +3047,10 @@ impl Worker {
         };
 
         let Some(dir) = dir else {
-            tracing::debug!(package_id = id, "cancel ignored (already terminal or unknown)");
+            tracing::debug!(
+                package_id = id,
+                "cancel ignored (already terminal or unknown)"
+            );
             return Ok(());
         };
 
@@ -2843,11 +3059,7 @@ impl Worker {
         self.clear_next_retry(id);
         // §D4: every not-yet-settled per-file row inherits the `cancelled` outcome.
         self.settle_unsettled_files(id, "cancelled");
-        tracing::info!(
-            package_id = id,
-            state = "cancelled",
-            "sync state"
-        );
+        tracing::info!(package_id = id, state = "cancelled", "sync state");
         // Journal the terminal `cancelled` BEFORE any `revoke_sent` so the batch's
         // Log reads cancelled → revoke_sent (§D3 order).
         self.journal(id, "cancelled", Some("by_user"));
@@ -2928,7 +3140,11 @@ impl Worker {
                 batch_name: batch_name.clone(),
             })?;
         }
-        tracing::debug!(package_id = id, count = records.len(), "sync history: transfer started");
+        tracing::debug!(
+            package_id = id,
+            count = records.len(),
+            "sync history: transfer started"
+        );
         Ok(())
     }
 
@@ -2936,7 +3152,10 @@ impl Worker {
     /// this package's manifest by `frame_uuid`.
     fn append_confirmed_history(&self, pending: &Pending, receipts: &[FrameReceipt]) -> Result<()> {
         let records = package::read_manifest(&pending.dir).with_context(|| {
-            format!("read manifest for confirm history {}", pending.dir.display())
+            format!(
+                "read manifest for confirm history {}",
+                pending.dir.display()
+            )
         })?;
         let by_uuid: HashMap<&str, &ManifestRecord> =
             records.iter().map(|r| (r.frame_uuid.as_str(), r)).collect();
@@ -2947,7 +3166,12 @@ impl Worker {
 
         for rec in receipts {
             let (filename, object, bytes, project) = match by_uuid.get(rec.frame_uuid.as_str()) {
-                Some(m) => (filename_of(&m.rel_path), object_of(m), m.byte_size, project_of(m)),
+                Some(m) => (
+                    filename_of(&m.rel_path),
+                    object_of(m),
+                    m.byte_size,
+                    project_of(m),
+                ),
                 None => (rec.frame_uuid.clone(), None, 0, None),
             };
             self.store.append_history(HistoryRow {
@@ -3025,11 +3249,7 @@ impl Worker {
 
 /// Basename of a forward-slash manifest `rel_path`.
 fn filename_of(rel_path: &str) -> String {
-    rel_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(rel_path)
-        .to_string()
+    rel_path.rsplit('/').next().unwrap_or(rel_path).to_string()
 }
 
 /// The stable per-package history batch key (Task 14): the basename of the

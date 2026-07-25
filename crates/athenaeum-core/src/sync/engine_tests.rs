@@ -26,12 +26,12 @@ use crate::package::{
 };
 use crate::sharing::iroh::proto::{FullHashEntry, OfferEntry};
 use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
-use crate::sync::diagnostics::ConnectClass;
 use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome,
     RevokeReason, StartInfo, TransportEvent,
 };
 use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
+use crate::sync::diagnostics::ConnectClass;
 
 use super::cleanup_coord::SharedPackageCleanup;
 use super::engine::{retry_backoff, PackageCleanupSink, SyncEngineHandle};
@@ -103,7 +103,10 @@ fn spawn_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf) -> Recei
             n += 1;
             a.fetch_add(1, SeqCst);
             let dest = dest_root.join(format!("fetch-{n}"));
-            match endpoint.fetch(from, &announce, &dest, noop_fetch_sink()).await {
+            match endpoint
+                .fetch(from, &announce, &dest, noop_fetch_sink())
+                .await
+            {
                 Ok(()) => {
                     let records = match package::read_manifest(&dest) {
                         Ok(r) => r,
@@ -143,7 +146,11 @@ fn spawn_cancelling_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBu
             };
             n += 1;
             let dest = dest_root.join(format!("fetch-{n}"));
-            if endpoint.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
+            if endpoint
+                .fetch(from, &announce, &dest, noop_fetch_sink())
+                .await
+                .is_ok()
+            {
                 let Ok(records) = package::read_manifest(&dest) else {
                     continue;
                 };
@@ -182,7 +189,11 @@ fn state_of(store: &StandaloneSyncStore, id: i64) -> Option<OutboundState> {
 }
 
 fn attempts_of(store: &StandaloneSyncStore, id: i64) -> u32 {
-    store.get_outbound(id).unwrap().map(|r| r.attempts).unwrap_or(0)
+    store
+        .get_outbound(id)
+        .unwrap()
+        .map(|r| r.attempts)
+        .unwrap_or(0)
 }
 
 /// Sorted file/dir names directly inside `dir` (for asserting a package dir's
@@ -209,7 +220,13 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
     let receiver_id = receiver.start().await.unwrap().node_id;
     let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("src1"), "uuid-1", "frame1.fits", "M42", 4096);
+    let pkg = build_package(
+        &tmp.path().join("src1"),
+        "uuid-1",
+        "frame1.fits",
+        "M42",
+        4096,
+    );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn(
@@ -218,7 +235,10 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
         receiver_id,
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
     wait_until(
         || state_of(&store, id) == Some(OutboundState::Confirmed),
         WAIT,
@@ -261,7 +281,9 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
     // the package dir's basename (`build_package` names it `pkg-<uuid>`) — so
     // `list_transfer_files` can recover it from the outbound row.
     assert!(
-        history.iter().all(|h| h.package_id.as_deref() == Some("pkg-uuid-1")),
+        history
+            .iter()
+            .all(|h| h.package_id.as_deref() == Some("pkg-uuid-1")),
         "every sent history row is stamped with the package dir basename batch key"
     );
 
@@ -280,7 +302,13 @@ async fn sent_history_rows_carry_batch_name_after_confirm() {
     let receiver_id = receiver.start().await.unwrap().node_id;
     let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("src1"), "uuid-1", "frame1.fits", "M42", 4096);
+    let pkg = build_package(
+        &tmp.path().join("src1"),
+        "uuid-1",
+        "frame1.fits",
+        "M42",
+        4096,
+    );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn(
@@ -294,7 +322,11 @@ async fn sent_history_rows_carry_batch_name_after_confirm() {
         .enqueue_package(&pkg, Some("My M42 Batch".to_string()), Vec::new())
         .await
         .unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
 
     let history = store
         .search_history(HistoryQuery {
@@ -306,7 +338,9 @@ async fn sent_history_rows_carry_batch_name_after_confirm() {
         .unwrap();
     assert_eq!(history.len(), 2, "start + confirm rows");
     assert!(
-        history.iter().all(|h| h.batch_name.as_deref() == Some("My M42 Batch")),
+        history
+            .iter()
+            .all(|h| h.batch_name.as_deref() == Some("My M42 Batch")),
         "every sent history row (started + confirmed) carries the batch name"
     );
 
@@ -342,7 +376,11 @@ async fn confirmed_package_is_released_from_transport() {
                 *captured.lock().unwrap() = Some(announce.clone());
                 n += 1;
                 let dest = dest_root.join(format!("fetch-{n}"));
-                if receiver.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
+                if receiver
+                    .fetch(from, &announce, &dest, noop_fetch_sink())
+                    .await
+                    .is_ok()
+                {
                     let Ok(records) = package::read_manifest(&dest) else {
                         continue;
                     };
@@ -360,7 +398,13 @@ async fn confirmed_package_is_released_from_transport() {
         });
     }
 
-    let pkg = build_package(&tmp.path().join("src_rel"), "uuid-rel", "rel.fits", "M42", 4096);
+    let pkg = build_package(
+        &tmp.path().join("src_rel"),
+        "uuid-rel",
+        "rel.fits",
+        "M42",
+        4096,
+    );
 
     // Keep the sender endpoint so we know its node id (it is moved into the
     // engine as a trait object; the clone here shares the same registry entry).
@@ -374,8 +418,15 @@ async fn confirmed_package_is_released_from_transport() {
         receiver_id,
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
 
     let captured_announce = captured
         .lock()
@@ -389,7 +440,12 @@ async fn confirmed_package_is_released_from_transport() {
     let deadline = Instant::now() + WAIT;
     let err = loop {
         match receiver
-            .fetch(sender_node, &captured_announce, dest.path(), noop_fetch_sink())
+            .fetch(
+                sender_node,
+                &captured_announce,
+                dest.path(),
+                noop_fetch_sink(),
+            )
             .await
         {
             Err(e) => break e,
@@ -411,7 +467,10 @@ async fn confirmed_package_is_released_from_transport() {
 struct CapturingEmitter(Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>);
 impl crate::events::ProgressEmitter for CapturingEmitter {
     fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
-        self.0.lock().unwrap().push((event_name.to_string(), payload));
+        self.0
+            .lock()
+            .unwrap()
+            .push((event_name.to_string(), payload));
     }
 }
 
@@ -427,11 +486,20 @@ async fn sender_emits_coarse_progress_and_finished_events() {
     let receiver_id = receiver.start().await.unwrap().node_id;
     let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("src_evt"), "uuid-evt", "evt.fits", "M42", 2048);
+    let pkg = build_package(
+        &tmp.path().join("src_evt"),
+        "uuid-evt",
+        "evt.fits",
+        "M42",
+        2048,
+    );
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
 
-    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
-    let emitter: Arc<dyn crate::events::ProgressEmitter> = Arc::new(CapturingEmitter(events.clone()));
+    let events = Arc::new(std::sync::Mutex::new(
+        Vec::<(String, serde_json::Value)>::new(),
+    ));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
     let engine = SyncEngine::spawn_with_emitter(
         store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
@@ -439,8 +507,15 @@ async fn sender_emits_coarse_progress_and_finished_events() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
     // Let the confirm event flush onto the emitter.
     wait_until(
         || {
@@ -455,7 +530,10 @@ async fn sender_emits_coarse_progress_and_finished_events() {
     .await;
 
     let evts = events.lock().unwrap();
-    let finished = evts.iter().find(|(n, _)| n == "sync-finished").expect("a sync-finished event");
+    let finished = evts
+        .iter()
+        .find(|(n, _)| n == "sync-finished")
+        .expect("a sync-finished event");
     assert_eq!(finished.1["direction"].as_str(), Some("sent"));
     assert_eq!(finished.1["outcome"].as_str(), Some("confirmed"));
     assert_eq!(finished.1["okCount"].as_u64(), Some(1));
@@ -473,8 +551,14 @@ async fn sender_emits_coarse_progress_and_finished_events() {
     // real partial progress), so a single-file package here yields at most 2.
     // Assert the coarse stage events stay bounded and the per-file ticks stay
     // proportional to the file count (never per-byte spam).
-    let stage_events = evts.iter().filter(|(n, _)| n != "sync-file-progress").count();
-    let file_events = evts.iter().filter(|(n, _)| n == "sync-file-progress").count();
+    let stage_events = evts
+        .iter()
+        .filter(|(n, _)| n != "sync-file-progress")
+        .count();
+    let file_events = evts
+        .iter()
+        .filter(|(n, _)| n == "sync-file-progress")
+        .count();
     assert!(
         stage_events <= 5,
         "coarse per-package stage events only, got {stage_events}: {evts:?}"
@@ -503,7 +587,13 @@ async fn sent_progress_carries_bytes() {
     let receiver_id = receiver.start().await.unwrap().node_id;
     let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("src_bytes"), "uuid-bytes", "bytes.fits", "M42", 4096);
+    let pkg = build_package(
+        &tmp.path().join("src_bytes"),
+        "uuid-bytes",
+        "bytes.fits",
+        "M42",
+        4096,
+    );
     // The announced byte size is the manifest's summed frame bytes.
     let expected_bytes: u64 = package::read_manifest(&pkg)
         .unwrap()
@@ -513,8 +603,11 @@ async fn sent_progress_carries_bytes() {
     assert!(expected_bytes > 0, "sanity: package has bytes");
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
-    let emitter: Arc<dyn crate::events::ProgressEmitter> = Arc::new(CapturingEmitter(events.clone()));
+    let events = Arc::new(std::sync::Mutex::new(
+        Vec::<(String, serde_json::Value)>::new(),
+    ));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
     let engine = SyncEngine::spawn_with_emitter(
         store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
@@ -522,8 +615,15 @@ async fn sent_progress_carries_bytes() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
     // Wait for the byte-bearing sent progress tick to flush onto the emitter.
     wait_until(
         || {
@@ -541,7 +641,9 @@ async fn sent_progress_carries_bytes() {
     let tick = evts
         .iter()
         .find(|(n, p)| {
-            n == "sync-progress" && p["direction"].as_str() == Some("sent") && p["bytesDone"].is_u64()
+            n == "sync-progress"
+                && p["direction"].as_str() == Some("sent")
+                && p["bytesDone"].is_u64()
         })
         .expect("a send-side sync-progress tick carrying bytes");
     assert_eq!(tick.1["stage"].as_str(), Some("transferring"));
@@ -571,7 +673,13 @@ async fn sent_upload_complete_precedes_confirmed() {
     let receiver_id = receiver.start().await.unwrap().node_id;
     let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("src_up"), "uuid-up", "up.fits", "M42", 4096);
+    let pkg = build_package(
+        &tmp.path().join("src_up"),
+        "uuid-up",
+        "up.fits",
+        "M42",
+        4096,
+    );
     let expected_bytes: u64 = package::read_manifest(&pkg)
         .unwrap()
         .iter()
@@ -579,8 +687,11 @@ async fn sent_upload_complete_precedes_confirmed() {
         .sum();
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
-    let emitter: Arc<dyn crate::events::ProgressEmitter> = Arc::new(CapturingEmitter(events.clone()));
+    let events = Arc::new(std::sync::Mutex::new(
+        Vec::<(String, serde_json::Value)>::new(),
+    ));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
     let engine = SyncEngine::spawn_with_emitter(
         store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
@@ -588,8 +699,15 @@ async fn sent_upload_complete_precedes_confirmed() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
     // Both signals must have landed on the emitter: the uploaded tick and the
     // confirmed finished event.
     wait_until(
@@ -663,7 +781,9 @@ async fn sent_per_file_upload_progress_keyed_by_row_id() {
     );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let events = Arc::new(std::sync::Mutex::new(
+        Vec::<(String, serde_json::Value)>::new(),
+    ));
     let emitter: Arc<dyn crate::events::ProgressEmitter> =
         Arc::new(CapturingEmitter(events.clone()));
     let engine = SyncEngine::spawn_with_emitter(
@@ -673,8 +793,15 @@ async fn sent_per_file_upload_progress_keyed_by_row_id() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
 
     let evts = events.lock().unwrap();
     let id_str = id.to_string();
@@ -742,7 +869,9 @@ async fn sent_per_file_upload_progress_emits_full_nested_rel_path() {
     );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let events = Arc::new(std::sync::Mutex::new(
+        Vec::<(String, serde_json::Value)>::new(),
+    ));
     let emitter: Arc<dyn crate::events::ProgressEmitter> =
         Arc::new(CapturingEmitter(events.clone()));
     let engine = SyncEngine::spawn_with_emitter(
@@ -752,8 +881,15 @@ async fn sent_per_file_upload_progress_emits_full_nested_rel_path() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
 
     let evts = events.lock().unwrap();
     // The nested file reaches its size in a per-file tick keyed by the FULL
@@ -795,7 +931,13 @@ async fn mid_transfer_abort_leaves_transferring_then_resume_completes() {
     });
     let stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("src2"), "uuid-2", "frame2.fits", "M31", 4096);
+    let pkg = build_package(
+        &tmp.path().join("src2"),
+        "uuid-2",
+        "frame2.fits",
+        "M31",
+        4096,
+    );
     let db_path = tmp.path().join("sync.db");
 
     // Engine A: long ack timeout so it will not retry before we kill it.
@@ -808,7 +950,10 @@ async fn mid_transfer_abort_leaves_transferring_then_resume_completes() {
             ack_timeout: Duration::from_secs(60),
         },
     );
-    let id = engine_a.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine_a
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     // The receiver aborts its first fetch; the row rests in Transferring.
     wait_until(|| stats.failures.load(SeqCst) >= 1, WAIT).await;
@@ -890,7 +1035,11 @@ async fn resume_reannounce_reuses_same_wire_package_id() {
                 seen.lock().unwrap().push(announce.package_id.0.clone());
                 n += 1;
                 let dest = dest_root.join(format!("fetch-{n}"));
-                if receiver.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
+                if receiver
+                    .fetch(from, &announce, &dest, noop_fetch_sink())
+                    .await
+                    .is_ok()
+                {
                     let Ok(records) = package::read_manifest(&dest) else {
                         continue;
                     };
@@ -908,7 +1057,13 @@ async fn resume_reannounce_reuses_same_wire_package_id() {
         });
     }
 
-    let pkg = build_package(&tmp.path().join("srcw"), "uuid-w", "framew.fits", "M31", 4096);
+    let pkg = build_package(
+        &tmp.path().join("srcw"),
+        "uuid-w",
+        "framew.fits",
+        "M31",
+        4096,
+    );
     let db_path = tmp.path().join("sync.db");
 
     // Engine A: long ack timeout so it will not retry before we kill it.
@@ -921,7 +1076,10 @@ async fn resume_reannounce_reuses_same_wire_package_id() {
             ack_timeout: Duration::from_secs(60),
         },
     );
-    let id = engine_a.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine_a
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     // First announce seen; the row rests Transferring (its first fetch aborted).
     wait_until(|| !seen.lock().unwrap().is_empty(), WAIT).await;
@@ -932,7 +1090,12 @@ async fn resume_reannounce_reuses_same_wire_package_id() {
     .await;
     let first_wire = seen.lock().unwrap()[0].clone();
     assert_eq!(
-        store_a.get_outbound(id).unwrap().unwrap().wire_package_id.as_deref(),
+        store_a
+            .get_outbound(id)
+            .unwrap()
+            .unwrap()
+            .wire_package_id
+            .as_deref(),
         Some(first_wire.as_str()),
         "the wire package_id must be persisted on the outbound row on the first build"
     );
@@ -956,7 +1119,10 @@ async fn resume_reannounce_reuses_same_wire_package_id() {
     .await;
 
     let all = seen.lock().unwrap().clone();
-    assert!(all.len() >= 2, "resume should have re-announced; saw {all:?}");
+    assert!(
+        all.len() >= 2,
+        "resume should have re-announced; saw {all:?}"
+    );
     assert!(
         all.iter().all(|w| *w == first_wire),
         "every announce pre- and post-restart must carry the SAME wire package_id; saw {all:?}"
@@ -978,7 +1144,13 @@ async fn reenqueue_same_dir_mints_a_new_wire_package_id() {
     let receiver_id = receiver.start().await.unwrap().node_id;
     let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("srcr"), "uuid-r", "framer.fits", "M42", 2048);
+    let pkg = build_package(
+        &tmp.path().join("srcr"),
+        "uuid-r",
+        "framer.fits",
+        "M42",
+        2048,
+    );
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn(
         store.clone() as Arc<dyn SyncStore>,
@@ -989,12 +1161,18 @@ async fn reenqueue_same_dir_mints_a_new_wire_package_id() {
     let wire_of = |id: i64| store.get_outbound(id).unwrap().unwrap().wire_package_id;
 
     // First enqueue: a wire id is minted + persisted during the announce build.
-    let id1 = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id1 = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
     wait_until(|| wire_of(id1).is_some(), WAIT).await;
     let wire1 = wire_of(id1).unwrap();
 
     // Re-enqueue the SAME dir → a DISTINCT row that mints its own fresh id.
-    let id2 = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id2 = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
     assert_ne!(id1, id2, "a re-enqueue is a distinct outbound row");
     wait_until(|| wire_of(id2).is_some(), WAIT).await;
     let wire2 = wire_of(id2).unwrap();
@@ -1022,7 +1200,13 @@ async fn ack_lost_then_duplicate_ack_confirms_once() {
     });
     let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("src3"), "uuid-3", "frame3.fits", "M13", 2048);
+    let pkg = build_package(
+        &tmp.path().join("src3"),
+        "uuid-3",
+        "frame3.fits",
+        "M13",
+        2048,
+    );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn(
@@ -1031,7 +1215,10 @@ async fn ack_lost_then_duplicate_ack_confirms_once() {
         receiver_id,
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
     wait_until(
         || state_of(&store, id) == Some(OutboundState::Confirmed),
         WAIT,
@@ -1053,10 +1240,7 @@ async fn ack_lost_then_duplicate_ack_confirms_once() {
             limit: 100,
         })
         .unwrap();
-    let confirmed: Vec<_> = history
-        .iter()
-        .filter(|h| h.finished_at.is_some())
-        .collect();
+    let confirmed: Vec<_> = history.iter().filter(|h| h.finished_at.is_some()).collect();
     assert_eq!(
         confirmed.len(),
         1,
@@ -1088,7 +1272,9 @@ async fn absent_peer_probes_with_one_package_then_presence_releases_all() {
         // below (well under a second after the beacon) CANNOT be satisfied by the
         // head's own next probe — otherwise the presence half of this test would
         // pass with the beacon removed entirely.
-        SyncConfig { ack_timeout: Duration::from_millis(700) },
+        SyncConfig {
+            ack_timeout: Duration::from_millis(700),
+        },
     );
 
     let mut ids = Vec::new();
@@ -1100,7 +1286,12 @@ async fn absent_peer_probes_with_one_package_then_presence_releases_all() {
             "M101",
             1024,
         );
-        ids.push(engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap());
+        ids.push(
+            engine
+                .enqueue_package(&pkg, None, Vec::new())
+                .await
+                .unwrap(),
+        );
     }
 
     // Every package makes its OWN first attempt — an enqueue is user intent and
@@ -1196,17 +1387,37 @@ async fn absent_head_is_re_elected_when_it_terminalizes() {
         store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
         receiver_id,
-        SyncConfig { ack_timeout: Duration::from_millis(150) },
+        SyncConfig {
+            ack_timeout: Duration::from_millis(150),
+        },
     );
 
     // NOTE: `build_package` returns the PACKAGE dir (`pkg-<uuid>`, a sibling of the
     // source root) — that is what the engine serves and what must vanish to
     // terminalize the package. Removing the source root would leave the engine
     // happily re-announcing an intact package.
-    let pkg_head = build_package(&tmp.path().join("src_head"), "uuid-head", "head.fits", "M101", 1024);
-    let pkg_tail = build_package(&tmp.path().join("src_tail"), "uuid-tail", "tail.fits", "M101", 1024);
-    let head = engine.enqueue_package(&pkg_head, None, Vec::new()).await.unwrap();
-    let tail = engine.enqueue_package(&pkg_tail, None, Vec::new()).await.unwrap();
+    let pkg_head = build_package(
+        &tmp.path().join("src_head"),
+        "uuid-head",
+        "head.fits",
+        "M101",
+        1024,
+    );
+    let pkg_tail = build_package(
+        &tmp.path().join("src_tail"),
+        "uuid-tail",
+        "tail.fits",
+        "M101",
+        1024,
+    );
+    let head = engine
+        .enqueue_package(&pkg_head, None, Vec::new())
+        .await
+        .unwrap();
+    let tail = engine
+        .enqueue_package(&pkg_tail, None, Vec::new())
+        .await
+        .unwrap();
 
     wait_until(
         || attempts_of(&store, head) >= 1 && attempts_of(&store, tail) >= 1,
@@ -1218,7 +1429,11 @@ async fn absent_head_is_re_elected_when_it_terminalizes() {
     // Terminalize the head the one way delivery-forever allows: its payload is
     // gone from disk, so re-announcing can never succeed (spec §1).
     std::fs::remove_dir_all(&pkg_head).unwrap();
-    wait_until(|| state_of(&store, head) == Some(OutboundState::Failed), WAIT).await;
+    wait_until(
+        || state_of(&store, head) == Some(OutboundState::Failed),
+        WAIT,
+    )
+    .await;
 
     // The tail must now BE the head: its attempts start climbing again.
     wait_until(|| attempts_of(&store, tail) > tail_parked_at, WAIT).await;
@@ -1244,11 +1459,22 @@ async fn presence_does_not_re_announce_a_package_awaiting_ack() {
         receiver_id,
         // Long ack timeout: the package must still be awaiting its ack when the
         // beacon lands, not already backed off.
-        SyncConfig { ack_timeout: Duration::from_secs(30) },
+        SyncConfig {
+            ack_timeout: Duration::from_secs(30),
+        },
     );
 
-    let pkg = build_package(&tmp.path().join("src_await"), "uuid-await", "await.fits", "M101", 1024);
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let pkg = build_package(
+        &tmp.path().join("src_await"),
+        "uuid-await",
+        "await.fits",
+        "M101",
+        1024,
+    );
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
     wait_until(|| attempts_of(&store, id) >= 1, WAIT).await;
     let attempts_before = attempts_of(&store, id);
 
@@ -1324,11 +1550,23 @@ fn the_flat_interval_scales_with_the_configured_base() {
 fn a_refusing_peer_still_escalates() {
     use std::time::Duration;
     let base = Duration::from_secs(30);
-    assert_eq!(retry_backoff(base, 0, Some(ConnectClass::Refused)), Duration::from_secs(30));
-    assert_eq!(retry_backoff(base, 1, Some(ConnectClass::Refused)), Duration::from_secs(60));
-    assert_eq!(retry_backoff(base, 4, Some(ConnectClass::Refused)), Duration::from_secs(1800));
+    assert_eq!(
+        retry_backoff(base, 0, Some(ConnectClass::Refused)),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        retry_backoff(base, 1, Some(ConnectClass::Refused)),
+        Duration::from_secs(60)
+    );
+    assert_eq!(
+        retry_backoff(base, 4, Some(ConnectClass::Refused)),
+        Duration::from_secs(1800)
+    );
     // As does an unclassifiable failure — we do not know it is the peer's fault.
-    assert_eq!(retry_backoff(base, 2, Some(ConnectClass::Other)), Duration::from_secs(300));
+    assert_eq!(
+        retry_backoff(base, 2, Some(ConnectClass::Other)),
+        Duration::from_secs(300)
+    );
 }
 
 /// Spec §2: a peer that never acks must NOT terminalize the package. Every ack
@@ -1345,7 +1583,13 @@ async fn timeouts_back_off_forever_without_failing() {
     let receiver = Arc::new(net.endpoint());
     let receiver_id = receiver.start().await.unwrap().node_id;
 
-    let pkg = build_package(&tmp.path().join("src4"), "uuid-4", "frame4.fits", "NGC7000", 1024);
+    let pkg = build_package(
+        &tmp.path().join("src4"),
+        "uuid-4",
+        "frame4.fits",
+        "NGC7000",
+        1024,
+    );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn_with_config(
@@ -1357,7 +1601,10 @@ async fn timeouts_back_off_forever_without_failing() {
         },
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     // Drive past 5+ deadline fires. With a 50ms base the backoff climbs
     // 50ms → 100ms → 500ms → 1500ms → 3000ms, so reaching 5 announce attempts
@@ -1489,13 +1736,15 @@ impl tracing::field::Visit for FieldCollector {
         }
     }
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.fields.insert(field.name().to_string(), value.to_string());
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
     }
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "message" {
             self.message = value.to_string();
         } else {
-            self.fields.insert(field.name().to_string(), value.to_string());
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
         }
     }
 }
@@ -1515,7 +1764,11 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
-        if !event.metadata().target().starts_with("athenaeum_core::sync") {
+        if !event
+            .metadata()
+            .target()
+            .starts_with("athenaeum_core::sync")
+        {
             return;
         }
         let mut collector = FieldCollector::default();
@@ -1550,7 +1803,13 @@ async fn ack_timeout_backoff_log_carries_delay_and_next_retry() {
     let receiver = Arc::new(net.endpoint());
     let receiver_id = receiver.start().await.unwrap().node_id;
 
-    let pkg = build_package(&tmp.path().join("src_log"), "uuid-log", "log.fits", "M31", 1024);
+    let pkg = build_package(
+        &tmp.path().join("src_log"),
+        "uuid-log",
+        "log.fits",
+        "M31",
+        1024,
+    );
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn_with_config(
         store.clone() as Arc<dyn SyncStore>,
@@ -1560,7 +1819,10 @@ async fn ack_timeout_backoff_log_carries_delay_and_next_retry() {
             ack_timeout: Duration::from_millis(50),
         },
     );
-    let _id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let _id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     // Wait until at least one backoff line has been captured.
     wait_until(
@@ -1620,7 +1882,13 @@ async fn missing_package_dir_fails_terminally() {
     let receiver = Arc::new(net.endpoint());
     let receiver_id = receiver.start().await.unwrap().node_id;
 
-    let pkg = build_package(&tmp.path().join("srcM"), "uuid-m", "frameM.fits", "M99", 1024);
+    let pkg = build_package(
+        &tmp.path().join("srcM"),
+        "uuid-m",
+        "frameM.fits",
+        "M99",
+        1024,
+    );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn_with_config(
@@ -1632,7 +1900,10 @@ async fn missing_package_dir_fails_terminally() {
         },
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     // Let the first announce succeed (proves the normal path ran and the
     // manifest was read + cached) before pulling the dir out from under it.
@@ -1700,7 +1971,13 @@ async fn peer_offline_backs_off_and_stays_pending() {
     let receiver = net.endpoint();
     let receiver_id = receiver.node_id();
 
-    let pkg = build_package(&tmp.path().join("src6"), "uuid-6", "frame6.fits", "IC1396", 1024);
+    let pkg = build_package(
+        &tmp.path().join("src6"),
+        "uuid-6",
+        "frame6.fits",
+        "IC1396",
+        1024,
+    );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn_with_config(
@@ -1712,7 +1989,10 @@ async fn peer_offline_backs_off_and_stays_pending() {
         },
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     // Drive several backoff windows: each failed announce bumps attempts and
     // climbs a rung. The row must still be pending, never terminal.
@@ -1768,7 +2048,13 @@ async fn failed_announce_last_error_carries_not_started_class_prefix() {
     let receiver = net.endpoint();
     let receiver_id = receiver.node_id();
 
-    let pkg = build_package(&tmp.path().join("src_cls"), "uuid-cls", "cls.fits", "M64", 1024);
+    let pkg = build_package(
+        &tmp.path().join("src_cls"),
+        "uuid-cls",
+        "cls.fits",
+        "M64",
+        1024,
+    );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn_with_config(
@@ -1780,7 +2066,10 @@ async fn failed_announce_last_error_carries_not_started_class_prefix() {
         },
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     // Wait for a failed attempt to record its classified last_error.
     wait_until(
@@ -1822,7 +2111,13 @@ async fn first_attempt_peer_offline_then_online_completes() {
     let receiver = Arc::new(net.endpoint());
     let receiver_id = receiver.node_id();
 
-    let pkg = build_package(&tmp.path().join("src7"), "uuid-7", "frame7.fits", "M27", 4096);
+    let pkg = build_package(
+        &tmp.path().join("src7"),
+        "uuid-7",
+        "frame7.fits",
+        "M27",
+        4096,
+    );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn_with_config(
@@ -1836,7 +2131,10 @@ async fn first_attempt_peer_offline_then_online_completes() {
         },
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     // Prove it attempted at least once while the peer was offline (every announce
     // attempt bumps the counter, including the first failing one).
@@ -1899,13 +2197,22 @@ async fn cancel_moves_to_cancelled_state() {
     let receiver = Arc::new(net.endpoint());
     let receiver_id = receiver.start().await.unwrap().node_id;
 
-    let pkg = build_package(&tmp.path().join("src5"), "uuid-5", "frame5.fits", "Sol", 1024);
+    let pkg = build_package(
+        &tmp.path().join("src5"),
+        "uuid-5",
+        "frame5.fits",
+        "Sol",
+        1024,
+    );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     // Spawn WITH a capturing emitter so we can assert the `sync-finished` outcome
     // as well as the persisted terminal state.
-    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
-    let emitter: Arc<dyn crate::events::ProgressEmitter> = Arc::new(CapturingEmitter(events.clone()));
+    let events = Arc::new(std::sync::Mutex::new(
+        Vec::<(String, serde_json::Value)>::new(),
+    ));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
     let engine = SyncEngine::spawn_with_config_and_emitter(
         store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
@@ -1916,7 +2223,10 @@ async fn cancel_moves_to_cancelled_state() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
     wait_until(
         || state_of(&store, id) == Some(OutboundState::Transferring),
         WAIT,
@@ -1924,7 +2234,11 @@ async fn cancel_moves_to_cancelled_state() {
     .await;
 
     engine.cancel(id).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Cancelled),
+        WAIT,
+    )
+    .await;
 
     // A user cancel lands in the first-class terminal `Cancelled` state, NOT
     // `Failed` — so the UI and retry eligibility can tell the two apart.
@@ -1997,11 +2311,20 @@ async fn all_cancelled_ack_marks_cancelled_by_receiver() {
     let receiver_id = receiver.start().await.unwrap().node_id;
     spawn_cancelling_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("src_cx"), "uuid-cx", "cx.fits", "M42", 2048);
+    let pkg = build_package(
+        &tmp.path().join("src_cx"),
+        "uuid-cx",
+        "cx.fits",
+        "M42",
+        2048,
+    );
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
 
-    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
-    let emitter: Arc<dyn crate::events::ProgressEmitter> = Arc::new(CapturingEmitter(events.clone()));
+    let events = Arc::new(std::sync::Mutex::new(
+        Vec::<(String, serde_json::Value)>::new(),
+    ));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
     let engine = SyncEngine::spawn_with_emitter(
         store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
@@ -2009,8 +2332,15 @@ async fn all_cancelled_ack_marks_cancelled_by_receiver() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Cancelled),
+        WAIT,
+    )
+    .await;
 
     // Terminal `Cancelled` carrying the exact "by receiver" reason string.
     let row = store.get_outbound(id).unwrap().unwrap();
@@ -2021,7 +2351,10 @@ async fn all_cancelled_ack_marks_cancelled_by_receiver() {
         "the UI keys its 'by receiver' display off this exact string"
     );
     // Cancelled, not confirmed — no confirmed_at stamp.
-    assert!(row.confirmed_at.is_none(), "a cancelled row is never confirmed");
+    assert!(
+        row.confirmed_at.is_none(),
+        "a cancelled row is never confirmed"
+    );
 
     // A brief settle so any (erroneous) cleanup would have a chance to run —
     // same idiom as `cancelled_package_keeps_payloads`.
@@ -2096,7 +2429,13 @@ async fn confirm_cleans_payloads_to_manifest_only() {
     let receiver_id = receiver.start().await.unwrap().node_id;
     let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("srcA"), "uuid-a", "frameA.fits", "M42", 4096);
+    let pkg = build_package(
+        &tmp.path().join("srcA"),
+        "uuid-a",
+        "frameA.fits",
+        "M42",
+        4096,
+    );
     // Pre-confirm the writer's payload copy exists inside the package dir.
     assert!(
         pkg.join("frameA.fits").exists(),
@@ -2110,11 +2449,22 @@ async fn confirm_cleans_payloads_to_manifest_only() {
         receiver_id,
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
 
     // Cleanup runs in the confirm path (after append_confirmed_history); poll.
-    wait_until(|| dir_entries(&pkg) == vec![MANIFEST_FILENAME.to_string()], WAIT).await;
+    wait_until(
+        || dir_entries(&pkg) == vec![MANIFEST_FILENAME.to_string()],
+        WAIT,
+    )
+    .await;
 
     assert_eq!(
         dir_entries(&pkg),
@@ -2141,12 +2491,20 @@ async fn startup_heal_cleans_confirmed_payloads() {
     let receiver = Arc::new(net.endpoint());
     let receiver_id = receiver.start().await.unwrap().node_id;
 
-    let pkg = build_package(&tmp.path().join("srcB"), "uuid-b", "frameB.fits", "M31", 8192);
+    let pkg = build_package(
+        &tmp.path().join("srcB"),
+        "uuid-b",
+        "frameB.fits",
+        "M31",
+        8192,
+    );
     assert!(pkg.join("frameB.fits").exists());
 
     // Seed a confirmed outbound row pointing at the package dir.
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let id = store.enqueue(&pkg.to_string_lossy(), receiver_id, None, &[]).unwrap();
+    let id = store
+        .enqueue(&pkg.to_string_lossy(), receiver_id, None, &[])
+        .unwrap();
     store.confirm(id, &[]).unwrap();
 
     // Spawn the engine → its startup heal iterates confirmed() and cleans.
@@ -2196,7 +2554,13 @@ async fn cancelled_package_keeps_payloads() {
     let receiver = Arc::new(net.endpoint());
     let receiver_id = receiver.start().await.unwrap().node_id;
 
-    let pkg = build_package(&tmp.path().join("srcC"), "uuid-c", "frameC.fits", "NGC7000", 1024);
+    let pkg = build_package(
+        &tmp.path().join("srcC"),
+        "uuid-c",
+        "frameC.fits",
+        "NGC7000",
+        1024,
+    );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn_with_config(
@@ -2208,7 +2572,10 @@ async fn cancelled_package_keeps_payloads() {
         },
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
     wait_until(
         || state_of(&store, id) == Some(OutboundState::Transferring),
         WAIT,
@@ -2217,7 +2584,11 @@ async fn cancelled_package_keeps_payloads() {
 
     // Cancel → terminal Cancelled.
     engine.cancel(id).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Cancelled),
+        WAIT,
+    )
+    .await;
 
     // A brief settle so any (erroneous) cleanup would have a chance to run.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2247,7 +2618,13 @@ async fn sink_defers_shared_payload_cleanup_until_all_targets_terminal() {
     let receiver_id = receiver.start().await.unwrap().node_id;
     let _stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("srcD"), "uuid-d", "frameD.fits", "M42", 4096);
+    let pkg = build_package(
+        &tmp.path().join("srcD"),
+        "uuid-d",
+        "frameD.fits",
+        "M42",
+        4096,
+    );
     assert!(pkg.join("frameD.fits").exists());
 
     // Two targets share this dir; only one is driven here.
@@ -2262,8 +2639,15 @@ async fn sink_defers_shared_payload_cleanup_until_all_targets_terminal() {
         coord.clone() as Arc<dyn PackageCleanupSink>,
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
 
     // Confirmed, but the shared payload MUST still be here — the second target
     // has not terminalized, so an in-line cleanup would have starved its retry.
@@ -2325,7 +2709,10 @@ async fn ack_from_unexpected_peer_does_not_confirm() {
         }
     });
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_ne!(
         state_of(&store, id),
@@ -2367,7 +2754,10 @@ async fn empty_ack_does_not_confirm() {
         }
     });
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_ne!(
         state_of(&store, id),
@@ -2407,8 +2797,12 @@ async fn crash_resume_only_redrives_its_own_peers_rows() {
     // Seed both rows directly (as a prior multi-engine run would have left them),
     // each bound to its own peer.
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let id_a = store.enqueue(&pkg_a.to_string_lossy(), receiver_a_id, None, &[]).unwrap();
-    let id_b = store.enqueue(&pkg_b.to_string_lossy(), receiver_b_id, None, &[]).unwrap();
+    let id_a = store
+        .enqueue(&pkg_a.to_string_lossy(), receiver_a_id, None, &[])
+        .unwrap();
+    let id_b = store
+        .enqueue(&pkg_b.to_string_lossy(), receiver_b_id, None, &[])
+        .unwrap();
 
     // ONE engine, bound to peer A only.
     let engine = SyncEngine::spawn(
@@ -2506,7 +2900,10 @@ async fn announce_carries_batch_name_and_file_manifest() {
         tokio::spawn(async move {
             let mut events = receiver.events().await;
             while let Some(event) = events.recv().await {
-                if let TransportEvent::AnnounceReceived { batch_name, files, .. } = event {
+                if let TransportEvent::AnnounceReceived {
+                    batch_name, files, ..
+                } = event
+                {
                     *captured.lock().unwrap() = Some((batch_name, files));
                     break;
                 }
@@ -2518,13 +2915,18 @@ async fn announce_carries_batch_name_and_file_manifest() {
     let pkg = build_package_multi(
         &tmp.path().join("src"),
         "named",
-        &[("uuid-a", "a.fits", "M42", 2048), ("uuid-b", "b.fits", "M42", 4096)],
+        &[
+            ("uuid-a", "a.fits", "M42", 2048),
+            ("uuid-b", "b.fits", "M42", 4096),
+        ],
     );
     // `CatalogSyncStore` (over a fresh db) exposes `lock_conn`, so the pre-seed
     // can set the row's `display_name` directly. Its `open` materialises the same
     // sync tables the standalone store does.
     let store = Arc::new(super::store::CatalogSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let id = store.enqueue(&pkg.to_string_lossy(), receiver_id, None, &[]).unwrap();
+    let id = store
+        .enqueue(&pkg.to_string_lossy(), receiver_id, None, &[])
+        .unwrap();
     crate::sync::store::set_outbound_display_name(&store.lock_conn(), id, Some("Orion Nebula"))
         .unwrap();
 
@@ -2684,10 +3086,18 @@ async fn all_duplicate_package_terminalizes_without_announce() {
     let receiver_id = receiver.start().await.unwrap().node_id;
     let stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("srcDup"), "uuid-dup", "dup.fits", "M42", 4096);
+    let pkg = build_package(
+        &tmp.path().join("srcDup"),
+        "uuid-dup",
+        "dup.fits",
+        "M42",
+        4096,
+    );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let events = Arc::new(std::sync::Mutex::new(
+        Vec::<(String, serde_json::Value)>::new(),
+    ));
     let emitter: Arc<dyn crate::events::ProgressEmitter> =
         Arc::new(CapturingEmitter(events.clone()));
     let engine = SyncEngine::spawn_with_emitter(
@@ -2697,8 +3107,15 @@ async fn all_duplicate_package_terminalizes_without_announce() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
 
     // Let any (erroneous) announce reach the receiver before asserting none did.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2744,10 +3161,18 @@ async fn negotiate_error_falls_back_to_full_announce() {
     let receiver_id = receiver.start().await.unwrap().node_id;
     let stats = spawn_receiver(receiver.clone(), tmp.path().join("recv"));
 
-    let pkg = build_package(&tmp.path().join("srcErr"), "uuid-err", "err.fits", "M42", 4096);
+    let pkg = build_package(
+        &tmp.path().join("srcErr"),
+        "uuid-err",
+        "err.fits",
+        "M42",
+        4096,
+    );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let events = Arc::new(std::sync::Mutex::new(
+        Vec::<(String, serde_json::Value)>::new(),
+    ));
     let emitter: Arc<dyn crate::events::ProgressEmitter> =
         Arc::new(CapturingEmitter(events.clone()));
     // Wrap the sender endpoint so `negotiate_want` always errors → full send.
@@ -2759,8 +3184,15 @@ async fn negotiate_error_falls_back_to_full_announce() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
 
     assert!(
         stats.attempts.load(SeqCst) >= 1,
@@ -2817,7 +3249,9 @@ async fn mixed_batch_serves_only_want_subset() {
     );
 
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let events = Arc::new(std::sync::Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+    let events = Arc::new(std::sync::Mutex::new(
+        Vec::<(String, serde_json::Value)>::new(),
+    ));
     let emitter: Arc<dyn crate::events::ProgressEmitter> =
         Arc::new(CapturingEmitter(events.clone()));
     let engine = SyncEngine::spawn_with_emitter(
@@ -2827,8 +3261,15 @@ async fn mixed_batch_serves_only_want_subset() {
         Some(emitter),
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
 
     // Exactly one announce → exactly one fetch, of the wanted frame only.
     assert_eq!(
@@ -2926,8 +3367,7 @@ async fn project_package_announces_via_announce_project() {
     // Receiver endpoint records the first inbound project advertisement.
     let receiver = Arc::new(net.endpoint());
     let receiver_id = receiver.start().await.unwrap().node_id;
-    let seen: Arc<std::sync::Mutex<Option<TransportEvent>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let seen: Arc<std::sync::Mutex<Option<TransportEvent>>> = Arc::new(std::sync::Mutex::new(None));
     {
         let receiver = receiver.clone();
         let seen = seen.clone();
@@ -2961,7 +3401,10 @@ async fn project_package_announces_via_announce_project() {
         Arc::new(net.endpoint()),
         receiver_id,
     );
-    let _id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let _id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     wait_until(|| seen.lock().unwrap().is_some(), WAIT).await;
     match seen.lock().unwrap().take().unwrap() {
@@ -3141,7 +3584,10 @@ async fn retry_path_re_resolves_and_re_adds_peer_address() {
         Some(refresher),
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
     // The ack never comes, so the ack deadline elapses and the Retry path runs,
     // re-resolving + re-registering the peer's address. Wait on that side effect
     // (the address landing on the transport) rather than a terminal state.
@@ -3258,8 +3704,140 @@ impl SharingTransport for ServeTickTransport {
         Ok(())
     }
     async fn events(&self) -> mpsc::Receiver<TransportEvent> {
-        self.rx.lock().unwrap().take().expect("events() called once")
+        self.rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("events() called once")
     }
+}
+
+/// Owner smoke 2026-07-25: after a dropped connection the sender's overall
+/// progress bar fell back to the start and counted the remainder as if it were the
+/// whole batch.
+///
+/// The provider's byte counter is scoped to ONE GET request — the iroh consumer
+/// builds a fresh `UploadAccumulator` per `GetRequestReceivedNotify` — so when the
+/// peer re-requests the ranges it still lacks, its ticks begin at ~0 again.
+/// Emitting them raw threw away everything already delivered. The engine now adds
+/// the base recorded in the durable per-file rows, so the figure only ever moves
+/// forward across sessions.
+#[tokio::test]
+async fn a_resumed_pull_continues_the_progress_instead_of_restarting_it() {
+    let tmp = tempdir().unwrap();
+    let peer: NodeId = *iroh::SecretKey::generate().public().as_bytes();
+
+    let (tx, rx) = mpsc::channel::<TransportEvent>(64);
+    let announce_count = Arc::new(AtomicUsize::new(0));
+    let announced_pid = Arc::new(std::sync::Mutex::new(None::<PackageId>));
+    let transport = Arc::new(ServeTickTransport {
+        node_id: peer,
+        rx: std::sync::Mutex::new(Some(rx)),
+        announce_count: Arc::clone(&announce_count),
+        announced_pid: Arc::clone(&announced_pid),
+    });
+
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let emitter: Arc<dyn crate::events::ProgressEmitter> =
+        Arc::new(CapturingEmitter(events.clone()));
+
+    // Two 1 KiB frames: one will be fully delivered before the drop.
+    let pkg = build_package_multi(
+        &tmp.path().join("src-resume"),
+        "pkg-resume",
+        &[
+            ("uuid-a", "a.fits", "M8", 1024),
+            ("uuid-b", "b.fits", "M8", 1024),
+        ],
+    );
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_inner(
+        store.clone() as Arc<dyn SyncStore>,
+        transport as Arc<dyn SharingTransport>,
+        peer,
+        SyncConfig {
+            ack_timeout: Duration::from_secs(30),
+        },
+        Some(emitter),
+        None,
+        None,
+    );
+
+    // The per-file rows are what carry the delivered-bytes base across sessions,
+    // so this enqueue must declare them (an empty list creates no rows).
+    let announce_files: Vec<AnnounceFileEntry> = ["a.fits", "b.fits"]
+        .iter()
+        .enumerate()
+        .map(|(i, f)| AnnounceFileEntry {
+            rel_path: (*f).to_string(),
+            byte_size: 1024,
+            frame_uuid: format!("uuid-{}", if i == 0 { "a" } else { "b" }),
+        })
+        .collect();
+    let id = engine
+        .enqueue_package(&pkg, None, announce_files)
+        .await
+        .unwrap();
+    wait_until(|| announced_pid.lock().unwrap().is_some(), WAIT).await;
+    let pid = announced_pid.lock().unwrap().clone().unwrap();
+
+    let last_bytes_done = || -> Option<u64> {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(n, p)| n == "sync-progress" && p["stage"] == "transferring")
+            .and_then(|(_, p)| p["bytesDone"].as_u64())
+    };
+
+    // ── Session 1: a.fits completes, b.fits is partway. ──────────────────────
+    tx.send(TransportEvent::ServeFileProgress {
+        package_id: pid.clone(),
+        file: "a.fits".to_string(),
+        bytes_done: 1024,
+        bytes_total: 1024,
+    })
+    .await
+    .unwrap();
+    tx.send(TransportEvent::ServeProgress {
+        package_id: pid.clone(),
+        bytes_sent: 1536,
+    })
+    .await
+    .unwrap();
+    wait_until(|| last_bytes_done() == Some(1536), WAIT).await;
+
+    // ── The connection drops; the peer re-requests only what it still lacks, so
+    //    the provider's counter restarts near zero. ───────────────────────────
+    tx.send(TransportEvent::ServeProgress {
+        package_id: pid.clone(),
+        bytes_sent: 64,
+    })
+    .await
+    .unwrap();
+    wait_until(|| last_bytes_done().is_some_and(|b| b != 1536), WAIT).await;
+
+    let resumed = last_bytes_done().expect("a progress tick after the drop");
+    assert!(
+        resumed >= 1024,
+        "the bar must keep the fully-delivered a.fits (1024 B); it restarted at {resumed}"
+    );
+    assert_eq!(
+        resumed, 1088,
+        "and read as delivered-so-far + this session: 1024 + 64"
+    );
+
+    // The session continues to climb from the base, not from zero.
+    tx.send(TransportEvent::ServeProgress {
+        package_id: pid.clone(),
+        bytes_sent: 512,
+    })
+    .await
+    .unwrap();
+    wait_until(|| last_bytes_done() == Some(1536), WAIT).await;
+
+    engine.shutdown().await;
 }
 
 /// Item 3: while a peer is actively pulling, serve ticks push the ack-timeout
@@ -3290,7 +3868,13 @@ async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
     // 600ms against 100ms ticks gives a 6× margin; every wait below scales to this
     // base (backoff rung 1 = 2× base = 1.2s).
     let ack_timeout = Duration::from_millis(600);
-    let pkg = build_package(&tmp.path().join("src-serve"), "uuid-serve", "f.fits", "M8", 1024);
+    let pkg = build_package(
+        &tmp.path().join("src-serve"),
+        "uuid-serve",
+        "f.fits",
+        "M8",
+        1024,
+    );
     let db_path = tmp.path().join("sync.db");
     let store = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
     let engine = SyncEngine::spawn_inner(
@@ -3303,12 +3887,19 @@ async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
         None,
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     // The first announce mints the wire package_id + arms the ack-wait deadline.
     wait_until(|| announced_pid.lock().unwrap().is_some(), WAIT).await;
     let pid = announced_pid.lock().unwrap().clone().unwrap();
-    assert_eq!(announce_count.load(SeqCst), 1, "exactly one announce so far");
+    assert_eq!(
+        announce_count.load(SeqCst),
+        1,
+        "exactly one announce so far"
+    );
 
     // ---- Phase 1: steady ticks suppress the ack timeout entirely. -------------
     // Tick every ~100ms (6× under the 600ms ack timeout) for > 3× the timeout,
@@ -3357,7 +3948,14 @@ async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
     // Stop ticking → the last-pushed AwaitAck deadline (200ms) elapses → the ack
     // timeout fires: next_retry_at is set and a Retry is armed (rung 1, 400ms).
     wait_until(
-        || store.get_outbound(id).unwrap().unwrap().next_retry_at.is_some(),
+        || {
+            store
+                .get_outbound(id)
+                .unwrap()
+                .unwrap()
+                .next_retry_at
+                .is_some()
+        },
         WAIT,
     )
     .await;
@@ -3384,12 +3982,21 @@ async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
         .await
         .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
-        if store.get_outbound(id).unwrap().unwrap().next_retry_at.is_none() {
+        if store
+            .get_outbound(id)
+            .unwrap()
+            .unwrap()
+            .next_retry_at
+            .is_none()
+        {
             cleared = true;
             break;
         }
     }
-    assert!(cleared, "a resumed serve tick must cancel the armed retry countdown");
+    assert!(
+        cleared,
+        "a resumed serve tick must cancel the armed retry countdown"
+    );
     // The disarmed Retry never fired — the flip pre-empted the re-announce.
     assert_eq!(
         announce_count.load(SeqCst),
@@ -3400,7 +4007,14 @@ async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
     // ---- Phase 2b: a ServeFileProgress tick ALSO disarms an armed retry. ------
     // (Review fix: pins the on_serve_file_progress call site independently.)
     wait_until(
-        || store.get_outbound(id).unwrap().unwrap().next_retry_at.is_some(),
+        || {
+            store
+                .get_outbound(id)
+                .unwrap()
+                .unwrap()
+                .next_retry_at
+                .is_some()
+        },
         WAIT,
     )
     .await;
@@ -3415,37 +4029,77 @@ async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
         .await
         .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
-        if store.get_outbound(id).unwrap().unwrap().next_retry_at.is_none() {
+        if store
+            .get_outbound(id)
+            .unwrap()
+            .unwrap()
+            .next_retry_at
+            .is_none()
+        {
             cleared = true;
             break;
         }
     }
-    assert!(cleared, "a per-file serve tick must cancel the armed retry countdown");
-    assert_eq!(announce_count.load(SeqCst), 1, "still no mid-pull re-announce");
+    assert!(
+        cleared,
+        "a per-file serve tick must cancel the armed retry countdown"
+    );
+    assert_eq!(
+        announce_count.load(SeqCst),
+        1,
+        "still no mid-pull re-announce"
+    );
 
     // ---- Phase 2c: ServeComplete ALSO defers/disarms (the post-upload window). -
     // (Review fix: pins the on_serve_complete call site — the peer finished
     // pulling; the ack window restarts from HERE, and an armed retry is disarmed.)
     wait_until(
-        || store.get_outbound(id).unwrap().unwrap().next_retry_at.is_some(),
+        || {
+            store
+                .get_outbound(id)
+                .unwrap()
+                .unwrap()
+                .next_retry_at
+                .is_some()
+        },
         WAIT,
     )
     .await;
-    tx.send(TransportEvent::ServeComplete { package_id: pid.clone() })
-        .await
-        .unwrap();
+    tx.send(TransportEvent::ServeComplete {
+        package_id: pid.clone(),
+    })
+    .await
+    .unwrap();
     wait_until(
-        || store.get_outbound(id).unwrap().unwrap().next_retry_at.is_none(),
+        || {
+            store
+                .get_outbound(id)
+                .unwrap()
+                .unwrap()
+                .next_retry_at
+                .is_none()
+        },
         WAIT,
     )
     .await;
-    assert_eq!(announce_count.load(SeqCst), 1, "serve-complete must not re-announce");
+    assert_eq!(
+        announce_count.load(SeqCst),
+        1,
+        "serve-complete must not re-announce"
+    );
 
     // ---- Phase 3: full silence resumes the ladder. ----------------------------
     // With no more ticks, the last-pushed deadline elapses and the ack timeout
     // fires again — the ladder climbs from the last-activity instant.
     wait_until(
-        || store.get_outbound(id).unwrap().unwrap().next_retry_at.is_some(),
+        || {
+            store
+                .get_outbound(id)
+                .unwrap()
+                .unwrap()
+                .next_retry_at
+                .is_some()
+        },
         WAIT,
     )
     .await;
@@ -3588,7 +4242,13 @@ async fn retry_replaces_stale_addressing_after_classified_dial_failure() {
         })
     });
 
-    let pkg = build_package(&tmp.path().join("src-t36"), "uuid-t36", "f.fits", "M8", 1024);
+    let pkg = build_package(
+        &tmp.path().join("src-t36"),
+        "uuid-t36",
+        "f.fits",
+        "M8",
+        1024,
+    );
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn_inner(
         store.clone() as Arc<dyn SyncStore>,
@@ -3602,7 +4262,10 @@ async fn retry_replaces_stale_addressing_after_classified_dial_failure() {
         Some(refresher),
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     // The announce fails (timeout class) and arms a retry; when the backoff window
     // elapses, the retry path re-resolves, REMOVES the stale entry, then re-adds the
@@ -3677,7 +4340,13 @@ async fn retry_refresh_unavailable_warns_with_peer() {
     let refresher: crate::sync::engine::AddrRefresher =
         Arc::new(|_p: NodeId| Box::pin(async { None::<iroh::EndpointAddr> }));
 
-    let pkg = build_package(&tmp.path().join("src-t34"), "uuid-t34", "f.fits", "M8", 1024);
+    let pkg = build_package(
+        &tmp.path().join("src-t34"),
+        "uuid-t34",
+        "f.fits",
+        "M8",
+        1024,
+    );
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let engine = SyncEngine::spawn_inner(
         store.clone() as Arc<dyn SyncStore>,
@@ -3690,7 +4359,10 @@ async fn retry_refresh_unavailable_warns_with_peer() {
         None,
         Some(refresher),
     );
-    let _id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let _id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     const MSG: &str = "retry: address refresh unavailable; dialing last-known address";
     wait_until(
@@ -3745,7 +4417,8 @@ async fn park_in_long_backoff(
         2048,
     );
 
-    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join(format!("sync_{label}.db"))).unwrap());
+    let store =
+        Arc::new(StandaloneSyncStore::open(tmp.path().join(format!("sync_{label}.db"))).unwrap());
     let engine = SyncEngine::spawn_with_config(
         store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
@@ -3761,7 +4434,10 @@ async fn park_in_long_backoff(
         },
     );
 
-    let id = engine.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, Vec::new())
+        .await
+        .unwrap();
 
     // A couple of failed announce attempts against the absent peer (spec §2).
     wait_until(|| attempts_of(&store, id) >= 2, WAIT).await;
@@ -3777,7 +4453,10 @@ async fn park_in_long_backoff(
                 .unwrap()
                 .and_then(|r| r.next_retry_at)
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-                .map(|t| t.with_timezone(&chrono::Utc) > chrono::Utc::now() + chrono::Duration::milliseconds(1200))
+                .map(|t| {
+                    t.with_timezone(&chrono::Utc)
+                        > chrono::Utc::now() + chrono::Duration::milliseconds(1200)
+                })
                 .unwrap_or(false)
         },
         WAIT,
@@ -3932,8 +4611,14 @@ async fn kick_all_resets_every_pending_package() {
         },
     );
 
-    let id_a = engine.enqueue_package(&pkg_a, None, Vec::new()).await.unwrap();
-    let id_b = engine.enqueue_package(&pkg_b, None, Vec::new()).await.unwrap();
+    let id_a = engine
+        .enqueue_package(&pkg_a, None, Vec::new())
+        .await
+        .unwrap();
+    let id_b = engine
+        .enqueue_package(&pkg_b, None, Vec::new())
+        .await
+        .unwrap();
 
     // Park both against the absent peer. Under D1 coalescing only the HEAD (the
     // lowest pending id) keeps a live countdown; its queue-mate parks with no
@@ -3959,7 +4644,11 @@ async fn kick_all_resets_every_pending_package() {
             .map(|r| r.next_retry_at.is_none())
             .unwrap_or(false)
     };
-    wait_until(|| attempts_of(&store, id_a) >= 1 && attempts_of(&store, id_b) >= 1, WAIT).await;
+    wait_until(
+        || attempts_of(&store, id_a) >= 1 && attempts_of(&store, id_b) >= 1,
+        WAIT,
+    )
+    .await;
     wait_until(
         || countdown_beyond_1200ms(id_a) && parked_without_countdown(id_b),
         WAIT,
@@ -4104,7 +4793,11 @@ fn spawn_gated_receiver(
             };
             n += 1;
             let dest = dest_root.join(format!("fetch-{n}"));
-            if endpoint.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
+            if endpoint
+                .fetch(from, &announce, &dest, noop_fetch_sink())
+                .await
+                .is_ok()
+            {
                 if !allow_ack.load(SeqCst) {
                     continue;
                 }
@@ -4138,7 +4831,11 @@ fn spawn_rejecting_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf
             };
             n += 1;
             let dest = dest_root.join(format!("fetch-{n}"));
-            if endpoint.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok() {
+            if endpoint
+                .fetch(from, &announce, &dest, noop_fetch_sink())
+                .await
+                .is_ok()
+            {
                 let Ok(records) = package::read_manifest(&dest) else {
                     continue;
                 };
@@ -4171,11 +4868,18 @@ async fn enqueue_writes_row_files_and_name_before_first_announce() {
     let pkg = build_package_multi(
         &tmp.path().join("src"),
         "meta",
-        &[("uuid-a", "a.fits", "M42", 2048), ("uuid-b", "b.fits", "M42", 4096)],
+        &[
+            ("uuid-a", "a.fits", "M42", 2048),
+            ("uuid-b", "b.fits", "M42", 4096),
+        ],
     );
     let db_path = tmp.path().join("sync.db");
     let store = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
-    let engine = SyncEngine::spawn(store.clone() as Arc<dyn SyncStore>, Arc::new(net.endpoint()), peer);
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        peer,
+    );
 
     let files = entries(&[("uuid-a", "a.fits", 2048), ("uuid-b", "b.fits", 4096)]);
     let id = engine
@@ -4220,22 +4924,45 @@ async fn want_subset_settles_excluded_duplicate_and_wanted_ingested() {
     let pkg = build_package_multi(
         &tmp.path().join("srcWant"),
         "want",
-        &[("uuid-a", "a.fits", "M42", 2048), ("uuid-b", "b.fits", "M42", 4096)],
+        &[
+            ("uuid-a", "a.fits", "M42", 2048),
+            ("uuid-b", "b.fits", "M42", 4096),
+        ],
     );
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
-    let engine = SyncEngine::spawn(store.clone() as Arc<dyn SyncStore>, Arc::new(net.endpoint()), receiver_id);
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
     let files = entries(&[("uuid-a", "a.fits", 2048), ("uuid-b", "b.fits", 4096)]);
     let id = engine.enqueue_package(&pkg, None, files).await.unwrap();
 
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
 
     let rows = files_of(&store, id);
     let a = file_row(&rows, "a.fits");
-    assert_eq!(a.state, OutboundFileState::Done, "excluded file is terminal");
-    assert_eq!(a.outcome.as_deref(), Some("duplicate"), "excluded file is a duplicate");
+    assert_eq!(
+        a.state,
+        OutboundFileState::Done,
+        "excluded file is terminal"
+    );
+    assert_eq!(
+        a.outcome.as_deref(),
+        Some("duplicate"),
+        "excluded file is a duplicate"
+    );
     let b = file_row(&rows, "b.fits");
     assert_eq!(b.state, OutboundFileState::Done, "wanted file is terminal");
-    assert_eq!(b.outcome.as_deref(), Some("ingested"), "wanted file was ingested");
+    assert_eq!(
+        b.outcome.as_deref(),
+        Some("ingested"),
+        "wanted file was ingested"
+    );
 
     engine.shutdown().await;
 }
@@ -4256,22 +4983,37 @@ async fn serve_complete_persists_delivered_uploaded_then_restart_confirms() {
     let pkg = build_package_multi(
         &tmp.path().join("srcDel"),
         "del",
-        &[("uuid-a", "a.fits", "M42", 2048), ("uuid-b", "b.fits", "M42", 4096)],
+        &[
+            ("uuid-a", "a.fits", "M42", 2048),
+            ("uuid-b", "b.fits", "M42", 4096),
+        ],
     );
     let db_path = tmp.path().join("sync.db");
     let store_a = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
     // Default (long) ack timeout: the row rests in Delivered awaiting the ack.
-    let engine_a = SyncEngine::spawn(store_a.clone() as Arc<dyn SyncStore>, Arc::new(net.endpoint()), receiver_id);
+    let engine_a = SyncEngine::spawn(
+        store_a.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
     let files = entries(&[("uuid-a", "a.fits", 2048), ("uuid-b", "b.fits", 4096)]);
     let id = engine_a.enqueue_package(&pkg, None, files).await.unwrap();
 
     // Phase 1: the peer pulled everything (ServeComplete) but did not ack → the
     // batch persists `Delivered` and every file row is `uploaded`.
-    wait_until(|| state_of(&store_a, id) == Some(OutboundState::Delivered), WAIT).await;
+    wait_until(
+        || state_of(&store_a, id) == Some(OutboundState::Delivered),
+        WAIT,
+    )
+    .await;
     let rows = files_of(&store_a, id);
     assert_eq!(rows.len(), 2);
     for r in &rows {
-        assert_eq!(r.state, OutboundFileState::Uploaded, "uploaded, not yet acked: {r:?}");
+        assert_eq!(
+            r.state,
+            OutboundFileState::Uploaded,
+            "uploaded, not yet acked: {r:?}"
+        );
     }
     assert!(sent_event_kinds(&db_path, id).contains(&"uploaded".to_string()));
 
@@ -4280,12 +5022,25 @@ async fn serve_complete_persists_delivered_uploaded_then_restart_confirms() {
     drop(engine_a);
     allow_ack.store(true, SeqCst);
     let store_b = Arc::new(StandaloneSyncStore::open(&db_path).unwrap());
-    let engine_b = SyncEngine::spawn(store_b.clone() as Arc<dyn SyncStore>, Arc::new(net.endpoint()), receiver_id);
-    wait_until(|| state_of(&store_b, id) == Some(OutboundState::Confirmed), WAIT).await;
+    let engine_b = SyncEngine::spawn(
+        store_b.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        receiver_id,
+    );
+    wait_until(
+        || state_of(&store_b, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
     let rows = files_of(&store_b, id);
     for r in &rows {
         assert_eq!(r.state, OutboundFileState::Done);
-        assert_eq!(r.outcome.as_deref(), Some("ingested"), "file {}: {r:?}", r.rel_path);
+        assert_eq!(
+            r.outcome.as_deref(),
+            Some("ingested"),
+            "file {}: {r:?}",
+            r.rel_path
+        );
     }
 
     engine_b.shutdown().await;
@@ -4310,7 +5065,9 @@ async fn ack_timeout_journals_retry_then_recovery_confirms_and_clears_error() {
         store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
         receiver_id,
-        SyncConfig { ack_timeout: Duration::from_millis(300) },
+        SyncConfig {
+            ack_timeout: Duration::from_millis(300),
+        },
     );
     let id = engine
         .enqueue_package(&pkg, None, entries(&[("uuid-to", "f.fits", 4096)]))
@@ -4319,23 +5076,55 @@ async fn ack_timeout_journals_retry_then_recovery_confirms_and_clears_error() {
 
     // Phase 1: the peer pulls but never acks → the ack times out. `last_error` set,
     // journal records ack_timeout + retry_scheduled.
-    wait_until(|| store.get_outbound(id).unwrap().unwrap().last_error.is_some(), WAIT).await;
+    wait_until(
+        || {
+            store
+                .get_outbound(id)
+                .unwrap()
+                .unwrap()
+                .last_error
+                .is_some()
+        },
+        WAIT,
+    )
+    .await;
     assert_eq!(
-        store.get_outbound(id).unwrap().unwrap().last_error.as_deref(),
+        store
+            .get_outbound(id)
+            .unwrap()
+            .unwrap()
+            .last_error
+            .as_deref(),
         Some("no ack from peer within timeout")
     );
     let kinds = sent_event_kinds(&db_path, id);
-    assert!(kinds.contains(&"ack_timeout".to_string()), "kinds: {kinds:?}");
-    assert!(kinds.contains(&"retry_scheduled".to_string()), "kinds: {kinds:?}");
+    assert!(
+        kinds.contains(&"ack_timeout".to_string()),
+        "kinds: {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"retry_scheduled".to_string()),
+        "kinds: {kinds:?}"
+    );
 
     // Phase 2: allow the ack → a re-announce confirms; no stale error survives,
     // journal records ack_received + confirmed.
     allow_ack.store(true, SeqCst);
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
     let row = store.get_outbound(id).unwrap().unwrap();
-    assert_eq!(row.last_error, None, "a confirmed transfer carries no stale reason");
+    assert_eq!(
+        row.last_error, None,
+        "a confirmed transfer carries no stale reason"
+    );
     let kinds = sent_event_kinds(&db_path, id);
-    assert!(kinds.contains(&"ack_received".to_string()), "kinds: {kinds:?}");
+    assert!(
+        kinds.contains(&"ack_received".to_string()),
+        "kinds: {kinds:?}"
+    );
     assert!(kinds.contains(&"confirmed".to_string()), "kinds: {kinds:?}");
 
     engine.shutdown().await;
@@ -4360,7 +5149,9 @@ async fn rejected_receipt_settles_file_with_rejected_outcome() {
         store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
         receiver_id,
-        SyncConfig { ack_timeout: Duration::from_secs(60) },
+        SyncConfig {
+            ack_timeout: Duration::from_secs(60),
+        },
     );
     let id = engine
         .enqueue_package(&pkg, None, entries(&[("uuid-r", "f.fits", 4096)]))
@@ -4411,7 +5202,9 @@ async fn mid_transfer_abort_leaves_file_sending_then_resume_uploads() {
         store.clone() as Arc<dyn SyncStore>,
         Arc::new(net.endpoint()),
         receiver_id,
-        SyncConfig { ack_timeout: Duration::from_secs(60) },
+        SyncConfig {
+            ack_timeout: Duration::from_secs(60),
+        },
     );
     let id = engine
         .enqueue_package(&pkg, None, entries(&[("uuid-s", "f.fits", 4096)]))
@@ -4429,7 +5222,11 @@ async fn mid_transfer_abort_leaves_file_sending_then_resume_uploads() {
 
     // Kick the retry: the second fetch completes → the file uploads → batch confirms.
     engine.kick(id).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
     let rows = files_of(&store, id);
     assert_eq!(rows[0].state, OutboundFileState::Done);
     assert_eq!(rows[0].outcome.as_deref(), Some("ingested"));
@@ -4470,7 +5267,10 @@ fn ingested_receipts_of(pkg: &Path) -> Vec<FrameReceipt> {
 
 /// The persisted per-attempt wire id of outbound row `id`.
 fn wire_of(store: &StandaloneSyncStore, id: i64) -> Option<String> {
-    store.get_outbound(id).unwrap().and_then(|r| r.wire_package_id)
+    store
+        .get_outbound(id)
+        .unwrap()
+        .and_then(|r| r.wire_package_id)
 }
 
 /// Whether `id` has announced + is serving/awaiting-ack — `Transferring` OR the
@@ -4519,10 +5319,16 @@ fn spawn_recording_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf
         while let Some(event) = events.recv().await {
             match event {
                 TransportEvent::AnnounceReceived { from, announce, .. } => {
-                    rec.announces.lock().unwrap().push(announce.package_id.0.clone());
+                    rec.announces
+                        .lock()
+                        .unwrap()
+                        .push(announce.package_id.0.clone());
                     n += 1;
                     let dest = dest_root.join(format!("fetch-{n}"));
-                    if endpoint.fetch(from, &announce, &dest, noop_fetch_sink()).await.is_ok()
+                    if endpoint
+                        .fetch(from, &announce, &dest, noop_fetch_sink())
+                        .await
+                        .is_ok()
                         && rec.ack_enabled.load(SeqCst)
                     {
                         if let Ok(records) = package::read_manifest(&dest) {
@@ -4538,7 +5344,9 @@ fn spawn_recording_receiver(endpoint: Arc<LoopbackTransport>, dest_root: PathBuf
                         }
                     }
                 }
-                TransportEvent::RevokeReceived { package_id, reason, .. } => {
+                TransportEvent::RevokeReceived {
+                    package_id, reason, ..
+                } => {
                     rec.revokes.lock().unwrap().push((package_id.0, reason));
                 }
                 _ => {}
@@ -4585,9 +5393,17 @@ async fn resend_cycle_one_row_cancel_then_confirm() {
 
     // Cancel mid-serve → Cancelled + Revoke{Cancelled}(w1).
     engine.cancel(id).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
     wait_until(
-        || rec.revokes().iter().any(|(pid, r)| *pid == w1 && *r == RevokeReason::Cancelled),
+        || state_of(&store, id) == Some(OutboundState::Cancelled),
+        WAIT,
+    )
+    .await;
+    wait_until(
+        || {
+            rec.revokes()
+                .iter()
+                .any(|(pid, r)| *pid == w1 && *r == RevokeReason::Cancelled)
+        },
         WAIT,
     )
     .await;
@@ -4602,11 +5418,19 @@ async fn resend_cycle_one_row_cancel_then_confirm() {
     rec.ack_enabled.store(true, SeqCst);
     engine.resend(id).await.unwrap();
 
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
 
     // ONE row: same id, attempts advanced, wire rotated to the resend's id.
     let row = store.get_outbound(id).unwrap().unwrap();
-    assert!(row.attempts >= 2, "attempts advanced past the original, got {}", row.attempts);
+    assert!(
+        row.attempts >= 2,
+        "attempts advanced past the original, got {}",
+        row.attempts
+    );
     assert_ne!(w2, w1, "resend rotated the wire id");
     assert_eq!(
         row.wire_package_id.as_deref(),
@@ -4616,8 +5440,14 @@ async fn resend_cycle_one_row_cancel_then_confirm() {
 
     // The resend announced the NEW wire id (no stale caching across the reset).
     let announces = rec.announces();
-    assert!(announces.contains(&w1), "attempt 1 announced w1, got {announces:?}");
-    assert!(announces.contains(&w2), "the resend announced the NEW wire id w2, got {announces:?}");
+    assert!(
+        announces.contains(&w1),
+        "attempt 1 announced w1, got {announces:?}"
+    );
+    assert!(
+        announces.contains(&w2),
+        "the resend announced the NEW wire id w2, got {announces:?}"
+    );
 
     // Per-file rows reset then settled to done/ingested on the resend.
     let rows = files_of(&store, id);
@@ -4632,13 +5462,31 @@ async fn resend_cycle_one_row_cancel_then_confirm() {
     let mut kinds = sent_event_kinds(&db_path, id);
     kinds.reverse();
     let pos = |k: &str| kinds.iter().position(|x| x == k);
-    assert!(pos("cancelled").is_some(), "journal has cancelled, got {kinds:?}");
-    assert!(pos("revoke_sent").is_some(), "journal has revoke_sent, got {kinds:?}");
+    assert!(
+        pos("cancelled").is_some(),
+        "journal has cancelled, got {kinds:?}"
+    );
+    assert!(
+        pos("revoke_sent").is_some(),
+        "journal has revoke_sent, got {kinds:?}"
+    );
     assert!(pos("resend").is_some(), "journal has resend, got {kinds:?}");
-    assert!(pos("confirmed").is_some(), "journal has confirmed, got {kinds:?}");
-    assert!(pos("cancelled") < pos("revoke_sent"), "cancelled before revoke_sent, got {kinds:?}");
-    assert!(pos("revoke_sent") < pos("resend"), "revoke_sent before resend, got {kinds:?}");
-    assert!(pos("resend") < pos("confirmed"), "resend before confirmed, got {kinds:?}");
+    assert!(
+        pos("confirmed").is_some(),
+        "journal has confirmed, got {kinds:?}"
+    );
+    assert!(
+        pos("cancelled") < pos("revoke_sent"),
+        "cancelled before revoke_sent, got {kinds:?}"
+    );
+    assert!(
+        pos("revoke_sent") < pos("resend"),
+        "revoke_sent before resend, got {kinds:?}"
+    );
+    assert!(
+        pos("resend") < pos("confirmed"),
+        "resend before confirmed, got {kinds:?}"
+    );
 
     engine.shutdown().await;
 }
@@ -4658,7 +5506,13 @@ async fn old_attempt_wire_id_ack_does_not_replay_onto_resend() {
     let rec = Recorder::new(false);
     spawn_recording_receiver(receiver.clone(), tmp.path().join("recv"), rec.clone());
 
-    let pkg = build_package(&tmp.path().join("src"), "uuid-replay", "r.fits", "M42", 4096);
+    let pkg = build_package(
+        &tmp.path().join("src"),
+        "uuid-replay",
+        "r.fits",
+        "M42",
+        4096,
+    );
     let files = announce_files_of(&pkg);
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     // Keep the sender endpoint so we know its node id for the hand-driven acks.
@@ -4676,7 +5530,11 @@ async fn old_attempt_wire_id_ack_does_not_replay_onto_resend() {
 
     // Cancel → Cancelled, then resend with a fresh wire id.
     engine.cancel(id).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Cancelled),
+        WAIT,
+    )
+    .await;
     let w2 = uuid::Uuid::new_v4().to_string();
     store.reset_outbound_for_resend(id, &w2).unwrap();
     engine.resend(id).await.unwrap();
@@ -4687,7 +5545,11 @@ async fn old_attempt_wire_id_ack_does_not_replay_onto_resend() {
 
     // STALE ack keyed by the cancelled attempt's wire id: must be ignored.
     receiver
-        .ack(sender_node, &PackageId(w1.clone()), ingested_receipts_of(&pkg))
+        .ack(
+            sender_node,
+            &PackageId(w1.clone()),
+            ingested_receipts_of(&pkg),
+        )
         .await
         .unwrap();
     // Give the sender a moment to (not) act on it.
@@ -4700,10 +5562,18 @@ async fn old_attempt_wire_id_ack_does_not_replay_onto_resend() {
 
     // FRESH ack on the resend's wire id: confirms.
     receiver
-        .ack(sender_node, &PackageId(w2.clone()), ingested_receipts_of(&pkg))
+        .ack(
+            sender_node,
+            &PackageId(w2.clone()),
+            ingested_receipts_of(&pkg),
+        )
         .await
         .unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Confirmed), WAIT).await;
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
     assert_eq!(wire_of(&store, id).as_deref(), Some(w2.as_str()));
 
     engine.shutdown().await;
@@ -4718,9 +5588,15 @@ struct SwitchableResponder {
 impl DedupResponder for SwitchableResponder {
     fn want_for_offer(&self, entries: &[OfferEntry]) -> (Vec<String>, Vec<String>) {
         if self.all_duplicate.load(SeqCst) {
-            (Vec::new(), entries.iter().map(|e| e.rel_path.clone()).collect())
+            (
+                Vec::new(),
+                entries.iter().map(|e| e.rel_path.clone()).collect(),
+            )
         } else {
-            (entries.iter().map(|e| e.rel_path.clone()).collect(), Vec::new())
+            (
+                entries.iter().map(|e| e.rel_path.clone()).collect(),
+                Vec::new(),
+            )
         }
     }
     fn confirm_full_hashes(&self, _entries: &[FullHashEntry]) -> Vec<String> {
@@ -4776,16 +5652,27 @@ async fn revoke_superseded_on_all_duplicate_after_prior_announce() {
         receiver_id,
     );
 
-    wait_until(|| state_of(&store2, id) == Some(OutboundState::Confirmed), WAIT).await;
     wait_until(
-        || rec.revokes().iter().any(|(pid, r)| *pid == w1 && *r == RevokeReason::Superseded),
+        || state_of(&store2, id) == Some(OutboundState::Confirmed),
+        WAIT,
+    )
+    .await;
+    wait_until(
+        || {
+            rec.revokes()
+                .iter()
+                .any(|(pid, r)| *pid == w1 && *r == RevokeReason::Superseded)
+        },
         WAIT,
     )
     .await;
 
     // The journal records the superseded revoke.
     let kinds = sent_event_kinds(&db_path, id);
-    assert!(kinds.iter().any(|k| k == "revoke_sent"), "journal has revoke_sent, got {kinds:?}");
+    assert!(
+        kinds.iter().any(|k| k == "revoke_sent"),
+        "journal has revoke_sent, got {kinds:?}"
+    );
 
     engine2.shutdown().await;
 }
@@ -4824,7 +5711,11 @@ async fn revoke_failed_on_local_terminal_failure() {
 
     wait_until(|| state_of(&store, id) == Some(OutboundState::Failed), WAIT).await;
     wait_until(
-        || rec.revokes().iter().any(|(pid, r)| *pid == w1 && *r == RevokeReason::Failed),
+        || {
+            rec.revokes()
+                .iter()
+                .any(|(pid, r)| *pid == w1 && *r == RevokeReason::Failed)
+        },
         WAIT,
     )
     .await;
@@ -4923,11 +5814,7 @@ async fn cancel_with_dead_peer_revoke_does_not_stall() {
     // The sender's transport delegates announce/serve to a working endpoint but its
     // revoke sleeps 30s (dead peer).
     let sender = Arc::new(SlowRevokeTransport(Arc::new(net.endpoint())));
-    let engine = SyncEngine::spawn(
-        store.clone() as Arc<dyn SyncStore>,
-        sender,
-        receiver_id,
-    );
+    let engine = SyncEngine::spawn(store.clone() as Arc<dyn SyncStore>, sender, receiver_id);
 
     let id = engine.enqueue_package(&pkg, None, files).await.unwrap();
     wait_until(|| is_serving(&store, id), WAIT).await;
@@ -4936,7 +5823,11 @@ async fn cancel_with_dead_peer_revoke_does_not_stall() {
     // the 30s revoke.
     let started = Instant::now();
     engine.cancel(id).await.unwrap();
-    wait_until(|| state_of(&store, id) == Some(OutboundState::Cancelled), WAIT).await;
+    wait_until(
+        || state_of(&store, id) == Some(OutboundState::Cancelled),
+        WAIT,
+    )
+    .await;
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_secs(5),
