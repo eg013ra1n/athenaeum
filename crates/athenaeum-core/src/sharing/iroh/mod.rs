@@ -69,6 +69,7 @@ use crate::sync::DedupResponder;
 
 pub mod blobs;
 pub mod node;
+pub mod pacer;
 pub mod proto;
 pub(crate) mod telemetry;
 
@@ -185,8 +186,7 @@ pub(crate) type ServeRootResolver = Arc<dyn Fn(Hash) -> Option<PackageId> + Send
 /// consumer task at router build beside the [`ServeRootResolver`]; each
 /// construction site supplies its own (the legacy [`IrohTransport`] resolves
 /// nothing, the shared node scans its role-prefixed `served_files` map).
-pub(crate) type ServeFileResolver =
-    Arc<dyn Fn(Hash, u64) -> Option<(String, u64)> + Send + Sync>;
+pub(crate) type ServeFileResolver = Arc<dyn Fn(Hash, u64) -> Option<(String, u64)> + Send + Sync>;
 
 /// Depth of the provider-events channel feeding the upload-progress consumer
 /// (Task 13). Per-connection/per-request notify messages are low volume; the
@@ -577,8 +577,7 @@ pub(crate) fn build_router(
                     // emits progress or a terminal complete — every other request
                     // is still drained fully (SAFETY RULE), just silently.
                     let root: Hash = (*m.inner).request.hash;
-                    let payload_carrying =
-                        request_is_payload_carrying(&(*m.inner).request.ranges);
+                    let payload_carrying = request_is_payload_carrying(&(*m.inner).request.ranges);
                     let mut updates = m.rx;
                     let resolver = Arc::clone(&serve_resolver);
                     let file_resolver = Arc::clone(&serve_file_resolver);
@@ -589,7 +588,11 @@ pub(crate) fn build_router(
                         // ALL per-file emits are additionally gated on this, so a
                         // non-payload request (or one for a foreign hash) never
                         // routes a `ServeFileProgress` — not even on the flush.
-                        let emit = if payload_carrying { resolver(root) } else { None };
+                        let emit = if payload_carrying {
+                            resolver(root)
+                        } else {
+                            None
+                        };
                         // Cumulative across every blob in this request (Task 13
                         // fix) — see `UploadAccumulator` docs for why a naive
                         // `max(end_offset)` over the raw stream is wrong.
@@ -931,7 +934,10 @@ impl IrohTransport {
     /// Left unset, the transport admits every connection (Perseus + sender
     /// transports never call this).
     pub fn set_connect_gate(&self, gate: ConnectGate) {
-        *self.connect_gate.lock().expect("connect_gate mutex poisoned") = Some(gate);
+        *self
+            .connect_gate
+            .lock()
+            .expect("connect_gate mutex poisoned") = Some(gate);
     }
 
     /// This endpoint's current [`EndpointAddr`] (direct addrs + relay url). Call
@@ -1004,11 +1010,16 @@ impl IrohTransport {
                 .context("connect sync control channel")?;
             spawn_conn_path_diagnostics(&conn, "outgoing");
             let (mut tx, mut rx) = conn.open_bi().await.context("open control stream")?;
-            tx.write_all(&bytes).await.context("write control message")?;
+            tx.write_all(&bytes)
+                .await
+                .context("write control message")?;
             tx.finish().context("finish control stream")?;
             // The receiver writes a one-byte ack only after handing the event to
             // the engine; an empty read means it closed without dispatching.
-            let ack = rx.read_to_end(8).await.context("await control delivery ack")?;
+            let ack = rx
+                .read_to_end(8)
+                .await
+                .context("await control delivery ack")?;
             if ack.is_empty() {
                 anyhow::bail!("control message not acknowledged by peer");
             }
@@ -1044,7 +1055,9 @@ impl IrohTransport {
                 .context("connect sync control channel")?;
             spawn_conn_path_diagnostics(&conn, "outgoing");
             let (mut tx, mut rx) = conn.open_bi().await.context("open control stream")?;
-            tx.write_all(&bytes).await.context("write control request")?;
+            tx.write_all(&bytes)
+                .await
+                .context("write control request")?;
             tx.finish().context("finish control request")?;
             // Read the peer's reply Msg (it finishes its send half after writing).
             let reply = rx
@@ -1075,7 +1088,10 @@ impl SharingTransport for IrohTransport {
         // Also retires the pre-Stage-1.5 auto-named tags on existing stores.
         match self.store.tags().delete_all().await {
             Ok(removed) if removed > 0 => {
-                tracing::info!(count = removed, "blob store startup sweep removed stale tags")
+                tracing::info!(
+                    count = removed,
+                    "blob store startup sweep removed stale tags"
+                )
             }
             Ok(_) => {}
             Err(e) => tracing::warn!(error = %e, "blob store startup sweep failed"),
@@ -1158,12 +1174,7 @@ impl SharingTransport for IrohTransport {
         Ok(())
     }
 
-    async fn revoke(
-        &self,
-        to: NodeId,
-        package_id: &PackageId,
-        reason: RevokeReason,
-    ) -> Result<()> {
+    async fn revoke(&self, to: NodeId, package_id: &PackageId, reason: RevokeReason) -> Result<()> {
         // One-shot best-effort control message (spec §D2): tell the receiver to
         // abort the transfer for `package_id`. `send_control` awaits the peer's
         // delivery ack; the caller (B3) log-and-continues on Err.
@@ -1219,12 +1230,7 @@ impl SharingTransport for IrohTransport {
         Ok(())
     }
 
-    async fn request_project(
-        &self,
-        to: NodeId,
-        project_id: &str,
-        package_id: &str,
-    ) -> Result<()> {
+    async fn request_project(&self, to: NodeId, project_id: &str, package_id: &str) -> Result<()> {
         self.send_control(
             to,
             Msg::ProjectRequest {
@@ -1245,7 +1251,10 @@ impl SharingTransport for IrohTransport {
         sink: FetchSink,
     ) -> Result<()> {
         let root_hash: Hash = pkg.root_hash.parse().with_context(|| {
-            format!("parse collection hash from announce root_hash {:?}", pkg.root_hash)
+            format!(
+                "parse collection hash from announce root_hash {:?}",
+                pkg.root_hash
+            )
         })?;
         let provider =
             EndpointId::from_bytes(&from).map_err(|e| anyhow!("invalid provider node id: {e}"))?;
@@ -1280,7 +1289,10 @@ impl SharingTransport for IrohTransport {
         dest_dir: &Path,
     ) -> Result<PathBuf> {
         let root_hash: Hash = pkg.root_hash.parse().with_context(|| {
-            format!("parse collection hash from announce root_hash {:?}", pkg.root_hash)
+            format!(
+                "parse collection hash from announce root_hash {:?}",
+                pkg.root_hash
+            )
         })?;
         let provider =
             EndpointId::from_bytes(&from).map_err(|e| anyhow!("invalid provider node id: {e}"))?;
@@ -1388,7 +1400,9 @@ impl SharingTransport for IrohTransport {
             .await
             .context("negotiate_want offer round")?;
         let (want, candidates) = match reply {
-            Msg::Want { want, candidates, .. } => (want, candidates),
+            Msg::Want {
+                want, candidates, ..
+            } => (want, candidates),
             other => anyhow::bail!("expected Want reply to Offer, got {other:?}"),
         };
 
@@ -1399,7 +1413,8 @@ impl SharingTransport for IrohTransport {
         }
 
         // Round 2: FullHashes → Want (still-wanted after full-hash disambiguation).
-        let entries = proto::build_full_hash_entries(&offer, &candidates, &full_by_rel, &mut wanted);
+        let entries =
+            proto::build_full_hash_entries(&offer, &candidates, &full_by_rel, &mut wanted);
         if !entries.is_empty() {
             let reply = self
                 .send_request(
@@ -1672,7 +1687,11 @@ impl ProtocolHandler for SyncControlProtocol {
                     // connections. A `spawn_blocking` join failure (the responder
                     // never panics) falls back to the safe direction: want
                     // everything, no candidates — matching the None branch.
-                    let responder = self.responder.lock().expect("responder mutex poisoned").clone();
+                    let responder = self
+                        .responder
+                        .lock()
+                        .expect("responder mutex poisoned")
+                        .clone();
                     let (want, candidates) = match responder {
                         Some(r) => {
                             let entries2 = entries.clone();
@@ -1713,7 +1732,11 @@ impl ProtocolHandler for SyncControlProtocol {
                     // file from disk (potentially many GB on a re-send) — move it
                     // off the async worker. A join failure resolves to the safe
                     // direction: keep every candidate wanted (the None branch).
-                    let responder = self.responder.lock().expect("responder mutex poisoned").clone();
+                    let responder = self
+                        .responder
+                        .lock()
+                        .expect("responder mutex poisoned")
+                        .clone();
                     let still = match responder {
                         Some(r) => {
                             let entries2 = entries.clone();

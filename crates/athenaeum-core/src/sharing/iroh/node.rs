@@ -173,8 +173,7 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// resolution — or `None` when it can't resolve right now (hub blip), in which
 /// case the loop keeps the existing relay map. The node stays hub-agnostic: it
 /// never reaches the hub itself, it only calls this callback.
-pub type RelayResolver =
-    Arc<dyn Fn() -> BoxFuture<Option<(RelayMode, Vec<String>)>> + Send + Sync>;
+pub type RelayResolver = Arc<dyn Fn() -> BoxFuture<Option<(RelayMode, Vec<String>)>> + Send + Sync>;
 
 /// A transport-level wake hook (Task 6, sync delivery-forever). Invoked when the
 /// node comes back online — a home-relay **reconnect** transition in the watcher,
@@ -220,7 +219,12 @@ pub struct RelayHealth {
 impl RelayHealth {
     /// The pre-transition disconnected baseline the node binds with.
     fn initial() -> Self {
-        Self { connected: false, url: None, last_error: None, since: Instant::now() }
+        Self {
+            connected: false,
+            url: None,
+            last_error: None,
+            since: Instant::now(),
+        }
     }
 }
 
@@ -316,7 +320,9 @@ fn resolve_served_root_in(
     let map = served.lock().expect("served mutex poisoned");
     map.iter().find_map(|(tag, entry)| {
         if entry.hash == hash {
-            tag.split("/pkg/").nth(1).map(|id| PackageId(id.to_string()))
+            tag.split("/pkg/")
+                .nth(1)
+                .map(|id| PackageId(id.to_string()))
         } else {
             None
         }
@@ -349,7 +355,9 @@ fn resolve_served_file_in(
             .find_map(|(tag, entry)| (entry.hash == root).then(|| tag.clone()))
     }?;
     let files = served_files.lock().expect("served_files mutex poisoned");
-    files.get(&tag).and_then(|entries| entries.get(entry_idx).cloned())
+    files
+        .get(&tag)
+        .and_then(|entries| entries.get(entry_idx).cloned())
 }
 
 /// Per-`(peer, package)` ack-claim + single Recv-consumer router (Task 2, Д4).
@@ -436,7 +444,9 @@ impl EventDemux {
         let target = {
             let mut inner = self.inner.lock().expect("demux mutex poisoned");
             match &event {
-                TransportEvent::AckReceived { from, package_id, .. } => inner
+                TransportEvent::AckReceived {
+                    from, package_id, ..
+                } => inner
                     .claims
                     .remove(&(*from, package_id.clone()))
                     .map(|(_, tx)| tx),
@@ -493,7 +503,11 @@ impl EventDemux {
     /// Number of live ack claims (test introspection for the demux).
     #[cfg(test)]
     fn claim_count(&self) -> usize {
-        self.inner.lock().expect("demux mutex poisoned").claims.len()
+        self.inner
+            .lock()
+            .expect("demux mutex poisoned")
+            .claims
+            .len()
     }
 
     /// Route a locally-generated [`ServeProgress`](TransportEvent::ServeProgress)
@@ -680,7 +694,12 @@ impl ControlPool {
     /// Close + evict a pooled connection once it has been idle for
     /// [`CONTROL_POOL_IDLE`]. One task per pooled connection; holds only a `Weak`
     /// to the pool so it never keeps it alive, and exits after it fires.
-    fn spawn_idle_reaper(self: Arc<Self>, to: NodeId, conn: Connection, last_used: Arc<Mutex<Instant>>) {
+    fn spawn_idle_reaper(
+        self: Arc<Self>,
+        to: NodeId,
+        conn: Connection,
+        last_used: Arc<Mutex<Instant>>,
+    ) {
         let stable_id = conn.stable_id();
         let weak = Arc::downgrade(&self);
         drop(self);
@@ -940,9 +959,7 @@ impl SharedIrohNode {
         let serve_file_resolver: ServeFileResolver = {
             let served = Arc::clone(&served);
             let served_files = Arc::clone(&served_files);
-            Arc::new(move |root, index| {
-                resolve_served_file_in(&served, &served_files, root, index)
-            })
+            Arc::new(move |root, index| resolve_served_file_in(&served, &served_files, root, index))
         };
         // Shared node: `EventSink::Demux` (inbound events fan out through the demux,
         // Task 2/Д4, not a single shared stream), and `flush_store_on_shutdown:
@@ -1022,7 +1039,11 @@ impl SharedIrohNode {
     /// A clone of the current endpoint handle (cheap, Arc-backed). Never holds the
     /// `net` lock across an await — callers use the returned clone.
     fn endpoint(&self) -> Endpoint {
-        self.net.lock().expect("net mutex poisoned").endpoint.clone()
+        self.net
+            .lock()
+            .expect("net mutex poisoned")
+            .endpoint
+            .clone()
     }
 
     /// A clone of the current pooled-control-connection handle.
@@ -1087,7 +1108,10 @@ impl SharedIrohNode {
     /// loopback binds are relay-disabled). Task 3.3 regression coverage.
     #[cfg(test)]
     pub(crate) fn set_relay_health_for_test(&self, health: RelayHealth) {
-        *self.relay_health.write().expect("relay_health lock poisoned") = health;
+        *self
+            .relay_health
+            .write()
+            .expect("relay_health lock poisoned") = health;
     }
 
     /// Test-only: force `uses_relay` on the current net layer so the health
@@ -1109,7 +1133,11 @@ impl SharedIrohNode {
 
     /// The relay URLs the endpoint currently carries (H1 groundwork, Task 7).
     pub fn relay_urls(&self) -> Vec<String> {
-        self.net.lock().expect("net mutex poisoned").relay_urls.clone()
+        self.net
+            .lock()
+            .expect("net mutex poisoned")
+            .relay_urls
+            .clone()
     }
 
     /// The node's current transport-reachability health for the status poll
@@ -1132,7 +1160,11 @@ impl SharedIrohNode {
         if !self.uses_relay() {
             return TransportHealth::direct_only(None, None);
         }
-        let health = self.relay_health.read().expect("relay_health lock poisoned").clone();
+        let health = self
+            .relay_health
+            .read()
+            .expect("relay_health lock poisoned")
+            .clone();
         // The cell (watcher transitions, online-wait-seeded before the first one)
         // is the sole authority. It starts disconnected, so a freshly-bound node
         // reads `direct_only` until the relay connects — and reverts to it the
@@ -1168,7 +1200,10 @@ impl SharedIrohNode {
     /// ALPNs, S4). Overwrites any previously installed gate; left unset, the node
     /// admits every connection.
     pub fn set_connect_gate(&self, gate: ConnectGate) {
-        *self.connect_gate.lock().expect("connect_gate mutex poisoned") = Some(gate);
+        *self
+            .connect_gate
+            .lock()
+            .expect("connect_gate mutex poisoned") = Some(gate);
     }
 
     /// Install the dedup [`DedupResponder`] that answers inbound `Offer` /
@@ -1331,7 +1366,12 @@ impl SharedIrohNode {
         // Abort the relay-refresh loop first (Task 8): setting `shutdown_done`
         // above means a refresh iteration racing this abort re-checks the flag
         // after its resolver await and bails before touching the endpoint.
-        if let Some(handle) = self.refresh_task.lock().expect("refresh_task mutex poisoned").take() {
+        if let Some(handle) = self
+            .refresh_task
+            .lock()
+            .expect("refresh_task mutex poisoned")
+            .take()
+        {
             handle.abort();
         }
         // Take the router + endpoint + relay watcher out of the network layer.
@@ -1379,7 +1419,12 @@ impl SharedIrohNode {
         }
         // Release the device-key advisory lock last — the identity stays
         // reserved until every teardown step has run; a re-bind then re-acquires.
-        drop(self.key_lock.lock().expect("key_lock mutex poisoned").take());
+        drop(
+            self.key_lock
+                .lock()
+                .expect("key_lock mutex poisoned")
+                .take(),
+        );
         tracing::info!(node_id = %hex32(&self.node_id), "shared iroh node shut down");
     }
 
@@ -1396,7 +1441,10 @@ impl SharedIrohNode {
     /// (the first resolver wins), so the app's several start entry points can all
     /// call it.
     pub fn start_relay_refresh(self: &Arc<Self>, resolver: RelayResolver) {
-        let mut guard = self.refresh_task.lock().expect("refresh_task mutex poisoned");
+        let mut guard = self
+            .refresh_task
+            .lock()
+            .expect("refresh_task mutex poisoned");
         if guard.is_some() {
             return;
         }
@@ -1500,7 +1548,10 @@ impl SharedIrohNode {
             net.relay_urls = new_strs.clone();
             net.uses_relay = uses_relay;
         }
-        *self.last_relay_urls.lock().expect("last_relay_urls mutex poisoned") = new_strs;
+        *self
+            .last_relay_urls
+            .lock()
+            .expect("last_relay_urls mutex poisoned") = new_strs;
         tracing::info!(
             added = added.len(),
             removed = removed.len(),
@@ -1591,9 +1642,14 @@ impl SharedIrohNode {
 
         let send = async {
             let (mut tx, mut rx) = conn.open_bi().await.context("open control stream")?;
-            tx.write_all(&bytes).await.context("write control message")?;
+            tx.write_all(&bytes)
+                .await
+                .context("write control message")?;
             tx.finish().context("finish control stream")?;
-            let ack = rx.read_to_end(8).await.context("await control delivery ack")?;
+            let ack = rx
+                .read_to_end(8)
+                .await
+                .context("await control delivery ack")?;
             if ack.is_empty() {
                 anyhow::bail!("control message not acknowledged by peer");
             }
@@ -1625,7 +1681,9 @@ impl SharedIrohNode {
 
         let exchange = async {
             let (mut tx, mut rx) = conn.open_bi().await.context("open control stream")?;
-            tx.write_all(&bytes).await.context("write control request")?;
+            tx.write_all(&bytes)
+                .await
+                .context("write control request")?;
             tx.finish().context("finish control request")?;
             let reply = rx
                 .read_to_end(MAX_CONTROL_BYTES)
@@ -1660,7 +1718,12 @@ impl SharedIrohNode {
         // delete exactly them — never a sibling role's live tags on the shared
         // store, which the old `tags().delete_all()` would have wiped. GC-safe:
         // in-flight imports are protected by their own temp tags.
-        if self.swept.lock().expect("swept mutex poisoned").insert(prefix) {
+        if self
+            .swept
+            .lock()
+            .expect("swept mutex poisoned")
+            .insert(prefix)
+        {
             let del_prefix = format!("{prefix}/pkg/");
             match self.store.tags().delete_prefix(del_prefix.as_bytes()).await {
                 Ok(removed) if removed > 0 => tracing::info!(
@@ -1683,18 +1746,17 @@ impl SharedIrohNode {
         if self.uses_relay() && !self.online_waited.swap(true, Ordering::SeqCst) {
             match tokio::time::timeout(ONLINE_TIMEOUT, endpoint.online()).await {
                 Ok(()) => {
-                    let relay_url = endpoint
-                        .addr()
-                        .relay_urls()
-                        .next()
-                        .map(|u| u.to_string());
+                    let relay_url = endpoint.addr().relay_urls().next().map(|u| u.to_string());
                     // Seed the health cell for the status surface (Task 3.3): the
                     // relay is connected right now, so `transport_health` can report
                     // `relay_connected` immediately, before the watcher records its
                     // first transition. This is a BRIDGE only — the watcher then
                     // overwrites this cell on every later transition (including a
                     // disconnect), so it never masks a dropped relay.
-                    *self.relay_health.write().expect("relay_health lock poisoned") = RelayHealth {
+                    *self
+                        .relay_health
+                        .write()
+                        .expect("relay_health lock poisoned") = RelayHealth {
                         connected: true,
                         url: relay_url.clone(),
                         last_error: None,
@@ -1852,7 +1914,10 @@ impl SharedIrohNode {
         sink: FetchSink,
     ) -> Result<()> {
         let root_hash: Hash = pkg.root_hash.parse().with_context(|| {
-            format!("parse collection hash from announce root_hash {:?}", pkg.root_hash)
+            format!(
+                "parse collection hash from announce root_hash {:?}",
+                pkg.root_hash
+            )
         })?;
         let provider =
             EndpointId::from_bytes(&from).map_err(|e| anyhow!("invalid provider node id: {e}"))?;
@@ -1894,7 +1959,10 @@ impl SharedIrohNode {
         dest_dir: &Path,
     ) -> Result<PathBuf> {
         let root_hash: Hash = pkg.root_hash.parse().with_context(|| {
-            format!("parse collection hash from announce root_hash {:?}", pkg.root_hash)
+            format!(
+                "parse collection hash from announce root_hash {:?}",
+                pkg.root_hash
+            )
         })?;
         let provider =
             EndpointId::from_bytes(&from).map_err(|e| anyhow!("invalid provider node id: {e}"))?;
@@ -1962,7 +2030,10 @@ impl SharedIrohNode {
 
     async fn role_release(&self, role: Role, package_id: &PackageId) -> Result<()> {
         let tag = role_package_tag(role.prefix(), package_id);
-        self.served.lock().expect("served mutex poisoned").remove(&tag);
+        self.served
+            .lock()
+            .expect("served mutex poisoned")
+            .remove(&tag);
         // Drop the per-file attribution entries in lock-step with `served` (Task
         // 2.2) so the two maps never drift.
         self.served_files
@@ -2057,7 +2128,9 @@ impl SharedIrohNode {
             .await
             .context("negotiate_want offer round")?;
         let (want, candidates) = match reply {
-            Msg::Want { want, candidates, .. } => (want, candidates),
+            Msg::Want {
+                want, candidates, ..
+            } => (want, candidates),
             other => anyhow::bail!("expected Want reply to Offer, got {other:?}"),
         };
 
@@ -2067,7 +2140,8 @@ impl SharedIrohNode {
             return Ok(wanted);
         }
 
-        let entries = proto::build_full_hash_entries(&offer, &candidates, &full_by_rel, &mut wanted);
+        let entries =
+            proto::build_full_hash_entries(&offer, &candidates, &full_by_rel, &mut wanted);
         if !entries.is_empty() {
             let reply = self
                 .send_request(
@@ -2119,7 +2193,11 @@ impl RoleHandle {
     /// [`events`](SharingTransport::events) has not been taken yet (the ack would
     /// then have no claimant) — the engine always takes it first.
     fn claim_ack(&self, to: NodeId, package_id: &PackageId) {
-        let tx = self.events_tx.lock().expect("events_tx mutex poisoned").clone();
+        let tx = self
+            .events_tx
+            .lock()
+            .expect("events_tx mutex poisoned")
+            .clone();
         match tx {
             Some(tx) => self
                 .node
@@ -2175,12 +2253,7 @@ impl SharingTransport for RoleHandle {
         res
     }
 
-    async fn revoke(
-        &self,
-        to: NodeId,
-        package_id: &PackageId,
-        reason: RevokeReason,
-    ) -> Result<()> {
+    async fn revoke(&self, to: NodeId, package_id: &PackageId, reason: RevokeReason) -> Result<()> {
         // Best-effort control message; no ack-claim to manage (revoke never
         // correlates a return receipt). Routes to the shared node's send path.
         self.node.revoke_inner(to, package_id, reason).await
@@ -2251,18 +2324,17 @@ impl SharingTransport for RoleHandle {
             .role_announce_project(self.role, to, project_id, package_id, announce)
             .await;
         if res.is_err() {
-            self.node.demux.release_claim(&(to, announce.package_id.clone()));
+            self.node
+                .demux
+                .release_claim(&(to, announce.package_id.clone()));
         }
         res
     }
 
-    async fn request_project(
-        &self,
-        to: NodeId,
-        project_id: &str,
-        package_id: &str,
-    ) -> Result<()> {
-        self.node.role_request_project(to, project_id, package_id).await
+    async fn request_project(&self, to: NodeId, project_id: &str, package_id: &str) -> Result<()> {
+        self.node
+            .role_request_project(to, project_id, package_id)
+            .await
     }
 
     async fn release(&self, package_id: &PackageId) -> Result<()> {
@@ -2552,7 +2624,11 @@ mod tests {
     /// per-blob-only bug would freeze at whichever single blob is largest
     /// (`size_b`, assuming `size_b > size_a` and both dwarf the hash-seq/manifest
     /// blobs), never reaching the collection's full announced `byte_size`.
-    fn build_two_frame_package(base: &Path, size_a: usize, size_b: usize) -> (PathBuf, PackageAnnounce) {
+    fn build_two_frame_package(
+        base: &Path,
+        size_a: usize,
+        size_b: usize,
+    ) -> (PathBuf, PackageAnnounce) {
         let src = base.join("src2");
         std::fs::create_dir_all(&src).unwrap();
         let mut records = Vec::new();
@@ -2674,7 +2750,9 @@ mod tests {
     #[tokio::test]
     async fn re_serving_the_same_package_skips_the_import() {
         let dir = tempdir().unwrap();
-        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled).await.unwrap();
+        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled)
+            .await
+            .unwrap();
         let (pkg_dir, announce) = build_one_frame_package(dir.path());
         let handle = node.role_handle(Role::Out);
 
@@ -2717,18 +2795,26 @@ mod tests {
     #[tokio::test]
     async fn a_different_want_subset_is_imported_rather_than_reused() {
         let dir = tempdir().unwrap();
-        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled).await.unwrap();
+        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled)
+            .await
+            .unwrap();
         let (pkg_dir, announce) = build_two_frame_package(dir.path(), 1024, 2048);
         let handle = node.role_handle(Role::Out);
 
         let full = HashSet::from(["frame_a.fits".to_string(), "frame_b.fits".to_string()]);
-        handle.serve(&announce, &pkg_dir, Some(&full)).await.unwrap();
+        handle
+            .serve(&announce, &pkg_dir, Some(&full))
+            .await
+            .unwrap();
         let full_hash = node
             .resolve_served_hash_for_test(Role::Out, &announce.package_id)
             .expect("full-subset serve records a hash");
 
         let subset = HashSet::from(["frame_a.fits".to_string()]);
-        handle.serve(&announce, &pkg_dir, Some(&subset)).await.unwrap();
+        handle
+            .serve(&announce, &pkg_dir, Some(&subset))
+            .await
+            .unwrap();
         let subset_hash = node
             .resolve_served_hash_for_test(Role::Out, &announce.package_id)
             .expect("subset serve records a hash");
@@ -2741,7 +2827,10 @@ mod tests {
         // And the SAME subset again does reuse — the fingerprint compares by
         // content, not by the HashSet's iteration order.
         let same_subset_again = HashSet::from(["frame_a.fits".to_string()]);
-        handle.serve(&announce, &pkg_dir, Some(&same_subset_again)).await.unwrap();
+        handle
+            .serve(&announce, &pkg_dir, Some(&same_subset_again))
+            .await
+            .unwrap();
         assert_eq!(
             node.resolve_served_hash_for_test(Role::Out, &announce.package_id),
             Some(subset_hash),
@@ -2779,10 +2868,17 @@ mod tests {
         // tests use.
         let sender_info = sender.handle(Role::Out).start().await.unwrap();
         let receiver_info = receiver.handle(Role::Recv).start().await.unwrap();
-        sender.add_peer_ticket(&receiver_info.pairing_ticket).unwrap();
-        receiver.add_peer_ticket(&sender_info.pairing_ticket).unwrap();
+        sender
+            .add_peer_ticket(&receiver_info.pairing_ticket)
+            .unwrap();
+        receiver
+            .add_peer_ticket(&sender_info.pairing_ticket)
+            .unwrap();
 
-        receiver.send_presence(sender.node_id()).await.expect("beacon delivers");
+        receiver
+            .send_presence(sender.node_id())
+            .await
+            .expect("beacon delivers");
 
         for _ in 0..200 {
             if !seen.lock().unwrap().is_empty() {
@@ -2837,8 +2933,13 @@ mod tests {
 
         // Registering the address — what `broadcast_presence` now does before every
         // beacon — makes the same call succeed.
-        receiver.add_peer_ticket(&sender_info.pairing_ticket).unwrap();
-        receiver.send_presence(sender.node_id()).await.expect("beacon delivers with a hint");
+        receiver
+            .add_peer_ticket(&sender_info.pairing_ticket)
+            .unwrap();
+        receiver
+            .send_presence(sender.node_id())
+            .await
+            .expect("beacon delivers with a hint");
 
         for _ in 0..200 {
             if !seen.lock().unwrap().is_empty() {
@@ -2858,10 +2959,15 @@ mod tests {
     #[tokio::test]
     async fn presence_to_an_unknown_peer_fails_without_spending_the_timeout() {
         let dir = tempdir().unwrap();
-        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled).await.unwrap();
+        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled)
+            .await
+            .unwrap();
 
         let started = Instant::now();
-        let err = node.send_presence([9u8; 32]).await.expect_err("no address, no beacon");
+        let err = node
+            .send_presence([9u8; 32])
+            .await
+            .expect_err("no address, no beacon");
 
         assert!(
             started.elapsed() < PRESENCE_SEND_TIMEOUT,
@@ -2884,9 +2990,16 @@ mod tests {
     #[tokio::test]
     async fn in_flight_tag_list_and_release_honor_the_transfer_namespace() {
         let dir = tempdir().unwrap();
-        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled).await.unwrap();
+        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled)
+            .await
+            .unwrap();
         let store = node.store();
-        let tt = store.blobs().add_bytes(b"seed".to_vec()).temp_tag().await.unwrap();
+        let tt = store
+            .blobs()
+            .add_bytes(b"seed".to_vec())
+            .temp_tag()
+            .await
+            .unwrap();
         for name in [
             "in-flight/recv/pkg/orphan", // orphan in-flight → enumerated, released
             "in-flight/recv/pkg/live",   // in-flight → enumerated, kept
@@ -2901,8 +3014,13 @@ mod tests {
         let recv = node.handle(Role::Recv);
 
         // list surfaces EXACTLY the two in-flight wire ids — nothing else.
-        let mut ids: Vec<String> =
-            recv.list_in_flight_tags().await.unwrap().into_iter().map(|p| p.0).collect();
+        let mut ids: Vec<String> = recv
+            .list_in_flight_tags()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|p| p.0)
+            .collect();
         ids.sort();
         assert_eq!(
             ids,
@@ -2920,8 +3038,14 @@ mod tests {
             tag_present(store, "in-flight/recv/pkg/live").await,
             "the other in-flight tag is untouched"
         );
-        assert!(tag_present(store, "recv/pkg/perm").await, "a permanent recv tag survives");
-        assert!(tag_present(store, "out/pkg/x").await, "a sender permanent tag survives");
+        assert!(
+            tag_present(store, "recv/pkg/perm").await,
+            "a permanent recv tag survives"
+        );
+        assert!(
+            tag_present(store, "out/pkg/x").await,
+            "a sender permanent tag survives"
+        );
         assert!(
             tag_present(store, "project/seed/deadbeef").await,
             "a foreign project/… tag survives both list and release (B7 namespace contract)"
@@ -2940,7 +3064,10 @@ mod tests {
         );
         // The parser round-trips a real receiver in-flight tag and rejects foreign
         // / permanent / malformed names.
-        let tag = super::blobs::in_flight_tag(&role_package_tag(Role::Recv.prefix(), &PackageId("abc".into())));
+        let tag = super::blobs::in_flight_tag(&role_package_tag(
+            Role::Recv.prefix(),
+            &PackageId("abc".into()),
+        ));
         assert_eq!(recv_in_flight_package_id(&tag), Some("abc"));
         assert_eq!(recv_in_flight_package_id("recv/pkg/abc"), None);
         assert_eq!(recv_in_flight_package_id("out/pkg/abc"), None);
@@ -3051,8 +3178,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let node = bind_disabled(dir.path()).await;
         let health = node.transport_health();
-        assert_eq!(health.status, "direct_only", "relay-disabled node is direct-only");
-        assert!(health.relay_url.is_none(), "no relay configured => no relay url");
+        assert_eq!(
+            health.status, "direct_only",
+            "relay-disabled node is direct-only"
+        );
+        assert!(
+            health.relay_url.is_none(),
+            "no relay configured => no relay url"
+        );
         node.shutdown().await;
     }
 
@@ -3209,7 +3342,9 @@ mod tests {
         let mut out_events = out.events().await;
         let mut r_ev = recv.events().await;
 
-        out.announce(r_info.node_id, &announce, "", "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &announce, "", "", &[])
+            .await
+            .unwrap();
         let wire = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce,
             other => panic!("expected AnnounceReceived, got {other:?}"),
@@ -3218,9 +3353,14 @@ mod tests {
         // A real blob download over QUIC: this is what drives the provider's
         // `GetRequestReceivedNotify` → our consumer → `ServeProgress` ticks.
         let dest = tempdir().unwrap();
-        recv.fetch(s_info.node_id, &wire, dest.path(), crate::sharing::noop_fetch_sink())
-            .await
-            .unwrap();
+        recv.fetch(
+            s_info.node_id,
+            &wire,
+            dest.path(),
+            crate::sharing::noop_fetch_sink(),
+        )
+        .await
+        .unwrap();
 
         // Poll for ServeProgress ticks until the peak reaches the full collection
         // size (the consumer's close-time flush may land slightly after `fetch`
@@ -3310,7 +3450,9 @@ mod tests {
         // route_serve_progress / route_serve_complete to target.
         let mut out_events = out.events().await;
         let mut r_ev = recv.events().await;
-        out.announce(r_info.node_id, &announce, "", "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &announce, "", "", &[])
+            .await
+            .unwrap();
         let wire = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce,
             other => panic!("expected AnnounceReceived, got {other:?}"),
@@ -3342,9 +3484,14 @@ mod tests {
 
         // (b) Full pull of the payload: EXACTLY ONE ServeComplete.
         let fdest = tempdir().unwrap();
-        recv.fetch(s_info.node_id, &wire, fdest.path(), crate::sharing::noop_fetch_sink())
-            .await
-            .unwrap();
+        recv.fetch(
+            s_info.node_id,
+            &wire,
+            fdest.path(),
+            crate::sharing::noop_fetch_sink(),
+        )
+        .await
+        .unwrap();
         let pull = collect_until_quiet(
             &mut out_events,
             Duration::from_millis(1500),
@@ -3445,16 +3592,23 @@ mod tests {
         // route_serve_file_progress to target.
         let mut out_events = out.events().await;
         let mut r_ev = recv.events().await;
-        out.announce(r_info.node_id, &announce, "", "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &announce, "", "", &[])
+            .await
+            .unwrap();
         let wire = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce,
             other => panic!("expected AnnounceReceived, got {other:?}"),
         };
 
         let dest = tempdir().unwrap();
-        recv.fetch(s_info.node_id, &wire, dest.path(), crate::sharing::noop_fetch_sink())
-            .await
-            .unwrap();
+        recv.fetch(
+            s_info.node_id,
+            &wire,
+            dest.path(),
+            crate::sharing::noop_fetch_sink(),
+        )
+        .await
+        .unwrap();
 
         // Drain the provider's per-file ticks after the pull settles.
         let evs = collect_until_quiet(
@@ -3538,16 +3692,23 @@ mod tests {
 
         let mut out_events = out.events().await;
         let mut r_ev = recv.events().await;
-        out.announce(r_info.node_id, &announce, "", "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &announce, "", "", &[])
+            .await
+            .unwrap();
         let wire = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce,
             other => panic!("expected AnnounceReceived, got {other:?}"),
         };
 
         let fdest = tempdir().unwrap();
-        recv.fetch(s_info.node_id, &wire, fdest.path(), crate::sharing::noop_fetch_sink())
-            .await
-            .unwrap();
+        recv.fetch(
+            s_info.node_id,
+            &wire,
+            fdest.path(),
+            crate::sharing::noop_fetch_sink(),
+        )
+        .await
+        .unwrap();
         drop(seeded); // the pre-seed temp tag is no longer needed
 
         let events = collect_until_quiet(
@@ -3628,9 +3789,16 @@ mod tests {
     }
 
     /// Mutually register two paired nodes' addresses (each learns the other's).
-    fn pair(a: &Arc<SharedIrohNode>, a_info: &StartInfo, b: &Arc<SharedIrohNode>, b_info: &StartInfo) {
-        a.add_peer_ticket(&b_info.pairing_ticket).expect("a pairs b");
-        b.add_peer_ticket(&a_info.pairing_ticket).expect("b pairs a");
+    fn pair(
+        a: &Arc<SharedIrohNode>,
+        a_info: &StartInfo,
+        b: &Arc<SharedIrohNode>,
+        b_info: &StartInfo,
+    ) {
+        a.add_peer_ticket(&b_info.pairing_ticket)
+            .expect("a pairs b");
+        b.add_peer_ticket(&a_info.pairing_ticket)
+            .expect("b pairs a");
     }
 
     // (a) Two Out handles announce to DIFFERENT peers concurrently; each ack
@@ -3665,8 +3833,14 @@ mod tests {
 
         // Announce to the two distinct peers (delivery completes when each
         // receiver's Recv consumer receives the announce).
-        out_a.announce(r1_info.node_id, &p1, "", "", &[]).await.unwrap();
-        out_b.announce(r2_info.node_id, &p2, "", "", &[]).await.unwrap();
+        out_a
+            .announce(r1_info.node_id, &p1, "", "", &[])
+            .await
+            .unwrap();
+        out_b
+            .announce(r2_info.node_id, &p2, "", "", &[])
+            .await
+            .unwrap();
 
         // Each receiver observes its own announce, then acks back to the sender.
         let pid1 = match recv_next(&mut r1_ev).await {
@@ -3680,26 +3854,42 @@ mod tests {
             TransportEvent::AnnounceReceived { announce, .. } => announce.package_id,
             other => panic!("expected AnnounceReceived on r2, got {other:?}"),
         };
-        recv1.ack(s_info.node_id, &pid1, mk_receipts()).await.unwrap();
-        recv2.ack(s_info.node_id, &pid2, mk_receipts()).await.unwrap();
+        recv1
+            .ack(s_info.node_id, &pid1, mk_receipts())
+            .await
+            .unwrap();
+        recv2
+            .ack(s_info.node_id, &pid2, mk_receipts())
+            .await
+            .unwrap();
 
         // The acks route to the correct Out handle — no cross-delivery.
         match recv_next(&mut ack_a).await {
-            TransportEvent::AckReceived { from, package_id, .. } => {
+            TransportEvent::AckReceived {
+                from, package_id, ..
+            } => {
                 assert_eq!(from, r1_info.node_id, "out_a's ack must come from r1");
                 assert_eq!(package_id, p1.package_id);
             }
             other => panic!("expected AckReceived on out_a, got {other:?}"),
         }
         match recv_next(&mut ack_b).await {
-            TransportEvent::AckReceived { from, package_id, .. } => {
+            TransportEvent::AckReceived {
+                from, package_id, ..
+            } => {
                 assert_eq!(from, r2_info.node_id, "out_b's ack must come from r2");
                 assert_eq!(package_id, p2.package_id);
             }
             other => panic!("expected AckReceived on out_b, got {other:?}"),
         }
-        assert!(ack_a.try_recv().is_err(), "out_a must not receive out_b's ack");
-        assert!(ack_b.try_recv().is_err(), "out_b must not receive out_a's ack");
+        assert!(
+            ack_a.try_recv().is_err(),
+            "out_a must not receive out_b's ack"
+        );
+        assert!(
+            ack_b.try_recv().is_err(),
+            "out_b must not receive out_a's ack"
+        );
         // Both claims consumed on their acks.
         wait_until_claims(&s, 0).await;
 
@@ -3736,8 +3926,12 @@ mod tests {
 
         // ONE package id, announced to two peers.
         let pkg = mk_announce("shared-pkg");
-        out.announce(r1_info.node_id, &pkg, "", "", &[]).await.unwrap();
-        out.announce(r2_info.node_id, &pkg, "", "", &[]).await.unwrap();
+        out.announce(r1_info.node_id, &pkg, "", "", &[])
+            .await
+            .unwrap();
+        out.announce(r2_info.node_id, &pkg, "", "", &[])
+            .await
+            .unwrap();
         assert_eq!(s.active_claims(), 2, "two distinct (peer, package) claims");
 
         let pid1 = match recv_next(&mut r1_ev).await {
@@ -3750,7 +3944,10 @@ mod tests {
         };
 
         // r1 acks: only the (r1, pkg) claim is consumed.
-        recv1.ack(s_info.node_id, &pid1, mk_receipts()).await.unwrap();
+        recv1
+            .ack(s_info.node_id, &pid1, mk_receipts())
+            .await
+            .unwrap();
         match recv_next(&mut acks).await {
             TransportEvent::AckReceived { from, .. } => assert_eq!(from, r1_info.node_id),
             other => panic!("expected r1 ack, got {other:?}"),
@@ -3758,7 +3955,10 @@ mod tests {
         wait_until_claims(&s, 1).await;
 
         // r2 acks: the (r2, pkg) claim is consumed too.
-        recv2.ack(s_info.node_id, &pid2, mk_receipts()).await.unwrap();
+        recv2
+            .ack(s_info.node_id, &pid2, mk_receipts())
+            .await
+            .unwrap();
         match recv_next(&mut acks).await {
             TransportEvent::AckReceived { from, .. } => assert_eq!(from, r2_info.node_id),
             other => panic!("expected r2 ack, got {other:?}"),
@@ -3804,8 +4004,11 @@ mod tests {
         let _ack = out.events().await;
 
         let pkg = mk_announce("orphan-pkg");
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(5), out.announce(r_info.node_id, &pkg, "", "", &[])).await;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            out.announce(r_info.node_id, &pkg, "", "", &[]),
+        )
+        .await;
         assert!(
             !matches!(outcome, Ok(Ok(()))),
             "an orphan announce must not receive a silent delivery ack, got {outcome:?}"
@@ -3848,8 +4051,12 @@ mod tests {
         let mut r_ev = recv.events().await; // Recv consumer → announces deliver + ack
         let pkg = mk_announce("pool-pkg");
 
-        out.announce(r_info.node_id, &pkg, "", "", &[]).await.unwrap();
-        out.announce(r_info.node_id, &pkg, "", "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &pkg, "", "", &[])
+            .await
+            .unwrap();
+        out.announce(r_info.node_id, &pkg, "", "", &[])
+            .await
+            .unwrap();
 
         // Both delivered to the receiver's single Recv consumer.
         let _ = recv_next(&mut r_ev).await;
@@ -3948,10 +4155,16 @@ mod tests {
 
         // Same set, different order → no change.
         let (added, removed) = relay_set_diff(&s(&["a", "b"]), &s(&["b", "a"]));
-        assert!(added.is_empty() && removed.is_empty(), "reordering is not a change");
+        assert!(
+            added.is_empty() && removed.is_empty(),
+            "reordering is not a change"
+        );
 
         // Empty new → everything removed; empty old → everything added.
-        assert_eq!(relay_set_diff(&s(&["a", "b"]), &s(&[])), (s(&[]), s(&["a", "b"])));
+        assert_eq!(
+            relay_set_diff(&s(&["a", "b"]), &s(&[])),
+            (s(&[]), s(&["a", "b"]))
+        );
         assert_eq!(relay_set_diff(&s(&[]), &s(&["a"])), (s(&["a"]), s(&[])));
     }
 
@@ -3977,38 +4190,69 @@ mod tests {
         pair(&s, &s_info, &r, &r_info);
 
         let id_before = s.node_id();
-        assert_eq!(*s.endpoint_addr().id.as_bytes(), id_before, "addr id == node id pre-swap");
+        assert_eq!(
+            *s.endpoint_addr().id.as_bytes(),
+            id_before,
+            "addr id == node id pre-swap"
+        );
 
         // Seed a tag on the shared store to prove the store is untouched by a swap.
-        let tt = s.store().blobs().add_bytes(b"survive".to_vec()).temp_tag().await.unwrap();
-        s.store().tags().set("out/pkg/keep", tt.hash_and_format()).await.unwrap();
+        let tt = s
+            .store()
+            .blobs()
+            .add_bytes(b"survive".to_vec())
+            .temp_tag()
+            .await
+            .unwrap();
+        s.store()
+            .tags()
+            .set("out/pkg/keep", tt.hash_and_format())
+            .await
+            .unwrap();
         drop(tt);
 
         // Open a live pooled control connection: one announce→ack round trip.
         let mut acks = out.events().await;
         let mut r_ev = recv.events().await;
         let pkg1 = mk_announce("pre-swap");
-        out.announce(r_info.node_id, &pkg1, "", "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &pkg1, "", "", &[])
+            .await
+            .unwrap();
         let pid1 = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce.package_id,
             other => panic!("expected AnnounceReceived pre-swap, got {other:?}"),
         };
-        recv.ack(s_info.node_id, &pid1, mk_receipts()).await.unwrap();
+        recv.ack(s_info.node_id, &pid1, mk_receipts())
+            .await
+            .unwrap();
         match recv_next(&mut acks).await {
-            TransportEvent::AckReceived { package_id, .. } => assert_eq!(package_id, pkg1.package_id),
+            TransportEvent::AckReceived { package_id, .. } => {
+                assert_eq!(package_id, pkg1.package_id)
+            }
             other => panic!("expected AckReceived pre-swap, got {other:?}"),
         }
-        assert_eq!(s.control_pool_dials(), 1, "one pooled dial established pre-swap");
+        assert_eq!(
+            s.control_pool_dials(),
+            1,
+            "one pooled dial established pre-swap"
+        );
 
         // Hot-swap the sender's relay map onto a fresh (fake-but-valid) relay set.
         let new_map = iroh::RelayMap::try_from_iter(["https://127.0.0.1:9"]).unwrap();
-        let want_urls: Vec<String> =
-            new_map.urls::<Vec<_>>().iter().map(|u| u.to_string()).collect();
+        let want_urls: Vec<String> = new_map
+            .urls::<Vec<_>>()
+            .iter()
+            .map(|u| u.to_string())
+            .collect();
         let changed = s.apply_relay_change(RelayMode::Custom(new_map)).await;
         assert!(changed, "inserting a relay onto the empty set is a change");
 
         // Identity + store + reported set all reflect the swap without a rebuild.
-        assert_eq!(s.node_id(), id_before, "node id stable across a relay hot-swap");
+        assert_eq!(
+            s.node_id(),
+            id_before,
+            "node id stable across a relay hot-swap"
+        );
         assert!(
             tag_present(s.store(), "out/pkg/keep").await,
             "the shared store (and its tag) must survive a relay hot-swap"
@@ -4018,21 +4262,31 @@ mod tests {
             id_before,
             "endpoint_addr id stable across a hot-swap (same endpoint, re-homed in place)"
         );
-        assert_eq!(s.relay_urls(), want_urls, "relay_urls() must reflect the hot-swapped set");
+        assert_eq!(
+            s.relay_urls(),
+            want_urls,
+            "relay_urls() must reflect the hot-swapped set"
+        );
 
         // The pre-swap connection was NOT dropped: a second announce→ack reuses the
         // SAME pooled connection (dials still 1). No re-pairing — the endpoint is
         // re-homed in place, its direct addr unchanged. A rebuild would have reset
         // the pool and forced a re-dial here.
         let pkg2 = mk_announce("post-swap");
-        out.announce(r_info.node_id, &pkg2, "", "", &[]).await.unwrap();
+        out.announce(r_info.node_id, &pkg2, "", "", &[])
+            .await
+            .unwrap();
         let pid2 = match recv_next(&mut r_ev).await {
             TransportEvent::AnnounceReceived { announce, .. } => announce.package_id,
             other => panic!("expected AnnounceReceived post-swap, got {other:?}"),
         };
-        recv.ack(s_info.node_id, &pid2, mk_receipts()).await.unwrap();
+        recv.ack(s_info.node_id, &pid2, mk_receipts())
+            .await
+            .unwrap();
         match recv_next(&mut acks).await {
-            TransportEvent::AckReceived { package_id, .. } => assert_eq!(package_id, pkg2.package_id),
+            TransportEvent::AckReceived { package_id, .. } => {
+                assert_eq!(package_id, pkg2.package_id)
+            }
             other => panic!("expected AckReceived post-swap, got {other:?}"),
         }
         assert_eq!(
@@ -4074,7 +4328,8 @@ mod tests {
         // Add one relay → a change (added=1, removed=0).
         let map = iroh::RelayMap::try_from_iter(["https://127.0.0.1:9"]).unwrap();
         assert!(
-            node.apply_relay_change(RelayMode::Custom(map.clone())).await,
+            node.apply_relay_change(RelayMode::Custom(map.clone()))
+                .await,
             "adding a relay is a change"
         );
         assert_eq!(node.relay_urls().len(), 1, "one relay now configured");
@@ -4106,9 +4361,15 @@ mod tests {
             events.iter().map(|e| e.message.clone()).collect::<Vec<_>>()
         );
         assert_eq!(swaps[0].fields.get("added").map(String::as_str), Some("1"));
-        assert_eq!(swaps[0].fields.get("removed").map(String::as_str), Some("0"));
+        assert_eq!(
+            swaps[0].fields.get("removed").map(String::as_str),
+            Some("0")
+        );
         assert_eq!(swaps[1].fields.get("added").map(String::as_str), Some("0"));
-        assert_eq!(swaps[1].fields.get("removed").map(String::as_str), Some("1"));
+        assert_eq!(
+            swaps[1].fields.get("removed").map(String::as_str),
+            Some("1")
+        );
         drop(events);
 
         node.shutdown().await;
@@ -4167,8 +4428,7 @@ mod tests {
         }
         // Zero control dispatch from the denied peer (the gate closed the
         // connection before any `Msg` was decoded).
-        let never_arrived =
-            tokio::time::timeout(Duration::from_millis(300), r_events.recv()).await;
+        let never_arrived = tokio::time::timeout(Duration::from_millis(300), r_events.recv()).await;
         assert!(
             never_arrived.is_err(),
             "the denied peer must produce zero control dispatch post-swap"
@@ -4230,7 +4490,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(node.relay_urls(), before, "a failed refresh must keep the current relay map");
+        assert_eq!(
+            node.relay_urls(),
+            before,
+            "a failed refresh must keep the current relay map"
+        );
 
         drop(_guard);
         node.shutdown().await;
@@ -4264,7 +4528,8 @@ mod tests {
             if field.name() == "message" {
                 self.message = value.to_string();
             } else {
-                self.fields.insert(field.name().to_string(), value.to_string());
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
             }
         }
     }
@@ -4284,7 +4549,11 @@ mod tests {
             event: &tracing::Event<'_>,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            if !event.metadata().target().starts_with("athenaeum_core::sharing") {
+            if !event
+                .metadata()
+                .target()
+                .starts_with("athenaeum_core::sharing")
+            {
                 return;
             }
             let mut collector = FieldCollector::default();
