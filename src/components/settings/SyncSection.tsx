@@ -49,6 +49,24 @@ function bytesToMbInput(raw: string): string {
   return String(Number((bytes / BYTES_PER_MB).toFixed(3)));
 }
 
+// Simultaneous incoming transfers (W2 T2.7). `sync.max_concurrent_receives` is
+// stored as a plain integer string; the server accepts 1..=8 and the receiver's
+// getter clamps into the same window. Mirror both here so a bad value never
+// round-trips and the field never shows a cap the receiver isn't using.
+const MIN_RECEIVES = 1;
+const MAX_RECEIVES = 8;
+const DEFAULT_RECEIVES = '2';
+
+/** Stored value → the integer text shown in the field, clamped the same way the
+ *  receiver clamps it (`SettingsManager::get_sync_max_concurrent_receives`), so
+ *  a hand-edited or migrated row displays the cap actually in force. Anything
+ *  unparseable falls back to the default. */
+function receivesToInput(raw: string): string {
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n)) return DEFAULT_RECEIVES;
+  return String(Math.min(MAX_RECEIVES, Math.max(MIN_RECEIVES, n)));
+}
+
 export default function SyncSection() {
   const mounted = useRef(true);
   const { notify } = useNotifications();
@@ -71,6 +89,14 @@ export default function SyncSection() {
   const [savedUploadMb, setSavedUploadMb] = useState('');
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [savingUpload, setSavingUpload] = useState(false);
+
+  // Simultaneous incoming transfers (W2 T2.7) — same text-backed shape as the
+  // upload limit: `savedReceives` is the last persisted value and drives the
+  // Save button's dirty state.
+  const [receives, setReceives] = useState(DEFAULT_RECEIVES);
+  const [savedReceives, setSavedReceives] = useState(DEFAULT_RECEIVES);
+  const [receivesError, setReceivesError] = useState<string | null>(null);
+  const [savingReceives, setSavingReceives] = useState(false);
 
   // Dev pairing-ticket disclosure — lazily fetched on first expand.
   const [showTicket, setShowTicket] = useState(false);
@@ -118,11 +144,14 @@ export default function SyncSection() {
       setUploadMb('');
       setSavedUploadMb('');
       setUploadError(null);
+      setReceives(DEFAULT_RECEIVES);
+      setSavedReceives(DEFAULT_RECEIVES);
+      setReceivesError(null);
       return;
     }
     (async () => {
       try {
-        const [ss, devVal, uploadVal] = await Promise.all([
+        const [ss, devVal, uploadVal, receivesVal] = await Promise.all([
           api.invoke<SyncStatus>('get_sync_status'),
           api.invoke<string>('get_setting', {
             key: 'sync.dev_ticket_pairing',
@@ -133,6 +162,12 @@ export default function SyncSection() {
             key: 'sync.max_upload_bytes_per_sec',
             defaultValue: '0',
           }),
+          // No dedicated getter command — the cap is read through generic
+          // `get_setting`, same default ("2") the backend applies.
+          api.invoke<string>('get_setting', {
+            key: 'sync.max_concurrent_receives',
+            defaultValue: DEFAULT_RECEIVES,
+          }),
         ]);
         if (!mounted.current) return;
         setSyncStatus(ss ?? null);
@@ -140,6 +175,9 @@ export default function SyncSection() {
         const mb = bytesToMbInput(uploadVal ?? '0');
         setUploadMb(mb);
         setSavedUploadMb(mb);
+        const lanes = receivesToInput(receivesVal ?? DEFAULT_RECEIVES);
+        setReceives(lanes);
+        setSavedReceives(lanes);
       } catch (err) {
         console.error('[sync] load sync settings failed:', err);
       }
@@ -241,6 +279,52 @@ export default function SyncSection() {
       });
     } finally {
       if (mounted.current) setSavingUpload(false);
+    }
+  };
+
+  const handleSaveConcurrentReceives = async () => {
+    const raw = receives.trim();
+    const n = Number(raw);
+    // Client mirror of the server's 1..=8 guard, so a typo answers inline
+    // instead of round-tripping. Whole numbers only — there is no half a lane.
+    if (raw === '' || !Number.isFinite(n) || !Number.isInteger(n)) {
+      setReceivesError(`Enter a whole number between ${MIN_RECEIVES} and ${MAX_RECEIVES}.`);
+      return;
+    }
+    if (n < MIN_RECEIVES || n > MAX_RECEIVES) {
+      setReceivesError(`Must be between ${MIN_RECEIVES} and ${MAX_RECEIVES}.`);
+      return;
+    }
+    setReceivesError(null);
+    setSavingReceives(true);
+    try {
+      await api.invoke('set_sync_max_concurrent_receives', { maxConcurrentReceives: n });
+      const shown = String(n);
+      if (mounted.current) {
+        setReceives(shown);
+        setSavedReceives(shown);
+      }
+      notify({
+        title: 'Simultaneous incoming transfers saved',
+        detail:
+          n === 1
+            ? 'Incoming transfers download one at a time.'
+            : `Up to ${n} incoming transfers download at once.`,
+        kind: 'sync',
+        tone: 'success',
+      });
+    } catch (err) {
+      console.error('[sync] set max concurrent receives failed:', err);
+      const msg = errMsg(err);
+      if (mounted.current) setReceivesError(msg);
+      notify({
+        title: 'Could not save simultaneous incoming transfers',
+        detail: msg,
+        kind: 'sync',
+        tone: 'warning',
+      });
+    } finally {
+      if (mounted.current) setSavingReceives(false);
     }
   };
 
@@ -432,6 +516,55 @@ export default function SyncSection() {
           Caps this device's total sync upload bandwidth. Uploads only — downloads are capped by
           the sending device's limit. Empty or <span className="text-content-secondary">0</span>{' '}
           means unlimited.
+        </p>
+      </div>
+
+      {/* Simultaneous incoming transfers (W2 T2.7): how many inbound transfers
+          download at once. Integer 1..=8, live-applied by the receive gate. */}
+      <div>
+        <h4 className="text-sm font-medium text-content-secondary mb-2">
+          Simultaneous incoming transfers
+        </h4>
+        <div className="flex items-center gap-3">
+          <input
+            type="number"
+            inputMode="numeric"
+            value={receives}
+            onChange={(e) => {
+              setReceives(e.target.value);
+              setReceivesError(null);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') handleSaveConcurrentReceives();
+            }}
+            step="1"
+            min={MIN_RECEIVES}
+            max={MAX_RECEIVES}
+            aria-label="Number of simultaneous incoming transfers"
+            className={`w-20 rounded-md border bg-surface-hover px-2.5 py-1.5 text-sm text-content focus:outline-none focus:border-accent transition-colors ${
+              receivesError ? 'border-error' : 'border-border'
+            }`}
+          />
+          <button
+            type="button"
+            onClick={handleSaveConcurrentReceives}
+            disabled={savingReceives || receives.trim() === savedReceives}
+            className="flex-shrink-0 inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs text-content-secondary hover:bg-surface-hover disabled:opacity-50 transition-colors"
+          >
+            {savingReceives ? (
+              <Loader2 size={13} className="animate-spin" />
+            ) : (
+              <Save size={13} />
+            )}
+            Save
+          </button>
+        </div>
+        {receivesError && <p className="mt-1.5 text-xs text-error">{receivesError}</p>}
+        <p className="mt-1.5 text-xs text-content-muted">
+          How many incoming transfers download at once. Others wait their turn — transfers from the
+          same device always arrive in order. Default{' '}
+          <span className="text-content-secondary">2</span>; raise it only if this machine's disk
+          keeps up.
         </p>
       </div>
 
