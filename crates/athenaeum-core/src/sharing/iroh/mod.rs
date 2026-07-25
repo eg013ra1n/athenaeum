@@ -50,7 +50,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use iroh_blobs::api::Store;
 use iroh_blobs::protocol::ChunkRangesSeq;
 use iroh_blobs::provider::events::{
-    ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+    ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate, ThrottleMode,
 };
 use iroh_blobs::store::fs::options::Options as FsOptions;
 use iroh_blobs::store::fs::FsStore;
@@ -76,6 +76,7 @@ pub(crate) mod telemetry;
 #[cfg(test)]
 mod tests;
 
+use pacer::UploadPacer;
 use proto::{announce_received_from_msg, Msg, OfferEntry};
 
 /// Custom ALPN for the announce/ack control channel. Distinct from
@@ -519,17 +520,37 @@ pub(crate) fn build_router(
     flush_store_on_shutdown: bool,
     serve_resolver: ServeRootResolver,
     serve_file_resolver: ServeFileResolver,
+    pacer: Arc<UploadPacer>,
 ) -> Router {
     // Provider upload events (Task 13): a masked `EventSender` feeds a per-process
     // consumer that turns a peer's collection pull into outgoing byte progress.
     // Mask: `Notify` on connect + `NotifyLog` on get (per-request transfer events);
-    // everything else stays at the default (get_many/observe off, push disabled,
-    // `throttle: ThrottleMode::None` — we never rate-limit a peer).
+    // everything else stays at the default (get_many/observe off, push disabled).
+    //
+    // `throttle: ThrottleMode::Intercept` is ALWAYS on (W1) — it is never toggled
+    // to match whether a limit is currently configured. The provider's writer
+    // awaits an rpc reply from our consumer before every ~16 KiB payload write, so
+    // DELAYING that reply IS the throttle; the mask itself is fixed at router
+    // build, so gating it on the setting would mean rebinding the endpoint to
+    // change a limit. Keeping it on makes the limit LIVE-updatable
+    // (`UploadPacer::set_rate`) with no reconnect.
+    //
+    // The disabled path is ~free: with rate 0 `reserve` returns `Duration::ZERO`
+    // after a single relaxed atomic load, and the consumer replies inline (no
+    // spawn, no sleep) — one in-process rpc round trip per 16 KiB against a link
+    // that is already doing QUIC framing + BLAKE3 verification on those same
+    // bytes.
+    //
+    // ONE pacer per endpoint, deliberately: the budget is the whole DEVICE's sync
+    // upload, shared across every peer and every concurrent GET, which is exactly
+    // what the setting promises (and what keeps an observatory's uplink usable
+    // while N peers pull at once).
     let (events, mut rx) = EventSender::channel(
         PROVIDER_EVENT_CAPACITY,
         EventMask {
             connected: ConnectMode::Notify,
             get: RequestMode::NotifyLog,
+            throttle: ThrottleMode::Intercept,
             ..EventMask::DEFAULT
         },
     );
@@ -553,6 +574,18 @@ pub(crate) fn build_router(
     // rx-carrying message gets a detached drain task unconditionally — even an
     // unmapped/foreign hash, even the Push*/Observe* notify messages a 0.103 mask
     // quirk can deliver despite the mask — and we never block, never drop early.
+    //
+    // The `Throttle` reply oneshot (`m.tx`) is load-bearing THE SAME WAY, and is
+    // the reason this rule now has teeth on the hot path: with
+    // `ThrottleMode::Intercept` the provider's writer awaits our reply before
+    // every ~16 KiB payload write. ALWAYS reply, and always reply `Ok(())` — a
+    // DROPPED `tx` errors the writer and an `Err(AbortReason::…)` reply
+    // deliberately kills the transfer, so neither is ever a valid way to say
+    // "slow down". The DELAY before the reply IS the throttle. And that delay is
+    // slept on a SPAWNED task, never here: this consumer task also carries the
+    // GET-request messages whose drain tasks keep every other in-flight transfer
+    // alive, so sleeping inline would stall the whole node's uploads for one
+    // paced chunk.
     let consumer_sink = sink.clone();
     tokio::spawn(async move {
         // A detached pure-drain task for any rx-carrying message we don't emit for
@@ -718,11 +751,37 @@ pub(crate) fn build_router(
                 ProviderMessage::PushRequestReceivedNotify(m) => drain_only!(m),
                 ProviderMessage::ObserveRequestReceived(m) => drain_only!(m),
                 ProviderMessage::ObserveRequestReceivedNotify(m) => drain_only!(m),
+                // The upload throttle (W1). The provider is asking permission to
+                // write `size` bytes (~16 KiB) and is BLOCKED on this reply; the
+                // pacer says how long that permission should be withheld.
+                //
+                // Both branches end in `send(Ok(()))` — see the SAFETY RULE above:
+                // dropping `tx` or replying `Err` aborts the peer's download, so
+                // waiting is the only rate-limiting move available to us.
+                ProviderMessage::Throttle(m) => {
+                    let wait = pacer.reserve(m.inner.size);
+                    if wait.is_zero() {
+                        // Unlimited (rate 0) or simply within budget: reply inline.
+                        // A local irpc oneshot never yields, so this costs no
+                        // scheduling at all — that is what keeps the always-on mask
+                        // free when the user has set no limit.
+                        m.tx.send(Ok(())).await.ok();
+                    } else {
+                        // Paced: sleep on a DETACHED task. Never on this consumer —
+                        // it also carries the messages that spawn every transfer's
+                        // drain task (SAFETY RULE), so a sleep here would stall
+                        // unrelated uploads node-wide.
+                        let tx = m.tx;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(wait).await;
+                            tx.send(Ok(())).await.ok();
+                        });
+                    }
+                }
                 // No update channel to drain.
                 ProviderMessage::ClientConnected(_)
                 | ProviderMessage::ClientConnectedNotify(_)
-                | ProviderMessage::ConnectionClosed(_)
-                | ProviderMessage::Throttle(_) => {}
+                | ProviderMessage::ConnectionClosed(_) => {}
             }
         }
     });
@@ -781,6 +840,12 @@ pub struct IrohTransport {
     /// into both protocol handlers at construction; the host installs the
     /// predicate later via [`set_connect_gate`](Self::set_connect_gate).
     connect_gate: SharedConnectGate,
+    /// Device-wide upload budget consulted by the provider throttle hook (W1).
+    /// Constructed unlimited (rate 0) and re-rated live via
+    /// [`set_upload_limit`](Self::set_upload_limit); the same `Arc` is held by the
+    /// provider-events consumer, so a rate change takes effect on the next chunk
+    /// of an in-flight transfer without rebinding anything.
+    upload_pacer: Arc<UploadPacer>,
 }
 
 impl IrohTransport {
@@ -888,6 +953,9 @@ impl IrohTransport {
         // (its Direct sink drops any `ServeFileProgress`); resolve nothing.
         let serve_file_resolver: ServeFileResolver =
             Arc::new(|_: Hash, _: u64| -> Option<(String, u64)> { None });
+        // Unlimited until a host calls `set_upload_limit`; the consumer and this
+        // struct share the one Arc so the limit is live-updatable.
+        let upload_pacer = Arc::new(UploadPacer::new(0));
         let router = build_router(
             endpoint,
             &store,
@@ -901,6 +969,7 @@ impl IrohTransport {
             true,
             serve_resolver,
             serve_file_resolver,
+            Arc::clone(&upload_pacer),
         );
 
         let endpoint = router.endpoint().clone();
@@ -919,7 +988,16 @@ impl IrohTransport {
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
             connect_gate,
+            upload_pacer,
         })
+    }
+
+    /// Set this endpoint's total sync UPLOAD limit in bytes/sec; `0` = unlimited.
+    ///
+    /// Takes effect on the next ~16 KiB chunk the provider offers — including
+    /// mid-transfer — because the throttle hook holds this same pacer.
+    pub fn set_upload_limit(&self, bytes_per_sec: u64) {
+        self.upload_pacer.set_rate(bytes_per_sec);
     }
 
     /// This endpoint's node id, available before [`start`](SharingTransport::start).

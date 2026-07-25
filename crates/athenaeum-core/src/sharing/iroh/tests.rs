@@ -1787,3 +1787,59 @@ async fn successful_fetch_clears_in_flight_tag() {
     provider.shutdown().await;
     receiver.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// W1: provider throttle hook (ThrottleMode::Intercept).
+// ---------------------------------------------------------------------------
+
+/// REGRESSION PIN for the deadly-drop arm. With `ThrottleMode::Intercept` on,
+/// the provider awaits an rpc reply from our consumer for EVERY ~16 KiB payload
+/// write — a dropped reply channel errors the writer and ABORTS the peer's
+/// download. The consumer's old `ProviderMessage::Throttle(_) => {}` arm did
+/// exactly that drop; this test transfers a multi-chunk package at rate 0
+/// (unlimited) over the REAL iroh stack and fails against that arm the moment
+/// the mask flips. Loopback e2e cannot cover this: the mock transport bypasses
+/// iroh-blobs entirely, so this real-QUIC-localhost test is the only pin.
+#[tokio::test]
+async fn throttle_intercept_zero_rate_transfer_completes() {
+    let provider = mem_transport().await;
+    let receiver = mem_transport().await;
+    let (provider_info, receiver_info) = start_and_pair(&provider, &receiver).await;
+    let mut receiver_events = receiver.events().await;
+
+    // ~600 KiB ⇒ dozens of 16 KiB payload chunks ⇒ many Throttle round trips.
+    let tmp = tempdir().unwrap();
+    let (pkg_dir, announce) = build_package(
+        &tmp.path().join("src-throttle"),
+        "uuid-throttle",
+        "frame_throttle.fits",
+        "M42",
+        600 * 1024,
+    );
+
+    provider.serve(&announce, &pkg_dir, None).await.unwrap();
+    provider
+        .announce(receiver_info.node_id, &announce, "", "", &[])
+        .await
+        .unwrap();
+    let wire = match recv_next(&mut receiver_events).await {
+        TransportEvent::AnnounceReceived { announce, .. } => announce,
+        other => panic!("expected AnnounceReceived, got {other:?}"),
+    };
+
+    let dest = tempdir().unwrap();
+    receiver
+        .fetch(provider_info.node_id, &wire, dest.path(), noop_fetch_sink())
+        .await
+        .expect(
+            "a zero-rate (unlimited) transfer must complete — an unreplied Throttle rpc aborts it",
+        );
+    assert_eq!(
+        xxh3_of(&pkg_dir.join("frame_throttle.fits")),
+        xxh3_of(&dest.path().join("frame_throttle.fits")),
+        "content intact through the intercept path"
+    );
+
+    provider.shutdown().await;
+    receiver.shutdown().await;
+}

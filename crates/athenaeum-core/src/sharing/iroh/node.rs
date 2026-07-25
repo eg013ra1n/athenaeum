@@ -61,6 +61,7 @@ use crate::sharing::{FetchSink, SharingTransport};
 use crate::sync::status::TransportHealth;
 use crate::sync::DedupResponder;
 
+use super::pacer::UploadPacer;
 use super::proto::{self, Msg, OfferEntry};
 use super::telemetry::{peer_conn_path, TransportCounters};
 use super::{
@@ -854,6 +855,14 @@ pub struct SharedIrohNode {
     /// control protocol handler, so installing it after `bind` takes effect on the
     /// already-spawned router.
     presence: SharedPresenceHook,
+    /// Device-wide upload budget consulted by the provider throttle hook (W1).
+    /// Bound unlimited (rate 0) and re-rated live via
+    /// [`set_upload_limit`](Self::set_upload_limit). The SAME `Arc` is held by the
+    /// provider-events consumer spawned inside
+    /// [`build_router`](super::build_router), so one pacer caps the whole node —
+    /// every role handle, every peer, every concurrent GET — and a limit change
+    /// lands on the next chunk without a rebind.
+    upload_pacer: Arc<UploadPacer>,
 }
 
 impl SharedIrohNode {
@@ -961,6 +970,11 @@ impl SharedIrohNode {
             let served_files = Arc::clone(&served_files);
             Arc::new(move |root, index| resolve_served_file_in(&served, &served_files, root, index))
         };
+        // The device-wide upload pacer (W1) is created BEFORE the router: the
+        // provider-events consumer spawned inside `build_router` holds a clone and
+        // consults it for every ~16 KiB payload chunk. Bound unlimited (rate 0) —
+        // the host applies the persisted setting afterwards via `set_upload_limit`.
+        let upload_pacer = Arc::new(UploadPacer::new(0));
         // Shared node: `EventSink::Demux` (inbound events fan out through the demux,
         // Task 2/Д4, not a single shared stream), and `flush_store_on_shutdown:
         // false` so a router teardown never tears down the store — the node flushes
@@ -975,6 +989,7 @@ impl SharedIrohNode {
             false,
             serve_resolver,
             serve_file_resolver,
+            Arc::clone(&upload_pacer),
         );
 
         let endpoint = router.endpoint().clone();
@@ -1031,7 +1046,19 @@ impl SharedIrohNode {
             relay_health,
             counters_at_bind,
             presence,
+            upload_pacer,
         }))
+    }
+
+    /// Set this node's total sync UPLOAD limit in bytes/sec; `0` = unlimited.
+    ///
+    /// One budget for the whole device: every role handle, every peer and every
+    /// concurrent GET draw on this pacer. Takes effect on the next ~16 KiB chunk
+    /// the provider offers — including mid-transfer — because the throttle hook in
+    /// the provider-events consumer holds the same `Arc`.
+    pub fn set_upload_limit(&self, bytes_per_sec: u64) {
+        self.upload_pacer.set_rate(bytes_per_sec);
+        tracing::info!(bytes_per_sec, "sync upload limit applied");
     }
 
     // ----- network-layer accessors (Task 8) -----------------------------------
