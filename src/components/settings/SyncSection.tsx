@@ -18,6 +18,7 @@ import {
   Copy,
   Check,
   Trash2,
+  Save,
 } from 'lucide-react';
 import { api } from '../../api';
 import { formatBytes } from '../transfers/presentation';
@@ -27,6 +28,25 @@ import type { AccountStatus, SyncStatus, TransferStorage, TransferCleanup } from
 /** Tauri and Axum both reject with a plain string, not an `Error`. */
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+// Upload speed limit (W1). The setting `sync.max_upload_bytes_per_sec` is stored
+// as BYTES per second ("0" = unlimited); the field shows DECIMAL megabytes per
+// second — 1 MB/s = 1_000_000 bytes/s, the convention ISPs and network gear use,
+// NOT 1 MiB/s = 1_048_576. Keep the two directions symmetric.
+const BYTES_PER_MB = 1_000_000;
+
+/** Client mirror of the server floor (100000 bytes/s), so the common mistake
+ *  gets an inline answer instead of a round-trip error. */
+const MIN_LIMIT_MB = 0.1;
+
+/** bytes/s (as stored, a string) → the MB/s text shown in the field. `0` and
+ *  anything unparseable render as empty, which the field labels "Unlimited". */
+function bytesToMbInput(raw: string): string {
+  const bytes = Number(raw);
+  if (!Number.isFinite(bytes) || bytes <= 0) return '';
+  // Trim float artifacts: 500000 / 1e6 must read "0.5", not "0.5000000000000001".
+  return String(Number((bytes / BYTES_PER_MB).toFixed(3)));
 }
 
 export default function SyncSection() {
@@ -43,6 +63,14 @@ export default function SyncSection() {
   // the one-click "clean up finished transfers" reclaim.
   const [storage, setStorage] = useState<TransferStorage | null>(null);
   const [cleaning, setCleaning] = useState(false);
+
+  // Upload speed limit (W1) — text-backed, not number-backed, so the field can
+  // legitimately be empty (= unlimited). `savedUploadMb` is the last persisted
+  // value and drives the Save button's dirty state.
+  const [uploadMb, setUploadMb] = useState('');
+  const [savedUploadMb, setSavedUploadMb] = useState('');
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [savingUpload, setSavingUpload] = useState(false);
 
   // Dev pairing-ticket disclosure — lazily fetched on first expand.
   const [showTicket, setShowTicket] = useState(false);
@@ -87,20 +115,31 @@ export default function SyncSection() {
     if (!signedIn) {
       setSyncStatus(null);
       setStorage(null);
+      setUploadMb('');
+      setSavedUploadMb('');
+      setUploadError(null);
       return;
     }
     (async () => {
       try {
-        const [ss, devVal] = await Promise.all([
+        const [ss, devVal, uploadVal] = await Promise.all([
           api.invoke<SyncStatus>('get_sync_status'),
           api.invoke<string>('get_setting', {
             key: 'sync.dev_ticket_pairing',
             defaultValue: 'false',
           }),
+          // Settings cross the boundary as STRINGS; "0" is the unlimited sentinel.
+          api.invoke<string>('get_setting', {
+            key: 'sync.max_upload_bytes_per_sec',
+            defaultValue: '0',
+          }),
         ]);
         if (!mounted.current) return;
         setSyncStatus(ss ?? null);
         setDevFlag(devVal.toLowerCase() === 'true');
+        const mb = bytesToMbInput(uploadVal ?? '0');
+        setUploadMb(mb);
+        setSavedUploadMb(mb);
       } catch (err) {
         console.error('[sync] load sync settings failed:', err);
       }
@@ -145,6 +184,63 @@ export default function SyncSection() {
       });
     } finally {
       if (mounted.current) setCleaning(false);
+    }
+  };
+
+  const handleSaveUploadLimit = async () => {
+    const raw = uploadMb.trim();
+    // Empty or 0 → unlimited. Anything else must parse and clear the same floor
+    // the server enforces, checked here so the common case never round-trips.
+    let bytesPerSec = 0;
+    if (raw !== '') {
+      const mbps = Number(raw);
+      if (!Number.isFinite(mbps) || mbps < 0) {
+        setUploadError('Enter a number in MB/s, or leave the field empty for unlimited.');
+        return;
+      }
+      if (mbps > 0 && mbps < MIN_LIMIT_MB) {
+        setUploadError(
+          `Minimum limit is ${MIN_LIMIT_MB} MB/s. Use 0 (or leave empty) for unlimited.`,
+        );
+        return;
+      }
+      bytesPerSec = Math.round(mbps * BYTES_PER_MB);
+      if (!Number.isSafeInteger(bytesPerSec)) {
+        setUploadError('That limit is too large — enter a realistic MB/s value.');
+        return;
+      }
+    }
+    setUploadError(null);
+    setSavingUpload(true);
+    try {
+      await api.invoke('set_sync_upload_limit', { bytesPerSec });
+      // Canonicalise the field to what was actually stored (0 → empty = Unlimited).
+      const shown = bytesToMbInput(String(bytesPerSec));
+      if (mounted.current) {
+        setUploadMb(shown);
+        setSavedUploadMb(shown);
+      }
+      notify({
+        title: 'Upload speed limit saved',
+        detail:
+          bytesPerSec === 0
+            ? 'Sync uploads from this device are unlimited.'
+            : `Sync uploads from this device are capped at ${shown} MB/s.`,
+        kind: 'sync',
+        tone: 'success',
+      });
+    } catch (err) {
+      console.error('[sync] set upload limit failed:', err);
+      const msg = errMsg(err);
+      if (mounted.current) setUploadError(msg);
+      notify({
+        title: 'Could not save upload speed limit',
+        detail: msg,
+        kind: 'sync',
+        tone: 'warning',
+      });
+    } finally {
+      if (mounted.current) setSavingUpload(false);
     }
   };
 
@@ -287,6 +383,55 @@ export default function SyncSection() {
         <p className="mt-1.5 text-xs text-content-muted">
           Removes finished transfers' temporary payloads and releases orphaned download data.
           Received files and transfer history are untouched.
+        </p>
+      </div>
+
+      {/* Upload speed limit (W1): one device-wide cap on sync UPLOAD bandwidth.
+          Shown in decimal MB/s, stored as bytes/s; empty or 0 = unlimited. */}
+      <div>
+        <h4 className="text-sm font-medium text-content-secondary mb-2">Upload speed limit</h4>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              inputMode="decimal"
+              value={uploadMb}
+              onChange={(e) => {
+                setUploadMb(e.target.value);
+                setUploadError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleSaveUploadLimit();
+              }}
+              step="0.1"
+              min="0"
+              placeholder="Unlimited"
+              aria-label="Upload speed limit in megabytes per second"
+              className={`w-32 rounded-md border bg-surface-hover px-2.5 py-1.5 text-sm text-content focus:outline-none focus:border-accent transition-colors ${
+                uploadError ? 'border-error' : 'border-border'
+              }`}
+            />
+            <span className="text-sm text-content-muted">MB/s</span>
+          </div>
+          <button
+            type="button"
+            onClick={handleSaveUploadLimit}
+            disabled={savingUpload || uploadMb.trim() === savedUploadMb}
+            className="flex-shrink-0 inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs text-content-secondary hover:bg-surface-hover disabled:opacity-50 transition-colors"
+          >
+            {savingUpload ? (
+              <Loader2 size={13} className="animate-spin" />
+            ) : (
+              <Save size={13} />
+            )}
+            Save
+          </button>
+        </div>
+        {uploadError && <p className="mt-1.5 text-xs text-error">{uploadError}</p>}
+        <p className="mt-1.5 text-xs text-content-muted">
+          Caps this device's total sync upload bandwidth. Uploads only — downloads are capped by
+          the sending device's limit. Empty or <span className="text-content-secondary">0</span>{' '}
+          means unlimited.
         </p>
       </div>
 
