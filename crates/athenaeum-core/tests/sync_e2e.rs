@@ -3419,11 +3419,12 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
     let out_id = latest_outbound_id(cdb);
 
     // Attempt 1: a SECOND inbound row appears (the batch's), and its subset fetch
-    // aborts → it lands `failed` at generation 1. Capture its id + attempt-1 wire.
+    // aborts. D2 §3.1: the abort is a vanished peer, so the row PARKS `waiting` at
+    // generation 1 rather than failing. Capture its id + attempt-1 wire.
     wait_until(
         || {
             count(pdb, "SELECT COUNT(*) FROM sync_inbound") == 2
-                && matches!(latest_inbound_package_id(pdb), Some(p) if matches!(inbound_row(pdb, &p), Some((s, _, _)) if s == "failed"))
+                && matches!(latest_inbound_package_id(pdb), Some(p) if matches!(inbound_row(pdb, &p), Some((s, _, _)) if s == "waiting"))
         },
         WAIT,
     )
@@ -3445,11 +3446,20 @@ async fn failed_fetch_then_resend_delivers_into_one_batch_row() {
         Some("package payload missing on disk"),
         "the sender failed on the missing payload (the honest resend route)"
     );
-    // The receiver row is STILL failed (the Revoke{Failed} hit an already-terminal
-    // row → no-op), non-cancelled, generation still 1 — re-drivable.
-    assert!(
-        matches!(inbound_row(pdb, &wire_attempt1), Some((s, _, _)) if s == "failed"),
-        "the receiver row stays failed (not cancelled) — a resend can re-drive it"
+    // D2 §4: the Revoke{Failed} now lands on a NON-terminal (parked) row, so it runs
+    // the full bookkeeping instead of the pre-D2 no-op — and stamps the honest
+    // terminal the sender just declared. That is the right answer: the sender said
+    // "I cannot deliver this", so continuing to wait for it would be the lie. The
+    // row is still non-cancelled and generation 1, so the resend re-drives it.
+    wait_until(
+        || matches!(inbound_row(pdb, &wire_attempt1), Some((s, _, _)) if s == "failed"),
+        WAIT,
+    )
+    .await;
+    assert_eq!(
+        inbound_last_error(pdb, &wire_attempt1).as_deref(),
+        Some("sender failed"),
+        "the revoke's reason is recorded, not a stale fetch error"
     );
     assert_eq!(inbound_generation(pdb, in_id), 1, "no stray re-announce bumped the inbound generation before the resend");
     std::fs::rename(&stashed, &pkg_ref).expect("restore the payload dir");

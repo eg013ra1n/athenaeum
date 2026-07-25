@@ -11,12 +11,16 @@ _The delivery beta — transfers you can watch, steer, and trust to finish._
 
 ## Changes
 
+- Transfer records written by this version cannot be read by older versions — update every device together.
 - Received files that would land inside the app's own data folder now raise a standing warning with a one-click way to pick a proper landing folder.
 - Incoming folders are named after the sending machine, with a safe fallback when a device name has no usable characters.
 - Transfer notifications and rows deduplicate cleanly when a batch reaches its final state.
 
 ## Bug Fixes
 
+- **A transfer whose sending device goes offline now shows as waiting for that device, not failed.** The receiving side kept only one word for every interrupted download, so closing the sender mid-transfer painted the row red for a batch the sender was still going to deliver. It now stays in the active list with an honest "waiting for peer" state, keeps what it already received, and resumes on its own when the device comes back — no clicking required. Failed is reserved for what the receiver genuinely cannot accept.
+- **The received-files counter climbs during a transfer** instead of reading `0 of 38` until the very end while the per-file bars visibly moved. Files that arrived in a single burst — resumed, already-present, small or empty — were never counted at all.
+- **"Clean up finished transfers" now reclaims the receiving side too.** On a machine that only receives, the button had nothing it could remove: leftover data from interrupted downloads was invisible to it and stayed on disk indefinitely. Received leftovers are now swept, and the storage figure next to the button includes them.
 - **Master calibration builds no longer fail** with `non-printable-ASCII string value for ATH_REJ`. A single non-ASCII character in an internally generated header value aborted every master build at the final write — after all the integration work was already done. Header writing is now also safe for file paths and names in any language (non-ASCII characters degrade to `?` placeholders in the FITS header instead of failing the build).
 - Deleting a scan root no longer errors when master calibration provenance references frames under it.
 - Renamed send targets in Perseus self-heal to device ids instead of failing the batch.
