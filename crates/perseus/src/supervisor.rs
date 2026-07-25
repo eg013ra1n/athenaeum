@@ -114,6 +114,20 @@ pub trait ManagedAgent: Send + 'static {
     fn node(&self) -> Option<Arc<SharedIrohNode>> {
         None
     }
+    /// Apply a total sync upload rate (bytes/sec, `0` = unlimited) to this
+    /// running agent's node — the supervisor's per-pass push, which is what makes
+    /// a `max_upload_mbps` edit that arrived by ANY route (the web PUT, or a hand
+    /// edit of `perseus.toml` over SSH) reach a node that is already bound.
+    ///
+    /// Defaulted over [`node`](Self::node), so production needs no impl and a
+    /// nodeless agent (the loopback injection path) is a no-op. It exists as its
+    /// own method purely so the supervisor's push is testable: a fake overrides it
+    /// to record the calls, which binding a real endpoint in a unit test cannot do.
+    fn set_upload_limit(&self, bytes_per_sec: u64) {
+        if let Some(node) = self.node() {
+            node.set_upload_limit(bytes_per_sec);
+        }
+    }
     /// The live in-flight (non-terminal) outbound package count.
     fn in_flight(&self) -> anyhow::Result<usize>;
     /// Gracefully stop the agent, returning a handle that completes on shutdown.
@@ -262,6 +276,11 @@ fn spawn_with(
         // capture-dir edit.
         let mut running_dirs: Vec<PathBuf> = vec![];
         let mut running_targets: Vec<String> = vec![];
+        // The upload rate (bytes/sec) the running agent's node was LAST given:
+        // seeded at launch with what `Agent::start` applied at bind time, then
+        // updated only when a pass pushes a change. Unlike the two lists above a
+        // divergence is live-applied, not restart-to-apply.
+        let mut running_upload_bps: u64 = 0;
         // When set and still in the future, the loop stays in `Failed` (no
         // relaunch) until this instant elapses.
         let mut backoff_until: Option<Instant> = None;
@@ -328,6 +347,12 @@ fn spawn_with(
                             on_agent(Some(a.as_ref()));
                             running_dirs = configured.clone();
                             running_targets = config.targets.clone();
+                            // The launcher was handed THIS config, and
+                            // `Agent::start` applies its upload cap right after
+                            // binding the node — so the bind-time value is what
+                            // the node holds. Seeding it here (rather than
+                            // pushing) keeps the first steady-state pass silent.
+                            running_upload_bps = config.upload_limit_bytes_per_sec();
                             let n = a.in_flight().unwrap_or(0) as u32;
                             agent = Some(a);
                             backoff_until = None;
@@ -343,7 +368,30 @@ fn spawn_with(
                     }
                 }
             } else if let Some(a) = &agent {
-                // Ready and running: refresh the in-flight count.
+                // Ready and running: live-apply an upload-cap change, then refresh
+                // the in-flight count.
+                //
+                // This is the ONLY path by which a `max_upload_mbps` edit reaches a
+                // node that is already bound when the edit did not come through the
+                // web PUT — a hand-edited `perseus.toml` over SSH, or a PUT that
+                // landed while `Agent::start` was still resolving/binding (that PUT
+                // saw no attached node, so it only wrote the file; the launch it
+                // raced applied the OLD value). Either way the next pass reads the
+                // file and reconciles.
+                //
+                // Strictly ON CHANGE: `UploadPacer::set_rate` resets the pacing
+                // schedule, so re-applying the same rate every tick would release a
+                // fresh burst each pass and the cap would not hold.
+                let want = config.upload_limit_bytes_per_sec();
+                if want != running_upload_bps {
+                    a.set_upload_limit(want);
+                    tracing::info!(
+                        bytes_per_sec = want,
+                        max_upload_mbps = config.max_upload_mbps,
+                        "upload limit pushed to running node"
+                    );
+                    running_upload_bps = want;
+                }
                 match a.in_flight() {
                     Ok(n) => {
                         let n = n as u32;
@@ -584,6 +632,11 @@ mod tests {
     struct AgentRecord {
         in_flight: Arc<AtomicUsize>,
         stopped: Arc<AtomicBool>,
+        /// Every `set_upload_limit` the supervisor pushed at this agent, in order.
+        /// The upload-limit test asserts BOTH the value and the call count (an
+        /// unconditional per-pass apply would clear the pacer's schedule each pass
+        /// and leak a burst, so "exactly once per change" is the contract).
+        upload_pushes: Arc<Mutex<Vec<u64>>>,
     }
 
     /// A fake [`ManagedAgent`] with no engine, watchers, or network — just the
@@ -592,6 +645,7 @@ mod tests {
         peer: String,
         in_flight: Arc<AtomicUsize>,
         stopped: Arc<AtomicBool>,
+        upload_pushes: Arc<Mutex<Vec<u64>>>,
     }
 
     impl ManagedAgent for FakeAgent {
@@ -619,6 +673,12 @@ mod tests {
                 auto_quiet_secs: 0,
             })
             .0
+        }
+        /// Record instead of touching a node: a unit test cannot bind a real
+        /// [`SharedIrohNode`] (it opens a socket and takes the device-key lock),
+        /// so the recorded call list IS the observable behaviour under test.
+        fn set_upload_limit(&self, bytes_per_sec: u64) {
+            self.upload_pushes.lock().unwrap().push(bytes_per_sec);
         }
         fn in_flight(&self) -> anyhow::Result<usize> {
             Ok(self.in_flight.load(Ordering::SeqCst))
@@ -679,12 +739,14 @@ mod tests {
                         let rec = AgentRecord {
                             in_flight: Arc::new(AtomicUsize::new(n as usize)),
                             stopped: Arc::new(AtomicBool::new(false)),
+                            upload_pushes: Arc::new(Mutex::new(Vec::new())),
                         };
                         st.created.lock().unwrap().push(rec.clone());
                         let agent = FakeAgent {
                             peer: "peer".to_string(),
                             in_flight: Arc::clone(&rec.in_flight),
                             stopped: Arc::clone(&rec.stopped),
+                            upload_pushes: Arc::clone(&rec.upload_pushes),
                         };
                         Ok(Box::new(agent) as Box<dyn ManagedAgent>)
                     }
@@ -726,15 +788,23 @@ mod tests {
     /// A ready (signed-in via ticket + ≥1 capture dir) config pointing at real
     /// capture directories.
     fn write_ready_config(path: &Path, data_dir: &Path, dirs: &[&Path]) {
+        write_ready_config_with(path, data_dir, dirs, "");
+    }
+
+    /// [`write_ready_config`] plus caller-supplied **top-level** keys (spliced in
+    /// before the `[retention]` table, where TOML requires them). Used by the
+    /// upload-limit test to vary `max_upload_mbps` on an otherwise identical file.
+    fn write_ready_config_with(path: &Path, data_dir: &Path, dirs: &[&Path], extra: &str) {
         let dirs_toml = dirs
             .iter()
             .map(|d| format!("\"{}\"", d.display()))
             .collect::<Vec<_>>()
             .join(", ");
         let text = format!(
-            "data_dir = \"{}\"\nmode = \"auto\"\ncapture_dirs = [{}]\npairing_ticket = \"t\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            "data_dir = \"{}\"\nmode = \"auto\"\ncapture_dirs = [{}]\npairing_ticket = \"t\"\n{}[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
             data_dir.display(),
-            dirs_toml
+            dirs_toml,
+            extra
         );
         write_config_atomic(path, &text);
     }
@@ -822,6 +892,93 @@ mod tests {
             seen.lock().unwrap().as_slice(),
             &[true],
             "on_agent must have seen Some once"
+        );
+        handle.shutdown().await;
+    }
+
+    /// W1 review (Important): a `max_upload_mbps` edit reaching `perseus.toml` by
+    /// ANY route must reach the node of an ALREADY-RUNNING agent — the hand-edit-
+    /// over-SSH case has no web PUT to apply it, and `Agent::start`'s bind-time
+    /// apply is a one-shot snapshot. The supervisor pass pushes it.
+    ///
+    /// Two halves, both load-bearing:
+    ///   1. a change IS pushed (with the decimal MB/s conversion), and
+    ///   2. it is pushed **exactly once** — not once per pass. `UploadPacer::
+    ///      set_rate` resets the pacing schedule, so re-applying the same rate
+    ///      every 20 ms tick would hand out a fresh burst each time and the cap
+    ///      would not hold. The steady-state passes before and after the edit must
+    ///      therefore be silent.
+    #[tokio::test]
+    async fn upload_limit_change_is_pushed_to_running_agent_once() {
+        let data = tempfile::tempdir().unwrap();
+        let cap = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("perseus.toml");
+        // Launch with a 4 MB/s cap: `Agent::start` applies that at bind time, so
+        // the supervisor must NOT re-push it.
+        write_ready_config_with(
+            &cfg_path,
+            data.path(),
+            &[cap.path()],
+            "max_upload_mbps = 4\n",
+        );
+
+        let (launcher, lstate) = fake_launcher(vec![Behavior::Launch(0)], 0);
+        let (on_agent, _seen) = recording_on_agent();
+        let handle = spawn(cfg_path.clone(), launcher, fast_opts(), on_agent);
+        let mut state = handle.state.clone();
+
+        tokio::time::timeout(T, state.wait_for(|s| s.label() == "running"))
+            .await
+            .expect("never reached Running")
+            .unwrap();
+        let rec = lstate.created.lock().unwrap()[0].clone();
+
+        // Several steady-state passes at the launch value push nothing: the
+        // bind-time apply already covered it.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            rec.upload_pushes.lock().unwrap().is_empty(),
+            "the launch-time value must not be re-pushed: {:?}",
+            rec.upload_pushes.lock().unwrap()
+        );
+
+        // The hand-edit-over-SSH case: the file changes with no web PUT involved.
+        write_ready_config_with(
+            &cfg_path,
+            data.path(),
+            &[cap.path()],
+            "max_upload_mbps = 8\n",
+        );
+        handle.wake.notify_one();
+
+        tokio::time::timeout(T, async {
+            loop {
+                if !rec.upload_pushes.lock().unwrap().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the edited upload limit never reached the running agent");
+        assert_eq!(
+            rec.upload_pushes.lock().unwrap().as_slice(),
+            &[8_000_000],
+            "pushed once, in bytes/sec (decimal MB/s)"
+        );
+
+        // …and stays pushed exactly once across many further passes.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            rec.upload_pushes.lock().unwrap().as_slice(),
+            &[8_000_000],
+            "an unchanged limit must never be re-applied (set_rate clears the pacing schedule)"
+        );
+        assert_eq!(
+            lstate.calls.load(Ordering::SeqCst),
+            1,
+            "an upload-limit edit is live — it must not restart the engine"
         );
         handle.shutdown().await;
     }

@@ -192,7 +192,7 @@ function renderSettingsTab() {
       <div class="muted target-intro">Caps the total sync upload rate so a big transfer leaves the site's uplink usable (SSH, remote desktop). 0 = unlimited. Applies immediately, mid-transfer included.</div>
       <div class="row">
         <label class="inline-label">Upload speed limit (MB/s)
-          <input id="ulLimit" type="number" min="0" class="qty" aria-label="Upload speed limit in megabytes per second, 0 for unlimited" />
+          <input id="ulLimit" type="number" min="0" step="1" class="qty" aria-label="Upload speed limit in whole megabytes per second, 0 for unlimited" />
         </label>
         <button id="ulSave">Save</button>
       </div>
@@ -550,7 +550,16 @@ async function loadUploadLimit() {
 
 async function saveUploadLimit() {
   const f = $('ulFlash');
-  const mbps = Math.max(0, Math.floor(Number($('ulLimit').value) || 0));
+  // The field is a whole-MB/s u32 server-side. Rounding a fractional entry would
+  // be actively dangerous — 0.5 would floor to 0, which means UNLIMITED, the exact
+  // opposite of what was typed. So reject it here and send nothing.
+  const raw = $('ulLimit').value.trim();
+  const mbps = Number(raw);
+  if (raw === '' || !Number.isInteger(mbps) || mbps < 0) {
+    f.textContent = 'whole MB/s (minimum 1); 0 = unlimited';
+    f.className = 'flash err';
+    return;
+  }
   try {
     const r = await api('/api/upload-limit', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ maxUploadMbps: mbps }) });
     if (r.status === 422) { f.textContent = 'rejected: ' + (await r.text()); f.className = 'flash err'; return; }

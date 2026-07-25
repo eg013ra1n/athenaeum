@@ -66,6 +66,8 @@ mode = "auto"                            # only value in the MVP
 # web_bind  = "127.0.0.1:8686"           # bind address (default); "" disables the page
 # web_token = "<random secret>"          # REQUIRED when web_bind is NOT loopback
 
+# max_upload_mbps = 8                    # cap sync upload (MB/s); 0/absent = unlimited
+
 [retention]
 policy = "keep_everything"               # keep_everything | on_confirm | keep_days | disk_pct
 dry_run = true                           # safe default; see the go-live note below
@@ -96,6 +98,15 @@ Notes:
   irreversible deletion a conscious, greppable acknowledgement that the
   M-Perseus-MVP soak has been signed off. Until you add both, retention runs in
   dry-run (logs would-deletes, removes nothing).
+- **`max_upload_mbps` caps upload bandwidth.** A night's frames going out at full
+  tilt saturates the site's uplink and your SSH session dies with it. Set a whole
+  number of **decimal MB/s** (1 MB/s = 1,000,000 bytes/sec) to hold sync uploads
+  under that, e.g. `max_upload_mbps = 8`; `0` or an absent key means unlimited
+  (the default). It is one budget for the whole agent — every target and every
+  concurrent transfer draws on it — and it caps uploads only. Editable both ways:
+  the web page's Settings tab applies it instantly, and a hand edit of this file
+  is picked up by a running agent within seconds (no restart, transfers in flight
+  included).
 - **Only confirmed frames are ever deleted.** No policy and no disk-pressure
   setting can ever delete a frame the primary has not fully received.
 - The `[retention]` table may be omitted entirely — it defaults to

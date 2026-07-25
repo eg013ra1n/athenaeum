@@ -1167,10 +1167,17 @@ async fn api_put_device_name(
 #[serde(rename_all = "camelCase")]
 struct UploadLimitDto {
     max_upload_mbps: u32,
-    /// Whether the value was applied to a RUNNING node as well as written to
-    /// `perseus.toml`. `false` while the engine is detached (setup/restart): the
-    /// edit is saved and takes effect when the agent next binds, which the UI says
-    /// out loud rather than implying an instant cap that did not happen.
+    /// Whether a node is attached right now — i.e. whether this response's value
+    /// could be handed straight to the running transport.
+    ///
+    /// Read it as "applied to a live node **at this instant**", not as "the file
+    /// value is in force": on a `PUT` those coincide (the handler applies before
+    /// answering), but on a `GET` it only reports node presence. `false` means the
+    /// engine is detached (setup, restart, or a launch still in flight) and the
+    /// persisted value is not live *yet* — it converges regardless, either at the
+    /// next bind (`Agent::start` applies it) or within one supervisor pass (the
+    /// pass pushes any on-disk change onto the running node). So `false` is never
+    /// "lost", only "not yet".
     applied_live: bool,
 }
 
@@ -1182,7 +1189,9 @@ struct UploadLimitEdit {
 }
 
 /// `GET /api/upload-limit` — the configured sync upload cap (MB/s, `0` =
-/// unlimited). Read-only.
+/// unlimited), plus whether a node is attached to apply it to right now
+/// (`appliedLive`, see [`UploadLimitDto`] — node presence, not "the file value is
+/// in force"). Read-only.
 async fn api_get_upload_limit(State(state): State<Arc<WebState>>) -> Json<UploadLimitDto> {
     let max_upload_mbps = state.config.read().await.max_upload_mbps;
     Json(UploadLimitDto {
@@ -1196,10 +1205,19 @@ async fn api_get_upload_limit(State(state): State<Arc<WebState>>) -> Json<Upload
 /// re-validated, atomic — a rejected edit leaves the file byte-identical and
 /// returns `422`), the live config is swapped, and the new rate is pushed onto the
 /// running [`SharedIrohNode`] so it takes effect on the next offered chunk,
-/// mid-transfer included. With no node attached (engine in setup/restart) the edit
-/// is file-only and the response says so via `appliedLive: false`; the startup path
-/// applies it when the agent next binds. The supervisor is woken so its config view
-/// refreshes at once. Returns the applied `{maxUploadMbps, appliedLive}`.
+/// mid-transfer included. This direct apply exists for instant feedback while the
+/// node is up; it is not the only route — the supervisor pass pushes any on-disk
+/// change onto the running node, which is what covers a hand-edited
+/// `perseus.toml`.
+///
+/// With no node attached (engine in setup/restart, or a launch still in flight)
+/// the edit is file-only and the response says so via `appliedLive: false`. It
+/// still converges: whichever of the two gets there first — `Agent::start`'s
+/// bind-time apply, or the next supervisor pass reconciling the file against what
+/// the node was last given. That reconciliation is also what repairs a PUT that
+/// raced a launch (the launch applied the pre-edit snapshot). The supervisor is
+/// woken so its config view — and that push — happen at once rather than on the
+/// next tick. Returns the applied `{maxUploadMbps, appliedLive}`.
 async fn api_put_upload_limit(
     State(state): State<Arc<WebState>>,
     Json(edit): Json<UploadLimitEdit>,
