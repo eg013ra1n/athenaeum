@@ -1893,16 +1893,66 @@ async fn handle_announce(
     // under it. Ingest is the disk-heavy half, so releasing after the fetch would
     // cap the wrong stage.
     //
-    // Both abort signals stay live across the wait, because the fetch select loop
-    // below re-checks them BEFORE its first poll of the fetch future (the
-    // `is_cancelled || is_revoke_abort_requested` check at the top of the loop, ahead
-    // of `select!`): a sender revoke that lands while this lane is parked here is
-    // recorded cross-task by the ingress pump, and a local decline while parked is
-    // recorded by `request_cancel` — either way the flag wins on the first pass and
-    // no byte moves. The revoke branch returns ack-free (its queued `RevokeReceived`
-    // does the bookkeeping next on this same lane); the cancel branch runs the local
-    // epilogue, which is a manifest-only fetch and legitimately holds the permit.
-    let _receive_permit = control.receive_gate.acquire().await;
+    // The WAIT IS INTERRUPTIBLE (W2 review). A bare `acquire().await` was wrong in
+    // two ways that only show up at the seam, both fixed by leaving the queue rather
+    // than merely declining to fetch once the permit finally arrives:
+    //
+    //  1. A parked transfer sits `announced`, and `cancel_incoming_package` reads
+    //     that state as "no live fetch to interrupt", so it stamps the row terminal
+    //     ITSELF. The parked lane then woke into the unconditional
+    //     `set_inbound_state(Fetching)` below and RESURRECTED a terminal row —
+    //     `fetching` carrying both `declined_at` and the `finished_at` of the
+    //     terminal it overwrote. Worse, it only re-closed if `cancel_epilogue`
+    //     succeeded, and that epilogue's `fetch_manifest` propagates with `?`: a
+    //     sender that left after the decline stranded the row at `fetching` forever,
+    //     where `delete_transfer_history` refuses it (non-terminal) and
+    //     `cancel_incoming_package` will not re-stamp it. Unclearable short of a
+    //     restart.
+    //  2. This lane owns its peer's FIFO channel while it waits, so a
+    //     `RevokeReceived` for the PARKED transfer queued behind it and the
+    //     sender-cancel terminal waited for a permit — the head-of-line block T2.3
+    //     removed, reintroduced for every peer beyond the cap.
+    //
+    // So: re-check the abort signals on every wake and abandon the queue outright.
+    // `request_cancel` and `request_revoke_abort` both `notify_waiters()`, which
+    // wakes only waiters registered AT THAT MOMENT (no stored permit), so the
+    // `Notified` is enabled BEFORE the flags are read — the same ordering the fetch
+    // select loop uses further down. The acquire future is pinned ACROSS wakes so a
+    // spurious wake (a cancel for some other package) does not cost this lane its
+    // place in the semaphore's FIFO queue.
+    let _receive_permit = {
+        let acquire_fut = control.receive_gate.acquire();
+        tokio::pin!(acquire_fut);
+        loop {
+            let notified = control.notified();
+            tokio::pin!(notified);
+            let _ = notified.as_mut().enable();
+            if abandon_parked_receive(store, control, &package_id, peer_device.as_str(), "parked") {
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                permit = &mut acquire_fut => break permit,
+                // Woken by a cancel or revoke abort (possibly for another package);
+                // loop back and let the re-check at the top decide.
+                _ = &mut notified => {}
+            }
+        }
+    };
+    // Post-acquire guard: the same decision once more, because a flag can land in
+    // the gap between the last wake and `acquire` resolving, and this is the last
+    // moment before the `Fetching` stamp below makes the row non-terminal again.
+    // Returning here drops the permit we just won — correct: a transfer nobody wants
+    // any more must hand its slot straight back.
+    if abandon_parked_receive(
+        store,
+        control,
+        &package_id,
+        peer_device.as_str(),
+        "admitted",
+    ) {
+        return Ok(());
+    }
 
     // Fetch the package into a per-package staging dir under the staging root
     // (out of the user-visible landing tree, so a half-fetched package never
@@ -2237,6 +2287,104 @@ async fn handle_announce(
         },
     );
     Ok(())
+}
+
+/// Should a transfer waiting for (or just admitted through) the receive gate
+/// ABANDON the queue instead of fetching? `true` ⇒ the caller returns `Ok(())`
+/// immediately, holding no permit and touching no row it does not own.
+///
+/// Called from two places in [`handle_announce`] with the same semantics: on every
+/// wake while parked (`stage = "parked"`, so the lane leaves the queue instead of
+/// waiting out a permit it no longer needs) and once more right after the permit is
+/// won (`stage = "admitted"`, closing the window where a flag lands between the last
+/// wake and `acquire` resolving). Both call sites are BEFORE the `Fetching` stamp,
+/// which is what keeps a terminal row terminal.
+///
+/// Three exits, in priority order:
+///
+/// 1. **Sender revoke** (`revoke_aborts`, set cross-task by the ingress pump). Leave
+///    the row ALONE and return: the `RevokeReceived` that set the flag is already
+///    queued on this same peer's lane and does the full reason-honest bookkeeping
+///    (terminal state, files, staging, tags, history, journal — no ack) the moment
+///    this call returns. Returning WITHOUT a permit is the point: the bookkeeping no
+///    longer waits for a receive slot.
+/// 2. **Row already terminal.** Somebody else (the decline command) closed it while
+///    this lane was parked. Never overwrite it — that write is the resurrection bug.
+/// 3. **Local decline** whose stamp has not landed yet. `cancel_incoming_package`
+///    signals before it writes, so the flag is briefly visible while the row is
+///    still `announced`. Return anyway and write NOTHING: that command owns this
+///    terminal (`stamp_now`: `Some(Announced) => true`, and it only ever signals
+///    when a control exists, so the stamp always follows), and it is a NAMED
+///    EXEMPTION from the "every terminal writer announces" invariant because the
+///    user just performed the action — a `sync-finished` from here would be the
+///    duplicate/false notification that exemption exists to prevent. Do not "fix"
+///    this by adding a state write.
+///
+/// Reaching case 2 or 3 at all means the flag landed DURING the wait: the same
+/// `is_cancelled` check runs before the gate (the cancel-epilogue diversion), so a
+/// transfer that was already declined never gets here.
+///
+/// **Deliberately NOT running [`cancel_epilogue`]** — that is what removes the
+/// wedge, and it is a decision, not an omission. The epilogue fetches the manifest
+/// to build its Cancelled receipts, so running it here would (a) require the permit
+/// this fn exists to give up, re-serializing declines behind the cap, and (b) put a
+/// `?`-propagating network call on the path of a row someone else already
+/// terminalized. The sender still learns: it never got an ack, so under
+/// delivery-forever it re-announces, and that announce hits the declined-final
+/// bounce ABOVE the gate — where the epilogue runs against an already-terminal row,
+/// so a failed manifest fetch cannot strand it. The only cost is that a sender which
+/// never re-announces leaves this row without per-frame Cancelled receipts/history;
+/// a terminal, deletable, honestly-labelled row is strictly better than the
+/// unclearable `fetching` one that alternative produced.
+fn abandon_parked_receive(
+    store: &Arc<CatalogSyncStore>,
+    control: &InboundControl,
+    package_id: &str,
+    peer_device: &str,
+    stage: &str,
+) -> bool {
+    if control.is_revoke_abort_requested(package_id) {
+        tracing::info!(
+            package_id = %package_id,
+            peer_device = %peer_device,
+            stage,
+            "sync receiver left the receive queue for a sender revoke; its queued revoke does the bookkeeping"
+        );
+        return true;
+    }
+    let state = {
+        let conn = store.lock_conn();
+        get_inbound(&conn, package_id)
+            .unwrap_or_else(|e| {
+                // Never swallow: a read failure here would otherwise silently look
+                // like "row not terminal" and let the fetch proceed over a decline.
+                tracing::warn!(package_id = %package_id, error = %format!("{e:#}"), "read inbound row while gated failed");
+                None
+            })
+            .map(|r| r.state)
+    };
+    if state.map(|s| s.is_terminal()).unwrap_or(false) {
+        tracing::info!(
+            package_id = %package_id,
+            peer_device = %peer_device,
+            stage,
+            state = ?state,
+            "sync receiver left the receive queue: the transfer was closed while it waited"
+        );
+        return true;
+    }
+    if control.is_cancelled(package_id) {
+        // No state write here on purpose — see the doc comment: the decline command
+        // owns this terminal and its stamp always follows its signal.
+        tracing::info!(
+            package_id = %package_id,
+            peer_device = %peer_device,
+            stage,
+            "sync receiver left the receive queue for a local decline"
+        );
+        return true;
+    }
+    false
 }
 
 /// Re-ack a fully-receipted transfer straight from the durable receipt log — the
@@ -2622,10 +2770,13 @@ fn count_landed(rows: &[InboundFileRow]) -> usize {
 /// (superseded) / `failed` — matching the `emit_finished` siblings' payload shape.
 /// **NO ack is sent for a revoke.**
 ///
-/// Serial-loop note: `RevokeReceived` and `AnnounceReceived` share the single
-/// consumer of the receiver event stream, so a revoke is processed only BETWEEN
-/// announces — it can never run concurrently with a fetch on the same loop. This
-/// fn touches NEITHER `InboundControl` signal: the in-flight abort was already
+/// Lane note (W2 T2.3): `RevokeReceived` and `AnnounceReceived` from ONE peer share
+/// that peer's serial lane, so a revoke is processed only between that peer's own
+/// announces — it can never run concurrently with the fetch it revokes. It CAN run
+/// while a DIFFERENT peer is mid-fetch, which is safe because everything this fn
+/// touches is owned by the revoking peer: its own `sync_inbound` row (keyed
+/// `(peer, batch_uuid)`), that row's file rows, its staging dir and its in-flight
+/// tags. This fn touches NEITHER `InboundControl` signal: the in-flight abort was already
 /// requested cross-task by the ingress pump (`request_revoke_abort`), and the
 /// local-decline `cancels` set must never carry a revoked wire id — its entries
 /// are permanent and a straggler re-announce of the same wire id would otherwise
@@ -2699,9 +2850,11 @@ async fn handle_revoke(
     // epilogue and mint a permanent `declined_at` the user never chose — turning a
     // benign sender cancel/supersede/failure into a receiver decline. The in-flight
     // fetch abort is already handled by the ingress pump's SEPARATE
-    // `request_revoke_abort` signal, and by the time this fn runs on the serial
-    // loop the fetch has been dealt with; every entry in `cancels` must stay
-    // decline-originated so the epilogue's `declined_at` stamp is sound.
+    // `request_revoke_abort` signal, and by the time this fn runs on the revoking
+    // peer's own lane that fetch has been dealt with (it either aborted or, if it
+    // was still parked on the receive gate, abandoned the queue outright); every
+    // entry in `cancels` must stay decline-originated so the epilogue's
+    // `declined_at` stamp is sound.
 
     // Honest terminal mapping (§D2): (row state, row detail, file state, file
     // outcome, file error, history outcome, reason tag).
@@ -2931,6 +3084,13 @@ async fn handle_project_announce(
     // the wire-id validation) and before the fetch. A project push shares the one
     // disk with personal transfers, so it shares the one cap; held through ingest and
     // ack, released on return.
+    //
+    // The wait is bare here, unlike personal sync's interruptible one: a project
+    // push has no cancel/revoke surface of its own (no `sync_inbound` row, no
+    // `InboundControl` signal keyed on it), so there is nothing a parked lane could
+    // re-check. NAMED FOLLOW-UP, not fixed here (W2 review, Minor): the permit is
+    // held across `transport.fetch` with no abort path at all, so a stalled project
+    // push occupies a receive slot until the transport itself gives up.
     let _receive_permit = receive_gate.acquire().await;
 
     // Fetch into a per-package staging dir keyed by the WIRE id (mirrors personal
@@ -7868,6 +8028,341 @@ mod tests {
             "both gate-holding transfers must still be fetching when the replay \
              lands, or this proves nothing: {hog_states:?}"
         );
+
+        handle.shutdown().await;
+    }
+
+    /// Saturate the receive gate: start `n` peers whose fetches are paced so they
+    /// genuinely block for seconds, and return once every one of them holds a
+    /// permit (`Fetching`). The senders are returned so the caller keeps them —
+    /// and their serves — alive for the rest of the test.
+    ///
+    /// The fault is armed HERE rather than by the caller because the loopback
+    /// latches `delay_per_read` once per `fetch` call: arming it before these
+    /// announces is what makes exactly these transfers the slow ones.
+    async fn saturate_receive_gate(
+        net: &LoopbackNetwork,
+        receiver_ep: &Arc<crate::sharing::loopback::LoopbackTransport>,
+        receiver_node: NodeId,
+        store: &Arc<CatalogSyncStore>,
+        root: &std::path::Path,
+        n: usize,
+    ) -> Vec<Arc<crate::sharing::loopback::LoopbackTransport>> {
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+        receiver_ep.set_fault(FaultPlan {
+            delay_per_read: Some(DELAY),
+            ..Default::default()
+        });
+        let mut senders = Vec::new();
+        for i in 0..n {
+            let tag = format!("hog{i}");
+            let sender = Arc::new(net.endpoint());
+            sender.start().await.unwrap();
+            let (dir, ann, files) = build_lane_fixture(root, &tag, 3);
+            let wire = ann.package_id.0.clone();
+            sender.serve(&ann, &dir, None).await.unwrap();
+            sender
+                .announce(
+                    receiver_node,
+                    &ann,
+                    &format!("Batch {tag}"),
+                    &format!("batch-{tag}"),
+                    &files,
+                )
+                .await
+                .unwrap();
+            poll_inbound(store, &wire, InboundState::Fetching).await;
+            senders.push(sender);
+        }
+        senders
+    }
+
+    /// Poll until `package_id` has a row in `want`, returning it; `None` on timeout.
+    async fn try_poll_inbound(
+        store: &Arc<CatalogSyncStore>,
+        package_id: &str,
+        want: InboundState,
+        budget: std::time::Duration,
+    ) -> Option<crate::sync::models::InboundRow> {
+        let started = std::time::Instant::now();
+        while started.elapsed() < budget {
+            let row = {
+                let conn = store.lock_conn();
+                get_inbound(&conn, package_id).unwrap()
+            };
+            if let Some(r) = row {
+                if r.state == want {
+                    return Some(r);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        None
+    }
+
+    /// W2 review, Important 1: a transfer PARKED on the receive gate that the user
+    /// declines must stay declined. The gate introduced a minutes-long window in
+    /// which a transfer sits `announced` with a live `handle_announce` behind it,
+    /// and `cancel_incoming_package` treats exactly that state as "no live fetch to
+    /// interrupt" — it stamps the row terminal itself
+    /// (`stamp_now`: `Some(Announced) => true`, api/sync.rs). The parked lane then
+    /// woke up and drove straight into an UNCONDITIONAL `set_inbound_state(Fetching)`,
+    /// resurrecting a terminal row: `state=fetching` carrying both `declined_at` and
+    /// the `finished_at` of the terminal it overwrote (the non-terminal branch of
+    /// `set_inbound_state` leaves `finished_at` alone).
+    ///
+    /// The tail is what makes it more than cosmetic. The resurrected row only
+    /// re-closes if `cancel_epilogue` succeeds, and the epilogue's `fetch_manifest`
+    /// propagates with `?` — so a sender that left after the decline strands the row
+    /// at `fetching` forever: `delete_transfer_history` refuses a non-terminal row
+    /// and `cancel_incoming_package` will not re-stamp it (`Fetching => control.is_none()`
+    /// is false while a receiver is running). Unclearable short of a restart.
+    ///
+    /// The un-served third package models that departed sender exactly as the
+    /// receiver experiences it — `fetch_manifest` answers "package not served by
+    /// peer" either way — so this test pins the whole defect, not just its cosmetic
+    /// half.
+    ///
+    /// Assertions: the row is NEVER observed non-terminal after the decline, no
+    /// `fetch_started` journal entry is ever written for it, and it is still
+    /// `cancelled` + `declined_at` once the permit-holders have finished and the
+    /// parked lane has had its chance to run.
+    #[tokio::test]
+    async fn decline_while_parked_stays_terminal_and_never_wedges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+
+        let control = Arc::new(InboundControl::new());
+        let (_info, handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            {
+                let incoming = incoming.clone();
+                Arc::new(move || incoming.clone()) as IncomingResolver
+            },
+            allow_all_peers(),
+            Default::default(),
+            Arc::clone(&control),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        let _hogs =
+            saturate_receive_gate(&net, &receiver_ep, receiver_node, &store, tmp.path(), 2).await;
+
+        // The third peer announces but never serves — the departed sender (above).
+        let victim = Arc::new(net.endpoint());
+        victim.start().await.unwrap();
+        let (_dir, ann, files) = build_lane_fixture(tmp.path(), "parked", 2);
+        let wire = ann.package_id.0.clone();
+        victim
+            .announce(receiver_node, &ann, "Parked Batch", "batch-parked", &files)
+            .await
+            .unwrap();
+
+        // It parks: the row exists (the upsert runs before the gate) and stays
+        // `announced` because the permit never comes.
+        let parked = try_poll_inbound(
+            &store,
+            &wire,
+            InboundState::Announced,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("the third announce should reach `announced` and park on the gate");
+        let inbound_id = parked.id;
+
+        // Decline it exactly as `cancel_incoming_package` does, in ITS order:
+        // `declined_at` first (guarded UPDATE), then the control flag, then the
+        // terminal stamp that `stamp_now` elects for an `Announced` row.
+        {
+            let conn = store.lock_conn();
+            conn.execute(
+                "UPDATE sync_inbound
+                 SET declined_at = COALESCE(declined_at, ?1)
+                 WHERE id = ?2 AND state NOT IN ('ingesting', 'done')",
+                rusqlite::params![crate::sync::now_iso(), inbound_id],
+            )
+            .unwrap();
+        }
+        control.request_cancel(&wire);
+        {
+            let conn = store.lock_conn();
+            set_inbound_state(&conn, &wire, InboundState::Cancelled, None).unwrap();
+        }
+
+        // Watch across the whole window in which a permit frees and the parked lane
+        // gets its turn. Sampling catches the resurrection live; the journal catches
+        // it durably even if every sample misses.
+        let watch_until = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut seen_non_terminal: Vec<InboundState> = Vec::new();
+        while std::time::Instant::now() < watch_until {
+            let state = {
+                let conn = store.lock_conn();
+                get_inbound(&conn, &wire).unwrap().map(|r| r.state)
+            };
+            if let Some(s) = state {
+                if !s.is_terminal() {
+                    seen_non_terminal.push(s);
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            seen_non_terminal.is_empty(),
+            "the declined row was resurrected to {seen_non_terminal:?} — the parked \
+             lane overwrote a terminal row after winning its permit"
+        );
+        let kinds = journal_kinds(&store, inbound_id);
+        assert!(
+            kinds.iter().all(|k| k != "fetch_started"),
+            "the parked lane started a fetch for a declined transfer: {kinds:?}"
+        );
+        let final_row = {
+            let conn = store.lock_conn();
+            get_inbound(&conn, &wire).unwrap().unwrap()
+        };
+        assert_eq!(
+            final_row.state,
+            InboundState::Cancelled,
+            "the decline is final and the row must be clearable (a non-terminal row \
+             is refused by delete_transfer_history)"
+        );
+        assert!(
+            final_row.declined_at.is_some(),
+            "the decline stays on the finality axis"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// W2 review, Important 2: the gate must not re-serialize BOOKKEEPING. A lane
+    /// parked on an uninterruptible `acquire()` still owns its peer's FIFO channel,
+    /// so a `RevokeReceived` for the parked transfer queued behind it and the
+    /// sender-cancel terminal waited for a receive permit — the exact head-of-line
+    /// block W2 T2.3 removed, reintroduced for every peer beyond the cap. The abort
+    /// flag correctly stopped bytes from moving; what stalled was the honest
+    /// terminal the user sees.
+    ///
+    /// The proof is a timestamp: the revoked row reaches its terminal WHILE both
+    /// permit-holders are still mid-fetch, so no permit can have been what let it
+    /// through.
+    #[tokio::test]
+    async fn revoke_while_parked_terminalizes_without_a_permit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+
+        let control = Arc::new(InboundControl::new());
+        let (_info, handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            {
+                let incoming = incoming.clone();
+                Arc::new(move || incoming.clone()) as IncomingResolver
+            },
+            allow_all_peers(),
+            Default::default(),
+            Arc::clone(&control),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        let hogs =
+            saturate_receive_gate(&net, &receiver_ep, receiver_node, &store, tmp.path(), 2).await;
+        let hog_wires: Vec<String> = {
+            let conn = store.lock_conn();
+            crate::sync::store::inbound_active(&conn)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.state == InboundState::Fetching)
+                .map(|r| r.package_id)
+                .collect()
+        };
+        assert_eq!(hog_wires.len(), 2, "both permits are held: {hog_wires:?}");
+
+        let victim = Arc::new(net.endpoint());
+        victim.start().await.unwrap();
+        let (dir, ann, files) = build_lane_fixture(tmp.path(), "revoked", 2);
+        let wire = ann.package_id.0.clone();
+        victim.serve(&ann, &dir, None).await.unwrap();
+        victim
+            .announce(
+                receiver_node,
+                &ann,
+                "Revoked Batch",
+                "batch-revoked",
+                &files,
+            )
+            .await
+            .unwrap();
+        try_poll_inbound(
+            &store,
+            &wire,
+            InboundState::Announced,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .expect("the third announce should park on the gate");
+
+        // The sender revokes what it just announced.
+        victim
+            .revoke(receiver_node, &ann.package_id, RevokeReason::Cancelled)
+            .await
+            .unwrap();
+
+        // Well inside the permit-holders' ~2.8s paced fetches.
+        let budget = std::time::Duration::from_millis(1200);
+        let row = try_poll_inbound(&store, &wire, InboundState::Cancelled, budget)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "the revoked transfer did not terminalize within {budget:?} — its \
+                     bookkeeping is queued behind a lane parked on the receive gate"
+                )
+            });
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some(crate::sync::models::REVOKED_BY_SENDER_DETAIL),
+            "the terminal is the revoke's, reason-honest"
+        );
+
+        // The proof it did not simply inherit a freed permit.
+        let hog_states: Vec<Option<InboundState>> = {
+            let conn = store.lock_conn();
+            hog_wires
+                .iter()
+                .map(|w| get_inbound(&conn, w).unwrap().map(|r| r.state))
+                .collect()
+        };
+        assert!(
+            hog_states
+                .iter()
+                .all(|s| matches!(s, Some(InboundState::Fetching))),
+            "both permit-holders must still be fetching when the revoke terminalizes, \
+             or the revoke merely waited its turn: {hog_states:?}"
+        );
+        let _ = hogs;
 
         handle.shutdown().await;
     }
