@@ -3991,11 +3991,16 @@ fn remove_terminal_payload_dirs(ctx: &ServiceContext) -> Result<(u32, u64), ApiE
 /// Model §D4; B0 findings Q4/R2). Shared by the startup sweep and the cleanup
 /// command. For every in-flight tag the live receive-side transport holds
 /// ([`SharingTransport::list_in_flight_tags`], already namespace-filtered to the
-/// transfer machinery's own tags), release it UNLESS a non-terminal `sync_inbound`
-/// row still carries that exact wire id — the tag then belongs to a live/resumable
+/// transfer machinery's own tags), release it UNLESS a LIVE `sync_inbound` row
+/// still carries that exact wire id — the tag then belongs to a live/resumable
 /// fetch and is kept. Returns the number released. No live transport (receiver not
 /// started) → 0 (nothing to enumerate or release). Best-effort per tag: a release
 /// failure `warn!`s and the pass continues.
+///
+/// "Live" is the non-terminal rows MINUS [`InboundState::Waiting`] (D2 §3.5): a
+/// parked row is non-terminal but has no fetch in flight, and letting it hold its
+/// tag would pin a partial download indefinitely — Clean-up would free strictly
+/// less than it did before D2.
 ///
 /// **GC note:** iroh-blobs 0.103 exposes no on-demand GC trigger reachable from our
 /// layer (`gc_run_once` is `pub` but lives in the private `store::gc` module; only
@@ -4026,6 +4031,13 @@ async fn release_orphan_in_flight_tags(
         let conn = db.conn();
         inbound_active(&conn)?
             .into_iter()
+            // D2 §3.5: `Waiting` is non-terminal but NOT live. Keeping its tag would
+            // pin a partial download indefinitely — Clean-up would free strictly
+            // less than it did before D2, the opposite of what D2 is for. The dedup
+            // handshake renegotiates the file list on the next attempt anyway, so at
+            // worst the peer re-sends what the GC reclaimed; an unbounded pin the
+            // user cannot clear is the worse trade.
+            .filter(|r| r.state != crate::sync::InboundState::Waiting)
             .map(|r| r.package_id)
             .collect()
     };
@@ -5566,6 +5578,60 @@ mod tests {
             "a dir with one fresh-mtime file survives the sweep even though the dir's \
              own entry mtime is old — dir_age reads the recursive MAX mtime, not just \
              the dir's own entry mtime"
+        );
+    }
+
+    /// D2 §3.5: a `Waiting` row must NOT protect its in-flight blob tag. Today a
+    /// dead fetch is terminal, so the sweep releases the tag and the GC reclaims
+    /// the partial bytes; if a parked row kept the protection, Clean-up would free
+    /// strictly LESS than before D2 — the opposite of what D2 is for. The partial
+    /// bytes are not worth an unbounded pin the user cannot clear: the dedup
+    /// handshake renegotiates the file list on the next attempt anyway, so at worst
+    /// the peer re-sends what the GC took.
+    #[tokio::test]
+    async fn the_orphan_sweep_releases_a_waiting_rows_tag_but_keeps_a_live_ones() {
+        use crate::sync::store::{set_inbound_state, upsert_inbound_announced, CatalogSyncStore};
+
+        let (tmp, ctx) = test_ctx();
+        {
+            let (_sync_dir, db_path) = sync_paths(&ctx).unwrap();
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            let conn = store.lock_conn();
+            let peer = "ff".repeat(32);
+            // Parked: non-terminal, but NOT live — its tag is reclaimable.
+            upsert_inbound_announced(&conn, &peer, "waiting-wire", 1, 10).unwrap();
+            set_inbound_state(
+                &conn,
+                "waiting-wire",
+                crate::sync::InboundState::Waiting,
+                Some("peer gone"),
+            )
+            .unwrap();
+            // Genuinely fetching: its tag is the live download's protection.
+            upsert_inbound_announced(&conn, &peer, "fetching-wire", 1, 10).unwrap();
+            set_inbound_state(
+                &conn,
+                "fetching-wire",
+                crate::sync::InboundState::Fetching,
+                None,
+            )
+            .unwrap();
+        }
+
+        let (ep, runtime) = started_loopback_runtime(&tmp).await;
+        ep.seed_in_flight_tag("waiting-wire");
+        ep.seed_in_flight_tag("fetching-wire");
+
+        let released = release_orphan_in_flight_tags(&ctx, &runtime).await.unwrap();
+
+        assert_eq!(released, 1, "exactly the parked row's tag");
+        assert!(
+            !ep.has_in_flight_tag("waiting-wire"),
+            "a parked row's partial download is reclaimable — it is not a live fetch"
+        );
+        assert!(
+            ep.has_in_flight_tag("fetching-wire"),
+            "a live fetch still owns its tag"
         );
     }
 

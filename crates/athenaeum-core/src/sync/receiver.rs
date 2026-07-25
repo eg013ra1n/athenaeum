@@ -5729,6 +5729,74 @@ mod tests {
         );
     }
 
+    /// D2 §4: `handle_revoke` returns early on a terminal row. A fetch that lost
+    /// its peer used to be `Failed` — terminal — so a revoke arriving afterwards
+    /// was a debug no-op; now the row is `Waiting`, so the revoke runs the full
+    /// bookkeeping. It must terminalize correctly and write each known file's
+    /// history exactly once (`insert_history_row` is a plain INSERT, not an
+    /// upsert, so a second bookkeeping pass over the same row would duplicate).
+    #[tokio::test]
+    async fn a_revoke_for_a_waiting_row_terminalizes_it_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap());
+        let staging_root = tmp.path().join("stage");
+        let transport = net_endpoint_only();
+        let control = InboundControl::new();
+        let emitter = RecordingEmitter::default();
+        let peer = "ee".repeat(32);
+        let id = seed_announced_row(&store, &peer, "rev-wait");
+        {
+            let conn = store.lock_conn();
+            set_inbound_state(
+                &conn,
+                "rev-wait",
+                InboundState::Waiting,
+                Some("peer gone: connection lost"),
+            )
+            .unwrap();
+        }
+
+        handle_revoke(
+            &store,
+            &transport,
+            &emitter,
+            &control,
+            &staging_root,
+            [9u8; 32],
+            &PackageId("rev-wait".to_string()),
+            RevokeReason::Cancelled,
+        )
+        .await;
+
+        let row = {
+            let conn = store.lock_conn();
+            get_inbound(&conn, "rev-wait").unwrap().unwrap()
+        };
+        assert_eq!(
+            row.state,
+            InboundState::Cancelled,
+            "the revoke closes the parked row instead of being ignored"
+        );
+        assert!(row.finished_at.is_some(), "and it is genuinely terminal");
+
+        let (file_count, history_count) = {
+            let conn = store.lock_conn();
+            let files = list_inbound_files(&conn, id).unwrap().len() as i64;
+            let history: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_history WHERE direction='received'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (files, history)
+        };
+        assert_eq!(
+            history_count, file_count,
+            "one history row per known file, no duplicates"
+        );
+    }
+
     /// Revoke for an unknown/stale wire id, and revoke for an already-terminal row,
     /// are both no-ops (the row is untouched; no history/journal written).
     #[tokio::test]
