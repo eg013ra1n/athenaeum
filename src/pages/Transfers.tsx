@@ -87,7 +87,9 @@ export default function Transfers() {
     );
 
     // Batch keys already on screen as a live/terminal row, so their history groups
-    // don't double — both directions by `batchUuid` (B5b).
+    // don't double — both directions by `batchUuid` (B5b). A variant-B ghost counts
+    // here too: it carries the batch's real `batchUuid` and IS on screen, so an
+    // older history group for the same batch must still stay hidden behind it.
     const liveSentKeys = new Set<string>();
     const liveRecvKeys = new Set<string>();
     for (const r of rows) {
@@ -131,7 +133,12 @@ export default function Transfers() {
     if (u.kind === 'live') {
       const r = u.row;
       // D1: both parked shapes belong in the Waiting chip — the countdown one and
-      // the peer-absent one.
+      // the peer-absent one. NOT the queued family: `queued_at_receiver` (variant
+      // A), a slot-parked inbound `queued` (variant C) and a lane-queue ghost
+      // (variant B) are all active-and-automatic — the peer is right there and the
+      // transfer starts by itself — so they fall through to Sending/Receiving by
+      // direction, alongside the transfers they are queued behind. Waiting is for
+      // "something is in the way", which is precisely what these are not.
       if (r.displayState === 'waiting' || r.displayState === 'waiting_peer') s.add('waiting');
       else if (r.terminal) {
         if (r.displayState === 'failed') s.add('failed');

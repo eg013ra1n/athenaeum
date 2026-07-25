@@ -54,7 +54,9 @@ function liveRows(item: Extract<UnifiedRow, { kind: 'live' }>): Array<{ label: s
     { label: 'Peer (node id)', value: r.peerShort, mono: true },
     { label: 'Raw state', value: r.state, mono: true },
     { label: 'Display state', value: r.displayState, mono: true },
-    { label: 'Created', value: formatTimestamp(r.createdAt) },
+    // A variant-B ghost has no row and therefore no creation timestamp — omit the
+    // line rather than print an empty (or fabricated) one.
+    ...(r.createdAt ? [{ label: 'Created', value: formatTimestamp(r.createdAt) }] : []),
     // §D5: `generation` is the user-facing "attempt N" (bumped only by a resend);
     // outbound `attempts` is the engine's internal announce-retry counter.
     { label: 'Attempt (generation)', value: String(r.generation) },

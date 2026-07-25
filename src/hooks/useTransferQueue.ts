@@ -24,6 +24,15 @@
 // so there is never a row+row double. Inbound terminal rows come only from the
 // durable read (there is no inbound ledger) and carry NO actions. The full
 // audit trail remains the History tab (`list_sync_history`).
+//
+// One further source, the only one with no durable row behind it at all:
+// `status.receiver.queued` (variant B) — announces routed to a sending peer's
+// lane that the lane hasn't started yet. They enter `rows` as GHOSTS (`ghost:
+// true`, `key: 'inq:<batchUuid>'`), so the receiver shows a batch that has
+// demonstrably arrived instead of nothing at all while the sender already calls
+// it "queued at receiver". Everything id-shaped on them is a placeholder and
+// every action is gated off; they are replaced by the real `in:<id>` row —
+// same `batchUuid`, same chip — the moment the lane picks the announce up.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../api';
@@ -161,6 +170,16 @@ export interface TransferRow {
   /** Bumped on every `sync-finished` for this package — a selected/expanded row
    * watches this to know its cached `list_transfer_files` detail needs a re-fetch. */
   finishNonce: number;
+  /** GHOST row (variant B, `SyncStatus.receiver.queued`): an announce the router
+   *  handed to a peer's lane that the lane hasn't started yet, so NO `sync_inbound`
+   *  row exists for it. Everything id-shaped is therefore a placeholder — `id` is
+   *  `-1`, `packageId` is `null`, `createdAt` is empty — and every affordance that
+   *  needs a durable handle (Cancel, Delete, the detail-pane `list_transfer_files` /
+   *  `list_transfer_events` reads) is gated OFF on it. Absent/`false` on every real
+   *  row. The ghost and the row it becomes share one `batchUuid`, and the backend
+   *  drops a queued entry whose batch already appears in `receiver.active`, so the
+   *  two can never be on screen at once. */
+  ghost?: boolean;
 }
 
 export interface UseTransferQueue {
@@ -662,6 +681,64 @@ export function useTransferQueue(): UseTransferQueue {
         finishNonce: finishNonce.get(`in:${s.packageId}`) ?? 0,
       });
     }
+    // Variant B GHOSTS: announces parked in a peer's lane queue that have no
+    // `sync_inbound` row yet (the device is still fetching an earlier batch from
+    // the same sender). Without these the receiver shows NOTHING for a transfer
+    // that has demonstrably arrived — the sender meanwhile shows it as "queued at
+    // receiver", so the two sides would disagree about a batch that exists.
+    //
+    // They ride the normal row shape (one `ghost` flag) rather than a parallel
+    // list, so the chip/subline/progress/device-name rendering is literally the
+    // same code path the real row uses — the handoff, when the lane picks the
+    // announce up, is then invisible: same `batchUuid`, same chip, same subline.
+    // No dedup needed here: `queued_inbound_summaries` already drops any entry
+    // whose batch is in `receiver.active`, in the SAME `get_sync_status` snapshot
+    // these rows come from, so a ghost and its live row can never coexist.
+    for (const q of status?.receiver.queued ?? []) {
+      out.push({
+        // Own namespace: a ghost is keyed on its batch (it has no row id), and
+        // `inq:` can never collide with the `in:<id>` row it later becomes.
+        key: `inq:${q.batchUuid}`,
+        kind: 'inbound',
+        ghost: true,
+        // No durable row exists yet — every id-shaped field is a placeholder, and
+        // every affordance that would use one is gated off (`TransferRow`'s
+        // `ghost`, `TransferDetail`'s fetch guard, `liveDeleteKey`'s terminal gate).
+        id: -1,
+        packageId: null,
+        packageShort: shortId(q.batchUuid),
+        peerShort: q.peerShort,
+        displayName: q.batchName,
+        deviceName: q.deviceName,
+        // The announce carries no capability stamp of its own (that lands on the
+        // row at ingest) — no badge on a ghost rather than a guessed one.
+        peerKind: null,
+        // Variant C's word, deliberately: to the user this is the same fact as a
+        // slot-parked row — it has arrived, it is next, it needs no help.
+        displayState: 'queued',
+        stalledUntil: null,
+        retrying: false,
+        // Manifest counts from the announce: N files, none done yet. Same shape a
+        // real announced row reports, so the progress line doesn't change on handoff.
+        fileCounts: { total: q.frameCount, done: 0, failed: 0 },
+        fileCount: q.frameCount,
+        byteSize: q.byteSize,
+        bytesDone: 0,
+        state: 'queued',
+        createdAt: '',
+        attempts: 0,
+        generation: 1,
+        batchUuid: q.batchUuid,
+        lastError: null,
+        nextRetryAt: null,
+        terminal: false,
+        resendable: false,
+        liveStage: null,
+        speedBps: null,
+        isTransferring: false,
+        finishNonce: 0,
+      });
+    }
     return out;
   }, [
     status,
@@ -674,7 +751,9 @@ export function useTransferQueue(): UseTransferQueue {
     finishNonce,
   ]);
 
-  // Live-only count (terminal rows excluded) — an inbound row still moving.
+  // Live-only count (terminal rows excluded) — an inbound row still moving, plus
+  // the variant-B ghosts (a batch queued on a peer's lane HAS arrived and is
+  // pending; leaving it out would under-report inbound work in progress).
   const activeCount =
     (status?.sender.queued ?? 0) +
     (status?.sender.transferring ?? 0) +

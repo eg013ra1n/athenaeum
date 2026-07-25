@@ -33,7 +33,12 @@ export function TransferDetail({ item, liveFiles, onClose }: TransferDetailProps
 
   const live = item.kind === 'live' ? item.row : null;
   const direction: Direction = live?.kind === 'outbound' ? 'sent' : 'received';
-  const id = live?.id;
+  // A variant-B GHOST has no `sync_inbound` row yet, so its `id` is a placeholder
+  // (`-1`) — never a handle `list_transfer_files` / `list_transfer_events` could
+  // resolve. Treat it as "no id": both tabs fall back to their empty states ("No
+  // file detail yet." / "No events recorded yet."), which is the literal truth
+  // until the lane picks the announce up.
+  const id = live && !live.ghost ? live.id : undefined;
 
   // Selection changed to a NON-live (history) row → drop any stale live detail.
   useEffect(() => {

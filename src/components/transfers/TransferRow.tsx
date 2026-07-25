@@ -152,6 +152,10 @@ function stageProgress(
     case 'announced':
     case 'waiting':
     case 'waiting_peer':
+    // Variant A: announced and sitting in the receiver's per-peer lane — exactly
+    // as far along as the other parked shapes (the announce is out, no byte of
+    // this batch has moved), so it shares their rung.
+    case 'queued_at_receiver':
       return 0.08;
     case 'transferring':
     case 'fetching':
@@ -194,11 +198,22 @@ function LiveRowBody({
   const batchName = row.displayName ?? row.packageShort;
   const deviceLabel = row.deviceName ?? row.peerShort;
   const chip = displayStateChip(row.displayState);
-  const subline = displayStateSubline(row.displayState);
+  const subline = displayStateSubline(row.displayState, row.kind);
   // Both waiting shapes are "parked, not broken": the countdown one and the
   // peer-absent one. Send now applies to both — a user staring at either wants to
   // try immediately, and the backend kick is exactly that.
   const waiting = row.displayState === 'waiting' || row.displayState === 'waiting_peer';
+  // Variant A — parked, but deliberately NOT part of the `waiting` set above and
+  // NOT send-now-able: a kick would only re-announce into the very lane queue this
+  // row is already sitting in — pointless spam that changes nothing (the engine's
+  // own `note_serve_activity` undoes a kick against a peer that is actively
+  // pulling). There is also no countdown behind it for "Send now" to collapse.
+  //
+  // It must be subtracted EXPLICITLY, not just left out of `waiting`: the raw
+  // state under this label is `Announced` or `Transferring`, and the `pending`
+  // arm below already offers Send now on `announced` — so without this the button
+  // would appear on exactly the rows the label exists to say "leave it alone".
+  const queuedAtReceiver = row.displayState === 'queued_at_receiver';
 
   const totalFiles = row.fileCounts.total || row.fileCount;
   const doneFiles = row.fileCounts.done;
@@ -226,7 +241,16 @@ function LiveRowBody({
   // INBOUND row's `lastError` (B5b) is a sender-revoke reason ("by sender" /
   // "sender failed" / superseded) — purely explanatory (the receiver has no retry
   // to act on), so it renders muted regardless of the row's own chip color.
-  const showReason = !!row.lastError && (row.retrying || row.terminal);
+  //
+  // Variant A exception: a `queued_at_receiver` row often carries BOTH
+  // `retrying: true` and a stale `"no ack from peer within timeout"` — the ack
+  // ladder arms while the receiver is busy with our sibling batch, and the
+  // engine only wipes that reason on THIS package's next serve tick, which by
+  // definition hasn't come. Rendering "Peer didn't respond — will keep retrying"
+  // under a "queued at receiver" chip would put back the exact misreading the
+  // state was introduced to remove (the receiver demonstrably IS responding —
+  // that live fact is what produced the label).
+  const showReason = !!row.lastError && (row.retrying || row.terminal) && !queuedAtReceiver;
   const reasonMuted =
     row.terminal &&
     !!row.lastError &&
@@ -238,11 +262,17 @@ function LiveRowBody({
       ? 'text-content-muted'
       : 'text-error/80';
 
+  // Variant B GHOST: an announce sitting in this peer's lane queue with NO
+  // `sync_inbound` row behind it yet. There is nothing to act on — no row id to
+  // cancel, no history to delete — so every affordance is gated off below and the
+  // row is pure information until the lane picks it up and the real row replaces it.
+  const ghost = row.ghost === true;
+
   const pending = !row.terminal && (row.state === 'queued' || row.state === 'announced');
   // Send-now: a pending row, or one sitting in the `waiting` backoff countdown — a
   // user staring at "retry in …" wants "try now", and the backend `kick` is exactly
   // that (collapse the backoff so the next worker pass re-announces).
-  const canSendNow = row.kind === 'outbound' && (pending || waiting);
+  const canSendNow = row.kind === 'outbound' && !queuedAtReceiver && (pending || waiting);
   // Cancel: ANY non-terminal row, both directions. The backend cancels
   // cooperatively at every stage — `engine.cancel(id)` for a send
   // (transferring/uploaded/waiting included), `cancel_incoming_package` for a
@@ -254,7 +284,12 @@ function LiveRowBody({
   // while `delete_transfer_history` refuses to delete a non-terminal row — a row
   // the user could not get rid of at all. `row.terminal` is structural (which list
   // the row came from), not a state list, so it cannot go stale the same way.
-  const canCancel = !row.terminal;
+  //
+  // A GHOST is the one non-terminal shape with nothing to cancel: no
+  // `sync_inbound` row exists yet, so `cancel_incoming_package` has no
+  // `package_id` to match on. It becomes cancellable the instant the lane turns
+  // it into a real row.
+  const canCancel = !row.terminal && !ghost;
   // Resend re-announces the on-disk payload — but a package's payload can be gone
   // by the time this renders: a `confirmed` row's payload is always cleaned up
   // after confirm, AND retention can sweep an old failed/cancelled row's payload

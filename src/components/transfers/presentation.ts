@@ -151,6 +151,14 @@ const CHIP_ERROR = 'bg-error/15 text-error';
  */
 export function displayStateChip(displayState: string): StateChip {
   switch (displayState) {
+    // ONE `queued` case for every direction, deliberately (it is the shared
+    // vocabulary of "this starts by itself, nothing is wrong"): the outbound
+    // local send queue, an inbound row parked on the receive-slot gate
+    // (`sync.max_concurrent_receives`), and a lane-queue GHOST (an announce with
+    // no row yet). The word reads correctly for all three — what differs is WHY,
+    // and that is exactly what [`displayStateSubline`]'s `kind` argument spells
+    // out underneath. Splitting the label per direction would make the ghost →
+    // real-row handoff visibly flicker for no gain.
     case 'queued':
       return { label: 'queued', className: CHIP_MUTED };
     case 'preparing':
@@ -172,6 +180,13 @@ export function displayStateChip(displayState: string): StateChip {
     // because there is no countdown behind it to explain the wait.
     case 'waiting_peer':
       return { label: 'waiting for peer', className: CHIP_NEUTRAL };
+    // Variant A: the destination device is alive and busy pulling ANOTHER batch
+    // of ours (the receiver runs one transfer per peer at a time). Same NEUTRAL
+    // tone as the two waiting shapes — the parked-not-broken family — because
+    // nothing is wrong and nobody has to act; it starts by itself the moment the
+    // sibling ahead of it drains.
+    case 'queued_at_receiver':
+      return { label: 'queued at receiver', className: CHIP_NEUTRAL };
     case 'confirmed':
       return { label: 'confirmed', className: CHIP_SUCCESS };
     case 'done':
@@ -185,14 +200,39 @@ export function displayStateChip(displayState: string): StateChip {
   }
 }
 
-/** The muted subline shown under a chip for states that need a plain-English
- *  qualifier — currently only `uploaded → "awaiting confirmation"` (§D5: the
- *  provider finished serving, the receiver ack hasn't landed). */
-export function displayStateSubline(displayState: string): string | null {
+/**
+ * The muted subline shown under a chip for states that need a plain-English
+ * qualifier — `uploaded → "awaiting confirmation"` (§D5: the provider finished
+ * serving, the receiver ack hasn't landed), plus the parked-not-broken family,
+ * whose whole job is to say WHY nothing is moving and that nobody has to act.
+ *
+ * `kind` disambiguates the ONE label that means two different things by
+ * direction (see [`displayStateChip`]'s `queued` note): an OUTBOUND `queued` is
+ * our own local send queue — self-evident, no subline, exactly as before — while
+ * an INBOUND `queued` is a row (or a lane-queue ghost) parked waiting for a free
+ * receive slot, which needs saying. Omitting `kind` keeps the historical
+ * behavior, so an un-updated call site can only lose a subline, never gain a
+ * wrong one.
+ */
+export function displayStateSubline(
+  displayState: string,
+  kind?: 'outbound' | 'inbound',
+): string | null {
   if (displayState === 'uploaded') return 'awaiting confirmation';
   // D1: says WHY there is no countdown. The transfer resumes the moment the peer
   // announces itself — which is a signal, not an instant we could name.
   if (displayState === 'waiting_peer') return 'device unreachable — resumes when it is back';
+  // Variant A: the receiver is alive and pulling a SIBLING batch of ours. There
+  // is no countdown behind this state on purpose (the wait ends on the sibling
+  // draining, not at an instant), so the subline carries the whole explanation.
+  if (displayState === 'queued_at_receiver')
+    return 'receiver is busy with your earlier transfer — starts automatically';
+  // Variant B/C (receive side): parked on the receive gate
+  // (`sync.max_concurrent_receives`) or sitting in this peer's lane queue behind
+  // another of its batches. Same sentence for both — from the user's side they
+  // are one fact: it has arrived, it is next, it needs no help.
+  if (displayState === 'queued' && kind === 'inbound')
+    return 'waiting for a free download slot — starts automatically';
   return null;
 }
 

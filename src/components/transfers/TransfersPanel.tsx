@@ -12,6 +12,7 @@ import type {
   InboundSummary,
   OutboundSummary,
   ProjectCard,
+  QueuedInboundSummary,
   SyncHistoryQuery,
 } from '../../types/models';
 
@@ -83,6 +84,10 @@ export function TransfersPanel() {
   const { open, closePanel, status, active, refresh } = useTransfers();
   const navigate = useNavigate();
   const incoming = status?.receiver.active ?? [];
+  // Variant B: announces parked in a sending peer's lane with no `sync_inbound`
+  // row yet. They belong in the same Active list as the rows — the batch has
+  // arrived, and the panel is the at-a-glance answer to "is anything coming in?".
+  const incomingQueued = status?.receiver.queued ?? [];
   const [tab, setTab] = useState<Tab>('active');
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [deviceNames, setDeviceNames] = useState<Record<string, string>>({});
@@ -285,7 +290,7 @@ export function TransfersPanel() {
 
         <div className="flex border-b border-border">
           {(['active', 'history'] as const).map((t) => {
-            const activeCount = active.length + incoming.length;
+            const activeCount = active.length + incoming.length + incomingQueued.length;
             return (
               <button
                 key={t}
@@ -305,7 +310,7 @@ export function TransfersPanel() {
 
         <div className="flex-1 overflow-y-auto">
           {tab === 'active' ? (
-            <ActiveTab active={active} incoming={incoming} />
+            <ActiveTab active={active} incoming={incoming} incomingQueued={incomingQueued} />
           ) : (
             <HistoryTab
               rows={filteredHistory}
@@ -324,8 +329,17 @@ export function TransfersPanel() {
   );
 }
 
-function ActiveTab({ active, incoming }: { active: OutboundSummary[]; incoming: InboundSummary[] }) {
-  if (active.length === 0 && incoming.length === 0) {
+function ActiveTab({
+  active,
+  incoming,
+  incomingQueued,
+}: {
+  active: OutboundSummary[];
+  incoming: InboundSummary[];
+  /** Variant-B lane-queue ghosts — announced, no `sync_inbound` row yet. */
+  incomingQueued: QueuedInboundSummary[];
+}) {
+  if (active.length === 0 && incoming.length === 0 && incomingQueued.length === 0) {
     return (
       <p className="px-4 py-10 text-center text-sm text-content-muted">No active transfers</p>
     );
@@ -337,7 +351,7 @@ function ActiveTab({ active, incoming }: { active: OutboundSummary[]; incoming: 
           unified view with actions + per-file detail lives on /transfers. */}
       {active.map((row) => {
         const chip = displayStateChip(row.displayState);
-        const subline = displayStateSubline(row.displayState);
+        const subline = displayStateSubline(row.displayState, 'outbound');
         const total = row.fileCounts.total || row.fileCount;
         return (
           <li key={`out-${row.id}`} className="flex items-start justify-between gap-2 px-4 py-3">
@@ -377,8 +391,10 @@ function ActiveTab({ active, incoming }: { active: OutboundSummary[]; incoming: 
         const chip = displayStateChip(row.displayState);
         // D2: received rows can now be parked too (`waiting_peer`), so this branch
         // needs the same subline the outbound one has — otherwise the panel shows
-        // a chip with no explanation of why nothing is moving.
-        const subline = displayStateSubline(row.displayState);
+        // a chip with no explanation of why nothing is moving. Variant C adds the
+        // slot-parked `queued`, whose subline exists ONLY for the receive side —
+        // hence the explicit kind.
+        const subline = displayStateSubline(row.displayState, 'inbound');
         const total = row.fileCounts.total || row.frameCount;
         return (
           <li key={`in-${row.id}`} className="flex items-start justify-between gap-2 px-4 py-3">
@@ -392,6 +408,44 @@ function ActiveTab({ active, incoming }: { active: OutboundSummary[]; incoming: 
                 <span aria-hidden="true">·</span>
                 <span className="shrink-0 tabular-nums">
                   {row.fileCounts.done} of {total}
+                </span>
+              </p>
+              {subline && <p className="mt-0.5 text-[10px] text-content-muted">{subline}</p>}
+            </div>
+            <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${chip.className}`}>
+              {chip.label}
+            </span>
+          </li>
+        );
+      })}
+      {/* Variant-B ghosts, last: a compact line per announce still sitting in its
+          sender's lane queue. Same chip + subline as a slot-parked real row (they
+          are one fact to the user), just without the per-file counter — there is
+          no row to count against yet, only the announce's manifest totals. */}
+      {incomingQueued.map((row) => {
+        const chip = displayStateChip('queued');
+        const subline = displayStateSubline('queued', 'inbound');
+        return (
+          <li
+            key={`inq-${row.batchUuid}`}
+            className="flex items-start justify-between gap-2 px-4 py-3"
+          >
+            <div className="min-w-0">
+              <p
+                className="truncate text-xs font-medium text-content"
+                title={row.batchName ?? row.batchUuid}
+              >
+                {row.batchName ?? shortPeer(row.batchUuid)}
+              </p>
+              <p
+                className="mt-0.5 flex items-center gap-1 text-[10px] text-content-muted"
+                title={row.deviceName ?? row.peerShort}
+              >
+                <ArrowDown size={9} className="shrink-0 text-success" />
+                <span className="truncate">{row.deviceName ?? row.peerShort}</span>
+                <span aria-hidden="true">·</span>
+                <span className="shrink-0 tabular-nums">
+                  {row.frameCount} file{row.frameCount === 1 ? '' : 's'}
                 </span>
               </p>
               {subline && <p className="mt-0.5 text-[10px] text-content-muted">{subline}</p>}
