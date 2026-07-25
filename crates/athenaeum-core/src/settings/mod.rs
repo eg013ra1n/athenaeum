@@ -53,6 +53,14 @@ pub mod defaults {
     // `SettingsManager::get_sync_max_upload_bytes_per_sec`).
     pub const SYNC_MAX_UPLOAD_BYTES_PER_SEC: &str = "0";
 
+    // Cap on simultaneous INCOMING transfers (W2). Mirrors
+    // `sync::DEFAULT_MAX_CONCURRENT_RECEIVES` — the fetch+ingest phase is bound
+    // by disk and the shared connection, not by the network, so two lanes keep a
+    // small transfer from queueing behind a large one without buying seek thrash.
+    // Clamped to 1..=8 on read (see
+    // `SettingsManager::get_sync_max_concurrent_receives`).
+    pub const SYNC_MAX_CONCURRENT_RECEIVES: &str = "2";
+
     // Full-app capture-node retention (task M4). Reclaims local disk once frames
     // are confirmed on the paired primary. Every default is the SAFE one: keep
     // everything, dry-run on, and no live opt-in — a fresh install never deletes
@@ -133,6 +141,13 @@ pub mod keys {
     /// upload pacer at bind (`api::sync::ensure_iroh_node`) and live on every
     /// `api::sync::set_sync_upload_limit`.
     pub const SYNC_MAX_UPLOAD_BYTES_PER_SEC: &str = "sync.max_upload_bytes_per_sec";
+
+    /// Cap on simultaneous INCOMING transfers (W2), 1..=8. Applied to the
+    /// receiver's [`ReceiveGate`](crate::sync::ReceiveGate) at receiver start
+    /// (`api::sync::receiver_hooks` → `SyncRuntime::ensure_started`) and live on
+    /// every `api::sync::set_sync_max_concurrent_receives` — a change never
+    /// interrupts a transfer already in flight.
+    pub const SYNC_MAX_CONCURRENT_RECEIVES: &str = "sync.max_concurrent_receives";
 
     // Full-app capture-node retention (task M4). Read by the hourly retention
     // tick (`api::retention`). All get/set through the generic `get_setting` /
@@ -391,6 +406,28 @@ impl SettingsManager {
         let n: u64 = value.parse()?;
         Ok(if n == 0 { 0 } else { n.max(100_000) })
     }
+
+    /// Get the cap on simultaneous INCOMING transfers (W2), clamped to `1..=8`.
+    ///
+    /// The clamp is defense in depth against a value that reached the
+    /// `sync.max_concurrent_receives` row some other way than
+    /// `api::sync::set_sync_max_concurrent_receives` (direct DB edit, a future
+    /// settings import, a botched migration): an out-of-range value must degrade
+    /// to a sane cap rather than panic or run unbounded. `0` in particular is not
+    /// "no limit" — it is "admit nobody", which would park every inbound transfer
+    /// forever, so it clamps UP to 1; anything above 8 clamps down, since beyond
+    /// that the lanes only fight over the same disk. Same 1..=8 window the gate
+    /// itself enforces ([`ReceiveGate::set_limit`](crate::sync::ReceiveGate::set_limit)),
+    /// so the two can never disagree.
+    pub fn get_sync_max_concurrent_receives(&self, conn: &Connection) -> Result<usize> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::SYNC_MAX_CONCURRENT_RECEIVES,
+            defaults::SYNC_MAX_CONCURRENT_RECEIVES,
+        )?;
+        let n: usize = value.parse()?;
+        Ok(n.clamp(1, 8))
+    }
 }
 
 #[cfg(test)]
@@ -563,6 +600,44 @@ mod tests {
             .persist_setting(&conn, keys::SYNC_MAX_UPLOAD_BYTES_PER_SEC, "0")
             .unwrap();
         assert_eq!(manager.get_sync_max_upload_bytes_per_sec(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn default_max_concurrent_receives_is_two() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+
+        // The shipped cap has exactly one definition
+        // (`sync::DEFAULT_MAX_CONCURRENT_RECEIVES`); this default string is its
+        // settings-layer twin and must agree with it.
+        assert_eq!(defaults::SYNC_MAX_CONCURRENT_RECEIVES, "2");
+        assert_eq!(
+            manager.get_sync_max_concurrent_receives(&conn).unwrap(),
+            crate::sync::DEFAULT_MAX_CONCURRENT_RECEIVES
+        );
+    }
+
+    #[test]
+    fn max_concurrent_receives_getter_clamps_out_of_range() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+
+        // Out-of-range values can only reach the row via something other than
+        // `api::sync::set_sync_max_concurrent_receives` (direct DB edit, a
+        // future settings import, a botched migration). `0` would mean "admit
+        // nobody" — every inbound transfer parks forever; a huge value would
+        // defeat the point of having a gate. Clamp both, never panic.
+        manager
+            .persist_setting(&conn, keys::SYNC_MAX_CONCURRENT_RECEIVES, "0")
+            .unwrap();
+        assert_eq!(manager.get_sync_max_concurrent_receives(&conn).unwrap(), 1);
+
+        manager
+            .persist_setting(&conn, keys::SYNC_MAX_CONCURRENT_RECEIVES, "99")
+            .unwrap();
+        assert_eq!(manager.get_sync_max_concurrent_receives(&conn).unwrap(), 8);
     }
 
     #[test]

@@ -97,8 +97,8 @@ pub use retention::{evaluate_and_apply, DeleteOutcome, RetentionOutcome, Retenti
 pub use receiver::{
     allow_all_peers, InboundControl, IncomingResolver, PeerAuthorizer, ProjectAnnounceGate,
     ProjectAnnouncementsRefresher, ProjectIngestedHook, ProjectReceiveHooks, ProjectRequestHandler,
-    ReceiverHooks, SyncFinishedEvent, SyncProgressEvent, SyncReceiver, SyncReceiverHandle,
-    SyncRuntime,
+    ReceiveGate, ReceiverHooks, SyncFinishedEvent, SyncProgressEvent, SyncReceiver,
+    SyncReceiverHandle, SyncRuntime, DEFAULT_MAX_CONCURRENT_RECEIVES,
 };
 pub use responder::{CatalogDedupResponder, DedupResponder};
 pub use sender::{StartedSender, SyncSenderRuntime};

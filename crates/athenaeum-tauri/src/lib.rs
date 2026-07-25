@@ -461,6 +461,7 @@ pub fn run() {
             commands::get_sync_auto_mode,
             commands::set_sync_auto_mode,
             commands::set_sync_upload_limit,
+            commands::set_sync_max_concurrent_receives,
             commands::get_sync_device_names,
             commands::get_sync_device_capabilities,
             commands::account_sign_in_start,

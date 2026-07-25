@@ -159,6 +159,17 @@ pub struct ReceiverHooks {
     /// [`collab_exchange::handle_project_request`](crate::api::collab_exchange::handle_project_request).
     /// Absent ⇒ the request is logged and dropped (pre-task-6 behavior).
     pub project_request_handler: Option<ProjectRequestHandler>,
+    /// Cap on simultaneous incoming transfers to start the receiver's
+    /// [`ReceiveGate`] at (W2 T2.7) — the host's persisted
+    /// `sync.max_concurrent_receives`. A number rather than a callback, but it
+    /// rides this struct for the same reason the hooks do: it is per-start
+    /// configuration the HOST resolves and the transport layer must not go
+    /// looking for. `sync::` sits below `api::` and never touches a
+    /// `ServiceContext`, so the settings read stays in
+    /// `api::sync::receiver_hooks` where the ctx already is. Absent ⇒
+    /// [`DEFAULT_MAX_CONCURRENT_RECEIVES`] (a host that says nothing gets the
+    /// shipped cap, which is also what a settings read that FAILS degrades to).
+    pub max_concurrent_receives: Option<usize>,
 }
 
 /// `sync-progress` payload: a per-package stage tick (never per-frame — discrete
@@ -398,6 +409,24 @@ impl ReceiveGate {
             .expect("receive gate state mutex poisoned")
             .limit
     }
+}
+
+/// Apply a host-supplied receive-concurrency cap to a control that has NOT been
+/// handed to a receive loop yet (W2 T2.7). `None` — no host value, or a settings
+/// read that failed — leaves the gate at [`DEFAULT_MAX_CONCURRENT_RECEIVES`], so
+/// a bad settings row degrades the cap, never the startup.
+///
+/// Called by [`SyncRuntime::ensure_started`] BEFORE
+/// [`SyncReceiver::spawn`], which is what makes the persisted value effective for
+/// the very first announce rather than from the second one on. Split out so the
+/// application is pinned by a unit test — `ensure_started` itself needs a bound
+/// [`SharedIrohNode`] and cannot run in one.
+fn apply_receive_limit(control: &InboundControl, configured: Option<usize>) {
+    let Some(limit) = configured else {
+        return;
+    };
+    control.receive_gate.set_limit(limit);
+    tracing::debug!(limit, "receive concurrency cap applied at receiver start");
 }
 
 /// Receiver-side cancellation control (Task 12): the shared signal the command
@@ -3170,6 +3199,10 @@ impl SyncRuntime {
         // spawned loop, and stashed on `Started` so `inbound_control()` hands it to
         // the command layer.
         let control = Arc::new(InboundControl::new());
+        // W2 T2.7: the persisted receive-concurrency cap the host resolved, applied
+        // BEFORE the loop spawns — so the first announce is already gated at the
+        // operator's number, not at the default until someone re-saves the setting.
+        apply_receive_limit(&control, hooks.max_concurrent_receives);
 
         // Staging lives under the sync dir; the landing root is resolved live per
         // package by the caller-supplied resolver (task 5).
@@ -7027,6 +7060,42 @@ mod tests {
             DEFAULT_MAX_CONCURRENT_RECEIVES,
             "`new()` and `default()` agree — `new()` still just forwards"
         );
+    }
+
+    /// The startup half of `sync.max_concurrent_receives` (W2 T2.7). This is the
+    /// REAL function `ensure_started` calls on the control it is about to hand
+    /// the receive loop — pinned here rather than through `ensure_started`
+    /// itself, which needs a bound `SharedIrohNode` (a real endpoint + relay
+    /// resolution) and so cannot run in a unit test. What that leaves untested
+    /// is one call line inside `ensure_started`; both halves of the behavior
+    /// (the settings read → `Option<usize>` carrier, and the carrier → gate
+    /// application below) are pinned by real functions.
+    #[test]
+    fn apply_receive_limit_absent_keeps_the_shipped_default() {
+        let control = InboundControl::new();
+        apply_receive_limit(&control, None);
+        assert_eq!(
+            control.receive_gate.limit(),
+            DEFAULT_MAX_CONCURRENT_RECEIVES,
+            "no host-supplied value ⇒ the shipped default stands"
+        );
+    }
+
+    #[test]
+    fn apply_receive_limit_applies_and_clamps_a_configured_value() {
+        let control = InboundControl::new();
+        apply_receive_limit(&control, Some(5));
+        assert_eq!(control.receive_gate.limit(), 5, "the persisted value wins");
+
+        // Defense in depth: the settings getter already clamps, and so does the
+        // gate — a value that somehow arrives out of range still lands in range
+        // rather than deadlocking the receiver (0) or unbounding it.
+        let control = InboundControl::new();
+        apply_receive_limit(&control, Some(0));
+        assert_eq!(control.receive_gate.limit(), 1);
+        let control = InboundControl::new();
+        apply_receive_limit(&control, Some(99));
+        assert_eq!(control.receive_gate.limit(), 8);
     }
 
     // ─── Per-peer receive lanes (W2 T2.3) ───────────────────────────────────

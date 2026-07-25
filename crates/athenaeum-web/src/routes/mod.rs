@@ -265,6 +265,10 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_sync_auto_mode", post(sync::get_sync_auto_mode))
         .route("/api/set_sync_auto_mode", post(sync::set_sync_auto_mode))
         .route("/api/set_sync_upload_limit", post(sync::set_sync_upload_limit))
+        .route(
+            "/api/set_sync_max_concurrent_receives",
+            post(sync::set_sync_max_concurrent_receives),
+        )
         .route("/api/get_sync_device_names", post(sync::get_sync_device_names))
         .route("/api/get_sync_device_capabilities", post(sync::get_sync_device_capabilities))
         // Account (Stage II, task B4)

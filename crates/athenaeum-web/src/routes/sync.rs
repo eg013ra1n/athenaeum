@@ -351,6 +351,30 @@ pub async fn set_sync_upload_limit(
         .map_err(api_err)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSyncMaxConcurrentReceivesArgs {
+    pub max_concurrent_receives: usize,
+}
+
+/// POST /api/set_sync_max_concurrent_receives
+///
+/// Persist and live-apply the cap on simultaneous INCOMING transfers (W2 T2.7),
+/// 1..=8. Resizes the running receiver's gate without restarting it (a shrink
+/// lands as the in-flight lanes finish) and is re-read at the next receiver
+/// start. Reads go through the generic `get_setting` — there is no dedicated
+/// getter route.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_sync_max_concurrent_receives(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetSyncMaxConcurrentReceivesArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    api::set_sync_max_concurrent_receives(&state.ctx, &state.sync, args.max_concurrent_receives)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
 /// POST /api/get_sync_device_names
 ///
 /// Map of peer node-id-hex → hub device name for the transfer history. Best-

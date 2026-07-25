@@ -342,7 +342,38 @@ fn receiver_hooks(
         announcements_refresher: Some(announcements_refresher(Arc::clone(ctx))),
         on_project_ingested: Some(on_project_ingested_hook(Arc::clone(ctx))),
         project_request_handler: request_handler,
+        // W2 T2.7: the persisted receive-concurrency cap travels with the hooks
+        // because `sync::` has no `ServiceContext` to read it from — see the
+        // field's doc. `ensure_started` applies it before the loop spawns.
+        max_concurrent_receives: configured_max_concurrent_receives(ctx),
     })
+}
+
+/// The persisted `sync.max_concurrent_receives`, for the receiver about to
+/// start (W2 T2.7). `None` when the value cannot be read at all — the receiver
+/// then keeps [`DEFAULT_MAX_CONCURRENT_RECEIVES`](crate::sync::DEFAULT_MAX_CONCURRENT_RECEIVES).
+///
+/// A settings read must never block startup: an unreachable DB or a garbage row
+/// degrades this to "receive at the shipped cap", never to "no receiver". Out-of-
+/// range rows don't even reach here as errors — the getter clamps them into
+/// 1..=8.
+fn configured_max_concurrent_receives(ctx: &ServiceContext) -> Option<usize> {
+    match db(ctx).and_then(|d| {
+        let conn = d.conn();
+        ctx.settings
+            .get_sync_max_concurrent_receives(&conn)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    }) {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                default = crate::sync::DEFAULT_MAX_CONCURRENT_RECEIVES,
+                "read receive concurrency cap at receiver start failed; using the default"
+            );
+            None
+        }
+    }
 }
 
 /// Build the task-8 [`ProjectAnnouncementsRefresher`](crate::sync::ProjectAnnouncementsRefresher)
@@ -4382,6 +4413,65 @@ pub async fn set_sync_upload_limit(
         node.set_upload_limit(bytes_per_sec);
     }
     tracing::info!(bytes_per_sec, "sync upload limit set");
+    Ok(())
+}
+
+/// Bounds check for [`set_sync_max_concurrent_receives`], split out so the real
+/// guard (not a test-local copy) is what tests pin — the same shape
+/// [`validate_upload_limit`] and `api::compute::validate_max_concurrent` use.
+///
+/// `0` would admit nobody: every inbound transfer would park at the gate
+/// forever, which reads to the operator as a dead receiver rather than a
+/// throttled one. Above 8 the lanes only contend for the same disk — the
+/// fetch+ingest phase is disk-bound, so more lanes buy seek thrash, not
+/// throughput.
+pub(crate) fn validate_max_concurrent_receives(n: usize) -> Result<(), ApiError> {
+    if n == 0 || n > 8 {
+        return Err(ApiError::Invalid(
+            "sync.max_concurrent_receives must be 1..=8".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Persist and live-apply the cap on simultaneous INCOMING transfers (W2 T2.7;
+/// see [`validate_max_concurrent_receives`] for the range).
+///
+/// Both halves matter and neither substitutes for the other: the persisted row
+/// is what the NEXT receiver start reads (`receiver_hooks` →
+/// [`SyncRuntime::ensure_started`](crate::sync::SyncRuntime::ensure_started)),
+/// while the live [`ReceiveGate`](crate::sync::ReceiveGate) resize is what makes
+/// the change land on the receiver running right now — without restarting it.
+/// A shrink never interrupts a transfer already holding a lane; it takes effect
+/// as the in-flight ones finish.
+///
+/// An un-started receiver is not an error: there is no gate to resize, and the
+/// value is already recorded for the start that eventually happens.
+pub async fn set_sync_max_concurrent_receives(
+    ctx: &ServiceContext,
+    sync: &SyncRuntime,
+    n: usize,
+) -> Result<(), ApiError> {
+    validate_max_concurrent_receives(n)?;
+    // Scoped so the connection guard is dropped before the `inbound_control` await.
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        ctx.settings
+            .persist_setting(&conn, keys::SYNC_MAX_CONCURRENT_RECEIVES, &n.to_string())
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+    let applied_live = if let Some(control) = sync.inbound_control().await {
+        control.receive_gate.set_limit(n);
+        true
+    } else {
+        false
+    };
+    tracing::info!(
+        max_concurrent_receives = n,
+        applied_live,
+        "sync receive concurrency cap set"
+    );
     Ok(())
 }
 
@@ -8525,5 +8615,137 @@ mod tests {
         ));
         assert!(validate_upload_limit(100_000).is_ok(), "the floor itself");
         assert!(validate_upload_limit(5_000_000).is_ok());
+    }
+
+    /// W2 §T2.7: the receive-concurrency bounds check, pinned through the REAL
+    /// guard (`validate_max_concurrent_receives`) — the ctx-taking setter only
+    /// forwards to it. `0` would park every inbound transfer forever; above 8
+    /// the lanes fight over one disk with nothing to gain.
+    #[test]
+    fn validate_max_concurrent_receives_rejects_out_of_range() {
+        assert!(matches!(
+            validate_max_concurrent_receives(0),
+            Err(ApiError::Invalid(_))
+        ));
+        assert!(validate_max_concurrent_receives(1).is_ok(), "the floor");
+        assert!(validate_max_concurrent_receives(8).is_ok(), "the ceiling");
+        assert!(matches!(
+            validate_max_concurrent_receives(9),
+            Err(ApiError::Invalid(_))
+        ));
+    }
+
+    /// The STARTUP half of W2 §T2.7: the value `receiver_hooks` carries into
+    /// `ensure_started`, read through the REAL reader. A fresh install reports
+    /// the shipped default; a persisted value overrides it. (The carrier's other
+    /// end — `Option<usize>` → gate — is pinned by `apply_receive_limit_*` in
+    /// `sync::receiver`; the two together cover the startup path without a bound
+    /// iroh node.)
+    #[test]
+    fn configured_max_concurrent_receives_reads_the_persisted_value() {
+        let (_tmp, ctx) = test_ctx();
+
+        assert_eq!(
+            configured_max_concurrent_receives(&ctx),
+            Some(crate::sync::DEFAULT_MAX_CONCURRENT_RECEIVES),
+            "a fresh install starts the receiver at the shipped default"
+        );
+
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            ctx.settings
+                .persist_setting(&conn, keys::SYNC_MAX_CONCURRENT_RECEIVES, "5")
+                .unwrap();
+        }
+        assert_eq!(
+            configured_max_concurrent_receives(&ctx),
+            Some(5),
+            "a receiver started fresh picks the persisted cap up"
+        );
+    }
+
+    /// The LIVE half of W2 §T2.7: with a receiver already started, the setter
+    /// resizes its running gate — no restart. The persisted row and the live
+    /// gate must both move.
+    #[tokio::test]
+    async fn set_max_concurrent_receives_resizes_a_running_receivers_gate() {
+        let (tmp, ctx) = test_ctx();
+        let (_ep, runtime) = started_loopback_runtime(&tmp).await;
+
+        let control = runtime
+            .inbound_control()
+            .await
+            .expect("a started runtime exposes its inbound control");
+        assert_eq!(
+            control.receive_gate.limit(),
+            crate::sync::DEFAULT_MAX_CONCURRENT_RECEIVES,
+            "the running receiver starts at the shipped default"
+        );
+
+        set_sync_max_concurrent_receives(&ctx, &runtime, 4)
+            .await
+            .expect("setter accepts an in-range value");
+
+        assert_eq!(
+            control.receive_gate.limit(),
+            4,
+            "the change lands on the RUNNING receiver's gate, not just the DB"
+        );
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        assert_eq!(
+            ctx.settings
+                .get_sync_max_concurrent_receives(&conn)
+                .unwrap(),
+            4,
+            "and it is persisted, so the next start applies it too"
+        );
+    }
+
+    /// A rejected value changes NOTHING — not the row, not the live gate.
+    #[tokio::test]
+    async fn set_max_concurrent_receives_rejects_without_touching_gate_or_row() {
+        let (tmp, ctx) = test_ctx();
+        let (_ep, runtime) = started_loopback_runtime(&tmp).await;
+        let control = runtime.inbound_control().await.unwrap();
+
+        assert!(matches!(
+            set_sync_max_concurrent_receives(&ctx, &runtime, 0).await,
+            Err(ApiError::Invalid(_))
+        ));
+        assert_eq!(
+            control.receive_gate.limit(),
+            crate::sync::DEFAULT_MAX_CONCURRENT_RECEIVES,
+            "a refused value never reaches the gate"
+        );
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        assert_eq!(
+            ctx.settings
+                .get_sync_max_concurrent_receives(&conn)
+                .unwrap(),
+            crate::sync::DEFAULT_MAX_CONCURRENT_RECEIVES,
+            "nor the row"
+        );
+    }
+
+    /// An un-started receiver is not an error: the value is persisted and the
+    /// eventual start applies it (the startup half above).
+    #[tokio::test]
+    async fn set_max_concurrent_receives_persists_without_a_started_receiver() {
+        let (_tmp, ctx) = test_ctx();
+        let runtime = SyncRuntime::new();
+        assert!(runtime.inbound_control().await.is_none(), "not started");
+
+        set_sync_max_concurrent_receives(&ctx, &runtime, 3)
+            .await
+            .expect("no receiver is not a failure");
+
+        assert_eq!(
+            configured_max_concurrent_receives(&ctx),
+            Some(3),
+            "the next start reads it back"
+        );
     }
 }

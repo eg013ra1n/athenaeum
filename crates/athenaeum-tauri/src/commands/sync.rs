@@ -251,6 +251,22 @@ pub async fn set_sync_upload_limit(
         .map_err(|e| e.to_string())
 }
 
+/// Persist and live-apply the cap on simultaneous INCOMING transfers (W2 T2.7),
+/// 1..=8. Resizes the running receiver's gate without restarting it (a shrink
+/// lands as the in-flight lanes finish) and is re-read at the next receiver
+/// start. Reads go through the generic `get_setting` — there is no dedicated
+/// getter command.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_sync_max_concurrent_receives(
+    state: State<'_, AppState>,
+    max_concurrent_receives: usize,
+) -> Result<(), String> {
+    api::set_sync_max_concurrent_receives(&state.ctx, &state.sync, max_concurrent_receives)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Map of peer node-id-hex → hub device name, for showing friendly names in the
 /// transfer history. Best-effort: hub unreachable / signed out → empty map.
 #[tauri::command]
