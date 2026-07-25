@@ -329,6 +329,28 @@ pub async fn set_sync_auto_mode(
     api::set_sync_auto_mode(&state.ctx, args.enabled).map(Json).map_err(api_err)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSyncUploadLimitArgs {
+    pub bytes_per_sec: u64,
+}
+
+/// POST /api/set_sync_upload_limit
+///
+/// Persist and live-apply the device-wide sync UPLOAD limit in bytes/sec (W1).
+/// `0` = unlimited; any real cap must be >= 100000. Reads go through the
+/// generic `get_setting` — there is no dedicated getter route.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_sync_upload_limit(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetSyncUploadLimitArgs>,
+) -> Result<Json<()>, (StatusCode, String)> {
+    api::set_sync_upload_limit(&state.ctx, args.bytes_per_sec)
+        .await
+        .map(Json)
+        .map_err(api_err)
+}
+
 /// POST /api/get_sync_device_names
 ///
 /// Map of peer node-id-hex → hub device name for the transfer history. Best-

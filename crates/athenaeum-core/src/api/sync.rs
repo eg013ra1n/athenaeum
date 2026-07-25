@@ -944,6 +944,23 @@ pub(crate) async fn ensure_iroh_node(
     let node = SharedIrohNode::bind(&sync_dir, relay_mode)
         .await
         .map_err(|e| ApiError::Internal(format!("bind shared iroh node: {e:#}")))?;
+    // W1: the node always binds unlimited, so the persisted device-wide upload
+    // cap is applied right here. This ONE site covers desktop AND web — the node
+    // binds lazily in core, so neither host needs startup code of its own. A
+    // settings read that fails must never fail the bind: log it and run
+    // unlimited (transfers degraded to "not throttled", never to "no transport").
+    match db(ctx).and_then(|d| {
+        let conn = d.conn();
+        ctx.settings
+            .get_sync_max_upload_bytes_per_sec(&conn)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    }) {
+        Ok(bytes_per_sec) => node.set_upload_limit(bytes_per_sec),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "read upload limit at bind failed; running unlimited"
+        ),
+    }
     // Unified store: the node binds at `<sync>/blobs`. After the first successful
     // bind, the old per-role stores are dead weight — remove them so a migrated
     // install doesn't carry three parallel blob DBs (tolerate absence).
@@ -4315,6 +4332,56 @@ pub fn set_sync_auto_mode(ctx: &ServiceContext, enabled: bool) -> Result<(), Api
         if enabled { "true" } else { "false" },
     )?;
     tracing::info!(enabled, "sync auto mode set");
+    Ok(())
+}
+
+/// Bounds check for [`set_sync_upload_limit`], split out so the real guard
+/// (not a test-local copy) is what tests pin — the same shape
+/// `api::compute::validate_max_concurrent` uses.
+///
+/// `0` is the unlimited sentinel and always passes. Any real cap must clear a
+/// 100 KB/s floor: below it a transfer stops looking slow and starts looking
+/// dead — a single frame would take hours and every progress bar would read as
+/// stalled — so the setting could strand the device's sync rather than tame it.
+pub(crate) fn validate_upload_limit(bytes_per_sec: u64) -> Result<(), ApiError> {
+    if bytes_per_sec != 0 && bytes_per_sec < 100_000 {
+        return Err(ApiError::Invalid(
+            "sync.max_upload_bytes_per_sec must be 0 (unlimited) or >= 100000".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Persist and live-apply the device-wide sync UPLOAD limit in bytes/sec
+/// (`0` = unlimited; see [`validate_upload_limit`] for the floor).
+///
+/// One budget for the whole device: every role handle, every peer and every
+/// concurrent GET draw on the shared node's pacer, so a change lands
+/// mid-transfer on the next ~16 KiB chunk the provider offers. When no node is
+/// bound yet there is nothing to re-rate and nothing to do — [`ensure_iroh_node`]
+/// applies the persisted value at bind, so this deliberately does NOT force a
+/// bind (and a whole endpoint + relay resolution) just to record a number.
+pub async fn set_sync_upload_limit(
+    ctx: &ServiceContext,
+    bytes_per_sec: u64,
+) -> Result<(), ApiError> {
+    validate_upload_limit(bytes_per_sec)?;
+    // Scoped so the connection guard is dropped before the `iroh_node` await.
+    {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        ctx.settings
+            .persist_setting(
+                &conn,
+                keys::SYNC_MAX_UPLOAD_BYTES_PER_SEC,
+                &bytes_per_sec.to_string(),
+            )
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+    if let Some(node) = ctx.iroh_node.lock().await.as_ref() {
+        node.set_upload_limit(bytes_per_sec);
+    }
+    tracing::info!(bytes_per_sec, "sync upload limit set");
     Ok(())
 }
 
@@ -8437,5 +8504,26 @@ mod tests {
             ..Default::default()
         };
         crate::db::insert_frame(&conn, &frame).unwrap()
+    }
+
+    /// W1 §T1.3: the upload-limit bounds check, pinned through the REAL guard
+    /// (`validate_upload_limit`) rather than a test-local copy — the
+    /// ctx-taking `set_sync_upload_limit` only forwards to it. `0` is the
+    /// unlimited sentinel and always passes; anything else must clear the
+    /// 100 KB/s floor, below which a transfer stops looking slow and starts
+    /// looking dead.
+    #[test]
+    fn validate_upload_limit_rejects_sub_floor_nonzero() {
+        assert!(validate_upload_limit(0).is_ok(), "0 = unlimited");
+        assert!(matches!(
+            validate_upload_limit(1),
+            Err(ApiError::Invalid(_))
+        ));
+        assert!(matches!(
+            validate_upload_limit(99_999),
+            Err(ApiError::Invalid(_))
+        ));
+        assert!(validate_upload_limit(100_000).is_ok(), "the floor itself");
+        assert!(validate_upload_limit(5_000_000).is_ok());
     }
 }

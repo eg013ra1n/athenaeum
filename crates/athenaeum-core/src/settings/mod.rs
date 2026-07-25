@@ -46,6 +46,13 @@ pub mod defaults {
     // operator opts in.
     pub const SYNC_AUTO_MODE: &str = "false";
 
+    // Device-wide sync UPLOAD throttle (W1). Bytes/sec across every peer and
+    // every concurrent GET. `0` = unlimited, and that is the default — a fresh
+    // install never throttles; the pacer only engages once the operator sets a
+    // cap. A nonzero value is floored at 100 KB/s on read (see
+    // `SettingsManager::get_sync_max_upload_bytes_per_sec`).
+    pub const SYNC_MAX_UPLOAD_BYTES_PER_SEC: &str = "0";
+
     // Full-app capture-node retention (task M4). Reclaims local disk once frames
     // are confirmed on the paired primary. Every default is the SAFE one: keep
     // everything, dry-run on, and no live opt-in — a fresh install never deletes
@@ -120,6 +127,12 @@ pub mod keys {
     /// `capture` device enqueues freshly-scanned files to its paired primary
     /// automatically at scan-finished. Default `"false"` (manual send only).
     pub const SYNC_AUTO_MODE: &str = "sync.auto_mode";
+
+    /// Device-wide sync UPLOAD throttle in bytes/sec (W1). `0` = unlimited.
+    /// One budget for the whole device — applied to the shared iroh node's
+    /// upload pacer at bind (`api::sync::ensure_iroh_node`) and live on every
+    /// `api::sync::set_sync_upload_limit`.
+    pub const SYNC_MAX_UPLOAD_BYTES_PER_SEC: &str = "sync.max_upload_bytes_per_sec";
 
     // Full-app capture-node retention (task M4). Read by the hourly retention
     // tick (`api::retention`). All get/set through the generic `get_setting` /
@@ -355,6 +368,29 @@ impl SettingsManager {
         let n: usize = value.parse()?;
         Ok(n.clamp(1, 8))
     }
+
+    /// Get the device-wide sync UPLOAD limit in bytes/sec. `0` means
+    /// **unlimited** (the default — a fresh install never throttles), and is
+    /// passed through untouched: it is the unlimited sentinel, not a very
+    /// small cap.
+    ///
+    /// Any nonzero value is floored at 100 KB/s — the same floor
+    /// `api::sync::validate_upload_limit` enforces on write, applied again
+    /// here as defense in depth against a value that reached the
+    /// `sync.max_upload_bytes_per_sec` row some other way (direct DB edit, a
+    /// future settings import, a botched migration). Below that floor a
+    /// transfer stops looking slow and starts looking dead: every progress bar
+    /// would read as stalled and a single frame would take hours, so a stray
+    /// tiny value can never strand the device's sync.
+    pub fn get_sync_max_upload_bytes_per_sec(&self, conn: &Connection) -> Result<u64> {
+        let value = self.get_with_precedence(
+            conn,
+            keys::SYNC_MAX_UPLOAD_BYTES_PER_SEC,
+            defaults::SYNC_MAX_UPLOAD_BYTES_PER_SEC,
+        )?;
+        let n: u64 = value.parse()?;
+        Ok(if n == 0 { 0 } else { n.max(100_000) })
+    }
 }
 
 #[cfg(test)]
@@ -501,5 +537,50 @@ mod tests {
 
         manager.persist_setting(&conn, keys::COMPUTE_MAX_CONCURRENT, "999").unwrap();
         assert_eq!(manager.get_compute_max_concurrent(&conn).unwrap(), 8);
+    }
+
+    #[test]
+    fn default_upload_limit_is_unlimited() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+
+        // A fresh install throttles nothing — the pacer only engages once the
+        // operator sets a cap.
+        assert_eq!(defaults::SYNC_MAX_UPLOAD_BYTES_PER_SEC, "0");
+        assert_eq!(manager.get_sync_max_upload_bytes_per_sec(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn upload_limit_getter_passes_zero_through() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+
+        // 0 is not "a very small cap" — it is the unlimited sentinel, so the
+        // 100 KB/s floor must NOT lift it.
+        manager
+            .persist_setting(&conn, keys::SYNC_MAX_UPLOAD_BYTES_PER_SEC, "0")
+            .unwrap();
+        assert_eq!(manager.get_sync_max_upload_bytes_per_sec(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn upload_limit_getter_clamps_tiny_nonzero_values() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let manager = SettingsManager::new();
+
+        // A sub-floor cap can only reach the row via something other than
+        // `api::sync::set_sync_upload_limit` (direct DB edit, settings import,
+        // botched migration). Clamp defensively: at 5 KB/s a transfer looks
+        // dead rather than slow.
+        manager
+            .persist_setting(&conn, keys::SYNC_MAX_UPLOAD_BYTES_PER_SEC, "5000")
+            .unwrap();
+        assert_eq!(
+            manager.get_sync_max_upload_bytes_per_sec(&conn).unwrap(),
+            100_000
+        );
     }
 }

@@ -237,6 +237,20 @@ pub async fn set_sync_auto_mode(state: State<'_, AppState>, enabled: bool) -> Re
     api::set_sync_auto_mode(&state.ctx, enabled).map_err(|e| e.to_string())
 }
 
+/// Persist and live-apply the device-wide sync UPLOAD limit in bytes/sec
+/// (W1). `0` = unlimited; any real cap must be >= 100000. Reads go through the
+/// generic `get_setting` — there is no dedicated getter command.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_sync_upload_limit(
+    state: State<'_, AppState>,
+    bytes_per_sec: u64,
+) -> Result<(), String> {
+    api::set_sync_upload_limit(&state.ctx, bytes_per_sec)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Map of peer node-id-hex → hub device name, for showing friendly names in the
 /// transfer history. Best-effort: hub unreachable / signed out → empty map.
 #[tauri::command]

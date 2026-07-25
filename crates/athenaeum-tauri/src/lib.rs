@@ -460,6 +460,7 @@ pub fn run() {
             commands::cleanup_finished_transfers,
             commands::get_sync_auto_mode,
             commands::set_sync_auto_mode,
+            commands::set_sync_upload_limit,
             commands::get_sync_device_names,
             commands::get_sync_device_capabilities,
             commands::account_sign_in_start,
