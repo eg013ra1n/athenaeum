@@ -356,6 +356,8 @@ function ActiveTab({ active, incoming }: { active: OutboundSummary[]; incoming: 
               {row.displayState === 'waiting' && (
                 <p className="mt-0.5 text-[10px] text-content-secondary">retry soon</p>
               )}
+              {/* D1: no "retry soon" here — a peer-absent row is not on a clock.
+                  The subline below says what it IS waiting for. */}
               {subline && <p className="mt-0.5 text-[10px] text-content-muted">{subline}</p>}
               {/* Reason shows only while a retry is genuinely pending — never
                   gated on the monotonic attempts counter. */}

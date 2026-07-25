@@ -108,17 +108,40 @@ pub struct OutboundSummary {
     pub resendable: bool,
 }
 
+/// The machine-readable class prefixes a failed dial writes into `last_error`
+/// (`sync::diagnostics::ConnectClass::tag`) that mean "the peer is not there"
+/// (D1 §3.3). Kept in step with the engine's own set by
+/// `absent_prefixes_match_the_engine_classes` — they are the same fact spelled
+/// twice, on opposite sides of the store.
+const PEER_ABSENT_PREFIXES: [&str; 4] =
+    ["no_route:", "timeout:", "relay_unreachable:", "not_started:"];
+
+/// Whether this row's recorded failure says the PEER is absent, as opposed to
+/// refusing us or our own side being broken.
+pub fn peer_looks_absent(last_error: Option<&str>) -> bool {
+    last_error.is_some_and(|e| PEER_ABSENT_PREFIXES.iter().any(|p| e.starts_with(p)))
+}
+
 /// The outbound presentation state (§D5), derived from the raw
-/// [`OutboundState`] and the armed-retry deadline. `waiting` (a live backoff
-/// window — neutral, not an error) WINS over the raw state when the package is
-/// non-terminal AND `next_retry_at` is set AND that deadline is still in the
-/// future; an armed-but-past deadline falls through to the raw state.
+/// [`OutboundState`], the armed-retry deadline, and the recorded failure class.
+///
+/// `waiting_peer` (D1) wins first: a package parked because its peer is absent is
+/// waiting for a SIGNAL, not for an instant, so rendering a countdown would put a
+/// number on the screen that means nothing — the transfer resumes the moment the
+/// peer announces itself, which may be seconds or hours from now. `waiting` (a
+/// live backoff window — neutral, not an error) then wins over the raw state when
+/// the package is non-terminal AND `next_retry_at` is set AND that deadline is
+/// still in the future; an armed-but-past deadline falls through to the raw state.
 pub fn outbound_display_state(
     state: OutboundState,
     next_retry_at: Option<&str>,
+    last_error: Option<&str>,
     now: DateTime<Utc>,
 ) -> String {
     if !state.is_terminal() {
+        if peer_looks_absent(last_error) {
+            return "waiting_peer".to_string();
+        }
         if let Some(ts) = next_retry_at {
             if let Ok(deadline) = DateTime::parse_from_rfc3339(ts) {
                 if deadline.with_timezone(&Utc) > now {
@@ -361,6 +384,95 @@ mod tests {
     }
 
     #[test]
+    /// D1: a package parked because its peer is absent reads as `waiting_peer` and
+    /// carries NO countdown — it resumes on a signal, and a number would be a lie.
+    #[test]
+    fn a_peer_absent_row_reads_as_waiting_for_the_peer() {
+        let now = Utc::now();
+        let future = (now + chrono::Duration::seconds(120)).to_rfc3339();
+        for err in [
+            "no_route: no known addresses",
+            "timeout: dial timed out",
+            "relay_unreachable: relay leg failed",
+            "not_started: peer not started",
+        ] {
+            assert_eq!(
+                outbound_display_state(OutboundState::Queued, None, Some(err), now),
+                "waiting_peer",
+                "{err}"
+            );
+            // Even with a countdown persisted (the probing head has one), the peer
+            // fact wins: the row says who it is waiting for, not when it will try.
+            assert_eq!(
+                outbound_display_state(OutboundState::Announced, Some(&future), Some(err), now),
+                "waiting_peer",
+                "{err}"
+            );
+        }
+    }
+
+    /// A peer that is UP and refusing us, or a failure we could not classify, is a
+    /// different fact — those keep the ordinary schedule and its countdown.
+    #[test]
+    fn a_refusing_or_unclassified_failure_is_not_peer_absent() {
+        let now = Utc::now();
+        let future = (now + chrono::Duration::seconds(60)).to_rfc3339();
+        assert_eq!(
+            outbound_display_state(
+                OutboundState::Queued,
+                Some(&future),
+                Some("refused: not on the peer's allow-list"),
+                now
+            ),
+            "waiting"
+        );
+        assert_eq!(
+            outbound_display_state(OutboundState::Queued, Some(&future), Some("other: disk full"), now),
+            "waiting"
+        );
+    }
+
+    /// A TERMINAL row never reads as waiting for anyone, whatever stale reason it
+    /// still carries.
+    #[test]
+    fn a_terminal_row_ignores_a_stale_absent_reason() {
+        let now = Utc::now();
+        for state in [OutboundState::Failed, OutboundState::Cancelled, OutboundState::Confirmed] {
+            let s = outbound_display_state(state, None, Some("no_route: gone"), now);
+            assert_ne!(s, "waiting_peer", "{state:?} is terminal");
+        }
+    }
+
+    /// Drift guard: the prefixes this mapper treats as "peer absent" must be
+    /// exactly the classes the ENGINE schedules flat. They are the same fact on
+    /// opposite sides of the store, and nothing but this test ties them together.
+    #[test]
+    fn absent_prefixes_match_the_engine_classes() {
+        use crate::sync::diagnostics::ConnectClass;
+        for class in [
+            ConnectClass::NoRoute,
+            ConnectClass::Timeout,
+            ConnectClass::RelayUnreachable,
+            ConnectClass::NotStarted,
+        ] {
+            let rendered = format!("{}: something", class.tag());
+            assert!(
+                peer_looks_absent(Some(&rendered)),
+                "{} is flat-scheduled by the engine but not treated as absent here",
+                class.tag()
+            );
+        }
+        for class in [ConnectClass::Refused, ConnectClass::Other] {
+            let rendered = format!("{}: something", class.tag());
+            assert!(
+                !peer_looks_absent(Some(&rendered)),
+                "{} escalates in the engine and must not read as absent",
+                class.tag()
+            );
+        }
+    }
+
+    #[test]
     fn outbound_display_state_maps_every_raw_state_without_retry() {
         let now = Utc::now();
         let cases = [
@@ -373,7 +485,7 @@ mod tests {
             (OutboundState::Cancelled, "cancelled"),
         ];
         for (state, expected) in cases {
-            assert_eq!(outbound_display_state(state, None, now), expected, "{state:?}");
+            assert_eq!(outbound_display_state(state, None, None, now), expected, "{state:?}");
         }
     }
 
@@ -389,7 +501,7 @@ mod tests {
             OutboundState::Delivered,
         ] {
             assert_eq!(
-                outbound_display_state(state, Some(&future), now),
+                outbound_display_state(state, Some(&future), None, now),
                 "waiting",
                 "{state:?} with a future retry should be waiting"
             );
@@ -400,8 +512,8 @@ mod tests {
     fn armed_past_retry_does_not_win() {
         let now = Utc::now();
         let past = offset(now, -30);
-        assert_eq!(outbound_display_state(OutboundState::Transferring, Some(&past), now), "transferring");
-        assert_eq!(outbound_display_state(OutboundState::Announced, Some(&past), now), "preparing");
+        assert_eq!(outbound_display_state(OutboundState::Transferring, Some(&past), None, now), "transferring");
+        assert_eq!(outbound_display_state(OutboundState::Announced, Some(&past), None, now), "preparing");
     }
 
     #[test]
@@ -409,16 +521,16 @@ mod tests {
         let now = Utc::now();
         let future = offset(now, 30);
         // A terminal row never shows waiting, even if a stale next_retry_at lingers.
-        assert_eq!(outbound_display_state(OutboundState::Confirmed, Some(&future), now), "confirmed");
-        assert_eq!(outbound_display_state(OutboundState::Failed, Some(&future), now), "failed");
-        assert_eq!(outbound_display_state(OutboundState::Cancelled, Some(&future), now), "cancelled");
+        assert_eq!(outbound_display_state(OutboundState::Confirmed, Some(&future), None, now), "confirmed");
+        assert_eq!(outbound_display_state(OutboundState::Failed, Some(&future), None, now), "failed");
+        assert_eq!(outbound_display_state(OutboundState::Cancelled, Some(&future), None, now), "cancelled");
     }
 
     #[test]
     fn unparseable_retry_deadline_falls_through_to_raw_state() {
         let now = Utc::now();
         assert_eq!(
-            outbound_display_state(OutboundState::Transferring, Some("not-a-date"), now),
+            outbound_display_state(OutboundState::Transferring, Some("not-a-date"), None, now),
             "transferring"
         );
     }

@@ -130,7 +130,9 @@ export default function Transfers() {
     const s = new Set<TransferFilter>(['all']);
     if (u.kind === 'live') {
       const r = u.row;
-      if (r.displayState === 'waiting') s.add('waiting');
+      // D1: both parked shapes belong in the Waiting chip — the countdown one and
+      // the peer-absent one.
+      if (r.displayState === 'waiting' || r.displayState === 'waiting_peer') s.add('waiting');
       else if (r.terminal) {
         if (r.displayState === 'failed') s.add('failed');
         else if (r.displayState === 'cancelled') s.add('cancelled');
@@ -191,7 +193,9 @@ export default function Transfers() {
 
   // Shared 1s countdown tick — runs ONLY while a `waiting` row with a live
   // deadline is actually on screen (filtered view), and stops on filter change /
-  // unmount. No per-row timers, no leak.
+  // unmount. No per-row timers, no leak. A `waiting_peer` row never has a
+  // `stalledUntil` (D1: it waits for a signal, not an instant), so it can never
+  // start this ticker.
   const hasVisibleCountdown = filtered.some(
     (u) => u.kind === 'live' && u.row.displayState === 'waiting' && !!u.row.stalledUntil,
   );

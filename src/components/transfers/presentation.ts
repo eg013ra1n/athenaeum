@@ -167,6 +167,11 @@ export function displayStateChip(displayState: string): StateChip {
       return { label: 'uploaded', className: CHIP_ACCENT };
     case 'waiting':
       return { label: 'waiting', className: CHIP_NEUTRAL };
+    // D1: parked because the PEER is absent. Same neutral tone as `waiting` —
+    // this is not an error, the transfer resumes by itself — but its own label,
+    // because there is no countdown behind it to explain the wait.
+    case 'waiting_peer':
+      return { label: 'waiting for peer', className: CHIP_NEUTRAL };
     case 'confirmed':
       return { label: 'confirmed', className: CHIP_SUCCESS };
     case 'done':
@@ -185,6 +190,9 @@ export function displayStateChip(displayState: string): StateChip {
  *  provider finished serving, the receiver ack hasn't landed). */
 export function displayStateSubline(displayState: string): string | null {
   if (displayState === 'uploaded') return 'awaiting confirmation';
+  // D1: says WHY there is no countdown. The transfer resumes the moment the peer
+  // announces itself — which is a signal, not an instant we could name.
+  if (displayState === 'waiting_peer') return 'device unreachable — resumes when it is back';
   return null;
 }
 

@@ -1501,7 +1501,12 @@ fn outbound_summary(
 ) -> OutboundSummary {
     let (file_count, byte_size) = package_totals(Path::new(&row.package_ref));
     let peer_hex = node_id_hex(&row.peer);
-    let display_state = outbound_display_state(row.state, row.next_retry_at.as_deref(), now);
+    let display_state = outbound_display_state(
+        row.state,
+        row.next_retry_at.as_deref(),
+        row.last_error.as_deref(),
+        now,
+    );
     let stalled_until = if display_state == "waiting" {
         row.next_retry_at.clone()
     } else {

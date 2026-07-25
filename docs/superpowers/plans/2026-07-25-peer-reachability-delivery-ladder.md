@@ -904,7 +904,7 @@ git commit -m "feat(sync): presence beacon on the two reachability edges; gated 
 - Consumes: the `class` prefix already carried in `OutboundRow::last_error`.
 - Produces: no new type; `OutboundSummary.displayState` gains the value `"waiting_peer"`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 /// A package parked because its peer is absent must not render a countdown to an
@@ -918,12 +918,12 @@ fn a_peer_absent_row_reads_as_waiting_for_the_peer() {
 }
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [x] **Step 2: Run it and watch it fail**
 
 Run: `cargo test -q -p athenaeum-core --lib a_peer_absent_row_reads`
 Expected: FAIL — `display_state` is `"waiting"` with a `stalled_until`.
 
-- [ ] **Step 3: Implement the mapping**
+- [x] **Step 3: Implement the mapping**
 
 In `status.rs`, where `display_state`/`stalled_until` are derived, add the branch before the existing `waiting` case:
 
@@ -971,18 +971,18 @@ fn absent_prefixes_match_the_engine_classes() {
 }
 ```
 
-- [ ] **Step 4: Render it**
+- [x] **Step 4: Render it**
 
 In `src/components/transfers/TransferRow.tsx`, map `waiting_peer` to `waiting for {deviceName} — unreachable` (device name already available on the row; fall back to the short peer id). Use design tokens (`text-content-muted`), never raw colors.
 
-- [ ] **Step 5: Run the gates**
+- [x] **Step 5: Run the gates**
 
 ```bash
 cargo test -q -p athenaeum-core --lib sync::status
 npx tsc --noEmit
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/athenaeum-core/src/sync/status.rs src/components/transfers/TransferRow.tsx

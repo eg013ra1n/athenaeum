@@ -151,6 +151,7 @@ function stageProgress(
       return 0.05;
     case 'announced':
     case 'waiting':
+    case 'waiting_peer':
       return 0.08;
     case 'transferring':
     case 'fetching':
@@ -194,7 +195,10 @@ function LiveRowBody({
   const deviceLabel = row.deviceName ?? row.peerShort;
   const chip = displayStateChip(row.displayState);
   const subline = displayStateSubline(row.displayState);
-  const waiting = row.displayState === 'waiting';
+  // Both waiting shapes are "parked, not broken": the countdown one and the
+  // peer-absent one. Send now applies to both — a user staring at either wants to
+  // try immediately, and the backend kick is exactly that.
+  const waiting = row.displayState === 'waiting' || row.displayState === 'waiting_peer';
 
   const totalFiles = row.fileCounts.total || row.fileCount;
   const doneFiles = row.fileCounts.done;
