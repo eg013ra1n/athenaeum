@@ -836,6 +836,28 @@ lastError: string | null,
  */
 peerKind: string | null, };
 
+export type QueuedInboundSummary = { 
+/**
+ * Sending peer node id (hex), shortened for display — same `short_id` handle
+ * [`InboundSummary::peer_short`] carries.
+ */
+peerShort: string, 
+/**
+ * The sending peer's friendly device name, resolved from the cached
+ * `SYNC_DEVICE_NAMES` hex→name map (no hub round-trip). `None` when unknown.
+ */
+deviceName: string | null, 
+/**
+ * The durable per-transfer batch identity (Transfers Batch Model §D1) the
+ * inbound row WILL be keyed on once this announce is processed — so the ghost
+ * and the row it becomes share one key.
+ */
+batchUuid: string, 
+/**
+ * The human batch name from the announce, `None` for a v1/unnamed batch.
+ */
+batchName: string | null, frameCount: number, byteSize: number, };
+
 export type SyncSenderStatus = { 
 /**
  * Whether the sender engine has been lazily started this session.
@@ -877,6 +899,15 @@ started: boolean,
  * `sync_inbound` rows, Task 14). Empty when nothing is being received.
  */
 active: Array<InboundSummary>, 
+/**
+ * Announces routed to a peer's lane but not yet processed (variant B): the
+ * batches queued behind whatever that device is currently sending us. Empty
+ * when the receiver is not started. Never contains a batch that already
+ * appears in [`active`](Self::active) — the `queued_inbound_summaries` mapper
+ * in `api::sync` drops those (a sender re-announces the in-flight batch on
+ * every backoff rung, and a ghost must never sit next to its own live row).
+ */
+queued: Array<QueuedInboundSummary>, 
 /**
  * Total frames received (history rows with `direction = received`).
  */

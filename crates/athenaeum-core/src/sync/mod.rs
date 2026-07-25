@@ -97,14 +97,15 @@ pub use retention::{evaluate_and_apply, DeleteOutcome, RetentionOutcome, Retenti
 pub use receiver::{
     allow_all_peers, InboundControl, IncomingResolver, PeerAuthorizer, ProjectAnnounceGate,
     ProjectAnnouncementsRefresher, ProjectIngestedHook, ProjectReceiveHooks, ProjectRequestHandler,
-    ReceiveGate, ReceiverHooks, SyncFinishedEvent, SyncProgressEvent, SyncReceiver,
-    SyncReceiverHandle, SyncRuntime, DEFAULT_MAX_CONCURRENT_RECEIVES,
+    QueuedAnnounce, QueuedAnnounceEntry, ReceiveGate, ReceiverHooks, SyncFinishedEvent,
+    SyncProgressEvent, SyncReceiver, SyncReceiverHandle, SyncRuntime,
+    DEFAULT_MAX_CONCURRENT_RECEIVES,
 };
 pub use responder::{CatalogDedupResponder, DedupResponder};
 pub use sender::{StartedSender, SyncSenderRuntime};
 pub use status::{
-    InboundSummary, OutboundSummary, SyncReceiverStatus, SyncSenderStatus, SyncStatus,
-    TransferFileCounts, TransferFileEntry, TransportHealth,
+    InboundSummary, OutboundSummary, QueuedInboundSummary, SyncReceiverStatus, SyncSenderStatus,
+    SyncStatus, TransferFileCounts, TransferFileEntry, TransportHealth,
 };
 pub use store::{
     ensure_history_columns, insert_sync_source, live_sources_for_package, mark_sync_source_deleted,

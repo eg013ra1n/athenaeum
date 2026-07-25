@@ -39,10 +39,10 @@ use crate::sync::store::{
 };
 use crate::sync::{
     node_id_hex, pairing, CatalogSyncStore, Direction, HistoryQuery, HistoryRow, InboundRow,
-    InboundSummary, OutboundRow, OutboundState, OutboundSummary, RefusalRefresher, StartedSender,
-    SyncEngine, SyncEngineHandle, SyncReceiverStatus, SyncRuntime, SyncSenderRuntime,
-    SyncSenderStatus, SyncStatus, SyncStore, TransferFileCounts, TransferFileEntry,
-    TransportHealth, CANCELLED_BY_RECEIVER_DETAIL,
+    InboundSummary, OutboundRow, OutboundState, OutboundSummary, QueuedInboundSummary,
+    RefusalRefresher, StartedSender, SyncEngine, SyncEngineHandle, SyncReceiverStatus, SyncRuntime,
+    SyncSenderRuntime, SyncSenderStatus, SyncStatus, SyncStore, TransferFileCounts,
+    TransferFileEntry, TransportHealth, CANCELLED_BY_RECEIVER_DETAIL,
 };
 
 /// Request filter for [`list_history`] (mirrors [`HistoryQuery`] over the
@@ -1849,6 +1849,65 @@ fn active_inbound_summaries(ctx: &ServiceContext) -> Result<Vec<InboundSummary>,
         .collect())
 }
 
+/// The receive-side GHOST rows (variant B): announces the router handed to a
+/// peer's lane that the lane has not started processing yet, mapped for display.
+///
+/// A device that sends a second batch while the first is still fetching gets no
+/// `sync_inbound` row for it until its lane drains — so without this the receiver
+/// shows nothing at all for a batch that has, in fact, arrived and is waiting. The
+/// live [`InboundControl`](crate::sync::InboundControl) map is the only record of
+/// it; no receiver started ⇒ no map ⇒ an empty vec (never an error).
+///
+/// **Duplicate rule.** A queued entry whose `batch_uuid` already appears among
+/// `active` is DROPPED. The sender re-announces on every backoff rung while it
+/// waits for an ack, so the batch currently being fetched re-queues on its own
+/// lane behind itself — surfacing that would render a ghost next to the live row
+/// for the same transfer, and the Transfers UI keys rows on `batchUuid`, so it
+/// would be a literal duplicate key. The comparison is on `batch_uuid` alone
+/// (not `(peer, batch_uuid)`): that is the identity the UI keys on, and it is
+/// sender-minted-uuid unique in practice. In-memory against the rows this same
+/// `get_status` already fetched — no extra query.
+///
+/// Named limit, not a bug: `active` holds only NON-terminal rows, so a re-announce
+/// of an already-terminal batch (a declined/failed transfer the sender is
+/// retrying) can ghost alongside the terminal row the frontend merges in from
+/// [`list_terminal_transfers`]. It resolves itself the moment that lane picks the
+/// announce up and resets the row.
+fn queued_inbound_summaries(
+    ctx: &ServiceContext,
+    control: Option<&crate::sync::InboundControl>,
+    active: &[InboundSummary],
+) -> Result<Vec<QueuedInboundSummary>, ApiError> {
+    let Some(control) = control else {
+        return Ok(Vec::new());
+    };
+    let entries = control.queued_announces_snapshot();
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let live: HashSet<&str> = active.iter().map(|r| r.batch_uuid.as_str()).collect();
+    let device_names = {
+        let db = db(ctx)?;
+        let conn = db.conn();
+        cached_device_names(&conn)
+    };
+    Ok(entries
+        .into_iter()
+        .filter(|e| !live.contains(e.batch_uuid.as_str()))
+        .map(|e| {
+            let hex = node_id_hex(&e.peer);
+            QueuedInboundSummary {
+                peer_short: short_id(&hex),
+                device_name: device_names.get(&hex).cloned(),
+                batch_uuid: e.batch_uuid,
+                batch_name: e.queued.batch_name,
+                frame_count: e.queued.frame_count,
+                byte_size: e.queued.byte_size,
+            }
+        })
+        .collect())
+}
+
 /// Transport-reachability health for the status poll (Task 3.3), resolved with
 /// NO network I/O and WITHOUT ever binding a node — a status poll must never spin
 /// up the transport just to report on it.
@@ -1889,6 +1948,12 @@ pub async fn get_status(
     let pairing_ticket = sync.ticket().await;
     let sender_status = build_sender_status(ctx, sender).await?;
     let active_inbound = active_inbound_summaries(ctx)?;
+    // Variant B: the announces sitting in a peer's lane queue with no row of their
+    // own yet. Read from the RUNNING receiver's control (None before start ⇒ empty)
+    // and de-duplicated against the active rows just fetched.
+    let inbound_control = sync.inbound_control().await;
+    let queued_inbound =
+        queued_inbound_summaries(ctx, inbound_control.as_deref(), &active_inbound)?;
     let transport = derive_transport_health(ctx).await?;
 
     Ok(SyncStatus {
@@ -1900,6 +1965,7 @@ pub async fn get_status(
         receiver: SyncReceiverStatus {
             started: transport_started,
             active: active_inbound,
+            queued: queued_inbound,
             received_total,
         },
         transport,
@@ -5319,6 +5385,87 @@ mod tests {
         let empty: HashMap<String, String> = HashMap::new();
         let s = inbound_summary(row(None), &names, &empty, &counts);
         assert_eq!(s.peer_kind, None, "neither stamp nor cache → None");
+    }
+
+    /// Variant B at the command boundary: the status poll surfaces the announces
+    /// queued on a busy peer's lane — and NEVER one that already has a live row.
+    ///
+    /// The sender re-announces on every backoff rung while it waits for an ack, so
+    /// the batch currently being fetched keeps re-queueing on its own lane behind
+    /// itself. Surfacing that would put a ghost next to the live row for the SAME
+    /// transfer, under the same `batchUuid` the Transfers UI keys rows on. The
+    /// genuinely-queued sibling — no row anywhere — is the one that must show up.
+    #[tokio::test]
+    async fn get_status_surfaces_queued_inbound_and_drops_row_duplicates() {
+        use crate::sync::store::{upsert_inbound_attempt, CatalogSyncStore};
+
+        let (tmp, ctx) = test_ctx();
+        let (_ep, runtime) = started_loopback_runtime(&tmp).await;
+        let sender = SyncSenderRuntime::new();
+
+        let peer_bytes: NodeId = [0xcc; 32];
+        let peer = node_id_hex(&peer_bytes);
+
+        // The transfer this device is fetching right now: a live, non-terminal row.
+        let (_sync_dir, db_path) = sync_paths(&ctx).unwrap();
+        {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            let conn = store.lock_conn();
+            upsert_inbound_attempt(&conn, &peer, "batch-live", "wire-live", 2, 100).unwrap();
+        }
+
+        let control = runtime
+            .inbound_control()
+            .await
+            .expect("a started runtime exposes its inbound control");
+        // Its own re-announce, queued behind itself on the peer's lane…
+        control.note_queued_announce(peer_bytes, "batch-live", Some("Live Batch".into()), 2, 100);
+        // …and the sibling that genuinely has nowhere else to be seen.
+        control.note_queued_announce(peer_bytes, "batch-next", Some("Next Batch".into()), 5, 500);
+
+        let status = get_status(&ctx, &runtime, &sender).await.unwrap();
+
+        assert!(
+            status
+                .receiver
+                .active
+                .iter()
+                .any(|r| r.batch_uuid == "batch-live"),
+            "the live row is where it always was"
+        );
+        assert_eq!(
+            status.receiver.queued.len(),
+            1,
+            "the re-announce of the batch that already has a row is dropped, got: {:?}",
+            status
+                .receiver
+                .queued
+                .iter()
+                .map(|q| q.batch_uuid.as_str())
+                .collect::<Vec<_>>()
+        );
+        let ghost = &status.receiver.queued[0];
+        assert_eq!(ghost.batch_uuid, "batch-next");
+        assert_eq!(ghost.batch_name.as_deref(), Some("Next Batch"));
+        assert_eq!(ghost.frame_count, 5);
+        assert_eq!(ghost.byte_size, 500);
+        assert_eq!(
+            ghost.peer_short,
+            short_id(&peer),
+            "the ghost carries the same short peer handle a real row would"
+        );
+        assert_eq!(
+            ghost.device_name, None,
+            "no cached device name for this peer — resolution is attempted, not invented"
+        );
+
+        // No receiver started ⇒ no lane queue to report on. Not an error, just empty.
+        let unstarted = SyncRuntime::new();
+        let status = get_status(&ctx, &unstarted, &sender).await.unwrap();
+        assert!(
+            status.receiver.queued.is_empty(),
+            "an unstarted receiver has no queued announces"
+        );
     }
 
     /// Dead-peer delete (tv2 blocker fix): a SENT batch whose only non-terminal

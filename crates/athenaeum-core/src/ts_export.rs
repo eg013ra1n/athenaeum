@@ -153,6 +153,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::sync::status::TransferFileCounts,
             crate::sync::status::OutboundSummary,
             crate::sync::status::InboundSummary,
+            crate::sync::status::QueuedInboundSummary,
             crate::sync::status::SyncSenderStatus,
             crate::sync::status::SyncReceiverStatus,
             crate::sync::status::TransportHealth,

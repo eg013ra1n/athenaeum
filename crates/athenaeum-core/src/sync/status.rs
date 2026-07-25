@@ -301,6 +301,38 @@ pub struct SyncSenderStatus {
     pub active: Vec<OutboundSummary>,
 }
 
+/// One announce QUEUED on a peer's receive lane but not yet processed (variant
+/// B) — a batch that exists only in memory, since the receiver writes no
+/// `sync_inbound` row until its lane picks the announce up.
+///
+/// The receive side runs one transfer per peer at a time, so a device that sends
+/// a second batch while the first is still fetching would otherwise show NOTHING
+/// on the receiver until the first finishes. This is the ghost row that says
+/// "queued behind the current transfer from this device" instead.
+///
+/// Deliberately NOT an [`InboundSummary`]: it has no durable row id, no state, no
+/// per-file counts and no progress — there is nothing to cancel, expand or resume
+/// yet. Giving it the real summary's shape would invite the UI to treat it as a
+/// real row. Everything here comes off the wire announce.
+#[derive(Debug, Clone, Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedInboundSummary {
+    /// Sending peer node id (hex), shortened for display — same `short_id` handle
+    /// [`InboundSummary::peer_short`] carries.
+    pub peer_short: String,
+    /// The sending peer's friendly device name, resolved from the cached
+    /// `SYNC_DEVICE_NAMES` hex→name map (no hub round-trip). `None` when unknown.
+    pub device_name: Option<String>,
+    /// The durable per-transfer batch identity (Transfers Batch Model §D1) the
+    /// inbound row WILL be keyed on once this announce is processed — so the ghost
+    /// and the row it becomes share one key.
+    pub batch_uuid: String,
+    /// The human batch name from the announce, `None` for a v1/unnamed batch.
+    pub batch_name: Option<String>,
+    pub frame_count: u32,
+    pub byte_size: u64,
+}
+
 /// Receive-side rollup for the down arrow + Active tab.
 #[derive(Debug, Clone, Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -310,6 +342,13 @@ pub struct SyncReceiverStatus {
     /// The in-flight inbound rows for the receive-side Active tab (non-terminal
     /// `sync_inbound` rows, Task 14). Empty when nothing is being received.
     pub active: Vec<InboundSummary>,
+    /// Announces routed to a peer's lane but not yet processed (variant B): the
+    /// batches queued behind whatever that device is currently sending us. Empty
+    /// when the receiver is not started. Never contains a batch that already
+    /// appears in [`active`](Self::active) — the `queued_inbound_summaries` mapper
+    /// in `api::sync` drops those (a sender re-announces the in-flight batch on
+    /// every backoff rung, and a ghost must never sit next to its own live row).
+    pub queued: Vec<QueuedInboundSummary>,
     /// Total frames received (history rows with `direction = received`).
     pub received_total: u32,
 }

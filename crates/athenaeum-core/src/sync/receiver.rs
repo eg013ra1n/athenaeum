@@ -462,14 +462,52 @@ fn apply_receive_limit(control: &InboundControl, configured: Option<usize>) {
 /// shares the control's lifetime and reach — one instance per started receiver,
 /// already threaded to both the receive loop and the command layer, which is
 /// exactly what "resize without restarting the receiver" needs.
+///
+/// `queued_announces` (variant B) is a fourth: the announces that have been ROUTED
+/// to a peer's lane but not yet processed — see [`note_queued_announce`].
+///
+/// [`note_queued_announce`]: Self::note_queued_announce
 pub struct InboundControl {
     cancels: std::sync::Mutex<std::collections::HashSet<String>>,
     revoke_aborts: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Announces sitting in a peer's lane queue, keyed `(peer, batch_uuid)` — the
+    /// ONLY evidence a second batch from a busy device exists at all, since no
+    /// `sync_inbound` row is written until its lane picks the announce up. See
+    /// [`note_queued_announce`](Self::note_queued_announce) for the whole contract.
+    queued_announces: std::sync::Mutex<HashMap<(NodeId, String), QueuedAnnounce>>,
     notify: tokio::sync::Notify,
     /// Concurrency gate for the fetch+ingest phase — see [`ReceiveGate`]. Public
     /// because the receive lanes acquire it directly and the settings command
     /// layer resizes it; it carries no cross-field invariant with the cancel sets.
     pub receive_gate: ReceiveGate,
+}
+
+/// One announce parked in a peer's lane queue: everything a "queued behind the
+/// current transfer" ghost row needs, captured off the wire announce at ROUTING
+/// time (there is no `sync_inbound` row to read it from yet — that is the whole
+/// point). Purely in-memory and per-process: a restart drops the lot, which is
+/// correct, since a restart also drops the lane queue these describe.
+#[derive(Debug, Clone)]
+pub struct QueuedAnnounce {
+    /// The human batch name from a v2/v3 announce, `None` for a v1/unnamed batch —
+    /// the same normalization `handle_announce` applies to `display_name`.
+    pub batch_name: Option<String>,
+    pub frame_count: u32,
+    pub byte_size: u64,
+    /// When this batch FIRST queued, RFC3339 (`now_iso`). Not refreshed by a
+    /// re-announce of the same key: the ghost dates from when the batch started
+    /// waiting, not from the sender's latest retry rung.
+    pub first_seen: String,
+}
+
+/// One entry of [`InboundControl::queued_announces_snapshot`]: the map key
+/// (`peer` + `batch_uuid`) rejoined with its [`QueuedAnnounce`], so a caller can
+/// resolve the peer's device name without reaching back into the map.
+#[derive(Debug, Clone)]
+pub struct QueuedAnnounceEntry {
+    pub peer: NodeId,
+    pub batch_uuid: String,
+    pub queued: QueuedAnnounce,
 }
 
 /// Hand-written rather than derived: `receive_gate` defaults to
@@ -481,6 +519,7 @@ impl Default for InboundControl {
         Self {
             cancels: Default::default(),
             revoke_aborts: Default::default(),
+            queued_announces: Default::default(),
             notify: Default::default(),
             receive_gate: ReceiveGate::new(DEFAULT_MAX_CONCURRENT_RECEIVES),
         }
@@ -548,6 +587,87 @@ impl InboundControl {
             .lock()
             .expect("inbound revoke_aborts mutex poisoned")
             .remove(package_id);
+    }
+
+    /// Record that `batch_uuid` from `peer` has been ROUTED to that peer's lane but
+    /// not yet processed (variant B). Called from the receiver's lane ROUTER, the
+    /// one place that sees an announce before the lane does.
+    ///
+    /// WHY this exists: the receiver processes one peer's events serially, so a
+    /// second batch announced while the first is still fetching sits in the lane
+    /// channel with `upsert_inbound_attempt` un-run — NO `sync_inbound` row, and so
+    /// nothing at all in the receive-side UI. This map is the only place that batch
+    /// is visible, and [`queued_announces_snapshot`](Self::queued_announces_snapshot)
+    /// is what turns it into a "queued behind the current transfer" ghost row.
+    ///
+    /// INSERT-IF-ABSENT, keyed `(peer, batch_uuid)`: a sender re-announces on every
+    /// backoff rung while it waits for an ack, so the same batch arrives repeatedly
+    /// with a fresh wire `package_id` each time. The durable batch identity is the
+    /// key precisely so those collapse into ONE entry — and the first insert's
+    /// [`first_seen`](QueuedAnnounce::first_seen) survives, so the ghost dates from
+    /// when the batch started waiting rather than from the latest retry.
+    ///
+    /// Deliberately NOT gated on the peer authorizer here: the lane arm clears the
+    /// entry at its very top, BEFORE its authorization gate, so an unauthorized
+    /// peer's announce is removed on the same pass that drops it. The only window
+    /// where an unauthorized announce could be visible is a peer that loses
+    /// authorization mid-transfer while its own lane is still busy — bounded by that
+    /// lane's next event, and not worth a second (side-effecting, refusal-refresh-
+    /// kicking) authorizer call per announce in the router.
+    pub fn note_queued_announce(
+        &self,
+        peer: NodeId,
+        batch_uuid: &str,
+        batch_name: Option<String>,
+        frame_count: u32,
+        byte_size: u64,
+    ) {
+        self.queued_announces
+            .lock()
+            .expect("inbound queued_announces mutex poisoned")
+            .entry((peer, batch_uuid.to_string()))
+            .or_insert_with(|| QueuedAnnounce {
+                batch_name,
+                frame_count,
+                byte_size,
+                first_seen: super::now_iso(),
+            });
+    }
+
+    /// Drop `(peer, batch_uuid)`'s queued entry because its lane has STARTED
+    /// processing that announce (called at the very top of the lane's
+    /// `AnnounceReceived` arm, before any gate — so every way out of that arm
+    /// removes it exactly once).
+    ///
+    /// Entries cannot leak in steady state: every announce the router inserts is
+    /// also routed, lanes drain in order, and a lane whose task panicked is re-minted
+    /// with the event RESENT (`route_to_lane`). The one honest edge: if the announce
+    /// event is itself the one that PANICS its lane mid-handling, its entry lingers —
+    /// until the sender's next re-announce of the same batch re-inserts under the
+    /// same key and that one processes. Bounded and self-healing, never unbounded
+    /// growth.
+    pub fn clear_queued_announce(&self, peer: &NodeId, batch_uuid: &str) {
+        self.queued_announces
+            .lock()
+            .expect("inbound queued_announces mutex poisoned")
+            .remove(&(*peer, batch_uuid.to_string()));
+    }
+
+    /// Every announce currently parked in a lane queue (order unspecified — a
+    /// `HashMap` iteration). Read by the status poll to build the receive-side
+    /// ghost rows; cheap enough for a 10-second poll (one mutex, a handful of
+    /// entries at most).
+    pub fn queued_announces_snapshot(&self) -> Vec<QueuedAnnounceEntry> {
+        self.queued_announces
+            .lock()
+            .expect("inbound queued_announces mutex poisoned")
+            .iter()
+            .map(|((peer, batch_uuid), queued)| QueuedAnnounceEntry {
+                peer: *peer,
+                batch_uuid: batch_uuid.clone(),
+                queued: queued.clone(),
+            })
+            .collect()
     }
 
     /// A future that resolves the next time [`request_cancel`](Self::request_cancel)
@@ -760,6 +880,33 @@ impl SyncReceiver {
                     continue;
                 };
 
+                // Variant B: an announce is about to go into a lane that may
+                // already be busy with an earlier transfer from the same peer, in
+                // which case it will sit in that channel with NO `sync_inbound`
+                // row — invisible to the receive-side UI until the lane drains.
+                // The router is the only component that sees the announce before
+                // the lane does, so it is the only place this can be recorded.
+                // The lane clears the entry the moment it starts processing it.
+                //
+                // `AnnounceReceived` ONLY, deliberately: this feeds the PERSONAL
+                // transfers list. `ProjectAnnounceReceived` is the collab-exchange
+                // path with its own rows and its own surface — out of scope here.
+                if let TransportEvent::AnnounceReceived {
+                    announce,
+                    batch_name,
+                    batch_uuid,
+                    ..
+                } = &ev
+                {
+                    deps.control.note_queued_announce(
+                        from,
+                        batch_uuid,
+                        batch_name.clone().filter(|n| !n.trim().is_empty()),
+                        announce.frame_count,
+                        announce.byte_size,
+                    );
+                }
+
                 route_to_lane(&mut lanes, from, ev, || {
                     let (tx, rx) = mpsc::unbounded_channel::<TransportEvent>();
                     lane_tasks.spawn(run_peer_lane(rx, deps.clone()));
@@ -957,6 +1104,15 @@ async fn process_receiver_event(ev: TransportEvent, deps: &ReceiverLaneDeps) {
             batch_uuid,
             files,
         } => {
+            // Variant B: this announce has LEFT the lane queue — it is
+            // being processed right now, so it must stop rendering as a
+            // ghost row (the durable `sync_inbound` row the rest of this
+            // arm writes takes over). Cleared at the VERY TOP, before the
+            // authorization gate and before every other early return
+            // (unsafe package id, pure-replay), so exactly one point
+            // covers every way out of this arm — a per-branch clear would
+            // be one `return` away from a permanent ghost.
+            control.clear_queued_announce(&from, &batch_uuid);
             // Authorization gate (finding H1): only ingest from a peer
             // on this receiver's allow-list. An unauthorized (or
             // revoked) node is silently dropped BEFORE any
@@ -7652,6 +7808,216 @@ mod tests {
 
         // And A finishes normally on its own lane afterwards.
         poll_inbound(&store, &wire_a, InboundState::Done).await;
+
+        handle.shutdown().await;
+    }
+
+    /// Variant B, control-level: the queued-announce map collapses a sender's
+    /// re-announces into ONE entry per `(peer, batch_uuid)` and forgets it when the
+    /// lane starts processing it.
+    ///
+    /// The dedupe is not cosmetic: a sender re-announces the same batch on every
+    /// backoff rung while it waits for an ack, each time under a FRESH wire
+    /// `package_id`. Keying on the wire id would grow one ghost row per retry for a
+    /// single waiting batch. Insert-if-absent on the durable batch identity also
+    /// keeps `first_seen` at the moment the batch started waiting rather than
+    /// letting the latest retry reset it.
+    #[test]
+    fn queued_announce_map_dedupes_reannounces_and_clears_on_process() {
+        let control = InboundControl::new();
+        let peer: NodeId = [9u8; 32];
+        let other: NodeId = [8u8; 32];
+
+        control.note_queued_announce(peer, "batch-1", Some("First Batch".into()), 3, 300);
+        let first_seen = control.queued_announces_snapshot()[0]
+            .queued
+            .first_seen
+            .clone();
+
+        // The SAME batch announced again (next backoff rung, new wire id, and — to
+        // make the assertion unambiguous — different figures).
+        control.note_queued_announce(peer, "batch-1", Some("First Batch (retry)".into()), 9, 900);
+        let snap = control.queued_announces_snapshot();
+        assert_eq!(
+            snap.len(),
+            1,
+            "a re-announce of a queued batch is the SAME queued batch, not a second one"
+        );
+        assert_eq!(
+            snap[0].queued.batch_name.as_deref(),
+            Some("First Batch"),
+            "insert-if-absent: the first announce's payload is kept, not overwritten"
+        );
+        assert_eq!(snap[0].queued.frame_count, 3);
+        assert_eq!(snap[0].queued.byte_size, 300);
+        assert_eq!(
+            snap[0].queued.first_seen, first_seen,
+            "the ghost dates from when the batch started waiting, not from the latest retry"
+        );
+
+        // The key is the PAIR: another batch from the same peer, and the same batch
+        // uuid from a different peer, are both entries of their own.
+        control.note_queued_announce(peer, "batch-2", None, 1, 10);
+        control.note_queued_announce(other, "batch-1", None, 1, 10);
+        assert_eq!(control.queued_announces_snapshot().len(), 3);
+
+        // Its lane picked it up ⇒ the durable row takes over and the ghost goes.
+        control.clear_queued_announce(&peer, "batch-1");
+        let after: Vec<(NodeId, String)> = control
+            .queued_announces_snapshot()
+            .into_iter()
+            .map(|e| (e.peer, e.batch_uuid))
+            .collect();
+        assert_eq!(after.len(), 2, "clear removes exactly the one key");
+        assert!(!after.contains(&(peer, "batch-1".to_string())));
+        assert!(after.contains(&(peer, "batch-2".to_string())));
+        assert!(
+            after.contains(&(other, "batch-1".to_string())),
+            "another peer's identically-named batch is untouched"
+        );
+
+        // Clearing a key that is not there is a no-op, never a panic — the lane arm
+        // clears unconditionally, including for announces that were never queued
+        // (a lane that was idle when the event arrived).
+        control.clear_queued_announce(&peer, "batch-1");
+        assert_eq!(control.queued_announces_snapshot().len(), 2);
+    }
+
+    /// The headline of variant B: while ONE peer's lane is busy fetching batch 1,
+    /// that peer's batch 2 — announced, routed, and sitting in the lane channel with
+    /// no `sync_inbound` row of its own — is visible in the control's queued map.
+    ///
+    /// This is the gap the feature exists to close: `upsert_inbound_attempt` has not
+    /// run for batch 2, so the durable state says nothing at all about it and the
+    /// receive-side UI shows nothing. The ROUTER is the only component that sees the
+    /// announce before the lane does, which is why the insert lives there.
+    ///
+    /// Same pacing mechanics as `two_peers_get_independent_lanes`: the loopback
+    /// `fetch` latches `delay_per_read` ONCE at entry, so arming the fault before
+    /// batch 1's announce and clearing it after batch 1 is observably `Fetching`
+    /// paces batch 1 only — batch 2 still fetches at full speed once its turn comes.
+    #[tokio::test]
+    async fn router_tracks_a_queued_announce_while_the_lane_is_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        // ONE sender: both batches must land on the SAME lane, or nothing queues.
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        let sender_node: NodeId = sender.node_id();
+        sender.start().await.unwrap();
+
+        // 3 payloads + the manifest ⇒ 4 paced reads ⇒ a ~2.8s fetch for batch 1.
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+        receiver_ep.set_fault(FaultPlan {
+            delay_per_read: Some(DELAY),
+            ..Default::default()
+        });
+
+        let control = Arc::new(InboundControl::new());
+        let (_info, handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            {
+                let incoming = incoming.clone();
+                Arc::new(move || incoming.clone()) as IncomingResolver
+            },
+            allow_all_peers(),
+            Default::default(),
+            Arc::clone(&control),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        let (dir_1, ann_1, files_1) = build_lane_fixture(tmp.path(), "busy", 3);
+        let wire_1 = ann_1.package_id.0.clone();
+        sender.serve(&ann_1, &dir_1, None).await.unwrap();
+        sender
+            .announce(receiver_node, &ann_1, "Busy Batch", "batch-busy", &files_1)
+            .await
+            .unwrap();
+        poll_inbound(&store, &wire_1, InboundState::Fetching).await;
+
+        // Batch 1 is under way with its pacing latched; batch 2 gets a full-speed
+        // fetch whenever the lane eventually reaches it.
+        receiver_ep.set_fault(FaultPlan::default());
+
+        let (dir_2, ann_2, files_2) = build_lane_fixture(tmp.path(), "queued", 1);
+        let wire_2 = ann_2.package_id.0.clone();
+        sender.serve(&ann_2, &dir_2, None).await.unwrap();
+        sender
+            .announce(
+                receiver_node,
+                &ann_2,
+                "Queued Batch",
+                "batch-queued",
+                &files_2,
+            )
+            .await
+            .unwrap();
+
+        // Comfortably inside batch 1's ~2.8s paced fetch.
+        let deadline = std::time::Duration::from_millis(2000);
+        let started = std::time::Instant::now();
+        let mut seen = None;
+        while started.elapsed() < deadline {
+            if let Some(entry) = control
+                .queued_announces_snapshot()
+                .into_iter()
+                .find(|e| e.batch_uuid == "batch-queued")
+            {
+                seen = Some(entry);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let entry = seen.unwrap_or_else(|| {
+            panic!(
+                "the second batch never showed up as QUEUED within {deadline:?} — \
+                 it is invisible while the lane is busy, which is the whole gap"
+            )
+        });
+        assert_eq!(entry.peer, sender_node, "the ghost names its sending peer");
+        assert_eq!(entry.queued.batch_name.as_deref(), Some("Queued Batch"));
+        assert_eq!(entry.queued.frame_count, ann_2.frame_count);
+        assert_eq!(entry.queued.byte_size, ann_2.byte_size);
+
+        // The other half of the proof, both directions at once: batch 1 really was
+        // mid-fetch (so the queueing is genuine) AND batch 2 has no durable row at
+        // all (so the map is the only thing that knows it exists).
+        {
+            let conn = store.lock_conn();
+            assert_eq!(
+                get_inbound(&conn, &wire_1).unwrap().map(|r| r.state),
+                Some(InboundState::Fetching),
+                "batch 1 must still be fetching — otherwise nothing was queued behind it"
+            );
+            assert!(
+                get_inbound(&conn, &wire_2).unwrap().is_none(),
+                "a queued announce has NO sync_inbound row yet — that is the gap being closed"
+            );
+        }
+        assert_eq!(
+            control.queued_announces_snapshot().len(),
+            1,
+            "only the queued batch is tracked; batch 1 cleared when its lane took it"
+        );
+
+        // Once the lane drains both, nothing is queued any more.
+        poll_inbound(&store, &wire_1, InboundState::Done).await;
+        poll_inbound(&store, &wire_2, InboundState::Done).await;
+        assert!(
+            control.queued_announces_snapshot().is_empty(),
+            "processing an announce removes its ghost — the durable row has taken over"
+        );
 
         handle.shutdown().await;
     }
