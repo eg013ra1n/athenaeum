@@ -670,9 +670,20 @@ impl SyncReceiver {
 /// as a perpetual in-progress transfer in [`inbound_active`](super::store::inbound_active)
 /// with no recorded reason) until a later re-announce happens to self-heal it
 /// (reviewer finding, Task 11 follow-up).
-/// Startup reconcile (zombie-inbound fix): stamp every non-terminal
-/// `sync_inbound` row (`announced`/`fetching`/`ingesting`) `Failed` with
-/// `"interrupted by restart"`.
+/// Startup reconcile (zombie-inbound fix): park every non-terminal
+/// `sync_inbound` row (`announced`/`fetching`/`ingesting`)
+/// [`Waiting`](InboundState::Waiting) with `"interrupted by restart"`.
+///
+/// D2 §4 changed this from `Failed`: the ATTEMPT could not survive the restart,
+/// but the TRANSFER is untouched — the sender is still obliged to deliver it and
+/// the next announce revives this same row — so the honest state is outstanding,
+/// not lost. Two consequences follow. The row's per-file rows are LEFT ALONE
+/// (§3.3): they are the resume checkpoint and the file counter's evidence, and
+/// settling them `failed` would throw away the record of what already arrived. And
+/// a row that is ALREADY `Waiting` is skipped: being non-terminal it returns from
+/// [`inbound_active`] on every launch, so re-stamping it would overwrite the
+/// reason a vanished peer left behind with `"interrupted by restart"` at the first
+/// restart.
 ///
 /// A fetch/ingest is in-memory and cannot survive the process it ran in, so any
 /// such row left on disk by a prior receiver is a zombie: the sender that owned
@@ -687,14 +698,14 @@ impl SyncReceiver {
 /// the `declined_at` axis, which this fn never writes (Decline Finality Axis
 /// §D3, pinned by `decline_survives_restart_reconcile_and_refuses_resend`).
 ///
-/// Receipt-log repair (Transfers smoke №8, item 4): before stamping a row
-/// `failed`, if it ALREADY holds a full receipt set under its wire id
+/// Receipt-log repair (Transfers smoke №8, item 4) still runs FIRST and is
+/// unchanged: if a row ALREADY holds a full receipt set under its wire id
 /// (`count_satisfied_receipts == frame_count > 0`), it reached a real terminal
 /// before the restart and its non-terminal `state` is only the residue of a
 /// mid-transfer duplicate announce's `upsert` reset. Such a row is stamped the
 /// HONEST terminal from its receipts (all-`Cancelled` → `Cancelled` + a
-/// `declined_at` repair; else `Done`) rather than a misleading `failed`, healing
-/// the field-stuck row on the next launch.
+/// `declined_at` repair; else `Done`) — and, being genuinely terminal, it DOES
+/// settle its per-file rows. Only the fallback below changed.
 ///
 /// Best-effort: a failed enumeration or per-row write warns and never blocks
 /// receiver startup.
@@ -710,6 +721,14 @@ fn reconcile_stale_inbound(store: &CatalogSyncStore) {
     let mut count: u32 = 0;
     let mut repaired: u32 = 0;
     for row in stale {
+        // D2 §4: a `Waiting` row is already parked with an honest reason, and being
+        // non-terminal it returns from `inbound_active` on EVERY launch. Re-stamping
+        // it would replace that reason with "interrupted by restart", so the first
+        // restart after a peer vanishes would erase the very thing this state
+        // records. Its per-file rows stay as the resume checkpoint too.
+        if row.state == InboundState::Waiting {
+            continue;
+        }
         // Receipt-log repair (Transfers smoke №8, item 4): a stale non-terminal row
         // that ALREADY holds a full receipt set under its wire id reached a real
         // terminal before the restart — its `state` was only left non-terminal by a
@@ -767,7 +786,7 @@ fn reconcile_stale_inbound(store: &CatalogSyncStore) {
         match set_inbound_state(
             &conn,
             &row.package_id,
-            InboundState::Failed,
+            InboundState::Waiting,
             Some("interrupted by restart"),
         ) {
             Ok(()) => count += 1,
@@ -777,28 +796,15 @@ fn reconcile_stale_inbound(store: &CatalogSyncStore) {
                 "inbound startup reconcile write failed"
             ),
         }
-        // Settle this row's un-settled per-file rows too (Transfers Status Model v2
-        // §D4): a later re-announce refreshes them back to `announced` via
-        // `record_inbound_manifest`. Best-effort.
-        if let Err(e) = settle_unsettled_inbound_files(
-            &conn,
-            row.id,
-            InboundFileState::Failed,
-            None,
-            Some("interrupted by restart"),
-        ) {
-            tracing::warn!(
-                inbound_id = row.id,
-                error = %format!("{e:#}"),
-                "inbound startup reconcile file-row settle failed"
-            );
-        }
+        // D2 §3.3: NO per-file settle here. The rows record what actually arrived
+        // before the restart, so they are this attempt's resume checkpoint and the
+        // file counter's evidence; a later re-announce refreshes them back to
+        // `announced` via `record_inbound_manifest` when the next attempt really
+        // starts. Settling them `failed` for a transfer that is merely outstanding
+        // would report zero received files for a batch we are still holding.
     }
     if count > 0 {
-        tracing::info!(
-            count,
-            "stale inbound rows reconciled to failed after restart"
-        );
+        tracing::info!(count, "stale inbound rows parked waiting after restart");
     }
     if repaired > 0 {
         tracing::info!(
@@ -2853,14 +2859,16 @@ mod tests {
         );
     }
 
-    /// Zombie-inbound fix (Part 2): on startup the receiver reconciles every
-    /// non-terminal `sync_inbound` row (announced/fetching/ingesting) to `failed`
-    /// with `"interrupted by restart"` — a fetch cannot survive a restart, so a
-    /// row left mid-fetch by a prior process is a zombie that would otherwise show
-    /// as a perpetual in-progress transfer. A `cancelled` row is terminal and left
-    /// untouched. This is what retro-cleans a field zombie on the next app launch.
+    /// Zombie-inbound fix (Part 2), as revised by D2 §4: on startup the receiver
+    /// reconciles every non-terminal `sync_inbound` row (announced/fetching/
+    /// ingesting) to `waiting` with `"interrupted by restart"` — a fetch cannot
+    /// survive a restart, so a row left mid-fetch by a prior process is a stale
+    /// attempt that would otherwise show as a perpetual in-progress transfer. It is
+    /// `Waiting` rather than `Failed` because the transfer itself is untouched: the
+    /// sender is still obliged to deliver it, and the next announce revives this
+    /// same row. A `cancelled` row is terminal and left untouched.
     #[tokio::test]
-    async fn startup_reconciles_stale_inbound_rows_to_failed() {
+    async fn startup_reconciles_stale_inbound_rows_to_waiting() {
         let tmp = tempfile::tempdir().unwrap();
         let staging_root = tmp.path().join("stage");
         let store = Arc::new(CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap());
@@ -2902,28 +2910,29 @@ mod tests {
         .unwrap();
 
         let conn = store.lock_conn();
-        // The stuck fetching row is now failed with the restart reason, terminal
-        // (finished_at stamped), and gone from the active set.
+        // The stuck fetching row is now parked waiting with the restart reason —
+        // non-terminal (no finished_at), and STILL active, because the transfer is
+        // still outstanding and the sender's next announce revives this same row.
         let fetching = get_inbound(&conn, "pkg-fetching").unwrap().unwrap();
         assert_eq!(
             fetching.state,
-            InboundState::Failed,
-            "a stale fetching row is reconciled to failed"
+            InboundState::Waiting,
+            "a stale fetching row is parked, not failed — the sender still owes it"
         );
         assert_eq!(
             fetching.last_error.as_deref(),
             Some("interrupted by restart")
         );
         assert!(
-            fetching.finished_at.is_some(),
-            "a terminal failed row stamps finished_at"
+            fetching.finished_at.is_none(),
+            "a waiting row is non-terminal and stamps no finished_at"
         );
         assert!(
-            !inbound_active(&conn)
+            inbound_active(&conn)
                 .unwrap()
                 .iter()
                 .any(|r| r.package_id == "pkg-fetching"),
-            "the reconciled row is no longer active"
+            "the parked row stays in the active set, visible without an event"
         );
 
         // The cancelled row is terminal and completely untouched.
@@ -2946,8 +2955,9 @@ mod tests {
     /// mid-transfer duplicate announce's upsert reset). The startup reconcile must
     /// stamp the HONEST terminal from the receipts — an all-Ingested set → `Done`,
     /// an all-Cancelled set → `Cancelled` + `declined_at` — instead of a misleading
-    /// `failed "interrupted by restart"`. A row with NO receipts is a genuine
-    /// zombie and still goes `failed`. This heals the owner's live stuck row.
+    /// `"interrupted by restart"`. A row with NO receipts never reached a terminal,
+    /// so it takes the fallback (D2 §4: `waiting`, not `failed` — the transfer is
+    /// outstanding, not lost). This heals the owner's live stuck row.
     #[tokio::test]
     async fn startup_repairs_fully_receipted_stale_inbound_from_receipt_log() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3045,12 +3055,13 @@ mod tests {
             "an all-cancelled repair stamps the decline axis"
         );
 
-        // (3) no receipts → still the honest zombie failure.
+        // (3) no receipts → the honest fallback: this attempt never reached a
+        // terminal, so the transfer is outstanding (D2 §4), not lost.
         let zombie = get_inbound(&conn, "pkg-zombie").unwrap().unwrap();
         assert_eq!(
             zombie.state,
-            InboundState::Failed,
-            "a receiptless stale row is still a failed zombie"
+            InboundState::Waiting,
+            "a receiptless stale row is parked, not failed"
         );
         assert_eq!(zombie.last_error.as_deref(), Some("interrupted by restart"));
     }
@@ -4393,10 +4404,14 @@ mod tests {
         );
     }
 
-    /// Item 5: the restart reconcile settles a stale row's un-settled per-file rows
-    /// to `failed`; a later re-announce restores them to `announced`.
+    /// Item 5, as revised by D2 §3.3: the restart reconcile parks a stale row
+    /// `waiting` and LEAVES its per-file rows exactly as the interrupted attempt
+    /// left them — they are the resume checkpoint and the file counter's evidence,
+    /// and the transfer is still outstanding, so settling them `failed` would throw
+    /// away the record of what already arrived. A later re-announce refreshes them
+    /// to `announced` when the next attempt genuinely starts.
     #[test]
-    fn reconcile_settles_file_rows_then_reannounce_restores() {
+    fn reconcile_parks_the_row_and_keeps_file_rows_then_reannounce_restores() {
         let tmp = tempfile::tempdir().unwrap();
         let store = CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap();
         let peer = "cc".repeat(32);
@@ -4427,14 +4442,21 @@ mod tests {
             let conn = store.lock_conn();
             assert_eq!(
                 get_inbound(&conn, "pkg").unwrap().unwrap().state,
-                InboundState::Failed
+                InboundState::Waiting
             );
             let rows = list_inbound_files(&conn, id).unwrap();
             assert!(
-                rows.iter().all(|r| r.state == InboundFileState::Failed
-                    && r.error.as_deref() == Some("interrupted by restart")),
-                "every un-settled file row is failed with the restart reason: {rows:?}"
+                rows.iter().all(|r| r.state != InboundFileState::Failed),
+                "no file row is settled by the reconcile — they are the checkpoint: {rows:?}"
             );
+            let l1 = rows.iter().find(|r| r.rel_path == "L1.fits").unwrap();
+            assert_eq!(
+                l1.state,
+                InboundFileState::Fetching,
+                "the mid-fetch file keeps its state"
+            );
+            assert_eq!(l1.bytes_done, 5, "and the bytes it had already received");
+            assert!(l1.error.is_none(), "a benign wait writes no per-file error");
         }
 
         // A re-announce refreshes the row + rows back to announced.
@@ -4449,6 +4471,62 @@ mod tests {
                 "a re-announce restores the file rows to announced: {rows:?}"
             );
         }
+    }
+
+    /// D2 §4: a `Waiting` row is non-terminal, so it comes back from
+    /// `inbound_active` on EVERY launch. Without an explicit skip the fallback
+    /// would overwrite the preserved reason with "interrupted by restart" — the
+    /// first restart after a peer vanishes would destroy exactly what the state
+    /// exists to record, and every later one would keep re-stamping it.
+    #[test]
+    fn the_reconcile_leaves_an_existing_waiting_row_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = CatalogSyncStore::open(tmp.path().join("catalog.db")).unwrap();
+        let peer = "dd".repeat(32);
+        let files = vec![afe("L1.fits", "u1", 10)];
+
+        let id = {
+            let conn = store.lock_conn();
+            let id = upsert_inbound_announced(&conn, &peer, "pkg", 1, 10).unwrap();
+            record_inbound_manifest(&conn, id, Some("N"), &files).unwrap();
+            set_inbound_file_state(
+                &conn,
+                id,
+                "L1.fits",
+                InboundFileState::Fetching,
+                7,
+                None,
+                None,
+            )
+            .unwrap();
+            set_inbound_state(
+                &conn,
+                "pkg",
+                InboundState::Waiting,
+                Some("peer gone: connection lost"),
+            )
+            .unwrap();
+            id
+        };
+
+        reconcile_stale_inbound(&store);
+        reconcile_stale_inbound(&store); // and again — idempotent across restarts
+
+        let conn = store.lock_conn();
+        let row = get_inbound(&conn, "pkg").unwrap().unwrap();
+        assert_eq!(row.state, InboundState::Waiting);
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("peer gone: connection lost"),
+            "the original reason survives every restart"
+        );
+        let rows = list_inbound_files(&conn, id).unwrap();
+        assert_eq!(
+            rows[0].state,
+            InboundFileState::Fetching,
+            "and the checkpoint is untouched"
+        );
+        assert_eq!(rows[0].bytes_done, 7);
     }
 
     // ── Transfers Batch Model (§D1/§D2, B4) ─────────────────────────────────────
@@ -5348,8 +5426,8 @@ mod tests {
             let row = get_inbound_by_row_id(&conn, inbound_id).unwrap().unwrap();
             assert_eq!(
                 row.state,
-                InboundState::Failed,
-                "the reconcile stamped the zombie attempt failed"
+                InboundState::Waiting,
+                "the reconcile parked the zombie attempt"
             );
             assert_eq!(row.last_error.as_deref(), Some("interrupted by restart"));
             assert!(
