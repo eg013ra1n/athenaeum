@@ -877,20 +877,26 @@ fn build_fetch_sink(
             name,
             bytes_done,
             bytes_total,
+            complete,
         } => {
             // Persist the per-file row transition (best-effort) BEFORE emitting
             // the live progress event — the live bar stays the event stream; the
             // DB row is the restart checkpoint and the file counter's evidence.
             //
             // D2 §3.4: the target state is computed from THIS tick and written
-            // whenever it differs from what was last written — the sender's
-            // shape. The previous scheme keyed the write on WHICH ARM ran: the
-            // first tick for a file always wrote `Fetching`, even when that tick
-            // already carried full bytes, after which the completion arm could
-            // never fire. Resumed, dedup'd, one-tick and zero-byte files were
-            // therefore stranded mid-transfer and never counted.
+            // whenever it differs from what was last written — the sender's shape.
+            // The pre-D2 scheme keyed the write on WHICH ARM ran, so a file whose
+            // first tick already carried full bytes could never reach the terminal
+            // rung.
+            //
+            // Completion comes from `complete`, NEVER from comparing the byte
+            // figures. A blob that has not started downloading reports (0, 0), so
+            // `bytes_done >= bytes_total` is true for every file of a batch before
+            // a single byte arrives — it marked all of them fetched at once, then
+            // walked them backwards as they actually started. Only the producer
+            // knows; see the field doc on `FetchEvent::File::complete`.
             if track_files {
-                let target = if bytes_done >= bytes_total {
+                let target = if complete {
                     InboundFileState::Fetched
                 } else {
                     InboundFileState::Fetching
@@ -3986,13 +3992,62 @@ mod tests {
             .unwrap_or_else(|| panic!("no file row for {rel}"))
     }
 
-    /// D2 §3.4: a file whose FIRST progress tick already carries full bytes must
-    /// still reach `fetched`. The old sink keyed its write on which arm ran — the
-    /// first tick always wrote `fetching`, after which the completion arm could
-    /// never fire — so resumed, dedup'd, one-tick and zero-byte files were stranded
-    /// mid-transfer and never counted. Invisible end-to-end, because ingest
-    /// overwrites the row right afterwards; visible to the user as a counter stuck
-    /// below the real figure.
+    /// REGRESSION (owner smoke 2026-07-25): the sink must take completion from the
+    /// producer's `complete` flag and NEVER re-derive it from the byte figures.
+    ///
+    /// The real transport observes a blob's bitfield, and a blob whose download has
+    /// not begun has an EMPTY one — `size() == 0`, `total_bytes() == 0`. So the
+    /// first tick of EVERY file in a batch reads (0, 0), and a
+    /// `bytes_done >= bytes_total` test calls all of them finished before a single
+    /// byte arrives: the counter jumped to the full figure at once and then walked
+    /// backwards as files actually started. The loopback mock hid this by helpfully
+    /// supplying the true size on its start tick; it no longer does.
+    #[test]
+    fn an_unstarted_file_reporting_zero_of_zero_is_not_fetched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![afe("a.fits", "u1", 500), afe("b.fits", "u2", 500)];
+        let (store, id, sink) = fetch_sink_fixture(&tmp, &files);
+
+        // What iroh emits first for a blob it has not begun: size unknown.
+        for name in ["a.fits", "b.fits"] {
+            sink(FetchEvent::File {
+                name: name.to_string(),
+                bytes_done: 0,
+                bytes_total: 0,
+                complete: false,
+            });
+        }
+
+        for name in ["a.fits", "b.fits"] {
+            assert_ne!(
+                file_state(&store, id, name).state,
+                InboundFileState::Fetched,
+                "{name}: an unstarted file must not count as received"
+            );
+        }
+
+        // …and only the one that genuinely finishes is counted.
+        sink(FetchEvent::File {
+            name: "a.fits".to_string(),
+            bytes_done: 500,
+            bytes_total: 500,
+            complete: true,
+        });
+        assert_eq!(
+            file_state(&store, id, "a.fits").state,
+            InboundFileState::Fetched
+        );
+        assert_ne!(
+            file_state(&store, id, "b.fits").state,
+            InboundFileState::Fetched,
+            "b never completed"
+        );
+    }
+
+    /// D2 §3.4: a file whose FIRST tick is already its terminal one — resumed,
+    /// already-present, or empty — must still reach `fetched`. The pre-D2 sink
+    /// keyed the write on which arm ran, so its completion arm could never fire for
+    /// these; they sat `fetching` forever and were never counted.
     #[test]
     fn a_file_that_completes_in_one_tick_still_reaches_fetched() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4002,16 +4057,20 @@ mod tests {
         ];
         let (store, id, sink) = fetch_sink_fixture(&tmp, &files);
 
-        // One and only one tick each, both already complete.
+        // One and only one tick each, both already complete. The empty file is the
+        // case the byte figures CANNOT distinguish from an unstarted one — only
+        // `complete` separates them.
         sink(FetchEvent::File {
             name: "sub/frame1.fits".to_string(),
             bytes_done: 500,
             bytes_total: 500,
+            complete: true,
         });
         sink(FetchEvent::File {
             name: "sub/empty.txt".to_string(),
             bytes_done: 0,
             bytes_total: 0,
+            complete: true,
         });
 
         assert_eq!(
@@ -4022,7 +4081,7 @@ mod tests {
         assert_eq!(
             file_state(&store, id, "sub/empty.txt").state,
             InboundFileState::Fetched,
-            "zero-byte files complete too — the old `bytes_total > 0` guard stranded them"
+            "an empty file reports (0, 0) exactly like an unstarted one — `complete` is what tells them apart"
         );
     }
 
@@ -4038,6 +4097,7 @@ mod tests {
             name: "a.fits".to_string(),
             bytes_done: 100,
             bytes_total: 500,
+            complete: false,
         });
         assert_eq!(
             file_state(&store, id, "a.fits").state,
@@ -4049,6 +4109,7 @@ mod tests {
             name: "a.fits".to_string(),
             bytes_done: 300,
             bytes_total: 500,
+            complete: false,
         });
         let mid = file_state(&store, id, "a.fits");
         assert_eq!(mid.state, InboundFileState::Fetching);
@@ -4061,6 +4122,7 @@ mod tests {
             name: "a.fits".to_string(),
             bytes_done: 500,
             bytes_total: 500,
+            complete: true,
         });
         let done = file_state(&store, id, "a.fits");
         assert_eq!(done.state, InboundFileState::Fetched);

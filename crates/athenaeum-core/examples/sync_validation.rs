@@ -179,7 +179,7 @@ async fn fetch(ticket: &str, dest: &Path) -> Result<()> {
     // byte_size is unknown to this CLI (no announce), so pass 0 — the batch total
     // stays 0 and only the per-file `File` events carry real sizes.
     let sink: athenaeum_core::sharing::FetchSink = std::sync::Arc::new(|ev| {
-        if let athenaeum_core::sharing::FetchEvent::File { name, bytes_done, bytes_total } = ev {
+        if let athenaeum_core::sharing::FetchEvent::File { name, bytes_done, bytes_total, .. } = ev {
             println!("  {name}: {bytes_done}/{bytes_total} bytes");
         }
     });

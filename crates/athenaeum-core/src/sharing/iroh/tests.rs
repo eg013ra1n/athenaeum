@@ -230,7 +230,7 @@ async fn iroh_roundtrip_two_endpoints_localhost() {
     let mut per_file: std::collections::HashMap<String, Vec<(u64, u64)>> =
         std::collections::HashMap::new();
     for ev in &events {
-        if let FetchEvent::File { name, bytes_done, bytes_total } = ev {
+        if let FetchEvent::File { name, bytes_done, bytes_total, .. } = ev {
             per_file.entry(name.clone()).or_default().push((*bytes_done, *bytes_total));
         }
     }

@@ -420,6 +420,10 @@ pub async fn fetch_collection_to_dir(
                         name: name.clone(),
                         bytes_done,
                         bytes_total,
+                        // The bitfield is the only thing that knows; see the field
+                        // doc on `FetchEvent::File::complete`. An unstarted blob and
+                        // an empty-but-finished one both read (0, 0) here.
+                        complete,
                     });
                 }
                 if complete {

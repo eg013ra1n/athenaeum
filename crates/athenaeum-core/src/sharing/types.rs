@@ -252,11 +252,21 @@ pub enum FetchEvent {
     /// to `bytes_total` (the announce's `byte_size`).
     Batch { bytes_done: u64, bytes_total: u64 },
     /// Per-file progress for one collection entry, keyed by its `name`
-    /// (forward-slash `rel_path`). Ends with `bytes_done == bytes_total`.
+    /// (forward-slash `rel_path`). Ends with `complete = true`.
     File {
         name: String,
         bytes_done: u64,
         bytes_total: u64,
+        /// Whether this file is now fully present locally — stated by the
+        /// PRODUCER, never re-derived by the consumer from the byte figures.
+        ///
+        /// The bytes cannot answer it. A blob whose download has not begun has an
+        /// EMPTY bitfield (`iroh_blobs::api::proto::Bitfield::empty` — `size: 0`,
+        /// no ranges), so its first tick reads `bytes_done == 0` AND
+        /// `bytes_total == 0`; so does a genuinely empty file that IS complete.
+        /// A `bytes_done >= bytes_total` test calls both of them finished and
+        /// marks every file of a batch complete before a single byte arrives.
+        complete: bool,
     },
 }
 

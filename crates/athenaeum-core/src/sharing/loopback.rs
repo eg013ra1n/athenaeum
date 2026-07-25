@@ -421,10 +421,19 @@ impl SharingTransport for LoopbackTransport {
             // Synthetic per-file progress: start at 0, then jump to complete after
             // the copy — deterministic, no timing (the iroh transport observes real
             // per-file byte progress; the mock only needs the contract shape).
+            //
+            // The start tick reports `bytes_total: 0` ON PURPOSE. That is the shape
+            // the REAL transport produces first: a blob whose download has not begun
+            // has an empty bitfield, so its size is not yet known. A mock that
+            // helpfully supplied the true size here would let a consumer that
+            // re-derives completion from the byte figures pass every loopback test
+            // and still mark a whole batch complete in production — which is
+            // precisely what happened.
             sink(FetchEvent::File {
                 name: name.clone(),
                 bytes_done: 0,
-                bytes_total: file.size,
+                bytes_total: 0,
+                complete: false,
             });
             // Symmetric provider-side START tick (Task 2.2): the iroh provider emits
             // real partial `ServeFileProgress` before a file completes, so the mock
@@ -509,6 +518,7 @@ impl SharingTransport for LoopbackTransport {
                 name,
                 bytes_done: file.size,
                 bytes_total: file.size,
+                complete: true,
             });
         }
 
