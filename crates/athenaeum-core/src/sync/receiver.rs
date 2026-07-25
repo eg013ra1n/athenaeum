@@ -466,7 +466,12 @@ fn apply_receive_limit(control: &InboundControl, configured: Option<usize>) {
 /// `queued_announces` (variant B) is a fourth: the announces that have been ROUTED
 /// to a peer's lane but not yet processed — see [`note_queued_announce`].
 ///
+/// `parked_for_slot` (variant C) is a fifth: the transfers whose lane HAS picked
+/// the announce up and is now blocked on `receive_gate` — see
+/// [`note_parked_for_slot`].
+///
 /// [`note_queued_announce`]: Self::note_queued_announce
+/// [`note_parked_for_slot`]: Self::note_parked_for_slot
 pub struct InboundControl {
     cancels: std::sync::Mutex<std::collections::HashSet<String>>,
     revoke_aborts: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -475,6 +480,10 @@ pub struct InboundControl {
     /// `sync_inbound` row is written until its lane picks the announce up. See
     /// [`note_queued_announce`](Self::note_queued_announce) for the whole contract.
     queued_announces: std::sync::Mutex<HashMap<(NodeId, String), QueuedAnnounce>>,
+    /// Wire package ids whose lane is blocked on the [`ReceiveGate`], keyed the way
+    /// the row is (`sync_inbound.package_id`). See
+    /// [`note_parked_for_slot`](Self::note_parked_for_slot).
+    parked_for_slot: std::sync::Mutex<std::collections::HashSet<String>>,
     notify: tokio::sync::Notify,
     /// Concurrency gate for the fetch+ingest phase — see [`ReceiveGate`]. Public
     /// because the receive lanes acquire it directly and the settings command
@@ -520,6 +529,7 @@ impl Default for InboundControl {
             cancels: Default::default(),
             revoke_aborts: Default::default(),
             queued_announces: Default::default(),
+            parked_for_slot: Default::default(),
             notify: Default::default(),
             receive_gate: ReceiveGate::new(DEFAULT_MAX_CONCURRENT_RECEIVES),
         }
@@ -670,6 +680,57 @@ impl InboundControl {
             .collect()
     }
 
+    /// Record that `package_id`'s lane is blocked on the [`ReceiveGate`] waiting for
+    /// a free receive slot (variant C). Inserted immediately before the gate wait
+    /// begins and removed on EVERY way out of it — always through
+    /// [`ParkedForSlotGuard`], never by hand, so the two can't drift apart.
+    ///
+    /// WHY this exists: a parked transfer's row is already written and sits in
+    /// [`InboundState::Announced`] — indistinguishable, in durable state, from one
+    /// that just arrived. The receive-side UI therefore showed a bare "announced"
+    /// for a transfer whose only remaining obstacle is the concurrency cap. This set
+    /// is the live signal that separates the two; the status poll reads it through
+    /// [`parked_for_slot_snapshot`](Self::parked_for_slot_snapshot) and relabels
+    /// those rows `queued`.
+    ///
+    /// Keyed on the WIRE package id, unlike variant B's durable-batch keying: this
+    /// entry is matched against a `sync_inbound` ROW, and `package_id` is the column
+    /// that row is looked up by (it is re-stamped to the current attempt's wire id
+    /// by `upsert_inbound_attempt`, which has already run by the time a lane parks).
+    /// A re-announce under a fresh wire id is a fresh park of a fresh row; there is
+    /// nothing to collapse.
+    ///
+    /// Personal sync only. `handle_project_announce` also waits on the same gate, but
+    /// a project push writes no `sync_inbound` row at all, so an entry for one could
+    /// never match anything the mapping reads — see the comment at its `acquire`.
+    pub fn note_parked_for_slot(&self, package_id: &str) {
+        self.parked_for_slot
+            .lock()
+            .expect("inbound parked_for_slot mutex poisoned")
+            .insert(package_id.to_string());
+    }
+
+    /// Drop `package_id`'s parked entry because its lane has left the gate queue —
+    /// by winning a permit, or by abandoning it for a decline/revoke/terminal row.
+    /// Called from [`ParkedForSlotGuard`]'s `Drop`, which is why no exit path
+    /// (including a panic) can leak an entry.
+    pub fn clear_parked_for_slot(&self, package_id: &str) {
+        self.parked_for_slot
+            .lock()
+            .expect("inbound parked_for_slot mutex poisoned")
+            .remove(package_id);
+    }
+
+    /// Every transfer currently waiting for a receive slot. Read by the status poll
+    /// to relabel those rows; cheap enough for a 10-second poll (one mutex, at most
+    /// a handful of entries).
+    pub fn parked_for_slot_snapshot(&self) -> std::collections::HashSet<String> {
+        self.parked_for_slot
+            .lock()
+            .expect("inbound parked_for_slot mutex poisoned")
+            .clone()
+    }
+
     /// A future that resolves the next time [`request_cancel`](Self::request_cancel)
     /// or [`request_revoke_abort`](Self::request_revoke_abort) is called. The
     /// in-flight fetch loop selects on this to learn about either without polling.
@@ -678,6 +739,41 @@ impl InboundControl {
     /// polled/`enable`d, so the call site enables it before checking the flag.
     pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
         self.notify.notified()
+    }
+}
+
+/// RAII marker for "this lane is waiting for a receive slot" (variant C): entering
+/// records the package on [`InboundControl::note_parked_for_slot`], dropping clears
+/// it.
+///
+/// A guard rather than paired calls because the wait has two shapes of exit — the
+/// permit is won, or [`abandon_parked_receive`] elects to leave the queue (for a
+/// revoke, for a row that went terminal underneath the lane, or for a local decline)
+/// and the loop `return`s — and a lane that leaked its entry would leave a transfer
+/// reading `queued` for the rest of the process's life, including long after it
+/// finished. `Drop` covers both, plus any exit added later, by construction; it also
+/// covers a panic, which no arrangement of manual clears can.
+struct ParkedForSlotGuard<'a> {
+    control: &'a InboundControl,
+    package_id: &'a str,
+}
+
+impl<'a> ParkedForSlotGuard<'a> {
+    /// Mark `package_id` parked; the returned guard un-marks it when it goes out of
+    /// scope. Insert and clear are one lexical unit — there is no way to do one
+    /// without the other.
+    fn enter(control: &'a InboundControl, package_id: &'a str) -> Self {
+        control.note_parked_for_slot(package_id);
+        Self {
+            control,
+            package_id,
+        }
+    }
+}
+
+impl Drop for ParkedForSlotGuard<'_> {
+    fn drop(&mut self) {
+        self.control.clear_parked_for_slot(self.package_id);
     }
 }
 
@@ -2135,6 +2231,15 @@ async fn handle_announce(
     // spurious wake (a cancel for some other package) does not cost this lane its
     // place in the semaphore's FIFO queue.
     let _receive_permit = {
+        // Variant C: while this block runs, the row sits `announced` with nothing in
+        // durable state to say it is merely waiting its turn. The marker is the live
+        // signal the status poll relabels `queued` on, and its scope is EXACTLY this
+        // block — entered before the acquire is first polled, dropped both when the
+        // permit is won and when the re-check below abandons the queue. Winning the
+        // permit therefore un-marks the transfer BEFORE the post-acquire guard and
+        // the `Fetching` stamp, which is right: it is no longer waiting for a slot,
+        // it has one.
+        let _parked = ParkedForSlotGuard::enter(control, &package_id);
         let acquire_fut = control.receive_gate.acquire();
         tokio::pin!(acquire_fut);
         loop {
@@ -3305,6 +3410,13 @@ async fn handle_project_announce(
     // re-check. NAMED FOLLOW-UP, not fixed here (W2 review, Minor): the permit is
     // held across `transport.fetch` with no abort path at all, so a stalled project
     // push occupies a receive slot until the transport itself gives up.
+    //
+    // For the same reason it carries no variant-C parked marker: that marker exists
+    // to relabel a `sync_inbound` row's display state, and a project push has no such
+    // row for an entry to ever match. It would also need `InboundControl` threaded in
+    // here, which this handler deliberately does not take — only the gate. A project
+    // push waiting for a slot is invisible in the Transfers UI because a project push
+    // is invisible in the Transfers UI, which is the collab surface's own question.
     let _receive_permit = receive_gate.acquire().await;
 
     // Fetch into a per-package staging dir keyed by the WIRE id (mirrors personal
@@ -8752,6 +8864,188 @@ mod tests {
         assert!(
             final_row.declined_at.is_some(),
             "the decline stays on the finality axis"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// Variant C: the live evidence that a transfer is waiting for a receive slot.
+    ///
+    /// A parked row sits in `Announced` — durably indistinguishable from one that
+    /// just arrived — so the receive-side UI could only say "announced" for a
+    /// transfer whose sole remaining obstacle is the concurrency cap.
+    /// [`InboundControl::parked_for_slot_snapshot`] is the signal that separates
+    /// them, and its whole value depends on being exact in BOTH directions: an entry
+    /// that never appears says nothing, and one that never leaves would leave a
+    /// finished transfer reading `queued` for the rest of the process's life.
+    ///
+    /// Gate crushed to 1 and one hog holding the only permit, so two victims park at
+    /// once. Then every exit from the wait is driven:
+    ///
+    /// 1. Both parked wire ids are in the snapshot while they wait.
+    /// 2. The DECLINED one's entry clears — that lane leaves the queue via
+    ///    `abandon_parked_receive` and never gets a permit at all.
+    /// 3. The other one's entry clears when it WINS its permit and runs to `Done`.
+    /// 4. Nothing at all is left behind once the run is over — including the hog,
+    ///    which parked for an instant of its own before being admitted.
+    ///
+    /// RED before the wiring: (1) failed — nothing ever recorded a park.
+    #[tokio::test]
+    async fn parked_rows_are_tracked_and_cleared_on_every_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+
+        let control = Arc::new(InboundControl::new());
+        // One slot, so a single hog is enough to park everything behind it.
+        control.receive_gate.set_limit(1);
+
+        let (_info, handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            {
+                let incoming = incoming.clone();
+                Arc::new(move || incoming.clone()) as IncomingResolver
+            },
+            allow_all_peers(),
+            Default::default(),
+            Arc::clone(&control),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        let _hogs =
+            saturate_receive_gate(&net, &receiver_ep, receiver_node, &store, tmp.path(), 1).await;
+
+        // Poll `cond` until it holds or the budget runs out.
+        async fn poll_until(budget: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+            let deadline = std::time::Instant::now() + budget;
+            while std::time::Instant::now() < deadline {
+                if cond() {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            cond()
+        }
+
+        // Two more peers (own lanes, so both reach the gate) that both park behind it.
+        // The survivor is SERVED so it can actually complete once admitted; the victim
+        // is declined before it ever gets that far. The senders are kept alive for the
+        // rest of the test — dropping one takes its serve with it, and the survivor
+        // still has to be fetchable.
+        let mut wires: Vec<String> = Vec::new();
+        let mut senders = Vec::new();
+        for tag in ["survivor", "victim"] {
+            let sender = Arc::new(net.endpoint());
+            sender.start().await.unwrap();
+            let (dir, ann, files) = build_lane_fixture(tmp.path(), tag, 2);
+            let wire = ann.package_id.0.clone();
+            sender.serve(&ann, &dir, None).await.unwrap();
+            sender
+                .announce(
+                    receiver_node,
+                    &ann,
+                    &format!("Batch {tag}"),
+                    &format!("batch-{tag}"),
+                    &files,
+                )
+                .await
+                .unwrap();
+            try_poll_inbound(
+                &store,
+                &wire,
+                InboundState::Announced,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap_or_else(|| panic!("{tag} should reach `announced` and park on the gate"));
+            wires.push(wire);
+            senders.push(sender);
+        }
+        let (survivor, victim) = (wires[0].clone(), wires[1].clone());
+
+        // 1. Both are on record as waiting for a slot.
+        let parked = control.parked_for_slot_snapshot();
+        assert!(
+            parked.contains(&survivor) && parked.contains(&victim),
+            "both parked transfers must be visible as waiting for a slot, got: {parked:?}"
+        );
+
+        // 2. Decline the victim exactly as `cancel_incoming_package` does. Its lane
+        //    leaves the gate queue without ever taking a permit, so ONLY the guard's
+        //    `Drop` can clear it.
+        let victim_id = {
+            let conn = store.lock_conn();
+            get_inbound(&conn, &victim).unwrap().unwrap().id
+        };
+        {
+            let conn = store.lock_conn();
+            conn.execute(
+                "UPDATE sync_inbound
+                 SET declined_at = COALESCE(declined_at, ?1)
+                 WHERE id = ?2 AND state NOT IN ('ingesting', 'done')",
+                rusqlite::params![crate::sync::now_iso(), victim_id],
+            )
+            .unwrap();
+        }
+        control.request_cancel(&victim);
+        {
+            let conn = store.lock_conn();
+            set_inbound_state(&conn, &victim, InboundState::Cancelled, None).unwrap();
+        }
+
+        let cleared = poll_until(std::time::Duration::from_secs(10), || {
+            !control.parked_for_slot_snapshot().contains(&victim)
+        })
+        .await;
+        assert!(
+            cleared,
+            "the declined transfer left the gate queue but stayed marked as waiting \
+             for a slot — an abandon path leaks its entry: {:?}",
+            control.parked_for_slot_snapshot()
+        );
+
+        // 3. The survivor takes the freed permit and finishes; winning a permit is
+        //    the other way out of the wait, and it must clear the entry too.
+        //
+        //    Explicit budget rather than `poll_inbound`'s 4s: this transfer waits out
+        //    the hog's paced fetch AND then pays the same pacing itself, which is more
+        //    than that helper allows even on an idle machine — and this suite runs its
+        //    tests in parallel.
+        try_poll_inbound(
+            &store,
+            &survivor,
+            InboundState::Done,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("the survivor should take the freed permit and finish");
+        assert!(
+            !control.parked_for_slot_snapshot().contains(&survivor),
+            "a transfer that WON its permit is still marked as waiting for one — a \
+             finished row would read `queued` forever"
+        );
+
+        // 4. Nothing left behind at all (the hog parked for an instant of its own
+        //    before it was admitted).
+        let empty = poll_until(std::time::Duration::from_secs(10), || {
+            control.parked_for_slot_snapshot().is_empty()
+        })
+        .await;
+        assert!(
+            empty,
+            "entries outlived the run: {:?}",
+            control.parked_for_slot_snapshot()
         );
 
         handle.shutdown().await;

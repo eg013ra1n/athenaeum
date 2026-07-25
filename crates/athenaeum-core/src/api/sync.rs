@@ -1691,14 +1691,21 @@ fn outbound_summary(
 /// Map one persisted `sync_inbound` row to its display [`InboundSummary`] — the
 /// SINGLE inbound-row → summary mapping, shared by the live receive-side Active
 /// rollup ([`active_inbound_summaries`]) and the terminal-rows read
-/// ([`list_terminal_transfers`]). Inbound presentation state mirrors the raw
-/// state (no receiver-side retry/backoff concept yet), so `stalled_until` is
-/// always `None`.
+/// ([`list_terminal_transfers`]). Inbound presentation state mirrors the raw state
+/// but for the two arms below, and there is no receiver-side retry/backoff concept,
+/// so `stalled_until` is always `None`.
+///
+/// `parked_for_slot` is the live set of wire package ids waiting on the receive gate
+/// ([`InboundControl::parked_for_slot_snapshot`]); callers with no running receiver
+/// — and every terminal-row read, where no entry could match — pass an empty set.
+///
+/// [`InboundControl::parked_for_slot_snapshot`]: crate::sync::InboundControl::parked_for_slot_snapshot
 fn inbound_summary(
     row: InboundRow,
     device_names: &HashMap<String, String>,
     device_kinds: &HashMap<String, String>,
     file_counts: &HashMap<i64, TransferFileCounts>,
+    parked_for_slot: &HashSet<String>,
 ) -> InboundSummary {
     // The stable per-transfer key the receiver keys its one long-lived row on;
     // fall back to the wire package id for a legacy row whose `batch_uuid` is
@@ -1722,10 +1729,26 @@ fn inbound_summary(
         // D2 §3.6: one chip for both directions. The send side derives
         // `waiting_peer` from an error-class prefix; the receive side has it as a
         // stored state. Same words to the user — the device is unreachable and this
-        // resumes when it is back — even though the mechanics beneath differ. Every
-        // other state still echoes raw.
+        // resumes when it is back — even though the mechanics beneath differ.
         display_state: match row.state {
             crate::sync::InboundState::Waiting => "waiting_peer".to_string(),
+            // Variant C: an `Announced` row whose lane is blocked on the receive gate
+            // is WAITING FOR A FREE RECEIVE SLOT (`sync.max_concurrent_receives`) —
+            // durably indistinguishable from one that just arrived, so the live
+            // parked set is the only thing that can tell the user which it is.
+            //
+            // "queued" is the shared vocabulary of every "this starts by itself,
+            // nothing is wrong" state across the feature: the outbound local queue,
+            // variant B's lane-queue ghosts, and this. One word, one meaning, both
+            // directions.
+            //
+            // `Announced` ONLY. The parked set is live and the rows are read a moment
+            // apart, so an entry can outlive the park by an instant; gating on the one
+            // state a parked row can actually be in means a stale entry is inert
+            // rather than a mislabelled running transfer.
+            crate::sync::InboundState::Announced if parked_for_slot.contains(&row.package_id) => {
+                "queued".to_string()
+            }
             other => other.as_str().to_string(),
         },
         stalled_until: None,
@@ -1832,7 +1855,10 @@ async fn build_sender_status(
 
 /// The receive-side Active-tab rows: every non-terminal `sync_inbound` row (Task
 /// 14), mapped to display summaries. Oldest-first (the store's ordering).
-fn active_inbound_summaries(ctx: &ServiceContext) -> Result<Vec<InboundSummary>, ApiError> {
+fn active_inbound_summaries(
+    ctx: &ServiceContext,
+    parked_for_slot: &HashSet<String>,
+) -> Result<Vec<InboundSummary>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
     let rows = inbound_active(&conn).map_err(|e| ApiError::Internal(format!("{e:#}")))?;
@@ -1845,7 +1871,15 @@ fn active_inbound_summaries(ctx: &ServiceContext) -> Result<Vec<InboundSummary>,
     let device_kinds = cached_device_kind_map(&conn);
     Ok(rows
         .into_iter()
-        .map(|row| inbound_summary(row, &device_names, &device_kinds, &file_counts))
+        .map(|row| {
+            inbound_summary(
+                row,
+                &device_names,
+                &device_kinds,
+                &file_counts,
+                parked_for_slot,
+            )
+        })
         .collect())
 }
 
@@ -1947,11 +1981,21 @@ pub async fn get_status(
     let transport_started = sync.is_started().await;
     let pairing_ticket = sync.ticket().await;
     let sender_status = build_sender_status(ctx, sender).await?;
-    let active_inbound = active_inbound_summaries(ctx)?;
-    // Variant B: the announces sitting in a peer's lane queue with no row of their
-    // own yet. Read from the RUNNING receiver's control (None before start ⇒ empty)
-    // and de-duplicated against the active rows just fetched.
+    // Both queued-ness signals live on the RUNNING receiver's control (None before
+    // start ⇒ nothing queued anywhere, never an error).
     let inbound_control = sync.inbound_control().await;
+    // Variant C: the rows whose lane is parked on the receive gate. The set and the
+    // rows are read a moment apart, so a transfer that crosses the gate in that gap
+    // can be labelled one poll late either way — harmless in both directions, since
+    // the relabel only ever applies to a row still sitting in `Announced` and the
+    // poll repeats every 10 seconds.
+    let parked_for_slot = inbound_control
+        .as_deref()
+        .map(|c| c.parked_for_slot_snapshot())
+        .unwrap_or_default();
+    let active_inbound = active_inbound_summaries(ctx, &parked_for_slot)?;
+    // Variant B: the announces sitting in a peer's lane queue with no row of their
+    // own yet, de-duplicated against the active rows just fetched.
     let queued_inbound =
         queued_inbound_summaries(ctx, inbound_control.as_deref(), &active_inbound)?;
     let transport = derive_transport_health(ctx).await?;
@@ -2064,9 +2108,14 @@ pub fn list_terminal_transfers(
             summary
         })
         .collect();
+    // `parked_for_slot` empty: parking is a property of a live `Announced` row
+    // waiting on the receive gate, and every row this read returns is TERMINAL, so
+    // no entry could ever match one. Passing the empty set (rather than reaching for
+    // the running receiver's control) keeps this a pure DB read.
+    let no_parked: HashSet<String> = HashSet::new();
     let received = in_rows
         .into_iter()
-        .map(|row| inbound_summary(row, &device_names, &device_kinds, &in_counts))
+        .map(|row| inbound_summary(row, &device_names, &device_kinds, &in_counts, &no_parked))
         .collect();
     Ok(TerminalTransfers { sent, received })
 }
@@ -5301,7 +5350,8 @@ mod tests {
             set_inbound_state(&conn, "wire-live", InboundState::Fetching, None).unwrap();
         }
 
-        let active = active_inbound_summaries(&ctx).expect("active inbound summaries");
+        let active =
+            active_inbound_summaries(&ctx, &HashSet::new()).expect("active inbound summaries");
         let parked = active
             .iter()
             .find(|r| r.package_id == "wire-wait")
@@ -5366,7 +5416,13 @@ mod tests {
         // 1) A stamped row wins even when the cache says otherwise.
         let mut kinds = HashMap::new();
         kinds.insert(peer.clone(), "athenaeum".to_string());
-        let s = inbound_summary(row(Some("perseus")), &names, &kinds, &counts);
+        let s = inbound_summary(
+            row(Some("perseus")),
+            &names,
+            &kinds,
+            &counts,
+            &HashSet::new(),
+        );
         assert_eq!(
             s.peer_kind.as_deref(),
             Some("perseus"),
@@ -5374,7 +5430,7 @@ mod tests {
         );
 
         // 2) A NULL-stamped row + a cache hit → the cache value.
-        let s = inbound_summary(row(None), &names, &kinds, &counts);
+        let s = inbound_summary(row(None), &names, &kinds, &counts, &HashSet::new());
         assert_eq!(
             s.peer_kind.as_deref(),
             Some("athenaeum"),
@@ -5383,7 +5439,7 @@ mod tests {
 
         // 3) Neither a stamp nor a cache entry → None.
         let empty: HashMap<String, String> = HashMap::new();
-        let s = inbound_summary(row(None), &names, &empty, &counts);
+        let s = inbound_summary(row(None), &names, &empty, &counts, &HashSet::new());
         assert_eq!(s.peer_kind, None, "neither stamp nor cache → None");
     }
 
@@ -5465,6 +5521,96 @@ mod tests {
         assert!(
             status.receiver.queued.is_empty(),
             "an unstarted receiver has no queued announces"
+        );
+    }
+
+    /// Variant C at the command boundary: a row whose lane is parked on the receive
+    /// gate reads `queued`, not `announced`.
+    ///
+    /// Both rows are `Announced` in the DB — that is the whole problem the live
+    /// parked set exists to solve. Durable state cannot tell "this just arrived" from
+    /// "this is waiting for a free receive slot", so a transfer blocked purely on the
+    /// concurrency cap showed a bare "announced" with nothing to suggest it starts by
+    /// itself.
+    ///
+    /// Three rows, one signal: the parked one relabels, the plain announced one does
+    /// NOT, and a parked id whose row has since moved to `Fetching` also does not —
+    /// the arm is gated on `Announced` alone, so a stale entry (the set and the rows
+    /// are read a moment apart) can never mislabel a running transfer.
+    #[tokio::test]
+    async fn a_parked_inbound_row_displays_queued() {
+        use crate::sync::store::{set_inbound_state, upsert_inbound_attempt, CatalogSyncStore};
+        use crate::sync::InboundState;
+
+        let (tmp, ctx) = test_ctx();
+        let (_ep, runtime) = started_loopback_runtime(&tmp).await;
+        let sender = SyncSenderRuntime::new();
+
+        let peer = "cc".repeat(32);
+        let (_sync_dir, db_path) = sync_paths(&ctx).unwrap();
+        {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            let conn = store.lock_conn();
+            // Parked on the gate, and one that simply arrived — indistinguishable here.
+            upsert_inbound_attempt(&conn, &peer, "batch-parked", "wire-parked", 2, 100).unwrap();
+            upsert_inbound_attempt(&conn, &peer, "batch-fresh", "wire-fresh", 2, 100).unwrap();
+            // Admitted and running, but still in the parked set (the stale-entry case).
+            upsert_inbound_attempt(&conn, &peer, "batch-moved", "wire-moved", 2, 100).unwrap();
+            set_inbound_state(&conn, "wire-moved", InboundState::Fetching, None).unwrap();
+        }
+
+        let control = runtime
+            .inbound_control()
+            .await
+            .expect("a started runtime exposes its inbound control");
+        // Exactly what `handle_announce`'s guard records: the WIRE package id.
+        control.note_parked_for_slot("wire-parked");
+        control.note_parked_for_slot("wire-moved");
+
+        let status = get_status(&ctx, &runtime, &sender).await.unwrap();
+        let row = |wire: &str| {
+            status
+                .receiver
+                .active
+                .iter()
+                .find(|r| r.package_id == wire)
+                .unwrap_or_else(|| panic!("{wire} is a non-terminal row — it must be ACTIVE"))
+        };
+
+        let parked = row("wire-parked");
+        assert_eq!(
+            parked.display_state, "queued",
+            "a transfer waiting for a receive slot says so"
+        );
+        assert_eq!(
+            parked.state,
+            InboundState::Announced,
+            "the raw state is untouched — `queued` is a display label over `announced`, \
+             and the frontend still gates on the raw state"
+        );
+
+        assert_eq!(
+            row("wire-fresh").display_state,
+            "announced",
+            "a row nobody parked still echoes raw"
+        );
+        assert_eq!(
+            row("wire-moved").display_state,
+            "fetching",
+            "the relabel is gated on `Announced` — a stale parked entry never overrides \
+             a transfer that has already been admitted"
+        );
+
+        // No receiver started ⇒ no parked set ⇒ every row reads raw. Not an error.
+        let unstarted = SyncRuntime::new();
+        let status = get_status(&ctx, &unstarted, &sender).await.unwrap();
+        assert!(
+            status
+                .receiver
+                .active
+                .iter()
+                .all(|r| r.display_state != "queued"),
+            "an unstarted receiver has nothing parked"
         );
     }
 
