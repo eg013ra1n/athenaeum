@@ -417,12 +417,12 @@ impl ReceiveGate {
 /// same abort mechanism, requested by [`request_revoke_abort`] from the receiver's
 /// event-ingress pump (see [`SyncReceiver::spawn`]) the instant a sender
 /// [`Revoke`](crate::sharing::types::RevokeReason) arrives — cross-task, so it can
-/// wake an in-flight fetch even while the serial receive loop is still busy
+/// wake an in-flight fetch even while that peer's receive lane is still busy
 /// awaiting an earlier `handle_announce`. Kept distinct from `cancels`
 /// deliberately: a revoke must NOT divert the aborted fetch into the local-decline
 /// [`cancel_epilogue`] (which sends an ack) — the ALREADY-QUEUED `RevokeReceived`
 /// event drives the reason-honest [`handle_revoke`] bookkeeping (no ack) once the
-/// serial loop drains it next. Both signals share the one `notify` — the select
+/// lane drains it next. Both signals share the one `notify` — the select
 /// loop just re-checks both flags on every wake, so one `Notify` is sufficient.
 ///
 /// [`is_cancelled`]: Self::is_cancelled
@@ -507,9 +507,10 @@ impl InboundControl {
     }
 
     /// Consume a [`request_revoke_abort`](Self::request_revoke_abort) entry once
-    /// its revoke has been drained by the serial loop (called at `handle_revoke`
-    /// entry). By then any fetch the flag needed to abort has already returned
-    /// (the loop is serial), and a LINGERING entry would wedge a straggler
+    /// its revoke has been drained by the peer's lane (called at `handle_revoke`
+    /// entry). By then any fetch the flag needed to abort has already returned —
+    /// a revoke and the announce it revokes come from the SAME peer, so they share
+    /// one serial lane. A LINGERING entry would wedge a straggler
     /// re-announce of the same wire id — under the Decline Finality Axis a
     /// revoke-cancelled row legitimately resets and re-fetches, and a stale abort
     /// flag would break that fetch on its first poll with no terminal written.
@@ -534,18 +535,23 @@ impl InboundControl {
 /// Handle to a running [`SyncReceiver`]. Dropping it (or calling
 /// [`shutdown`](Self::shutdown)) stops the event loop.
 ///
-/// It owns BOTH background tasks the receiver spawns: the serial fetch→ingest→ack
-/// loop (`join`) AND the event-ingress `pump` (B4-fix) that forwards transport
-/// events into the loop's channel. Both must be aborted on shutdown — the pump is
+/// It owns BOTH background tasks the receiver spawns: the per-peer lane ROUTER
+/// (`join`) AND the event-ingress `pump` (B4-fix) that forwards transport events
+/// into the router's channel. Both must be aborted on shutdown — the pump is
 /// normally parked in `raw_events.recv().await`, so without an explicit abort it
-/// would linger blocked on the transport stream after the loop stops (B5 §6a).
+/// would linger blocked on the transport stream after the router stops (B5 §6a).
+///
+/// The lanes themselves need no handle: they live in a `JoinSet` owned by the
+/// router task, so aborting the router aborts every lane in flight with it —
+/// unchanged "stop now" semantics from when the router WAS the single serial loop
+/// (pinned by `shutdown_aborts_lanes_in_flight`).
 pub struct SyncReceiverHandle {
     join: JoinHandle<()>,
     pump: JoinHandle<()>,
 }
 
 impl SyncReceiverHandle {
-    /// Abort both receiver tasks (serial loop + ingress pump) and await their exit.
+    /// Abort both receiver tasks (lane router + ingress pump) and await their exit.
     pub async fn shutdown(self) {
         self.join.abort();
         self.pump.abort();
@@ -596,27 +602,30 @@ impl SyncReceiver {
         let raw_events = transport.events().await;
 
         // Ingress pump (Transfers Batch Model §D2, B4-fix): decouples RECEIVING a
-        // transport event from PROCESSING it. The serial loop below stays the sole
-        // processor (no concurrent `handle_announce`/`handle_revoke` — the B2
-        // single-writer invariant `upsert_inbound_attempt` relies on holds), which
-        // means a `RevokeReceived` queued behind a currently-running, blocking
-        // `handle_announce` fetch would otherwise sit unprocessed until that fetch
-        // finishes on its own — the opposite of "revoke stops the download
-        // promptly". This pump task is never blocked by that fetch: it forwards
-        // every event, in order, into a fresh channel the serial loop drains, and
-        // for an AUTHORIZED peer's `RevokeReceived` it ALSO signals
+        // transport event from PROCESSING it. Processing is serial WITHIN a peer
+        // (its lane — no concurrent `handle_announce`/`handle_revoke` for one peer,
+        // which is what the B2 single-writer invariant `upsert_inbound_attempt`
+        // relies on), which means a `RevokeReceived` queued behind a
+        // currently-running, blocking `handle_announce` fetch on that same lane
+        // would otherwise sit unprocessed until the fetch finishes on its own — the
+        // opposite of "revoke stops the download promptly". This pump task is never
+        // blocked by that fetch: it forwards every event, in order, into a fresh
+        // channel the lane router drains, and for an AUTHORIZED peer's
+        // `RevokeReceived` it ALSO signals
         // [`InboundControl::request_revoke_abort`] synchronously, right here, the
         // instant the event arrives — which wakes the fetch-abort select loop
         // inside `handle_announce` cross-task (the same `Notify`
         // [`cancel_incoming_package`](crate::api::sync::cancel_incoming_package)
-        // already wakes). The event is still forwarded on to the serial loop so
-        // `handle_revoke` performs the reason-honest bookkeeping (terminal state,
-        // settle files, staging, tags, history, journal — no ack) once it drains
-        // it, strictly after the aborted `handle_announce` call has returned. The
-        // pump re-runs the SAME H1 authorizer the serial loop's arms use (never
-        // trust-then-verify) so an unauthorized peer cannot poison the abort set —
-        // belt-and-suspenders in dev-ticket mode, where there is no connect_gate.
-        // Unbounded so the pump's `send` never itself blocks on a busy consumer.
+        // already wakes). Note the ORDER: the abort flag is set BEFORE routing, so
+        // it reaches an in-flight fetch no matter which lane that fetch is on. The
+        // event is still forwarded on so `handle_revoke` performs the reason-honest
+        // bookkeeping (terminal state, settle files, staging, tags, history,
+        // journal — no ack) once the peer's lane drains it, strictly after the
+        // aborted `handle_announce` call has returned. The pump re-runs the SAME H1
+        // authorizer the lane's arms use (never trust-then-verify) so an
+        // unauthorized peer cannot poison the abort set — belt-and-suspenders in
+        // dev-ticket mode, where there is no connect_gate. Unbounded so the pump's
+        // `send` never itself blocks on a busy consumer.
         let (forward_tx, mut events) = mpsc::unbounded_channel::<TransportEvent>();
         let pump_control = Arc::clone(&control);
         let pump_authorized = Arc::clone(&authorized);
@@ -647,194 +656,390 @@ impl SyncReceiver {
         // before the spawned loop exists.
         reconcile_stale_inbound(&store);
 
-        let loop_transport = Arc::clone(&transport);
+        let deps = ReceiverLaneDeps {
+            store,
+            staging_root: staging_root.clone(),
+            incoming,
+            authorized,
+            project_gate,
+            announcements_refresher,
+            on_project_ingested,
+            request_handler,
+            control,
+            transport: Arc::clone(&transport),
+            emitter,
+        };
+
+        // Per-peer serial lanes (W2 T2.3). This task is now a ROUTER: it owns no
+        // handling of its own, it only fans each event out to the lane of the peer
+        // it came from. One lane per peer, each a serial `run_peer_lane` task, so
+        // a slow transfer from device A no longer holds device B's events hostage
+        // while every peer's own events stay strictly FIFO.
+        //
+        // WHY per-peer is exactly the right boundary — every key the old global
+        // serialization protected is PEER-OWNED, so two lanes can never contend
+        // for one:
+        //  - inbound rows key on `(peer, batch_uuid)` (`upsert_inbound_attempt`),
+        //    so the B2 single-writer invariant holds per lane;
+        //  - the revoke-abort / cancel flags name that peer's wire ids;
+        //  - staging dirs are `<staging>/<wire_id>` on sender-minted uuids;
+        //  - landing trees are `<incoming>/<sender_slug>/…` — with ONE caveat
+        //    worth stating, since it is the only genuinely cross-lane key here:
+        //    the slug prefers the peer's cached DEVICE NAME, so two devices that
+        //    share a name share a parent dir. Still safe — `resolve_landing_dir`'s
+        //    check-then-claim (active collision → `_2`/`_3`…) runs entirely under
+        //    one `store.lock_conn()` guard, so two lanes serialize on the store
+        //    mutex and the second one sees the first one's persisted claim.
+        //  - `InboundControl`'s one shared `Notify` wakes every lane's fetch loop,
+        //    but each re-checks its OWN package key on wake — already safe by
+        //    construction (see `InboundControl`), a spurious wake costs one poll.
+        //
+        // Lanes are long-lived: one per peer that has ever sent us an event,
+        // parked on `recv` when idle (a parked task costs ~nothing, and paired
+        // devices are few). Not tearing them down between transfers is deliberate
+        // — it is what keeps a peer's ordering across CONSECUTIVE transfers, not
+        // just within one.
+        //
+        // ACCEPTED RISK, named rather than fixed: staging dirs are keyed by the
+        // SENDER-minted wire id alone, so an authorized-but-malicious peer that
+        // reuses another peer's wire id could collide across lanes. The exposure
+        // is pre-existing and not created here (`handle_revoke` already correlates
+        // by wire id globally); peer-scoped staging is a named follow-up, out of
+        // scope for this task.
+        //
+        // The ingress pump above is deliberately NOT part of this: it sets the
+        // revoke-abort flag BEFORE routing, so a revoke still aborts an in-flight
+        // fetch cross-task regardless of which lane the fetch is on, and only the
+        // bookkeeping is ordered behind that peer's own announce.
         let join = tokio::spawn(async move {
             tracing::info!(staging_root = %staging_root.display(), "sync receiver online");
+            let mut lanes: HashMap<NodeId, mpsc::UnboundedSender<TransportEvent>> = HashMap::new();
+            let mut lane_tasks = tokio::task::JoinSet::new();
+
             while let Some(ev) = events.recv().await {
-                match ev {
-                    // `batch_uuid` (spec §D1/§D2) is the durable per-transfer identity
-                    // the receiver keys ONE inbound row on across every attempt (B4):
-                    // v3 → the sender's package-dir basename; v1/v2 → the wire package
-                    // id (B1 fallback), which reproduces today's per-attempt rows.
-                    TransportEvent::AnnounceReceived {
-                        from,
-                        announce,
-                        batch_name,
-                        batch_uuid,
-                        files,
-                    } => {
-                        // Authorization gate (finding H1): only ingest from a peer
-                        // on this receiver's allow-list. An unauthorized (or
-                        // revoked) node is silently dropped BEFORE any
-                        // fetch/ingest/ack — it never touches the catalog or the
-                        // landing folder, and gets no signal it was even heard.
-                        if !authorized(&from) {
-                            tracing::warn!(
-                                from = %super::node_id_hex(&from),
-                                package_id = %announce.package_id.0,
-                                "sync receiver dropped announce from an unauthorized peer"
-                            );
-                            continue;
-                        }
-                        // Task 4.1 (candidate (a)): time each inline announce
-                        // handling. `announce` is moved into the call, so capture
-                        // the package id first; `from` (a `NodeId`) is `Copy`.
-                        // Instrumentation only — no behavior change.
-                        let announce_started = std::time::Instant::now();
-                        let package_id_for_log = announce.package_id.0.clone();
-                        if let Err(e) = handle_announce(
-                            &store,
-                            &staging_root,
-                            &incoming,
-                            loop_transport.as_ref(),
-                            Arc::clone(&emitter),
-                            &control,
-                            from,
-                            announce,
-                            batch_name,
-                            batch_uuid,
-                            files,
-                        )
-                        .await
-                        {
-                            tracing::error!(error = %format!("{e:#}"), "sync receiver announce handling failed");
-                        }
-                        tracing::info!(
-                            package_id = %package_id_for_log,
-                            from = %super::node_id_hex(&from),
-                            duration_ms = announce_started.elapsed().as_millis() as u64,
-                            "sync receiver announce handled"
-                        );
-                    }
-                    // Collab exchange (slice 4): an inbound PROJECT package
-                    // advertisement. The ROW KEY is the event's hub `package_id`
-                    // (audit B1) while fetch/ack use the wire `announce.package_id`.
-                    TransportEvent::ProjectAnnounceReceived {
-                        from,
-                        project_id,
-                        package_id,
-                        announce,
-                    } => {
-                        // The hub package id is peer-controlled — reject anything
-                        // that is not a single safe path segment BEFORE the gate
-                        // (same C1 guard as personal sync).
-                        if let Err(e) = crate::package::validate_package_id(&package_id) {
-                            tracing::warn!(
-                                from = %super::node_id_hex(&from),
-                                project_id,
-                                package_id,
-                                error = %e,
-                                "project announce rejected: unsafe package_id"
-                            );
-                            continue;
-                        }
-                        // Cross-account trust: only a verified current member of
-                        // `project_id` may push-seed to us. Gate absent or
-                        // refusing ⇒ drop (fail-closed — never accept-all).
-                        let accepted = project_gate
-                            .as_ref()
-                            .map(|gate| gate(&from, &project_id))
-                            .unwrap_or(false);
-                        if !accepted {
-                            tracing::warn!(
-                                from = %super::node_id_hex(&from),
-                                project_id,
-                                package_id,
-                                "project announce dropped: sender is not an authorized project member"
-                            );
-                            continue;
-                        }
-                        if let Err(e) = handle_project_announce(
-                            &store,
-                            &staging_root,
-                            loop_transport.as_ref(),
-                            emitter.as_ref(),
-                            announcements_refresher.as_ref(),
-                            on_project_ingested.as_ref(),
-                            from,
-                            project_id,
-                            package_id,
-                            announce,
-                        )
-                        .await
-                        {
-                            tracing::error!(error = %format!("{e:#}"), "sync receiver project announce handling failed");
-                        }
-                    }
-                    // Collab exchange (slice 4, task 6): a member asked us (a
-                    // holder) to serve a project package. Dispatch to the host's
-                    // serve handler, which authorizes (`may_serve_package`),
-                    // reconstructs the serve dir, and enqueues an explicit-target
-                    // serve back to `from` through the collab sender map. The
-                    // handler `tokio::spawn`s the async work, so this stays
-                    // non-blocking. Absent handler ⇒ log + drop (pre-task-6).
-                    TransportEvent::ProjectRequestReceived {
-                        from,
-                        project_id,
-                        package_id,
-                    } => match &request_handler {
-                        Some(handler) => {
-                            tracing::info!(
-                                from = %super::node_id_hex(&from),
-                                project_id,
-                                package_id,
-                                "project package requested — dispatching serve"
-                            );
-                            handler(from, project_id, package_id);
-                        }
-                        None => {
-                            tracing::warn!(
-                                from = %super::node_id_hex(&from),
-                                project_id,
-                                package_id,
-                                "project package requested but no serve handler installed; dropping"
-                            );
-                        }
-                    },
-                    // A sender revoked an outstanding announce (spec §D2, B4): abort
-                    // any in-flight fetch, drive the row to an honest terminal, settle
-                    // file rows, release in-flight tags, and write history + journal.
-                    // NO ack is sent for a revoke.
-                    TransportEvent::RevokeReceived {
-                        from,
-                        package_id,
-                        reason,
-                    } => {
-                        // H1 belt-and-suspenders (mirrors the `AnnounceReceived`
-                        // arm): the connect_gate covers production, but dev-ticket
-                        // mode installs no gate, so this per-event authorizer check
-                        // must be uniform across every event kind that can touch
-                        // catalog/receiver state. An unauthorized peer's revoke is
-                        // silently dropped before it can terminalize any row.
-                        if !authorized(&from) {
-                            tracing::warn!(
-                                from = %super::node_id_hex(&from),
-                                package_id = %package_id.0,
-                                "sync receiver dropped revoke from an unauthorized peer"
-                            );
-                            continue;
-                        }
-                        handle_revoke(
-                            &store,
-                            loop_transport.as_ref(),
-                            emitter.as_ref(),
-                            &control,
-                            &staging_root,
-                            from,
-                            &package_id,
-                            reason,
-                        )
-                        .await;
-                    }
-                    // `AckReceived` is the sender's half — the receiver loop does
-                    // not consume it.
-                    _ => {}
+                // No peer ⇒ not ours to process (`AckReceived` is the sender half;
+                // the `Serve*` variants originate on our own endpoint). This is the
+                // old `_ => {}` arm, now stated once in `event_peer`.
+                let Some(from) = event_peer(&ev) else {
+                    continue;
+                };
+
+                let lane = lanes.entry(from).or_insert_with(|| {
+                    let (tx, rx) = mpsc::unbounded_channel::<TransportEvent>();
+                    lane_tasks.spawn(run_peer_lane(rx, deps.clone()));
+                    tracing::debug!(
+                        from = %super::node_id_hex(&from),
+                        lanes = lane_tasks.len(),
+                        "sync receiver opened a receive lane"
+                    );
+                    tx
+                });
+                if lane.send(ev).is_err() {
+                    // The only way a lane channel closes while we still hold its
+                    // sender is the lane task being gone — i.e. it panicked. Drop
+                    // the entry so the NEXT event from this peer mints a fresh lane
+                    // (self-healing: one peer's panic costs it one event, never its
+                    // whole future traffic). The dropped event is not retried — the
+                    // lane that would have run it just died mid-work.
+                    tracing::warn!(
+                        from = %super::node_id_hex(&from),
+                        "sync receiver lane is gone; dropping this event and reopening on the next"
+                    );
+                    lanes.remove(&from);
                 }
+                // Reap eagerly so a lane panic is LOUD when it happens, not only at
+                // shutdown (a lane never finishes on its own while we hold its
+                // sender, so this only ever yields panicked tasks).
+                while let Some(res) = lane_tasks.try_join_next() {
+                    report_lane_exit(res);
+                }
+            }
+
+            // Normal close (the transport stream ended, not an abort): dropping the
+            // map closes every lane channel, so each lane drains the work already
+            // queued on it and exits — then we wait for them. An ABORT of this task
+            // instead drops the `JoinSet` itself, which aborts every lane in flight:
+            // the same "stop now" semantics `SyncReceiverHandle::shutdown` has always
+            // had.
+            drop(lanes);
+            while let Some(res) = lane_tasks.join_next().await {
+                report_lane_exit(res);
             }
             tracing::info!("sync receiver event stream closed; loop stopping");
         });
 
         Ok((info, SyncReceiverHandle { join, pump }))
+    }
+}
+
+/// Everything one receive lane needs to process an event: exactly the values the
+/// pre-lane single serial `match` captured, bundled so each lane task can own a
+/// clone. Every field is an `Arc` (or the cheap `staging_root` path), so a clone
+/// shares the one store / control / transport rather than duplicating state —
+/// which is what lets lanes stay independent tasks without splitting ownership.
+#[derive(Clone)]
+struct ReceiverLaneDeps {
+    store: Arc<CatalogSyncStore>,
+    staging_root: PathBuf,
+    incoming: IncomingResolver,
+    authorized: PeerAuthorizer,
+    project_gate: Option<ProjectAnnounceGate>,
+    announcements_refresher: Option<ProjectAnnouncementsRefresher>,
+    on_project_ingested: Option<ProjectIngestedHook>,
+    request_handler: Option<ProjectRequestHandler>,
+    control: Arc<InboundControl>,
+    transport: Arc<dyn SharingTransport>,
+    emitter: Arc<dyn ProgressEmitter>,
+}
+
+/// Which peer an event belongs to — the lane key. `None` = the receiver does not
+/// process this variant at all.
+///
+/// Deliberately EXHAUSTIVE with no `_` arm: a new [`TransportEvent`] variant must
+/// fail to compile here, forcing whoever adds it to decide whether it is
+/// peer-scoped work (route it) or not (an explicit `None`). The old loop's silent
+/// `_ => {}` is the failure mode this replaces.
+fn event_peer(ev: &TransportEvent) -> Option<NodeId> {
+    match ev {
+        TransportEvent::AnnounceReceived { from, .. }
+        | TransportEvent::ProjectAnnounceReceived { from, .. }
+        | TransportEvent::ProjectRequestReceived { from, .. }
+        | TransportEvent::RevokeReceived { from, .. } => Some(*from),
+        // The sender half of the protocol — consumed by `SyncEngine`, never here.
+        TransportEvent::AckReceived { .. } => None,
+        // Locally-originated serve-side progress (our own endpoint, no peer):
+        // routed to the sender engine, never processed by the receiver.
+        TransportEvent::ServeProgress { .. } => None,
+        TransportEvent::ServeComplete { .. } => None,
+        TransportEvent::ServeFileProgress { .. } => None,
+    }
+}
+
+/// One peer's serial lane: drains its channel in order, awaiting each event's
+/// handling before the next. FIFO within a peer is a hard guarantee (a revoke
+/// must do its bookkeeping strictly after the announce it revokes has returned);
+/// FIFO ACROSS peers is deliberately given up — that is the point of lanes.
+async fn run_peer_lane(mut rx: mpsc::UnboundedReceiver<TransportEvent>, deps: ReceiverLaneDeps) {
+    while let Some(ev) = rx.recv().await {
+        process_receiver_event(ev, &deps).await;
+    }
+}
+
+/// Log a finished lane task. A lane exits cleanly only when its channel closes
+/// (receiver shutting down); anything else is a panic that silently kills that
+/// peer's processing until the next event reopens a lane, so it is logged at
+/// `error` rather than swallowed by the `JoinSet`.
+fn report_lane_exit(res: Result<(), tokio::task::JoinError>) {
+    if let Err(e) = res {
+        if e.is_panic() {
+            tracing::error!(
+                error = %e,
+                "sync receiver lane PANICKED — that peer's events stopped being processed"
+            );
+        }
+    }
+}
+
+/// Handle one routed transport event. Lifted verbatim out of the pre-lane serial
+/// loop's `match`; the only change is that its inputs arrive through
+/// [`ReceiverLaneDeps`] instead of being captured by the loop's closure.
+async fn process_receiver_event(ev: TransportEvent, deps: &ReceiverLaneDeps) {
+    let ReceiverLaneDeps {
+        store,
+        staging_root,
+        incoming,
+        authorized,
+        project_gate,
+        announcements_refresher,
+        on_project_ingested,
+        request_handler,
+        control,
+        transport,
+        emitter,
+    } = deps;
+
+    match ev {
+        // `batch_uuid` (spec §D1/§D2) is the durable per-transfer identity
+        // the receiver keys ONE inbound row on across every attempt (B4):
+        // v3 → the sender's package-dir basename; v1/v2 → the wire package
+        // id (B1 fallback), which reproduces today's per-attempt rows.
+        TransportEvent::AnnounceReceived {
+            from,
+            announce,
+            batch_name,
+            batch_uuid,
+            files,
+        } => {
+            // Authorization gate (finding H1): only ingest from a peer
+            // on this receiver's allow-list. An unauthorized (or
+            // revoked) node is silently dropped BEFORE any
+            // fetch/ingest/ack — it never touches the catalog or the
+            // landing folder, and gets no signal it was even heard.
+            if !authorized(&from) {
+                tracing::warn!(
+                    from = %super::node_id_hex(&from),
+                    package_id = %announce.package_id.0,
+                    "sync receiver dropped announce from an unauthorized peer"
+                );
+                return;
+            }
+            // Task 4.1 (candidate (a)): time each inline announce
+            // handling. `announce` is moved into the call, so capture
+            // the package id first; `from` (a `NodeId`) is `Copy`.
+            // Instrumentation only — no behavior change.
+            let announce_started = std::time::Instant::now();
+            let package_id_for_log = announce.package_id.0.clone();
+            if let Err(e) = handle_announce(
+                store,
+                staging_root,
+                incoming,
+                transport.as_ref(),
+                Arc::clone(emitter),
+                control,
+                from,
+                announce,
+                batch_name,
+                batch_uuid,
+                files,
+            )
+            .await
+            {
+                tracing::error!(error = %format!("{e:#}"), "sync receiver announce handling failed");
+            }
+            tracing::info!(
+                package_id = %package_id_for_log,
+                from = %super::node_id_hex(&from),
+                duration_ms = announce_started.elapsed().as_millis() as u64,
+                "sync receiver announce handled"
+            );
+        }
+        // Collab exchange (slice 4): an inbound PROJECT package
+        // advertisement. The ROW KEY is the event's hub `package_id`
+        // (audit B1) while fetch/ack use the wire `announce.package_id`.
+        TransportEvent::ProjectAnnounceReceived {
+            from,
+            project_id,
+            package_id,
+            announce,
+        } => {
+            // The hub package id is peer-controlled — reject anything
+            // that is not a single safe path segment BEFORE the gate
+            // (same C1 guard as personal sync).
+            if let Err(e) = crate::package::validate_package_id(&package_id) {
+                tracing::warn!(
+                    from = %super::node_id_hex(&from),
+                    project_id,
+                    package_id,
+                    error = %e,
+                    "project announce rejected: unsafe package_id"
+                );
+                return;
+            }
+            // Cross-account trust: only a verified current member of
+            // `project_id` may push-seed to us. Gate absent or
+            // refusing ⇒ drop (fail-closed — never accept-all).
+            let accepted = project_gate
+                .as_ref()
+                .map(|gate| gate(&from, &project_id))
+                .unwrap_or(false);
+            if !accepted {
+                tracing::warn!(
+                    from = %super::node_id_hex(&from),
+                    project_id,
+                    package_id,
+                    "project announce dropped: sender is not an authorized project member"
+                );
+                return;
+            }
+            if let Err(e) = handle_project_announce(
+                store,
+                staging_root,
+                transport.as_ref(),
+                emitter.as_ref(),
+                announcements_refresher.as_ref(),
+                on_project_ingested.as_ref(),
+                from,
+                project_id,
+                package_id,
+                announce,
+            )
+            .await
+            {
+                tracing::error!(error = %format!("{e:#}"), "sync receiver project announce handling failed");
+            }
+        }
+        // Collab exchange (slice 4, task 6): a member asked us (a
+        // holder) to serve a project package. Dispatch to the host's
+        // serve handler, which authorizes (`may_serve_package`),
+        // reconstructs the serve dir, and enqueues an explicit-target
+        // serve back to `from` through the collab sender map. The
+        // handler `tokio::spawn`s the async work, so this stays
+        // non-blocking. Absent handler ⇒ log + drop (pre-task-6).
+        TransportEvent::ProjectRequestReceived {
+            from,
+            project_id,
+            package_id,
+        } => match request_handler {
+            Some(handler) => {
+                tracing::info!(
+                    from = %super::node_id_hex(&from),
+                    project_id,
+                    package_id,
+                    "project package requested — dispatching serve"
+                );
+                handler(from, project_id, package_id);
+            }
+            None => {
+                tracing::warn!(
+                    from = %super::node_id_hex(&from),
+                    project_id,
+                    package_id,
+                    "project package requested but no serve handler installed; dropping"
+                );
+            }
+        },
+        // A sender revoked an outstanding announce (spec §D2, B4): abort
+        // any in-flight fetch, drive the row to an honest terminal, settle
+        // file rows, release in-flight tags, and write history + journal.
+        // NO ack is sent for a revoke.
+        TransportEvent::RevokeReceived {
+            from,
+            package_id,
+            reason,
+        } => {
+            // H1 belt-and-suspenders (mirrors the `AnnounceReceived`
+            // arm): the connect_gate covers production, but dev-ticket
+            // mode installs no gate, so this per-event authorizer check
+            // must be uniform across every event kind that can touch
+            // catalog/receiver state. An unauthorized peer's revoke is
+            // silently dropped before it can terminalize any row.
+            if !authorized(&from) {
+                tracing::warn!(
+                    from = %super::node_id_hex(&from),
+                    package_id = %package_id.0,
+                    "sync receiver dropped revoke from an unauthorized peer"
+                );
+                return;
+            }
+            handle_revoke(
+                store,
+                transport.as_ref(),
+                emitter.as_ref(),
+                control,
+                staging_root,
+                from,
+                &package_id,
+                reason,
+            )
+            .await;
+        }
+        // Never routed to a lane (`event_peer` returns `None` for these), so this
+        // arm is unreachable in practice — kept total rather than `unreachable!`
+        // so a routing mistake degrades to a no-op instead of killing the lane.
+        TransportEvent::AckReceived { .. }
+        | TransportEvent::ServeProgress { .. }
+        | TransportEvent::ServeComplete { .. }
+        | TransportEvent::ServeFileProgress { .. } => {}
     }
 }
 
@@ -1725,7 +1930,8 @@ async fn handle_announce(
             // Sender-revoked mid-fetch (B4-fix): the fetch is already dropped
             // above. Do NOT touch row/file state here and send NO ack — the
             // already-queued `RevokeReceived` event runs `handle_revoke`'s
-            // reason-honest bookkeeping the moment the serial loop drains it next.
+            // reason-honest bookkeeping the moment this peer's lane — the same one
+            // running this call, so strictly after it returns — drains it next.
             tracing::info!(
                 package_id = %package_id,
                 peer_device = %peer_device,
@@ -2176,7 +2382,7 @@ async fn cancel_epilogue(
     //    `package_id`-keyed read/write in this fn hit the row even when the row
     //    still carried an older attempt's wire id (the declined-final resend
     //    path, where `upsert_inbound_attempt` left the row untouched). One merged
-    //    UPDATE = one commit on the serial loop; rotating to the already-current
+    //    UPDATE = one commit on the peer's lane; rotating to the already-current
     //    id is a no-op-shaped write.
     {
         let conn = store.lock_conn();
@@ -6379,7 +6585,7 @@ mod tests {
 
     /// H1 (deny), the revoke twin of `receiver_drops_announce_from_unauthorized_peer`
     /// (B5 §6b): a `RevokeReceived` from a peer NOT on the allow-list must be dropped
-    /// on BOTH the ingress pump (no `request_revoke_abort`) AND the serial loop (no
+    /// on BOTH the ingress pump (no `request_revoke_abort`) AND the peer's lane (no
     /// `handle_revoke`), leaving the seeded non-terminal row and its journal untouched.
     /// Without the guard the unauthorized revoke would terminalize a stranger's row.
     #[tokio::test]
@@ -6462,10 +6668,10 @@ mod tests {
     /// `Revoke` delivered while the receiver's fetch is GENUINELY blocking (not a
     /// near-instant loopback copy) aborts it PROMPTLY — well before the fetch
     /// would have finished on its own. Without the fix, `RevokeReceived` queues
-    /// behind the single-consumer serial loop's in-progress, blocking
-    /// `handle_announce` call and only gets processed (as a no-op, on the
-    /// already-`Done` row) once the fetch completes naturally — exactly the bug
-    /// the review flagged.
+    /// behind the in-progress, blocking `handle_announce` call of the SAME peer
+    /// (one serial lane, by design — a revoke and the announce it revokes always
+    /// share one) and only gets processed (as a no-op, on the already-`Done` row)
+    /// once the fetch completes naturally — exactly the bug the review flagged.
     ///
     /// Proof, all three required by the review:
     /// 1. **Bounded deadline, not fetch-completion**: revoke→`Cancelled` lands
@@ -6780,5 +6986,468 @@ mod tests {
             DEFAULT_MAX_CONCURRENT_RECEIVES,
             "`new()` and `default()` agree — `new()` still just forwards"
         );
+    }
+
+    // ─── Per-peer receive lanes (W2 T2.3) ───────────────────────────────────
+
+    /// The four peer-scoped variants route to their sender's lane, and a
+    /// locally-originated one does not route at all. The REAL guard against a
+    /// future variant slipping through unrouted is [`event_peer`]'s wildcard-free
+    /// match (a new variant fails to compile there); this pins the mapping those
+    /// arms produce today, so a lane key can never be quietly re-pointed at
+    /// something other than the sending peer.
+    #[test]
+    fn event_peer_covers_every_processed_variant() {
+        let from: NodeId = [9u8; 32];
+        let announce = PackageAnnounce {
+            package_id: PackageId("pkg".into()),
+            root_hash: "0".repeat(64),
+            byte_size: 0,
+            frame_count: 1,
+        };
+
+        assert_eq!(
+            event_peer(&TransportEvent::AnnounceReceived {
+                from,
+                announce: announce.clone(),
+                batch_name: None,
+                batch_uuid: "batch".into(),
+                files: None,
+            }),
+            Some(from)
+        );
+        assert_eq!(
+            event_peer(&TransportEvent::ProjectAnnounceReceived {
+                from,
+                project_id: "proj".into(),
+                package_id: "hub-pkg".into(),
+                announce,
+            }),
+            Some(from)
+        );
+        assert_eq!(
+            event_peer(&TransportEvent::ProjectRequestReceived {
+                from,
+                project_id: "proj".into(),
+                package_id: "hub-pkg".into(),
+            }),
+            Some(from)
+        );
+        assert_eq!(
+            event_peer(&TransportEvent::RevokeReceived {
+                from,
+                package_id: PackageId("pkg".into()),
+                reason: RevokeReason::Cancelled,
+            }),
+            Some(from)
+        );
+
+        // The sender half of the protocol: carries a `from`, but the receiver has
+        // no work for it — it must NOT open a lane.
+        assert_eq!(
+            event_peer(&TransportEvent::AckReceived {
+                from,
+                package_id: PackageId("pkg".into()),
+                receipts: vec![],
+            }),
+            None
+        );
+        // Locally-originated serve progress: no peer at all.
+        assert_eq!(
+            event_peer(&TransportEvent::ServeComplete {
+                package_id: PackageId("pkg".into()),
+            }),
+            None
+        );
+    }
+
+    /// Build a package fixture of `count` distinct FITS payloads under
+    /// `root/<tag>`, with every frame uuid prefixed by `tag` AND its pixel values
+    /// offset by `tag`. Two fixtures built with different tags therefore collide
+    /// neither in frame identity nor in CONTENT (ingest dedups on both), and share
+    /// no directory — so one receiver can take both at once, which is the whole
+    /// point of the lane tests. Returns `(pkg_dir, announce, files)` like
+    /// [`build_v2_fixture`].
+    fn build_lane_fixture(
+        root: &std::path::Path,
+        tag: &str,
+        count: usize,
+    ) -> (std::path::PathBuf, PackageAnnounce, Vec<AnnounceFileEntry>) {
+        use crate::models::{Frame, ImageType};
+        use crate::package::{ManifestRecord, PayloadKind, MANIFEST_VERSION};
+
+        let base = root.join(format!("lane-{tag}"));
+        let src_dir = base.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        // Per-tag pixel offset: two fixtures must never produce byte-identical
+        // payloads, or the second one's frames ingest as content duplicates.
+        let tag_offset = tag.bytes().map(u32::from).sum::<u32>() as f32;
+
+        let mut entries = Vec::new();
+        let mut items = Vec::new();
+        for i in 0..count {
+            let uuid = format!("frame-{tag}-{i}");
+            let rel = format!("L_{i:04}.fits");
+            let src = src_dir.join(&uuid); // unique flat source name
+            let val = tag_offset + 0.1f32 * (i as f32 + 1.0);
+            crate::fits_writer::write_fits_f32(&src, 4, 4, 1, &[val; 16], &[]).unwrap();
+            let byte_size = std::fs::metadata(&src).unwrap().len();
+            let xxh3 = crate::package::xxh3_full_file(&src).unwrap();
+            let frame = Frame {
+                object: Some("M31".to_string()),
+                imagetyp: Some(ImageType::Light),
+                naxis1: Some(4),
+                naxis2: Some(4),
+                uuid: Some(uuid.clone()),
+                updated_at: Some("2026-01-16T10:00:00.000Z".to_string()),
+                ..Default::default()
+            };
+            let record = ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: uuid.clone(),
+                origin_catalog_uuid: format!("catalog-{tag}"),
+                origin_device: "aa".repeat(32),
+                payload_kind: PayloadKind::RawFrame,
+                rel_path: rel.clone(),
+                byte_size,
+                xxh3,
+                frame_meta: serde_json::to_value(&frame).unwrap(),
+                analysis: None,
+                app_version: "test".to_string(),
+                project: None,
+            };
+            entries.push(afe(&rel, &uuid, byte_size));
+            items.push((src, record));
+        }
+        let pkg_dir = base.join("pkg");
+        let announce = crate::package::write_package(&pkg_dir, items).unwrap();
+        (pkg_dir, announce, entries)
+    }
+
+    /// The headline of W2 T2.3: transfers from DIFFERENT devices no longer queue
+    /// behind each other. One receiver, two sender endpoints. Peer A's fetch is
+    /// paced so it genuinely blocks for seconds; peer B announces a small package
+    /// while A is mid-fetch and must run to a terminal **while A is still
+    /// fetching**.
+    ///
+    /// Against the pre-lane single serial consumer this cannot pass at all: B's
+    /// `AnnounceReceived` sits unread in the consumer channel until A's inline
+    /// `handle_announce` returns, so B's row does not even exist inside the
+    /// deadline — the poll below panics with "peer B never reached Done".
+    ///
+    /// Pacing mechanics: the loopback `fetch` latches `delay_per_read` ONCE at
+    /// entry, so arming the fault before A's announce and clearing it after A is
+    /// observably `Fetching` paces A only — B's fetch runs at full speed while A's
+    /// already-running one keeps its pauses.
+    #[tokio::test]
+    async fn two_peers_get_independent_lanes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let slow_sender = Arc::new(net.endpoint());
+        let fast_sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        slow_sender.start().await.unwrap();
+        fast_sender.start().await.unwrap();
+
+        // 3 payloads + the manifest ⇒ 4 paced reads ⇒ a ~2.8s fetch for peer A.
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+        receiver_ep.set_fault(FaultPlan {
+            delay_per_read: Some(DELAY),
+            ..Default::default()
+        });
+
+        let (_info, handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            {
+                let incoming = incoming.clone();
+                Arc::new(move || incoming.clone()) as IncomingResolver
+            },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        let (dir_a, ann_a, files_a) = build_lane_fixture(tmp.path(), "slow", 3);
+        let wire_a = ann_a.package_id.0.clone();
+        slow_sender.serve(&ann_a, &dir_a, None).await.unwrap();
+        slow_sender
+            .announce(receiver_node, &ann_a, "Slow Batch", "batch-slow", &files_a)
+            .await
+            .unwrap();
+        poll_inbound(&store, &wire_a, InboundState::Fetching).await;
+
+        // A is under way with its pacing latched; B gets a full-speed fetch.
+        receiver_ep.set_fault(FaultPlan::default());
+
+        let (dir_b, ann_b, files_b) = build_lane_fixture(tmp.path(), "fast", 1);
+        let wire_b = ann_b.package_id.0.clone();
+        fast_sender.serve(&ann_b, &dir_b, None).await.unwrap();
+        fast_sender
+            .announce(receiver_node, &ann_b, "Fast Batch", "batch-fast", &files_b)
+            .await
+            .unwrap();
+
+        // Comfortably inside A's ~2.8s paced fetch: if B only lands after A, this
+        // window expires with no B row (or a non-terminal one) and the test fails.
+        let deadline = std::time::Duration::from_millis(2000);
+        let started = std::time::Instant::now();
+        let mut landed = None;
+        while started.elapsed() < deadline {
+            let (b_row, a_row) = {
+                let conn = store.lock_conn();
+                (
+                    get_inbound(&conn, &wire_b).unwrap(),
+                    get_inbound(&conn, &wire_a).unwrap(),
+                )
+            };
+            if matches!(&b_row, Some(r) if r.state == InboundState::Done) {
+                landed = Some((b_row.unwrap(), a_row));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (b_row, a_row) = landed.unwrap_or_else(|| {
+            panic!(
+                "peer B never reached Done within {deadline:?} while peer A was fetching — \
+                 B is queued behind A instead of riding its own lane"
+            )
+        });
+        assert_eq!(b_row.state, InboundState::Done);
+
+        // The other half of the proof: A really was still mid-fetch when B landed,
+        // so B overtook a genuinely blocking transfer rather than following a fast
+        // one.
+        assert_eq!(
+            a_row.map(|r| r.state),
+            Some(InboundState::Fetching),
+            "peer A must still be mid-fetch when B lands — otherwise this proves nothing"
+        );
+
+        // And A finishes normally on its own lane afterwards.
+        poll_inbound(&store, &wire_a, InboundState::Done).await;
+
+        handle.shutdown().await;
+    }
+
+    /// Shutdown semantics are UNCHANGED by the lane split: `shutdown` aborts the
+    /// router task, whose `JoinSet` aborts every lane still in flight on drop —
+    /// exactly the "stop now, mid-fetch" behavior the single serial loop had when
+    /// it was the thing being aborted.
+    ///
+    /// Pinned by outcome: a paced fetch that is aborted mid-flight never reaches a
+    /// terminal, checked a full uninterrupted-fetch duration later. A lane that
+    /// survived its router (or a `shutdown` that drained instead of aborting) would
+    /// land the row `Done` inside that window.
+    #[tokio::test]
+    async fn shutdown_aborts_lanes_in_flight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+        const READS: u32 = 4; // 3 payloads + manifest
+        receiver_ep.set_fault(FaultPlan {
+            delay_per_read: Some(DELAY),
+            ..Default::default()
+        });
+
+        let (_info, handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            {
+                let incoming = incoming.clone();
+                Arc::new(move || incoming.clone()) as IncomingResolver
+            },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce, files) = build_lane_fixture(tmp.path(), "abort", 3);
+        let wire = announce.package_id.0.clone();
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender
+            .announce(
+                receiver_node,
+                &announce,
+                "Abort Batch",
+                "batch-abort",
+                &files,
+            )
+            .await
+            .unwrap();
+        poll_inbound(&store, &wire, InboundState::Fetching).await;
+
+        handle.shutdown().await;
+
+        // Well past the point the fetch would have finished had its lane lived on.
+        tokio::time::sleep(DELAY * READS + std::time::Duration::from_millis(500)).await;
+        let row = {
+            let conn = store.lock_conn();
+            get_inbound(&conn, &wire).unwrap().unwrap()
+        };
+        assert_ne!(
+            row.state,
+            InboundState::Done,
+            "shutdown must abort the in-flight lane, not let it run to completion"
+        );
+        assert!(
+            row.finished_at.is_none(),
+            "the aborted attempt writes no terminal; the startup reconcile parks it on the next launch"
+        );
+    }
+
+    /// The invariant pin for the same change: within ONE peer, events stay strictly
+    /// FIFO — a lane is serial. Green before AND after the lane split; it exists so
+    /// a later "make it faster" edit cannot quietly buy cross-peer parallelism with
+    /// same-peer reordering.
+    ///
+    /// Sequence: announce (paced, genuinely blocking fetch) → revoke. What must
+    /// hold, and why each assertion is an ORDERING statement rather than a repeat of
+    /// [`revoke_mid_fetch_aborts_promptly_not_at_fetch_completion`] (which pins the
+    /// promptness and the ack-free reason-honesty of the same pair):
+    ///
+    /// 1. The fetch aborts promptly (the pump's cross-task flag) — kept here only
+    ///    so the rest of the test is meaningful.
+    /// 2. **`handle_revoke` ran strictly AFTER `handle_announce` returned**: its
+    ///    staging cleanup is still in effect a full uninterrupted-fetch duration
+    ///    later. Had the two overlapped, the still-running fetch would have
+    ///    re-created files under the staging dir it had just deleted.
+    /// 3. The terminal is the revoke's mapping (`Cancelled` / `by sender`) and
+    ///    survives that same settle window — nothing from the announce side wrote
+    ///    after it.
+    /// 4. No cancel-epilogue ack: zero receipts, no `cancelled` journal entry.
+    #[tokio::test]
+    async fn same_peer_events_stay_fifo_under_lanes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        // 3 payloads + manifest ⇒ 4 paced reads ⇒ ~2.8s uninterrupted.
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(700);
+        const READS: u32 = 4;
+        receiver_ep.set_fault(FaultPlan {
+            delay_per_read: Some(DELAY),
+            ..Default::default()
+        });
+
+        let (_info, handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            {
+                let incoming = incoming.clone();
+                Arc::new(move || incoming.clone()) as IncomingResolver
+            },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        let (pkg_dir, announce, files) = build_lane_fixture(tmp.path(), "fifo", 3);
+        let wire = announce.package_id.0.clone();
+        sender.serve(&announce, &pkg_dir, None).await.unwrap();
+        sender
+            .announce(receiver_node, &announce, "Fifo Batch", "batch-fifo", &files)
+            .await
+            .unwrap();
+
+        poll_inbound(&store, &wire, InboundState::Fetching).await;
+        let inbound_id = {
+            let conn = store.lock_conn();
+            get_inbound(&conn, &wire).unwrap().unwrap().id
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let staging = sync_dir.join("staging").join(&wire);
+        assert!(
+            staging.exists(),
+            "the fetch is writing into staging before the revoke: {staging:?}"
+        );
+
+        sender
+            .revoke(receiver_node, &announce.package_id, RevokeReason::Cancelled)
+            .await
+            .unwrap();
+        let row = poll_inbound(&store, &wire, InboundState::Cancelled).await;
+        assert_eq!(row.last_error.as_deref(), Some("by sender"));
+
+        // Settle past the point the uninterrupted fetch would have finished: a
+        // concurrent (non-FIFO) announce handler would still be copying here.
+        tokio::time::sleep(DELAY * READS + std::time::Duration::from_millis(500)).await;
+
+        assert!(
+            !staging.exists(),
+            "staging re-appeared after the revoke's cleanup — the announce handler \
+             was still running, so the revoke did NOT follow it in order: {staging:?}"
+        );
+        let settled = {
+            let conn = store.lock_conn();
+            get_inbound(&conn, &wire).unwrap().unwrap()
+        };
+        assert_eq!(
+            settled.state,
+            InboundState::Cancelled,
+            "the revoke's terminal is final — nothing from the announce side wrote after it"
+        );
+        assert_eq!(settled.last_error.as_deref(), Some("by sender"));
+        assert!(settled.finished_at.is_some(), "a revoked row is terminal");
+
+        assert_eq!(
+            count_scalar(
+                &store,
+                &format!("SELECT COUNT(*) FROM sync_receipts WHERE package_id='{wire}'")
+            ),
+            0,
+            "the revoke path sends no ack and writes no receipts"
+        );
+        let kinds = journal_kinds(&store, inbound_id);
+        assert!(
+            kinds.iter().any(|k| k == "revoked"),
+            "journal has the revoke: {kinds:?}"
+        );
+        assert!(
+            kinds.iter().all(|k| k != "cancelled"),
+            "the local cancel_epilogue never ran: {kinds:?}"
+        );
+
+        handle.shutdown().await;
     }
 }
