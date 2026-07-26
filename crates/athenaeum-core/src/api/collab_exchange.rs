@@ -811,9 +811,10 @@ pub async fn refresh_all_project_packages(
             }
         }
     }
-    // Surface any download failures a spawned pull task buffered (F3) — drained
-    // exactly once so the frontend raises one `downloadFailed` per failure.
-    all.extend(drain_download_failures());
+    // Surface every change buffered off this path — a spawned pull task's
+    // `downloadFailed` (F3) and the auto-replication worker's own refresh diffs
+    // (D3 T5) — drained exactly once so the frontend raises each one only once.
+    all.extend(drain_pending_package_changes());
     Ok(all)
 }
 
@@ -1285,8 +1286,9 @@ fn swarm_fetch_plan(
 /// untouched by D3.
 ///
 /// `emitter` carries the `project-download-progress` events of the swarm path
-/// ([`ProjectDownloadProgress`]); `None` (the auto-replication worker, tests) is
-/// a silent run, never a different transfer.
+/// ([`ProjectDownloadProgress`]); the auto-replication worker (D3 T5) passes the
+/// host emitter too, so a background pull is as visible as a pressed Download.
+/// `None` (tests) is a silent run, never a different transfer.
 pub async fn download_project_package(
     ctx: &ServiceContext,
     sync: &crate::sync::SyncRuntime,
@@ -1828,34 +1830,51 @@ fn set_download_failed(
     push_download_failure(project_id, package_id, detail);
 }
 
-/// Process-local buffer of `downloadFailed` state changes a spawned
-/// `download_project_package` task produced but could not surface itself (it
-/// returns into a spawned task, not the UI). [`refresh_all_project_packages`]
-/// drains it so the next poll reports each failure exactly once (F3).
-static PENDING_DOWNLOAD_FAILURES: std::sync::OnceLock<std::sync::Mutex<Vec<PackageStateChange>>> =
+/// Process-local buffer of package state changes observed OFF the UI's refresh
+/// path, so the next [`refresh_all_project_packages`] reports each of them
+/// exactly once. Two producers:
+///
+/// * `downloadFailed` from a spawned `download_project_package` task, which
+///   returns into a task, not the UI (F3);
+/// * the diffs the D3 auto-replication worker's own announcement refresh
+///   consumed — `apply_announcements` diffs against the DB, so once the worker
+///   has upserted a row a later UI poll sees it as KNOWN and would raise
+///   nothing. Without this buffer, auto-replication would silently swallow the
+///   `newPackage` / `approved` / `rejected` notifications for exactly the
+///   projects it keeps most current.
+static PENDING_PACKAGE_CHANGES: std::sync::OnceLock<std::sync::Mutex<Vec<PackageStateChange>>> =
     std::sync::OnceLock::new();
 
-fn pending_download_failures() -> &'static std::sync::Mutex<Vec<PackageStateChange>> {
-    PENDING_DOWNLOAD_FAILURES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+fn pending_package_changes() -> &'static std::sync::Mutex<Vec<PackageStateChange>> {
+    PENDING_PACKAGE_CHANGES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
 /// Enqueue a `downloadFailed` change (F3). Poison-tolerant: a failed lock only
 /// means the change isn't surfaced this cycle, never a panic. `detail` (Task 9)
 /// is the per-holder probe classification summary, or `None`.
 fn push_download_failure(project_id: &str, package_id: &str, detail: Option<String>) {
-    if let Ok(mut buf) = pending_download_failures().lock() {
-        buf.push(PackageStateChange {
-            project_id: project_id.to_string(),
-            package_id: package_id.to_string(),
-            kind: "downloadFailed".to_string(),
-            detail,
-        });
+    push_package_changes(vec![PackageStateChange {
+        project_id: project_id.to_string(),
+        package_id: package_id.to_string(),
+        kind: "downloadFailed".to_string(),
+        detail,
+    }]);
+}
+
+/// Enqueue changes a non-UI refresh consumed (D3 T5). Poison-tolerant, same as
+/// [`push_download_failure`].
+fn push_package_changes(changes: Vec<PackageStateChange>) {
+    if changes.is_empty() {
+        return;
+    }
+    if let Ok(mut buf) = pending_package_changes().lock() {
+        buf.extend(changes);
     }
 }
 
-/// Drain the buffered `downloadFailed` changes exactly once (F3).
-fn drain_download_failures() -> Vec<PackageStateChange> {
-    match pending_download_failures().lock() {
+/// Drain the buffered changes exactly once (F3).
+fn drain_pending_package_changes() -> Vec<PackageStateChange> {
+    match pending_package_changes().lock() {
         Ok(mut buf) => std::mem::take(&mut *buf),
         Err(_) => Vec::new(),
     }
@@ -1880,6 +1899,358 @@ async fn wait_for_local_complete(ctx: &ServiceContext, package_id: &str) -> bool
         }
         tokio::time::sleep(DOWNLOAD_POLL_INTERVAL).await;
     }
+}
+
+// ── D3 §3.3: auto-replication — published contributions download themselves ──
+//
+// A background pass per project: refresh the hub's announcement list, diff it
+// against what this device already holds, and pull each missing package through
+// the SAME [`download_project_package`] the Download button uses (swarm first,
+// sequential fallback). Nothing new travels on the wire — the hub's announcement
+// list is already the shared truth, and the need list is computed locally.
+
+/// How often the auto-replication worker sweeps every auto-enabled project
+/// (spec §3.3). Long by design: a whole-swarm failure means every holder is
+/// gone, and 20 minutes is an honest retry interval for that.
+pub const COLLAB_AUTO_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// Grace before the FIRST pass of a session, so auto-replication never competes
+/// with app start (receiver boot, initial scan, first render). The monitor loop's
+/// 3 s startup deferral is the same idea, scaled to a background bulk pull.
+const COLLAB_AUTO_SYNC_STARTUP_DELAY: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Armed once per process. The worker is spawned from EVERY `ensure_started`
+/// site (autostart + the dev `start_sync`), exactly like the sender resurrection
+/// and the orphan sweep, so this flag — not the call site — is what makes it
+/// one loop per app run.
+static AUTO_SYNC_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What one pass did — the loop's log line and the unit tests' oracle.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AutoSyncPassOutcome {
+    /// Projects that passed the role + toggle gates (i.e. were actually swept).
+    pub projects: usize,
+    /// Packages the pass handed to the download path.
+    pub attempted: usize,
+    /// Of those, how many returned an error. NOTE: an exhausted download is
+    /// `Ok(())` by [`download_project_package`]'s contract (the terminal
+    /// `local_status` carries that outcome), so this counts hard errors only.
+    pub failed: usize,
+}
+
+/// May this device pull a project's packages at all? Mirrors the download
+/// role guard's rule (`coordinator || data_role == "send_receive"`, see
+/// [`download_project_package`]) against the CACHED project row, as a cheap
+/// pre-filter that skips the hub call for a `send`-only membership.
+///
+/// It is only a pre-filter: the authority stays [`download_project_package`],
+/// which re-resolves this device's membership from the signed snapshot by node
+/// id and fails closed. A stale cache row can therefore cost one refused
+/// download, never an unauthorized one.
+fn role_allows_replication(data_role: &str, is_coordinator: bool) -> bool {
+    is_coordinator || data_role == "send_receive"
+}
+
+/// The need diff (spec §3.3), pure and unit-tested: which of `packages` this
+/// device should download. `published ∧ ¬superseded ∧ ¬mine ∧ local_status ≠
+/// complete`, and empty whenever the role forbids replication or the project's
+/// toggle is off.
+///
+/// `failed` re-enters (retry by cadence — the swarm fetch already absorbed
+/// per-holder failures), and so does a `downloading` row: a process killed
+/// mid-download leaves that status behind forever otherwise. The worker is
+/// serial, so it never races itself; a pass racing a user's own Download click
+/// is the same double-start a double-click already is today.
+fn replication_need(packages: &[PackageRow], role_allows: bool, auto_on: bool) -> Vec<String> {
+    if !role_allows || !auto_on {
+        return Vec::new();
+    }
+    packages
+        .iter()
+        .filter(|p| {
+            p.state == "published"
+                && !p.superseded
+                && p.origin != "mine"
+                && p.local_status != "complete"
+        })
+        .map(|p| p.package_id.clone())
+        .collect()
+}
+
+/// One auto-replication pass.
+///
+/// `scope` limits it to a single project ("Sync now"); `None` sweeps every
+/// cached project. `force_auto_on` overrides the per-project toggle — an
+/// explicit user act ("Sync now") syncs a project whose auto-replication is off,
+/// while the role gate is NEVER overridden (that one is authorization).
+///
+/// `download` is the seam: production passes the real
+/// [`download_project_package`] call, tests inject a recorder. Downloads are
+/// awaited ONE AT A TIME (spec §3.3 — the Split fan-out inside one package
+/// already saturates the link; cross-package parallelism would just fight the
+/// `ReceiveGate`).
+///
+/// Never returns an error and never propagates one: a signed-out device, an
+/// unreadable catalog, an unreachable hub for one project, or a failing download
+/// are each logged and stepped over, because the caller is a loop that must
+/// survive all of them.
+async fn run_auto_sync_pass<F, Fut>(
+    ctx: &ServiceContext,
+    scope: Option<&str>,
+    force_auto_on: bool,
+    download: F,
+) -> AutoSyncPassOutcome
+where
+    F: Fn(String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<(), ApiError>>,
+{
+    let mut outcome = AutoSyncPassOutcome::default();
+
+    // Signed out ⇒ nothing to poll and nothing to pull. Same quiet degradation
+    // the announcement poll itself takes.
+    match crate::api::account::hub_credentials(ctx) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::debug!("collab auto-sync: signed out; pass skipped");
+            return outcome;
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e}"), "collab auto-sync: account read failed; pass skipped");
+            return outcome;
+        }
+    }
+
+    let projects = {
+        let database = match db(ctx) {
+            Ok(database) => database,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e}"), "collab auto-sync: catalog unavailable; pass skipped");
+                return outcome;
+            }
+        };
+        match crate::db::collab::list_projects(&database.conn()) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "collab auto-sync: project list failed; pass skipped");
+                return outcome;
+            }
+        }
+    };
+
+    for project in projects {
+        if scope.is_some_and(|only| only != project.project_id) {
+            continue;
+        }
+        let role_allows = role_allows_replication(&project.data_role, project.is_coordinator);
+        let auto_on = force_auto_on || project.auto_replicate;
+        if !role_allows || !auto_on {
+            tracing::debug!(
+                project_id = %project.project_id,
+                role_allows,
+                auto_on,
+                "collab auto-sync: project skipped"
+            );
+            continue;
+        }
+        outcome.projects += 1;
+
+        // Refresh the announcement list first — the need diff is only as good as
+        // the hub view it diffs against. A per-project failure skips THIS project
+        // (its downloads would poll the same unreachable hub anyway) and never
+        // the pass. The diffs this refresh consumed are buffered for the next UI
+        // poll: `apply_announcements` diffs against the DB, so a change the
+        // worker absorbed would otherwise never reach a notification.
+        match refresh_project_packages(ctx, &project.project_id).await {
+            Ok(changes) => push_package_changes(changes),
+            Err(e) => {
+                tracing::warn!(
+                    project_id = %project.project_id,
+                    error = %format!("{e}"),
+                    "collab auto-sync: announcement refresh failed; project skipped this pass"
+                );
+                continue;
+            }
+        }
+
+        let packages = {
+            let database = match db(ctx) {
+                Ok(database) => database,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e}"), "collab auto-sync: catalog unavailable; pass aborted");
+                    return outcome;
+                }
+            };
+            match list_packages(&database.conn(), &project.project_id) {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(
+                        project_id = %project.project_id,
+                        error = %format!("{e:#}"),
+                        "collab auto-sync: package list failed; project skipped this pass"
+                    );
+                    continue;
+                }
+            }
+        };
+
+        let need = replication_need(&packages, role_allows, auto_on);
+        if need.is_empty() {
+            tracing::debug!(project_id = %project.project_id, "collab auto-sync: nothing to replicate");
+            continue;
+        }
+        tracing::info!(
+            project_id = %project.project_id,
+            count = need.len(),
+            "collab auto-sync: replicating missing packages"
+        );
+        for package_id in need {
+            outcome.attempted += 1;
+            if let Err(e) = download(project.project_id.clone(), package_id.clone()).await {
+                outcome.failed += 1;
+                tracing::warn!(
+                    project_id = %project.project_id,
+                    package_id = %package_id,
+                    error = %format!("{e}"),
+                    "collab auto-sync: package download failed; continuing"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        projects = outcome.projects,
+        attempted = outcome.attempted,
+        failed = outcome.failed,
+        "collab auto-sync pass complete"
+    );
+    outcome
+}
+
+/// One pass with the REAL download path bound (the production seam). `'static`
+/// by construction so the loop can run it on its own task.
+async fn auto_sync_pass(
+    ctx: Arc<ServiceContext>,
+    sync: Arc<crate::sync::SyncRuntime>,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+    scope: Option<String>,
+    force_auto_on: bool,
+) -> AutoSyncPassOutcome {
+    let ctx_for_pass = Arc::clone(&ctx);
+    run_auto_sync_pass(
+        &ctx_for_pass,
+        scope.as_deref(),
+        force_auto_on,
+        move |project_id, package_id| {
+            let ctx = Arc::clone(&ctx);
+            let sync = Arc::clone(&sync);
+            let emitter = emitter.clone();
+            async move {
+                download_project_package(&ctx, &sync, &project_id, &package_id, emitter).await
+            }
+        },
+    )
+    .await
+}
+
+/// The auto-replication loop (spec §3.3): a pass every `interval`, after a short
+/// startup grace. Each pass runs on its own task so a panic anywhere below is
+/// logged and the loop survives it — the retention loop's shape, for the same
+/// reason (a background loop that dies is a feature that silently stops).
+pub async fn run_collab_auto_sync_loop(
+    ctx: Arc<ServiceContext>,
+    sync: Arc<crate::sync::SyncRuntime>,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+    interval: std::time::Duration,
+) {
+    tracing::info!(interval_secs = interval.as_secs(), "collab auto-sync loop armed");
+    let mut delay = COLLAB_AUTO_SYNC_STARTUP_DELAY.min(interval);
+    loop {
+        tokio::time::sleep(delay).await;
+        delay = interval;
+        let pass = tokio::spawn(auto_sync_pass(
+            Arc::clone(&ctx),
+            Arc::clone(&sync),
+            emitter.clone(),
+            None,
+            false,
+        ));
+        if let Err(error) = pass.await {
+            tracing::error!(%error, "collab auto-sync pass task panicked");
+        }
+    }
+}
+
+/// Arm the auto-replication loop for this process (D3 §3.3). Called from every
+/// `ensure_started` site; the second and later calls are no-ops, so the app runs
+/// exactly one worker. Returns the spawned handle only for the call that armed
+/// it (tests / callers that want to observe it).
+pub fn spawn_collab_auto_sync(
+    ctx: Arc<ServiceContext>,
+    sync: Arc<crate::sync::SyncRuntime>,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if AUTO_SYNC_ARMED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        tracing::debug!("collab auto-sync already armed; not spawning a second loop");
+        return None;
+    }
+    Some(tokio::spawn(run_collab_auto_sync_loop(
+        ctx,
+        sync,
+        emitter,
+        COLLAB_AUTO_SYNC_INTERVAL,
+    )))
+}
+
+/// Set one project's auto-replication preference (D3 §3.3). Local-only — the hub
+/// never learns of it. The worker reads the column at the start of every pass,
+/// so there is nothing to live-apply: turning it off stops the NEXT pass, and a
+/// download already in flight is finished (it is a receive like any other).
+pub fn set_project_auto_replicate(
+    ctx: &ServiceContext,
+    project_id: &str,
+    enabled: bool,
+) -> Result<(), ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+    let updated = crate::db::collab::set_auto_replicate(&conn, project_id, enabled)?;
+    if updated == 0 {
+        return Err(ApiError::Invalid(format!("unknown project {project_id}")));
+    }
+    tracing::info!(project_id, enabled, "collab auto-replication toggled");
+    Ok(())
+}
+
+/// "Sync now" for one project (D3 §3.3): run a single auto-replication pass
+/// scoped to `project_id`, immediately, on a spawned task — the command returns
+/// as soon as the project is known, exactly like `download_collab_package`, and
+/// the packages report progress through the usual `local_status` +
+/// `project-download-progress` / `sync-finished` events.
+///
+/// The toggle is FORCED ON for this pass: pressing "Sync now" is an explicit
+/// user act, so it must work on a project whose auto-replication is off. The
+/// role gate is not overridden — that one is authorization, not preference.
+///
+/// Shape note: this deliberately runs its own pass instead of kicking the
+/// worker's cadence. A shared kick would have to smuggle "this project, toggle
+/// forced" through the wakeup, and a worker that is mid-pass would answer the
+/// button minutes late; one scoped pass is the honest reading of the button.
+pub fn sync_project_now(
+    ctx: Arc<ServiceContext>,
+    sync: Arc<crate::sync::SyncRuntime>,
+    project_id: &str,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
+) -> Result<(), ApiError> {
+    {
+        let db = db(&ctx)?;
+        let conn = db.conn();
+        if crate::db::collab::get_project(&conn, project_id)?.is_none() {
+            return Err(ApiError::Invalid(format!("unknown project {project_id}")));
+        }
+    }
+    tracing::info!(project_id, "collab sync now requested");
+    let scope = project_id.to_string();
+    tokio::spawn(auto_sync_pass(ctx, sync, emitter, Some(scope), true));
+    Ok(())
 }
 
 // ── Project-scoped WBPP export (slice 5, "processor payoff") ──────────────────
@@ -2157,6 +2528,8 @@ mod tests {
                 members_json: members_json.to_string(),
                 thresholds_version: None,
                 thresholds_rules_json: None,
+                // local preference — ignored on write
+                auto_replicate: true,
                 fetched_at: String::new(),
             },
         )
@@ -3085,6 +3458,9 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        // Drains the process-global change buffer — serialize against the other
+        // draining test so neither steals the other's entries (D3 T5).
+        let _drain_guard = drain_lock();
         let (_tmp, ctx) = test_ctx();
         let own = own_node_for(&ctx);
         {
@@ -3909,5 +4285,430 @@ mod tests {
             .await
             .expect("tags().get")
             .is_some()
+    }
+
+    // ── D3 Task 5: the auto-replication need diff ────────────────────────────
+
+    /// The default row `replication_need` accepts: published, not superseded,
+    /// not mine, not yet complete.
+    fn needed_package(hub: &str) -> PackageRow {
+        base_package(hub, "p-auto", "Pub")
+    }
+
+    /// The happy shape: every published foreign package I don't hold yet, in the
+    /// row order the caller passed (newest announcement first).
+    #[test]
+    fn replication_need_takes_published_foreign_incomplete_packages() {
+        let rows = vec![needed_package("pkg-a"), needed_package("pkg-b")];
+        assert_eq!(replication_need(&rows, true, true), vec!["pkg-a", "pkg-b"]);
+    }
+
+    /// Only `published` replicates: a pending contribution is coordinator
+    /// moderation material (spec §2 — on-demand only), a rejected one is dead.
+    #[test]
+    fn replication_need_skips_unpublished_states() {
+        for state in ["pending", "rejected"] {
+            let mut row = needed_package("pkg-a");
+            row.state = state.to_string();
+            assert!(
+                replication_need(&[row], true, true).is_empty(),
+                "{state} must never auto-download"
+            );
+        }
+    }
+
+    /// A superseded announcement's bytes are obsolete — never worth the link.
+    #[test]
+    fn replication_need_skips_superseded() {
+        let mut row = needed_package("pkg-a");
+        row.superseded = true;
+        assert!(replication_need(&[row], true, true).is_empty());
+    }
+
+    /// I already hold what I published.
+    #[test]
+    fn replication_need_skips_my_own_packages() {
+        let mut row = needed_package("pkg-a");
+        row.origin = "mine".to_string();
+        row.own = true;
+        assert!(replication_need(&[row], true, true).is_empty());
+    }
+
+    /// `complete` is the only local status that settles a package; `failed`
+    /// re-enters the diff (retry by cadence, spec §3.3), as does a `downloading`
+    /// row left behind by a killed process.
+    #[test]
+    fn replication_need_skips_complete_and_readmits_failed() {
+        let mut complete = needed_package("pkg-done");
+        complete.local_status = "complete".to_string();
+        let mut failed = needed_package("pkg-failed");
+        failed.local_status = "failed".to_string();
+        let mut downloading = needed_package("pkg-downloading");
+        downloading.local_status = "downloading".to_string();
+
+        assert_eq!(
+            replication_need(&[complete, failed, downloading], true, true),
+            vec!["pkg-failed", "pkg-downloading"]
+        );
+    }
+
+    /// A `send`-role device may not pull at all (the hub's authz says so too) —
+    /// the diff is empty regardless of the rows.
+    #[test]
+    fn replication_need_is_empty_when_the_role_forbids_it() {
+        let rows = vec![needed_package("pkg-a")];
+        assert!(replication_need(&rows, false, true).is_empty());
+    }
+
+    /// The per-project toggle is off ⇒ nothing is needed, whatever the hub lists.
+    #[test]
+    fn replication_need_is_empty_when_the_toggle_is_off() {
+        let rows = vec![needed_package("pkg-a")];
+        assert!(replication_need(&rows, true, false).is_empty());
+    }
+
+    /// The pass's cheap role pre-filter mirrors the download guard's rule
+    /// (`coordinator || data_role == "send_receive"`).
+    #[test]
+    fn role_allows_replication_matches_the_download_guard() {
+        assert!(role_allows_replication("send_receive", false));
+        assert!(
+            role_allows_replication("send", true),
+            "a coordinator may always pull"
+        );
+        assert!(!role_allows_replication("send", false));
+    }
+
+    // ── D3 Task 5: the auto-replication worker pass ──────────────────────────
+
+    /// The download seam the pass tests inject: records every `(project, package)`
+    /// it was handed, fails the ids in `fail`, and flags any OVERLAP (two
+    /// downloads in flight at once) so "one at a time" is pinned by construction.
+    #[derive(Default)]
+    struct DownloadRecorder {
+        calls: std::sync::Mutex<Vec<(String, String)>>,
+        in_flight: std::sync::atomic::AtomicBool,
+        overlapped: std::sync::atomic::AtomicBool,
+        fail: std::sync::Mutex<HashSet<String>>,
+    }
+
+    impl DownloadRecorder {
+        fn failing(ids: &[&str]) -> Self {
+            let rec = DownloadRecorder::default();
+            *rec.fail.lock().unwrap() = ids.iter().map(|s| s.to_string()).collect();
+            rec
+        }
+
+        async fn run(&self, project_id: String, package_id: String) -> Result<(), ApiError> {
+            use std::sync::atomic::Ordering;
+            if self.in_flight.swap(true, Ordering::SeqCst) {
+                self.overlapped.store(true, Ordering::SeqCst);
+            }
+            // Give any concurrent caller a real chance to observe the overlap.
+            tokio::task::yield_now().await;
+            let fails = self.fail.lock().unwrap().contains(&package_id);
+            self.calls.lock().unwrap().push((project_id, package_id.clone()));
+            self.in_flight.store(false, Ordering::SeqCst);
+            if fails {
+                return Err(ApiError::Internal(format!("download {package_id} exploded")));
+            }
+            Ok(())
+        }
+
+        /// Downloaded package ids, sorted (the row order is `list_packages`'s, not
+        /// this seam's contract).
+        fn package_ids(&self) -> Vec<String> {
+            let mut ids: Vec<String> =
+                self.calls.lock().unwrap().iter().map(|(_, p)| p.clone()).collect();
+            ids.sort();
+            ids
+        }
+
+        fn overlapped(&self) -> bool {
+            self.overlapped.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// [`PENDING_PACKAGE_CHANGES`] is a process-global static: tests that DRAIN
+    /// it (directly or through [`refresh_all_project_packages`]) must not run
+    /// concurrently, or they steal each other's entries. Push-only tests need no
+    /// lock — a foreign push is filtered out by package id.
+    static PKG_CHANGE_DRAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn drain_lock() -> std::sync::MutexGuard<'static, ()> {
+        PKG_CHANGE_DRAIN_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Run one pass with a recording download seam.
+    async fn pass_with(
+        ctx: &ServiceContext,
+        rec: &Arc<DownloadRecorder>,
+        scope: Option<&str>,
+        force_auto_on: bool,
+    ) -> AutoSyncPassOutcome {
+        let rec = Arc::clone(rec);
+        run_auto_sync_pass(ctx, scope, force_auto_on, move |project_id, package_id| {
+            let rec = Arc::clone(&rec);
+            async move { rec.run(project_id, package_id).await }
+        })
+        .await
+    }
+
+    /// Seed a cached project row with an explicit role + toggle.
+    fn seed_project_with(
+        conn: &Connection,
+        project_id: &str,
+        data_role: &str,
+        coordinator: bool,
+        auto_replicate: bool,
+    ) {
+        seed_project(conn, project_id, &members_json());
+        conn.execute(
+            "UPDATE collab_projects SET data_role = ?2, is_coordinator = ?3 WHERE project_id = ?1",
+            rusqlite::params![project_id, data_role, coordinator as i64],
+        )
+        .unwrap();
+        crate::db::collab::set_auto_replicate(conn, project_id, auto_replicate).unwrap();
+    }
+
+    /// One announcement mock for a project.
+    async fn mock_announcements(
+        server: &wiremock::MockServer,
+        project_id: &str,
+        anns: Vec<serde_json::Value>,
+        expect: u64,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/projects/{project_id}/announcements")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(anns))
+            .expect(expect)
+            .mount(server)
+            .await;
+    }
+
+    /// The pass refreshes the project's announcements and downloads EVERY missing
+    /// published package, one at a time.
+    #[tokio::test]
+    async fn auto_pass_downloads_each_missing_package_serially() {
+        let server = wiremock::MockServer::start().await;
+        mock_announcements(
+            &server,
+            "p-auto",
+            vec![
+                ann_json("ann-1", "pkg-1", false, "published", &[], None, serde_json::json!([])),
+                ann_json("ann-2", "pkg-2", false, "published", &[], None, serde_json::json!([])),
+            ],
+            1,
+        )
+        .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        {
+            let conn = db(&ctx).unwrap().conn();
+            seed_project_with(&conn, "p-auto", "send_receive", false, true);
+        }
+
+        let rec = Arc::new(DownloadRecorder::default());
+        let outcome = pass_with(&ctx, &rec, None, false).await;
+
+        assert_eq!(rec.package_ids(), vec!["pkg-1", "pkg-2"]);
+        assert!(!rec.overlapped(), "packages download one at a time (spec §3.3)");
+        assert_eq!(outcome.projects, 1);
+        assert_eq!(outcome.attempted, 2);
+        assert_eq!(outcome.failed, 0);
+    }
+
+    /// A `send`-role project and an auto-replication-disabled project are both
+    /// skipped BEFORE the hub call — `.expect(0)` pins that the pass doesn't even
+    /// poll them.
+    #[tokio::test]
+    async fn auto_pass_skips_send_role_and_disabled_projects() {
+        let server = wiremock::MockServer::start().await;
+        let anns =
+            vec![ann_json("ann-1", "pkg-1", false, "published", &[], None, serde_json::json!([]))];
+        mock_announcements(&server, "p-send", anns.clone(), 0).await;
+        mock_announcements(&server, "p-off", anns, 0).await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        {
+            let conn = db(&ctx).unwrap().conn();
+            seed_project_with(&conn, "p-send", "send", false, true);
+            seed_project_with(&conn, "p-off", "send_receive", false, false);
+        }
+
+        let rec = Arc::new(DownloadRecorder::default());
+        let outcome = pass_with(&ctx, &rec, None, false).await;
+
+        assert!(rec.package_ids().is_empty(), "neither project replicates");
+        assert_eq!(outcome.projects, 0);
+        assert_eq!(outcome.attempted, 0);
+    }
+
+    /// One package's download failing never ends the pass — the next package is
+    /// still attempted (per-package `warn!` + continue).
+    #[tokio::test]
+    async fn auto_pass_survives_a_failing_download() {
+        let server = wiremock::MockServer::start().await;
+        mock_announcements(
+            &server,
+            "p-auto",
+            vec![
+                ann_json("ann-1", "pkg-1", false, "published", &[], None, serde_json::json!([])),
+                ann_json("ann-2", "pkg-2", false, "published", &[], None, serde_json::json!([])),
+            ],
+            1,
+        )
+        .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        {
+            let conn = db(&ctx).unwrap().conn();
+            seed_project_with(&conn, "p-auto", "send_receive", false, true);
+        }
+
+        let rec = Arc::new(DownloadRecorder::failing(&["pkg-2"]));
+        let outcome = pass_with(&ctx, &rec, None, false).await;
+
+        assert_eq!(rec.package_ids(), vec!["pkg-1", "pkg-2"], "both were attempted");
+        assert_eq!(outcome.attempted, 2);
+        assert_eq!(outcome.failed, 1);
+    }
+
+    /// "Sync now" is an explicit user act: it runs ONE project's pass with the
+    /// toggle forced on, and never touches the other projects.
+    #[tokio::test]
+    async fn sync_now_pass_is_scoped_and_ignores_the_toggle() {
+        let server = wiremock::MockServer::start().await;
+        mock_announcements(
+            &server,
+            "p-off",
+            vec![ann_json("ann-1", "pkg-1", false, "published", &[], None, serde_json::json!([]))],
+            1,
+        )
+        .await;
+        mock_announcements(
+            &server,
+            "p-other",
+            vec![ann_json("ann-2", "pkg-2", false, "published", &[], None, serde_json::json!([]))],
+            0,
+        )
+        .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        {
+            let conn = db(&ctx).unwrap().conn();
+            seed_project_with(&conn, "p-off", "send_receive", false, false);
+            seed_project_with(&conn, "p-other", "send_receive", false, true);
+        }
+
+        let rec = Arc::new(DownloadRecorder::default());
+        let outcome = pass_with(&ctx, &rec, Some("p-off"), true).await;
+
+        assert_eq!(rec.package_ids(), vec!["pkg-1"], "only the named project syncs");
+        assert_eq!(outcome.projects, 1);
+    }
+
+    /// The worker's own announcement refresh CONSUMES the state diffs (they are
+    /// computed against the DB, so a later UI poll sees a known row and raises
+    /// nothing), therefore the pass buffers them for the next
+    /// [`refresh_all_project_packages`] — without this, auto-replication would
+    /// silently swallow the `newPackage` / `approved` / `rejected` notifications
+    /// of exactly the projects it keeps most current.
+    #[tokio::test]
+    async fn auto_pass_buffers_the_diffs_its_refresh_consumed() {
+        let _drain_guard = drain_lock();
+        let server = wiremock::MockServer::start().await;
+        mock_announcements(
+            &server,
+            "p-buffered",
+            vec![ann_json(
+                "ann-buffered",
+                "pkg-buffered",
+                false,
+                "published",
+                &[],
+                None,
+                serde_json::json!([]),
+            )],
+            2, // the pass polls once; the UI refresh below polls again
+        )
+        .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        {
+            let conn = db(&ctx).unwrap().conn();
+            seed_project_with(&conn, "p-buffered", "send_receive", false, true);
+        }
+
+        let rec = Arc::new(DownloadRecorder::default());
+        pass_with(&ctx, &rec, None, false).await;
+
+        let changes = refresh_all_project_packages(&ctx).await.unwrap();
+        let mine: Vec<_> = changes
+            .iter()
+            .filter(|c| c.package_id == "pkg-buffered")
+            .collect();
+        assert_eq!(
+            mine.len(),
+            1,
+            "the worker's diff reaches the UI exactly once"
+        );
+        assert_eq!(mine[0].kind, "newPackage");
+        assert_eq!(mine[0].project_id, "p-buffered");
+    }
+
+    /// Signed out ⇒ the pass is a silent no-op (no hub call, no download): the
+    /// loop keeps ticking on a signed-out device without touching anything.
+    #[tokio::test]
+    async fn auto_pass_is_a_no_op_when_signed_out() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = db(&ctx).unwrap().conn();
+            seed_project_with(&conn, "p-auto", "send_receive", false, true);
+        }
+
+        let rec = Arc::new(DownloadRecorder::default());
+        let outcome = pass_with(&ctx, &rec, None, false).await;
+
+        assert!(rec.package_ids().is_empty());
+        assert_eq!(outcome.projects, 0);
+    }
+
+    /// The api-level toggle persists through the db accessor pair.
+    #[test]
+    fn set_project_auto_replicate_persists() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = db(&ctx).unwrap().conn();
+            seed_project(&conn, "p-auto", &members_json());
+        }
+
+        let toggle = |ctx: &ServiceContext| {
+            let conn = db(ctx).unwrap().conn();
+            crate::db::collab::get_project(&conn, "p-auto")
+                .unwrap()
+                .unwrap()
+                .auto_replicate
+        };
+
+        set_project_auto_replicate(&ctx, "p-auto", false).unwrap();
+        assert!(!toggle(&ctx));
+
+        set_project_auto_replicate(&ctx, "p-auto", true).unwrap();
+        assert!(toggle(&ctx));
+
+        assert!(
+            set_project_auto_replicate(&ctx, "no-such-project", false).is_err(),
+            "an unknown project is a user-visible error, not a silent no-op"
+        );
     }
 }

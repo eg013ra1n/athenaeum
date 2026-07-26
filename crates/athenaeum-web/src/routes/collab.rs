@@ -43,6 +43,13 @@ pub struct DownloadArgs {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AutoReplicateArgs {
+    project_id: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DecideArgs {
     announcement_id: String,
     approve: bool,
@@ -186,6 +193,40 @@ pub async fn download_collab_package(
         }
     });
     Ok(Json(()))
+}
+
+/// D3 §3.3: turn this project's auto-replication on or off (local preference —
+/// the hub never learns of it). The worker reads the column at the start of each
+/// pass, so there is nothing to live-apply.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn set_project_auto_replicate(
+    State(state): State<WebAppState>,
+    Json(args): Json<AutoReplicateArgs>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    exchange::set_project_auto_replicate(&state.ctx, &args.project_id, args.enabled)
+        .map(Json)
+        .map_err(api_err)
+}
+
+/// D3 §3.3 "Sync now": run one auto-replication pass for this project
+/// immediately, with the toggle forced on (an explicit user act). Returns as soon
+/// as the pass is spawned — progress rides the usual `local_status` +
+/// `project-download-progress` / `sync-finished` SSE events.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn sync_project_now(
+    State(state): State<WebAppState>,
+    Json(args): Json<ProjectIdArgs>,
+) -> Result<Json<()>, (axum::http::StatusCode, String)> {
+    let emitter: Arc<dyn ProgressEmitter> =
+        Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+    exchange::sync_project_now(
+        Arc::clone(&state.ctx),
+        Arc::clone(&state.sync),
+        &args.project_id,
+        Some(emitter),
+    )
+    .map(Json)
+    .map_err(api_err)
 }
 
 #[tracing::instrument(skip_all, err(Debug))]

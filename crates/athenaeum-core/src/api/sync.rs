@@ -1131,8 +1131,10 @@ pub async fn autostart_if_enabled(
             Arc::clone(&emitter),
         )),
     )?;
-    // Clone the emitter for the resurrection spawn before `ensure_started` moves it.
+    // Clone the emitter for the resurrection + auto-sync spawns before
+    // `ensure_started` moves it.
     let emitter_for_resurrect = Arc::clone(&emitter);
+    let emitter_for_auto_sync = Arc::clone(&emitter);
     sync.ensure_started(
         node, sync_dir, db_path, incoming, authorized, hooks, emitter,
     )
@@ -1159,6 +1161,17 @@ pub async fn autostart_if_enabled(
         Arc::clone(&ctx_arc),
         Arc::clone(&sync),
     ));
+    // D3 §3.3: arm the collab auto-replication worker — published contributions
+    // of every auto-enabled project download themselves. Armed here (and at the
+    // other `ensure_started` site) rather than in each host's startup: the pass
+    // pulls through `download_project_package`, which needs exactly the started
+    // `SyncRuntime` this function just produced. Idempotent — the FIRST call
+    // spawns the one loop and every later one no-ops.
+    crate::api::collab_exchange::spawn_collab_auto_sync(
+        Arc::clone(&ctx_arc),
+        Arc::clone(&sync),
+        Some(emitter_for_auto_sync),
+    );
     Ok(true)
 }
 
@@ -1455,8 +1468,10 @@ pub async fn get_pairing_ticket(
         )),
     )?;
 
-    // Clone the emitter for the resurrection spawn before `ensure_started` moves it.
+    // Clone the emitter for the resurrection + auto-sync spawns before
+    // `ensure_started` moves it.
     let emitter_for_resurrect = Arc::clone(&emitter);
+    let emitter_for_auto_sync = Arc::clone(&emitter);
     let ticket = sync
         .ensure_started(
             node, sync_dir, db_path, incoming, authorized, hooks, emitter,
@@ -1481,6 +1496,14 @@ pub async fn get_pairing_ticket(
         Arc::clone(&ctx_arc),
         Arc::clone(&sync),
     ));
+    // D3 §3.3: arm the collab auto-replication worker here too — the OTHER
+    // `ensure_started` site. Idempotent (once per process), so it no-ops if
+    // autostart already armed it.
+    crate::api::collab_exchange::spawn_collab_auto_sync(
+        Arc::clone(&ctx_arc),
+        Arc::clone(&sync),
+        Some(emitter_for_auto_sync),
+    );
     Ok(ticket)
 }
 

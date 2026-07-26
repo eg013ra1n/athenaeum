@@ -1273,7 +1273,12 @@ capability: DeviceCapability,
  */
 hubUrl: string, };
 
-export type ProjectCard = { projectId: string, slug: string, title: string, dataRole: string, coordinator: boolean, requireApproval: boolean, pendingAnnouncements: number, projectStatus: string, targetName: string, targetRaDeg: number, targetDecDeg: number, targetRadiusDeg: number, membershipVersion: number, linkedSets: number, candidates: number, publishable: number, fetchedAt: string, };
+export type ProjectCard = { projectId: string, slug: string, title: string, dataRole: string, coordinator: boolean, requireApproval: boolean, pendingAnnouncements: number, projectStatus: string, targetName: string, targetRaDeg: number, targetDecDeg: number, targetRadiusDeg: number, membershipVersion: number, linkedSets: number, candidates: number, publishable: number, 
+/**
+ * D3 §3.3: this device auto-downloads the project's published contributions
+ * (default ON). Local preference — `set_project_auto_replicate` writes it.
+ */
+autoReplicate: boolean, fetchedAt: string, };
 
 export type ProjectDetail = { card: ProjectCard, members: Array<ProjectMemberView>, thresholdsVersion: number | null, thresholds: Array<ThresholdRuleView>, links: Array<LinkedSetView>, portalBase: string, };
 

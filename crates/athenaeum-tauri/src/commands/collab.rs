@@ -149,6 +149,41 @@ pub async fn download_collab_package(
     Ok(())
 }
 
+/// D3 §3.3: turn this project's auto-replication on or off (local preference —
+/// the hub never learns of it). The worker reads the column at the start of each
+/// pass, so there is nothing to live-apply.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn set_project_auto_replicate(
+    state: State<'_, AppState>,
+    project_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    exchange::set_project_auto_replicate(&state.ctx, &project_id, enabled)
+        .map_err(|e| e.to_string())
+}
+
+/// D3 §3.3 "Sync now": run one auto-replication pass for this project
+/// immediately, with the toggle forced on (an explicit user act). Returns as soon
+/// as the pass is spawned — progress rides the usual `local_status` +
+/// `project-download-progress` / `sync-finished` events.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn sync_project_now(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    project_id: String,
+) -> Result<(), String> {
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
+    exchange::sync_project_now(
+        Arc::clone(&state.ctx),
+        Arc::clone(&state.sync),
+        &project_id,
+        Some(emitter),
+    )
+    .map_err(|e| e.to_string())
+}
+
 /// Every received contribution for a project (cache-only — no hub call).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]

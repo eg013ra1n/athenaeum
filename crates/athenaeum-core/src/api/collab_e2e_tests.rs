@@ -169,6 +169,8 @@ fn seed_project(conn: &Connection, project_id: &str, members_json: &str, require
             members_json: members_json.into(),
             thresholds_version: Some(4),
             thresholds_rules_json: None,
+            // local preference — ignored on write
+            auto_replicate: true,
             fetched_at: String::new(),
         },
     )

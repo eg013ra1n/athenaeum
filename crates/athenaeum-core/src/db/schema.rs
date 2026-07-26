@@ -1850,6 +1850,19 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // D3 §3.3: per-project auto-replication preference. LOCAL only — never hub
+    // state, so `db::collab::upsert_project` deliberately leaves this column out
+    // of its wholesale poll refresh and only `set_auto_replicate` writes it.
+    // DEFAULT 1: joining a project starts pulling its published contributions
+    // (existing rows inherit the default on this ALTER, which is the intent —
+    // members joined precisely to get the data).
+    if !column_exists(conn, "collab_projects", "auto_replicate")? {
+        conn.execute(
+            "ALTER TABLE collab_projects ADD COLUMN auto_replicate INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+
     // Local project↔frame-set links. NEVER sent to the hub (spec §7).
     conn.execute(
         "CREATE TABLE IF NOT EXISTS project_links (

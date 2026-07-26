@@ -20,7 +20,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 const SELECT_COLS: &str = "project_id, slug, title, data_role, is_coordinator, require_approval, \
     pending_announcements, project_status, target_name, target_ra_deg, target_dec_deg, \
     target_radius_deg, membership_version, snapshot_payload_b64, snapshot_signature_b64, \
-    members_json, thresholds_version, thresholds_rules_json, fetched_at";
+    members_json, thresholds_version, thresholds_rules_json, auto_replicate, fetched_at";
 
 /// One cached collaboration project (poll snapshot, refreshed wholesale).
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +45,11 @@ pub struct CollabProjectRow {
     pub members_json: String,
     pub thresholds_version: Option<i32>,
     pub thresholds_rules_json: Option<String>,
+    /// D3 §3.3 auto-replication toggle (default ON). LOCAL preference, never hub
+    /// state: populated on read, **ignored on write** — [`upsert_project`] leaves
+    /// the column out entirely so a wholesale poll refresh can't clobber it, and
+    /// [`set_auto_replicate`] is the only writer.
+    pub auto_replicate: bool,
     /// Set by SQL (`datetime('now')`); ignored on write, populated on read.
     pub fetched_at: String,
 }
@@ -69,12 +74,17 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<CollabProjectRow> {
         members_json: row.get(15)?,
         thresholds_version: row.get(16)?,
         thresholds_rules_json: row.get(17)?,
-        fetched_at: row.get(18)?,
+        auto_replicate: row.get::<_, i64>(18)? != 0,
+        fetched_at: row.get(19)?,
     })
 }
 
 /// Insert or refresh the cache row for one project. Keyed on `project_id`; every
 /// non-PK column is overwritten and `fetched_at` is stamped `datetime('now')`.
+///
+/// `auto_replicate` is deliberately NOT in the column list: it is a local
+/// preference (D3 §3.3), so the poll must leave whatever the user chose — and a
+/// freshly inserted row takes the schema default (ON).
 pub fn upsert_project(conn: &Connection, row: &CollabProjectRow) -> Result<()> {
     conn.execute(
         "INSERT INTO collab_projects
@@ -145,6 +155,17 @@ pub fn get_project(conn: &Connection, project_id: &str) -> Result<Option<CollabP
     )
     .optional()
     .map_err(Into::into)
+}
+
+/// Set one project's auto-replication preference (D3 §3.3) — the ONLY writer of
+/// `collab_projects.auto_replicate`. Returns the number of rows updated (0 when
+/// the project isn't cached, e.g. a membership pruned between read and write).
+pub fn set_auto_replicate(conn: &Connection, project_id: &str, enabled: bool) -> Result<usize> {
+    let updated = conn.execute(
+        "UPDATE collab_projects SET auto_replicate = ?2 WHERE project_id = ?1",
+        params![project_id, enabled as i64],
+    )?;
+    Ok(updated)
 }
 
 /// Delete every cache row whose `project_id` is NOT in `keep_ids` (the ids the
@@ -281,8 +302,44 @@ mod tests {
             members_json: "[]".into(),
             thresholds_version: Some(1),
             thresholds_rules_json: Some("[]".into()),
+            // ignored on write (local preference)
+            auto_replicate: true,
             fetched_at: String::new(), // set by SQL
         }
+    }
+
+    /// D3 §3.3: the auto-replication toggle defaults ON, is written only through
+    /// [`set_auto_replicate`], and a hub poll's wholesale re-upsert must never
+    /// clobber it (the column is deliberately absent from `upsert_project`'s
+    /// column list — it is LOCAL preference, never hub state).
+    #[test]
+    fn auto_replicate_defaults_on_and_survives_a_poll_upsert() {
+        let conn = test_conn();
+        upsert_project(&conn, &sample_row("p-1")).unwrap();
+        assert!(
+            get_project(&conn, "p-1").unwrap().unwrap().auto_replicate,
+            "default ON — joining a project starts pulling published contributions"
+        );
+
+        assert_eq!(set_auto_replicate(&conn, "p-1", false).unwrap(), 1);
+        assert!(!get_project(&conn, "p-1").unwrap().unwrap().auto_replicate);
+
+        // A poll re-upserts every hub-mirrored column; the toggle is not one.
+        upsert_project(&conn, &sample_row("p-1")).unwrap();
+        assert!(
+            !get_project(&conn, "p-1").unwrap().unwrap().auto_replicate,
+            "the hub poll never writes the local toggle"
+        );
+        assert!(
+            !list_projects(&conn).unwrap()[0].auto_replicate,
+            "the list view carries the same value"
+        );
+
+        assert_eq!(
+            set_auto_replicate(&conn, "no-such-project", true).unwrap(),
+            0,
+            "an unknown project touches nothing"
+        );
     }
 
     #[test]

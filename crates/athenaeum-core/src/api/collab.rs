@@ -144,6 +144,9 @@ pub struct ProjectCard {
     pub linked_sets: i64,
     pub candidates: i64,
     pub publishable: i64,
+    /// D3 §3.3: this device auto-downloads the project's published contributions
+    /// (default ON). Local preference — `set_project_auto_replicate` writes it.
+    pub auto_replicate: bool,
     pub fetched_at: String,
 }
 
@@ -701,6 +704,7 @@ fn card_from_row(ctx: &ServiceContext, row: CollabProjectRow) -> Result<ProjectC
         linked_sets,
         candidates: gate.total,
         publishable: gate.publishable,
+        auto_replicate: row.auto_replicate,
         fetched_at: row.fetched_at,
     })
 }
@@ -878,6 +882,8 @@ async fn fetch_one_project(
         members_json,
         thresholds_version,
         thresholds_rules_json,
+        // local preference — ignored on write
+        auto_replicate: true,
         fetched_at: String::new(), // filled by SQL
     })
 }
@@ -1869,6 +1875,8 @@ mod tests {
                 thresholds_rules_json: Some(
                     r#"[{"metricKey":"not_trailed","op":"reject_if","value":true}]"#.into(),
                 ),
+                // local preference — ignored on write
+                auto_replicate: true,
                 fetched_at: String::new(), // filled by SQL
             },
         )
@@ -2377,6 +2385,8 @@ mod tests {
                 members_json: members_json.into(),
                 thresholds_version: Some(4),
                 thresholds_rules_json: None,
+                // local preference — ignored on write
+                auto_replicate: true,
                 fetched_at: String::new(),
             },
         )

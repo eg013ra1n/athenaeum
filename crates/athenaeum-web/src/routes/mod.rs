@@ -291,6 +291,8 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/refresh_collab_packages", post(collab::refresh_collab_packages))
         .route("/api/list_collab_packages", post(collab::list_collab_packages))
         .route("/api/download_collab_package", post(collab::download_collab_package))
+        .route("/api/set_project_auto_replicate", post(collab::set_project_auto_replicate))
+        .route("/api/sync_project_now", post(collab::sync_project_now))
         .route("/api/list_collab_contributions", post(collab::list_collab_contributions))
         .route("/api/list_collab_moderation", post(collab::list_collab_moderation))
         .route("/api/decide_collab_announcement", post(collab::decide_collab_announcement))

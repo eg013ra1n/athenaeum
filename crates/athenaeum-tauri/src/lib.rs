@@ -482,6 +482,8 @@ pub fn run() {
             commands::refresh_collab_packages,
             commands::list_collab_packages,
             commands::download_collab_package,
+            commands::set_project_auto_replicate,
+            commands::sync_project_now,
             commands::list_collab_contributions,
             commands::list_collab_moderation,
             commands::decide_collab_announcement,

@@ -416,6 +416,8 @@ mod tests {
                 members_json: "[]".into(),
                 thresholds_version: None,
                 thresholds_rules_json: None,
+                // local preference — ignored on write
+                auto_replicate: true,
                 fetched_at: String::new(),
             },
         )
