@@ -2030,9 +2030,12 @@ function onLibPreviewClick(e) {
 //    preview pane already use). A response that lands after the dialog closed —
 //    or after it was reopened for the other action — neither paints nor acts.
 //  * ONE in-flight write at a time (`libDlg.busy` disables the submit button and
-//    blocks Escape/scrim close): a double-click must not enqueue two batches or
-//    delete twice, and closing mid-delete would throw away the per-file outcomes
-//    the operator needs to see.
+//    the target boxes): a double-click must not enqueue two batches or delete
+//    twice. Closing is NOT blocked though — a write that never answers (a wedged
+//    network share) would otherwise leave a full-page scrim with no exit but a
+//    reload. Closing over a live write leaves a standing flash saying it is still
+//    running, and the response, when it lands, paints nothing (its ticket is
+//    stale) but still re-reads the listing, which is where the truth now shows.
 //  * Escape closes; **Enter never confirms**. The element focused on open is the
 //    safe one (Cancel on the delete confirm), so a stray Return dismisses.
 //  * No focus trap — Tab still reaches the page behind the scrim. That matches
@@ -2048,7 +2051,8 @@ const LIB_DLG_LIST_CAP = 200;   // rows shown per list before "…and N more"
 
 let libDlg = null;              // the open dialog's whole state, or null
 let libDlgSeq = 0;              // monotonic; a stale response never paints
-let libDlgReturnFocus = null;   // element focus returns to on close
+let libDlgReturnFocus = null;   // SELECTOR (not node) focus returns to on close
+let libDlgOrphanedWrite = false;  // a write outlived its dialog; converge on answer
 
 const libNFiles = (n) => n + (n === 1 ? ' file' : ' files');
 // A package ref is an absolute-ish path; its basename is the uuid directory the
@@ -2094,10 +2098,14 @@ function libDlgOpen(kind) {
   libDlg = {
     kind, items, seq,
     phase: 'loading', busy: false, error: null,
-    targets: [], picked: new Set(), waiting: [],   // send
+    targets: [], picked: new Set(), waiting: [], targetsOk: false,   // send
     preview: null, outcomes: null, sent: null,
   };
-  libDlgReturnFocus = document.activeElement || null;
+  // Focus goes back to the FOOTER BUTTON this dialog was opened from — recorded
+  // as a selector, not as the node. `libRefresh` re-renders `#libFooter` while
+  // the dialog is still open, so by close time the clicked element is detached
+  // and `.focus()` on it silently lands on <body>. Re-query at close instead.
+  libDlgReturnFocus = `[data-lib-act="${kind}"]`;
   host.hidden = false;
   document.addEventListener('keydown', onLibDlgKey);
   libDlgRender({ focus: true });
@@ -2106,27 +2114,48 @@ function libDlgOpen(kind) {
 
 function libDlgClose() {
   if (!libDlg) return;
+  // Closing over a live write does not stop it — the request is on the wire and
+  // the server will finish it. Say so, standing, in the library's own flash: the
+  // dialog was the only place that answer was going to be shown.
+  if (libDlg.busy) {
+    libDlgOrphanedWrite = true;
+    libSay(`${libDlg.kind === 'send' ? 'Send' : 'Delete'} still running — refresh the listing to see the result.`, true);
+  }
   libDlgSeq++;                            // orphan every in-flight response
   libDlg = null;
   document.removeEventListener('keydown', onLibDlgKey);
   const host = $('libDialog');
   if (host) { host.hidden = true; host.innerHTML = ''; }
-  const back = libDlgReturnFocus;
+  const sel = libDlgReturnFocus;
   libDlgReturnFocus = null;
-  // Only if it is still in the document — the footer it came from is re-rendered
-  // by the listing refresh a completed action kicks off.
-  if (back && back.focus && (!document.contains || document.contains(back))) back.focus();
+  // Re-query rather than restore a held node (see libDlgOpen). No match — the
+  // footer hides itself once the selection is empty — means there is genuinely
+  // nothing to return to, so focus is left alone rather than forced somewhere.
+  if (sel && document.querySelector) {
+    const back = document.querySelector(sel);
+    if (back && back.focus) back.focus();
+  }
 }
 
-// Escape closes (never mid-write); Enter is deliberately unbound — a destructive
-// confirm must be clicked, or tabbed to and pressed, never fired by a stray
-// Return while the operator is reading the warnings.
+// The answer to a write whose dialog is gone. It must never paint into a dialog
+// that closed (or reopened for the other action) — but the listing is now the
+// only surface that can show what really happened, so re-read it.
+function libDlgOrphanDrop() {
+  if (!libDlgOrphanedWrite) return;
+  libDlgOrphanedWrite = false;
+  libRefresh();
+}
+
+// Escape closes — including mid-write, deliberately: a wedged POST must not trap
+// the operator behind a scrim with no exit but F5 (libDlgClose leaves the
+// standing flash). Enter is unbound — a destructive confirm must be clicked, or
+// tabbed to and pressed, never fired by a stray Return while reading warnings.
 function onLibDlgKey(e) {
   if (!libDlg) return;
   if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
   if (e.key !== 'Escape') return;
   e.preventDefault();
-  if (!libDlg.busy) libDlgClose();
+  libDlgClose();
 }
 
 // ── render ──
@@ -2155,11 +2184,13 @@ function libDlgRender(opts) {
 // paraphrased — a 400 naming two ambiguous devices is the operator's fix.
 const libDlgErrHtml = (msg) => (msg ? `<p class="lib-dlg-err">${esc(msg)}</p>` : '');
 
-// Cancel is disabled while a write is in flight for the same reason Escape is:
-// the outcome rows are the only record of what a delete actually did.
+// Cancel stays LIVE while a write is in flight (see the section header): it does
+// not abort the request — it gives up watching for the answer, which the standing
+// flash then points at the listing for. The label says which of the two it is.
 const libDlgCancelBtn = (label, d, focusHere) =>
   `<button class="ghost" data-dlg-act="cancel"${focusHere ? ' id="libDlgFocus"' : ''}`
-  + `${d.busy ? ' disabled title="waiting for the server…"' : ''}>${esc(label)}</button>`;
+  + `${d.busy ? ' title="the request keeps running — the listing will show the result"' : ''}>`
+  + `${esc(d.busy ? 'Close' : label)}</button>`;
 
 // ── send dialog ──
 function libSendDialogParts(d) {
@@ -2204,7 +2235,18 @@ function libSendDialogParts(d) {
         ? `<span class="muted mono" title="${esc(view.hint)}">${esc(shortHex(view.hint))}…</span>` : ''}
     </label>`;
   }).join('');
-  const noTargets = `<p class="lib-dlg-warn">No device is reachable from this node right now — the sync engine is not running, or it has no send targets. Add one under Settings → Send Targets.</p>`;
+  // Two very different empties. The load SUCCEEDED with nothing configured →
+  // the instruction below is the fix. The load FAILED → we know nothing about
+  // this node's targets, and printing "add one under Settings" over a network
+  // error would be a confident wrong diagnosis, so the error line stands alone.
+  const noTargets = d.targetsOk
+    ? `<p class="lib-dlg-warn">No device is reachable from this node right now — the sync engine is not running, or it has no send targets. Add one under Settings → Send Targets.</p>`
+    : '';
+  // The picker's honest premise (see libSendLoad): these rows are the CONFIGURED
+  // send targets of the running launcher, not a list of live, proven engines.
+  const premise = d.targets.length
+    ? '<p class="muted">These are this node\'s configured send targets — one that failed to start will refuse the send and say so.</p>'
+    : '';
   const waiting = d.waiting.length
     ? `<p class="muted">Saved but not applied yet: ${d.waiting.map((t) => esc(libTargetLabel(t))).join(', ')} — ${d.waiting.length === 1 ? 'it becomes' : 'they become'} sendable once the sync engine restarts.</p>`
     : '';
@@ -2213,6 +2255,7 @@ function libSendDialogParts(d) {
   return {
     body: `<p>Send ${subject} to:</p>${dirNote}`
       + (d.targets.length ? `<div class="lib-dlg-targets">${rows}</div>` : noTargets)
+      + premise
       + waiting
       + libDlgErrHtml(d.error),
     actions: libDlgCancelBtn('Cancel', d, !d.targets.length)
@@ -2230,10 +2273,16 @@ function libSendMessage(rep) {
   return `Sent ${libNFiles(enqueued)}` + (skipped ? ` (${skipped} no longer on disk)` : '');
 }
 
-// The targets this node can actually reach: `runtime` is the list the RUNNING
-// engines were spawned over, and `resolve_send_targets` matches against exactly
-// those. A target saved under Settings but not yet applied is in `configured`
-// only — offering it would guarantee a 400, so it is named as pending instead.
+// `runtime` is the LAUNCHER'S CONFIG verbatim — the target list the supervisor
+// handed the running engines, not a list of engines that came up. `resolve_targets`
+// SKIPS a target it cannot resolve (unknown device, no relay path), so the live
+// engines are a subset of `runtime`, sometimes a strict one, and a row here that
+// was skipped at launch answers `400 unknown send target: <name>` when picked.
+// That is the honest best this page can do without a per-target liveness read:
+// the rows are what this node is CONFIGURED to send to (said plainly under the
+// picker), the 400 names the one that is not there, and a target saved under
+// Settings but not yet applied is in `configured` only — offering it would be a
+// guaranteed 400, so it is named as pending instead of listed.
 async function libSendLoad() {
   const seq = libDlg.seq;
   let dto = null;
@@ -2246,7 +2295,9 @@ async function libSendLoad() {
     libDlg.error = 'could not read the send targets: ' + error;
     libDlg.targets = [];
     libDlg.picked = new Set();
+    libDlg.targetsOk = false;   // an unread list is NOT an empty list
   } else {
+    libDlg.targetsOk = true;
     const runtime = Array.isArray(dto.runtime) ? dto.runtime.map(String) : [];
     const configured = Array.isArray(dto.configured) ? dto.configured.map(String) : [];
     // A config can legitimately hold one device twice (by id and by name); two
@@ -2282,14 +2333,18 @@ async function libSendSubmit() {
       body: JSON.stringify({ targets, items: d.items }),
     });
   } catch (e) { error = (e && e.message) ? e.message : String(e); }
-  if (!libDlg || libDlg.seq !== seq) return;    // closed (or reopened) under us
+  // Closed (or reopened) under us: paint nothing, but converge the listing.
+  if (!libDlg || libDlg.seq !== seq) { libDlgOrphanDrop(); return; }
   if (!error && !res.ok) {
     let body = '';
     try { body = await res.text(); } catch (e) { body = ''; }
-    if (!libDlg || libDlg.seq !== seq) return;
+    if (!libDlg || libDlg.seq !== seq) { libDlgOrphanDrop(); return; }
     error = String(body || '').trim() || ('HTTP ' + res.status);
   }
   if (error) {
+    // Including the 400 that names a configured target the engines never got:
+    // `busy` clears, the picker re-renders with the same boxes still editable,
+    // and the server's own sentence is what the operator reads.
     console.error('[library] send failed:', error);
     libDlg.busy = false;
     libDlg.error = error;
@@ -2299,7 +2354,7 @@ async function libSendSubmit() {
   }
   let rep = null;
   try { rep = await res.json(); } catch (e) { rep = {}; }
-  if (!libDlg || libDlg.seq !== seq) return;
+  if (!libDlg || libDlg.seq !== seq) { libDlgOrphanDrop(); return; }
   libDlg.busy = false;
   libDlg.sent = rep || {};
   libDlg.phase = 'result';
@@ -2512,11 +2567,13 @@ async function libDeleteSubmit() {
   let error = null;
   try { res = await libDeletePost(true); }
   catch (e) { error = (e && e.message) ? e.message : String(e); }
-  if (!libDlg || libDlg.seq !== seq) return;
+  // Closed under us: the per-file outcomes are lost to the operator, so the
+  // listing re-read is the only thing that can still tell them what happened.
+  if (!libDlg || libDlg.seq !== seq) { libDlgOrphanDrop(); return; }
   if (!error && !res.ok) {
     let body = '';
     try { body = await res.text(); } catch (e) { body = ''; }
-    if (!libDlg || libDlg.seq !== seq) return;
+    if (!libDlg || libDlg.seq !== seq) { libDlgOrphanDrop(); return; }
     error = String(body || '').trim() || ('HTTP ' + res.status);
   }
   if (error) {
@@ -2529,7 +2586,7 @@ async function libDeleteSubmit() {
   }
   let rep = null;
   try { rep = await res.json(); } catch (e) { rep = {}; }
-  if (!libDlg || libDlg.seq !== seq) return;
+  if (!libDlg || libDlg.seq !== seq) { libDlgOrphanDrop(); return; }
   libDlg.busy = false;
   libDlg.outcomes = Array.isArray(rep.outcomes) ? rep.outcomes : [];
   libDlg.phase = 'result';
@@ -2543,11 +2600,11 @@ async function libDeleteSubmit() {
 // ── dialog event handlers (bound once to the stable host in wireLibrary) ──
 function onLibDialogClick(e) {
   if (!libDlg) return;
-  if (e.target === $('libDialog')) { if (!libDlg.busy) libDlgClose(); return; }  // scrim
+  if (e.target === $('libDialog')) { libDlgClose(); return; }   // scrim — live mid-write
   const act = e.target.closest('[data-dlg-act]');
   if (!act) return;
   switch (act.dataset.dlgAct) {
-    case 'cancel': if (!libDlg.busy) libDlgClose(); break;
+    case 'cancel': libDlgClose(); break;
     case 'send': libSendSubmit(); break;
     case 'delete': libDeleteSubmit(); break;
     case 'retry':
