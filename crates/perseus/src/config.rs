@@ -1852,6 +1852,27 @@ interval_secs = 600
         assert_eq!(cfg.data_dir, platform_data_dir());
     }
 
+    /// The schedule keys the shipped template documents are copy-pasteable: an
+    /// operator who uncomments them and flips the mode gets a config that
+    /// validates. A commented example that does not parse is a trap, so it is
+    /// pinned rather than trusted.
+    #[test]
+    fn template_schedule_example_is_valid_when_uncommented() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("perseus.toml");
+        ensure_config_exists(&path).unwrap();
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("mode = \"auto\"", "mode = \"scheduled\"")
+            .replace("# schedule_times =", "schedule_times =")
+            .replace("# schedule_catchup =", "schedule_catchup =");
+        std::fs::write(&path, &text).unwrap();
+        let cfg = Config::load_lenient(&path).expect("the documented example must validate");
+        assert_eq!(cfg.mode, Mode::Scheduled);
+        assert_eq!(cfg.send_cfg().schedule_times, vec![(6, 0), (14, 30)]);
+        assert!(cfg.schedule_catchup);
+    }
+
     #[test]
     fn resolve_config_path_precedence() {
         let cwd = tempfile::tempdir().unwrap();
