@@ -7,8 +7,10 @@
 # Behaviour:
 #   - DISCORD_WEBHOOK_URL empty -> log + exit 0 (so the first pipeline after
 #     merging the change doesn't go red while secrets are being added).
-#   - Transport / HTTP error from Discord -> log warning + exit 0 (the build
+#   - Transport error / 5xx from Discord -> log warning + exit 0 (the build
 #     is already shipped; chat outages don't fail the pipeline).
+#   - 4xx from Discord -> exit 1 (config error: dead webhook — visible as an
+#     allow_failure yellow "!" instead of rotting green forever).
 #   - DRY_RUN=1 -> print the JSON payload to stdout instead of POSTing.
 set -euo pipefail
 
@@ -92,7 +94,16 @@ http_code=$(
 
 if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
   echo "Discord notification posted (HTTP $http_code)."
+elif [ "$http_code" -ge 400 ] && [ "$http_code" -lt 500 ]; then
+  # 4xx is a configuration error (dead webhook URL) — it will fail every
+  # future release identically, so surface it as a job failure. The job is
+  # allow_failure: the pipeline still passes, but the yellow "!" is visible.
+  echo "ERROR: Discord notification rejected (HTTP $http_code) — check DISCORD_WEBHOOK_URL."
+  echo "Response body:"
+  cat "$RESP_TMP" 2>/dev/null || true
+  exit 1
 else
+  # Transport trouble (timeout, 5xx) is transient — the build already shipped.
   echo "WARNING: Discord notification failed (HTTP $http_code). Pipeline continues."
   echo "Response body:"
   cat "$RESP_TMP" 2>/dev/null || true

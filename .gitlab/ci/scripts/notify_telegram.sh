@@ -95,7 +95,17 @@ http_code=$(
 
 if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
   echo "Telegram notification posted (HTTP $http_code)."
+elif [ "$http_code" -ge 400 ] && [ "$http_code" -lt 500 ]; then
+  # 4xx is a configuration error (revoked bot token, wrong chat id) — it will
+  # fail every future release identically, so surface it as a job failure.
+  # The job is allow_failure: the pipeline still passes, but the yellow "!"
+  # is visible instead of rotting green (401 went unnoticed for 4 releases).
+  echo "ERROR: Telegram notification rejected (HTTP $http_code) — check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID."
+  echo "Response body:"
+  cat "$RESP_TMP" 2>/dev/null || true
+  exit 1
 else
+  # Transport trouble (timeout, 5xx) is transient — the build already shipped.
   echo "WARNING: Telegram notification failed (HTTP $http_code). Pipeline continues."
   echo "Response body:"
   cat "$RESP_TMP" 2>/dev/null || true

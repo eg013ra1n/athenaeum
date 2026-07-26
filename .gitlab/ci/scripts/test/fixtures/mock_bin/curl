@@ -87,6 +87,15 @@ case "$url" in
       fi
     fi
     ;;
+  *api.telegram.org* | *discord.com/api/webhooks*)
+    # notify_telegram.sh / notify_discord.sh POSTs. Steered by:
+    #   MOCK_CURL_NOTIFY_HTTP   HTTP status to return (default 200)
+    #   MOCK_CURL_NOTIFY_BODY   response body verbatim (default {"ok":true})
+    http_code="${MOCK_CURL_NOTIFY_HTTP:-200}"
+    notify_body="${MOCK_CURL_NOTIFY_BODY:-}"
+    [ -n "$notify_body" ] || notify_body='{"ok":true}'
+    printf '%s' "$notify_body" > "$output_file"
+    ;;
   *)
     echo "mock curl: unrecognised URL: $url" >&2
     http_code="000"

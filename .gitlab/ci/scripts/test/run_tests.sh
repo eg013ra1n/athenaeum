@@ -262,6 +262,68 @@ out=$(
 )
 assert_contains "fallback body when notes missing" "is out" "$out"
 
+# --- live-HTTP branches via the curl mock (no real network) ---
+# A 4xx is a config error (revoked bot token, dead webhook): it must FAIL the
+# job — allow_failure renders it as a yellow "!" — instead of exiting green.
+# A real 401 rotted unseen for four releases behind the old soft-fail.
+rc=0
+out=$(
+  PATH="$FIXTURES_DIR/mock_bin:$PATH" \
+  MOCK_CURL_NOTIFY_HTTP=401 \
+  MOCK_CURL_NOTIFY_BODY='{"ok":false,"error_code":401,"description":"Unauthorized"}' \
+  TELEGRAM_BOT_TOKEN="dummy:token" \
+  TELEGRAM_CHAT_ID="@athenaeum_releases" \
+  CI_COMMIT_TAG="v0.2.0" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
+  "$HELPERS_DIR/notify_telegram.sh" 2>&1
+) || rc=$?
+assert_eq "telegram 401 exits non-zero" "1" "$rc"
+assert_contains "telegram 401 names the variables" "check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID" "$out"
+assert_contains "telegram 401 echoes the response body" "Unauthorized" "$out"
+
+# Transport trouble / 5xx stays soft: the build already shipped.
+rc=0
+out=$(
+  PATH="$FIXTURES_DIR/mock_bin:$PATH" \
+  MOCK_CURL_NOTIFY_HTTP=503 \
+  TELEGRAM_BOT_TOKEN="dummy:token" \
+  TELEGRAM_CHAT_ID="@athenaeum_releases" \
+  CI_COMMIT_TAG="v0.2.0" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
+  "$HELPERS_DIR/notify_telegram.sh" 2>&1
+) || rc=$?
+assert_eq "telegram 5xx stays soft" "0" "$rc"
+assert_contains "telegram 5xx warns and continues" "WARNING: Telegram notification failed (HTTP 503)" "$out"
+
+# Happy path still reports the post.
+out=$(
+  PATH="$FIXTURES_DIR/mock_bin:$PATH" \
+  MOCK_CURL_NOTIFY_HTTP=200 \
+  TELEGRAM_BOT_TOKEN="dummy:token" \
+  TELEGRAM_CHAT_ID="@athenaeum_releases" \
+  CI_COMMIT_TAG="v0.2.0" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
+  "$HELPERS_DIR/notify_telegram.sh" 2>&1
+)
+assert_contains "telegram 200 posts" "Telegram notification posted (HTTP 200)" "$out"
+
+# Discord mirrors the same 4xx-is-config-error contract.
+rc=0
+out=$(
+  PATH="$FIXTURES_DIR/mock_bin:$PATH" \
+  MOCK_CURL_NOTIFY_HTTP=404 \
+  DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/dummy" \
+  CI_COMMIT_TAG="v0.2.0" \
+  RELEASE_NOTES_BASE_URL="https://example.com/blog" \
+  RELEASE_NOTES_PATH="$FIXTURES_DIR/short.md" \
+  "$HELPERS_DIR/notify_discord.sh" 2>&1
+) || rc=$?
+assert_eq "discord 404 exits non-zero" "1" "$rc"
+assert_contains "discord 404 names the variable" "check DISCORD_WEBHOOK_URL" "$out"
+
 echo
 echo "-- update_dockerhub_description.sh --"
 
