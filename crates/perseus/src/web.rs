@@ -30,6 +30,10 @@
 //!   `stat(2)` and a `304`. Inherits `/api/library`'s status contract, adding
 //!   `415` (not a FITS/XISF frame) and `422` (a frame that will not decode).
 //!   Without the `preview` feature the route answers `404 preview not built`.
+//! - `POST /api/library/send` — send an arbitrary library selection now, as one
+//!   explicit `browser` batch ([`LibrarySendRequest`] → [`LibrarySendReport`]).
+//!   Selected files leave the batcher's pending set first, so the next
+//!   auto/scheduled flush cannot send them a second time.
 //! - `GET`/`PUT /api/capture-dirs` — the configured vs. running capture
 //!   directories + a `restartPending` flag ([`CaptureDirsDto`]); a PUT rewrites
 //!   `perseus.toml`'s capture selection, adopts it into the live config, and
@@ -86,7 +90,7 @@ use athenaeum_core::sync::{
 use athenaeum_core::sync::{Direction, HistoryRow};
 
 use crate::batch_store::BatchStore;
-use crate::batcher::BatcherHandle;
+use crate::batcher::{BatcherHandle, Delivery};
 use crate::config::{Config, Mode, RetentionConfig, SendCfg};
 use crate::config_edit::{
     apply_capture_dirs_edit, apply_device_name_edit, apply_retention_edit, apply_send_mode_edit,
@@ -529,6 +533,9 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         // preview not built` stub, so the router shape never depends on how the
         // binary was compiled.
         .route("/api/library/preview", get(api_library_preview))
+        // Send an explicit library selection now, as one `browser` batch
+        // (0.5.1 T8, spec §1a). Bearer-gated like every other `/api/*` route.
+        .route("/api/library/send", post(api_library_send))
         .route("/api/targets", get(api_get_targets).put(api_put_targets))
         .route("/api/targets/options", get(api_get_target_options))
         .route(
@@ -1541,6 +1548,10 @@ fn library_status_for(head: &str, chain: &str) -> (StatusCode, String) {
     } else if head.starts_with("invalid path segment")
         || head.starts_with("path escapes root")
         || head.starts_with("not a directory")
+        // Send/delete only (T8+): the client said "file" (or "directory") and the
+        // filesystem says otherwise. The path resolved, so it is the request that
+        // is wrong — a stale listing — not the target that is missing.
+        || head.starts_with("not a file")
     {
         (StatusCode::BAD_REQUEST, head)
     } else if head.starts_with("not a renderable frame") {
@@ -1778,6 +1789,191 @@ async fn api_library_preview(
 #[cfg(not(feature = "preview"))]
 async fn api_library_preview() -> (StatusCode, String) {
     (StatusCode::NOT_FOUND, "preview not built".to_string())
+}
+
+/// `POST /api/library/send` request body (0.5.1 §1a).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibrarySendRequest {
+    /// Which running send targets to fan this batch out to — each either a peer
+    /// device id (hex) or that peer's friendly device name. Empty / omitted
+    /// means **every** configured target, exactly what an auto or manual flush
+    /// does; an unresolvable entry is a `400` before anything is built.
+    #[serde(default)]
+    targets: Vec<String>,
+    /// The browser selection: files and/or whole directories, in the
+    /// `(root, rel)` wire form every library route uses.
+    items: Vec<crate::library::SendItem>,
+}
+
+/// `POST /api/library/send` success payload.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibrarySendReport {
+    /// Files that actually made it into the package. Can be fewer than the
+    /// selection expanded to: a file that vanished or will not parse is dropped
+    /// at build time with a `warn!` and the rest of the batch proceeds.
+    enqueued: usize,
+    /// The package directory the batch was staged in — the same `package_ref`
+    /// the transfers list and the `perseus_batch` row key on.
+    package_ref: String,
+}
+
+/// Map a selection-expansion error onto the shared library status contract.
+/// Split from [`library_error_status`] only so each route logs its own stable
+/// message; the statuses themselves are deliberately identical.
+fn send_error_status(err: &anyhow::Error) -> (StatusCode, String) {
+    let chain = format!("{err:#}");
+    tracing::error!(error = %chain, "web library send: selection expansion failed");
+    library_status_for(&err.to_string(), &chain)
+}
+
+/// Resolve the request's `targets` onto running engines.
+///
+/// `None` (an empty request list) means "the batcher's own fan-out set" — the
+/// status quo for every other send. A named target matches a running peer's id
+/// (hex) or its friendly device name, case-insensitively; repeats collapse, so
+/// naming a device twice cannot enqueue the same package to it twice. An
+/// unknown name is a `400`: sending "to a device" that is not a configured
+/// target must fail loudly, never silently fan out to everyone.
+fn resolve_send_targets(
+    engines: &[(String, Arc<SyncEngineHandle>)],
+    names: &HashMap<String, String>,
+    targets: &[String],
+) -> Result<Option<Vec<Arc<SyncEngineHandle>>>, (StatusCode, String)> {
+    if targets.is_empty() {
+        return Ok(None);
+    }
+    let mut chosen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for want in targets {
+        let found = engines.iter().find(|(peer, _)| {
+            peer.eq_ignore_ascii_case(want)
+                || names
+                    .get(peer)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(want))
+        });
+        let Some((peer, engine)) = found else {
+            tracing::error!(target = %want, "web library send: unknown send target");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown send target: {want}"),
+            ));
+        };
+        if chosen.iter().any(|p| p == peer) {
+            continue;
+        }
+        chosen.push(peer.clone());
+        out.push(Arc::clone(engine));
+    }
+    Ok(Some(out))
+}
+
+/// `POST /api/library/send` — send an arbitrary library selection **now**, as
+/// one explicit `browser` batch (spec §1a).
+///
+/// This is not a flush: the operator picked these files, so already-sent ones are
+/// deliberately allowed (re-sending is the button's whole point — the receiver's
+/// dedup handshake decides what actually travels, and a fully-duplicate selection
+/// confirms as "already on peer"). Whatever of the selection is sitting in the
+/// batcher's pending set is taken OUT of it first, inside
+/// [`BatcherHandle::send_explicit`], so the next auto or scheduled flush cannot
+/// send it a second time.
+///
+/// Delivery and bookkeeping are the batcher's own — same build, same fan-out,
+/// same record-seen-only-what-shipped rule, same batch rows — with one
+/// difference: a batch that reaches no target is **not** re-queued for the next
+/// automatic flush. It is a `502` with its staged package removed and its own
+/// pending removal undone (a failed send changes nothing), and the operator
+/// retries explicitly.
+///
+/// Statuses: `503` while the engine is detached (nothing to send into), `400` for
+/// a hostile / mistyped path or an unknown target, `404` for a missing item or
+/// root, `502` for an unmounted root or a zero-target delivery, `422` when the
+/// selection expands to nothing or nothing in it can be built.
+///
+/// The expansion (canonicalize + a recursive walk) runs on a blocking thread for
+/// the same reason the listing does: a capture root is routinely a network share.
+async fn api_library_send(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<LibrarySendRequest>,
+) -> Result<Json<LibrarySendReport>, (StatusCode, String)> {
+    // Sending needs both the running engines (somewhere to send) and the running
+    // batcher (the send seam + the pending accumulator the guard clears). They
+    // arrive and leave together on attach/detach, so either being absent is the
+    // same honest answer the other engine-dependent write routes give.
+    let engines = state.engines.read().await.clone();
+    let batcher = match state.batcher.read().await.clone() {
+        Some(batcher) if !engines.is_empty() => batcher,
+        _ => {
+            tracing::warn!("web library send: sync engine is not running");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sync engine is not running — finish setup first".to_string(),
+            ));
+        }
+    };
+
+    // Targets first: an unknown one must fail before any file is hashed or copied.
+    let names = state.device_names.read().await.clone();
+    let selected = resolve_send_targets(&engines, &names, &req.targets)?;
+
+    let config = state.config.read().await.clone();
+    let items = req.items;
+    let expanded =
+        tokio::task::spawn_blocking(move || crate::library::expand_selection(&config, &items))
+            .await
+            .map_err(|e| {
+                let msg = format!("{e}");
+                tracing::error!(error = %msg, "web library send: expansion task panicked");
+                (StatusCode::INTERNAL_SERVER_ERROR, msg)
+            })?;
+    let files = expanded.map_err(|e| send_error_status(&e))?;
+
+    if files.is_empty() {
+        tracing::warn!("web library send: selection expanded to no files");
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "selection contains no files to send".to_string(),
+        ));
+    }
+
+    match batcher.send_explicit(&files, selected.as_deref()).await {
+        Delivery::Sent(outcome) => {
+            tracing::info!(
+                package_ref = %outcome.package_ref,
+                file_count = outcome.file_count,
+                selected = files.len(),
+                targets = selected.as_ref().map_or(engines.len(), Vec::len),
+                "library selection sent as a browser batch"
+            );
+            Ok(Json(LibrarySendReport {
+                enqueued: outcome.file_count,
+                package_ref: outcome.package_ref,
+            }))
+        }
+        Delivery::Unbuildable(error) => {
+            // Every picked file vanished or will not parse. Nothing was written,
+            // nothing was recorded — say so instead of reporting an empty send.
+            let msg = format!("{error:#}");
+            tracing::error!(error = %msg, count = files.len(), "web library send: nothing buildable");
+            Err((StatusCode::UNPROCESSABLE_ENTITY, msg))
+        }
+        Delivery::NoTarget {
+            package_ref,
+            file_count,
+        } => {
+            tracing::error!(
+                package_ref = %package_ref,
+                file_count,
+                "web library send: package reached no target"
+            );
+            Err((
+                StatusCode::BAD_GATEWAY,
+                "no target accepted the package".to_string(),
+            ))
+        }
+    }
 }
 
 /// `GET /api/pending` — the "To sync" tree over the batcher's current pending
@@ -6254,5 +6450,342 @@ mod tests {
         let app = build_router(state, None);
         let res = get(&app, "/api/library/preview?root=0&path=light.fits").await;
         assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // ── T8 (0.5.1 local library): POST /api/library/send ──────────────────────
+
+    /// Write a minimal, parseable single-frame FITS. The send path builds a REAL
+    /// package (parse → stat → hash → copy), so its fixtures must actually parse.
+    fn write_fixture_fits(path: &Path, object: &str) {
+        use athenaeum_core::fits_writer::keywords::{FrameKind, HeaderBuilder};
+        let cards = HeaderBuilder::new(FrameKind::Light)
+            .object(object)
+            .exptime(60.0)
+            .filter("Ha")
+            .instrume("TestCam")
+            .build()
+            .expect("build header");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        athenaeum_core::fits_writer::write_fits_f32(path, 8, 8, 1, &vec![0.0f32; 64], &cards)
+            .expect("write fixture fits");
+    }
+
+    /// A live send harness: the library state above plus one loopback engine as
+    /// the sole target and a real MANUAL-mode batcher (it never auto-flushes, so
+    /// the pending accumulator is stable across the assertions).
+    struct SendHarness {
+        state: Arc<WebState>,
+        cap: PathBuf,
+        engine: Arc<SyncEngineHandle>,
+        batcher: crate::batcher::BatcherHandle,
+        stable_tx: tokio::sync::mpsc::Sender<(PathBuf, PathBuf)>,
+        // Held so the batcher loop (and with it the pending set) outlives the test.
+        _task: tokio::task::JoinHandle<()>,
+        _cfg_tx: watch::Sender<SendCfg>,
+        _tmp: tempfile::TempDir,
+    }
+
+    impl SendHarness {
+        /// Feed one file into the batcher as a watcher would — the canonical
+        /// `(capture_dir, file)` spelling — and wait for the loop to absorb it.
+        async fn make_pending(&self, rel: &str) {
+            let cap = std::fs::canonicalize(&self.cap).unwrap();
+            let file = std::fs::canonicalize(self.cap.join(rel)).unwrap();
+            self.stable_tx.send((cap, file)).await.unwrap();
+            for _ in 0..1000 {
+                if !self.batcher.pending_snapshot().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            panic!("the batcher never took the fed file");
+        }
+
+        /// Is this capture file recorded in the seen store (i.e. did it ship)?
+        fn is_seen(&self, rel: &str) -> bool {
+            let p = std::fs::canonicalize(self.cap.join(rel)).unwrap();
+            let m = std::fs::metadata(&p).unwrap();
+            !self
+                .state
+                .seen
+                .should_enqueue(&p, m.len(), crate::seen::mtime_millis(m.modified().ok()))
+                .unwrap()
+        }
+    }
+
+    async fn send_harness() -> SendHarness {
+        let (state, tmp, cap) = library_test_state().await;
+        let config = state.config.read().await.clone();
+        let transport: Arc<dyn SharingTransport> = Arc::new(LoopbackNetwork::new().endpoint());
+        let engine = Arc::new(SyncEngine::spawn(
+            Arc::clone(&state.store) as Arc<dyn SyncStore>,
+            transport,
+            PEER,
+        ));
+        let (stable_tx, stable_rx) = tokio::sync::mpsc::channel::<(PathBuf, PathBuf)>(8);
+        let (cfg_tx, cfg_rx) = watch::channel(config.send_cfg());
+        let (batcher, task) = crate::batcher::spawn_batcher(
+            stable_rx,
+            vec![Arc::clone(&engine)],
+            Arc::clone(&state.seen),
+            Arc::clone(&state.batches),
+            config,
+            node_id_hex(&PEER),
+            None,
+            cfg_rx,
+        );
+        *state.engines.write().await = vec![(node_id_hex(&PEER), Arc::clone(&engine))];
+        *state.engine.write().await = Some(Arc::clone(&engine));
+        *state.batcher.write().await = Some(batcher.clone());
+        SendHarness {
+            state,
+            cap,
+            engine,
+            batcher,
+            stable_tx,
+            _task: task,
+            _cfg_tx: cfg_tx,
+            _tmp: tmp,
+        }
+    }
+
+    /// The whole happy path in one pass: a mixed file + directory selection is
+    /// expanded (recursively, eligible-only), packaged as ONE `browser` batch,
+    /// recorded seen, and — the spec §1a double-send guard — the selected file
+    /// that was sitting in the batcher's pending set is taken OUT of it.
+    #[tokio::test]
+    async fn library_send_packages_the_selection_and_clears_it_from_pending() {
+        let h = send_harness().await;
+        write_fixture_fits(&h.cap.join("a.fits"), "M42");
+        write_fixture_fits(&h.cap.join("M31/b.fits"), "M31");
+        write_fixture_fits(&h.cap.join("M31/sub/c.fits"), "M31");
+        std::fs::write(h.cap.join("M31/notes.txt"), b"not a frame").unwrap();
+        h.make_pending("a.fits").await;
+
+        let app = build_router(Arc::clone(&h.state), None);
+        let res = post_json(
+            &app,
+            "/api/library/send",
+            serde_json::json!({
+                "items": [
+                    { "root": 0, "rel": "a.fits" },
+                    { "root": 0, "rel": "M31", "dir": true }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(
+            v["enqueued"], 3,
+            "the picked file + both nested frames; notes.txt is not swept in"
+        );
+        let package_ref = v["packageRef"].as_str().unwrap().to_string();
+        assert!(Path::new(&package_ref).is_dir(), "the package was written");
+
+        let rows = h.state.batches.list().unwrap();
+        assert_eq!(rows.len(), 1, "one batch row");
+        assert_eq!(rows[0].mode, "browser", "recorded as a browser batch");
+        assert_eq!(rows[0].file_count, 3);
+        assert_eq!(rows[0].package_ref, package_ref);
+
+        for rel in ["a.fits", "M31/b.fits", "M31/sub/c.fits"] {
+            assert!(h.is_seen(rel), "{rel} recorded seen");
+        }
+        assert!(
+            h.batcher.pending_snapshot().is_empty(),
+            "the sent file left the pending set — no second send on the next flush"
+        );
+    }
+
+    /// A selection that expands to no files is a `422`, whether it was empty or
+    /// only held ineligible entries. Nothing is built and no row is recorded.
+    #[tokio::test]
+    async fn library_send_with_nothing_to_send_is_422() {
+        let h = send_harness().await;
+        std::fs::create_dir_all(h.cap.join("empty")).unwrap();
+        std::fs::write(h.cap.join("empty/notes.txt"), b"x").unwrap();
+        let app = build_router(Arc::clone(&h.state), None);
+
+        for items in [
+            serde_json::json!([]),
+            serde_json::json!([{ "root": 0, "rel": "empty", "dir": true }]),
+        ] {
+            let body = serde_json::json!({ "items": items });
+            let res = post_json(&app, "/api/library/send", body).await;
+            assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "{items}");
+        }
+        assert!(h.state.batches.list().unwrap().is_empty());
+    }
+
+    /// An explicitly picked file ships whatever its extension — but if NOTHING in
+    /// the selection can be built into a manifest record, that is an honest `422`
+    /// rather than a `200` over an empty package.
+    #[tokio::test]
+    async fn library_send_of_only_unbuildable_files_is_422() {
+        let h = send_harness().await;
+        std::fs::write(h.cap.join("notes.txt"), b"not a frame").unwrap();
+        let app = build_router(Arc::clone(&h.state), None);
+        let res = post_json(
+            &app,
+            "/api/library/send",
+            serde_json::json!({ "items": [{ "root": 0, "rel": "notes.txt" }] }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(h.state.batches.list().unwrap().is_empty());
+        assert!(!h.is_seen("notes.txt"), "nothing shipped, nothing seen");
+    }
+
+    /// Targets name the running send targets, by peer id or friendly device
+    /// name. An unknown one is a `400` before anything is built.
+    #[tokio::test]
+    async fn library_send_resolves_targets_and_refuses_an_unknown_one() {
+        let h = send_harness().await;
+        write_fixture_fits(&h.cap.join("a.fits"), "M42");
+        *h.state.device_names.write().await =
+            HashMap::from([(node_id_hex(&PEER), "obs-pi".to_string())]);
+        let app = build_router(Arc::clone(&h.state), None);
+        let items = serde_json::json!([{ "root": 0, "rel": "a.fits" }]);
+
+        let res = post_json(
+            &app,
+            "/api/library/send",
+            serde_json::json!({ "targets": ["no-such-device"], "items": items }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            h.state.batches.list().unwrap().is_empty(),
+            "an unknown target builds nothing"
+        );
+
+        let res = post_json(
+            &app,
+            "/api/library/send",
+            serde_json::json!({ "targets": ["obs-pi"], "items": items }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK, "the friendly name resolves");
+        assert_eq!(h.state.batches.list().unwrap().len(), 1);
+    }
+
+    /// The send route inherits the T1 path contract verbatim — the same inputs a
+    /// listing refuses, with the same statuses — plus the two kind mismatches.
+    #[tokio::test]
+    async fn library_send_inherits_the_path_contract() {
+        let h = send_harness().await;
+        write_fixture_fits(&h.cap.join("a.fits"), "M42");
+        std::fs::create_dir_all(h.cap.join("M31")).unwrap();
+        let app = build_router(Arc::clone(&h.state), None);
+
+        let cases: Vec<(serde_json::Value, StatusCode)> = vec![
+            (
+                serde_json::json!({ "root": 7, "rel": "a.fits" }),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                serde_json::json!({ "root": 0, "rel": "gone.fits" }),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                serde_json::json!({ "root": 0, "rel": ".." }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({ "root": 0, "rel": "a\\b.fits" }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({ "root": 0, "rel": "M31" }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!({ "root": 0, "rel": "a.fits", "dir": true }),
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (item, want) in cases {
+            let res = post_json(
+                &app,
+                "/api/library/send",
+                serde_json::json!({ "items": [item.clone()] }),
+            )
+            .await;
+            assert_eq!(res.status(), want, "item {item}");
+        }
+
+        // An unmounted root is a 502 ("root unavailable"), never a 404.
+        std::fs::remove_dir_all(&h.cap).unwrap();
+        let res = post_json(
+            &app,
+            "/api/library/send",
+            serde_json::json!({ "items": [{ "root": 0, "rel": "a.fits" }] }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// A package that reaches ZERO targets is a `502`, its staged dir is gone,
+    /// nothing is recorded seen — and the send is a no-op on the pending set: a
+    /// selected file that was queued for the next flush is still queued.
+    #[tokio::test]
+    async fn library_send_that_reaches_no_target_is_502_and_leaves_no_package() {
+        let h = send_harness().await;
+        write_fixture_fits(&h.cap.join("a.fits"), "M42");
+        h.make_pending("a.fits").await;
+        // The sole target's worker is gone: every enqueue now fails.
+        h.engine.shutdown().await;
+
+        let app = build_router(Arc::clone(&h.state), None);
+        let res = post_json(
+            &app,
+            "/api/library/send",
+            serde_json::json!({ "items": [{ "root": 0, "rel": "a.fits" }] }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "no target accepted the package"
+        );
+
+        assert!(h.state.batches.list().unwrap().is_empty(), "no batch row");
+        assert!(!h.is_seen("a.fits"), "nothing shipped, nothing seen");
+        let packages = h.state.config.read().await.packages_dir();
+        let leftovers: Vec<_> = std::fs::read_dir(&packages)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "the undelivered package dir was removed: {leftovers:?}"
+        );
+        let cap = std::fs::canonicalize(&h.cap).unwrap();
+        assert_eq!(
+            h.batcher.pending_snapshot(),
+            vec![(cap.clone(), cap.join("a.fits"))],
+            "a send that shipped nothing leaves the pending set as it found it"
+        );
+    }
+
+    /// A detached page (engine still in setup) cannot send: an honest `503`, the
+    /// same answer the other engine-dependent write routes give.
+    #[tokio::test]
+    async fn library_send_while_detached_is_503() {
+        let (state, _tmp, cap) = library_test_state().await;
+        write_fixture_fits(&cap.join("a.fits"), "M42");
+        let app = build_router(state, None);
+        let res = post_json(
+            &app,
+            "/api/library/send",
+            serde_json::json!({ "items": [{ "root": 0, "rel": "a.fits" }] }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

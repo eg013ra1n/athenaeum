@@ -36,6 +36,18 @@
 //! whose files all vanished is dropped with a `warn!` (there is nothing left to
 //! send). The batcher loop never fails on a bad batch — a single flush error is
 //! logged and the loop continues.
+//!
+//! # The third sender: an explicit browser batch
+//!
+//! The library page can send an arbitrary selection *now*
+//! ([`BatcherHandle::send_explicit`], batch mode `browser`, 0.5.1 §1a). That is
+//! not a flush — the files are the operator's pick, not the accumulator — but it
+//! must deliver and record identically, so both paths run the same
+//! [`deliver_batch`] body with the same [`SendContext`] (engines, stores,
+//! config, `origin_device`). The differences are exactly two, and both are in
+//! the failure direction: a browser send takes its files OUT of the pending set
+//! so the next auto/scheduled flush cannot send them twice, and it never
+//! re-queues a batch that reached no target (it only undoes its own removal).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -75,6 +87,11 @@ pub struct BatcherHandle {
     /// Fire a manual flush. `()` is the whole message — the batcher flushes its
     /// entire pending set as one `manual` batch (a no-op when empty).
     flush_tx: mpsc::Sender<()>,
+    /// Everything a delivery needs besides the files (engines, stores, config,
+    /// this node's device id, the cleanup coordinator). Shared with the loop, so
+    /// a browser send ([`send_explicit`](Self::send_explicit)) builds and records
+    /// EXACTLY what an auto/manual flush would.
+    ctx: Arc<SendContext>,
 }
 
 impl BatcherHandle {
@@ -91,6 +108,42 @@ impl BatcherHandle {
             .collect()
     }
 
+    /// Take exactly these `(capture_dir, file)` pairs out of the pending
+    /// accumulator, returning how many were actually in it.
+    ///
+    /// The double-send guard behind both browser actions on the library: a file
+    /// sent explicitly ([`send_explicit`](Self::send_explicit)) or deleted must
+    /// not also go out with the next auto/scheduled flush. Matching is by
+    /// **exact pair**, so callers must spell the capture dir the way the watcher
+    /// does — canonicalized, which is what
+    /// [`expand_selection`](crate::library::expand_selection) returns. A pair
+    /// that is not pending is silently not counted: the caller's selection is a
+    /// list of files to act on, not an assertion about the accumulator.
+    pub fn remove_pending(&self, files: &[(PathBuf, PathBuf)]) -> usize {
+        self.take_pending(files).len()
+    }
+
+    /// [`remove_pending`](Self::remove_pending), returning **which** pairs were
+    /// actually taken — so a caller whose operation then ships nothing can put
+    /// exactly those back and leave the accumulator as it found it.
+    fn take_pending(&self, files: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, PathBuf)> {
+        let mut guard = self.pending.lock().expect("batcher pending mutex poisoned");
+        files
+            .iter()
+            .filter(|pair| guard.remove(*pair))
+            .cloned()
+            .collect()
+    }
+
+    /// Put back pairs taken by [`take_pending`](Self::take_pending) after an
+    /// attempt that shipped nothing.
+    fn restore_pending(&self, files: Vec<(PathBuf, PathBuf)>) {
+        let mut guard = self.pending.lock().expect("batcher pending mutex poisoned");
+        for pair in files {
+            guard.insert(pair);
+        }
+    }
+
     /// Signal the batcher to flush the whole pending set now as one `manual`
     /// batch. The operator's "Send N pending" action. The batcher itself guards
     /// the empty case, so calling this with nothing pending records no batch.
@@ -100,6 +153,88 @@ impl BatcherHandle {
     pub async fn flush_now(&self) {
         let _ = self.flush_tx.send(()).await;
     }
+
+    /// Send an explicit, caller-chosen set of files as ONE `browser` batch
+    /// (0.5.1 §1a) — the library page's "Send to…".
+    ///
+    /// Not a flush: `files` is whatever the operator picked, pending or not,
+    /// already-sent or not (re-sending is the point of the button; the receiver's
+    /// dedup handshake decides what actually travels). The selected files are
+    /// **removed from the pending accumulator first**, so the next auto or
+    /// scheduled flush cannot send them a second time — the guard lives here,
+    /// inside the one entry point, rather than in each caller.
+    ///
+    /// Delivery and bookkeeping are the batcher's own ([`deliver_batch`]): the
+    /// same build (from the batcher's own spawn-time config and `origin_device`),
+    /// the same fan-out, the same record-seen-only-what-shipped rule, the same
+    /// batch rows — with one deliberate difference on failure. A flush that
+    /// reaches no target re-queues its whole batch for the next quiet window; a
+    /// browser send does **not**: the operator is standing right there and
+    /// retries explicitly, and enrolling library files they picked once into the
+    /// automatic path would send something they were told had failed.
+    ///
+    /// What an attempt that ships **nothing** does do is undo its own pending
+    /// removal — exactly the pairs it took, no others — so a failed send is a
+    /// no-op on the accumulator rather than quietly dropping tonight's frames out
+    /// of the next flush. (A file dropped at build time inside an otherwise
+    /// successful batch is NOT put back, matching the flush path: it stays unseen
+    /// and is retried on the next detection / restart instead of spinning
+    /// in-session.)
+    ///
+    /// `engines` overrides the fan-out set for a targeted send; `None` means
+    /// every configured target, exactly as a flush does.
+    ///
+    /// Runs on the CALLER's task, not the batcher loop — a large selection's
+    /// hashing and copying must not stall the accumulator.
+    pub async fn send_explicit(
+        &self,
+        files: &[(PathBuf, PathBuf)],
+        engines: Option<&[Arc<SyncEngineHandle>]>,
+    ) -> Delivery {
+        let taken = self.take_pending(files);
+        if !taken.is_empty() {
+            tracing::info!(
+                count = taken.len(),
+                "browser send took files out of the pending set"
+            );
+        }
+        let engines = engines.unwrap_or(&self.ctx.engines);
+        let delivery = deliver_batch(&self.ctx, engines, files, BROWSER_MODE).await;
+        if !matches!(delivery, Delivery::Sent(_)) && !taken.is_empty() {
+            tracing::warn!(
+                count = taken.len(),
+                "browser send shipped nothing; returning its files to the pending set"
+            );
+            self.restore_pending(taken);
+        }
+        delivery
+    }
+}
+
+/// The [`BatchStore`] mode string of a batch sent explicitly from the library
+/// page, beside the batcher's own `auto` / `manual`.
+pub const BROWSER_MODE: &str = "browser";
+
+/// Everything one delivery needs besides the files: where to send, where to
+/// record, and how to build. Shared (behind an [`Arc`]) by the batcher loop and
+/// every [`BatcherHandle`], so a browser send cannot drift from a flush — same
+/// engines, same stores, same config, same `origin_device`.
+pub struct SendContext {
+    /// One handle per configured send target; a built package is fanned out to
+    /// all of them.
+    engines: Vec<Arc<SyncEngineHandle>>,
+    /// The stat-aware dedup authority: only files that actually shipped are
+    /// recorded here.
+    seen: Arc<SeenStore>,
+    /// Per-batch send history (`perseus_batch` + `perseus_batch_files`).
+    batches: Arc<BatchStore>,
+    /// The config the packages are built from (packages dir, capture roots for
+    /// `rel_path` labelling). Spawn-time, like the rest of the batcher's view.
+    config: Config,
+    /// This node's device id (hex), stamped into every manifest record.
+    origin_device: String,
+    /// Shared-payload cleanup coordinator, `Some` only for a ≥2-target fan-out.
+    cleanup: Option<Arc<SharedPackageCleanup>>,
 }
 
 /// The result of one non-empty, delivered flush: the package it produced and how
@@ -107,9 +242,131 @@ impl BatcherHandle {
 /// recorded" — an empty pending set, an all-vanished batch, or a zero-target
 /// delivery (whose files were re-queued for retry).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FlushOutcome {
-    package_ref: String,
-    file_count: usize,
+pub struct FlushOutcome {
+    pub package_ref: String,
+    pub file_count: usize,
+}
+
+/// What one [`deliver_batch`] attempt did. The three arms are the only outcomes,
+/// and each caller decides what its own mode makes of them (a flush re-queues on
+/// [`NoTarget`](Delivery::NoTarget); a browser send reports it and stops).
+#[derive(Debug)]
+pub enum Delivery {
+    /// At least one target durably queued the package; the shipped files are
+    /// recorded seen and the batch rows are written.
+    Sent(FlushOutcome),
+    /// Nothing in the batch could be built (every file vanished or won't parse),
+    /// so no package was written and nothing was recorded. Carries the build
+    /// error for the caller's own message.
+    Unbuildable(anyhow::Error),
+    /// A package was built but reached ZERO targets. Its files were NOT recorded
+    /// seen and no batch row exists; the staged dir has already been released
+    /// (registered with the fan-out coordinator at `0`, or removed outright), so
+    /// nothing leaks whatever the caller decides next.
+    NoTarget {
+        package_ref: String,
+        file_count: usize,
+    },
+}
+
+/// Build ONE package from `files`, fan it out to `engines`, and — only when a
+/// target accepted it — record the shipped files as seen and write the batch
+/// rows. The single delivery path: the batcher's auto/manual flush and the
+/// library page's browser send both go through here, so their bookkeeping cannot
+/// diverge.
+///
+/// The order is load-bearing and mirrors the legacy per-file consumer:
+/// build → enqueue-to-all → register cleanup → record seen (ONLY the files that
+/// actually made it into the package) → record batch row → record file linkage.
+/// A drained file dropped at build time (present but unbuildable) is deliberately
+/// left unseen so it is retried on the next detection / restart rather than
+/// silently lost; a failed history write only costs a status-page row, never a
+/// frame, so both are `warn!`-and-continue.
+async fn deliver_batch(
+    ctx: &SendContext,
+    engines: &[Arc<SyncEngineHandle>],
+    files: &[(PathBuf, PathBuf)],
+    mode: &str,
+) -> Delivery {
+    let built = match build_batch_package(&ctx.config, files, &ctx.origin_device) {
+        Ok(built) => built,
+        Err(error) => return Delivery::Unbuildable(error),
+    };
+    // The packaged record count == the number of files that actually shipped.
+    // Some given files may have been dropped at build time (present but
+    // unbuildable); those are deliberately absent from `included`.
+    let n = built.included.len();
+
+    let (first_id, delivered) = enqueue_package_to_all(
+        engines,
+        &built.pkg_dir,
+        Some(&built.display_name),
+        &built.files,
+    )
+    .await;
+    // Fan-out only: register the delivered target count so the shared payload is
+    // freed exactly once, after every target is terminal (mirrors the per-file
+    // path). Single-target agents keep the engine's in-line cleanup (`None`).
+    // `delivered == 0` registers an expected of 0 → the orphaned copy is cleaned
+    // immediately (no target's retry can ever need it).
+    if let Some(coord) = &ctx.cleanup {
+        coord.register(&built.pkg_dir, delivered);
+    }
+    let pkg_dir = built.pkg_dir.clone();
+    let package_ref = pkg_dir.to_string_lossy().into_owned();
+
+    if first_id.is_none() {
+        // Reached no target. The files were NOT recorded as seen — what happens
+        // to them next is the caller's call. The staged package is orphaned
+        // either way (any next attempt mints a fresh dir): with a fan-out
+        // `cleanup` the zero `register` above already freed it; a single-target
+        // agent (`None`) must drop it here, or an Auto-mode dead-worker leaks one
+        // dir per quiet window. Best-effort — a failure just warns.
+        if ctx.cleanup.is_none() {
+            if let Err(error) = std::fs::remove_dir_all(&pkg_dir) {
+                tracing::warn!(%error, package_ref = %package_ref, "failed to clean orphaned zero-target package dir");
+            }
+        }
+        return Delivery::NoTarget {
+            package_ref,
+            file_count: n,
+        };
+    }
+
+    // At least one target durably queued the package. Mark seen ONLY the files
+    // that actually made it into the package (so a restart never re-baselines
+    // them) and record the batch. A given file that was dropped at build time
+    // (present-but-unbuildable) is intentionally left unseen: it never shipped,
+    // so it must stay enqueue-eligible and get retried on the next detection /
+    // restart rather than be silently lost (the durable seen store is the dedup
+    // authority). This is not the zero-target path — we do NOT put it back into
+    // any queue (that would spin a permanently-corrupt file forever in-session);
+    // simply not marking it seen matches the legacy per-file behavior exactly.
+    for file in &built.included {
+        record_seen(&ctx.seen, file, &package_ref);
+    }
+    if let Err(error) = ctx.batches.record(&package_ref, mode, &now_rfc3339(), n) {
+        // The files are already durably queued + recorded seen; a failed history
+        // write only loses a status-page row, never a frame.
+        tracing::warn!(%error, package_ref = %package_ref, "failed to record batch row");
+    }
+    // Durable rel_path → source linkage for a later confirmed-package rebuild.
+    // Same best-effort contract as the batch row above.
+    if let Err(error) = ctx.batches.record_files(&package_ref, &built.rel_sources) {
+        tracing::warn!(%error, package_ref = %package_ref, "failed to record batch file linkage");
+    }
+    tracing::info!(
+        package_ref = %package_ref,
+        delivered,
+        targets = engines.len(),
+        file_count = n,
+        mode,
+        "batch flushed"
+    );
+    Delivery::Sent(FlushOutcome {
+        package_ref,
+        file_count: n,
+    })
 }
 
 /// The auto quiet window as a [`Duration`], **floored at 1s**. `auto_quiet_secs`
@@ -153,16 +410,10 @@ fn now_rfc3339() -> String {
 ///   retried on the next flush, with an `error!`.
 ///
 /// A single bad flush never propagates: the caller (the loop) keeps running.
-#[allow(clippy::too_many_arguments)]
 async fn flush_once(
     mode: Mode,
     pending: &Arc<Mutex<BTreeSet<(PathBuf, PathBuf)>>>,
-    engines: &[Arc<SyncEngineHandle>],
-    seen: &SeenStore,
-    batches: &BatchStore,
-    config: &Config,
-    origin_device: &str,
-    cleanup: &Option<Arc<SharedPackageCleanup>>,
+    ctx: &SendContext,
 ) -> Option<FlushOutcome> {
     // Drain under the lock, then release it before any await (never hold a std
     // Mutex across .await).
@@ -174,9 +425,9 @@ async fn flush_once(
         std::mem::take(&mut *guard).into_iter().collect()
     };
 
-    let built = match build_batch_package(config, &files, origin_device) {
-        Ok(built) => built,
-        Err(error) => {
+    match deliver_batch(ctx, &ctx.engines, &files, mode_str(mode)).await {
+        Delivery::Sent(outcome) => Some(outcome),
+        Delivery::Unbuildable(error) => {
             // Every file in the batch vanished / won't parse. There is nothing on
             // disk to send and nothing to retry — drop the batch.
             tracing::warn!(
@@ -185,94 +436,25 @@ async fn flush_once(
                 mode = mode_str(mode),
                 "batch had no buildable files; dropping"
             );
-            return None;
+            None
         }
-    };
-    // The packaged record count == the number of files that actually shipped.
-    // Some drained files may have been dropped at build time (present but
-    // unbuildable); those are deliberately absent from `included`.
-    let n = built.included.len();
-
-    let (first_id, delivered) = enqueue_package_to_all(
-        engines,
-        &built.pkg_dir,
-        Some(&built.display_name),
-        &built.files,
-    )
-    .await;
-    // Fan-out only: register the delivered target count so the shared payload is
-    // freed exactly once, after every target is terminal (mirrors the per-file
-    // path). Single-target agents keep the engine's in-line cleanup (`None`).
-    // `delivered == 0` registers an expected of 0 → the orphaned copy is cleaned
-    // immediately (no target's retry can ever need it).
-    if let Some(coord) = cleanup {
-        coord.register(&built.pkg_dir, delivered);
-    }
-    let pkg_dir = built.pkg_dir.clone();
-    let package_ref = pkg_dir.to_string_lossy().into_owned();
-
-    match first_id {
-        Some(_) => {
-            // At least one target durably queued the package. Mark seen ONLY the
-            // files that actually made it into the package (so a restart never
-            // re-baselines them) and record the batch. A drained file that was
-            // dropped at build time (present-but-unbuildable) is intentionally
-            // left unseen: it never shipped, so it must stay enqueue-eligible and
-            // get retried on the next detection / restart rather than be silently
-            // lost (the durable seen store is the dedup authority). This is not
-            // the zero-target re-queue path — we do NOT re-insert it into
-            // `pending` (that would spin a permanently-corrupt file forever
-            // in-session); simply not marking it seen matches the legacy per-file
-            // behavior exactly.
-            for file in &built.included {
-                record_seen(seen, file, &package_ref);
-            }
-            if let Err(error) = batches.record(&package_ref, mode_str(mode), &now_rfc3339(), n) {
-                // The files are already durably queued + recorded seen; a failed
-                // history write only loses a status-page row, never a frame.
-                tracing::warn!(%error, package_ref = %package_ref, "failed to record batch row");
-            }
-            // Durable rel_path → source linkage for a later confirmed-package
-            // rebuild. Same best-effort contract as the batch row above.
-            if let Err(error) = batches.record_files(&package_ref, &built.rel_sources) {
-                tracing::warn!(%error, package_ref = %package_ref, "failed to record batch file linkage");
-            }
-            tracing::info!(
-                package_ref = %package_ref,
-                delivered,
-                targets = engines.len(),
-                file_count = n,
-                mode = mode_str(mode),
-                "batch flushed"
-            );
-            Some(FlushOutcome {
-                package_ref,
-                file_count: n,
-            })
-        }
-        None => {
+        Delivery::NoTarget {
+            package_ref,
+            file_count,
+        } => {
             // Reached no target. The files were NOT recorded as seen, so put them
             // back to retry on the next flush rather than silently losing them.
+            // (A browser send deliberately does not — see
+            // [`BatcherHandle::send_explicit`].)
             tracing::error!(
-                targets = engines.len(),
-                file_count = n,
+                targets = ctx.engines.len(),
+                file_count,
                 package_ref = %package_ref,
                 "batch reached no target; re-queuing its files for retry"
             );
             let mut guard = pending.lock().expect("batcher pending mutex poisoned");
             for item in files {
                 guard.insert(item);
-            }
-            drop(guard);
-            // The staged package is now orphaned (its files are re-queued and the
-            // next flush mints a fresh dir). With a fan-out `cleanup` the zero
-            // `register` above already frees it; a single-target agent (`None`)
-            // must drop it here, or an Auto-mode dead-worker leaks one dir per
-            // quiet window. Best-effort — a failure just warns.
-            if cleanup.is_none() {
-                if let Err(error) = std::fs::remove_dir_all(&pkg_dir) {
-                    tracing::warn!(%error, package_ref = %package_ref, "failed to clean orphaned zero-target package dir");
-                }
             }
             None
         }
@@ -301,9 +483,21 @@ pub fn spawn_batcher(
 ) -> (BatcherHandle, JoinHandle<()>) {
     let pending: Arc<Mutex<BTreeSet<(PathBuf, PathBuf)>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let (flush_tx, mut flush_rx) = mpsc::channel::<()>(FLUSH_CHANNEL_CAP);
+    // One delivery context, shared by the loop and every handle clone: a browser
+    // send through `BatcherHandle::send_explicit` builds and records exactly what
+    // this loop's own flush would.
+    let ctx = Arc::new(SendContext {
+        engines,
+        seen,
+        batches,
+        config,
+        origin_device,
+        cleanup,
+    });
     let handle = BatcherHandle {
         pending: Arc::clone(&pending),
         flush_tx,
+        ctx: Arc::clone(&ctx),
     };
 
     let loop_pending = Arc::clone(&pending);
@@ -351,10 +545,7 @@ pub fn spawn_batcher(
                         None => std::future::pending::<()>().await,
                     }
                 } => {
-                    flush_once(
-                        Mode::Auto, &loop_pending, &engines, &seen, &batches,
-                        &config, &origin_device, &cleanup,
-                    ).await;
+                    flush_once(Mode::Auto, &loop_pending, &ctx).await;
                     deadline = rearm(&loop_pending, &cfg);
                 }
 
@@ -366,10 +557,7 @@ pub fn spawn_batcher(
                         flush_open = false;
                         continue;
                     }
-                    flush_once(
-                        Mode::Manual, &loop_pending, &engines, &seen, &batches,
-                        &config, &origin_device, &cleanup,
-                    ).await;
+                    flush_once(Mode::Manual, &loop_pending, &ctx).await;
                     deadline = rearm(&loop_pending, &cfg);
                 }
 
@@ -718,6 +906,131 @@ mod tests {
     fn stat_size_mtime(path: &Path) -> (u64, i64) {
         let m = std::fs::metadata(path).expect("stat test file");
         (m.len(), crate::seen::mtime_millis(m.modified().ok()))
+    }
+
+    /// `remove_pending` takes exactly the named `(capture_dir, file)` pairs out of
+    /// the accumulator and reports how many it found. A pair that is not pending
+    /// (never fed, or already flushed) is simply not counted — the caller's own
+    /// selection is not an assertion about what the batcher holds.
+    #[tokio::test]
+    async fn remove_pending_removes_exactly_the_named_pairs() {
+        let h = Harness::spawn(SendCfg {
+            mode: Mode::Manual,
+            auto_quiet_secs: 60,
+        });
+        h.feed(&[0, 1, 2]).await;
+        wait_until(|| h.handle.pending_snapshot().len() == 3).await;
+
+        let removed = h.handle.remove_pending(&[
+            (h.capture.clone(), h.files[0].clone()),
+            (h.capture.clone(), h.files[2].clone()),
+            // Never pending: same file, a different capture dir.
+            (h.capture.join("elsewhere"), h.files[1].clone()),
+        ]);
+        assert_eq!(removed, 2, "only the two truly-pending pairs were removed");
+        assert_eq!(
+            h.handle.pending_snapshot(),
+            vec![(h.capture.clone(), h.files[1].clone())],
+            "the untouched file stays pending"
+        );
+    }
+
+    /// A browser send delivers the given files as ONE `browser` batch through the
+    /// same build → enqueue → record-seen → record-batch path a flush uses, and
+    /// takes those files out of the pending accumulator first, so the next
+    /// auto/scheduled flush cannot send them a second time (spec §1a).
+    #[tokio::test]
+    async fn send_explicit_delivers_a_browser_batch_and_drains_those_pending() {
+        let h = Harness::spawn(SendCfg {
+            mode: Mode::Manual,
+            auto_quiet_secs: 60,
+        });
+        h.feed(&[0, 1]).await;
+        wait_until(|| h.handle.pending_snapshot().len() == 2).await;
+
+        let picked = vec![
+            (h.capture.clone(), h.files[0].clone()),
+            // Deliberately NOT pending: a browser send may pick any library file.
+            (h.capture.clone(), h.files[2].clone()),
+        ];
+        let outcome = match h.handle.send_explicit(&picked, None).await {
+            Delivery::Sent(outcome) => outcome,
+            other => panic!("expected a delivered batch, got {other:?}"),
+        };
+        assert_eq!(outcome.file_count, 2);
+
+        let rows = h.batches.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mode, "browser", "the batch is recorded as browser");
+        assert_eq!(rows[0].file_count, 2);
+        assert_eq!(rows[0].package_ref, outcome.package_ref);
+
+        assert_eq!(
+            h.handle.pending_snapshot(),
+            vec![(h.capture.clone(), h.files[1].clone())],
+            "the sent file left the pending set; the unselected one stayed"
+        );
+
+        // Both sent files are recorded seen (dedup authority), so a restart never
+        // re-baselines them.
+        for i in [0usize, 2] {
+            let (size, mtime) = stat_size_mtime(&h.files[i]);
+            assert!(
+                !h.seen.should_enqueue(&h.files[i], size, mtime).unwrap(),
+                "file {i} recorded seen"
+            );
+        }
+    }
+
+    /// A browser send that reaches ZERO targets leaves no staged package dir
+    /// behind, records nothing, and is a **no-op on the accumulator**: the file
+    /// it took out of pending goes back (it never shipped), while a file that was
+    /// never pending is not injected into the automatic path.
+    #[tokio::test]
+    async fn send_explicit_with_no_targets_drops_the_package_and_restores_pending() {
+        let h = Harness::spawn(SendCfg {
+            mode: Mode::Manual,
+            auto_quiet_secs: 60,
+        });
+        h.feed(&[0]).await;
+        wait_until(|| h.handle.pending_snapshot().len() == 1).await;
+
+        let picked = vec![
+            (h.capture.clone(), h.files[0].clone()),
+            // Never pending: a failed send must not enroll it into the auto path.
+            (h.capture.clone(), h.files[1].clone()),
+        ];
+        // An explicit EMPTY engine set is the zero-target case.
+        let package_ref = match h.handle.send_explicit(&picked, Some(&[])).await {
+            Delivery::NoTarget {
+                package_ref,
+                file_count,
+            } => {
+                assert_eq!(file_count, 2);
+                package_ref
+            }
+            other => panic!("expected a zero-target delivery, got {other:?}"),
+        };
+        assert!(
+            !Path::new(&package_ref).exists(),
+            "the orphaned package dir was removed"
+        );
+        assert_eq!(
+            h.handle.pending_snapshot(),
+            vec![(h.capture.clone(), h.files[0].clone())],
+            "the taken file is back; the never-pending one was not added"
+        );
+        assert!(
+            h.batches.list().unwrap().is_empty(),
+            "no batch row for an undelivered package"
+        );
+        for i in [0usize, 1] {
+            let (size, mtime) = stat_size_mtime(&h.files[i]);
+            assert!(
+                h.seen.should_enqueue(&h.files[i], size, mtime).unwrap(),
+                "nothing shipped, so nothing is recorded seen"
+            );
+        }
     }
 
     /// A present-but-unbuildable file (garbage, non-FITS) drained in a batch is

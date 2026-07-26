@@ -32,7 +32,10 @@
 //! files carry the derived per-file [`FileStatus`].
 
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+use crate::config::Config;
 
 mod listing;
 pub use listing::{list_directory, FileStatus, LibraryEntry, LibraryListing, StatusSources};
@@ -119,9 +122,245 @@ pub fn to_wire_rel(root: &Path, abs: &Path) -> Option<String> {
     Some(parts.join("/"))
 }
 
+/// One item of a browser selection: a file or a whole directory, addressed in
+/// the wire form every library route uses.
+///
+/// `dir` is the client telling us which it *meant*; the server verifies it
+/// against the filesystem rather than guessing, so a selection built against a
+/// stale listing fails loudly (`"not a file"` / `"not a directory"`) instead of
+/// silently sending something else.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendItem {
+    /// Index into [`Config::capture_dirs_resolved`]; `0` (the only root on a
+    /// single-root node) when omitted.
+    #[serde(default)]
+    pub root: usize,
+    /// Forward-slash wire rel-path inside that root; `""` is the root itself.
+    pub rel: String,
+    /// `true` → expand recursively (see [`expand_selection`]).
+    #[serde(default)]
+    pub dir: bool,
+}
+
+/// Expand a browser selection into the `(capture_dir, file)` pairs the send
+/// pipeline speaks — the same pair shape the watcher feeds the batcher.
+///
+/// Every item passes the T1 guard ([`resolve_in_root`]), so the whole expansion
+/// carries its stable error prefixes (`"invalid path segment"`, `"not found"`,
+/// `"path escapes root"`, `"canonicalize root"`) plus two of its own for a
+/// kind mismatch: `"not a file"` and `"not a directory"`.
+///
+/// **The eligibility split is deliberate.** A `dir: true` item walks the subtree
+/// and keeps only files with a capture extension
+/// ([`is_eligible`](crate::watcher::is_eligible)) — picking a night's folder must
+/// not sweep `.DS_Store`, logs or sidecars into a package. A file named
+/// **explicitly** (`dir: false`) is sent whatever its extension: the operator
+/// pointed at that exact file, and the receiver simply stores what arrives. (If
+/// it turns out to be unparseable, [`build_batch_package`](crate::run::build_batch_package)
+/// drops it with a `warn!` and the rest of the batch proceeds — an honest
+/// eligible-subset outcome, not a silent one.)
+///
+/// Symlinks are never followed during the walk, so a symlinked subdirectory can
+/// never contribute files from outside the root; the guard already refuses one
+/// addressed directly.
+///
+/// The `capture_dir` half of every pair is the **canonical** root — the exact
+/// spelling [`spawn_watcher`](crate::watcher::spawn_watcher) pairs its stable
+/// files with — so [`BatcherHandle::remove_pending`](crate::batcher::BatcherHandle::remove_pending)
+/// matches the pending entries by pair. Results are deduplicated (a directory
+/// and a file inside it collapse) and deterministically ordered.
+///
+/// An empty result is **not** an error: the route turns "expanded to nothing"
+/// into its own status, so an empty selection and an empty directory reach the
+/// same answer.
+pub fn expand_selection(config: &Config, items: &[SendItem]) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let roots = config.capture_dirs_resolved();
+    let mut out: BTreeSet<(PathBuf, PathBuf)> = BTreeSet::new();
+    for item in items {
+        let Some(root) = roots.get(item.root) else {
+            bail!("not found: unknown capture root {}", item.root);
+        };
+        // Guard first: nothing below may see a path that has not been
+        // canonicalized and prefix-checked against the root.
+        let abs = resolve_in_root(root, &item.rel)?;
+        let canon_root = std::fs::canonicalize(root)
+            .with_context(|| format!("canonicalize root {}", root.display()))?;
+        if item.dir {
+            if !abs.is_dir() {
+                bail!("not a directory: {:?}", item.rel);
+            }
+            for entry in walkdir::WalkDir::new(&abs).sort_by_file_name() {
+                match entry {
+                    Ok(e) if e.file_type().is_file() && crate::watcher::is_eligible(e.path()) => {
+                        out.insert((canon_root.clone(), e.path().to_path_buf()));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        // One unreadable entry must not fail the whole selection
+                        // (the same eligible-subset stance the batcher takes).
+                        tracing::warn!(
+                            %error,
+                            path = %abs.display(),
+                            "library send: skipped an unreadable entry while expanding a directory"
+                        );
+                    }
+                }
+            }
+        } else {
+            if !abs.is_file() {
+                bail!("not a file: {:?}", item.rel);
+            }
+            out.insert((canon_root, abs));
+        }
+    }
+    Ok(out.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config over a single capture root inside a fresh temp tree. Returns the
+    /// tempdir guard (kept alive by the caller), the config, and the root.
+    fn test_config() -> (tempfile::TempDir, Config, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cap = tmp.path().join("cap");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&cap).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let toml = format!(
+            "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"manual\"\n\
+             [retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            cap.display(),
+            data.display()
+        );
+        let config = Config::from_toml_str(&toml).unwrap();
+        (tmp, config, cap)
+    }
+
+    fn write(root: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, bytes).unwrap();
+        std::fs::canonicalize(&p).unwrap()
+    }
+
+    fn item(root: usize, rel: &str, dir: bool) -> SendItem {
+        SendItem {
+            root,
+            rel: rel.to_string(),
+            dir,
+        }
+    }
+
+    /// A `dir: true` item walks the whole subtree, files only, and keeps ONLY
+    /// capture-eligible extensions — a browser directory pick must not sweep
+    /// `.DS_Store` / logs / sidecars into a package.
+    #[test]
+    fn expand_selection_walks_a_directory_recursively_eligible_only() {
+        let (_tmp, config, cap) = test_config();
+        let b = write(&cap, "M31/b.fits", b"x");
+        let c = write(&cap, "M31/sub/c.xisf", b"x");
+        write(&cap, "M31/notes.txt", b"x");
+        write(&cap, "M31/.DS_Store", b"x");
+        write(&cap, "other.fits", b"x"); // outside the selected dir
+
+        let files = expand_selection(&config, &[item(0, "M31", true)]).unwrap();
+        let got: Vec<PathBuf> = files.iter().map(|(_, f)| f.clone()).collect();
+        assert_eq!(got, vec![b, c], "recursive, files only, eligible only");
+    }
+
+    /// An explicitly named file is the operator's call: it ships even when its
+    /// extension is not one the watcher would ever enqueue. (The build drops it
+    /// with a `warn!` if it turns out to be unparseable — that is a different,
+    /// honest failure.) Only *directory expansion* filters by eligibility.
+    #[test]
+    fn expand_selection_allows_an_explicitly_named_ineligible_file() {
+        let (_tmp, config, cap) = test_config();
+        let notes = write(&cap, "notes.txt", b"x");
+        let files = expand_selection(&config, &[item(0, "notes.txt", false)]).unwrap();
+        assert_eq!(
+            files.iter().map(|(_, f)| f.clone()).collect::<Vec<_>>(),
+            vec![notes]
+        );
+    }
+
+    /// Every item runs through the T1 guard, and the two kind mismatches
+    /// (`dir` on a file, file on a directory) are their own stable prefixes.
+    #[test]
+    fn expand_selection_applies_the_guard_and_the_kind_check() {
+        let (_tmp, config, cap) = test_config();
+        write(&cap, "M31/b.fits", b"x");
+
+        let cases: Vec<(SendItem, &str)> = vec![
+            (item(0, "..", false), "invalid path segment"),
+            (item(0, "a\\b.fits", false), "invalid path segment"),
+            (item(0, "nope.fits", false), "not found"),
+            (item(0, "M31", false), "not a file"),
+            (item(0, "M31/b.fits", true), "not a directory"),
+            (item(7, "", true), "not found"),
+        ];
+        for (it, prefix) in cases {
+            let err = expand_selection(&config, &[it.clone()])
+                .expect_err(&format!("{it:?} must fail"))
+                .to_string();
+            assert!(err.starts_with(prefix), "{it:?} → {err:?}");
+        }
+    }
+
+    /// The `capture_dir` half of every pair is the CANONICAL root — the exact
+    /// spelling the watcher pairs its stable files with, so
+    /// [`BatcherHandle::remove_pending`](crate::batcher::BatcherHandle::remove_pending)
+    /// matches by pair. Overlapping items (a directory and a file inside it)
+    /// collapse to one entry.
+    #[test]
+    fn expand_selection_dedupes_and_pairs_with_the_canonical_root() {
+        let (_tmp, config, cap) = test_config();
+        let b = write(&cap, "M31/b.fits", b"x");
+        let files = expand_selection(
+            &config,
+            &[item(0, "M31", true), item(0, "M31/b.fits", false)],
+        )
+        .unwrap();
+        assert_eq!(
+            files,
+            vec![(std::fs::canonicalize(&cap).unwrap(), b)],
+            "one pair, canonical root"
+        );
+    }
+
+    /// An empty selection is not an error here — the route turns "expanded to
+    /// nothing" into its own `422`, and an empty directory must reach that same
+    /// answer rather than a different one.
+    #[test]
+    fn expand_selection_of_nothing_is_empty_not_an_error() {
+        let (_tmp, config, cap) = test_config();
+        std::fs::create_dir_all(cap.join("empty")).unwrap();
+        assert!(expand_selection(&config, &[]).unwrap().is_empty());
+        assert!(expand_selection(&config, &[item(0, "empty", true)])
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A symlinked subdirectory is never followed: its contents belong to
+    /// another tree, and following it would package files from outside the root.
+    #[cfg(unix)]
+    #[test]
+    fn expand_selection_does_not_follow_symlinks_out_of_the_root() {
+        let (tmp, config, cap) = test_config();
+        let outside = tmp.path().join("secret");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("f.fits"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, cap.join("link")).unwrap();
+        write(&cap, "own.fits", b"x");
+
+        // The whole root: the symlinked dir contributes nothing.
+        let files = expand_selection(&config, &[item(0, "", true)]).unwrap();
+        assert_eq!(files.len(), 1, "only the root's own file: {files:?}");
+        // And addressing it directly is refused by the guard.
+        assert!(expand_selection(&config, &[item(0, "link", true)]).is_err());
+    }
 
     #[test]
     fn split_rel_accepts_plain_segments() {
