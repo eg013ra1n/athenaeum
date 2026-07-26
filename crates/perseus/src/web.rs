@@ -103,6 +103,10 @@ const SENT_FILES_CAP: usize = 6;
 /// most recent N packages keep the endpoint bounded in time and memory.
 const STATUS_SCAN_LIMIT: u32 = 5000;
 
+/// One memoized free-space reading: when it was taken, the exact path set it
+/// answers for, and the volumes measured behind those paths.
+type FreeSpaceReading = (Instant, Vec<PathBuf>, Vec<VolumeInfo>);
+
 /// Shared state for the always-on status-page router.
 ///
 /// The page is owned by the [`supervisor`](crate::supervisor), not the agent:
@@ -205,13 +209,20 @@ pub struct WebState {
     pub node: RwLock<Option<Arc<SharedIrohNode>>>,
     /// Memoized free-space reading: `(taken_at, probed_paths, volumes)`.
     ///
+    /// Held only for the clone in and out — never across the probe, so a poller
+    /// can always read the last reading. The probed path set is part of the key
+    /// so a capture-dir edit is not served a reading for the old roots.
+    pub free_space: Mutex<Option<FreeSpaceReading>>,
+    /// Single-flight token for refreshing [`free_space`](Self::free_space).
+    ///
     /// The probe is a blocking syscall that can hang as long as a wedged network
     /// mount takes to time out, and `/api/status` is polled every 2 s by every
-    /// open browser. Running it behind this mutex means at most ONE probe is ever
-    /// in flight (never a growing pile of stuck blocking-pool threads) and the
-    /// result is reused for [`FREE_SPACE_TTL`]. The probed path set is part of the
-    /// key so a capture-dir edit is not served a reading for the old roots.
-    pub free_space: tokio::sync::Mutex<Option<(Instant, Vec<PathBuf>, Vec<VolumeInfo>)>>,
+    /// open browser. Whoever wins this token runs the one probe (never a growing
+    /// pile of stuck blocking-pool threads); everyone else is served the memo's
+    /// last value instead of queueing behind it. It is a `try_lock`-only token —
+    /// nobody ever awaits it — and being a guard it is released even if the
+    /// winner's request is cancelled mid-probe.
+    pub free_space_refresh: tokio::sync::Mutex<()>,
 }
 
 impl WebState {
@@ -257,7 +268,8 @@ impl WebState {
             // meanwhile is persisted and applied at the next startup.
             node: RwLock::new(None),
             // Probed on the first `/api/status`, then reused for FREE_SPACE_TTL.
-            free_space: tokio::sync::Mutex::new(None),
+            free_space: Mutex::new(None),
+            free_space_refresh: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -728,33 +740,83 @@ const FREE_SPACE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The free-space reading for `paths`, memoized on [`WebState::free_space`].
 ///
-/// The lock is deliberately held across the probe: concurrent pollers wait for
-/// the one in flight and then read the fresh value, instead of each spawning
-/// their own blocking task — which, against a wedged network mount, would
-/// accumulate stuck blocking-pool threads for as long as the mount stays wedged.
+/// **At most one request ever waits on a probe.** The refresher holds only
+/// [`WebState::free_space_refresh`] across the blocking syscall, never the memo
+/// itself, so a concurrent poller that finds a refresh in flight is served the
+/// last reading immediately (see [`last_free_space`]) instead of queueing. A
+/// wedged network mount therefore stalls the one caller that started the probe,
+/// not every `/api/status` behind it — the status page keeps rendering with a
+/// value a few seconds old.
 ///
 /// Never fails: a join error (or any per-path failure inside
 /// [`crate::diskspace::probe_volumes`]) degrades to fewer chips, never a 500.
 /// The status page has to render with a capture share offline.
 async fn free_space_snapshot(state: &WebState, paths: Vec<PathBuf>) -> Vec<VolumeInfo> {
-    let mut cached = state.free_space.lock().await;
-    if let Some((at, cached_paths, vols)) = cached.as_ref() {
-        if at.elapsed() < FREE_SPACE_TTL && *cached_paths == paths {
-            return vols.clone();
-        }
+    free_space_snapshot_with(state, paths, |paths| {
+        crate::diskspace::probe_volumes(&paths)
+    })
+    .await
+}
+
+/// [`free_space_snapshot`] with the probe injected, so tests can hold one in
+/// flight and observe what a concurrent caller is handed.
+async fn free_space_snapshot_with<P>(
+    state: &WebState,
+    paths: Vec<PathBuf>,
+    probe: P,
+) -> Vec<VolumeInfo>
+where
+    P: FnOnce(Vec<PathBuf>) -> Vec<VolumeInfo> + Send + 'static,
+{
+    if let Some(vols) = fresh_free_space(state, &paths) {
+        return vols;
+    }
+
+    // A refresh is due — but only for whoever takes the token. `try_lock`, never
+    // `lock`: a caller that loses serves stale rather than parking on a syscall
+    // that a dead mount can hold for minutes.
+    let Ok(_refreshing) = state.free_space_refresh.try_lock() else {
+        return last_free_space(state);
+    };
+
+    // The winner may have raced a refresh that finished between the check above
+    // and the token — re-check before paying for a second probe.
+    if let Some(vols) = fresh_free_space(state, &paths) {
+        return vols;
     }
 
     let probed = paths.clone();
-    let vols =
-        match tokio::task::spawn_blocking(move || crate::diskspace::probe_volumes(&probed)).await {
-            Ok(vols) => vols,
-            Err(error) => {
-                tracing::warn!(%error, "web status: free-space probe task failed");
-                Vec::new()
-            }
-        };
-    *cached = Some((Instant::now(), paths, vols.clone()));
+    let vols = match tokio::task::spawn_blocking(move || probe(probed)).await {
+        Ok(vols) => vols,
+        Err(error) => {
+            tracing::warn!(%error, "web status: free-space probe task failed");
+            Vec::new()
+        }
+    };
+    *state.free_space.lock().expect("free_space mutex poisoned") =
+        Some((Instant::now(), paths, vols.clone()));
     vols
+}
+
+/// The memoized reading — only if it was taken for exactly `paths` and is still
+/// inside [`FREE_SPACE_TTL`].
+fn fresh_free_space(state: &WebState, paths: &[PathBuf]) -> Option<Vec<VolumeInfo>> {
+    let cached = state.free_space.lock().expect("free_space mutex poisoned");
+    let (at, cached_paths, vols) = cached.as_ref()?;
+    (at.elapsed() < FREE_SPACE_TTL && cached_paths.as_slice() == paths).then(|| vols.clone())
+}
+
+/// The last reading of any age, whatever path set it was taken for — what a
+/// caller gets when someone else's refresh is in flight. Empty until the first
+/// probe has ever completed, which renders as "no chips yet", not an error.
+fn last_free_space(state: &WebState) -> Vec<VolumeInfo> {
+    state
+        .free_space
+        .lock()
+        .expect("free_space mutex poisoned")
+        .as_ref()
+        .map(|(_, _, vols)| vols.clone())
+        .unwrap_or_default()
 }
 
 /// `GET /api/status`
@@ -2704,7 +2766,8 @@ mod tests {
             // No iroh node in the harness (loopback transports bind none): an
             // upload-limit edit is file-only here, `appliedLive: false`.
             node: RwLock::new(None),
-            free_space: tokio::sync::Mutex::new(None),
+            free_space: Mutex::new(None),
+            free_space_refresh: tokio::sync::Mutex::new(()),
         });
         (state, tmp)
     }
@@ -2866,7 +2929,7 @@ mod tests {
         // Plant a sentinel in the memo. Still inside the TTL with the same path
         // set, so the next call must return it verbatim — proof it did not
         // re-probe.
-        *state.free_space.lock().await = Some((
+        *state.free_space.lock().unwrap() = Some((
             Instant::now(),
             vec![dir.clone()],
             vec![VolumeInfo {
@@ -2886,6 +2949,117 @@ mod tests {
             other.is_empty(),
             "a changed path set re-probes instead of serving the cached roots"
         );
+    }
+
+    /// Contention serves stale: while one probe is in flight (a wedged mount is
+    /// exactly this, for minutes), a second poller gets the last reading back
+    /// immediately — it neither waits on the probe nor starts its own.
+    #[tokio::test]
+    async fn concurrent_poll_is_served_stale_never_queued() {
+        let (state, tmp) = test_state().await;
+        let dir = tmp.path().to_path_buf();
+
+        // A reading that no longer answers the question being asked — here
+        // because it was taken for the previous capture-dir set (an expired TTL
+        // takes the identical path). A refresh is due, and this last value is
+        // what a caller who loses the token must be handed.
+        *state.free_space.lock().unwrap() = Some((
+            Instant::now(),
+            vec![PathBuf::from("/previous/capture/dir")],
+            vec![VolumeInfo {
+                root: PathBuf::from("/stale"),
+                free_bytes: 1,
+                total_bytes: 2,
+            }],
+        ));
+
+        // The winner's probe parks until this test releases it — no sleeping.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let winner_state = Arc::clone(&state);
+        let winner_paths = vec![dir.clone()];
+        let winner = tokio::spawn(async move {
+            free_space_snapshot_with(&winner_state, winner_paths, move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                vec![VolumeInfo {
+                    root: PathBuf::from("/fresh"),
+                    free_bytes: 3,
+                    total_bytes: 4,
+                }]
+            })
+            .await
+        });
+        started_rx.await.expect("the probe started");
+
+        // Second caller while the probe is still stuck: the stale value, right
+        // now. Its probe returns a marker instead of panicking so that a second
+        // probe shows up as a wrong value, not as a laundered empty vec.
+        let marker = || {
+            vec![VolumeInfo {
+                root: PathBuf::from("/second-probe-ran"),
+                free_bytes: 0,
+                total_bytes: 0,
+            }]
+        };
+        let contended =
+            free_space_snapshot_with(&state, vec![dir.clone()], move |_| marker()).await;
+        assert_eq!(contended.len(), 1);
+        assert_eq!(
+            contended[0].root,
+            PathBuf::from("/stale"),
+            "a contended caller serves stale, it does not probe or wait"
+        );
+
+        // The winner still gets — and memoizes — the fresh reading.
+        release_tx.send(()).unwrap();
+        let fresh = winner.await.unwrap();
+        assert_eq!(fresh[0].root, PathBuf::from("/fresh"));
+        let next_poll = free_space_snapshot_with(&state, vec![dir], move |_| marker()).await;
+        assert_eq!(
+            next_poll[0].root,
+            PathBuf::from("/fresh"),
+            "inside the TTL the next poll is served from the memo"
+        );
+    }
+
+    /// Nothing probed yet + a refresh in flight → an empty reading (no chips),
+    /// never a wait and never an error.
+    #[tokio::test]
+    async fn contention_with_an_empty_memo_yields_no_volumes() {
+        let (state, tmp) = test_state().await;
+        let dir = tmp.path().to_path_buf();
+        assert!(state.free_space.lock().unwrap().is_none());
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let winner_state = Arc::clone(&state);
+        let winner_paths = vec![dir.clone()];
+        let winner = tokio::spawn(async move {
+            free_space_snapshot_with(&winner_state, winner_paths, move |paths| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                crate::diskspace::probe_volumes(&paths)
+            })
+            .await
+        });
+        started_rx.await.expect("the probe started");
+
+        // A second probe would return this marker (rather than panicking, which
+        // `spawn_blocking` would launder into the same empty vec the assertion
+        // expects) — so an empty result really means "no second probe".
+        let contended = free_space_snapshot_with(&state, vec![dir], |_| {
+            vec![VolumeInfo {
+                root: PathBuf::from("/second-probe-ran"),
+                free_bytes: 0,
+                total_bytes: 0,
+            }]
+        })
+        .await;
+        assert!(contended.is_empty(), "no reading yet → no chips, no wait");
+
+        release_tx.send(()).unwrap();
+        assert_eq!(winner.await.unwrap().len(), 1, "the real probe still ran");
     }
 
     #[tokio::test]
@@ -5077,7 +5251,8 @@ mod tests {
             batches: Arc::clone(&batches),
             send_cfg_tx: RwLock::new(send_cfg_tx),
             node: RwLock::new(None),
-            free_space: tokio::sync::Mutex::new(None),
+            free_space: Mutex::new(None),
+            free_space_refresh: tokio::sync::Mutex::new(()),
         });
 
         let app = build_router(state, None);

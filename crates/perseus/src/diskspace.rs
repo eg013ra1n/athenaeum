@@ -10,16 +10,33 @@
 //! SMB capture root offline; the status page must still render. Every failure
 //! path here logs `warn!(root, error, "free-space probe skipped")` and drops the
 //! entry, so the caller only ever sees the volumes it could actually measure.
+//!
+//! **Only the exact requested path is measured** — never an ancestor of it. A
+//! path that is absent (an unmounted share, a capture dir the software has not
+//! recreated yet) is skipped. Resolving `/Volumes/astro/captures` up to
+//! `/Volumes` would report the *boot disk's* free space under the NAS's label,
+//! which is worse than showing nothing. The paths this probe is handed
+//! (`data_dir`, the configured capture dirs) normally exist, so the skip costs a
+//! chip for one poll at most.
+//!
+//! **Known limitation.** Nothing here reads the mount table, so a mount-point
+//! directory that persists while nothing is mounted on it — the ordinary Linux
+//! shape, an empty `/mnt/nas` — is indistinguishable from a plain local
+//! directory and will measure whatever volume it sits on (usually the root
+//! filesystem). That reading belongs to the wrong disk. Telling the two apart
+//! needs mount-table inspection (`/proc/self/mountinfo`, `getmntinfo`), which
+//! this module deliberately does not do: it is a documented limitation, not
+//! something the exact-path rule above can rule out.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::warn;
 
 /// Capacity of one mounted volume, tagged with the requested path that first
 /// landed on it (the label the UI shows, and the key a per-root view matches on).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VolumeInfo {
-    /// The requested path this entry was measured for — as passed in, not the
-    /// (possibly shallower) path that was actually stat'd.
+    /// The requested path this entry was measured for, exactly as passed in —
+    /// and, when several requested paths share a volume, the first of them.
     pub root: PathBuf,
     /// Bytes available to this (unprivileged) process — `f_bavail`, not
     /// `f_bfree`: the root-reserved slack is not free space for Perseus.
@@ -37,16 +54,18 @@ pub fn probe_volumes(paths: &[PathBuf]) -> Vec<VolumeInfo> {
     let mut seen: Vec<imp::VolumeKey> = Vec::new();
 
     for requested in paths {
-        let Some(target) = probe_target(requested) else {
+        // Exact path or nothing: an absent path is skipped, never resolved to an
+        // ancestor (see the module doc). The `exists` check is only here for the
+        // clearer log line — `volume_key` would fail on it anyway.
+        if !requested.exists() {
             warn!(
                 root = %requested.display(),
                 error = "path not present",
                 "free-space probe skipped"
             );
             continue;
-        };
-
-        let key = match imp::volume_key(&target) {
+        }
+        let key = match imp::volume_key(requested) {
             Ok(key) => key,
             Err(error) => {
                 warn!(root = %requested.display(), %error, "free-space probe skipped");
@@ -57,7 +76,7 @@ pub fn probe_volumes(paths: &[PathBuf]) -> Vec<VolumeInfo> {
             continue;
         }
 
-        let (free_bytes, total_bytes) = match imp::capacity(&target) {
+        let (free_bytes, total_bytes) = match imp::capacity(requested) {
             Ok(cap) => cap,
             Err(error) => {
                 warn!(root = %requested.display(), %error, "free-space probe skipped");
@@ -74,27 +93,6 @@ pub fn probe_volumes(paths: &[PathBuf]) -> Vec<VolumeInfo> {
     }
 
     out
-}
-
-/// The path to actually stat for `path`: itself, or — when it is momentarily
-/// gone — its **immediate** parent.
-///
-/// The one-level cap is deliberate. Walking further up would answer the wrong
-/// question: an unmounted share (`/Volumes/astro/captures`, `Z:\captures`) has
-/// no existing parent either, and climbing past it lands on `/Volumes` — the
-/// boot disk — which would report the system drive's free space under the NAS's
-/// label. That is worse than saying nothing. One level covers the case that is
-/// really about a live volume: the leaf capture folder deleted/recreated by the
-/// capture software while the disk itself stayed mounted.
-fn probe_target(path: &Path) -> Option<PathBuf> {
-    if path.exists() {
-        return Some(path.to_path_buf());
-    }
-    let parent = path.parent()?;
-    if parent.as_os_str().is_empty() || !parent.exists() {
-        return None;
-    }
-    Some(parent.to_path_buf())
 }
 
 #[cfg(unix)]
@@ -251,27 +249,24 @@ mod tests {
         assert_eq!(vols[0].root, a);
     }
 
-    /// The mounted-parent case: the leaf folder is gone (capture software
-    /// recreating it) but the disk is up — measure the parent, label the request.
+    /// An absent path yields NO entry — the probe never climbs to an ancestor.
+    /// Covers both shapes at once: a capture root that IS the mount point
+    /// (`/Volumes/astro` gone while unmounted, whose parent is the boot disk)
+    /// and a leaf under a live parent. Either fallback would label another
+    /// volume's numbers with this path.
     #[test]
-    fn missing_leaf_falls_back_to_its_existing_parent() {
+    fn absent_path_is_skipped_never_measured_through_an_ancestor() {
         let tmp = tempfile::tempdir().unwrap();
-        let leaf = tmp.path().join("not_yet_created");
-        let vols = probe_volumes(&[leaf.clone()]);
-        assert_eq!(vols.len(), 1);
-        assert_eq!(vols[0].root, leaf);
-        assert!(vols[0].total_bytes > 0);
-    }
-
-    /// An offline share (`<mount>/captures` where `<mount>` itself is absent) is
-    /// skipped — never silently reported as the enclosing disk's free space.
-    #[test]
-    fn absent_mount_point_is_skipped_not_climbed_past() {
-        let tmp = tempfile::tempdir().unwrap();
-        let offline = tmp.path().join("unmounted_share").join("captures");
+        let mount_point = tmp.path().join("unmounted_share");
+        let leaf_under_live_parent = tmp.path().join("not_yet_created");
         assert!(
-            probe_volumes(&[offline]).is_empty(),
-            "an unmounted share reports nothing, not the parent disk"
+            probe_volumes(&[
+                mount_point.clone(),
+                mount_point.join("captures"),
+                leaf_under_live_parent,
+            ])
+            .is_empty(),
+            "an absent path reports nothing, not the volume its parent sits on"
         );
     }
 
