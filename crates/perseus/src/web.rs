@@ -1798,7 +1798,8 @@ struct LibrarySendRequest {
     /// Which running send targets to fan this batch out to — each either a peer
     /// device id (hex) or that peer's friendly device name. Empty / omitted
     /// means **every** configured target, exactly what an auto or manual flush
-    /// does; an unresolvable entry is a `400` before anything is built.
+    /// does; an unresolvable *or ambiguous* entry is a `400` before anything is
+    /// built.
     #[serde(default)]
     targets: Vec<String>,
     /// The browser selection: files and/or whole directories, in the
@@ -1811,8 +1812,9 @@ struct LibrarySendRequest {
 #[serde(rename_all = "camelCase")]
 struct LibrarySendReport {
     /// Files that actually made it into the package. Can be fewer than the
-    /// selection expanded to: a file that vanished or will not parse is dropped
-    /// at build time with a `warn!` and the rest of the batch proceeds.
+    /// selection asked for: a named file that has already vanished is dropped
+    /// during expansion, and one that will not parse is dropped at build time —
+    /// both with a `warn!`, and the rest of the batch proceeds (spec §1a).
     enqueued: usize,
     /// The package directory the batch was staged in — the same `package_ref`
     /// the transfers list and the `perseus_batch` row key on.
@@ -1836,6 +1838,12 @@ fn send_error_status(err: &anyhow::Error) -> (StatusCode, String) {
 /// naming a device twice cannot enqueue the same package to it twice. An
 /// unknown name is a `400`: sending "to a device" that is not a configured
 /// target must fail loudly, never silently fan out to everyone.
+///
+/// So is an **ambiguous** one. Friendly device names are not unique — two nodes
+/// can genuinely both be called "obs-pi" — and picking whichever one the engine
+/// list happens to hold first would report a `200` for a batch that reached the
+/// other machine. The operator gets a `400` naming the candidates and re-sends
+/// by peer id (always unique).
 fn resolve_send_targets(
     engines: &[(String, Arc<SyncEngineHandle>)],
     names: &HashMap<String, String>,
@@ -1847,18 +1855,42 @@ fn resolve_send_targets(
     let mut chosen: Vec<String> = Vec::new();
     let mut out = Vec::new();
     for want in targets {
-        let found = engines.iter().find(|(peer, _)| {
-            peer.eq_ignore_ascii_case(want)
-                || names
-                    .get(peer)
-                    .is_some_and(|name| name.eq_ignore_ascii_case(want))
-        });
-        let Some((peer, engine)) = found else {
-            tracing::error!(target = %want, "web library send: unknown send target");
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("unknown send target: {want}"),
-            ));
+        let matched: Vec<(&String, &Arc<SyncEngineHandle>)> = engines
+            .iter()
+            .filter(|(peer, _)| {
+                peer.eq_ignore_ascii_case(want)
+                    || names
+                        .get(peer)
+                        .is_some_and(|name| name.eq_ignore_ascii_case(want))
+            })
+            .map(|(peer, engine)| (peer, engine))
+            .collect();
+        let (peer, engine) = match matched.as_slice() {
+            [] => {
+                tracing::error!(target = %want, "web library send: unknown send target");
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown send target: {want}"),
+                ));
+            }
+            [one] => *one,
+            many => {
+                let peers: Vec<&str> = many.iter().map(|(peer, _)| peer.as_str()).collect();
+                let peers = peers.join(", ");
+                tracing::error!(
+                    target = %want,
+                    count = many.len(),
+                    peers = %peers,
+                    "web library send: ambiguous send target"
+                );
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "ambiguous target name: {want} matches {} devices ({peers}) — send by device id",
+                        many.len()
+                    ),
+                ));
+            }
         };
         if chosen.iter().any(|p| p == peer) {
             continue;
@@ -1888,9 +1920,15 @@ fn resolve_send_targets(
 /// retries explicitly.
 ///
 /// Statuses: `503` while the engine is detached (nothing to send into), `400` for
-/// a hostile / mistyped path or an unknown target, `404` for a missing item or
-/// root, `502` for an unmounted root or a zero-target delivery, `422` when the
-/// selection expands to nothing or nothing in it can be built.
+/// a hostile / mistyped path or an unknown / ambiguous target, `404` for an
+/// unknown root or a missing directory, `502` for an unmounted root or a
+/// zero-target delivery, `422` when the selection expands to nothing or nothing
+/// in it can be built.
+///
+/// A named file that has vanished under a stale listing is **not** a `404`: it is
+/// dropped from the selection with a `warn!` and the rest ships (spec §1a) — the
+/// browser listing is a snapshot, and one deleted frame must not fail the whole
+/// send. Only a selection that expands to *nothing* becomes the `422`.
 ///
 /// The expansion (canonicalize + a recursive walk) runs on a blocking thread for
 /// the same reason the listing does: a capture root is routinely a network share.
@@ -6672,8 +6710,103 @@ mod tests {
         assert_eq!(h.state.batches.list().unwrap().len(), 1);
     }
 
+    /// Friendly device names are not unique. Two running targets called the same
+    /// thing is a `400` naming both candidates — never a `200` for a batch that
+    /// silently reached only whichever engine came first in the list.
+    #[tokio::test]
+    async fn library_send_refuses_an_ambiguous_target_name() {
+        const PEER_B: [u8; 32] = [6u8; 32];
+        let h = send_harness().await;
+        write_fixture_fits(&h.cap.join("a.fits"), "M42");
+
+        // A second running target, distinct peer id, SAME friendly name.
+        let transport: Arc<dyn SharingTransport> = Arc::new(LoopbackNetwork::new().endpoint());
+        let other = Arc::new(SyncEngine::spawn(
+            Arc::clone(&h.state.store) as Arc<dyn SyncStore>,
+            transport,
+            PEER_B,
+        ));
+        h.state
+            .engines
+            .write()
+            .await
+            .push((node_id_hex(&PEER_B), other));
+        *h.state.device_names.write().await = HashMap::from([
+            (node_id_hex(&PEER), "obs-pi".to_string()),
+            (node_id_hex(&PEER_B), "obs-pi".to_string()),
+        ]);
+
+        let app = build_router(Arc::clone(&h.state), None);
+        let res = post_json(
+            &app,
+            "/api/library/send",
+            serde_json::json!({
+                "targets": ["obs-pi"],
+                "items": [{ "root": 0, "rel": "a.fits" }]
+            }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body).into_owned();
+        assert!(body.starts_with("ambiguous target name"), "got {body:?}");
+        assert!(
+            body.contains(&node_id_hex(&PEER)) && body.contains(&node_id_hex(&PEER_B)),
+            "the message names both candidates, so the operator can pick one: {body:?}"
+        );
+        assert!(
+            h.state.batches.list().unwrap().is_empty(),
+            "an ambiguous target builds nothing"
+        );
+    }
+
+    /// A file that vanished between the listing and the send is dropped and the
+    /// REST of the selection still ships (spec §1a, eligible subset): a browser
+    /// listing is a snapshot, and one deleted frame must not fail the whole send.
+    #[tokio::test]
+    async fn library_send_skips_a_vanished_file_and_sends_the_rest() {
+        let h = send_harness().await;
+        write_fixture_fits(&h.cap.join("a.fits"), "M42");
+        let app = build_router(Arc::clone(&h.state), None);
+
+        let res = post_json(
+            &app,
+            "/api/library/send",
+            serde_json::json!({
+                "items": [
+                    { "root": 0, "rel": "a.fits" },
+                    { "root": 0, "rel": "gone.fits" }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "one vanished file is not fatal"
+        );
+        let v = body_json(res).await;
+        assert_eq!(v["enqueued"], 1, "only the surviving file was packaged");
+
+        let rows = h.state.batches.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_count, 1);
+        assert!(
+            h.is_seen("a.fits"),
+            "the file that shipped is recorded seen"
+        );
+    }
+
     /// The send route inherits the T1 path contract verbatim — the same inputs a
     /// listing refuses, with the same statuses — plus the two kind mismatches.
+    ///
+    /// One deliberate exception: a named FILE that vanished is skipped rather
+    /// than refused (spec §1a — see
+    /// [`library_send_skips_a_vanished_file_and_sends_the_rest`]), so the `404`
+    /// here is carried by an unknown root and a missing *directory*, which stay
+    /// hard failures.
     #[tokio::test]
     async fn library_send_inherits_the_path_contract() {
         let h = send_harness().await;
@@ -6687,7 +6820,7 @@ mod tests {
                 StatusCode::NOT_FOUND,
             ),
             (
-                serde_json::json!({ "root": 0, "rel": "gone.fits" }),
+                serde_json::json!({ "root": 0, "rel": "gone", "dir": true }),
                 StatusCode::NOT_FOUND,
             ),
             (

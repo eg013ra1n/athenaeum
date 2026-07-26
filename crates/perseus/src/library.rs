@@ -151,6 +151,16 @@ pub struct SendItem {
 /// `"path escapes root"`, `"canonicalize root"`) plus two of its own for a
 /// kind mismatch: `"not a file"` and `"not a directory"`.
 ///
+/// **One failure is absorbed rather than propagated: an explicitly named
+/// (`dir: false`) file that is no longer there.** A browser listing goes stale
+/// the moment a capture is moved or a retention pass runs, and one such file must
+/// not fail the operator's whole send — it is dropped with a `warn!` and the rest
+/// of the selection proceeds (spec §1a, the eligible-subset stance). Every other
+/// class still fails the request: hostile syntax, an escape and an offline root
+/// are not "one file went missing", and a vanished **directory** is not either —
+/// expanding a tree that is not there is a different selection, not a subset of
+/// the asked-for one.
+///
 /// **The eligibility split is deliberate.** A `dir: true` item walks the subtree
 /// and keeps only files with a capture extension
 /// ([`is_eligible`](crate::watcher::is_eligible)) — picking a night's folder must
@@ -183,7 +193,22 @@ pub fn expand_selection(config: &Config, items: &[SendItem]) -> Result<Vec<(Path
         };
         // Guard first: nothing below may see a path that has not been
         // canonicalized and prefix-checked against the root.
-        let abs = resolve_in_root(root, &item.rel)?;
+        let abs = match resolve_in_root(root, &item.rel) {
+            Ok(abs) => abs,
+            // The one absorbed failure (see the fn docs): a named file that
+            // vanished under a stale listing. `"not found"` is the guard's
+            // stable prefix for exactly that, so the match is on the class, not
+            // on a substring of some path.
+            Err(error) if !item.dir && error.to_string().starts_with("not found") => {
+                tracing::warn!(
+                    rel = %item.rel,
+                    root_index = item.root,
+                    "selected file vanished — skipped"
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let canon_root = std::fs::canonicalize(root)
             .with_context(|| format!("canonicalize root {}", root.display()))?;
         if item.dir {
@@ -254,6 +279,83 @@ mod tests {
         }
     }
 
+    /// Run `f` with a WARN-level subscriber attached to THIS thread and return
+    /// its result plus everything that was logged.
+    ///
+    /// Thread-local ([`tracing::subscriber::with_default`]) rather than global:
+    /// only one global subscriber may exist per test binary, and the code under
+    /// test here is plain synchronous code running on the calling thread.
+    fn capture_warnings<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl tracing_subscriber::fmt::MakeWriter<'_> for Buf {
+            type Writer = Buf;
+            fn make_writer(&self) -> Buf {
+                self.clone()
+            }
+        }
+
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        (out, logged)
+    }
+
+    /// A file that vanished between the listing and the send is dropped from the
+    /// selection and the rest still ships (spec §1a) — one deleted frame under a
+    /// stale browser listing must not fail the operator's whole send. The skip is
+    /// logged, never silent.
+    #[test]
+    fn expand_selection_skips_a_vanished_file_and_keeps_the_rest() {
+        let (_tmp, config, cap) = test_config();
+        let a = write(&cap, "a.fits", b"x");
+
+        let (files, logged) = capture_warnings(|| {
+            expand_selection(
+                &config,
+                &[item(0, "a.fits", false), item(0, "gone.fits", false)],
+            )
+            .expect("a vanished file is skipped, not fatal")
+        });
+
+        assert_eq!(
+            files.iter().map(|(_, f)| f.clone()).collect::<Vec<_>>(),
+            vec![a],
+            "the surviving file still ships"
+        );
+        assert!(
+            logged.contains("selected file vanished") && logged.contains("gone.fits"),
+            "the skip must be logged with the file it dropped, got {logged:?}"
+        );
+    }
+
+    /// A vanished **directory** is NOT absorbed: expanding a tree that is not
+    /// there is a different selection, not a subset of the asked-for one.
+    #[test]
+    fn expand_selection_still_fails_on_a_vanished_directory() {
+        let (_tmp, config, _cap) = test_config();
+        let err = expand_selection(&config, &[item(0, "gone", true)])
+            .expect_err("a missing directory is fatal")
+            .to_string();
+        assert!(err.starts_with("not found"), "got {err:?}");
+    }
+
     /// A `dir: true` item walks the whole subtree, files only, and keeps ONLY
     /// capture-eligible extensions — a browser directory pick must not sweep
     /// `.DS_Store` / logs / sidecars into a package.
@@ -288,6 +390,10 @@ mod tests {
 
     /// Every item runs through the T1 guard, and the two kind mismatches
     /// (`dir` on a file, file on a directory) are their own stable prefixes.
+    ///
+    /// A named file that is merely *missing* is deliberately absent from this
+    /// matrix — that is the one absorbed class, pinned by
+    /// [`expand_selection_skips_a_vanished_file_and_keeps_the_rest`].
     #[test]
     fn expand_selection_applies_the_guard_and_the_kind_check() {
         let (_tmp, config, cap) = test_config();
@@ -296,7 +402,7 @@ mod tests {
         let cases: Vec<(SendItem, &str)> = vec![
             (item(0, "..", false), "invalid path segment"),
             (item(0, "a\\b.fits", false), "invalid path segment"),
-            (item(0, "nope.fits", false), "not found"),
+            (item(0, "nope", true), "not found"),
             (item(0, "M31", false), "not a file"),
             (item(0, "M31/b.fits", true), "not a directory"),
             (item(7, "", true), "not found"),

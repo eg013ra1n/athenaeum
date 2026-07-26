@@ -87,6 +87,17 @@ pub struct BatcherHandle {
     /// Fire a manual flush. `()` is the whole message — the batcher flushes its
     /// entire pending set as one `manual` batch (a no-op when empty).
     flush_tx: mpsc::Sender<()>,
+    /// Nudge the loop to re-derive its auto quiet deadline.
+    ///
+    /// The loop arms that deadline from the events it sees, and a handle-side
+    /// [`restore_pending`](Self::restore_pending) is not one of them: those pairs
+    /// go back into the accumulator behind the loop's back. Without this signal
+    /// an Auto-mode agent whose browser send failed after the quiet window had
+    /// already elapsed would hold the returned files with **no armed timer** —
+    /// until the next capture happened to arrive, which on a finished night is
+    /// never. [`Notify::notify_one`] stores a permit when the loop is busy
+    /// elsewhere, so a nudge is never lost.
+    rearm: Arc<tokio::sync::Notify>,
     /// Everything a delivery needs besides the files (engines, stores, config,
     /// this node's device id, the cleanup coordinator). Shared with the loop, so
     /// a browser send ([`send_explicit`](Self::send_explicit)) builds and records
@@ -136,12 +147,21 @@ impl BatcherHandle {
     }
 
     /// Put back pairs taken by [`take_pending`](Self::take_pending) after an
-    /// attempt that shipped nothing.
+    /// attempt that shipped nothing, and nudge the loop to re-arm its quiet
+    /// timer for them ([`rearm`](Self::rearm) — the loop never saw these pairs
+    /// arrive, so nothing else will).
     fn restore_pending(&self, files: Vec<(PathBuf, PathBuf)>) {
-        let mut guard = self.pending.lock().expect("batcher pending mutex poisoned");
-        for pair in files {
-            guard.insert(pair);
+        if files.is_empty() {
+            return;
         }
+        {
+            let mut guard = self.pending.lock().expect("batcher pending mutex poisoned");
+            for pair in files {
+                guard.insert(pair);
+            }
+        }
+        // Outside the lock: never signal while holding a std Mutex the loop wants.
+        self.rearm.notify_one();
     }
 
     /// Signal the batcher to flush the whole pending set now as one `manual`
@@ -179,7 +199,9 @@ impl BatcherHandle {
     /// of the next flush. (A file dropped at build time inside an otherwise
     /// successful batch is NOT put back, matching the flush path: it stays unseen
     /// and is retried on the next detection / restart instead of spinning
-    /// in-session.)
+    /// in-session.) Returned files also re-arm the auto quiet timer, so they are
+    /// picked up by the next window rather than waiting on a capture that may
+    /// never come — see [`rearm`](Self::rearm).
     ///
     /// `engines` overrides the fan-out set for a targeted send; `None` means
     /// every configured target, exactly as a flush does.
@@ -494,9 +516,13 @@ pub fn spawn_batcher(
         origin_device,
         cleanup,
     });
+    // The restore nudge: signalled by a handle that puts files back, awaited by
+    // the loop's re-arm branch.
+    let rearm_signal = Arc::new(tokio::sync::Notify::new());
     let handle = BatcherHandle {
         pending: Arc::clone(&pending),
         flush_tx,
+        rearm: Arc::clone(&rearm_signal),
         ctx: Arc::clone(&ctx),
     };
 
@@ -561,6 +587,14 @@ pub fn spawn_batcher(
                     deadline = rearm(&loop_pending, &cfg);
                 }
 
+                // A handle put files BACK into the accumulator (a browser send
+                // that shipped nothing). The loop never saw them arrive, so
+                // nothing armed the quiet timer for them — re-derive it, exactly
+                // as a post-flush or a mode change does.
+                () = rearm_signal.notified() => {
+                    deadline = rearm(&loop_pending, &cfg);
+                }
+
                 // A live config edit (Task 6). Adopt the new mode/quiet window:
                 // Manual disarms the timer; Auto re-arms it iff something is
                 // already pending.
@@ -587,10 +621,11 @@ pub fn spawn_batcher(
     (handle, task)
 }
 
-/// The post-flush / mode-change deadline: `Some(now + quiet)` in auto mode when
-/// files remain pending, else `None`. This is what makes a zero-target flush
-/// retry (its re-queued files keep the timer armed) and a fully-drained flush go
-/// idle.
+/// The post-flush / mode-change / post-restore deadline: `Some(now + quiet)` in
+/// auto mode when files remain pending, else `None`. This is what makes a
+/// zero-target flush retry (its re-queued files keep the timer armed), a failed
+/// browser send's returned files get a window of their own, and a fully-drained
+/// flush go idle.
 fn rearm(pending: &Arc<Mutex<BTreeSet<(PathBuf, PathBuf)>>>, cfg: &SendCfg) -> Option<Instant> {
     if cfg.mode != Mode::Auto {
         return None;
@@ -676,6 +711,13 @@ mod tests {
         /// as the sole target. The temp tree is intentionally leaked (`keep`) so
         /// the built package survives the assertions.
         fn spawn(send_cfg: SendCfg) -> Self {
+            Self::spawn_with_targets(send_cfg, true)
+        }
+
+        /// [`spawn`](Self::spawn), but `targets == false` gives the batcher an
+        /// EMPTY engine set — the zero-target agent (dead worker / no configured
+        /// peer), where every delivery reaches nobody.
+        fn spawn_with_targets(send_cfg: SendCfg, targets: bool) -> Self {
             let tmp = tempfile::tempdir().unwrap().keep();
             let capture = tmp.join("capture");
             let data = tmp.join("data");
@@ -716,9 +758,14 @@ mod tests {
             let (stable_tx, stable_rx) = mpsc::channel::<(PathBuf, PathBuf)>(64);
             let (cfg_tx, cfg_rx) = watch::channel(send_cfg);
 
+            let engines = if targets {
+                vec![Arc::clone(&engine)]
+            } else {
+                Vec::new()
+            };
             let (handle, task) = spawn_batcher(
                 stable_rx,
-                vec![Arc::clone(&engine)],
+                engines,
                 Arc::clone(&seen),
                 Arc::clone(&batches),
                 config,
@@ -1076,5 +1123,90 @@ mod tests {
             h.seen.should_enqueue(&bad, bs, bm).unwrap(),
             "a dropped-but-present file is left enqueue-eligible for retry"
         );
+    }
+
+    /// A FLUSH that reaches zero targets re-queues its files — the batcher's
+    /// oldest and most load-bearing rule, and the one thing the browser path
+    /// deliberately does NOT inherit. Without it a night's frames are drained
+    /// out of the accumulator, never recorded seen, and never retried: silently
+    /// lost until the next restart re-detects them.
+    ///
+    /// Driven through [`flush_once`] directly (the same entry the loop's timer
+    /// branch uses) so the assertion cannot race the scheduler.
+    #[tokio::test]
+    async fn a_zero_target_flush_requeues_its_files_and_records_nothing() {
+        let h = Harness::spawn_with_targets(
+            SendCfg {
+                mode: Mode::Manual,
+                auto_quiet_secs: 60,
+            },
+            false, // no engines: every delivery reaches nobody
+        );
+        h.feed(&[0]).await;
+        wait_until(|| h.handle.pending_snapshot().len() == 1).await;
+
+        let outcome = flush_once(Mode::Auto, &h.handle.pending, &h.handle.ctx).await;
+        assert!(
+            outcome.is_none(),
+            "a package that reached no target is not a recorded flush"
+        );
+        assert_eq!(
+            h.handle.pending_snapshot(),
+            vec![(h.capture.clone(), h.files[0].clone())],
+            "the drained file is back in the accumulator for the next flush"
+        );
+        assert_eq!(
+            h.batch_count(),
+            0,
+            "no batch row for an undelivered package"
+        );
+        let (size, mtime) = stat_size_mtime(&h.files[0]);
+        assert!(
+            h.seen.should_enqueue(&h.files[0], size, mtime).unwrap(),
+            "nothing shipped, so nothing is recorded seen"
+        );
+    }
+
+    /// Files returned to the accumulator by a failed browser send must ARM the
+    /// auto quiet timer. The loop never saw them arrive, so if the window had
+    /// already elapsed while they were out (the send was still hashing) nothing
+    /// else would ever re-arm it — on a finished night those frames would sit
+    /// pending until the next restart.
+    #[tokio::test(start_paused = true)]
+    async fn a_restore_re_arms_the_auto_quiet_timer() {
+        let h = Harness::spawn(SendCfg {
+            mode: Mode::Auto,
+            auto_quiet_secs: 60,
+        });
+        h.feed(&[0]).await;
+        wait_until(|| h.handle.pending_snapshot().len() == 1).await;
+
+        // The state a browser send leaves while it is delivering: its files are
+        // OUT of the accumulator, so the quiet window elapses over an empty set
+        // and the loop disarms the timer.
+        let taken = h
+            .handle
+            .take_pending(&[(h.capture.clone(), h.files[0].clone())]);
+        assert_eq!(taken.len(), 1);
+        tokio::time::advance(Duration::from_secs(61)).await;
+        settle().await;
+        assert_eq!(
+            h.batch_count(),
+            0,
+            "nothing was pending when the timer fired"
+        );
+
+        // The send failed: its file comes back, and nothing else ever arrives.
+        h.handle.restore_pending(taken);
+        settle().await;
+        tokio::time::advance(Duration::from_secs(61)).await;
+        wait_until(|| h.batch_count() == 1).await;
+
+        assert_eq!(
+            h.batches.list().unwrap()[0].file_count,
+            1,
+            "the returned file went out on the re-armed window"
+        );
+        assert!(h.handle.pending_snapshot().is_empty(), "and drained");
     }
 }
