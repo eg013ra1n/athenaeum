@@ -19,7 +19,11 @@ docker run --rm --platform linux/arm64 \
   set -euo pipefail
   cargo install cargo-deb --locked
   cd crates/perseus
-  cargo deb --variant headless --no-default-features -- -p perseus
+  # `--no-default-features` drops the tray; `--features preview` puts the frame
+  # renderer back. Without it the RPi package serves `/api/library/preview` as a
+  # 404 stub and the Library tab has no images. The renderer is pure Rust — no
+  # cmake/nasm — so nothing extra is installed in this container for it.
+  cargo deb --variant headless --no-default-features --features preview -- -p perseus
   cd /work
   tar czf target/debian/perseus-'"$VERSION"'-linux-arm64.tar.gz -C target/release perseus
 '

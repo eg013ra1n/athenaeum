@@ -18,8 +18,22 @@ name = "perseus"
 path = "src/main.rs"
 
 [features]
+# FITS/XISF preview rendering for the library browser (0.5.1 T6). ON by default,
+# so every packaged build ships it — including the headless ones, which is the
+# whole point (an operator browsing a Pi's capture folder wants to SEE the frame
+# before sending it). rustafits's JPEG encoder is pure Rust, so this costs
+# compile time and binary size, never a C toolchain.
+#
+# `--no-default-features` drops it; `GET /api/library/preview` then answers a
+# `404 preview not built` stub so the router shape stays identical either way.
+# NOTE for packagers: `--no-default-features` must be paired with
+# `--features preview` unless a genuinely preview-less binary is wanted.
+default = ["preview"]
+preview = ["dep:rustafits"]
 # GUI tray mode. Off by default so headless builds (RPi, check:headless-core)
 # pull zero GUI deps. Desktop packages build with `--features tray`.
+# Deliberately NOT in `default`: adding `preview` to `default` above must not
+# quietly turn the tray on anywhere.
 tray = ["dep:tray-icon", "dep:tao", "dep:open", "dep:auto-launch"]
 
 [dependencies]
@@ -28,6 +42,14 @@ tray = ["dep:tray-icon", "dep:tao", "dep:open", "dep:auto-launch"]
 # needs only the ungated modules: sharing (iroh transport + loopback), package,
 # sync, fits_parser, fits_writer, models.
 athenaeum-core = { path = "../athenaeum-core", default-features = false }
+# FITS/XISF → auto-stretched 8-bit RGB for the library preview (feature
+# `preview`). A DIRECT path dep on the submodule rather than athenaeum-core's
+# `render` feature: `render` also switches on analysis/integration/flat-analysis,
+# none of which a capture node has any use for. Its JPEG encoder is pure Rust
+# (no cmake/nasm), so this stays cross-compilable to arm64 with nothing but the
+# Rust toolchain. The lib target is named `astroimage` (rustafits's `[lib] name`),
+# so `preview.rs` says `use astroimage::…`.
+rustafits = { path = "../../rustafits", optional = true }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
@@ -103,7 +125,12 @@ tower = { version = "0.5", features = ["util"] }
 # Debian packaging (cargo-deb). The parent table is the desktop package (tray UI +
 # GUI runtime deps); `variants.headless` overrides it for RPi/servers with no GUI.
 # Build desktop: `cargo deb -- -p perseus` from crates/perseus.
-# Build headless: `cargo deb --variant headless --no-default-features -- -p perseus`.
+# Build headless: `cargo deb --variant headless --no-default-features --features preview -- -p perseus`.
+#
+# Both variants must ship the `preview` feature. The desktop build gets it from
+# `default`; the headless build passes `--no-default-features`, so it names
+# `preview` explicitly in its own `features` array below — that array is the only
+# thing keeping the RPi package's `/api/library/preview` from being the 404 stub.
 [package.metadata.deb]
 maintainer = "Vilen Sharifov <vilen.sharifov@gmail.com>"
 copyright = "2026, Vilen Sharifov"
@@ -119,9 +146,11 @@ assets = [
   ["packaging/linux/perseus.service", "usr/share/doc/perseus/examples/", "644"],
 ]
 
-# Headless variant (RPi/servers): no tray feature, no GUI deps.
+# Headless variant (RPi/servers): no tray feature, no GUI deps — but `preview`
+# stays on. It is listed explicitly because this variant is built with
+# `--no-default-features`, which would otherwise strip it out of `default`.
 [package.metadata.deb.variants.headless]
-features = []
+features = ["preview"]
 depends = "$auto"
 assets = [
   ["target/release/perseus", "usr/bin/", "755"],

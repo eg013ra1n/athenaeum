@@ -24,6 +24,12 @@
 //!   root, each file joined to its derived send status
 //!   ([`library::LibraryListing`](crate::library::LibraryListing)). Shallow (one
 //!   `read_dir`, never a walk); an offline root is a `502`, not a `404`.
+//! - `GET /api/library/preview?root=<idx>&path=<rel>&w=<px>` — one frame,
+//!   auto-stretched to a JPEG ([`crate::preview`]). Serialized to one render at
+//!   a time behind a small LRU, and ETag-conditional: a repeat look costs a
+//!   `stat(2)` and a `304`. Inherits `/api/library`'s status contract, adding
+//!   `415` (not a FITS/XISF frame) and `422` (a frame that will not decode).
+//!   Without the `preview` feature the route answers `404 preview not built`.
 //! - `GET`/`PUT /api/capture-dirs` — the configured vs. running capture
 //!   directories + a `restartPending` flag ([`CaptureDirsDto`]); a PUT rewrites
 //!   `perseus.toml`'s capture selection, adopts it into the live config, and
@@ -227,6 +233,12 @@ pub struct WebState {
     /// nobody ever awaits it — and being a guard it is released even if the
     /// winner's request is cancelled mid-probe.
     pub free_space_refresh: tokio::sync::Mutex<()>,
+    /// The library preview renderer (0.5.1 T6): a one-permit gate plus a small
+    /// LRU of rendered JPEGs. Lives here rather than in a global so its lifetime
+    /// is the page's, and so tests get a fresh one per state. Engine-independent
+    /// — a detached node can still browse and preview its capture folders.
+    #[cfg(feature = "preview")]
+    pub preview: crate::preview::PreviewCache,
 }
 
 impl WebState {
@@ -274,6 +286,8 @@ impl WebState {
             // Probed on the first `/api/status`, then reused for FREE_SPACE_TTL.
             free_space: Mutex::new(None),
             free_space_refresh: tokio::sync::Mutex::new(()),
+            #[cfg(feature = "preview")]
+            preview: crate::preview::PreviewCache::new(),
         }
     }
 
@@ -507,9 +521,14 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
             get(api_get_capture_dirs).put(api_put_capture_dirs),
         )
         // The local library browser (0.5.1 T4): one directory of one capture
-        // root, per-file send status joined in. Read-only; send/preview/delete
-        // are later tasks on the same `library` contract.
+        // root, per-file send status joined in. Read-only; send/delete are
+        // later tasks on the same `library` contract.
         .route("/api/library", get(api_library))
+        // One frame → an auto-stretched JPEG (0.5.1 T6). Registered
+        // unconditionally: without the `preview` feature the handler is a `404
+        // preview not built` stub, so the router shape never depends on how the
+        // binary was compiled.
+        .route("/api/library/preview", get(api_library_preview))
         .route("/api/targets", get(api_get_targets).put(api_put_targets))
         .route("/api/targets/options", get(api_get_target_options))
         .route(
@@ -1487,7 +1506,31 @@ fn library_error_status(
 ) -> (StatusCode, String) {
     let chain = format!("{err:#}");
     tracing::error!(error = %chain, root_index, path, "web library: listing failed");
-    let head = err.to_string();
+    library_status_for(&err.to_string(), &chain)
+}
+
+/// The same mapping for the preview route (0.5.1 T6). Split from
+/// [`library_error_status`] only so each route logs its own stable message —
+/// the status contract itself is shared, deliberately: a path that 404s for the
+/// listing must 404 for the preview too.
+#[cfg(feature = "preview")]
+fn preview_error_status(
+    err: &anyhow::Error,
+    root_index: usize,
+    path: &str,
+) -> (StatusCode, String) {
+    let chain = format!("{err:#}");
+    tracing::error!(error = %chain, root_index, path, "web library: preview failed");
+    library_status_for(&err.to_string(), &chain)
+}
+
+/// The pure prefix → status decision, shared by every library route.
+///
+/// `head` is the error's own message (the stable prefix); `chain` is the full
+/// `{:#}` rendering, used only as the body of the catch-all `500` where there is
+/// no contract to honour and the operator needs everything we know.
+fn library_status_for(head: &str, chain: &str) -> (StatusCode, String) {
+    let head = head.to_string();
     if head.starts_with("canonicalize root") {
         // The configured root itself is unreachable — an unmounted share, the T3
         // offline-at-boot case. That is an upstream fault, not a bad request, and
@@ -1500,8 +1543,13 @@ fn library_error_status(
         || head.starts_with("not a directory")
     {
         (StatusCode::BAD_REQUEST, head)
+    } else if head.starts_with("not a renderable frame") {
+        // Preview-only (T6): the path resolved perfectly, the file is simply not
+        // something we can turn into pixels. That is the media type being wrong,
+        // not the request — a `400` would send the UI hunting for a bad path.
+        (StatusCode::UNSUPPORTED_MEDIA_TYPE, head)
     } else {
-        (StatusCode::INTERNAL_SERVER_ERROR, chain)
+        (StatusCode::INTERNAL_SERVER_ERROR, chain.to_string())
     }
 }
 
@@ -1566,6 +1614,170 @@ async fn api_library(
         Ok(listing) => Ok(Json(listing)),
         Err(e) => Err(library_error_status(&e, q.root, &q.path)),
     }
+}
+
+/// Query for [`api_library_preview`]: which file, and how wide.
+#[cfg(feature = "preview")]
+#[derive(serde::Deserialize)]
+struct PreviewQuery {
+    #[serde(default)]
+    root: usize,
+    /// Forward-slash wire rel-path of the FILE to render (the T1 contract).
+    #[serde(default)]
+    path: String,
+    /// Target width in pixels, clamped into
+    /// [`MIN_WIDTH`](crate::preview::MIN_WIDTH)..=[`MAX_WIDTH`](crate::preview::MAX_WIDTH)
+    /// by the renderer. Absent means [`DEFAULT_PREVIEW_WIDTH`].
+    #[serde(default = "default_preview_width")]
+    w: u32,
+}
+
+/// Width served when the client does not ask for one — a comfortable inline
+/// pane on a laptop, and cheap enough for a Pi to produce in well under a second.
+#[cfg(feature = "preview")]
+const DEFAULT_PREVIEW_WIDTH: u32 = 640;
+
+#[cfg(feature = "preview")]
+fn default_preview_width() -> u32 {
+    DEFAULT_PREVIEW_WIDTH
+}
+
+/// Does the request's `If-None-Match` cover `etag`?
+///
+/// Handles the list form (`"a", "b"`), the `*` wildcard, and the `W/` weak
+/// prefix — all of which a real browser or proxy will send. The comparison is
+/// deliberately weak (RFC 9110 §13.1.2: `If-None-Match` uses weak comparison),
+/// so `W/"x"` matches `"x"`.
+#[cfg(feature = "preview")]
+fn if_none_match_matches(headers: &axum::http::HeaderMap, etag: &str) -> bool {
+    let Some(raw) = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    raw.split(',').any(|tok| {
+        let tok = tok.trim();
+        tok == "*" || tok.strip_prefix("W/").unwrap_or(tok) == etag
+    })
+}
+
+/// `GET /api/library/preview?root=<idx>&path=<rel>&w=<px>` — one frame, rendered
+/// to an auto-stretched JPEG (0.5.1 T6).
+///
+/// The shape is built around making the *repeat* request free. One `stat(2)`
+/// yields the [`PreviewKey`](crate::preview::PreviewKey), the key yields the
+/// ETag, and a matching `If-None-Match` is answered `304` right there — before
+/// the concurrency gate, before any decode, without even needing the bytes to
+/// still be cached. Only a genuine miss reaches
+/// [`render_jpeg`](crate::preview::render_jpeg), which serializes renders and
+/// keeps the last few results.
+///
+/// Statuses mirror `/api/library` exactly (`502` offline root, `404` missing,
+/// `400` hostile path) plus two of its own: `415` for a file that is not a
+/// FITS/XISF frame, and `422` when the file IS one but will not decode.
+///
+/// The resolve + stat runs on a blocking thread for the same reason the listing
+/// does: a capture root is routinely a network share, and a wedged mount must
+/// stall one blocking-pool thread rather than a reactor worker.
+#[cfg(feature = "preview")]
+async fn api_library_preview(
+    State(state): State<Arc<WebState>>,
+    headers: axum::http::HeaderMap,
+    Query(q): Query<PreviewQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let roots = state.config.read().await.capture_dirs_resolved();
+    let Some(root) = roots.get(q.root).cloned() else {
+        tracing::error!(
+            root_index = q.root,
+            count = roots.len(),
+            "web preview: root index out of range"
+        );
+        return Err((StatusCode::NOT_FOUND, "unknown root".to_string()));
+    };
+
+    let rel = q.path.clone();
+    let requested_width = q.w;
+    let resolved = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<(PathBuf, crate::preview::PreviewKey)> {
+            // T1 guard first: nothing below may see a path that has not been
+            // canonicalized and prefix-checked against the root.
+            let abs = crate::library::resolve_in_root(&root, &rel)?;
+            // Same extension set the watcher enqueues — the browser must not be
+            // able to talk this route into decoding perseus.toml. The `is_file`
+            // half catches a DIRECTORY that happens to be named `something.fits`:
+            // without it that reaches the decoder and comes back as a confusing
+            // `422 "failed to read image"` instead of an honest `415`.
+            if !abs.is_file() || !crate::watcher::is_eligible(&abs) {
+                anyhow::bail!("not a renderable frame: {rel:?}");
+            }
+            let key = crate::preview::PreviewKey::stat(&abs, requested_width)?;
+            Ok((abs, key))
+        },
+    )
+    .await
+    .map_err(|e| {
+        let msg = format!("{e}");
+        tracing::error!(error = %msg, "web preview: resolve task panicked");
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
+
+    let (abs, key) = match resolved {
+        Ok(v) => v,
+        Err(e) => return Err(preview_error_status(&e, q.root, &q.path)),
+    };
+
+    let etag = key.etag();
+    // `no-cache` (store it, but revalidate) rather than `no-store`: it is exactly
+    // what turns the ETag into a saving — the browser keeps the JPEG and we
+    // answer the next look with an empty 304.
+    let cache_control = "private, no-cache";
+    if if_none_match_matches(&headers, &etag) {
+        tracing::debug!(path = %abs.display(), width = key.width(), "preview not modified");
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, cache_control.to_string()),
+            ],
+        )
+            .into_response());
+    }
+
+    let bytes = crate::preview::render_jpeg(&state.preview, &key, &abs)
+        .await
+        .map_err(|e| {
+            let chain = format!("{e:#}");
+            tracing::error!(
+                error = %chain,
+                root_index = q.root,
+                path = %q.path,
+                "web preview: render failed"
+            );
+            (StatusCode::UNPROCESSABLE_ENTITY, chain)
+        })?;
+
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/jpeg".to_string()),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, cache_control.to_string()),
+        ],
+        // One copy out of the shared cache buffer. The alternative (handing the
+        // `Arc` to the body) would pin a cache entry for as long as a slow client
+        // takes to drain it; a few hundred KB memcpy is the cheaper trade.
+        axum::body::Body::from(bytes.to_vec()),
+    )
+        .into_response())
+}
+
+/// Stub for builds without the `preview` feature, so the router has the same
+/// shape either way and the UI gets an honest, greppable answer instead of a
+/// bare axum 404 that looks like a version mismatch.
+#[cfg(not(feature = "preview"))]
+async fn api_library_preview() -> (StatusCode, String) {
+    (StatusCode::NOT_FOUND, "preview not built".to_string())
 }
 
 /// `GET /api/pending` — the "To sync" tree over the batcher's current pending
@@ -2884,6 +3096,8 @@ mod tests {
             node: RwLock::new(None),
             free_space: Mutex::new(None),
             free_space_refresh: tokio::sync::Mutex::new(()),
+            #[cfg(feature = "preview")]
+            preview: crate::preview::PreviewCache::new(),
         });
         (state, tmp)
     }
@@ -5369,6 +5583,8 @@ mod tests {
             node: RwLock::new(None),
             free_space: Mutex::new(None),
             free_space_refresh: tokio::sync::Mutex::new(()),
+            #[cfg(feature = "preview")]
+            preview: crate::preview::PreviewCache::new(),
         });
 
         let app = build_router(state, None);
@@ -5841,5 +6057,202 @@ mod tests {
         let app = build_router(state, None);
         let res = get(&app, "/api/library?root=0&path=a.fits").await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── T6 (0.5.1 local library): GET /api/library/preview ────────────────────
+
+    /// Without the `preview` feature the route still EXISTS — it just refuses
+    /// with a greppable reason, so the UI can tell "this build has no renderer"
+    /// apart from "this Perseus is too old to know the route".
+    #[cfg(not(feature = "preview"))]
+    #[tokio::test]
+    async fn library_preview_is_a_404_stub_without_the_feature() {
+        let (state, _tmp, _cap) = library_test_state().await;
+        let app = build_router(state, None);
+        let res = get(&app, "/api/library/preview?root=0&path=a.fits").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "preview not built");
+    }
+
+    #[cfg(feature = "preview")]
+    async fn get_with(app: &Router, uri: &str, header: (&str, &str)) -> Response {
+        app.clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(uri)
+                    .header(header.0, header.1)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The whole conditional-request contract in one pass: a real frame renders
+    /// to JPEG bytes with an ETag, and echoing that ETag back is answered `304`
+    /// with no body — and, critically, WITHOUT re-rendering.
+    #[cfg(feature = "preview")]
+    #[tokio::test]
+    async fn library_preview_renders_jpeg_then_revalidates_to_304() {
+        let (state, _tmp, cap) = library_test_state().await;
+        crate::preview::write_test_fits(&cap.join("light.fits"), 256, 192);
+        let app = build_router(Arc::clone(&state), None);
+
+        let res = get(&app, "/api/library/preview?root=0&path=light.fits&w=128").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "image/jpeg"
+        );
+        let etag = res
+            .headers()
+            .get(header::ETAG)
+            .expect("a preview carries an ETag")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(etag.starts_with('"'), "strong ETag, quoted: {etag}");
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[0..3], &[0xFF, 0xD8, 0xFF], "JPEG magic bytes");
+        assert_eq!(state.preview.render_count(), 1);
+
+        let res = get_with(
+            &app,
+            "/api/library/preview?root=0&path=light.fits&w=128",
+            ("if-none-match", &etag),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(res.headers().get(header::ETAG).unwrap(), etag.as_str());
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty(), "a 304 carries no body");
+        assert_eq!(
+            state.preview.render_count(),
+            1,
+            "a 304 must never reach the renderer"
+        );
+    }
+
+    /// The stale case: the same path with a *different* ETag re-renders rather
+    /// than 304-ing, so a rewritten sub is never served from the browser's cache.
+    #[cfg(feature = "preview")]
+    #[tokio::test]
+    async fn library_preview_with_a_stale_etag_re_renders() {
+        let (state, _tmp, cap) = library_test_state().await;
+        crate::preview::write_test_fits(&cap.join("light.fits"), 256, 192);
+        let app = build_router(Arc::clone(&state), None);
+        let res = get_with(
+            &app,
+            "/api/library/preview?root=0&path=light.fits&w=128",
+            ("if-none-match", "\"0000000000000000\""),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(state.preview.render_count(), 1);
+    }
+
+    /// A width past the cap is clamped, not rejected — and it shares the cap's
+    /// cache entry, which is what the single clamp point in the key buys.
+    #[cfg(feature = "preview")]
+    #[tokio::test]
+    async fn library_preview_clamps_an_absurd_width() {
+        let (state, _tmp, cap) = library_test_state().await;
+        crate::preview::write_test_fits(&cap.join("light.fits"), 256, 192);
+        let app = build_router(Arc::clone(&state), None);
+
+        let huge = get(&app, "/api/library/preview?root=0&path=light.fits&w=99999").await;
+        assert_eq!(huge.status(), StatusCode::OK);
+        let huge_etag = huge.headers().get(header::ETAG).unwrap().clone();
+
+        let capped = get(
+            &app,
+            &format!(
+                "/api/library/preview?root=0&path=light.fits&w={}",
+                crate::preview::MAX_WIDTH
+            ),
+        )
+        .await;
+        assert_eq!(capped.status(), StatusCode::OK);
+        assert_eq!(capped.headers().get(header::ETAG).unwrap(), &huge_etag);
+        assert_eq!(
+            state.preview.render_count(),
+            1,
+            "both requests are the same clamped render"
+        );
+    }
+
+    /// A file inside the root that is not a frame is a `415` — the path was fine,
+    /// the media type is not. The browser must not be able to point this route at
+    /// `perseus.toml`.
+    #[cfg(feature = "preview")]
+    #[tokio::test]
+    async fn library_preview_of_a_non_frame_is_415() {
+        let (state, _tmp, cap) = library_test_state().await;
+        write_file(&cap, "notes.txt", b"hello");
+        write_file(&cap, "perseus.toml", b"secret = 1");
+        // A DIRECTORY wearing a frame's extension must not reach the decoder.
+        std::fs::create_dir_all(cap.join("trap.fits")).unwrap();
+        let app = build_router(state, None);
+        for rel in ["notes.txt", "perseus.toml", "trap.fits"] {
+            let res = get(&app, &format!("/api/library/preview?root=0&path={rel}")).await;
+            assert_eq!(
+                res.status(),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "path {rel:?}"
+            );
+        }
+    }
+
+    /// The right extension over the wrong bytes is a `422`: we accepted the file
+    /// as a frame and then could not decode it. Distinct from the `415` above.
+    #[cfg(feature = "preview")]
+    #[tokio::test]
+    async fn library_preview_of_an_undecodable_frame_is_422() {
+        let (state, _tmp, cap) = library_test_state().await;
+        write_file(&cap, "broken.fits", b"not really a FITS file");
+        let app = build_router(state, None);
+        let res = get(&app, "/api/library/preview?root=0&path=broken.fits").await;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// The preview route inherits the T1 path contract verbatim: the same inputs
+    /// that a listing refuses, it refuses, with the same statuses.
+    #[cfg(feature = "preview")]
+    #[tokio::test]
+    async fn library_preview_inherits_the_path_contract() {
+        let (state, _tmp, cap) = library_test_state().await;
+        crate::preview::write_test_fits(&cap.join("light.fits"), 128, 96);
+        let app = build_router(state, None);
+
+        let res = get(&app, "/api/library/preview?root=7&path=light.fits").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "unknown root");
+
+        let res = get(&app, "/api/library/preview?root=0&path=gone.fits").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "missing file");
+
+        for path in ["..", "%2e%2e", "a%2F..%2Fb"] {
+            let res = get(&app, &format!("/api/library/preview?root=0&path={path}")).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "path {path:?}");
+        }
+    }
+
+    /// An unmounted capture root is a `502` here too, never a `404` — the
+    /// preview must not tell an operator their frames are gone because a share
+    /// dropped.
+    #[cfg(feature = "preview")]
+    #[tokio::test]
+    async fn library_preview_offline_root_is_502() {
+        let (state, _tmp, cap) = library_test_state().await;
+        std::fs::remove_dir_all(&cap).unwrap();
+        let app = build_router(state, None);
+        let res = get(&app, "/api/library/preview?root=0&path=light.fits").await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
     }
 }

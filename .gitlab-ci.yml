@@ -449,7 +449,10 @@ build:perseus:linux:
     # cargo deb builds the tray variant (GTK/appindicator/libxdo-linked) and
     # overwrites target/release/perseus, which is useless on a headless x64 server
     # — so the amd64 tar.gz must capture the --no-default-features build beforehand.
-    - cargo build --release -p perseus --no-default-features   # headless (no tray)
+    # `--features preview` is NOT optional here: --no-default-features drops the
+    # tray AND the frame renderer, and a headless server package without the
+    # renderer serves /api/library/preview as a 404 stub (empty Library tab).
+    - cargo build --release -p perseus --no-default-features --features preview   # headless (no tray)
     # cargo deb used to create target/debian/ as a side effect; with the tar now
     # running first (headless ordering above), the dir must exist explicitly
     # (pipeline 222 failure: "Cannot open: No such file or directory").

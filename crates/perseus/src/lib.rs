@@ -36,6 +36,10 @@
 //! - [`library`] — the library path contract: wire rel-paths are forward-slash,
 //!   and [`library::resolve_in_root`] is the single containment guard every
 //!   library route (listing, preview, send, delete) resolves user paths through.
+//! - `preview` (feature `preview`, on by default) — FITS/XISF → JPEG rendering
+//!   behind a one-permit gate and an 8-entry LRU, with stat-derived ETags so a
+//!   revalidation costs a `stat(2)` and nothing else. Without the feature the
+//!   module is absent and `GET /api/library/preview` is a `404` stub.
 //! - [`diskspace`] — free-space probe: one entry per unique volume behind the
 //!   capture roots + data dir, de-duplicated by `dev()` / volume prefix. A
 //!   failed probe (offline share) is skipped with a `warn!`, never an error.
@@ -51,6 +55,8 @@ pub mod config_edit;
 pub mod diskspace;
 pub mod library;
 pub mod pending;
+#[cfg(feature = "preview")]
+pub mod preview;
 pub mod resend;
 pub mod run;
 pub mod seen;

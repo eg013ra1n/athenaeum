@@ -5357,6 +5357,7 @@ dependencies = [
  "notify",
  "open",
  "rusqlite",
+ "rustafits",
  "serde",
  "serde_json",
  "tao",
