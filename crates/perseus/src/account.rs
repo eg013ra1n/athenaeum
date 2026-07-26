@@ -1040,6 +1040,8 @@ mod tests {
             device_name: None,
             mode: Mode::Auto,
             auto_quiet_secs: crate::config::DEFAULT_AUTO_QUIET_SECS,
+            schedule_times: Vec::new(),
+            schedule_catchup: true,
             retention: RetentionConfig::default(),
             stability_secs: 1,
             poll_interval_secs: 1,

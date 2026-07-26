@@ -4,8 +4,19 @@
 
 # Where Perseus keeps its database, logs, staged packages, and credentials.
 data_dir = '{data_dir}'
-mode = "auto"            # "auto" (send each capture) or "manual" (queue; send from the web page)
+mode = "auto"            # "auto" (send each capture), "manual" (queue; send from the web page)
+                         # or "scheduled" (queue; send at schedule_times below)
 auto_quiet_secs = 60     # auto: flush after N seconds with no new file
+
+# scheduled mode: wall-clock send times in THIS device's local time, "HH:MM".
+# Capture all night, ship once when the uplink is free. Required (at least one
+# entry) when mode = "scheduled"; ignored in the other modes. The web page's
+# "Send N pending now" button keeps working in every mode.
+# schedule_times = ["06:00", "14:30"]
+# If a send time passes while Perseus is not running, send once at startup
+# instead of waiting for the next one. One catch-up send, never one per missed
+# time. Default true.
+# schedule_catchup = true
 
 # Optional friendly name for this node in your account (defaults to the hostname).
 # device_name = "Observatory Pi"

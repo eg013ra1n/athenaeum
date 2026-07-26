@@ -69,6 +69,8 @@ fn test_config(capture_dir: &Path, data_dir: &Path) -> Config {
         // stabilized frame within seconds — the e2e asserts confirmation inside
         // `WAIT`, and the production 60s default would blow that budget.
         auto_quiet_secs: 1,
+        schedule_times: Vec::new(),
+        schedule_catchup: true,
         retention: RetentionConfig {
             policy: RetentionPolicy::KeepEverything,
             dry_run: true,
@@ -100,6 +102,8 @@ fn test_config_multi(capture_dirs: &[&Path], data_dir: &Path) -> Config {
         mode: Mode::Auto,
         // Short quiet window so the batcher flushes promptly (see `test_config`).
         auto_quiet_secs: 1,
+        schedule_times: Vec::new(),
+        schedule_catchup: true,
         retention: RetentionConfig {
             policy: RetentionPolicy::KeepEverything,
             dry_run: true,

@@ -369,6 +369,7 @@ pub(crate) fn mode_str(m: Mode) -> &'static str {
     match m {
         Mode::Auto => "auto",
         Mode::Manual => "manual",
+        Mode::Scheduled => "scheduled",
     }
 }
 

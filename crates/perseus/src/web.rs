@@ -2332,7 +2332,7 @@ async fn api_put_send_mode(
     // Live-apply: push the new send config onto the running batcher's watch
     // channel (a no-op send when detached — no receiver). This is what makes the
     // Auto↔Manual / quiet-window change take effect with no engine restart.
-    let _ = state.send_cfg_tx.read().await.send(send);
+    let _ = state.send_cfg_tx.read().await.send(send.clone());
     // Wake the supervisor so its per-pass config view refreshes immediately.
     state.supervisor_wake.notify_one();
     Ok(Json(SendModeDto {
@@ -5831,6 +5831,8 @@ mod tests {
             device_name: None,
             mode: crate::config::Mode::Auto,
             auto_quiet_secs: crate::config::DEFAULT_AUTO_QUIET_SECS,
+            schedule_times: Vec::new(),
+            schedule_catchup: true,
             retention: RetentionConfig::default(),
             stability_secs: 1,
             poll_interval_secs: 1,
@@ -6163,6 +6165,7 @@ mod tests {
             SendCfg {
                 mode: Mode::Manual,
                 auto_quiet_secs: 45,
+                ..SendCfg::default()
             },
             "the running batcher's send-config channel adopts the edit"
         );

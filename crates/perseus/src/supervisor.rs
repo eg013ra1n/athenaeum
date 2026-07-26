@@ -685,6 +685,7 @@ mod tests {
             watch::channel(SendCfg {
                 mode: crate::config::Mode::Auto,
                 auto_quiet_secs: 0,
+                ..SendCfg::default()
             })
             .0
         }

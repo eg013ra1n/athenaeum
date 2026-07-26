@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 const DDL: &str = "CREATE TABLE IF NOT EXISTS perseus_batch (
     package_ref      TEXT PRIMARY KEY,
@@ -55,6 +55,26 @@ const DDL_FILES: &str = "CREATE TABLE IF NOT EXISTS perseus_batch_files (
 /// (`IF NOT EXISTS`): an existing agent DB gains it on the next open.
 const DDL_FILES_SOURCE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_perseus_batch_files_source
     ON perseus_batch_files(source_path)";
+
+/// Agent-scoped key/value scratch table — one row per fact the agent must
+/// remember across restarts that is not *about* a batch. The scheduler (0.5.1
+/// §3) is the first and only client: it stores [`KEY_LAST_SCHEDULED_FIRE`] so a
+/// restart can tell "we already sent at 06:00" from "we slept through 06:00".
+///
+/// A generic KV rather than a `last_scheduled_fire` column somewhere: the fact
+/// has no natural owning row (it belongs to the *agent*, not to any batch), and
+/// the next such fact should not each cost a table. Values are plain strings —
+/// the caller owns the encoding (this key uses RFC-3339). Additive DDL, same
+/// `IF NOT EXISTS` pattern as the tables above.
+const DDL_META: &str = "CREATE TABLE IF NOT EXISTS perseus_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)";
+
+/// `perseus_meta` key holding the RFC-3339 timestamp of the last
+/// scheduled-mode fire. Named here so the writer (the batcher's scheduled arm)
+/// and the reader (the startup catch-up check) cannot drift apart on a literal.
+pub const KEY_LAST_SCHEDULED_FIRE: &str = "last_scheduled_fire";
 
 /// One recorded send-batch: the package it belongs to, whether it was sent
 /// `auto` or `manual`, the RFC-3339 timestamp the batcher stamped, and the number
@@ -94,6 +114,7 @@ impl BatchStore {
             .context("create perseus_batch_files")?;
         conn.execute(DDL_FILES_SOURCE_INDEX, [])
             .context("create idx_perseus_batch_files_source")?;
+        conn.execute(DDL_META, []).context("create perseus_meta")?;
 
         // files_deleted_at (UI v2 §4.1): guarded ALTER — CREATE IF NOT EXISTS never
         // adds a column to an existing table. Additive; pre-upgrade rows read NULL.
@@ -310,6 +331,35 @@ impl BatchStore {
         out.dedup();
         Ok(out)
     }
+
+    /// Read a `perseus_meta` value. `None` = the key was never
+    /// written — a first run, distinct from a written-then-empty value, which is
+    /// exactly the distinction the scheduler's catch-up check needs ("never
+    /// fired" must not read as "fired at the epoch").
+    pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("batch store mutex poisoned");
+        let mut stmt = conn
+            .prepare_cached("SELECT value FROM perseus_meta WHERE key = ?1")
+            .context("prepare meta_get")?;
+        let value = stmt
+            .query_row(params![key], |r| r.get::<_, String>(0))
+            .optional()
+            .context("query meta_get")?;
+        Ok(value)
+    }
+
+    /// Write a `perseus_meta` value, replacing any previous one for
+    /// the key (upsert — the table holds current facts, not a history).
+    pub fn meta_set(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("batch store mutex poisoned");
+        conn.execute(
+            "INSERT INTO perseus_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .context("write perseus_meta")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -331,6 +381,57 @@ mod tests {
         assert_eq!(store.list().unwrap()[0].files_deleted_at, None);
         store.mark_files_deleted("/pkg/u1", "2026-07-23T11:00:00Z").unwrap();
         assert_eq!(store.list().unwrap()[0].files_deleted_at.as_deref(), Some("2026-07-23T11:00:00Z"));
+    }
+
+    /// The `perseus_meta` KV (0.5.1 T12): a never-written key reads `None` — the
+    /// distinction the scheduler's catch-up needs between "never fired" and
+    /// "fired at some stored time" — and a write is an upsert, so the row holds
+    /// the current fact rather than accumulating history.
+    #[test]
+    fn meta_kv_roundtrips_and_upserts() {
+        let (_tmp, store) = store();
+        assert_eq!(store.meta_get(KEY_LAST_SCHEDULED_FIRE).unwrap(), None);
+
+        store
+            .meta_set(KEY_LAST_SCHEDULED_FIRE, "2026-07-26T06:00:00+02:00")
+            .unwrap();
+        assert_eq!(
+            store.meta_get(KEY_LAST_SCHEDULED_FIRE).unwrap().as_deref(),
+            Some("2026-07-26T06:00:00+02:00")
+        );
+
+        store
+            .meta_set(KEY_LAST_SCHEDULED_FIRE, "2026-07-27T06:00:00+02:00")
+            .unwrap();
+        assert_eq!(
+            store.meta_get(KEY_LAST_SCHEDULED_FIRE).unwrap().as_deref(),
+            Some("2026-07-27T06:00:00+02:00"),
+            "the second write replaces the first"
+        );
+
+        // Keys are independent, and an unrelated key stays absent.
+        store.meta_set("other", "x").unwrap();
+        assert_eq!(store.meta_get("other").unwrap().as_deref(), Some("x"));
+        assert_eq!(store.meta_get("never-written").unwrap(), None);
+    }
+
+    /// The meta row survives a reopen of the same file — it is the *persistence*
+    /// that makes catch-up possible across a restart.
+    #[test]
+    fn meta_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("perseus.db");
+        {
+            let store = BatchStore::open(&path).unwrap();
+            store
+                .meta_set(KEY_LAST_SCHEDULED_FIRE, "2026-07-26T06:00:00Z")
+                .unwrap();
+        }
+        let reopened = BatchStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.meta_get(KEY_LAST_SCHEDULED_FIRE).unwrap().as_deref(),
+            Some("2026-07-26T06:00:00Z")
+        );
     }
 
     #[test]

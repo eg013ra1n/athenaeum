@@ -8,8 +8,10 @@
 //! ```toml
 //! capture_dir = "/data/capture"
 //! data_dir = "/var/lib/perseus"
-//! mode = "auto"                             # "auto" or "manual" (Phase 2)
+//! mode = "auto"                             # "auto" | "manual" | "scheduled"
 //! auto_quiet_secs = 60                       # auto: flush after N idle seconds
+//! schedule_times = ["06:00", "14:30"]        # scheduled: local wall-clock send times
+//! schedule_catchup = true                    # scheduled: catch up ONE missed point at startup
 //! device_name = "Observatory Pi"            # optional; defaults to the hostname
 //! max_upload_mbps = 8                        # cap sync upload (MB/s); 0/absent = unlimited
 //!
@@ -118,16 +120,50 @@ pub enum Mode {
     /// Queue stabilized frames; the operator triggers the send explicitly from
     /// the web page (Phase 2).
     Manual,
+    /// Queue stabilized frames and flush them on a **wall-clock schedule**
+    /// ([`Config::schedule_times`], local device time) — the observatory case:
+    /// capture all night, ship once at 06:00 when the uplink is free (0.5.1 §3).
+    /// The manual "Send N pending now" button stays available in this mode.
+    Scheduled,
 }
 
 /// A snapshot of the send-behaviour knobs the batcher (Task 4) and web page
-/// (Task 6) read live: the current [`Mode`] plus the auto-mode quiet window.
-/// Cheap to copy so a `watch` channel can hand out the latest value without a
-/// lock on the whole [`Config`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (Task 6) read live: the current [`Mode`], the auto-mode quiet window, and the
+/// scheduled-mode calendar (0.5.1 §3). Cheap to clone so a `watch` channel can
+/// hand out the latest value without a lock on the whole [`Config`].
+///
+/// Not `Copy` since the schedule arrived: a handful of daily points is a `Vec`,
+/// and the alternative (a fixed-size array, or an `Arc` for a struct this small)
+/// would trade a real constraint for a synthetic one. Every consumer clones it
+/// out of the watch channel once per change, not per frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendCfg {
     pub mode: Mode,
     pub auto_quiet_secs: u64,
+    /// Local wall-clock send points as `(hour, minute)`, **sorted and
+    /// de-duplicated** ([`crate::schedule::parse_points`]). Only consulted in
+    /// [`Mode::Scheduled`]; empty there means "no schedule armed" — the batcher
+    /// disarms rather than guessing a time (validation refuses to *persist* that
+    /// combination, so it can only arise from a hand-built value).
+    pub schedule_times: Vec<(u8, u8)>,
+    /// Whether a schedule point that elapsed while the agent was down triggers
+    /// one catch-up send at startup (spec §3). Default `true`.
+    pub schedule_catchup: bool,
+}
+
+impl Default for SendCfg {
+    /// The shipped defaults: auto mode, the standard quiet window, no schedule,
+    /// catch-up on. Exists mainly so a caller that only cares about one knob can
+    /// write `SendCfg { mode, ..Default::default() }` and stay correct as the
+    /// struct grows.
+    fn default() -> Self {
+        Self {
+            mode: Mode::Auto,
+            auto_quiet_secs: DEFAULT_AUTO_QUIET_SECS,
+            schedule_times: Vec::new(),
+            schedule_catchup: true,
+        }
+    }
 }
 
 /// Retention policy. Parsed and validated here; the evaluator that acts on it is
@@ -353,6 +389,19 @@ pub struct Config {
     /// defaulted (absent from the contract sample); ignored in [`Mode::Manual`].
     #[serde(default = "default_auto_quiet_secs")]
     pub auto_quiet_secs: u64,
+    /// Wall-clock send times for [`Mode::Scheduled`], as `"HH:MM"` strings in the
+    /// **device's local time** (`schedule_times = ["06:00", "14:30"]`). Order and
+    /// duplicates don't matter — [`schedule_points`](Self::schedule_points)
+    /// normalises. Additive/defaulted; every entry is format-checked by
+    /// [`validate_structure_at`](Self::validate_structure_at) whatever the mode,
+    /// and [`Mode::Scheduled`] additionally requires at least one.
+    #[serde(default)]
+    pub schedule_times: Vec<String>,
+    /// Whether a schedule point missed while the agent was down fires **once** at
+    /// startup (spec §3). Defaults to `true` — the observatory that was rebooted
+    /// at 05:50 still gets its 06:00 send.
+    #[serde(default = "default_true")]
+    pub schedule_catchup: bool,
     #[serde(default)]
     pub retention: RetentionConfig,
     #[serde(default = "default_stability_secs")]
@@ -562,6 +611,26 @@ impl Config {
             }
         }
         // `mode` is an enum, so any non-`auto` value already failed to parse.
+        // The schedule (0.5.1 §3), by contrast, is free-form text and gets two
+        // rules — both LEVEL-INDEPENDENT (they fire at `Boot` as well as
+        // `Strict`, unlike the capture-dir existence arm above). The reasoning:
+        // a malformed schedule is a **typo in the file**, not a transient fact
+        // about the environment. There is no mount that can appear later and make
+        // `"6h30"` a time, and coming up with a silently ignored schedule would
+        // mean an observatory that quietly never sends. Typos fail loudly, at
+        // every level; environmental state does not.
+        //
+        // Entry format is checked regardless of the active mode, so an operator
+        // who prepares times while still in auto mode learns about the typo when
+        // they save it — not weeks later, at the moment they flip to scheduled.
+        let points = self.schedule_points()?;
+        if self.mode == Mode::Scheduled && points.is_empty() {
+            bail!(
+                "mode = \"scheduled\" needs at least one send time — set e.g. \
+                 schedule_times = [\"06:00\"] (local device time), or switch mode \
+                 back to \"auto\"/\"manual\""
+            );
+        }
         // Hard invariant (plan Global Constraints): dry-run is the default and
         // live deletion is a GATED, explicit action. `dry_run = false` is only
         // accepted alongside the soak opt-in — otherwise it is a
@@ -698,7 +767,24 @@ impl Config {
         SendCfg {
             mode: self.mode,
             auto_quiet_secs: self.auto_quiet_secs,
+            // A validated config has no malformed entries (validation runs the
+            // same parser and refuses the file otherwise). Should a Config be
+            // hand-built past validation, degrading to "no points" makes the
+            // batcher DISARM — the honest failure — instead of firing at a
+            // guessed time.
+            schedule_times: self.schedule_points().unwrap_or_default(),
+            schedule_catchup: self.schedule_catchup,
         }
+    }
+
+    /// The configured schedule as normalised `(hour, minute)` points: parsed,
+    /// range-checked, sorted, de-duplicated. The single interpretation of
+    /// `schedule_times` — validation and [`send_cfg`](Self::send_cfg) both go
+    /// through here, so the file can never validate under one reading and run
+    /// under another. `Err` names the offending string
+    /// ([`crate::schedule::parse_hhmm`]).
+    pub fn schedule_points(&self) -> Result<Vec<(u8, u8)>> {
+        crate::schedule::parse_points(&self.schedule_times)
     }
 
     /// The upload cap as the bytes/sec rate
@@ -759,6 +845,8 @@ impl Config {
             device_name: None,
             mode: Mode::Auto,
             auto_quiet_secs: DEFAULT_AUTO_QUIET_SECS,
+            schedule_times: Vec::new(),
+            schedule_catchup: true,
             retention: RetentionConfig::default(),
             stability_secs: DEFAULT_STABILITY_SECS,
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
@@ -1112,6 +1200,124 @@ mode = "auto"
         assert_eq!(cfg.auto_quiet_secs, 15);
         assert_eq!(cfg.send_cfg().auto_quiet_secs, 15);
         assert_eq!(cfg.send_cfg().mode, Mode::Auto);
+    }
+
+    // ---- 0.5.1 §3: scheduled mode ----
+
+    /// The full scheduled-mode shape parses and reaches [`SendCfg`] normalised:
+    /// sorted, de-duplicated, zero-padding-insensitive.
+    #[test]
+    fn scheduled_mode_parses_and_normalises_times() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = good_toml(capture.path()).replace(
+            "mode = \"auto\"",
+            "mode = \"scheduled\"\nschedule_times = [\"14:30\", \"06:00\", \"6:00\"]",
+        );
+        let cfg = Config::from_toml_str(&text).expect("scheduled is a valid send mode");
+        assert_eq!(cfg.mode, Mode::Scheduled);
+        let send = cfg.send_cfg();
+        assert_eq!(send.mode, Mode::Scheduled);
+        assert_eq!(
+            send.schedule_times,
+            vec![(6, 0), (14, 30)],
+            "sorted + deduped, \"6:00\" and \"06:00\" are the same point"
+        );
+        assert!(send.schedule_catchup, "catch-up defaults ON");
+    }
+
+    /// `schedule_catchup` is additive with a `true` default, and an explicit
+    /// `false` reaches the live [`SendCfg`].
+    #[test]
+    fn schedule_catchup_defaults_true_and_honours_false() {
+        let capture = tempfile::tempdir().unwrap();
+        let base = good_toml(capture.path());
+        assert!(
+            Config::from_toml_str(&base).unwrap().schedule_catchup,
+            "absent key defaults to true"
+        );
+        let text = base.replace(
+            "mode = \"auto\"",
+            "mode = \"scheduled\"\nschedule_times = [\"06:00\"]\nschedule_catchup = false",
+        );
+        let cfg = Config::from_toml_str(&text).expect("valid config");
+        assert!(!cfg.schedule_catchup);
+        assert!(!cfg.send_cfg().schedule_catchup);
+    }
+
+    /// `mode = "scheduled"` with no times is a broken config, not a silently
+    /// inert one — an observatory that would never send.
+    #[test]
+    fn scheduled_mode_without_times_is_rejected() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = good_toml(capture.path()).replace("mode = \"auto\"", "mode = \"scheduled\"");
+        let err = Config::from_toml_str(&text).expect_err("scheduled needs at least one time");
+        assert!(
+            err.chain().any(|c| c.to_string().contains("schedule_times")),
+            "error must name the key to fix: {err:#}"
+        );
+    }
+
+    /// A malformed `"HH:MM"` names the offending value, and does so **whatever
+    /// the mode** — it is a typo in the file, so an operator preparing times
+    /// while still in auto mode is told immediately, not weeks later when they
+    /// flip to scheduled.
+    #[test]
+    fn bad_schedule_time_is_rejected_naming_the_value_in_every_mode() {
+        let capture = tempfile::tempdir().unwrap();
+        for mode in ["auto", "manual", "scheduled"] {
+            let text = good_toml(capture.path()).replace(
+                "mode = \"auto\"",
+                &format!("mode = \"{mode}\"\nschedule_times = [\"06:00\", \"6h30\"]"),
+            );
+            let err = Config::from_toml_str(&text)
+                .err()
+                .unwrap_or_else(|| panic!("mode={mode}: a malformed time must be rejected"));
+            assert!(
+                err.chain().any(|c| c.to_string().contains("6h30")),
+                "mode={mode}: error must name the offending value: {err:#}"
+            );
+        }
+    }
+
+    /// Schedule validation is **level-independent**: unlike the capture-dir
+    /// existence arm, it fires at [`CaptureDirCheck::Boot`] as well as `Strict`.
+    /// A broken schedule is a typo in the file, and no later mount can fix it.
+    #[test]
+    fn schedule_validation_fires_at_both_check_levels() {
+        let mut cfg = Config::fallback();
+        cfg.mode = Mode::Scheduled;
+        assert!(
+            cfg.validate_structure_at(CaptureDirCheck::Boot).is_err(),
+            "scheduled with no times must fail at boot too"
+        );
+        assert!(cfg.validate_structure_at(CaptureDirCheck::Strict).is_err());
+
+        cfg.schedule_times = vec!["6h30".into()];
+        assert!(
+            cfg.validate_structure_at(CaptureDirCheck::Boot).is_err(),
+            "a malformed time must fail at boot too"
+        );
+        assert!(cfg.validate_structure_at(CaptureDirCheck::Strict).is_err());
+
+        cfg.schedule_times = vec!["06:00".into()];
+        assert!(cfg.validate_structure_at(CaptureDirCheck::Boot).is_ok());
+        assert!(cfg.validate_structure_at(CaptureDirCheck::Strict).is_ok());
+    }
+
+    /// Times configured while in another mode are kept and normalised (so a flip
+    /// to scheduled is a one-key edit) but arm nothing on their own — the mode is
+    /// the switch.
+    #[test]
+    fn schedule_times_are_kept_but_inert_in_other_modes() {
+        let capture = tempfile::tempdir().unwrap();
+        let text = good_toml(capture.path()).replace(
+            "mode = \"auto\"",
+            "mode = \"auto\"\nschedule_times = [\"06:00\"]",
+        );
+        let cfg = Config::from_toml_str(&text).expect("valid config");
+        let send = cfg.send_cfg();
+        assert_eq!(send.mode, Mode::Auto);
+        assert_eq!(send.schedule_times, vec![(6, 0)]);
     }
 
     /// W1 T1.6: the upload cap is additive — a config written before the knob

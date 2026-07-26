@@ -115,6 +115,11 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32
 
 [dev-dependencies]
 tempfile = "3"
+# DST arms of the scheduler math (schedule.rs, 0.5.1 T12): a REAL IANA zone
+# (America/New_York) so the spring-forward gap and fall-back fold are the ones the
+# tz database defines, not ones a hand-rolled fake TimeZone invented. Dev-only —
+# the agent itself schedules in `chrono::Local` and ships no tz database.
+chrono-tz = "0.10"
 # Mock HTTP hub for the account login / pairing-resolution tests (task M1).
 wiremock = "0.6"
 # `ServiceExt::oneshot` to drive the web router in-process (no bound socket) in

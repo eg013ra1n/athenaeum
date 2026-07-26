@@ -43,6 +43,9 @@
 //! - [`diskspace`] — free-space probe: one entry per unique volume behind the
 //!   capture roots + data dir, de-duplicated by `dev()` / volume prefix. A
 //!   failed probe (offline share) is skipped with a `warn!`, never an error.
+//! - [`schedule`] — pure wall-clock scheduler math for `Mode::Scheduled`: the
+//!   next fire strictly after a given instant and the single catch-up point for a
+//!   sleep, both DST-aware and generic over the time zone so they are testable.
 //! - [`pending`] — pure derivation of the "To sync" tree: groups the batcher's
 //!   pending accumulator snapshot into a [`pending::PendingNode`] trie by
 //!   `rel_path` (object / date / type / file) for the web view.
@@ -59,6 +62,7 @@ pub mod pending;
 pub mod preview;
 pub mod resend;
 pub mod run;
+pub mod schedule;
 pub mod seen;
 pub mod supervisor;
 #[cfg(feature = "tray")]

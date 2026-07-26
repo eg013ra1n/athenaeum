@@ -412,6 +412,7 @@ fn mode_str(mode: Mode) -> &'static str {
     match mode {
         Mode::Auto => "auto",
         Mode::Manual => "manual",
+        Mode::Scheduled => "scheduled",
     }
 }
 
@@ -536,7 +537,7 @@ pub fn spawn_batcher(
     let task = tokio::spawn(async move {
         // The live send config. Seeded from the watch channel (production seeds it
         // with `config.send_cfg()`), then updated in place on every change.
-        let mut cfg = *send_cfg_rx.borrow();
+        let mut cfg = send_cfg_rx.borrow().clone();
         // The auto quiet deadline. `None` = disarmed (manual mode, or auto with an
         // empty pending set). Recreated as a fresh `sleep_until` each loop turn, so
         // reassigning it here *is* the timer reset.
@@ -607,9 +608,16 @@ pub fn spawn_batcher(
                 changed = send_cfg_rx.changed(), if cfg_open => {
                     match changed {
                         Ok(()) => {
-                            cfg = *send_cfg_rx.borrow_and_update();
+                            cfg = send_cfg_rx.borrow_and_update().clone();
                             deadline = match cfg.mode {
-                                Mode::Manual => None,
+                                // T12 note: `Scheduled` is inert here on purpose —
+                                // this arm is the AUTO quiet timer, and the
+                                // scheduler's own wall-clock arm is T13. Until it
+                                // lands, scheduled mode behaves as manual (files
+                                // accumulate; the web "Send now" button flushes),
+                                // which is the safe degradation: nothing sends
+                                // early, nothing is lost.
+                                Mode::Manual | Mode::Scheduled => None,
                                 Mode::Auto => rearm(&loop_pending, &cfg),
                             };
                         }
@@ -818,6 +826,7 @@ mod tests {
         let h = Harness::spawn(SendCfg {
             mode: Mode::Auto,
             auto_quiet_secs: 60,
+            ..SendCfg::default()
         });
 
         h.feed(&[0, 1]).await; // two files arrive at t0
@@ -846,6 +855,7 @@ mod tests {
         let h = Harness::spawn(SendCfg {
             mode: Mode::Auto,
             auto_quiet_secs: 60,
+            ..SendCfg::default()
         });
 
         h.feed(&[0]).await; // first file at t0 → deadline t60
@@ -883,6 +893,7 @@ mod tests {
         let h = Harness::spawn(SendCfg {
             mode: Mode::Manual,
             auto_quiet_secs: 60,
+            ..SendCfg::default()
         });
 
         h.feed(&[0, 1, 2]).await;
@@ -916,6 +927,7 @@ mod tests {
         let h = Harness::spawn(SendCfg {
             mode: Mode::Manual,
             auto_quiet_secs: 60,
+            ..SendCfg::default()
         });
 
         h.feed(&[0, 1, 2]).await;
@@ -970,6 +982,7 @@ mod tests {
         let h = Harness::spawn(SendCfg {
             mode: Mode::Manual,
             auto_quiet_secs: 60,
+            ..SendCfg::default()
         });
         h.feed(&[0, 1, 2]).await;
         wait_until(|| h.handle.pending_snapshot().len() == 3).await;
@@ -997,6 +1010,7 @@ mod tests {
         let h = Harness::spawn(SendCfg {
             mode: Mode::Manual,
             auto_quiet_secs: 60,
+            ..SendCfg::default()
         });
         h.feed(&[0, 1]).await;
         wait_until(|| h.handle.pending_snapshot().len() == 2).await;
@@ -1044,6 +1058,7 @@ mod tests {
         let h = Harness::spawn(SendCfg {
             mode: Mode::Manual,
             auto_quiet_secs: 60,
+            ..SendCfg::default()
         });
         h.feed(&[0]).await;
         wait_until(|| h.handle.pending_snapshot().len() == 1).await;
@@ -1098,6 +1113,7 @@ mod tests {
         let h = Harness::spawn(SendCfg {
             mode: Mode::Manual,
             auto_quiet_secs: 60,
+            ..SendCfg::default()
         });
 
         let good = h.files[0].clone();
@@ -1145,6 +1161,7 @@ mod tests {
             SendCfg {
                 mode: Mode::Manual,
                 auto_quiet_secs: 60,
+                ..SendCfg::default()
             },
             false, // no engines: every delivery reaches nobody
         );
@@ -1183,6 +1200,7 @@ mod tests {
         let h = Harness::spawn(SendCfg {
             mode: Mode::Auto,
             auto_quiet_secs: 60,
+            ..SendCfg::default()
         });
         h.feed(&[0]).await;
         wait_until(|| h.handle.pending_snapshot().len() == 1).await;
