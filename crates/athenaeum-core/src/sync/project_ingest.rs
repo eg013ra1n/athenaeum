@@ -202,13 +202,23 @@ pub fn ingest_project_package(
         receipts.push(receipt);
     }
 
-    // 4. On ≥1 landed frame, retain the (already anchor-verified) manifest bytes
-    //    so this node can re-serve the package byte-identically (Д2). The local
-    //    status reflects whether every frame was accepted.
+    // 4. Retain the (already anchor-verified) manifest bytes so this node can
+    //    re-serve the package byte-identically (Д2). The local status reflects
+    //    whether every frame was accepted.
     //    Epilogue: both writes under ONE final connection acquisition (W2 T2.1).
+    //
+    //    Retained whenever the ingest SUCCEEDED, landed frames or not (F9): an
+    //    incremental re-publish whose every frame is already local ingests zero
+    //    and completes, and a `complete` row with no manifest is a package this
+    //    device can serve by neither path — both `reconstruct_*_dir`s rebuild from
+    //    these bytes, and `report_have_after_ingest` refuses to advertise a
+    //    package it cannot cover. The manifest describes the package's CONTENT,
+    //    not this run's work. A run that landed frames but rejected others keeps
+    //    its pre-F9 behaviour (retain), while an ingest that accepted NOTHING
+    //    retains nothing — there is no package here to serve.
     let status = if failed.is_empty() { "complete" } else { "failed" };
     conn.with(|c| -> Result<()> {
-        if ingested_count >= 1 {
+        if ingested_count >= 1 || failed.is_empty() {
             crate::db::collab_exchange::set_manifest(c, package_id, &manifest_bytes)
                 .with_context(|| format!("retain manifest for package {package_id}"))?;
         }
@@ -1069,5 +1079,71 @@ mod tests {
         for name in ["A.fits", "B.fits", "C.fits"] {
             assert!(serve_dir.join(name).exists(), "{name} served in the reconstructed dir");
         }
+    }
+
+    // F9: an ALL-DUPLICATE ingest — an incremental re-publish whose every frame is
+    // already local — completes having landed nothing, and must STILL retain the
+    // manifest. Without it the row reads `complete` while the package can be
+    // served by neither path (both `reconstruct_*_dir`s rebuild from the retained
+    // manifest, and the have-report gate refuses to advertise a package it cannot
+    // cover). The manifest describes the package's CONTENT, not this run's work.
+    #[test]
+    fn collab_all_duplicate_ingest_keeps_the_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let conn = test_conn();
+        let landing = tmp.path().join("landing");
+        seed_project(&conn);
+        seed_collab_root(&conn, &landing);
+
+        // pkg1 lands frame A.
+        let a = b"frame-A-shared-content";
+        let staging1 = tmp.path().join("staging1");
+        let anchor1 = stage(
+            &staging1,
+            vec![record("u-A", "A.fits", &hash_bytes(a), Some(default_stamp()))],
+            &[("A.fits", a)],
+        );
+        seed_package(&conn, Some(&anchor1));
+        ingest_project_package(
+            IngestConn::Borrowed(&conn),
+            &staging1,
+            PROJECT_ID,
+            HUB_PACKAGE_ID,
+            PEER,
+        )
+        .unwrap();
+
+        // pkg2 re-includes ONLY that unchanged frame ⇒ nothing new lands.
+        const PKG2: &str = "hub-pkg-2";
+        let staging2 = tmp.path().join("staging2");
+        let anchor2 = stage(
+            &staging2,
+            vec![record("u-A", "A.fits", &hash_bytes(a), Some(stamp_for(PKG2)))],
+            &[("A.fits", a)],
+        );
+        seed_named_package(&conn, PKG2, &anchor2);
+        let out =
+            ingest_project_package(IngestConn::Borrowed(&conn), &staging2, PROJECT_ID, PKG2, PEER)
+                .unwrap();
+        assert!(matches!(out.receipts[0].outcome, ReceiptOutcome::Duplicate));
+        assert_eq!(out.ok_count, 1);
+        assert!(out.failed.is_empty());
+
+        let row = crate::db::collab_exchange::get_package(&conn, PKG2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.local_status, "complete", "a duplicate-only ingest succeeded");
+        assert!(
+            row.manifest_ndjson.is_some(),
+            "the manifest is retained even though this run landed nothing"
+        );
+
+        // …and the package is genuinely servable: the seed dir rebuilds from the
+        // retained manifest + the payload that landed under pkg1.
+        let sync_dir = tmp.path().join("sync");
+        let seed_dir =
+            crate::api::collab_exchange::reconstruct_seed_dir(&conn, &sync_dir, PKG2).unwrap();
+        crate::package::validate_package(&seed_dir).unwrap();
+        assert!(seed_dir.join("A.fits").exists(), "the overlap payload is served");
     }
 }
