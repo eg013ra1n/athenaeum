@@ -84,7 +84,7 @@ After a successful ingest (and after own publish), the device imports the packag
 
 | Existing piece | Interaction |
 | ---- | ---- |
-| `ReceiveGate` (W2) | one permit per package pull; auto-worker serializes per project anyway |
+| `ReceiveGate` (W2) | one permit per package pull; auto-worker serializes per project anyway. **The serialization is not the worker's alone** (F1, 2026-07-26): "Sync now" spawns un-deduped passes, the need diff re-admits `downloading`/`failed` rows, and Retry calls the command directly — so a process-wide in-flight guard (`IN_FLIGHT_PACKAGE_PULLS`) enforces one pull per package ACROSS passes, and the two status writes that outlive an attempt (`rearm_for_fallback`, `set_download_failed`) refuse to overwrite `complete` |
 | Upload pacer (W1) | caps seeding egress; no per-project knob in v1 |
 | Per-peer lanes (W2) | untouched — the swarm path doesn't ride the receiver lanes at all; fallback (б) does, as today |
 | `queued` vocabulary | reused for worker-queued packages |

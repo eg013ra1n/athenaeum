@@ -1253,6 +1253,62 @@ fn swarm_fetch_plan(
     Some(providers)
 }
 
+/// Packages whose pull is running RIGHT NOW, keyed by the hub package uuid — the
+/// exclusion that makes overlapping pulls of one package impossible (F1).
+///
+/// The concurrency is real and has three sources: [`sync_project_now`] spawns a
+/// pass per press with no de-duplication, [`replication_need`] re-admits
+/// `downloading` AND `failed` rows on every 20-minute pass, and the UI's Retry
+/// button calls the command directly. Everything a pull touches is keyed by the
+/// package id alone — the swarm staging dir (`collab_swarm/<package_id>`), the
+/// collection tag `release` reclaims, and the row's `local_status` — so two
+/// pulls of one package are two writers on one set of resources: the faster
+/// one's [`remove_swarm_staging`] + `release` yank the dir and the bytes out
+/// from under the slower one's export/ingest, whose failure then re-arms
+/// `downloading` over the winner's `complete` and finally stamps `failed` on a
+/// package that is fully landed and seeded.
+///
+/// A module static for the same reason [`SWARM_UNFIT`] is one: process-lifetime
+/// scratch state with no owner in the data model, and it keeps every signature
+/// and both host wrappers untouched. Cross-PROCESS overlap (desktop + web on one
+/// catalog) is out of its reach, which is why the two status guards below
+/// ([`rearm_for_fallback`], [`set_download_failed`]) stand on their own.
+static IN_FLIGHT_PACKAGE_PULLS: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn in_flight_package_pulls() -> &'static std::sync::Mutex<HashSet<String>> {
+    IN_FLIGHT_PACKAGE_PULLS.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// An RAII claim on one package's pull. The entry is released on EVERY exit —
+/// early return, `?`, or a panic in the pull — because a leaked claim would make
+/// that package undownloadable for the rest of the process.
+struct PackagePullClaim(String);
+
+impl PackagePullClaim {
+    /// `None` when another pull of `package_id` already holds the claim.
+    ///
+    /// Poison-tolerant in the permissive direction: a poisoned lock grants the
+    /// claim, because the guard is protection against a race and refusing every
+    /// download after one unrelated panic would be the worse failure.
+    fn acquire(package_id: &str) -> Option<Self> {
+        match in_flight_package_pulls().lock() {
+            Ok(mut set) => set
+                .insert(package_id.to_string())
+                .then(|| PackagePullClaim(package_id.to_string())),
+            Err(_) => Some(PackagePullClaim(package_id.to_string())),
+        }
+    }
+}
+
+impl Drop for PackagePullClaim {
+    fn drop(&mut self) {
+        if let Ok(mut set) = in_flight_package_pulls().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
 /// Д6 explicit download of a project package: role-gate, poll the hub for the
 /// package's current holders, then try each holder sequentially — attach a dial
 /// hint (audit B4), `request_project`, and wait for the served package to ingest
@@ -1289,6 +1345,13 @@ fn swarm_fetch_plan(
 /// ([`ProjectDownloadProgress`]); the auto-replication worker (D3 T5) passes the
 /// host emitter too, so a background pull is as visible as a pressed Download.
 /// `None` (tests) is a silent run, never a different transfer.
+///
+/// **One pull per package at a time** ([`IN_FLIGHT_PACKAGE_PULLS`], F1). A call
+/// that arrives while this package is already being pulled returns `Ok(())`
+/// after a log line rather than starting a second, resource-sharing attempt: an
+/// in-flight pull IS the requested work, and the caller's contract (the terminal
+/// `local_status` carries the outcome, not the return value) holds either way.
+/// The claim spans the swarm attempt AND the sequential fallback.
 pub async fn download_project_package(
     ctx: &ServiceContext,
     sync: &crate::sync::SyncRuntime,
@@ -1296,6 +1359,17 @@ pub async fn download_project_package(
     package_id: &str,
     emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<(), ApiError> {
+    let _claim = match PackagePullClaim::acquire(package_id) {
+        Some(claim) => claim,
+        None => {
+            tracing::info!(
+                project_id,
+                package_id,
+                "download skipped: a pull of this package is already running"
+            );
+            return Ok(());
+        }
+    };
     let (sync_dir, db_path) = crate::api::sync::sync_paths(ctx)?;
 
     // ── Role guard (fail-closed) ─────────────────────────────────────────────
@@ -1471,19 +1545,24 @@ pub async fn download_project_package(
                     error = %format!("{e:#}"),
                     "swarm download failed; falling back to the sequential holder loop"
                 );
-                // Re-arm the row for the fallback. A fetch failure never touched
-                // the status (still `downloading`), but a PARTIAL ingest did:
-                // `ingest_project_package` writes `failed` when any frame is
-                // rejected, and `wait_for_local_complete` returns false the
-                // instant it reads `failed` — so without this the fallback would
-                // skip every holder in milliseconds on a stale verdict instead of
-                // waiting for the serve it just requested. Best-effort: a write
-                // failure only costs the fallback, never the caller's result.
+                // Re-arm the row for the fallback ([`rearm_for_fallback`] — a
+                // partial swarm ingest wrote `failed`, which the fallback's
+                // `wait_for_local_complete` would read as a stale verdict), but
+                // never over a `complete` another writer landed meanwhile (F1).
+                // Best-effort: a write failure only costs the fallback, never the
+                // caller's result.
                 {
                     let db = db(ctx)?;
                     let conn = db.conn();
-                    if let Err(e) = set_local_status(&conn, package_id, "downloading") {
-                        tracing::warn!(package_id, error = %format!("{e}"), "swarm download: re-arm status for the fallback errored");
+                    match rearm_for_fallback(&conn, package_id) {
+                        Ok(true) => {}
+                        Ok(false) => tracing::info!(
+                            package_id,
+                            "swarm download: package already complete; fallback not re-armed"
+                        ),
+                        Err(e) => {
+                            tracing::warn!(package_id, error = %format!("{e}"), "swarm download: re-arm status for the fallback errored")
+                        }
                     }
                 }
             }
@@ -1796,6 +1875,30 @@ async fn try_swarm_download(
     Ok(())
 }
 
+/// Re-arm a row for the sequential fallback after a failed swarm attempt —
+/// UNLESS it is already `complete` (F1). Returns whether it re-armed.
+///
+/// The re-arm exists because a PARTIAL swarm ingest writes `failed`, and
+/// [`wait_for_local_complete`] returns false the instant it reads `failed` — so
+/// without it the fallback would skip every holder in milliseconds on a stale
+/// verdict instead of waiting for the serve it just requested.
+///
+/// The `complete` exclusion exists because this attempt is not the only writer:
+/// the receiver's push arm (a stray announce for the same package) can land it
+/// while the swarm fetch is in flight, and a second app process shares the
+/// catalog. Re-arming over a landed package would put a fully ingested, seeded
+/// package back into `downloading` and hand the terminal `failed` below the last
+/// word.
+fn rearm_for_fallback(conn: &rusqlite::Connection, package_id: &str) -> Result<bool> {
+    if let Some(row) = get_package(conn, package_id)? {
+        if row.local_status == "complete" {
+            return Ok(false);
+        }
+    }
+    set_local_status(conn, package_id, "downloading")?;
+    Ok(true)
+}
+
 /// Best-effort removal of a swarm staging dir. Missing is normal (a fetch that
 /// failed before the export step never created it); anything else is logged,
 /// never swallowed, and never fails the download.
@@ -1815,6 +1918,14 @@ fn remove_swarm_staging(staging: &Path) {
 /// itself). Logged, never masks the caller's own error/return. `detail` (Task 9)
 /// carries the per-holder probe classes for the notification; `None` when the
 /// failure had no per-holder classification (signed out, hub blip, no holders).
+///
+/// **Never over a `complete` row** (F1): this attempt is not the only writer —
+/// the receiver's push arm, a second app process on the same catalog, or (before
+/// [`IN_FLIGHT_PACKAGE_PULLS`]) a concurrent pass can land the package while
+/// this attempt is still walking holders. Stamping `failed` on a fully landed,
+/// seeded package would make the row lie, re-admit it to the need diff forever,
+/// and raise a `downloadFailed` notification for work that succeeded — so the
+/// buffered change is suppressed with the status write.
 fn set_download_failed(
     ctx: &ServiceContext,
     project_id: &str,
@@ -1823,6 +1934,20 @@ fn set_download_failed(
 ) {
     if let Ok(db) = db(ctx) {
         let conn = db.conn();
+        match get_package(&conn, package_id) {
+            Ok(Some(row)) if row.local_status == "complete" => {
+                tracing::info!(
+                    project_id,
+                    package_id,
+                    "download attempt failed but the package is already complete; status kept"
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(package_id, error = %format!("{e}"), "download: reading the row before failing it errored")
+            }
+        }
         if let Err(e) = set_local_status(&conn, package_id, "failed") {
             tracing::warn!(package_id, error = %format!("{e}"), "download: set failed status errored");
         }
@@ -3512,6 +3637,129 @@ mod tests {
                 .iter()
                 .all(|c| !(c.kind == "downloadFailed" && c.package_id == "pkg-x")),
             "the buffer is not re-drained"
+        );
+    }
+
+    /// F1: two pulls of ONE package must never run at once. The swarm staging
+    /// dir, the collection tag and the row's `local_status` are all keyed by the
+    /// package id alone, so an overlapping pass — the 20-minute worker re-admits
+    /// `downloading` AND `failed` rows, "Sync now" spawns an un-deduped pass, and
+    /// Retry calls straight in — would have the faster pull's staging cleanup +
+    /// blob release yank the directory and the bytes out from under the slower
+    /// one, whose failure then re-arms `downloading` over the winner's `complete`
+    /// and finally stamps `failed` on a fully landed, seeded package. The second
+    /// call is a logged skip (an in-flight pull IS the requested work), so the hub
+    /// sees exactly ONE announcement poll.
+    #[tokio::test]
+    async fn concurrent_pulls_of_one_package_run_once() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (_tmp, ctx) = test_ctx();
+        let own = own_node_for(&ctx);
+        {
+            let conn = db(&ctx).unwrap().conn();
+            let members = serde_json::json!([
+                { "accountId": "acc-me", "displayName": "Me", "dataRole": "send_receive",
+                  "coordinator": false, "nodes": [B64.encode(own)] }
+            ])
+            .to_string();
+            seed_project(&conn, "p-1", &members);
+        }
+
+        // The hub answer is SLOW on purpose: the first pull is provably still
+        // inside it when the second call starts. No holders ⇒ whichever pull gets
+        // through exhausts and lands `failed`.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/projects/p-1/announcements"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(400))
+                    .set_body_json(serde_json::json!([ann_json(
+                        "ann-conc",
+                        "pkg-conc",
+                        false,
+                        "published",
+                        &[],
+                        None,
+                        serde_json::json!([])
+                    )])),
+            )
+            .mount(&server)
+            .await;
+        wire_hub(&ctx, &server.uri());
+
+        let ctx = Arc::new(ctx);
+        let sync = Arc::new(crate::sync::SyncRuntime::new());
+        let first = tokio::spawn({
+            let ctx = Arc::clone(&ctx);
+            let sync = Arc::clone(&sync);
+            async move { download_project_package(&ctx, &sync, "p-1", "pkg-conc", None).await }
+        });
+        // Let the first pull reach the (delayed) hub call before the second starts.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        download_project_package(&ctx, &sync, "p-1", "pkg-conc", None)
+            .await
+            .expect("the concurrent pull is a skip, not an error");
+        first.await.unwrap().unwrap();
+
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "only one pull polled the hub; the concurrent one was skipped"
+        );
+    }
+
+    /// F1: a failing attempt must never stamp `failed` over a package another
+    /// writer already landed. The row would lie about a fully ingested + seeded
+    /// package, the need diff would re-admit it on every pass, and the UI would
+    /// offer a Retry for work that is done.
+    #[test]
+    fn set_download_failed_never_clobbers_a_complete_package() {
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = db(&ctx).unwrap().conn();
+            seed_project(&conn, "p-1", &members_json());
+            let mut row = base_package("pkg-done", "p-1", "Alice");
+            row.local_status = "complete".to_string();
+            upsert_package(&conn, &row).unwrap();
+        }
+
+        set_download_failed(&ctx, "p-1", "pkg-done", Some("no holder delivered".into()));
+
+        assert_eq!(
+            get_package(&db(&ctx).unwrap().conn(), "pkg-done").unwrap().unwrap().local_status,
+            "complete",
+            "a landed package keeps its status"
+        );
+    }
+
+    /// F1: the post-swarm re-arm never resurrects a package another writer
+    /// completed while the swarm attempt was in flight (the receiver's push arm
+    /// can land the same package); a `failed` / `none` row is re-armed as before,
+    /// otherwise the sequential fallback would skip every holder on a stale
+    /// verdict.
+    #[test]
+    fn fallback_rearm_skips_a_completed_row() {
+        let conn = test_conn();
+        seed_project(&conn, "p-1", &members_json());
+        let mut done = base_package("pkg-done", "p-1", "Alice");
+        done.local_status = "complete".to_string();
+        upsert_package(&conn, &done).unwrap();
+        let mut broken = base_package("pkg-broken", "p-1", "Alice");
+        broken.local_status = "failed".to_string();
+        upsert_package(&conn, &broken).unwrap();
+
+        assert!(!rearm_for_fallback(&conn, "pkg-done").unwrap(), "complete is left alone");
+        assert_eq!(
+            get_package(&conn, "pkg-done").unwrap().unwrap().local_status,
+            "complete"
+        );
+        assert!(rearm_for_fallback(&conn, "pkg-broken").unwrap(), "a failed row re-arms");
+        assert_eq!(
+            get_package(&conn, "pkg-broken").unwrap().unwrap().local_status,
+            "downloading"
         );
     }
 
