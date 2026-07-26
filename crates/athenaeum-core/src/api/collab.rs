@@ -1402,7 +1402,13 @@ pub async fn publish_collab_frames(
     };
 
     // ── 6. Hub announce (anchored on the pre-minted hub uuid) ────────────────
+    // Both abandon paths below must UNSEED before dropping `pub_dir` (F5): step
+    // 3b already imported that dir as a `project/<pid>/<pkg>` collection with
+    // TryReference, i.e. blobs that REFERENCE files inside it. A tag left over a
+    // deleted dir is a permanent seed every GET fails on — the same phantom-holder
+    // shape the supersede-reclaim unseed exists to prevent.
     let Some((hub_url, token)) = crate::api::account::hub_credentials(ctx)? else {
+        node.unseed_project_package(project_id, &hub_package_id).await;
         let _ = std::fs::remove_dir_all(&pub_dir);
         return Err(ApiError::SignedOut("Sign in to publish to a project.".into()));
     };
@@ -1419,7 +1425,9 @@ pub async fn publish_collab_frames(
         Ok(r) => r,
         Err(e) => {
             // A closed/duplicate (409), 403, or network failure leaves nothing
-            // published — drop the retained dir so a retry starts clean.
+            // published — stop seeding it, then drop the retained dir so a retry
+            // starts clean (F5, see the note above).
+            node.unseed_project_package(project_id, &hub_package_id).await;
             let _ = std::fs::remove_dir_all(&pub_dir);
             return Err(client_err(e));
         }
@@ -2897,6 +2905,54 @@ mod tests {
                 .is_some(),
             "the publisher is seed №1 under project/<project_id>/<package_id>"
         );
+        node.shutdown().await;
+    }
+
+    /// F5: a publish that dies at the hub announce must leave NO seed tag behind.
+    /// Step 3b imported the retained pub dir as a `project/<pid>/<pkg>` collection
+    /// with `TryReference` — blobs that REFERENCE files inside that dir — and both
+    /// abandon paths delete the dir, so a surviving tag is a permanent seed every
+    /// GET fails on: exactly the phantom holder the supersede-reclaim unseed
+    /// exists to prevent.
+    #[tokio::test]
+    async fn failed_announce_leaves_no_seed_tag() {
+        use n0_future::StreamExt as _;
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/api/v1/projects/p-1/announcements"))
+            .respond_with(ResponseTemplate::new(409).set_body_string("project closed"))
+            .mount(&server)
+            .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        let out_dir = _tmp.path().join("cal_out");
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(&conn, "p-1", "[]");
+            seed_publishable_set(&conn, &out_dir, "M101 Set", &["uuid-f5-1"])
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        let sender = crate::sync::SyncSenderRuntime::new();
+        publish_collab_frames(&ctx, &sender, "p-1", None)
+            .await
+            .expect_err("a 409 announce fails the publish");
+
+        let node = ctx.iroh_node.lock().await.take().expect("publish bound the node");
+        let mut seeded = Vec::new();
+        let mut stream = node.store().tags().list_prefix(b"project/").await.unwrap();
+        while let Some(entry) = stream.next().await {
+            seeded.push(String::from_utf8_lossy(entry.unwrap().name.as_ref()).to_string());
+        }
+        assert!(seeded.is_empty(), "a failed publish seeds nothing, got {seeded:?}");
+
+        // …and the dir those blobs would have referenced is gone with it.
+        let pub_root = _tmp.path().join("sync").join("collab_pub");
+        let retained = std::fs::read_dir(&pub_root).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(retained, 0, "the retained publication dir is dropped too");
+
         node.shutdown().await;
     }
 
