@@ -79,6 +79,10 @@ function setTab(name) {
   // listing is fetched on demand only (never polled; see the library section).
   if (active === 'transfers' && window.PerseusApp) window.PerseusApp.refreshTransfers();
   if (active === 'library') libRefresh();
+  // The preview overlay belongs to the Library tab. Leaving the tab closes it —
+  // an overlay left "open" while its tab is hidden would keep the document-level
+  // arrow/Escape listener, stealing those keys from the tab now on screen.
+  else libPvClose();
 }
 
 function wireTabs() {
@@ -1326,7 +1330,8 @@ async function refreshTransfers() {
 // re-reads with the ↻ button; only the roots view's free-space chips ride the
 // existing /api/status tick, which is memoized server-side.
 //
-// `libState` is the contract the later send / delete / preview tasks read:
+// `libState` is the contract the preview pane below and the later send / delete
+// tasks read:
 //   root         index into the configured capture roots, or null = roots view
 //   path         forward-slash wire rel-path of the listed directory ("" = root)
 //   selected     Set of rel-paths picked IN THE CURRENT ROOT
@@ -1546,7 +1551,8 @@ function renderLibListing() {
     return libRowMarkup(rel, (picked) => `
       <td class="lib-sel"><input type="checkbox" data-lib-pick="${esc(rel)}"
         aria-label="Select ${esc(f.name)}"${picked ? ' checked' : ''} /></td>
-      <td class="mono">${esc(f.name)}</td>
+      <td><button class="lib-file mono" data-lib-pv="${esc(rel)}"
+        title="Preview ${esc(f.name)}">${esc(f.name)}</button></td>
       <td>${esc(fmtSize(f.size))}</td>
       <td class="mono muted">${esc(fmtMtime(f.mtimeMs))}</td>
       <td>${libStatusChip(f)}</td>`);
@@ -1558,8 +1564,11 @@ function renderLibListing() {
 }
 
 // ── render: selection footer ──
-// The three actions are wired by later tasks (send / delete / preview); they
-// render disabled here rather than absent so the shape of the bar is honest.
+// Send / Delete are wired by later tasks and render disabled rather than absent
+// so the shape of the bar is honest. Preview is live (T7): it opens the first
+// selected file OF THE LISTED FOLDER, because that folder's files are exactly
+// what the pane's ←/→ walk covers — a selection reaching into a folder that is
+// no longer on screen has no walk to join, so the button says so instead.
 function renderLibFooter() {
   const el = $('libFooter');
   if (!el) return;
@@ -1575,13 +1584,15 @@ function renderLibFooter() {
   libState.selected.forEach((rel) => { if (!here.has(rel)) outside++; });
   const note = outside ? ` <span class="muted">· ${outside} outside this folder</span>` : '';
   const soon = 'not wired yet';
+  const pv = libPvFirstSelectedFile();
+  const pvTitle = pv ? 'Preview ' + pv.name : 'select a file in this folder to preview';
   el.hidden = false;
   el.innerHTML = `<span><b>${n}</b> selected${note}</span>
     <button class="ghost" data-lib-act="clear">Clear</button>
     <span class="spacer"></span>
     <button disabled title="${esc(soon)}">Send to…</button>
     <button class="ghost" disabled title="${esc(soon)}">Delete</button>
-    <button class="ghost" disabled title="${esc(soon)}">Preview</button>`;
+    <button class="ghost" data-lib-act="preview"${pv ? '' : ' disabled'} title="${esc(pvTitle)}">Preview</button>`;
 }
 
 function libRender() {
@@ -1627,6 +1638,10 @@ function libSelectedItems() {
 // ── navigation ──
 function libShowRoots() {
   libLoadSeq++;                 // abandon any in-flight listing
+  // The pane walks ONE directory of ONE root. Leaving that root (the operator's
+  // click, or the identity guard in libOnStatus retreating from a re-pointed
+  // index) leaves its walk list addressing a folder nobody is browsing.
+  libPvClose();
   libClearSelection();          // a rel only means something inside its root
   libState.root = null;
   libRootPath = null;
@@ -1718,6 +1733,282 @@ function libOnStatus(s) {
   if (libState.root === null) { renderLibCrumbs(); renderLibRoots(); }
 }
 
+// ── preview pane: the pre-blink look at one frame (T7) ──────────────────────
+// An overlay over `#libPreview` showing one frame from GET /api/library/preview,
+// with ←/→ (buttons and keys) walking the listed folder. Four things shape it:
+//
+//  * The route is BEARER-GATED, so a bare `<img src=…>` cannot reach it on a
+//    non-loopback node — the browser attaches no Authorization header to an
+//    image load. Every frame therefore rides the same `api()` helper as the rest
+//    of the page and reaches the <img> as an object URL. The detour keeps the
+//    server's ETag fast path: `fetch` still revalidates out of the browser's
+//    HTTP cache on its own, so a second pass over a folder costs 304s.
+//  * Object URLs are owned, not leaked: exactly one is alive at a time, revoked
+//    the moment it is replaced and again on close. A 200-frame blink walk holds
+//    one blob, not two hundred.
+//  * Arrow-mashing must never paint out of order. Every load takes a ticket
+//    (`libPvSeq`, the guard `libLoad` already uses) and aborts the request it
+//    replaces, so a slow first frame cannot overwrite the frame now on screen
+//    and the server's single render slot is not queued full of junk nobody will
+//    look at.
+//  * An error NEVER closes the pane. The operator is mid-blink: a bad frame is
+//    an inline message and the arrows keep working straight past it.
+//
+// The walk list is SNAPSHOT at open time (the listed directory's files, in
+// listing order, directories skipped). A `404` re-reads the listing behind the
+// pane, and a list re-shuffling under the operator's fingers mid-walk would be
+// worse than a stale one — the position would jump and `→` would land somewhere
+// nobody chose. The fresh listing is what they see when the pane closes.
+//
+// Every file is previewable-by-click, including a `.txt` the capture software
+// dropped in: which extensions render is the server's contract (one list, in
+// `watcher::is_eligible`), and a second copy here would drift. A non-frame comes
+// back `415` and reads as "not a renderable frame" in the pane.
+const LIB_PREVIEW_WIDTH = 1200;     // one width for every frame → one cache entry each
+
+let libPvState = { open: false, root: null, path: '', files: [], idx: -1 };
+let libPvSeq = 0;                   // monotonic; a stale frame never paints
+let libPvAbort = null;              // in-flight request, aborted when superseded
+let libPvUrl = null;                // the ONE live object URL
+let libPvReturnFocus = null;        // element focus returns to on close
+let libPvRefreshed = new Set();     // rels whose 404 already cost one listing re-read
+
+// The listed folder's files as the pane walks them: display name + wire rel.
+const libPvFiles = () => (libState.entries || []).map((f) => ({
+  name: String(f.name),
+  rel: libJoin(libState.path, String(f.name)),
+}));
+
+// The footer button's subject: the first SELECTED file that is in the folder on
+// screen (listing order). Null → the button renders disabled.
+function libPvFirstSelectedFile() {
+  if (libState.root === null) return null;
+  return libPvFiles().find((f) => libState.selected.has(f.rel)) || null;
+}
+
+function libPvOpen(rel) {
+  if (libState.root === null) return;
+  const files = libPvFiles();
+  const idx = files.findIndex((f) => f.rel === rel);
+  if (idx < 0) return;              // not a file of the listed folder — no walk to join
+  const host = $('libPreview');
+  if (!host) return;
+  // Re-opening over an open pane would add a SECOND keydown listener (and orphan
+  // the live object URL). The overlay covers the listing, so no click can do it
+  // today; the guard is what keeps that true for the next caller.
+  if (libPvState.open) libPvClose();
+  libPvState = { open: true, root: libState.root, path: libState.path, files, idx };
+  libPvRefreshed = new Set();
+  libPvReturnFocus = document.activeElement || null;
+  host.innerHTML = `
+    <div class="lib-pv" id="libPvDialog" role="dialog" aria-modal="true" aria-label="Frame preview" tabindex="-1">
+      <div class="lib-pv-head" id="libPvHead"></div>
+      <div class="lib-pv-stage">
+        <img class="lib-pv-img" id="libPvImg" alt="" hidden />
+        <div class="lib-pv-note" id="libPvNote" role="status"></div>
+      </div>
+    </div>`;
+  host.hidden = false;
+  document.addEventListener('keydown', onLibPvKey);
+  libPvShow(idx);
+  const dlg = $('libPvDialog');
+  if (dlg && dlg.focus) dlg.focus();
+}
+
+function libPvClose() {
+  if (!libPvState.open) return;
+  libPvSeq++;                       // orphan every in-flight load
+  if (libPvAbort) { libPvAbort.abort(); libPvAbort = null; }
+  if (libPvUrl) { URL.revokeObjectURL(libPvUrl); libPvUrl = null; }
+  document.removeEventListener('keydown', onLibPvKey);
+  libPvState = { open: false, root: null, path: '', files: [], idx: -1 };
+  libPvRefreshed = new Set();
+  const host = $('libPreview');
+  // Emptying the host drops the <img> and with it the onload/onerror closures.
+  if (host) { host.hidden = true; host.innerHTML = ''; }
+  const back = libPvReturnFocus;
+  libPvReturnFocus = null;
+  // Only if it is still in the document — the row it came from may have been
+  // re-rendered out from under it by the 404 refresh.
+  if (back && back.focus && (!document.contains || document.contains(back))) back.focus();
+}
+
+// Stop at the ends rather than wrap: mid-walk a wrap is indistinguishable from
+// "this folder is shorter than I thought", and the arrow that would do it is
+// rendered disabled, so nothing about stopping is a surprise.
+function libPvStep(delta) {
+  if (!libPvState.open) return;
+  const next = libPvState.idx + delta;
+  if (next < 0 || next >= libPvState.files.length) return;
+  libPvShow(next);
+}
+
+function libPvRenderHead() {
+  const el = $('libPvHead');
+  if (!el) return;
+  const n = libPvState.files.length;
+  const i = libPvState.idx;
+  const cur = libPvState.files[i];
+  el.innerHTML = `
+    <span class="lib-pv-name mono" title="${esc(cur ? cur.rel : '')}">${esc(cur ? cur.name : '')}</span>
+    <span class="spacer"></span>
+    <span class="lib-pv-pos muted">${i + 1} / ${n}</span>
+    <button class="ghost" data-pv-step="-1" title="Previous frame (←)" aria-label="Previous frame"${i <= 0 ? ' disabled' : ''}>&#8592;</button>
+    <button class="ghost" data-pv-step="1" title="Next frame (→)" aria-label="Next frame"${i >= n - 1 ? ' disabled' : ''}>&#8594;</button>
+    <button class="ghost" data-pv-act="close" title="Close (Esc)" aria-label="Close preview">&#10005;</button>`;
+}
+
+// The note is the pane's one status line (loading, then any failure). The
+// element carries role="status", so each replacement is announced.
+function libPvSay(html) {
+  const el = $('libPvNote');
+  if (!el) return;
+  el.hidden = false;
+  el.innerHTML = html;
+}
+
+function libPvFail(head, detail) {
+  const img = $('libPvImg');
+  if (img) img.hidden = true;
+  libPvSay(`<div class="lib-pv-err"><b>${esc(head)}</b>`
+    + (detail ? `<div class="lib-pv-errmsg mono">${esc(detail)}</div>` : '')
+    + `<div class="lib-pv-errfoot"><button class="ghost" data-pv-act="retry">Retry</button></div></div>`);
+}
+
+// Show frame `idx`: paint the head from what is already known (name, position,
+// which arrow is at an end), blank the stage, and start the load. The image is
+// HIDDEN while the next frame renders rather than left dimmed underneath — a
+// stale frame under a fresh caption is exactly the misread a blink comparison
+// must not make. The stage keeps its height, so nothing jumps.
+function libPvShow(idx) {
+  const files = libPvState.files;
+  if (!libPvState.open || !files.length) return;
+  const i = Math.max(0, Math.min(files.length - 1, idx));
+  libPvState.idx = i;
+  const cur = files[i];
+  const seq = ++libPvSeq;
+  if (libPvAbort) { libPvAbort.abort(); libPvAbort = null; }
+  libPvRenderHead();
+  const img = $('libPvImg');
+  if (img) { img.hidden = true; img.alt = 'Preview of ' + cur.name; }
+  libPvSay('<span class="lib-pv-spin" aria-hidden="true"></span>rendering…');
+  libPvLoad(seq, cur);
+}
+
+function libPvUrlFor(root, rel) {
+  return '/api/library/preview?root=' + encodeURIComponent(root)
+    + '&path=' + encodeURIComponent(rel) + '&w=' + LIB_PREVIEW_WIDTH;
+}
+
+// Map a refusal onto what the operator needs to read. 415 and 404 get plain
+// language (they are the two an operator hits routinely — a log file in the
+// capture dir, a frame deleted since the listing); everything else says the
+// status out loud and echoes the server's own words rather than paraphrasing a
+// failure nobody predicted.
+function libPvHttpError(status, body, cur) {
+  const msg = String(body || '').trim();
+  if (status === 415) { libPvFail('Not a renderable frame', msg); return; }
+  if (status === 404) {
+    libPvFail('File gone', msg || 'the file is no longer on disk');
+    // The listing behind the pane is now lying (spec §2). Re-read it ONCE per
+    // file: an operator arrowing back and forth across a deleted frame must not
+    // turn into one listing GET per keypress against a network share.
+    if (!libPvRefreshed.has(cur.rel)
+      && libState.root === libPvState.root && libState.path === libPvState.path) {
+      libPvRefreshed.add(cur.rel);
+      libRefresh();
+    }
+    return;
+  }
+  libPvFail('Preview failed (HTTP ' + status + ')', msg);
+}
+
+async function libPvLoad(seq, cur) {
+  const ac = (typeof AbortController === 'function') ? new AbortController() : null;
+  libPvAbort = ac;
+  const url = libPvUrlFor(libPvState.root, cur.rel);
+  let res = null;
+  try {
+    res = await api(url, ac ? { signal: ac.signal } : {});
+  } catch (e) {
+    if (ac && ac.signal.aborted) return;      // superseded — the newer frame owns the pane
+    if (seq !== libPvSeq) return;
+    console.error('[library] preview request failed:', cur.rel, e);
+    libPvFail('Preview failed', (e && e.message) ? e.message : String(e));
+    return;
+  }
+  if (seq !== libPvSeq) return;
+  if (!res.ok) {
+    let body = '';
+    try { body = await res.text(); } catch (e) { body = ''; }
+    if (seq !== libPvSeq) return;
+    console.error('[library] preview failed:', cur.rel, res.status, body);
+    libPvHttpError(res.status, body, cur);
+    return;
+  }
+  let blob = null;
+  try {
+    blob = await res.blob();
+  } catch (e) {
+    if (ac && ac.signal.aborted) return;
+    if (seq !== libPvSeq) return;
+    console.error('[library] preview body failed:', cur.rel, e);
+    libPvFail('Preview failed', (e && e.message) ? e.message : String(e));
+    return;
+  }
+  if (seq !== libPvSeq) return;                // never mint a URL for a frame nobody wants
+  const img = $('libPvImg');
+  if (!img) return;
+  const prev = libPvUrl;
+  const next = URL.createObjectURL(blob);
+  libPvUrl = next;
+  // Both handlers answer for THIS source only: the ticket rules out a superseded
+  // frame, the src comparison a handler left over from one. A browser that
+  // reports the REPLACED load's abort as an error is the case neither can tell
+  // apart — hence the revoke ordering below (nothing aborts in the first place),
+  // and if one slipped through anyway the real onload that follows clears the
+  // note, so the pane cannot end up stuck on a failure that did not happen.
+  img.onload = () => {
+    if (seq !== libPvSeq || img.src !== next) return;
+    img.hidden = false;
+    const note = $('libPvNote');
+    if (note) note.hidden = true;
+  };
+  img.onerror = () => {
+    if (seq !== libPvSeq || img.src !== next) return;
+    console.error('[library] preview image did not decode:', cur.rel);
+    libPvFail('Preview failed', 'the rendered image did not decode');
+  };
+  img.src = next;
+  // Revoke the frame this one replaces only AFTER the swap. The <img> may still
+  // have been decoding it (the operator arrowed on mid-decode), and pulling the
+  // URL out from under a live load would surface as a decode failure for a frame
+  // nobody is looking at any more.
+  if (prev) URL.revokeObjectURL(prev);
+}
+
+// Bound only while the pane is open (added in libPvOpen, removed in libPvClose),
+// so nothing on this page loses its arrow keys the rest of the time.
+function onLibPvKey(e) {
+  if (!libPvState.open) return;
+  // A held modifier belongs to the browser (⌘←  is Back, Alt+→ is Forward) —
+  // never steal it.
+  if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (e.key === 'Escape') { e.preventDefault(); libPvClose(); return; }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); libPvStep(-1); return; }
+  if (e.key === 'ArrowRight') { e.preventDefault(); libPvStep(1); }
+}
+
+function onLibPreviewClick(e) {
+  if (e.target === $('libPreview')) { libPvClose(); return; }   // the scrim
+  const step = e.target.closest('[data-pv-step]');
+  if (step) { libPvStep(Number(step.dataset.pvStep)); return; }
+  const act = e.target.closest('[data-pv-act]');
+  if (!act) return;
+  if (act.dataset.pvAct === 'close') libPvClose();
+  else if (act.dataset.pvAct === 'retry') libPvShow(libPvState.idx);
+}
+
 // ── delegated handlers (bound once to the stable panel, never per render) ──
 function onLibraryClick(e) {
   const rootBtn = e.target.closest('[data-lib-root]');
@@ -1728,12 +2019,17 @@ function onLibraryClick(e) {
     libLoad(libState.root, nav.dataset.libNav || '');
     return;
   }
+  // A file's NAME opens the preview; its checkbox is a separate element, so
+  // picking a file never opens the pane and vice versa.
+  const pv = e.target.closest('[data-lib-pv]');
+  if (pv) { libPvOpen(pv.dataset.libPv); return; }
   const act = e.target.closest('[data-lib-act]');
   if (!act) return;
   switch (act.dataset.libAct) {
     case 'roots': libShowRoots(); break;
     case 'refresh': case 'retry': libRefresh(); break;
     case 'clear': libClearSelection(); libRender(); break;
+    case 'preview': { const f = libPvFirstSelectedFile(); if (f) libPvOpen(f.rel); break; }
   }
 }
 
@@ -1749,6 +2045,9 @@ function wireLibrary() {
   const panel = $('tab-library');
   panel.addEventListener('click', onLibraryClick);
   panel.addEventListener('change', onLibraryChange);
+  // The preview overlay lives outside the panel (index.html), so it gets its own
+  // delegated click handler — bound once, never per open.
+  $('libPreview').addEventListener('click', onLibPreviewClick);
 }
 
 // ── boot ────────────────────────────────────────────────────────────────────
@@ -1758,7 +2057,7 @@ window.PerseusApp = {
   api, getJson, $, esc, shortHex, fmtSize, fmtDur, fmtCountdown, fmtMtime,
   setTab,
   refreshTransfers,
-  // Library tab surface for the later send / delete / preview tasks: the live
+  // Library tab surface for the later send / delete tasks: the live
   // state object, the loader, and the selection as [{root, rel, dir}].
   libState, libLoad, libRefresh, libSelectedItems,
 };

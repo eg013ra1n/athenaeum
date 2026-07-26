@@ -30,6 +30,13 @@
     <main id="tab-library" hidden></main>
     <main id="tab-settings" hidden></main>
 
+    <!-- Frame preview overlay (0.5.1 T7), the pre-blink look at one frame. It
+         sits OUTSIDE the tab panels on purpose: a fixed overlay nested in a
+         panel would be hidden along with its tab while still holding the
+         document-level key listener. app.js fills it on open and empties it on
+         close; `hidden` is the only visibility switch (see the [hidden] rule). -->
+    <div id="libPreview" class="lib-pv-overlay" hidden></div>
+
     <script src="/app.js"></script>
   </body>
 </html>
