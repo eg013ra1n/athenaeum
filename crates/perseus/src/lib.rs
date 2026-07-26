@@ -33,6 +33,9 @@
 //! - [`web`] — the embedded status-page server: an axum router with bearer auth
 //!   and read-only status/sent/history endpoints (task 9); Task 10 adds write
 //!   handlers onto the same router.
+//! - [`library`] — the library path contract: wire rel-paths are forward-slash,
+//!   and [`library::resolve_in_root`] is the single containment guard every
+//!   library route (listing, preview, send, delete) resolves user paths through.
 //! - [`pending`] — pure derivation of the "To sync" tree: groups the batcher's
 //!   pending accumulator snapshot into a [`pending::PendingNode`] trie by
 //!   `rel_path` (object / date / type / file) for the web view.
@@ -42,6 +45,7 @@ pub mod batch_store;
 pub mod batcher;
 pub mod config;
 pub mod config_edit;
+pub mod library;
 pub mod pending;
 pub mod resend;
 pub mod run;
