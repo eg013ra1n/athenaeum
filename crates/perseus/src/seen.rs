@@ -183,6 +183,32 @@ impl SeenStore {
         Ok(())
     }
 
+    /// Whether a **live** (`deleted_at IS NULL`) seen row exists for `path` —
+    /// i.e. Perseus has handed exactly this capture file to the sync engine at
+    /// least once and retention has not since removed it.
+    ///
+    /// This is the library listing's last status arm (T4): a file with no batch
+    /// participation that still resolves here left the node under an older
+    /// bookkeeping shape, so it is honestly `Sent` rather than `Unsent`. A
+    /// retention-deleted row is deliberately excluded — it is an audit trail of a
+    /// file that is *gone*, and a file freshly re-captured at the same path is a
+    /// new frame (`mark_enqueued` clears `deleted_at`, making it live again).
+    ///
+    /// `path` must be the same spelling the watcher recorded (canonicalized); a
+    /// different spelling of the same file reads `false`, never a wrong `true`.
+    pub fn is_recorded(&self, path: &Path) -> Result<bool> {
+        let conn = self.conn.lock().expect("seen store mutex poisoned");
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM perseus_seen WHERE path = ?1 AND deleted_at IS NULL",
+                params![path.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("query perseus_seen is_recorded")?;
+        Ok(found.is_some())
+    }
+
     /// Resolve the *live* source capture file for a confirmed package
     /// (`package_ref` = `sync_outbound.package_ref`), or `None` when there is no
     /// live linkage. Returns the recorded `(size, mtime_ms)` alongside the path
@@ -341,6 +367,32 @@ mod tests {
         store.mark_enqueued(&a, 100, 111, "/pkg/a").unwrap();
         assert!(!store.should_enqueue(&a, 100, 111).unwrap());
         assert!(store.should_enqueue(&b, 100, 111).unwrap());
+    }
+
+    // ── library status join (task T4) ────────────────────────────────────────
+
+    #[test]
+    fn is_recorded_tracks_only_live_rows() {
+        let (_tmp, store) = store();
+        let p = PathBuf::from("/cap/a.fits");
+        assert!(
+            !store.is_recorded(&p).unwrap(),
+            "a never-enqueued file is not recorded"
+        );
+        store.mark_enqueued(&p, 100, 111, "/pkg/a").unwrap();
+        assert!(store.is_recorded(&p).unwrap(), "an enqueued file is recorded");
+        store.mark_deleted(&p).unwrap();
+        assert!(
+            !store.is_recorded(&p).unwrap(),
+            "a retention-deleted row is audit history, not a live record"
+        );
+        // A re-capture at the same path clears deleted_at → live again.
+        store.mark_enqueued(&p, 200, 222, "/pkg/b").unwrap();
+        assert!(store.is_recorded(&p).unwrap());
+        assert!(
+            !store.is_recorded(&PathBuf::from("/cap/other.fits")).unwrap(),
+            "paths are tracked independently"
+        );
     }
 
     // ── retention source-mapping (task A8) ───────────────────────────────────

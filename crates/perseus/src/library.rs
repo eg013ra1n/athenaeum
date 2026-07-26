@@ -24,10 +24,18 @@
 //!
 //! Errors are [`anyhow`] with **stable message prefixes** that callers may match
 //! on to pick an HTTP status: `"invalid path segment"`, `"path escapes root"`,
-//! `"not found"`.
+//! `"not found"`, `"canonicalize root"` (the configured root itself is offline —
+//! a `502`, not a client error) and, from [`listing`], `"not a directory"`.
+//!
+//! The [`listing`] submodule builds on this contract: it turns one
+//! `(root_index, rel_path)` into a single-directory [`LibraryListing`] whose
+//! files carry the derived per-file [`FileStatus`].
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
+
+mod listing;
+pub use listing::{list_directory, FileStatus, LibraryEntry, LibraryListing, StatusSources};
 
 /// Validate a wire rel-path and split it into plain filename segments.
 ///

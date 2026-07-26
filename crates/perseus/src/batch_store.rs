@@ -48,6 +48,14 @@ const DDL_FILES: &str = "CREATE TABLE IF NOT EXISTS perseus_batch_files (
     PRIMARY KEY (package_ref, rel_path)
 )";
 
+/// Reverse-lookup index for [`BatchStore::batches_for_source`]. The library
+/// listing (T4) runs ONE `source_path =` lookup per file in the browsed
+/// directory, so without this the status join degrades to a full table scan per
+/// row — quadratic on a node with a long send history. Additive and idempotent
+/// (`IF NOT EXISTS`): an existing agent DB gains it on the next open.
+const DDL_FILES_SOURCE_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_perseus_batch_files_source
+    ON perseus_batch_files(source_path)";
+
 /// One recorded send-batch: the package it belongs to, whether it was sent
 /// `auto` or `manual`, the RFC-3339 timestamp the batcher stamped, and the number
 /// of files the package carried.
@@ -84,6 +92,8 @@ impl BatchStore {
         conn.execute(DDL, []).context("create perseus_batch")?;
         conn.execute(DDL_FILES, [])
             .context("create perseus_batch_files")?;
+        conn.execute(DDL_FILES_SOURCE_INDEX, [])
+            .context("create idx_perseus_batch_files_source")?;
 
         // files_deleted_at (UI v2 §4.1): guarded ALTER — CREATE IF NOT EXISTS never
         // adds a column to an existing table. Additive; pre-upgrade rows read NULL.
@@ -250,6 +260,33 @@ impl BatchStore {
         tx.commit().context("commit batch delete")
     }
 
+    /// Every batch ONE source capture file rode in, as DISTINCT `package_ref`s
+    /// sorted ascending. The library listing's per-file join (T4): a file's
+    /// participation count, and the set of outbound rows whose newest attempt
+    /// decides its status.
+    ///
+    /// `source` is the path spelling the batcher recorded, which is the
+    /// **canonicalized** capture path (the watcher canonicalizes both the root and
+    /// each discovered file before it emits them). A caller that hands over a
+    /// non-canonical spelling of the same file gets an empty result — not a wrong
+    /// one. The statement is cached: this runs once per listed file, not once per
+    /// request.
+    pub fn batches_for_source(&self, source: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("batch store mutex poisoned");
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT DISTINCT package_ref FROM perseus_batch_files
+                 WHERE source_path = ?1 ORDER BY package_ref ASC",
+            )
+            .context("prepare batches_for_source")?;
+        let refs = stmt
+            .query_map(params![source], |r| r.get::<_, String>(0))
+            .context("query batches_for_source")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect batches_for_source rows")?;
+        Ok(refs)
+    }
+
     /// DISTINCT package_refs that reference ANY of `sources` — a file's full set of
     /// batch participations (original + divert copies), the obligation verdict's
     /// cross-batch input. Chunked IN-list (999 SQLite param cap).
@@ -316,6 +353,53 @@ mod tests {
         let mut refs = store.packages_for_sources(&["/cap/a.fits".to_string()]).unwrap();
         refs.sort();
         assert_eq!(refs, vec!["/pkg/u1".to_string(), "/pkg/u2".to_string()]);
+    }
+
+    #[test]
+    fn batches_for_source_returns_only_that_sources_participations() {
+        let (_tmp, store) = store();
+        store
+            .record_files("/pkg/u1", &[("a.fits".into(), PathBuf::from("/cap/a.fits"))])
+            .unwrap();
+        store
+            .record_files(
+                "/pkg/u2",
+                &[
+                    ("a.fits".into(), PathBuf::from("/cap/a.fits")),
+                    ("b.fits".into(), PathBuf::from("/cap/b.fits")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store.batches_for_source("/cap/a.fits").unwrap(),
+            vec!["/pkg/u1".to_string(), "/pkg/u2".to_string()],
+            "every batch this file rode in, sorted"
+        );
+        assert_eq!(
+            store.batches_for_source("/cap/b.fits").unwrap(),
+            vec!["/pkg/u2".to_string()]
+        );
+        assert!(
+            store.batches_for_source("/cap/never.fits").unwrap().is_empty(),
+            "an unpackaged file has no participations"
+        );
+    }
+
+    /// The listing route runs one lookup per file in a directory, so the
+    /// `source_path` index is load-bearing, not cosmetic.
+    #[test]
+    fn open_creates_the_source_path_index() {
+        let (_tmp, store) = store();
+        let conn = store.conn.lock().unwrap();
+        let found: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_perseus_batch_files_source'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(found, 1, "perseus_batch_files(source_path) must be indexed");
     }
 
     #[test]

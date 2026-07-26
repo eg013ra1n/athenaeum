@@ -20,6 +20,10 @@
 //!   enabled here (the edit carries no soak field).
 //! - `GET /api/retention/log` — the recent retention-pass ring buffer
 //!   ([`RetentionRunRecord`], newest-first).
+//! - `GET /api/library?root=<idx>&path=<rel>` — one directory of one capture
+//!   root, each file joined to its derived send status
+//!   ([`library::LibraryListing`](crate::library::LibraryListing)). Shallow (one
+//!   `read_dir`, never a walk); an offline root is a `502`, not a `404`.
 //! - `GET`/`PUT /api/capture-dirs` — the configured vs. running capture
 //!   directories + a `restartPending` flag ([`CaptureDirsDto`]); a PUT rewrites
 //!   `perseus.toml`'s capture selection, adopts it into the live config, and
@@ -502,6 +506,10 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
             "/api/capture-dirs",
             get(api_get_capture_dirs).put(api_put_capture_dirs),
         )
+        // The local library browser (0.5.1 T4): one directory of one capture
+        // root, per-file send status joined in. Read-only; send/preview/delete
+        // are later tasks on the same `library` contract.
+        .route("/api/library", get(api_library))
         .route("/api/targets", get(api_get_targets).put(api_put_targets))
         .route("/api/targets/options", get(api_get_target_options))
         .route(
@@ -1449,6 +1457,114 @@ fn parse_mode(s: &str) -> Option<Mode> {
         "auto" => Some(Mode::Auto),
         "manual" => Some(Mode::Manual),
         _ => None,
+    }
+}
+
+/// Query for [`api_library`]: which capture root, and which directory in it.
+#[derive(serde::Deserialize)]
+struct LibraryQuery {
+    /// Index into [`Config::capture_dirs_resolved`]. Defaults to the first root,
+    /// which is the only one on a single-root node.
+    #[serde(default)]
+    root: usize,
+    /// Forward-slash wire rel-path of the directory to list; the default `""` is
+    /// the root itself.
+    #[serde(default)]
+    path: String,
+}
+
+/// Map a [`crate::library`] error onto the HTTP status contract built on T1's
+/// stable message prefixes.
+///
+/// The FULL anyhow chain is logged with `{:#}` **first**, unconditionally:
+/// `resolve_in_root` labels any failed canonicalize of the target `"not found"`,
+/// so a permission hole and a genuinely absent file produce the same 404 — only
+/// the logged chain says which it really was.
+fn library_error_status(
+    err: &anyhow::Error,
+    root_index: usize,
+    path: &str,
+) -> (StatusCode, String) {
+    let chain = format!("{err:#}");
+    tracing::error!(error = %chain, root_index, path, "web library: listing failed");
+    let head = err.to_string();
+    if head.starts_with("canonicalize root") {
+        // The configured root itself is unreachable — an unmounted share, the T3
+        // offline-at-boot case. That is an upstream fault, not a bad request, and
+        // NOT a 404 (which would read as "the path you asked for is gone").
+        (StatusCode::BAD_GATEWAY, "root unavailable".to_string())
+    } else if head.starts_with("not found") {
+        (StatusCode::NOT_FOUND, head)
+    } else if head.starts_with("invalid path segment")
+        || head.starts_with("path escapes root")
+        || head.starts_with("not a directory")
+    {
+        (StatusCode::BAD_REQUEST, head)
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, chain)
+    }
+}
+
+/// `GET /api/library?root=<idx>&path=<rel>` — one directory of one capture root,
+/// each file carrying its derived send status.
+///
+/// The three status sources are snapshotted ONCE per request (the batcher's
+/// pending set, every outbound row, and the two Perseus stores) and handed to
+/// [`list_directory`](crate::library::list_directory) as borrowed handles, so the
+/// per-file join never re-reads them.
+///
+/// The whole filesystem + SQLite pass runs on a blocking thread: a capture root is
+/// routinely a network share, and a wedged mount must stall one blocking-pool
+/// thread rather than a reactor worker (the same stance as the free-space probe).
+async fn api_library(
+    State(state): State<Arc<WebState>>,
+    Query(q): Query<LibraryQuery>,
+) -> Result<Json<crate::library::LibraryListing>, (StatusCode, String)> {
+    let roots = state.config.read().await.capture_dirs_resolved();
+    let Some(root) = roots.get(q.root).cloned() else {
+        tracing::error!(
+            root_index = q.root,
+            count = roots.len(),
+            "web library: root index out of range"
+        );
+        return Err((StatusCode::NOT_FOUND, "unknown root".to_string()));
+    };
+    // A detached page (engine in setup) has no batcher: nothing is pending, which
+    // is the honest answer, not an error.
+    let pending = match state.batcher.read().await.as_ref() {
+        Some(b) => b.pending_snapshot(),
+        None => Vec::new(),
+    };
+    // Unbounded window on purpose: a file's status must not flip to `unsent`
+    // because its batch fell out of a recent-N cap.
+    let outbound = state.store.all_outbound(u32::MAX).map_err(|e| {
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web library: read outbound failed");
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
+
+    let batches = Arc::clone(&state.batches);
+    let seen = Arc::clone(&state.seen);
+    let (root_index, rel) = (q.root, q.path.clone());
+    let listed = tokio::task::spawn_blocking(move || {
+        let src = crate::library::StatusSources {
+            pending: &pending,
+            batches: &batches,
+            seen: &seen,
+            outbound: &outbound,
+        };
+        crate::library::list_directory(root_index, &root, &rel, &src)
+    })
+    .await
+    .map_err(|e| {
+        let msg = format!("{e}");
+        tracing::error!(error = %msg, "web library: listing task panicked");
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
+
+    match listed {
+        Ok(listing) => Ok(Json(listing)),
+        Err(e) => Err(library_error_status(&e, q.root, &q.path)),
     }
 }
 
@@ -5488,5 +5604,242 @@ mod tests {
                 other => panic!("unexpected kind {other}"),
             }
         }
+    }
+
+    // ── T4 (0.5.1 local library): GET /api/library ────────────────────────────
+
+    /// A `WebState` whose capture root is a real, populated directory separate
+    /// from the data dir, with both Perseus stores open on the data dir's db.
+    /// Returns the state, the tempdir guard, and the capture root.
+    async fn library_test_state() -> (Arc<WebState>, tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let cap = tmp.path().join("cap");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&cap).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let db = data.join("perseus.db");
+        let store = Arc::new(StandaloneSyncStore::open(&db).unwrap());
+        let seen = Arc::new(crate::seen::SeenStore::open(&db).unwrap());
+        let batches = Arc::new(crate::batch_store::BatchStore::open(&db).unwrap());
+
+        let toml_str = format!(
+            "capture_dir = \"{}\"\ndata_dir = \"{}\"\npairing_ticket = \"t\"\nmode = \"manual\"\n[retention]\npolicy = \"keep_days\"\ndry_run = true\nkeep_days = 21\n",
+            cap.display(),
+            data.display()
+        );
+        let config_path = tmp.path().join("perseus.toml");
+        std::fs::write(&config_path, &toml_str).unwrap();
+        let config = Config::from_toml_str(&toml_str).unwrap();
+        let (_state_tx, state_rx) = watch::channel(AgentState::Running { in_flight: 0 });
+        let state = Arc::new(WebState::detached(
+            store,
+            seen,
+            batches,
+            config,
+            config_path,
+            state_rx,
+            Arc::new(Notify::new()),
+        ));
+        (state, tmp, cap)
+    }
+
+    fn write_file(root: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
+        let p = root.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&p, bytes).unwrap();
+        std::fs::canonicalize(&p).unwrap()
+    }
+
+    /// The full status join over the wire: one file seeded into each derivable
+    /// status (queued rides a live manual-mode batcher), camelCase keys, and a
+    /// single-directory listing.
+    #[tokio::test]
+    async fn library_listing_reports_every_status() {
+        let (state, _tmp, cap) = library_test_state().await;
+
+        write_file(&cap, "unsent.fits", b"0123456789");
+        let queued = write_file(&cap, "queued.fits", b"x");
+        let sending = write_file(&cap, "sending.fits", b"x");
+        let delivered = write_file(&cap, "delivered.fits", b"x");
+        let declined = write_file(&cap, "declined.fits", b"x");
+        let sent = write_file(&cap, "sent.fits", b"x");
+        std::fs::create_dir_all(cap.join("M31")).unwrap();
+        write_file(&cap, "M31/nested.fits", b"x");
+
+        // Batch participations + their newest outbound rows.
+        for (pkg, path) in [
+            ("/pkg/sending", &sending),
+            ("/pkg/delivered", &delivered),
+            ("/pkg/declined", &declined),
+        ] {
+            state
+                .batches
+                .record_files(pkg, &[("f.fits".to_string(), path.clone())])
+                .unwrap();
+        }
+        let id_s = state
+            .store
+            .enqueue("/pkg/sending", PEER, None, &[])
+            .unwrap();
+        state
+            .store
+            .set_state(id_s, OutboundState::Transferring)
+            .unwrap();
+        let id_d = state
+            .store
+            .enqueue("/pkg/delivered", PEER, None, &[])
+            .unwrap();
+        state.store.confirm(id_d, &[]).unwrap();
+        let id_x = state
+            .store
+            .enqueue("/pkg/declined", PEER, None, &[])
+            .unwrap();
+        state
+            .store
+            .set_state(id_x, OutboundState::Cancelled)
+            .unwrap();
+        state
+            .store
+            .set_last_error(id_x, Some(CANCELLED_BY_RECEIVER_DETAIL))
+            .unwrap();
+
+        // Seen-only linkage → Sent.
+        state
+            .seen
+            .mark_enqueued(&sent, 1, 1, "/pkg/legacy")
+            .unwrap();
+
+        // A live MANUAL-mode batcher never auto-flushes, so a fed path stays
+        // pending for the whole test. Deliberately spawned with NO engine: the
+        // seeded outbound rows above are the fixture, and a real engine's
+        // crash-resume would re-drive them (a missing payload dir fails the
+        // transferring row) out from under the assertions. Manual mode never
+        // reaches the fan-out, so an empty target list is never consulted.
+        let (stable_tx, stable_rx) = tokio::sync::mpsc::channel::<(PathBuf, PathBuf)>(8);
+        let config = state.config.read().await.clone();
+        let (send_cfg_tx, send_cfg_rx) = watch::channel(config.send_cfg());
+        let (batcher, _task) = crate::batcher::spawn_batcher(
+            stable_rx,
+            Vec::new(),
+            Arc::clone(&state.seen),
+            Arc::clone(&state.batches),
+            config,
+            node_id_hex(&PEER),
+            None,
+            send_cfg_rx,
+        );
+        stable_tx.send((cap.clone(), queued.clone())).await.unwrap();
+        // Wait for the batcher loop to absorb it (manual mode → it stays). The
+        // budget is generous on purpose: the loop takes it on its first turn, so
+        // a long ceiling costs nothing and cannot make this test time-sensitive.
+        for _ in 0..1000 {
+            if !batcher.pending_snapshot().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(batcher.pending_snapshot().len(), 1, "the file is pending");
+        *state.batcher.write().await = Some(batcher);
+
+        let app = build_router(Arc::clone(&state), None);
+        let res = get(&app, "/api/library?root=0&path=").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+
+        assert_eq!(v["root"], 0);
+        assert_eq!(v["path"], "");
+        assert_eq!(
+            v["dirs"].as_array().unwrap(),
+            &vec![serde_json::json!("M31")],
+            "subdirectories are listed, their contents are not"
+        );
+
+        let files = v["files"].as_array().unwrap();
+        let by_name: HashMap<&str, &serde_json::Value> = files
+            .iter()
+            .map(|f| (f["name"].as_str().unwrap(), f))
+            .collect();
+        assert_eq!(files.len(), 6, "no nested file at root level: {by_name:?}");
+        assert_eq!(by_name["unsent.fits"]["status"], "unsent");
+        assert_eq!(by_name["queued.fits"]["status"], "queued");
+        assert_eq!(by_name["sending.fits"]["status"], "sending");
+        assert_eq!(by_name["delivered.fits"]["status"], "delivered");
+        assert_eq!(by_name["declined.fits"]["status"], "declined");
+        assert_eq!(by_name["sent.fits"]["status"], "sent");
+
+        // camelCase keys + honest per-entry facts.
+        assert_eq!(by_name["unsent.fits"]["size"], 10);
+        assert!(by_name["unsent.fits"]["mtimeMs"].as_i64().unwrap() > 0);
+        assert_eq!(by_name["unsent.fits"]["batches"], 0);
+        assert_eq!(by_name["sending.fits"]["batches"], 1);
+        assert!(
+            by_name["unsent.fits"]["retention"].is_null(),
+            "retention is T15's field; it ships null here"
+        );
+
+        // Descending into the subdirectory lists only its own contents.
+        let sub = body_json(get(&app, "/api/library?root=0&path=M31").await).await;
+        assert_eq!(sub["path"], "M31");
+        assert_eq!(sub["files"].as_array().unwrap().len(), 1);
+        assert_eq!(sub["files"][0]["name"], "nested.fits");
+
+        // Both senders stay bound to here so the batcher loop — and with it the
+        // pending set the assertions read — outlives the requests.
+        drop(stable_tx);
+        drop(send_cfg_tx);
+    }
+
+    /// A root index past the configured capture dirs is a `404`, not a panic.
+    #[tokio::test]
+    async fn library_unknown_root_is_404() {
+        let (state, _tmp, _cap) = library_test_state().await;
+        let app = build_router(state, None);
+        let res = get(&app, "/api/library?root=7&path=").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The T3 offline-at-boot case: a configured root that is not mounted is a
+    /// `502` with the contract body, never a 404 that reads as "you asked for a
+    /// path that does not exist".
+    #[tokio::test]
+    async fn library_offline_root_is_502_root_unavailable() {
+        let (state, _tmp, cap) = library_test_state().await;
+        std::fs::remove_dir_all(&cap).unwrap();
+        let app = build_router(state, None);
+        let res = get(&app, "/api/library?root=0&path=").await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&body), "root unavailable");
+    }
+
+    #[tokio::test]
+    async fn library_missing_subdirectory_is_404() {
+        let (state, _tmp, _cap) = library_test_state().await;
+        let app = build_router(state, None);
+        let res = get(&app, "/api/library?root=0&path=nope").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn library_hostile_path_is_400() {
+        let (state, _tmp, _cap) = library_test_state().await;
+        let app = build_router(state, None);
+        for path in ["..", "%2e%2e", "a%2F..%2Fb"] {
+            let res = get(&app, &format!("/api/library?root=0&path={path}")).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "path {path:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn library_listing_a_file_is_400() {
+        let (state, _tmp, cap) = library_test_state().await;
+        write_file(&cap, "a.fits", b"x");
+        let app = build_router(state, None);
+        let res = get(&app, "/api/library?root=0&path=a.fits").await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 }
