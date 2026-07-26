@@ -1353,6 +1353,11 @@ let libVolumes = [];        // last /api/status `volumes` (free space per volume
 let libStatusSeen = false;  // a status landed → the roots view can speak honestly
 let libStatusSig = null;    // skip the roots re-render when nothing moved
 let libLoadSeq = 0;         // monotonic; a stale listing response never paints
+// The PATH of the root being browsed, remembered on entry. `libState.root` is an
+// index into a list the operator can edit under Settings, so the index alone is
+// not an identity: dropping an earlier capture dir silently re-points it at a
+// different folder. See the guard in libOnStatus.
+let libRootPath = null;
 
 // The chip tooltips. `delivered` is deliberately "at least one device": the
 // listing status is ANY-of across a fan-out, and per-target detail is the
@@ -1419,7 +1424,7 @@ function renderLibraryTab() {
         <h2>Library</h2>
         <div class="lib-crumbs" id="libCrumbs" aria-label="Location"></div>
         <span class="spacer"></span>
-        <button class="ghost" data-lib-act="refresh" title="Re-read this folder">&#8635;</button>
+        <button class="ghost" id="libRefreshBtn" data-lib-act="refresh" title="Re-read this folder">&#8635;</button>
       </div>
       <div id="libBody"></div>
       <div class="lib-footer" id="libFooter" hidden></div>
@@ -1485,12 +1490,19 @@ function libStatusChip(f) {
   // Own-property lookup only: `status` is server-controlled, and a plain `[st]`
   // would resolve `toString` / `constructor` off Object.prototype and stringify
   // a function into the tooltip.
-  const title = Object.prototype.hasOwnProperty.call(LIB_STATUS_TITLE, st) ? LIB_STATUS_TITLE[st] : st;
+  const known = Object.prototype.hasOwnProperty.call(LIB_STATUS_TITLE, st);
+  const title = known ? LIB_STATUS_TITLE[st] : st;
+  // The class token rides the SAME whitelist. An unknown status echoed into
+  // `class` would collide with unrelated rules on this page (`.chip.safe`,
+  // `.chip.auto`, …) and paint a colour nobody derived — a neutral chip is the
+  // honest rendering. The text is still echoed (escaped), so the operator sees
+  // exactly what the server said.
+  const cls = known ? ' ' + st : '';
   const n = Number(f.batches) || 0;
   const suffix = n > 0
     ? ` <span class="lib-batches" title="in ${n} batch${n === 1 ? '' : 'es'}">&times;${n}</span>`
     : '';
-  return `<span class="chip lib-st ${esc(st)}" title="${esc(title)}">${esc(st)}</span>${suffix}`;
+  return `<span class="chip lib-st${cls}" title="${esc(title)}">${esc(st)}</span>${suffix}`;
 }
 
 function libRowMarkup(rel, cells) {
@@ -1574,6 +1586,10 @@ function renderLibFooter() {
 
 function libRender() {
   renderLibCrumbs();
+  // ↻ does different work per view (status re-poll vs. one listing GET), so it
+  // says which — a button whose tooltip describes the other view reads as broken.
+  const rb = $('libRefreshBtn');
+  if (rb) rb.title = libState.root === null ? 'Re-read the capture roots' : 'Re-read this folder';
   if (libState.root === null) renderLibRoots(); else renderLibListing();
   renderLibFooter();
 }
@@ -1613,6 +1629,7 @@ function libShowRoots() {
   libLoadSeq++;                 // abandon any in-flight listing
   libClearSelection();          // a rel only means something inside its root
   libState.root = null;
+  libRootPath = null;
   libState.path = '';
   libState.dirs = [];
   libState.entries = [];
@@ -1625,6 +1642,7 @@ async function libLoad(root, path) {
   const rel = path || '';
   if (root !== libState.root) libClearSelection();
   libState.root = root;
+  libRootPath = String(libRoots[root] ?? '');
   libState.path = rel;
   libState.error = null;
   libState.loading = true;
@@ -1655,10 +1673,12 @@ async function libLoad(root, path) {
   libRender();
 }
 
-// Re-read what is on screen: the roots view is served by the status poll, a
-// listing costs one GET. Also the Retry button's action.
+// Re-read what is on screen. A listing costs one GET; the roots view has no
+// endpoint of its own — it is painted from `/api/status`, so re-reading it means
+// re-polling status out of turn (libOnStatus then repaints only if something
+// actually moved). Also the Retry button's action.
 function libRefresh() {
-  if (libState.root === null) { libRender(); return; }
+  if (libState.root === null) { refreshStatus(); return; }
   libLoad(libState.root, libState.path);
 }
 
@@ -1684,6 +1704,16 @@ function libOnStatus(s) {
   libStatusSig = sig;
   libRoots = roots;
   libVolumes = vols;
+  // The browsed root is addressed by INDEX, and this list is what the index
+  // addresses. An edit under Settings → Capture Directories can drop or reorder
+  // an entry, after which the same index means a different folder — the crumbs
+  // would relabel themselves and every rel in the selection would suddenly claim
+  // to belong to a path nobody picked. Identity is the path, so when it stops
+  // matching, retreat to the roots view (which clears the selection).
+  if (libState.root !== null && String(libRoots[libState.root] ?? '') !== libRootPath) {
+    libShowRoots();
+    return;
+  }
   // Only the roots view reads these; a listing keeps its own crumbs/rows.
   if (libState.root === null) { renderLibCrumbs(); renderLibRoots(); }
 }

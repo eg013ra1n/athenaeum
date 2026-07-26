@@ -18,6 +18,14 @@
 }
 
 * { box-sizing: border-box; }
+/* `hidden` is this page's ONLY visibility switch (tab panels, the pending tree,
+   the transfer detail pane, the library selection bar). Several of those
+   elements also carry a class that sets `display`, and an author `display` beats
+   the UA's `[hidden] { display: none }` — so the bar stayed on screen, empty and
+   bordered, forever. Stated once, with `!important`, it holds for every present
+   and future display-setting class; nothing in this app wants to be visible
+   while the attribute is set. */
+[hidden] { display: none !important; }
 body {
   font-family: system-ui, -apple-system, sans-serif; margin: 0;
   background: var(--surface); color: var(--content); line-height: 1.5; font-size: 14px;
