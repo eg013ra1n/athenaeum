@@ -27,9 +27,10 @@ build:windows:
     - windows
   only:
     - tags
-  needs:
-    - job: build:linux
-      artifacts: false
+  # Dedicated windows machine — start immediately, parallel to linux/macos.
+  # (The old `needs: build:linux` gate predates the dedicated runner and cost
+  # every release a serialized ~14 min.)
+  needs: []
   cache:
     key: "main-windows"
     policy: pull
