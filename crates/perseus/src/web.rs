@@ -1521,9 +1521,11 @@ struct PendingDto {
 struct SendModeDto {
     mode: String,
     auto_quiet_secs: u64,
-    /// Normalised `HH:MM` schedule points (see [`schedule_times_wire`]). Empty
-    /// in any mode with no times configured — the wire never reports a schedule
-    /// the batcher would not act on.
+    /// Normalised `HH:MM` schedule points (see [`schedule_times_wire`]).
+    /// Reported in **every** mode, not only `scheduled`: switching to
+    /// `auto`/`manual` keeps the times in the file, and the page has to be able
+    /// to show (and re-arm from) them without the operator retyping. Only
+    /// `scheduled` mode makes the batcher act on them.
     schedule_times: Vec<String>,
     schedule_catchup: bool,
 }
@@ -4167,20 +4169,23 @@ mod tests {
             .as_str()
             .expect("a schedule saved through the web edit arms a deadline")
             .to_string();
-        assert!(
-            next.contains("T06:00:00"),
+        let next_dt = chrono::DateTime::parse_from_rfc3339(&next).expect("RFC-3339");
+        assert_eq!(
+            next_dt.time().format("%H:%M:%S").to_string(),
+            "06:00:00",
             "the armed deadline is the time just saved, got {next}"
         );
 
         // Add a second point: the deadline re-derives from the NEW schedule, so it
-        // is always one of the configured points and always ahead of now — never a
-        // stamp left over from the schedule that was just replaced.
+        // is one of the configured points — never a stamp left over from the
+        // schedule that was just replaced.
         //
-        // Deliberately NOT asserted here: that the deadline moved earlier. The two
-        // stamps come from two independently-timed `/api/status` calls, so a clock
-        // that crosses a point between them would flip the comparison — a real
-        // flake for a claim that is pure arithmetic, already pinned by
-        // `schedule::next_fire`'s own unit tests.
+        // Deliberately NOT asserted here: that the deadline moved earlier, or that
+        // it is ahead of a `now` sampled after the response. Both compare a stamp
+        // from one call against a clock read in another, so a clock crossing a
+        // point in between flips them — a real flake for claims that are pure
+        // arithmetic, already pinned by `schedule::next_fire`'s own unit tests.
+        // What this test owns is the plumbing: the edit reaches the deadline.
         let res = put(serde_json::json!({
             "mode": "scheduled", "autoQuietSecs": 30,
             "scheduleTimes": ["06:00", "05:00"], "scheduleCatchup": true,
@@ -4191,13 +4196,13 @@ mod tests {
             .as_str()
             .expect("still armed")
             .to_string();
+        // Clock-free: parse the stamp and compare its time-of-day against the two
+        // fixture points. No `now` is read, so nothing here can race the clock.
+        let two_dt = chrono::DateTime::parse_from_rfc3339(&two).expect("RFC-3339");
+        let two_hhmmss = two_dt.time().format("%H:%M:%S").to_string();
         assert!(
-            two.contains("T05:00:00") || two.contains("T06:00:00"),
+            two_hhmmss == "05:00:00" || two_hhmmss == "06:00:00",
             "the deadline is one of the two configured points, got {two}"
-        );
-        assert!(
-            chrono::DateTime::parse_from_rfc3339(&two).unwrap() > chrono::Local::now(),
-            "and it is ahead of now, got {two}"
         );
 
         // Back to Manual: the line disappears — the header never advertises a

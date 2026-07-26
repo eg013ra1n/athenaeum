@@ -141,6 +141,9 @@ ul.log { list-style: none; margin: 0; padding: 0; max-height: 14rem; overflow-y:
 .chip.sched-time { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--accent); padding: 0.15rem 0.3rem 0.15rem 0.6rem; font-variant-numeric: tabular-nums; }
 .chip.sched-time .chipx { background: transparent; border: 0; color: inherit; font-size: 0.95rem; line-height: 1; padding: 0 0.15rem; cursor: pointer; border-radius: 6px; }
 .chip.sched-time .chipx:hover { background: var(--surface-hover); }
+/* "On schedule" picked but not saved yet (no send time to save it with). Lives
+   on the card, unlike the shared flash line the next message overwrites. */
+.sched-unsaved { color: var(--warning); font-size: 0.82rem; margin-top: 0.5rem; }
 /* The armed scheduled send, in the page header beside the free-space chips. */
 .next-send { white-space: nowrap; font-variant-numeric: tabular-nums; }
 /* The pending counter doubles as the tree toggle (collapsed by default). */

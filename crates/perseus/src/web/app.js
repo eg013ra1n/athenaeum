@@ -143,6 +143,9 @@ function renderTransfersTab() {
             <input id="schedCatchup" type="checkbox" /> Catch up a missed send at startup
           </label>
         </div>
+        <!-- The armed-but-unsaved marker (see schedArming). On the card itself,
+             not only in the shared flash line, which the next message overwrites. -->
+        <div id="schedUnsaved" class="sched-unsaved" hidden>On schedule is not saved yet — add a send time to apply it.</div>
       </div>
       <div class="flash" id="tosyncFlash"></div>
       <div id="pendingTree" hidden><div class="empty">nothing pending — all captures sent</div></div>
@@ -795,22 +798,42 @@ function wireRetention() {
 //
 // `scheduleTimes` mirrors the server's normalised `HH:MM` list and is the payload
 // every save PUTs. It is only ever REPLACED by a server response (the poll, or a
-// PUT echo) or by an explicit add/remove — so the page can never invent a schedule,
-// and can never PUT one it has not read. `sendModeSaving` counts PUTs in flight:
-// while one is, the poll must not repaint the card, or a tick landing between the
-// request and its response would visibly revert the operator's edit (and, worse,
-// leave the mutation staged against a stale list).
+// PUT echo) or by an explicit add/remove — so the page can never invent a schedule.
+// `sendCfgSeen` is what makes the other half of that claim — that the page can
+// never PUT a schedule it has not READ — actually hold. The boot value of
+// `scheduleTimes` is `[]`, and an empty list sent EXPLICITLY is a clear the server
+// honours; so if the first `/api/pending` never landed (agent restarting, page
+// opened offline) a plain save would erase the on-disk schedule with a 200. The
+// flag is set only where a server response paints the card (`applyModeControls`),
+// and until it is true the two schedule keys are OMITTED from the payload — the
+// backend's `Option` fields read absence as "leave the key alone".
+// `sendModeSaving` counts PUTs in flight: while one is, the poll must not repaint
+// the card, or a tick landing between the request and its response would visibly
+// revert the operator's edit (and, worse, leave the mutation staged against a
+// stale list).
 // `schedArming` covers the one state that is deliberately NOT saved: the operator
 // has picked "On schedule" on a node with no times yet. That PUT would be a 422
 // (the config refuses `scheduled` with an empty schedule) and the next poll would
 // snap the radio back to Immediately — collapsing the very editor they opened to
 // type a time into. While armed, the page holds the un-saved selection, the poll
-// leaves the card alone, and the first added time carries the mode switch with it.
+// leaves the card alone, `#schedUnsaved` says so ON THE CARD (the shared flash is
+// overwritten by the next message), and the first added time carries the mode
+// switch with it. It ends when a save carries the intent, or when the operator
+// picks another mode.
 let pendingCount = 0;
 let lastPendingJson = null;
 let scheduleTimes = [];
 let sendModeSaving = 0;
 let schedArming = false;
+let sendCfgSeen = false;
+
+// The single writer of `schedArming`, so the un-saved marker on the card can
+// never disagree with the flag the poll guard reads.
+function setSchedArming(on) {
+  schedArming = on;
+  const el = $('schedUnsaved');
+  if (el) el.hidden = !on;
+}
 
 // Which radio is selected. Read from the inputs (not from a remembered variable)
 // so it can never disagree with what the operator sees — and, since T14, it knows
@@ -885,6 +908,11 @@ function applyModeControls(mode, quietSecs, times, catchup) {
   if (document.activeElement !== $('quietSecs')) $('quietSecs').value = quietSecs;
   if (document.activeElement !== $('schedCatchup')) $('schedCatchup').checked = catchup !== false;
   scheduleTimes = normalizeTimes(times);
+  // This is the ONLY caller-agnostic proof the page has read the node's send
+  // config: every path into here (the poll, a PUT echo, the post-rejection
+  // re-sync) carries server values. From here on a save may speak about the
+  // schedule; before it, it must stay silent about it.
+  sendCfgSeen = true;
   updateModeVisibility();
   renderScheduleTimes();
   updateSendButton();
@@ -946,13 +974,21 @@ async function saveSendMode() {
   const edit = {
     mode: currentMode(),
     autoQuietSecs: Number($('quietSecs').value) || 0,
-    scheduleTimes: scheduleTimes.slice(),
-    scheduleCatchup: $('schedCatchup').checked,
   };
+  // Only speak about the schedule once it has been read. `scheduleTimes: []` is
+  // an explicit clear the server obeys, and the boot value IS `[]` — so a save
+  // made before the first successful read (agent restarting, page opened
+  // offline) would silently erase the operator's send times, with a 200. Absent
+  // keys mean "leave them alone" on the backend, which is the only truthful
+  // thing an unread page can say.
+  if (sendCfgSeen) {
+    edit.scheduleTimes = scheduleTimes.slice();
+    edit.scheduleCatchup = $('schedCatchup').checked;
+  }
   const f = $('tosyncFlash');
   // Whatever this save does, the un-saved arming state is over: the request now
   // carries the operator's intent, and its outcome (or the next poll) is truth.
-  schedArming = false;
+  setSchedArming(false);
   sendModeSaving++;
   try {
     const r = await api('/api/send-mode', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(edit) });
@@ -977,9 +1013,12 @@ async function saveSendMode() {
   finally { sendModeSaving--; }
 }
 
-// Re-read the send config and repaint the card UNCONDITIONALLY. The focus guard
-// in the poll exists to protect an edit in progress; this runs after an edit has
-// already been decided (and refused), so the guard would only preserve a fiction.
+// Re-read the send config and repaint the card without the poll's focus guard:
+// that guard protects an edit in progress, and this runs after an edit has
+// already been decided (and refused), so it would only preserve a fiction.
+// `applyModeControls` still leaves the two live inputs (`#quietSecs`,
+// `#schedCatchup`) alone if the caret is inside them — repainting under the
+// operator's fingers is a different hazard, and this path does not license it.
 async function resyncSendMode() {
   try {
     const m = await getJson('/api/send-mode');
@@ -1031,13 +1070,31 @@ async function sendNow() {
 }
 
 function wireTosync() {
+  // Start from the un-armed state, so the marker in the markup and the flag can
+  // only ever have been brought together by `setSchedArming`.
+  setSchedArming(false);
   document.querySelectorAll('input[name="sendMode"]').forEach((r) => r.addEventListener('change', () => {
+    const f = $('tosyncFlash');
+    if (currentMode() === 'scheduled' && !sendCfgSeen) {
+      // The node's schedule has not been read yet. Opening the editor now would
+      // show an empty list that is NOT the node's, and every edit made in it
+      // would speak about times the page has never seen. Undo the selection
+      // back to the un-painted card and say why.
+      $('modeScheduled').checked = false;
+      updateModeVisibility(); updateSendButton();
+      f.textContent = 'still reading the schedule on this node — try again in a moment';
+      f.className = 'flash';
+      return;
+    }
     updateModeVisibility(); updateSendButton();
-    if (currentMode() === 'scheduled' && !scheduleTimes.length) {
+    if (currentMode() !== 'scheduled') {
+      // Leaving the schedule abandons whatever was held un-saved with it — the
+      // save below carries the mode actually chosen.
+      setSchedArming(false);
+    } else if (!scheduleTimes.length) {
       // Hold the selection un-saved (see `schedArming`) and ask for the missing
       // piece instead of PUTting something the config would refuse.
-      schedArming = true;
-      const f = $('tosyncFlash');
+      setSchedArming(true);
       f.textContent = 'add at least one send time — the switch is saved with it';
       f.className = 'flash';
       $('schedAdd').focus();
