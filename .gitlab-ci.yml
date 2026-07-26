@@ -33,7 +33,11 @@ build:windows:
   needs: []
   cache:
     key: "main-windows"
-    policy: pull
+    # pull-push: each release refreshes the machine-local cache with the dep
+    # set it just built — a fresh runner machine warms itself on the first tag
+    # instead of building cold forever (the manual main-branch warmer compiles
+    # a months-stale dep tree and nobody remembers to run it).
+    policy: pull-push
     paths:
       - .cargo/registry/
       - .cargo/git/
@@ -90,7 +94,8 @@ build:linux:
       fi
   cache:
     key: "main-linux"
-    policy: pull
+    # pull-push: see build:windows — releases keep their own cache warm.
+    policy: pull-push
     paths:
       - .cargo/registry/
       - .cargo/git/
@@ -208,7 +213,8 @@ build:macos:
     - tags
   cache:
     key: "main-macos"
-    policy: pull
+    # pull-push: see build:windows — releases keep their own cache warm.
+    policy: pull-push
     paths:
       - .cargo/registry/
       - .cargo/git/
