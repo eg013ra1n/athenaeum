@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context, Result};
-use notify::{Event, RecursiveMode, Watcher as _};
+use anyhow::Result;
+use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher as _};
 use tokio::sync::mpsc;
 
 use crate::seen::{mtime_millis, SeenStore};
@@ -153,18 +153,37 @@ impl StabilityTracker {
 }
 
 /// Eligible capture files directly under or nested within `dir`, sorted.
+///
+/// Infallible by contract: a walk error (unreadable entry, or — the case that
+/// matters here — an offline network mount, where the *root itself* yields one
+/// `Err`) is logged and skipped, never propagated. Callers that want to notice
+/// a persistently failing sweep use [`scan_eligible_reporting`].
 fn scan_eligible(dir: &Path) -> Vec<PathBuf> {
+    scan_eligible_reporting(dir).0
+}
+
+/// [`scan_eligible`] plus the number of walk errors swallowed during the sweep.
+///
+/// The count is the offline-share signal: an unreachable mount makes
+/// `WalkDir` fail on the root, so the sweep returns `(vec![], 1)` rather than a
+/// legitimately empty directory's `(vec![], 0)`. The watcher loop uses that to
+/// emit a rate-limited warning instead of silently discovering nothing.
+fn scan_eligible_reporting(dir: &Path) -> (Vec<PathBuf>, usize) {
     let mut out = Vec::new();
+    let mut errors = 0usize;
     for entry in walkdir::WalkDir::new(dir).sort_by_file_name() {
         match entry {
             Ok(e) if e.file_type().is_file() && is_eligible(e.path()) => {
                 out.push(e.path().to_path_buf())
             }
             Ok(_) => {}
-            Err(e) => tracing::debug!(error = %e, "walk capture dir entry failed"),
+            Err(e) => {
+                errors += 1;
+                tracing::debug!(error = %e, "walk capture dir entry failed");
+            }
         }
     }
-    out
+    (out, errors)
 }
 
 /// FITS/XISF payload extensions Perseus enqueues. Case-insensitive.
@@ -207,10 +226,69 @@ impl WatcherHandle {
     }
 }
 
+/// How many consecutive failing poll sweeps pass between "capture dir sweep is
+/// failing" warnings. At the default 2s poll interval that is ~2 minutes — loud
+/// enough that an offline share is visible in the log, quiet enough that a NAS
+/// unplugged overnight does not fill the file.
+const SCAN_ERROR_WARN_EVERY_TICKS: u64 = 60;
+
+/// Arm a `notify` watcher on `capture_dir`, or `None` if the filesystem cannot
+/// provide one.
+///
+/// Establishing a watch fails on plenty of *supported* setups — SMB/NFS mounts
+/// most of all, but also inotify-instance exhaustion on Linux. That is not a
+/// fatal condition for this watcher: `notify` events only ever *seed* candidate
+/// paths, and the periodic tick runs a full `scan_eligible` sweep, so discovery
+/// is complete without any events at all. Returning `None` therefore means
+/// "poll-only mode", not "broken root" — the failure costs latency, never
+/// correctness.
+fn establish_watcher(
+    capture_dir: &Path,
+    raw_tx: mpsc::UnboundedSender<PathBuf>,
+) -> Option<RecommendedWatcher> {
+    // `notify`'s callback runs on its own thread; it only forwards eligible raw
+    // event paths to the async loop, which does all the stat'ing.
+    let sink = move |res: notify::Result<Event>| match res {
+        Ok(event) => {
+            for path in event.paths {
+                if is_eligible(&path) {
+                    let _ = raw_tx.send(path);
+                }
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "notify watcher error"),
+    };
+    let degrade = |error: notify::Error| {
+        tracing::warn!(
+            path = %capture_dir.display(),
+            %error,
+            "filesystem watch unavailable — running poll-only (normal for SMB/NFS mounts)"
+        );
+    };
+
+    let mut watcher = match notify::recommended_watcher(sink) {
+        Ok(w) => w,
+        Err(error) => {
+            degrade(error);
+            return None;
+        }
+    };
+    if let Err(error) = watcher.watch(capture_dir, RecursiveMode::Recursive) {
+        degrade(error);
+        return None;
+    }
+    Some(watcher)
+}
+
 /// Start watching `capture_dir` (recursively). Stable capture files are sent on
 /// `stable_tx` as `(owning_capture_dir, file_path)`; the consumer builds a
 /// package (with a `rel_path` relative to that capture dir) and enqueues it.
-/// Returns once the `notify` watcher is armed.
+/// Returns once the watcher task is spawned.
+///
+/// If the `notify` watch cannot be established (network filesystem, inotify
+/// limits) the root degrades to **poll-only mode** — a `warn!` and then normal
+/// service on the tick sweep alone — rather than failing. The `Result` is kept
+/// for call-site stability; it is currently always `Ok`.
 ///
 /// The owning capture dir is the *canonicalized* root this watcher watches (see
 /// the canonicalize note below): pairing it with each stable path lets the
@@ -229,32 +307,53 @@ pub fn spawn_watcher(
     stable_tx: mpsc::Sender<(PathBuf, PathBuf)>,
     seen_store: Arc<SeenStore>,
 ) -> Result<WatcherHandle> {
+    Ok(spawn_watcher_with_options(
+        capture_dir,
+        stability,
+        poll_interval,
+        stable_tx,
+        seen_store,
+        false,
+    ))
+}
+
+/// [`spawn_watcher`]'s body, with the poll-only degradation forceable.
+///
+/// `force_poll_only` skips watch establishment entirely, which is exactly the
+/// state a failed `watch()` leaves the loop in. It exists so the poll-only path
+/// is testable deterministically, without depending on how a given platform's
+/// `notify` backend reacts to a contrived path. Production always passes
+/// `false` and reaches poll-only via a genuine establishment failure.
+fn spawn_watcher_with_options(
+    capture_dir: PathBuf,
+    stability: Duration,
+    poll_interval: Duration,
+    stable_tx: mpsc::Sender<(PathBuf, PathBuf)>,
+    seen_store: Arc<SeenStore>,
+    force_poll_only: bool,
+) -> WatcherHandle {
     // Canonicalize the watched root so both discovery sources — `notify` events
     // and the directory poll — speak the same path spelling. Without this, macOS
     // reports `notify` paths under `/private/var/...` while a walkdir of a
     // `/var/...` tempdir yields the other spelling of the same file, and the two
     // would be tracked (and enqueued) as two distinct files.
+    //
+    // An unreachable/absent root simply keeps its configured spelling here; the
+    // poll sweep retries it every tick, so a share that mounts later is picked
+    // up without a restart.
     let capture_dir = std::fs::canonicalize(&capture_dir).unwrap_or(capture_dir);
 
-    // `notify`'s callback runs on its own thread; forward raw event paths into
-    // the async task over an unbounded channel (a bounded one could deadlock the
-    // fs-event thread).
+    // Raw event paths cross from `notify`'s own thread into the async task over
+    // an unbounded channel (a bounded one could deadlock the fs-event thread).
     let (raw_tx, mut raw_rx) = mpsc::unbounded_channel::<PathBuf>();
-    let mut watcher =
-        notify::recommended_watcher(move |res: notify::Result<Event>| match res {
-            Ok(event) => {
-                for path in event.paths {
-                    if is_eligible(&path) {
-                        let _ = raw_tx.send(path);
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "notify watcher error"),
-        })
-        .context("create filesystem watcher")?;
-    watcher
-        .watch(&capture_dir, RecursiveMode::Recursive)
-        .with_context(|| format!("watch capture dir {}", capture_dir.display()))?;
+    let watcher = if force_poll_only {
+        None
+    } else {
+        establish_watcher(&capture_dir, raw_tx)
+    };
+    // No watcher → no events will ever arrive; the loop runs on the tick sweep
+    // alone (see `establish_watcher`).
+    let watch_active = watcher.is_some();
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -302,8 +401,14 @@ pub fn spawn_watcher(
             stability_secs = stability.as_secs(),
             baseline = baseline.len(),
             baseline_new,
+            poll_only = !watch_active,
             "capture watcher armed"
         );
+
+        // Consecutive poll sweeps that hit walk errors (offline share). Warns are
+        // rate-limited off this counter and it resets — silently, no error state
+        // to clear — the moment a sweep succeeds again.
+        let mut failing_sweeps: u64 = 0;
 
         loop {
             tokio::select! {
@@ -311,7 +416,10 @@ pub fn spawn_watcher(
                     tracing::info!("capture watcher stopping");
                     break;
                 }
-                Some(path) = raw_rx.recv() => {
+                // Disabled outright in poll-only mode: with no watcher the raw
+                // sender is already dropped, and an always-`None` branch would
+                // be polled on every select! turn for nothing.
+                Some(path) = raw_rx.recv(), if watch_active => {
                     // notify gives low-latency discovery. Canonicalize so the
                     // path matches the poll's spelling (see the note in
                     // `spawn_watcher`); skip if it vanished or is already handled.
@@ -328,10 +436,33 @@ pub fn spawn_watcher(
                     // events (FSEvents on macOS, and NAS/SMB/NFS where core's
                     // monitor eschews watchers entirely). Rescanning each tick
                     // guarantees new files are discovered even if no event fired.
-                    for path in scan_eligible(&capture_dir) {
+                    // In poll-only mode this is the ONLY discovery path.
+                    let (found, scan_errors) = scan_eligible_reporting(&capture_dir);
+                    for path in found {
                         if !tracker.contains_emitted(&path) {
                             candidates.insert(path);
                         }
+                    }
+
+                    // An offline share fails the sweep every tick; say so once
+                    // per SCAN_ERROR_WARN_EVERY_TICKS rather than every 2s, and
+                    // recover with a single line when the mount comes back.
+                    if scan_errors > 0 {
+                        if failing_sweeps % SCAN_ERROR_WARN_EVERY_TICKS == 0 {
+                            tracing::warn!(
+                                path = %capture_dir.display(),
+                                count = scan_errors,
+                                "capture dir sweep failing — mount may be offline"
+                            );
+                        }
+                        failing_sweeps += 1;
+                    } else if failing_sweeps > 0 {
+                        tracing::info!(
+                            path = %capture_dir.display(),
+                            count = failing_sweeps,
+                            "capture dir sweep recovered"
+                        );
+                        failing_sweeps = 0;
                     }
 
                     // Re-stat every candidate: a growing file resets its window,
@@ -388,7 +519,7 @@ pub fn spawn_watcher(
         }
     });
 
-    Ok(WatcherHandle { shutdown_tx, join })
+    WatcherHandle { shutdown_tx, join }
 }
 
 #[cfg(test)]
@@ -474,6 +605,84 @@ mod tests {
         t.forget(&p);
         assert_eq!(t.pending_len(), 0);
         assert!(t.collect_stable(t0 + Duration::from_secs(10)).is_empty());
+    }
+
+    /// Poll-only mode, forced deterministically (no dependence on how a given
+    /// platform's `notify` backend reacts to an odd path): a file created
+    /// *after* spawn is still discovered and emitted by the tick sweep alone.
+    #[tokio::test]
+    async fn poll_only_mode_discovers_new_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let capture = tmp.path().join("capture");
+        std::fs::create_dir_all(&capture).unwrap();
+        let seen = Arc::new(SeenStore::open(tmp.path().join("perseus.db")).unwrap());
+        let (tx, mut rx) = mpsc::channel::<(PathBuf, PathBuf)>(8);
+
+        let handle = spawn_watcher_with_options(
+            capture.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            tx,
+            seen,
+            /* force_poll_only = */ true,
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        std::fs::write(capture.join("l1.fits"), b"data").unwrap();
+
+        let (dir, file) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("poll fallback must find the file")
+            .expect("stable-file channel closed");
+        assert!(
+            file.ends_with("l1.fits"),
+            "unexpected stable file: {}",
+            file.display()
+        );
+        assert!(
+            file.starts_with(&dir),
+            "emitted file must sit under the reported capture dir"
+        );
+        handle.shutdown().await;
+    }
+
+    /// A capture root whose `notify` watch cannot be established (here: the
+    /// directory does not exist at spawn — the portable stand-in for the
+    /// SMB/NFS case where `watch()` errors) must NOT kill the watcher. The
+    /// per-tick `scan_eligible` sweep is a complete discovery path on its own,
+    /// so the root degrades to poll-only and still emits files that appear
+    /// later.
+    #[tokio::test]
+    async fn unwatchable_dir_degrades_to_poll_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seen = Arc::new(SeenStore::open(tmp.path().join("perseus.db")).unwrap());
+        // Does not exist yet → notify's `watch()` fails for this path.
+        let capture = tmp.path().join("capture");
+        let (tx, mut rx) = mpsc::channel::<(PathBuf, PathBuf)>(8);
+
+        let handle = spawn_watcher(
+            capture.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            tx,
+            seen,
+        )
+        .expect("an unwatchable capture dir must degrade, not fail the spawn");
+
+        // The mount "comes back": the directory and a capture file appear.
+        std::fs::create_dir_all(&capture).unwrap();
+        std::fs::write(capture.join("l1.fits"), b"data").unwrap();
+
+        let (_dir, file) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("poll fallback must find the file")
+            .expect("stable-file channel closed");
+        assert!(
+            file.ends_with("l1.fits"),
+            "unexpected stable file: {}",
+            file.display()
+        );
+        handle.shutdown().await;
     }
 
     #[test]
