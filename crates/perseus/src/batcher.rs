@@ -613,10 +613,13 @@ pub fn spawn_batcher(
                                 // T12 note: `Scheduled` is inert here on purpose —
                                 // this arm is the AUTO quiet timer, and the
                                 // scheduler's own wall-clock arm is T13. Until it
-                                // lands, scheduled mode behaves as manual (files
-                                // accumulate; the web "Send now" button flushes),
-                                // which is the safe degradation: nothing sends
-                                // early, nothing is lost.
+                                // lands, scheduled mode behaves as manual: files
+                                // accumulate and only an explicit flush ships them
+                                // (`POST /api/send-now` works in this mode; the web
+                                // page hides its own button until the scheduler UI
+                                // lands, so the interim flush path is the route, or
+                                // switching mode back in the TOML). Safe
+                                // degradation: nothing sends early, nothing is lost.
                                 Mode::Manual | Mode::Scheduled => None,
                                 Mode::Auto => rearm(&loop_pending, &cfg),
                             };

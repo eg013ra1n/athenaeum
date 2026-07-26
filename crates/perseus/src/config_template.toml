@@ -10,8 +10,12 @@ auto_quiet_secs = 60     # auto: flush after N seconds with no new file
 
 # scheduled mode: wall-clock send times in THIS device's local time, "HH:MM".
 # Capture all night, ship once when the uplink is free. Required (at least one
-# entry) when mode = "scheduled"; ignored in the other modes. The web page's
-# "Send N pending now" button keeps working in every mode.
+# entry) when mode = "scheduled"; ignored in the other modes.
+# INTERIM: set "scheduled" HERE, not on the web page. The page has no scheduler
+# controls yet — it shows "scheduled" as Auto, hides its "Send N pending now"
+# button, and saving that panel rewrites mode back to "auto". The manual flush
+# itself (POST /api/send-now) does work in scheduled mode; only the button that
+# calls it is hidden. Both gaps close when the scheduler settings page lands.
 # schedule_times = ["06:00", "14:30"]
 # If a send time passes while Perseus is not running, send once at startup
 # instead of waiting for the next one. One catch-up send, never one per missed

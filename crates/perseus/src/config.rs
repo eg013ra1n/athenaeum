@@ -764,15 +764,25 @@ impl Config {
     /// window). The batcher (Task 4) and web page (Task 6) read this rather than
     /// the whole [`Config`], so a live edit can be published on a `watch` channel.
     pub fn send_cfg(&self) -> SendCfg {
+        // A validated config has no malformed entries (validation runs the same
+        // parser and refuses the file otherwise). Should a Config be hand-built
+        // past validation, degrading to "no points" makes the batcher DISARM —
+        // the honest failure — instead of firing at a guessed time. Unreachable
+        // in production, but a disarmed scheduler must never be silent.
+        let schedule_times = match self.schedule_points() {
+            Ok(points) => points,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "schedule_times unparseable in send_cfg — scheduler disarmed"
+                );
+                Vec::new()
+            }
+        };
         SendCfg {
             mode: self.mode,
             auto_quiet_secs: self.auto_quiet_secs,
-            // A validated config has no malformed entries (validation runs the
-            // same parser and refuses the file otherwise). Should a Config be
-            // hand-built past validation, degrading to "no points" makes the
-            // batcher DISARM — the honest failure — instead of firing at a
-            // guessed time.
-            schedule_times: self.schedule_points().unwrap_or_default(),
+            schedule_times,
             schedule_catchup: self.schedule_catchup,
         }
     }

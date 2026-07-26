@@ -38,18 +38,21 @@
 use anyhow::{bail, Result};
 use chrono::{DateTime, Days, LocalResult, NaiveDate, TimeDelta, TimeZone};
 
-/// How many days ahead [`next_fire_in`] will look for a valid point. One day is
-/// enough for any sane schedule (every point repeats daily); the margin only
-/// exists so a pathological zone/date arithmetic failure degrades to `None`
-/// instead of looping.
+/// How many days *past today* [`next_fire_in`] will look for a valid point: the
+/// scan runs `0..=MAX_LOOKAHEAD_DAYS`, i.e. today plus this many following
+/// dates. Today plus one day is enough for any sane schedule (every point
+/// repeats daily); the rest of the margin only exists so a pathological
+/// zone/date arithmetic failure degrades to `None` instead of looping.
 const MAX_LOOKAHEAD_DAYS: u64 = 8;
 
-/// How many days back [`missed_point_in`] scans. Two is provably enough: every
-/// schedule point repeats daily, so if *any* point falls in `(last_fire, now]`
-/// then either today's or yesterday's does — yesterday's points are all earlier
-/// than today's midnight and therefore `<= now`, and if a point three days back
-/// were inside the window, yesterday's (being later) would be inside it too. The
-/// extra day is slack for zone-offset edges.
+/// How many days *before today* [`missed_point_in`] scans: the scan runs
+/// `0..=MAX_LOOKBACK_DAYS`, i.e. today plus this many earlier dates. Today plus
+/// yesterday is provably enough: every schedule point repeats daily, so if *any*
+/// point falls in `(last_fire, now]` then either today's or yesterday's does —
+/// yesterday's points are all earlier than today's midnight and therefore
+/// `<= now`, and if a point three days back were inside the window, yesterday's
+/// (being later) would be inside it too. The third date is slack for zone-offset
+/// edges.
 const MAX_LOOKBACK_DAYS: u64 = 2;
 
 /// Minute-by-minute probe budget for walking out of a DST gap. Real gaps are
@@ -139,8 +142,8 @@ fn resolve_point<Tz: TimeZone>(
 
 /// The next schedule point strictly after `now`, in `now`'s own time zone.
 ///
-/// `None` when `times` is empty (or nothing resolvable was found within
-/// `MAX_LOOKAHEAD_DAYS`). Returning an `Option` rather than a fabricated
+/// `None` when `times` is empty (or nothing resolvable was found in the
+/// `MAX_LOOKAHEAD_DAYS` scan window). Returning an `Option` rather than a fabricated
 /// timestamp is deliberate: "no schedule points" must **disarm** the batcher's
 /// timer, and a caller that has to unwrap a value cannot express that. It also
 /// maps 1:1 onto the batcher's existing `deadline: Option<Instant>`.
@@ -479,8 +482,14 @@ mod tests {
             "", "6", "24:00", "06:60", "6h05", "06:5", "-1:00", "06:00:00", "aa:bb",
         ] {
             let err = parse_hhmm(bad).unwrap_err().to_string();
+            // Match the QUOTED input token, not a bare substring: every message
+            // ends with the hint `(e.g. "06:00")`, so a digit-only input like
+            // "6" would satisfy `err.contains(bad)` without the message ever
+            // naming it. `"6"` (with the quotes) appears only where the parser
+            // echoes the operator's own string back.
+            let quoted = format!("\"{bad}\"");
             assert!(
-                err.contains(bad) || bad.is_empty(),
+                err.contains(&quoted),
                 "error for {bad:?} must name the offending value, got: {err}"
             );
         }
