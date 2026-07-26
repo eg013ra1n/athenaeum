@@ -107,6 +107,7 @@ use crate::resend::{self, is_declined};
 use crate::run::delete_package_sources;
 use crate::seen::SeenStore;
 use crate::supervisor::AgentState;
+use crate::watcher::WatcherForget;
 
 mod account_api;
 use account_api::*;
@@ -218,6 +219,14 @@ pub struct WebState {
     /// A placeholder (no receivers) while detached — sends are harmless no-ops —
     /// and, like `retention_tx`, left as-is on detach rather than cleared.
     pub send_cfg_tx: RwLock<watch::Sender<SendCfg>>,
+    /// The running watchers' aggregate forget handle (0.5.1 T9b), threaded in
+    /// from the agent on attach. Both deletion routes (`POST /api/library/delete`
+    /// and `POST /api/delete-files`) hand it the paths they removed, so a frame
+    /// re-copied to a deleted path is enqueued again in the SAME process run —
+    /// the stamped seen row alone cannot do that, because the watcher drops an
+    /// already-emitted path before it ever consults the store. Empty while
+    /// detached (no watchers to correct), which is a silent no-op.
+    pub watcher_forget: RwLock<WatcherForget>,
     /// The running agent's shared iroh node, threaded in on attach (W1 T1.6).
     /// `PUT /api/upload-limit` calls
     /// [`SharedIrohNode::set_upload_limit`] on it so an upload-cap edit takes
@@ -289,6 +298,10 @@ impl WebState {
             // Placeholder send-config channel (no receivers) until `attach` swaps
             // in the running batcher's real sender — mirrors `retention_tx`.
             send_cfg_tx: RwLock::new(watch::channel(send_cfg).0),
+            // No watchers until the agent arms them (`attach`); a detached
+            // delete's forget is a no-op, which is correct — there is no emitted
+            // set to correct.
+            watcher_forget: RwLock::new(WatcherForget::none()),
             // No node until the agent binds one (`attach`); an upload-limit edit
             // meanwhile is persisted and applied at the next startup.
             node: RwLock::new(None),
@@ -319,6 +332,7 @@ impl WebState {
         running_targets: Vec<String>,
         batcher: Option<BatcherHandle>,
         send_cfg_tx: watch::Sender<SendCfg>,
+        watcher_forget: WatcherForget,
         node: Option<Arc<SharedIrohNode>>,
     ) {
         *self.engine.write().await = engine;
@@ -332,6 +346,7 @@ impl WebState {
         *self.running_targets.write().await = running_targets;
         *self.batcher.write().await = batcher;
         *self.send_cfg_tx.write().await = send_cfg_tx;
+        *self.watcher_forget.write().await = watcher_forget;
         *self.node.write().await = node;
     }
 
@@ -368,6 +383,9 @@ impl WebState {
         // a detached page's send-now is an honest no-op. `send_cfg_tx` is left
         // as-is (a harmless stale sender) exactly like `retention_tx`.
         *self.batcher.write().await = None;
+        // The watchers die with the agent, so their forget channels are closed
+        // senders: drop them rather than keep sending into the void.
+        *self.watcher_forget.write().await = WatcherForget::none();
         // The node dies with the agent (its endpoint + device-key lock are torn
         // down on shutdown): drop our handle so a detached upload-limit edit is an
         // honest file-only write, applied when the next agent binds.
@@ -2160,6 +2178,9 @@ async fn api_library_delete(
     }
 
     let batcher = state.batcher.read().await.clone();
+    // Cloned out of the lock, like `batcher`: the pass runs on a blocking thread
+    // and re-arms the running watchers for every path it unlinks (T9b).
+    let watcher_forget = state.watcher_forget.read().await.clone();
     let store = Arc::clone(&state.store);
     let seen = Arc::clone(&state.seen);
     let report = tokio::task::spawn_blocking(move || {
@@ -2168,6 +2189,7 @@ async fn api_library_delete(
             seen: &seen,
             batcher: batcher.as_ref(),
             actor: crate::run::MANUAL_WEB_ACTOR,
+            watcher_forget: &watcher_forget,
         };
         crate::library::delete_perform(&plan, &ctx)
     })
@@ -2879,12 +2901,14 @@ async fn api_delete_files(
 
     // Allowed: delete every live source through the shared safety contract.
     let peer_device = state.peer_device.read().await.clone();
+    let watcher_forget = state.watcher_forget.read().await.clone();
     let detail = match delete_package_sources(
         &*state.store,
         &state.seen,
         Path::new(&batch.package_ref),
         "deleted_manual",
         &peer_device,
+        &watcher_forget,
     ) {
         Ok(d) => d,
         Err(e) => {
@@ -3523,6 +3547,9 @@ mod tests {
             batcher: RwLock::new(None),
             batches,
             send_cfg_tx: RwLock::new(watch::channel(config.send_cfg()).0),
+            // No capture watcher in the harness: the forget fan-out is a no-op,
+            // exactly as on a detached node.
+            watcher_forget: RwLock::new(WatcherForget::none()),
             // No iroh node in the harness (loopback transports bind none): an
             // upload-limit edit is file-only here, `appliedLive: false`.
             node: RwLock::new(None),
@@ -6009,6 +6036,9 @@ mod tests {
             device_names: RwLock::new(HashMap::new()),
             running_dirs: RwLock::new(config.capture_dirs_resolved()),
             running_targets: RwLock::new(config.targets.clone()),
+            // No capture watcher in the harness: the forget fan-out is a no-op,
+            // exactly as on a detached node.
+            watcher_forget: RwLock::new(WatcherForget::none()),
             batcher: RwLock::new(Some(batcher)),
             batches: Arc::clone(&batches),
             send_cfg_tx: RwLock::new(send_cfg_tx),
@@ -7531,6 +7561,79 @@ mod tests {
             state.seen.should_enqueue(&abs, size, mtime_ms).unwrap(),
             "a file that reappears after a delete is a NEW capture and must be sent"
         );
+    }
+
+    /// §2 row 4, the other half — the same reappear case with a RUNNING WATCHER,
+    /// which is the half that actually decides whether the frame is sent again.
+    ///
+    /// The stamped seen row proven by the test above is necessary and not
+    /// sufficient: both of the watcher's discovery paths drop a path they have
+    /// already emitted BEFORE consulting the store, so on a Pi that runs for
+    /// weeks the re-copied frame would never be enqueued again. Here the delete
+    /// goes through the route with the watcher's forget channel attached exactly
+    /// as the supervisor attaches it, and the re-created file must be emitted a
+    /// second time within the same process run.
+    #[tokio::test]
+    async fn library_delete_lets_a_running_watcher_send_the_recreation_again() {
+        use std::time::Duration;
+
+        let (state, _tmp, cap) = library_test_state().await;
+
+        let (stable_tx, mut stable_rx) = tokio::sync::mpsc::channel::<(PathBuf, PathBuf)>(8);
+        // Poll-only: discovery on the tick sweep alone is complete and
+        // deterministic, and it keeps the test off a real FSEvents/inotify watch.
+        let watcher = crate::watcher::spawn_watcher_with_options(
+            cap.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            stable_tx,
+            Arc::clone(&state.seen),
+            /* force_poll_only = */ true,
+        );
+        // Exactly what `WebState::attach` does with the agent's aggregate.
+        *state.watcher_forget.write().await = WatcherForget::new(vec![watcher.forget_sender()]);
+
+        let abs = write_file(&cap, "a.fits", b"0123456789");
+        let (_dir, first) = tokio::time::timeout(Duration::from_secs(5), stable_rx.recv())
+            .await
+            .expect("the watcher must emit the new capture")
+            .expect("stable-file channel closed");
+        assert_eq!(first, abs);
+
+        // Record it as the enqueue path does: without the route's `mark_deleted`
+        // the durable store would dedup the stat-identical recreation below, so
+        // this keeps BOTH halves of the reappear row under test.
+        let meta = std::fs::metadata(&abs).unwrap();
+        state
+            .seen
+            .mark_enqueued(
+                &abs,
+                meta.len(),
+                crate::seen::mtime_millis(meta.modified().ok()),
+                "/pkg/u1",
+            )
+            .unwrap();
+
+        let app = build_router(Arc::clone(&state), None);
+        let v = body_json(
+            post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(serde_json::json!([{ "root": 0, "rel": "a.fits" }]), true),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(outcome_of(&v, "a.fits")["kind"], "deleted");
+
+        // Re-copied from the camera media, same bytes at the same path.
+        std::fs::write(&abs, b"0123456789").unwrap();
+        let (_dir, again) = tokio::time::timeout(Duration::from_secs(5), stable_rx.recv())
+            .await
+            .expect("a re-created capture must be enqueued again in the same run")
+            .expect("stable-file channel closed");
+        assert_eq!(again, abs, "the same path, discovered a second time");
+        watcher.shutdown().await;
     }
 
     /// §2 row 7 — **directory delete**: recursive, one file's failure never

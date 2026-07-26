@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 use crate::batcher::BatcherHandle;
 use crate::config::{Config, RetentionConfig, SendCfg};
 use crate::run::Agent;
+use crate::watcher::WatcherForget;
 use crate::web::RetentionRunRecord;
 
 /// The observable lifecycle state of the capture node, published on a
@@ -105,6 +106,14 @@ pub trait ManagedAgent: Send + 'static {
     /// The send-config live-edit sender (the web `PUT /api/send-mode` writes here
     /// so the running batcher live-applies an Auto↔Manual / quiet-window change).
     fn send_cfg_tx(&self) -> watch::Sender<SendCfg>;
+    /// The running watchers' aggregate forget handle (0.5.1 T9b) — the web
+    /// deletion routes hand it every path they removed so a re-capture at that
+    /// path is enqueued again without a restart. Defaults to the empty aggregate
+    /// (like [`node`](Self::node)) so fakes and the watch-less injection path
+    /// need no impl; an empty one is a silent no-op.
+    fn watcher_forget(&self) -> WatcherForget {
+        WatcherForget::none()
+    }
     /// The running agent's shared iroh node (W1 T1.6). The web
     /// `PUT /api/upload-limit` calls
     /// [`set_upload_limit`](athenaeum_core::sharing::iroh::node::SharedIrohNode::set_upload_limit)
@@ -158,6 +167,9 @@ impl ManagedAgent for Agent {
     }
     fn send_cfg_tx(&self) -> watch::Sender<SendCfg> {
         Agent::send_cfg_tx(self)
+    }
+    fn watcher_forget(&self) -> WatcherForget {
+        Agent::watcher_forget(self)
     }
     fn node(&self) -> Option<Arc<SharedIrohNode>> {
         Agent::node(self)
@@ -559,6 +571,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
                     let retention_log = agent.retention_log();
                     let batcher = agent.batcher();
                     let send_cfg_tx = agent.send_cfg_tx();
+                    let watcher_forget = agent.watcher_forget();
                     let node = agent.node();
                     let device_names = PairingCache::load(&data_dir).device_names;
                     // The dirs + targets the engine was launched over — read from
@@ -586,6 +599,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
                             running_targets,
                             batcher,
                             send_cfg_tx,
+                            watcher_forget,
                             node,
                         )
                         .await;

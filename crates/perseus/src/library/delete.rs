@@ -23,7 +23,7 @@
 //! | file is `queued` | taken out of the batcher pending set **first**, then unlinked — the next auto/scheduled flush never sees it; a delete that then fails puts it back | [`delete_perform`] step 1 |
 //! | file is in an **in-flight** batch | deleted anyway; the transfer completes from the package's payload *copy*. The preview NAMES the batch so the operator knows | `in_flight_batches` |
 //! | file was in a **confirmed** batch | deleted freely; that batch's re-send degrades to its eligible subset later | `confirmed_batches` |
-//! | file **reappears** later | [`SeenStore::mark_deleted`] stamps the row, and [`SeenStore::should_enqueue`] treats anything found at a stamped path as new | [`delete_perform`] step 4 |
+//! | file **reappears** later | [`SeenStore::mark_deleted`] stamps the row, and [`SeenStore::should_enqueue`] treats anything found at a stamped path as new; the running watchers are told to un-emit the path, so the recreation is discovered in this run and not only after a restart | [`delete_perform`] step 4 + [`WatcherForget`](crate::watcher::WatcherForget) |
 //! | delete races a flush | already safe — the batcher drops vanished files with a `warn!` | batcher |
 //! | directory delete | recursive, files first by the rules above, then empty dirs deepest-first; one file's failure never strands its siblings | [`delete_perform`] |
 //! | audit | one `sync_history` row per deleted file, written BEFORE the unlink | [`write_deletion_audit`] |
@@ -178,6 +178,11 @@ pub struct DeleteContext<'a> {
     /// (`deleted_<actor>`); the web browser passes `run::MANUAL_WEB_ACTOR`
     /// (`"manual-web"`).
     pub actor: &'a str,
+    /// Every running watcher's forget channel — the in-process half of the
+    /// reappear row. A stamped seen row alone does not heal this run: the
+    /// watcher drops a path it has already emitted BEFORE it ever consults the
+    /// store. Empty while detached (no watchers to correct), which is a no-op.
+    pub watcher_forget: &'a crate::watcher::WatcherForget,
 }
 
 /// One file the pass will try to unlink.
@@ -589,6 +594,14 @@ pub fn delete_preview(
 ///    reappear row). A failure here is logged, not fatal: the file is already
 ///    gone and audited.
 ///
+/// Once every file has been through those four steps, the pass makes ONE batched
+/// [`WatcherForget::forget`](crate::watcher::WatcherForget::forget) call carrying
+/// every path it actually unlinked. That is the in-process second half of step 4:
+/// the watcher skips paths it has already emitted *before* it consults the seen
+/// store, so without it a re-capture at a deleted path is invisible — no error,
+/// no log — until the agent restarts. Batched per pass rather than per file so a
+/// 200-frame directory delete costs one message per watcher, not 200.
+///
 /// One file's failure never stops the pass — the operator asked for a set, and a
 /// permission hole on one frame must not strand the other ninety-nine.
 ///
@@ -605,6 +618,11 @@ pub fn delete_preview(
 /// drops it with a `warn!` anyway.
 pub fn delete_perform(plan: &DeletePlan, ctx: &DeleteContext<'_>) -> DeleteReport {
     let mut report = DeleteReport::default();
+    // Paths that are genuinely gone from disk, for the one batched forget below.
+    // Only successful unlinks: a file that survived the pass (a failed unlink, an
+    // unwritable audit) is still there and still emitted, and re-arming discovery
+    // for it would re-send a file that was already sent.
+    let mut unlinked: Vec<PathBuf> = Vec::new();
 
     for file in &plan.files {
         let path = file.path.as_path();
@@ -626,6 +644,7 @@ pub fn delete_perform(plan: &DeletePlan, ctx: &DeleteContext<'_>) -> DeleteRepor
             Ok(size) => {
                 tracing::info!(path = %path.display(), size, actor = ctx.actor, "library delete");
                 report.deleted_paths.push(path.display().to_string());
+                unlinked.push(file.path.clone());
                 report.items.push(DeleteOutcomeItem {
                     rel: file.rel.clone(),
                     root: file.root,
@@ -647,6 +666,11 @@ pub fn delete_perform(plan: &DeletePlan, ctx: &DeleteContext<'_>) -> DeleteRepor
             }
         }
     }
+
+    // Step 4's in-process half, once for the whole pass: the paths are
+    // `PlanFile::path` — canonical parent + own name — which is exactly the
+    // spelling the watcher's tracker keys on (see `WatcherForget`'s contract).
+    ctx.watcher_forget.forget(unlinked);
 
     // The plan's refusals and already-gone entries are outcomes too — reported
     // after the files that were acted on, matching [`delete_preview`]'s order so
@@ -811,6 +835,14 @@ mod tests {
 
     impl Stores {
         fn perform(&self, plan: &DeletePlan) -> DeleteReport {
+            self.perform_with_forget(plan, &crate::watcher::WatcherForget::none())
+        }
+
+        fn perform_with_forget(
+            &self,
+            plan: &DeletePlan,
+            watcher_forget: &crate::watcher::WatcherForget,
+        ) -> DeleteReport {
             delete_perform(
                 plan,
                 &DeleteContext {
@@ -820,6 +852,7 @@ mod tests {
                     // simply has no pending set to clear.
                     batcher: None,
                     actor: "test",
+                    watcher_forget,
                 },
             )
         }
@@ -1035,6 +1068,72 @@ mod tests {
         assert_eq!(rows.len(), 1, "the audit landed first");
         assert_eq!(rows[0].outcome, "deleted_test");
         assert_eq!(rows[0].bytes, 10);
+    }
+
+    /// §2's reappear row, in-process half (T9b): the pass hands every path it
+    /// UNLINKED to the watchers, batched into one message — and nothing else.
+    ///
+    /// A file that survived the pass must not be forgotten: it is still on disk
+    /// and still emitted, so re-arming discovery for it would re-send a file that
+    /// was already sent. The failure is produced the same way
+    /// [`the_audit_row_is_written_before_the_unlink`] produces it (an unwritable
+    /// parent), so the two agree on what "the unlink really failed" means.
+    #[cfg(unix)]
+    #[test]
+    fn a_performed_pass_forgets_exactly_the_paths_it_unlinked() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, config, cap) = test_config(false);
+        let gone = write(&cap, "gone.fits", b"0123456789");
+        let locked = cap.join("locked");
+        let survivor = write(&cap, "locked/stays.fits", b"0123456789");
+        let plan = plan_deletion(
+            &config,
+            &[item("gone.fits", false), item("locked/stays.fits", false)],
+        )
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
+        let forget = crate::watcher::WatcherForget::new(vec![tx]);
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let s = stores(&config);
+        let report = s.perform_with_forget(&plan, &forget);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!gone.exists() && survivor.exists(), "{report:?}");
+        let batch = rx.try_recv().expect("one batched forget for the pass");
+        assert_eq!(
+            batch,
+            vec![gone],
+            "only the unlinked path is forgotten — a surviving file is still emitted, \
+             and re-arming it would re-send a file that was already sent"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "batched per pass, not one message per file"
+        );
+    }
+
+    /// A pass that unlinks nothing sends nothing — no empty broadcasts.
+    #[test]
+    fn a_pass_that_deletes_nothing_sends_no_forget() {
+        let (_tmp, config, cap) = test_config(true);
+        write(&cap, ".perseus/secret.db", b"x");
+        let plan = plan_deletion(&config, &[item(".perseus/secret.db", false)]).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
+        let s = stores(&config);
+        let report = s.perform_with_forget(&plan, &crate::watcher::WatcherForget::new(vec![tx]));
+
+        assert!(matches!(
+            report.items[0].outcome,
+            DeleteOutcomeDto::Refused { .. }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing was deleted, nothing to arm"
+        );
     }
 
     /// The wire shapes T10 switches on. `kind` is one field for every arm.

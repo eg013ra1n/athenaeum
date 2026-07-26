@@ -49,7 +49,7 @@ use crate::batch_store::BatchStore;
 use crate::batcher::{spawn_batcher, BatcherHandle};
 use crate::config::{Config, RetentionConfig, SendCfg};
 use crate::seen::{SeenStore, SourceLink};
-use crate::watcher::{self, WatcherHandle};
+use crate::watcher::{self, WatcherForget, WatcherHandle};
 use crate::web::RetentionRunRecord;
 
 /// Parse a pairing ticket string into its `EndpointTicket`. Factored out so the
@@ -569,6 +569,13 @@ pub struct Agent {
     /// false). All watchers feed the single enqueue pipeline; graceful shutdown
     /// drops ALL of them before draining the consumer.
     watchers: Vec<WatcherHandle>,
+    /// One forget channel per running watcher, aggregated (0.5.1 T9b). Every
+    /// deletion path — the retention loop below, and the web library route via
+    /// [`WebState`](crate::web::WebState) — hands the paths it removed to this so
+    /// the watchers stop treating them as already-emitted. Without it a frame
+    /// re-copied to a deleted path is silently never sent again until the process
+    /// restarts. Empty (a no-op) when `watch` is false: no watchers exist.
+    watcher_forget: WatcherForget,
     /// The batcher loop's task (Sync Phase 2): accumulates the watcher's stable
     /// files and flushes them as one package per batch. `Some` only on the
     /// `watch` path (there is no batcher in enqueue-backlog mode). Replaces the
@@ -871,7 +878,7 @@ impl Agent {
         // harmless no-op), matching the retention_tx pattern above.
         let (send_cfg_tx, send_cfg_rx) = watch::channel(config.send_cfg());
 
-        let (watchers, batcher_task, batcher, retention_task) = if watch {
+        let (watchers, watcher_forget, batcher_task, batcher, retention_task) = if watch {
             // Each stable file is paired with the (canonicalized) capture dir it
             // came from, so the consumer can compute a capture-dir-relative
             // rel_path (with a per-dir label when watching more than one root).
@@ -904,6 +911,11 @@ impl Agent {
             // Drop our own sender: the batcher's channel now closes precisely
             // when the LAST watcher drops its clone (i.e. all have shut down).
             drop(stable_tx);
+            // Every watcher's forget channel, fanned out as one handle (T9b): a
+            // deleted path is broadcast to all of them, since forgetting a path a
+            // watcher never emitted is a no-op (see `WatcherForget`).
+            let watcher_forget =
+                WatcherForget::new(watchers.iter().map(|w| w.forget_sender()).collect());
             // Sync Phase 2: the batcher replaces the per-file consumer —
             // accumulate stable files, flush the whole set as ONE package on the
             // auto quiet-timer or a manual signal, fan it to every target. It
@@ -926,9 +938,11 @@ impl Agent {
                 retention_rx,
                 Arc::clone(&retention_log),
                 peer_device.clone(),
+                watcher_forget.clone(),
             );
             (
                 watchers,
+                watcher_forget,
                 Some(batcher_task),
                 Some(batcher),
                 Some(retention_task),
@@ -939,7 +953,7 @@ impl Agent {
             // for API symmetry).
             drop(retention_rx);
             drop(send_cfg_rx);
-            (Vec::new(), None, None, None)
+            (Vec::new(), WatcherForget::none(), None, None, None)
         };
 
         Ok(Self {
@@ -955,6 +969,7 @@ impl Agent {
             origin_device,
             peer_device,
             watchers,
+            watcher_forget,
             batcher_task,
             batcher,
             send_cfg_tx,
@@ -1108,6 +1123,14 @@ impl Agent {
     /// "Send N pending" ([`BatcherHandle::flush_now`]).
     pub fn batcher(&self) -> Option<BatcherHandle> {
         self.batcher.clone()
+    }
+
+    /// A clone of the aggregate watcher-forget handle (0.5.1 T9b). The web layer
+    /// takes one on attach so `POST /api/library/delete` and
+    /// `POST /api/delete-files` re-arm discovery for the paths they removed;
+    /// empty (a no-op) when the agent runs without `watch`.
+    pub fn watcher_forget(&self) -> WatcherForget {
+        self.watcher_forget.clone()
     }
 
     /// A clone of the send-config live-edit sender. The web settings page (Task 6)
@@ -1594,8 +1617,10 @@ fn retention_delete_source(
     pkg_ref: &Path,
     outcome: &str,
     peer_device: &str,
+    watcher_forget: &WatcherForget,
 ) -> Result<DeleteOutcome> {
-    let detail = delete_package_sources(store, seen, pkg_ref, outcome, peer_device)?;
+    let detail =
+        delete_package_sources(store, seen, pkg_ref, outcome, peer_device, watcher_forget)?;
     if !detail.removed.is_empty() {
         return Ok(DeleteOutcome::Removed);
     }
@@ -1615,6 +1640,15 @@ fn retention_delete_source(
 /// threaded out so a batch deletion's per-file report keeps "source missing"
 /// and "source changed since confirmation" honestly distinct (controller
 /// resolution). The two `SkippedNoop` branches carry different reasons.
+///
+/// `gone` collects every source this call left *absent from disk* — one pushed
+/// path per `mark_deleted`, and only there, so the two can never drift. The
+/// caller batches them into a single
+/// [`WatcherForget::forget`](crate::watcher::WatcherForget::forget): the durable
+/// stamp alone does not heal the running watcher, which drops an already-emitted
+/// path before it ever reaches the seen store. Both `mark_deleted` sites qualify
+/// — the file this call unlinked, and the one it found already gone out-of-band
+/// (equally deleted, equally in need of re-arming).
 fn delete_one_source(
     store: &dyn SyncStore,
     seen: &SeenStore,
@@ -1622,6 +1656,7 @@ fn delete_one_source(
     link: &SourceLink,
     outcome: &str,
     peer_device: &str,
+    gone: &mut Vec<PathBuf>,
 ) -> Result<(DeleteOutcome, &'static str)> {
     let source = link.path.clone();
 
@@ -1637,6 +1672,7 @@ fn delete_one_source(
             "retention: source already gone out-of-band; marking linkage dead"
         );
         seen.mark_deleted(&source)?;
+        gone.push(source.clone());
         return Ok((DeleteOutcome::SkippedNoop, "source missing since confirmation"));
     }
 
@@ -1683,6 +1719,9 @@ fn delete_one_source(
             "retention: failed to stamp seen row deleted after a successful delete"
         );
     }
+    // Un-emit it regardless of the stamp's outcome: the file is gone from disk,
+    // which is the only precondition re-arming discovery has.
+    gone.push(source.clone());
 
     Ok((DeleteOutcome::Removed, ""))
 }
@@ -1701,18 +1740,25 @@ pub struct SourceDeleteDetail {
 /// contract (audit-before-delete, TOCTOU guard, honest no-ops), capturing a
 /// per-file outcome instead of stopping at the first error — one bad file must
 /// not strand its batch-mates' deletion.
+///
+/// `watcher_forget` un-emits the sources that ended up gone, in ONE batched call
+/// for the whole package (spec §2's reappear row, in-process half). Callers with
+/// no running watcher — the unit tests, a detached web page — pass
+/// [`WatcherForget::none`], which is a silent no-op.
 pub fn delete_package_sources(
     store: &dyn SyncStore,
     seen: &SeenStore,
     pkg_ref: &Path,
     outcome: &str,
     peer_device: &str,
+    watcher_forget: &WatcherForget,
 ) -> Result<SourceDeleteDetail> {
     let mut detail = SourceDeleteDetail::default();
+    let mut gone: Vec<PathBuf> = Vec::new();
     let links = seen.sources_for_package(&pkg_ref.to_string_lossy())?;
     for link in &links {
         let path = link.path.display().to_string();
-        match delete_one_source(store, seen, pkg_ref, link, outcome, peer_device) {
+        match delete_one_source(store, seen, pkg_ref, link, outcome, peer_device, &mut gone) {
             Ok((DeleteOutcome::Removed, _)) => detail.removed.push(path),
             Ok((DeleteOutcome::SkippedNoop, reason)) => {
                 detail.skipped.push((path, format!("skipped: {reason}")))
@@ -1723,6 +1769,7 @@ pub fn delete_package_sources(
             }
         }
     }
+    watcher_forget.forget(gone);
     Ok(detail)
 }
 
@@ -1740,11 +1787,19 @@ pub fn run_retention_once(
     now: DateTime<Utc>,
     disk_probe: &dyn Fn() -> u8,
     peer_device: &str,
+    watcher_forget: &WatcherForget,
 ) -> Result<RetentionOutcome> {
     let policy = config.retention.to_core_policy();
     let dry_run = config.retention.dry_run;
     let mut deleter = |pkg_ref: &Path| {
-        retention_delete_source(store, seen, pkg_ref, "retention_deleted", peer_device)
+        retention_delete_source(
+            store,
+            seen,
+            pkg_ref,
+            "retention_deleted",
+            peer_device,
+            watcher_forget,
+        )
     };
     evaluate_and_apply(store, &policy, dry_run, now, disk_probe, &mut deleter)
 }
@@ -1770,6 +1825,7 @@ fn spawn_retention_task(
     mut retention_rx: watch::Receiver<RetentionConfig>,
     retention_log: Arc<Mutex<VecDeque<RetentionRunRecord>>>,
     peer_device: String,
+    watcher_forget: WatcherForget,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         // Capture volumes are static across retention edits; resolve once.
@@ -1803,6 +1859,9 @@ fn spawn_retention_task(
             pass_config.retention = retention;
             let dirs = capture_dirs.clone();
             let peer_device = peer_device.clone();
+            // Cloned per pass: the pass runs on a blocking thread, and the
+            // aggregate is just an Arc of unbounded senders (never awaits).
+            let watcher_forget = watcher_forget.clone();
             let res = tokio::task::spawn_blocking(move || {
                 // Probe every capture volume and take the MAX usage: disk
                 // pressure on any one watched directory should trigger the gate.
@@ -1814,6 +1873,7 @@ fn spawn_retention_task(
                     Utc::now(),
                     &disk_probe,
                     &peer_device,
+                    &watcher_forget,
                 )
             })
             .await;
@@ -2346,8 +2406,16 @@ mod retention_tests {
         store.confirm(id2, &[]).unwrap();
 
         let probe = || 0u8;
-        let outcome =
-            run_retention_once(&config, &store, &seen, Utc::now(), &probe, &peer_hex()).unwrap();
+        let outcome = run_retention_once(
+            &config,
+            &store,
+            &seen,
+            Utc::now(),
+            &probe,
+            &peer_hex(),
+            &WatcherForget::none(),
+        )
+        .unwrap();
 
         assert_eq!(outcome.deleted.len(), 2, "both confirmed sources deleted");
         assert!(
@@ -2388,7 +2456,16 @@ mod retention_tests {
         let (_pkg1, id1) = register(&config, &store, &seen, &s1);
         store.confirm(id1, &[]).unwrap();
 
-        run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8, &peer_hex()).unwrap();
+        run_retention_once(
+            &config,
+            &store,
+            &seen,
+            Utc::now(),
+            &|| 0u8,
+            &peer_hex(),
+            &WatcherForget::none(),
+        )
+        .unwrap();
 
         let rows = store
             .search_history(HistoryQuery {
@@ -2427,8 +2504,16 @@ mod retention_tests {
         let (pkg1, id1) = register(&config, &store, &seen, &s1);
         store.confirm(id1, &[]).unwrap();
 
-        let outcome =
-            run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8, &peer_hex()).unwrap();
+        let outcome = run_retention_once(
+            &config,
+            &store,
+            &seen,
+            Utc::now(),
+            &|| 0u8,
+            &peer_hex(),
+            &WatcherForget::none(),
+        )
+        .unwrap();
 
         assert!(outcome.dry_run);
         assert_eq!(outcome.eligible.len(), 1, "reports the confirmed candidate");
@@ -2459,8 +2544,16 @@ mod retention_tests {
         // Enqueued + linked but NEVER confirmed.
         let (pkg1, _id1) = register(&config, &store, &seen, &s1);
 
-        let outcome =
-            run_retention_once(&config, &store, &seen, Utc::now(), &|| 99u8, &peer_hex()).unwrap();
+        let outcome = run_retention_once(
+            &config,
+            &store,
+            &seen,
+            Utc::now(),
+            &|| 99u8,
+            &peer_hex(),
+            &WatcherForget::none(),
+        )
+        .unwrap();
 
         assert!(outcome.eligible.is_empty(), "unconfirmed never eligible");
         assert!(outcome.deleted.is_empty());
@@ -2497,8 +2590,16 @@ mod retention_tests {
         // Corrupt the package: remove its manifest so `read_manifest` fails.
         std::fs::remove_file(pkg1.join(MANIFEST_FILENAME)).unwrap();
 
-        let outcome =
-            run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8, &peer_hex()).unwrap();
+        let outcome = run_retention_once(
+            &config,
+            &store,
+            &seen,
+            Utc::now(),
+            &|| 0u8,
+            &peer_hex(),
+            &WatcherForget::none(),
+        )
+        .unwrap();
 
         assert_eq!(
             outcome.deleted.len(),
@@ -2527,8 +2628,14 @@ mod retention_tests {
         store.confirm(id1, &[]).unwrap();
 
         let failing = FailingAppendHistoryStore(&store);
-        let result =
-            retention_delete_source(&failing, &seen, &pkg1, "retention_deleted", &peer_hex());
+        let result = retention_delete_source(
+            &failing,
+            &seen,
+            &pkg1,
+            "retention_deleted",
+            &peer_hex(),
+            &WatcherForget::none(),
+        );
 
         assert!(
             result.is_err(),
@@ -2565,8 +2672,16 @@ mod retention_tests {
         // file lands here after confirmation but before retention runs.
         std::fs::write(&s1, b"brand-new-unconfirmed-content").unwrap();
 
-        let outcome =
-            run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8, &peer_hex()).unwrap();
+        let outcome = run_retention_once(
+            &config,
+            &store,
+            &seen,
+            Utc::now(),
+            &|| 0u8,
+            &peer_hex(),
+            &WatcherForget::none(),
+        )
+        .unwrap();
 
         assert!(
             outcome.deleted.is_empty(),
@@ -2596,8 +2711,16 @@ mod retention_tests {
         // Simulate this package's linkage already handled by an earlier pass.
         seen.mark_deleted(&s1).unwrap();
 
-        let outcome =
-            run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8, &peer_hex()).unwrap();
+        let outcome = run_retention_once(
+            &config,
+            &store,
+            &seen,
+            Utc::now(),
+            &|| 0u8,
+            &peer_hex(),
+            &WatcherForget::none(),
+        )
+        .unwrap();
 
         assert!(
             outcome.deleted.is_empty(),
@@ -2630,8 +2753,16 @@ mod retention_tests {
         // Out-of-band removal: something other than retention deleted the file.
         std::fs::remove_file(&s1).unwrap();
 
-        let outcome =
-            run_retention_once(&config, &store, &seen, Utc::now(), &|| 0u8, &peer_hex()).unwrap();
+        let outcome = run_retention_once(
+            &config,
+            &store,
+            &seen,
+            Utc::now(),
+            &|| 0u8,
+            &peer_hex(),
+            &WatcherForget::none(),
+        )
+        .unwrap();
 
         assert!(
             outcome.deleted.is_empty(),
@@ -2680,6 +2811,7 @@ mod retention_tests {
             std::path::Path::new("/pkg/uuid-1"),
             "deleted_manual",
             "peerhex",
+            &WatcherForget::none(),
         )
         .unwrap();
         assert_eq!(detail.removed.len(), 2, "both files removed: {detail:?}");
@@ -2694,6 +2826,7 @@ mod retention_tests {
             std::path::Path::new("/pkg/uuid-1"),
             "deleted_manual",
             "peerhex",
+            &WatcherForget::none(),
         )
         .unwrap();
         assert!(again.removed.is_empty());
@@ -2725,6 +2858,7 @@ mod retention_tests {
             std::path::Path::new("/pkg/uuid-1"),
             "deleted_manual",
             "peerhex",
+            &WatcherForget::none(),
         )
         .unwrap();
         assert_eq!(detail.removed, vec![a.display().to_string()]);
@@ -2736,6 +2870,66 @@ mod retention_tests {
         assert!(detail.skipped[0].0.contains("b.fits"));
         assert!(!a.exists(), "unchanged batch-mate still deleted");
         assert!(b.exists(), "changed file preserved");
+    }
+
+    /// The retention half of §2's reappear row (T9b): every source the pass left
+    /// GONE is handed to the watchers in one batched message, so a frame
+    /// re-copied to that path is enqueued again without waiting for a restart.
+    ///
+    /// Both `mark_deleted` sites qualify and are exercised here: the file this
+    /// pass unlinked, and the one it found already removed out-of-band. The file
+    /// preserved by the TOCTOU guard must NOT be forgotten — it is still on disk
+    /// and still emitted, and re-arming it would re-send it.
+    #[test]
+    fn delete_package_sources_forgets_every_source_it_left_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
+        let seen = SeenStore::open(tmp.path().join("perseus.db")).unwrap();
+        let removed = tmp.path().join("a.fits");
+        let out_of_band = tmp.path().join("b.fits");
+        let changed = tmp.path().join("c.fits");
+        for p in [&removed, &out_of_band, &changed] {
+            std::fs::write(p, b"aaaa").unwrap();
+        }
+        for p in [&removed, &out_of_band, &changed] {
+            let m = std::fs::metadata(p).unwrap();
+            seen.mark_enqueued(
+                p,
+                m.len(),
+                crate::seen::mtime_millis(m.modified().ok()),
+                "/pkg/uuid-1",
+            )
+            .unwrap();
+        }
+        // `b` disappears out-of-band; `c` is rewritten since confirmation, so the
+        // TOCTOU guard preserves it.
+        std::fs::remove_file(&out_of_band).unwrap();
+        std::fs::write(&changed, b"different-and-longer").unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PathBuf>>();
+        let detail = delete_package_sources(
+            &store,
+            &seen,
+            std::path::Path::new("/pkg/uuid-1"),
+            "retention_deleted",
+            "peerhex",
+            &WatcherForget::new(vec![tx]),
+        )
+        .unwrap();
+
+        assert_eq!(detail.removed, vec![removed.display().to_string()]);
+        assert!(!removed.exists() && changed.exists(), "{detail:?}");
+        let batch = rx.try_recv().expect("one batched forget for the package");
+        assert_eq!(
+            batch,
+            vec![removed, out_of_band],
+            "both gone sources are forgotten (links are path-ordered), the \
+             preserved one is not"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "batched per package, not one message per file"
+        );
     }
 }
 

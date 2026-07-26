@@ -26,7 +26,10 @@
 //! periodic tick. A file is emitted as "stable" (ready to enqueue) once its
 //! `(size, mtime)` has held steady for the configured quiet window. A file that
 //! keeps growing keeps resetting the window, so a half-written FITS is never
-//! sent. Each path is emitted at most once.
+//! sent. Each path is emitted at most once — until it is **deleted**, at which
+//! point the deleter un-emits it through [`WatcherForget`] so a re-capture at
+//! that path is sent again without waiting for a restart (spec §2's "reappears"
+//! row; the durable half of that row lives in the seen store).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -111,6 +114,35 @@ impl StabilityTracker {
     /// Drop a candidate (e.g. the file vanished before stabilizing).
     pub fn forget(&mut self, path: &Path) {
         self.pending.remove(path);
+    }
+
+    /// Forget every trace of `paths` — both the in-progress observation state and
+    /// the **emitted** set — so a file re-created at one of those paths is
+    /// discovered and enqueued again *within this process run*. Returns how many
+    /// of them the tracker actually knew about.
+    ///
+    /// This is the in-process half of spec §2's "file reappears" row; the durable
+    /// half is [`SeenStore::mark_deleted`](crate::seen::SeenStore::mark_deleted).
+    /// Both are needed and neither substitutes for the other: the seen store is
+    /// consulted only *after* [`contains_emitted`](Self::contains_emitted) has
+    /// already let the path through, so a still-emitted path is dropped by both
+    /// the event arm and the poll sweep before any store lookup happens. Without
+    /// this call the re-created file is invisible — no error, no log — until the
+    /// agent restarts, which on an observatory Pi means never.
+    ///
+    /// Called only for paths that are **gone from disk** (unlinked by the library
+    /// delete route or a retention pass, or found already missing), so re-arming
+    /// discovery cannot re-send a file that is still there and already sent.
+    pub fn forget_paths(&mut self, paths: &[PathBuf]) -> usize {
+        let mut known = 0usize;
+        for path in paths {
+            let was_pending = self.pending.remove(path).is_some();
+            let was_emitted = self.emitted.remove(path);
+            if was_pending || was_emitted {
+                known += 1;
+            }
+        }
+        known
     }
 
     /// Return every pending path whose quiet window has fully elapsed by `now`,
@@ -216,6 +248,10 @@ pub fn is_eligible(path: &Path) -> bool {
 /// [`shutdown`]: WatcherHandle::shutdown
 pub struct WatcherHandle {
     shutdown_tx: mpsc::Sender<()>,
+    /// Deleted paths to drop from the tracker's emitted set (see
+    /// [`StabilityTracker::forget_paths`]). Unbounded so a deleter — which may be
+    /// running on a blocking thread — never awaits the watcher's loop.
+    forget_tx: mpsc::UnboundedSender<Vec<PathBuf>>,
     join: tokio::task::JoinHandle<()>,
 }
 
@@ -226,6 +262,12 @@ impl WatcherHandle {
         let _ = self.join.await;
     }
 
+    /// A sender for this watcher's forget channel, for building the aggregate
+    /// [`WatcherForget`] the deleters hold.
+    pub fn forget_sender(&self) -> mpsc::UnboundedSender<Vec<PathBuf>> {
+        self.forget_tx.clone()
+    }
+
     /// Hard-kill: abort the watcher task immediately, no graceful handshake.
     /// Test-only — production shutdown should always go through
     /// [`shutdown`](Self::shutdown). Used by the crash-resume e2e test to
@@ -233,6 +275,69 @@ impl WatcherHandle {
     #[doc(hidden)]
     pub fn abort_for_test(self) {
         self.join.abort();
+    }
+}
+
+/// The deleters' handle on every running watcher's forget channel.
+///
+/// # Why a fan-out and not a routed send
+///
+/// A forget is broadcast to ALL watchers rather than routed to the one owning
+/// the path's capture root. Forgetting a path a watcher never emitted is a pure
+/// no-op ([`StabilityTracker::forget_paths`] just fails to find it), so routing
+/// would buy nothing and cost a capture-root resolution at every delete site —
+/// including the retention pass, which knows a source path but not which root it
+/// came from.
+///
+/// # Path spelling is a contract
+///
+/// Paths must arrive **canonical**, because that is the only spelling the tracker
+/// ever keys on: the watcher canonicalizes its capture root at spawn and both
+/// discovery paths (the `notify` event arm and the poll sweep) derive from it.
+/// Both callers already satisfy this — the library deleter's victim is
+/// `canonical parent + own name` (`library::delete::victim_path`) and retention's
+/// source paths come from the seen store, recorded from the watcher's own
+/// canonical emission. A non-canonical spelling is not an error; it simply
+/// forgets nothing, which is why the contract is documented rather than asserted.
+///
+/// Cloneable and cheap; an empty one (no watchers — a detached web page, or an
+/// agent started without `watch`) is a silent no-op.
+#[derive(Clone, Default)]
+pub struct WatcherForget {
+    senders: Arc<Vec<mpsc::UnboundedSender<Vec<PathBuf>>>>,
+}
+
+impl WatcherForget {
+    /// Aggregate over one sender per running watcher.
+    pub fn new(senders: Vec<mpsc::UnboundedSender<Vec<PathBuf>>>) -> Self {
+        Self {
+            senders: Arc::new(senders),
+        }
+    }
+
+    /// The no-watcher aggregate: every [`forget`](Self::forget) is a no-op.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Whether this aggregate reaches no watcher at all.
+    pub fn is_empty(&self) -> bool {
+        self.senders.is_empty()
+    }
+
+    /// Ask every watcher to forget `paths` (see the type docs for the spelling
+    /// contract). One batched send per watcher — deleters pass a whole pass's
+    /// worth of paths, never one call per file.
+    ///
+    /// Fire-and-forget: a closed channel (its watcher has already shut down) is
+    /// ignored, since a stopped watcher has no emitted set left to correct.
+    pub fn forget(&self, paths: Vec<PathBuf>) {
+        if paths.is_empty() || self.senders.is_empty() {
+            return;
+        }
+        for tx in self.senders.iter() {
+            let _ = tx.send(paths.clone());
+        }
     }
 }
 
@@ -370,7 +475,12 @@ pub fn spawn_watcher(
 /// is testable deterministically, without depending on how a given platform's
 /// `notify` backend reacts to a contrived path. Production always passes
 /// `false` and reaches poll-only via a genuine establishment failure.
-fn spawn_watcher_with_options(
+///
+/// `pub(crate)` for tests outside this module (the web layer's end-to-end delete
+/// → re-capture test drives a real watcher): discovery is complete on the tick
+/// sweep alone, and skipping `notify` keeps those tests both deterministic and
+/// quick — establishing a real FSEvents watch costs seconds on macOS.
+pub(crate) fn spawn_watcher_with_options(
     capture_dir: PathBuf,
     stability: Duration,
     poll_interval: Duration,
@@ -402,6 +512,10 @@ fn spawn_watcher_with_options(
     let watch_active = watcher.is_some();
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    // Deleted paths to un-emit (spec §2's reappear row). Unbounded: the senders
+    // are deleters running on blocking threads, and they must never await this
+    // loop — which may itself be blocked stat'ing an offline mount.
+    let (forget_tx, mut forget_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
 
     let join = tokio::spawn(async move {
         // Move the watcher into the task so it lives exactly as long as the loop.
@@ -461,6 +575,22 @@ fn spawn_watcher_with_options(
                 _ = shutdown_rx.recv() => {
                     tracing::info!("capture watcher stopping");
                     break;
+                }
+                // A file was deleted (library route or retention pass): drop it
+                // from the emitted set so a re-capture at the same path is
+                // discovered again in THIS run. Handled before the tick so a
+                // forget that lands between two sweeps takes effect on the very
+                // next one.
+                Some(paths) = forget_rx.recv() => {
+                    let forgotten = tracker.forget_paths(&paths);
+                    for path in &paths {
+                        candidates.remove(path);
+                    }
+                    tracing::debug!(
+                        count = paths.len(),
+                        forgotten,
+                        "watcher forgot deleted paths"
+                    );
                 }
                 // Disabled outright in poll-only mode: with no watcher the raw
                 // sender is already dropped, and an always-`None` branch would
@@ -569,7 +699,11 @@ fn spawn_watcher_with_options(
         }
     });
 
-    WatcherHandle { shutdown_tx, join }
+    WatcherHandle {
+        shutdown_tx,
+        forget_tx,
+        join,
+    }
 }
 
 #[cfg(test)]
@@ -885,6 +1019,134 @@ mod tests {
             file.display()
         );
         handle.shutdown().await;
+    }
+
+    /// The unit half of the forget seam: it clears BOTH the emitted set and any
+    /// in-progress observation, and reports how many paths it actually knew.
+    #[test]
+    fn forget_paths_clears_emitted_and_pending() {
+        let mut t = StabilityTracker::new(Duration::from_secs(1));
+        let t0 = Instant::now();
+        let emitted = PathBuf::from("/cap/emitted.fits");
+        let growing = PathBuf::from("/cap/growing.fits");
+        let unknown = PathBuf::from("/cap/never-seen.fits");
+
+        t.observe(&emitted, stat(100), t0);
+        assert_eq!(
+            t.collect_stable(t0 + Duration::from_secs(2)),
+            vec![emitted.clone()]
+        );
+        t.observe(&growing, stat(50), t0 + Duration::from_secs(2));
+        assert!(t.contains_emitted(&emitted));
+        assert_eq!(t.pending_len(), 1);
+
+        let known = t.forget_paths(&[emitted.clone(), growing.clone(), unknown]);
+        assert_eq!(known, 2, "only the two the tracker knew about count");
+        assert!(
+            !t.contains_emitted(&emitted),
+            "the emitted set must no longer block this path"
+        );
+        assert_eq!(t.pending_len(), 0, "in-progress observation is dropped too");
+    }
+
+    /// Why the seam has to exist, pinned as a test rather than a comment: the
+    /// emitted set — not the seen store — is what silently swallows a file
+    /// re-created at a path this run already sent. The store is consulted only
+    /// AFTER `contains_emitted` has let the path through, so the durable
+    /// `mark_deleted` fix alone cannot heal this within one process run.
+    #[test]
+    fn emitted_blocks_a_recreation_until_the_path_is_forgotten() {
+        let mut t = StabilityTracker::new(Duration::from_secs(1));
+        let t0 = Instant::now();
+        let p = PathBuf::from("/cap/a.fits");
+
+        t.observe(&p, stat(100), t0);
+        assert_eq!(
+            t.collect_stable(t0 + Duration::from_secs(2)),
+            vec![p.clone()]
+        );
+
+        // Deleted, then re-copied from the camera media: byte-identical, so even
+        // a stat-aware check would see the same `(size, mtime)`.
+        t.observe(&p, stat(100), t0 + Duration::from_secs(3));
+        assert!(
+            t.collect_stable(t0 + Duration::from_secs(10)).is_empty(),
+            "documents the defect: the emitted set drops it, invisibly"
+        );
+
+        // …and with the seam, the very same recreation is emitted again.
+        t.forget_paths(&[p.clone()]);
+        t.observe(&p, stat(100), t0 + Duration::from_secs(11));
+        assert_eq!(t.collect_stable(t0 + Duration::from_secs(13)), vec![p]);
+    }
+
+    /// The load-bearing one, through a RUNNING watcher: create → emitted →
+    /// delete (the deleter's two steps: `mark_deleted` + forget) → re-create
+    /// identical bytes → emitted AGAIN, inside one process run.
+    ///
+    /// Poll-only so discovery is the deterministic tick sweep rather than a
+    /// platform-dependent `notify` event.
+    #[tokio::test]
+    async fn a_forgotten_path_is_emitted_again_after_recreation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let capture = tmp.path().join("capture");
+        std::fs::create_dir_all(&capture).unwrap();
+        let seen = Arc::new(SeenStore::open(tmp.path().join("perseus.db")).unwrap());
+        let (tx, mut rx) = mpsc::channel::<(PathBuf, PathBuf)>(8);
+
+        let handle = spawn_watcher_with_options(
+            capture.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            tx,
+            Arc::clone(&seen),
+            /* force_poll_only = */ true,
+        );
+
+        std::fs::write(capture.join("l1.fits"), b"0123456789").unwrap();
+        let (_dir, first) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the first capture must be emitted")
+            .expect("stable-file channel closed");
+        assert!(first.ends_with("l1.fits"));
+
+        // Record it exactly as the enqueue path does, so the durable store would
+        // dedup a stat-identical recreation if `mark_deleted` were skipped —
+        // this is what makes the assertion below about the EMITTED set.
+        let meta = std::fs::metadata(&first).unwrap();
+        seen.mark_enqueued(
+            &first,
+            meta.len(),
+            mtime_millis(meta.modified().ok()),
+            "/pkg/u1",
+        )
+        .unwrap();
+
+        // The deleter's two steps, in its order: unlink, stamp the seen row,
+        // then un-emit the path.
+        std::fs::remove_file(&first).unwrap();
+        seen.mark_deleted(&first).unwrap();
+        let forget = WatcherForget::new(vec![handle.forget_sender()]);
+        forget.forget(vec![first.clone()]);
+
+        // Re-copied from the camera media: same bytes at the same path.
+        std::fs::write(&first, b"0123456789").unwrap();
+
+        let (_dir, again) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a re-created capture must be emitted again within the same run")
+            .expect("stable-file channel closed");
+        assert_eq!(again, first, "the same path, enqueued a second time");
+        handle.shutdown().await;
+    }
+
+    /// An empty aggregate (no watchers: a detached web page, or an agent started
+    /// without `watch`) is a silent no-op, not a panic or an error.
+    #[test]
+    fn an_empty_forget_aggregate_is_a_no_op() {
+        let forget = WatcherForget::none();
+        assert!(forget.is_empty());
+        forget.forget(vec![PathBuf::from("/cap/a.fits")]);
     }
 
     #[test]
