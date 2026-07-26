@@ -25,9 +25,9 @@
 //! Errors are [`anyhow`] with **stable message prefixes** that callers may match
 //! on to pick an HTTP status: `"invalid path segment"`, `"path escapes root"`,
 //! `"not found"`, `"canonicalize root"` (the configured root itself is offline —
-//! a `502`, not a client error) and, from [`listing`], `"not a directory"`.
+//! a `502`, not a client error) and, from [`list_directory`], `"not a directory"`.
 //!
-//! The [`listing`] submodule builds on this contract: it turns one
+//! [`list_directory`] builds on this contract: it turns one
 //! `(root_index, rel_path)` into a single-directory [`LibraryListing`] whose
 //! files carry the derived per-file [`FileStatus`].
 

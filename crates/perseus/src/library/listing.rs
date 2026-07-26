@@ -38,9 +38,9 @@
 //! **canonicalized** (`spawn_watcher` canonicalizes the root, and each discovered
 //! file, precisely so `notify` and the poll sweep agree). This module matches
 //! that by resolving the browsed directory ONCE through
-//! [`resolve_in_root`](super::resolve_in_root) and joining entry names onto the
-//! canonical result — never by calling [`to_wire_rel`](super::to_wire_rel) per
-//! row, which would cost two canonicalizations per file.
+//! [`super::resolve_in_root`] and joining entry names onto the canonical result —
+//! never by calling [`super::to_wire_rel`] per row, which would cost two
+//! canonicalizations per file.
 //!
 //! The one spelling that still diverges is an in-root **symlink to a file**: the
 //! watcher records the link's target, this listing keys on the link's own path,
