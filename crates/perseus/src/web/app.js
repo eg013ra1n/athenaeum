@@ -1,8 +1,9 @@
 // Perseus web UI v2 — client script.
 //
 // A framework-free, single-file vanilla app. The page shell (index.html) is a
-// two-tab skeleton: this script renders the Transfers + Settings sections into
-// the empty <main> panels, wires their controls, and drives the 2 s poll. Every
+// three-tab skeleton: this script renders the Transfers + Library + Settings
+// sections into the empty <main> panels, wires their controls, and drives the
+// 2 s poll (the Library listing is on-demand only — see its section). Every
 // Settings section (account/OTP, device name, capture dirs, send targets,
 // retention) is ported behaviour-for-behaviour from the v1 page; only the DOM
 // structure + class names changed. The upload-speed cap is the one section with
@@ -35,6 +36,17 @@ async function getJson(path) { const r = await api(path); if (!r.ok) throw new E
 const shortHex = (h) => (h || '').slice(0, 8);
 const fmtSize = (b) => { if (b == null) return '–'; const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0, n = b; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + ' ' + u[i]; };
 const fmtDur = (s) => (s == null ? '–' : s.toFixed(1) + 's');
+// Epoch milliseconds → `YYYY-MM-DD HH:MM` in the operator's local zone (the
+// project-wide timestamp spelling). `0` is what the listing reports for a
+// filesystem that gave no mtime, so it reads as unknown rather than 1970.
+function fmtMtime(ms) {
+  const n = Number(ms);
+  if (!n) return '–';
+  const d = new Date(n);
+  if (isNaN(d.getTime())) return '–';
+  const p = (x) => String(x).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
 // A live `m:ss` countdown to a server-supplied RFC3339 deadline, clamped at 0 (a
 // past deadline reads "0:00", never negative). Re-evaluated every 2 s `tick`, so
 // it stays honest against the client clock without any timer of its own. Empty
@@ -48,19 +60,25 @@ function fmtCountdown(iso) {
 }
 
 // ── tab shell ───────────────────────────────────────────────────────────────
-// Two tabs, active one remembered in localStorage. Switching toggles `hidden` on
-// the panels + an `active` class on the buttons — no router, no history.
+// Three tabs, active one remembered in localStorage. Switching toggles `hidden`
+// on the panels + an `active` class on the buttons — no router, no history. An
+// unknown / never-stored name falls back to Transfers.
+const TAB_NAMES = ['transfers', 'library', 'settings'];
+const tabBtnId = (name) => 'tabBtn' + name[0].toUpperCase() + name.slice(1);
+
 function setTab(name) {
-  const transfers = name !== 'settings';
-  activeTab = transfers ? 'transfers' : 'settings';
-  $('tab-transfers').hidden = !transfers;
-  $('tab-settings').hidden = transfers;
-  $('tabBtnTransfers').classList.toggle('active', transfers);
-  $('tabBtnSettings').classList.toggle('active', !transfers);
-  try { localStorage.setItem('perseus.tab', transfers ? 'transfers' : 'settings'); } catch (e) { /* private mode */ }
-  // Entering the Transfers tab: refresh at once (the /api/transfers poll is
-  // gated to this tab, so it is idle while Settings is showing).
-  if (transfers && window.PerseusApp) window.PerseusApp.refreshTransfers();
+  const active = TAB_NAMES.includes(name) ? name : 'transfers';
+  activeTab = active;
+  TAB_NAMES.forEach((t) => {
+    $('tab-' + t).hidden = t !== active;
+    $(tabBtnId(t)).classList.toggle('active', t === active);
+  });
+  try { localStorage.setItem('perseus.tab', active); } catch (e) { /* private mode */ }
+  // Entering a tab: refresh it at once. Both list views are gated to their own
+  // tab — /api/transfers is polled only while Transfers shows, and the library
+  // listing is fetched on demand only (never polled; see the library section).
+  if (active === 'transfers' && window.PerseusApp) window.PerseusApp.refreshTransfers();
+  if (active === 'library') libRefresh();
 }
 
 function wireTabs() {
@@ -299,11 +317,15 @@ async function refreshStatus() {
     $('conn').textContent = 'connected';
     renderAgentBanner(s);
     renderVolumes(s.volumes);
+    // The Library tab's roots view rides this same poll (root list + the
+    // per-root free-space chip); it never fetches a listing on the tick.
+    libOnStatus(s);
   } catch (e) {
     $('connDot').className = 'conn-dot err';
     $('conn').textContent = 'offline: ' + e.message;
     // Drop the chips rather than leave a reading nobody can vouch for.
     renderVolumes([]);
+    libOnStatus(null);
   }
 }
 
@@ -1297,13 +1319,418 @@ async function refreshTransfers() {
   updateTransferCountdowns();
 }
 
+// ── library: capture-root browser (roots → one directory at a time) ─────────
+// A LAZY browser: exactly one GET /api/library per navigation (the server does a
+// single read_dir, never a walk) and NO poll of its own — a capture root is
+// routinely a NAS share and a 2 s re-listing would hammer it. The operator
+// re-reads with the ↻ button; only the roots view's free-space chips ride the
+// existing /api/status tick, which is memoized server-side.
+//
+// `libState` is the contract the later send / delete / preview tasks read:
+//   root         index into the configured capture roots, or null = roots view
+//   path         forward-slash wire rel-path of the listed directory ("" = root)
+//   selected     Set of rel-paths picked IN THE CURRENT ROOT
+//   entries      the current directory's file rows (T4 `LibraryEntry`)
+//   selectedDirs the subset of `selected` that are directories — a directory
+//                means "everything under it", resolved server-side, so the flag
+//                has to travel with the item (see libSelectedItems)
+// Selection deliberately survives navigation WITHIN a root (pick a few subs in
+// one night's folder, descend into the next, act on both) and is cleared the
+// moment the root changes, so every rel in `selected` belongs to `libState.root`.
+let libState = {
+  root: null,
+  path: '',
+  selected: new Set(),
+  selectedDirs: new Set(),
+  entries: [],
+  dirs: [],
+  error: null,
+  loading: false,
+};
+
+let libRoots = [];          // configured capture roots; the index IS the API's `root`
+let libVolumes = [];        // last /api/status `volumes` (free space per volume)
+let libStatusSeen = false;  // a status landed → the roots view can speak honestly
+let libStatusSig = null;    // skip the roots re-render when nothing moved
+let libLoadSeq = 0;         // monotonic; a stale listing response never paints
+
+// The chip tooltips. `delivered` is deliberately "at least one device": the
+// listing status is ANY-of across a fan-out, and per-target detail is the
+// Transfers tab's job, not this chip's.
+const LIB_STATUS_TITLE = {
+  unsent: 'never enqueued',
+  queued: 'accumulated — waiting for the next flush',
+  sending: 'in flight to at least one device',
+  delivered: 'delivered to at least one device',
+  declined: 'every device that answered declined it',
+  sent: 'handed to the sync engine',
+};
+
+const libJoin = (path, name) => (path ? path + '/' + name : name);
+
+// Boundary-aware prefix test over DISPLAY paths (a root may be `/mnt/…`,
+// `C:\…` or a UNC share): `/mnt/data` must not match `/mnt/database`.
+function libPathUnder(p, prefix) {
+  if (!prefix || !p.startsWith(prefix)) return false;
+  if (p.length === prefix.length) return true;
+  const last = prefix[prefix.length - 1];
+  if (last === '/' || last === '\\') return true;
+  const next = p[prefix.length];
+  return next === '/' || next === '\\';
+}
+
+// A `volumes` entry is labelled with the FIRST probed path that landed on that
+// volume, so a root is matched by longest CONTAINING prefix, not equality — that
+// is what puts a chip on a capture root sitting under the data dir's volume.
+//
+// A root with no containing label gets NO chip, and that is deliberate. Two
+// SIBLING roots on one disk (`…/cam1`, `…/cam2`) collapse to a single entry
+// labelled `…/cam1`, and nothing on the wire says the second one belongs to it:
+// device ids never travel, and a volume whose probe FAILED (an offline share) is
+// simply absent from the list. So "it must be the earlier volume" is a guess
+// that, for an unmounted NAS root, would print the local disk's free space under
+// the NAS's name — the exact wrong-disk reading `diskspace.rs` refuses to commit
+// by never resolving a path to an ancestor. A missing chip is the honest answer;
+// closing the gap needs the status DTO to say which volume each root is on.
+function libVolumeFor(rootPath) {
+  let best = null;
+  for (const v of libVolumes) {
+    const vr = String(v && v.root != null ? v.root : '');
+    if (!libPathUnder(rootPath, vr)) continue;
+    if (!best || vr.length > String(best.root).length) best = v;
+  }
+  return best;
+}
+
+// Crumb label for a root: its last path segment, with the full configured path
+// in the title (a capture root is often a long share path).
+function libRootName(idx) {
+  const p = libRoots[idx];
+  if (p == null) return 'root #' + idx;
+  const segs = String(p).split(/[\\/]+/).filter(Boolean);
+  return segs.length ? segs[segs.length - 1] : String(p);
+}
+
+// ── section markup ──
+function renderLibraryTab() {
+  $('tab-library').innerHTML = `
+    <section id="library">
+      <div class="lib-head">
+        <h2>Library</h2>
+        <div class="lib-crumbs" id="libCrumbs" aria-label="Location"></div>
+        <span class="spacer"></span>
+        <button class="ghost" data-lib-act="refresh" title="Re-read this folder">&#8635;</button>
+      </div>
+      <div id="libBody"></div>
+      <div class="lib-footer" id="libFooter" hidden></div>
+    </section>`;
+}
+
+// ── render: breadcrumbs ──
+function renderLibCrumbs() {
+  const el = $('libCrumbs');
+  if (!el) return;
+  if (libState.root === null) {
+    el.innerHTML = '<span class="lib-crumb-cur">Capture roots</span>';
+    return;
+  }
+  const rootPath = String(libRoots[libState.root] ?? '');
+  const segs = libState.path ? libState.path.split('/') : [];
+  const sep = '<span class="lib-crumb-sep">/</span>';
+  const html = ['<button class="lib-crumb" data-lib-act="roots">Capture roots</button>', sep];
+  html.push(segs.length
+    ? `<button class="lib-crumb" data-lib-nav="" title="${esc(rootPath)}">${esc(libRootName(libState.root))}</button>`
+    : `<span class="lib-crumb-cur" title="${esc(rootPath)}">${esc(libRootName(libState.root))}</span>`);
+  let acc = '';
+  segs.forEach((s, i) => {
+    acc = libJoin(acc, s);
+    html.push(sep);
+    html.push(i === segs.length - 1
+      ? `<span class="lib-crumb-cur">${esc(s)}</span>`
+      : `<button class="lib-crumb" data-lib-nav="${esc(acc)}">${esc(s)}</button>`);
+  });
+  el.innerHTML = html.join('');
+}
+
+// ── render: the roots list (top level) ──
+function renderLibRoots() {
+  const body = $('libBody');
+  if (!body) return;
+  if (!libStatusSeen) { body.innerHTML = '<div class="empty">loading capture roots…</div>'; return; }
+  if (!libRoots.length) {
+    body.innerHTML = '<div class="empty">no capture directories configured — add one under Settings → Capture Directories</div>';
+    return;
+  }
+  body.innerHTML = libRoots.map((p, i) => {
+    const path = String(p);
+    const v = libVolumeFor(path);
+    let chip = '';
+    if (v) {
+      const low = Number(v.freeBytes) < FREE_LOW_BYTES;
+      const title = `${v.root} — ${fmtSize(v.freeBytes)} free of ${fmtSize(v.totalBytes)}`;
+      chip = `<span class="chip vol${low ? ' chip-danger' : ''}" title="${esc(title)}">Free: ${esc(fmtSize(v.freeBytes))}</span>`;
+    }
+    return `<button class="lib-root" data-lib-root="${i}">
+      <span class="lib-caret" aria-hidden="true">&#9656;</span>
+      <span class="mono">${esc(path)}</span>
+      <span class="spacer"></span>
+      ${chip}
+    </button>`;
+  }).join('');
+}
+
+// ── render: one directory ──
+function libStatusChip(f) {
+  const st = String(f.status || 'unsent');
+  // Own-property lookup only: `status` is server-controlled, and a plain `[st]`
+  // would resolve `toString` / `constructor` off Object.prototype and stringify
+  // a function into the tooltip.
+  const title = Object.prototype.hasOwnProperty.call(LIB_STATUS_TITLE, st) ? LIB_STATUS_TITLE[st] : st;
+  const n = Number(f.batches) || 0;
+  const suffix = n > 0
+    ? ` <span class="lib-batches" title="in ${n} batch${n === 1 ? '' : 'es'}">&times;${n}</span>`
+    : '';
+  return `<span class="chip lib-st ${esc(st)}" title="${esc(title)}">${esc(st)}</span>${suffix}`;
+}
+
+function libRowMarkup(rel, cells) {
+  const picked = libState.selected.has(rel);
+  return `<tr${picked ? ' class="lib-picked"' : ''}>${cells(picked)}</tr>`;
+}
+
+function renderLibListing() {
+  const body = $('libBody');
+  if (!body) return;
+  // An error NEVER degrades to an empty listing — an unmounted share must not
+  // read as "this folder has nothing in it" (spec §7).
+  if (libState.error) {
+    body.innerHTML = `<div class="lib-error">
+      <div>
+        <div><b>Could not list this folder</b></div>
+        <div class="lib-error-msg mono">${esc(libState.error)}</div>
+      </div>
+      <span class="spacer"></span>
+      <button class="ghost" data-lib-act="retry">Retry</button>
+    </div>`;
+    return;
+  }
+  if (libState.loading) { body.innerHTML = '<div class="empty">listing…</div>'; return; }
+  const dirs = libState.dirs || [];
+  const files = libState.entries || [];
+  if (!dirs.length && !files.length) { body.innerHTML = '<div class="empty">this folder is empty</div>'; return; }
+
+  const dirRows = dirs.map((name) => {
+    const rel = libJoin(libState.path, String(name));
+    return libRowMarkup(rel, (picked) => `
+      <td class="lib-sel"><input type="checkbox" data-lib-pick="${esc(rel)}" data-lib-dir="1"
+        aria-label="Select folder ${esc(name)} and everything under it"${picked ? ' checked' : ''} /></td>
+      <td><button class="lib-dir" data-lib-nav="${esc(rel)}">
+        <span class="lib-caret" aria-hidden="true">&#9656;</span> ${esc(name)}/</button></td>
+      <td class="muted">–</td><td class="muted">–</td><td class="muted">–</td>`);
+  }).join('');
+
+  const fileRows = files.map((f) => {
+    const rel = libJoin(libState.path, String(f.name));
+    return libRowMarkup(rel, (picked) => `
+      <td class="lib-sel"><input type="checkbox" data-lib-pick="${esc(rel)}"
+        aria-label="Select ${esc(f.name)}"${picked ? ' checked' : ''} /></td>
+      <td class="mono">${esc(f.name)}</td>
+      <td>${esc(fmtSize(f.size))}</td>
+      <td class="mono muted">${esc(fmtMtime(f.mtimeMs))}</td>
+      <td>${libStatusChip(f)}</td>`);
+  }).join('');
+
+  body.innerHTML = `<div class="tablewrap"><table>
+    <thead><tr><th class="lib-sel"></th><th>name</th><th>size</th><th>modified</th><th>status</th></tr></thead>
+    <tbody>${dirRows}${fileRows}</tbody></table></div>`;
+}
+
+// ── render: selection footer ──
+// The three actions are wired by later tasks (send / delete / preview); they
+// render disabled here rather than absent so the shape of the bar is honest.
+function renderLibFooter() {
+  const el = $('libFooter');
+  if (!el) return;
+  const n = libState.selected.size;
+  if (!n || libState.root === null) { el.hidden = true; el.innerHTML = ''; return; }
+  // Selection spans the whole root, so say plainly how much of it is out of
+  // sight — an operator must never act on rows they cannot see.
+  const here = new Set([
+    ...(libState.dirs || []).map((d) => libJoin(libState.path, String(d))),
+    ...(libState.entries || []).map((f) => libJoin(libState.path, String(f.name))),
+  ]);
+  let outside = 0;
+  libState.selected.forEach((rel) => { if (!here.has(rel)) outside++; });
+  const note = outside ? ` <span class="muted">· ${outside} outside this folder</span>` : '';
+  const soon = 'not wired yet';
+  el.hidden = false;
+  el.innerHTML = `<span><b>${n}</b> selected${note}</span>
+    <button class="ghost" data-lib-act="clear">Clear</button>
+    <span class="spacer"></span>
+    <button disabled title="${esc(soon)}">Send to…</button>
+    <button class="ghost" disabled title="${esc(soon)}">Delete</button>
+    <button class="ghost" disabled title="${esc(soon)}">Preview</button>`;
+}
+
+function libRender() {
+  renderLibCrumbs();
+  if (libState.root === null) renderLibRoots(); else renderLibListing();
+  renderLibFooter();
+}
+
+// ── selection ──
+function libClearSelection() {
+  libState.selected.clear();
+  libState.selectedDirs.clear();
+}
+
+function libTogglePick(rel, isDir, on) {
+  if (on) {
+    libState.selected.add(rel);
+    if (isDir) libState.selectedDirs.add(rel);
+  } else {
+    libState.selected.delete(rel);
+    libState.selectedDirs.delete(rel);
+  }
+  // Only the footer depends on the selection — re-rendering the table here would
+  // yank focus off the checkbox the operator just clicked.
+  renderLibFooter();
+}
+
+// The current selection as the later tasks consume it. `dir: true` means "this
+// rel is a directory — everything under it", expanded server-side.
+function libSelectedItems() {
+  if (libState.root === null) return [];
+  return Array.from(libState.selected, (rel) => ({
+    root: libState.root,
+    rel,
+    dir: libState.selectedDirs.has(rel),
+  }));
+}
+
+// ── navigation ──
+function libShowRoots() {
+  libLoadSeq++;                 // abandon any in-flight listing
+  libClearSelection();          // a rel only means something inside its root
+  libState.root = null;
+  libState.path = '';
+  libState.dirs = [];
+  libState.entries = [];
+  libState.error = null;
+  libState.loading = false;
+  libRender();
+}
+
+async function libLoad(root, path) {
+  const rel = path || '';
+  if (root !== libState.root) libClearSelection();
+  libState.root = root;
+  libState.path = rel;
+  libState.error = null;
+  libState.loading = true;
+  libRender();
+  const seq = ++libLoadSeq;
+  let listing = null;
+  let error = null;
+  try {
+    listing = await getJson('/api/library?root=' + encodeURIComponent(root) + '&path=' + encodeURIComponent(rel));
+  } catch (e) {
+    error = (e && e.message) ? e.message : String(e);
+  }
+  if (seq !== libLoadSeq) return;   // a newer navigation already won — never paint
+  libState.loading = false;
+  if (error) {
+    console.error('[library] listing failed:', root, rel, error);
+    libState.error = error;
+    libState.dirs = [];
+    libState.entries = [];
+  } else {
+    libState.error = null;
+    libState.dirs = Array.isArray(listing.dirs) ? listing.dirs : [];
+    libState.entries = Array.isArray(listing.files) ? listing.files : [];
+    // The server echoes the NORMALIZED rel-path; adopt it so the crumbs match
+    // what the containment guard actually resolved.
+    if (typeof listing.path === 'string') libState.path = listing.path;
+  }
+  libRender();
+}
+
+// Re-read what is on screen: the roots view is served by the status poll, a
+// listing costs one GET. Also the Retry button's action.
+function libRefresh() {
+  if (libState.root === null) { libRender(); return; }
+  libLoad(libState.root, libState.path);
+}
+
+// Fed by every /api/status poll. `captureDirs` is exactly the list the library
+// `root` index addresses (both are `capture_dirs_resolved()`), so the roots view
+// needs no fetch of its own.
+function libOnStatus(s) {
+  if (!s) {
+    // Offline tick: drop the free-space chips rather than show a reading nobody
+    // can vouch for, but KEEP the roots — the configured list did not vanish
+    // because one poll hiccuped, and blanking it would read as "none configured".
+    if (!libVolumes.length) return;
+    libVolumes = [];
+    libStatusSig = null;
+    if (libState.root === null) renderLibRoots();
+    return;
+  }
+  libStatusSeen = true;
+  const roots = Array.isArray(s.captureDirs) ? s.captureDirs.map(String) : [];
+  const vols = Array.isArray(s.volumes) ? s.volumes : [];
+  const sig = JSON.stringify([roots, vols]);
+  if (sig === libStatusSig) return;   // nothing moved → no reflow
+  libStatusSig = sig;
+  libRoots = roots;
+  libVolumes = vols;
+  // Only the roots view reads these; a listing keeps its own crumbs/rows.
+  if (libState.root === null) { renderLibCrumbs(); renderLibRoots(); }
+}
+
+// ── delegated handlers (bound once to the stable panel, never per render) ──
+function onLibraryClick(e) {
+  const rootBtn = e.target.closest('[data-lib-root]');
+  if (rootBtn) { libLoad(Number(rootBtn.dataset.libRoot), ''); return; }
+  const nav = e.target.closest('[data-lib-nav]');
+  if (nav) {
+    if (libState.root === null) return;   // a rel is meaningless without its root
+    libLoad(libState.root, nav.dataset.libNav || '');
+    return;
+  }
+  const act = e.target.closest('[data-lib-act]');
+  if (!act) return;
+  switch (act.dataset.libAct) {
+    case 'roots': libShowRoots(); break;
+    case 'refresh': case 'retry': libRefresh(); break;
+    case 'clear': libClearSelection(); libRender(); break;
+  }
+}
+
+function onLibraryChange(e) {
+  const box = e.target.closest('[data-lib-pick]');
+  if (!box) return;
+  libTogglePick(box.dataset.libPick, box.dataset.libDir === '1', box.checked);
+  const row = box.closest('tr');
+  if (row) row.classList.toggle('lib-picked', box.checked);
+}
+
+function wireLibrary() {
+  const panel = $('tab-library');
+  panel.addEventListener('click', onLibraryClick);
+  panel.addEventListener('change', onLibraryChange);
+}
+
 // ── boot ────────────────────────────────────────────────────────────────────
 // The shared helpers + the live refreshTransfers renderer are exposed on
 // PerseusApp so the poll tick and the To-Sync manual flush can drive the list.
 window.PerseusApp = {
-  api, getJson, $, esc, shortHex, fmtSize, fmtDur, fmtCountdown,
+  api, getJson, $, esc, shortHex, fmtSize, fmtDur, fmtCountdown, fmtMtime,
   setTab,
   refreshTransfers,
+  // Library tab surface for the later send / delete / preview tasks: the live
+  // state object, the loader, and the selection as [{root, rel, dir}].
+  libState, libLoad, libRefresh, libSelectedItems,
 };
 
 function tick() {
@@ -1317,11 +1744,14 @@ function tick() {
 
 function boot() {
   renderTransfersTab();
+  renderLibraryTab();
   renderSettingsTab();
   mountBanner();
+  // wireTabs() restores the saved tab, so every panel's markup must exist first.
   wireTabs();
   wireTosync();
   wireTransfers();
+  wireLibrary();
   wireCaptureDirs();
   wireTargets();
   wireDeviceName();

@@ -17,15 +17,17 @@
       <span class="vol-chips" id="volChips" aria-label="Free disk space"></span>
       <nav class="tabs" role="tablist" aria-label="Perseus sections">
         <button class="tab active" id="tabBtnTransfers" data-tab="transfers" role="tab">Transfers</button>
+        <button class="tab" id="tabBtnLibrary" data-tab="library" role="tab">Library</button>
         <button class="tab" id="tabBtnSettings" data-tab="settings" role="tab">Settings</button>
       </nav>
     </header>
 
     <!-- Tab panels. app.js renders each tab's sections into these empty <main>s
          on boot (and inserts the global lifecycle banner just below the header).
-         A later task fills the Transfers tab's #transferList with the unified
-         transfer list. -->
+         The Library panel is the capture-root browser (0.5.1 T5): it is filled
+         on demand, never by the 2 s poll. -->
     <main id="tab-transfers"></main>
+    <main id="tab-library" hidden></main>
     <main id="tab-settings" hidden></main>
 
     <script src="/app.js"></script>

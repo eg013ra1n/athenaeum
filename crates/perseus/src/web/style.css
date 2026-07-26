@@ -174,6 +174,52 @@ ul.tlog { list-style: none; margin: 0; padding: 0; max-height: 18rem; overflow-y
 ul.tlog li { border-bottom: 1px solid var(--border); padding: 0.3rem 0; font-size: 0.8rem; display: flex; gap: 0.4rem; align-items: baseline; flex-wrap: wrap; }
 ul.tlog li:last-child { border-bottom: 0; }
 
+/* ── Library tab: roots list, one-directory listing, selection footer ── */
+.lib-head { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+.lib-head h2 { margin: 0; }
+.lib-crumbs { display: flex; align-items: center; gap: 0.15rem; flex-wrap: wrap; }
+.lib-crumb { background: transparent; border: 0; color: var(--accent); padding: 0.15rem 0.35rem; border-radius: 4px; font-size: 0.85rem; }
+.lib-crumb:hover { background: var(--surface-hover); }
+.lib-crumb-cur { color: var(--content); padding: 0.15rem 0.35rem; font-size: 0.85rem; }
+.lib-crumb-sep { color: var(--content-muted); }
+
+/* One configured capture root, with its volume's free-space chip. */
+.lib-root { display: flex; width: 100%; align-items: center; gap: 0.5rem; text-align: left; font-size: 0.85rem;
+  background: var(--surface); color: var(--content); border: 1px solid var(--border); border-radius: 8px;
+  padding: 0.55rem 0.7rem; margin-bottom: 0.4rem; }
+.lib-root:hover { background: var(--surface-hover); }
+.lib-caret { color: var(--content-muted); }
+
+/* Listing rows. Only directories are clickable in the listing — a file's own
+   actions live in the selection footer. */
+.lib-dir { background: transparent; border: 0; color: var(--accent); padding: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; }
+.lib-dir:hover { text-decoration: underline; }
+.lib-sel { width: 1.6rem; }
+.lib-batches { font-size: 0.72rem; color: var(--content-muted); }
+tr.lib-picked > td { background: var(--surface-hover); }
+
+/* Derived send status (T4's FileStatus). Scoped to `.lib-st` so the Transfers
+   tab's state chips keep their own meaning of the same words. */
+.lib-st.unsent { color: var(--content-muted); }
+.lib-st.queued { color: var(--accent); }
+.lib-st.sending { color: var(--accent); animation: lib-pulse 1.4s ease-in-out infinite; }
+.lib-st.delivered, .lib-st.sent { color: var(--success); }
+.lib-st.declined { color: var(--error); }
+@keyframes lib-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+@media (prefers-reduced-motion: reduce) { .lib-st.sending { animation: none; } }
+
+/* Selection bar — sticks to the bottom of the viewport while browsing a long
+   directory, so the count and the actions never scroll out of reach. */
+.lib-footer { position: sticky; bottom: 0; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+  margin-top: 0.6rem; padding: 0.5rem 0.7rem; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px; }
+
+/* A failed listing (offline share, vanished folder) — never an empty table. */
+.lib-error { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+  border: 1px solid var(--error); border-radius: 8px; padding: 0.7rem 0.9rem; }
+.lib-error-msg { color: var(--error); word-break: break-word; }
+
 /* In-page confirm dialog — no window.confirm / alert() anywhere. */
 .tconfirm-overlay { position: fixed; inset: 0; background: var(--scrim); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 1rem; }
 .tconfirm { background: var(--surface-raised); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.25rem; max-width: 30rem; width: 100%; }
