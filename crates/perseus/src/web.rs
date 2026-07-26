@@ -48,6 +48,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::{
     extract::{Query, Request, State},
@@ -81,6 +82,7 @@ use crate::config_edit::{
     apply_capture_dirs_edit, apply_device_name_edit, apply_retention_edit, apply_send_mode_edit,
     apply_targets_edit, apply_upload_limit_edit, RetentionEdit,
 };
+use crate::diskspace::VolumeInfo;
 use crate::pending::{pending_tree, PendingNode};
 use crate::resend::{self, is_declined};
 use crate::run::delete_package_sources;
@@ -201,6 +203,15 @@ pub struct WebState {
     /// binds no node): the edit still persists to `perseus.toml` and is applied by
     /// the startup path when the engine next comes up.
     pub node: RwLock<Option<Arc<SharedIrohNode>>>,
+    /// Memoized free-space reading: `(taken_at, probed_paths, volumes)`.
+    ///
+    /// The probe is a blocking syscall that can hang as long as a wedged network
+    /// mount takes to time out, and `/api/status` is polled every 2 s by every
+    /// open browser. Running it behind this mutex means at most ONE probe is ever
+    /// in flight (never a growing pile of stuck blocking-pool threads) and the
+    /// result is reused for [`FREE_SPACE_TTL`]. The probed path set is part of the
+    /// key so a capture-dir edit is not served a reading for the old roots.
+    pub free_space: tokio::sync::Mutex<Option<(Instant, Vec<PathBuf>, Vec<VolumeInfo>)>>,
 }
 
 impl WebState {
@@ -245,6 +256,8 @@ impl WebState {
             // No node until the agent binds one (`attach`); an upload-limit edit
             // meanwhile is persisted and applied at the next startup.
             node: RwLock::new(None),
+            // Probed on the first `/api/status`, then reused for FREE_SPACE_TTL.
+            free_space: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -365,6 +378,23 @@ struct StatusDto {
     retention: RetentionDto,
     /// Coarse package counts (see [`CountsDto`]).
     counts: CountsDto,
+    /// Free space per unique volume behind the capture dirs + data dir. A
+    /// volume that could not be probed (offline share, vanished root) is simply
+    /// absent — see [`crate::diskspace`].
+    volumes: Vec<VolumeDto>,
+}
+
+/// One volume's free-space reading, for the status header's chips (and, later,
+/// the Library tab's root rows).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VolumeDto {
+    /// The configured path this reading was taken for (display string).
+    root: String,
+    /// Bytes available to Perseus on that volume.
+    free_bytes: u64,
+    /// Total bytes on that volume.
+    total_bytes: u64,
 }
 
 /// The retention table, flattened for the status page. `policy` is the same
@@ -691,6 +721,42 @@ async fn style_css() -> impl IntoResponse {
     )
 }
 
+/// How long one free-space reading is reused before `/api/status` re-probes.
+/// Short enough that a filling capture disk is visibly filling, long enough that
+/// several browsers polling at 2 s do not each pay for a syscall round-trip.
+const FREE_SPACE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The free-space reading for `paths`, memoized on [`WebState::free_space`].
+///
+/// The lock is deliberately held across the probe: concurrent pollers wait for
+/// the one in flight and then read the fresh value, instead of each spawning
+/// their own blocking task — which, against a wedged network mount, would
+/// accumulate stuck blocking-pool threads for as long as the mount stays wedged.
+///
+/// Never fails: a join error (or any per-path failure inside
+/// [`crate::diskspace::probe_volumes`]) degrades to fewer chips, never a 500.
+/// The status page has to render with a capture share offline.
+async fn free_space_snapshot(state: &WebState, paths: Vec<PathBuf>) -> Vec<VolumeInfo> {
+    let mut cached = state.free_space.lock().await;
+    if let Some((at, cached_paths, vols)) = cached.as_ref() {
+        if at.elapsed() < FREE_SPACE_TTL && *cached_paths == paths {
+            return vols.clone();
+        }
+    }
+
+    let probed = paths.clone();
+    let vols =
+        match tokio::task::spawn_blocking(move || crate::diskspace::probe_volumes(&probed)).await {
+            Ok(vols) => vols,
+            Err(error) => {
+                tracing::warn!(%error, "web status: free-space probe task failed");
+                Vec::new()
+            }
+        };
+    *cached = Some((Instant::now(), paths, vols.clone()));
+    vols
+}
+
 /// `GET /api/status`
 async fn api_status(
     State(state): State<Arc<WebState>>,
@@ -745,6 +811,19 @@ async fn api_status(
         .filter(|r| r.state == OutboundState::Cancelled)
         .count() as u64;
 
+    // Free space per unique volume behind the capture dirs + data dir.
+    let mut probe_paths = configured.clone();
+    probe_paths.push(config.data_dir.clone());
+    let volumes: Vec<VolumeDto> = free_space_snapshot(&state, probe_paths)
+        .await
+        .into_iter()
+        .map(|v| VolumeDto {
+            root: v.root.display().to_string(),
+            free_bytes: v.free_bytes,
+            total_bytes: v.total_bytes,
+        })
+        .collect();
+
     Ok(Json(StatusDto {
         agent_state: agent.label().to_string(),
         agent_detail: agent.detail(),
@@ -768,6 +847,7 @@ async fn api_status(
             cancelled_total,
             queued,
         },
+        volumes,
     }))
 }
 
@@ -2624,6 +2704,7 @@ mod tests {
             // No iroh node in the harness (loopback transports bind none): an
             // upload-limit edit is file-only here, `appliedLive: false`.
             node: RwLock::new(None),
+            free_space: tokio::sync::Mutex::new(None),
         });
         (state, tmp)
     }
@@ -2755,6 +2836,56 @@ mod tests {
         assert_eq!(v["inFlight"][0]["deletable"], false);
         assert_eq!(v["counts"]["confirmedTotal"], 1);
         assert_eq!(v["counts"]["queued"], 0);
+        // Free space per unique volume: the harness's capture dir and data dir
+        // are the same tempdir, so they de-duplicate to exactly one entry —
+        // camelCase, non-empty, and internally consistent.
+        let vols = v["volumes"].as_array().expect("volumes is an array");
+        assert_eq!(vols.len(), 1, "capture dir + data dir share one volume");
+        assert!(vols[0]["root"].is_string());
+        let free = vols[0]["freeBytes"]
+            .as_u64()
+            .expect("freeBytes camelCase u64");
+        let total = vols[0]["totalBytes"]
+            .as_u64()
+            .expect("totalBytes camelCase u64");
+        assert!(total > 0 && free <= total);
+    }
+
+    /// The free-space memo: a second poll inside the TTL is served from the
+    /// cache (no second syscall against a possibly-wedged mount), while a
+    /// changed path set — a capture-dir edit — forces a fresh probe instead of
+    /// reporting the old roots.
+    #[tokio::test]
+    async fn free_space_snapshot_memoizes_per_path_set() {
+        let (state, tmp) = test_state().await;
+        let dir = tmp.path().to_path_buf();
+
+        let first = free_space_snapshot(&state, vec![dir.clone()]).await;
+        assert_eq!(first.len(), 1, "the tempdir's volume probes fine");
+
+        // Plant a sentinel in the memo. Still inside the TTL with the same path
+        // set, so the next call must return it verbatim — proof it did not
+        // re-probe.
+        *state.free_space.lock().await = Some((
+            Instant::now(),
+            vec![dir.clone()],
+            vec![VolumeInfo {
+                root: PathBuf::from("/sentinel"),
+                free_bytes: 7,
+                total_bytes: 9,
+            }],
+        ));
+        let cached = free_space_snapshot(&state, vec![dir.clone()]).await;
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].root, PathBuf::from("/sentinel"));
+
+        // A different path set invalidates: this one probes to nothing.
+        let other =
+            free_space_snapshot(&state, vec![PathBuf::from("/definitely/not/mounted/xyz")]).await;
+        assert!(
+            other.is_empty(),
+            "a changed path set re-probes instead of serving the cached roots"
+        );
     }
 
     #[tokio::test]
@@ -4946,6 +5077,7 @@ mod tests {
             batches: Arc::clone(&batches),
             send_cfg_tx: RwLock::new(send_cfg_tx),
             node: RwLock::new(None),
+            free_space: tokio::sync::Mutex::new(None),
         });
 
         let app = build_router(state, None);

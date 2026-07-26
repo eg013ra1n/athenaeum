@@ -32,6 +32,8 @@ header .sub { color: var(--content-muted); font-size: 0.85rem; }
 .conn-dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: var(--content-muted); display: inline-block; }
 .conn-dot.ok { background: var(--success); }
 .conn-dot.err { background: var(--error); }
+/* Free-space chips, beside the connection state. */
+.vol-chips { display: inline-flex; gap: 0.35rem; flex-wrap: wrap; }
 .tabs { display: flex; gap: 0.4rem; margin-left: auto; }
 .tab { background: transparent; border: 1px solid transparent; color: var(--content-muted); padding: 0.4rem 0.9rem; border-radius: 6px; cursor: pointer; font-size: 0.9rem; }
 .tab:hover { background: var(--surface-hover); color: var(--content); }
@@ -63,6 +65,10 @@ td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; fo
 .chip.done { color: var(--success); }
 .chip.uploaded { color: var(--accent); }
 .chip.pending { color: var(--content-muted); }
+/* Free-space chip (status header now, Library root rows later): quiet by
+   default, red once the volume drops under the low-space floor. */
+.chip.vol { color: var(--content-muted); border: 1px solid var(--border); }
+.chip.chip-danger { color: var(--error); border-color: var(--error); }
 /* Send-target chips: the current target list, each with an inline remove. */
 .chips { display: flex; flex-wrap: wrap; gap: 0.4rem; }
 .chip.target { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--accent); padding: 0.15rem 0.3rem 0.15rem 0.6rem; }

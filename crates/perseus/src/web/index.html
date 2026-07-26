@@ -12,6 +12,9 @@
       <span class="sub">headless capture node</span>
       <span class="conn-dot" id="connDot"></span>
       <span class="sub" id="conn"></span>
+      <!-- Free space per capture/data volume, filled by refreshStatus() from
+           /api/status `volumes`. Empty while offline or unprobeable. -->
+      <span class="vol-chips" id="volChips" aria-label="Free disk space"></span>
       <nav class="tabs" role="tablist" aria-label="Perseus sections">
         <button class="tab active" id="tabBtnTransfers" data-tab="transfers" role="tab">Transfers</button>
         <button class="tab" id="tabBtnSettings" data-tab="settings" role="tab">Settings</button>

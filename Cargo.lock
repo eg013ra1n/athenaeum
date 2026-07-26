@@ -5371,6 +5371,7 @@ dependencies = [
  "tray-icon",
  "uuid",
  "walkdir",
+ "windows-sys 0.59.0",
  "wiremock",
 ]
 

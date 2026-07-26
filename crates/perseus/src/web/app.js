@@ -274,15 +274,36 @@ function renderAgentBanner(s) {
   }
 }
 
+// Free space per unique volume behind the capture dirs + data dir. A volume the
+// agent could not probe (offline share) is simply absent from `volumes` — the
+// header then shows one chip fewer rather than a stale or invented number.
+// Below FREE_LOW_BYTES the chip turns red: a fixed floor, not a percentage, so
+// it means the same thing on a 2 TB capture disk and a 256 GB SSD.
+const FREE_LOW_BYTES = 10 * 1024 * 1024 * 1024;
+
+function renderVolumes(vols) {
+  const el = $('volChips');
+  if (!el) return;   // never let a missing chip slot fake an offline poll
+  const list = Array.isArray(vols) ? vols : [];
+  el.innerHTML = list.map((v) => {
+    const low = Number(v.freeBytes) < FREE_LOW_BYTES;
+    const title = `${v.root} — ${fmtSize(v.freeBytes)} free of ${fmtSize(v.totalBytes)}`;
+    return `<span class="chip vol${low ? ' chip-danger' : ''}" title="${esc(title)}">Free: ${esc(fmtSize(v.freeBytes))}</span>`;
+  }).join('');
+}
+
 async function refreshStatus() {
   try {
     const s = await getJson('/api/status');
     $('connDot').className = 'conn-dot ok';
     $('conn').textContent = 'connected';
     renderAgentBanner(s);
+    renderVolumes(s.volumes);
   } catch (e) {
     $('connDot').className = 'conn-dot err';
     $('conn').textContent = 'offline: ' + e.message;
+    // Drop the chips rather than leave a reading nobody can vouch for.
+    renderVolumes([]);
   }
 }
 

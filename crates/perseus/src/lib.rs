@@ -36,6 +36,9 @@
 //! - [`library`] — the library path contract: wire rel-paths are forward-slash,
 //!   and [`library::resolve_in_root`] is the single containment guard every
 //!   library route (listing, preview, send, delete) resolves user paths through.
+//! - [`diskspace`] — free-space probe: one entry per unique volume behind the
+//!   capture roots + data dir, de-duplicated by `dev()` / volume prefix. A
+//!   failed probe (offline share) is skipped with a `warn!`, never an error.
 //! - [`pending`] — pure derivation of the "To sync" tree: groups the batcher's
 //!   pending accumulator snapshot into a [`pending::PendingNode`] trie by
 //!   `rel_path` (object / date / type / file) for the web view.
@@ -45,6 +48,7 @@ pub mod batch_store;
 pub mod batcher;
 pub mod config;
 pub mod config_edit;
+pub mod diskspace;
 pub mod library;
 pub mod pending;
 pub mod resend;

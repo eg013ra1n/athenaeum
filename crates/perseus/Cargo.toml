@@ -79,11 +79,17 @@ tray-icon = { version = "0.21", optional = true }
 tao = { version = "0.34", optional = true }
 open = { version = "5.3", optional = true }
 auto-launch = { version = "0.5", optional = true }
-# Unix `statvfs` for the retention disk-usage probe (disk_pct policy). Already in
-# the workspace lock as a transitive dep; named here so run.rs can call it
-# directly. On non-unix the probe is a safe stub (0% → never triggers deletion).
+# Unix `statvfs` for the retention disk-usage probe (disk_pct policy) and the
+# per-volume free-space probe (diskspace.rs). Already in the workspace lock as a
+# transitive dep; named here so run.rs can call it directly. On non-unix the
+# retention probe is a safe stub (0% → never triggers deletion).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Windows free-space probe (diskspace.rs): `GetDiskFreeSpaceExW`. Windows-only so
+# unix/RPi builds pull nothing extra; 0.59 already resolves in the workspace lock.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
 
 [dev-dependencies]
 tempfile = "3"
