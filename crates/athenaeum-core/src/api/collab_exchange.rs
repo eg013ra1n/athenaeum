@@ -863,7 +863,7 @@ fn kick_auto_sync_if_changed(changes: &[PackageStateChange]) -> bool {
 pub async fn refresh_all_project_packages(
     ctx: &ServiceContext,
 ) -> Result<Vec<PackageStateChange>, ApiError> {
-    let project_ids: Vec<String> = {
+    let project_ids: HashSet<String> = {
         let db = db(ctx)?;
         let conn = db.conn();
         crate::db::collab::list_projects(&conn)?
@@ -872,8 +872,8 @@ pub async fn refresh_all_project_packages(
             .collect()
     };
     let mut all = Vec::new();
-    for pid in project_ids {
-        match refresh_project_packages(ctx, &pid).await {
+    for pid in &project_ids {
+        match refresh_project_packages(ctx, pid).await {
             Ok(mut c) => all.append(&mut c),
             Err(e) => {
                 tracing::warn!(project_id = %pid, error = %format!("{e}"), "refresh project packages failed; continuing")
@@ -882,8 +882,9 @@ pub async fn refresh_all_project_packages(
     }
     // Surface every change buffered off this path — a spawned pull task's
     // `downloadFailed` (F3) and the auto-replication worker's own refresh diffs
-    // (D3 T5) — drained exactly once so the frontend raises each one only once.
-    all.extend(drain_pending_package_changes());
+    // (D3 T5) — drained exactly once so the frontend raises each one only once,
+    // and only for projects this device still has (F7).
+    all.extend(drain_pending_package_changes(&project_ids));
     Ok(all)
 }
 
@@ -2234,23 +2235,65 @@ fn push_download_failure(project_id: &str, package_id: &str, detail: Option<Stri
     }]);
 }
 
+/// Hard cap on the buffer (F7). Only a UI refresh drains it, so a headless host
+/// or a window nobody opens for a week lets the auto-replication worker append
+/// forever — every pass buffers its diffs. 200 is far more than any one refresh
+/// would show; past it the OLDEST go, because a notification the user never saw
+/// for an event days old is the one worth losing.
+const MAX_PENDING_PACKAGE_CHANGES: usize = 200;
+
+/// One warn per process when the cap first bites — an unbounded log line per
+/// overflowing pass would be its own leak.
+static PENDING_OVERFLOW_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Enqueue changes a non-UI refresh consumed (D3 T5). Poison-tolerant, same as
-/// [`push_download_failure`].
+/// [`push_download_failure`]. Capped at [`MAX_PENDING_PACKAGE_CHANGES`],
+/// drop-oldest.
 fn push_package_changes(changes: Vec<PackageStateChange>) {
     if changes.is_empty() {
         return;
     }
     if let Ok(mut buf) = pending_package_changes().lock() {
         buf.extend(changes);
+        if buf.len() > MAX_PENDING_PACKAGE_CHANGES {
+            let dropped = buf.len() - MAX_PENDING_PACKAGE_CHANGES;
+            buf.drain(..dropped);
+            if !PENDING_OVERFLOW_WARNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                tracing::warn!(
+                    cap = MAX_PENDING_PACKAGE_CHANGES,
+                    dropped,
+                    "collab package-change buffer full; dropping the oldest entries (nothing has drained it — no project refresh since app start?)"
+                );
+            }
+        }
     }
 }
 
-/// Drain the buffered changes exactly once (F3).
-fn drain_pending_package_changes() -> Vec<PackageStateChange> {
-    match pending_package_changes().lock() {
+/// Drain the buffered changes exactly once (F3), keeping only those whose
+/// project this device still has (F7).
+///
+/// A project can be left, deleted, or dropped from the hub between the buffering
+/// pass and the refresh that drains it; replaying its `downloadFailed` /
+/// `newPackage` would notify about a project the user cannot even open, and the
+/// entry would otherwise sit in the buffer for the life of the process.
+fn drain_pending_package_changes(known_projects: &HashSet<String>) -> Vec<PackageStateChange> {
+    let buffered = match pending_package_changes().lock() {
         Ok(mut buf) => std::mem::take(&mut *buf),
         Err(_) => Vec::new(),
+    };
+    let before = buffered.len();
+    let kept: Vec<PackageStateChange> = buffered
+        .into_iter()
+        .filter(|c| known_projects.contains(&c.project_id))
+        .collect();
+    if kept.len() != before {
+        tracing::debug!(
+            dropped = before - kept.len(),
+            "buffered package changes dropped for projects this device no longer has"
+        );
     }
+    kept
 }
 
 /// Poll `project_packages.local_status` every [`DOWNLOAD_POLL_INTERVAL`] up to
@@ -5268,6 +5311,71 @@ mod tests {
         );
         assert_eq!(mine[0].kind, "newPackage");
         assert_eq!(mine[0].project_id, "p-buffered");
+    }
+
+    /// F7: the buffer is bounded and drop-oldest. Only a UI refresh drains it, so
+    /// a headless host or an unopened window lets every worker pass append
+    /// forever; past the cap the oldest entries go, keeping the ones a user might
+    /// still act on.
+    #[test]
+    fn buffered_package_changes_are_capped_drop_oldest() {
+        let _drain_guard = drain_lock();
+        // Start from a known-empty buffer: this static is process-global.
+        let known: HashSet<String> = ["p-cap".to_string()].into_iter().collect();
+        drain_pending_package_changes(&known);
+
+        for i in 0..(MAX_PENDING_PACKAGE_CHANGES + 50) {
+            push_package_changes(vec![PackageStateChange {
+                project_id: "p-cap".to_string(),
+                package_id: format!("pkg-{i:04}"),
+                kind: "newPackage".to_string(),
+                detail: None,
+            }]);
+        }
+
+        let drained = drain_pending_package_changes(&known);
+        assert_eq!(drained.len(), MAX_PENDING_PACKAGE_CHANGES, "the buffer is capped");
+        assert_eq!(
+            drained.first().unwrap().package_id,
+            format!("pkg-{:04}", 50),
+            "the OLDEST entries are the ones dropped"
+        );
+        assert_eq!(
+            drained.last().unwrap().package_id,
+            format!("pkg-{:04}", MAX_PENDING_PACKAGE_CHANGES + 49),
+            "the newest entry survives"
+        );
+    }
+
+    /// F7: a change buffered for a project this device no longer has is dropped at
+    /// the drain, not replayed — a notification about a project the user cannot
+    /// open, which would otherwise sit in the buffer for the life of the process.
+    #[tokio::test]
+    async fn buffered_changes_for_a_pruned_project_are_not_replayed() {
+        let _drain_guard = drain_lock();
+        let (_tmp, ctx) = test_ctx();
+        {
+            let conn = db(&ctx).unwrap().conn();
+            seed_project(&conn, "p-live", &members_json());
+        }
+        // Clear anything a sibling test left behind, then buffer one change for a
+        // live project and one for a project that is gone locally.
+        drain_pending_package_changes(&HashSet::new());
+        push_download_failure("p-live", "pkg-live", None);
+        push_download_failure("p-gone", "pkg-gone", None);
+
+        let changes = refresh_all_project_packages(&ctx).await.unwrap();
+        assert!(
+            changes.iter().any(|c| c.package_id == "pkg-live"),
+            "the live project's change still reaches the UI"
+        );
+        assert!(
+            !changes.iter().any(|c| c.package_id == "pkg-gone"),
+            "a pruned project's buffered change is dropped"
+        );
+        // …and it is not lingering for the next refresh either.
+        let again = refresh_all_project_packages(&ctx).await.unwrap();
+        assert!(again.iter().all(|c| c.package_id != "pkg-gone"));
     }
 
     /// Signed out ⇒ the pass is a silent no-op (no hub call, no download): the
