@@ -1316,11 +1316,108 @@ fn swarm_unfit() -> &'static std::sync::Mutex<HashSet<String>> {
     SWARM_UNFIT.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
 }
 
-/// Record that `package_id`'s swarm fetch failed. Poison-tolerant: a failed lock
-/// only costs one more wasted attempt, never a panic.
+/// Record that `package_id` cannot be swarm-fetched for the rest of the session.
+/// Poison-tolerant: a failed lock only costs one more wasted attempt, never a
+/// panic. Who may call this is decided by [`cache_swarm_unfit`].
 fn mark_swarm_unfit(package_id: &str) {
     if let Ok(mut set) = swarm_unfit().lock() {
         set.insert(package_id.to_string());
+    }
+}
+
+/// Which stage of a swarm attempt failed — the discrimination the verdict needs
+/// (F6). Deliberately coarse: these two are what the call site can know for a
+/// fact, without reading error strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwarmStage {
+    /// Nothing was fetched — no provider served the announced collection, or the
+    /// transport refused the fan-out outright.
+    Fetch,
+    /// The bytes arrived and the ingest rejected frames.
+    Ingest,
+}
+
+/// One failed swarm attempt: the stage plus the error the caller logs.
+struct SwarmAttemptError {
+    stage: SwarmStage,
+    error: anyhow::Error,
+}
+
+impl SwarmAttemptError {
+    fn fetch(error: anyhow::Error) -> Self {
+        SwarmAttemptError {
+            stage: SwarmStage::Fetch,
+            error,
+        }
+    }
+
+    fn ingest(error: anyhow::Error) -> Self {
+        SwarmAttemptError {
+            stage: SwarmStage::Ingest,
+            error,
+        }
+    }
+}
+
+/// May this session cache a swarm-unfit verdict for the attempt that just
+/// failed? Spec §3.2 scopes the cache to LEGACY DISCRIMINATION — "one cheap
+/// failed round per package per app run" for an announcement whose `root_hash` is
+/// a pre-D3 manifest identifier — and marking every failure class blinds the
+/// swarm to conditions that change by themselves (F6).
+///
+/// * `transport_swarm_capable = false` — no bound node, so `fetch_collection_multi`
+///   is the trait's bail. Nothing on the network is involved; every later attempt
+///   in this process gets the same answer. Cacheable.
+/// * [`SwarmStage::Fetch`] with a capable transport — no provider served the
+///   collection. A dead swarm (holders offline) and a legacy hash (holders alive,
+///   nobody holds THAT hash) are indistinguishable here… until the sequential
+///   fallback answers it: a fallback that DELIVERED proves a holder was alive and
+///   served the whole package, so what the swarm could not resolve is the hash,
+///   not reachability. Cacheable only in that case; a whole-swarm failure stays
+///   retryable, because 20 minutes later those holders may be back.
+/// * [`SwarmStage::Ingest`] — the fetch worked. A per-frame rejection can be a
+///   transient landing fault and says nothing about the swarm. Never cacheable.
+fn cache_swarm_unfit(
+    stage: SwarmStage,
+    transport_swarm_capable: bool,
+    fallback_delivered: bool,
+) -> bool {
+    if !transport_swarm_capable {
+        return true;
+    }
+    match stage {
+        SwarmStage::Fetch => fallback_delivered,
+        SwarmStage::Ingest => false,
+    }
+}
+
+/// Apply [`cache_swarm_unfit`] to the attempt this download made (if any), once
+/// the sequential fallback's outcome is known. A no-op when no swarm attempt was
+/// made or the verdict is retryable.
+fn record_swarm_verdict(
+    package_id: &str,
+    attempt: Option<SwarmStage>,
+    transport_swarm_capable: bool,
+    fallback_delivered: bool,
+) {
+    let Some(stage) = attempt else {
+        return;
+    };
+    if cache_swarm_unfit(stage, transport_swarm_capable, fallback_delivered) {
+        mark_swarm_unfit(package_id);
+        tracing::info!(
+            package_id,
+            stage = ?stage,
+            fallback_delivered,
+            "swarm marked unfit for the rest of the session"
+        );
+    } else {
+        tracing::debug!(
+            package_id,
+            stage = ?stage,
+            fallback_delivered,
+            "swarm failure is retryable; no session verdict cached"
+        );
     }
 }
 
@@ -1464,12 +1561,13 @@ impl Drop for PackagePullClaim {
 /// usable collection hash and someone else holds the package, one
 /// [`fetch_collection_multi`](SharingTransport::fetch_collection_multi) pulls it
 /// from EVERY holder at once (split per child blob, byte-level failover) and, on
-/// success, ingests + reports-have and returns. Any failure — including the
-/// legacy case where the `root_hash` is a pre-D3 manifest identifier no provider
-/// serves — caches a per-package swarm-unfit verdict for the session and falls
-/// through to the sequential loop below IN THE SAME CALL: the user pressed
-/// Download, not "try again in 20 minutes". The sequential loop itself is
-/// untouched by D3.
+/// success, ingests + reports-have and returns. Any failure falls through to the
+/// sequential loop below IN THE SAME CALL — the user pressed Download, not "try
+/// again in 20 minutes" — and only the failure classes that cannot change this
+/// session cache a swarm-unfit verdict ([`cache_swarm_unfit`], F6: a legacy
+/// `root_hash` no provider serves, or a transport that cannot fan out; never a
+/// dead swarm or a rejected ingest). The sequential loop itself is untouched by
+/// D3.
 ///
 /// `emitter` carries the `project-download-progress` events of the swarm path
 /// ([`ProjectDownloadProgress`]); the auto-replication worker (D3 T5) passes the
@@ -1613,6 +1711,12 @@ pub async fn download_project_package(
     // authz-checked fallback (a raw blob GET carries no `may_serve_package`
     // check, so the swarm path must not become a way around it).
     let swarm_capable = ann.state == "published" && looks_like_collection_hash(&ann.root_hash);
+    // What a failed swarm attempt left behind, for the session verdict decided at
+    // the fallback's exits below (F6): the stage that failed, plus whether the
+    // transport could fan out at all (a bound node means the collab role handle;
+    // without one the trait's default bails, which no retry can change).
+    let mut swarm_attempt: Option<SwarmStage> = None;
+    let swarm_transport_capable = node.is_some();
     if let Some(providers) =
         swarm_fetch_plan(&holders, own_node, swarm_capable, &swarm_unfit_snapshot(), package_id)
     {
@@ -1662,17 +1766,18 @@ pub async fn download_project_package(
                 tracing::info!(project_id, package_id, sources, "swarm download complete");
                 return Ok(());
             }
-            Err(e) => {
-                // Every failure is the same failure here: providers that don't
-                // serve this hash (legacy announcement), a transport with no
-                // swarm support, a dead swarm, or a rejected ingest. One cheap
-                // verdict per package per session, then the sequential loop.
-                mark_swarm_unfit(package_id);
+            Err(attempt) => {
+                // The session verdict is NOT decided here (F6): a dead swarm and
+                // a legacy hash both look like "nobody served it", and only the
+                // fallback's outcome tells them apart — see `cache_swarm_unfit`,
+                // applied at both exits below.
+                swarm_attempt = Some(attempt.stage);
                 tracing::warn!(
                     project_id,
                     package_id,
                     sources,
-                    error = %format!("{e:#}"),
+                    stage = ?attempt.stage,
+                    error = %format!("{:#}", attempt.error),
                     "swarm download failed; falling back to the sequential holder loop"
                 );
                 // Re-arm the row for the fallback ([`rearm_for_fallback`] — a
@@ -1759,6 +1864,9 @@ pub async fn download_project_package(
 
         // Wait for the receiver to flip local_status to complete (Task 5 ingest).
         if wait_for_local_complete(ctx, package_id).await {
+            // A holder just served the whole package, so any swarm fetch that
+            // failed above failed on the HASH, not on reachability (F6).
+            record_swarm_verdict(package_id, swarm_attempt, swarm_transport_capable, true);
             // No seed call here (D3 T4): on this path the RECEIVER ingested, and
             // its `on_project_ingested` hook already seeds before its own
             // report-have. That hook runs on a spawned task, so this loop's
@@ -1775,8 +1883,13 @@ pub async fn download_project_package(
         tracing::warn!(project_id, package_id, holder = %holder_name, "download: holder did not deliver in time; next holder");
     }
 
-    // Every holder exhausted. Carry the per-holder probe classes (Task 9) into the
-    // `downloadFailed` detail so the notification names why each holder was skipped.
+    // Every holder exhausted — nobody delivered by ANY path, so a swarm failure
+    // above is a dead swarm, not a legacy hash: no session verdict unless the
+    // transport itself cannot fan out (F6).
+    record_swarm_verdict(package_id, swarm_attempt, swarm_transport_capable, false);
+
+    // Carry the per-holder probe classes (Task 9) into the `downloadFailed`
+    // detail so the notification names why each holder was skipped.
     let detail = if probe_failures.is_empty() {
         None
     } else {
@@ -1789,8 +1902,9 @@ pub async fn download_project_package(
 
 /// One swarm attempt for `package_id` (D3 §3.1): dial hints → receive permit →
 /// [`fetch_collection_multi`](SharingTransport::fetch_collection_multi) across
-/// every provider → ingest. `Ok(())` means the package is locally complete; ANY
-/// `Err` is the caller's signal to cache a swarm-unfit verdict and fall back.
+/// every provider → ingest. `Ok(())` means the package is locally complete; an
+/// `Err` is the caller's signal to fall back, carrying the [`SwarmStage`] the
+/// session verdict is decided from ([`cache_swarm_unfit`], F6).
 ///
 /// Status transitions are the fallback's, unchanged: the row is already
 /// `downloading` (set by the caller before any network I/O), and
@@ -1811,11 +1925,12 @@ async fn try_swarm_download(
     sync_dir: &Path,
     db_path: &Path,
     emitter: Option<&dyn ProgressEmitter>,
-) -> Result<()> {
+) -> Result<(), SwarmAttemptError> {
     // The hub id is peer-minted; guard it before it becomes a path segment (C1),
     // exactly as `reconstruct_serve_dir` does.
     crate::package::validate_package_id(package_id)
-        .with_context(|| format!("reject unsafe collab package id {package_id}"))?;
+        .with_context(|| format!("reject unsafe collab package id {package_id}"))
+        .map_err(SwarmAttemptError::fetch)?;
     let staging = sync_dir.join(SWARM_STAGING_DIR).join(package_id);
 
     // Dial hints for EVERY provider up front (the sequential loop attaches one
@@ -1924,7 +2039,7 @@ async fn try_swarm_download(
         // attempt. Nothing resumable is thrown away here.
         remove_swarm_staging(&staging);
         emit_done(emitter);
-        return Err(e);
+        return Err(SwarmAttemptError::fetch(e));
     }
 
     // Ingest on a blocking thread over its OWN catalog connection (W2's
@@ -1966,11 +2081,12 @@ async fn try_swarm_download(
             )
         })
         .await
-        .context("swarm project ingest join")?
+        .context("swarm project ingest join")
+        .map_err(SwarmAttemptError::ingest)?
     };
     remove_swarm_staging(&staging);
     emit_done(emitter);
-    let outcome = outcome?;
+    let outcome = outcome.map_err(SwarmAttemptError::ingest)?;
 
     // Drop the fetched blobs (best-effort, idempotent) — the payloads are landed
     // contributions now, and the collection tag would otherwise keep a second
@@ -1989,11 +2105,13 @@ async fn try_swarm_download(
         // sequential fallback gets its turn — a per-frame reject can be a
         // transient landing fault, and the fallback re-delivers the same frames
         // through an ingest that is idempotent per (project, publisher, uuid).
-        anyhow::bail!(
+        // Ingest-stage, so it never earns a session verdict (F6): the fetch
+        // itself worked, which is all the swarm was ever asked to do.
+        return Err(SwarmAttemptError::ingest(anyhow!(
             "swarm ingest rejected {} of {} frames",
             outcome.failed.len(),
             outcome.failed.len() + outcome.ok_count
-        );
+        )));
     }
     tracing::info!(
         project_id,
@@ -4222,6 +4340,32 @@ mod tests {
             swarm_fetch_plan(&holders, NODE_SR, true, &swarm_unfit_snapshot(), PKG).is_none(),
             "the second attempt is refused for the rest of the session"
         );
+    }
+
+    /// F6: the session verdict is scoped to what can never work again this run.
+    /// Marking every failure class — which is what the first cut did — blinds the
+    /// swarm to the two conditions that change by themselves: holders coming back
+    /// online, and a landing fault that rejected a frame.
+    #[test]
+    fn swarm_unfit_is_cached_only_for_verdicts_that_cannot_change() {
+        // No swarm-capable transport: nothing on the network is involved and no
+        // retry in this process can do better.
+        assert!(cache_swarm_unfit(SwarmStage::Fetch, false, false));
+        assert!(cache_swarm_unfit(SwarmStage::Ingest, false, false));
+
+        // Dead swarm — nobody served the collection AND the fallback delivered
+        // nothing either. Holders come back; the next pass retries cheaply.
+        assert!(!cache_swarm_unfit(SwarmStage::Fetch, true, false));
+
+        // Same fetch failure, but a holder then served the WHOLE package through
+        // the fallback: the holders were live, so what the swarm could not resolve
+        // is the announced hash (a pre-D3 identifier, or nobody seeding it).
+        assert!(cache_swarm_unfit(SwarmStage::Fetch, true, true));
+
+        // An ingest rejection is not a statement about the swarm — the fetch
+        // worked — whichever way the fallback goes.
+        assert!(!cache_swarm_unfit(SwarmStage::Ingest, true, true));
+        assert!(!cache_swarm_unfit(SwarmStage::Ingest, true, false));
     }
 
     /// D3 §3.2 legacy discrimination, end to end: an announcement whose
