@@ -696,6 +696,13 @@ pub(crate) fn spawn_batcher_with_clock(
                     // re-arm itself), and after a plain tick it is a no-op — unless
                     // the clock moved, which is precisely the case it exists to
                     // absorb.
+                    //
+                    // Corollary of re-deriving AFTER the flush: a flush that runs
+                    // long enough to overrun a closely-following point (06:00 and
+                    // 06:05 with a five-minute send) skips that point — its files
+                    // simply ride the next one. Deliberate: the alternative is a
+                    // fire that immediately re-fires into a set the flush it just
+                    // waited for has already drained.
                     sched_fire = arm_schedule(&cfg, &clock);
                 }
 
@@ -740,6 +747,26 @@ pub(crate) fn spawn_batcher_with_clock(
                                 Mode::Manual | Mode::Scheduled => None,
                                 Mode::Auto => rearm(&loop_pending, &cfg),
                             };
+                            // A point that is ALREADY DUE must not vanish into a
+                            // config edit that won the select! race against its own
+                            // fire arm. `next_fire` is strictly-after `now`, so
+                            // re-deriving over a due arm would silently defer that
+                            // send by up to a day (nothing is stamped, so a restart
+                            // still catches it up — but only a restart). Serve it
+                            // first instead, exactly as the fire arm would have.
+                            if let Some(fire) = sched_fire.filter(|fire| *fire <= clock()) {
+                                if arm_schedule(&cfg, &clock).is_some() {
+                                    fire_scheduled(clock(), &loop_pending, &ctx).await;
+                                } else {
+                                    // The edit left scheduled mode (or emptied the
+                                    // points): there is no schedule left to serve
+                                    // the point on, so it is dropped — out loud.
+                                    tracing::warn!(
+                                        dropped_fire = %fire,
+                                        "config edit dropped a due scheduled point"
+                                    );
+                                }
+                            }
                             // No catch-up here, deliberately: catch-up answers
                             // "did a point elapse while the agent was DOWN", and
                             // this process has been up the whole time. A flip into
@@ -752,6 +779,8 @@ pub(crate) fn spawn_batcher_with_clock(
                             // the ordinary next point. It is not lost, only
                             // deferred: nothing was stamped, so the next start
                             // finds the same missed point and catches up then.
+                            // (Once that owed fire comes DUE the guard above serves
+                            // it instead of replacing it.)
                             sched_fire = arm_schedule(&cfg, &clock);
                         }
                         Err(_) => {
@@ -1901,6 +1930,67 @@ mod tests {
         assert!(
             h.last_fire() >= local_at(27, 6, 0),
             "the fire is stamped in the resumed present, got {}",
+            h.last_fire()
+        );
+    }
+
+    /// A point that is already DUE survives a config edit racing its own fire arm:
+    /// the batch still goes out once, and the edited schedule is armed after it.
+    ///
+    /// Without the guard the edit's re-derive would swallow the point silently —
+    /// `next_fire` is strictly-after, so the send would defer up to a day with an
+    /// untouched stamp. The race is staged deterministically by moving only the
+    /// CALENDAR past the point (the monotonic tick sleep is not ready, so the
+    /// config branch is the only runnable arm — no select! coin flip).
+    #[tokio::test(start_paused = true)]
+    async fn a_due_point_survives_a_config_edit_race() {
+        let (clock, skew) = skewable_clock(local_at(26, 5, 58));
+        let h = Harness::spawn_with(
+            scheduled_cfg(&[(6, 0)], true),
+            Opts {
+                clock: Some(clock),
+                ..Opts::default()
+            },
+        );
+        h.feed(&[0]).await;
+        settle().await;
+        assert_eq!(h.batch_count(), 0, "the point is two minutes out");
+
+        // 06:03 on the calendar only: the armed 06:00 point is due, but the
+        // batcher is still parked on its (monotonic) tick sleep.
+        *skew.lock().unwrap() = chrono::TimeDelta::minutes(5);
+        // The edit lands first — it adds a second point, so "the new schedule was
+        // armed" is observable below.
+        h.cfg_tx
+            .send(scheduled_cfg(&[(6, 0), (21, 0)], true))
+            .unwrap();
+
+        wait_until(|| h.batch_count() == 1).await;
+        assert_eq!(
+            h.batches.list().unwrap()[0].mode,
+            "scheduled",
+            "the due point was served as a scheduled batch, not dropped"
+        );
+        assert_eq!(h.batches.list().unwrap()[0].file_count, 1);
+        assert!(
+            h.handle.pending_snapshot().is_empty(),
+            "and it drained the accumulator"
+        );
+        assert!(
+            h.last_fire() >= local_at(26, 6, 0),
+            "the fire is stamped, so no restart re-catches it up, got {}",
+            h.last_fire()
+        );
+
+        // The edit's own schedule is live: the newly added 21:00 point fires too.
+        h.feed(&[1]).await;
+        wait_until(|| h.handle.pending_snapshot().len() == 1).await;
+        *skew.lock().unwrap() = chrono::TimeDelta::hours(15) + chrono::TimeDelta::minutes(5);
+        tokio::time::advance(SCHEDULE_TICK).await;
+        wait_until(|| h.batch_count() == 2).await;
+        assert!(
+            h.last_fire() >= local_at(26, 21, 0),
+            "the point the config edit ADDED fired, got {}",
             h.last_fire()
         );
     }
