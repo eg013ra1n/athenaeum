@@ -16,11 +16,22 @@
 //!   operator hits "Send N pending" on the web page, which calls
 //!   [`BatcherHandle::flush_now`] — the whole pending set goes out as one
 //!   `manual` batch. A `flush_now` with nothing pending is a no-op.
+//! - **Scheduled** ([`Mode::Scheduled`], 0.5.1 §3): a **wall-clock calendar**.
+//!   Files accumulate all night and the whole set flushes at each configured
+//!   local time (`06:00`, `14:30`, …) as one `scheduled` batch. Unlike the auto
+//!   quiet timer, a newly stabilized file does **not** move the fire time: the
+//!   schedule is a property of the clock, not of the capture activity. A point
+//!   that elapses with nothing pending is a no-op flush that still counts as a
+//!   fire (see [`fire_scheduled`]), and a point missed while the agent was down
+//!   is caught up **once** shortly after startup (see [`startup_catch_up`] and
+//!   [`catch_up_grace`] — the grace exists because a catch-up fired at the
+//!   batcher's very first instant would always find an empty accumulator).
 //!
-//! The mode is read **live** from a [`watch`] channel, so a web-side edit that
-//! flips Auto↔Manual (or changes the quiet window) takes effect on the running
-//! batcher with no restart: switching to Manual disarms the timer, switching to
-//! Auto re-arms it if anything is already pending.
+//! The mode is read **live** from a [`watch`] channel, so a web-side edit takes
+//! effect on the running batcher with no restart: switching to Manual disarms
+//! both timers, switching to Auto re-arms the quiet timer if anything is already
+//! pending, and switching to Scheduled (or editing its times) re-derives the next
+//! fire from the wall clock.
 //!
 //! # Delivery + bookkeeping (the flush)
 //!
@@ -54,19 +65,49 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use athenaeum_core::sync::{SharedPackageCleanup, SyncEngineHandle};
+use chrono::{DateTime, Local};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Duration, Instant};
 
-use crate::batch_store::BatchStore;
+use crate::batch_store::{BatchStore, KEY_LAST_SCHEDULED_FIRE};
 use crate::config::{Config, Mode, SendCfg};
 use crate::run::{build_batch_package, enqueue_package_to_all, record_seen};
+use crate::schedule;
 use crate::seen::SeenStore;
 
 /// Capacity of the manual-flush signal channel. A handful of buffered "send now"
 /// clicks is plenty — each drains the whole pending set, so extra signals past
 /// the first collapse into cheap empty no-op flushes.
 const FLUSH_CHANNEL_CAP: usize = 8;
+
+/// Longest single sleep the scheduled arm ever takes, however far away the next
+/// fire is.
+///
+/// The fire time is a **calendar** instant; `sleep_until` waits on a
+/// **monotonic** one. Sleeping the whole gap in one go would bake the current
+/// clock offset into a timer that survives NTP steps, a suspended laptop and an
+/// operator fixing the date — a machine that resumes an hour late would still
+/// wait out its original ten hours. So the loop sleeps in short hops and
+/// re-derives the remaining time from the wall clock on every wake: any clock
+/// jump is absorbed within one tick, forward (fire promptly, at the first wake
+/// where the point is in the past) and backward alike (the target simply stays
+/// in the future and is waited for again).
+///
+/// A minute is the resolution the schedule itself has (points are `HH:MM`), so
+/// this costs at most one wasted wake per minute per agent and can never make a
+/// fire more than a tick late.
+const SCHEDULE_TICK: Duration = Duration::from_secs(60);
+
+/// The batcher's view of the local wall clock — [`chrono::Local::now`] in
+/// production, a tokio-driven fake in the tests.
+///
+/// Scheduled mode is the only consumer and the whole reason for the
+/// indirection: `tokio`'s `start_paused` moves `Instant` but never
+/// `Local::now()`, so without an injectable clock a calendar scheduler is
+/// untestable — the tests would have to sleep in real seconds and could never
+/// reach tomorrow's 06:00 at all.
+pub(crate) type WallClock = Arc<dyn Fn() -> DateTime<Local> + Send + Sync>;
 
 /// A cheap, cloneable control handle to a running batcher. Holds the shared
 /// pending set (so the web status page can show what is queued) and the
@@ -501,6 +542,34 @@ async fn flush_once(
 /// re-detects them and the batcher re-batches them. No frame is lost.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_batcher(
+    stable_rx: mpsc::Receiver<(PathBuf, PathBuf)>,
+    engines: Vec<Arc<SyncEngineHandle>>,
+    seen: Arc<SeenStore>,
+    batches: Arc<BatchStore>,
+    config: Config,
+    origin_device: String,
+    cleanup: Option<Arc<SharedPackageCleanup>>,
+    send_cfg_rx: watch::Receiver<SendCfg>,
+) -> (BatcherHandle, JoinHandle<()>) {
+    spawn_batcher_with_clock(
+        stable_rx,
+        engines,
+        seen,
+        batches,
+        config,
+        origin_device,
+        cleanup,
+        send_cfg_rx,
+        Arc::new(Local::now),
+    )
+}
+
+/// [`spawn_batcher`] with the wall clock the scheduled arm reads injected — the
+/// production entry point passes [`chrono::Local::now`]; the tests pass a clock
+/// driven by tokio's paused timer, which is the only way to watch a calendar
+/// schedule reach 06:00 inside a unit test (see [`WallClock`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_batcher_with_clock(
     mut stable_rx: mpsc::Receiver<(PathBuf, PathBuf)>,
     engines: Vec<Arc<SyncEngineHandle>>,
     seen: Arc<SeenStore>,
@@ -509,6 +578,7 @@ pub fn spawn_batcher(
     origin_device: String,
     cleanup: Option<Arc<SharedPackageCleanup>>,
     mut send_cfg_rx: watch::Receiver<SendCfg>,
+    clock: WallClock,
 ) -> (BatcherHandle, JoinHandle<()>) {
     let pending: Arc<Mutex<BTreeSet<(PathBuf, PathBuf)>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let (flush_tx, mut flush_rx) = mpsc::channel::<()>(FLUSH_CHANNEL_CAP);
@@ -542,6 +612,21 @@ pub fn spawn_batcher(
         // empty pending set). Recreated as a fresh `sleep_until` each loop turn, so
         // reassigning it here *is* the timer reset.
         let mut deadline: Option<Instant> = None;
+        // The scheduled arm's target, in WALL-CLOCK time (`None` = disarmed: any
+        // mode but Scheduled, or Scheduled with no points). Kept as a calendar
+        // instant, never as a monotonic one, so every wake can re-check it against
+        // the real clock — see [`SCHEDULE_TICK`].
+        //
+        // Seeded before the first select! so a catch-up owed from a point missed
+        // while the agent was down (spec §3) is armed exactly once, at startup: the
+        // earlier of that owed fire and the ordinary next point.
+        let mut sched_fire: Option<DateTime<Local>> = [
+            startup_catch_up(&cfg, &ctx, &clock),
+            arm_schedule(&cfg, &clock),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         // Guards to disable a select! branch whose channel has closed, so a closed
         // channel never spins the loop. In practice both senders outlive the loop
         // (the watcher channel closes first, breaking us out), but this is cheap
@@ -550,9 +635,17 @@ pub fn spawn_batcher(
         let mut flush_open = true;
 
         loop {
+            // The scheduled arm's tokio deadline, re-derived from the wall clock on
+            // every turn (cheap: one `Local::now()` only while the schedule is
+            // armed). Deriving it here rather than caching an `Instant` is what
+            // makes a clock jump self-correcting — see [`SCHEDULE_TICK`].
+            let sched_wake = sched_fire.as_ref().map(|fire| schedule_wake(fire, &clock));
+
             tokio::select! {
                 // A watcher stabilized a file. Accumulate it; in auto mode this
                 // (re)arms the quiet timer — a steady drip keeps pushing it out.
+                // In SCHEDULED mode it deliberately does not: the fire time is a
+                // property of the calendar, not of the capture activity.
                 maybe = stable_rx.recv() => {
                     let Some(item) = maybe else {
                         // All watchers gone → graceful shutdown. See the fn docs:
@@ -582,6 +675,30 @@ pub fn spawn_batcher(
                     deadline = rearm(&loop_pending, &cfg);
                 }
 
+                // The scheduled arm (spec §3). This wakes MUCH more often than it
+                // fires: `sched_wake` is `min(fire, now + SCHEDULE_TICK)`, so most
+                // wakes are just "re-read the wall clock". The point is due only
+                // when the calendar says so — never when the monotonic timer alone
+                // says so, which is what keeps a suspended laptop or an NTP step
+                // from firing a day early.
+                () = async {
+                    match sched_wake {
+                        Some(at) => sleep_until(at).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let now = clock();
+                    if sched_fire.as_ref().is_some_and(|fire| *fire <= now) {
+                        fire_scheduled(now, &loop_pending, &ctx).await;
+                    }
+                    // Re-derive on EVERY wake, fired or not: after a fire this is
+                    // the next point (strictly after `now`, so a fire can never
+                    // re-arm itself), and after a plain tick it is a no-op — unless
+                    // the clock moved, which is precisely the case it exists to
+                    // absorb.
+                    sched_fire = arm_schedule(&cfg, &clock);
+                }
+
                 // The operator hit "Send N pending". Flush the whole set as a
                 // manual batch regardless of mode.
                 maybe = flush_rx.recv(), if flush_open => {
@@ -598,31 +715,44 @@ pub fn spawn_batcher(
                 // that shipped nothing). The loop never saw them arrive, so
                 // nothing armed the quiet timer for them — re-derive it, exactly
                 // as a post-flush or a mode change does.
+                //
+                // `sched_fire` is deliberately NOT touched here: a scheduled fire
+                // is a wall-clock appointment, not an activity-derived window, so
+                // returned files change *what* the next point sends, never *when*
+                // it happens. (Recomputing would be harmless but misleading — it
+                // would suggest the accumulator's contents move the calendar.)
                 () = rearm_signal.notified() => {
                     deadline = rearm(&loop_pending, &cfg);
                 }
 
-                // A live config edit (Task 6). Adopt the new mode/quiet window:
-                // Manual disarms the timer; Auto re-arms it iff something is
-                // already pending.
+                // A live config edit (Task 6). Adopt the new mode/quiet window/
+                // schedule: Manual disarms both timers; Auto re-arms the quiet
+                // timer iff something is already pending; Scheduled re-derives its
+                // next fire from the wall clock (which is also how a live edit of
+                // `schedule_times` takes effect).
                 changed = send_cfg_rx.changed(), if cfg_open => {
                     match changed {
                         Ok(()) => {
                             cfg = send_cfg_rx.borrow_and_update().clone();
                             deadline = match cfg.mode {
-                                // T12 note: `Scheduled` is inert here on purpose —
-                                // this arm is the AUTO quiet timer, and the
-                                // scheduler's own wall-clock arm is T13. Until it
-                                // lands, scheduled mode behaves as manual: files
-                                // accumulate and only an explicit flush ships them
-                                // (`POST /api/send-now` works in this mode; the web
-                                // page hides its own button until the scheduler UI
-                                // lands, so the interim flush path is the route, or
-                                // switching mode back in the TOML). Safe
-                                // degradation: nothing sends early, nothing is lost.
+                                // The AUTO quiet timer is off in both of the other
+                                // modes; scheduled mode drives `sched_fire` below.
                                 Mode::Manual | Mode::Scheduled => None,
                                 Mode::Auto => rearm(&loop_pending, &cfg),
                             };
+                            // No catch-up here, deliberately: catch-up answers
+                            // "did a point elapse while the agent was DOWN", and
+                            // this process has been up the whole time. A flip into
+                            // scheduled mode simply waits for the next point (spec
+                            // §3: a non-empty pending set is taken by that point,
+                            // nothing is lost or double-armed).
+                            //
+                            // An edit landing inside the startup catch-up's short
+                            // grace window therefore replaces that owed fire with
+                            // the ordinary next point. It is not lost, only
+                            // deferred: nothing was stamped, so the next start
+                            // finds the same missed point and catches up then.
+                            sched_fire = arm_schedule(&cfg, &clock);
                         }
                         Err(_) => {
                             // Sender dropped; stop polling this branch.
@@ -654,6 +784,172 @@ fn rearm(pending: &Arc<Mutex<BTreeSet<(PathBuf, PathBuf)>>>, cfg: &SendCfg) -> O
     has_pending.then(|| Instant::now() + quiet_window(cfg))
 }
 
+/// The next wall-clock fire in [`Mode::Scheduled`], or `None` — any other mode,
+/// or scheduled with no points (an empty `schedule_times` **disarms** rather
+/// than guessing a time; validation refuses to persist that combination, so it
+/// can only arrive from a hand-built config).
+///
+/// Unlike [`rearm`] this does not look at the pending set: a schedule point is
+/// due whether or not anything accumulated, and a point that finds nothing
+/// pending is a no-op flush that still counts as a fire (see
+/// [`fire_scheduled`]).
+fn arm_schedule(cfg: &SendCfg, clock: &WallClock) -> Option<DateTime<Local>> {
+    if cfg.mode != Mode::Scheduled {
+        return None;
+    }
+    schedule::next_fire(&cfg.schedule_times, clock())
+}
+
+/// The tokio deadline for the next scheduled wake: `min(fire, now +
+/// SCHEDULE_TICK)`, translated from the calendar into the monotonic clock at the
+/// last possible moment.
+///
+/// A `fire` already in the past yields `Instant::now()` (zero remaining), so an
+/// overdue point is served on the very next loop turn instead of waiting out a
+/// tick.
+fn schedule_wake(fire: &DateTime<Local>, clock: &WallClock) -> Instant {
+    let remaining = (*fire - clock())
+        .to_std()
+        .unwrap_or(Duration::ZERO)
+        .min(SCHEDULE_TICK);
+    Instant::now() + remaining
+}
+
+/// One scheduled fire: the same drain-and-flush the manual button performs,
+/// recorded as a `scheduled` batch, followed by the `last_scheduled_fire` stamp.
+///
+/// Two things are deliberate here:
+///
+/// - **An empty pending set still counts as a fire.** No batch row is written
+///   (the batcher never records empty batches), but the stamp advances — the
+///   stamp records "the schedule reached this point", not "a package went out".
+///   Without that, a quiet night would look like a missed point forever and
+///   every restart would catch up again.
+/// - **The stamp is written after the flush, never before.** A crash in between
+///   costs one redundant catch-up on the next start (whose files the receiver's
+///   dedup handshake trims anyway); the opposite order would silently swallow
+///   the fire.
+async fn fire_scheduled(
+    at: DateTime<Local>,
+    pending: &Arc<Mutex<BTreeSet<(PathBuf, PathBuf)>>>,
+    ctx: &SendContext,
+) {
+    let outcome = flush_once(Mode::Scheduled, pending, ctx).await;
+    stamp_scheduled_fire(&ctx.batches, at);
+    tracing::info!(
+        at = %at.to_rfc3339(),
+        file_count = outcome.as_ref().map_or(0, |o| o.file_count),
+        "scheduled fire"
+    );
+}
+
+/// Persist the time of the last scheduled fire (the catch-up window's lower
+/// bound). Best-effort: a failed write only costs one redundant catch-up on the
+/// next start, so it warns rather than derailing a delivered batch — but it is
+/// never swallowed, because a *permanently* unwritable stamp means every restart
+/// re-fires.
+fn stamp_scheduled_fire(batches: &BatchStore, at: DateTime<Local>) {
+    let value = at.to_rfc3339();
+    if let Err(error) = batches.meta_set(KEY_LAST_SCHEDULED_FIRE, &value) {
+        tracing::warn!(
+            %error,
+            value = %value,
+            "failed to stamp the last scheduled fire; a restart may catch up again"
+        );
+    }
+}
+
+/// How long after startup an owed catch-up fire waits before flushing.
+///
+/// A catch-up fired at the batcher's very first instant would flush an **empty**
+/// set every time and be a stamp, not a send: at that moment the watchers have
+/// not yet re-detected last night's unsent frames, and by construction cannot
+/// have — a file only reaches the accumulator once it has been seen unchanged
+/// for the write-stability window. So the owed fire is armed a short settle
+/// period out, derived from the operator's own watcher knobs (one full stability
+/// window plus a few poll ticks of slack) rather than a new invented one.
+///
+/// Files that take longer than that to settle (a very large tree on a slow
+/// share) are not lost — they simply go out at the next point, or on the
+/// operator's "Send N pending now".
+fn catch_up_grace(config: &Config) -> Duration {
+    config.stability() + 3 * config.poll_interval()
+}
+
+/// The startup catch-up check (spec §3), run **once** before the first arm:
+/// returns the instant an owed catch-up fire should happen at, or `None` when
+/// nothing is owed.
+///
+/// One fire, never one per missed point — [`schedule::missed_point`] returns
+/// only the LATEST point in `(last_fire, now]`, so a week of downtime owes a
+/// single send (the pending set is drained whole either way; N fires would be
+/// N-1 empty no-ops with N-1 misleading history rows).
+///
+/// The "never fired before" case is **not** a catch-up: nothing can have been
+/// missed before the feature was switched on, and treating an absent stamp as
+/// "infinitely behind" would make the first start in scheduled mode always fire.
+/// It writes the stamp as a *baseline* instead, so the very next start can tell a
+/// genuinely missed point from a fresh install — including a crash-loop that
+/// restarts across a point.
+fn startup_catch_up(
+    cfg: &SendCfg,
+    ctx: &SendContext,
+    clock: &WallClock,
+) -> Option<DateTime<Local>> {
+    if cfg.mode != Mode::Scheduled {
+        return None;
+    }
+    let now = clock();
+    let stamp = match ctx.batches.meta_get(KEY_LAST_SCHEDULED_FIRE) {
+        Ok(stamp) => stamp,
+        Err(error) => {
+            // Unknown window: neither catch up (it could fire for a point that
+            // already fired) nor baseline (it could clobber a good stamp).
+            tracing::warn!(%error, "failed to read the last scheduled fire; skipping the catch-up check");
+            return None;
+        }
+    };
+    let last = match stamp.as_deref().map(DateTime::parse_from_rfc3339) {
+        Some(Ok(last)) => Some(last.with_timezone(&Local)),
+        Some(Err(error)) => {
+            tracing::warn!(
+                %error,
+                value = %stamp.unwrap_or_default(),
+                "unparseable last_scheduled_fire; treating this start as the first"
+            );
+            None
+        }
+        None => None,
+    };
+    let Some(last) = last else {
+        stamp_scheduled_fire(&ctx.batches, now);
+        tracing::info!(
+            at = %now.to_rfc3339(),
+            "scheduled mode has no previous fire on record; recording a baseline instead of catching up"
+        );
+        return None;
+    };
+    if !cfg.schedule_catchup {
+        tracing::debug!(
+            last_fire = %last.to_rfc3339(),
+            "schedule_catchup is off; not checking for a missed point"
+        );
+        return None;
+    }
+    let missed = schedule::missed_point(&cfg.schedule_times, last, now)?;
+    let grace = catch_up_grace(&ctx.config);
+    let at = now
+        .checked_add_signed(chrono::TimeDelta::from_std(grace).unwrap_or_default())
+        .unwrap_or(now);
+    tracing::info!(
+        last_fire = %last.to_rfc3339(),
+        missed_point = %missed.to_rfc3339(),
+        at = %at.to_rfc3339(),
+        "catching up one schedule point missed while the agent was down"
+    );
+    Some(at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,7 +959,70 @@ mod tests {
     use athenaeum_core::sharing::loopback::LoopbackNetwork;
     use athenaeum_core::sync::store::{StandaloneSyncStore, SyncStore};
     use athenaeum_core::sync::SyncEngine;
+    use chrono::TimeZone;
     use std::path::Path;
+
+    /// A fixed local wall-clock instant on 2026-07-26/27 — a plain summer weekend
+    /// with no DST transition in any real zone at these hours, so the schedule
+    /// tests are deterministic whatever the machine's time zone is. (A zone that
+    /// somehow had a gap here would `expect`-fail loudly rather than skew a
+    /// deadline silently.)
+    fn local_at(day: u32, hour: u32, minute: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 7, day, hour, minute, 0)
+            .earliest()
+            .expect("2026-07-{day} {hour}:{minute} local exists in this zone")
+    }
+
+    /// A [`WallClock`] driven by tokio's (paused) timer: `base + elapsed`.
+    ///
+    /// This is the whole reason the batcher takes an injectable clock.
+    /// `start_paused` moves `Instant`, never `chrono::Local::now()`, so a
+    /// scheduler test driven by the real clock could only ever assert "it did not
+    /// fire yet". Deriving the wall clock from the same virtual timeline makes
+    /// `tokio::time::advance(2h)` mean "two hours passed" to the calendar too.
+    fn virtual_clock(base: DateTime<Local>) -> WallClock {
+        skewable_clock(base).0
+    }
+
+    /// [`virtual_clock`] plus a test-settable **skew** — the only way to move the
+    /// calendar *independently* of the monotonic timer, which is exactly the
+    /// divergence [`SCHEDULE_TICK`] exists to absorb (a suspended machine waking
+    /// hours later, an NTP step, an operator fixing the date).
+    fn skewable_clock(base: DateTime<Local>) -> (WallClock, Arc<Mutex<chrono::TimeDelta>>) {
+        let skew = Arc::new(Mutex::new(chrono::TimeDelta::zero()));
+        let origin = Instant::now();
+        let handle = Arc::clone(&skew);
+        let clock: WallClock = Arc::new(move || {
+            let skew = *handle.lock().expect("skew mutex poisoned");
+            base + chrono::TimeDelta::from_std(origin.elapsed()).unwrap_or_default() + skew
+        });
+        (clock, skew)
+    }
+
+    /// A scheduled-mode [`SendCfg`] over `times`, with catch-up as given.
+    fn scheduled_cfg(times: &[(u8, u8)], catchup: bool) -> SendCfg {
+        SendCfg {
+            mode: Mode::Scheduled,
+            auto_quiet_secs: 60,
+            schedule_times: times.to_vec(),
+            schedule_catchup: catchup,
+        }
+    }
+
+    /// The non-default knobs a test's batcher is spawned with.
+    #[derive(Default)]
+    struct Opts {
+        /// Give the batcher an EMPTY engine set — the zero-target agent (dead
+        /// worker / no configured peer), where every delivery reaches nobody.
+        no_targets: bool,
+        /// Drive the batcher's wall clock from the paused tokio timer (see
+        /// [`virtual_clock`] / [`skewable_clock`]). `None` = the real clock.
+        clock: Option<WallClock>,
+        /// Seed `perseus_meta.last_scheduled_fire` before the loop starts — the
+        /// state a restart finds.
+        last_fire: Option<DateTime<Local>>,
+    }
 
     /// Yield the scheduler enough times for the single-threaded test runtime to
     /// drive the batcher task to a parked state (all currently-queued channel
@@ -716,10 +1075,10 @@ mod tests {
         handle: BatcherHandle,
         _task: JoinHandle<()>,
         _engine: Arc<SyncEngineHandle>,
-        // Held so the batcher's `send_cfg_rx.changed()` branch never sees a
-        // dropped sender for the life of the test (the tests set mode via the
-        // seed only, not by pushing edits).
-        _cfg_tx: watch::Sender<SendCfg>,
+        /// The live send-config sender. Held so the batcher's
+        /// `send_cfg_rx.changed()` branch never sees a dropped sender for the life
+        /// of the test, and used by the mode-flip test to push an edit.
+        cfg_tx: watch::Sender<SendCfg>,
     }
 
     impl Harness {
@@ -728,13 +1087,11 @@ mod tests {
         /// as the sole target. The temp tree is intentionally leaked (`keep`) so
         /// the built package survives the assertions.
         fn spawn(send_cfg: SendCfg) -> Self {
-            Self::spawn_with_targets(send_cfg, true)
+            Self::spawn_with(send_cfg, Opts::default())
         }
 
-        /// [`spawn`](Self::spawn), but `targets == false` gives the batcher an
-        /// EMPTY engine set — the zero-target agent (dead worker / no configured
-        /// peer), where every delivery reaches nobody.
-        fn spawn_with_targets(send_cfg: SendCfg, targets: bool) -> Self {
+        /// [`spawn`](Self::spawn) with the non-default knobs in [`Opts`].
+        fn spawn_with(send_cfg: SendCfg, opts: Opts) -> Self {
             let tmp = tempfile::tempdir().unwrap().keep();
             let capture = tmp.join("capture");
             let data = tmp.join("data");
@@ -761,6 +1118,12 @@ mod tests {
             let seen = Arc::new(SeenStore::open(config.db_path()).unwrap());
             let batches = Arc::new(BatchStore::open(config.db_path()).unwrap());
             let store = Arc::new(StandaloneSyncStore::open(config.db_path()).unwrap());
+            // The state a restart finds: what the last scheduled fire was, if any.
+            if let Some(last) = opts.last_fire {
+                batches
+                    .meta_set(KEY_LAST_SCHEDULED_FIRE, &last.to_rfc3339())
+                    .unwrap();
+            }
 
             // A loopback engine with a live worker: `enqueue_package` durably
             // queues (delivered == 1) without needing a started receiver, which is
@@ -775,12 +1138,13 @@ mod tests {
             let (stable_tx, stable_rx) = mpsc::channel::<(PathBuf, PathBuf)>(64);
             let (cfg_tx, cfg_rx) = watch::channel(send_cfg);
 
-            let engines = if targets {
-                vec![Arc::clone(&engine)]
-            } else {
+            let engines = if opts.no_targets {
                 Vec::new()
+            } else {
+                vec![Arc::clone(&engine)]
             };
-            let (handle, task) = spawn_batcher(
+            let clock: WallClock = opts.clock.unwrap_or_else(|| Arc::new(Local::now));
+            let (handle, task) = spawn_batcher_with_clock(
                 stable_rx,
                 engines,
                 Arc::clone(&seen),
@@ -789,6 +1153,7 @@ mod tests {
                 "aa".repeat(32),
                 None,
                 cfg_rx,
+                clock,
             );
 
             Harness {
@@ -801,7 +1166,7 @@ mod tests {
                 handle,
                 _task: task,
                 _engine: engine,
-                _cfg_tx: cfg_tx,
+                cfg_tx,
             }
         }
 
@@ -818,6 +1183,39 @@ mod tests {
 
         fn batch_count(&self) -> usize {
             self.batches.list().unwrap().len()
+        }
+
+        /// The persisted `last_scheduled_fire`, parsed back into local time.
+        /// Panics if it was never written — every scheduled-mode start records at
+        /// least a baseline.
+        fn last_fire(&self) -> DateTime<Local> {
+            let raw = self
+                .batches
+                .meta_get(KEY_LAST_SCHEDULED_FIRE)
+                .unwrap()
+                .expect("a scheduled-mode batcher always records a fire time");
+            DateTime::parse_from_rfc3339(&raw)
+                .expect("the stamp is RFC-3339")
+                .with_timezone(&Local)
+        }
+
+        /// The rel_paths the batch with `mode` carried, sorted — "which files
+        /// actually went out in *that* batch".
+        fn files_in_batch(&self, mode: &str) -> Vec<String> {
+            let rows = self.batches.list().unwrap();
+            let row = rows
+                .iter()
+                .find(|r| r.mode == mode)
+                .unwrap_or_else(|| panic!("no {mode} batch was recorded"));
+            let mut rels: Vec<String> = self
+                .batches
+                .files_for(&row.package_ref)
+                .unwrap()
+                .into_iter()
+                .map(|(rel, _)| rel)
+                .collect();
+            rels.sort();
+            rels
         }
     }
 
@@ -1160,13 +1558,16 @@ mod tests {
     /// branch uses) so the assertion cannot race the scheduler.
     #[tokio::test]
     async fn a_zero_target_flush_requeues_its_files_and_records_nothing() {
-        let h = Harness::spawn_with_targets(
+        let h = Harness::spawn_with(
             SendCfg {
                 mode: Mode::Manual,
                 auto_quiet_secs: 60,
                 ..SendCfg::default()
             },
-            false, // no engines: every delivery reaches nobody
+            Opts {
+                no_targets: true, // no engines: every delivery reaches nobody
+                ..Opts::default()
+            },
         );
         h.feed(&[0]).await;
         wait_until(|| h.handle.pending_snapshot().len() == 1).await;
@@ -1235,5 +1636,317 @@ mod tests {
             "the returned file went out on the re-armed window"
         );
         assert!(h.handle.pending_snapshot().is_empty(), "and drained");
+    }
+
+    // ---- Scheduled mode (0.5.1 §3) ----
+
+    /// The core of scheduled mode: files that stabilize before the point WAIT for
+    /// it (no quiet-timer send, no per-file send), and the point ships the whole
+    /// accumulated set as one `scheduled` batch and stamps the fire.
+    ///
+    /// The clock crosses one [`SCHEDULE_TICK`] boundary before the point, so this
+    /// also pins that a tick wake is not a fire.
+    #[tokio::test(start_paused = true)]
+    async fn scheduled_fires_at_the_point_and_not_before() {
+        let h = Harness::spawn_with(
+            scheduled_cfg(&[(6, 0)], true),
+            Opts {
+                clock: Some(virtual_clock(local_at(26, 5, 58))),
+                ..Opts::default()
+            },
+        );
+
+        h.feed(&[0, 1]).await;
+        settle().await;
+
+        // 05:59 — one tick later, still a minute short of the point.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        settle().await;
+        assert_eq!(h.batch_count(), 0, "a tick wake is not a fire");
+        assert_eq!(
+            h.handle.pending_snapshot().len(),
+            2,
+            "the set is still accumulating for the point"
+        );
+
+        // 06:00:30 — past the point.
+        tokio::time::advance(Duration::from_secs(90)).await;
+        wait_until(|| h.batch_count() == 1).await;
+
+        let rows = h.batches.list().unwrap();
+        assert_eq!(rows[0].mode, "scheduled");
+        assert_eq!(rows[0].file_count, 2, "the whole set went out as one batch");
+        assert!(
+            h.handle.pending_snapshot().is_empty(),
+            "the point drained the accumulator"
+        );
+        assert!(
+            h.last_fire() >= local_at(26, 6, 0),
+            "the fire is stamped at or after the point it served, got {}",
+            h.last_fire()
+        );
+    }
+
+    /// A point that arrives with nothing pending is a no-op flush — no batch row
+    /// (the batcher never records empty batches) — but it STILL stamps: the stamp
+    /// records that the schedule reached the point, not that a package went out.
+    /// Without that, a quiet night would look like a missed point forever and
+    /// every restart would catch it up again.
+    #[tokio::test(start_paused = true)]
+    async fn a_point_with_nothing_pending_records_no_batch_but_still_stamps() {
+        let h = Harness::spawn_with(
+            scheduled_cfg(&[(6, 0)], true),
+            Opts {
+                clock: Some(virtual_clock(local_at(26, 5, 59))),
+                ..Opts::default()
+            },
+        );
+        settle().await;
+        let baseline = h.last_fire();
+        assert!(
+            baseline < local_at(26, 6, 0),
+            "the startup baseline predates it"
+        );
+
+        tokio::time::advance(Duration::from_secs(120)).await; // 06:01
+        wait_until(|| h.last_fire() >= local_at(26, 6, 0)).await;
+
+        assert_eq!(
+            h.batch_count(),
+            0,
+            "an empty point writes no batch row — empty batches never exist"
+        );
+    }
+
+    /// Collision (spec §3): a manual "Send N pending" mid-window drains what was
+    /// accumulated; the scheduled point that follows carries ONLY what stabilized
+    /// after that drain. By construction (the accumulator is drained at flush),
+    /// but it is the owner's stated requirement, so it is pinned.
+    #[tokio::test(start_paused = true)]
+    async fn a_manual_drain_leaves_only_later_files_for_the_point() {
+        let h = Harness::spawn_with(
+            scheduled_cfg(&[(6, 0)], true),
+            Opts {
+                clock: Some(virtual_clock(local_at(26, 5, 58))),
+                ..Opts::default()
+            },
+        );
+
+        // Two files accumulate and the operator sends them by hand.
+        h.feed(&[0, 1]).await;
+        settle().await;
+        h.handle.flush_now().await;
+        wait_until(|| h.batch_count() == 1).await;
+
+        // A third stabilizes after the manual drain.
+        h.feed(&[2]).await;
+        wait_until(|| h.handle.pending_snapshot().len() == 1).await;
+
+        tokio::time::advance(Duration::from_secs(150)).await; // 06:00:30
+        wait_until(|| h.batch_count() == 2).await;
+
+        assert_eq!(
+            h.files_in_batch("manual"),
+            vec!["a.fits", "b.fits"],
+            "the manual batch took what was pending when it ran"
+        );
+        assert_eq!(
+            h.files_in_batch("scheduled"),
+            vec!["c.fits"],
+            "the point carries ONLY the file that stabilized after the drain"
+        );
+    }
+
+    /// Catch-up (spec §3): a point that elapsed while the agent was down fires
+    /// **once** at startup, shortly after boot — late enough for the restarted
+    /// watchers to have put last night's unsent frames back into the accumulator
+    /// (see [`catch_up_grace`]), which is the whole point of catching up.
+    #[tokio::test(start_paused = true)]
+    async fn a_point_missed_while_down_is_caught_up_once_at_startup() {
+        let h = Harness::spawn_with(
+            scheduled_cfg(&[(6, 0)], true),
+            Opts {
+                // Booted at 09:00; last fired yesterday at 05:00, so today's 06:00
+                // passed unattended.
+                clock: Some(virtual_clock(local_at(26, 9, 0))),
+                last_fire: Some(local_at(25, 5, 0)),
+                ..Opts::default()
+            },
+        );
+
+        // The restarted watcher re-detects the night's unsent frames.
+        h.feed(&[0, 1]).await;
+        wait_until(|| h.handle.pending_snapshot().len() == 2).await;
+
+        tokio::time::advance(Duration::from_secs(60)).await; // past the settle grace
+        wait_until(|| h.batch_count() == 1).await;
+
+        let rows = h.batches.list().unwrap();
+        assert_eq!(rows[0].mode, "scheduled");
+        assert_eq!(rows[0].file_count, 2, "the caught-up set went out whole");
+        assert!(
+            h.last_fire() >= local_at(26, 9, 0),
+            "the catch-up advanced the stamp past the missed point, so the next \
+             start does not fire again, got {}",
+            h.last_fire()
+        );
+
+        // Exactly one fire: the ordinary next point is tomorrow's 06:00, so a long
+        // wait adds nothing.
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        settle().await;
+        assert_eq!(
+            h.batch_count(),
+            1,
+            "catch-up fires once, not once per point"
+        );
+    }
+
+    /// `schedule_catchup = false` skips the missed point entirely — and leaves the
+    /// recorded fire time alone, so turning the flag back on later still measures
+    /// downtime from the last real fire.
+    #[tokio::test(start_paused = true)]
+    async fn catch_up_disabled_skips_the_missed_point() {
+        let last = local_at(25, 5, 0);
+        let h = Harness::spawn_with(
+            scheduled_cfg(&[(6, 0)], false),
+            Opts {
+                clock: Some(virtual_clock(local_at(26, 9, 0))),
+                last_fire: Some(last),
+                ..Opts::default()
+            },
+        );
+        h.feed(&[0, 1]).await;
+        wait_until(|| h.handle.pending_snapshot().len() == 2).await;
+
+        tokio::time::advance(Duration::from_secs(300)).await;
+        settle().await;
+
+        assert_eq!(h.batch_count(), 0, "no catch-up when the flag is off");
+        assert_eq!(
+            h.last_fire(),
+            last,
+            "and the recorded fire time is untouched"
+        );
+        assert_eq!(
+            h.handle.pending_snapshot().len(),
+            2,
+            "the files wait for the next real point"
+        );
+    }
+
+    /// The FIRST start in scheduled mode has no recorded fire, and that is not
+    /// "infinitely behind": nothing can have been missed before the feature was
+    /// switched on. It records a baseline instead of firing, so the very next
+    /// start can tell a genuinely missed point from a fresh install.
+    #[tokio::test(start_paused = true)]
+    async fn a_first_run_records_a_baseline_instead_of_catching_up() {
+        let boot = local_at(26, 9, 0);
+        let h = Harness::spawn_with(
+            scheduled_cfg(&[(6, 0)], true),
+            Opts {
+                clock: Some(virtual_clock(boot)),
+                last_fire: None, // never fired: a fresh install
+                ..Opts::default()
+            },
+        );
+        h.feed(&[0, 1]).await;
+        wait_until(|| h.handle.pending_snapshot().len() == 2).await;
+
+        tokio::time::advance(Duration::from_secs(300)).await;
+        settle().await;
+
+        assert_eq!(
+            h.batch_count(),
+            0,
+            "a fresh install has nothing to catch up"
+        );
+        let stamp = h.last_fire();
+        assert!(
+            stamp >= boot && stamp < boot + chrono::TimeDelta::minutes(1),
+            "the baseline is the boot instant, got {stamp}"
+        );
+    }
+
+    /// A wall clock that jumps forward without the monotonic timer following it —
+    /// a laptop resuming from suspend, an NTP step, a Pi getting its first real
+    /// time from the network — still fires within one [`SCHEDULE_TICK`].
+    ///
+    /// This is what the capped, re-derived sleep buys. A single
+    /// `sleep_until(fire_instant)` armed at 20:00 for tomorrow's 06:00 would wait
+    /// out its full ten monotonic hours no matter what the calendar said, so a
+    /// machine that slept through the night would send at 16:00.
+    #[tokio::test(start_paused = true)]
+    async fn a_forward_clock_jump_is_absorbed_within_one_tick() {
+        let (clock, skew) = skewable_clock(local_at(26, 20, 0));
+        let h = Harness::spawn_with(
+            scheduled_cfg(&[(6, 0)], true),
+            Opts {
+                clock: Some(clock),
+                ..Opts::default()
+            },
+        );
+        h.feed(&[0]).await;
+        settle().await;
+        assert_eq!(h.batch_count(), 0, "the point is ten hours out");
+
+        // The machine suspends and resumes past the point: the calendar moved,
+        // the monotonic clock did not.
+        *skew.lock().unwrap() = chrono::TimeDelta::hours(10) + chrono::TimeDelta::minutes(5);
+
+        // ONE tick of monotonic time — not the ten hours the naive arm would need.
+        tokio::time::advance(SCHEDULE_TICK).await;
+        wait_until(|| h.batch_count() == 1).await;
+        assert_eq!(h.batches.list().unwrap()[0].mode, "scheduled");
+        assert!(
+            h.last_fire() >= local_at(27, 6, 0),
+            "the fire is stamped in the resumed present, got {}",
+            h.last_fire()
+        );
+    }
+
+    /// The schedule follows a LIVE mode edit, both ways: flipping to Manual
+    /// disarms it (the point passes with nothing sent), flipping back re-arms it
+    /// from the wall clock and the next point fires.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_mode_flip_disarms_and_re_arms_the_schedule() {
+        let h = Harness::spawn_with(
+            scheduled_cfg(&[(6, 0)], true),
+            Opts {
+                clock: Some(virtual_clock(local_at(26, 5, 58))),
+                ..Opts::default()
+            },
+        );
+        h.feed(&[0]).await;
+        settle().await;
+
+        // Flip to Manual before the point.
+        h.cfg_tx
+            .send(SendCfg {
+                mode: Mode::Manual,
+                ..scheduled_cfg(&[(6, 0)], true)
+            })
+            .unwrap();
+        settle().await;
+        tokio::time::advance(Duration::from_secs(180)).await; // 06:01 — the point passed
+        settle().await;
+        assert_eq!(h.batch_count(), 0, "manual mode ignores the schedule");
+        assert_eq!(
+            h.handle.pending_snapshot().len(),
+            1,
+            "and nothing was drained"
+        );
+
+        // Flip back: the schedule re-arms for the next point (tomorrow's 06:00).
+        h.cfg_tx.send(scheduled_cfg(&[(6, 0)], true)).unwrap();
+        settle().await;
+        tokio::time::advance(Duration::from_secs(24 * 3600)).await;
+        wait_until(|| h.batch_count() == 1).await;
+        assert_eq!(h.batches.list().unwrap()[0].mode, "scheduled");
+        assert_eq!(
+            h.batches.list().unwrap()[0].file_count,
+            1,
+            "the file that waited through the flip went out on the next point"
+        );
     }
 }

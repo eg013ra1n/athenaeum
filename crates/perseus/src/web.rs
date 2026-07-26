@@ -445,6 +445,17 @@ struct StatusDto {
     /// volume that could not be probed (offline share, vanished root) is simply
     /// absent — see [`crate::diskspace`].
     volumes: Vec<VolumeDto>,
+    /// When the next scheduled send is due (RFC-3339, **local offset** — the
+    /// operator configured `06:00` in local time and must read `06:00` back),
+    /// or `None` whenever nothing is armed: any mode but `scheduled`, or
+    /// `scheduled` with no times.
+    ///
+    /// Recomputed per poll from the live config rather than plumbed out of the
+    /// batcher: it is a pure function of `(schedule_times, now)`
+    /// ([`crate::schedule::next_fire`]), so a stateless recompute is both cheaper
+    /// than a channel and incapable of going stale — including on a detached
+    /// node, which has no batcher to ask.
+    next_scheduled_send: Option<String>,
 }
 
 /// One volume's free-space reading, for the status header's chips (and, later,
@@ -942,6 +953,16 @@ async fn api_status(
         .filter(|r| r.state == OutboundState::Cancelled)
         .count() as u64;
 
+    // The next calendar send (0.5.1 §3), derived — see `StatusDto`. Seconds
+    // resolution and the local offset are both deliberate: the schedule has
+    // minute resolution, and rendering it in UTC would show an operator in
+    // UTC+3 a "next send" three hours off their own 06:00.
+    let send = config.send_cfg();
+    let next_scheduled_send = (send.mode == Mode::Scheduled)
+        .then(|| crate::schedule::next_fire(&send.schedule_times, chrono::Local::now()))
+        .flatten()
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Secs, false));
+
     // Free space per unique volume behind the capture dirs + data dir.
     let mut probe_paths = configured.clone();
     probe_paths.push(config.data_dir.clone());
@@ -979,6 +1000,7 @@ async fn api_status(
             queued,
         },
         volumes,
+        next_scheduled_send,
     }))
 }
 
@@ -3974,6 +3996,56 @@ mod tests {
             .as_u64()
             .expect("totalBytes camelCase u64");
         assert!(total > 0 && free <= total);
+        // Auto mode: nothing is on the calendar, so the field is absent rather
+        // than a fabricated time.
+        assert!(
+            v["nextScheduledSend"].is_null(),
+            "auto mode has no scheduled send, got {}",
+            v["nextScheduledSend"]
+        );
+    }
+
+    /// In scheduled mode `/api/status` carries the next calendar send — derived
+    /// per poll from the live config (0.5.1 §3), rendered RFC-3339 in **local**
+    /// time so the operator reads back the `06:00` they configured.
+    #[tokio::test]
+    async fn status_reports_the_next_scheduled_send() {
+        let (state, tmp) = test_state().await;
+        let toml_str = format!(
+            "capture_dir = \"{}\"\ndata_dir = \"{}\"\npairing_ticket = \"t\"\n\
+             mode = \"scheduled\"\nschedule_times = [\"06:00\"]\n\
+             [retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            tmp.path().display(),
+            tmp.path().display()
+        );
+        *state.config.write().await = Config::from_toml_str(&toml_str).unwrap();
+
+        let app = build_router(Arc::clone(&state), None);
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/api/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        let next = v["nextScheduledSend"]
+            .as_str()
+            .expect("scheduled mode reports a next send");
+        assert!(
+            next.contains("T06:00:00"),
+            "the next send is the configured local 06:00, got {next}"
+        );
+        // A real RFC-3339 instant, and it is in the future (strictly-after
+        // semantics: standing exactly at 06:00 arms tomorrow's).
+        let parsed = chrono::DateTime::parse_from_rfc3339(next).expect("RFC-3339");
+        assert!(
+            parsed > chrono::Local::now(),
+            "the next send is ahead of now"
+        );
     }
 
     /// The free-space memo: a second poll inside the TTL is served from the
