@@ -14,23 +14,28 @@
 //! | source | fact it contributes |
 //! | ---- | ---- |
 //! | [`BatcherHandle::pending_snapshot`](crate::batcher::BatcherHandle::pending_snapshot) | accumulated, not yet flushed → [`Queued`](FileStatus::Queued) |
-//! | [`BatchStore::batches_for_source`] + `sync_outbound` | which packages carried it, and how each package's NEWEST attempt ended |
+//! | [`BatchStore::batches_for_source`] + `sync_outbound` | which packages carried it, and how each package's newest attempt TO EACH TARGET ended |
 //! | [`SeenStore::is_recorded`] | it was handed to the engine at least once and retention has not removed it |
+//!
+//! A package fanned out to several targets has one `sync_outbound` row per
+//! target under the same `package_ref`, so the unit of a verdict is
+//! `(package_ref, peer)` — see `newest_by_target`. Every target of every batch
+//! carrying the file votes, and the batch arms are ANY-of.
 //!
 //! Precedence runs newest-fact-first, because a file can be several of these at
 //! once (a re-captured frame is both `Queued` now and `Delivered` from a previous
 //! batch — the operator cares about the pending send):
 //!
 //! 1. in the pending set → [`Queued`](FileStatus::Queued);
-//! 2. else any batch whose newest attempt is non-terminal → [`Sending`](FileStatus::Sending);
-//! 3. else any batch whose newest attempt is `Confirmed` → [`Delivered`](FileStatus::Delivered);
-//! 4. else any batch whose newest attempt is a **receiver decline** → [`Declined`](FileStatus::Declined);
+//! 2. else ANY target's newest attempt non-terminal → [`Sending`](FileStatus::Sending) (something is still moving);
+//! 3. else ANY target's newest attempt `Confirmed` → [`Delivered`](FileStatus::Delivered) (it landed somewhere — which targets got it is the Transfers tab's job, not this chip's);
+//! 4. else ANY target's newest attempt a **receiver decline** → [`Declined`](FileStatus::Declined);
 //! 5. else a live seen row → [`Sent`](FileStatus::Sent);
 //! 6. else [`Unsent`](FileStatus::Unsent).
 //!
-//! A locally-failed or operator-cancelled batch deliberately falls through arms
-//! 2–4: neither says anything about the file's fate that arm 5 does not say more
-//! honestly.
+//! A locally-failed or operator-cancelled attempt deliberately falls through
+//! arms 2–4: neither says anything about the file's fate that arm 5 does not say
+//! more honestly.
 //!
 //! # Path spelling is the join key
 //!
@@ -52,6 +57,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use athenaeum_core::sharing::types::NodeId;
 use athenaeum_core::sync::{OutboundRow, OutboundState};
 
 use crate::batch_store::BatchStore;
@@ -69,11 +75,13 @@ pub enum FileStatus {
     Unsent,
     /// Accumulated in the batcher, awaiting the next flush.
     Queued,
-    /// At least one batch carrying it is in flight (newest attempt non-terminal).
+    /// At least one target of one batch carrying it is in flight (that target's
+    /// newest attempt is non-terminal).
     Sending,
-    /// A batch carrying it was confirmed by the receiver.
+    /// A batch carrying it was confirmed by at least one receiver.
     Delivered,
-    /// A batch carrying it was declined by the receiver (final per batch).
+    /// Every target that reached a verdict declined it (final per
+    /// `(batch, target)`).
     Declined,
     /// Handed to the sync engine at some point, with no live batch row that says
     /// more.
@@ -123,16 +131,32 @@ pub struct StatusSources<'a> {
     pub batches: &'a BatchStore,
     pub seen: &'a SeenStore,
     /// Every outbound row in the read window, in any order — the newest attempt
-    /// per `package_ref` is picked here, not by the caller.
+    /// per `(package_ref, peer)` is picked here, not by the caller.
     pub outbound: &'a [OutboundRow],
 }
 
-/// The newest attempt of each package: highest `sync_outbound.id` wins, since a
-/// resend/divert always mints a higher id than the attempt it supersedes.
-fn newest_by_package(outbound: &[OutboundRow]) -> HashMap<&str, &OutboundRow> {
-    let mut map: HashMap<&str, &OutboundRow> = HashMap::new();
+/// Every target's newest row for each package: outer key `package_ref`, inner
+/// key `peer`.
+///
+/// **`package_ref` alone is NOT a transfer.** A Perseus package fanned out to N
+/// configured targets is enqueued once per target
+/// (`run::enqueue_package_to_all`), so N
+/// `sync_outbound` rows share one `package_ref` (the payload dir path) and
+/// differ only by `peer`. Collapsing them into one row would let whichever
+/// target happened to be enqueued last speak for the whole fan-out — a NAS still
+/// transferring would read `Delivered` because the studio box confirmed.
+///
+/// Within one target the row IS the transfer: a resend resets it in place
+/// (generation+1, batch model v2.1) rather than inserting, and a divert mints a
+/// row against a DIFFERENT peer — so a second row for the same pair only appears
+/// in a stale read window. Max-id-wins keeps that case defensive rather than
+/// arbitrary.
+fn newest_by_target(outbound: &[OutboundRow]) -> HashMap<&str, HashMap<NodeId, &OutboundRow>> {
+    let mut map: HashMap<&str, HashMap<NodeId, &OutboundRow>> = HashMap::new();
     for row in outbound {
         map.entry(row.package_ref.as_str())
+            .or_default()
+            .entry(row.peer)
             .and_modify(|cur| {
                 if row.id > cur.id {
                     *cur = row;
@@ -149,7 +173,7 @@ fn newest_by_package(outbound: &[OutboundRow]) -> HashMap<&str, &OutboundRow> {
 fn status_for(
     abs: &Path,
     pending: &HashSet<&Path>,
-    newest: &HashMap<&str, &OutboundRow>,
+    newest: &HashMap<&str, HashMap<NodeId, &OutboundRow>>,
     src: &StatusSources<'_>,
 ) -> Result<(FileStatus, usize)> {
     let refs = src.batches.batches_for_source(&abs.to_string_lossy())?;
@@ -164,16 +188,21 @@ fn status_for(
     for package_ref in &refs {
         // A batch whose outbound rows were history-deleted contributes no
         // verdict — it must not pin the file to a status nothing backs.
-        let Some(row) = newest.get(package_ref.as_str()) else {
+        let Some(targets) = newest.get(package_ref.as_str()) else {
             continue;
         };
-        if !row.state.is_terminal() {
-            return Ok((FileStatus::Sending, batches));
-        }
-        if row.state == OutboundState::Confirmed {
-            confirmed = true;
-        } else if is_declined(row) {
-            declined = true;
+        // Every target of every batch votes; the arms below are ANY-of, so one
+        // still-moving copy outranks a confirmed sibling and one confirmed copy
+        // outranks a sibling the other receiver declined.
+        for row in targets.values() {
+            if !row.state.is_terminal() {
+                return Ok((FileStatus::Sending, batches));
+            }
+            if row.state == OutboundState::Confirmed {
+                confirmed = true;
+            } else if is_declined(row) {
+                declined = true;
+            }
         }
     }
     if confirmed {
@@ -213,7 +242,7 @@ pub fn list_directory(
     let entries = std::fs::read_dir(&dir).with_context(|| format!("read dir {}", dir.display()))?;
 
     let pending: HashSet<&Path> = src.pending.iter().map(|(_, file)| file.as_path()).collect();
-    let newest = newest_by_package(src.outbound);
+    let newest = newest_by_target(src.outbound);
 
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<LibraryEntry> = Vec::new();
@@ -346,18 +375,32 @@ mod tests {
         }
     }
 
+    const PEER_B: [u8; 32] = [9u8; 32];
+
     /// A bare outbound row: only the fields the status join reads (`id`,
-    /// `package_ref`, `state`, `last_error`) matter; the rest are inert.
+    /// `package_ref`, `peer`, `state`, `last_error`) matter; the rest are inert.
     fn row(
         id: i64,
         package_ref: &str,
         state: OutboundState,
         last_error: Option<&str>,
     ) -> OutboundRow {
+        row_to(id, package_ref, PEER, state, last_error)
+    }
+
+    /// Same, with an explicit target — a fan-out package has one row per peer
+    /// under the SAME `package_ref`.
+    fn row_to(
+        id: i64,
+        package_ref: &str,
+        peer: [u8; 32],
+        state: OutboundState,
+        last_error: Option<&str>,
+    ) -> OutboundRow {
         OutboundRow {
             id,
             package_ref: package_ref.to_string(),
-            peer: PEER,
+            peer,
             state,
             attempts: 0,
             created_at: "2026-07-26T10:00:00.000Z".into(),
@@ -533,6 +576,107 @@ mod tests {
             f.status_of(&f.list("", &[], &fresh_confirm), "a.fits"),
             FileStatus::Delivered,
             "the newest attempt confirmed"
+        );
+    }
+
+    // ── fan-out: one package_ref, one row per target ─────────────────────────
+
+    /// A package sent to two targets has two rows sharing one `package_ref`.
+    /// Collapsing them by id alone would let the last-enqueued target speak for
+    /// the whole fan-out — here the NAS copy is still moving and must win.
+    #[test]
+    fn a_live_target_beats_a_confirmed_sibling_target() {
+        let f = fixture();
+        let abs = f.touch("a.fits", b"x");
+        f.batches
+            .record_files("/pkg/u1", &[("a.fits".into(), abs)])
+            .unwrap();
+        let outbound = vec![
+            row_to(1, "/pkg/u1", PEER, OutboundState::Transferring, None),
+            row_to(2, "/pkg/u1", PEER_B, OutboundState::Confirmed, None),
+        ];
+        assert_eq!(
+            f.status_of(&f.list("", &[], &outbound), "a.fits"),
+            FileStatus::Sending,
+            "one target confirming does not finish the fan-out"
+        );
+    }
+
+    /// Landing on ANY target is delivery for the library chip: the file exists
+    /// somewhere off this node. Per-target detail is the Transfers tab's job.
+    #[test]
+    fn a_confirmed_target_beats_a_declined_sibling_target() {
+        let f = fixture();
+        let abs = f.touch("a.fits", b"x");
+        f.batches
+            .record_files("/pkg/u1", &[("a.fits".into(), abs)])
+            .unwrap();
+        let outbound = vec![
+            row_to(1, "/pkg/u1", PEER, OutboundState::Confirmed, None),
+            row_to(
+                2,
+                "/pkg/u1",
+                PEER_B,
+                OutboundState::Cancelled,
+                Some(CANCELLED_BY_RECEIVER_DETAIL),
+            ),
+        ];
+        assert_eq!(
+            f.status_of(&f.list("", &[], &outbound), "a.fits"),
+            FileStatus::Delivered,
+            "it WAS delivered — one receiver declining does not unsend it"
+        );
+    }
+
+    /// Only when every target declined is the file honestly `Declined`.
+    #[test]
+    fn every_target_declining_is_declined() {
+        let f = fixture();
+        let abs = f.touch("a.fits", b"x");
+        f.batches
+            .record_files("/pkg/u1", &[("a.fits".into(), abs)])
+            .unwrap();
+        let outbound = vec![
+            row_to(
+                1,
+                "/pkg/u1",
+                PEER,
+                OutboundState::Cancelled,
+                Some(CANCELLED_BY_RECEIVER_DETAIL),
+            ),
+            row_to(
+                2,
+                "/pkg/u1",
+                PEER_B,
+                OutboundState::Cancelled,
+                Some(CANCELLED_BY_RECEIVER_DETAIL),
+            ),
+        ];
+        assert_eq!(
+            f.status_of(&f.list("", &[], &outbound), "a.fits"),
+            FileStatus::Declined
+        );
+    }
+
+    /// The per-attempt collapse still applies WITHIN a target: a resend resets
+    /// the same row, but a stale read window can hold both spellings.
+    #[test]
+    fn newest_attempt_wins_per_target_not_across_targets() {
+        let f = fixture();
+        let abs = f.touch("a.fits", b"x");
+        f.batches
+            .record_files("/pkg/u1", &[("a.fits".into(), abs)])
+            .unwrap();
+        let outbound = vec![
+            row_to(1, "/pkg/u1", PEER, OutboundState::Confirmed, None),
+            // Same target, older attempt — must not resurrect a live status.
+            row_to(9, "/pkg/u1", PEER_B, OutboundState::Confirmed, None),
+            row_to(3, "/pkg/u1", PEER_B, OutboundState::Announced, None),
+        ];
+        assert_eq!(
+            f.status_of(&f.list("", &[], &outbound), "a.fits"),
+            FileStatus::Delivered,
+            "both targets' newest attempts confirmed"
         );
     }
 
