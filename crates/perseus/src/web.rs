@@ -7258,12 +7258,11 @@ mod tests {
 
     /// §2 row 1 — a **queued** file. The pending set is cleared BEFORE the
     /// unlink, so no scheduled or auto flush can ever see a file that is about
-    /// to stop existing.
+    /// to stop existing; a preview on the way there touches neither.
     ///
-    /// The ordering is proved rather than assumed: the second phase makes the
-    /// unlink fail (read-only parent), and the file's pending entry is gone even
-    /// though the file is still on disk — which can only happen if the removal
-    /// ran first.
+    /// The failure half of that promise — a pass that removes the pair and then
+    /// cannot delete the file puts it back — is
+    /// [`library_delete_that_fails_puts_the_file_back_in_the_pending_set`].
     #[tokio::test]
     async fn library_delete_queued_file_leaves_the_pending_set_first() {
         let h = send_harness().await;
@@ -7302,36 +7301,59 @@ mod tests {
             "and it left the pending set — the next flush cannot send it"
         );
 
-        // Phase 2 (unix): a failing unlink still leaves the pending set cleared.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let locked = h.cap.join("locked");
-            std::fs::create_dir_all(&locked).unwrap();
-            write_file(&h.cap, "locked/b.fits", b"x");
-            h.make_pending("locked/b.fits").await;
-            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    }
 
-            let v = body_json(
-                post_json(
-                    &app,
-                    "/api/library/delete",
-                    delete_body(
-                        serde_json::json!([{ "root": 0, "rel": "locked/b.fits" }]),
-                        true,
-                    ),
-                )
-                .await,
+    /// §2 row 1, failure half — a delete that does NOT happen puts the file
+    /// back where it found it.
+    ///
+    /// The pending removal is a promise about a file that is about to stop
+    /// existing. When the unlink then fails, the file is still on disk and still
+    /// unsent, so leaving it out of the accumulator would silently cancel its
+    /// send for the life of the process while the operator was told only "delete
+    /// failed" — the watcher cannot repair it either, because its sweep skips
+    /// paths it has already emitted. So the pair goes back, and the restore
+    /// re-arms the quiet timer for it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn library_delete_that_fails_puts_the_file_back_in_the_pending_set() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let h = send_harness().await;
+        let app = build_router(Arc::clone(&h.state), None);
+        let locked = h.cap.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        write_file(&h.cap, "locked/b.fits", b"x");
+        h.make_pending("locked/b.fits").await;
+        let pending_before = h.batcher.pending_snapshot();
+        // A read-only parent is what makes the unlink itself fail.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let v = body_json(
+            post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(
+                    serde_json::json!([{ "root": 0, "rel": "locked/b.fits" }]),
+                    true,
+                ),
             )
-            .await;
-            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
-            assert_eq!(outcome_of(&v, "locked/b.fits")["kind"], "error");
-            assert!(locked.join("b.fits").exists(), "the unlink really failed");
-            assert!(
-                h.batcher.pending_snapshot().is_empty(),
-                "pending was cleared before the unlink was attempted"
-            );
-        }
+            .await,
+        )
+        .await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(
+            outcome_of(&v, "locked/b.fits")["kind"],
+            "error",
+            "the failure is still reported as a failure"
+        );
+        assert!(locked.join("b.fits").exists(), "the unlink really failed");
+        assert_eq!(
+            h.batcher.pending_snapshot(),
+            pending_before,
+            "and the file is back in the pending set, in the watcher's own \
+             (capture_dir, file) spelling — the next flush still sends it"
+        );
     }
 
     /// §2 row 2 — a file in an **in-flight** batch. The delete proceeds (the

@@ -146,11 +146,17 @@ impl BatcherHandle {
             .collect()
     }
 
-    /// Put back pairs taken by [`take_pending`](Self::take_pending) after an
-    /// attempt that shipped nothing, and nudge the loop to re-arm its quiet
+    /// Put back pairs taken by [`take_pending`](Self::take_pending) /
+    /// [`remove_pending`](Self::remove_pending) after an attempt that shipped
+    /// nothing — a browser send that reached no target, or a library delete that
+    /// failed and left the file on disk — and nudge the loop to re-arm its quiet
     /// timer for them ([`rearm`](Self::rearm) — the loop never saw these pairs
     /// arrive, so nothing else will).
-    fn restore_pending(&self, files: Vec<(PathBuf, PathBuf)>) {
+    ///
+    /// `pub(crate)` for that second caller: nothing outside this crate may plant
+    /// entries in the accumulator, but a caller that took some out and then did
+    /// nothing with them must be able to leave it as it found it.
+    pub(crate) fn restore_pending(&self, files: Vec<(PathBuf, PathBuf)>) {
         if files.is_empty() {
             return;
         }

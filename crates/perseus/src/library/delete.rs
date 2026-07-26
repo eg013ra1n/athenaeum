@@ -20,7 +20,7 @@
 //!
 //! | case | behaviour | where |
 //! | ---- | ---- | ---- |
-//! | file is `queued` | taken out of the batcher pending set **first**, then unlinked — the next auto/scheduled flush never sees it | [`delete_perform`] step 1 |
+//! | file is `queued` | taken out of the batcher pending set **first**, then unlinked — the next auto/scheduled flush never sees it; a delete that then fails puts it back | [`delete_perform`] step 1 |
 //! | file is in an **in-flight** batch | deleted anyway; the transfer completes from the package's payload *copy*. The preview NAMES the batch so the operator knows | `in_flight_batches` |
 //! | file was in a **confirmed** batch | deleted freely; that batch's re-send degrades to its eligible subset later | `confirmed_batches` |
 //! | file **reappears** later | [`SeenStore::mark_deleted`] stamps the row, and [`SeenStore::should_enqueue`] treats anything found at a stamped path as new | [`delete_perform`] step 4 |
@@ -592,10 +592,17 @@ pub fn delete_preview(
 /// One file's failure never stops the pass — the operator asked for a set, and a
 /// permission hole on one frame must not strand the other ninety-nine.
 ///
-/// A file removed from the pending set by a pass that then fails to delete it is
-/// deliberately NOT put back: it is still on disk with no seen row, so the
-/// watcher's next sweep re-enqueues it. Restoring it here would risk a duplicate
-/// entry racing that sweep.
+/// A file whose pair was taken out of the pending set by a pass that then does
+/// NOT delete it gets that pair back ([`BatcherHandle::restore_pending`], which
+/// also re-arms the auto quiet timer). The removal is a promise about a file
+/// that is about to stop existing; when the delete fails, the file is still
+/// there and still unsent, and nothing else would ever put it back — the
+/// watcher's sweep skips paths it has already emitted, so a pending path it
+/// still holds is never re-enqueued. Dropping it would silently cancel its send
+/// for the life of the process while telling the operator only "delete failed".
+/// This includes the file that failed to `stat`: that is as often an unreadable
+/// parent as a genuinely vanished file, and a flush that meets a truly gone file
+/// drops it with a `warn!` anyway.
 pub fn delete_perform(plan: &DeletePlan, ctx: &DeleteContext<'_>) -> DeleteReport {
     let mut report = DeleteReport::default();
 
@@ -603,70 +610,42 @@ pub fn delete_perform(plan: &DeletePlan, ctx: &DeleteContext<'_>) -> DeleteRepor
         let path = file.path.as_path();
 
         // 1. Out of the pending set first (spec §2's queued row).
-        if let Some(batcher) = ctx.batcher {
-            let pairs = [(file.root_dir.clone(), file.path.clone())];
-            if batcher.remove_pending(&pairs) > 0 {
+        let pair = (file.root_dir.clone(), file.path.clone());
+        let was_pending = ctx.batcher.is_some_and(|batcher| {
+            let removed = batcher.remove_pending(std::slice::from_ref(&pair)) > 0;
+            if removed {
                 tracing::info!(
                     path = %path.display(),
                     "library delete: removed from the pending set before deleting"
                 );
             }
-        }
-
-        // `symlink_metadata`: a symlink's own size, and a dangling link still
-        // stats (it is deletable, and its audit row should say so).
-        let size = match std::fs::symlink_metadata(path) {
-            Ok(meta) => meta.len(),
-            Err(error) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    %error,
-                    "library delete: file vanished before it could be deleted"
-                );
-                report.push_failure(file, "not found".to_string());
-                continue;
-            }
-        };
-
-        // 2. Audit BEFORE the destructive action; a failure refuses this file.
-        if let Err(error) = write_deletion_audit(ctx.store, path, size, ctx.actor) {
-            let chain = format!("{error:#}");
-            tracing::error!(
-                path = %path.display(),
-                error = %chain,
-                "library delete: audit row could not be persisted — file left alone"
-            );
-            report.push_failure(file, "audit could not be written".to_string());
-            continue;
-        }
-
-        // 3. The destructive action.
-        if let Err(error) = std::fs::remove_file(path) {
-            tracing::error!(
-                path = %path.display(),
-                %error,
-                "library delete: unlink failed"
-            );
-            report.push_failure(file, error.to_string());
-            continue;
-        }
-
-        // 4. Best-effort bookkeeping: the file is gone and audited either way.
-        if let Err(error) = ctx.seen.mark_deleted(path) {
-            tracing::error!(
-                path = %path.display(),
-                error = %format!("{error:#}"),
-                "library delete: failed to stamp the seen row deleted after a successful delete"
-            );
-        }
-
-        tracing::info!(path = %path.display(), size, actor = ctx.actor, "library delete");
-        report.deleted_paths.push(path.display().to_string());
-        report.items.push(DeleteOutcomeItem {
-            rel: file.rel.clone(),
-            root: file.root,
-            outcome: DeleteOutcomeDto::Deleted,
+            removed
         });
+
+        match delete_one_file(path, ctx) {
+            Ok(size) => {
+                tracing::info!(path = %path.display(), size, actor = ctx.actor, "library delete");
+                report.deleted_paths.push(path.display().to_string());
+                report.items.push(DeleteOutcomeItem {
+                    rel: file.rel.clone(),
+                    root: file.root,
+                    outcome: DeleteOutcomeDto::Deleted,
+                });
+            }
+            Err(reason) => {
+                // Undo step 1: the file survived this pass, so the accumulator
+                // must look exactly as it did before it (see the doc above).
+                if let (true, Some(batcher)) = (was_pending, ctx.batcher) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        reason = %reason,
+                        "library delete: nothing was deleted — returning the file to the pending set"
+                    );
+                    batcher.restore_pending(vec![pair]);
+                }
+                report.push_failure(file, reason);
+            }
+        }
     }
 
     // The plan's refusals and already-gone entries are outcomes too — reported
@@ -704,6 +683,61 @@ pub fn delete_perform(plan: &DeletePlan, ctx: &DeleteContext<'_>) -> DeleteRepor
     }
 
     report
+}
+
+/// Steps 2–4 of [`delete_perform`] for one victim: stat, audit, unlink, stamp.
+///
+/// Split out so every way this can end without a deletion is ONE `Err` arm at
+/// the call site — the pending restore hangs off that arm, and a later step
+/// added here cannot forget it. `Ok` is the file's size (for the log); `Err` is
+/// the reason the report carries, and carries with it the guarantee that the
+/// file was NOT removed.
+fn delete_one_file(path: &Path, ctx: &DeleteContext<'_>) -> Result<u64, String> {
+    // `symlink_metadata`: a symlink's own size, and a dangling link still
+    // stats (it is deletable, and its audit row should say so).
+    let size = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "library delete: file vanished before it could be deleted"
+            );
+            return Err("not found".to_string());
+        }
+    };
+
+    // 2. Audit BEFORE the destructive action; a failure refuses this file.
+    if let Err(error) = write_deletion_audit(ctx.store, path, size, ctx.actor) {
+        let chain = format!("{error:#}");
+        tracing::error!(
+            path = %path.display(),
+            error = %chain,
+            "library delete: audit row could not be persisted — file left alone"
+        );
+        return Err("audit could not be written".to_string());
+    }
+
+    // 3. The destructive action.
+    if let Err(error) = std::fs::remove_file(path) {
+        tracing::error!(
+            path = %path.display(),
+            %error,
+            "library delete: unlink failed"
+        );
+        return Err(error.to_string());
+    }
+
+    // 4. Best-effort bookkeeping: the file is gone and audited either way.
+    if let Err(error) = ctx.seen.mark_deleted(path) {
+        tracing::error!(
+            path = %path.display(),
+            error = %format!("{error:#}"),
+            "library delete: failed to stamp the seen row deleted after a successful delete"
+        );
+    }
+
+    Ok(size)
 }
 
 impl DeleteReport {
