@@ -399,6 +399,8 @@ struct FileFacts {
 ///
 /// `confirms` is `None` under `keep_everything`: no fate is stated, so the extra
 /// per-file `package_for_path` lookup is skipped entirely on the default policy.
+/// An *empty* map (a node where nothing has confirmed yet) skips it for the same
+/// reason — no lookup can hit.
 fn status_for(
     abs: &Path,
     pending: &HashSet<&Path>,
@@ -414,6 +416,11 @@ fn status_for(
     // package the file no longer links to can never delete it.
     let anchor = match confirms {
         None => FateAnchor::NotConfirmed,
+        // Nothing on this node has ever confirmed, so every `confirms.get` below
+        // would miss and every file would land on `NotConfirmed` anyway — skip
+        // the per-file linkage query outright. This is the whole first night of
+        // a fresh node, and the listing is the hot path there.
+        Some(confirms) if confirms.is_empty() => FateAnchor::NotConfirmed,
         Some(confirms) => match src.seen.package_for_path(abs)? {
             None => FateAnchor::NotConfirmed,
             Some(package_ref) => match confirms.get(package_ref.as_str()) {

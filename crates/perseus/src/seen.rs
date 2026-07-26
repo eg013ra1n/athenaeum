@@ -237,16 +237,23 @@ impl SeenStore {
     /// The library's retention fate line reads this to anchor its clock on the
     /// linkage that can actually fire, rather than on an older package that
     /// carried the same bytes and lost the linkage when the file was re-sent.
+    ///
+    /// The statement is cached (as in [`BatchStore::batches_for_source`], the
+    /// other half of the library's per-file join): a listing runs this once per
+    /// file in the directory, so re-preparing it per row is pure overhead.
+    ///
+    /// [`BatchStore::batches_for_source`]: crate::batch_store::BatchStore::batches_for_source
     pub fn package_for_path(&self, path: &Path) -> Result<Option<String>> {
         let conn = self.conn.lock().expect("seen store mutex poisoned");
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT package_ref FROM perseus_seen WHERE path = ?1 AND deleted_at IS NULL",
+            )
+            .context("prepare perseus_seen package_for_path")?;
         // `package_ref` is nullable, so the row itself is `Option<Option<_>>`:
         // outer = is there a live row, inner = does it carry a linkage.
-        let row: Option<Option<String>> = conn
-            .query_row(
-                "SELECT package_ref FROM perseus_seen WHERE path = ?1 AND deleted_at IS NULL",
-                params![path.to_string_lossy()],
-                |r| r.get(0),
-            )
+        let row: Option<Option<String>> = stmt
+            .query_row(params![path.to_string_lossy()], |r| r.get(0))
             .optional()
             .context("query perseus_seen package_for_path")?;
         Ok(row.flatten())

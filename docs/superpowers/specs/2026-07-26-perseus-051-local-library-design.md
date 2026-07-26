@@ -61,6 +61,10 @@ operator nests `data_dir` inside a capture root by misconfiguration.
   "already on peer" (existing behavior, an honest success).
 - Vanished-between-listing-and-send files follow the batcher's existing rule:
   dropped with `warn!`, the rest of the batch proceeds (eligible-subset).
+- **As shipped**, the response is `{ enqueued, skipped, package_ref }`. `skipped`
+  counts exactly the files dropped above, so the page reports "Sent 4 files
+  (1 no longer on disk)" rather than leaving the operator to work out why fewer
+  files shipped than were picked.
 
 ## §2 Deletion — allowed always, honest always
 
@@ -72,12 +76,12 @@ makes consequences explicit instead of forbidding:
 | File is `queued` (pending, never sent) | Removed from the batcher pending set **first**, then disk-deleted. The scheduler/auto flush never sees it. |
 | File is in an **in-flight** batch | The transfer is unaffected — uploads read the package's payload *copy*, not the original (`build_batch_package` copies at flush). UI states: "N selected files are part of transfer #X — it will complete from its packaged copy." |
 | File was in a **confirmed** batch | Deleted freely. Consequence: that batch's *Send again* / *Send to device* (§6) degrade by the eligible-subset rule — "97 of 100 (3 deleted locally)"; at 0 remaining the affordance disables with the reason. |
-| File **reappears** later (re-copied from camera media) | On delete Perseus stamps `seen.mark_deleted` (the retention deleter's existing mechanism), so an identical `(size, mtime)` re-creation is treated as NEW and gets sent. Without this the seen-store would silently skip it — the worst quiet failure in this matrix. |
+| File **reappears** later (re-copied from camera media) | On delete Perseus stamps `seen.mark_deleted` (the retention deleter's existing mechanism), so an identical `(size, mtime)` re-creation is treated as NEW and gets sent. Without this the seen-store would silently skip it — the worst quiet failure in this matrix. **As shipped the stamp alone is not enough within one agent run**: the watcher's in-process emitted-paths set short-circuits *before* the seen store, so every in-app deletion (Library §2 *and* retention) also broadcasts a batched `WatcherForget::forget` for the paths it unlinked (T9b) — a re-creation re-enqueues on the next sweep. A file deleted **outside** Perseus (SSH, Finder, the capture software) is re-detected only after an agent restart; that is deliberate, since auto-forgetting on a stat flap would re-send half a night's data off a network share that blinked. |
 | Delete races a flush / scheduled fire | Already safe: the batcher drops vanished files with `warn!`; a flush is never fatal. |
 | Delete during a preview render | Render returns an error; UI shows "file gone" and refreshes the listing. |
 | Directory delete | Recursive, per-file rules above; a per-file failure (e.g. Windows sharing violation while the flush copies it into a payload) is reported per file and the rest proceed; the directory is removed only once emptied. |
 | Overlap with obligation-gated **Delete source files** | That flow already treats an already-missing file as already-deleted (idempotent) and keeps its audit. |
-| Audit | Every manual deletion writes the same retention-style audit row with actor `manual-web` (path, size, timestamp) — visible in the retention log beside `retention_deleted` rows. |
+| Audit | Every manual deletion writes the same retention-style audit row with actor `manual-web` (path, size, timestamp) — visible in the retention log beside `retention_deleted` rows. The row lands **before** the unlink (retention's own audit-before-delete contract), so a failed unlink can leave an audit row for a file that is still on disk. That asymmetry is the intended one — a deletion is never invisible — and it is the same shape retention already has. |
 
 API: `POST /api/library/delete { items, confirm }` — two-step on one route.
 `confirm: false` deletes nothing and returns the per-item preview (counts, the
@@ -115,9 +119,12 @@ one variant), `schedule_times = ["06:00", "14:30"]` (local device time,
   - Agent asleep across points → one catch-up fire at startup.
   - Mode flipped to `scheduled` with a non-empty pending set → next point takes
     it; nothing is lost or double-armed.
-- **UI.** Settings: mode radio (Immediately / On schedule / Manually) + an
-  HH:MM list editor; status header shows "next scheduled send: …". The web
-  page's existing "Send N pending now" button remains in every mode.
+- **UI.** Mode radio (Immediately / On schedule / Manually) + an HH:MM list
+  editor; status header shows "next scheduled send: …". The web page's existing
+  "Send N pending now" button remains in every mode. **As shipped these live in
+  the Transfers tab's "To Sync" strip, not Settings** — they sit beside the
+  pending count and the Send-now button they govern, which is where the operator
+  is already looking when they decide when the night should leave.
 
 ## §4 Preview — pre-blink
 
@@ -147,10 +154,20 @@ server exports). Exposed on `GET /api/status` as
 Library tab and the status header, red under a fixed 10 GB threshold.
 Display-only in v1 — no alerts, no config.
 
+**Shipped gap, deliberate.** Because the dedup keeps only the *first* requested
+path as a volume's label, two **sibling** roots on one disk (`…/cam1`, `…/cam2`)
+collapse to a single entry labelled `…/cam1`, and nothing on the wire says the
+second belongs to it. The UI matches a root to a volume by longest containing
+prefix, so the sibling gets **no chip at all** rather than a guessed one — for an
+unmounted NAS root a guess would print the local disk's free space under the
+NAS's name, the exact wrong-disk reading `diskspace.rs` refuses to commit by
+never resolving a path to an ancestor. Closing the gap needs the status DTO to
+say which volume each root sits on; noted as a follow-up, not done in v1.
+
 ## §6 Send a previous batch to another node
 
-Transfers history rows gain **Send to device…** (picker of the account's
-receive-capable devices, same source as the targets editor):
+Transfers history rows gain **Send to device…** (picker of this node's send
+targets):
 
 - Mints a **new** transfer — fresh payload dir basename ⇒ fresh wire
   `batch_uuid` ⇒ a brand-new inbound row on the chosen peer. The original row
@@ -161,6 +178,14 @@ receive-capable devices, same source as the targets editor):
 - Missing sources → eligible-subset: "sends 97 of 100 (3 deleted locally)" on
   the confirm; 0 → disabled with reason.
 - The receiving side's dedup handshake trims whatever that node already has.
+- **Picker amendment (shipped).** The draft above said "the account's
+  receive-capable devices, same source as the targets editor". It is not: the
+  picker (shared by §1a and §6 through one `loadSendTargets` read) offers
+  `GET /api/targets`'s **`runtime`** list — the targets the supervisor handed the
+  *running engines* — which is a subset of the configured list, itself a subset
+  of the account's devices. Offering an account device this node has no engine
+  for would be a guaranteed `400 unknown send target`; a target saved under
+  Settings but not yet applied is named as pending instead of listed.
 
 ## §7 Multiple roots, Windows paths, SMB
 
@@ -202,20 +227,40 @@ receive-capable devices, same source as the targets editor):
 
 Facts (verified against `sync/retention.rs` + `config.rs`, restated for the UI):
 candidates come from **one chokepoint** — confirmed packages only; `keep_days`
-ages from the row's **`confirmed_at`** (not capture time); `keep_everything` is
-the default and short-circuits before any probe; `dry_run` defaults on and live
-deletion additionally requires `i_have_verified_the_soak = true`; passes run
-every `interval_secs` (default hourly); every candidate is audited before
-deletion and the file is verified to exactly match what was transferred.
+ages from the row's **`confirmed_at`** (not capture time) **per confirmed row**
+— see the correction below; `keep_everything` is the default and short-circuits
+before any probe; `dry_run` defaults on and live deletion additionally requires
+`i_have_verified_the_soak = true`; passes run every `interval_secs` (default
+hourly); every candidate is audited before deletion and the file is verified to
+exactly match what was transferred.
+
+> **Correction (shipped behavior).** An earlier draft of this section said a file
+> becomes deletable "N days after **every target** confirmed receiving it". That
+> is wrong, and it is wrong in the dangerous direction — it promises a delay the
+> code does not honour. The evaluator draws its candidates from
+> `store.confirmed()`, i.e. **every confirmed row, aged individually**. A package
+> fanned out to three devices is therefore a candidate as soon as its
+> **earliest** confirmation ages out; it never waits for the slowest target. The
+> card copy and the per-file fate line below are the shipped, corrected wording.
 
 - **Settings → Retention card**, generated from the *effective* config:
   - `keep_everything`: "Perseus never deletes capture files. Manual deletion in
-    Library and per-batch *Delete source files* are the only paths."
-  - `keep_days`: "A file becomes deletable **N days after every target
-    confirmed receiving it** (not N days after capture). Checked hourly. Next
-    pass: <time>."
-  - `disk_pct`: "When the capture volume exceeds **N %**, oldest confirmed
-    files are deleted until usage is back under the cap."
+    Library, and a batch's *Delete source files*, are the only paths."
+  - `on_confirm`: "A file is deleted on the first pass after a target confirms
+    receiving it — there is no grace period."
+  - `keep_days`: "A file becomes deletable **N days after it was confirmed
+    received** — the clock starts at the confirmation, not at capture. When a
+    batch went to several devices, **the earliest confirmation starts it**."
+  - `disk_pct`: "While a capture volume sits at or over **N %**, confirmed files
+    are deleted oldest-confirmed-first until usage drops back under the cap.
+    Below the cap nothing is deleted."
+  - **Cadence, not a countdown.** The card states "Checked every hour" (from
+    `interval_secs`) plus the **last recorded pass**, not a "next pass: <time>"
+    as drafted: the retention loop is a plain `sleep(interval)` select with no
+    exposed deadline, so a next-pass clock would be a number the agent never
+    promised. A pass whose record carries `errors` — a failed/panicked tick, or a
+    pass that ran and left the volume over the cap — renders as "did not complete
+    cleanly", never as a quiet 0-candidate pass.
   - Mode banner: yellow **DRY-RUN — nothing is deleted, candidates are only
     logged**, or red **live deletion armed** (two-key opt-in visible). Link to
     the existing retention log (`/api/retention/log`).
@@ -224,6 +269,16 @@ deletion and the file is verified to exactly match what was transferred.
   deletable after …" in dry-run); `disk_pct` → "deleted under disk pressure,
   oldest first"; unsent/unconfirmed → "kept until sent and confirmed";
   `keep_everything` → no fate line at all.
+  - The anchor is the **earliest usable `confirmed_at` across the targets of the
+    package the file is still LIVE-linked to** (`SeenStore::package_for_path`) —
+    same rule as the card, and read through the one linkage that can actually
+    delete the file, not through its whole batch-participation history. The map
+    separates *confirmed at all* (the key) from *when* (the value), because
+    `on_confirm`/`disk_pct` never read a timestamp: a confirmed-but-undated
+    package still gets their line, while `keep_days` degrades to **no line at
+    all** rather than naming a wrong date or falsely claiming the file is kept.
+    `keep_everything` skips the whole confirm scan *and* the per-file linkage
+    lookup; so does an empty confirm map (nothing on the node has confirmed yet).
 - The card explicitly separates **manual deletion** (§2, always available,
   audit actor `manual-web`) from **retention** (`retention_deleted`) so the log
   reads unambiguously.

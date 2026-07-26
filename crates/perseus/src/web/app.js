@@ -542,6 +542,19 @@ function renderRetentionLastPass(rows) {
   const when = fmtMtime(Date.parse(newest.at));
   const acted = (newest.deleted || []).length;
   const eligible = (newest.wouldDelete || []).length;
+  const errors = newest.errors || [];
+  // A tick that FAILED or panicked is recorded with both lists empty and the
+  // reason in `errors`; a pass that ran but left the volume at/over the cap
+  // records its warning there too. Either way the arms below would state a
+  // clean pass ("0 candidates logged, nothing deleted") over a record that says
+  // otherwise — the exact reassurance this card exists to withhold. Counts
+  // follow only when the pass produced any, so a failed tick never borrows the
+  // vocabulary of a quiet one.
+  if (errors.length) {
+    const counts = acted || eligible ? ` (${acted} deleted, ${eligible} eligible)` : '';
+    el.textContent = `Last pass ${when} did not complete cleanly — ${errors.join('; ')}${counts}`;
+    return;
+  }
   el.textContent = newest.dryRun
     ? `Last pass ${when} — ${eligible} candidate${eligible === 1 ? '' : 's'} logged, nothing deleted.`
     : `Last pass ${when} — ${acted} file${acted === 1 ? '' : 's'} deleted of ${eligible} eligible.`;

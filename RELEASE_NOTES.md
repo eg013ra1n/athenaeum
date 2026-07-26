@@ -27,3 +27,22 @@ _The batch beta — every transfer is one honest row, receivers work in parallel
 - **The received-files counter climbs during a transfer** instead of reading `0 of 38` until the very end while the per-file bars visibly moved. Files that arrived in a single burst — resumed, already-present, small or empty — were never counted at all.
 - A resumed transfer continues from where the sender left off instead of restarting its progress from zero.
 - Duplicate detection before a transfer now consults the receiver's whole scanned library, so files the peer already has are skipped reliably — including on the very first transfer to a freshly scanned machine.
+
+<!-- 0.5.1 seed
+Feature bullets for the 0.5.1 local-library cycle, parked here so the release
+rewrite finds them. NOT published notes: everything below is inside this comment
+so a tag cut today ships the 0.5.0 notes above unchanged. Move the bullets up
+into "What's New" (and drop this block) when 0.5.1 is written.
+
+## What's New — Perseus observatory agent
+
+- **A file browser for the observatory agent.** Perseus' web page gains a Library tab that shows exactly what the agent watches: every capture folder, one directory at a time, with a status on each file — never sent, waiting for the next send, in flight, delivered, or declined — and how many batches it took part in. No more guessing from the outside whether last night actually left the mountain.
+- **Look before you send.** Select any frame in the Library and preview it right there, then walk the whole folder with the arrow keys: a pre-blink pass over the night without copying anything down first. Renders one at a time so a Raspberry Pi stays responsive, and a second pass over the same folder is instant.
+- **Send anything, again, anywhere.** Pick any files or folders in the Library and send them now, to all your devices or to one you choose — including files that were already sent, which is the point. And any past transfer can be sent to a different device from its history row: it goes out as a brand-new transfer, rebuilt from the originals still on disk, and honestly says "sends 97 of 100" when three of them are gone. Whatever the receiving device already has is skipped automatically.
+- **Delete anything, and know what happens.** Deletion is never blocked. Before it happens Perseus tells you the consequence: a file still waiting to be sent leaves the queue, a file inside a transfer that is already uploading does not disturb it, and a file from a delivered batch simply shrinks what "send again" can rebuild. Every manual deletion is written to the same audit log as automatic cleanup. If the file comes back later — recopied from the camera media — it is treated as new and sent again, immediately, without restarting the agent.
+- **Sends on a schedule.** Alongside "as soon as files settle" and "only when I press send", Perseus can now flush everything pending at fixed times of day: set 06:00, or 06:00 and 14:30, and the whole night goes out in one batch at that moment. The agent's page shows the next scheduled send, and if the machine was asleep across a scheduled time it catches up once when it wakes — once, not once per missed slot.
+- **Free space at a glance.** Each capture folder carries a free-space chip on the agent's page, red when the disk is running out, so a full observatory disk is visible before it becomes a lost night.
+- **Retention, in plain words.** Settings now states exactly what the agent will delete, generated from the policy actually running: never, on confirmation, N days after a file was confirmed received, or under disk pressure. Dry run and live deletion are called out in full, each file in the Library carries its own fate line ("deletable after …", "kept until sent and confirmed"), and the card reports the last cleanup pass — including when a pass did not complete cleanly.
+- **Capture folders on a network share are supported.** If the agent cannot establish a file-system watch on a share, it now falls back to polling for that folder and keeps discovering files instead of that folder going quiet.
+0.5.1 seed end -->
+
