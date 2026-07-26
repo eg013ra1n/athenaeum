@@ -1005,6 +1005,18 @@ pub async fn refresh_projects(ctx: &ServiceContext) -> Result<Vec<ProjectCard>, 
         }
     }
 
+    // Stop seeding every project the hub no longer lists (D3 T4). This prune is
+    // the ONE place local project membership ends — a project I left, was removed
+    // from, or that was archived — and a device that is not a member has no
+    // business advertising or serving that project's blobs. Only a SUCCESSFUL
+    // `my_projects` reaches here (a failed list returns above) and a per-project
+    // fetch failure still counts as "still mine", so this can never fire on a hub
+    // blip. Scoped per project id, never a prefix sweep. Re-joining and
+    // re-downloading re-seeds.
+    for lost in previous_ids.iter().filter(|id| !keep.contains(id)) {
+        crate::api::collab_exchange::unseed_project_local_data(ctx, lost).await;
+    }
+
     list_projects(ctx)
 }
 
@@ -1417,6 +1429,9 @@ pub async fn publish_collab_frames(
     );
 
     // ── 7. Local rows: upsert (origin=mine), mark supersedes, drop stale dirs ─
+    // Own packages whose retained dir this publish reclaimed — unseeded right
+    // after the DB scope closes (D3 T4).
+    let mut reclaimed: Vec<String> = Vec::new();
     {
         let db = db(ctx)?;
         let conn = db.conn();
@@ -1472,10 +1487,21 @@ pub async fn publish_collab_frames(
                                 }
                             }
                         }
+                        // The unseed can't run under the DB borrow (it awaits) —
+                        // collect and do it right after this scope.
+                        reclaimed.push(old.package_id.clone());
                     }
                 }
             }
         }
+    }
+
+    // Stop seeding every package whose retained dir was just reclaimed (D3 T4).
+    // A project seed is a TryReference import: its blobs reference the files
+    // under that dir, so a seed left pinned over a deleted publication is a
+    // holder the hub advertises and every GET fails on.
+    for old_package_id in &reclaimed {
+        node.unseed_project_package(project_id, old_package_id).await;
     }
 
     // ── 8. Push-seed the first receive-capable member (Д8) ───────────────────
@@ -1717,35 +1743,48 @@ pub async fn decide_announcement(
             .reject_announcement(&token, announcement_id, &reason)
             .await
             .map_err(decide_err)?;
-        let db = db(ctx)?;
-        let conn = db.conn();
-        match get_package_by_announcement(&conn, announcement_id).map_err(internal)? {
-            Some(pkg) => {
-                let contributions =
-                    contributions_for_package(&conn, &pkg.package_id).map_err(internal)?;
-                for c in &contributions {
-                    if c.landed_path.is_empty() {
-                        continue;
-                    }
-                    if let Err(e) = std::fs::remove_file(&c.landed_path) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            tracing::warn!(path = %c.landed_path, error = %e, "reject: removing review-copy file failed");
+        // The package the reject tore down, if any — unseeded right after the DB
+        // borrow closes (the unseed awaits).
+        let deleted: Option<(String, String)> = {
+            let db = db(ctx)?;
+            let conn = db.conn();
+            match get_package_by_announcement(&conn, announcement_id).map_err(internal)? {
+                Some(pkg) => {
+                    let contributions =
+                        contributions_for_package(&conn, &pkg.package_id).map_err(internal)?;
+                    for c in &contributions {
+                        if c.landed_path.is_empty() {
+                            continue;
+                        }
+                        if let Err(e) = std::fs::remove_file(&c.landed_path) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                tracing::warn!(path = %c.landed_path, error = %e, "reject: removing review-copy file failed");
+                            }
                         }
                     }
+                    let removed = delete_package(&conn, &pkg.package_id).map_err(internal)?;
+                    tracing::info!(
+                        announcement_id,
+                        package_id = %pkg.package_id,
+                        hub_state = %resp.state,
+                        files = contributions.len(),
+                        removed,
+                        "rejected announcement; review copy deleted"
+                    );
+                    Some((pkg.project_id, pkg.package_id))
                 }
-                let removed = delete_package(&conn, &pkg.package_id).map_err(internal)?;
-                tracing::info!(
-                    announcement_id,
-                    package_id = %pkg.package_id,
-                    hub_state = %resp.state,
-                    files = contributions.len(),
-                    removed,
-                    "rejected announcement; review copy deleted"
-                );
+                None => {
+                    tracing::info!(announcement_id, hub_state = %resp.state, "rejected announcement; no local review copy to delete");
+                    None
+                }
             }
-            None => {
-                tracing::info!(announcement_id, hub_state = %resp.state, "rejected announcement; no local review copy to delete");
-            }
+        };
+        // The review copy's landed files are gone, so the seed that REFERENCED
+        // them must go with them (D3 T4) — and a rejected package must not stay
+        // servable to anyone in any case.
+        if let Some((project_id, package_id)) = deleted {
+            crate::api::collab_exchange::unseed_package_local_data(ctx, &project_id, &package_id)
+                .await;
         }
     }
     Ok(())
@@ -3092,6 +3131,213 @@ mod tests {
                 .is_empty(),
             "contributions cascaded away"
         );
+    }
+
+    // ── D3 T4: unseeding at every project-data deletion site ─────────────────
+
+    /// Seed `package_id` for `project_id` on `ctx`'s node from a throwaway one-file
+    /// package dir, binding the node if the test has not already. Returns the node.
+    ///
+    /// The seed's CONTENT is irrelevant to a deletion test — what is asserted is
+    /// that the tag lives and dies with the project data — so this skips the
+    /// (heavier) real reconstruct and imports a minimal dir directly.
+    async fn seed_package_on_node(
+        ctx: &ServiceContext,
+        dir_root: &std::path::Path,
+        project_id: &str,
+        package_id: &str,
+    ) -> std::sync::Arc<crate::sharing::iroh::node::SharedIrohNode> {
+        let node = crate::api::sync::ensure_iroh_node(ctx).await.unwrap();
+        let pkg_dir = dir_root.join(format!("seed-{project_id}-{package_id}"));
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            pkg_dir.join(crate::package::MANIFEST_FILENAME),
+            format!("{project_id}/{package_id}\n").as_bytes(),
+        )
+        .unwrap();
+        node.seed_project_collection(project_id, package_id, &pkg_dir)
+            .await
+            .unwrap();
+        node
+    }
+
+    async fn seed_tag_present(
+        node: &crate::sharing::iroh::node::SharedIrohNode,
+        project_id: &str,
+        package_id: &str,
+    ) -> bool {
+        node.store()
+            .tags()
+            .get(format!("project/{project_id}/{package_id}").as_bytes())
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    /// Deletion site 1 (D3 T4): a re-publish reclaims the superseded own package's
+    /// retained `local_dir` — the very files its seed REFERENCES (`TryReference`)
+    /// — so the same step must stop seeding it. The new package is seeded, and
+    /// another project's seed is untouched.
+    #[tokio::test]
+    async fn publish_supersede_unseeds_the_reclaimed_package() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/api/v1/projects/p-1/announcements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "ann-1", "state": "published"
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        mount_announce(&server, "p-1", "ann-2", "published").await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        let out_dir = _tmp.path().join("cal_out");
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(
+                &conn,
+                "p-1",
+                &serde_json::json!([member_json("Solo", "send", false, &[0x33; 32])]).to_string(),
+            );
+            seed_publishable_set(
+                &conn,
+                &out_dir,
+                "M101 Set",
+                &[
+                    "ccccccc1-cccc-4ccc-8ccc-cccccccccccc",
+                    "ccccccc2-cccc-4ccc-8ccc-cccccccccccc",
+                ],
+            )
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        let sender = crate::sync::SyncSenderRuntime::new();
+        let first = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        // A neighbouring project's seed, which nothing here may touch.
+        let node = seed_package_on_node(&ctx, _tmp.path(), "p-other", "pkg-other").await;
+        assert!(seed_tag_present(&node, "p-1", &first.package_id).await);
+
+        let second = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+        assert_eq!(second.superseded_announcements, vec!["ann-1".to_string()]);
+
+        assert!(
+            !seed_tag_present(&node, "p-1", &first.package_id).await,
+            "the superseded package is unseeded in the same step that deletes its \
+             retained dir — a seed over deleted files is a phantom holder"
+        );
+        assert!(
+            seed_tag_present(&node, "p-1", &second.package_id).await,
+            "the new publication is seeded"
+        );
+        assert!(
+            seed_tag_present(&node, "p-other", "pkg-other").await,
+            "another project's seed is untouched"
+        );
+        node.shutdown().await;
+    }
+
+    /// Deletion site 2 (D3 T4): rejecting an announcement deletes the review
+    /// copy's landed files, so it must also stop seeding that package.
+    #[tokio::test]
+    async fn reject_unseeds_the_review_copy() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/api/v1/announcements/ann-r/reject"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "ann-r", "state": "rejected"
+            })))
+            .mount(&server)
+            .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        let land = _tmp.path().join("land");
+        std::fs::create_dir_all(&land).unwrap();
+        let f1 = land.join("u-1.fits");
+        std::fs::write(&f1, b"aaa").unwrap();
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_moderation_package(&conn, "p-1", "pkg-r", "ann-r", "pending", "complete", 1);
+            add_contribution(&conn, "p-1", "pkg-r", "u-1", f1.to_str().unwrap(), None);
+        }
+        let node = seed_package_on_node(&ctx, _tmp.path(), "p-1", "pkg-r").await;
+        seed_package_on_node(&ctx, _tmp.path(), "p-2", "pkg-keep").await;
+
+        decide_announcement(&ctx, "ann-r", false, Some("FWHM too high".into()))
+            .await
+            .unwrap();
+
+        assert!(!f1.exists(), "the review copy's landed file is deleted");
+        assert!(
+            !seed_tag_present(&node, "p-1", "pkg-r").await,
+            "a rejected package stops being seeded in the same operation"
+        );
+        assert!(
+            seed_tag_present(&node, "p-2", "pkg-keep").await,
+            "another project's seed is untouched"
+        );
+        node.shutdown().await;
+    }
+
+    /// Deletion site 3 (D3 T4): a project the hub no longer lists (left, removed,
+    /// archived) is pruned from the cache — this device is not a member any more,
+    /// so it must stop seeding EVERY package of that project. The `p-stays` seed
+    /// is the scope control: unseeding is per project id, never a `project/`
+    /// prefix sweep, so a project this prune did not name keeps every seed.
+    #[tokio::test]
+    async fn pruning_a_lost_project_unseeds_all_its_packages() {
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        use ed25519_dalek::SigningKey;
+
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let server = MockServer::start().await;
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/api/v1/collab/pubkey"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "pubkey": B64.encode(key.verifying_key().to_bytes())
+            })))
+            .mount(&server)
+            .await;
+        // The hub lists NOTHING: every cached project is gone from my membership.
+        Mock::given(wm_method("GET"))
+            .and(wm_path("/api/v1/me/projects"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            seed_publish_project(&conn, "p-gone", "[]");
+            seed_moderation_package(&conn, "p-gone", "pkg-a", "ann-a", "published", "complete", 1);
+            seed_moderation_package(&conn, "p-gone", "pkg-b", "ann-b", "published", "complete", 1);
+        }
+        let node = seed_package_on_node(&ctx, _tmp.path(), "p-gone", "pkg-a").await;
+        seed_package_on_node(&ctx, _tmp.path(), "p-gone", "pkg-b").await;
+        seed_package_on_node(&ctx, _tmp.path(), "p-stays", "pkg-c").await;
+
+        refresh_projects(&ctx).await.unwrap();
+
+        assert!(
+            crate::db::collab::get_project(&crate::api::db(&ctx).unwrap().conn(), "p-gone")
+                .unwrap()
+                .is_none(),
+            "the lost project was pruned (the real deletion this hangs off)"
+        );
+        assert!(
+            !seed_tag_present(&node, "p-gone", "pkg-a").await
+                && !seed_tag_present(&node, "p-gone", "pkg-b").await,
+            "every package of a project I am no longer in stops seeding"
+        );
+        assert!(
+            seed_tag_present(&node, "p-stays", "pkg-c").await,
+            "a project I am still in keeps seeding"
+        );
+        node.shutdown().await;
     }
 
     /// A hub 409 (already decided) is a `Conflict` and leaves the local review

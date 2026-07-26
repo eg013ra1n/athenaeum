@@ -102,7 +102,7 @@ pub fn reconstruct_serve_dir(
     let records = parse_manifest_bytes(manifest_bytes)
         .with_context(|| format!("parse retained manifest for {package_id}"))?;
     let serve_dir = sync_dir.join("collab_serve").join(package_id);
-    materialize_serve_dir(conn, &pkg.project_id, &serve_dir, manifest_bytes, &records)
+    materialize_package_dir(conn, &pkg.project_id, &serve_dir, manifest_bytes, &records)
         .with_context(|| format!("reconstruct collab serve dir for {package_id}"))?;
     tracing::info!(
         package_id,
@@ -111,6 +111,87 @@ pub fn reconstruct_serve_dir(
         "collab serve dir reconstructed"
     );
     Ok(serve_dir)
+}
+
+/// Where a RECEIVED package's seed dir lives: `<sync_dir>/collab_seed/<package_id>`
+/// (D3 §3.4). Deliberately NOT `collab_serve`, and that separation is the whole
+/// point — see [`reconstruct_seed_dir`].
+const SEED_DIR: &str = "collab_seed";
+
+/// Rebuild the directory this device SEEDS for a locally-held package — the
+/// lifetime-safe twin of [`reconstruct_serve_dir`] (D3 §3.4).
+///
+/// - `origin='mine'` ⇒ the retained publication dir (`local_dir`), which publish
+///   already seeded (D3 T2) and which only its own supersede-reclaim deletes.
+/// - anything received ⇒ `<sync_dir>/collab_seed/<package_id>`, materialized from
+///   the retained manifest + the landed contributions by the SAME
+///   [`materialize_package_dir`] the serve path uses (hard links, byte-copy
+///   fallback), and idempotent the same way.
+///
+/// **Why not just seed the serve dir.** A seed is imported with
+/// [`ImportMode::TryReference`](iroh_blobs::api::blobs::ImportMode::TryReference),
+/// which makes the blob store keep a REFERENCE TO A PATH (vendored
+/// `store/fs/import.rs` → `ImportSource::External(path, …)`), re-opened on every
+/// later read. A `collab_serve/<pkg>` dir is temporary by contract:
+/// [`CollabCleanupSink::on_terminal`] deletes it at every push-serve terminal.
+/// Seeding it would therefore leave a permanently-tagged collection whose blobs
+/// point at paths the next serve deletes — a device the hub advertises as a
+/// holder but that fails every GET. `collab_seed/<pkg>` is touched by nothing
+/// except the unseed paths ([`unseed_package_local_data`] /
+/// [`unseed_project_local_data`]), and it is not the swarm staging dir
+/// ([`SWARM_STAGING_DIR`], removed after every fetch) either.
+///
+/// When the store ALREADY holds the content — the common case right after a
+/// fetch — the import is satisfied from what is there and no reference is taken;
+/// the dir is what a re-import reads when the store does not (measured both ways
+/// by `downloader_seed_survives_collab_serve_cleanup` and the three-node e2e). It
+/// must therefore outlive the tag in either case, which is why every unseed site
+/// drops the tag and this dir together.
+///
+/// **Why hard links are the right reference.** The seed dir's entries are hard
+/// links to the landed contribution files, so the store's referenced path stays
+/// valid for as long as the SEED itself does — even when the contribution is
+/// later superseded and its landed file unlinked (`replace_contribution_for_uuid`
+/// + the caller's `remove_file`), the inode survives behind our link and the seed
+/// keeps serving exactly the bytes its collection hash names. Referencing
+/// `landed_path` directly would have made that ordinary re-publish silently
+/// break every older package this device seeds. On a landing root that cannot be
+/// hard-linked (a different volume), the fallback is a byte copy — the same
+/// trade the serve path already makes.
+pub fn reconstruct_seed_dir(
+    conn: &rusqlite::Connection,
+    sync_dir: &Path,
+    package_id: &str,
+) -> Result<PathBuf> {
+    let pkg = crate::db::collab_exchange::get_package(conn, package_id)?
+        .ok_or_else(|| anyhow!("collab package {package_id} not found for seeding"))?;
+
+    if pkg.origin == "mine" {
+        let dir = pkg
+            .local_dir
+            .as_deref()
+            .ok_or_else(|| anyhow!("own collab package {package_id} has no retained local_dir"))?;
+        return Ok(PathBuf::from(dir));
+    }
+
+    crate::package::validate_package_id(package_id)
+        .with_context(|| format!("reject unsafe collab package id {package_id}"))?;
+    let manifest_bytes = pkg
+        .manifest_ndjson
+        .as_deref()
+        .ok_or_else(|| anyhow!("collab package {package_id} has no retained manifest to seed"))?;
+    let records = parse_manifest_bytes(manifest_bytes)
+        .with_context(|| format!("parse retained manifest for {package_id}"))?;
+    let seed_dir = sync_dir.join(SEED_DIR).join(package_id);
+    materialize_package_dir(conn, &pkg.project_id, &seed_dir, manifest_bytes, &records)
+        .with_context(|| format!("materialize collab seed dir for {package_id}"))?;
+    tracing::debug!(
+        package_id,
+        count = records.len(),
+        path = %seed_dir.display(),
+        "collab seed dir materialized"
+    );
+    Ok(seed_dir)
 }
 
 /// Parse retained NDJSON manifest bytes into records (blank lines skipped,
@@ -153,7 +234,7 @@ fn manifest_fully_local(
     Ok(true)
 }
 
-/// Materialize `serve_dir` from the RETAINED MANIFEST (Д2): `manifest.ndjson`
+/// Materialize `dest_dir` from the RETAINED MANIFEST (Д2): `manifest.ndjson`
 /// byte-exact from `manifest_bytes`, then for each manifest record resolve its
 /// payload among locally-held contributions by content hash
 /// (`find_contribution_by_project_and_hash`, scoped to `project_id`) and
@@ -168,18 +249,23 @@ fn manifest_fully_local(
 /// HARD error — we refuse to serve a package we cannot fully reconstruct
 /// (the request handler's silent-drop discipline turns the error into a refusal).
 /// Idempotent — a second call re-writes the manifest and skips present payloads.
-fn materialize_serve_dir(
+///
+/// Two callers, two destinations: [`reconstruct_serve_dir`] (the temporary
+/// `collab_serve/<pkg>` a push-serve enqueues) and [`reconstruct_seed_dir`] (the
+/// durable `collab_seed/<pkg>` a seed references). Both want byte-identical
+/// content laid out at the manifest's `rel_path`s; only their lifetimes differ.
+fn materialize_package_dir(
     conn: &rusqlite::Connection,
     project_id: &str,
-    serve_dir: &Path,
+    dest_dir: &Path,
     manifest_bytes: &[u8],
     records: &[crate::package::ManifestRecord],
 ) -> Result<()> {
-    std::fs::create_dir_all(serve_dir)
-        .with_context(|| format!("create collab serve dir {}", serve_dir.display()))?;
+    std::fs::create_dir_all(dest_dir)
+        .with_context(|| format!("create collab package dir {}", dest_dir.display()))?;
     // The manifest is written byte-exact so a re-serve is byte-identical to the
     // original (Д2). Overwriting with the same bytes keeps the second call idempotent.
-    let manifest_path = serve_dir.join(crate::package::MANIFEST_FILENAME);
+    let manifest_path = dest_dir.join(crate::package::MANIFEST_FILENAME);
     std::fs::write(&manifest_path, manifest_bytes)
         .with_context(|| format!("write serve manifest {}", manifest_path.display()))?;
 
@@ -187,7 +273,7 @@ fn materialize_serve_dir(
         // `rel_path` originated in a peer's manifest — guard before joining (L1).
         crate::package::validate_rel_path(&record.rel_path)
             .with_context(|| format!("reject unsafe manifest rel_path {}", record.rel_path))?;
-        let dest = serve_dir.join(&record.rel_path);
+        let dest = dest_dir.join(&record.rel_path);
         if dest.exists() {
             // Idempotent second call: the payload is already materialized.
             continue;
@@ -896,6 +982,168 @@ pub async fn report_have_after_ingest(
     Ok(())
 }
 
+/// **Every downloader becomes a seed** (D3 §3.4): after a successful ingest, pin
+/// the package's blobs under `project/<project_id>/<package_id>` so an incoming
+/// swarm GET is served straight out of the blob store — no control-message round
+/// trip, no reconstruct-on-demand, no `may_serve_package` handshake.
+///
+/// ONE hook for BOTH ingest completions: the receiver's push/fallback arm (via
+/// `api::sync`'s `on_project_ingested` hook, which calls this before
+/// [`report_have_after_ingest`]) and the swarm path
+/// ([`download_project_package`], which calls it before its own `report_have`).
+///
+/// **Order is load-bearing: seed, THEN report_have.** `report_have` is what puts
+/// this device on the hub's holder list, i.e. what makes other members' swarm
+/// fetches dial us; advertising before the blobs are servable would publish a
+/// phantom holder every fetch has to fail over.
+///
+/// **Best-effort by design, and that is not a lie.** A seed failure is a `warn!`
+/// and the caller still reports have — because a device with the package landed
+/// can serve it via the pre-D3 path regardless (`handle_project_request`
+/// reconstructs and enqueues on demand), which is exactly today's semantics. What
+/// is lost on failure is the zero-round-trip swarm serve, not the holder claim.
+///
+/// Reads the ALREADY-BOUND node off the context and never binds one: seeding is a
+/// side effect of an ingest that already happened, and a no-node context (loopback
+/// tests, a host with sync not started) must not grow an endpoint for it.
+pub async fn seed_ingested_package(ctx: &ServiceContext, package_id: &str) {
+    let Some(node) = ctx.iroh_node.lock().await.clone() else {
+        tracing::debug!(package_id, "project seed skipped: no iroh node bound");
+        return;
+    };
+    let (sync_dir, _db_path) = match crate::api::sync::sync_paths(ctx) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(package_id, error = %format!("{e}"), "project seed skipped: sync paths unavailable");
+            return;
+        }
+    };
+
+    // Same completeness gate `report_have_after_ingest` applies (F1): the hook
+    // fires after a partial ingest too, and a package whose payloads are not all
+    // local cannot be reconstructed — seeding it would pin a broken collection.
+    let (project_id, dir) = {
+        let db = match db(ctx) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(package_id, error = %format!("{e}"), "project seed skipped: catalog unavailable");
+                return;
+            }
+        };
+        let conn = db.conn();
+        let row = match get_package(&conn, package_id) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                tracing::warn!(package_id, "project seed skipped: no local package row");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(package_id, error = %format!("{e}"), "project seed skipped: package read failed");
+                return;
+            }
+        };
+        if row.local_status != "complete" {
+            tracing::debug!(
+                package_id,
+                local_status = %row.local_status,
+                "project seed skipped: package not locally complete"
+            );
+            return;
+        }
+        match reconstruct_seed_dir(&conn, &sync_dir, package_id) {
+            Ok(dir) => (row.project_id, dir),
+            Err(e) => {
+                tracing::warn!(package_id, error = %format!("{e:#}"), "project seed skipped: seed dir unavailable");
+                return;
+            }
+        }
+    };
+
+    match node
+        .seed_project_collection(&project_id, package_id, &dir)
+        .await
+    {
+        Ok(hash) => tracing::info!(
+            project_id = %project_id,
+            package_id,
+            root_hash = %hash,
+            "ingested package seeded"
+        ),
+        Err(e) => tracing::warn!(
+            project_id = %project_id,
+            package_id,
+            error = %format!("{e:#}"),
+            "seeding an ingested package failed; serving falls back to on-demand reconstruction"
+        ),
+    }
+}
+
+/// Stop seeding ONE package and drop the materialized seed dir that backed it —
+/// the teardown half of [`seed_ingested_package`], for the sites that delete a
+/// package's local data (D3 §3.4: "deleting a project's local data deletes its
+/// `project/<id>/…` tags in the same operation").
+///
+/// Best-effort and silent about absence: a package that was never seeded, a node
+/// that is not bound, and a seed dir that does not exist are all normal. The seed
+/// dir is removed because it is derived (hard links rebuilt by
+/// [`reconstruct_seed_dir`] from the manifest + contributions); leaving it behind
+/// an untagged collection would be pure garbage. An `origin='mine'` package's seed
+/// dir IS its retained `local_dir`, which lives under `collab_pub` and is
+/// therefore never matched here — its own publish path owns that dir's lifetime.
+pub async fn unseed_package_local_data(ctx: &ServiceContext, project_id: &str, package_id: &str) {
+    let Some(node) = ctx.iroh_node.lock().await.clone() else {
+        tracing::debug!(project_id, package_id, "unseed skipped: no iroh node bound");
+        return;
+    };
+    node.unseed_project_package(project_id, package_id).await;
+    if let Ok((sync_dir, _db_path)) = crate::api::sync::sync_paths(ctx) {
+        remove_seed_dir(&sync_dir, package_id);
+    }
+}
+
+/// Stop seeding EVERY package of one project + drop their seed dirs — the
+/// project-scoped twin of [`unseed_package_local_data`], for the site where this
+/// device stops being a member of the project at all.
+pub async fn unseed_project_local_data(ctx: &ServiceContext, project_id: &str) {
+    let Some(node) = ctx.iroh_node.lock().await.clone() else {
+        tracing::debug!(project_id, "unseed skipped: no iroh node bound");
+        return;
+    };
+    node.unseed_project(project_id).await;
+    let Ok((sync_dir, _db_path)) = crate::api::sync::sync_paths(ctx) else {
+        return;
+    };
+    let package_ids: Vec<String> = match db(ctx) {
+        Ok(d) => match list_packages(&d.conn(), project_id) {
+            Ok(rows) => rows.into_iter().map(|r| r.package_id).collect(),
+            Err(e) => {
+                tracing::warn!(project_id, error = %format!("{e}"), "unseed: listing the project's packages failed; seed dirs left in place");
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            tracing::warn!(project_id, error = %format!("{e}"), "unseed: catalog unavailable; seed dirs left in place");
+            Vec::new()
+        }
+    };
+    for package_id in package_ids {
+        remove_seed_dir(&sync_dir, &package_id);
+    }
+}
+
+/// Best-effort removal of one `collab_seed/<package_id>` tree. Missing is normal
+/// (never seeded, or already cleaned); anything else is logged, never swallowed.
+fn remove_seed_dir(sync_dir: &Path, package_id: &str) {
+    let dir = sync_dir.join(SEED_DIR).join(package_id);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => tracing::debug!(package_id, path = %dir.display(), "collab seed dir removed"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(package_id, path = %dir.display(), error = %e, "collab seed dir cleanup failed")
+        }
+    }
+}
+
 // ── D3 §3.1: the swarm (multi-source) download path ─────────────────────────
 //
 // The preferred path in front of the sequential holder loop: hand the WHOLE
@@ -1191,6 +1439,13 @@ pub async fn download_project_package(
         .await
         {
             Ok(()) => {
+                // Seed BEFORE reporting have (D3 §3.4/T4): `report_have` is what
+                // puts this device on the hub's holder list, so advertising ahead
+                // of a servable seed would publish a phantom every other member's
+                // fetch has to fail over. Best-effort — a failed seed still
+                // reports have, because the package is still servable through the
+                // on-demand `handle_project_request` path.
+                seed_ingested_package(ctx, package_id).await;
                 // No ack on this path (spec §3.1.4): an ack settles a SENDER's
                 // outbound row, and no holder enqueued one — nobody was asked to
                 // serve. `report_have` is this path's completion signal, exactly
@@ -1293,6 +1548,12 @@ pub async fn download_project_package(
 
         // Wait for the receiver to flip local_status to complete (Task 5 ingest).
         if wait_for_local_complete(ctx, package_id).await {
+            // No seed call here (D3 T4): on this path the RECEIVER ingested, and
+            // its `on_project_ingested` hook already seeds before its own
+            // report-have. That hook runs on a spawned task, so this loop's
+            // report-have can win the race — which is fine and is exactly the
+            // pre-D3 semantics: a landed package is servable through
+            // `handle_project_request` whether or not the seed has landed yet.
             // Report-have (device bearer) so the hub adds us to the swarm.
             if let Err(e) = client.report_have(&token, &ann.id).await {
                 tracing::warn!(announcement_id = %ann.id, error = %format!("{e}"), "download: report_have failed after ingest");
@@ -3272,5 +3533,381 @@ mod tests {
             .is_none(),
             "the cached verdict sends the next Download straight to the fallback"
         );
+    }
+
+    // ── D3 T4: every downloader becomes a seed ───────────────────────────────
+
+    /// Bind a real (relay-disabled) shared node at `ctx`'s sync dir and install it
+    /// on the context — exactly where `ensure_iroh_node` leaves it in production,
+    /// which is where [`seed_ingested_package`] reads it from.
+    async fn bind_node_into(
+        ctx: &ServiceContext,
+    ) -> Arc<crate::sharing::iroh::node::SharedIrohNode> {
+        let (sync_dir, _db_path) = crate::api::sync::sync_paths(ctx).unwrap();
+        std::fs::create_dir_all(&sync_dir).unwrap();
+        let node = crate::sharing::iroh::node::SharedIrohNode::bind(
+            &sync_dir,
+            iroh::RelayMode::Disabled,
+        )
+        .await
+        .expect("bind relay-disabled node");
+        *ctx.iroh_node.lock().await = Some(Arc::clone(&node));
+        node
+    }
+
+    /// The root hash a node currently seeds for `(project, package)`, or `None`.
+    async fn seeded_hash(
+        node: &crate::sharing::iroh::node::SharedIrohNode,
+        project_id: &str,
+        package_id: &str,
+    ) -> Option<iroh_blobs::Hash> {
+        node.store()
+            .tags()
+            .get(format!("project/{project_id}/{package_id}").as_bytes())
+            .await
+            .expect("tags().get")
+            .map(|t| t.hash)
+    }
+
+    /// Export every child of the collection `root` out of `node`'s store into
+    /// `dest` — the local twin of what an incoming GET reads. A blob imported
+    /// with `TryReference` is a REFERENCE TO A PATH, so this fails the moment
+    /// that path is gone: it is the oracle for "the seed is still servable".
+    async fn export_collection_locally(
+        node: &crate::sharing::iroh::node::SharedIrohNode,
+        root: iroh_blobs::Hash,
+        dest: &Path,
+    ) -> Result<()> {
+        let store = node.store();
+        let collection = iroh_blobs::format::collection::Collection::load(root, store)
+            .await
+            .with_context(|| format!("load collection {root}"))?;
+        std::fs::create_dir_all(dest)?;
+        for (name, hash) in collection.iter() {
+            let target = dest.join(name);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            store
+                .blobs()
+                .export(*hash, &target)
+                .await
+                .with_context(|| format!("export {name} ({hash})"))?;
+        }
+        Ok(())
+    }
+
+    /// THE seam (D3 T4). `CollabCleanupSink::on_terminal` deletes
+    /// `collab_serve/<pkg>` at every push-serve terminal, and a `TryReference`
+    /// blob is a reference to a PATH (vendored `store/fs/import.rs`:
+    /// `ImportSource::External(path, …)`) — so seeding the SERVE dir would put
+    /// every seeded blob behind a path the next serve terminal deletes, turning
+    /// this device into a phantom holder the hub still advertises. The seed
+    /// therefore targets its own `collab_seed/<pkg>` tree of hard links, which no
+    /// cleanup path touches. Here: seed, then run the real cleanup sink over the
+    /// real reconstructed serve dir, then assert the seeded collection still
+    /// exports byte-identical content.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn downloader_seed_survives_collab_serve_cleanup() {
+        const PROJECT: &str = "p-seam";
+        const HUB: &str = "hub-seam";
+
+        let (tmp, ctx) = test_ctx();
+        // 128 KiB: comfortably above the store's inline threshold, so the blob is
+        // genuinely an external reference and not data copied into redb — an
+        // inlined payload would survive any deletion and prove nothing.
+        let payload = vec![0x5Au8; 128 * 1024];
+        let landing = tmp.path().join("land");
+        {
+            let conn = db(&ctx).unwrap().conn();
+            seed_received_package(&conn, &landing, PROJECT, HUB, "Alice", "published", &payload);
+        }
+        let node = bind_node_into(&ctx).await;
+
+        seed_ingested_package(&ctx, HUB).await;
+        let root = seeded_hash(&node, PROJECT, HUB)
+            .await
+            .expect("the post-ingest hook seeds the package");
+
+        // The seed target is NOT the serve dir.
+        let (sync_dir, _db_path) = crate::api::sync::sync_paths(&ctx).unwrap();
+        let seed_dir = sync_dir.join(SEED_DIR).join(HUB);
+        assert!(seed_dir.join("L_0001.fits").exists(), "the seed dir holds the payload");
+
+        // Now do what a push-serve does: reconstruct the serve dir and let the
+        // real cleanup sink take it at terminal.
+        let serve_dir = {
+            let conn = db(&ctx).unwrap().conn();
+            reconstruct_serve_dir(&conn, &sync_dir, HUB).unwrap()
+        };
+        assert_ne!(serve_dir, seed_dir, "the serve dir and the seed dir are separate trees");
+        CollabCleanupSink.on_terminal(&serve_dir);
+        assert!(!serve_dir.exists(), "the serve dir is gone (the cleanup really ran)");
+
+        // The seed is untouched and still servable.
+        let out = tmp.path().join("exported");
+        export_collection_locally(&node, root, &out)
+            .await
+            .expect("the seeded collection must still export after the serve dir is cleaned");
+        assert_eq!(
+            std::fs::read(out.join("L_0001.fits")).unwrap(),
+            payload,
+            "the seed serves byte-identical content"
+        );
+
+        node.shutdown().await;
+    }
+
+    /// A stamped N-frame package dir (manifest + payloads), plus its manifest
+    /// anchor and byte size — built exactly the way a publisher builds one.
+    ///
+    /// MANY children on purpose: `SplitStrategy::Split` issues one request per
+    /// collection child and re-shuffles the provider list for each, so a
+    /// dozen-plus payloads is what makes "both holders served" a fact rather than
+    /// a coin flip.
+    fn build_stamped_package(
+        src_root: &Path,
+        project_id: &str,
+        hub_package_id: &str,
+        files: usize,
+        size: usize,
+    ) -> (PathBuf, String, u64) {
+        std::fs::create_dir_all(src_root).unwrap();
+        let mut records = Vec::with_capacity(files);
+        for i in 0..files {
+            let name = format!("L_{i:02}.fits");
+            let payload_path = src_root.join(&name);
+            // Distinct, non-repeating content per file, so a mis-attributed child
+            // fails the content check rather than merely a size check.
+            let bytes: Vec<u8> = (0..size).map(|j| ((j + i * 97) % 251) as u8).collect();
+            std::fs::write(&payload_path, &bytes).unwrap();
+            records.push((
+                payload_path,
+                ManifestRecord {
+                    v: MANIFEST_VERSION,
+                    frame_uuid: format!("uuid-crown-{i:02}"),
+                    origin_catalog_uuid: "cat".to_string(),
+                    origin_device: "de".repeat(32),
+                    payload_kind: PayloadKind::CalibratedLight,
+                    rel_path: name,
+                    byte_size: size as u64,
+                    xxh3: hash_bytes(&bytes),
+                    frame_meta: serde_json::json!({ "object": "M42" }),
+                    analysis: None,
+                    app_version: "test".to_string(),
+                    project: Some(ProjectStamp {
+                        project_id: project_id.to_string(),
+                        package_id: hub_package_id.to_string(),
+                        thresholds_version: None,
+                        cal_engine_version: None,
+                    }),
+                },
+            ));
+        }
+        let pkg_dir = src_root
+            .parent()
+            .unwrap()
+            .join(format!("pkg-{hub_package_id}"));
+        let announce = crate::package::write_package(&pkg_dir, records).unwrap();
+        let anchor =
+            crate::package::xxh3_full_file(&pkg_dir.join(crate::package::MANIFEST_FILENAME))
+                .unwrap();
+        (pkg_dir, anchor, announce.byte_size)
+    }
+
+    /// Total bytes a node's endpoint has sent since bind (relay + direct) — the
+    /// per-provider oracle, taken from iroh's own socket counters. The Split
+    /// progress stream is lossy upstream (T1's re-gate), so telemetry can never
+    /// answer "did this provider serve payload"; this can.
+    fn sent_bytes(node: &Arc<crate::sharing::iroh::node::SharedIrohNode>) -> u64 {
+        let c = node.counters_snapshot_for_test();
+        c.send_direct_bytes.saturating_add(c.send_relay_bytes)
+    }
+
+    /// A provider's send delta must clear this to count as "served real payload".
+    /// Same floor and same reasoning as the T1 swarm tests: measured non-serving
+    /// providers still send ~16 KB of handshake/ACK traffic, one served 96 KiB
+    /// child is an order of magnitude above that.
+    const SERVED_PAYLOAD_FLOOR: u64 = 64 * 1024;
+
+    /// **The crown e2e** (real QUIC, three nodes): A publishes+seeds (T2), B swarm
+    /// -fetches from [A], ingests for real and seeds through the T4 hook, then C
+    /// swarm-fetches from [A, B] and BOTH serve payload bytes.
+    ///
+    /// This is the whole point of D3: the swarm only grows if a downloader turns
+    /// into a provider. Two things make that work and both are asserted — B's
+    /// seed carries the SAME collection hash A announced (content addressing
+    /// across devices: B's seed dir is the retained manifest bytes plus the
+    /// landed payloads at their manifest `rel_path`s, so it imports to A's hash),
+    /// and after the production `release` of the fetched collection the project
+    /// seed is the ONLY tag pinning those blobs on B.
+    ///
+    /// Scope, honestly: the byte counters prove BOTH holders served payload for
+    /// C's fetch. They cannot prove B served *out of its seed dir* — a device
+    /// that just fetched a package already holds those blobs as store-owned
+    /// copies, and the seed's re-import does not displace them (measured: B's
+    /// `blobs/data` still holds one package's worth after seeding). The seed dir
+    /// is what the seed references when the store does NOT already hold the
+    /// content, and `downloader_seed_survives_collab_serve_cleanup` is the test
+    /// that pins that case.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn swarm_downloader_becomes_a_seed_and_serves_the_next_downloader() {
+        use crate::sharing::iroh::node::SharedIrohNode;
+
+        const PROJECT: &str = "proj-crown";
+        const HUB: &str = "hub-crown";
+        const FILES: usize = 14;
+        const SIZE: usize = 96 * 1024;
+
+        // ── A: the publisher, seed №1 (the T2 path) ──────────────────────────
+        let a_tmp = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let (pkg_dir, anchor, byte_size) =
+            build_stamped_package(&src.path().join("src"), PROJECT, HUB, FILES, SIZE);
+        let a_node = SharedIrohNode::bind(&a_tmp.path().join("sync"), iroh::RelayMode::Disabled)
+            .await
+            .unwrap();
+        let a_collab = a_node.handle(Role::Collab);
+        let a_info = a_collab.start().await.unwrap();
+        let root = a_node
+            .seed_project_collection(PROJECT, HUB, &pkg_dir)
+            .await
+            .expect("A seeds what it published");
+
+        // ── B: a real downloader — fetch, ingest, seed through the T4 hook ────
+        let (b_tmp, b_ctx) = test_ctx();
+        let (b_sync_dir, b_db_path) = crate::api::sync::sync_paths(&b_ctx).unwrap();
+        {
+            let conn = db(&b_ctx).unwrap().conn();
+            seed_project(&conn, PROJECT, &members_json());
+            let mut row = base_package(HUB, PROJECT, "Alice");
+            row.origin = "received".to_string();
+            row.manifest_xxh3 = Some(anchor.clone());
+            row.byte_size = byte_size as i64;
+            row.frame_count = FILES as i64;
+            row.root_hash = root.to_hex().to_string();
+            upsert_package(&conn, &row).unwrap();
+        }
+        let b_node = bind_node_into(&b_ctx).await;
+        let b_collab = b_node.handle(Role::Collab);
+        let b_info = b_collab.start().await.unwrap();
+
+        // Relay-disabled endpoints have no discovery: every pair needs the other's
+        // address out of band (in production those are the holder dial hints).
+        b_node.add_peer_ticket(&a_info.pairing_ticket).unwrap();
+        a_node.add_peer_ticket(&b_info.pairing_ticket).unwrap();
+
+        let telemetry: ProviderTelemetrySink = Arc::new(|_| {});
+        let staging = b_sync_dir.join(SWARM_STAGING_DIR).join(HUB);
+        b_collab
+            .fetch_collection_multi(
+                vec![a_info.node_id],
+                &root.to_string(),
+                byte_size,
+                &staging,
+                noop_fetch_sink(),
+                telemetry,
+            )
+            .await
+            .expect("B fetches the package from A");
+
+        // Real ingest over B's own catalog connection, exactly as the swarm path
+        // runs it, then the production staging + blob cleanup.
+        let outcome = {
+            let store = CatalogSyncStore::open(&b_db_path).unwrap();
+            crate::sync::ingest_project_package(
+                crate::sync::IngestConn::Shared(&store),
+                &staging,
+                PROJECT,
+                HUB,
+                "swarm",
+            )
+            .expect("B ingests the fetched package")
+        };
+        assert!(outcome.failed.is_empty(), "every frame ingested: {outcome:?}");
+        remove_swarm_staging(&staging);
+        b_collab
+            .release(&PackageId(root.to_hex().to_string()))
+            .await
+            .expect("B releases the fetched collection, as the swarm path does");
+
+        seed_ingested_package(&b_ctx, HUB).await;
+
+        assert_eq!(
+            seeded_hash(&b_node, PROJECT, HUB).await,
+            Some(root),
+            "B's seed must BE A's collection — identical bytes, identical hash, or \
+             there is no swarm for C to fetch from"
+        );
+        assert!(
+            !tag_present_on(&b_node, &format!("collab/pkg/{}", root.to_hex())).await,
+            "after release, the project seed is the only tag pinning these blobs on B"
+        );
+
+        // ── C: the second downloader — fetches from [A, B] ───────────────────
+        let c_tmp = tempfile::tempdir().unwrap();
+        let c_node = SharedIrohNode::bind(&c_tmp.path().join("sync"), iroh::RelayMode::Disabled)
+            .await
+            .unwrap();
+        let c_collab = c_node.handle(Role::Collab);
+        let c_info = c_collab.start().await.unwrap();
+        for ticket in [&a_info.pairing_ticket, &b_info.pairing_ticket] {
+            c_node.add_peer_ticket(ticket).unwrap();
+        }
+        a_node.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+        b_node.add_peer_ticket(&c_info.pairing_ticket).unwrap();
+
+        let a_before = sent_bytes(&a_node);
+        let b_before = sent_bytes(&b_node);
+        let c_dest = c_tmp.path().join("landed");
+        let sink: ProviderTelemetrySink = Arc::new(|_| {});
+        c_collab
+            .fetch_collection_multi(
+                vec![a_info.node_id, b_info.node_id],
+                &root.to_string(),
+                byte_size,
+                &c_dest,
+                noop_fetch_sink(),
+                sink,
+            )
+            .await
+            .expect("C completes from the two-holder swarm");
+
+        for i in 0..FILES {
+            let name = format!("L_{i:02}.fits");
+            assert_eq!(
+                std::fs::read(pkg_dir.join(&name)).unwrap(),
+                std::fs::read(c_dest.join(&name)).unwrap(),
+                "{name} must land byte-identical at C"
+            );
+        }
+
+        let a_sent = sent_bytes(&a_node).saturating_sub(a_before);
+        let b_sent = sent_bytes(&b_node).saturating_sub(b_before);
+        assert!(
+            a_sent > SERVED_PAYLOAD_FLOOR && b_sent > SERVED_PAYLOAD_FLOOR,
+            "BOTH holders must have served payload — the downloader-turned-seed is \
+             the whole point of D3 (a sent {a_sent} B, b sent {b_sent} B, floor \
+             {SERVED_PAYLOAD_FLOOR} B)"
+        );
+
+        drop(b_tmp);
+        a_node.shutdown().await;
+        b_node.shutdown().await;
+        c_node.shutdown().await;
+    }
+
+    async fn tag_present_on(
+        node: &crate::sharing::iroh::node::SharedIrohNode,
+        name: &str,
+    ) -> bool {
+        node.store()
+            .tags()
+            .get(name.as_bytes())
+            .await
+            .expect("tags().get")
+            .is_some()
     }
 }

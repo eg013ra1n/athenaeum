@@ -399,13 +399,21 @@ fn announcements_refresher(ctx: Arc<ServiceContext>) -> crate::sync::ProjectAnno
 }
 
 /// Build the task-8 [`ProjectIngestedHook`](crate::sync::ProjectIngestedHook)
-/// fired after a project package ingests + acks: a best-effort report-have so the
-/// hub adds this device to the package's swarm. `tokio::spawn`ed off the receive
-/// loop; a failure only means the hub doesn't list us as a holder yet.
+/// fired after a project package ingests + acks: seed the package (D3 T4), then a
+/// best-effort report-have so the hub adds this device to the package's swarm.
+/// `tokio::spawn`ed off the receive loop; a failure only means the hub doesn't
+/// list us as a holder yet.
+///
+/// Seed BEFORE report-have (D3 §3.4): `report_have` is what makes other members'
+/// swarm fetches dial this device, so advertising first would publish a holder
+/// whose blobs are not servable yet. The seed is best-effort — a failed seed still
+/// reports have, because a landed package is still servable through the on-demand
+/// `handle_project_request` path (exactly the pre-D3 semantics).
 fn on_project_ingested_hook(ctx: Arc<ServiceContext>) -> crate::sync::ProjectIngestedHook {
     Arc::new(move |project_id: String, package_id: String| {
         let ctx = Arc::clone(&ctx);
         tokio::spawn(async move {
+            crate::api::collab_exchange::seed_ingested_package(&ctx, &package_id).await;
             if let Err(e) =
                 crate::api::collab_exchange::report_have_after_ingest(&ctx, &package_id).await
             {
