@@ -102,8 +102,15 @@ pub fn reconstruct_serve_dir(
     let records = parse_manifest_bytes(manifest_bytes)
         .with_context(|| format!("parse retained manifest for {package_id}"))?;
     let serve_dir = sync_dir.join("collab_serve").join(package_id);
-    materialize_package_dir(conn, &pkg.project_id, &serve_dir, manifest_bytes, &records)
-        .with_context(|| format!("reconstruct collab serve dir for {package_id}"))?;
+    materialize_package_dir(
+        conn,
+        &pkg.project_id,
+        package_id,
+        &serve_dir,
+        manifest_bytes,
+        &records,
+    )
+    .with_context(|| format!("reconstruct collab serve dir for {package_id}"))?;
     tracing::info!(
         package_id,
         count = records.len(),
@@ -183,8 +190,15 @@ pub fn reconstruct_seed_dir(
     let records = parse_manifest_bytes(manifest_bytes)
         .with_context(|| format!("parse retained manifest for {package_id}"))?;
     let seed_dir = sync_dir.join(SEED_DIR).join(package_id);
-    materialize_package_dir(conn, &pkg.project_id, &seed_dir, manifest_bytes, &records)
-        .with_context(|| format!("materialize collab seed dir for {package_id}"))?;
+    materialize_package_dir(
+        conn,
+        &pkg.project_id,
+        package_id,
+        &seed_dir,
+        manifest_bytes,
+        &records,
+    )
+    .with_context(|| format!("materialize collab seed dir for {package_id}"))?;
     tracing::debug!(
         package_id,
         count = records.len(),
@@ -257,6 +271,7 @@ fn manifest_fully_local(
 fn materialize_package_dir(
     conn: &rusqlite::Connection,
     project_id: &str,
+    package_id: &str,
     dest_dir: &Path,
     manifest_bytes: &[u8],
     records: &[crate::package::ManifestRecord],
@@ -299,18 +314,33 @@ fn materialize_package_dir(
                 .with_context(|| format!("create serve payload dir {}", parent.display()))?;
         }
         let src = Path::new(&contribution.landed_path);
-        // Hard-link the landed copy into the serve dir — no second full copy of the
-        // frame. Fall back to a byte copy when hard-linking is impossible (a
-        // cross-device landing root, EXDEV, or any other link error).
+        // Hard-link the landed copy into the destination — no second full copy of
+        // the frame. Fall back to a byte copy when hard-linking is impossible (a
+        // landing root on a different volume from the sync dir, EXDEV, or any
+        // other link error).
+        //
+        // WARN, not debug (F3): for a `collab_seed/<pkg>` dir the copy is
+        // PERMANENT — the seed lives as long as the package does — so a
+        // cross-volume landing root silently doubles the on-disk cost of every
+        // package this device seeds. The serve dir's copy is transient by
+        // comparison (`CollabCleanupSink` takes it at the next terminal), but one
+        // honest line per materialized package is worth it either way. Storage
+        // accounting for the duplicate is a named follow-up, not this log line.
         if let Err(e) = std::fs::hard_link(src, &dest) {
-            tracing::debug!(
+            tracing::warn!(
+                package_id,
                 src = %src.display(),
                 dest = %dest.display(),
+                bytes = record.byte_size,
                 error = %e,
-                "collab serve: hard link failed; copying payload instead"
+                "collab package dir: hard link failed (landing root on another volume?); copying the full payload instead"
             );
             std::fs::copy(src, &dest).with_context(|| {
-                format!("copy serve payload {} -> {}", src.display(), dest.display())
+                format!(
+                    "copy package payload {} -> {}",
+                    src.display(),
+                    dest.display()
+                )
             })?;
         }
     }
