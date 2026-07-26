@@ -266,7 +266,9 @@ function renderSettingsTab() {
         <div class="muted ret-note" id="retCadence"></div>
         <!-- A recorded fact from the pass log, never a predicted next tick. -->
         <div class="muted ret-note" id="retLastPass"></div>
-        <div class="muted ret-note">Deleting files yourself is a separate path and always available: Library &rarr; <b>Delete</b>, and a batch's <b>Delete source files</b>. Those are recorded as <code>manual-web</code>; retention's own deletions are recorded as <code>retention_deleted</code>, so the audit trail never confuses the two.</div>
+        <!-- The outcome tags are the exact strings written to sync_history, so
+             an operator can grep for them. -->
+        <div class="muted ret-note">Deleting files yourself is a separate path and always available: Library &rarr; <b>Delete</b> (recorded as <code>deleted_manual-web</code>) and a batch's <b>Delete source files</b> (recorded as <code>deleted_manual</code>). Retention's own deletions are recorded as <code>retention_deleted</code>, so the audit trail never confuses them.</div>
         <div class="ret-note"><a href="#retlogHead">Recent retention passes &darr;</a></div>
       </div>
       <div class="indicators">
@@ -516,15 +518,25 @@ async function savePolicy() {
   } catch (e) { f.textContent = 'save failed: ' + e.message; f.className = 'flash err'; }
 }
 
-// The card's "last pass" line rides the same fetch as the log below it: the ring
-// buffer's newest `at` IS the last pass, so it costs no extra request and states
-// a fact the agent recorded rather than one this page derived.
+// The pass log is a SHARED ring: the Library's own Delete route push-fronts a
+// record with `policy = 'manual-web'` beside retention's automatic passes, so
+// "the newest row" is not the same thing as "the last retention pass". Under a
+// DRY-RUN banner an operator deleting three files themselves would otherwise
+// read "Last pass — 3 files deleted", which reads as the policy having fired.
+// Anything whose policy starts with `manual` is an operator action, never a pass.
+function isManualRecord(r) {
+  return typeof r.policy === 'string' && r.policy.startsWith('manual');
+}
+
+// The card's "last pass" line rides the same fetch as the log below it: the
+// newest RETENTION record's `at` IS the last pass, so it costs no extra request
+// and states a fact the agent recorded rather than one this page derived.
 function renderRetentionLastPass(rows) {
   const el = $('retLastPass');
   if (!el) return;
-  const newest = rows && rows.length ? rows[0] : null;
+  const newest = (rows || []).find((r) => !isManualRecord(r));
   if (!newest) {
-    el.textContent = 'No pass recorded since this agent started.';
+    el.textContent = 'No retention pass recorded since this agent started.';
     return;
   }
   const when = fmtMtime(Date.parse(newest.at));
@@ -539,9 +551,15 @@ async function refreshLog() {
   try {
     const rows = await getJson('/api/retention/log');
     renderRetentionLastPass(rows);
+    // The list below shows BOTH kinds — an operator auditing deletions wants
+    // them in one timeline — but labels the manual ones, and drops the
+    // dry-run/LIVE + eligible columns there: a manual delete has no eligibility
+    // phase (the selection is the verdict) and is never a dry run.
     $('retlog').innerHTML = rows.length
       ? rows.map((r) => {
-          const bits = [`${r.dryRun ? 'dry-run' : 'LIVE'}`, `${r.policy}`, `deleted ${r.deleted.length}`, `eligible ${r.wouldDelete.length}`];
+          const bits = isManualRecord(r)
+            ? ['manual delete', `${r.policy}`, `deleted ${r.deleted.length}`]
+            : [`${r.dryRun ? 'dry-run' : 'LIVE'}`, `${r.policy}`, `deleted ${r.deleted.length}`, `eligible ${r.wouldDelete.length}`];
           if (r.errors.length) bits.push('⚠ ' + r.errors.map(esc).join('; '));
           return `<li class="logline"><span class="mono muted">${esc(r.at)}</span> — ${bits.map(esc).join(' · ')}</li>`;
         }).join('')

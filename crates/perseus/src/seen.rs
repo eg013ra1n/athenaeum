@@ -223,6 +223,35 @@ impl SeenStore {
         Ok(found.is_some())
     }
 
+    /// The `package_ref` of the **live** (`deleted_at IS NULL`) seen row for
+    /// `path`: the one package whose confirm can ever cause this file to be
+    /// deleted. `None` when there is no live row (never enqueued, or deleted and
+    /// the capture reappeared), and `None` too for a legacy row predating the
+    /// retention columns, whose `package_ref` is NULL.
+    ///
+    /// This is the exact inverse of
+    /// [`sources_for_package`](Self::sources_for_package), and it exists because
+    /// that is the ONLY direction retention travels: `path` is the PRIMARY KEY
+    /// and [`mark_enqueued`](Self::mark_enqueued) overwrites `package_ref` on
+    /// every re-enqueue, so at most ONE package can resolve back to a given file.
+    /// The library's retention fate line reads this to anchor its clock on the
+    /// linkage that can actually fire, rather than on an older package that
+    /// carried the same bytes and lost the linkage when the file was re-sent.
+    pub fn package_for_path(&self, path: &Path) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("seen store mutex poisoned");
+        // `package_ref` is nullable, so the row itself is `Option<Option<_>>`:
+        // outer = is there a live row, inner = does it carry a linkage.
+        let row: Option<Option<String>> = conn
+            .query_row(
+                "SELECT package_ref FROM perseus_seen WHERE path = ?1 AND deleted_at IS NULL",
+                params![path.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .optional()
+            .context("query perseus_seen package_for_path")?;
+        Ok(row.flatten())
+    }
+
     /// Resolve the *live* source capture file for a confirmed package
     /// (`package_ref` = `sync_outbound.package_ref`), or `None` when there is no
     /// live linkage. Returns the recorded `(size, mtime_ms)` alongside the path
@@ -430,6 +459,43 @@ mod tests {
         assert!(
             !store.is_recorded(&PathBuf::from("/cap/other.fits")).unwrap(),
             "paths are tracked independently"
+        );
+    }
+
+    /// The linkage the library's retention fate line anchors on: exactly the
+    /// package `sources_for_package` would hand the deleter back, and nothing
+    /// else. A re-enqueue MOVES it (the `path` PRIMARY KEY overwrites
+    /// `package_ref`), a deletion hides it, and a legacy row without a linkage
+    /// reports none.
+    #[test]
+    fn package_for_path_tracks_the_live_linkage_only() {
+        let (_tmp, store) = store();
+        let p = PathBuf::from("/cap/a.fits");
+        assert_eq!(store.package_for_path(&p).unwrap(), None, "never enqueued");
+
+        store.mark_enqueued(&p, 100, 111, "/pkg/one").unwrap();
+        assert_eq!(
+            store.package_for_path(&p).unwrap(),
+            Some("/pkg/one".to_string())
+        );
+
+        // A re-send overwrites the linkage: only the NEW package can delete it.
+        store.mark_enqueued(&p, 100, 111, "/pkg/two").unwrap();
+        assert_eq!(
+            store.package_for_path(&p).unwrap(),
+            Some("/pkg/two".to_string()),
+            "the re-enqueue moved the linkage off /pkg/one"
+        );
+        assert!(
+            store.sources_for_package("/pkg/one").unwrap().is_empty(),
+            "…and the two directions agree"
+        );
+
+        store.mark_deleted(&p).unwrap();
+        assert_eq!(
+            store.package_for_path(&p).unwrap(),
+            None,
+            "a deleted row is audit history, not a live linkage"
         );
     }
 

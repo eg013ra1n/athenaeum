@@ -45,7 +45,8 @@ pub use delete::{
     INTERNAL_PATH_REASON,
 };
 pub use listing::{
-    list_directory, retention_fate, FileStatus, LibraryEntry, LibraryListing, StatusSources,
+    list_directory, retention_fate, FateAnchor, FileStatus, LibraryEntry, LibraryListing,
+    StatusSources,
 };
 
 /// Validate a wire rel-path and split it into plain filename segments.

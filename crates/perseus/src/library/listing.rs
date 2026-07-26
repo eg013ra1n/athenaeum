@@ -41,11 +41,19 @@
 //!
 //! [`LibraryEntry::retention`] does not read [`FileStatus`] at all. The status
 //! chip answers "where is this file in its send life"; the fate line answers
-//! "what will retention do to it", and the two legitimately disagree — a file
-//! whose re-capture is `Sending` can still be a deletion candidate through an
-//! older package that confirmed weeks ago. [`retention_fate`] is derived from
-//! the evaluator (`athenaeum_core::sync::retention`), never from the chip; see
-//! its docs for the three resolutions that follow from that.
+//! "what will retention do to it", and the two legitimately disagree — a
+//! re-captured file sitting in the batcher reads `Queued` while its live seen
+//! linkage still points at the package that confirmed last week, which is the
+//! candidacy that will delete it. [`retention_fate`] is derived from the
+//! evaluator (`athenaeum_core::sync::retention`), never from the chip; see its
+//! docs for the resolutions that follow from that.
+//!
+//! Its anchor comes from the **live seen linkage**
+//! ([`SeenStore::package_for_path`]), not from the batch-participation set: the
+//! deleter only ever resolves candidates through `sources_for_package`
+//! (`deleted_at IS NULL`), and `perseus_seen.path` is the PRIMARY KEY, so a
+//! re-enqueue MOVES the linkage and only the package named by the live row can
+//! ever delete the file.
 //!
 //! # Path spelling is the join key
 //!
@@ -78,9 +86,32 @@ use crate::seen::{mtime_millis, SeenStore};
 
 use super::{resolve_in_root, split_rel};
 
-/// Fate line for a file no policy will ever name a date for — it has not
-/// reached the confirmed-only chokepoint yet.
+/// Fate line for a file no policy can name yet — its live seen linkage has not
+/// reached the confirmed-only chokepoint (or there is no live linkage at all).
 const FATE_KEPT: &str = "kept until sent and confirmed";
+
+/// What retention's clock says about one file, resolved through its **live**
+/// seen linkage ([`SeenStore::package_for_path`]).
+///
+/// The last two states are kept distinct on purpose. "Never confirmed" and
+/// "confirmed, but no row carried a usable instant" are different facts, and
+/// collapsing them makes the fate line print [`FATE_KEPT`] over a file whose
+/// package HAS confirmed — denying a confirm that happened. Only `keep_days`
+/// reads the instant at all; `on_confirm` and `disk_pct` act on the confirm
+/// itself, exactly as the evaluator does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FateAnchor {
+    /// No confirmed row can name this file: it has no live seen linkage (never
+    /// enqueued, or deleted and re-captured at the same path), or the package it
+    /// IS linked to has not confirmed to any target.
+    NotConfirmed,
+    /// The linked package confirmed; this is the earliest usable confirm across
+    /// its targets — the instant retention's clock starts.
+    ConfirmedAt(DateTime<Utc>),
+    /// The linked package confirmed, but no confirmed row carried a parseable
+    /// `confirmed_at`.
+    ConfirmedUndated,
+}
 
 /// The derived send fate of one capture file. Serialized lowercase — the wire
 /// values the Library UI switches on.
@@ -203,48 +234,66 @@ pub(super) fn newest_by_target(
 /// straight to the evaluator — so the threshold in the sentence can never drift
 /// from the threshold that will be applied.
 ///
-/// `confirmed_at` is the **earliest** usable confirm across every package
-/// carrying the file (see `earliest_confirm_by_package`); `None` means no
-/// confirmed row with a parseable timestamp exists, which is exactly the state
-/// in which the evaluator can never name the file.
+/// `anchor` is resolved through the file's **live seen linkage** — see
+/// [`FateAnchor`] and `confirm_anchor_by_package`.
 ///
-/// Three deliberate resolutions:
+/// Four deliberate resolutions:
 ///
-/// 1. **No `status` parameter.** A file can be `Sending` (a re-capture is in
-///    flight) while an *older* package carrying it confirmed weeks ago —
-///    retention deletes it via that older package's candidacy. Gating on the
-///    status chip would print "kept" over a file about to be removed.
-/// 2. **The unconfirmed arm applies to every policy, not just `keep_days`.**
+/// 1. **No `status` parameter.** A re-captured file waiting in the batcher reads
+///    `Queued` while its live seen linkage still points at the package that
+///    confirmed last week — retention deletes it through that candidacy. Gating
+///    on the status chip would print "kept" over a file about to be removed.
+/// 2. **The anchor follows the LIVE linkage, not every package that ever carried
+///    the file.** The deleter resolves candidates via `sources_for_package`
+///    (`WHERE package_ref = ? AND deleted_at IS NULL`) and `perseus_seen.path` is
+///    the PRIMARY KEY, so a re-enqueue moves the linkage and the old package can
+///    never name the file again. Anchoring on it would print a date that can
+///    never fire.
+/// 3. **The unconfirmed arm applies to every policy, not just `keep_days`.**
 ///    `disk_pct` draws its candidates from the same confirmed-only chokepoint,
 ///    so an unconfirmed file is not a pressure candidate either (spec §8 lists
 ///    "unsent/unconfirmed → kept…" as its own row; this is that row).
-/// 3. **`on_confirm` gets a line** even though the spec's card copy enumerates
+/// 4. **`on_confirm` gets a line** even though the spec's card copy enumerates
 ///    only three policies: it is a real, selectable value in `config.rs`, and
 ///    silence about the most aggressive policy Perseus has would be the worst
 ///    possible omission.
 ///
-/// Returns `None` only for `keep_everything` — and for a `keep_days` threshold
-/// too large to add to a date, where naming no date beats naming a wrong one.
+/// Returns `None` for `keep_everything`, and for the two `keep_days` states in
+/// which no honest date exists: a confirm with no usable timestamp, and a
+/// threshold too large to add to a date. Both degrade the SAME way — naming no
+/// date beats naming a wrong one, and beats [`FATE_KEPT`], which would deny a
+/// confirm that happened.
 pub fn retention_fate(
     policy: &RetentionPolicy,
     dry_run: bool,
-    confirmed_at: Option<DateTime<Utc>>,
+    anchor: FateAnchor,
 ) -> Option<String> {
     // The evaluator short-circuits here before any candidate work; so do we.
     if matches!(policy, RetentionPolicy::KeepEverything) {
         return None;
     }
-    // The single chokepoint: no confirmed row ⇒ no policy can ever name it.
-    let Some(confirmed_at) = confirmed_at else {
+    // The single chokepoint: the live linkage has no confirm ⇒ no policy can
+    // ever name it.
+    if matches!(anchor, FateAnchor::NotConfirmed) {
         return Some(FATE_KEPT.to_string());
-    };
+    }
     // "would be " turns every deletion sentence into its dry-run form. The
     // `kept` arm above never takes it — it is not a deletion statement.
     let prefix = if dry_run { "would be " } else { "" };
     match policy {
         RetentionPolicy::KeepEverything => None,
+        // Neither policy reads `confirmed_at`: the evaluator makes every
+        // confirmed row a candidate (`disk_pct` gated on the probe), dated or
+        // not. So an undated confirm changes nothing here.
         RetentionPolicy::OnConfirm => Some(format!("{prefix}deleted at the next retention pass")),
         RetentionPolicy::KeepDays(days) => {
+            // The only policy that needs the instant. Missing it is the
+            // evaluator's warn-and-refuse state (`confirmed_age_reached`), which
+            // is broken data rather than a promise to keep the file — so: no
+            // line, the same degrade as the unrepresentable threshold below.
+            let FateAnchor::ConfirmedAt(confirmed_at) = anchor else {
+                return None;
+            };
             // Mirrors `confirmed_age_reached`: eligible once
             // `now - confirmed_at >= days`. Checked all the way through —
             // `keep_days` is only validated `>= 1`, so a hand-edited absurd
@@ -259,6 +308,10 @@ pub fn retention_fate(
                 );
                 return None;
             };
+            // A date already in the past is the honest answer, not a bug: the
+            // file IS eligible and is waiting for the next pass (or for the
+            // dry-run to be turned off). Inventing "any moment now" would state
+            // a schedule the loop does not expose.
             Some(format!(
                 "{prefix}deletable after {}",
                 deletable_at.format("%Y-%m-%d")
@@ -270,8 +323,16 @@ pub fn retention_fate(
     }
 }
 
-/// The earliest usable `confirmed_at` per `package_ref`, over EVERY confirmed
-/// row — the instant retention's clock starts for that package.
+/// Per `package_ref`: whether it confirmed at all (the key is present), and the
+/// earliest usable `confirmed_at` across its targets (the value) — the instant
+/// retention's clock starts for that package.
+///
+/// The two facts are separate because the policies read them separately.
+/// `on_confirm` and `disk_pct` act on the confirm itself and never look at a
+/// timestamp; only `keep_days` needs the instant. So a package whose only
+/// confirmed rows carry a missing/unparseable `confirmed_at` maps to
+/// `Some(None)` — confirmed, undated — never to an absent key, which would read
+/// as "never confirmed" and print [`FATE_KEPT`] over a delivered file.
 ///
 /// **Deliberately not [`newest_by_target`]'s collapse.** That map keeps one row
 /// per `(package_ref, peer)` by max id, which is the right lens for a *status*
@@ -283,17 +344,19 @@ pub fn retention_fate(
 /// both a confirmed and a newer live row for one pair, this errs toward warning
 /// the operator rather than toward a silent "kept".
 ///
-/// A missing or unparseable timestamp contributes nothing, matching the
-/// evaluator's fail-safe (`confirmed_age_reached` warns and refuses eligibility).
-/// It is logged at `debug` rather than `warn`: this is a read-only display
-/// derivation re-run on every UI poll, and the evaluator already warns once per
-/// pass on the same rows — a second `warn!` per file per poll would bury it.
-fn earliest_confirm_by_package(outbound: &[OutboundRow]) -> HashMap<&str, DateTime<Utc>> {
-    let mut map: HashMap<&str, DateTime<Utc>> = HashMap::new();
+/// An unusable timestamp is logged at `debug` rather than `warn`: this is a
+/// read-only display derivation re-run on every UI poll, and the evaluator
+/// already warns once per pass on the same rows — a second `warn!` per file per
+/// poll would bury it.
+fn confirm_anchor_by_package(outbound: &[OutboundRow]) -> HashMap<&str, Option<DateTime<Utc>>> {
+    let mut map: HashMap<&str, Option<DateTime<Utc>>> = HashMap::new();
     for row in outbound {
         if row.state != OutboundState::Confirmed {
             continue;
         }
+        // Insert the KEY for every confirmed row, dated or not: its presence is
+        // the "this package confirmed" fact the timestamp-free policies act on.
+        let slot = map.entry(row.package_ref.as_str()).or_insert(None);
         let Some(ts) = row.confirmed_at.as_deref() else {
             tracing::debug!(
                 package_ref = %row.package_ref,
@@ -313,13 +376,10 @@ fn earliest_confirm_by_package(outbound: &[OutboundRow]) -> HashMap<&str, DateTi
                 continue;
             }
         };
-        map.entry(row.package_ref.as_str())
-            .and_modify(|cur| {
-                if parsed < *cur {
-                    *cur = parsed;
-                }
-            })
-            .or_insert(parsed);
+        match *slot {
+            Some(cur) if cur <= parsed => {}
+            _ => *slot = Some(parsed),
+        }
     }
     map
 }
@@ -328,35 +388,45 @@ fn earliest_confirm_by_package(outbound: &[OutboundRow]) -> HashMap<&str, DateTi
 struct FileFacts {
     status: FileStatus,
     batches: usize,
-    /// Earliest usable confirm across every package carrying the file. Retention
-    /// deletes a file the moment ANY of its packages becomes a candidate (the
-    /// deleter maps a candidate `package_ref` back to its sources), so the
-    /// earliest anchor is the one that decides.
-    confirmed_at: Option<DateTime<Utc>>,
+    /// Retention's clock for this file, read through its LIVE seen linkage —
+    /// the only package whose candidacy can reach it (`retention_fate` note 2).
+    anchor: FateAnchor,
 }
 
 /// Derive one file's status, batch-participation count, and retention anchor.
 /// See the module docs for the precedence; the batch lookup runs unconditionally
 /// so `batches` is honest even for a file whose status came from an earlier arm.
+///
+/// `confirms` is `None` under `keep_everything`: no fate is stated, so the extra
+/// per-file `package_for_path` lookup is skipped entirely on the default policy.
 fn status_for(
     abs: &Path,
     pending: &HashSet<&Path>,
     newest: &HashMap<&str, HashMap<NodeId, &OutboundRow>>,
-    confirms: &HashMap<&str, DateTime<Utc>>,
+    confirms: Option<&HashMap<&str, Option<DateTime<Utc>>>>,
     src: &StatusSources<'_>,
 ) -> Result<FileFacts> {
     let refs = src.batches.batches_for_source(&abs.to_string_lossy())?;
     let batches = refs.len();
     // Resolved for every arm, including the early returns below: the retention
-    // anchor is independent of the status chip (see `retention_fate`'s note 1).
-    let confirmed_at = refs
-        .iter()
-        .filter_map(|r| confirms.get(r.as_str()).copied())
-        .min();
+    // anchor is independent of the status chip (see `retention_fate`'s note 1),
+    // and it goes through the seen linkage rather than `refs` (note 2) — a
+    // package the file no longer links to can never delete it.
+    let anchor = match confirms {
+        None => FateAnchor::NotConfirmed,
+        Some(confirms) => match src.seen.package_for_path(abs)? {
+            None => FateAnchor::NotConfirmed,
+            Some(package_ref) => match confirms.get(package_ref.as_str()) {
+                None => FateAnchor::NotConfirmed,
+                Some(None) => FateAnchor::ConfirmedUndated,
+                Some(Some(at)) => FateAnchor::ConfirmedAt(*at),
+            },
+        },
+    };
     let facts = |status| FileFacts {
         status,
         batches,
-        confirmed_at,
+        anchor,
     };
 
     if pending.contains(abs) {
@@ -426,13 +496,14 @@ pub fn list_directory(
     // Resolved through the same seam the retention task uses, so the sentence
     // and the evaluator can never disagree about the threshold.
     let policy = src.retention.to_core_policy();
-    // `keep_everything` names nothing, so skip the whole confirm scan — the
-    // evaluator short-circuits at exactly the same point, and this is the
-    // default policy (i.e. the common case) on every node.
+    // `keep_everything` names nothing, so skip the whole confirm scan AND the
+    // per-file linkage lookup it feeds — the evaluator short-circuits at exactly
+    // the same point, and this is the default policy (i.e. the common case) on
+    // every node.
     let confirms = if matches!(policy, RetentionPolicy::KeepEverything) {
-        HashMap::new()
+        None
     } else {
-        earliest_confirm_by_package(src.outbound)
+        Some(confirm_anchor_by_package(src.outbound))
     };
 
     let mut dirs: Vec<String> = Vec::new();
@@ -469,14 +540,14 @@ pub fn list_directory(
             tracing::debug!(path = %abs.display(), "library listing: skipping non-regular entry");
             continue;
         }
-        let f = status_for(&abs, &pending, &newest, &confirms, src)?;
+        let f = status_for(&abs, &pending, &newest, confirms.as_ref(), src)?;
         files.push(LibraryEntry {
             name,
             size: meta.len(),
             mtime_ms: mtime_millis(meta.modified().ok()),
             status: f.status,
             batches: f.batches,
-            retention: retention_fate(&policy, src.retention.dry_run, f.confirmed_at),
+            retention: retention_fate(&policy, src.retention.dry_run, f.anchor),
         });
     }
     dirs.sort();
@@ -1062,6 +1133,12 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    /// A dated confirm anchor — what a file whose LIVE linkage confirmed at `ts`
+    /// resolves to.
+    fn dated(ts: &str) -> FateAnchor {
+        FateAnchor::ConfirmedAt(at(ts))
+    }
+
     /// A confirmed row with an explicit `confirmed_at` — the only timestamp the
     /// evaluator's `keep_days` arm reads.
     fn confirmed_row(
@@ -1081,18 +1158,16 @@ mod tests {
     #[test]
     fn keep_everything_never_shows_a_fate_line() {
         for dry_run in [true, false] {
-            assert_eq!(
-                retention_fate(
-                    &CorePolicy::KeepEverything,
-                    dry_run,
-                    Some(at("2026-07-01T00:00:00Z"))
-                ),
-                None
-            );
-            assert_eq!(
-                retention_fate(&CorePolicy::KeepEverything, dry_run, None),
-                None
-            );
+            for anchor in [
+                dated("2026-07-01T00:00:00Z"),
+                FateAnchor::NotConfirmed,
+                FateAnchor::ConfirmedUndated,
+            ] {
+                assert_eq!(
+                    retention_fate(&CorePolicy::KeepEverything, dry_run, anchor),
+                    None
+                );
+            }
         }
     }
 
@@ -1102,7 +1177,7 @@ mod tests {
             retention_fate(
                 &CorePolicy::KeepDays(21),
                 false,
-                Some(at("2026-07-12T22:30:00Z"))
+                dated("2026-07-12T22:30:00Z")
             )
             .unwrap(),
             "deletable after 2026-08-02",
@@ -1116,7 +1191,7 @@ mod tests {
             retention_fate(
                 &CorePolicy::KeepDays(21),
                 true,
-                Some(at("2026-07-12T22:30:00Z"))
+                dated("2026-07-12T22:30:00Z")
             )
             .unwrap(),
             "would be deletable after 2026-08-02"
@@ -1127,11 +1202,38 @@ mod tests {
     fn keep_days_without_a_confirm_is_kept_until_sent_and_confirmed() {
         for dry_run in [true, false] {
             assert_eq!(
-                retention_fate(&CorePolicy::KeepDays(21), dry_run, None).unwrap(),
+                retention_fate(&CorePolicy::KeepDays(21), dry_run, FateAnchor::NotConfirmed)
+                    .unwrap(),
                 "kept until sent and confirmed",
                 "no confirmed row ⇒ the single chokepoint never names it"
             );
         }
+    }
+
+    /// A confirm that aged out before the pass could run renders a PAST date.
+    /// That is the honest statement — the file is eligible and waiting for the
+    /// next pass — and inventing "any moment now" would promise a schedule the
+    /// retention loop does not expose.
+    #[test]
+    fn a_long_past_confirm_renders_a_past_date_not_a_softened_phrase() {
+        assert_eq!(
+            retention_fate(
+                &CorePolicy::KeepDays(7),
+                false,
+                dated("2020-01-01T00:00:00Z")
+            )
+            .unwrap(),
+            "deletable after 2020-01-08"
+        );
+        assert_eq!(
+            retention_fate(
+                &CorePolicy::KeepDays(7),
+                true,
+                dated("2020-01-01T00:00:00Z")
+            )
+            .unwrap(),
+            "would be deletable after 2020-01-08"
+        );
     }
 
     #[test]
@@ -1140,7 +1242,7 @@ mod tests {
             retention_fate(
                 &CorePolicy::DiskPct { max_pct: 80 },
                 false,
-                Some(at("2026-07-01T00:00:00Z"))
+                dated("2026-07-01T00:00:00Z")
             )
             .unwrap(),
             "deleted under disk pressure, oldest first"
@@ -1153,7 +1255,7 @@ mod tests {
             retention_fate(
                 &CorePolicy::DiskPct { max_pct: 80 },
                 true,
-                Some(at("2026-07-01T00:00:00Z"))
+                dated("2026-07-01T00:00:00Z")
             )
             .unwrap(),
             "would be deleted under disk pressure, oldest first"
@@ -1166,7 +1268,12 @@ mod tests {
     #[test]
     fn disk_pct_without_a_confirm_is_kept_until_sent_and_confirmed() {
         assert_eq!(
-            retention_fate(&CorePolicy::DiskPct { max_pct: 80 }, false, None).unwrap(),
+            retention_fate(
+                &CorePolicy::DiskPct { max_pct: 80 },
+                false,
+                FateAnchor::NotConfirmed
+            )
+            .unwrap(),
             "kept until sent and confirmed"
         );
     }
@@ -1177,41 +1284,62 @@ mod tests {
     #[test]
     fn on_confirm_says_the_next_pass() {
         assert_eq!(
-            retention_fate(
-                &CorePolicy::OnConfirm,
-                false,
-                Some(at("2026-07-01T00:00:00Z"))
-            )
-            .unwrap(),
+            retention_fate(&CorePolicy::OnConfirm, false, dated("2026-07-01T00:00:00Z")).unwrap(),
             "deleted at the next retention pass"
         );
         assert_eq!(
-            retention_fate(
-                &CorePolicy::OnConfirm,
-                true,
-                Some(at("2026-07-01T00:00:00Z"))
-            )
-            .unwrap(),
+            retention_fate(&CorePolicy::OnConfirm, true, dated("2026-07-01T00:00:00Z")).unwrap(),
             "would be deleted at the next retention pass"
         );
         assert_eq!(
-            retention_fate(&CorePolicy::OnConfirm, false, None).unwrap(),
+            retention_fate(&CorePolicy::OnConfirm, false, FateAnchor::NotConfirmed).unwrap(),
             "kept until sent and confirmed"
         );
     }
 
-    /// A hand-edited `keep_days` too large to add to a date must not print a
-    /// wrong date — and must not claim "kept until sent and confirmed" either,
-    /// which would deny a confirm that happened. No line is the honest answer.
+    /// The timestamp-free policies do not read `confirmed_at` at all — the
+    /// evaluator makes every confirmed row a candidate, dated or not — so an
+    /// undated confirm must still state the deletion, never "kept".
     #[test]
-    fn an_unrepresentable_keep_days_names_no_date_rather_than_a_wrong_one() {
+    fn an_undated_confirm_still_names_the_timestamp_free_policies() {
+        assert_eq!(
+            retention_fate(&CorePolicy::OnConfirm, false, FateAnchor::ConfirmedUndated).unwrap(),
+            "deleted at the next retention pass"
+        );
+        assert_eq!(
+            retention_fate(
+                &CorePolicy::DiskPct { max_pct: 80 },
+                true,
+                FateAnchor::ConfirmedUndated
+            )
+            .unwrap(),
+            "would be deleted under disk pressure, oldest first"
+        );
+    }
+
+    /// The two `keep_days` states with no honest date degrade IDENTICALLY: a
+    /// confirm whose timestamp is unusable, and a threshold too large to add to
+    /// a date. Neither may print a wrong date, and neither may claim "kept until
+    /// sent and confirmed" — that would deny a confirm that happened. No line.
+    #[test]
+    fn keep_days_degrades_to_no_line_when_no_honest_date_exists() {
+        assert_eq!(
+            retention_fate(
+                &CorePolicy::KeepDays(7),
+                false,
+                FateAnchor::ConfirmedUndated
+            ),
+            None,
+            "confirmed, but no usable instant"
+        );
         assert_eq!(
             retention_fate(
                 &CorePolicy::KeepDays(u32::MAX),
                 false,
-                Some(at("2026-07-01T00:00:00Z"))
+                dated("2026-07-01T00:00:00Z")
             ),
-            None
+            None,
+            "a hand-edited threshold that cannot be added to a date"
         );
     }
 
@@ -1229,8 +1357,9 @@ mod tests {
         f.retention.dry_run = false;
         let abs = f.touch("a.fits", b"x");
         f.batches
-            .record_files("/pkg/u1", &[("a.fits".into(), abs)])
+            .record_files("/pkg/u1", &[("a.fits".into(), abs.clone())])
             .unwrap();
+        f.seen.mark_enqueued(&abs, 1, 1, "/pkg/u1").unwrap();
         let outbound = vec![
             confirmed_row(1, "/pkg/u1", PEER, "2026-07-05T00:00:00Z"),
             confirmed_row(2, "/pkg/u1", PEER_B, "2026-07-01T00:00:00Z"),
@@ -1242,12 +1371,16 @@ mod tests {
         );
     }
 
-    /// A file carried by TWO packages — one confirmed long ago, one still in
-    /// flight — reads `sending`, but retention would delete it via the old
-    /// package's candidacy. Gating the fate line on the status chip would print
-    /// "kept" over a file that is about to be removed.
+    /// The anchor follows the LIVE seen linkage, and a re-send moves it.
+    ///
+    /// `perseus_seen.path` is the PRIMARY KEY and `mark_enqueued` overwrites
+    /// `package_ref`, while the deleter only ever resolves candidates through
+    /// `sources_for_package` (`deleted_at IS NULL`). So once `/pkg/new` carries
+    /// the file, `/pkg/old`'s ancient confirm can NEVER delete it — printing its
+    /// date would name a deadline that can never fire. The honest line while the
+    /// new package is unconfirmed is the kept-until arm.
     #[test]
-    fn an_older_confirmed_package_sets_the_fate_while_a_newer_one_is_in_flight() {
+    fn a_resend_moves_the_fate_onto_the_new_live_package() {
         let mut f = fixture();
         f.retention.policy = crate::config::RetentionPolicy::KeepDays;
         f.retention.keep_days = 7;
@@ -1255,25 +1388,68 @@ mod tests {
         f.batches
             .record_files("/pkg/old", &[("a.fits".into(), abs.clone())])
             .unwrap();
-        f.batches
-            .record_files("/pkg/new", &[("a.fits".into(), abs)])
-            .unwrap();
+        f.seen.mark_enqueued(&abs, 1, 1, "/pkg/old").unwrap();
         let outbound = vec![
             confirmed_row(1, "/pkg/old", PEER, "2026-07-01T00:00:00Z"),
             row(2, "/pkg/new", OutboundState::Transferring, None),
         ];
+
+        // Before the re-send the old package IS the live linkage.
+        assert_eq!(
+            f.fate_of(&f.list("", &[], &outbound), "a.fits").unwrap(),
+            "would be deletable after 2026-07-08"
+        );
+
+        // The re-send: a second package carries the file, and the seen row moves
+        // with it — exactly what the batcher does on the next enqueue.
+        f.batches
+            .record_files("/pkg/new", &[("a.fits".into(), abs.clone())])
+            .unwrap();
+        f.seen.mark_enqueued(&abs, 1, 1, "/pkg/new").unwrap();
+
         let listing = f.list("", &[], &outbound);
         assert_eq!(f.status_of(&listing, "a.fits"), FileStatus::Sending);
+        assert_eq!(listing.files[0].batches, 2, "both participations counted");
         assert_eq!(
             f.fate_of(&listing, "a.fits").unwrap(),
-            "would be deletable after 2026-07-08",
-            "the evaluator does not care that a re-capture is moving"
+            "kept until sent and confirmed",
+            "the old package lost the linkage; its confirm can never delete this file"
+        );
+    }
+
+    /// A file the operator (or retention) deleted and the camera media then
+    /// re-copied has a `deleted_at`-stamped seen row: NO live linkage, so no
+    /// package can name it, however long ago the old one confirmed. It is a new
+    /// capture waiting to be sent.
+    #[test]
+    fn a_reappeared_file_has_no_live_linkage_and_reads_kept() {
+        let mut f = fixture();
+        f.retention.policy = crate::config::RetentionPolicy::KeepDays;
+        f.retention.keep_days = 7;
+        let abs = f.touch("a.fits", b"x");
+        f.batches
+            .record_files("/pkg/u1", &[("a.fits".into(), abs.clone())])
+            .unwrap();
+        f.seen.mark_enqueued(&abs, 1, 1, "/pkg/u1").unwrap();
+        f.seen.mark_deleted(&abs).unwrap();
+        let outbound = vec![confirmed_row(1, "/pkg/u1", PEER, "2026-07-01T00:00:00Z")];
+
+        let listing = f.list("", &[], &outbound);
+        assert_eq!(
+            f.status_of(&listing, "a.fits"),
+            FileStatus::Delivered,
+            "the batch history is still real"
+        );
+        assert_eq!(
+            f.fate_of(&listing, "a.fits").unwrap(),
+            "kept until sent and confirmed",
+            "a corpse row is not a linkage — this file is unsent again"
         );
     }
 
     /// The evaluator fails SAFE on a missing / unparseable `confirmed_at` (it
-    /// warns and refuses eligibility). The fate line mirrors that: no invented
-    /// date.
+    /// warns and refuses eligibility). The fate line mirrors that with NO line —
+    /// not the kept-until arm, which would deny the confirm that happened.
     #[test]
     fn a_confirmed_row_without_a_usable_timestamp_names_no_date() {
         let mut f = fixture();
@@ -1281,19 +1457,40 @@ mod tests {
         f.retention.keep_days = 7;
         let abs = f.touch("a.fits", b"x");
         f.batches
-            .record_files("/pkg/u1", &[("a.fits".into(), abs)])
+            .record_files("/pkg/u1", &[("a.fits".into(), abs.clone())])
             .unwrap();
+        f.seen.mark_enqueued(&abs, 1, 1, "/pkg/u1").unwrap();
 
         let missing = vec![row(1, "/pkg/u1", OutboundState::Confirmed, None)];
-        assert_eq!(
-            f.fate_of(&f.list("", &[], &missing), "a.fits").unwrap(),
-            "kept until sent and confirmed"
-        );
+        assert_eq!(f.fate_of(&f.list("", &[], &missing), "a.fits"), None);
 
         let garbage = vec![confirmed_row(1, "/pkg/u1", PEER, "not-a-timestamp")];
+        assert_eq!(f.fate_of(&f.list("", &[], &garbage), "a.fits"), None);
+    }
+
+    /// The fate line is NOT gated on the status chip: a re-captured file waiting
+    /// in the batcher reads `queued`, while its live linkage — the package that
+    /// carried the previous copy — confirmed long enough ago to name a date.
+    /// Printing "kept" here would cover a file that is about to be removed.
+    #[test]
+    fn a_queued_recapture_still_shows_its_live_packages_deadline() {
+        let mut f = fixture();
+        f.retention.policy = crate::config::RetentionPolicy::KeepDays;
+        f.retention.keep_days = 7;
+        let abs = f.touch("a.fits", b"x");
+        f.batches
+            .record_files("/pkg/u1", &[("a.fits".into(), abs.clone())])
+            .unwrap();
+        f.seen.mark_enqueued(&abs, 1, 1, "/pkg/u1").unwrap();
+        let outbound = vec![confirmed_row(1, "/pkg/u1", PEER, "2026-07-01T00:00:00Z")];
+        let pending = vec![(f.root.clone(), abs)];
+
+        let listing = f.list("", &pending, &outbound);
+        assert_eq!(f.status_of(&listing, "a.fits"), FileStatus::Queued);
         assert_eq!(
-            f.fate_of(&f.list("", &[], &garbage), "a.fits").unwrap(),
-            "kept until sent and confirmed"
+            f.fate_of(&listing, "a.fits").unwrap(),
+            "would be deletable after 2026-07-08",
+            "the evaluator does not care that a re-capture is waiting to flush"
         );
     }
 

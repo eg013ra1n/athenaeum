@@ -7119,6 +7119,14 @@ mod tests {
             .seen
             .mark_enqueued(&sent, 1, 1, "/pkg/legacy")
             .unwrap();
+        // The retention fate line anchors on the LIVE seen linkage, not on batch
+        // participation — the deleter only ever resolves candidates through
+        // `sources_for_package`. Give the delivered file the linkage its own
+        // enqueue would have written, so the date below is one that can fire.
+        state
+            .seen
+            .mark_enqueued(&delivered, 1, 1, "/pkg/delivered")
+            .unwrap();
 
         // A live MANUAL-mode batcher never auto-flushes, so a fed path stays
         // pending for the whole test. Deliberately spawned with NO engine: the
@@ -7249,6 +7257,12 @@ mod tests {
             .enqueue("/pkg/delivered", PEER, None, &[])
             .unwrap();
         state.store.confirm(id, &[]).unwrap();
+        // The live linkage the fate anchor reads (see the note in
+        // `library_listing_reports_every_status`).
+        state
+            .seen
+            .mark_enqueued(&delivered, 1, 1, "/pkg/delivered")
+            .unwrap();
 
         // Same request, both policies — only the config differs.
         let app = build_router(Arc::clone(&state), None);
