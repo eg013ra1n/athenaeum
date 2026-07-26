@@ -184,9 +184,19 @@ pub struct SendItem {
 /// An empty result is **not** an error: the route turns "expanded to nothing"
 /// into its own status, so an empty selection and an empty directory reach the
 /// same answer.
-pub fn expand_selection(config: &Config, items: &[SendItem]) -> Result<Vec<(PathBuf, PathBuf)>> {
+///
+/// Returns the pairs **and the number of named files skipped as vanished**, so
+/// the route can report a partial send honestly (`skipped` in the send payload)
+/// instead of leaving the operator to infer it from a smaller `enqueued` than
+/// they picked. Only that one absorbed class is counted — every other drop is
+/// either fatal here or happens later, at build time.
+pub fn expand_selection(
+    config: &Config,
+    items: &[SendItem],
+) -> Result<(Vec<(PathBuf, PathBuf)>, usize)> {
     let roots = config.capture_dirs_resolved();
     let mut out: BTreeSet<(PathBuf, PathBuf)> = BTreeSet::new();
+    let mut skipped = 0usize;
     for item in items {
         let Some(root) = roots.get(item.root) else {
             bail!("not found: unknown capture root {}", item.root);
@@ -200,11 +210,19 @@ pub fn expand_selection(config: &Config, items: &[SendItem]) -> Result<Vec<(Path
             // stable prefix for exactly that, so the match is on the class, not
             // on a substring of some path.
             Err(error) if !item.dir && error.to_string().starts_with("not found") => {
+                // The bound error goes in the record, never dropped: `"not found"`
+                // is only the guard's *wrapper*, and the cause underneath may be
+                // an EACCES or an ELOOP rather than a real absence. Alternate
+                // Display (`{:#}`) so the whole chain is visible, not just the
+                // wrapper we matched on.
+                let chain = format!("{error:#}");
                 tracing::warn!(
+                    error = %chain,
                     rel = %item.rel,
                     root_index = item.root,
                     "selected file vanished — skipped"
                 );
+                skipped += 1;
                 continue;
             }
             Err(error) => return Err(error),
@@ -239,7 +257,7 @@ pub fn expand_selection(config: &Config, items: &[SendItem]) -> Result<Vec<(Path
             out.insert((canon_root, abs));
         }
     }
-    Ok(out.into_iter().collect())
+    Ok((out.into_iter().collect(), skipped))
 }
 
 #[cfg(test)]
@@ -326,7 +344,7 @@ mod tests {
         let (_tmp, config, cap) = test_config();
         let a = write(&cap, "a.fits", b"x");
 
-        let (files, logged) = capture_warnings(|| {
+        let ((files, skipped), logged) = capture_warnings(|| {
             expand_selection(
                 &config,
                 &[item(0, "a.fits", false), item(0, "gone.fits", false)],
@@ -339,9 +357,19 @@ mod tests {
             vec![a],
             "the surviving file still ships"
         );
+        assert_eq!(
+            skipped, 1,
+            "the drop is counted, so the route can report it"
+        );
         assert!(
             logged.contains("selected file vanished") && logged.contains("gone.fits"),
             "the skip must be logged with the file it dropped, got {logged:?}"
+        );
+        // The bound error is never swallowed: `"not found"` is a wrapper that can
+        // hide an EACCES/ELOOP, so the cause has to be in the record.
+        assert!(
+            logged.contains("error="),
+            "the skip must carry the error it absorbed, got {logged:?}"
         );
     }
 
@@ -368,9 +396,10 @@ mod tests {
         write(&cap, "M31/.DS_Store", b"x");
         write(&cap, "other.fits", b"x"); // outside the selected dir
 
-        let files = expand_selection(&config, &[item(0, "M31", true)]).unwrap();
+        let (files, skipped) = expand_selection(&config, &[item(0, "M31", true)]).unwrap();
         let got: Vec<PathBuf> = files.iter().map(|(_, f)| f.clone()).collect();
         assert_eq!(got, vec![b, c], "recursive, files only, eligible only");
+        assert_eq!(skipped, 0, "nothing vanished");
     }
 
     /// An explicitly named file is the operator's call: it ships even when its
@@ -381,7 +410,7 @@ mod tests {
     fn expand_selection_allows_an_explicitly_named_ineligible_file() {
         let (_tmp, config, cap) = test_config();
         let notes = write(&cap, "notes.txt", b"x");
-        let files = expand_selection(&config, &[item(0, "notes.txt", false)]).unwrap();
+        let (files, _) = expand_selection(&config, &[item(0, "notes.txt", false)]).unwrap();
         assert_eq!(
             files.iter().map(|(_, f)| f.clone()).collect::<Vec<_>>(),
             vec![notes]
@@ -424,7 +453,7 @@ mod tests {
     fn expand_selection_dedupes_and_pairs_with_the_canonical_root() {
         let (_tmp, config, cap) = test_config();
         let b = write(&cap, "M31/b.fits", b"x");
-        let files = expand_selection(
+        let (files, _) = expand_selection(
             &config,
             &[item(0, "M31", true), item(0, "M31/b.fits", false)],
         )
@@ -443,10 +472,11 @@ mod tests {
     fn expand_selection_of_nothing_is_empty_not_an_error() {
         let (_tmp, config, cap) = test_config();
         std::fs::create_dir_all(cap.join("empty")).unwrap();
-        assert!(expand_selection(&config, &[]).unwrap().is_empty());
-        assert!(expand_selection(&config, &[item(0, "empty", true)])
-            .unwrap()
-            .is_empty());
+        assert_eq!(expand_selection(&config, &[]).unwrap(), (Vec::new(), 0));
+        assert_eq!(
+            expand_selection(&config, &[item(0, "empty", true)]).unwrap(),
+            (Vec::new(), 0)
+        );
     }
 
     /// A symlinked subdirectory is never followed: its contents belong to
@@ -462,7 +492,7 @@ mod tests {
         write(&cap, "own.fits", b"x");
 
         // The whole root: the symlinked dir contributes nothing.
-        let files = expand_selection(&config, &[item(0, "", true)]).unwrap();
+        let (files, _) = expand_selection(&config, &[item(0, "", true)]).unwrap();
         assert_eq!(files.len(), 1, "only the root's own file: {files:?}");
         // And addressing it directly is refused by the guard.
         assert!(expand_selection(&config, &[item(0, "link", true)]).is_err());

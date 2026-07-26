@@ -1816,6 +1816,11 @@ struct LibrarySendReport {
     /// during expansion, and one that will not parse is dropped at build time —
     /// both with a `warn!`, and the rest of the batch proceeds (spec §1a).
     enqueued: usize,
+    /// How many named files were dropped during expansion because they were no
+    /// longer on disk. The counterpart to `enqueued`: together they let the page
+    /// say "sent 4, 1 vanished" instead of leaving the operator to work out why
+    /// fewer files shipped than were picked. `0` on a whole-selection send.
+    skipped: usize,
     /// The package directory the batch was staged in — the same `package_ref`
     /// the transfers list and the `perseus_batch` row key on.
     package_ref: String,
@@ -1844,6 +1849,14 @@ fn send_error_status(err: &anyhow::Error) -> (StatusCode, String) {
 /// list happens to hold first would report a `200` for a batch that reached the
 /// other machine. The operator gets a `400` naming the candidates and re-sends
 /// by peer id (always unique).
+///
+/// **Ambiguity is counted in DEVICES, not in matching entries.** The engine list
+/// can legitimately hold the same peer twice (a device configured under both its
+/// id and its name, a duplicated target entry), and both of those speak to one
+/// machine — there is nothing for the operator to disambiguate, so refusing the
+/// send would be a false `400`. Matches are therefore collapsed by resolved peer
+/// hex *before* the one/many decision; only genuinely different peers can make a
+/// name ambiguous.
 fn resolve_send_targets(
     engines: &[(String, Arc<SyncEngineHandle>)],
     names: &HashMap<String, String>,
@@ -1855,7 +1868,7 @@ fn resolve_send_targets(
     let mut chosen: Vec<String> = Vec::new();
     let mut out = Vec::new();
     for want in targets {
-        let matched: Vec<(&String, &Arc<SyncEngineHandle>)> = engines
+        let mut matched: Vec<(&String, &Arc<SyncEngineHandle>)> = engines
             .iter()
             .filter(|(peer, _)| {
                 peer.eq_ignore_ascii_case(want)
@@ -1865,6 +1878,11 @@ fn resolve_send_targets(
             })
             .map(|(peer, engine)| (peer, engine))
             .collect();
+        // Collapse repeats of the SAME peer first (see the fn docs): one device
+        // reached through two engine entries is not an ambiguity, and only what
+        // survives this may be weighed one-versus-many below.
+        let mut seen_peers: HashSet<String> = HashSet::new();
+        matched.retain(|(peer, _)| seen_peers.insert(peer.to_ascii_lowercase()));
         let (peer, engine) = match matched.as_slice() {
             [] => {
                 tracing::error!(target = %want, "web library send: unknown send target");
@@ -1966,7 +1984,7 @@ async fn api_library_send(
                 tracing::error!(error = %msg, "web library send: expansion task panicked");
                 (StatusCode::INTERNAL_SERVER_ERROR, msg)
             })?;
-    let files = expanded.map_err(|e| send_error_status(&e))?;
+    let (files, skipped) = expanded.map_err(|e| send_error_status(&e))?;
 
     if files.is_empty() {
         tracing::warn!("web library send: selection expanded to no files");
@@ -1982,11 +2000,13 @@ async fn api_library_send(
                 package_ref = %outcome.package_ref,
                 file_count = outcome.file_count,
                 selected = files.len(),
+                skipped,
                 targets = selected.as_ref().map_or(engines.len(), Vec::len),
                 "library selection sent as a browser batch"
             );
             Ok(Json(LibrarySendReport {
                 enqueued: outcome.file_count,
+                skipped,
                 package_ref: outcome.package_ref,
             }))
         }
@@ -6762,6 +6782,55 @@ mod tests {
         );
     }
 
+    /// Two engine entries for the SAME peer are not an ambiguity — a device
+    /// configured under both its id and its friendly name reaches one machine, so
+    /// naming it must resolve (and enqueue once), never `400`. Ambiguity is
+    /// counted in devices, not in matching entries.
+    #[tokio::test]
+    async fn library_send_dedupes_repeated_entries_for_one_peer() {
+        let h = send_harness().await;
+        write_fixture_fits(&h.cap.join("a.fits"), "M42");
+
+        // A second engine entry carrying the SAME peer id (a distinct handle, so
+        // the collapse must key on the resolved hex, not on the Arc).
+        let transport: Arc<dyn SharingTransport> = Arc::new(LoopbackNetwork::new().endpoint());
+        let twin = Arc::new(SyncEngine::spawn(
+            Arc::clone(&h.state.store) as Arc<dyn SyncStore>,
+            transport,
+            PEER,
+        ));
+        h.state
+            .engines
+            .write()
+            .await
+            .push((node_id_hex(&PEER), twin));
+        *h.state.device_names.write().await =
+            HashMap::from([(node_id_hex(&PEER), "obs-pi".to_string())]);
+
+        let app = build_router(Arc::clone(&h.state), None);
+        let res = post_json(
+            &app,
+            "/api/library/send",
+            serde_json::json!({
+                "targets": ["obs-pi"],
+                "items": [{ "root": 0, "rel": "a.fits" }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "one device listed twice still resolves"
+        );
+        let v = body_json(res).await;
+        assert_eq!(v["enqueued"], 1);
+        assert_eq!(
+            h.state.batches.list().unwrap().len(),
+            1,
+            "one batch, sent once — the repeat did not fan out twice"
+        );
+    }
+
     /// A file that vanished between the listing and the send is dropped and the
     /// REST of the selection still ships (spec §1a, eligible subset): a browser
     /// listing is a snapshot, and one deleted frame must not fail the whole send.
@@ -6789,6 +6858,10 @@ mod tests {
         );
         let v = body_json(res).await;
         assert_eq!(v["enqueued"], 1, "only the surviving file was packaged");
+        assert_eq!(
+            v["skipped"], 1,
+            "the drop is reported, not left to be inferred from a short count"
+        );
 
         let rows = h.state.batches.list().unwrap();
         assert_eq!(rows.len(), 1);
