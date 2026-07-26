@@ -15,11 +15,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use iroh::{Endpoint, EndpointId};
+use iroh_blobs::api::blobs::{AddPathOptions, ImportMode};
 use iroh_blobs::api::downloader::{DownloadProgressItem, DownloadRequest, Shuffled, SplitStrategy};
 use iroh_blobs::api::{Store, TempTag};
 use iroh_blobs::format::collection::Collection;
 use iroh_blobs::protocol::{ChunkRanges, GetRequest};
-use iroh_blobs::{Hash, HashAndFormat};
+use iroh_blobs::{BlobFormat, Hash, HashAndFormat};
 use n0_future::StreamExt as _;
 
 use crate::package::{read_manifest, validate_rel_path, ManifestRecord, MANIFEST_FILENAME};
@@ -95,17 +96,42 @@ fn collect_files(root: &Path) -> Result<Vec<PkgFile>> {
 }
 
 /// Import every file under `pkg_dir` into `store` and assemble them into a
-/// collection. Returns the collection [`Hash`] (the package `root_hash`) plus the
-/// ORDERED collection entries `(rel_path, byte_size)` — in the exact order
-/// [`Collection::from_iter`] stores them (the sorted-name walk order) — so the
-/// provider-upload-events consumer (Task 2.2) can attribute a served child to its
-/// entry by hash-seq index. Pins the collection under the deterministic `tag`
-/// name so it survives garbage collection and is serveable to peers — and so
-/// `release` can later delete it by that exact name.
+/// collection, COPYING each payload into the store ([`ImportMode::Copy`]) — the
+/// safe default for a dir the app may rebuild or mutate (a Perseus resend
+/// rewrites its payloads in place). Returns the collection [`Hash`] (the package
+/// `root_hash`) plus the ORDERED collection entries `(rel_path, byte_size)` — in
+/// the exact order [`Collection::from_iter`] stores them (the sorted-name walk
+/// order) — so the provider-upload-events consumer (Task 2.2) can attribute a
+/// served child to its entry by hash-seq index. Pins the collection under the
+/// deterministic `tag` name so it survives garbage collection and is serveable to
+/// peers — and so `release` can later delete it by that exact name.
+///
+/// [`import_package_collection_with_mode`] is the same import under a caller-
+/// chosen [`ImportMode`]; project seeding (D3) uses `TryReference` there.
 pub async fn import_package_collection(
     store: &Store,
     pkg_dir: &Path,
     tag: &str,
+) -> Result<(Hash, Vec<(String, u64)>)> {
+    import_package_collection_with_mode(store, pkg_dir, tag, ImportMode::Copy).await
+}
+
+/// [`import_package_collection`] under an explicit [`ImportMode`].
+///
+/// `ImportMode::TryReference` makes the fs store REFERENCE each payload where it
+/// lies instead of copying it in (D3 §3.4: a device that seeds a project package
+/// pays metadata, not a second copy of every frame). The invariant it demands —
+/// the file never changes after import — is the caller's to guarantee; a rewritten
+/// file makes the seed fail BLAKE3 verification at every downloader (an
+/// availability problem, never a silent-corruption one). The store may still copy
+/// (it inlines small files regardless of mode), which is why this is a hint, and
+/// the mode never affects the resulting hashes — an identical package always
+/// yields the identical collection hash either way.
+pub async fn import_package_collection_with_mode(
+    store: &Store,
+    pkg_dir: &Path,
+    tag: &str,
+    mode: ImportMode,
 ) -> Result<(Hash, Vec<(String, u64)>)> {
     let files = collect_files(pkg_dir)?;
     let count = files.len();
@@ -121,7 +147,11 @@ pub async fn import_package_collection(
     for f in &files {
         let tt = store
             .blobs()
-            .add_path(&f.abs)
+            .add_path_with_opts(AddPathOptions {
+                path: f.abs.clone(),
+                format: BlobFormat::Raw,
+                mode,
+            })
             .temp_tag()
             .await
             .with_context(|| format!("import blob {}", f.abs.display()))?;
@@ -135,6 +165,7 @@ pub async fn import_package_collection(
         path = %pkg_dir.display(),
         count,
         root_hash = %hash,
+        reference = matches!(mode, ImportMode::TryReference),
         "package imported as collection"
     );
     Ok((hash, entries))

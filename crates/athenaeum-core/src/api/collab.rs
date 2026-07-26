@@ -1295,12 +1295,45 @@ pub async fn publish_collab_frames(
         .map_err(|e| ApiError::Internal(format!("read written manifest: {e}")))?;
     let manifest_xxh3 = xxh3_full_file(&manifest_path)
         .map_err(|e| ApiError::Internal(format!("hash written manifest: {e:#}")))?;
-    // Hub rootHash: the hub REQUIRES exactly 64 hex chars. `write_package`'s own
-    // `root_hash` is a 16-hex xxh3 placeholder, so compute the BLAKE3 collection
-    // anchor over the manifest bytes (`iroh_blobs::Hash` — blake3 is not a direct
-    // dep). This is an IDENTIFIER only; the wire transfer substitutes the real
-    // iroh collection hash per serve.
-    let root_hash = iroh_blobs::Hash::new(&manifest_bytes).to_hex();
+
+    // ── 3b. Seed the collection; its hash IS the hub rootHash (D3 T2) ────────
+    // Importing the retained pub dir as an iroh collection makes this device the
+    // package's first seed, and the collection's own hash is what the hub carries
+    // as `root_hash`. That is what makes the announcement swarm-capable from the
+    // moment it is born: every downloader can ask ANY holder for this exact
+    // content-addressed collection and verify every byte against this one value,
+    // so a package can be pulled from all its holders at once instead of from
+    // whoever happens to answer a control message. (Pre-D3 this field carried a
+    // BLAKE3 over the manifest bytes — an identifier no blob store ever held.)
+    // The import is TryReference, so the blobs reference `pub_dir` in place; that
+    // dir is retained as this row's `local_dir` and is only removed when the
+    // publish itself fails or a later publish supersedes it.
+    // A node that cannot bind fails the publish exactly like a hub failure below:
+    // the announce two steps down needs the network anyway, and an announcement
+    // without a fetchable hash would be a lie.
+    let node = match crate::api::sync::ensure_iroh_node(ctx).await {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&pub_dir);
+            return Err(e);
+        }
+    };
+    let root_hash = match node
+        .seed_project_collection(project_id, &hub_package_id, &pub_dir)
+        .await
+    {
+        Ok(h) => h.to_hex(),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&pub_dir);
+            tracing::error!(
+                project_id,
+                package_id = %hub_package_id,
+                error = %format!("{e:#}"),
+                "publish: seeding the package collection failed"
+            );
+            return Err(ApiError::Internal(format!("seed published package: {e:#}")));
+        }
+    };
 
     let frame_count = kept.len() as i64;
     let byte_size = announce.byte_size as i64;
@@ -2416,10 +2449,23 @@ mod tests {
     }
 
     /// Point `ctx`'s account hub at `uri` and store a device token.
+    ///
+    /// Also caches a bogus relay map: publishing binds the shared iroh node (D3
+    /// T2 seeds the collection before announcing), and a signed-in ctx with no
+    /// relay map at all refuses to bind rather than ride iroh's public relays.
+    /// `.invalid` is guaranteed non-resolvable (RFC 2606) and no role is ever
+    /// started here, so the endpoint binds locally and the test stays hermetic —
+    /// the same trick `api::sync`'s node tests use.
     fn wire_hub(ctx: &ServiceContext, uri: &str) {
         {
             let conn = crate::api::db(ctx).unwrap().conn();
             crate::db::set_setting(&conn, crate::settings::keys::ACCOUNT_HUB_URL, uri).unwrap();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::SYNC_CACHED_RELAYS,
+                "https://relay.invalid",
+            )
+            .unwrap();
         }
         crate::api::account::store_token_for_test(ctx, "tok").unwrap();
     }
@@ -2712,6 +2758,86 @@ mod tests {
                 .unwrap()
                 .is_some());
         }
+    }
+
+    /// (e) D3 T2: the `rootHash` the hub receives is the REAL iroh collection
+    /// hash of the published package — pinned against an INDEPENDENT import of
+    /// the same retained dir into a fresh store (content addressing makes that a
+    /// hash equality, not a re-derivation of our own code path) — and publishing
+    /// left this device seeding that collection under `project/<pid>/<pkgid>`.
+    /// The pre-D3 placeholder (BLAKE3 over the manifest bytes) is asserted GONE:
+    /// no provider's blob store ever held that value, which is exactly why a
+    /// swarm fetch against it could not work.
+    #[tokio::test]
+    async fn publish_root_hash_is_the_collection_hash() {
+        let server = MockServer::start().await;
+        mount_announce(&server, "p-1", "ann-e", "published").await;
+
+        let (_tmp, ctx) = test_ctx();
+        wire_hub(&ctx, &server.uri());
+        let out_dir = _tmp.path().join("cal_out");
+        let set_id = {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            // No members ⇒ no push-seed target; this test is about the hash.
+            seed_publish_project(&conn, "p-1", "[]");
+            seed_publishable_set(&conn, &out_dir, "M101 Set", &["uuid-e-1", "uuid-e-2"])
+        };
+        link_frame_set(&ctx, "p-1", set_id).unwrap();
+
+        let sender = crate::sync::SyncSenderRuntime::new();
+        let result = publish_collab_frames(&ctx, &sender, "p-1", None).await.unwrap();
+
+        // Independent oracle: import the retained pub dir into a fresh store.
+        let pub_dir = _tmp.path().join("sync").join("collab_pub").join(&result.package_id);
+        let oracle_store: iroh_blobs::api::Store =
+            iroh_blobs::store::mem::MemStore::new().into();
+        let (expected, _entries) = crate::sharing::iroh::blobs::import_package_collection(
+            &oracle_store,
+            &pub_dir,
+            "oracle/pkg/check",
+        )
+        .await
+        .unwrap();
+        let expected = expected.to_hex();
+
+        let bodies = announce_bodies(&server).await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0]["rootHash"].as_str().unwrap(),
+            expected,
+            "the hub is told the collection hash a downloader can actually fetch"
+        );
+
+        // The manifest-bytes placeholder is gone (it is a different value).
+        let manifest_bytes =
+            std::fs::read(pub_dir.join(crate::package::MANIFEST_FILENAME)).unwrap();
+        assert_ne!(
+            expected,
+            iroh_blobs::Hash::new(&manifest_bytes).to_hex(),
+            "the announced hash is no longer the manifest-bytes identifier"
+        );
+
+        // The local row carries the same value the hub got.
+        {
+            let conn = crate::api::db(&ctx).unwrap().conn();
+            let row = crate::db::collab_exchange::get_package(&conn, &result.package_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.root_hash, expected, "the stored row matches the hub");
+        }
+
+        // Publishing seeded the package: the node holds it under the reserved tag.
+        let node = ctx.iroh_node.lock().await.take().expect("publish bound the node");
+        assert!(
+            node.store()
+                .tags()
+                .get(format!("project/p-1/{}", result.package_id).as_bytes())
+                .await
+                .unwrap()
+                .is_some(),
+            "the publisher is seed №1 under project/<project_id>/<package_id>"
+        );
+        node.shutdown().await;
     }
 
     /// An empty gate (no publishable frames) is an `Invalid`, never a panic.

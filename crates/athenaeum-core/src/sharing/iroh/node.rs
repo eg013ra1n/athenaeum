@@ -43,6 +43,7 @@ use async_trait::async_trait;
 use iroh::endpoint::{presets, Connection};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, Watcher};
+use iroh_blobs::api::blobs::ImportMode;
 use iroh_blobs::api::Store;
 use iroh_blobs::store::fs::options::Options as FsOptions;
 use iroh_blobs::store::fs::FsStore;
@@ -271,13 +272,41 @@ fn role_package_tag(prefix: &str, package_id: &PackageId) -> String {
 /// sweep and the writer can never drift.
 const RECV_IN_FLIGHT_PREFIX: &str = "in-flight/recv/pkg/";
 
+/// The tag namespace under which PROJECT SEEDING (D3 §3.4) pins collections:
+/// `project/<project_id>/<package_id>`. Two producers write here — a publisher
+/// seeding what it just published ([`SharedIrohNode::seed_project_collection`]
+/// from `api::collab::publish_collab_frames`, D3 T2) and a downloader seeding
+/// what it just ingested (the same call from `api::collab_exchange`, D3 T4) —
+/// and the only deleters are [`SharedIrohNode::unseed_project_package`] /
+/// [`SharedIrohNode::unseed_project`], driven by local-data deletion.
+///
+/// The namespace is deliberately outside BOTH transfer-machinery scopes: the
+/// per-role startup sweep only deletes `<prefix>/pkg/` ([`SharedIrohNode::role_start`])
+/// and the B7 orphan reclaim only enumerates [`RECV_IN_FLIGHT_PREFIX`]
+/// ([`recv_in_flight_package_id`]), so a seed survives every boot until its
+/// project's data is deleted. Seeds must be durable that way: a swept seeding tag
+/// would turn a real holder into a phantom the hub still advertises.
+const PROJECT_SEED_PREFIX: &str = "project/";
+
+/// The seeding tag for ONE project package (D3 §3.4).
+fn project_seed_tag(project_id: &str, package_id: &str) -> String {
+    format!("{PROJECT_SEED_PREFIX}{project_id}/{package_id}")
+}
+
+/// The tag prefix covering EVERY package seeded for one project — the delete
+/// scope of [`SharedIrohNode::unseed_project`].
+fn project_seed_prefix(project_id: &str) -> String {
+    format!("{PROJECT_SEED_PREFIX}{project_id}/")
+}
+
 /// If `tag` is a receiver-side in-flight download tag
 /// (`in-flight/recv/pkg/<wire_package_id>`), return that wire package id; else
 /// `None`. This one function IS the B7 namespace contract: a permanent
-/// `<role>/pkg/…` tag, a future `project/…` seeding tag, or any other foreign
-/// tag yields `None`, so the orphan sweep that releases what this matches can
-/// never touch a tag the transfer machinery does not own. Package ids are single
-/// path-segment uuids/hex, so a value carrying a `/` is rejected as malformed.
+/// `<role>/pkg/…` tag, a `project/…` seeding tag ([`PROJECT_SEED_PREFIX`]), or
+/// any other foreign tag yields `None`, so the orphan sweep that releases what
+/// this matches can never touch a tag the transfer machinery does not own.
+/// Package ids are single path-segment uuids/hex, so a value carrying a `/` is
+/// rejected as malformed.
 fn recv_in_flight_package_id(tag: &str) -> Option<&str> {
     tag.strip_prefix(RECV_IN_FLIGHT_PREFIX)
         .filter(|id| !id.is_empty() && !id.contains('/'))
@@ -2179,6 +2208,157 @@ impl SharedIrohNode {
         Ok(())
     }
 
+    /// **Seed a project package** (D3 §3.4): import `pkg_dir` as a collection
+    /// pinned under the reserved `project/<project_id>/<package_id>` tag
+    /// (`PROJECT_SEED_PREFIX`), and return the collection [`Hash`].
+    ///
+    /// That hash is the package's REAL `root_hash`: the publisher sends it to the
+    /// hub at announce (D3 T2) and every downloader fetches + BLAKE3-verifies
+    /// against it, from any holder, in any mix — which is what makes the
+    /// announcement swarm-capable. Seeding is puller-driven from here on: the
+    /// blobs simply being resident under a permanent tag is what lets an incoming
+    /// GET be served, with no control-message round trip.
+    ///
+    /// Imported with [`ImportMode::TryReference`], so the blobs REFERENCE the
+    /// files under `pkg_dir` in place — seeding costs metadata, not a second copy
+    /// of every frame. `pkg_dir` must therefore stay put and stay unchanged for as
+    /// long as the tag lives (publisher: the retained `collab_pub/<package_id>`
+    /// dir; downloader: the landed contribution files). A rewritten file makes
+    /// this seed fail verification at every downloader — an availability problem,
+    /// never a silent-corruption one.
+    ///
+    /// The served-collection entry is recorded exactly the way `role_serve`
+    /// records one, for the same two reasons: the re-import short-circuit
+    /// (re-seeding an already-seeded package must not re-hash a multi-GB dir) and
+    /// the by-hash ordered entry list. Attribution differs BY DESIGN — a
+    /// `project/…` key has no `/pkg/` segment, so `resolve_served_root_in` yields
+    /// `None` for it and a swarm GET (no announce, no ack claim, no transfer row
+    /// behind it) never routes upload progress at a package id nothing is waiting
+    /// on. That is a skip, not a mask: `find_map` walks past a `None`, so when a
+    /// project seed and a role serve share one collection hash — a publisher
+    /// push-seeds the very dir it just seeded — the role tag still resolves the
+    /// transfer. The per-file resolver is indifferent to which of the two it
+    /// picks: equal hashes mean byte-identical collections, hence identical
+    /// ordered entry lists.
+    pub async fn seed_project_collection(
+        &self,
+        project_id: &str,
+        package_id: &str,
+        pkg_dir: &Path,
+    ) -> Result<Hash> {
+        let tag = project_seed_tag(project_id, package_id);
+        {
+            let served = self.served.lock().expect("served mutex poisoned");
+            if let Some(entry) = served.get(&tag) {
+                tracing::debug!(
+                    project_id,
+                    package_id,
+                    root_hash = %entry.hash,
+                    "project seed reuses the already-imported collection"
+                );
+                return Ok(entry.hash);
+            }
+        }
+        let (hash, entries) = blobs::import_package_collection_with_mode(
+            &self.store,
+            pkg_dir,
+            &tag,
+            ImportMode::TryReference,
+        )
+        .await
+        .with_context(|| format!("seed project package {package_id}"))?;
+        self.served.lock().expect("served mutex poisoned").insert(
+            tag.clone(),
+            ServedCollection {
+                hash,
+                want_fingerprint: None,
+            },
+        );
+        self.served_files
+            .lock()
+            .expect("served_files mutex poisoned")
+            .insert(tag, entries);
+        tracing::info!(
+            project_id,
+            package_id,
+            root_hash = %hash,
+            path = %pkg_dir.display(),
+            "project collection seeded"
+        );
+        Ok(hash)
+    }
+
+    /// Stop seeding ONE project package: forget its served entry and delete its
+    /// `project/<project_id>/<package_id>` tag (exact name — a sibling package of
+    /// the same project and every other project are untouched).
+    ///
+    /// Best-effort by design: this runs from local-data deletion paths, where a
+    /// tag that refuses to go must not abort the deletion. The failure is logged,
+    /// never swallowed; what it leaves behind is a pinned collection over files
+    /// that are about to disappear — a failing GET, never a wrong one.
+    pub async fn unseed_project_package(&self, project_id: &str, package_id: &str) {
+        let tag = project_seed_tag(project_id, package_id);
+        self.forget_served_tag(&tag);
+        match self.store.tags().delete(tag.as_bytes()).await {
+            Ok(removed) => tracing::info!(
+                project_id,
+                package_id,
+                tags_removed = removed,
+                "project package unseeded"
+            ),
+            Err(e) => tracing::warn!(
+                project_id,
+                package_id,
+                error = %e,
+                "delete project seed tag failed"
+            ),
+        }
+    }
+
+    /// Stop seeding EVERY package of one project — the prefix twin of
+    /// [`unseed_project_package`](Self::unseed_project_package), for
+    /// leave-project / delete-project-data. Scoped to `project/<project_id>/`, so
+    /// another project's seeds survive. Same best-effort semantics.
+    pub async fn unseed_project(&self, project_id: &str) {
+        let prefix = project_seed_prefix(project_id);
+        self.forget_served_prefix(&prefix);
+        match self.store.tags().delete_prefix(prefix.as_bytes()).await {
+            Ok(removed) => {
+                tracing::info!(project_id, tags_removed = removed, "project unseeded")
+            }
+            Err(e) => tracing::warn!(
+                project_id,
+                error = %e,
+                "delete project seed tags failed"
+            ),
+        }
+    }
+
+    /// Drop one tag's `served` + `served_files` entries in lock-step (the two maps
+    /// never drift), the way `role_release` does for a role package tag.
+    fn forget_served_tag(&self, tag: &str) {
+        self.served
+            .lock()
+            .expect("served mutex poisoned")
+            .remove(tag);
+        self.served_files
+            .lock()
+            .expect("served_files mutex poisoned")
+            .remove(tag);
+    }
+
+    /// [`forget_served_tag`](Self::forget_served_tag) for every key under `prefix`.
+    fn forget_served_prefix(&self, prefix: &str) {
+        self.served
+            .lock()
+            .expect("served mutex poisoned")
+            .retain(|tag, _| !tag.starts_with(prefix));
+        self.served_files
+            .lock()
+            .expect("served_files mutex poisoned")
+            .retain(|tag, _| !tag.starts_with(prefix));
+    }
+
     /// Enumerate the receiver-side in-flight download tags currently in the
     /// shared store as their wire [`PackageId`]s (B7 orphan reclaim). Lists ONLY
     /// the `in-flight/recv/pkg/` namespace via a prefixed tag scan and parses
@@ -2965,6 +3145,165 @@ mod tests {
             node.resolve_served_hash_for_test(Role::Out, &announce.package_id),
             Some(subset_hash),
             "an identical subset reuses the import"
+        );
+
+        node.shutdown().await;
+    }
+
+    /// Total bytes of every regular file under `dir` (D3 T2 store-growth oracle).
+    fn dir_size(dir: &Path) -> u64 {
+        walkdir::WalkDir::new(dir)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.file_type().is_file())
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum()
+    }
+
+    /// D3 T2: a project seed lands under the RESERVED `project/…` namespace and
+    /// survives every role's startup sweep. The sweep is what makes seeding
+    /// durable at all — a seeding tag that a sibling role's boot deleted would
+    /// turn every seeded device into a phantom holder on the next app start.
+    #[tokio::test]
+    async fn seed_tag_lands_and_survives_the_sweep() {
+        let dir = tempdir().unwrap();
+        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled)
+            .await
+            .unwrap();
+        let (pkg_dir, _announce) = build_one_frame_package(dir.path());
+
+        node.seed_project_collection("proj-1", "pkg-1", &pkg_dir)
+            .await
+            .expect("seeding a retained package dir succeeds");
+
+        assert!(
+            tag_present(node.store(), "project/proj-1/pkg-1").await,
+            "the seed lands under project/<project_id>/<package_id>"
+        );
+
+        // A control tag in a swept namespace proves the sweeps actually ran.
+        let tt = node
+            .store()
+            .blobs()
+            .add_bytes(b"sweep control".to_vec())
+            .temp_tag()
+            .await
+            .unwrap();
+        node.store()
+            .tags()
+            .set("out/pkg/control", tt.hash_and_format())
+            .await
+            .unwrap();
+        drop(tt);
+        for role in [Role::Recv, Role::Out, Role::Collab] {
+            node.handle(role).start().await.unwrap();
+        }
+        assert!(
+            !tag_present(node.store(), "out/pkg/control").await,
+            "the control tag in the swept namespace is gone (the sweeps ran)"
+        );
+        assert!(
+            tag_present(node.store(), "project/proj-1/pkg-1").await,
+            "the project seed survives every role's startup sweep"
+        );
+
+        node.shutdown().await;
+    }
+
+    /// D3 T2: seeding imports with `ImportMode::TryReference`, so the blobs
+    /// reference the retained package dir in place — a seeding device pays
+    /// metadata, not a second copy of every frame. Compared against the same
+    /// package imported the normal (Copy) way by `serve`, in its own store.
+    ///
+    /// The oracle is the store's OWNED-DATA dir (`<blobs>/data`, where a copied
+    /// blob's `<hash>.data` lands), not the whole store dir: the redb index file
+    /// is ~1 MB the moment it exists and would drown the signal.
+    #[tokio::test]
+    async fn try_reference_does_not_copy_payloads() {
+        const PAYLOAD: usize = 1024 * 1024;
+        // The package lives OUTSIDE both store dirs, so measuring the store
+        // measures only what the store itself wrote.
+        let pkg_root = tempdir().unwrap();
+        let (pkg_dir, announce) = build_two_frame_package(pkg_root.path(), PAYLOAD, 4096);
+
+        let copy_dir = tempdir().unwrap();
+        let copy_node = SharedIrohNode::bind(copy_dir.path(), RelayMode::Disabled)
+            .await
+            .unwrap();
+        copy_node
+            .role_handle(Role::Out)
+            .serve(&announce, &pkg_dir, None)
+            .await
+            .unwrap();
+        copy_node.shutdown().await;
+        let copied = dir_size(&copy_dir.path().join("blobs").join("data"));
+
+        let ref_dir = tempdir().unwrap();
+        let ref_node = SharedIrohNode::bind(ref_dir.path(), RelayMode::Disabled)
+            .await
+            .unwrap();
+        ref_node
+            .seed_project_collection("proj-1", "pkg-1", &pkg_dir)
+            .await
+            .unwrap();
+        ref_node.shutdown().await;
+        let referenced = dir_size(&ref_dir.path().join("blobs").join("data"));
+
+        assert!(
+            copied as usize >= PAYLOAD,
+            "sanity: a Copy import writes the payload into the store \
+             (measured {copied} bytes for a {PAYLOAD}-byte payload)"
+        );
+        assert!(
+            referenced < 256 * 1024,
+            "a TryReference import must not duplicate the payload: the store grew \
+             by {referenced} bytes (Copy grew by {copied})"
+        );
+    }
+
+    /// D3 T2: the unseed API is exactly as scoped as its name — per package by
+    /// exact tag, per project by prefix — so tearing one project's local data
+    /// down can never stop another project's packages from being served.
+    #[tokio::test]
+    async fn unseed_removes_exactly_the_project_tags() {
+        let dir = tempdir().unwrap();
+        let node = SharedIrohNode::bind(dir.path(), RelayMode::Disabled)
+            .await
+            .unwrap();
+        let (pkg_dir, _announce) = build_one_frame_package(dir.path());
+
+        for (project, package) in [
+            ("proj-1", "pkg-a"),
+            ("proj-1", "pkg-b"),
+            ("proj-2", "pkg-z"),
+        ] {
+            node.seed_project_collection(project, package, &pkg_dir)
+                .await
+                .unwrap();
+        }
+
+        node.unseed_project_package("proj-1", "pkg-a").await;
+        assert!(
+            !tag_present(node.store(), "project/proj-1/pkg-a").await,
+            "the named package is unseeded"
+        );
+        assert!(
+            tag_present(node.store(), "project/proj-1/pkg-b").await,
+            "a sibling package in the same project keeps seeding"
+        );
+        assert!(
+            tag_present(node.store(), "project/proj-2/pkg-z").await,
+            "another project is untouched"
+        );
+
+        node.unseed_project("proj-1").await;
+        assert!(
+            !tag_present(node.store(), "project/proj-1/pkg-b").await,
+            "unseeding the project removes its remaining packages"
+        );
+        assert!(
+            tag_present(node.store(), "project/proj-2/pkg-z").await,
+            "unseeding one project never touches another's tags"
         );
 
         node.shutdown().await;

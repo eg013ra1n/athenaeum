@@ -102,10 +102,22 @@ fn test_ctx() -> (tempfile::TempDir, ServiceContext) {
 
 /// Point `ctx`'s account hub at `uri` + store a device token (mirrors
 /// `api::collab::wire_hub`, but with a distinct per-ctx token).
+///
+/// The cached bogus relay map is what lets publish bind the shared iroh node
+/// (D3 T2 seeds the collection before announcing) without a hub relay route: a
+/// signed-in ctx with no relay map refuses to bind rather than ride iroh's
+/// public relays. `.invalid` is non-resolvable (RFC 2606) and no role is started
+/// on that node here, so nothing leaves the machine.
 fn wire_hub(ctx: &ServiceContext, uri: &str, token: &str) {
     {
         let conn = db(ctx).unwrap().conn();
         crate::db::set_setting(&conn, crate::settings::keys::ACCOUNT_HUB_URL, uri).unwrap();
+        crate::db::set_setting(
+            &conn,
+            crate::settings::keys::SYNC_CACHED_RELAYS,
+            "https://relay.invalid",
+        )
+        .unwrap();
     }
     crate::api::account::store_token_for_test(ctx, token).unwrap();
 }
