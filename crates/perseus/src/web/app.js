@@ -79,10 +79,12 @@ function setTab(name) {
   // listing is fetched on demand only (never polled; see the library section).
   if (active === 'transfers' && window.PerseusApp) window.PerseusApp.refreshTransfers();
   if (active === 'library') libRefresh();
-  // The preview overlay belongs to the Library tab. Leaving the tab closes it —
-  // an overlay left "open" while its tab is hidden would keep the document-level
-  // arrow/Escape listener, stealing those keys from the tab now on screen.
-  else libPvClose();
+  // The preview overlay and the action dialogs belong to the Library tab.
+  // Leaving the tab closes both — an overlay left "open" while its tab is hidden
+  // would keep the document-level arrow/Escape listener, stealing those keys
+  // from the tab now on screen (and a dialog would still be holding a selection
+  // snapshot nobody can see).
+  else { libPvClose(); libDlgClose(); }
 }
 
 function wireTabs() {
@@ -1432,6 +1434,7 @@ function renderLibraryTab() {
         <button class="ghost" id="libRefreshBtn" data-lib-act="refresh" title="Re-read this folder">&#8635;</button>
       </div>
       <div id="libBody"></div>
+      <div class="flash" id="libFlash"></div>
       <div class="lib-footer" id="libFooter" hidden></div>
     </section>`;
 }
@@ -1564,11 +1567,12 @@ function renderLibListing() {
 }
 
 // ── render: selection footer ──
-// Send / Delete are wired by later tasks and render disabled rather than absent
-// so the shape of the bar is honest. Preview is live (T7): it opens the first
-// selected file OF THE LISTED FOLDER, because that folder's files are exactly
-// what the pane's ←/→ walk covers — a selection reaching into a folder that is
-// no longer on screen has no walk to join, so the button says so instead.
+// Send to… / Delete open the T10 dialogs over the WHOLE selection (every root-
+// relative pick, including the ones scrolled out of sight — hence the "N outside
+// this folder" note beside the count). Preview is the odd one out (T7): it opens
+// the first selected file OF THE LISTED FOLDER, because that folder's files are
+// exactly what the pane's ←/→ walk covers — a selection reaching into a folder
+// that is no longer on screen has no walk to join, so the button says so instead.
 function renderLibFooter() {
   const el = $('libFooter');
   if (!el) return;
@@ -1583,15 +1587,16 @@ function renderLibFooter() {
   let outside = 0;
   libState.selected.forEach((rel) => { if (!here.has(rel)) outside++; });
   const note = outside ? ` <span class="muted">· ${outside} outside this folder</span>` : '';
-  const soon = 'not wired yet';
   const pv = libPvFirstSelectedFile();
   const pvTitle = pv ? 'Preview ' + pv.name : 'select a file in this folder to preview';
+  const sendTitle = 'Send this selection to a device now, as one batch';
+  const delTitle = 'Delete this selection from disk (you see the consequences first)';
   el.hidden = false;
   el.innerHTML = `<span><b>${n}</b> selected${note}</span>
     <button class="ghost" data-lib-act="clear">Clear</button>
     <span class="spacer"></span>
-    <button disabled title="${esc(soon)}">Send to…</button>
-    <button class="ghost" disabled title="${esc(soon)}">Delete</button>
+    <button data-lib-act="send" title="${esc(sendTitle)}">Send to…</button>
+    <button class="ghost" data-lib-act="delete" title="${esc(delTitle)}">Delete</button>
     <button class="ghost" data-lib-act="preview"${pv ? '' : ' disabled'} title="${esc(pvTitle)}">Preview</button>`;
 }
 
@@ -1638,10 +1643,13 @@ function libSelectedItems() {
 // ── navigation ──
 function libShowRoots() {
   libLoadSeq++;                 // abandon any in-flight listing
-  // The pane walks ONE directory of ONE root. Leaving that root (the operator's
-  // click, or the identity guard in libOnStatus retreating from a re-pointed
-  // index) leaves its walk list addressing a folder nobody is browsing.
+  // The pane walks ONE directory of ONE root, and a dialog holds a selection
+  // snapshot taken inside one root. Leaving that root (the operator's click, or
+  // the identity guard in libOnStatus retreating from a re-pointed index) leaves
+  // the walk list addressing a folder nobody is browsing — and would leave the
+  // dialog about to act on rel-paths whose root index now means something else.
   libPvClose();
+  libDlgClose();
   libClearSelection();          // a rel only means something inside its root
   libState.root = null;
   libRootPath = null;
@@ -2009,6 +2017,561 @@ function onLibPreviewClick(e) {
   else if (act.dataset.pvAct === 'retry') libPvShow(libPvState.idx);
 }
 
+// ── library actions: the Send-to picker and the Delete confirm (T10) ────────
+// Both footer actions drive ONE modal over `#libDialog`, a body-level host beside
+// the preview overlay (same placement, same reason). Five rules shape it:
+//
+//  * The SELECTION IS SNAPSHOT at open (`libDlg.items`). The 2 s status tick can
+//    retreat the browser out of its root (libOnStatus's identity guard), and a
+//    dialog still acting on rel-paths whose root index has been re-pointed would
+//    address a folder nobody picked — so `libShowRoots` and a tab switch close
+//    it, and everything after open reads the snapshot, never the live Set.
+//  * Every round trip takes a ticket (`libDlgSeq`, the guard `libLoad` and the
+//    preview pane already use). A response that lands after the dialog closed —
+//    or after it was reopened for the other action — neither paints nor acts.
+//  * ONE in-flight write at a time (`libDlg.busy` disables the submit button and
+//    blocks Escape/scrim close): a double-click must not enqueue two batches or
+//    delete twice, and closing mid-delete would throw away the per-file outcomes
+//    the operator needs to see.
+//  * Escape closes; **Enter never confirms**. The element focused on open is the
+//    safe one (Cancel on the delete confirm), so a stray Return dismisses.
+//  * No focus trap — Tab still reaches the page behind the scrim. That matches
+//    the page's existing `.tconfirm` dialog and the preview pane; one shared fix
+//    later beats three divergent ones now.
+//
+// The delete dialog is deliberately a TWO-CALL flow against one route: the
+// preview (`confirm: false`) is what the operator reads, the confirm
+// (`confirm: true`) is what they authorise. Both plan over the same selection,
+// so the only difference between what the dialog said and what happened is what
+// really changed on disk in between — and that lands as a per-file outcome.
+const LIB_DLG_LIST_CAP = 200;   // rows shown per list before "…and N more"
+
+let libDlg = null;              // the open dialog's whole state, or null
+let libDlgSeq = 0;              // monotonic; a stale response never paints
+let libDlgReturnFocus = null;   // element focus returns to on close
+
+const libNFiles = (n) => n + (n === 1 ? ' file' : ' files');
+// A package ref is an absolute-ish path; its basename is the uuid directory the
+// operator actually recognises from the Transfers tab. Full ref goes in `title`.
+const libBaseName = (ref) => {
+  const s = String(ref ?? '');
+  const segs = s.split(/[\\/]+/).filter(Boolean);
+  return segs.length ? segs[segs.length - 1] : s;
+};
+
+// The library's own status line (the page's `.flash` convention). Outcomes are
+// written here as well as into the dialog, so the answer survives the close.
+function libSay(msg, ok) {
+  const f = $('libFlash');
+  if (!f) return;
+  f.textContent = msg;
+  f.className = 'flash ' + (ok ? 'ok' : 'err');
+}
+
+// A configured target reads as its friendly device name when the Settings
+// picker's device list can resolve it (id → name, the same lookup `tgLabel`
+// does), with the id kept as a `hint` beside it; otherwise the raw entry,
+// shortened when it is a bare peer id and with NO hint — repeating the same
+// truncated hex twice says nothing. That device list is fetched by the Settings
+// section on sign-in — the Library tab never makes a hub call of its own, so an
+// unresolvable id is shown honestly rather than waited for.
+function libTargetView(entry) {
+  const raw = String(entry ?? '');
+  const hit = tgOptions.find((d) => d.id === raw) || tgOptions.find((d) => d.name === raw);
+  if (hit) return { label: hit.name, hint: hit.name === raw ? '' : raw };
+  return { label: /^[0-9a-f]{16,}$/i.test(raw) ? shortHex(raw) + '…' : raw, hint: '' };
+}
+const libTargetLabel = (entry) => libTargetView(entry).label;
+
+// ── open / close ──
+function libDlgOpen(kind) {
+  const items = libSelectedItems();
+  if (!items.length) return;              // footer is hidden without a selection
+  const host = $('libDialog');
+  if (!host) return;
+  if (libDlg) libDlgClose();              // never stack two (or two key listeners)
+  const seq = ++libDlgSeq;
+  libDlg = {
+    kind, items, seq,
+    phase: 'loading', busy: false, error: null,
+    targets: [], picked: new Set(), waiting: [],   // send
+    preview: null, outcomes: null, sent: null,
+  };
+  libDlgReturnFocus = document.activeElement || null;
+  host.hidden = false;
+  document.addEventListener('keydown', onLibDlgKey);
+  libDlgRender({ focus: true });
+  if (kind === 'send') libSendLoad(); else libDeleteLoad();
+}
+
+function libDlgClose() {
+  if (!libDlg) return;
+  libDlgSeq++;                            // orphan every in-flight response
+  libDlg = null;
+  document.removeEventListener('keydown', onLibDlgKey);
+  const host = $('libDialog');
+  if (host) { host.hidden = true; host.innerHTML = ''; }
+  const back = libDlgReturnFocus;
+  libDlgReturnFocus = null;
+  // Only if it is still in the document — the footer it came from is re-rendered
+  // by the listing refresh a completed action kicks off.
+  if (back && back.focus && (!document.contains || document.contains(back))) back.focus();
+}
+
+// Escape closes (never mid-write); Enter is deliberately unbound — a destructive
+// confirm must be clicked, or tabbed to and pressed, never fired by a stray
+// Return while the operator is reading the warnings.
+function onLibDlgKey(e) {
+  if (!libDlg) return;
+  if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (e.key !== 'Escape') return;
+  e.preventDefault();
+  if (!libDlg.busy) libDlgClose();
+}
+
+// ── render ──
+// One shell for both dialogs; the body/actions come from the per-kind builders.
+// `focus` is passed only on a PHASE change: re-focusing on every render would
+// yank focus off the target checkbox the operator just clicked.
+function libDlgRender(opts) {
+  const host = $('libDialog');
+  if (!host || !libDlg) return;
+  const d = libDlg;
+  const title = d.kind === 'send' ? 'Send to…' : 'Delete from disk';
+  const parts = d.kind === 'send' ? libSendDialogParts(d) : libDeleteDialogParts(d);
+  host.innerHTML = `
+    <div class="tconfirm lib-dlg" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+      <h3>${esc(title)}</h3>
+      <div class="tconfirm-body lib-dlg-body">${parts.body}</div>
+      <div class="tconfirm-actions">${parts.actions}</div>
+    </div>`;
+  if (opts && opts.focus) {
+    const f = $('libDlgFocus');
+    if (f && f.focus) f.focus();
+  }
+}
+
+// The error line shared by both dialogs: the server's own words, escaped, never
+// paraphrased — a 400 naming two ambiguous devices is the operator's fix.
+const libDlgErrHtml = (msg) => (msg ? `<p class="lib-dlg-err">${esc(msg)}</p>` : '');
+
+// Cancel is disabled while a write is in flight for the same reason Escape is:
+// the outcome rows are the only record of what a delete actually did.
+const libDlgCancelBtn = (label, d, focusHere) =>
+  `<button class="ghost" data-dlg-act="cancel"${focusHere ? ' id="libDlgFocus"' : ''}`
+  + `${d.busy ? ' disabled title="waiting for the server…"' : ''}>${esc(label)}</button>`;
+
+// ── send dialog ──
+function libSendDialogParts(d) {
+  const dirs = d.items.filter((i) => i.dir).length;
+  const files = d.items.length - dirs;
+  const subject = dirs
+    ? `<b>${d.items.length}</b> selected ${d.items.length === 1 ? 'item' : 'items'}`
+    : `<b>${files}</b> selected ${files === 1 ? 'file' : 'files'}`;
+  const dirNote = dirs
+    ? `<p class="muted">${dirs === 1 ? 'One folder is' : dirs + ' folders are'} in the selection — everything inside travels too.</p>`
+    : '';
+
+  if (d.phase === 'loading') {
+    return {
+      body: '<div class="empty">reading this node\'s send targets…</div>',
+      actions: libDlgCancelBtn('Cancel', d, true),
+    };
+  }
+
+  if (d.phase === 'result') {
+    const rep = d.sent || {};
+    const ref = String(rep.packageRef || '');
+    return {
+      body: `<p class="lib-dlg-ok">${esc(libSendMessage(rep))}</p>`
+        + (ref
+          ? `<p class="muted">batch <span class="mono" title="${esc(ref)}">${esc(libBaseName(ref))}</span></p>`
+          : '')
+        + '<p class="muted">The listing behind this dialog has been re-read — the status chips now show what the engine is doing with them.</p>',
+      actions: libDlgCancelBtn('Close', d, false)
+        + '<button data-dlg-act="transfers" id="libDlgFocus">View in Transfers</button>',
+    };
+  }
+
+  // phase 'form' — the picker itself.
+  const rows = d.targets.map((t, i) => {
+    const raw = String(t);
+    const view = libTargetView(raw);
+    const idAttr = i === 0 ? ' id="libDlgFocus"' : '';
+    return `<label class="inline-label lib-dlg-target">
+      <input type="checkbox" data-dlg-target="${esc(raw)}"${idAttr}${d.picked.has(raw) ? ' checked' : ''}${d.busy ? ' disabled' : ''} />
+      <span>${esc(view.label)}</span>${view.hint
+        ? `<span class="muted mono" title="${esc(view.hint)}">${esc(shortHex(view.hint))}…</span>` : ''}
+    </label>`;
+  }).join('');
+  const noTargets = `<p class="lib-dlg-warn">No device is reachable from this node right now — the sync engine is not running, or it has no send targets. Add one under Settings → Send Targets.</p>`;
+  const waiting = d.waiting.length
+    ? `<p class="muted">Saved but not applied yet: ${d.waiting.map((t) => esc(libTargetLabel(t))).join(', ')} — ${d.waiting.length === 1 ? 'it becomes' : 'they become'} sendable once the sync engine restarts.</p>`
+    : '';
+  const canSend = d.targets.length > 0 && d.picked.size > 0 && !d.busy;
+  const label = dirs ? `Send ${d.items.length} items` : `Send ${libNFiles(files)}`;
+  return {
+    body: `<p>Send ${subject} to:</p>${dirNote}`
+      + (d.targets.length ? `<div class="lib-dlg-targets">${rows}</div>` : noTargets)
+      + waiting
+      + libDlgErrHtml(d.error),
+    actions: libDlgCancelBtn('Cancel', d, !d.targets.length)
+      + `<button data-dlg-act="send" id="libDlgSubmit"${canSend ? '' : ' disabled'}>`
+      + `${esc(d.busy ? 'Sending…' : label)}</button>`,
+  };
+}
+
+// "4 sent, 1 no longer on disk" — the skipped count is the server's own answer
+// for named files that vanished under a stale listing, and saying it is the only
+// way the operator can tell why fewer files shipped than were picked.
+function libSendMessage(rep) {
+  const enqueued = Number(rep.enqueued) || 0;
+  const skipped = Number(rep.skipped) || 0;
+  return `Sent ${libNFiles(enqueued)}` + (skipped ? ` (${skipped} no longer on disk)` : '');
+}
+
+// The targets this node can actually reach: `runtime` is the list the RUNNING
+// engines were spawned over, and `resolve_send_targets` matches against exactly
+// those. A target saved under Settings but not yet applied is in `configured`
+// only — offering it would guarantee a 400, so it is named as pending instead.
+async function libSendLoad() {
+  const seq = libDlg.seq;
+  let dto = null;
+  let error = null;
+  try { dto = await getJson('/api/targets'); }
+  catch (e) { error = (e && e.message) ? e.message : String(e); }
+  if (!libDlg || libDlg.seq !== seq) return;
+  if (error) {
+    console.error('[library] send: could not read send targets:', error);
+    libDlg.error = 'could not read the send targets: ' + error;
+    libDlg.targets = [];
+    libDlg.picked = new Set();
+  } else {
+    const runtime = Array.isArray(dto.runtime) ? dto.runtime.map(String) : [];
+    const configured = Array.isArray(dto.configured) ? dto.configured.map(String) : [];
+    // A config can legitimately hold one device twice (by id and by name); two
+    // checkboxes toggling the same key would be a lie about what is being sent.
+    libDlg.targets = Array.from(new Set(runtime));
+    libDlg.picked = new Set(libDlg.targets);
+    libDlg.waiting = configured.filter((t) => !runtime.includes(t));
+  }
+  libDlg.phase = 'form';
+  libDlgRender({ focus: true });
+}
+
+async function libSendSubmit() {
+  const d = libDlg;
+  if (!d || d.kind !== 'send' || d.busy || d.phase !== 'form') return;
+  const picked = d.targets.filter((t) => d.picked.has(t));
+  if (!picked.length) return;
+  // Everything checked → send the batcher's OWN fan-out set (`targets: []`),
+  // which is what an auto or manual flush does. It is also the more robust wire:
+  // a named target is resolved against the running engines through the hub's
+  // device-name map, and the whole-set default cannot fail that resolution.
+  const targets = picked.length === d.targets.length ? [] : picked;
+  const seq = d.seq;
+  d.busy = true;
+  d.error = null;
+  libDlgRender();
+  let res = null;
+  let error = null;
+  try {
+    res = await api('/api/library/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targets, items: d.items }),
+    });
+  } catch (e) { error = (e && e.message) ? e.message : String(e); }
+  if (!libDlg || libDlg.seq !== seq) return;    // closed (or reopened) under us
+  if (!error && !res.ok) {
+    let body = '';
+    try { body = await res.text(); } catch (e) { body = ''; }
+    if (!libDlg || libDlg.seq !== seq) return;
+    error = String(body || '').trim() || ('HTTP ' + res.status);
+  }
+  if (error) {
+    console.error('[library] send failed:', error);
+    libDlg.busy = false;
+    libDlg.error = error;
+    libDlgRender();
+    libSay('send failed: ' + error, false);
+    return;
+  }
+  let rep = null;
+  try { rep = await res.json(); } catch (e) { rep = {}; }
+  if (!libDlg || libDlg.seq !== seq) return;
+  libDlg.busy = false;
+  libDlg.sent = rep || {};
+  libDlg.phase = 'result';
+  libDlgRender({ focus: true });
+  libSay(libSendMessage(libDlg.sent), true);
+  // The selection is deliberately KEPT: re-sending, previewing or deleting the
+  // same files next is a normal follow-up, and the operator cleared nothing.
+  libRefresh();
+}
+
+// ── delete dialog ──
+// The preview's rows are grouped, not listed one warning per file: an operator
+// deleting a night's folder must read three sentences, not four hundred.
+function libDeleteSummary(preview) {
+  const rows = Array.isArray(preview) ? preview : [];
+  const blocked = rows.filter((r) => r && r.blocked);
+  const live = rows.filter((r) => r && !r.blocked);
+  const queued = live.filter((r) => r.queued).length;
+  const confirmed = live.filter((r) => (Number(r.confirmedBatches) || 0) > 0).length;
+  // batch label -> how many of these files it carries. A Map, not an object: the
+  // labels are server-controlled and `{}` would let `constructor` collide with
+  // Object.prototype.
+  const inFlight = new Map();
+  live.forEach((r) => (Array.isArray(r.inFlightBatches) ? r.inFlightBatches : [])
+    .forEach((b) => inFlight.set(String(b), (inFlight.get(String(b)) || 0) + 1)));
+  return { rows, live, blocked, queued, confirmed, inFlight };
+}
+
+// A capped `<li>` list — a 5 000-frame folder must not paint 5 000 rows.
+function libDlgList(rows, render) {
+  const shown = rows.slice(0, LIB_DLG_LIST_CAP).map(render).join('');
+  const more = rows.length > LIB_DLG_LIST_CAP
+    ? `<li class="muted">…and ${rows.length - LIB_DLG_LIST_CAP} more</li>`
+    : '';
+  return `<ul class="lib-dlg-list">${shown}${more}</ul>`;
+}
+
+function libDeleteWarningsHtml(sum) {
+  const out = [];
+  if (sum.queued) {
+    // T9b: a deleted file that is captured again at the same path IS enqueued
+    // again (the watcher-forget seam), so this warning must not read as "gone
+    // from the queue forever".
+    out.push(`<p class="lib-dlg-warn">${libNFiles(sum.queued)} waiting in the send queue — deleting leaves the queue, unsent.</p>`
+      + '<p class="muted">A frame captured again at the same path afterwards is picked up and sent as new.</p>');
+  }
+  sum.inFlight.forEach((n, label) => {
+    out.push(`<p class="lib-dlg-warn">${libNFiles(n)} in transfer `
+      + `<span class="mono" title="${esc(label)}">${esc(libBaseName(label))}</span>`
+      + ' — that transfer completes from its packaged copy.</p>');
+  });
+  if (sum.confirmed) {
+    out.push(`<p class="lib-dlg-warn">${libNFiles(sum.confirmed)} already delivered in a confirmed batch — `
+      + 'the delivered copies stay put; a later re-send of those batches carries fewer files.</p>');
+  }
+  if (sum.blocked.length) {
+    out.push(`<p class="lib-dlg-warn">${libNFiles(sum.blocked.length)} will NOT be deleted:</p>`
+      + libDlgList(sum.blocked, (r) =>
+        `<li class="mono">${esc(r.rel)} <span class="muted">— ${esc(r.blocked)}</span></li>`));
+  }
+  return out.join('');
+}
+
+function libDeleteDialogParts(d) {
+  if (d.phase === 'loading') {
+    return {
+      body: '<div class="empty">checking what these files are involved in…</div>',
+      actions: libDlgCancelBtn('Cancel', d, true),
+    };
+  }
+  if (d.phase === 'error') {
+    return {
+      body: '<p>Nothing has been deleted.</p>' + libDlgErrHtml(d.error),
+      actions: libDlgCancelBtn('Close', d, true) + '<button data-dlg-act="retry">Retry</button>',
+    };
+  }
+  if (d.phase === 'result') {
+    const res = libDeleteOutcome(d.outcomes);
+    return {
+      body: `<p class="${res.clean ? 'lib-dlg-ok' : 'lib-dlg-warn'}">${esc(res.summary)}</p>`
+        + (res.problems.length
+          ? libDlgList(res.problems, (p) =>
+            `<li class="mono">${esc(p.rel)} <span class="muted">— ${esc(p.kind)}${p.reason ? ': ' + esc(p.reason) : ''}</span></li>`)
+          : '')
+        + (res.problems.length
+          ? '<p class="muted">The files that survived are still selected, so you can look at them and try again.</p>'
+          : ''),
+      actions: libDlgCancelBtn('Close', d, true),
+    };
+  }
+
+  // phase 'form' — the preview.
+  const sum = libDeleteSummary(d.preview);
+  const n = sum.live.length;
+  const body = `<p>Delete <b>${n}</b> ${n === 1 ? 'file' : 'files'} from disk?</p>`
+    + (n
+      ? `<details class="lib-dlg-files"><summary>show ${n === 1 ? 'it' : 'them'}</summary>`
+        + libDlgList(sum.live, (r) => `<li class="mono">${esc(r.rel)}</li>`)
+        + '</details>'
+      : '<p class="muted">Nothing in this selection can be deleted.</p>')
+    + libDeleteWarningsHtml(sum)
+    + libDlgErrHtml(d.error);
+  return {
+    body,
+    actions: libDlgCancelBtn('Cancel', d, true)
+      + `<button class="danger" data-dlg-act="delete" id="libDlgSubmit"${(n && !d.busy) ? '' : ' disabled'}>`
+      + `${esc(d.busy ? 'Deleting…' : 'Delete ' + libNFiles(n))}</button>`,
+  };
+}
+
+// The per-path outcomes as one honest line. Anything that is not a `deleted`
+// counts as a problem, including a `kind` this build does not know — a file that
+// was not confirmed deleted must never be summed into "Deleted N".
+function libDeleteOutcome(outcomes) {
+  const rows = Array.isArray(outcomes) ? outcomes : [];
+  let deleted = 0, refused = 0, failed = 0;
+  const problems = [];
+  rows.forEach((o) => {
+    const kind = (o && o.outcome && o.outcome.kind) ? String(o.outcome.kind) : 'error';
+    const reason = (o && o.outcome && o.outcome.reason) ? String(o.outcome.reason) : '';
+    if (kind === 'deleted') { deleted++; return; }
+    if (kind === 'refused') refused++; else failed++;
+    problems.push({ rel: String(o && o.rel ? o.rel : ''), kind, reason });
+  });
+  const parts = [`Deleted ${deleted}`];
+  if (refused) parts.push(`${refused} refused`);
+  if (failed) parts.push(`${failed} error${failed === 1 ? '' : 's'}`);
+  let summary = parts.join(', ');
+  // One problem → name its reason inline ("Deleted 9, 1 error — not found");
+  // more than one and the list below carries them.
+  if (problems.length === 1 && problems[0].reason) summary += ' — ' + problems[0].reason;
+  return { deleted, refused, failed, problems, clean: problems.length === 0, summary };
+}
+
+// Drop only what is really gone. A file stays picked when its own outcome was
+// not `deleted`; a FOLDER stays picked while anything under it survived, so the
+// operator can retry exactly the failures. A rel nobody reported on is left
+// alone — an unreported pick is not evidence of anything.
+function libPruneSelection(outcomes) {
+  const rows = (Array.isArray(outcomes) ? outcomes : []).filter((o) => o && o.root === libState.root);
+  const deleted = new Set();
+  const survived = new Set();
+  rows.forEach((o) => {
+    const kind = (o.outcome && o.outcome.kind) ? String(o.outcome.kind) : 'error';
+    (kind === 'deleted' ? deleted : survived).add(String(o.rel));
+  });
+  const under = (set, rel) => {
+    for (const r of set) if (r === rel || r.startsWith(rel + '/')) return true;
+    return false;
+  };
+  Array.from(libState.selected).forEach((rel) => {
+    const isDir = libState.selectedDirs.has(rel);
+    const gone = isDir
+      ? (!under(survived, rel) && under(deleted, rel))
+      : deleted.has(rel);
+    if (gone) {
+      libState.selected.delete(rel);
+      libState.selectedDirs.delete(rel);
+    }
+  });
+}
+
+async function libDeletePost(confirm) {
+  return api('/api/library/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items: libDlg.items, confirm }),
+  });
+}
+
+// Step one: `confirm: false` touches nothing and answers with one row per file.
+async function libDeleteLoad() {
+  const seq = libDlg.seq;
+  let res = null;
+  let error = null;
+  try { res = await libDeletePost(false); }
+  catch (e) { error = (e && e.message) ? e.message : String(e); }
+  if (!libDlg || libDlg.seq !== seq) return;
+  if (!error && !res.ok) {
+    let body = '';
+    try { body = await res.text(); } catch (e) { body = ''; }
+    if (!libDlg || libDlg.seq !== seq) return;
+    error = String(body || '').trim() || ('HTTP ' + res.status);
+  }
+  if (error) {
+    console.error('[library] delete preview failed:', error);
+    libDlg.error = error;
+    libDlg.phase = 'error';
+    libDlgRender({ focus: true });
+    return;
+  }
+  let rep = null;
+  try { rep = await res.json(); } catch (e) { rep = {}; }
+  if (!libDlg || libDlg.seq !== seq) return;
+  libDlg.preview = Array.isArray(rep.preview) ? rep.preview : [];
+  libDlg.phase = 'form';
+  libDlgRender({ focus: true });
+}
+
+// Step two: `confirm: true` performs, and the per-path outcomes are the record.
+async function libDeleteSubmit() {
+  const d = libDlg;
+  if (!d || d.kind !== 'delete' || d.busy || d.phase !== 'form') return;
+  if (!libDeleteSummary(d.preview).live.length) return;
+  const seq = d.seq;
+  d.busy = true;
+  d.error = null;
+  libDlgRender();
+  let res = null;
+  let error = null;
+  try { res = await libDeletePost(true); }
+  catch (e) { error = (e && e.message) ? e.message : String(e); }
+  if (!libDlg || libDlg.seq !== seq) return;
+  if (!error && !res.ok) {
+    let body = '';
+    try { body = await res.text(); } catch (e) { body = ''; }
+    if (!libDlg || libDlg.seq !== seq) return;
+    error = String(body || '').trim() || ('HTTP ' + res.status);
+  }
+  if (error) {
+    console.error('[library] delete failed:', error);
+    libDlg.busy = false;
+    libDlg.error = error;
+    libDlgRender();
+    libSay('delete failed: ' + error, false);
+    return;
+  }
+  let rep = null;
+  try { rep = await res.json(); } catch (e) { rep = {}; }
+  if (!libDlg || libDlg.seq !== seq) return;
+  libDlg.busy = false;
+  libDlg.outcomes = Array.isArray(rep.outcomes) ? rep.outcomes : [];
+  libDlg.phase = 'result';
+  const res2 = libDeleteOutcome(libDlg.outcomes);
+  libPruneSelection(libDlg.outcomes);
+  libDlgRender({ focus: true });
+  libSay(res2.summary, res2.clean);
+  libRefresh();     // the listing is now lying about files that are gone
+}
+
+// ── dialog event handlers (bound once to the stable host in wireLibrary) ──
+function onLibDialogClick(e) {
+  if (!libDlg) return;
+  if (e.target === $('libDialog')) { if (!libDlg.busy) libDlgClose(); return; }  // scrim
+  const act = e.target.closest('[data-dlg-act]');
+  if (!act) return;
+  switch (act.dataset.dlgAct) {
+    case 'cancel': if (!libDlg.busy) libDlgClose(); break;
+    case 'send': libSendSubmit(); break;
+    case 'delete': libDeleteSubmit(); break;
+    case 'retry':
+      libDlg.error = null;
+      libDlg.phase = 'loading';
+      libDlgRender({ focus: true });
+      if (libDlg.kind === 'send') libSendLoad(); else libDeleteLoad();
+      break;
+    case 'transfers': libDlgClose(); setTab('transfers'); break;
+  }
+}
+
+// The picker's checkboxes patch the Set + the submit button in place. A full
+// re-render here would move focus and collapse the list's scroll position.
+function onLibDialogChange(e) {
+  if (!libDlg || libDlg.kind !== 'send') return;
+  const box = e.target.closest('[data-dlg-target]');
+  if (!box) return;
+  const key = String(box.dataset.dlgTarget);
+  if (box.checked) libDlg.picked.add(key); else libDlg.picked.delete(key);
+  const btn = $('libDlgSubmit');
+  if (btn) btn.disabled = libDlg.picked.size === 0 || libDlg.busy;
+}
+
 // ── delegated handlers (bound once to the stable panel, never per render) ──
 function onLibraryClick(e) {
   const rootBtn = e.target.closest('[data-lib-root]');
@@ -2030,6 +2593,8 @@ function onLibraryClick(e) {
     case 'refresh': case 'retry': libRefresh(); break;
     case 'clear': libClearSelection(); libRender(); break;
     case 'preview': { const f = libPvFirstSelectedFile(); if (f) libPvOpen(f.rel); break; }
+    case 'send': libDlgOpen('send'); break;
+    case 'delete': libDlgOpen('delete'); break;
   }
 }
 
@@ -2045,9 +2610,12 @@ function wireLibrary() {
   const panel = $('tab-library');
   panel.addEventListener('click', onLibraryClick);
   panel.addEventListener('change', onLibraryChange);
-  // The preview overlay lives outside the panel (index.html), so it gets its own
-  // delegated click handler — bound once, never per open.
+  // The preview overlay and the action dialogs live outside the panel
+  // (index.html), so they get their own delegated handlers — bound once to the
+  // stable hosts, never per open.
   $('libPreview').addEventListener('click', onLibPreviewClick);
+  $('libDialog').addEventListener('click', onLibDialogClick);
+  $('libDialog').addEventListener('change', onLibDialogChange);
 }
 
 // ── boot ────────────────────────────────────────────────────────────────────

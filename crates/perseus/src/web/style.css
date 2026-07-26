@@ -271,3 +271,27 @@ tr.lib-picked > td { background: var(--surface-hover); }
 .tconfirm-body p { margin: 0.35rem 0; }
 .tconfirm-warn { color: var(--error); font-weight: 600; }
 .tconfirm-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.9rem; }
+
+/* ── Library action dialogs (T10): Send-to picker + delete confirm ──
+   Structure and buttons are the .tconfirm dialog above; `.lib-dlg` only widens
+   it and lets a long file list scroll inside the body instead of pushing the
+   actions off screen. `hidden` is the visibility switch here too, and the global
+   [hidden] rule beats the `display: flex` below — see the note at the top. */
+.lib-dlg-overlay { position: fixed; inset: 0; z-index: 55; background: var(--scrim);
+  display: flex; align-items: center; justify-content: center; padding: 1rem; }
+.lib-dlg { max-width: 40rem; }
+.lib-dlg-body { max-height: 60vh; overflow-y: auto; }
+/* The warnings: every one of them states a consequence, never a prohibition. */
+.lib-dlg-warn { color: var(--warning); margin: 0.5rem 0 0.15rem; }
+.lib-dlg-err { color: var(--error); word-break: break-word; margin-top: 0.6rem; }
+.lib-dlg-ok { color: var(--success); }
+/* One row per reachable send target. `label` is column-flex page-wide, so the
+   row direction comes from .inline-label; this adds the hit area + hover. */
+.lib-dlg-targets { display: flex; flex-direction: column; gap: 0.1rem; margin: 0.5rem 0; }
+.lib-dlg-target { color: var(--content); padding: 0.25rem 0.35rem; border-radius: 6px; cursor: pointer; }
+.lib-dlg-target:hover { background: var(--surface-hover); }
+.lib-dlg-files > summary { cursor: pointer; color: var(--content-muted); font-size: 0.82rem; padding: 0.15rem 0; }
+/* Path lists (files to delete, blocked rows, per-file failures) — capped in JS,
+   scrolled here, so a night's folder cannot push the buttons out of reach. */
+ul.lib-dlg-list { list-style: none; margin: 0.25rem 0 0; padding: 0; max-height: 14rem; overflow-y: auto; }
+ul.lib-dlg-list li { padding: 0.1rem 0; font-size: 0.78rem; word-break: break-all; }

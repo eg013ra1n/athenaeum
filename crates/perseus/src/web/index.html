@@ -37,6 +37,13 @@
          close; `hidden` is the only visibility switch (see the [hidden] rule). -->
     <div id="libPreview" class="lib-pv-overlay" hidden></div>
 
+    <!-- Library action dialogs (0.5.1 T10): the Send-to picker and the delete
+         confirm. Same body-level placement, and the same reason, as the preview
+         overlay above — a fixed overlay nested in the Library panel would be
+         hidden along with its tab while still holding the document-level Escape
+         listener. app.js fills it on open and empties it on close. -->
+    <div id="libDialog" class="lib-dlg-overlay" hidden></div>
+
     <script src="/app.js"></script>
   </body>
 </html>
