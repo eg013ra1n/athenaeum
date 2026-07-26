@@ -9,8 +9,9 @@
 // structure + class names changed. The upload-speed cap is the one section with
 // no v1 ancestor (W1 T1.6). The Transfers tab ships its "To Sync" strip
 // plus the unified one-row-per-batch transfer list (filter chips, the shared
-// bottom detail pane with Files / Targets / Log sub-tabs, and the two delete
-// actions), rendered by `refreshTransfers` off GET /api/transfers.
+// bottom detail pane with Files / Targets / Log sub-tabs, the two delete
+// actions, and — on a settled batch — "Send to device…", the §6 two-step
+// divert), rendered by `refreshTransfers` off GET /api/transfers.
 
 // ── shared helpers (token, fetch, formatters) ───────────────────────────────
 // Bearer token kept in sessionStorage, not localStorage (finding L4): it is
@@ -85,6 +86,9 @@ function setTab(name) {
   // from the tab now on screen (and a dialog would still be holding a selection
   // snapshot nobody can see).
   else { libPvClose(); libDlgClose(); }
+  // Same rule for the Transfers tab's own dialog: it holds an Escape listener
+  // and, left open, its guard would freeze the list it is no longer over.
+  if (active !== 'transfers') sendToClose();
 }
 
 function wireTabs() {
@@ -963,13 +967,18 @@ function transferRowHtml(b) {
   const dhBtn = batchAllTerminal(b)
     ? `<button class="ghost" data-act="delete-history" data-ref="${esc(b.packageRef)}" title="Remove this batch from the transfer history">Delete history</button>`
     : '';
+  // §6: only a settled batch may be sent on — a live one is still serving from
+  // the package dir this would copy (the route refuses it too).
+  const stBtn = batchAllTerminal(b) && (b.targets || []).length
+    ? `<button class="ghost" data-act="send-to" data-ref="${esc(b.packageRef)}" title="Send this batch to another device as a new transfer">Send to device…</button>`
+    : '';
   const files = `${b.fileCount} file${b.fileCount === 1 ? '' : 's'}`;
   return `<div class="trow${open ? ' open' : ''}" data-batch-toggle data-ref="${esc(b.packageRef)}">
     <div class="trow-main">
       <span class="trow-name">${esc(transferName(b))}</span>
       ${markers.join(' ')}
       <span class="spacer"></span>
-      <span class="trow-actions">${dfBtn}${dhBtn}</span>
+      <span class="trow-actions">${stBtn}${dfBtn}${dhBtn}</span>
     </div>
     <div class="trow-sub">
       <span class="muted mono">${esc(b.createdAt)}</span>
@@ -1165,6 +1174,7 @@ async function onTransferAction(btn) {
   const act = btn.dataset.act;
   if (act === 'delete-files') { confirmDeleteFiles(btn.dataset.ref); return; }
   if (act === 'delete-history') { confirmDeleteHistory(btn.dataset.ref); return; }
+  if (act === 'send-to') { sendToOpen(btn.dataset.ref); return; }
   const id = Number(btn.dataset.id);
   const dispatch = {
     kick: ['/api/kick', { ids: [id] }, 'send requested'],
@@ -1286,6 +1296,245 @@ async function doDeleteHistory(ref) {
     transferFlash('history delete failed: ' + e.message, false);
   }
   refreshTransfers();
+}
+
+// ── send a recorded batch to another device (§6) ──
+// The one action on this page that CREATES something, so it gets a real dialog
+// rather than a one-line confirm: pick the device, read what would travel, then
+// send. Two round trips against one route — the preview (`confirm:false`) counts
+// resolvable sources and builds nothing, the send (`confirm:true`) performs —
+// because "sends 2 of 3 (1 deleted locally)" has to be on screen BEFORE the
+// operator commits. The counts can move between the two (a capture file can be
+// deleted in between); the send's own numbers are the ones reported.
+//
+// Discipline mirrors the Library dialog: every round trip carries a ticket
+// (`sendToSeq`) so a late response never paints into a closed or reopened
+// dialog, Escape always closes (even mid-write — the request finishes on the
+// server and the list shows the truth), and Enter is deliberately unbound.
+let sendToDlg = null;   // the open dialog's whole state, or null
+let sendToSeq = 0;      // monotonic; a stale response never paints
+
+function sendToOpen(ref) {
+  const b = transfersData.find((x) => x.packageRef === ref);
+  if (!b) return;
+  // Any of the batch's rows will do: every fan-out row shares the package dir,
+  // and the server re-reads the batch from it.
+  const source = (b.targets || [])[0];
+  if (!source) return;
+  if (sendToDlg) sendToClose();
+  transferDialogOpen = true;          // freeze the list under the dialog
+  const overlay = document.createElement('div');
+  overlay.className = 'tconfirm-overlay';
+  overlay.addEventListener('click', onSendToClick);
+  document.body.appendChild(overlay);
+  sendToDlg = {
+    overlay, ref, id: source.rowId, name: transferName(b), fileCount: b.fileCount,
+    seq: ++sendToSeq, phase: 'loading', busy: false, error: null,
+    targets: [], targetsOk: false, waiting: [], picked: null,
+    sent: 0, skipped: 0, newId: null,
+  };
+  document.addEventListener('keydown', onSendToKey);
+  sendToRender();
+  sendToLoadTargets();
+}
+
+function sendToClose() {
+  if (!sendToDlg) return;
+  const wasBusy = sendToDlg.busy;
+  sendToSeq++;                        // orphan every in-flight response
+  sendToDlg.overlay.remove();
+  sendToDlg = null;
+  document.removeEventListener('keydown', onSendToKey);
+  transferDialogOpen = false;
+  if (wasBusy) transferFlash('send still running — the list will show the result', true);
+  refreshTransfers();                 // paint whatever the server now holds
+}
+
+function onSendToKey(e) {
+  if (!sendToDlg) return;
+  if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+  if (e.key !== 'Escape') return;
+  e.preventDefault();
+  sendToClose();
+}
+
+async function sendToLoadTargets() {
+  const seq = sendToDlg.seq;
+  const res = await loadSendTargets();
+  if (!sendToDlg || sendToDlg.seq !== seq) return;
+  sendToDlg.targetsOk = res.ok;
+  sendToDlg.targets = res.targets;
+  sendToDlg.waiting = res.waiting;
+  sendToDlg.error = res.ok ? null : 'could not read the send targets: ' + res.error;
+  // ONE device per send — this mints a transfer aimed at a single peer, not a
+  // fan-out — so a single-target node is pre-picked and anything else asks.
+  sendToDlg.picked = res.targets.length === 1 ? res.targets[0] : null;
+  sendToDlg.phase = 'form';
+  sendToRender();
+}
+
+// Focus is re-applied on EVERY render, not only on a phase change: a radio
+// group is driven by the arrow keys, which fire clicks, which re-render — so
+// without this the second arrow press would have nothing focused to move from.
+// There is no text input in this dialog, so nothing can be interrupted.
+function sendToRender() {
+  const d = sendToDlg;
+  if (!d) return;
+  const parts = sendToParts(d);
+  d.overlay.innerHTML = `
+    <div class="tconfirm" role="dialog" aria-modal="true" aria-label="Send to device">
+      <h3>Send to device</h3>
+      <div class="tconfirm-body">${parts.body}</div>
+      <div class="tconfirm-actions">${parts.actions}</div>
+    </div>`;
+  const focus = d.overlay.querySelector('#tsendFocus');
+  if (focus && focus.focus) focus.focus();
+}
+
+// `focusHere` marks the element focus lands on after a render (see sendToRender).
+const sendToCancelBtn = (label, focusHere) =>
+  `<button class="ghost" data-tsend="cancel"${focusHere ? ' id="tsendFocus"' : ''}>${esc(label)}</button>`;
+const sendToErrHtml = (msg) => (msg ? `<p class="tsend-err">${esc(msg)}</p>` : '');
+const sendToFiles = (n) => n + (n === 1 ? ' file' : ' files');
+
+function sendToParts(d) {
+  const subject = `<b>${esc(d.name)}</b>`;
+  if (d.phase === 'loading') {
+    return { body: '<div class="empty">reading this node\'s send targets…</div>', actions: sendToCancelBtn('Cancel', true) };
+  }
+
+  if (d.phase === 'blocked') {
+    // The batch itself cannot be sent (its files are gone) — no device choice
+    // fixes that, so the picker is gone and only the way out remains.
+    return { body: `<p>Send ${subject} to another device?</p>${sendToErrHtml(d.error)}`, actions: sendToCancelBtn('Close', true) };
+  }
+
+  if (d.phase === 'preview') {
+    const of = d.skipped ? ` of ${d.sent + d.skipped}` : '';
+    const gone = d.skipped
+      ? `<p class="tconfirm-warn">${d.skipped} no longer on disk — ${d.skipped === 1 ? 'it is' : 'they are'} left out of this send.</p>`
+      : '';
+    return {
+      body: `<p>Sends ${sendToFiles(d.sent)}${of} to <b>${esc(libTargetLabel(d.picked))}</b>, as a new transfer.</p>`
+        + gone
+        + '<p class="muted">The original batch and its history stay as they are; the receiving device skips whatever it already has.</p>'
+        + sendToErrHtml(d.error),
+      actions: sendToCancelBtn(d.busy ? 'Close' : 'Back', false)
+        + `<button data-tsend="send" id="tsendFocus"${d.busy ? ' disabled' : ''}>${esc(d.busy ? 'Sending…' : 'Send ' + sendToFiles(d.sent))}</button>`,
+    };
+  }
+
+  if (d.phase === 'result') {
+    const gone = d.skipped ? ` (${d.skipped} no longer on disk)` : '';
+    return {
+      body: `<p class="tsend-ok">Sent ${sendToFiles(d.sent)}${gone} to ${esc(libTargetLabel(d.picked))} as transfer #${d.newId}.</p>`
+        + '<p class="muted">It is queued now — the new row in this list carries its progress.</p>',
+      actions: sendToCancelBtn('Close', true),
+    };
+  }
+
+  // phase 'form' — the device picker. Focus rides the picked row (or the first
+  // one) so the arrow keys walk the group.
+  const focusOn = d.picked && d.targets.includes(d.picked) ? d.picked : d.targets[0];
+  const rows = d.targets.map((t) => {
+    const raw = String(t);
+    const view = libTargetView(raw);
+    return `<label class="tsend-target" data-tsend-target="${esc(raw)}">
+      <input type="radio" name="tsendTarget"${raw === focusOn ? ' id="tsendFocus"' : ''}${d.picked === raw ? ' checked' : ''}${d.busy ? ' disabled' : ''} />
+      <span>${esc(view.label)}</span>${view.hint
+      ? `<span class="muted mono" title="${esc(view.hint)}">${esc(shortHex(view.hint))}…</span>` : ''}
+    </label>`;
+  }).join('');
+  // Same two empties as the Library picker: a list that loaded empty has a fix
+  // to point at, one that failed to load has nothing honest to say about it.
+  const noTargets = d.targetsOk
+    ? '<p class="tconfirm-warn">No device is reachable from this node right now — the sync engine is not running, or it has no send targets. Add one under Settings → Send Targets.</p>'
+    : '';
+  const premise = d.targets.length
+    ? '<p class="muted">These are this node\'s configured send targets — one that failed to start will refuse the send and say so.</p>'
+    : '';
+  const waiting = d.waiting.length
+    ? `<p class="muted">Saved but not applied yet: ${d.waiting.map((t) => esc(libTargetLabel(t))).join(', ')} — ${d.waiting.length === 1 ? 'it becomes' : 'they become'} sendable once the sync engine restarts.</p>`
+    : '';
+  return {
+    body: `<p>Send ${subject} (${sendToFiles(d.fileCount)}) to:</p>`
+      + (d.targets.length ? `<div class="tsend-targets">${rows}</div>` : noTargets)
+      + premise + waiting + sendToErrHtml(d.error),
+    actions: sendToCancelBtn('Cancel', !d.targets.length)
+      + `<button data-tsend="preview"${(d.picked && !d.busy) ? '' : ' disabled'}>${esc(d.busy ? 'Checking…' : 'Continue')}</button>`,
+  };
+}
+
+function onSendToClick(e) {
+  const d = sendToDlg;
+  if (!d) return;
+  if (e.target === d.overlay || e.target.closest('[data-tsend="cancel"]')) {
+    // From the preview, Cancel means "back to the picker" — nothing was built
+    // yet, and re-opening the whole dialog to change device would be silly.
+    if (d.phase === 'preview' && !d.busy) { d.phase = 'form'; d.error = null; sendToRender(); return; }
+    sendToClose();
+    return;
+  }
+  const pick = e.target.closest('[data-tsend-target]');
+  if (pick) { d.picked = pick.dataset.tsendTarget; d.error = null; sendToRender(); return; }
+  if (e.target.closest('[data-tsend="preview"]')) { sendToStep(false); return; }
+  if (e.target.closest('[data-tsend="send"]')) { sendToStep(true); return; }
+}
+
+// One step of the two-step route. `confirm:false` fills the preview, `true`
+// performs — the only difference on this side is which phase the answer lands in.
+async function sendToStep(confirm) {
+  const d = sendToDlg;
+  if (!d || d.busy || !d.picked) return;
+  const seq = d.seq;
+  d.busy = true;
+  d.error = null;
+  sendToRender();
+
+  let res = null;
+  let error = null;
+  try {
+    res = await api('/api/transfers/send-to', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: d.id, target: d.picked, confirm }),
+    });
+  } catch (e) { error = (e && e.message) ? e.message : String(e); }
+  if (!sendToDlg || sendToDlg.seq !== seq) return;   // closed / reopened under us
+  let gone = false;
+  if (!error && !res.ok) {
+    gone = res.status === 409;
+    let body = '';
+    try { body = await res.text(); } catch (e) { body = ''; }
+    if (!sendToDlg || sendToDlg.seq !== seq) return;
+    error = String(body || '').trim() || ('HTTP ' + res.status);
+  }
+  if (error) {
+    console.error('[transfers] send-to failed:', error);
+    sendToDlg.busy = false;
+    sendToDlg.error = error;
+    // A 409 is about the batch, not the chosen device: no other pick helps, so
+    // the picker gives way to a dead end. Everything else stays editable.
+    if (gone) sendToDlg.phase = 'blocked';
+    sendToRender();
+    transferFlash('send to device failed: ' + error, false);
+    return;
+  }
+  let rep = null;
+  try { rep = await res.json(); } catch (e) { rep = {}; }
+  if (!sendToDlg || sendToDlg.seq !== seq) return;
+  sendToDlg.busy = false;
+  sendToDlg.sent = Number(rep.sent) || 0;
+  sendToDlg.skipped = Number(rep.skipped) || 0;
+  if (confirm) {
+    sendToDlg.newId = rep.newId;
+    sendToDlg.phase = 'result';
+    transferFlash(`sent to ${libTargetLabel(sendToDlg.picked)} as a new transfer`, true);
+    refreshTransfers();               // fetch now; the list paints on close
+  } else {
+    sendToDlg.phase = 'preview';
+  }
+  sendToRender();
 }
 
 // ── delegated click handler + poll ──
@@ -2283,28 +2532,44 @@ function libSendMessage(rep) {
 // picker), the 400 names the one that is not there, and a target saved under
 // Settings but not yet applied is in `configured` only — offering it would be a
 // guaranteed 400, so it is named as pending instead of listed.
+// The one read of this node's send targets, shared by both "send somewhere"
+// dialogs (Library §1a and Transfers §6) so they can never disagree about which
+// devices are offerable. `ok:false` means the list is UNKNOWN, which is not the
+// same as empty — the callers render those two very differently.
+async function loadSendTargets() {
+  try {
+    const dto = await getJson('/api/targets');
+    const runtime = Array.isArray(dto.runtime) ? dto.runtime.map(String) : [];
+    const configured = Array.isArray(dto.configured) ? dto.configured.map(String) : [];
+    // A config can legitimately hold one device twice (by id and by name); two
+    // rows toggling the same key would be a lie about what is being sent.
+    return {
+      ok: true,
+      targets: Array.from(new Set(runtime)),
+      waiting: configured.filter((t) => !runtime.includes(t)),
+      error: null,
+    };
+  } catch (e) {
+    const error = (e && e.message) ? e.message : String(e);
+    console.error('[targets] could not read the send targets:', error);
+    return { ok: false, targets: [], waiting: [], error };
+  }
+}
+
 async function libSendLoad() {
   const seq = libDlg.seq;
-  let dto = null;
-  let error = null;
-  try { dto = await getJson('/api/targets'); }
-  catch (e) { error = (e && e.message) ? e.message : String(e); }
+  const res = await loadSendTargets();
   if (!libDlg || libDlg.seq !== seq) return;
-  if (error) {
-    console.error('[library] send: could not read send targets:', error);
-    libDlg.error = 'could not read the send targets: ' + error;
+  if (!res.ok) {
+    libDlg.error = 'could not read the send targets: ' + res.error;
     libDlg.targets = [];
     libDlg.picked = new Set();
     libDlg.targetsOk = false;   // an unread list is NOT an empty list
   } else {
     libDlg.targetsOk = true;
-    const runtime = Array.isArray(dto.runtime) ? dto.runtime.map(String) : [];
-    const configured = Array.isArray(dto.configured) ? dto.configured.map(String) : [];
-    // A config can legitimately hold one device twice (by id and by name); two
-    // checkboxes toggling the same key would be a lie about what is being sent.
-    libDlg.targets = Array.from(new Set(runtime));
-    libDlg.picked = new Set(libDlg.targets);
-    libDlg.waiting = configured.filter((t) => !runtime.includes(t));
+    libDlg.targets = res.targets;
+    libDlg.picked = new Set(res.targets);
+    libDlg.waiting = res.waiting;
   }
   libDlg.phase = 'form';
   libDlgRender({ focus: true });

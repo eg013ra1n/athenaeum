@@ -272,6 +272,16 @@ tr.lib-picked > td { background: var(--surface-hover); }
 .tconfirm-warn { color: var(--error); font-weight: 600; }
 .tconfirm-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.9rem; }
 
+/* ── Transfers → "Send to device…" (T11, §6) ──
+   The .tconfirm shell above, plus a one-device picker. `label` is column-flex
+   page-wide, so each row sets its own direction (the Library picker gets that
+   from .inline-label; this one is standalone). */
+.tsend-targets { display: flex; flex-direction: column; gap: 0.1rem; margin: 0.5rem 0; max-height: 14rem; overflow-y: auto; }
+.tsend-target { display: flex; flex-direction: row; align-items: center; gap: 0.45rem; color: var(--content); padding: 0.25rem 0.35rem; border-radius: 6px; cursor: pointer; }
+.tsend-target:hover { background: var(--surface-hover); }
+.tsend-err { color: var(--error); word-break: break-word; margin-top: 0.6rem; }
+.tsend-ok { color: var(--success); }
+
 /* ── Library action dialogs (T10): Send-to picker + delete confirm ──
    Structure and buttons are the .tconfirm dialog above; `.lib-dlg` only widens
    it and lets a long file list scroll inside the body instead of pushing the

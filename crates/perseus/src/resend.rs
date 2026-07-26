@@ -8,12 +8,20 @@
 //!   the receiver deleted its copies). Same `batch_uuid` ⇒ the receiver's
 //!   existing inbound row resets in place; its dedup handshake re-ingests only
 //!   what is actually missing on that side.
+//! - [`send_batch_to_target`] — mint a NEW transfer from an already-recorded
+//!   batch, to any peer with a running engine: fresh dir basename ⇒ fresh wire
+//!   `batch_uuid` ⇒ a brand-new inbound row on that peer. Its payload comes
+//!   from the package dir when it still holds one, else from the original
+//!   capture files (eligible subset: what is gone is dropped and counted, only
+//!   an all-gone batch is refused). [`SourceDisposition`] decides what happens
+//!   to the source identity.
 //! - [`resend_declined_as_new`] — the deliberate operator re-ask for a
-//!   **receiver-declined** transfer. A decline is final per `batch_uuid`
-//!   (same-batch re-announces bounce all-cancelled, and Perseus's autonomous
-//!   retries must never override a human decline), so this mints a NEW
-//!   transfer: fresh dir basename ⇒ fresh wire `batch_uuid` ⇒ a brand-new
-//!   inbound row on the receiver, while the declined row stays as history.
+//!   **receiver-declined** transfer, i.e. [`send_batch_to_target`] back at the
+//!   row's own peer with the declined identity retired. A decline is final per
+//!   `batch_uuid` (same-batch re-announces bounce all-cancelled, and Perseus's
+//!   autonomous retries must never override a human decline), so the new
+//!   `batch_uuid` is what gets the receiver a fresh inbound row, while the
+//!   declined row stays as history.
 //!
 //! Mirrors the desktop's `api::sync::resend_transfer` /
 //! `resend_declined_as_new_transfer` semantics, rebuilt on Perseus's own
@@ -104,33 +112,129 @@ impl RebuildReport {
 
 /// Where a manifest record's payload bytes will come from.
 enum RestoreSource {
-    /// A valid payload copy is already in the package dir (double-click /
-    /// crash-resume idempotency) — nothing to copy.
-    AlreadyPresent,
-    /// Verified original at this path; copy it back into the package dir.
-    CopyFrom(PathBuf),
+    /// A valid payload copy already sits in the planned package dir at this
+    /// path. Restoring in place is a no-op (double-click / crash-resume
+    /// idempotency — it must never be "copied onto itself"); materializing a
+    /// SECOND package dir from the same manifest copies it across.
+    Present(PathBuf),
+    /// Verified original capture file at this path.
+    Original(PathBuf),
 }
 
-/// Restore a package dir's payload copies from the original capture files,
-/// using the surviving `manifest.ndjson` as the authority (it is the one file
-/// payload cleanup keeps). Source resolution per record, in order:
+impl RestoreSource {
+    fn path(&self) -> &Path {
+        match self {
+            RestoreSource::Present(p) | RestoreSource::Original(p) => p,
+        }
+    }
+}
+
+/// A resolved but not-yet-executed rebuild: where every manifest record's bytes
+/// would come from, and what would be dropped.
 ///
-/// 1. the durable `perseus_batch_files` linkage (`rel_path → source_path`);
-/// 2. reverse-mapping the `rel_path` onto every configured capture dir — with
+/// Building one is READ-ONLY (it stats and hashes candidates, and writes
+/// nothing), which is what lets the same resolution serve two callers: the §6
+/// confirm's dry-run — "sends 97 of 100 (3 deleted locally)" — and the first
+/// half of [`rebuild_package_payloads`]. [`apply`](Self::apply) then
+/// materializes it into a package dir, which may be the one it was planned
+/// against (an in-place rebuild) or a fresh one (a divert that must leave the
+/// source batch untouched).
+pub struct RebuildPlan {
+    /// The dir the manifest was read from — also where a `Present` source lives.
+    src_dir: PathBuf,
+    /// Every restorable record with its resolved byte source, in manifest order.
+    /// Records that resolved to nothing are absent; they are named in
+    /// `report.missing` / `report.changed`.
+    restorable: Vec<(ManifestRecord, RestoreSource)>,
+    /// How many records the manifest carried before resolution.
+    total: usize,
+    /// The honesty report (`restored` / `missing` / `changed` rel_paths).
+    pub report: RebuildReport,
+}
+
+impl RebuildPlan {
+    /// Manifest records the batch was recorded with.
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// Records that can still be served (the eligible subset).
+    pub fn sendable(&self) -> usize {
+        self.restorable.len()
+    }
+
+    /// Records that would be dropped — original gone, or found but rewritten
+    /// since (a changed capture file is a NEW snapshot, never this batch's).
+    pub fn skipped(&self) -> usize {
+        self.report.missing.len() + self.report.changed.len()
+    }
+
+    /// Materialize the plan into `dest_dir`: copy every restorable record's
+    /// bytes to its `rel_path` there and write the manifest that describes
+    /// exactly what landed.
+    ///
+    /// The manifest is (re)written whenever it is not already exactly the set
+    /// just materialized: a fresh `dest_dir` has none at all, and an in-place
+    /// partial rebuild must shrink to the restored subset so the package never
+    /// advertises files it cannot serve.
+    pub fn apply(&self, dest_dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dest_dir)
+            .with_context(|| format!("create package dir {}", dest_dir.display()))?;
+        for (record, source) in &self.restorable {
+            let dest = dest_dir.join(&record.rel_path);
+            let src = source.path();
+            if src == dest {
+                continue; // already in place
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create payload dir {}", parent.display()))?;
+            }
+            let copied = std::fs::copy(src, &dest)
+                .with_context(|| format!("restore {} -> {}", src.display(), dest.display()))?;
+            // Same integrity guard as the package writer: the copy must satisfy
+            // the manifest it will be served under.
+            if copied != record.byte_size {
+                bail!(
+                    "restored copy size mismatch for {}: copied {} bytes, manifest byte_size {}",
+                    record.rel_path,
+                    copied,
+                    record.byte_size
+                );
+            }
+        }
+        if dest_dir != self.src_dir || !self.report.is_full() {
+            let records: Vec<&ManifestRecord> =
+                self.restorable.iter().map(|(record, _)| record).collect();
+            write_manifest_atomic(dest_dir, &records)?;
+        }
+        Ok(())
+    }
+}
+
+/// Resolve — without touching anything — where each of `pkg_dir`'s manifest
+/// records would get its payload bytes, using the surviving `manifest.ndjson`
+/// as the authority (it is the one file payload cleanup keeps). Source
+/// resolution per record, in order:
+///
+/// 1. a valid payload copy already in the package dir;
+/// 2. the durable `perseus_batch_files` linkage (`rel_path → source_path`);
+/// 3. reverse-mapping the `rel_path` onto every configured capture dir — with
 ///    and without the multi-dir label prefix (pre-linkage batches).
 ///
 /// Every candidate is verified against the record's `(byte_size, xxh3)` before
-/// use, so a lossy label or a moved file can never smuggle wrong bytes into
-/// the batch; the ORIGINAL manifest records (and thus `frame_uuid`s) are kept
-/// byte-for-byte — the receiver's dedup then skips what it still has and
-/// ingests what it deleted. A partial restore rewrites the manifest to the
-/// restored subset (the batch honestly shrinks); zero restorable files is an
-/// error raised BEFORE any mutation.
-pub fn rebuild_package_payloads(
+/// it is accepted, so a lossy label or a moved file can never smuggle wrong
+/// bytes into the batch; the ORIGINAL manifest records (and thus `frame_uuid`s)
+/// are kept byte-for-byte — the receiver's dedup then skips what it still has
+/// and ingests what it deleted.
+///
+/// A zero-restorable plan is returned, not refused: the caller decides whether
+/// that is an error (a rebuild) or an answer (the dry-run behind a confirm).
+pub fn plan_package_rebuild(
     pkg_dir: &Path,
     config: &Config,
     batches: &BatchStore,
-) -> Result<RebuildReport> {
+) -> Result<RebuildPlan> {
     let records = read_manifest(pkg_dir)
         .with_context(|| format!("read manifest for rebuild {}", pkg_dir.display()))?;
     if records.is_empty() {
@@ -147,15 +251,16 @@ pub fn rebuild_package_payloads(
         .collect();
     let capture_dirs = config.capture_dirs_resolved();
 
+    let total = records.len();
     let mut report = RebuildReport::default();
-    let mut plan: Vec<(&ManifestRecord, RestoreSource)> = Vec::new();
-    for record in &records {
+    let mut restorable: Vec<(ManifestRecord, RestoreSource)> = Vec::new();
+    for record in records {
         // Idempotency: a payload copy that already matches the manifest needs
-        // no work (and must never be "copied onto itself").
+        // no work when the plan is applied in place.
         let dest = pkg_dir.join(&record.rel_path);
-        if verify_source(&dest, record).is_some() {
+        if verify_source(&dest, &record).is_some() {
             report.restored.push(record.rel_path.clone());
-            plan.push((record, RestoreSource::AlreadyPresent));
+            restorable.push((record, RestoreSource::Present(dest)));
             continue;
         }
 
@@ -175,64 +280,54 @@ pub fn rebuild_package_payloads(
             }
         }
 
-        match resolve_source(&candidates, record) {
+        match resolve_source(&candidates, &record) {
             SourceResolution::Verified(src) => {
                 report.restored.push(record.rel_path.clone());
-                plan.push((record, RestoreSource::CopyFrom(src)));
+                restorable.push((record, RestoreSource::Original(src)));
             }
-            SourceResolution::Changed => report.changed.push(record.rel_path.clone()),
-            SourceResolution::Missing => report.missing.push(record.rel_path.clone()),
+            SourceResolution::Changed => report.changed.push(record.rel_path),
+            SourceResolution::Missing => report.missing.push(record.rel_path),
         }
     }
 
-    if report.restored.is_empty() {
+    Ok(RebuildPlan {
+        src_dir: pkg_dir.to_path_buf(),
+        restorable,
+        total,
+        report,
+    })
+}
+
+/// Restore a package dir's payload copies from the original capture files, in
+/// place: [`plan_package_rebuild`] + [`RebuildPlan::apply`] onto the same dir.
+///
+/// A partial restore rewrites the manifest to the restored subset (the batch
+/// honestly shrinks); zero restorable files is an error raised BEFORE any
+/// mutation.
+pub fn rebuild_package_payloads(
+    pkg_dir: &Path,
+    config: &Config,
+    batches: &BatchStore,
+) -> Result<RebuildReport> {
+    let plan = plan_package_rebuild(pkg_dir, config, batches)?;
+    if plan.sendable() == 0 {
         bail!(
             "none of the {} original files could be restored ({} missing, {} changed) — nothing to resend",
-            records.len(),
-            report.missing.len(),
-            report.changed.len()
+            plan.total(),
+            plan.report.missing.len(),
+            plan.report.changed.len()
         );
     }
-
-    // All mutations happen only after the whole plan resolved: copy the payload
-    // bytes back, then (on a partial restore) rewrite the manifest to the
-    // restored subset so the package never advertises files it cannot serve.
-    for (record, source) in &plan {
-        let RestoreSource::CopyFrom(src) = source else {
-            continue;
-        };
-        let dest = pkg_dir.join(&record.rel_path);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create payload dir {}", parent.display()))?;
-        }
-        let copied = std::fs::copy(src, &dest)
-            .with_context(|| format!("restore {} -> {}", src.display(), dest.display()))?;
-        // Same integrity guard as the package writer: the copy must satisfy
-        // the manifest it will be served under.
-        if copied != record.byte_size {
-            bail!(
-                "restored copy size mismatch for {}: copied {} bytes, manifest byte_size {}",
-                record.rel_path,
-                copied,
-                record.byte_size
-            );
-        }
-    }
-
-    if !report.is_full() {
-        let restored: Vec<&ManifestRecord> = plan.iter().map(|(record, _)| *record).collect();
-        write_manifest_atomic(pkg_dir, &restored)?;
-    }
+    plan.apply(pkg_dir)?;
 
     tracing::info!(
         dir = %pkg_dir.display(),
-        restored = report.restored.len(),
-        missing = report.missing.len(),
-        changed = report.changed.len(),
+        restored = plan.report.restored.len(),
+        missing = plan.report.missing.len(),
+        changed = plan.report.changed.len(),
         "package payloads rebuilt from originals"
     );
-    Ok(report)
+    Ok(plan.report)
 }
 
 /// How a record's source candidates resolved: a verified path, "found but the
@@ -414,26 +509,94 @@ pub async fn resend_in_place(
     Ok(report)
 }
 
-/// Divert a **receiver-declined** transfer into a brand-NEW transfer (the
-/// explicit operator re-ask; autonomous retries never come here). The payload
-/// gets a fresh package identity — new dir basename ⇒ new wire `batch_uuid` ⇒
-/// the receiver keys a brand-new inbound row while its old declined row (and
-/// our old outbound row) stay as history.
+/// What a divert does with the SOURCE transfer's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceDisposition {
+    /// The source is spent. A receiver decline is final per `batch_uuid`, so the
+    /// declined identity has no future: its payload MOVES into the new one when
+    /// no fan-out sibling still serves the dir, the `perseus_seen` retention
+    /// linkage follows it, and the old row is stamped with the divert
+    /// cross-link (which doubles as the double-click guard).
+    Retire,
+    /// The source stays live history — 0.5.1 §6, "the original row and its
+    /// history are untouched". The new identity is materialized BESIDE it: the
+    /// old dir is never written (its Files tab, its *Delete source files*
+    /// affordance and any future in-place resend all still read it), its
+    /// `perseus_seen` linkage keeps pointing at the batch that actually
+    /// delivered those files, and its row state/error are left exactly as they
+    /// are.
+    Keep,
+}
+
+/// One accepted divert: the brand-new transfer and how much of the batch it
+/// carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SentBatch {
+    /// The new outbound row's id (the worker minted it).
+    pub new_id: i64,
+    /// Files the new transfer actually carries.
+    pub sent: usize,
+    /// Manifest records dropped because their original is gone from disk, or
+    /// was rewritten since (a changed capture file is a NEW snapshot, which the
+    /// watcher enqueues on its own — never smuggled into a batch that promised
+    /// different bytes).
+    pub skipped: usize,
+}
+
+/// Why a divert could not be built.
+#[derive(Debug)]
+pub enum SendBatchError {
+    /// The package dir was cleaned after delivery AND not one original capture
+    /// file survives — there is nothing left to send. Nothing was touched.
+    /// Callers map this to its own status (`409`), separately from a genuine
+    /// failure: it is an answer about the batch, not a fault.
+    AllSourcesGone(String),
+    /// Anything else (unreadable manifest, failed copy, dead engine).
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for SendBatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendBatchError::AllSourcesGone(detail) => write!(f, "{detail}"),
+            SendBatchError::Other(error) => write!(f, "{error:#}"),
+        }
+    }
+}
+
+// `source` is deliberately not forwarded: `Display` already prints the whole
+// `Other` chain (`{error:#}`), so an anyhow wrapper — which is how
+// `resend_declined_as_new` re-raises this — reads the same either way.
+impl std::error::Error for SendBatchError {}
+
+impl From<anyhow::Error> for SendBatchError {
+    fn from(error: anyhow::Error) -> Self {
+        SendBatchError::Other(error)
+    }
+}
+
+/// Send an already-recorded batch as a brand-NEW transfer, to `engine`'s peer —
+/// which may be a device this batch never went to (0.5.1 §6 *Send to device…*)
+/// or the row's own peer (the declined re-ask, and the deliberate "ask them
+/// again" — the receiver's dedup handshake decides what actually travels).
 ///
-/// Ownership decides the on-disk move:
-/// - **sole owner** (no other outbound row shares the dir — the single-target
-///   agent): atomic `rename`, the desktop model;
-/// - **shared dir** (fan-out): the dir is COPIED into the new identity and the
-///   new dir is registered with the cleanup coordinator (`expected = 1`) —
-///   renaming would yank the payload out from under the sibling targets' rows.
+/// The payload gets a fresh package identity: new dir basename ⇒ new wire
+/// `batch_uuid` ⇒ a brand-new inbound row on the chosen peer, keyed apart from
+/// anything the source batch already established there.
 ///
-/// Perseus bookkeeping follows the payload: live `perseus_seen` linkages are
-/// re-pointed (retention tracks the new transfer's confirm) and the
-/// `perseus_batch_files` rows are cloned. On success the old row's error gains
-/// the `— resent as new transfer #N` suffix, which both journals the divert in
-/// the UI and makes a double-click bounce off the strict [`is_declined`] guard.
+/// **Where the bytes come from.** A package dir still holding its payload is
+/// taken as-is; one already freed by post-confirm cleanup is rebuilt from the
+/// original capture files through [`plan_package_rebuild`]. A rebuild that
+/// cannot find every original is an **eligible subset**, not a failure: the new
+/// manifest shrinks to what can actually be served and the drop count comes
+/// back in [`SentBatch::skipped`]. Only a batch with *nothing* left is refused
+/// ([`SendBatchError::AllSourcesGone`]).
+///
+/// **What happens to the source** is [`SourceDisposition`]'s call — and a
+/// `Retire` still copies rather than moves when a fan-out sibling's row shares
+/// the dir, because renaming would yank the payload out from under it.
 #[allow(clippy::too_many_arguments)]
-pub async fn resend_declined_as_new(
+pub async fn send_batch_to_target(
     store: &StandaloneSyncStore,
     engine: &SyncEngineHandle,
     cleanup: Option<&SharedPackageCleanup>,
@@ -441,11 +604,9 @@ pub async fn resend_declined_as_new(
     batches: &BatchStore,
     seen: &SeenStore,
     row: &OutboundRow,
-) -> Result<i64> {
-    if !is_declined(row) {
-        bail!("only a receiver-declined transfer can be resent as a new transfer");
-    }
-
+    disposition: SourceDisposition,
+) -> Result<SentBatch, SendBatchError> {
+    let retire = disposition == SourceDisposition::Retire;
     let old_ref = row.package_ref.clone();
     let old_dir = PathBuf::from(&old_ref);
     let parent = old_dir
@@ -455,12 +616,6 @@ pub async fn resend_declined_as_new(
     let new_dir = parent.join(uuid::Uuid::new_v4().to_string());
     let new_ref = new_dir.to_string_lossy().into_owned();
 
-    // A declined fan-out row's payload may already be freed (decline is
-    // terminal on every target) — resurrect it from the originals first.
-    if !package_has_payload(&old_dir) {
-        rebuild_package_payloads(&old_dir, config, batches)?;
-    }
-
     // Shared-dir probe: any OTHER outbound row on the same package dir means a
     // fan-out sibling still owns it — never rename it out from under them.
     let shared = store
@@ -468,10 +623,58 @@ pub async fn resend_declined_as_new(
         .context("scan outbound rows for dir ownership")?
         .iter()
         .any(|other| other.id != row.id && other.package_ref == old_ref);
+    // Only a retired source hands its payload over; everything else is a copy
+    // beside it.
+    let moved = retire && !shared;
 
-    // Manifest read BEFORE the move (both branches serve the same bytes).
-    let records = read_manifest(&old_dir)
-        .with_context(|| format!("read manifest for divert {}", old_dir.display()))?;
+    let mut skipped = 0usize;
+    if package_has_payload(&old_dir) {
+        if moved {
+            if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                return Err(SendBatchError::Other(if e.kind() == std::io::ErrorKind::NotFound {
+                    anyhow::anyhow!(
+                        "package data is missing on disk; cannot resend (already resent as a new transfer?)"
+                    )
+                } else {
+                    anyhow::Error::from(e)
+                        .context(format!("rename declined package dir {old_ref} -> {new_ref}"))
+                }));
+            }
+        } else {
+            copy_dir_recursive(&old_dir, &new_dir)
+                .with_context(|| format!("copy package dir {old_ref} -> {new_ref}"))?;
+        }
+    } else {
+        // Payload freed after delivery (or by the fan-out coordinator) — rebuild
+        // from the originals. The plan is resolved against the OLD dir, which is
+        // where the manifest and the `perseus_batch_files` linkage are keyed,
+        // and applied into whichever dir the new transfer will serve from: a
+        // KEPT source is never written to, so its manifest keeps naming the full
+        // batch even when this send can only carry part of it.
+        let plan = plan_package_rebuild(&old_dir, config, batches)?;
+        if plan.sendable() == 0 {
+            return Err(SendBatchError::AllSourcesGone(format!(
+                "all {} source files are gone from disk ({} missing, {} changed)",
+                plan.total(),
+                plan.report.missing.len(),
+                plan.report.changed.len()
+            )));
+        }
+        skipped = plan.skipped();
+        plan.apply(if moved { &old_dir } else { &new_dir })?;
+        if moved {
+            if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                return Err(SendBatchError::Other(anyhow::Error::from(e).context(
+                    format!("rename rebuilt package dir {old_ref} -> {new_ref}"),
+                )));
+            }
+        }
+    }
+
+    // The announce is built from the manifest the NEW dir actually serves — a
+    // partial rebuild already shrank it, so this is the eligible subset.
+    let records = read_manifest(&new_dir)
+        .with_context(|| format!("read manifest for divert {}", new_dir.display()))?;
     let files: Vec<AnnounceFileEntry> = records
         .iter()
         .map(|record| AnnounceFileEntry {
@@ -492,29 +695,26 @@ pub async fn resend_declined_as_new(
             )
         });
 
-    if shared {
-        copy_dir_recursive(&old_dir, &new_dir)
-            .with_context(|| format!("copy shared package dir {old_ref} -> {new_ref}"))?;
-        // The copy is a fresh single-row dir: gate its cleanup on that one row.
+    // A copied dir is a fresh single-row package: gate its cleanup on that one
+    // row, or its terminal would free a dir the coordinator never counted.
+    if !moved {
         if let Some(coord) = cleanup {
             coord.register(&new_dir, 1);
         }
-    } else if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
-        return Err(if e.kind() == std::io::ErrorKind::NotFound {
-            anyhow::anyhow!(
-                "package data is missing on disk; cannot resend (already resent as a new transfer?)"
-            )
-        } else {
-            anyhow::Error::from(e)
-                .context(format!("rename declined package dir {old_ref} -> {new_ref}"))
-        });
     }
 
-    // Perseus bookkeeping follows the payload — best-effort (a failure only
-    // degrades retention/rebuild for the NEW transfer, the safe direction).
-    match seen.relink_package(&old_ref, &new_ref) {
-        Ok(moved) => tracing::debug!(moved, "perseus_seen linkage moved to diverted transfer"),
-        Err(error) => tracing::warn!(%error, "perseus_seen relink failed; retention may not track the new transfer"),
+    // Perseus bookkeeping — best-effort (a failure only degrades
+    // retention/rebuild for the NEW transfer, the safe direction).
+    // Only a RETIRED source hands its `perseus_seen` linkage over: retention
+    // has to track a transfer that can still confirm, and the declined one
+    // never will. A kept source keeps its own: those files were delivered under
+    // IT, and re-pointing them at a fresh, unconfirmed transfer would silently
+    // un-deliver them for retention.
+    if retire {
+        match seen.relink_package(&old_ref, &new_ref) {
+            Ok(rows) => tracing::debug!(rows, "perseus_seen linkage moved to diverted transfer"),
+            Err(error) => tracing::warn!(%error, "perseus_seen relink failed; retention may not track the new transfer"),
+        }
     }
     if let Err(error) = batches.clone_files(&old_ref, &new_ref) {
         tracing::warn!(%error, "perseus_batch_files clone failed; a future rebuild falls back to reverse-mapping");
@@ -536,50 +736,120 @@ pub async fn resend_declined_as_new(
     {
         Ok(id) => id,
         Err(e) => {
-            // Undo so the old row's divert affordance stays live: put the
-            // payload back under the old identity (and the linkage with it).
-            if shared {
+            // Undo so the source row's affordances stay live: put a moved
+            // payload back under the old identity (and the linkage with it), or
+            // drop the copy nobody will ever serve.
+            if moved {
+                if std::fs::rename(&new_dir, &old_dir).is_err() {
+                    tracing::error!(old_ref = %old_ref, new_ref = %new_ref, "divert undo rename failed; payload dir left under the new name");
+                }
+            } else {
                 let _ = std::fs::remove_dir_all(&new_dir);
-            } else if std::fs::rename(&new_dir, &old_dir).is_err() {
-                tracing::error!(old_ref = %old_ref, new_ref = %new_ref, "divert undo rename failed; payload dir left under the new name");
+                if let Err(error) = batches.delete(&new_ref) {
+                    tracing::warn!(%error, "divert undo: batch rows for the dropped copy not removed");
+                }
             }
-            if let Err(error) = seen.relink_package(&new_ref, &old_ref) {
-                tracing::warn!(%error, "divert undo: perseus_seen relink-back failed");
+            if retire {
+                if let Err(error) = seen.relink_package(&new_ref, &old_ref) {
+                    tracing::warn!(%error, "divert undo: perseus_seen relink-back failed");
+                }
             }
-            return Err(e.context("enqueue diverted transfer"));
+            return Err(anyhow::Error::from(e)
+                .context("enqueue diverted transfer")
+                .into());
         }
     };
 
-    // Journal cross-links + the double-click guard suffix, all best-effort:
-    // the new transfer is already durably queued.
-    if let Err(error) = store.set_last_error(
-        row.id,
-        Some(&format!(
-            "{CANCELLED_BY_RECEIVER_DETAIL} — resent as new transfer #{new_id}"
-        )),
-    ) {
-        tracing::warn!(%error, id = row.id, "divert suffix not recorded on the declined row");
+    // Journal cross-links, all best-effort: the new transfer is already durably
+    // queued. The declined re-ask also stamps the old row's error with the
+    // `— resent as new transfer #N` suffix, which both shows the divert in the
+    // UI and makes a double-click bounce off the strict [`is_declined`] guard;
+    // a KEPT source's row is never written to.
+    if retire {
+        if let Err(error) = store.set_last_error(
+            row.id,
+            Some(&format!(
+                "{CANCELLED_BY_RECEIVER_DETAIL} — resent as new transfer #{new_id}"
+            )),
+        ) {
+            tracing::warn!(%error, id = row.id, "divert suffix not recorded on the declined row");
+        }
     }
+    let (old_detail, new_detail) = if retire {
+        (
+            format!("as_new_transfer={new_id}"),
+            format!("of_declined={}", row.id),
+        )
+    } else {
+        (
+            format!("sent_to_device={new_id}"),
+            format!("of_batch={}", row.id),
+        )
+    };
     let _ = store.append_sync_event(
         athenaeum_core::sync::Direction::Sent,
         &row.id.to_string(),
         "resend",
-        Some(&format!("as_new_transfer={new_id}")),
+        Some(&old_detail),
     );
     let _ = store.append_sync_event(
         athenaeum_core::sync::Direction::Sent,
         &new_id.to_string(),
         "resend",
-        Some(&format!("of_declined={}", row.id)),
+        Some(&new_detail),
     );
     tracing::info!(
         old_id = row.id,
         new_id,
+        moved,
         shared,
+        sent = records.len(),
+        skipped,
         new_ref = %new_ref,
-        "declined transfer diverted to a new transfer"
+        "batch diverted to a new transfer"
     );
-    Ok(new_id)
+    Ok(SentBatch {
+        new_id,
+        sent: records.len(),
+        skipped,
+    })
+}
+
+/// Divert a **receiver-declined** transfer into a brand-NEW transfer (the
+/// explicit operator re-ask; autonomous retries never come here), re-asking the
+/// row's OWN peer: [`send_batch_to_target`] with the declined identity
+/// [retired](SourceDisposition::Retire).
+///
+/// The gate is strict on purpose — only a receiver-declined row comes here, and
+/// only once (the divert's own suffix breaks [`is_declined`] for a second
+/// click). Everything else routes to [`resend_in_place`] (same `batch_uuid`) or,
+/// for a deliberate send elsewhere, to [`send_batch_to_target`] with
+/// [`SourceDisposition::Keep`].
+#[allow(clippy::too_many_arguments)]
+pub async fn resend_declined_as_new(
+    store: &StandaloneSyncStore,
+    engine: &SyncEngineHandle,
+    cleanup: Option<&SharedPackageCleanup>,
+    config: &Config,
+    batches: &BatchStore,
+    seen: &SeenStore,
+    row: &OutboundRow,
+) -> Result<i64> {
+    if !is_declined(row) {
+        bail!("only a receiver-declined transfer can be resent as a new transfer");
+    }
+    let done = send_batch_to_target(
+        store,
+        engine,
+        cleanup,
+        config,
+        batches,
+        seen,
+        row,
+        SourceDisposition::Retire,
+    )
+    .await?;
+    Ok(done.new_id)
 }
 
 /// Copy `src`'s regular files (and subdirectories) into `dst`, creating `dst`.
@@ -1039,5 +1309,368 @@ mod tests {
         );
 
         h.engine.shutdown().await;
+    }
+
+    // ── §6 send a recorded batch to another device ────────────────────────────
+
+    const PEER_B: [u8; 32] = [0xCD; 32];
+
+    /// A DELIVERED batch the way the operator meets it in the Transfers history:
+    /// a confirmed outbound row whose package dir has been cleaned back to its
+    /// manifest, with the `perseus_batch_files` linkage and the `perseus_seen`
+    /// rows the real send path leaves behind — plus a second peer's engine to
+    /// divert it to.
+    struct SendToHarness {
+        _tmp: tempfile::TempDir,
+        config: Config,
+        store: Arc<StandaloneSyncStore>,
+        seen: SeenStore,
+        batches: BatchStore,
+        /// The source row's own peer.
+        engine_a: SyncEngineHandle,
+        /// The divert target — a device this batch never went to.
+        engine_b: SyncEngineHandle,
+        pkg: std::path::PathBuf,
+        sources: Vec<std::path::PathBuf>,
+        row_id: i64,
+    }
+
+    impl SendToHarness {
+        fn row(&self) -> OutboundRow {
+            self.store.get_outbound(self.row_id).unwrap().unwrap()
+        }
+        async fn shutdown(self) {
+            self.engine_a.shutdown().await;
+            self.engine_b.shutdown().await;
+        }
+    }
+
+    /// `rels` are capture-dir-relative names; each becomes a source file, a
+    /// manifest record and a linkage row.
+    ///
+    /// `delivered` picks which terminal shape the history row has, and the two
+    /// differ on disk exactly as they do in production: a **confirmed** batch's
+    /// payload copies are gone (post-confirm cleanup — the engine even heals
+    /// leftovers at startup, so a confirmed row with payload is not a state that
+    /// exists), a **failed** one still holds them.
+    fn send_to_harness(rels: &[&str], delivered: bool) -> SendToHarness {
+        let tmp = tempfile::tempdir().unwrap();
+        let cap = tmp.path().join("cap");
+        let config = config_with_dirs(tmp.path(), &[&cap]);
+        let sources: Vec<std::path::PathBuf> = rels
+            .iter()
+            .enumerate()
+            .map(|(i, rel)| {
+                let src = cap.join(rel);
+                std::fs::write(&src, format!("payload-{i}-{rel}").as_bytes()).unwrap();
+                src
+            })
+            .collect();
+
+        let pkg = tmp.path().join("packages").join("sent-uuid");
+        let pairs: Vec<(&Path, &str)> = sources
+            .iter()
+            .zip(rels.iter())
+            .map(|(src, rel)| (src.as_path(), *rel))
+            .collect();
+        if delivered {
+            build_and_clean_pkg(&pkg, &pairs);
+        } else {
+            let records: Vec<(std::path::PathBuf, ManifestRecord)> = pairs
+                .iter()
+                .enumerate()
+                .map(|(i, (src, rel))| {
+                    ((*src).to_path_buf(), record_for(src, rel, &format!("u-{i}")))
+                })
+                .collect();
+            write_package(&pkg, records).unwrap();
+        }
+
+        let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("perseus.db")).unwrap());
+        let seen = SeenStore::open(tmp.path().join("perseus.db")).unwrap();
+        let batches = BatchStore::open(tmp.path().join("perseus.db")).unwrap();
+        let pkg_ref = pkg.to_string_lossy().into_owned();
+        let row_id = store.enqueue(&pkg_ref, PEER, None, &[]).unwrap();
+        if delivered {
+            store.confirm(row_id, &[]).unwrap();
+        } else {
+            store.set_state(row_id, OutboundState::Failed).unwrap();
+        }
+        for src in &sources {
+            let m = std::fs::metadata(src).unwrap();
+            seen.mark_enqueued(
+                src,
+                m.len(),
+                crate::seen::mtime_millis(m.modified().ok()),
+                &pkg_ref,
+            )
+            .unwrap();
+        }
+        batches
+            .record_files(
+                &pkg_ref,
+                &sources
+                    .iter()
+                    .zip(rels.iter())
+                    .map(|(src, rel)| ((*rel).to_string(), src.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        batches.record(&pkg_ref, "auto", "2026-07-26T00:00:00.000Z", rels.len()).unwrap();
+
+        let spawn = |peer: [u8; 32]| {
+            let transport: Arc<dyn SharingTransport> = Arc::new(LoopbackNetwork::new().endpoint());
+            SyncEngine::spawn(
+                Arc::clone(&store) as Arc<dyn athenaeum_core::sync::store::SyncStore>,
+                transport,
+                peer,
+            )
+        };
+        let engine_a = spawn(PEER);
+        let engine_b = spawn(PEER_B);
+        SendToHarness {
+            _tmp: tmp,
+            config,
+            store,
+            seen,
+            batches,
+            engine_a,
+            engine_b,
+            pkg,
+            sources,
+            row_id,
+        }
+    }
+
+    /// The §6 happy path: a confirmed, cleaned batch is sent to a SECOND device
+    /// as a brand-new transfer — new row on that peer, fresh `batch_uuid` (a new
+    /// dir basename), payload rebuilt from the originals — and the source batch
+    /// is left exactly as it was: same state, no error stamp, still
+    /// manifest-only, still holding its own retention linkage.
+    #[tokio::test]
+    async fn send_to_second_peer_mints_a_new_transfer_and_leaves_the_source_untouched() {
+        let h = send_to_harness(&["a.fits", "b.fits"], true);
+        let row = h.row();
+        let old_ref = row.package_ref.clone();
+
+        let done = send_batch_to_target(
+            &h.store,
+            &h.engine_b,
+            None,
+            &h.config,
+            &h.batches,
+            &h.seen,
+            &row,
+            SourceDisposition::Keep,
+        )
+        .await
+        .expect("the divert succeeds");
+
+        assert_ne!(done.new_id, h.row_id, "a brand-new transfer, never a reset");
+        assert_eq!((done.sent, done.skipped), (2, 0), "the whole batch travels");
+
+        let new_row = h.store.get_outbound(done.new_id).unwrap().unwrap();
+        assert_eq!(new_row.peer, PEER_B, "queued on the TARGET peer's engine");
+        assert_ne!(new_row.package_ref, old_ref, "a fresh package identity");
+        let new_dir = std::path::PathBuf::from(&new_row.package_ref);
+        assert_ne!(
+            new_dir.file_name(),
+            std::path::Path::new(&old_ref).file_name(),
+            "a fresh dir basename IS the fresh wire batch_uuid"
+        );
+        assert!(package_has_payload(&new_dir), "payload rebuilt into the new dir");
+        assert_eq!(read_manifest(&new_dir).unwrap().len(), 2);
+        for (rel, src) in ["a.fits", "b.fits"].iter().zip(h.sources.iter()) {
+            assert_eq!(
+                std::fs::read(new_dir.join(rel)).unwrap(),
+                std::fs::read(src).unwrap(),
+                "{rel} carries the original bytes"
+            );
+        }
+
+        // …and the source batch is untouched, on disk and in the DB.
+        let old = h.store.get_outbound(h.row_id).unwrap().unwrap();
+        assert_eq!(old.state, OutboundState::Confirmed);
+        assert_eq!(old.last_error, None, "no divert stamp on a kept source");
+        assert_eq!(old.package_ref, old_ref, "the dir was never renamed away");
+        assert!(
+            !package_has_payload(&h.pkg),
+            "the delivered batch's dir stays cleaned — nothing was restored into it"
+        );
+        assert_eq!(read_manifest(&h.pkg).unwrap().len(), 2, "old manifest intact");
+        assert_eq!(
+            h.seen.source_for_package(&old_ref).unwrap().map(|l| l.path),
+            Some(h.sources[0].clone()),
+            "retention still tracks the batch that actually delivered these files"
+        );
+        assert!(
+            h.seen.source_for_package(&new_row.package_ref).unwrap().is_none(),
+            "…and was not re-pointed at the unconfirmed new transfer"
+        );
+
+        // The new transfer carries its own bookkeeping (rebuild + history).
+        assert_eq!(
+            h.batches.files_for(&new_row.package_ref).unwrap().len(),
+            2,
+            "the rel_path → source linkage was cloned"
+        );
+        assert!(
+            h.batches
+                .list()
+                .unwrap()
+                .iter()
+                .any(|b| b.package_ref == new_row.package_ref),
+            "the new batch shows in the transfers history"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// Eligible subset (owner rule: act on the eligible portion, report `N of
+    /// M`): one source deleted since the batch shipped is dropped and counted,
+    /// the other two travel — and the SOURCE batch's manifest still names all
+    /// three, because a kept source is never rewritten.
+    #[tokio::test]
+    async fn send_to_sends_the_eligible_subset_when_a_source_was_deleted() {
+        let h = send_to_harness(&["a.fits", "b.fits", "c.fits"], true);
+        std::fs::remove_file(&h.sources[1]).unwrap();
+        let row = h.row();
+
+        let done = send_batch_to_target(
+            &h.store,
+            &h.engine_b,
+            None,
+            &h.config,
+            &h.batches,
+            &h.seen,
+            &row,
+            SourceDisposition::Keep,
+        )
+        .await
+        .expect("a partial batch still sends");
+
+        assert_eq!((done.sent, done.skipped), (2, 1), "2 of 3, one deleted locally");
+        let new_dir =
+            std::path::PathBuf::from(h.store.get_outbound(done.new_id).unwrap().unwrap().package_ref);
+        let manifest = read_manifest(&new_dir).unwrap();
+        assert_eq!(
+            manifest.iter().map(|r| r.rel_path.as_str()).collect::<Vec<_>>(),
+            vec!["a.fits", "c.fits"],
+            "the new package advertises only what it can serve"
+        );
+        assert!(!new_dir.join("b.fits").exists());
+        assert_eq!(
+            read_manifest(&h.pkg).unwrap().len(),
+            3,
+            "the source batch still records the full three-file delivery"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// Every source deleted → a typed refusal (the route's `409`), raised before
+    /// anything is built: no new dir, no new row, source manifest intact.
+    #[tokio::test]
+    async fn send_to_refuses_when_every_source_is_gone() {
+        let h = send_to_harness(&["a.fits", "b.fits"], true);
+        for src in &h.sources {
+            std::fs::remove_file(src).unwrap();
+        }
+        let before = h.store.all_outbound(u32::MAX).unwrap().len();
+        let row = h.row();
+
+        let err = send_batch_to_target(
+            &h.store,
+            &h.engine_b,
+            None,
+            &h.config,
+            &h.batches,
+            &h.seen,
+            &row,
+            SourceDisposition::Keep,
+        )
+        .await
+        .expect_err("nothing left to send");
+
+        assert!(
+            matches!(err, SendBatchError::AllSourcesGone(_)),
+            "the all-gone answer is its own variant, not a generic failure: {err}"
+        );
+        assert_eq!(
+            h.store.all_outbound(u32::MAX).unwrap().len(),
+            before,
+            "no transfer was minted"
+        );
+        assert_eq!(read_manifest(&h.pkg).unwrap().len(), 2, "source manifest intact");
+        let siblings = std::fs::read_dir(h.pkg.parent().unwrap()).unwrap().count();
+        assert_eq!(siblings, 1, "no half-built package dir was left behind");
+
+        h.shutdown().await;
+    }
+
+    /// A batch whose dir still holds its payload (here: a FAILED transfer the
+    /// operator re-routes to another device) is COPIED into the new identity —
+    /// the source keeps serving its own bytes for its Files tab, its *Delete
+    /// source files* and a later in-place resend.
+    #[tokio::test]
+    async fn send_to_copies_an_intact_package_and_leaves_the_original_servable() {
+        let h = send_to_harness(&["a.fits"], false);
+        let row = h.row();
+
+        let done = send_batch_to_target(
+            &h.store,
+            &h.engine_b,
+            None,
+            &h.config,
+            &h.batches,
+            &h.seen,
+            &row,
+            SourceDisposition::Keep,
+        )
+        .await
+        .expect("the divert succeeds");
+
+        assert_eq!((done.sent, done.skipped), (1, 0));
+        assert!(
+            package_has_payload(&h.pkg),
+            "the source dir was copied, never moved"
+        );
+        let new_dir =
+            std::path::PathBuf::from(h.store.get_outbound(done.new_id).unwrap().unwrap().package_ref);
+        assert_eq!(
+            std::fs::read(new_dir.join("a.fits")).unwrap(),
+            std::fs::read(h.pkg.join("a.fits")).unwrap(),
+            "byte-identical copy"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// Sending back to the row's OWN peer is allowed: it is an explicit operator
+    /// re-ask, and the fresh `batch_uuid` gets it a brand-new inbound row there
+    /// (the receiver's dedup handshake then decides what actually travels).
+    #[tokio::test]
+    async fn send_to_the_same_peer_is_an_allowed_re_ask() {
+        let h = send_to_harness(&["a.fits"], true);
+        let row = h.row();
+
+        let done = send_batch_to_target(
+            &h.store,
+            &h.engine_a,
+            None,
+            &h.config,
+            &h.batches,
+            &h.seen,
+            &row,
+            SourceDisposition::Keep,
+        )
+        .await
+        .expect("re-asking the same device is allowed");
+
+        let new_row = h.store.get_outbound(done.new_id).unwrap().unwrap();
+        assert_eq!(new_row.peer, PEER, "same device…");
+        assert_ne!(new_row.package_ref, h.pkg.to_string_lossy(), "…new batch_uuid");
+
+        h.shutdown().await;
     }
 }

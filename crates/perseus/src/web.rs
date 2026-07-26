@@ -14,6 +14,12 @@
 //!   retention policy, and coarse package counts ([`StatusDto`]).
 //! - `GET /api/transfers` — the grouped read model (one element per batch across
 //!   every fan-out target) + `GET /api/transfers/events` for a batch's merged log.
+//! - `POST /api/transfers/send-to` — send an already-recorded batch to another
+//!   device as a brand-new transfer ([`SendToRequest`] → [`SendToReport`]), the
+//!   source batch and its history untouched. Two steps on one route:
+//!   `confirm: false` answers with "sends N of M" and builds nothing,
+//!   `confirm: true` performs. Missing originals are dropped and counted; only
+//!   an all-gone batch is refused (`409`).
 //! - `GET`/`PUT /api/retention/policy` — read the live retention config +
 //!   read-only soak gate ([`PolicyDto`]); a whitelisted [`RetentionEdit`] is
 //!   applied to `perseus.toml` and adopted live. Live deletion can never be
@@ -598,6 +604,9 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         // The explicit operator divert for a receiver-declined transfer (a
         // decline is final per batch_uuid; this mints a NEW transfer).
         .route("/api/resend-as-new", post(api_resend_as_new))
+        // Send an already-recorded batch to ANOTHER device as a new transfer
+        // (0.5.1 §6). Two steps on one route (`confirm`), like /api/library/delete.
+        .route("/api/transfers/send-to", post(api_send_to))
         // Per-row send-now (wake out of backoff) and user-cancel (Task 9). Both
         // bearer-gated; `/api/send-now` (the batcher flush) is a different route.
         .route("/api/kick", post(api_kick))
@@ -1894,44 +1903,28 @@ fn resolve_send_targets(
     let mut chosen: Vec<String> = Vec::new();
     let mut out = Vec::new();
     for want in targets {
-        let mut matched: Vec<(&String, &Arc<SyncEngineHandle>)> = engines
-            .iter()
-            .filter(|(peer, _)| {
-                peer.eq_ignore_ascii_case(want)
-                    || names
-                        .get(peer)
-                        .is_some_and(|name| name.eq_ignore_ascii_case(want))
-            })
-            .map(|(peer, engine)| (peer, engine))
-            .collect();
-        // Collapse repeats of the SAME peer first (see the fn docs): one device
-        // reached through two engine entries is not an ambiguity, and only what
-        // survives this may be weighed one-versus-many below.
-        let mut seen_peers: HashSet<String> = HashSet::new();
-        matched.retain(|(peer, _)| seen_peers.insert(peer.to_ascii_lowercase()));
-        let (peer, engine) = match matched.as_slice() {
-            [] => {
+        let (peer, engine) = match resolve_one_target(engines, names, want) {
+            Ok(hit) => hit,
+            Err(TargetMiss::Unknown) => {
                 tracing::error!(target = %want, "web library send: unknown send target");
                 return Err((
                     StatusCode::BAD_REQUEST,
                     format!("unknown send target: {want}"),
                 ));
             }
-            [one] => *one,
-            many => {
-                let peers: Vec<&str> = many.iter().map(|(peer, _)| peer.as_str()).collect();
+            Err(TargetMiss::Ambiguous(peers)) => {
+                let count = peers.len();
                 let peers = peers.join(", ");
                 tracing::error!(
                     target = %want,
-                    count = many.len(),
+                    count,
                     peers = %peers,
                     "web library send: ambiguous send target"
                 );
                 return Err((
                     StatusCode::BAD_REQUEST,
                     format!(
-                        "ambiguous target name: {want} matches {} devices ({peers}) — send by device id",
-                        many.len()
+                        "ambiguous target name: {want} matches {count} devices ({peers}) — send by device id"
                     ),
                 ));
             }
@@ -1943,6 +1936,51 @@ fn resolve_send_targets(
         out.push(Arc::clone(engine));
     }
     Ok(Some(out))
+}
+
+/// Why one requested target did not land on exactly one running engine.
+/// Rendered into a `400` by each route in its own words — the same failure means
+/// something different to "send these files" than it does to "divert this batch".
+enum TargetMiss {
+    /// Nothing running answers to this id or name.
+    Unknown,
+    /// Two or more genuinely different peers answer to it (hex ids of each).
+    Ambiguous(Vec<String>),
+}
+
+/// Resolve ONE requested target — a peer id (hex) or a friendly device name,
+/// case-insensitively — against the RUNNING engines.
+///
+/// Shared by every route that sends somewhere, so they cannot drift on what
+/// "that device" means. See [`resolve_send_targets`] for why ambiguity is
+/// counted in devices rather than in matching entries.
+fn resolve_one_target<'a>(
+    engines: &'a [(String, Arc<SyncEngineHandle>)],
+    names: &HashMap<String, String>,
+    want: &str,
+) -> Result<(&'a String, &'a Arc<SyncEngineHandle>), TargetMiss> {
+    let mut matched: Vec<(&String, &Arc<SyncEngineHandle>)> = engines
+        .iter()
+        .filter(|(peer, _)| {
+            peer.eq_ignore_ascii_case(want)
+                || names
+                    .get(peer)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(want))
+        })
+        .map(|(peer, engine)| (peer, engine))
+        .collect();
+    // Collapse repeats of the SAME peer first: one device reached through two
+    // engine entries is not an ambiguity, and only what survives this may be
+    // weighed one-versus-many below.
+    let mut seen_peers: HashSet<String> = HashSet::new();
+    matched.retain(|(peer, _)| seen_peers.insert(peer.to_ascii_lowercase()));
+    match matched.as_slice() {
+        [] => Err(TargetMiss::Unknown),
+        [one] => Ok(*one),
+        many => Err(TargetMiss::Ambiguous(
+            many.iter().map(|(peer, _)| (*peer).clone()).collect(),
+        )),
+    }
 }
 
 /// `POST /api/library/send` — send an arbitrary library selection **now**, as
@@ -3237,6 +3275,241 @@ async fn api_resend_as_new(
             Err((StatusCode::BAD_REQUEST, msg))
         }
     }
+}
+
+/// `POST /api/transfers/send-to` request body (0.5.1 §6). Two steps, one route
+/// — the same shape `POST /api/library/delete` uses.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendToRequest {
+    /// The outbound row to re-send from (any row of the batch — every fan-out
+    /// row of one batch shares its package dir).
+    id: i64,
+    /// The device to send to: a peer id (hex) or its friendly device name,
+    /// resolved against the RUNNING engines.
+    target: String,
+    /// `false` (the default) counts what would travel and touches nothing;
+    /// `true` builds and queues the transfer. Defaulting to the harmless step is
+    /// deliberate: a malformed or truncated body can only ever under-send.
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// `POST /api/transfers/send-to` payload. On the preview step `newId` is
+/// `null` and nothing was built.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SendToReport {
+    /// Which step answered — so a client that ignored its own `confirm` flag
+    /// still cannot mistake a preview for a queued transfer.
+    confirmed: bool,
+    /// The new outbound row's id (`confirm: true` only).
+    new_id: Option<i64>,
+    /// Files the new transfer carries (the eligible subset).
+    sent: usize,
+    /// Files the batch recorded that can no longer be served — the original is
+    /// gone from disk, or was rewritten since it shipped.
+    skipped: usize,
+}
+
+/// `POST /api/transfers/send-to` — send an already-recorded batch to another
+/// device as a brand-NEW transfer (0.5.1 §6).
+///
+/// Fresh package dir basename ⇒ fresh wire `batch_uuid` ⇒ a brand-new inbound
+/// row on the chosen peer, while **the source batch and its history are left
+/// exactly as they are** ([`resend::SourceDisposition::Keep`]) — it is still
+/// serving its Files tab, its *Delete source files* verdict and any in-place
+/// resend. Bytes come from the package dir when it still holds them, else are
+/// rebuilt from the original capture files; whatever no longer exists is
+/// dropped and counted rather than failing the send (the owner rule: act on the
+/// eligible portion, report `N of M`).
+///
+/// Two steps on one route: `confirm: false` resolves the same plan read-only and
+/// answers with the counts the confirm dialog shows, `confirm: true` performs.
+/// The two are independent reads of the disk, so a file deleted between them
+/// simply shows up in the confirm's own `skipped` — the executed counts are the
+/// authoritative ones.
+///
+/// **The target must be a device with a running engine on THIS node**, which is
+/// a strict subset of the account's device list: an account device that is not
+/// in this node's `targets` (or whose engine failed to start) has nothing here
+/// to send through, and is refused by name rather than silently fanned out to
+/// whoever is around. This narrows §6's "picker of the account's receive-capable
+/// devices" to what can actually be honoured; the UI picker lists the same
+/// running set the library Send dialog does.
+///
+/// Sending to the SOURCE row's own peer is deliberately allowed: it is an
+/// explicit operator re-ask, and the receiver's dedup handshake decides what
+/// actually travels (a fully-duplicate re-ask confirms as "already on peer").
+///
+/// Statuses: `503` while the engine is detached, `404` for an unknown row,
+/// `400` for an unknown / ambiguous target, `409` when the batch is still in
+/// flight or when every one of its files is gone from disk, `500` for a genuine
+/// build failure.
+async fn api_send_to(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<SendToRequest>,
+) -> Result<Json<SendToReport>, (StatusCode, String)> {
+    let engines = state.engines.read().await.clone();
+    if engines.is_empty() {
+        tracing::warn!("web send-to: sync engine is not running");
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sync engine is not running — finish setup first".to_string(),
+        ));
+    }
+    let row = match state.store.get_outbound(req.id) {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            tracing::warn!(id = req.id, "web send-to: unknown transfer");
+            return Err((StatusCode::NOT_FOUND, "unknown transfer".to_string()));
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::error!(id = req.id, error = %msg, "web send-to: outbound lookup failed");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
+        }
+    };
+    // Every row on this package dir must be settled, not just the named one: a
+    // live target is still serving from the dir this send copies, and its
+    // terminal can free the payload mid-copy (the fan-out cleanup coordinator
+    // frees a dir the moment its last target finishes). Same gate the UI shows
+    // the action behind.
+    let live = match state.store.all_outbound(u32::MAX) {
+        Ok(rows) => rows
+            .into_iter()
+            .any(|other| other.package_ref == row.package_ref && !other.state.is_terminal()),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            tracing::error!(id = req.id, error = %msg, "web send-to: outbound scan failed");
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, msg));
+        }
+    };
+    if live {
+        tracing::warn!(id = req.id, "web send-to: the batch is still in flight");
+        return Err((
+            StatusCode::CONFLICT,
+            "this batch is still in flight — send it on once it has finished".to_string(),
+        ));
+    }
+
+    let names = state.device_names.read().await.clone();
+    let engine = match resolve_one_target(&engines, &names, &req.target) {
+        Ok((_, engine)) => Arc::clone(engine),
+        Err(TargetMiss::Unknown) => {
+            tracing::error!(target = %req.target, "web send-to: target has no running engine here");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "target not configured on this node — add it under Settings → Send Targets"
+                    .to_string(),
+            ));
+        }
+        Err(TargetMiss::Ambiguous(peers)) => {
+            let count = peers.len();
+            let peers = peers.join(", ");
+            tracing::error!(target = %req.target, count, peers = %peers, "web send-to: ambiguous target");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "ambiguous target name: {} matches {count} devices ({peers}) — send by device id",
+                    req.target
+                ),
+            ));
+        }
+    };
+
+    let config = state.config.read().await.clone();
+    if !req.confirm {
+        // The dry-run behind the confirm dialog: resolve the same sources the
+        // send would, build nothing. It stats and hashes candidate originals, so
+        // it goes to a blocking thread like every other capture-dir walk here.
+        let batches = Arc::clone(&state.batches);
+        let dir = PathBuf::from(&row.package_ref);
+        let counts = tokio::task::spawn_blocking(move || preview_send_to(&dir, &config, &batches))
+            .await
+            .map_err(|e| {
+                let msg = format!("{e}");
+                tracing::error!(id = req.id, error = %msg, "web send-to: preview task panicked");
+                (StatusCode::INTERNAL_SERVER_ERROR, msg)
+            })?;
+        let (sent, skipped) = counts.map_err(|e| {
+            let msg = format!("{e:#}");
+            tracing::error!(id = req.id, error = %msg, "web send-to: preview failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg)
+        })?;
+        if sent == 0 {
+            tracing::warn!(id = req.id, skipped, "web send-to: every source file is gone");
+            return Err((
+                StatusCode::CONFLICT,
+                "all source files deleted locally".to_string(),
+            ));
+        }
+        return Ok(Json(SendToReport {
+            confirmed: false,
+            new_id: None,
+            sent,
+            skipped,
+        }));
+    }
+
+    let cleanup = state.cleanup.read().await.clone();
+    match resend::send_batch_to_target(
+        &state.store,
+        &engine,
+        cleanup.as_deref(),
+        &config,
+        &state.batches,
+        &state.seen,
+        &row,
+        resend::SourceDisposition::Keep,
+    )
+    .await
+    {
+        Ok(done) => {
+            tracing::info!(
+                old_id = req.id,
+                new_id = done.new_id,
+                target = %req.target,
+                sent = done.sent,
+                skipped = done.skipped,
+                "batch sent to another device via web"
+            );
+            Ok(Json(SendToReport {
+                confirmed: true,
+                new_id: Some(done.new_id),
+                sent: done.sent,
+                skipped: done.skipped,
+            }))
+        }
+        Err(resend::SendBatchError::AllSourcesGone(detail)) => {
+            tracing::warn!(id = req.id, error = %detail, "web send-to: every source file is gone");
+            Err((
+                StatusCode::CONFLICT,
+                "all source files deleted locally".to_string(),
+            ))
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            tracing::error!(id = req.id, target = %req.target, error = %msg, "web send-to failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, msg))
+        }
+    }
+}
+
+/// The read-only half of [`api_send_to`]: `(sendable, skipped)` for the batch in
+/// `dir`, without writing anything. A dir that still holds its payload serves
+/// its manifest as-is; a cleaned one is resolved against the originals exactly
+/// as the send would.
+fn preview_send_to(
+    dir: &Path,
+    config: &Config,
+    batches: &BatchStore,
+) -> anyhow::Result<(usize, usize)> {
+    if resend::package_has_payload(dir) {
+        return Ok((read_manifest(dir)?.len(), 0));
+    }
+    let plan = resend::plan_package_rebuild(dir, config, batches)?;
+    Ok((plan.sendable(), plan.skipped()))
 }
 
 /// `POST /api/kick` — send-now for one or more pending packages (spec §2 wake
@@ -7903,5 +8176,313 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::BAD_GATEWAY, "offline root");
+    }
+
+    // ── T11 (0.5.1 §6): POST /api/transfers/send-to ───────────────────────────
+
+    /// A delivered batch as the Transfers history holds it — a confirmed row
+    /// over a cleaned (manifest-only) package dir, its `perseus_batch_files`
+    /// linkage intact — plus two running engines: the batch's own peer and a
+    /// SECOND device it never went to.
+    struct SendToHarness {
+        state: Arc<WebState>,
+        cap: PathBuf,
+        pkg: PathBuf,
+        row_id: i64,
+        sources: Vec<PathBuf>,
+        _engines: Vec<Arc<SyncEngineHandle>>,
+        _tmp: tempfile::TempDir,
+    }
+
+    const PEER_B: [u8; 32] = [7u8; 32];
+
+    async fn send_to_harness(rels: &[&str]) -> SendToHarness {
+        use athenaeum_core::package::write_package;
+
+        let (state, tmp, cap) = library_test_state().await;
+        let sources: Vec<PathBuf> = rels
+            .iter()
+            .enumerate()
+            .map(|(i, rel)| write_file(&cap, rel, format!("payload-{i}-{rel}").as_bytes()))
+            .collect();
+
+        // A real package (real sizes + xxh3, so a rebuild can verify its
+        // sources), then stripped to its manifest the way post-confirm cleanup
+        // leaves it.
+        let pkg = tmp.path().join("packages").join("sent-uuid");
+        let records: Vec<(PathBuf, ManifestRecord)> = sources
+            .iter()
+            .zip(rels.iter())
+            .enumerate()
+            .map(|(i, (src, rel))| {
+                (
+                    src.clone(),
+                    ManifestRecord {
+                        v: MANIFEST_VERSION,
+                        frame_uuid: format!("uuid-{i}"),
+                        origin_catalog_uuid: format!("uuid-{i}"),
+                        origin_device: "self-node".to_string(),
+                        payload_kind: PayloadKind::RawFrame,
+                        rel_path: (*rel).to_string(),
+                        byte_size: std::fs::metadata(src).unwrap().len(),
+                        xxh3: athenaeum_core::package::xxh3_full_file(src).unwrap(),
+                        frame_meta: serde_json::json!({}),
+                        analysis: None,
+                        app_version: "test".to_string(),
+                        project: None,
+                    },
+                )
+            })
+            .collect();
+        write_package(&pkg, records).unwrap();
+        for entry in std::fs::read_dir(&pkg).unwrap().flatten() {
+            if entry.file_name() != std::ffi::OsStr::new(MANIFEST_FILENAME) {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+
+        let pkg_ref = pkg.display().to_string();
+        let row_id = state.store.enqueue(&pkg_ref, PEER, None, &[]).unwrap();
+        state.store.confirm(row_id, &[]).unwrap();
+        state
+            .batches
+            .record_files(
+                &pkg_ref,
+                &sources
+                    .iter()
+                    .zip(rels.iter())
+                    .map(|(src, rel)| ((*rel).to_string(), src.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        state
+            .batches
+            .record(&pkg_ref, "auto", "2026-07-26T00:00:00.000Z", rels.len())
+            .unwrap();
+
+        let mut engines = Vec::new();
+        let mut registry = Vec::new();
+        for peer in [PEER, PEER_B] {
+            let transport: Arc<dyn SharingTransport> = Arc::new(LoopbackNetwork::new().endpoint());
+            let engine = Arc::new(SyncEngine::spawn(
+                Arc::clone(&state.store) as Arc<dyn SyncStore>,
+                transport,
+                peer,
+            ));
+            registry.push((node_id_hex(&peer), Arc::clone(&engine)));
+            engines.push(engine);
+        }
+        *state.engines.write().await = registry;
+        *state.device_names.write().await = HashMap::from([
+            (node_id_hex(&PEER), "obs-a".to_string()),
+            (node_id_hex(&PEER_B), "obs-b".to_string()),
+        ]);
+
+        SendToHarness {
+            state,
+            cap,
+            pkg,
+            row_id,
+            sources,
+            _engines: engines,
+            _tmp: tmp,
+        }
+    }
+
+    fn send_to_body(id: i64, target: &str, confirm: bool) -> serde_json::Value {
+        serde_json::json!({ "id": id, "target": target, "confirm": confirm })
+    }
+
+    /// The §6 round trip over the wire: the confirm step's preview counts every
+    /// file and builds nothing, then the send mints a new transfer on the SECOND
+    /// device (fresh batch_uuid, its own history row) while the source batch
+    /// keeps its state, its manifest and its cleaned dir.
+    #[tokio::test]
+    async fn send_to_previews_then_sends_the_batch_to_another_device() {
+        let h = send_to_harness(&["a.fits", "b.fits"]).await;
+        let app = build_router(Arc::clone(&h.state), None);
+
+        let v = body_json(
+            post_json(&app, "/api/transfers/send-to", send_to_body(h.row_id, "obs-b", false)).await,
+        )
+        .await;
+        assert_eq!(v["confirmed"], false);
+        assert_eq!(v["newId"], serde_json::Value::Null, "a preview builds nothing");
+        assert_eq!((v["sent"].as_u64(), v["skipped"].as_u64()), (Some(2), Some(0)));
+        assert_eq!(
+            h.state.store.all_outbound(u32::MAX).unwrap().len(),
+            1,
+            "no transfer was minted by the preview"
+        );
+
+        let res = post_json(&app, "/api/transfers/send-to", send_to_body(h.row_id, "obs-b", true)).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["confirmed"], true);
+        assert_eq!((v["sent"].as_u64(), v["skipped"].as_u64()), (Some(2), Some(0)));
+        let new_id = v["newId"].as_i64().expect("a new transfer id");
+        assert_ne!(new_id, h.row_id);
+
+        let new_row = h.state.store.get_outbound(new_id).unwrap().unwrap();
+        assert_eq!(new_row.peer, PEER_B, "queued on the chosen device");
+        assert_ne!(
+            Path::new(&new_row.package_ref).file_name(),
+            h.pkg.file_name(),
+            "a fresh dir basename IS the fresh wire batch_uuid"
+        );
+
+        // The source batch is untouched…
+        let old = h.state.store.get_outbound(h.row_id).unwrap().unwrap();
+        assert_eq!(old.state, OutboundState::Confirmed);
+        assert_eq!(old.last_error, None);
+        assert!(!resend::package_has_payload(&h.pkg), "still cleaned");
+        // …and both batches now show in the grouped transfers list.
+        let refs: Vec<String> = body_json(get(&app, "/api/transfers").await)
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["packageRef"].as_str().unwrap().to_string())
+            .collect();
+        assert!(refs.contains(&h.pkg.display().to_string()));
+        assert!(refs.contains(&new_row.package_ref));
+    }
+
+    /// Eligible subset over the wire: one source deleted since the batch shipped
+    /// is reported by the preview (`2 of 3`) and dropped by the send — never a
+    /// refusal of the whole batch.
+    #[tokio::test]
+    async fn send_to_reports_and_sends_the_eligible_subset() {
+        let h = send_to_harness(&["a.fits", "b.fits", "c.fits"]).await;
+        std::fs::remove_file(&h.sources[1]).unwrap();
+        let app = build_router(Arc::clone(&h.state), None);
+
+        let v = body_json(
+            post_json(&app, "/api/transfers/send-to", send_to_body(h.row_id, "obs-b", false)).await,
+        )
+        .await;
+        assert_eq!(
+            (v["sent"].as_u64(), v["skipped"].as_u64()),
+            (Some(2), Some(1)),
+            "the confirm dialog's `sends 2 of 3 (1 deleted locally)`"
+        );
+
+        let v = body_json(
+            post_json(&app, "/api/transfers/send-to", send_to_body(h.row_id, "obs-b", true)).await,
+        )
+        .await;
+        assert_eq!((v["sent"].as_u64(), v["skipped"].as_u64()), (Some(2), Some(1)));
+        let new_row = h
+            .state
+            .store
+            .get_outbound(v["newId"].as_i64().unwrap())
+            .unwrap()
+            .unwrap();
+        let new_dir = PathBuf::from(&new_row.package_ref);
+        assert_eq!(read_manifest(&new_dir).unwrap().len(), 2);
+        assert!(!new_dir.join("b.fits").exists());
+        assert_eq!(
+            read_manifest(&h.pkg).unwrap().len(),
+            3,
+            "the source batch still records the full delivery"
+        );
+    }
+
+    /// Every source gone → `409` on BOTH steps, with the same sentence: there is
+    /// nothing left to send, and nothing was built.
+    #[tokio::test]
+    async fn send_to_with_every_source_deleted_is_409() {
+        let h = send_to_harness(&["a.fits", "b.fits"]).await;
+        for src in &h.sources {
+            std::fs::remove_file(src).unwrap();
+        }
+        let app = build_router(Arc::clone(&h.state), None);
+
+        for confirm in [false, true] {
+            let res = post_json(
+                &app,
+                "/api/transfers/send-to",
+                send_to_body(h.row_id, "obs-b", confirm),
+            )
+            .await;
+            assert_eq!(res.status(), StatusCode::CONFLICT, "confirm={confirm}");
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&body),
+                "all source files deleted locally",
+                "confirm={confirm}"
+            );
+        }
+        assert_eq!(
+            h.state.store.all_outbound(u32::MAX).unwrap().len(),
+            1,
+            "nothing was minted"
+        );
+    }
+
+    /// The request's two ways of naming something that is not there: an unknown
+    /// row id is a `404`, and a device with no engine on THIS node — every
+    /// account device that is not a configured, running target — is a `400` that
+    /// says where to fix it. Neither builds anything.
+    #[tokio::test]
+    async fn send_to_refuses_an_unknown_row_and_a_target_without_an_engine() {
+        let h = send_to_harness(&["a.fits"]).await;
+        let app = build_router(Arc::clone(&h.state), None);
+
+        let res = post_json(
+            &app,
+            "/api/transfers/send-to",
+            send_to_body(h.row_id + 4242, "obs-b", true),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let res = post_json(
+            &app,
+            "/api/transfers/send-to",
+            send_to_body(h.row_id, "obs-elsewhere", true),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("Settings → Send Targets"),
+            "the 400 says how to make that device sendable"
+        );
+        assert_eq!(h.state.store.all_outbound(u32::MAX).unwrap().len(), 1);
+        assert!(h.cap.join("a.fits").exists(), "sources are never touched");
+    }
+
+    /// A still-running transfer is not history yet: its package dir is being
+    /// served and its own terminal can free the payload mid-copy, so the send is
+    /// refused (`409`) until it settles.
+    #[tokio::test]
+    async fn send_to_refuses_a_source_transfer_that_is_still_in_flight() {
+        let h = send_to_harness(&["a.fits"]).await;
+        h.state
+            .store
+            .set_state(h.row_id, OutboundState::Transferring)
+            .unwrap();
+        let app = build_router(Arc::clone(&h.state), None);
+        let res = post_json(
+            &app,
+            "/api/transfers/send-to",
+            send_to_body(h.row_id, "obs-b", true),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        assert_eq!(h.state.store.all_outbound(u32::MAX).unwrap().len(), 1);
+    }
+
+    /// A detached node has nothing to send through: `503`, the same answer every
+    /// other engine-dependent write route gives mid-setup.
+    #[tokio::test]
+    async fn send_to_while_detached_is_503() {
+        let (state, _tmp, _cap) = library_test_state().await;
+        let id = state.store.enqueue("pkg-x", PEER, None, &[]).unwrap();
+        state.store.confirm(id, &[]).unwrap();
+        let app = build_router(state, None);
+        let res = post_json(&app, "/api/transfers/send-to", send_to_body(id, "obs-b", false)).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
