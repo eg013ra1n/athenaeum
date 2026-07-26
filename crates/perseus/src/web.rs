@@ -1496,11 +1496,19 @@ async fn api_put_upload_limit(
 struct PendingDto {
     /// The pending accumulator grouped into a `rel_path` trie (see [`pending_tree`]).
     tree: PendingNode,
-    /// The current send mode (`auto` | `manual`) — the same snake_case string the
-    /// TOML uses ([`crate::config_edit::mode_str`]).
+    /// The current send mode (`auto` | `scheduled` | `manual`) — the same
+    /// snake_case string the TOML uses ([`crate::config_edit::mode_str`]).
     mode: String,
-    /// The auto-mode quiet window in seconds (inert in manual mode).
+    /// The auto-mode quiet window in seconds (inert in the other two modes).
     auto_quiet_secs: u64,
+    /// The scheduled-mode send times, normalised `HH:MM` (see
+    /// [`schedule_times_wire`]). Carried here as well as on `/api/send-mode` so
+    /// the page renders the whole To-Sync strip — mode, quiet window, schedule —
+    /// off the single 2 s poll, and can never PUT a schedule it never read.
+    schedule_times: Vec<String>,
+    /// Whether a schedule point missed while the agent was down fires once at
+    /// startup.
+    schedule_catchup: bool,
     /// Total pending files — the batcher's accumulator length, i.e. the "N
     /// pending" the manual "send now" button acts on.
     count: usize,
@@ -1513,16 +1521,46 @@ struct PendingDto {
 struct SendModeDto {
     mode: String,
     auto_quiet_secs: u64,
+    /// Normalised `HH:MM` schedule points (see [`schedule_times_wire`]). Empty
+    /// in any mode with no times configured — the wire never reports a schedule
+    /// the batcher would not act on.
+    schedule_times: Vec<String>,
+    schedule_catchup: bool,
 }
 
 /// `PUT /api/send-mode` request body. `mode` is a free string (not the [`Mode`]
 /// enum) so an unknown value is a clean `400` from the handler rather than a
 /// `422` deserialization error from the extractor.
+///
+/// The two schedule fields are `Option` and **absent means "leave it alone"**,
+/// not "clear it": a client that predates the scheduler (a browser tab loaded
+/// before this build, which still PUTs `{mode, autoQuietSecs}`) must not erase
+/// an operator's send times as a side effect of flipping the mode. Sending
+/// `scheduleTimes: []` explicitly IS a clear — and then the validator refuses it
+/// if the mode is `scheduled`.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SendModeEdit {
     mode: String,
     auto_quiet_secs: u64,
+    #[serde(default)]
+    schedule_times: Option<Vec<String>>,
+    #[serde(default)]
+    schedule_catchup: Option<bool>,
+}
+
+/// The wire form of a [`SendCfg`]'s schedule points: zero-padded `HH:MM`, in the
+/// canonical (sorted, deduped) order [`crate::schedule::parse_points`] produced.
+///
+/// Rendering from the parsed points rather than the raw `schedule_times` strings
+/// is deliberate — the page shows what the scheduler will actually do, so an
+/// operator who hand-edited `["14:30", "6:00", "6:00"]` into the file reads back
+/// the two points that exist, in the order they fire.
+fn schedule_times_wire(send: &SendCfg) -> Vec<String> {
+    send.schedule_times
+        .iter()
+        .map(|(h, m)| format!("{h:02}:{m:02}"))
+        .collect()
 }
 
 /// `POST /api/send-now` response: how many pending files the manual flush carried
@@ -1535,9 +1573,16 @@ struct SendNowDto {
 
 /// Parse a wire `mode` string into a [`Mode`]. `None` for any unknown value — the
 /// handler maps that to a `400`.
+///
+/// The strings are exactly [`crate::config_edit::mode_str`]'s, so a value read
+/// out of a `GET` can always be PUT back unchanged. `scheduled` was deliberately
+/// absent until this task: T12 taught the *config* about the mode while the web
+/// edit path could not yet carry its times, and accepting the mode without them
+/// would have written a file the validator rejects.
 fn parse_mode(s: &str) -> Option<Mode> {
     match s {
         "auto" => Some(Mode::Auto),
+        "scheduled" => Some(Mode::Scheduled),
         "manual" => Some(Mode::Manual),
         _ => None,
     }
@@ -2311,27 +2356,40 @@ async fn api_get_pending(State(state): State<Arc<WebState>>) -> Json<PendingDto>
         tree,
         mode: crate::config_edit::mode_str(send.mode).to_string(),
         auto_quiet_secs: send.auto_quiet_secs,
+        schedule_times: schedule_times_wire(&send),
+        schedule_catchup: send.schedule_catchup,
         count,
     })
 }
 
-/// `GET /api/send-mode` — the current send mode + auto quiet window. Read-only.
+/// `GET /api/send-mode` — the current send mode, auto quiet window and schedule.
+/// Read-only.
 async fn api_get_send_mode(State(state): State<Arc<WebState>>) -> Json<SendModeDto> {
     let send = state.config.read().await.send_cfg();
     Json(SendModeDto {
         mode: crate::config_edit::mode_str(send.mode).to_string(),
         auto_quiet_secs: send.auto_quiet_secs,
+        schedule_times: schedule_times_wire(&send),
+        schedule_catchup: send.schedule_catchup,
     })
 }
 
-/// `PUT /api/send-mode` — flip Auto↔Manual (and/or change the quiet window),
-/// **live**. An unknown `mode` string is a `400` before anything is touched.
-/// Otherwise [`apply_send_mode_edit`] rewrites `perseus.toml` (comment-preserving,
-/// re-validated, atomic — a rejected edit leaves the file byte-identical and
-/// returns `422`), the live config is swapped, and the new [`SendCfg`] is pushed
-/// onto the batcher's `send_cfg_tx` so the running batcher adopts it on its next
-/// select! turn — no restart. The supervisor is woken so its config view refreshes
-/// at once. Returns the applied `{mode, autoQuietSecs}`.
+/// `PUT /api/send-mode` — switch between Auto / Scheduled / Manual (and/or change
+/// the quiet window or the schedule), **live**. An unknown `mode` string is a
+/// `400` before anything is touched. Otherwise [`apply_send_mode_edit`] rewrites
+/// `perseus.toml` (comment-preserving, re-validated, atomic — a rejected edit
+/// leaves the file byte-identical and returns `422`), the live config is swapped,
+/// and the new [`SendCfg`] is pushed onto the batcher's `send_cfg_tx` so the
+/// running batcher adopts it on its next select! turn — no restart. The
+/// supervisor is woken so its config view refreshes at once. Returns the applied
+/// `{mode, autoQuietSecs, scheduleTimes, scheduleCatchup}`.
+///
+/// Mode and schedule travel into **one** file edit: `scheduled` with no times is
+/// a validation error, so switching to it and supplying its times must be a
+/// single validated document or the legitimate switch would be impossible (see
+/// [`apply_send_mode_edit`]). A `scheduled` PUT that brings no usable time is
+/// therefore a `422` carrying the validator's own actionable message, with the
+/// file untouched — never a half-applied mode.
 async fn api_put_send_mode(
     State(state): State<Arc<WebState>>,
     Json(edit): Json<SendModeEdit>,
@@ -2343,23 +2401,32 @@ async fn api_put_send_mode(
             format!("unknown send mode: {}", edit.mode),
         )
     })?;
-    let new_cfg =
-        apply_send_mode_edit(&state.config_path, mode, edit.auto_quiet_secs).map_err(|e| {
-            let msg = format!("{e:#}");
-            tracing::error!(error = %msg, "web send-mode edit rejected");
-            (StatusCode::UNPROCESSABLE_ENTITY, msg)
-        })?;
+    let new_cfg = apply_send_mode_edit(
+        &state.config_path,
+        mode,
+        edit.auto_quiet_secs,
+        edit.schedule_times.as_deref(),
+        edit.schedule_catchup,
+    )
+    .map_err(|e| {
+        let msg = format!("{e:#}");
+        tracing::error!(error = %msg, "web send-mode edit rejected");
+        (StatusCode::UNPROCESSABLE_ENTITY, msg)
+    })?;
     let send = new_cfg.send_cfg();
     *state.config.write().await = new_cfg;
     // Live-apply: push the new send config onto the running batcher's watch
     // channel (a no-op send when detached — no receiver). This is what makes the
-    // Auto↔Manual / quiet-window change take effect with no engine restart.
+    // mode / quiet-window / schedule change take effect with no engine restart —
+    // the batcher re-arms its schedule timer on every config change (T13).
     let _ = state.send_cfg_tx.read().await.send(send.clone());
     // Wake the supervisor so its per-pass config view refreshes immediately.
     state.supervisor_wake.notify_one();
     Ok(Json(SendModeDto {
         mode: crate::config_edit::mode_str(send.mode).to_string(),
         auto_quiet_secs: send.auto_quiet_secs,
+        schedule_times: schedule_times_wire(&send),
+        schedule_catchup: send.schedule_catchup,
     }))
 }
 
@@ -4045,6 +4112,110 @@ mod tests {
         assert!(
             parsed > chrono::Local::now(),
             "the next send is ahead of now"
+        );
+    }
+
+    /// 0.5.1 T14: the status header's "Next scheduled send" follows a **live**
+    /// send-mode edit — no restart. This is the whole page-level claim of the
+    /// scheduler UI: the operator flips to On schedule, adds a time, and the
+    /// header updates on the next 2 s poll because `/api/status` recomputes the
+    /// deadline from the config the PUT just swapped in.
+    #[tokio::test]
+    async fn status_next_scheduled_send_follows_a_live_send_mode_edit() {
+        let (state, _tmp) = test_state().await; // sample config: mode = "auto"
+        let app = build_router(state, None);
+        let status = |app: axum::Router| async move {
+            body_json(
+                app.oneshot(
+                    HttpRequest::builder()
+                        .uri("/api/status")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await
+        };
+        let put = |body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    HttpRequest::builder()
+                        .method("PUT")
+                        .uri("/api/send-mode")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Auto: nothing armed, so the header line is absent.
+        assert!(status(app.clone()).await["nextScheduledSend"].is_null());
+
+        // Flip to On schedule with one time.
+        let res = put(serde_json::json!({
+            "mode": "scheduled", "autoQuietSecs": 30,
+            "scheduleTimes": ["06:00"], "scheduleCatchup": true,
+        }))
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let next = status(app.clone()).await["nextScheduledSend"]
+            .as_str()
+            .expect("a schedule saved through the web edit arms a deadline")
+            .to_string();
+        assert!(
+            next.contains("T06:00:00"),
+            "the armed deadline is the time just saved, got {next}"
+        );
+
+        // Add a second point: the deadline re-derives from the NEW schedule, so it
+        // is always one of the configured points and always ahead of now — never a
+        // stamp left over from the schedule that was just replaced.
+        //
+        // Deliberately NOT asserted here: that the deadline moved earlier. The two
+        // stamps come from two independently-timed `/api/status` calls, so a clock
+        // that crosses a point between them would flip the comparison — a real
+        // flake for a claim that is pure arithmetic, already pinned by
+        // `schedule::next_fire`'s own unit tests.
+        let res = put(serde_json::json!({
+            "mode": "scheduled", "autoQuietSecs": 30,
+            "scheduleTimes": ["06:00", "05:00"], "scheduleCatchup": true,
+        }))
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let two = status(app.clone()).await["nextScheduledSend"]
+            .as_str()
+            .expect("still armed")
+            .to_string();
+        assert!(
+            two.contains("T05:00:00") || two.contains("T06:00:00"),
+            "the deadline is one of the two configured points, got {two}"
+        );
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&two).unwrap() > chrono::Local::now(),
+            "and it is ahead of now, got {two}"
+        );
+
+        // Back to Manual: the line disappears — the header never advertises a
+        // send the batcher will not make.
+        let res = put(serde_json::json!({ "mode": "manual", "autoQuietSecs": 30 })).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            status(app.clone()).await["nextScheduledSend"].is_null(),
+            "manual mode arms nothing, even though the times are still in the file"
+        );
+
+        // …and the times ARE still in the file, so switching back re-arms without
+        // the operator retyping them.
+        let res = put(serde_json::json!({ "mode": "scheduled", "autoQuietSecs": 30 })).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            status(app).await["nextScheduledSend"].is_string(),
+            "the preserved schedule re-arms on the way back"
         );
     }
 
@@ -6298,6 +6469,205 @@ mod tests {
         // A follow-up GET reflects the adopted cap.
         let v = body_json(get(&app, "/api/upload-limit").await).await;
         assert_eq!(v["maxUploadMbps"], 8);
+    }
+
+    /// 0.5.1 T14 (the brief's RED test): a `scheduled` PUT that carries its own
+    /// times round-trips — through the wire echo, the on-disk file, the live
+    /// `SendCfg` channel, and a follow-up `GET`. Times normalise on the way out:
+    /// zero-padded, sorted, deduped.
+    #[tokio::test]
+    async fn put_send_mode_scheduled_with_times_roundtrips() {
+        let (state, _tmp) = test_state().await; // sample config: mode = "auto"
+        let mut rx = state.send_cfg_tx.read().await.subscribe();
+        let config_path = state.config_path.clone();
+        let app = build_router(state, None);
+
+        // GET on an auto config reports an empty schedule and catch-up ON.
+        let v = body_json(get(&app, "/api/send-mode").await).await;
+        assert_eq!(v["mode"], "auto");
+        assert_eq!(v["scheduleTimes"], serde_json::json!([]));
+        assert_eq!(v["scheduleCatchup"], true, "catch-up defaults ON");
+
+        let body = serde_json::json!({
+            "mode": "scheduled",
+            "autoQuietSecs": 30,
+            // Deliberately unsorted, unpadded and duplicated.
+            "scheduleTimes": ["14:30", "6:00", "06:00"],
+            "scheduleCatchup": false,
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/send-mode")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["mode"], "scheduled", "the PUT echoes the applied mode");
+        assert_eq!(
+            v["scheduleTimes"],
+            serde_json::json!(["06:00", "14:30"]),
+            "the echo is normalised: padded, sorted, deduped"
+        );
+        assert_eq!(v["scheduleCatchup"], false);
+
+        // The live-apply reached the batcher's send-config channel.
+        let live = rx.borrow_and_update().clone();
+        assert_eq!(live.mode, Mode::Scheduled);
+        assert_eq!(live.schedule_times, vec![(6, 0), (14, 30)]);
+        assert!(!live.schedule_catchup);
+
+        // The on-disk config carries the scheduled mode + its times.
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded = Config::from_toml_str(&text).unwrap();
+        assert_eq!(reloaded.mode, Mode::Scheduled, "written to disk: {text}");
+        assert_eq!(
+            reloaded.schedule_times,
+            vec!["06:00".to_string(), "14:30".to_string()]
+        );
+        assert!(!reloaded.schedule_catchup);
+
+        // A follow-up GET reflects it, and so does the pending poll that drives
+        // the To-Sync card (the page renders the whole strip off one fetch).
+        let v = body_json(get(&app, "/api/send-mode").await).await;
+        assert_eq!(v["mode"], "scheduled");
+        assert_eq!(v["scheduleTimes"], serde_json::json!(["06:00", "14:30"]));
+        let p = body_json(get(&app, "/api/pending").await).await;
+        assert_eq!(p["mode"], "scheduled");
+        assert_eq!(p["scheduleTimes"], serde_json::json!(["06:00", "14:30"]));
+        assert_eq!(p["scheduleCatchup"], false);
+    }
+
+    /// A `scheduled` PUT with **no** times is a `422` carrying the validator's
+    /// actionable message, and the config is left byte-identical — the mode is
+    /// never written on its own into a state the validator rejects.
+    #[tokio::test]
+    async fn put_send_mode_scheduled_without_times_is_422_and_file_untouched() {
+        let (state, _tmp) = test_state().await;
+        let config_path = state.config_path.clone();
+        let before = std::fs::read_to_string(&config_path).unwrap();
+        let app = build_router(state, None);
+
+        let body = serde_json::json!({
+            "mode": "scheduled",
+            "autoQuietSecs": 30,
+            "scheduleTimes": [],
+            "scheduleCatchup": true,
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/send-mode")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let msg = String::from_utf8(
+            axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(
+            msg.contains("at least one send time"),
+            "the operator gets the validator's actionable message: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            before,
+            "a rejected scheduled edit leaves the config byte-identical"
+        );
+
+        // A malformed time is refused the same way, naming the entry.
+        let body = serde_json::json!({
+            "mode": "scheduled", "autoQuietSecs": 30, "scheduleTimes": ["6h30"],
+        });
+        let res = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("PUT")
+                    .uri("/api/send-mode")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), before);
+    }
+
+    /// A schedule-blind PUT (`{mode, autoQuietSecs}` only — the shape a stale
+    /// browser tab loaded before this task still sends) flips the mode and leaves
+    /// the operator's `schedule_times` / `schedule_catchup` intact. Auto/manual
+    /// behaviour is otherwise unchanged.
+    #[tokio::test]
+    async fn put_send_mode_without_schedule_fields_preserves_them() {
+        let (state, _tmp) = test_state().await;
+        let config_path = state.config_path.clone();
+        let app = build_router(state, None);
+
+        let put = |body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    HttpRequest::builder()
+                        .method("PUT")
+                        .uri("/api/send-mode")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Seed a real schedule.
+        let res = put(serde_json::json!({
+            "mode": "scheduled", "autoQuietSecs": 30,
+            "scheduleTimes": ["06:00"], "scheduleCatchup": false,
+        }))
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // The old wire shape: mode + quiet only.
+        let res = put(serde_json::json!({ "mode": "manual", "autoQuietSecs": 45 })).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["mode"], "manual");
+        assert_eq!(v["autoQuietSecs"], 45);
+        assert_eq!(
+            v["scheduleTimes"],
+            serde_json::json!(["06:00"]),
+            "the times are still there — a schedule-blind edit never erases them"
+        );
+        assert_eq!(v["scheduleCatchup"], false);
+
+        let reloaded = Config::from_toml_str(&std::fs::read_to_string(&config_path).unwrap())
+            .expect("still parses");
+        assert_eq!(reloaded.mode, Mode::Manual);
+        assert_eq!(reloaded.schedule_times, vec!["06:00".to_string()]);
+        assert!(!reloaded.schedule_catchup);
+
+        // …and back to auto, still non-destructive.
+        let res = put(serde_json::json!({ "mode": "auto", "autoQuietSecs": 20 })).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["mode"], "auto");
+        assert_eq!(v["scheduleTimes"], serde_json::json!(["06:00"]));
     }
 
     /// An unknown `mode` string is a clean `400` (not a `422` extractor error nor

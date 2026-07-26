@@ -271,20 +271,41 @@ pub fn apply_device_name_edit(config_path: &Path, name: &str) -> Result<Config> 
     Ok(cfg)
 }
 
-/// Rewrite the top-level send `mode` + `auto_quiet_secs` keys in `config_path`,
-/// preserving all comments/layout ([`toml_edit`]), then re-parse + validate the
-/// whole file and atomically replace it. Returns the freshly re-validated
-/// [`Config`] so the caller can publish the new [`crate::config::SendCfg`] onto
-/// the batcher's live `watch` channel (Task 4) — this edit applies live, no
-/// engine restart.
+/// Rewrite the top-level send `mode` + `auto_quiet_secs` keys in `config_path`
+/// — and, when the caller supplies them, the [`Mode::Scheduled`] knobs
+/// `schedule_times` + `schedule_catchup` — preserving all comments/layout
+/// ([`toml_edit`]), then re-parse + validate the whole file and atomically
+/// replace it. Returns the freshly re-validated [`Config`] so the caller can
+/// publish the new [`crate::config::SendCfg`] onto the batcher's live `watch`
+/// channel (Task 4) — this edit applies live, no engine restart.
 ///
-/// Both keys are written at the document root. Edit-on-copy,
-/// write-after-validate: on **any** error the file is left byte-identical, with
-/// no partial or orphaned tmp file.
+/// **Mode and times are written in ONE edit** (0.5.1 T14). That is not a
+/// convenience: `mode = "scheduled"` with an empty `schedule_times` is a
+/// validation error, so a two-step "write the mode, then write the times" would
+/// have to either refuse a legitimate switch-with-times or leave the file in a
+/// state the validator rejects. One document, one validate, one atomic write —
+/// so a `scheduled` edit that brings its own times succeeds, and one that brings
+/// none is refused as a whole with the validator's own actionable message.
+///
+/// `schedule_times = None` / `schedule_catchup = None` mean **leave that key
+/// exactly as it is** — a page (or a stale browser tab) that only knows about
+/// mode + quiet window must never silently erase an operator's schedule.
+/// `Some(&[])` is an explicit "clear the times", which the validator then
+/// refuses if the mode is `scheduled`.
+///
+/// Supplied times are written **canonically** (zero-padded `HH:MM`, sorted,
+/// deduped) when every entry parses; if any entry does not, the list is written
+/// verbatim so the shared validator — not this function — produces the rejection
+/// message naming the offending entry.
+///
+/// Edit-on-copy, write-after-validate: on **any** error the file is left
+/// byte-identical, with no partial or orphaned tmp file.
 pub fn apply_send_mode_edit(
     config_path: &Path,
     mode: Mode,
     auto_quiet_secs: u64,
+    schedule_times: Option<&[String]>,
+    schedule_catchup: Option<bool>,
 ) -> Result<Config> {
     let original = std::fs::read_to_string(config_path)
         .with_context(|| format!("read {}", config_path.display()))?;
@@ -294,6 +315,14 @@ pub fn apply_send_mode_edit(
 
     doc["mode"] = toml_edit::value(mode_str(mode));
     doc["auto_quiet_secs"] = toml_edit::value(auto_quiet_secs as i64);
+    if let Some(times) = schedule_times {
+        let written = canonical_schedule_times(times);
+        let array: toml_edit::Array = written.iter().map(|t| t.as_str()).collect();
+        doc["schedule_times"] = toml_edit::value(array);
+    }
+    if let Some(catchup) = schedule_catchup {
+        doc["schedule_catchup"] = toml_edit::value(catchup);
+    }
 
     let candidate = doc.to_string();
     // Re-validate the whole edited document at the PARSE-VALID tier (see the
@@ -315,9 +344,31 @@ pub fn apply_send_mode_edit(
     tracing::info!(
         mode = mode_str(mode),
         auto_quiet_secs,
+        schedule_points = schedule_times.map(<[String]>::len),
+        schedule_catchup,
         "send mode edited via web"
     );
     Ok(cfg)
+}
+
+/// The `HH:MM` strings [`apply_send_mode_edit`] writes for a supplied schedule:
+/// canonical (zero-padded, sorted, deduped) when **every** entry parses, and the
+/// caller's list verbatim otherwise.
+///
+/// The verbatim fallback is deliberate. Normalising a partly-broken list would
+/// mean this function inventing its own error for the bad entry, competing with
+/// — and drifting from — the one [`Config::validate_structure`] already emits.
+/// Writing it through unchanged keeps a single source of that message, and the
+/// candidate is still only a validated in-memory document at this point, so the
+/// bad list never reaches disk.
+fn canonical_schedule_times(times: &[String]) -> Vec<String> {
+    match crate::schedule::parse_points(times) {
+        Ok(points) => points
+            .iter()
+            .map(|(h, m)| format!("{h:02}:{m:02}"))
+            .collect(),
+        Err(_) => times.to_vec(),
+    }
 }
 
 /// Rewrite the top-level `max_upload_mbps` key in `config_path`, preserving all
@@ -620,7 +671,7 @@ i_have_verified_the_soak = false
     fn apply_send_mode_edit_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_min_config(dir.path());
-        let cfg = apply_send_mode_edit(&path, Mode::Manual, 30).unwrap();
+        let cfg = apply_send_mode_edit(&path, Mode::Manual, 30, None, None).unwrap();
         assert_eq!(cfg.mode, Mode::Manual);
         assert_eq!(cfg.auto_quiet_secs, 30);
         let reloaded = Config::load_lenient(&path).unwrap();
@@ -634,7 +685,7 @@ i_have_verified_the_soak = false
     fn apply_send_mode_edit_preserves_comments() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_min_config(dir.path());
-        apply_send_mode_edit(&path, Mode::Manual, 45).unwrap();
+        apply_send_mode_edit(&path, Mode::Manual, 45, None, None).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# top comment"), "top comment preserved: {text}");
         assert!(text.contains("device_name = \"old-name\""), "unrelated key preserved");
@@ -682,6 +733,102 @@ i_have_verified_the_soak = false
             !p.with_extension("toml.tmp").exists(),
             "no orphan tmp file after a successful edit"
         );
+        assert!(
+            !text.contains("schedule_times"),
+            "an edit that passes no schedule must not invent the key: {text}"
+        );
+    }
+
+    /// 0.5.1 T14 (the brief's RED test): mode + times land in ONE edit, so a
+    /// `scheduled` switch that brings its own times validates as a single
+    /// document — never as a transient `scheduled`-with-no-times file that the
+    /// validator would refuse. The written times are canonical: zero-padded,
+    /// sorted, deduped.
+    #[test]
+    fn apply_send_mode_edit_writes_scheduled_mode_and_times_in_one_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+        let times: Vec<String> = vec!["14:30".into(), "6:00".into(), "06:00".into()];
+        let cfg =
+            apply_send_mode_edit(&path, Mode::Scheduled, 30, Some(&times), Some(false)).unwrap();
+        assert_eq!(cfg.mode, Mode::Scheduled);
+        assert_eq!(cfg.send_cfg().schedule_times, vec![(6, 0), (14, 30)]);
+        assert!(!cfg.schedule_catchup);
+
+        let reloaded = Config::load_lenient(&path).unwrap();
+        assert_eq!(reloaded.mode, Mode::Scheduled);
+        assert_eq!(
+            reloaded.schedule_times,
+            vec!["06:00".to_string(), "14:30".to_string()],
+            "written canonical: padded, sorted, deduped"
+        );
+        assert!(!reloaded.schedule_catchup);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# top comment"), "comments preserved: {text}");
+    }
+
+    /// `scheduled` with no times is refused by the shared validator, and the
+    /// refusal leaves the file **byte-identical** — the edit is applied to an
+    /// in-memory copy and only written after validation passes.
+    #[test]
+    fn apply_send_mode_edit_scheduled_without_times_leaves_file_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = apply_send_mode_edit(&path, Mode::Scheduled, 30, Some(&[]), None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("at least one send time"),
+            "the validator's actionable message reaches the caller: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a rejected edit leaves the file byte-identical"
+        );
+        assert!(
+            !path.with_extension("toml.tmp").exists(),
+            "no orphan tmp after a rejected edit"
+        );
+    }
+
+    /// An unparseable time is written verbatim so the SHARED validator (not this
+    /// function) produces the message — and the rejection still leaves the file
+    /// byte-identical.
+    #[test]
+    fn apply_send_mode_edit_rejects_a_malformed_time_without_touching_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let times: Vec<String> = vec!["06:00".into(), "6h30".into()];
+        let err = apply_send_mode_edit(&path, Mode::Scheduled, 30, Some(&times), None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("6h30"),
+            "the offending entry is named: {err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    /// `None` means "leave this key alone": a plain auto/manual edit from a page
+    /// that never knew about the scheduler must not erase an operator's times.
+    #[test]
+    fn apply_send_mode_edit_none_schedule_preserves_existing_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+        let times: Vec<String> = vec!["06:00".into()];
+        apply_send_mode_edit(&path, Mode::Scheduled, 30, Some(&times), Some(false)).unwrap();
+
+        // A schedule-blind edit: mode + quiet only.
+        let cfg = apply_send_mode_edit(&path, Mode::Manual, 45, None, None).unwrap();
+        assert_eq!(cfg.mode, Mode::Manual);
+        assert_eq!(
+            cfg.schedule_times,
+            vec!["06:00".to_string()],
+            "the times survive a schedule-blind edit"
+        );
+        assert!(!cfg.schedule_catchup, "so does the catch-up flag");
     }
 
     /// Clearing the cap back to `0` (unlimited) is a normal edit, not a removal —

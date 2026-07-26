@@ -124,9 +124,25 @@ ul.log { list-style: none; margin: 0; padding: 0; max-height: 14rem; overflow-y:
 /* ── To Sync strip (Transfers tab) ── */
 .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 .seg label { flex-direction: row; align-items: center; gap: 0.3rem; padding: 0.3rem 0.6rem; color: var(--content); cursor: pointer; }
-.seg label:first-child { border-right: 1px solid var(--border); }
+/* Every segment but the last carries the divider. `:first-child` was enough while
+   the control was two-way; the T14 three-way mode would have left the middle
+   segment fused to the last one. */
+.seg label:not(:last-child) { border-right: 1px solid var(--border); }
 .inline-label { flex-direction: row; align-items: center; gap: 0.4rem; color: var(--content-muted); }
 .qty { width: 6rem; }
+/* Scheduled-mode editor (0.5.1 T14): the send-time chips + the add row. Shown by
+   updateModeVisibility(), which sets `display` inline — hence no display here. */
+.sched-wrap { border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem 0.75rem; margin-bottom: 0.5rem; }
+.sched-wrap > .muted { font-size: 0.82rem; margin-bottom: 0.5rem; }
+.sched-list { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-bottom: 0.6rem; }
+.sched-list .empty { padding: 0.15rem 0; }
+/* Same removable-chip shape as a send target, kept as its own selector so the two
+   lists can diverge without one silently restyling the other. */
+.chip.sched-time { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--accent); padding: 0.15rem 0.3rem 0.15rem 0.6rem; font-variant-numeric: tabular-nums; }
+.chip.sched-time .chipx { background: transparent; border: 0; color: inherit; font-size: 0.95rem; line-height: 1; padding: 0 0.15rem; cursor: pointer; border-radius: 6px; }
+.chip.sched-time .chipx:hover { background: var(--surface-hover); }
+/* The armed scheduled send, in the page header beside the free-space chips. */
+.next-send { white-space: nowrap; font-variant-numeric: tabular-nums; }
 /* The pending counter doubles as the tree toggle (collapsed by default). */
 .counter { background: var(--surface-hover); color: var(--content); border: 1px solid var(--border); border-radius: 6px; padding: 0.3rem 0.7rem; cursor: pointer; font-size: 0.85rem; }
 .counter[aria-expanded="true"] { color: var(--accent); }

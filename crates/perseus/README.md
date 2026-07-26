@@ -60,7 +60,9 @@ capture_dir = "/data/capture"            # directory your capture app writes to
 # capture_dirs = ["/data/cam1", "/data/cam2"]  # …or watch several (see note below)
 data_dir = "/var/lib/perseus"            # SQLite store + blob store + device key + logs
 pairing_ticket = "<paste from primary>"  # primary → Settings → Sync (dev)
-mode = "auto"                            # only value in the MVP
+mode = "auto"                            # auto | scheduled | manual (editable on the web page)
+# schedule_times = ["06:00", "14:30"]    # scheduled: local wall-clock send times (>=1 required)
+# schedule_catchup = true                # scheduled: catch up ONE missed send at startup
 
 # Local status page (optional; top-level keys — must precede any table):
 # web_bind  = "127.0.0.1:8686"           # bind address (default); "" disables the page

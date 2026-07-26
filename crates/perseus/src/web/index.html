@@ -15,6 +15,11 @@
       <!-- Free space per capture/data volume, filled by refreshStatus() from
            /api/status `volumes`. Empty while offline or unprobeable. -->
       <span class="vol-chips" id="volChips" aria-label="Free disk space"></span>
+      <!-- The armed scheduled send (0.5.1 T14), from /api/status
+           `nextScheduledSend`. Present ONLY in scheduled mode with a live
+           deadline — hidden in every other case, so it can never show a stale
+           or invented time. -->
+      <span class="sub next-send" id="nextSend" hidden></span>
       <nav class="tabs" role="tablist" aria-label="Perseus sections">
         <button class="tab active" id="tabBtnTransfers" data-tab="transfers" role="tab">Transfers</button>
         <button class="tab" id="tabBtnLibrary" data-tab="library" role="tab">Library</button>

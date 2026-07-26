@@ -101,9 +101,11 @@ function wireTabs() {
 // ── section markup (rendered into the empty <main> panels on boot) ───────────
 function renderTransfersTab() {
   // The "To sync" strip: the pending accumulator as a rel_path tree (collapsed
-  // by default, expanded by clicking the counter), the live Auto↔Manual toggle,
-  // the auto quiet-window input, and the manual "Send N pending" button. Polled
-  // on the 2 s tick; the toggle/quiet input are not clobbered while focused.
+  // by default, expanded by clicking the counter), the live three-way send-mode
+  // control (0.5.1 T14: Immediately / On schedule / Manually), the auto
+  // quiet-window input, the schedule editor, and the "Send N pending now"
+  // button. Polled on the 2 s tick; the controls are not clobbered while the
+  // operator is inside the card or while a save is in flight.
   // Below it, the `#transfers` section holds the unified one-row-per-batch list:
   // filter chips (with live counts), the list body, and the shared bottom detail
   // pane. Its body/chips/pane are re-rendered by refreshTransfers().
@@ -112,8 +114,9 @@ function renderTransfersTab() {
       <h2>To Sync</h2>
       <div class="row" style="margin-bottom:0.5rem;">
         <div class="seg" role="radiogroup" aria-label="Send mode">
-          <label><input type="radio" name="sendMode" id="modeAuto" value="auto" /> Auto</label>
-          <label><input type="radio" name="sendMode" id="modeManual" value="manual" /> Manual</label>
+          <label><input type="radio" name="sendMode" id="modeAuto" value="auto" /> Immediately (quiet window)</label>
+          <label><input type="radio" name="sendMode" id="modeScheduled" value="scheduled" /> On schedule</label>
+          <label><input type="radio" name="sendMode" id="modeManual" value="manual" /> Manually</label>
         </div>
         <label id="quietWrap" class="inline-label">
           quiet window (s)
@@ -123,7 +126,23 @@ function renderTransfersTab() {
           <span id="pendingCaret">&#9656;</span> <span id="pendingCount">0</span> pending
         </button>
         <span class="spacer"></span>
-        <button id="sendNow" disabled>Send 0 pending</button>
+        <button id="sendNow" disabled title="Send everything pending right now. Works in every mode.">Send 0 pending now</button>
+      </div>
+      <!-- Scheduled mode only: the local wall-clock send times + the catch-up
+           opt-in. Revealed by updateModeVisibility(); every mutation saves. -->
+      <div id="schedWrap" class="sched-wrap" style="display:none;">
+        <div class="muted">Sends everything pending at these times, on this device's local clock.</div>
+        <div id="schedList" class="sched-list"></div>
+        <div class="row">
+          <label class="inline-label">add a time
+            <input id="schedAdd" type="time" class="qty" aria-label="New scheduled send time" />
+          </label>
+          <button id="schedAddBtn" class="ghost">Add</button>
+          <span class="spacer"></span>
+          <label class="inline-label">
+            <input id="schedCatchup" type="checkbox" /> Catch up a missed send at startup
+          </label>
+        </div>
       </div>
       <div class="flash" id="tosyncFlash"></div>
       <div id="pendingTree" hidden><div class="empty">nothing pending — all captures sent</div></div>
@@ -180,6 +199,11 @@ function renderSettingsTab() {
 
     <section id="capture-dirs">
       <h2>Capture Directories</h2>
+      <!-- Spec §7's network-share hint. It belongs beside the poll interval, but
+           that knob has no editor on this page (it is file-only), so it is stated
+           here — next to the field that decides WHAT gets polled — naming the key
+           rather than pointing at a control that does not exist. -->
+      <div class="muted target-intro">Watching a network share (SMB/NFS)? Raise <code>poll_interval_secs</code> in <code>perseus.toml</code> to reduce NAS load — the folder is re-listed on every poll.</div>
       <div class="tablewrap"><table>
         <thead><tr><th>directory</th><th></th></tr></thead>
         <tbody id="cdList"></tbody>
@@ -320,6 +344,21 @@ function renderVolumes(vols) {
   }).join('');
 }
 
+// The armed scheduled send, straight off `/api/status`. The server sends a stamp
+// only in scheduled mode with a live deadline, so a missing/unparseable value
+// hides the line rather than guessing — the same rule as the volume chips: no
+// reading is better than one nobody can vouch for.
+function renderNextSend(iso) {
+  const el = $('nextSend');
+  if (!el) return;
+  const t = iso ? Date.parse(iso) : NaN;
+  if (isNaN(t)) { el.textContent = ''; el.hidden = true; return; }
+  // The server sends a local-offset stamp; fmtMtime prints it in the operator's
+  // own zone, so a 06:00 schedule reads back as 06:00.
+  el.textContent = 'Next scheduled send: ' + fmtMtime(t);
+  el.hidden = false;
+}
+
 async function refreshStatus() {
   try {
     const s = await getJson('/api/status');
@@ -327,6 +366,7 @@ async function refreshStatus() {
     $('conn').textContent = 'connected';
     renderAgentBanner(s);
     renderVolumes(s.volumes);
+    renderNextSend(s.nextScheduledSend);
     // The Library tab's roots view rides this same poll (root list + the
     // per-root free-space chip); it never fetches a listing on the tick.
     libOnStatus(s);
@@ -335,6 +375,7 @@ async function refreshStatus() {
     $('conn').textContent = 'offline: ' + e.message;
     // Drop the chips rather than leave a reading nobody can vouch for.
     renderVolumes([]);
+    renderNextSend(null);
     libOnStatus(null);
   }
 }
@@ -746,38 +787,106 @@ function wireRetention() {
   $('saveRet').addEventListener('click', savePolicy);
 }
 
-// ── to sync: pending tree + Auto/Manual toggle + manual send ────────────────
+// ── to sync: pending tree + send-mode control + schedule editor + manual send ─
 // `pendingCount` is the last-fetched total; the Send button label + enabled state
-// derive from it plus the currently-selected mode. `lastPendingJson` guards the
-// tree render so an unchanged pending set doesn't collapse the operator's expanded
-// <details> every 2 s tick. The tree itself is collapsed by default and toggled by
-// clicking the pending counter.
+// derive from it. `lastPendingJson` guards the tree render so an unchanged pending
+// set doesn't collapse the operator's expanded <details> every 2 s tick. The tree
+// itself is collapsed by default and toggled by clicking the pending counter.
+//
+// `scheduleTimes` mirrors the server's normalised `HH:MM` list and is the payload
+// every save PUTs. It is only ever REPLACED by a server response (the poll, or a
+// PUT echo) or by an explicit add/remove — so the page can never invent a schedule,
+// and can never PUT one it has not read. `sendModeSaving` counts PUTs in flight:
+// while one is, the poll must not repaint the card, or a tick landing between the
+// request and its response would visibly revert the operator's edit (and, worse,
+// leave the mutation staged against a stale list).
+// `schedArming` covers the one state that is deliberately NOT saved: the operator
+// has picked "On schedule" on a node with no times yet. That PUT would be a 422
+// (the config refuses `scheduled` with an empty schedule) and the next poll would
+// snap the radio back to Immediately — collapsing the very editor they opened to
+// type a time into. While armed, the page holds the un-saved selection, the poll
+// leaves the card alone, and the first added time carries the mode switch with it.
 let pendingCount = 0;
 let lastPendingJson = null;
+let scheduleTimes = [];
+let sendModeSaving = 0;
+let schedArming = false;
 
-const currentMode = () => ($('modeManual').checked ? 'manual' : 'auto');
+// Which radio is selected. Read from the inputs (not from a remembered variable)
+// so it can never disagree with what the operator sees — and, since T14, it knows
+// all THREE modes: before, `scheduled` read back as `auto`, so simply opening the
+// page on a scheduled node and saving anything silently rewrote the mode.
+const currentMode = () =>
+  ($('modeScheduled').checked ? 'scheduled' : $('modeManual').checked ? 'manual' : 'auto');
 
-function updateQuietVisibility() {
-  // The quiet window is inert in manual mode — only show it for Auto.
-  $('quietWrap').style.display = currentMode() === 'auto' ? '' : 'none';
+// `HH:MM`, tolerating a single-digit hour and a browser that appends seconds
+// (`<input type="time">` yields `HH:MM:SS` when a step is in play). Returns the
+// canonical zero-padded form, or null if it is not a time at all — the same shape
+// the Rust side accepts, so the page never sends what the validator would refuse.
+const HHMM_RE = /^(\d{1,2}):(\d{2})(?::\d{2})?$/;
+function normTime(s) {
+  const m = HHMM_RE.exec(String(s ?? '').trim());
+  if (!m) return null;
+  const h = Number(m[1]), mi = Number(m[2]);
+  if (!(h >= 0 && h <= 23 && mi >= 0 && mi <= 59)) return null;
+  return String(h).padStart(2, '0') + ':' + String(mi).padStart(2, '0');
+}
+// Canonical list: padded, deduped, sorted. Sorting zero-padded `HH:MM` strings
+// lexically IS chronological order, so no date arithmetic is needed. Anything
+// unparseable is dropped rather than carried — the server normalises identically.
+function normalizeTimes(list) {
+  const out = [];
+  (Array.isArray(list) ? list : []).forEach((t) => {
+    const n = normTime(t);
+    if (n && out.indexOf(n) < 0) out.push(n);
+  });
+  out.sort();
+  return out;
+}
+
+function updateModeVisibility() {
+  const mode = currentMode();
+  // The quiet window belongs to Immediately; the schedule editor to On schedule.
+  $('quietWrap').style.display = mode === 'auto' ? '' : 'none';
+  $('schedWrap').style.display = mode === 'scheduled' ? '' : 'none';
 }
 
 function updateSendButton() {
-  const manual = currentMode() === 'manual';
   const btn = $('sendNow');
-  btn.textContent = `Send ${pendingCount} pending`;
-  // Auto flushes on its own quiet timer → the manual button is hidden. In Manual
-  // it is enabled only when there is something to flush.
-  btn.style.display = manual ? '' : 'none';
-  btn.disabled = !(manual && pendingCount > 0);
+  btn.textContent = `Send ${pendingCount} pending now`;
+  // Visible in EVERY mode: `POST /api/send-now` flushes the accumulator whatever
+  // the mode is, so hiding it outside Manual (as the v2 page did) misrepresented
+  // the backend — an operator in Immediately or On schedule can always push what
+  // is waiting without changing their mode.
+  btn.style.display = '';
+  btn.disabled = pendingCount === 0;
 }
 
-function applyModeControls(mode, quietSecs) {
-  $('modeAuto').checked = mode !== 'manual';
+// Paint the schedule points as removable chips. `data-sched-del` carries the
+// canonical time; the delegated handler matches it against `scheduleTimes`, so a
+// value that is not in the list removes nothing.
+function renderScheduleTimes() {
+  const list = $('schedList');
+  if (!list) return;
+  if (!scheduleTimes.length) {
+    list.innerHTML = '<div class="empty">no send times yet — add one below</div>';
+    return;
+  }
+  list.innerHTML = scheduleTimes
+    .map((t) => `<span class="chip sched-time">${esc(t)}<button class="chipx" data-sched-del="${esc(t)}" title="Remove ${esc(t)}" aria-label="Remove ${esc(t)}">&times;</button></span>`)
+    .join('');
+}
+
+function applyModeControls(mode, quietSecs, times, catchup) {
+  $('modeScheduled').checked = mode === 'scheduled';
   $('modeManual').checked = mode === 'manual';
-  // Never clobber the quiet input while the operator is typing in it.
+  $('modeAuto').checked = mode !== 'scheduled' && mode !== 'manual';
+  // Never clobber an input while the operator is typing/toggling in it.
   if (document.activeElement !== $('quietSecs')) $('quietSecs').value = quietSecs;
-  updateQuietVisibility();
+  if (document.activeElement !== $('schedCatchup')) $('schedCatchup').checked = catchup !== false;
+  scheduleTimes = normalizeTimes(times);
+  updateModeVisibility();
+  renderScheduleTimes();
   updateSendButton();
 }
 
@@ -814,27 +923,97 @@ async function refreshPending() {
     const p = await getJson('/api/pending');
     pendingCount = p.count;
     $('pendingCount').textContent = p.count;
-    // Don't clobber the toggle/quiet input while the operator is interacting with
-    // the card; the tree + button label always reflect the live count.
-    if (!$('tosync').contains(document.activeElement)) applyModeControls(p.mode, p.autoQuietSecs);
-    else updateSendButton();
+    // Don't clobber the controls while the operator is interacting with the card,
+    // nor while a save is in flight (a tick landing mid-PUT carries the OLD state
+    // and would visibly undo the edit); the tree + button label always reflect the
+    // live count.
+    if (!sendModeSaving && !schedArming && !$('tosync').contains(document.activeElement)) {
+      applyModeControls(p.mode, p.autoQuietSecs, p.scheduleTimes, p.scheduleCatchup);
+    } else updateSendButton();
     renderPendingTree(p.tree);
   } catch (e) {
     $('pendingTree').innerHTML = `<div class="empty">error: ${esc(e.message)}</div>`;
   }
 }
 
+// The single save path for the whole strip: mode, quiet window, schedule times
+// and the catch-up flag go in ONE PUT, because the server writes them in one
+// validated file edit (`scheduled` with no times is a validation error, so the
+// mode cannot be saved apart from its times). A 400/422 renders the server's own
+// message inline — for a scheduled save with no times that is the validator's
+// actionable "needs at least one send time", and the config on disk is untouched.
 async function saveSendMode() {
-  const edit = { mode: currentMode(), autoQuietSecs: Number($('quietSecs').value) || 0 };
+  const edit = {
+    mode: currentMode(),
+    autoQuietSecs: Number($('quietSecs').value) || 0,
+    scheduleTimes: scheduleTimes.slice(),
+    scheduleCatchup: $('schedCatchup').checked,
+  };
   const f = $('tosyncFlash');
+  // Whatever this save does, the un-saved arming state is over: the request now
+  // carries the operator's intent, and its outcome (or the next poll) is truth.
+  schedArming = false;
+  sendModeSaving++;
   try {
     const r = await api('/api/send-mode', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(edit) });
-    if (r.status === 400 || r.status === 422) { f.textContent = 'rejected: ' + (await r.text()); f.className = 'flash err'; return; }
+    if (r.status === 400 || r.status === 422) {
+      f.textContent = 'rejected: ' + (await r.text()); f.className = 'flash err';
+      // The page is now holding a state the server refused (e.g. the schedule the
+      // operator just emptied, which is still on disk). Re-read the truth instead
+      // of waiting for a tick that the focus guard may never let through — two
+      // out-of-step lists is how the NEXT save silently drops what this rejection
+      // preserved.
+      await resyncSendMode();
+      return;
+    }
     if (!r.ok) throw new Error(await r.text());
     const m = await r.json();
-    applyModeControls(m.mode, m.autoQuietSecs);
+    applyModeControls(m.mode, m.autoQuietSecs, m.scheduleTimes, m.scheduleCatchup);
     f.textContent = 'saved'; f.className = 'flash ok';
+    // The armed deadline moves with the schedule; re-read it now rather than
+    // waiting out the tick, so "Next scheduled send" agrees with what was saved.
+    refreshStatus();
   } catch (e) { f.textContent = 'save failed: ' + e.message; f.className = 'flash err'; }
+  finally { sendModeSaving--; }
+}
+
+// Re-read the send config and repaint the card UNCONDITIONALLY. The focus guard
+// in the poll exists to protect an edit in progress; this runs after an edit has
+// already been decided (and refused), so the guard would only preserve a fiction.
+async function resyncSendMode() {
+  try {
+    const m = await getJson('/api/send-mode');
+    applyModeControls(m.mode, m.autoQuietSecs, m.scheduleTimes, m.scheduleCatchup);
+  } catch (e) {
+    console.error('[tosync] could not re-read the send mode:', e);
+  }
+}
+
+// Add the time in the picker. Rejected client-side only for the two cases the
+// operator can see and fix here (not a time / already listed); everything else is
+// the server's call.
+function schedAddTime() {
+  const f = $('tosyncFlash');
+  const raw = $('schedAdd').value;
+  const t = normTime(raw);
+  if (!t) { f.textContent = 'enter a time as HH:MM'; f.className = 'flash err'; return; }
+  if (scheduleTimes.indexOf(t) >= 0) { f.textContent = t + ' is already scheduled'; f.className = 'flash'; return; }
+  scheduleTimes = normalizeTimes(scheduleTimes.concat([t]));
+  $('schedAdd').value = '';
+  renderScheduleTimes();
+  saveSendMode();
+}
+
+// Remove one point. Saving an EMPTY schedule while in scheduled mode is allowed
+// to reach the server on purpose: it comes back as the validator's 422 with the
+// file untouched, which is a truthful "you must keep at least one" — better than
+// a client-side rule that silently disagrees with the config contract.
+function schedRemoveTime(t) {
+  const before = scheduleTimes.length;
+  scheduleTimes = scheduleTimes.filter((x) => x !== t);
+  if (scheduleTimes.length === before) return;   // nothing matched — no PUT
+  renderScheduleTimes();
+  saveSendMode();
 }
 
 async function sendNow() {
@@ -853,10 +1032,31 @@ async function sendNow() {
 
 function wireTosync() {
   document.querySelectorAll('input[name="sendMode"]').forEach((r) => r.addEventListener('change', () => {
-    updateQuietVisibility(); updateSendButton(); saveSendMode();
+    updateModeVisibility(); updateSendButton();
+    if (currentMode() === 'scheduled' && !scheduleTimes.length) {
+      // Hold the selection un-saved (see `schedArming`) and ask for the missing
+      // piece instead of PUTting something the config would refuse.
+      schedArming = true;
+      const f = $('tosyncFlash');
+      f.textContent = 'add at least one send time — the switch is saved with it';
+      f.className = 'flash';
+      $('schedAdd').focus();
+      return;
+    }
+    saveSendMode();
   }));
   $('quietSecs').addEventListener('change', saveSendMode);
   $('quietSecs').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); saveSendMode(); } });
+  // Schedule editor. One delegated listener on the chip list (rows are re-rendered
+  // on every change, so per-row listeners would have to be re-attached — and
+  // leaked — each time).
+  $('schedAddBtn').addEventListener('click', schedAddTime);
+  $('schedAdd').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); schedAddTime(); } });
+  $('schedList').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-sched-del]');
+    if (btn) schedRemoveTime(btn.dataset.schedDel);
+  });
+  $('schedCatchup').addEventListener('change', saveSendMode);
   $('sendNow').addEventListener('click', sendNow);
   // The pending tree is collapsed by default; the counter toggles it.
   $('pendingToggle').addEventListener('click', () => {
