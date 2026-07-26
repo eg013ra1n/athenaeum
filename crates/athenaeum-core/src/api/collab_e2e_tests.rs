@@ -743,7 +743,7 @@ async fn three_instance_project_flow_publish_moderate_deliver_export() {
         .mount(&proc_server)
         .await;
 
-    download_project_package(&proc_ctx, &proc_runtime, PROJECT, &pkg)
+    download_project_package(&proc_ctx, &proc_runtime, PROJECT, &pkg, None)
         .await
         .unwrap();
 

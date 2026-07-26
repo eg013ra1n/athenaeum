@@ -159,8 +159,10 @@ pub async fn list_collab_packages(
         .map_err(api_err)
 }
 
-/// Spawns the Д6 download and returns immediately — the terminal `local_status` +
-/// `sync-finished` SSE event carry the outcome.
+/// Spawns the D3 swarm download (falling back to the Д6 sequential pull in the
+/// same call) and returns immediately — the terminal `local_status` +
+/// `sync-finished` SSE event carry the outcome, and the swarm path's live source
+/// count rides `project-download-progress`.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn download_collab_package(
     State(state): State<WebAppState>,
@@ -168,9 +170,17 @@ pub async fn download_collab_package(
 ) -> Result<Json<()>, (axum::http::StatusCode, String)> {
     let ctx = Arc::clone(&state.ctx);
     let sync = Arc::clone(&state.sync);
+    let emitter: Arc<dyn ProgressEmitter> =
+        Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
     tokio::spawn(async move {
-        if let Err(e) =
-            exchange::download_project_package(&ctx, &sync, &args.project_id, &args.package_id).await
+        if let Err(e) = exchange::download_project_package(
+            &ctx,
+            &sync,
+            &args.project_id,
+            &args.package_id,
+            Some(emitter),
+        )
+        .await
         {
             tracing::error!(error = %format!("{e}"), "collab package download failed");
         }

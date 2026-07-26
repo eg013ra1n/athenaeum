@@ -122,21 +122,26 @@ pub async fn list_collab_packages(
     exchange::list_project_packages(&state.ctx, &project_id).map_err(|e| e.to_string())
 }
 
-/// Start the Д6 explicit sequential-holder download of a project package. Spawns
-/// the pull and returns immediately — the terminal `local_status` + `sync-finished`
-/// event carry the outcome.
+/// Start the download of a project package: the D3 swarm fetch across every
+/// holder, falling back to the Д6 sequential-holder pull in the same call. Spawns
+/// the pull and returns immediately — the terminal `local_status` +
+/// `sync-finished` event carry the outcome, and the swarm path's live source
+/// count rides `project-download-progress`.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn download_collab_package(
     state: State<'_, AppState>,
+    app: AppHandle,
     project_id: String,
     package_id: String,
 ) -> Result<(), String> {
     let ctx = Arc::clone(&state.ctx);
     let sync = Arc::clone(&state.sync);
+    let emitter: Arc<dyn ProgressEmitter> = Arc::new(TauriProgressEmitter(app));
     tokio::spawn(async move {
         if let Err(e) =
-            exchange::download_project_package(&ctx, &sync, &project_id, &package_id).await
+            exchange::download_project_package(&ctx, &sync, &project_id, &package_id, Some(emitter))
+                .await
         {
             tracing::error!(error = %format!("{e}"), "collab package download failed");
         }

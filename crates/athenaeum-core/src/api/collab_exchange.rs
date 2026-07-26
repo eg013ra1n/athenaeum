@@ -30,6 +30,7 @@
 //! Ungated (no render gate): depends only on `db`, `sync`, `sharing`, `collab`,
 //! `package`, so it compiles in the headless (`--no-default-features`) build.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -47,8 +48,8 @@ use crate::events::ProgressEmitter;
 use crate::export::models::WbppExportConfig;
 use crate::services::ServiceContext;
 use crate::sharing::iroh::node::Role;
-use crate::sharing::types::NodeId;
-use crate::sharing::SharingTransport;
+use crate::sharing::types::{NodeId, PackageId};
+use crate::sharing::{noop_fetch_sink, ProviderEvent, ProviderTelemetrySink, SharingTransport};
 use crate::sync::{
     node_id_hex, pairing, CatalogSyncStore, PackageCleanupSink, StartedSender, SyncEngine,
     SyncEngineHandle, SyncSenderRuntime, SyncStore,
@@ -499,6 +500,31 @@ pub struct PackageStateChange {
     pub detail: Option<String>,
 }
 
+/// Live progress of a SWARM download (D3 §3.1.3), emitted on
+/// `project-download-progress`. Two events per attempt: `stage = "fetching"`
+/// when the fan-out starts and `stage = "done"` when it ends (either way — the
+/// outcome travels on `local_status`, as it always has). The UI clears its
+/// "downloading from N sources" line on `done`.
+///
+/// `sources` is the PROVIDER COUNT this attempt was handed — the holder set
+/// minus self — not a count derived from provider telemetry. The blob layer's
+/// per-provider stream is lossy by construction (see [`ProviderTelemetrySink`]),
+/// so counting distinct providers from it reads low and jittery; the list we
+/// passed in is the honest figure.
+///
+/// The sequential fallback emits nothing here: it pulls from exactly one holder
+/// at a time and already reports through the receiver's `sync-progress`.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectDownloadProgress {
+    pub project_id: String,
+    pub package_id: String,
+    /// How many holders the fan-out was handed.
+    pub sources: usize,
+    /// `fetching` | `done`.
+    pub stage: String,
+}
+
 /// Map an [`AccountClientError`](crate::account::AccountClientError) onto the api
 /// boundary (mirrors `api::collab::client_err`).
 fn client_err(e: crate::account::AccountClientError) -> ApiError {
@@ -870,6 +896,114 @@ pub async fn report_have_after_ingest(
     Ok(())
 }
 
+// ── D3 §3.1: the swarm (multi-source) download path ─────────────────────────
+//
+// The preferred path in front of the sequential holder loop: hand the WHOLE
+// holder set to one `fetch_collection_multi`, which splits the collection per
+// child blob across every provider with byte-level failover. Everything below is
+// try-then-fall-back by design — see `swarm_unfit` for why shape alone can never
+// decide whether a swarm fetch is possible.
+
+/// Where a swarm fetch stages the collection it exports, per package:
+/// `<sync_dir>/collab_swarm/<package_id>`.
+///
+/// Deliberately NOT the receiver's `<sync_dir>/staging/<wire_id>` (spec §3.1.4
+/// says "the same staging layout", which this is — one dir per package under the
+/// sync dir — but not the same DIRECTORY). A received package's serve dir is
+/// `collab_serve/<hub_package_id>`, so the wire id a holder announces for it IS
+/// the hub package id, and the receiver stages that push at
+/// `staging/<hub_package_id>` — byte-for-byte the path a hub-uuid-keyed swarm
+/// staging dir would use. A swarm fetch racing a stray push announce for the same
+/// package would then have two writers in one directory. This orchestrator-side
+/// dir keeps the two paths disjoint; it sits next to `collab_serve`/`collab_pub`
+/// in the same family.
+const SWARM_STAGING_DIR: &str = "collab_swarm";
+
+/// Session-scoped verdicts: package ids whose swarm fetch was tried and failed,
+/// so the rest of this process goes straight to the sequential fallback.
+///
+/// The carrier is a module static for the same reason
+/// [`PENDING_DOWNLOAD_FAILURES`] is one: this is process-lifetime scratch state
+/// with no owner in the data model (there is no per-session struct on the
+/// download path — `ServiceContext` is the app's service registry, and
+/// `SyncRuntime` is the receive-side transport holder; neither should grow a
+/// collab-download cache), and a static keeps every signature and both host
+/// wrappers untouched. Cleared only by restarting the app, which is exactly the
+/// spec's "one cheap failed round per package per app run" (§3.2).
+static SWARM_UNFIT: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn swarm_unfit() -> &'static std::sync::Mutex<HashSet<String>> {
+    SWARM_UNFIT.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// Record that `package_id`'s swarm fetch failed. Poison-tolerant: a failed lock
+/// only costs one more wasted attempt, never a panic.
+fn mark_swarm_unfit(package_id: &str) {
+    if let Ok(mut set) = swarm_unfit().lock() {
+        set.insert(package_id.to_string());
+    }
+}
+
+/// A snapshot of the session's swarm-unfit verdicts (the plan takes it by
+/// reference so it stays a pure function). Poison ⇒ an empty set: retrying a
+/// swarm fetch is the safe degradation, never a wrong download.
+fn swarm_unfit_snapshot() -> HashSet<String> {
+    swarm_unfit()
+        .lock()
+        .map(|s| s.clone())
+        .unwrap_or_else(|_| HashSet::new())
+}
+
+/// Could `s` be an iroh collection hash? Shape only — 64 hex characters, which
+/// is also exactly what the hub validates.
+///
+/// This can never be the real discrimination: a pre-D3 announcement's
+/// `root_hash` is a BLAKE3 of the manifest bytes, which passes this same shape
+/// test and no provider's blob store contains (spec §3.2). Legacy is told apart
+/// by TRYING and failing, then caching the verdict — this gate only keeps
+/// obvious non-hashes (the `"rh"`-style placeholder rows) off the wire.
+fn looks_like_collection_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Decide whether to attempt a swarm fetch, and against whom — the pure,
+/// unit-tested half of the swarm path.
+///
+/// `Some(providers)` = the holder set minus this device, each with its
+/// self-reported relay hint preserved (the dial-hint builder needs it per
+/// provider). `None` = go straight to the sequential fallback, for any of:
+/// the root hash cannot be a collection hash / the package is not swarm-eligible
+/// (`root_hash_is_swarm_capable`, which the caller also ANDs with the published
+/// state — spec §5 keeps a pending package on the authz-checked fallback), the
+/// package already earned a swarm-unfit verdict this session, or nobody but me
+/// holds it.
+///
+/// The self-filter is deliberately duplicated here (the caller's `holders` are
+/// already self-filtered for the sequential loop): the plan must be decidable on
+/// its own inputs, and a provider set containing our own node would make the
+/// downloader dial itself.
+fn swarm_fetch_plan(
+    holders: &[(NodeId, String, Option<String>)],
+    own_node: NodeId,
+    root_hash_is_swarm_capable: bool,
+    swarm_unfit: &HashSet<String>,
+    package_id: &str,
+) -> Option<Vec<(NodeId, Option<String>)>> {
+    if !root_hash_is_swarm_capable || swarm_unfit.contains(package_id) {
+        return None;
+    }
+    let providers: Vec<(NodeId, Option<String>)> = holders
+        .iter()
+        .filter(|(n, _, _)| *n != own_node)
+        .map(|(n, _, relay)| (*n, relay.clone()))
+        .collect();
+    if providers.is_empty() {
+        return None;
+    }
+    Some(providers)
+}
+
 /// Д6 explicit download of a project package: role-gate, poll the hub for the
 /// package's current holders, then try each holder sequentially — attach a dial
 /// hint (audit B4), `request_project`, and wait for the served package to ingest
@@ -890,13 +1024,29 @@ pub async fn report_have_after_ingest(
 /// Runs on a command-spawned task (Task 11): the terminal `local_status` +
 /// `sync-finished` event carry the outcome, so returning `Ok` on an exhausted
 /// attempt is normal, not an error.
+///
+/// **D3 §3.1: a swarm attempt runs first.** When the announcement carries a
+/// usable collection hash and someone else holds the package, one
+/// [`fetch_collection_multi`](SharingTransport::fetch_collection_multi) pulls it
+/// from EVERY holder at once (split per child blob, byte-level failover) and, on
+/// success, ingests + reports-have and returns. Any failure — including the
+/// legacy case where the `root_hash` is a pre-D3 manifest identifier no provider
+/// serves — caches a per-package swarm-unfit verdict for the session and falls
+/// through to the sequential loop below IN THE SAME CALL: the user pressed
+/// Download, not "try again in 20 minutes". The sequential loop itself is
+/// untouched by D3.
+///
+/// `emitter` carries the `project-download-progress` events of the swarm path
+/// ([`ProjectDownloadProgress`]); `None` (the auto-replication worker, tests) is
+/// a silent run, never a different transfer.
 pub async fn download_project_package(
     ctx: &ServiceContext,
     sync: &crate::sync::SyncRuntime,
     project_id: &str,
     package_id: &str,
+    emitter: Option<Arc<dyn ProgressEmitter>>,
 ) -> Result<(), ApiError> {
-    let (sync_dir, _db_path) = crate::api::sync::sync_paths(ctx)?;
+    let (sync_dir, db_path) = crate::api::sync::sync_paths(ctx)?;
 
     // ── Role guard (fail-closed) ─────────────────────────────────────────────
     // Only a send_receive member or the coordinator may pull. Own membership is
@@ -999,6 +1149,90 @@ pub async fn download_project_package(
         Vec::new()
     };
 
+    // ── D3 §3.1: the swarm attempt, BEFORE the sequential fallback ───────────
+    //
+    // Eligibility is deliberately coarse: the hub validates `root_hash` as 64
+    // hex, which a LEGACY (pre-D3) manifest identifier satisfies too, so shape
+    // can never tell a real collection hash from one — the discrimination is
+    // try-then-fallback with a cached verdict (spec §3.2). The published gate is
+    // spec §5: a still-pending package is only ever pulled through the
+    // authz-checked fallback (a raw blob GET carries no `may_serve_package`
+    // check, so the swarm path must not become a way around it).
+    let swarm_capable = ann.state == "published" && looks_like_collection_hash(&ann.root_hash);
+    if let Some(providers) =
+        swarm_fetch_plan(&holders, own_node, swarm_capable, &swarm_unfit_snapshot(), package_id)
+    {
+        // The swarm rides the COLLAB role handle when a node is bound (its
+        // in-flight tag then lands under `in-flight/collab/pkg/…`, outside the
+        // prefix the receiver's B7 orphan sweep reclaims — see the role note on
+        // `SharedIrohNode::role_fetch_multi`). With no node bound (loopback
+        // tests) it rides the started transport, whose default
+        // `fetch_collection_multi` bails — an explicit fallback, not a silent
+        // degradation to one provider.
+        let swarm_transport: Arc<dyn SharingTransport> = match &node {
+            Some(n) => n.handle(Role::Collab),
+            None => Arc::clone(&transport),
+        };
+        let sources = providers.len();
+        match try_swarm_download(
+            sync,
+            &swarm_transport,
+            node.as_ref(),
+            &relay_urls,
+            &providers,
+            project_id,
+            package_id,
+            &ann.root_hash,
+            ann.byte_size.max(0) as u64,
+            &sync_dir,
+            &db_path,
+            emitter.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => {
+                // No ack on this path (spec §3.1.4): an ack settles a SENDER's
+                // outbound row, and no holder enqueued one — nobody was asked to
+                // serve. `report_have` is this path's completion signal, exactly
+                // as it is the sequential loop's.
+                if let Err(e) = client.report_have(&token, &ann.id).await {
+                    tracing::warn!(announcement_id = %ann.id, error = %format!("{e}"), "swarm download: report_have failed after ingest");
+                }
+                tracing::info!(project_id, package_id, sources, "swarm download complete");
+                return Ok(());
+            }
+            Err(e) => {
+                // Every failure is the same failure here: providers that don't
+                // serve this hash (legacy announcement), a transport with no
+                // swarm support, a dead swarm, or a rejected ingest. One cheap
+                // verdict per package per session, then the sequential loop.
+                mark_swarm_unfit(package_id);
+                tracing::warn!(
+                    project_id,
+                    package_id,
+                    sources,
+                    error = %format!("{e:#}"),
+                    "swarm download failed; falling back to the sequential holder loop"
+                );
+                // Re-arm the row for the fallback. A fetch failure never touched
+                // the status (still `downloading`), but a PARTIAL ingest did:
+                // `ingest_project_package` writes `failed` when any frame is
+                // rejected, and `wait_for_local_complete` returns false the
+                // instant it reads `failed` — so without this the fallback would
+                // skip every holder in milliseconds on a stale verdict instead of
+                // waiting for the serve it just requested. Best-effort: a write
+                // failure only costs the fallback, never the caller's result.
+                {
+                    let db = db(ctx)?;
+                    let conn = db.conn();
+                    if let Err(e) = set_local_status(&conn, package_id, "downloading") {
+                        tracing::warn!(package_id, error = %format!("{e}"), "swarm download: re-arm status for the fallback errored");
+                    }
+                }
+            }
+        }
+    }
+
     // Per-holder probe failure classes (Task 9), surfaced in the terminal
     // `downloadFailed` detail if every holder is exhausted — an operator then sees
     // WHY each holder was skipped (offline / refused / relay_unreachable), not just
@@ -1079,6 +1313,237 @@ pub async fn download_project_package(
     set_download_failed(ctx, project_id, package_id, detail);
     tracing::warn!(project_id, package_id, holders = holders.len(), "download failed: no holder delivered");
     Ok(())
+}
+
+/// One swarm attempt for `package_id` (D3 §3.1): dial hints → receive permit →
+/// [`fetch_collection_multi`](SharingTransport::fetch_collection_multi) across
+/// every provider → ingest. `Ok(())` means the package is locally complete; ANY
+/// `Err` is the caller's signal to cache a swarm-unfit verdict and fall back.
+///
+/// Status transitions are the fallback's, unchanged: the row is already
+/// `downloading` (set by the caller before any network I/O), and
+/// [`ingest_project_package`](crate::sync::ingest_project_package) is the ONE
+/// writer of the terminal `complete`/`failed` — the same write the sequential
+/// path waits on in `wait_for_local_complete`. Nothing here second-guesses it.
+#[allow(clippy::too_many_arguments)]
+async fn try_swarm_download(
+    sync: &crate::sync::SyncRuntime,
+    swarm_transport: &Arc<dyn SharingTransport>,
+    node: Option<&Arc<crate::sharing::iroh::node::SharedIrohNode>>,
+    relay_urls: &[String],
+    providers: &[(NodeId, Option<String>)],
+    project_id: &str,
+    package_id: &str,
+    root_hash: &str,
+    byte_size: u64,
+    sync_dir: &Path,
+    db_path: &Path,
+    emitter: Option<&dyn ProgressEmitter>,
+) -> Result<()> {
+    // The hub id is peer-minted; guard it before it becomes a path segment (C1),
+    // exactly as `reconstruct_serve_dir` does.
+    crate::package::validate_package_id(package_id)
+        .with_context(|| format!("reject unsafe collab package id {package_id}"))?;
+    let staging = sync_dir.join(SWARM_STAGING_DIR).join(package_id);
+
+    // Dial hints for EVERY provider up front (the sequential loop attaches one
+    // per holder inside its loop; the swarm has no loop). Same rule, verbatim:
+    // prefer the holder's own reported relay, fall back to our resolved set, and
+    // `cross_account = true` so the hint carries the relay ONLY, never direct
+    // addrs (S1). A hint that cannot be built costs that provider its dial, not
+    // the fetch — the others still serve.
+    if let Some(node) = node {
+        for (holder, relay) in providers {
+            let reported = relay.as_ref().map(|url| crate::account::EndpointAddrReport {
+                home_relay_url: Some(url.clone()),
+                direct_addrs: Vec::new(),
+                reported_at: None,
+            });
+            match pairing::peer_dial_addr(*holder, reported.as_ref(), relay_urls, true) {
+                Ok(addr) => node.add_peer(addr),
+                Err(e) => tracing::warn!(
+                    error = %format!("{e:#}"),
+                    holder = %node_id_hex(holder),
+                    "swarm download: dial hint build failed for one provider"
+                ),
+            }
+        }
+    }
+
+    // Fairness (spec §3.1.5): a project pull is a receive like any other, so it
+    // takes ONE `ReceiveGate` permit for the whole fetch + ingest. A receiver
+    // that has not started has no gate — proceed WITHOUT a permit: the gate is a
+    // fairness device between concurrent receives, not a correctness gate, and a
+    // not-started receiver means there are no competing receives to be fair to.
+    // Dropped on return, so the sequential fallback never runs holding it.
+    let _receive_permit = match sync.inbound_control().await {
+        Some(control) => Some(control.receive_gate.acquire().await),
+        None => {
+            tracing::debug!(package_id, "swarm download: no receiver started; no receive permit");
+            None
+        }
+    };
+
+    let sources = providers.len();
+    if let Some(emitter) = emitter {
+        crate::events::emit_event(
+            emitter,
+            "project-download-progress",
+            &ProjectDownloadProgress {
+                project_id: project_id.to_string(),
+                package_id: package_id.to_string(),
+                sources,
+                stage: "fetching".to_string(),
+            },
+        );
+    }
+    tracing::info!(project_id, package_id, sources, root_hash, "swarm download attempt");
+
+    // Per-provider journal. There is no collab-side `sync_events` journal to
+    // write to — that table is keyed by a transfer's `batch_key` and a project
+    // pull has no `sync_inbound` row — so the journal IS `tracing`, exactly like
+    // the sequential loop's per-holder lines. Debug level: the stream is a
+    // lossy sample (see `ProviderTelemetrySink`), and a `Failed` is a provider
+    // switch, not an error.
+    let telemetry: ProviderTelemetrySink = {
+        let package_id = package_id.to_string();
+        Arc::new(move |ev| match ev {
+            ProviderEvent::Trying(id) => {
+                tracing::debug!(package_id = %package_id, holder = %node_id_hex(&id), "swarm download: provider tried")
+            }
+            ProviderEvent::Failed(id) => {
+                tracing::debug!(package_id = %package_id, holder = %node_id_hex(&id), "swarm download: provider failed; switching")
+            }
+        })
+    };
+
+    let fetch = swarm_transport
+        .fetch_collection_multi(
+            providers.iter().map(|(n, _)| *n).collect(),
+            root_hash,
+            byte_size,
+            &staging,
+            noop_fetch_sink(),
+            telemetry,
+        )
+        .await
+        .with_context(|| format!("swarm fetch collection {root_hash} for package {package_id}"));
+
+    let emit_done = |emitter: Option<&dyn ProgressEmitter>| {
+        if let Some(emitter) = emitter {
+            crate::events::emit_event(
+                emitter,
+                "project-download-progress",
+                &ProjectDownloadProgress {
+                    project_id: project_id.to_string(),
+                    package_id: package_id.to_string(),
+                    sources,
+                    stage: "done".to_string(),
+                },
+            );
+        }
+    };
+
+    if let Err(e) = fetch {
+        // Remove the staging dir on failure too: the verified partial BYTES live
+        // in the blob store under the in-flight tag (which the fetch keeps on
+        // every non-success exit, so a retry resumes across any holder), and a
+        // half-exported directory would only be re-exported wholesale by the next
+        // attempt. Nothing resumable is thrown away here.
+        remove_swarm_staging(&staging);
+        emit_done(emitter);
+        return Err(e);
+    }
+
+    // Ingest on a blocking thread over its OWN catalog connection (W2's
+    // `IngestConn::Shared` per-frame locking — never the app's `db(ctx)` guard,
+    // which would be held for the whole multi-GB package).
+    //
+    // Racing a stray push announce for the same package (the receiver's
+    // `handle_project_announce` arm) is SAFE but not free. Sequentially it is a
+    // no-op: `ingest_project_package` resolves a same-(project, publisher, uuid)
+    // record with identical xxh3 as a Duplicate BEFORE touching the payload, so
+    // the loser lands nothing, inserts no contribution row, and only re-writes
+    // the same `local_status`. Truly CONCURRENTLY the two arms hold different
+    // `CatalogSyncStore` connections, so the per-frame guard does not span them
+    // and both can pass the duplicate check for one frame — costing a second
+    // landed copy + contribution row for that uuid, never a corrupt one. Both
+    // arms take a `ReceiveGate` permit from the SAME gate, so that window only
+    // opens at `sync.max_concurrent_receives >= 2`. Named, not fixed here:
+    // closing it means one shared ingest lock across the receiver and this
+    // orchestrator, and the receiver arm is the untouched fallback path.
+    let outcome = {
+        let staging = staging.clone();
+        let project_id = project_id.to_string();
+        let package_id = package_id.to_string();
+        let db_path = db_path.to_path_buf();
+        // The serving "peer" recorded in `sync_history`: a swarm fetch has no
+        // single serving device, so the literal names the PATH instead of
+        // pretending one holder delivered it. History metadata only — the landing
+        // slug is hub-anchored (Д5), and the Transfers history renders an unknown
+        // peer string verbatim (`shortPeer`), never parses it as hex.
+        tokio::task::spawn_blocking(move || -> Result<crate::sync::ProjectIngestOutcome> {
+            let store = CatalogSyncStore::open(&db_path)
+                .with_context(|| format!("open catalog sync store {}", db_path.display()))?;
+            crate::sync::ingest_project_package(
+                crate::sync::IngestConn::Shared(&store),
+                &staging,
+                &project_id,
+                &package_id,
+                "swarm",
+            )
+        })
+        .await
+        .context("swarm project ingest join")?
+    };
+    remove_swarm_staging(&staging);
+    emit_done(emitter);
+    let outcome = outcome?;
+
+    // Drop the fetched blobs (best-effort, idempotent) — the payloads are landed
+    // contributions now, and the collection tag would otherwise keep a second
+    // full copy in the blob store forever. The tag is keyed by the canonical
+    // lowercase hex of the collection hash (`role_fetch_multi`), and `release`
+    // reclaims its `in-flight/` derivative too.
+    if let Err(e) = swarm_transport
+        .release(&PackageId(root_hash.to_lowercase()))
+        .await
+    {
+        tracing::warn!(package_id, root_hash, error = %format!("{e:#}"), "swarm download: blob release failed");
+    }
+
+    if !outcome.failed.is_empty() {
+        // Ingest already wrote `failed`. Report it as a swarm failure so the
+        // sequential fallback gets its turn — a per-frame reject can be a
+        // transient landing fault, and the fallback re-delivers the same frames
+        // through an ingest that is idempotent per (project, publisher, uuid).
+        anyhow::bail!(
+            "swarm ingest rejected {} of {} frames",
+            outcome.failed.len(),
+            outcome.failed.len() + outcome.ok_count
+        );
+    }
+    tracing::info!(
+        project_id,
+        package_id,
+        ok = outcome.ok_count,
+        sources,
+        "swarm download ingested"
+    );
+    Ok(())
+}
+
+/// Best-effort removal of a swarm staging dir. Missing is normal (a fetch that
+/// failed before the export step never created it); anything else is logged,
+/// never swallowed, and never fails the download.
+fn remove_swarm_staging(staging: &Path) {
+    match std::fs::remove_dir_all(staging) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(path = %staging.display(), error = %e, "swarm download: staging cleanup failed")
+        }
+    }
 }
 
 /// Best-effort `set_local_status("failed")` for a genuine download attempt, plus
@@ -2347,7 +2812,7 @@ mod tests {
             seed_project(&conn, "p-1", &members);
         }
         let sync = crate::sync::SyncRuntime::new();
-        let err = download_project_package(&ctx, &sync, "p-1", "pkg-x").await.unwrap_err();
+        let err = download_project_package(&ctx, &sync, "p-1", "pkg-x", None).await.unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)), "send-only is fail-closed Invalid, got {err:?}");
     }
 
@@ -2384,24 +2849,31 @@ mod tests {
 
         let sync = crate::sync::SyncRuntime::new();
         // Role passes, poll finds the package, no other holder to pull from ⇒ failed.
-        download_project_package(&ctx, &sync, "p-1", "pkg-x").await.unwrap();
+        download_project_package(&ctx, &sync, "p-1", "pkg-x", None).await.unwrap();
         assert_eq!(
             get_package(&db(&ctx).unwrap().conn(), "pkg-x").unwrap().unwrap().local_status,
             "failed",
             "an exhausted download lands failed"
         );
 
-        // The next refresh drains exactly one downloadFailed for pkg-x.
+        // The next refresh drains exactly one downloadFailed for pkg-x. Scoped to
+        // THIS package id on purpose: the F3 buffer is a process-global static, so
+        // any other test whose download exhausts in the same binary contributes its
+        // own entry to the same drain (D3 T3 added one).
         let changes = refresh_all_project_packages(&ctx).await.unwrap();
-        let dl_failed: Vec<_> = changes.iter().filter(|c| c.kind == "downloadFailed").collect();
+        let dl_failed: Vec<_> = changes
+            .iter()
+            .filter(|c| c.kind == "downloadFailed" && c.package_id == "pkg-x")
+            .collect();
         assert_eq!(dl_failed.len(), 1, "exactly one buffered downloadFailed drained");
-        assert_eq!(dl_failed[0].package_id, "pkg-x");
         assert_eq!(dl_failed[0].project_id, "p-1");
 
         // Drained exactly once — a second refresh surfaces no more.
         let again = refresh_all_project_packages(&ctx).await.unwrap();
         assert!(
-            again.iter().all(|c| c.kind != "downloadFailed"),
+            again
+                .iter()
+                .all(|c| !(c.kind == "downloadFailed" && c.package_id == "pkg-x")),
             "the buffer is not re-drained"
         );
     }
@@ -2575,7 +3047,7 @@ mod tests {
         wire_hub(&ctx, &server.uri());
 
         // ── Drive the download. ────────────────────────────────────────────────
-        download_project_package(&ctx, &runtime, PROJECT, HUB).await.unwrap();
+        download_project_package(&ctx, &runtime, PROJECT, HUB, None).await.unwrap();
 
         // D holds the package: local_status complete, one landed contribution
         // (never into files/frames), and the hub was told we now have it.
@@ -2601,5 +3073,204 @@ mod tests {
         assert_eq!(haves, 1, "report_have hit the hub once after ingest");
 
         a_engine.shutdown().await;
+
+        // D3 T3: the swarm attempt ran FIRST and failed (the loopback transport
+        // has no multi-source fetch), so this completion is the sequential
+        // fallback's — proof the fallback still delivers with the swarm path in
+        // front of it, not proof the swarm block was skipped.
+        assert!(
+            swarm_unfit_snapshot().contains(HUB),
+            "the swarm attempt was made and cached its unfit verdict"
+        );
+    }
+
+    // ── D3 Task 3: the swarm download path ───────────────────────────────────
+
+    /// One holder tuple in the shape `download_project_package` builds.
+    fn holder_tuple(n: NodeId, relay: Option<&str>) -> (NodeId, String, Option<String>) {
+        (n, "Holder".to_string(), relay.map(str::to_string))
+    }
+
+    /// No holder at all ⇒ nothing to fan out to (the caller's own no-holders
+    /// guard already covers this; the plan refuses independently).
+    #[test]
+    fn swarm_fetch_plan_none_without_holders() {
+        assert!(swarm_fetch_plan(&[], NODE_SR, true, &HashSet::new(), "pkg-1").is_none());
+    }
+
+    /// I cannot serve myself: a holder list of only this device plans nothing.
+    #[test]
+    fn swarm_fetch_plan_none_when_only_self_holds() {
+        let holders = vec![holder_tuple(NODE_SR, None)];
+        assert!(swarm_fetch_plan(&holders, NODE_SR, true, &HashSet::new(), "pkg-1").is_none());
+    }
+
+    /// A cached swarm-unfit verdict (spec §3.2 legacy discrimination) refuses
+    /// this package only — its neighbours still plan.
+    #[test]
+    fn swarm_fetch_plan_none_when_package_is_swarm_unfit() {
+        let holders = vec![holder_tuple(NODE_COORD, None)];
+        let unfit: HashSet<String> = ["pkg-1".to_string()].into_iter().collect();
+        assert!(swarm_fetch_plan(&holders, NODE_SR, true, &unfit, "pkg-1").is_none());
+        assert!(
+            swarm_fetch_plan(&holders, NODE_SR, true, &unfit, "pkg-2").is_some(),
+            "another package is unaffected by pkg-1's verdict"
+        );
+    }
+
+    /// A root hash that cannot even be a collection hash never reaches the wire.
+    #[test]
+    fn swarm_fetch_plan_none_when_the_root_hash_is_not_swarm_capable() {
+        let holders = vec![holder_tuple(NODE_COORD, None)];
+        assert!(swarm_fetch_plan(&holders, NODE_SR, false, &HashSet::new(), "pkg-1").is_none());
+    }
+
+    /// Shape gate only — 64 hex characters. A legacy manifest identifier passes
+    /// it too (by design: the real discrimination is try-then-fallback).
+    #[test]
+    fn collection_hash_shape_is_64_hex() {
+        assert!(looks_like_collection_hash(&"a".repeat(64)));
+        assert!(looks_like_collection_hash(&"F".repeat(64)), "case-insensitive");
+        assert!(!looks_like_collection_hash(""));
+        assert!(!looks_like_collection_hash("rh"), "the pre-D3 placeholder value");
+        assert!(!looks_like_collection_hash(&"a".repeat(63)));
+        assert!(!looks_like_collection_hash(&"a".repeat(65)));
+        assert!(!looks_like_collection_hash(&"g".repeat(64)), "not hex");
+    }
+
+    /// The plan is every holder but me, each keeping its own relay hint (the
+    /// dial-hint builder needs it per provider).
+    #[test]
+    fn swarm_fetch_plan_lists_every_other_holder_with_its_relay_hint() {
+        let holders = vec![
+            holder_tuple(NODE_COORD, Some("https://relay.one/")),
+            holder_tuple(NODE_SR, None), // self — excluded
+            holder_tuple(NODE_SEND_ONLY, None),
+        ];
+        let plan = swarm_fetch_plan(&holders, NODE_SR, true, &HashSet::new(), "pkg-1").unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                (NODE_COORD, Some("https://relay.one/".to_string())),
+                (NODE_SEND_ONLY, None),
+            ]
+        );
+    }
+
+    /// The verdict is sticky for the process: once marked, every later plan for
+    /// that package refuses, so a second Download in the same session goes
+    /// straight to the sequential path without a second multi-fetch attempt.
+    #[test]
+    fn swarm_unfit_is_cached_for_the_session() {
+        const PKG: &str = "pkg-unfit-session";
+        let holders = vec![holder_tuple(NODE_COORD, None)];
+        assert!(
+            swarm_fetch_plan(&holders, NODE_SR, true, &swarm_unfit_snapshot(), PKG).is_some(),
+            "the first attempt is planned"
+        );
+        mark_swarm_unfit(PKG);
+        assert!(
+            swarm_fetch_plan(&holders, NODE_SR, true, &swarm_unfit_snapshot(), PKG).is_none(),
+            "the second attempt is refused for the rest of the session"
+        );
+    }
+
+    /// D3 §3.2 legacy discrimination, end to end: an announcement whose
+    /// `root_hash` is a well-formed 64-hex value NO provider serves (exactly a
+    /// pre-D3 manifest identifier) fails the swarm attempt, caches the
+    /// swarm-unfit verdict, and falls through to the sequential holder loop IN
+    /// THE SAME CALL — here the loop exhausts (its one holder is not on the
+    /// loopback network), which is what proves it was entered.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn swarm_download_falls_back_when_providers_lack_the_hash() {
+        use crate::sharing::loopback::LoopbackNetwork;
+        use crate::sync::{allow_all_peers, ProjectReceiveHooks, SyncReceiver, SyncRuntime};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const PROJECT: &str = "proj-swarm-fb";
+        const HUB: &str = "hub-swarm-fb-1";
+
+        let (tmp, ctx) = test_ctx();
+        let own = own_node_for(&ctx);
+        let (sync_dir, _db_path) = crate::api::sync::sync_paths(&ctx).unwrap();
+        {
+            let conn = db(&ctx).unwrap().conn();
+            let members = serde_json::json!([
+                { "accountId": "acc-me", "displayName": "Me", "dataRole": "send_receive",
+                  "coordinator": true, "nodes": [B64.encode(own)] }
+            ])
+            .to_string();
+            seed_project(&conn, PROJECT, &members);
+            upsert_package(&conn, &base_package(HUB, PROJECT, "Alice")).unwrap();
+        }
+
+        // A started runtime over a loopback endpoint: its `fetch_collection_multi`
+        // is the trait's default (bails), which is exactly how a transport without
+        // swarm support behaves — the swarm attempt fails at the transport.
+        let net = LoopbackNetwork::new();
+        let ep = Arc::new(net.endpoint());
+        let store = Arc::new(CatalogSyncStore::open(tmp.path().join("recv.db")).unwrap());
+        let incoming: crate::sync::receiver::IncomingResolver = {
+            let p = sync_dir.join("incoming");
+            Arc::new(move || p.clone())
+        };
+        let (_info, handle) = SyncReceiver::spawn(
+            store,
+            sync_dir.clone(),
+            incoming,
+            allow_all_peers(),
+            ProjectReceiveHooks::default(),
+            Arc::new(crate::sync::InboundControl::new()),
+            Arc::clone(&ep) as Arc<dyn SharingTransport>,
+            Arc::new(crate::events::NullEmitter),
+        )
+        .await
+        .unwrap();
+        let runtime = SyncRuntime::new();
+        runtime
+            .set_started_for_test(Arc::clone(&ep) as Arc<dyn SharingTransport>, handle, "t".into())
+            .await;
+
+        // The hub lists ONE holder that is not on the loopback network at all, so
+        // the sequential fallback's `request_project` cannot route to it.
+        let ghost = [0x5A; 32];
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/v1/projects/{PROJECT}/announcements")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                ann_json("ann-fb", HUB, false, "published", &[], None, serde_json::json!([
+                    { "pubkey": B64.encode(ghost), "displayName": "Ghost",
+                      "lastSeenAt": chrono::Utc::now().to_rfc3339() }
+                ]))
+            ])))
+            .mount(&server)
+            .await;
+        wire_hub(&ctx, &server.uri());
+
+        download_project_package(&ctx, &runtime, PROJECT, HUB, None).await.unwrap();
+
+        assert!(
+            swarm_unfit_snapshot().contains(HUB),
+            "the failed swarm attempt cached a swarm-unfit verdict"
+        );
+        assert_eq!(
+            get_package(&db(&ctx).unwrap().conn(), HUB).unwrap().unwrap().local_status,
+            "failed",
+            "the call fell through to the sequential loop and exhausted it"
+        );
+        // No second attempt is planned for the rest of the session.
+        assert!(
+            swarm_fetch_plan(
+                &[holder_tuple(ghost, None)],
+                own,
+                true,
+                &swarm_unfit_snapshot(),
+                HUB
+            )
+            .is_none(),
+            "the cached verdict sends the next Download straight to the fallback"
+        );
     }
 }

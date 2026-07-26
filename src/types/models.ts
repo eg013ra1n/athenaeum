@@ -1370,6 +1370,16 @@ holderCount: number,
  */
 onlineCount: number, };
 
+export type ProjectDownloadProgress = { projectId: string, packageId: string, 
+/**
+ * How many holders the fan-out was handed.
+ */
+sources: number, 
+/**
+ * `fetching` | `done`.
+ */
+stage: string, };
+
 export type ContributionView = { packageId: string, frameUuid: string, publisher: string, relPath: string, byteSize: number, 
 /**
  * A newer contribution for the same frame uuid supersedes this one.
