@@ -800,13 +800,13 @@ function wireRetention() {
 // every save PUTs. It is only ever REPLACED by a server response (the poll, or a
 // PUT echo) or by an explicit add/remove — so the page can never invent a schedule.
 // `sendCfgSeen` is what makes the other half of that claim — that the page can
-// never PUT a schedule it has not READ — actually hold. The boot value of
+// never PUT a send config it has not READ — actually hold. The boot value of
 // `scheduleTimes` is `[]`, and an empty list sent EXPLICITLY is a clear the server
 // honours; so if the first `/api/pending` never landed (agent restarting, page
 // opened offline) a plain save would erase the on-disk schedule with a 200. The
 // flag is set only where a server response paints the card (`applyModeControls`),
-// and until it is true the two schedule keys are OMITTED from the payload — the
-// backend's `Option` fields read absence as "leave the key alone".
+// and until it is true `saveSendMode` writes NOTHING — the mode and the quiet
+// window are no more the node's than the times are (see the gate there).
 // `sendModeSaving` counts PUTs in flight: while one is, the poll must not repaint
 // the card, or a tick landing between the request and its response would visibly
 // revert the operator's edit (and, worse, leave the mutation staged against a
@@ -826,6 +826,10 @@ let scheduleTimes = [];
 let sendModeSaving = 0;
 let schedArming = false;
 let sendCfgSeen = false;
+
+// Said by every path that refuses to act on an un-read card, so the operator sees
+// one explanation whichever control they reached for.
+const READING_HINT = 'still reading the schedule on this node — try again in a moment';
 
 // The single writer of `schedArming`, so the un-saved marker on the card can
 // never disagree with the flag the poll guard reads.
@@ -971,21 +975,29 @@ async function refreshPending() {
 // message inline — for a scheduled save with no times that is the validator's
 // actionable "needs at least one send time", and the config on disk is untouched.
 async function saveSendMode() {
+  const f = $('tosyncFlash');
+  // Until the card has been painted from server values, the WHOLE strip is
+  // read-only — not just its schedule half. Omitting the two schedule keys was
+  // not enough: `mode` and `autoQuietSecs` are not optional on the backend, and
+  // on an un-read page neither of them is the node's. The radiogroup can be
+  // BLANK here (the mode guard in `wireTosync` undoes a refused selection), and
+  // `currentMode()` reads blank as `auto`; an empty `#quietSecs` reads as 0. So
+  // one click on a scheduled node would PUT `auto` + a zero quiet window over
+  // its config, with a 200. Nothing may be written before something was read.
+  if (!sendCfgSeen) {
+    f.textContent = READING_HINT;
+    f.className = 'flash';
+    return;
+  }
   const edit = {
     mode: currentMode(),
     autoQuietSecs: Number($('quietSecs').value) || 0,
+    // Safe to speak about only because of the gate above: `scheduleTimes: []` is
+    // an explicit clear the server obeys, and the boot value IS `[]` — sent
+    // before the first read it would have erased the operator's send times.
+    scheduleTimes: scheduleTimes.slice(),
+    scheduleCatchup: $('schedCatchup').checked,
   };
-  // Only speak about the schedule once it has been read. `scheduleTimes: []` is
-  // an explicit clear the server obeys, and the boot value IS `[]` — so a save
-  // made before the first successful read (agent restarting, page opened
-  // offline) would silently erase the operator's send times, with a 200. Absent
-  // keys mean "leave them alone" on the backend, which is the only truthful
-  // thing an unread page can say.
-  if (sendCfgSeen) {
-    edit.scheduleTimes = scheduleTimes.slice();
-    edit.scheduleCatchup = $('schedCatchup').checked;
-  }
-  const f = $('tosyncFlash');
   // Whatever this save does, the un-saved arming state is over: the request now
   // carries the operator's intent, and its outcome (or the next poll) is truth.
   setSchedArming(false);
@@ -1082,7 +1094,7 @@ function wireTosync() {
       // back to the un-painted card and say why.
       $('modeScheduled').checked = false;
       updateModeVisibility(); updateSendButton();
-      f.textContent = 'still reading the schedule on this node — try again in a moment';
+      f.textContent = READING_HINT;
       f.className = 'flash';
       return;
     }
