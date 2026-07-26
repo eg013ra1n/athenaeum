@@ -1415,6 +1415,80 @@ fn source_stat_unchanged(link: &SourceLink, current_size: u64, current_mtime_ms:
     link.size == current_size && link.mtime_ms == current_mtime_ms
 }
 
+/// The audit tag for a deletion the operator performed from the **Library tab**
+/// (spec §2's `manual-web` actor). It is also the label the manual pass takes in
+/// the retention log's `policy` column, so one string names the actor in both
+/// places.
+pub(crate) const MANUAL_WEB_ACTOR: &str = "manual-web";
+
+/// The `sync_history` audit row for deleting `source` when there is no package
+/// manifest to describe it: identity fields blank, `bytes` from the live stat.
+///
+/// Two callers share it. [`build_retention_history_rows`] falls back to it when
+/// a package's manifest is unreadable (a degraded audit beats no audit), and
+/// [`write_deletion_audit`] uses it as the *only* shape a library deletion can
+/// have — that path deletes a capture file the operator picked by hand, which
+/// belongs to no single package, so there is no manifest to read and no frame
+/// identity to copy. Keeping one constructor means both kinds of deletion land
+/// in the history with the same columns filled the same way.
+fn minimal_deletion_row(
+    source: &Path,
+    byte_size: u64,
+    outcome: &str,
+    peer_device: &str,
+) -> HistoryRow {
+    let filename = source
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    HistoryRow {
+        frame_uuid: String::new(),
+        filename,
+        object: None,
+        peer_device: peer_device.to_string(),
+        direction: Direction::Sent,
+        bytes: byte_size,
+        started_at: now_iso(),
+        finished_at: Some(now_iso()),
+        outcome: outcome.to_string(),
+        // Perseus is a personal-sync capture agent — no project dimension.
+        project: None,
+        // No per-batch detail surface on the Perseus agent (Task 14).
+        package_id: None,
+        // Batch naming (Transfers Status Model v2) is app-only; the agent
+        // never names its capture batches.
+        batch_name: None,
+    }
+}
+
+/// Persist the audit row for ONE manually deleted capture file, **before** it is
+/// unlinked (0.5.1 T9, spec §2's audit row).
+///
+/// This is the library deleter's half of the audit-before-delete contract
+/// [`delete_one_source`] implements for retention: the caller must treat an
+/// `Err` here as a refusal to delete — a file is only ever removed once it is
+/// durably discoverable that it was.
+///
+/// `actor` names *who* deleted it and is stamped as the row's outcome in the
+/// `deleted_<actor>` family — [`MANUAL_WEB_ACTOR`] gives `deleted_manual-web`,
+/// beside retention's own `retention_deleted` and the obligation-gated batch
+/// delete's `deleted_manual`. The `peer_device` column is deliberately left
+/// **empty**: a library deletion is not a package's epilogue, so no single peer
+/// can honestly be named as the one this file was sent to (it may have gone to
+/// several, or to none at all).
+pub(crate) fn write_deletion_audit(
+    store: &dyn SyncStore,
+    path: &Path,
+    size: u64,
+    actor: &str,
+) -> Result<()> {
+    let row = minimal_deletion_row(path, size, &format!("deleted_{actor}"), "");
+    store
+        .append_history(row)
+        .with_context(|| format!("persist {actor} deletion audit for {}", path.display()))
+}
+
 /// Build the `sync_history` audit row(s) for deleting `source`. The package
 /// manifest is the source of truth for frame identity/bytes/object; when it
 /// can't be read (or is unexpectedly empty) this falls back to one minimal row
@@ -1451,29 +1525,7 @@ fn build_retention_history_rows(
     };
 
     if records.is_empty() {
-        let filename = source
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default()
-            .to_string();
-        return vec![HistoryRow {
-            frame_uuid: String::new(),
-            filename,
-            object: None,
-            peer_device: peer_device.to_string(),
-            direction: Direction::Sent,
-            bytes: byte_size,
-            started_at: now_iso(),
-            finished_at: Some(now_iso()),
-            outcome: outcome.to_string(),
-            // Perseus is a personal-sync capture agent — no project dimension.
-            project: None,
-            // No per-batch detail surface on the Perseus agent (Task 14).
-            package_id: None,
-            // Batch naming (Transfers Status Model v2) is app-only; the agent
-            // never names its capture batches.
-            batch_name: None,
-        }];
+        return vec![minimal_deletion_row(source, byte_size, outcome, peer_device)];
     }
 
     records

@@ -37,7 +37,13 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 
+mod delete;
 mod listing;
+pub use delete::{
+    delete_perform, delete_preview, plan_deletion, DeleteContext, DeleteOutcomeDto,
+    DeleteOutcomeItem, DeletePlan, DeletePreviewItem, DeleteReport, DeleteSources,
+    INTERNAL_PATH_REASON,
+};
 pub use listing::{list_directory, FileStatus, LibraryEntry, LibraryListing, StatusSources};
 
 /// Validate a wire rel-path and split it into plain filename segments.

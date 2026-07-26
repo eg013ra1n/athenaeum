@@ -121,24 +121,38 @@ impl SeenStore {
     }
 
     /// Whether `path` at `(size, mtime_ms)` should be (re-)enqueued: `true` when
-    /// there is no recorded row, or the recorded row's stat differs from the
-    /// current one (a real edit, or a different file recreated at the same
-    /// path). A lookup error is never treated as "skip" — it errs on the side
-    /// of enqueueing, since a duplicate send is harmless and a silent skip is
-    /// not (see the module doc).
+    /// there is no recorded row, when the row is a **deleted** one, or when the
+    /// recorded row's stat differs from the current one (a real edit, or a
+    /// different file recreated at the same path). A lookup error is never
+    /// treated as "skip" — it errs on the side of enqueueing, since a duplicate
+    /// send is harmless and a silent skip is not (see the module doc).
+    ///
+    /// The `deleted_at` arm is spec §2's "file reappears" row (0.5.1 T9). A
+    /// stamped row is the audit trail of a file that is *gone* — retention
+    /// removed it, or the operator deleted it from the Library tab — so anything
+    /// found at that path afterwards is a NEW capture, typically the same frame
+    /// re-copied from the camera media, which reproduces the original
+    /// `(size, mtime)` exactly. Comparing stats against a corpse would call that
+    /// "already sent" and drop it silently, the quietest data loss this agent
+    /// can have; the row is history, not a live dedup key. A real re-enqueue
+    /// clears the stamp ([`mark_enqueued`](Self::mark_enqueued)), so this arm
+    /// fires once per deletion, never on a loop.
     pub fn should_enqueue(&self, path: &Path, size: u64, mtime_ms: i64) -> Result<bool> {
         let conn = self.conn.lock().expect("seen store mutex poisoned");
-        let row: Option<(i64, i64)> = conn
+        let row: Option<(i64, i64, Option<String>)> = conn
             .query_row(
-                "SELECT size, mtime FROM perseus_seen WHERE path = ?1",
+                "SELECT size, mtime, deleted_at FROM perseus_seen WHERE path = ?1",
                 params![path.to_string_lossy()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()
             .context("query perseus_seen")?;
         Ok(match row {
             None => true,
-            Some((seen_size, seen_mtime)) => seen_size != size as i64 || seen_mtime != mtime_ms,
+            Some((_, _, Some(_deleted))) => true,
+            Some((seen_size, seen_mtime, None)) => {
+                seen_size != size as i64 || seen_mtime != mtime_ms
+            }
         })
     }
 
@@ -357,6 +371,30 @@ mod tests {
         store.mark_enqueued(&p, 200, 222, "/pkg/a2").unwrap();
         assert!(!store.should_enqueue(&p, 200, 222).unwrap(), "latest stat wins");
         assert!(store.should_enqueue(&p, 100, 111).unwrap(), "stale stat no longer matches");
+    }
+
+    /// Spec §2, the "file reappears" row — and the quietest possible data loss
+    /// if it is wrong.
+    ///
+    /// A `deleted_at` row is the audit trail of a file that is **gone**. When an
+    /// identical `(size, mtime)` file turns up at that path again it is a NEW
+    /// capture (the camera media was re-copied), not the one that was deleted —
+    /// so it must be enqueued. Matching the stat of a corpse and calling it
+    /// "already sent" would silently drop a frame nobody ever synced.
+    #[test]
+    fn a_deleted_row_reenqueues_an_identical_recreation() {
+        let (_tmp, store) = store();
+        let p = PathBuf::from("/cap/a.fits");
+        store.mark_enqueued(&p, 100, 111, "/pkg/a").unwrap();
+        assert!(
+            !store.should_enqueue(&p, 100, 111).unwrap(),
+            "the live row still dedups its own file"
+        );
+        store.mark_deleted(&p).unwrap();
+        assert!(
+            store.should_enqueue(&p, 100, 111).unwrap(),
+            "a file re-created at a deleted row's path is NEW, whatever its stat"
+        );
     }
 
     #[test]

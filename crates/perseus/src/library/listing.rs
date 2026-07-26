@@ -151,7 +151,9 @@ pub struct StatusSources<'a> {
 /// row against a DIFFERENT peer — so a second row for the same pair only appears
 /// in a stale read window. Max-id-wins keeps that case defensive rather than
 /// arbitrary.
-fn newest_by_target(outbound: &[OutboundRow]) -> HashMap<&str, HashMap<NodeId, &OutboundRow>> {
+pub(super) fn newest_by_target(
+    outbound: &[OutboundRow],
+) -> HashMap<&str, HashMap<NodeId, &OutboundRow>> {
     let mut map: HashMap<&str, HashMap<NodeId, &OutboundRow>> = HashMap::new();
     for row in outbound {
         map.entry(row.package_ref.as_str())

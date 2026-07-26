@@ -34,6 +34,11 @@
 //!   explicit `browser` batch ([`LibrarySendRequest`] → [`LibrarySendReport`]).
 //!   Selected files leave the batcher's pending set first, so the next
 //!   auto/scheduled flush cannot send them a second time.
+//! - `POST /api/library/delete` — delete a library selection
+//!   ([`LibraryDeleteRequest`] → [`LibraryDeleteReport`]). Two steps on one
+//!   route: `confirm: false` returns the per-file consequence preview and
+//!   touches nothing, `confirm: true` performs and returns a per-path outcome.
+//!   Nothing is ever forbidden except a Perseus-internal path (spec §2).
 //! - `GET`/`PUT /api/capture-dirs` — the configured vs. running capture
 //!   directories + a `restartPending` flag ([`CaptureDirsDto`]); a PUT rewrites
 //!   `perseus.toml`'s capture selection, adopts it into the live config, and
@@ -536,6 +541,9 @@ pub fn build_router(state: Arc<WebState>, token: Option<String>) -> Router {
         // Send an explicit library selection now, as one `browser` batch
         // (0.5.1 T8, spec §1a). Bearer-gated like every other `/api/*` route.
         .route("/api/library/send", post(api_library_send))
+        // Delete a library selection — two steps (preview / confirm) on one
+        // route, spec §2's consequence matrix (0.5.1 T9).
+        .route("/api/library/delete", post(api_library_delete))
         .route("/api/targets", get(api_get_targets).put(api_put_targets))
         .route("/api/targets/options", get(api_get_target_options))
         .route(
@@ -2032,6 +2040,176 @@ async fn api_library_send(
             ))
         }
     }
+}
+
+/// `POST /api/library/delete` request body (0.5.1 §2). Two steps, one route.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryDeleteRequest {
+    /// The browser selection: files and/or whole directories, in the
+    /// `(root, rel)` wire form every library route uses.
+    items: Vec<crate::library::SendItem>,
+    /// `false` (the default) previews and touches nothing; `true` performs.
+    /// Defaulting to the harmless step is deliberate: a malformed or truncated
+    /// body can only ever under-delete.
+    #[serde(default)]
+    confirm: bool,
+}
+
+/// `POST /api/library/delete` payload. Exactly one of the two lists is
+/// populated, per `confirmed` — so a client that ignored its own `confirm` flag
+/// still cannot mistake a preview for a completed deletion.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LibraryDeleteReport {
+    /// Echo of the request's `confirm`: did this call actually delete?
+    confirmed: bool,
+    /// One row per file the selection resolves to, with the consequence of
+    /// removing it. Empty when `confirmed`.
+    preview: Vec<crate::library::DeletePreviewItem>,
+    /// One row per path acted on. Empty when not `confirmed`.
+    outcomes: Vec<crate::library::DeleteOutcomeItem>,
+}
+
+/// Map a delete-planning error onto the shared library status contract. Split
+/// from [`library_error_status`] only so each route logs its own stable message.
+fn delete_error_status(err: &anyhow::Error) -> (StatusCode, String) {
+    let chain = format!("{err:#}");
+    tracing::error!(error = %chain, "web library delete: selection planning failed");
+    library_status_for(&err.to_string(), &chain)
+}
+
+/// `POST /api/library/delete` — the operator deletes anything, at any moment,
+/// with the consequence stated instead of the deletion forbidden (spec §2).
+///
+/// Two steps on one route. `confirm: false` returns the per-file preview and
+/// touches nothing — for each file: is it waiting in the batcher, which live
+/// transfers carry it, how many confirmed batches would degrade. `confirm: true`
+/// performs and returns a per-path outcome. Both plan the same way over the same
+/// selection, so the dialog and the action differ only by what really changed on
+/// disk in between — and that lands as a per-file outcome, not a surprise.
+///
+/// Deletion is engine-INDEPENDENT: a detached node (still in setup) can delete
+/// its capture folders, it simply has no pending set to clear. That is why this
+/// route, unlike `/api/library/send`, has no `503` arm.
+///
+/// Statuses: `400` for a hostile / mistyped path or a stale kind (`"not a
+/// file"`), `404` for an unknown root, `502` for an unmounted one. A path that
+/// merely vanished is **not** a status — it is that item's own `error` row,
+/// while the rest of the selection proceeds.
+///
+/// The planning walk, the fs deletions and the SQLite writes all run on blocking
+/// threads: a capture root is routinely a network share, and a wedged mount must
+/// stall one blocking-pool thread rather than a reactor worker.
+async fn api_library_delete(
+    State(state): State<Arc<WebState>>,
+    Json(req): Json<LibraryDeleteRequest>,
+) -> Result<Json<LibraryDeleteReport>, (StatusCode, String)> {
+    let config = state.config.read().await.clone();
+    let items = req.items;
+    let plan = tokio::task::spawn_blocking(move || crate::library::plan_deletion(&config, &items))
+        .await
+        .map_err(|e| {
+            let msg = format!("{e}");
+            tracing::error!(error = %msg, "web library delete: planning task panicked");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg)
+        })?
+        .map_err(|e| delete_error_status(&e))?;
+
+    // A detached page has no batcher: nothing is pending, which is the honest
+    // answer rather than an error (the same stance the listing takes).
+    let pending = match state.batcher.read().await.as_ref() {
+        Some(b) => b.pending_snapshot(),
+        None => Vec::new(),
+    };
+
+    if !req.confirm {
+        // Unbounded window on purpose, exactly as in the listing: a file's
+        // in-flight batch must not go unmentioned because it fell out of a cap.
+        let outbound = state.store.all_outbound(u32::MAX).map_err(|e| {
+            let msg = format!("{e:#}");
+            tracing::error!(error = %msg, "web library delete: read outbound failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg)
+        })?;
+        let batches = Arc::clone(&state.batches);
+        let preview = tokio::task::spawn_blocking(move || {
+            let src = crate::library::DeleteSources {
+                pending: &pending,
+                batches: &batches,
+                outbound: &outbound,
+            };
+            crate::library::delete_preview(&plan, &src)
+        })
+        .await
+        .map_err(|e| {
+            let msg = format!("{e}");
+            tracing::error!(error = %msg, "web library delete: preview task panicked");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg)
+        })?
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            tracing::error!(error = %msg, "web library delete: preview failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, msg)
+        })?;
+        tracing::info!(files = preview.len(), "library delete preview");
+        return Ok(Json(LibraryDeleteReport {
+            confirmed: false,
+            preview,
+            outcomes: Vec::new(),
+        }));
+    }
+
+    let batcher = state.batcher.read().await.clone();
+    let store = Arc::clone(&state.store);
+    let seen = Arc::clone(&state.seen);
+    let report = tokio::task::spawn_blocking(move || {
+        let ctx = crate::library::DeleteContext {
+            store: &*store,
+            seen: &seen,
+            batcher: batcher.as_ref(),
+            actor: crate::run::MANUAL_WEB_ACTOR,
+        };
+        crate::library::delete_perform(&plan, &ctx)
+    })
+    .await
+    .map_err(|e| {
+        let msg = format!("{e}");
+        tracing::error!(error = %msg, "web library delete: delete task panicked");
+        (StatusCode::INTERNAL_SERVER_ERROR, msg)
+    })?;
+
+    // Spec §2's audit half: the per-file `sync_history` rows are already
+    // written; this puts the PASS in the retention log beside the automatic
+    // ones, labelled by its actor so an operator reading that log can tell a
+    // policy deletion from their own.
+    if !report.deleted_paths.is_empty() || !report.notes.is_empty() {
+        let record = RetentionRunRecord {
+            at: now_rfc3339(),
+            dry_run: false,
+            policy: crate::run::MANUAL_WEB_ACTOR.to_string(),
+            deleted: report.deleted_paths.clone(),
+            // A manual pass has no eligibility phase: the operator's selection
+            // IS the verdict.
+            would_delete: Vec::new(),
+            errors: report.notes.clone(),
+        };
+        let handle = state.retention_log.read().await;
+        let mut log = handle.lock().expect("retention_log mutex poisoned");
+        log.push_front(record);
+        log.truncate(50);
+    }
+
+    tracing::info!(
+        deleted = report.deleted_paths.len(),
+        reported = report.items.len(),
+        problems = report.notes.len(),
+        "library delete finished"
+    );
+    Ok(Json(LibraryDeleteReport {
+        confirmed: true,
+        preview: Vec::new(),
+        outcomes: report.items,
+    }))
 }
 
 /// `GET /api/pending` — the "To sync" tree over the batcher's current pending
@@ -6993,5 +7171,612 @@ mod tests {
         )
         .await;
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // ── T9 (0.5.1 local library): POST /api/library/delete, spec §2 matrix ─────
+    //
+    // One test per row of the spec's consequence table. The owner requirement
+    // behind all of them: the operator may delete ANYTHING at any moment, and
+    // the consequence is stated rather than the deletion forbidden.
+
+    /// `{ items, confirm }` for the delete route.
+    fn delete_body(items: serde_json::Value, confirm: bool) -> serde_json::Value {
+        serde_json::json!({ "items": items, "confirm": confirm })
+    }
+
+    /// One item's preview row from a `confirm: false` response.
+    fn preview_of<'a>(v: &'a serde_json::Value, rel: &str) -> &'a serde_json::Value {
+        v["preview"]
+            .as_array()
+            .expect("preview list")
+            .iter()
+            .find(|p| p["rel"] == rel)
+            .unwrap_or_else(|| panic!("{rel} not previewed: {v}"))
+    }
+
+    /// One item's outcome row from a `confirm: true` response.
+    fn outcome_of<'a>(v: &'a serde_json::Value, rel: &str) -> &'a serde_json::Value {
+        &v["outcomes"]
+            .as_array()
+            .expect("outcome list")
+            .iter()
+            .find(|p| p["rel"] == rel)
+            .unwrap_or_else(|| panic!("{rel} has no outcome: {v}"))["outcome"]
+    }
+
+    /// Every `sync_history` row whose outcome is `outcome`.
+    fn history_rows_with_outcome(
+        store: &StandaloneSyncStore,
+        outcome: &str,
+    ) -> Vec<athenaeum_core::sync::HistoryRow> {
+        store
+            .search_history(athenaeum_core::sync::HistoryQuery {
+                filename: None,
+                object: None,
+                direction: None,
+                peer: None,
+                project: None,
+                package_id: None,
+                limit: 1000,
+            })
+            .unwrap()
+            .into_iter()
+            .filter(|h| h.outcome == outcome)
+            .collect()
+    }
+
+    /// Seed a batch that carries `source`: a package directory holding a payload
+    /// copy, the `perseus_batch_files` linkage, and one outbound row in `state`.
+    /// Returns the package ref.
+    async fn seed_batch(
+        st: &Arc<WebState>,
+        dir: &Path,
+        name: &str,
+        source: &Path,
+        state: OutboundState,
+    ) -> String {
+        let pkg = dir.join(name);
+        std::fs::create_dir_all(&pkg).unwrap();
+        // The payload COPY — what the upload actually reads, and what must
+        // survive the original being deleted.
+        std::fs::copy(source, pkg.join("payload.fits")).unwrap();
+        let pkg_ref = pkg.display().to_string();
+        st.batches
+            .record_files(
+                &pkg_ref,
+                &[("payload.fits".to_string(), source.to_path_buf())],
+            )
+            .unwrap();
+        let id = st.store.enqueue(&pkg_ref, PEER, None, &[]).unwrap();
+        if state == OutboundState::Confirmed {
+            st.store.confirm(id, &[]).unwrap();
+        } else {
+            st.store.set_state(id, state).unwrap();
+        }
+        pkg_ref
+    }
+
+    /// §2 row 1 — a **queued** file. The pending set is cleared BEFORE the
+    /// unlink, so no scheduled or auto flush can ever see a file that is about
+    /// to stop existing.
+    ///
+    /// The ordering is proved rather than assumed: the second phase makes the
+    /// unlink fail (read-only parent), and the file's pending entry is gone even
+    /// though the file is still on disk — which can only happen if the removal
+    /// ran first.
+    #[tokio::test]
+    async fn library_delete_queued_file_leaves_the_pending_set_first() {
+        let h = send_harness().await;
+        write_file(&h.cap, "a.fits", b"x");
+        h.make_pending("a.fits").await;
+        let app = build_router(Arc::clone(&h.state), None);
+
+        let v = body_json(
+            post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(serde_json::json!([{ "root": 0, "rel": "a.fits" }]), false),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(preview_of(&v, "a.fits")["queued"], true);
+        assert!(
+            h.cap.join("a.fits").exists() && h.batcher.pending_snapshot().len() == 1,
+            "a preview touches neither disk nor the pending set"
+        );
+
+        let v = body_json(
+            post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(serde_json::json!([{ "root": 0, "rel": "a.fits" }]), true),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(outcome_of(&v, "a.fits")["kind"], "deleted");
+        assert!(!h.cap.join("a.fits").exists(), "the file is gone");
+        assert!(
+            h.batcher.pending_snapshot().is_empty(),
+            "and it left the pending set — the next flush cannot send it"
+        );
+
+        // Phase 2 (unix): a failing unlink still leaves the pending set cleared.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = h.cap.join("locked");
+            std::fs::create_dir_all(&locked).unwrap();
+            write_file(&h.cap, "locked/b.fits", b"x");
+            h.make_pending("locked/b.fits").await;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+            let v = body_json(
+                post_json(
+                    &app,
+                    "/api/library/delete",
+                    delete_body(
+                        serde_json::json!([{ "root": 0, "rel": "locked/b.fits" }]),
+                        true,
+                    ),
+                )
+                .await,
+            )
+            .await;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(outcome_of(&v, "locked/b.fits")["kind"], "error");
+            assert!(locked.join("b.fits").exists(), "the unlink really failed");
+            assert!(
+                h.batcher.pending_snapshot().is_empty(),
+                "pending was cleared before the unlink was attempted"
+            );
+        }
+    }
+
+    /// §2 row 2 — a file in an **in-flight** batch. The delete proceeds (the
+    /// upload reads the package's payload copy, not the original), and the
+    /// preview NAMES the batch so the operator is told, not blocked.
+    #[tokio::test]
+    async fn library_delete_names_the_in_flight_batch_and_leaves_the_transfer_alone() {
+        let (state, tmp, cap) = library_test_state().await;
+        let abs = write_file(&cap, "a.fits", b"x");
+        let pkg_ref = seed_batch(
+            &state,
+            tmp.path(),
+            "pkg-live",
+            &abs,
+            OutboundState::Transferring,
+        )
+        .await;
+        let app = build_router(Arc::clone(&state), None);
+
+        let v = body_json(
+            post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(serde_json::json!([{ "root": 0, "rel": "a.fits" }]), false),
+            )
+            .await,
+        )
+        .await;
+        let p = preview_of(&v, "a.fits");
+        assert_eq!(
+            p["inFlightBatches"],
+            serde_json::json!(["pkg-live"]),
+            "the live batch is named in the confirm dialog: {p}"
+        );
+        assert_eq!(p["confirmedBatches"], 0);
+
+        let v = body_json(
+            post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(serde_json::json!([{ "root": 0, "rel": "a.fits" }]), true),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            outcome_of(&v, "a.fits")["kind"],
+            "deleted",
+            "an in-flight transfer never forbids the delete"
+        );
+        assert!(!abs.exists());
+        assert!(
+            Path::new(&pkg_ref).join("payload.fits").exists(),
+            "the payload copy the upload reads is untouched"
+        );
+        let rows = state.store.all_outbound(u32::MAX).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].state,
+            OutboundState::Transferring,
+            "the transfer row is untouched — it completes from its copy"
+        );
+    }
+
+    /// §2 row 3 — a file from a **confirmed** batch deletes freely, and the
+    /// batch's own history survives: its source linkage still resolves, which is
+    /// what makes a later re-send degrade honestly ("97 of 100") instead of
+    /// forgetting the file was ever in it.
+    #[tokio::test]
+    async fn library_delete_of_a_confirmed_batch_file_keeps_the_batch_history() {
+        let (state, tmp, cap) = library_test_state().await;
+        let abs = write_file(&cap, "a.fits", b"x");
+        let pkg_ref = seed_batch(
+            &state,
+            tmp.path(),
+            "pkg-done",
+            &abs,
+            OutboundState::Confirmed,
+        )
+        .await;
+        let app = build_router(Arc::clone(&state), None);
+
+        let v = body_json(
+            post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(serde_json::json!([{ "root": 0, "rel": "a.fits" }]), false),
+            )
+            .await,
+        )
+        .await;
+        let p = preview_of(&v, "a.fits");
+        assert_eq!(p["confirmedBatches"], 1, "the consequence is stated: {p}");
+        assert_eq!(p["inFlightBatches"], serde_json::json!([]));
+
+        let v = body_json(
+            post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(serde_json::json!([{ "root": 0, "rel": "a.fits" }]), true),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(outcome_of(&v, "a.fits")["kind"], "deleted");
+        assert!(!abs.exists());
+        assert_eq!(
+            state
+                .batches
+                .batches_for_source(&abs.to_string_lossy())
+                .unwrap(),
+            vec![pkg_ref],
+            "the batch still knows it carried this file"
+        );
+    }
+
+    /// §2 row 4 — the **reappear** case, and the worst quiet failure in the
+    /// matrix if it is wrong.
+    ///
+    /// A frame re-copied from the camera media reproduces the original
+    /// `(size, mtime)` byte for byte. After a delete, the seen store must treat
+    /// exactly that as NEW — otherwise the frame is silently never sent again.
+    /// The chain is asserted end to end: delete → row stamped → identical
+    /// re-creation → `should_enqueue`.
+    #[tokio::test]
+    async fn library_delete_lets_an_identical_recreation_be_sent_again() {
+        let (state, _tmp, cap) = library_test_state().await;
+        let abs = write_file(&cap, "a.fits", b"0123456789");
+        let meta = std::fs::metadata(&abs).unwrap();
+        let (size, mtime_ms) = (meta.len(), crate::seen::mtime_millis(meta.modified().ok()));
+        let modified = meta.modified().unwrap();
+        state
+            .seen
+            .mark_enqueued(&abs, size, mtime_ms, "/pkg/u1")
+            .unwrap();
+        assert!(
+            !state.seen.should_enqueue(&abs, size, mtime_ms).unwrap(),
+            "precondition: while it lives, the recorded file is deduped"
+        );
+
+        let app = build_router(Arc::clone(&state), None);
+        let v = body_json(
+            post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(serde_json::json!([{ "root": 0, "rel": "a.fits" }]), true),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(outcome_of(&v, "a.fits")["kind"], "deleted");
+        assert!(
+            !state.seen.is_recorded(&abs).unwrap(),
+            "the seen row is stamped deleted, not live"
+        );
+
+        // Re-copied from the camera media: same bytes, same mtime.
+        std::fs::write(&abs, b"0123456789").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&abs)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let again = std::fs::metadata(&abs).unwrap();
+        assert_eq!(
+            (
+                again.len(),
+                crate::seen::mtime_millis(again.modified().ok())
+            ),
+            (size, mtime_ms),
+            "the re-creation really is stat-identical"
+        );
+        assert!(
+            state.seen.should_enqueue(&abs, size, mtime_ms).unwrap(),
+            "a file that reappears after a delete is a NEW capture and must be sent"
+        );
+    }
+
+    /// §2 row 7 — **directory delete**: recursive, one file's failure never
+    /// strands its siblings, and a directory is removed only once it is empty.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn library_delete_of_a_directory_is_recursive_and_keeps_going_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let (state, _tmp, cap) = library_test_state().await;
+        write_file(&cap, "M31/a.fits", b"x");
+        write_file(&cap, "M31/notes.txt", b"x"); // not capture-eligible: still deleted
+        write_file(&cap, "M31/sub/b.fits", b"x");
+        write_file(&cap, "M31/locked/c.fits", b"x");
+        let locked = cap.join("M31/locked");
+        // Read-only parent: `c.fits` cannot be unlinked (the portable stand-in
+        // for the spec's Windows sharing violation).
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let app = build_router(Arc::clone(&state), None);
+        let v = body_json(
+            post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(
+                    serde_json::json!([{ "root": 0, "rel": "M31", "dir": true }]),
+                    true,
+                ),
+            )
+            .await,
+        )
+        .await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        for rel in ["M31/a.fits", "M31/notes.txt", "M31/sub/b.fits"] {
+            assert_eq!(outcome_of(&v, rel)["kind"], "deleted", "{rel}");
+            assert!(!cap.join(rel).exists(), "{rel} is gone");
+        }
+        assert_eq!(
+            outcome_of(&v, "M31/locked/c.fits")["kind"],
+            "error",
+            "the one that could not be removed is reported, not hidden: {v}"
+        );
+        assert!(locked.join("c.fits").exists());
+        assert!(
+            !cap.join("M31/sub").exists(),
+            "an emptied subdirectory is removed"
+        );
+        assert!(
+            cap.join("M31").exists() && locked.exists(),
+            "a directory that still holds something survives"
+        );
+    }
+
+    /// §2 — the only refusal: a Perseus-internal path. `data_dir` nested inside a
+    /// capture root is a misconfiguration, not an invitation to delete the
+    /// agent's own database; the rest of the selection still goes.
+    #[tokio::test]
+    async fn library_delete_refuses_a_perseus_internal_path() {
+        // A capture root with the data dir INSIDE it — the case the guard alone
+        // cannot catch, since the data dir really is under the root.
+        let tmp = tempfile::tempdir().unwrap();
+        let cap = tmp.path().join("cap");
+        let data = cap.join(".perseus");
+        std::fs::create_dir_all(&data).unwrap();
+        let db = data.join("perseus.db");
+        let store = Arc::new(StandaloneSyncStore::open(&db).unwrap());
+        let seen = Arc::new(crate::seen::SeenStore::open(&db).unwrap());
+        let batches = Arc::new(crate::batch_store::BatchStore::open(&db).unwrap());
+        let toml_str = format!(
+            "capture_dir = \"{}\"\ndata_dir = \"{}\"\npairing_ticket = \"t\"\nmode = \"manual\"\n[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            cap.display(),
+            data.display()
+        );
+        let config_path = tmp.path().join("perseus.toml");
+        std::fs::write(&config_path, &toml_str).unwrap();
+        let config = Config::from_toml_str(&toml_str).unwrap();
+        let (_state_tx, state_rx) = watch::channel(AgentState::Running { in_flight: 0 });
+        let state = Arc::new(WebState::detached(
+            store,
+            seen,
+            batches,
+            config,
+            config_path,
+            state_rx,
+            Arc::new(Notify::new()),
+        ));
+        let own = write_file(&cap, "a.fits", b"x");
+
+        let app = build_router(Arc::clone(&state), None);
+        // Naming it directly.
+        let v = body_json(
+            post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(
+                    serde_json::json!([{ "root": 0, "rel": ".perseus/perseus.db" }]),
+                    true,
+                ),
+            )
+            .await,
+        )
+        .await;
+        let outcome = outcome_of(&v, ".perseus/perseus.db");
+        assert_eq!(outcome["kind"], "refused");
+        assert_eq!(outcome["reason"], crate::library::INTERNAL_PATH_REASON);
+        assert!(db.exists(), "the agent's own database is untouched");
+
+        // And swept up by a whole-root delete: the internal subtree is refused
+        // while everything else still goes.
+        let v = body_json(
+            post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(
+                    serde_json::json!([{ "root": 0, "rel": "", "dir": true }]),
+                    true,
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(outcome_of(&v, "a.fits")["kind"], "deleted");
+        assert_eq!(outcome_of(&v, ".perseus")["kind"], "refused");
+        assert!(!own.exists(), "the operator's own file went");
+        assert!(db.exists(), "the database did not");
+        assert!(cap.exists(), "a capture root itself is never removed");
+    }
+
+    /// §2 — **audit**. Every manual deletion writes the retention-style history
+    /// row with the `manual-web` actor, and the pass shows up in the retention
+    /// log beside the automatic passes' `retention_deleted` rows.
+    #[tokio::test]
+    async fn library_delete_writes_an_audit_row_and_shows_in_the_retention_log() {
+        let (state, _tmp, cap) = library_test_state().await;
+        let abs = write_file(&cap, "a.fits", b"0123456789");
+        let app = build_router(Arc::clone(&state), None);
+
+        // A preview writes NOTHING.
+        post_json(
+            &app,
+            "/api/library/delete",
+            delete_body(serde_json::json!([{ "root": 0, "rel": "a.fits" }]), false),
+        )
+        .await;
+        assert!(
+            history_rows_with_outcome(&state.store, "deleted_manual-web").is_empty(),
+            "a preview leaves no audit trail — it deleted nothing"
+        );
+        assert!(body_json(get(&app, "/api/retention/log").await)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty());
+
+        post_json(
+            &app,
+            "/api/library/delete",
+            delete_body(serde_json::json!([{ "root": 0, "rel": "a.fits" }]), true),
+        )
+        .await;
+
+        let audit = history_rows_with_outcome(&state.store, "deleted_manual-web");
+        assert_eq!(audit.len(), 1, "one audit row per deleted file");
+        assert_eq!(audit[0].filename, "a.fits");
+        assert_eq!(audit[0].bytes, 10, "the size it had when it was deleted");
+
+        let log = body_json(get(&app, "/api/retention/log").await).await;
+        let entry = &log.as_array().unwrap()[0];
+        assert_eq!(
+            entry["policy"], "manual-web",
+            "the pass is labelled by its actor: {entry}"
+        );
+        assert_eq!(entry["dryRun"], false);
+        assert_eq!(
+            entry["deleted"],
+            serde_json::json!([abs.display().to_string()]),
+            "the deleted path is visible beside the automatic passes"
+        );
+    }
+
+    /// §2 — a path that **vanished** between the listing and the delete is that
+    /// item's own honest `not found`, never the whole request's failure: the
+    /// outcome the operator asked for already holds for it, and the rest of the
+    /// selection still goes.
+    #[tokio::test]
+    async fn library_delete_of_a_vanished_path_reports_it_and_proceeds() {
+        let (state, _tmp, cap) = library_test_state().await;
+        let survivor = write_file(&cap, "a.fits", b"x");
+        let app = build_router(Arc::clone(&state), None);
+
+        let body = delete_body(
+            serde_json::json!([
+                { "root": 0, "rel": "gone.fits" },
+                { "root": 0, "rel": "gone-dir", "dir": true },
+                { "root": 0, "rel": "a.fits" }
+            ]),
+            false,
+        );
+        let v = body_json(post_json(&app, "/api/library/delete", body).await).await;
+        assert_eq!(preview_of(&v, "gone.fits")["blocked"], "not found");
+        assert_eq!(
+            preview_of(&v, "gone-dir")["blocked"],
+            "not found",
+            "a vanished DIRECTORY is absorbed too — unlike a send, the asked-for \
+             outcome already holds"
+        );
+        assert!(preview_of(&v, "a.fits")["blocked"].is_null());
+
+        let body = delete_body(
+            serde_json::json!([
+                { "root": 0, "rel": "gone.fits" },
+                { "root": 0, "rel": "a.fits" }
+            ]),
+            true,
+        );
+        let res = post_json(&app, "/api/library/delete", body).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(outcome_of(&v, "gone.fits")["kind"], "error");
+        assert_eq!(outcome_of(&v, "gone.fits")["reason"], "not found");
+        assert_eq!(outcome_of(&v, "a.fits")["kind"], "deleted");
+        assert!(!survivor.exists(), "the rest of the selection proceeded");
+    }
+
+    /// The path contract is inherited whole: a hostile or mistyped selection is
+    /// the request's own failure (nothing is a "partial delete" there), and an
+    /// unmounted root is a `502` rather than a `404` that reads as "your file is
+    /// gone".
+    #[tokio::test]
+    async fn library_delete_inherits_the_path_contract() {
+        let (state, _tmp, cap) = library_test_state().await;
+        write_file(&cap, "a.fits", b"x");
+        let app = build_router(Arc::clone(&state), None);
+
+        for (items, want) in [
+            (
+                serde_json::json!([{ "root": 0, "rel": "../escape" }]),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!([{ "root": 0, "rel": "a.fits", "dir": true }]),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                serde_json::json!([{ "root": 9, "rel": "a.fits" }]),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let res = post_json(
+                &app,
+                "/api/library/delete",
+                delete_body(items.clone(), true),
+            )
+            .await;
+            assert_eq!(res.status(), want, "{items}");
+        }
+        assert!(
+            cap.join("a.fits").exists(),
+            "a refused request deletes nothing"
+        );
+
+        std::fs::remove_dir_all(&cap).unwrap();
+        let res = post_json(
+            &app,
+            "/api/library/delete",
+            delete_body(serde_json::json!([{ "root": 0, "rel": "a.fits" }]), true),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_GATEWAY, "offline root");
     }
 }
