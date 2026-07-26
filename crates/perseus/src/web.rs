@@ -1674,7 +1674,9 @@ fn library_status_for(head: &str, chain: &str) -> (StatusCode, String) {
 /// The three status sources are snapshotted ONCE per request (the batcher's
 /// pending set, every outbound row, and the two Perseus stores) and handed to
 /// [`list_directory`](crate::library::list_directory) as borrowed handles, so the
-/// per-file join never re-reads them.
+/// per-file join never re-reads them. The live retention config rides along as a
+/// fourth source: it is what turns each row's confirm history into the T15 fate
+/// line, and it is read in the SAME `config` guard as the roots.
 ///
 /// The whole filesystem + SQLite pass runs on a blocking thread: a capture root is
 /// routinely a network share, and a wedged mount must stall one blocking-pool
@@ -1683,7 +1685,12 @@ async fn api_library(
     State(state): State<Arc<WebState>>,
     Query(q): Query<LibraryQuery>,
 ) -> Result<Json<crate::library::LibraryListing>, (StatusCode, String)> {
-    let roots = state.config.read().await.capture_dirs_resolved();
+    // One read of the live config for BOTH the roots and the retention knobs, so
+    // the listing cannot mix a pre-edit root list with a post-edit policy.
+    let (roots, retention) = {
+        let cfg = state.config.read().await;
+        (cfg.capture_dirs_resolved(), cfg.retention.clone())
+    };
     let Some(root) = roots.get(q.root).cloned() else {
         tracing::error!(
             root_index = q.root,
@@ -1715,6 +1722,7 @@ async fn api_library(
             batches: &batches,
             seen: &seen,
             outbound: &outbound,
+            retention: &retention,
         };
         crate::library::list_directory(root_index, &root, &rel, &src)
     })
@@ -7175,10 +7183,39 @@ mod tests {
         assert!(by_name["unsent.fits"]["mtimeMs"].as_i64().unwrap() > 0);
         assert_eq!(by_name["unsent.fits"]["batches"], 0);
         assert_eq!(by_name["sending.fits"]["batches"], 1);
-        assert!(
-            by_name["unsent.fits"]["retention"].is_null(),
-            "retention is T15's field; it ships null here"
+
+        // T15 fate line, under this fixture's `keep_days = 21, dry_run = true`
+        // config. Nothing but `delivered.fits` has a confirmed row, so every
+        // other entry reads the honest "not a candidate yet" line.
+        let confirmed_at = state
+            .store
+            .all_outbound(u32::MAX)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.package_ref == "/pkg/delivered")
+            .and_then(|r| r.confirmed_at)
+            .expect("the delivered row carries a confirmed_at");
+        let deletable = chrono::DateTime::parse_from_rfc3339(&confirmed_at)
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            + chrono::Duration::days(21);
+        assert_eq!(
+            by_name["delivered.fits"]["retention"],
+            format!("would be deletable after {}", deletable.format("%Y-%m-%d")),
+            "the clock starts at the row's confirmed_at, and dry-run says 'would be'"
         );
+        for name in [
+            "unsent.fits",
+            "queued.fits",
+            "sending.fits",
+            "sent.fits",
+            "declined.fits",
+        ] {
+            assert_eq!(
+                by_name[name]["retention"], "kept until sent and confirmed",
+                "{name}: no confirmed row ⇒ retention can never name it"
+            );
+        }
 
         // Descending into the subdirectory lists only its own contents.
         let sub = body_json(get(&app, "/api/library?root=0&path=M31").await).await;
@@ -7190,6 +7227,50 @@ mod tests {
         // pending set the assertions read — outlives the requests.
         drop(stable_tx);
         drop(send_cfg_tx);
+    }
+
+    /// T15: on a `keep_everything` node the fate line is absent from EVERY row,
+    /// confirmed ones included — the operator must not read a deletion sentence
+    /// on a node that deletes nothing. The policy is read live off the config,
+    /// so flipping it flips the whole listing with no restart.
+    #[tokio::test]
+    async fn library_listing_omits_the_fate_line_under_keep_everything() {
+        let (state, _tmp, cap) = library_test_state().await;
+        let delivered = write_file(&cap, "delivered.fits", b"x");
+        state
+            .batches
+            .record_files(
+                "/pkg/delivered",
+                &[("f.fits".to_string(), delivered.clone())],
+            )
+            .unwrap();
+        let id = state
+            .store
+            .enqueue("/pkg/delivered", PEER, None, &[])
+            .unwrap();
+        state.store.confirm(id, &[]).unwrap();
+
+        // Same request, both policies — only the config differs.
+        let app = build_router(Arc::clone(&state), None);
+        let v = body_json(get(&app, "/api/library?root=0&path=").await).await;
+        assert_eq!(v["files"][0]["status"], "delivered");
+        assert!(
+            v["files"][0]["retention"]
+                .as_str()
+                .unwrap()
+                .starts_with("would be deletable after "),
+            "sanity: the fixture starts on keep_days, got {:?}",
+            v["files"][0]["retention"]
+        );
+
+        state.config.write().await.retention.policy =
+            crate::config::RetentionPolicy::KeepEverything;
+        let v = body_json(get(&app, "/api/library?root=0&path=").await).await;
+        assert_eq!(v["files"][0]["status"], "delivered", "status is unchanged");
+        assert!(
+            v["files"][0]["retention"].is_null(),
+            "keep_everything states no fate at all"
+        );
     }
 
     /// A root index past the configured capture dirs is a `404`, not a panic.

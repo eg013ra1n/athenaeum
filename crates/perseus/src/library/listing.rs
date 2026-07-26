@@ -37,6 +37,16 @@
 //! arms 2–4: neither says anything about the file's fate that arm 5 does not say
 //! more honestly.
 //!
+//! # The retention fate line is a SEPARATE derivation
+//!
+//! [`LibraryEntry::retention`] does not read [`FileStatus`] at all. The status
+//! chip answers "where is this file in its send life"; the fate line answers
+//! "what will retention do to it", and the two legitimately disagree — a file
+//! whose re-capture is `Sending` can still be a deletion candidate through an
+//! older package that confirmed weeks ago. [`retention_fate`] is derived from
+//! the evaluator (`athenaeum_core::sync::retention`), never from the chip; see
+//! its docs for the three resolutions that follow from that.
+//!
 //! # Path spelling is the join key
 //!
 //! Every store keys on the path spelling the watcher recorded, which is
@@ -58,13 +68,19 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use athenaeum_core::sharing::types::NodeId;
-use athenaeum_core::sync::{OutboundRow, OutboundState};
+use athenaeum_core::sync::{OutboundRow, OutboundState, RetentionPolicy};
+use chrono::{DateTime, Utc};
 
 use crate::batch_store::BatchStore;
+use crate::config::RetentionConfig;
 use crate::resend::is_declined;
 use crate::seen::{mtime_millis, SeenStore};
 
 use super::{resolve_in_root, split_rel};
+
+/// Fate line for a file no policy will ever name a date for — it has not
+/// reached the confirmed-only chokepoint yet.
+const FATE_KEPT: &str = "kept until sent and confirmed";
 
 /// The derived send fate of one capture file. Serialized lowercase — the wire
 /// values the Library UI switches on.
@@ -103,8 +119,9 @@ pub struct LibraryEntry {
     /// How many recorded send batches carried this file (original + any divert
     /// copies). `0` for a file that was never packaged.
     pub batches: usize,
-    /// What retention intends to do with this file. Always `None` here — the
-    /// field ships now so the wire shape is stable, and T15 fills it.
+    /// What retention intends to do with this file, in the operator's words
+    /// ([`retention_fate`]). `None` under `keep_everything` — the node deletes
+    /// nothing, so there is no fate to state.
     pub retention: Option<String>,
 }
 
@@ -133,6 +150,11 @@ pub struct StatusSources<'a> {
     /// Every outbound row in the read window, in any order — the newest attempt
     /// per `(package_ref, peer)` is picked here, not by the caller.
     pub outbound: &'a [OutboundRow],
+    /// The live retention knobs, for the per-file fate line ([`retention_fate`]).
+    /// Taken as the whole config rather than a pre-mapped policy so the listing
+    /// goes through the same `to_core_policy()` seam the retention task does —
+    /// the threshold in the sentence is then the threshold that will be applied.
+    pub retention: &'a RetentionConfig,
 }
 
 /// Every target's newest row for each package: outer key `package_ref`, inner
@@ -169,20 +191,176 @@ pub(super) fn newest_by_target(
     map
 }
 
-/// Derive one file's status and batch-participation count. See the module docs
-/// for the precedence; the batch lookup runs unconditionally so `batches` is
-/// honest even for a file whose status came from an earlier arm.
+/// What retention intends to do with one file, in the operator's words.
+///
+/// # This mirrors the evaluator, not the card copy
+///
+/// Every arm below was derived by reading
+/// [`evaluate_and_apply`](athenaeum_core::sync::evaluate_and_apply), because a
+/// fate line that disagrees with the evaluator is worse than no line at all.
+/// `policy` is deliberately the **core** [`RetentionPolicy`] — the carrying enum
+/// `RetentionConfig::to_core_policy` produces and the retention task passes
+/// straight to the evaluator — so the threshold in the sentence can never drift
+/// from the threshold that will be applied.
+///
+/// `confirmed_at` is the **earliest** usable confirm across every package
+/// carrying the file (see `earliest_confirm_by_package`); `None` means no
+/// confirmed row with a parseable timestamp exists, which is exactly the state
+/// in which the evaluator can never name the file.
+///
+/// Three deliberate resolutions:
+///
+/// 1. **No `status` parameter.** A file can be `Sending` (a re-capture is in
+///    flight) while an *older* package carrying it confirmed weeks ago —
+///    retention deletes it via that older package's candidacy. Gating on the
+///    status chip would print "kept" over a file about to be removed.
+/// 2. **The unconfirmed arm applies to every policy, not just `keep_days`.**
+///    `disk_pct` draws its candidates from the same confirmed-only chokepoint,
+///    so an unconfirmed file is not a pressure candidate either (spec §8 lists
+///    "unsent/unconfirmed → kept…" as its own row; this is that row).
+/// 3. **`on_confirm` gets a line** even though the spec's card copy enumerates
+///    only three policies: it is a real, selectable value in `config.rs`, and
+///    silence about the most aggressive policy Perseus has would be the worst
+///    possible omission.
+///
+/// Returns `None` only for `keep_everything` — and for a `keep_days` threshold
+/// too large to add to a date, where naming no date beats naming a wrong one.
+pub fn retention_fate(
+    policy: &RetentionPolicy,
+    dry_run: bool,
+    confirmed_at: Option<DateTime<Utc>>,
+) -> Option<String> {
+    // The evaluator short-circuits here before any candidate work; so do we.
+    if matches!(policy, RetentionPolicy::KeepEverything) {
+        return None;
+    }
+    // The single chokepoint: no confirmed row ⇒ no policy can ever name it.
+    let Some(confirmed_at) = confirmed_at else {
+        return Some(FATE_KEPT.to_string());
+    };
+    // "would be " turns every deletion sentence into its dry-run form. The
+    // `kept` arm above never takes it — it is not a deletion statement.
+    let prefix = if dry_run { "would be " } else { "" };
+    match policy {
+        RetentionPolicy::KeepEverything => None,
+        RetentionPolicy::OnConfirm => Some(format!("{prefix}deleted at the next retention pass")),
+        RetentionPolicy::KeepDays(days) => {
+            // Mirrors `confirmed_age_reached`: eligible once
+            // `now - confirmed_at >= days`. Checked all the way through —
+            // `keep_days` is only validated `>= 1`, so a hand-edited absurd
+            // value must degrade to silence, not panic or print a wrapped date.
+            let deletable_at = chrono::Duration::try_days(i64::from(*days))
+                .and_then(|d| confirmed_at.checked_add_signed(d));
+            let Some(deletable_at) = deletable_at else {
+                tracing::warn!(
+                    keep_days = *days,
+                    confirmed_at = %confirmed_at,
+                    "library fate: keep_days threshold is not representable as a date; no fate line"
+                );
+                return None;
+            };
+            Some(format!(
+                "{prefix}deletable after {}",
+                deletable_at.format("%Y-%m-%d")
+            ))
+        }
+        RetentionPolicy::DiskPct { .. } => {
+            Some(format!("{prefix}deleted under disk pressure, oldest first"))
+        }
+    }
+}
+
+/// The earliest usable `confirmed_at` per `package_ref`, over EVERY confirmed
+/// row — the instant retention's clock starts for that package.
+///
+/// **Deliberately not [`newest_by_target`]'s collapse.** That map keeps one row
+/// per `(package_ref, peer)` by max id, which is the right lens for a *status*
+/// chip. The evaluator instead reads
+/// [`confirmed()`](athenaeum_core::sync::store::SyncStore::confirmed) — every
+/// row whose state is `Confirmed`, with no per-target collapse — and applies its
+/// age test per row, so a package is a candidate as soon as its EARLIEST confirm
+/// ages out. Taking the min here reproduces that. In a stale read window holding
+/// both a confirmed and a newer live row for one pair, this errs toward warning
+/// the operator rather than toward a silent "kept".
+///
+/// A missing or unparseable timestamp contributes nothing, matching the
+/// evaluator's fail-safe (`confirmed_age_reached` warns and refuses eligibility).
+/// It is logged at `debug` rather than `warn`: this is a read-only display
+/// derivation re-run on every UI poll, and the evaluator already warns once per
+/// pass on the same rows — a second `warn!` per file per poll would bury it.
+fn earliest_confirm_by_package(outbound: &[OutboundRow]) -> HashMap<&str, DateTime<Utc>> {
+    let mut map: HashMap<&str, DateTime<Utc>> = HashMap::new();
+    for row in outbound {
+        if row.state != OutboundState::Confirmed {
+            continue;
+        }
+        let Some(ts) = row.confirmed_at.as_deref() else {
+            tracing::debug!(
+                package_ref = %row.package_ref,
+                "library fate: confirmed row without confirmed_at; contributes no retention clock"
+            );
+            continue;
+        };
+        let parsed = match DateTime::parse_from_rfc3339(ts) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(error) => {
+                tracing::debug!(
+                    package_ref = %row.package_ref,
+                    confirmed_at = %ts,
+                    %error,
+                    "library fate: unparseable confirmed_at; contributes no retention clock"
+                );
+                continue;
+            }
+        };
+        map.entry(row.package_ref.as_str())
+            .and_modify(|cur| {
+                if parsed < *cur {
+                    *cur = parsed;
+                }
+            })
+            .or_insert(parsed);
+    }
+    map
+}
+
+/// Everything the join derives for one file.
+struct FileFacts {
+    status: FileStatus,
+    batches: usize,
+    /// Earliest usable confirm across every package carrying the file. Retention
+    /// deletes a file the moment ANY of its packages becomes a candidate (the
+    /// deleter maps a candidate `package_ref` back to its sources), so the
+    /// earliest anchor is the one that decides.
+    confirmed_at: Option<DateTime<Utc>>,
+}
+
+/// Derive one file's status, batch-participation count, and retention anchor.
+/// See the module docs for the precedence; the batch lookup runs unconditionally
+/// so `batches` is honest even for a file whose status came from an earlier arm.
 fn status_for(
     abs: &Path,
     pending: &HashSet<&Path>,
     newest: &HashMap<&str, HashMap<NodeId, &OutboundRow>>,
+    confirms: &HashMap<&str, DateTime<Utc>>,
     src: &StatusSources<'_>,
-) -> Result<(FileStatus, usize)> {
+) -> Result<FileFacts> {
     let refs = src.batches.batches_for_source(&abs.to_string_lossy())?;
     let batches = refs.len();
+    // Resolved for every arm, including the early returns below: the retention
+    // anchor is independent of the status chip (see `retention_fate`'s note 1).
+    let confirmed_at = refs
+        .iter()
+        .filter_map(|r| confirms.get(r.as_str()).copied())
+        .min();
+    let facts = |status| FileFacts {
+        status,
+        batches,
+        confirmed_at,
+    };
 
     if pending.contains(abs) {
-        return Ok((FileStatus::Queued, batches));
+        return Ok(facts(FileStatus::Queued));
     }
 
     let mut confirmed = false;
@@ -198,7 +376,7 @@ fn status_for(
         // outranks a sibling the other receiver declined.
         for row in targets.values() {
             if !row.state.is_terminal() {
-                return Ok((FileStatus::Sending, batches));
+                return Ok(facts(FileStatus::Sending));
             }
             if row.state == OutboundState::Confirmed {
                 confirmed = true;
@@ -208,15 +386,15 @@ fn status_for(
         }
     }
     if confirmed {
-        return Ok((FileStatus::Delivered, batches));
+        return Ok(facts(FileStatus::Delivered));
     }
     if declined {
-        return Ok((FileStatus::Declined, batches));
+        return Ok(facts(FileStatus::Declined));
     }
     if src.seen.is_recorded(abs)? {
-        return Ok((FileStatus::Sent, batches));
+        return Ok(facts(FileStatus::Sent));
     }
-    Ok((FileStatus::Unsent, batches))
+    Ok(facts(FileStatus::Unsent))
 }
 
 /// List the directory at `(root, rel)` with each file's derived status.
@@ -245,6 +423,17 @@ pub fn list_directory(
 
     let pending: HashSet<&Path> = src.pending.iter().map(|(_, file)| file.as_path()).collect();
     let newest = newest_by_target(src.outbound);
+    // Resolved through the same seam the retention task uses, so the sentence
+    // and the evaluator can never disagree about the threshold.
+    let policy = src.retention.to_core_policy();
+    // `keep_everything` names nothing, so skip the whole confirm scan — the
+    // evaluator short-circuits at exactly the same point, and this is the
+    // default policy (i.e. the common case) on every node.
+    let confirms = if matches!(policy, RetentionPolicy::KeepEverything) {
+        HashMap::new()
+    } else {
+        earliest_confirm_by_package(src.outbound)
+    };
 
     let mut dirs: Vec<String> = Vec::new();
     let mut files: Vec<LibraryEntry> = Vec::new();
@@ -280,15 +469,14 @@ pub fn list_directory(
             tracing::debug!(path = %abs.display(), "library listing: skipping non-regular entry");
             continue;
         }
-        let (status, batches) = status_for(&abs, &pending, &newest, src)?;
+        let f = status_for(&abs, &pending, &newest, &confirms, src)?;
         files.push(LibraryEntry {
             name,
             size: meta.len(),
             mtime_ms: mtime_millis(meta.modified().ok()),
-            status,
-            batches,
-            // T15 fills this; the field ships now so the wire shape is stable.
-            retention: None,
+            status: f.status,
+            batches: f.batches,
+            retention: retention_fate(&policy, src.retention.dry_run, f.confirmed_at),
         });
     }
     dirs.sort();
@@ -322,6 +510,10 @@ mod tests {
         root: PathBuf,
         batches: BatchStore,
         seen: SeenStore,
+        /// The retention knobs the fate line is derived from. Defaults to
+        /// `keep_everything`, so every status test above sees `retention: None`
+        /// exactly as it did before T15; the fate tests set it explicitly.
+        retention: crate::config::RetentionConfig,
     }
 
     fn fixture() -> Fixture {
@@ -336,6 +528,7 @@ mod tests {
             root,
             batches,
             seen,
+            retention: crate::config::RetentionConfig::default(),
         }
     }
 
@@ -363,6 +556,7 @@ mod tests {
                 batches: &self.batches,
                 seen: &self.seen,
                 outbound,
+                retention: &self.retention,
             };
             list_directory(0, &self.root, rel, &src).unwrap()
         }
@@ -374,6 +568,16 @@ mod tests {
                 .find(|e| e.name == name)
                 .unwrap_or_else(|| panic!("{name} not listed"))
                 .status
+        }
+
+        fn fate_of(&self, listing: &LibraryListing, name: &str) -> Option<String> {
+            listing
+                .files
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} not listed"))
+                .retention
+                .clone()
         }
     }
 
@@ -786,6 +990,7 @@ mod tests {
             batches: &f.batches,
             seen: &f.seen,
             outbound: &[],
+            retention: &f.retention,
         };
         let err = list_directory(0, &gone, "", &src).unwrap_err().to_string();
         assert!(err.starts_with("canonicalize root"), "got {err:?}");
@@ -799,6 +1004,7 @@ mod tests {
             batches: &f.batches,
             seen: &f.seen,
             outbound: &[],
+            retention: &f.retention,
         };
         let err = list_directory(0, &f.root, "nope", &src)
             .unwrap_err()
@@ -814,6 +1020,7 @@ mod tests {
             batches: &f.batches,
             seen: &f.seen,
             outbound: &[],
+            retention: &f.retention,
         };
         let err = list_directory(0, &f.root, "..", &src)
             .unwrap_err()
@@ -831,11 +1038,278 @@ mod tests {
             batches: &f.batches,
             seen: &f.seen,
             outbound: &[],
+            retention: &f.retention,
         };
         let err = list_directory(0, &f.root, "a.fits", &src)
             .unwrap_err()
             .to_string();
         assert!(err.starts_with("not a directory"), "got {err:?}");
+    }
+
+    // ── retention fate (T15, spec §8) ────────────────────────────────────────
+    //
+    // The contract these pin is "the fate line never lies": every arm below was
+    // derived by reading `sync/retention.rs::evaluate_and_apply`, not the card
+    // copy. Where the spec's prose and the evaluator disagree, the evaluator
+    // wins and the test says so.
+
+    use athenaeum_core::sync::RetentionPolicy as CorePolicy;
+    use chrono::{DateTime, Utc};
+
+    fn at(ts: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(ts)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    /// A confirmed row with an explicit `confirmed_at` — the only timestamp the
+    /// evaluator's `keep_days` arm reads.
+    fn confirmed_row(
+        id: i64,
+        package_ref: &str,
+        peer: [u8; 32],
+        confirmed_at: &str,
+    ) -> OutboundRow {
+        OutboundRow {
+            confirmed_at: Some(confirmed_at.to_string()),
+            ..row_to(id, package_ref, peer, OutboundState::Confirmed, None)
+        }
+    }
+
+    /// `keep_everything` short-circuits before any candidate work — no line at
+    /// all, in either mode, confirmed or not.
+    #[test]
+    fn keep_everything_never_shows_a_fate_line() {
+        for dry_run in [true, false] {
+            assert_eq!(
+                retention_fate(
+                    &CorePolicy::KeepEverything,
+                    dry_run,
+                    Some(at("2026-07-01T00:00:00Z"))
+                ),
+                None
+            );
+            assert_eq!(
+                retention_fate(&CorePolicy::KeepEverything, dry_run, None),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn keep_days_names_the_date_n_days_after_the_confirm() {
+        assert_eq!(
+            retention_fate(
+                &CorePolicy::KeepDays(21),
+                false,
+                Some(at("2026-07-12T22:30:00Z"))
+            )
+            .unwrap(),
+            "deletable after 2026-08-02",
+            "the clock starts at confirmed_at, never at capture time"
+        );
+    }
+
+    #[test]
+    fn keep_days_dry_run_prefixes_would_be() {
+        assert_eq!(
+            retention_fate(
+                &CorePolicy::KeepDays(21),
+                true,
+                Some(at("2026-07-12T22:30:00Z"))
+            )
+            .unwrap(),
+            "would be deletable after 2026-08-02"
+        );
+    }
+
+    #[test]
+    fn keep_days_without_a_confirm_is_kept_until_sent_and_confirmed() {
+        for dry_run in [true, false] {
+            assert_eq!(
+                retention_fate(&CorePolicy::KeepDays(21), dry_run, None).unwrap(),
+                "kept until sent and confirmed",
+                "no confirmed row ⇒ the single chokepoint never names it"
+            );
+        }
+    }
+
+    #[test]
+    fn disk_pct_says_deleted_under_pressure_oldest_first() {
+        assert_eq!(
+            retention_fate(
+                &CorePolicy::DiskPct { max_pct: 80 },
+                false,
+                Some(at("2026-07-01T00:00:00Z"))
+            )
+            .unwrap(),
+            "deleted under disk pressure, oldest first"
+        );
+    }
+
+    #[test]
+    fn disk_pct_dry_run_prefixes_would_be() {
+        assert_eq!(
+            retention_fate(
+                &CorePolicy::DiskPct { max_pct: 80 },
+                true,
+                Some(at("2026-07-01T00:00:00Z"))
+            )
+            .unwrap(),
+            "would be deleted under disk pressure, oldest first"
+        );
+    }
+
+    /// `disk_pct` still draws its candidates from the confirmed-only chokepoint,
+    /// so an unconfirmed file is NOT a pressure candidate — saying otherwise
+    /// would be the exact lie this feature exists to prevent.
+    #[test]
+    fn disk_pct_without_a_confirm_is_kept_until_sent_and_confirmed() {
+        assert_eq!(
+            retention_fate(&CorePolicy::DiskPct { max_pct: 80 }, false, None).unwrap(),
+            "kept until sent and confirmed"
+        );
+    }
+
+    /// `on_confirm` is a real, configurable policy (`config.rs`) the spec's card
+    /// copy does not enumerate. Omitting a line for it would hide the most
+    /// aggressive policy Perseus has.
+    #[test]
+    fn on_confirm_says_the_next_pass() {
+        assert_eq!(
+            retention_fate(
+                &CorePolicy::OnConfirm,
+                false,
+                Some(at("2026-07-01T00:00:00Z"))
+            )
+            .unwrap(),
+            "deleted at the next retention pass"
+        );
+        assert_eq!(
+            retention_fate(
+                &CorePolicy::OnConfirm,
+                true,
+                Some(at("2026-07-01T00:00:00Z"))
+            )
+            .unwrap(),
+            "would be deleted at the next retention pass"
+        );
+        assert_eq!(
+            retention_fate(&CorePolicy::OnConfirm, false, None).unwrap(),
+            "kept until sent and confirmed"
+        );
+    }
+
+    /// A hand-edited `keep_days` too large to add to a date must not print a
+    /// wrong date — and must not claim "kept until sent and confirmed" either,
+    /// which would deny a confirm that happened. No line is the honest answer.
+    #[test]
+    fn an_unrepresentable_keep_days_names_no_date_rather_than_a_wrong_one() {
+        assert_eq!(
+            retention_fate(
+                &CorePolicy::KeepDays(u32::MAX),
+                false,
+                Some(at("2026-07-01T00:00:00Z"))
+            ),
+            None
+        );
+    }
+
+    // ── the join: which confirm anchors the clock ────────────────────────────
+
+    /// A fan-out package has one row per target. `store.confirmed()` returns
+    /// EVERY confirmed row, and `confirmed_age_reached` is applied per row — so
+    /// the package becomes a candidate the moment the EARLIEST confirm ages out,
+    /// not when the last target catches up.
+    #[test]
+    fn the_clock_starts_at_the_earliest_confirm_across_targets() {
+        let mut f = fixture();
+        f.retention.policy = crate::config::RetentionPolicy::KeepDays;
+        f.retention.keep_days = 10;
+        f.retention.dry_run = false;
+        let abs = f.touch("a.fits", b"x");
+        f.batches
+            .record_files("/pkg/u1", &[("a.fits".into(), abs)])
+            .unwrap();
+        let outbound = vec![
+            confirmed_row(1, "/pkg/u1", PEER, "2026-07-05T00:00:00Z"),
+            confirmed_row(2, "/pkg/u1", PEER_B, "2026-07-01T00:00:00Z"),
+        ];
+        assert_eq!(
+            f.fate_of(&f.list("", &[], &outbound), "a.fits").unwrap(),
+            "deletable after 2026-07-11",
+            "the earliest confirm ages out first — the later target does not delay it"
+        );
+    }
+
+    /// A file carried by TWO packages — one confirmed long ago, one still in
+    /// flight — reads `sending`, but retention would delete it via the old
+    /// package's candidacy. Gating the fate line on the status chip would print
+    /// "kept" over a file that is about to be removed.
+    #[test]
+    fn an_older_confirmed_package_sets_the_fate_while_a_newer_one_is_in_flight() {
+        let mut f = fixture();
+        f.retention.policy = crate::config::RetentionPolicy::KeepDays;
+        f.retention.keep_days = 7;
+        let abs = f.touch("a.fits", b"x");
+        f.batches
+            .record_files("/pkg/old", &[("a.fits".into(), abs.clone())])
+            .unwrap();
+        f.batches
+            .record_files("/pkg/new", &[("a.fits".into(), abs)])
+            .unwrap();
+        let outbound = vec![
+            confirmed_row(1, "/pkg/old", PEER, "2026-07-01T00:00:00Z"),
+            row(2, "/pkg/new", OutboundState::Transferring, None),
+        ];
+        let listing = f.list("", &[], &outbound);
+        assert_eq!(f.status_of(&listing, "a.fits"), FileStatus::Sending);
+        assert_eq!(
+            f.fate_of(&listing, "a.fits").unwrap(),
+            "would be deletable after 2026-07-08",
+            "the evaluator does not care that a re-capture is moving"
+        );
+    }
+
+    /// The evaluator fails SAFE on a missing / unparseable `confirmed_at` (it
+    /// warns and refuses eligibility). The fate line mirrors that: no invented
+    /// date.
+    #[test]
+    fn a_confirmed_row_without_a_usable_timestamp_names_no_date() {
+        let mut f = fixture();
+        f.retention.policy = crate::config::RetentionPolicy::KeepDays;
+        f.retention.keep_days = 7;
+        let abs = f.touch("a.fits", b"x");
+        f.batches
+            .record_files("/pkg/u1", &[("a.fits".into(), abs)])
+            .unwrap();
+
+        let missing = vec![row(1, "/pkg/u1", OutboundState::Confirmed, None)];
+        assert_eq!(
+            f.fate_of(&f.list("", &[], &missing), "a.fits").unwrap(),
+            "kept until sent and confirmed"
+        );
+
+        let garbage = vec![confirmed_row(1, "/pkg/u1", PEER, "not-a-timestamp")];
+        assert_eq!(
+            f.fate_of(&f.list("", &[], &garbage), "a.fits").unwrap(),
+            "kept until sent and confirmed"
+        );
+    }
+
+    /// The default policy leaves every row's `retention` null — the whole field
+    /// is absent from the UI on a node that never deletes.
+    #[test]
+    fn keep_everything_leaves_every_entry_without_a_fate_line() {
+        let f = fixture(); // RetentionConfig::default() == keep_everything
+        let abs = f.touch("a.fits", b"x");
+        f.batches
+            .record_files("/pkg/u1", &[("a.fits".into(), abs)])
+            .unwrap();
+        let outbound = vec![confirmed_row(1, "/pkg/u1", PEER, "2026-07-01T00:00:00Z")];
+        let listing = f.list("", &[], &outbound);
+        assert_eq!(f.status_of(&listing, "a.fits"), FileStatus::Delivered);
+        assert_eq!(f.fate_of(&listing, "a.fits"), None);
     }
 
     /// The wire enum is camelCase-stable — the UI (T5) switches on these strings.

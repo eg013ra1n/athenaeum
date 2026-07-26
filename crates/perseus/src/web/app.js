@@ -256,6 +256,19 @@ function renderSettingsTab() {
 
     <section id="retention">
       <h2>Retention</h2>
+      <!-- Spec §8: what this node will do to capture files, in the operator's
+           words, generated from the EFFECTIVE config below. The mode banner and
+           the policy sentence are the two things an operator must be able to
+           read without opening perseus.toml. -->
+      <div class="banner" id="retMode" style="display:none;"></div>
+      <div class="ret-card">
+        <div id="retPolicy">reading the retention policy…</div>
+        <div class="muted ret-note" id="retCadence"></div>
+        <!-- A recorded fact from the pass log, never a predicted next tick. -->
+        <div class="muted ret-note" id="retLastPass"></div>
+        <div class="muted ret-note">Deleting files yourself is a separate path and always available: Library &rarr; <b>Delete</b>, and a batch's <b>Delete source files</b>. Those are recorded as <code>manual-web</code>; retention's own deletions are recorded as <code>retention_deleted</code>, so the audit trail never confuses the two.</div>
+        <div class="ret-note"><a href="#retlogHead">Recent retention passes &darr;</a></div>
+      </div>
       <div class="indicators">
         <span class="ind">soak opt-in: <b id="iSoak">–</b></span>
         <span class="ind">live deletion: <b id="iLive">–</b></span>
@@ -277,7 +290,7 @@ function renderSettingsTab() {
         <button id="saveRet">Save</button>
       </div>
       <div class="flash" id="retflash"></div>
-      <h2 class="section-sub">Recent retention passes</h2>
+      <h2 class="section-sub" id="retlogHead">Recent retention passes</h2>
       <ul class="log" id="retlog"><li class="empty">no passes recorded yet</li></ul>
     </section>`;
 }
@@ -383,7 +396,89 @@ async function refreshStatus() {
   }
 }
 
-// ── retention (policy editor + recent-pass log) ─────────────────────────────
+// ── retention (transparency card + policy editor + recent-pass log) ─────────
+
+// The policy sentence (spec §8), generated from the EFFECTIVE config so it can
+// never describe a policy the node is not running.
+//
+// The `keep_days` wording deliberately does NOT say "after every target
+// confirmed" (the spec's draft phrasing). The evaluator
+// (`athenaeum_core::sync::retention`) draws candidates from `store.confirmed()`
+// — EVERY confirmed row, tested for age individually — so a fan-out package is
+// a candidate as soon as its EARLIEST confirmation ages out, without waiting for
+// the slowest target. Saying "every target" would promise a delay the code does
+// not honour, which is the one thing this card exists to prevent.
+//
+// Returns plain text: the caller assigns it with `textContent`, so a
+// server-supplied policy name in the fallback arm can never inject markup.
+function retentionPolicyText(p) {
+  const days = Number(p.keepDays);
+  const pct = Number(p.diskMaxPct);
+  switch (p.policy) {
+    case 'keep_everything':
+      return 'Perseus never deletes capture files. Manual deletion in Library, and a batch’s "Delete source files", are the only paths.';
+    case 'on_confirm':
+      return 'A file is deleted on the first pass after a target confirms receiving it — there is no grace period.';
+    case 'keep_days':
+      return `A file becomes deletable ${days} day${days === 1 ? '' : 's'} after it was confirmed received — the clock starts at the confirmation, not at capture. When a batch went to several devices, the earliest confirmation starts it.`;
+    case 'disk_pct':
+      return `While a capture volume sits at or over ${pct} %, confirmed files are deleted oldest-confirmed-first until usage drops back under the cap. Below the cap nothing is deleted.`;
+    default:
+      return `Unrecognised policy "${p.policy}" — this page cannot say what it will do.`;
+  }
+}
+
+// "Checked every hour", from `interval_secs`. No next-pass countdown: the
+// retention loop is a plain `sleep(interval)` select with no exposed deadline,
+// and inventing a timer here would produce a number the agent never promised.
+// The card states the cadence (config) and the LAST pass (a recorded fact, see
+// `refreshLog`) instead.
+function retentionCadenceText(p) {
+  // Under keep_everything the loop still ticks, but no pass can ever have a
+  // consequence — describing a cadence would dress up a no-op as vigilance.
+  if (p.policy === 'keep_everything') return '';
+  const secs = Number(p.intervalSecs);
+  if (!Number.isFinite(secs) || secs <= 0) return 'Pass cadence unknown.';
+  let every;
+  if (secs % 3600 === 0) { const h = secs / 3600; every = h === 1 ? 'every hour' : `every ${h} hours`; }
+  else if (secs % 60 === 0) { const m = secs / 60; every = m === 1 ? 'every minute' : `every ${m} minutes`; }
+  else every = `every ${secs} seconds`;
+  return `Checked ${every}. Every candidate is verified to still match what was transferred before it is touched.`;
+}
+
+// Yellow dry-run / red live-armed, with the two-key opt-in named in full.
+// `keep_everything` gets neither: nothing is ever a candidate, so a red "armed"
+// banner would overstate and a yellow "nothing is deleted" would just repeat the
+// policy sentence. The one case worth saying out loud is armed-but-inert, so the
+// operator knows what flipping the dropdown below means.
+function renderRetentionMode(p) {
+  const b = $('retMode');
+  if (!b) return;
+  b.style.display = '';
+  if (p.policy === 'keep_everything') {
+    if (p.liveDeletionPossible) {
+      b.className = 'banner warn';
+      b.textContent = 'Live deletion is armed in perseus.toml, but keep_everything means nothing is ever a candidate. Changing the policy below starts deleting confirmed files for real.';
+      return;
+    }
+    b.style.display = 'none';
+    b.textContent = '';
+    return;
+  }
+  if (p.liveDeletionPossible) {
+    b.className = 'banner err';
+    b.textContent = 'LIVE DELETION ARMED — confirmed capture files are really removed. Both keys are turned in perseus.toml: dry_run = false and i_have_verified_the_soak = true.';
+    return;
+  }
+  b.className = 'banner warn';
+  // dry_run = false alone never validates, so a node can reach here with the
+  // flag off and still delete nothing. Say which key is missing rather than
+  // letting the editor below read as if it were armed.
+  b.textContent = p.dryRun
+    ? 'DRY-RUN — nothing is deleted. Candidates are only logged, every pass.'
+    : 'DRY-RUN — nothing is deleted. dry_run is off, but i_have_verified_the_soak is not set in perseus.toml, and live deletion needs both keys.';
+}
+
 async function loadPolicy() {
   try {
     const p = await getJson('/api/retention/policy');
@@ -395,6 +490,11 @@ async function loadPolicy() {
     $('iSoak').textContent = p.soakOptIn ? 'yes' : 'no';
     $('iLive').textContent = p.liveDeletionPossible ? 'ACTIVE' : 'off (dry-run)';
     $('iLive').style.color = p.liveDeletionPossible ? 'var(--error)' : 'var(--content-muted)';
+    // textContent, not innerHTML: the sentence embeds server-supplied numbers
+    // and, in the fallback arm, a server-supplied policy name.
+    $('retPolicy').textContent = retentionPolicyText(p);
+    $('retCadence').textContent = retentionCadenceText(p);
+    renderRetentionMode(p);
   } catch (e) { const f = $('retflash'); f.textContent = 'load failed: ' + e.message; f.className = 'flash err'; }
 }
 
@@ -416,9 +516,29 @@ async function savePolicy() {
   } catch (e) { f.textContent = 'save failed: ' + e.message; f.className = 'flash err'; }
 }
 
+// The card's "last pass" line rides the same fetch as the log below it: the ring
+// buffer's newest `at` IS the last pass, so it costs no extra request and states
+// a fact the agent recorded rather than one this page derived.
+function renderRetentionLastPass(rows) {
+  const el = $('retLastPass');
+  if (!el) return;
+  const newest = rows && rows.length ? rows[0] : null;
+  if (!newest) {
+    el.textContent = 'No pass recorded since this agent started.';
+    return;
+  }
+  const when = fmtMtime(Date.parse(newest.at));
+  const acted = (newest.deleted || []).length;
+  const eligible = (newest.wouldDelete || []).length;
+  el.textContent = newest.dryRun
+    ? `Last pass ${when} — ${eligible} candidate${eligible === 1 ? '' : 's'} logged, nothing deleted.`
+    : `Last pass ${when} — ${acted} file${acted === 1 ? '' : 's'} deleted of ${eligible} eligible.`;
+}
+
 async function refreshLog() {
   try {
     const rows = await getJson('/api/retention/log');
+    renderRetentionLastPass(rows);
     $('retlog').innerHTML = rows.length
       ? rows.map((r) => {
           const bits = [`${r.dryRun ? 'dry-run' : 'LIVE'}`, `${r.policy}`, `deleted ${r.deleted.length}`, `eligible ${r.wouldDelete.length}`];
@@ -2031,6 +2151,20 @@ function libStatusChip(f) {
   return `<span class="chip lib-st${cls}" title="${esc(title)}">${esc(st)}</span>${suffix}`;
 }
 
+// The T15 per-file fate line: what retention intends to do with THIS file, as a
+// muted line under the status chip. The server sends `null` under
+// `keep_everything` (a node that deletes nothing has no fate to state), and only
+// ever sends free text — so it is escaped, never classed on.
+//
+// It is a separate fact from the chip and may legitimately disagree with it: a
+// re-captured frame reads `sending` while an older confirmed batch already makes
+// it a deletion candidate.
+function libFateLine(f) {
+  const fate = f.retention;
+  if (typeof fate !== 'string' || !fate) return '';
+  return `<div class="lib-fate muted" title="What retention will do with this file — see Settings &rarr; Retention">${esc(fate)}</div>`;
+}
+
 function libRowMarkup(rel, cells) {
   const picked = libState.selected.has(rel);
   return `<tr${picked ? ' class="lib-picked"' : ''}>${cells(picked)}</tr>`;
@@ -2076,7 +2210,7 @@ function renderLibListing() {
         title="Preview ${esc(f.name)}">${esc(f.name)}</button></td>
       <td>${esc(fmtSize(f.size))}</td>
       <td class="mono muted">${esc(fmtMtime(f.mtimeMs))}</td>
-      <td>${libStatusChip(f)}</td>`);
+      <td>${libStatusChip(f)}${libFateLine(f)}</td>`);
   }).join('');
 
   body.innerHTML = `<div class="tablewrap"><table>
