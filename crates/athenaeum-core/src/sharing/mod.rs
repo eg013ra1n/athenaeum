@@ -83,6 +83,18 @@ pub enum ProviderEvent {
 /// and for the same reason (the caller awaits the fetch inline and drains no
 /// channel meanwhile, so a callback avoids the backpressure a shared channel
 /// would risk).
+///
+/// **This stream is a SAMPLE, not a ledger.** The underlying blob downloader
+/// buffers each child's events in its own small channel and drops whatever it
+/// has not drained by the time the last child finishes, so an arbitrary share of
+/// the events never arrives — the faster the transfer, the bigger the share
+/// (a localhost fetch can surface a fraction of its children; a slow
+/// real-network one surfaces most). The consumer's contract follows from that:
+/// drive advisory UI and journal lines, never a correctness decision. A provider
+/// that never appears here may well have served half the collection, so do not
+/// derive a provider count, a "this holder is dead" verdict, or a
+/// retry/fallback trigger from it. Details and the upstream mechanism are in
+/// [`fetch_collection_multi`](SharingTransport::fetch_collection_multi)'s doc.
 pub type ProviderTelemetrySink = Arc<dyn Fn(ProviderEvent) + Send + Sync>;
 
 /// A [`ProviderTelemetrySink`] that discards every event — for call sites that

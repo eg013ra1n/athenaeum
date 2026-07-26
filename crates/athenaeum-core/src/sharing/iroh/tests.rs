@@ -1957,7 +1957,20 @@ fn recording_telemetry() -> (ProviderTelemetrySink, Arc<Mutex<Vec<ProviderEvent>
     (sink, events)
 }
 
-/// The set of provider ids the downloader actually tried, from a telemetry log.
+/// The set of provider ids the downloader reported trying.
+///
+/// **Sampling only, never an oracle.** Split-mode provider events are lossy on
+/// iroh-blobs 0.103: `handle_download_split_impl` funnels each child's events
+/// through its own 16-slot mpsc channel into a stream of receivers drained
+/// SEQUENTIALLY (`into_stream(progress_rx).flat_map(into_stream)`), and when the
+/// last child finishes it returns and drops every receiver it never reached. A
+/// child's two events (Trying + PartComplete) fit its buffer without ever
+/// blocking the child, so on fast localhost the children all finish long before
+/// the drain walks their channels — instrumented runs observed 3 to 16 Trying
+/// events for the same 15-child fetch. Asserting "both providers appear here"
+/// therefore samples the few drained channels, which failed roughly 1 run in 8.
+/// The sound oracle is the provider-side byte delta ([`sent_bytes`]); this stays
+/// only as a pipe-sanity check that events flow at all.
 fn tried_providers(events: &Arc<Mutex<Vec<ProviderEvent>>>) -> std::collections::HashSet<NodeId> {
     events
         .lock()
@@ -1969,6 +1982,27 @@ fn tried_providers(events: &Arc<Mutex<Vec<ProviderEvent>>>) -> std::collections:
         })
         .collect()
 }
+
+/// Total bytes this node's endpoint has sent since bind (relay + direct).
+///
+/// Bracketing a fetch with two readings gives each PROVIDER's contribution
+/// directly from iroh's own socket counters — ground truth that no progress
+/// stream can lose.
+fn sent_bytes(node: &Arc<SharedIrohNode>) -> u64 {
+    let c = node.counters_snapshot_for_test();
+    c.send_direct_bytes.saturating_add(c.send_relay_bytes)
+}
+
+/// A provider's send delta must clear this to count as "served real payload".
+///
+/// Sits between the two populations it has to separate, both measured by forcing
+/// the regression it guards against (`SplitStrategy::Split` → `None`, so one
+/// provider serves everything): the serving provider sent 1_430_494 B, the
+/// non-serving one 15_789 B — phase-1 meta plus QUIC/TLS handshake and ACKs, not
+/// the near-zero a naive reading would predict. 64 KiB leaves 4x headroom below
+/// the noise floor and 21x below one served child, so the assertion has teeth
+/// against a single-provider regression with no room to flake.
+const SERVED_PAYLOAD_FLOOR: u64 = 64 * 1024;
 
 async fn bind_disabled(dir: &Path) -> Arc<SharedIrohNode> {
     SharedIrohNode::bind(dir, RelayMode::Disabled)
@@ -2102,6 +2136,12 @@ async fn multi_fetch_uses_both_providers() {
 
     let (telemetry, seen) = recording_telemetry();
     let dest = tempdir().unwrap();
+
+    // The oracle: each provider's OWN socket send counter, bracketed around the
+    // fetch. Ground truth, and immune to the progress stream's lossiness.
+    let a_before = sent_bytes(&a);
+    let b_before = sent_bytes(&b);
+
     c_recv
         .fetch_collection_multi(
             vec![a_info.node_id, b_info.node_id],
@@ -2116,14 +2156,23 @@ async fn multi_fetch_uses_both_providers() {
 
     assert_package_landed(&pkg_dir, dest.path(), FILES);
 
-    let tried = tried_providers(&seen);
+    // With 15 children each independently re-shuffling a 2-provider list, the
+    // chance that one provider wins zero first picks is 2^-15 — and a
+    // single-provider regression puts the other's delta in the handshake range,
+    // two orders of magnitude below the floor.
+    let a_sent = sent_bytes(&a).saturating_sub(a_before);
+    let b_sent = sent_bytes(&b).saturating_sub(b_before);
     assert!(
-        tried.contains(&a_info.node_id) && tried.contains(&b_info.node_id),
+        a_sent > SERVED_PAYLOAD_FLOOR && b_sent > SERVED_PAYLOAD_FLOOR,
         "Split must spread the collection's children over BOTH providers — \
-         telemetry saw {} of 2 (a={}, b={})",
-        tried.len(),
-        tried.contains(&a_info.node_id),
-        tried.contains(&b_info.node_id)
+         a sent {a_sent} B, b sent {b_sent} B (floor {SERVED_PAYLOAD_FLOOR} B)"
+    );
+
+    // Sanity only: the telemetry pipe is wired and delivers SOMETHING. It cannot
+    // be asserted per-provider — see `tried_providers`.
+    assert!(
+        !tried_providers(&seen).is_empty(),
+        "the provider telemetry sink must receive at least one event"
     );
 
     a.shutdown().await;
@@ -2175,6 +2224,8 @@ async fn multi_fetch_survives_a_provider_dying_mid_transfer() {
 
     let (telemetry, seen) = recording_telemetry();
     let dest = tempdir().unwrap();
+    let a_before = sent_bytes(&a);
+    let b_before = sent_bytes(&b);
     let fetch_done = Arc::new(AtomicBool::new(false));
     let task = {
         let c_recv = Arc::clone(&c_recv);
@@ -2205,6 +2256,12 @@ async fn multi_fetch_survives_a_provider_dying_mid_transfer() {
         "the fetch finished before the provider could be killed — the kill would \
          prove nothing; lower the upload limit or grow the package"
     );
+    // Read A's contribution BEFORE killing it: a shut-down endpoint's counters
+    // are not something to lean on, and this is the number that says the victim
+    // was genuinely serving when it died (17 children each re-shuffle a
+    // 2-provider list, so A wins ~half the first picks and, paced at 2 MB/s, has
+    // pushed ~300 KB by now).
+    let a_sent = sent_bytes(&a).saturating_sub(a_before);
     a.shutdown().await;
 
     let res = tokio::time::timeout(Duration::from_secs(120), task)
@@ -2215,16 +2272,25 @@ async fn multi_fetch_survives_a_provider_dying_mid_transfer() {
 
     assert_package_landed(&pkg_dir, dest.path(), FILES);
 
-    // A is only PROBABLY recorded as failed (the kill may land after its last
-    // child settled), but it must certainly have been in the rotation.
-    let tried = tried_providers(&seen);
+    // Both halves of the story, on provider-side byte counters rather than the
+    // lossy progress stream: the victim was really serving when it died, and the
+    // survivor really carried the package home.
+    let b_sent = sent_bytes(&b).saturating_sub(b_before);
     assert!(
-        tried.contains(&a_info.node_id),
-        "the provider we killed must have been tried before it died"
+        a_sent > SERVED_PAYLOAD_FLOOR,
+        "the provider we killed must have been serving payload when it died — \
+         it sent only {a_sent} B (floor {SERVED_PAYLOAD_FLOOR} B)"
     );
     assert!(
-        tried.contains(&b_info.node_id),
-        "the surviving provider must have served children"
+        b_sent > SERVED_PAYLOAD_FLOOR,
+        "the surviving provider must have served the rest of the package — \
+         it sent only {b_sent} B (floor {SERVED_PAYLOAD_FLOOR} B)"
+    );
+
+    // Sanity only, never per-provider — see `tried_providers`.
+    assert!(
+        !tried_providers(&seen).is_empty(),
+        "the provider telemetry sink must receive at least one event"
     );
 
     b.shutdown().await;

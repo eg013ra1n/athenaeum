@@ -1116,6 +1116,20 @@ impl SharedIrohNode {
         resolve_served_root_in(&self.served, hash)
     }
 
+    /// Test hook (D3 Task 1): this node's live [`TransportCounters`], so a test
+    /// can bracket an operation with two snapshots and assert on the bytes it
+    /// actually moved.
+    ///
+    /// The provider-side byte delta is the only SOUND oracle for "did this
+    /// holder really serve part of the collection?". The blob downloader's
+    /// per-provider progress items are best-effort and lossy on this iroh-blobs
+    /// version (see [`blobs::fetch_collection_multi`]), so a swarm test that
+    /// asserts on telemetry alone is asserting on a sample, not on reality.
+    #[cfg(test)]
+    pub(crate) fn counters_snapshot_for_test(&self) -> TransportCounters {
+        TransportCounters::snapshot(&self.endpoint())
+    }
+
     /// Live ack-claim count (test introspection for the demux).
     #[cfg(test)]
     pub(crate) fn active_claims(&self) -> usize {

@@ -583,6 +583,27 @@ pub async fn fetch_collection_to_dir(
 /// - The progress stream's per-provider items — dropped by the scalar fetch —
 ///   are routed into `telemetry` as [`ProviderEvent`]s.
 ///
+/// ## Provider telemetry is BEST-EFFORT (upstream lossiness)
+///
+/// On iroh-blobs 0.103 the Split path does NOT guarantee delivery of every
+/// per-provider item. `handle_download_split_impl` gives each child its own
+/// 16-slot mpsc channel and drains the resulting stream of receivers
+/// SEQUENTIALLY; a child's two events (`TryProvider` + `PartComplete`) fit that
+/// buffer without ever blocking the child, so children run to completion whether
+/// or not anyone has read their channel — and when the last one finishes, the
+/// implementation returns and drops every receiver the drain never reached,
+/// discarding their events. The faster the transfer, the more is lost:
+/// instrumented localhost runs observed anywhere from 3 to 16 `TryProvider`
+/// events for the same 15-child fetch, while a slow real-network transfer drains
+/// far more completely.
+///
+/// So: `telemetry` is a SAMPLE of provider activity, sound enough to drive an
+/// advisory "downloading from N sources" figure or a journal line, and never
+/// sound enough for a correctness decision — do not count providers from it, do
+/// not conclude a provider was unused because it never appeared, do not gate
+/// retries or fallbacks on it. The transfer's own `Result` is the outcome; a
+/// provider's byte counters are the ground truth about who served what.
+///
 /// Everything else is identical on purpose: entry-name validation before a
 /// single byte touches `dest_dir`, the per-file observer tasks and their
 /// abort-on-drop guard, the throttled batch progress sink, the in-flight tag
