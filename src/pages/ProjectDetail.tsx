@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { ExternalLink, Loader2, Plus, Send, Target } from 'lucide-react';
 import { api } from '../api';
 import { openUrl } from '../api/desktop';
 import { safeExternalUrl } from '../utils/externalUrl';
 import { useNotifications } from '../contexts/NotificationContext';
+import AutoReplicateBar from '../components/collab/AutoReplicateBar';
 import LinkObjectDialog from '../components/collab/LinkObjectDialog';
 import ReceiveTab from '../components/collab/ReceiveTab';
 import ModerationQueue from '../components/collab/ModerationQueue';
@@ -14,6 +15,7 @@ import type {
   FrameGateRow,
   GateReport,
   ProjectDetail as Detail,
+  ProjectDownloadProgress,
   ProjectPackageView,
   PublishResult,
 } from '../types/models';
@@ -40,6 +42,10 @@ export default function ProjectDetail() {
   const [publishConfirm, setPublishConfirm] = useState(false);
   const [publishBusy, setPublishBusy] = useState(false);
   const [publishError, setPublishError] = useState<string | null>(null);
+  // D3 §3.1.3 live swarm figure: packageId → the provider count the fan-out was
+  // launched with. Filled on `stage: 'fetching'`, dropped on `stage: 'done'`, so
+  // a row only carries the line while its fetch is actually running.
+  const [downloadSources, setDownloadSources] = useState<Map<string, number>>(new Map());
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -80,6 +86,9 @@ export default function ProjectDetail() {
     }
   }, [id]);
 
+  const loadPackagesRef = useRef(loadPackages);
+  loadPackagesRef.current = loadPackages;
+
   useEffect(() => {
     void load();
   }, [load]);
@@ -87,6 +96,41 @@ export default function ProjectDetail() {
   useEffect(() => {
     void loadPackages();
   }, [loadPackages]);
+
+  // `project-download-progress` rides both the manual Download click and the
+  // auto-replication worker, so it is listened for at page level (it must
+  // survive tab switches) and handed down to the Receive tab. The event only
+  // carries the source count — the row's status still comes from the stored
+  // `local_status`, so each edge also re-lists the packages: that is what flips
+  // an auto-started download to `downloading` in the UI (and settles it back
+  // afterwards) without waiting for a poll to be armed.
+  useEffect(() => {
+    if (!id) return;
+    // Navigating to another project drops whatever was in flight for the old one.
+    setDownloadSources((prev) => (prev.size === 0 ? prev : new Map()));
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    api
+      .listen<ProjectDownloadProgress>('project-download-progress', (p) => {
+        if (cancelled || p.projectId !== id) return;
+        setDownloadSources((prev) => {
+          const next = new Map(prev);
+          if (p.stage === 'fetching') next.set(p.packageId, p.sources);
+          else next.delete(p.packageId);
+          return next;
+        });
+        void loadPackagesRef.current();
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error('[projects] download-progress listen failed:', err));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [id]);
 
   const openPortal = async (path: string) => {
     if (!detail) return;
@@ -158,6 +202,14 @@ export default function ProjectDetail() {
   const needsApproval = c.requireApproval && !c.coordinator;
   const coordinatorName = detail.members.find((m) => m.coordinator)?.displayName ?? 'the coordinator';
   const publishable = gate?.publishable ?? 0;
+  // The project's published volume, client-side from the rows already listed:
+  // every announcement that survived moderation and has not been superseded.
+  const publishedBytes =
+    packages === null
+      ? null
+      : packages
+          .filter((p) => p.state === 'published' && !p.superseded)
+          .reduce((sum, p) => sum + p.byteSize, 0);
 
   const tabs: Tab[] = [
     'contribute',
@@ -184,6 +236,19 @@ export default function ProjectDetail() {
           Manage on portal <ExternalLink size={13} />
         </button>
       </div>
+
+      {/* Auto-replication is role-gated in core (`role_allows_replication`:
+          coordinator or send_receive) exactly like the Receive tab, so the bar
+          shows on the same condition — a send-only member has nothing to pull. */}
+      {id && canReceive && (
+        <AutoReplicateBar
+          projectId={id}
+          autoReplicate={c.autoReplicate}
+          publishedBytes={publishedBytes}
+          onToggled={() => void load()}
+          onSynced={() => void loadPackages()}
+        />
+      )}
 
       <div className="flex gap-1 border-b border-border">
         {tabs.map((t) => (
@@ -261,7 +326,13 @@ export default function ProjectDetail() {
       )}
 
       {activeTab === 'receive' && id && (
-        <ReceiveTab projectId={id} projectTitle={c.title} packages={packages} reload={loadPackages} />
+        <ReceiveTab
+          projectId={id}
+          projectTitle={c.title}
+          packages={packages}
+          reload={loadPackages}
+          downloadSources={downloadSources}
+        />
       )}
 
       {activeTab === 'moderation' && id && (

@@ -22,11 +22,18 @@ export default function ReceiveTab({
   projectTitle,
   packages,
   reload,
+  downloadSources,
 }: {
   projectId: string;
   projectTitle?: string;
   packages: ProjectPackageView[] | null;
   reload: () => void;
+  /**
+   * D3 §3.1.3: packageId → the number of holders the running swarm fetch was
+   * handed. Owned by the parent page (the event outlives this tab's mount) and
+   * populated only while a fetch is in flight — manual or auto-replicated.
+   */
+  downloadSources?: Map<string, number>;
 }) {
   // `undefined` = still loading the folder setting; `null` = unset (banner).
   const [collabDir, setCollabDir] = useState<string | null | undefined>(undefined);
@@ -164,6 +171,7 @@ export default function ReceiveTab({
                     busy={busy.has(p.packageId)}
                     disabledDir={dirUnset}
                     collabDir={collabDir ?? null}
+                    sources={downloadSources?.get(p.packageId) ?? null}
                     onDownload={() => void startDownload(p.packageId)}
                   />
                 </span>
@@ -193,18 +201,26 @@ function ReceiveAction({
   busy,
   disabledDir,
   collabDir,
+  sources,
   onDownload,
 }: {
   pkg: ProjectPackageView;
   busy: boolean;
   disabledDir: boolean;
   collabDir: string | null;
+  /** Providers the running swarm fetch was handed; `null` when none is running. */
+  sources: number | null;
   onDownload: () => void;
 }) {
   if (pkg.localStatus === 'downloading' || busy) {
     return (
       <span className="inline-flex items-center gap-1 text-xs text-accent">
         <Loader2 size={12} className="animate-spin" /> Downloading…
+        {sources !== null && sources > 0 && (
+          <span className="text-content-muted">
+            from {sources} source{sources === 1 ? '' : 's'}
+          </span>
+        )}
       </span>
     );
   }
