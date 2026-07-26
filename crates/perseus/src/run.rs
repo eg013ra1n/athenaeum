@@ -881,6 +881,18 @@ impl Agent {
             // enqueue consumer below.
             let mut watchers = Vec::new();
             for dir in config.capture_dirs_resolved() {
+                // Spec §7: a root that is not on disk at boot (an offline share,
+                // a NAS that mounts after the Pi) is NOT fatal — config
+                // validation accepts it at the boot level and the watcher's
+                // poll-only sweep picks it up when the mount returns. Say so
+                // once, here, where the engine actually starts; the ongoing
+                // complaint is the watcher's own rate-limited sweep warning.
+                if !dir.exists() {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        "capture dir not present at startup — will keep polling for it"
+                    );
+                }
                 watchers.push(watcher::spawn_watcher(
                     dir,
                     config.stability(),

@@ -286,7 +286,7 @@ fn spawn_with(
         let mut backoff_until: Option<Instant> = None;
 
         loop {
-            let config = match Config::load_lenient(&config_path) {
+            let config = match Config::load_lenient_for_boot(&config_path) {
                 Ok(c) => c,
                 Err(e) => {
                     // Surface the full error chain (parse detail included) so the
@@ -486,7 +486,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
     use crate::seen::SeenStore;
     use crate::web::{build_router, WebState};
 
-    let config = Config::load_lenient(&config_path).unwrap_or_else(|e| {
+    let config = Config::load_lenient_for_boot(&config_path).unwrap_or_else(|e| {
         tracing::error!(
             error = %format!("{e:#}"),
             path = %config_path.display(),
@@ -564,7 +564,7 @@ pub async fn start_supervised(config_path: PathBuf) -> Result<SupervisorHandle> 
                     // The dirs + targets the engine was launched over — read from
                     // the same config file the launcher just used (authoritative,
                     // sync). Both back the web editors' `restartPending`.
-                    let launched = Config::load_lenient(&attach_config_path);
+                    let launched = Config::load_lenient_for_boot(&attach_config_path);
                     let running_dirs = launched
                         .as_ref()
                         .map(|c| c.capture_dirs_resolved())

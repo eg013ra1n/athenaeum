@@ -287,6 +287,37 @@ impl std::fmt::Display for SetupNeed {
     }
 }
 
+/// How strictly a configured capture directory must already exist on disk.
+///
+/// The existence question has two legitimate answers and the *caller* decides
+/// which one applies — the same config file is read by two very different
+/// consumers:
+///
+/// - An operator typing a path into the settings page must be told immediately
+///   that it is wrong ([`Strict`](Self::Strict)); silently accepting a typo
+///   means a root that watches nothing forever.
+/// - An observatory agent booting before its NAS has mounted must come up
+///   anyway ([`Boot`](Self::Boot)). Spec §7 makes an offline share a *supported*
+///   state: the watcher spawns on the absent root and its poll-only sweep
+///   discovers the share when the mount returns, emitting a rate-limited warn in
+///   the meantime. Bailing here — before the watcher ever runs — made that
+///   recovery machinery unreachable and killed the agent instead.
+///
+/// Only the existence arm differs. Every other structural rule (both capture-dir
+/// forms set, the live-deletion soak gate, the web-token rules, …) fires
+/// identically at both levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureDirCheck {
+    /// A capture directory absent from disk is a hard error. Used by the strict
+    /// loaders and by every interactive edit (the web settings PUTs in
+    /// [`crate::config_edit`], which re-validate through
+    /// [`Config::from_toml_str_lenient`]).
+    Strict,
+    /// A capture directory absent from disk is accepted. Used by the agent-boot
+    /// loaders so an unreachable share cannot stop the process from starting.
+    Boot,
+}
+
 /// Parsed + validated Perseus configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -367,10 +398,32 @@ impl Config {
     /// remaining gaps into [`SetupNeed`]s (see [`setup_needs`](Self::setup_needs))
     /// rather than refusing to start.
     pub fn load_lenient(path: &Path) -> Result<Self> {
+        Self::load_lenient_at(path, CaptureDirCheck::Strict)
+    }
+
+    /// [`load_lenient`](Self::load_lenient) at the **boot** capture-dir level —
+    /// the entry point every agent-startup path uses (`run`, the supervisor
+    /// loop, the tray).
+    ///
+    /// The only difference is that a capture directory which is not on disk
+    /// right now is accepted instead of fatal (see [`CaptureDirCheck::Boot`] and
+    /// spec §7): an observatory whose NAS mounts a minute after the Pi boots
+    /// must come up and keep polling, not exit. The watcher spawn site logs the
+    /// one-shot `"capture dir not present at startup"` warning; the watcher's
+    /// own sweep counter then rate-limits the ongoing complaint and logs the
+    /// recovery when the share appears.
+    pub fn load_lenient_for_boot(path: &Path) -> Result<Self> {
+        Self::load_lenient_at(path, CaptureDirCheck::Boot)
+    }
+
+    fn load_lenient_at(path: &Path, dirs: CaptureDirCheck) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read perseus config {}", path.display()))?;
-        Self::from_toml_str_lenient(&text)
-            .with_context(|| format!("invalid perseus config {}", path.display()))
+        let cfg = Self::parse_toml(&text)
+            .with_context(|| format!("invalid perseus config {}", path.display()))?;
+        cfg.validate_structure_at(dirs)
+            .with_context(|| format!("invalid perseus config {}", path.display()))?;
+        Ok(cfg)
     }
 
     /// Parse + strictly validate a config from a TOML string. Split out so
@@ -386,8 +439,18 @@ impl Config {
     /// but incomplete config (empty capture list, no pairing route) is accepted;
     /// use [`setup_needs`](Self::setup_needs) to learn what is still missing.
     pub fn from_toml_str_lenient(text: &str) -> Result<Self> {
+        Self::from_toml_str_lenient_at(text, CaptureDirCheck::Strict)
+    }
+
+    /// [`from_toml_str_lenient`](Self::from_toml_str_lenient) at the **boot**
+    /// capture-dir level — see [`load_lenient_for_boot`](Self::load_lenient_for_boot).
+    pub fn from_toml_str_lenient_for_boot(text: &str) -> Result<Self> {
+        Self::from_toml_str_lenient_at(text, CaptureDirCheck::Boot)
+    }
+
+    fn from_toml_str_lenient_at(text: &str, dirs: CaptureDirCheck) -> Result<Self> {
         let cfg = Self::parse_toml(text)?;
-        cfg.validate_structure()?;
+        cfg.validate_structure_at(dirs)?;
         Ok(cfg)
     }
 
@@ -426,6 +489,10 @@ impl Config {
     /// the "is this file broken?" check, `validate_ready` (private) adds the "is
     /// setup finished?" demands that lenient callers skip (see [`setup_needs`]).
     ///
+    /// Capture directories must exist on disk here ([`CaptureDirCheck::Strict`]).
+    /// Agent boot deliberately does NOT come through this function — see
+    /// [`load_lenient_for_boot`](Self::load_lenient_for_boot).
+    ///
     /// [`validate_structure`]: Self::validate_structure
     /// [`setup_needs`]: Self::setup_needs
     pub fn validate(&self) -> Result<()> {
@@ -441,6 +508,14 @@ impl Config {
     /// in the production transport wiring (`run`), so tests and the loopback path
     /// can supply a placeholder.
     pub fn validate_structure(&self) -> Result<()> {
+        self.validate_structure_at(CaptureDirCheck::Strict)
+    }
+
+    /// [`validate_structure`](Self::validate_structure) with the capture-dir
+    /// **existence** arm set by the caller; every other structural rule is
+    /// identical at both levels. See [`CaptureDirCheck`] for which level belongs
+    /// to which call site.
+    pub fn validate_structure_at(&self, dirs: CaptureDirCheck) -> Result<()> {
         // Setting BOTH capture-directory forms is a structural misconfiguration
         // (an empty list, by contrast, is a legal setup state — see
         // `validate_ready`). Keep the wording actionable; tests pin the substring.
@@ -451,7 +526,14 @@ impl Config {
             if dir.as_os_str().is_empty() {
                 bail!("capture directory must not be empty");
             }
-            if !dir.exists() {
+            // Existence is the ONE level-dependent rule. At boot an absent root
+            // is a legitimate, recoverable state (offline share, spec §7) that
+            // the watcher's poll sweep resolves on its own; refusing it here
+            // would stop the agent before that machinery ever runs. No log line
+            // at this level on purpose — the supervisor re-reads the config
+            // every couple of seconds, so a warn here would flood the file; the
+            // one-shot warning lives at the watcher spawn site instead.
+            if dirs == CaptureDirCheck::Strict && !dir.exists() {
                 bail!(
                     "capture directory does not exist: {} — create it (or point \
                      at the right path) before starting Perseus",
@@ -1238,19 +1320,96 @@ mode = "auto"
         );
     }
 
-    /// Review minor (a): a `capture_dir` that doesn't exist on disk must be
-    /// rejected with an actionable message, not silently accepted (the watcher
-    /// would otherwise fail confusingly later, or watch nothing).
+    /// Review minor (a): a `capture_dir` that doesn't exist on disk is rejected
+    /// at the STRICT level with an actionable message. This is the arm an
+    /// interactive settings-page edit runs through
+    /// ([`Config::from_toml_str_lenient`], used by every `config_edit::apply_*`),
+    /// so a user typing a wrong path still gets the loud error — both tiers are
+    /// asserted here, because only the boot tier was downgraded.
     #[test]
     fn nonexistent_capture_dir_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
         let text = good_toml(&missing);
+
         let err = Config::from_toml_str(&text).expect_err("missing capture_dir must fail");
         assert!(
             err.chain().any(|c| c.to_string().contains("does not exist")),
             "error should say the capture directory does not exist: {err:#}"
         );
+
+        // The interactive-edit tier (parse-valid) must stay strict too.
+        let err = Config::from_toml_str_lenient(&text)
+            .expect_err("an interactive edit must still reject a missing dir");
+        assert!(
+            err.chain().any(|c| c.to_string().contains("does not exist")),
+            "the edit tier's error must name the missing directory: {err:#}"
+        );
+    }
+
+    /// Spec §7: an offline-at-boot share must NOT kill the agent. The BOOT
+    /// validation level accepts a capture directory that is not on disk yet and
+    /// still reports it in the watch list, so the watcher is spawned on it and
+    /// its poll-only sweep picks the share up when the mount returns.
+    #[test]
+    fn nonexistent_capture_dir_is_accepted_at_boot_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nas-not-mounted-yet");
+        let text = good_toml(&missing);
+
+        let cfg = Config::from_toml_str_lenient_for_boot(&text)
+            .expect("an offline share must not block agent boot (spec §7)");
+        assert_eq!(
+            cfg.capture_dirs_resolved(),
+            vec![missing.clone()],
+            "the absent root must still be watched, so it can be picked up later"
+        );
+        // Explicit level knob: same config, opposite verdicts.
+        assert!(cfg.validate_structure_at(CaptureDirCheck::Boot).is_ok());
+        assert!(cfg.validate_structure_at(CaptureDirCheck::Strict).is_err());
+    }
+
+    /// The boot level downgrades ONLY the existence arm — every other structural
+    /// rule (here: both capture-dir forms set, and the live-deletion soak gate)
+    /// still fires, so a genuinely broken file is still refused at boot.
+    #[test]
+    fn boot_level_downgrades_only_the_existence_arm() {
+        let a = tempfile::tempdir().unwrap();
+        let both = toml_with(&format!(
+            "capture_dir = \"{d}\"\ncapture_dirs = [\"{d}\"]",
+            d = a.path().display()
+        ));
+        let err = Config::from_toml_str_lenient_for_boot(&both)
+            .expect_err("both forms is still a broken file at boot");
+        assert!(
+            err.chain()
+                .any(|c| c.to_string().contains("either capture_dir or capture_dirs")),
+            "boot must still reject the both-forms misconfiguration: {err:#}"
+        );
+
+        let soak = good_toml(a.path()).replace("dry_run = true", "dry_run = false");
+        let err = Config::from_toml_str_lenient_for_boot(&soak)
+            .expect_err("the soak gate is not a boot-level exemption");
+        assert!(
+            err.chain()
+                .any(|c| c.to_string().contains("i_have_verified_the_soak")),
+            "boot must still refuse un-opted-in live deletion: {err:#}"
+        );
+    }
+
+    /// `load_lenient_for_boot` is the file-level entry the agent actually boots
+    /// through: a config naming an unmounted share loads instead of exiting.
+    #[test]
+    fn load_lenient_for_boot_accepts_an_unmounted_share() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nas-not-mounted-yet");
+        let path = tmp.path().join("perseus.toml");
+        std::fs::write(&path, good_toml(&missing)).unwrap();
+
+        let cfg = Config::load_lenient_for_boot(&path).expect("boot load must succeed");
+        assert_eq!(cfg.capture_dirs_resolved(), vec![missing]);
+        // The strict file loader still refuses it.
+        assert!(Config::load_lenient(&path).is_err());
     }
 
     #[test]

@@ -138,7 +138,7 @@ pub fn run_tray(config_path: std::path::PathBuf) -> anyhow::Result<()> {
         // A broken config must not kill the tray — the supervisor already
         // surfaces the parse error (red icon + web banner). Fall back to the
         // default loopback bind so "Open Web UI" still points somewhere useful.
-        let bind: std::net::SocketAddr = crate::config::Config::load_lenient(&config_path)
+        let bind: std::net::SocketAddr = crate::config::Config::load_lenient_for_boot(&config_path)
             .ok()
             .map(|c| c.web_bind)
             .filter(|b| !b.is_empty())
@@ -195,7 +195,7 @@ pub fn run_tray(config_path: std::path::PathBuf) -> anyhow::Result<()> {
                 tracing::info!("tray icon created");
             }
             tao::event::Event::UserEvent(UserEvent::State(state)) => {
-                let dirs = crate::config::Config::load_lenient(&config_path)
+                let dirs = crate::config::Config::load_lenient_for_boot(&config_path)
                     .map(|c| c.capture_dirs_resolved().len())
                     .unwrap_or(0);
                 status_item.set_text(state_line(&state, dirs));

@@ -105,7 +105,7 @@ fn main() -> Result<()> {
     // publishes `Failed { error }` (red icon + web banner), recovering once the
     // file is fixed. `login`/`status`/`enqueue-backlog` still fail fast.
     let (config, initial_load_error): (Option<Config>, Option<anyhow::Error>) =
-        match Config::load_lenient(&config_path) {
+        match Config::load_lenient_for_boot(&config_path) {
             Ok(c) => (Some(c), None),
             Err(e) if supervisor_mode => (None, Some(e)),
             Err(e) => return Err(e),

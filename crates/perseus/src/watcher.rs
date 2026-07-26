@@ -162,15 +162,23 @@ fn scan_eligible(dir: &Path) -> Vec<PathBuf> {
     scan_eligible_reporting(dir).0
 }
 
-/// [`scan_eligible`] plus the number of walk errors swallowed during the sweep.
+/// [`scan_eligible`] plus the number of **root-level** walk failures.
 ///
-/// The count is the offline-share signal: an unreachable mount makes
-/// `WalkDir` fail on the root, so the sweep returns `(vec![], 1)` rather than a
-/// legitimately empty directory's `(vec![], 0)`. The watcher loop uses that to
-/// emit a rate-limited warning instead of silently discovering nothing.
+/// The count is the offline-share signal, and it counts ONLY errors reported at
+/// `depth() == 0` — walkdir's precise way of saying "the capture directory
+/// itself could not be read". An unreachable mount makes `WalkDir` fail on the
+/// root, so the sweep returns `(vec![], 1)` rather than a legitimately empty
+/// directory's `(vec![], 0)`, and the watcher loop turns that into a
+/// rate-limited warning instead of silently discovering nothing.
+///
+/// Errors on *child* entries are deliberately NOT counted. A perfectly healthy
+/// macOS volume root carries `.Trashes` / `.Spotlight-V100` directories that
+/// deny traversal, so counting those would pin the "mount may be offline"
+/// warning on forever for a root that is entirely fine. Child errors stay a
+/// `debug!` line, exactly as they were before the offline-share signal existed.
 fn scan_eligible_reporting(dir: &Path) -> (Vec<PathBuf>, usize) {
     let mut out = Vec::new();
-    let mut errors = 0usize;
+    let mut root_errors = 0usize;
     for entry in walkdir::WalkDir::new(dir).sort_by_file_name() {
         match entry {
             Ok(e) if e.file_type().is_file() && is_eligible(e.path()) => {
@@ -178,12 +186,14 @@ fn scan_eligible_reporting(dir: &Path) -> (Vec<PathBuf>, usize) {
             }
             Ok(_) => {}
             Err(e) => {
-                errors += 1;
-                tracing::debug!(error = %e, "walk capture dir entry failed");
+                if e.depth() == 0 {
+                    root_errors += 1;
+                }
+                tracing::debug!(error = %e, depth = e.depth(), "walk capture dir entry failed");
             }
         }
     }
-    (out, errors)
+    (out, root_errors)
 }
 
 /// FITS/XISF payload extensions Perseus enqueues. Case-insensitive.
@@ -231,6 +241,42 @@ impl WatcherHandle {
 /// enough that an offline share is visible in the log, quiet enough that a NAS
 /// unplugged overnight does not fill the file.
 const SCAN_ERROR_WARN_EVERY_TICKS: u64 = 60;
+
+/// What one poll tick's sweep outcome should put in the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepLog {
+    /// Nothing to say — a healthy sweep after a healthy one, or a failing sweep
+    /// still inside the rate-limit window.
+    Silent,
+    /// Emit the "capture dir sweep failing — mount may be offline" warning.
+    Warn,
+    /// Emit the "capture dir sweep recovered" line, carrying how many
+    /// consecutive sweeps had been failing.
+    Recovered(u64),
+}
+
+/// Fold one sweep outcome into the consecutive-failing-sweep counter, returning
+/// the new counter and what to log.
+///
+/// Pure, so the rate-limit arithmetic is testable with no clock, no filesystem
+/// and no runtime. Failing sweeps warn on the very first one and then every
+/// [`SCAN_ERROR_WARN_EVERY_TICKS`]th after it (#1, #61, #121, …). A successful
+/// sweep resets the counter to zero, which is what makes the NEXT outage warn
+/// immediately rather than inheriting the previous outage's rate-limit phase.
+fn fold_sweep(failing_sweeps: u64, sweep_failed: bool) -> (u64, SweepLog) {
+    if sweep_failed {
+        let log = if failing_sweeps % SCAN_ERROR_WARN_EVERY_TICKS == 0 {
+            SweepLog::Warn
+        } else {
+            SweepLog::Silent
+        };
+        (failing_sweeps.saturating_add(1), log)
+    } else if failing_sweeps > 0 {
+        (0, SweepLog::Recovered(failing_sweeps))
+    } else {
+        (0, SweepLog::Silent)
+    }
+}
 
 /// Arm a `notify` watcher on `capture_dir`, or `None` if the filesystem cannot
 /// provide one.
@@ -446,23 +492,22 @@ fn spawn_watcher_with_options(
 
                     // An offline share fails the sweep every tick; say so once
                     // per SCAN_ERROR_WARN_EVERY_TICKS rather than every 2s, and
-                    // recover with a single line when the mount comes back.
-                    if scan_errors > 0 {
-                        if failing_sweeps % SCAN_ERROR_WARN_EVERY_TICKS == 0 {
-                            tracing::warn!(
-                                path = %capture_dir.display(),
-                                count = scan_errors,
-                                "capture dir sweep failing — mount may be offline"
-                            );
-                        }
-                        failing_sweeps += 1;
-                    } else if failing_sweeps > 0 {
-                        tracing::info!(
+                    // recover with a single line when the mount comes back. The
+                    // arithmetic lives in `fold_sweep` so it is unit-tested.
+                    let (next_failing, sweep_log) = fold_sweep(failing_sweeps, scan_errors > 0);
+                    failing_sweeps = next_failing;
+                    match sweep_log {
+                        SweepLog::Silent => {}
+                        SweepLog::Warn => tracing::warn!(
                             path = %capture_dir.display(),
-                            count = failing_sweeps,
+                            count = scan_errors,
+                            "capture dir sweep failing — mount may be offline"
+                        ),
+                        SweepLog::Recovered(failed) => tracing::info!(
+                            path = %capture_dir.display(),
+                            count = failed,
                             "capture dir sweep recovered"
-                        );
-                        failing_sweeps = 0;
+                        ),
                     }
 
                     // Re-stat every candidate: a growing file resets its window,
@@ -676,6 +721,158 @@ mod tests {
         let (_dir, file) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("poll fallback must find the file")
+            .expect("stable-file channel closed");
+        assert!(
+            file.ends_with("l1.fits"),
+            "unexpected stable file: {}",
+            file.display()
+        );
+        handle.shutdown().await;
+    }
+
+    /// An unreachable root is what the offline-share signal is FOR: walkdir
+    /// fails on the root entry itself (`depth() == 0`), so the sweep reports
+    /// exactly one failure — distinguishable from a legitimately empty dir.
+    #[test]
+    fn missing_root_counts_as_one_sweep_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (found, errors) = scan_eligible_reporting(&tmp.path().join("not-mounted"));
+        assert!(found.is_empty());
+        assert_eq!(errors, 1, "an unreadable root is one root-level failure");
+
+        // …and a real, empty directory reports zero, which is the contrast the
+        // whole signal rests on.
+        let (found, errors) = scan_eligible_reporting(tmp.path());
+        assert!(found.is_empty());
+        assert_eq!(errors, 0, "an empty but readable dir is not a failure");
+    }
+
+    /// Review finding: a *child* entry that cannot be traversed must NOT be
+    /// counted. A healthy macOS volume root carries `.Trashes` /
+    /// `.Spotlight-V100` (traversal denied), and counting those pinned the
+    /// "mount may be offline" warning on forever for a perfectly fine root.
+    /// Only `depth() == 0` — the root itself — is the offline signal.
+    #[cfg(unix)]
+    #[test]
+    fn child_walk_errors_do_not_count_as_offline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a.fits"), b"x").unwrap();
+        let denied = root.join(".Trashes");
+        std::fs::create_dir(&denied).unwrap();
+        std::fs::write(denied.join("hidden.fits"), b"x").unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Running as root ignores the mode bits — skip rather than assert a
+        // property the environment cannot produce.
+        if std::fs::read_dir(&denied).is_ok() {
+            std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let (found, errors) = scan_eligible_reporting(root);
+        // Restore before any assertion can unwind, so tempdir cleanup succeeds.
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            errors, 0,
+            "an untraversable child must not read as an offline mount"
+        );
+        assert_eq!(found.len(), 1, "the readable payload is still discovered");
+        assert!(found[0].ends_with("a.fits"));
+    }
+
+    /// The rate-limit arithmetic, exercised without a clock, a filesystem or a
+    /// runtime: the first failing sweep warns, the next 59 stay silent, and
+    /// sweep #61 warns again.
+    #[test]
+    fn fold_sweep_warns_on_the_first_then_every_sixtieth() {
+        // Sweep #1.
+        let (n, log) = fold_sweep(0, true);
+        assert_eq!((n, log), (1, SweepLog::Warn), "the first failure warns");
+
+        // Sweeps #2..#60 are inside the rate-limit window.
+        let mut n = n;
+        for i in 2..=SCAN_ERROR_WARN_EVERY_TICKS {
+            let (next, log) = fold_sweep(n, true);
+            assert_eq!(log, SweepLog::Silent, "sweep #{i} must stay quiet");
+            n = next;
+        }
+        assert_eq!(n, SCAN_ERROR_WARN_EVERY_TICKS);
+
+        // Sweep #61 — one full window later — warns again.
+        let (n, log) = fold_sweep(n, true);
+        assert_eq!(log, SweepLog::Warn, "the window has elapsed; warn again");
+        assert_eq!(n, SCAN_ERROR_WARN_EVERY_TICKS + 1);
+    }
+
+    /// A healthy sweep after a healthy sweep says nothing at all.
+    #[test]
+    fn fold_sweep_is_silent_while_healthy() {
+        assert_eq!(fold_sweep(0, false), (0, SweepLog::Silent));
+    }
+
+    /// Recovery emits ONE line carrying the outage length and resets the counter
+    /// to zero — which is precisely what makes the NEXT outage warn immediately
+    /// instead of inheriting the previous outage's rate-limit phase.
+    #[test]
+    fn fold_sweep_recovery_resets_so_the_next_outage_warns_immediately() {
+        // Three failing sweeps, then the mount returns.
+        let mut n = 0;
+        for _ in 0..3 {
+            n = fold_sweep(n, true).0;
+        }
+        assert_eq!(n, 3);
+        let (n, log) = fold_sweep(n, false);
+        assert_eq!(
+            log,
+            SweepLog::Recovered(3),
+            "recovery reports the outage length"
+        );
+        assert_eq!(n, 0, "counter resets on recovery");
+
+        // A second outage warns on its very first sweep, not 60 ticks later.
+        assert_eq!(fold_sweep(n, true), (1, SweepLog::Warn));
+    }
+
+    /// The whole point of the counter, end to end: a root that goes away
+    /// mid-run must not kill the watcher — the sweep keeps failing, and when
+    /// the mount returns the file that appeared on it is still discovered.
+    ///
+    /// Poll-only is forced so discovery cannot come from a `notify` event (a
+    /// vanished+recreated directory invalidates the original watch anyway); the
+    /// assertion is convergent — it fails only if recovery never happens.
+    #[tokio::test]
+    async fn vanished_root_recovers_when_the_mount_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let capture = tmp.path().join("capture");
+        std::fs::create_dir_all(&capture).unwrap();
+        let seen = Arc::new(SeenStore::open(tmp.path().join("perseus.db")).unwrap());
+        let (tx, mut rx) = mpsc::channel::<(PathBuf, PathBuf)>(8);
+
+        let handle = spawn_watcher_with_options(
+            capture.clone(),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            tx,
+            seen,
+            /* force_poll_only = */ true,
+        );
+
+        // The share drops: the root disappears under the running watcher, so
+        // every sweep now fails on the root entry.
+        std::fs::remove_dir_all(&capture).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The mount returns, carrying a new capture.
+        std::fs::create_dir_all(&capture).unwrap();
+        std::fs::write(capture.join("l1.fits"), b"data").unwrap();
+
+        let (_dir, file) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the watcher must recover once the root is back")
             .expect("stable-file channel closed");
         assert!(
             file.ends_with("l1.fits"),
