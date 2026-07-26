@@ -498,9 +498,14 @@ fn spawn_watcher_with_options(
                     failing_sweeps = next_failing;
                     match sweep_log {
                         SweepLog::Silent => {}
+                        // `failing_sweeps` is the post-fold counter, so this
+                        // reads 1 on the first failure and 61, 121, … on the
+                        // rate-limited repeats — how long the outage has run.
+                        // A failing root yields exactly one root-level error,
+                        // so the raw `scan_errors` would be a constant 1.
                         SweepLog::Warn => tracing::warn!(
                             path = %capture_dir.display(),
-                            count = scan_errors,
+                            failing_sweeps,
                             "capture dir sweep failing — mount may be offline"
                         ),
                         SweepLog::Recovered(failed) => tracing::info!(

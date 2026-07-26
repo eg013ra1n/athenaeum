@@ -103,7 +103,12 @@ fn main() -> Result<()> {
     // stderr line — no log file, no icon. Instead we log under the platform data
     // dir and hand the path to the supervisor, whose loop reloads from disk and
     // publishes `Failed { error }` (red icon + web banner), recovering once the
-    // file is fixed. `login`/`status`/`enqueue-backlog` still fail fast.
+    // file is fixed. For the one-shot commands this load is still fatal, but
+    // since the Boot/Strict split it is a LENIENT gate: `login`/`status` come up
+    // on a config that merely fails full validation (an unmounted capture dir,
+    // an incomplete setup) and stop only on a file that is unreadable,
+    // unparseable, or structurally invalid. `enqueue-backlog` needs a fully
+    // valid config, so it re-loads strictly itself (see `async_main`).
     let (config, initial_load_error): (Option<Config>, Option<anyhow::Error>) =
         match Config::load_lenient_for_boot(&config_path) {
             Ok(c) => (Some(c), None),

@@ -8,8 +8,12 @@
 //!
 //! **A probe failure is never an error.** An observatory routinely runs with an
 //! SMB capture root offline; the status page must still render. Every failure
-//! path here logs `warn!(root, error, "free-space probe skipped")` and drops the
-//! entry, so the caller only ever sees the volumes it could actually measure.
+//! path here logs `root, error, "free-space probe skipped"` and drops the entry,
+//! so the caller only ever sees the volumes it could actually measure. The
+//! *absent path* skip logs at `debug!` rather than `warn!`: it is the expected
+//! steady state of an offline share, and the status page is polled every couple
+//! of seconds, so warning on it would emit a dozen lines a minute forever. A
+//! path that IS present but fails to stat is unexpected and still warns.
 //!
 //! **Only the exact requested path is measured** — never an ancestor of it. A
 //! path that is absent (an unmounted share, a capture dir the software has not
@@ -29,7 +33,7 @@
 //! something the exact-path rule above can rule out.
 
 use std::path::PathBuf;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Capacity of one mounted volume, tagged with the requested path that first
 /// landed on it (the label the UI shows, and the key a per-root view matches on).
@@ -58,7 +62,7 @@ pub fn probe_volumes(paths: &[PathBuf]) -> Vec<VolumeInfo> {
         // ancestor (see the module doc). The `exists` check is only here for the
         // clearer log line — `volume_key` would fail on it anyway.
         if !requested.exists() {
-            warn!(
+            debug!(
                 root = %requested.display(),
                 error = "path not present",
                 "free-space probe skipped"
