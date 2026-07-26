@@ -811,12 +811,51 @@ async fn poll_project_announcements(
 
 /// Poll one project's announcements into `project_packages`. Returns the diffs the
 /// frontend turns into `notify()` calls. NEVER notifies itself.
+///
+/// A poll that actually CHANGED something also kicks the auto-replication worker
+/// (spec §3.3's "immediately after a hub poll that changed any project's package
+/// set", F4) — without it a fresh approval waits out the 20-minute cadence.
 pub async fn refresh_project_packages(
     ctx: &ServiceContext,
     project_id: &str,
 ) -> Result<Vec<PackageStateChange>, ApiError> {
     let (_anns, changes) = poll_project_announcements(ctx, project_id).await?;
+    kick_auto_sync_if_changed(&changes);
     Ok(changes)
+}
+
+/// The wakeup the auto-replication worker waits on between passes (F4, spec
+/// §3.3: a pass "immediately after a hub poll that changed any project's package
+/// set"). A module static for the same reason [`SWARM_UNFIT`] and
+/// [`PENDING_PACKAGE_CHANGES`] are: the producers ([`refresh_project_packages`],
+/// reached from both hosts' poll commands) and the consumer (the worker spawned
+/// by [`spawn_collab_auto_sync`]) have no shared owner, and a static keeps both
+/// arming sites in `api::sync` and every command signature untouched.
+static AUTO_SYNC_KICK: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+fn auto_sync_kick() -> &'static tokio::sync::Notify {
+    AUTO_SYNC_KICK.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Kick the auto-replication worker iff `changes` is non-empty — i.e. only when
+/// the refresh actually moved a project's package rows. Returns whether it
+/// kicked (the unit-test oracle).
+///
+/// A no-op refresh must NOT kick: the poll cadence would then drive the worker
+/// instead of the 20-minute interval it is designed around. Note the benign
+/// self-feedback this bounds: a worker pass refreshes announcements itself, so a
+/// pass that observes changes schedules exactly ONE follow-up pass, whose own
+/// refresh sees nothing new and kicks nobody.
+fn kick_auto_sync_if_changed(changes: &[PackageStateChange]) -> bool {
+    if changes.is_empty() {
+        return false;
+    }
+    // `notify_one` with no waiter STORES a permit, so a kick that lands while a
+    // pass is running is not lost — the next wait consumes it immediately — and
+    // several kicks in one window collapse into a single follow-up pass.
+    auto_sync_kick().notify_one();
+    tracing::debug!(count = changes.len(), "collab auto-sync kicked by a package-set change");
+    true
 }
 
 /// All cached projects (the poll-cadence entry point). A per-project failure is
@@ -2368,10 +2407,11 @@ async fn auto_sync_pass(
     .await
 }
 
-/// The auto-replication loop (spec §3.3): a pass every `interval`, after a short
-/// startup grace. Each pass runs on its own task so a panic anywhere below is
-/// logged and the loop survives it — the retention loop's shape, for the same
-/// reason (a background loop that dies is a feature that silently stops).
+/// The auto-replication loop (spec §3.3): a pass every `interval` OR as soon as a
+/// hub poll changes a project's package set, after a short startup grace. Each
+/// pass runs on its own task so a panic anywhere below is logged and the loop
+/// survives it — the retention loop's shape, for the same reason (a background
+/// loop that dies is a feature that silently stops).
 pub async fn run_collab_auto_sync_loop(
     ctx: Arc<ServiceContext>,
     sync: Arc<crate::sync::SyncRuntime>,
@@ -2379,19 +2419,52 @@ pub async fn run_collab_auto_sync_loop(
     interval: std::time::Duration,
 ) {
     tracing::info!(interval_secs = interval.as_secs(), "collab auto-sync loop armed");
-    let mut delay = COLLAB_AUTO_SYNC_STARTUP_DELAY.min(interval);
+    auto_sync_loop_inner(
+        COLLAB_AUTO_SYNC_STARTUP_DELAY.min(interval),
+        interval,
+        move || {
+            let ctx = Arc::clone(&ctx);
+            let sync = Arc::clone(&sync);
+            let emitter = emitter.clone();
+            async move {
+                let pass = tokio::spawn(auto_sync_pass(ctx, sync, emitter, None, false));
+                if let Err(error) = pass.await {
+                    tracing::error!(%error, "collab auto-sync pass task panicked");
+                }
+            }
+        },
+    )
+    .await
+}
+
+/// The loop's shape, with the pass injected (the production binding is
+/// [`run_collab_auto_sync_loop`]; tests pass a counter).
+///
+/// The startup grace is deliberately NOT interruptible: it exists so bulk pulls
+/// don't compete with app start (receiver boot, initial scan, first render), and
+/// a hub poll during those 90 seconds is exactly the traffic it protects against.
+/// A kick that lands inside the grace — or during a running pass — is not lost:
+/// [`tokio::sync::Notify::notify_one`] stores ONE permit when nobody is waiting,
+/// so the wait below returns immediately the next time round and produces exactly
+/// one follow-up pass no matter how many kicks arrived. Overlapping per-package
+/// work between a kicked pass and its predecessor is prevented by
+/// [`IN_FLIGHT_PACKAGE_PULLS`], not by the cadence.
+async fn auto_sync_loop_inner<F, Fut>(
+    startup_delay: std::time::Duration,
+    interval: std::time::Duration,
+    run_pass: F,
+) where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    tokio::time::sleep(startup_delay).await;
     loop {
-        tokio::time::sleep(delay).await;
-        delay = interval;
-        let pass = tokio::spawn(auto_sync_pass(
-            Arc::clone(&ctx),
-            Arc::clone(&sync),
-            emitter.clone(),
-            None,
-            false,
-        ));
-        if let Err(error) = pass.await {
-            tracing::error!(%error, "collab auto-sync pass task panicked");
+        run_pass().await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = auto_sync_kick().notified() => {
+                tracing::info!("collab auto-sync: package set changed; running a pass now");
+            }
         }
     }
 }
@@ -5068,6 +5141,56 @@ mod tests {
 
         assert!(rec.package_ids().is_empty());
         assert_eq!(outcome.projects, 0);
+    }
+
+    /// F4: only a refresh that actually MOVED a project's package rows kicks the
+    /// worker. Kicking on every poll would put the worker on the poll cadence
+    /// instead of the 20-minute interval it is designed around.
+    #[test]
+    fn only_a_real_package_set_change_kicks_the_worker() {
+        assert!(!kick_auto_sync_if_changed(&[]), "a no-op refresh kicks nobody");
+        assert!(
+            kick_auto_sync_if_changed(&[PackageStateChange {
+                project_id: "p-1".into(),
+                package_id: "pkg-1".into(),
+                kind: "approved".into(),
+                detail: None,
+            }]),
+            "an approval kicks the worker"
+        );
+    }
+
+    /// F4: the kick actually WAKES the loop — spec §3.3 promises a pass
+    /// "immediately after a hub poll that changed any project's package set", and
+    /// without it a fresh approval waits out the 20-minute cadence (which reads as
+    /// broken to anyone smoke-testing two devices). The interval here is an hour,
+    /// so only a kick can produce the second pass.
+    #[tokio::test]
+    async fn a_package_set_change_wakes_the_auto_sync_loop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let passes = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let passes = Arc::clone(&passes);
+            async move {
+                auto_sync_loop_inner(
+                    Duration::ZERO,
+                    Duration::from_secs(3600),
+                    move || {
+                        let passes = Arc::clone(&passes);
+                        async move {
+                            passes.fetch_add(1, Ordering::SeqCst);
+                        }
+                    },
+                )
+                .await
+            }
+        });
+
+        wait_until(|| passes.load(Ordering::SeqCst) >= 1, Duration::from_secs(5)).await;
+        auto_sync_kick().notify_one();
+        wait_until(|| passes.load(Ordering::SeqCst) >= 2, Duration::from_secs(5)).await;
+        task.abort();
     }
 
     /// The api-level toggle persists through the db accessor pair.
