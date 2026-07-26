@@ -1733,16 +1733,27 @@ pub async fn decide_announcement(
             .approve_announcement(&token, announcement_id)
             .await
             .map_err(decide_err)?;
-        let db = db(ctx)?;
-        let conn = db.conn();
-        let updated = conn
-            .execute(
-                "UPDATE project_packages SET state = 'published', decided_at = datetime('now') \
-                 WHERE announcement_id = ?1",
-                [announcement_id],
-            )
-            .map_err(|e| internal(e.into()))?;
-        tracing::info!(announcement_id, hub_state = %resp.state, updated, "approved announcement");
+        {
+            let db = db(ctx)?;
+            let conn = db.conn();
+            let updated = conn
+                .execute(
+                    "UPDATE project_packages SET state = 'published', decided_at = datetime('now') \
+                     WHERE announcement_id = ?1",
+                    [announcement_id],
+                )
+                .map_err(|e| internal(e.into()))?;
+            tracing::info!(announcement_id, hub_state = %resp.state, updated, "approved announcement");
+        }
+        // Seed the copy the approval just published (D3 §3.4 / F2). A review copy
+        // lands while the announcement is still pending, so its post-ingest seed
+        // was skipped by the state gate and NOTHING else would ever seed it — the
+        // need diff skips locally-complete packages. Awaited rather than spawned:
+        // this boundary holds a `&ServiceContext` (no `'static` handle to hand a
+        // task), and the work is local — hard-link the seed dir, import it. Never
+        // fatal: `seed_approved_announcement` logs and returns, so a seed failure
+        // cannot turn a successful decision into a reported failure.
+        crate::api::collab_exchange::seed_approved_announcement(ctx, announcement_id).await;
     } else {
         let reason = reason.expect("the reject path validates a reason above");
         let resp = client

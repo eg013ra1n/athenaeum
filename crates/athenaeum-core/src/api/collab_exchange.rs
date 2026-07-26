@@ -992,6 +992,17 @@ pub async fn report_have_after_ingest(
 /// `api::sync`'s `on_project_ingested` hook, which calls this before
 /// [`report_have_after_ingest`]) and the swarm path
 /// ([`download_project_package`], which calls it before its own `report_have`).
+/// A third caller is [`seed_approved_announcement`], for the copy that was
+/// ingested while still pending and only becomes seedable at the decision.
+///
+/// **PUBLISHED packages only** (F2). A seeded collection is served by the
+/// provider machinery to anyone past the connect gate — no
+/// [`may_serve_package`](crate::collab::authz::may_serve_package) check runs on a
+/// raw blob GET, which is why the swarm path itself only ever fetches `published`
+/// packages (spec §5). A coordinator's PENDING review copy is ingested through
+/// this same hook, so seeding on `local_status` alone would hand every member of
+/// the project a way around the pending ⇒ coordinator-only serve rule that spec
+/// §6 says still governs who may pull. Approval is what lifts the gate.
 ///
 /// **Order is load-bearing: seed, THEN report_have.** `report_have` is what puts
 /// this device on the hub's holder list, i.e. what makes other members' swarm
@@ -1051,6 +1062,16 @@ pub async fn seed_ingested_package(ctx: &ServiceContext, package_id: &str) {
             );
             return;
         }
+        // The state gate (F2): a pending review copy stays unseeded until it is
+        // decided — see the doc above.
+        if row.state != "published" {
+            tracing::debug!(
+                package_id,
+                state = %row.state,
+                "project seed skipped: package not published"
+            );
+            return;
+        }
         match reconstruct_seed_dir(&conn, &sync_dir, package_id) {
             Ok(dir) => (row.project_id, dir),
             Err(e) => {
@@ -1077,6 +1098,46 @@ pub async fn seed_ingested_package(ctx: &ServiceContext, package_id: &str) {
             "seeding an ingested package failed; serving falls back to on-demand reconstruction"
         ),
     }
+}
+
+/// Seed the package an APPROVAL just published (F2) — the other half of the
+/// state gate [`seed_ingested_package`] applies.
+///
+/// A coordinator's review copy lands while the announcement is still `pending`,
+/// so its post-ingest seed is skipped; approval is the moment it becomes
+/// servable to the project, and nothing else would seed it (the need diff only
+/// pulls packages that are NOT locally complete, so no later pass revisits it).
+/// Called from `api::collab::decide_announcement`'s approve branch AFTER the row
+/// flips to `published`.
+///
+/// Best-effort with the ingest hook's exact contract: an unknown announcement, a
+/// package that is not locally complete, and a failed import are each a log line,
+/// never an error — a seed failure must not turn a successful moderation
+/// decision into a reported failure, and the package stays servable through the
+/// on-demand `handle_project_request` path either way.
+pub async fn seed_approved_announcement(ctx: &ServiceContext, announcement_id: &str) {
+    let package_id = {
+        let db = match db(ctx) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(announcement_id, error = %format!("{e}"), "approved-package seed skipped: catalog unavailable");
+                return;
+            }
+        };
+        let conn = db.conn();
+        match crate::db::collab_exchange::get_package_by_announcement(&conn, announcement_id) {
+            Ok(Some(row)) => row.package_id,
+            Ok(None) => {
+                tracing::debug!(announcement_id, "approved-package seed skipped: no local package row");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(announcement_id, error = %format!("{e}"), "approved-package seed skipped: package read failed");
+                return;
+            }
+        }
+    };
+    seed_ingested_package(ctx, &package_id).await;
 }
 
 /// Stop seeding ONE package and drop the materialized seed dir that backed it —
@@ -4278,6 +4339,54 @@ mod tests {
             std::fs::read(out.join("L_0001.fits")).unwrap(),
             payload,
             "the seed serves byte-identical content"
+        );
+
+        node.shutdown().await;
+    }
+
+    /// F2: seeding is gated on the package being PUBLISHED, not merely locally
+    /// complete. A coordinator's PENDING review copy that is seeded is served
+    /// straight out of the blob store to anyone past the connect gate, with none
+    /// of `authorize_and_reconstruct_serve`'s pending ⇒ coordinator-only check —
+    /// which is exactly the rule spec §6 claims still governs who may pull. The
+    /// copy becomes servable the moment the coordinator approves it, through the
+    /// same seed path `decide_announcement` calls.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pending_review_copy_is_seeded_only_after_approval() {
+        const PROJECT: &str = "p-pending-seed";
+        const HUB: &str = "hub-pending-seed";
+
+        let (tmp, ctx) = test_ctx();
+        let payload = vec![0x11u8; 128 * 1024];
+        let landing = tmp.path().join("land");
+        {
+            let conn = db(&ctx).unwrap().conn();
+            seed_received_package(&conn, &landing, PROJECT, HUB, "Alice", "pending", &payload);
+        }
+        let node = bind_node_into(&ctx).await;
+
+        // The post-ingest hook fires for a review copy too — and must not seed it.
+        seed_ingested_package(&ctx, HUB).await;
+        assert!(
+            seeded_hash(&node, PROJECT, HUB).await.is_none(),
+            "a pending review copy is not seeded"
+        );
+
+        // The coordinator approves: the hub state lands on the row and the
+        // approval's own seed hook runs.
+        {
+            let conn = db(&ctx).unwrap().conn();
+            conn.execute(
+                "UPDATE project_packages SET state = 'published' WHERE package_id = ?1",
+                [HUB],
+            )
+            .unwrap();
+        }
+        seed_approved_announcement(&ctx, &format!("ann-{HUB}")).await;
+        assert!(
+            seeded_hash(&node, PROJECT, HUB).await.is_some(),
+            "approving the announcement seeds the package"
         );
 
         node.shutdown().await;
