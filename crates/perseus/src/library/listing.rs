@@ -547,6 +547,13 @@ pub fn list_directory(
             tracing::debug!(path = %abs.display(), "library listing: skipping non-regular entry");
             continue;
         }
+        // Only capture payloads are listed — the SAME extension gate the watcher
+        // enqueues by and the send-selection expands by (`watcher::is_eligible`:
+        // fits/fit/fts/xisf, case-insensitive), so the Library never shows a file
+        // Perseus would never send (logs, sidecars, temp files).
+        if !crate::watcher::is_eligible(&abs) {
+            continue;
+        }
         let f = status_for(&abs, &pending, &newest, confirms.as_ref(), src)?;
         files.push(LibraryEntry {
             name,
@@ -996,6 +1003,40 @@ mod tests {
 
     // ── listing shape ────────────────────────────────────────────────────────
 
+    /// Only capture payloads list — the same `watcher::is_eligible` gate the
+    /// enqueue and send-selection paths use (fits/fit/fts/xisf, any case).
+    /// Logs, sidecars and temp files in the capture dir stay invisible;
+    /// directories always list (they are navigation, not payloads).
+    #[test]
+    fn listing_shows_only_capture_extensions() {
+        let f = fixture();
+        f.touch("a.fits", b"x");
+        f.touch("b.FIT", b"x");
+        f.touch("c.xisf", b"x");
+        f.touch("d.fts", b"x");
+        f.touch("session.log", b"x");
+        f.touch("notes.txt", b"x");
+        f.touch("frame.fits.tmp", b"x");
+        f.touch("Lights/keep.me", b"x");
+        let listing = f.list("", &[], &[]);
+        let names: Vec<_> = listing.files.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "a.fits".to_string(),
+                "b.FIT".to_string(),
+                "c.xisf".to_string(),
+                "d.fts".to_string()
+            ],
+            "non-capture files never list"
+        );
+        assert_eq!(
+            listing.dirs,
+            vec!["Lights".to_string()],
+            "directories list regardless of their contents"
+        );
+    }
+
     #[test]
     fn listing_is_a_single_directory_never_a_walk() {
         let f = fixture();
@@ -1034,16 +1075,19 @@ mod tests {
         assert_eq!(names, vec!["a.fits", "b.fits", "c.fits"]);
     }
 
-    /// Browse-everything: the listing is a file manager, not a capture filter.
-    /// Only send/preview care about the extension.
+    /// REVERSED 2026-07-28 (owner call): the listing is a CAPTURE browser, not a
+    /// file manager — it shows exactly what Perseus would send. The v1
+    /// browse-everything stance (this test's original assertion) put logs and
+    /// sidecars in front of the operator with statuses that could only ever
+    /// read "unsent".
     #[test]
-    fn non_fits_files_are_listed_too() {
+    fn non_fits_files_are_hidden() {
         let f = fixture();
         f.touch("notes.txt", b"hello");
         f.touch("light.fits", b"x");
         let listing = f.list("", &[], &[]);
         let names: Vec<_> = listing.files.iter().map(|e| e.name.clone()).collect();
-        assert_eq!(names, vec!["light.fits", "notes.txt"]);
+        assert_eq!(names, vec!["light.fits"]);
     }
 
     #[test]
