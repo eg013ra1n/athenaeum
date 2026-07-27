@@ -41,6 +41,45 @@ pub struct AnnounceFileEntry {
     pub frame_uuid: String,
 }
 
+/// How the receiver lays a transfer's files on disk (spec 2026-07-27
+/// perseus-mirror-hierarchy). `Batch` = today's per-transfer
+/// `<sender_slug>/<batch_slug>/` folder; `Mirror` = the stable
+/// `<sender_slug>/<rel_path>` capture-mirror tree (no batch level). Postcard
+/// variant order is FROZEN (this rides `Msg::Announce4`); append-only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PackageLayout {
+    #[default]
+    Batch,
+    Mirror,
+}
+
+impl PackageLayout {
+    /// The DB TEXT repr — also the value the `sync_outbound.layout` column
+    /// defaults to for `Batch`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PackageLayout::Batch => "batch",
+            PackageLayout::Mirror => "mirror",
+        }
+    }
+
+    /// DB TEXT → layout. Unknown text degrades to `Batch` (a read never fails
+    /// on a value written by a newer build).
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "mirror" => PackageLayout::Mirror,
+            "batch" => PackageLayout::Batch,
+            other => {
+                tracing::warn!(
+                    value = other,
+                    "unknown sync_outbound.layout; defaulting to batch"
+                );
+                PackageLayout::Batch
+            }
+        }
+    }
+}
+
 /// V2 package announce: the [`PackageAnnounce`] fields plus a human batch display
 /// name and the full file manifest.
 ///
@@ -299,6 +338,22 @@ impl std::error::Error for LocalFault {}
 /// True when `err` carries a [`LocalFault`] anywhere in its context chain.
 pub fn is_local_fault(err: &anyhow::Error) -> bool {
     err.downcast_ref::<LocalFault>().is_some()
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn package_layout_db_roundtrip_and_default() {
+        assert_eq!(PackageLayout::Batch.as_str(), "batch");
+        assert_eq!(PackageLayout::Mirror.as_str(), "mirror");
+        assert_eq!(PackageLayout::from_db("mirror"), PackageLayout::Mirror);
+        assert_eq!(PackageLayout::from_db("batch"), PackageLayout::Batch);
+        // Unknown value degrades to Batch (never a parse failure on read).
+        assert_eq!(PackageLayout::from_db("wat"), PackageLayout::Batch);
+        assert_eq!(PackageLayout::default(), PackageLayout::Batch);
+    }
 }
 
 #[cfg(test)]

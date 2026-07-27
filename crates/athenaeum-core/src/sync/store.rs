@@ -14,7 +14,9 @@ use std::sync::Mutex;
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
-use crate::sharing::types::{AnnounceFileEntry, FrameReceipt, NodeId, PackageId, ReceiptOutcome};
+use crate::sharing::types::{
+    AnnounceFileEntry, FrameReceipt, NodeId, PackageId, PackageLayout, ReceiptOutcome,
+};
 
 use super::models::{
     Direction, HistoryQuery, HistoryRow, InboundFileRow, InboundFileState, InboundRow,
@@ -44,7 +46,8 @@ pub const DDL_OUTBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_outbound (
     wire_package_id TEXT,
     display_name TEXT,
     project_id TEXT,
-    generation INTEGER NOT NULL DEFAULT 1
+    generation INTEGER NOT NULL DEFAULT 1,
+    layout TEXT NOT NULL DEFAULT 'batch'
 )";
 
 /// Idempotently add the trailing `sync_outbound` columns (`last_error` — Task 9,
@@ -81,6 +84,9 @@ pub fn ensure_outbound_columns(conn: &Connection) -> Result<()> {
         // is a constant default, so ALTER ADD COLUMN back-fills every existing row
         // to generation 1.
         ("generation", "INTEGER NOT NULL DEFAULT 1"),
+        // Perseus mirror-hierarchy (spec 2026-07-27): receiver landing layout,
+        // stamped per transfer at enqueue. Constant default back-fills 'batch'.
+        ("layout", "TEXT NOT NULL DEFAULT 'batch'"),
     ] {
         if !existing.contains(col) {
             conn.execute(
@@ -696,6 +702,7 @@ type OutboundRaw = (
     Option<String>,
     Option<String>,
     i64,
+    String,
 );
 
 fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
@@ -713,6 +720,7 @@ fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
         display_name,
         project_id,
         generation,
+        layout,
     ) = raw;
     Ok(OutboundRow {
         id,
@@ -728,6 +736,7 @@ fn to_outbound(raw: OutboundRaw) -> Result<OutboundRow> {
         display_name,
         project_id,
         generation: generation.max(0) as u32,
+        layout: PackageLayout::from_db(&layout),
     })
 }
 
@@ -779,7 +788,7 @@ fn to_history(raw: HistoryRaw) -> Result<HistoryRow> {
 }
 
 const OUTBOUND_COLS: &str =
-    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at, wire_package_id, display_name, project_id, generation";
+    "id, package_ref, peer, state, attempts, created_at, confirmed_at, last_error, next_retry_at, wire_package_id, display_name, project_id, generation, layout";
 const HISTORY_COLS: &str =
     "frame_uuid, filename, object, peer_device, direction, bytes, started_at, finished_at, outcome, project, package_id, batch_name";
 
@@ -801,6 +810,7 @@ fn outbound_raw_from_row(r: &rusqlite::Row) -> rusqlite::Result<OutboundRaw> {
         r.get(10)?,
         r.get(11)?,
         r.get(12)?,
+        r.get(13)?,
     ))
 }
 
@@ -3827,6 +3837,80 @@ mod tests {
         ensure_inbound_columns(&conn).unwrap();
         ensure_history_columns(&conn).unwrap();
         assert!(cols(&conn, "sync_inbound").contains(&"display_name".to_string()));
+    }
+
+    /// Mirror-hierarchy T1: a fresh DB carries `sync_outbound.layout`, and a row
+    /// inserted through the current (layout-less) enqueue signature reads back as
+    /// [`PackageLayout::Batch`] — the column's constant default. A row whose
+    /// column holds `'mirror'` decodes through the same read path as
+    /// [`PackageLayout::Mirror`], so the DB text repr is pinned end to end.
+    #[test]
+    fn outbound_layout_column_exists_and_defaults_to_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sync.db");
+        StandaloneSyncStore::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        assert!(cols(&conn, "sync_outbound").contains(&"layout".to_string()));
+
+        // Insert via the current signature (layout is not a parameter yet) — the
+        // column default must back-fill 'batch'.
+        let id = insert_outbound_with_files(&conn, "/tmp/pkg-x", &node_id_hex(&PEER), None, &[])
+            .unwrap();
+        let row = outbound_row_by_id(&conn, id).unwrap().unwrap();
+        assert_eq!(row.layout, PackageLayout::Batch, "default layout is batch");
+
+        conn.execute(
+            "UPDATE sync_outbound SET layout = 'mirror' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        let row = outbound_row_by_id(&conn, id).unwrap().unwrap();
+        assert_eq!(
+            row.layout,
+            PackageLayout::Mirror,
+            "'mirror' decodes on the read path"
+        );
+    }
+
+    /// Mirror-hierarchy T1: a pre-mirror `sync_outbound` (no `layout` column) with
+    /// a row already in it gains the column through the guarded ALTER, and that
+    /// existing row back-fills to `batch` — an upgrade never re-labels a transfer
+    /// the user already queued. Idempotent, like every other guarded column.
+    #[test]
+    fn legacy_outbound_row_back_fills_layout_batch() {
+        let conn = Connection::open_in_memory().unwrap();
+        // PRE-mirror-hierarchy DDL, copied from the CREATE statement before this
+        // cycle (through `generation`, without `layout`).
+        conn.execute(
+            "CREATE TABLE sync_outbound (
+                id INTEGER PRIMARY KEY, package_ref TEXT NOT NULL, peer TEXT NOT NULL,
+                state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+                confirmed_at TEXT, last_error TEXT, next_retry_at TEXT, wire_package_id TEXT,
+                display_name TEXT, project_id TEXT, generation INTEGER NOT NULL DEFAULT 1
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_outbound (package_ref, peer, state, attempts, created_at)
+             VALUES ('p', ?1, 'queued', 0, 't0')",
+            params![node_id_hex(&PEER)],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        assert!(!cols(&conn, "sync_outbound").contains(&"layout".to_string()));
+
+        ensure_outbound_columns(&conn).unwrap();
+        assert!(cols(&conn, "sync_outbound").contains(&"layout".to_string()));
+        assert_eq!(
+            outbound_row_by_id(&conn, id).unwrap().unwrap().layout,
+            PackageLayout::Batch,
+            "a pre-existing row back-fills to batch"
+        );
+
+        // Idempotent: a second pass is a no-op, not an error.
+        ensure_outbound_columns(&conn).unwrap();
+        assert!(cols(&conn, "sync_outbound").contains(&"layout".to_string()));
     }
 
     /// tv2 §D1: `display_name` write paths round-trip on both directions and clear

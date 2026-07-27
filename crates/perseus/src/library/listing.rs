@@ -695,6 +695,7 @@ mod tests {
             display_name: None,
             project_id: None,
             generation: 1,
+            layout: athenaeum_core::sharing::types::PackageLayout::Batch,
         }
     }
 

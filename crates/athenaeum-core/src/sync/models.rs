@@ -9,7 +9,7 @@
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::sharing::types::NodeId;
+use crate::sharing::types::{NodeId, PackageLayout};
 
 /// Sender-side lifecycle of one outbound package.
 ///
@@ -368,6 +368,14 @@ pub struct OutboundRow {
     /// clean "attempt N" that ignores announce churn.
     #[serde(default)]
     pub generation: u32,
+    /// Receiver landing layout for this transfer (Perseus mirror-hierarchy, spec
+    /// 2026-07-27): [`Batch`](PackageLayout::Batch) — the per-transfer
+    /// `<sender_slug>/<batch_slug>/` folder — or [`Mirror`](PackageLayout::Mirror),
+    /// the stable `<sender_slug>/<rel_path>` capture-mirror tree. Stamped once at
+    /// enqueue and constant for the transfer's life, so a resend lands where the
+    /// first attempt did. `Batch` for every legacy row (the column's DB default).
+    #[serde(default)]
+    pub layout: PackageLayout,
 }
 
 /// One row of `sync_history`: an append-only audit entry for a per-frame
