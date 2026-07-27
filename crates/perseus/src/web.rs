@@ -2152,8 +2152,11 @@ async fn api_library_send(
             }))
         }
         Delivery::Unbuildable(error) => {
-            // Every picked file vanished or will not parse. Nothing was written,
-            // nothing was recorded — say so instead of reporting an empty send.
+            // No package exists: every picked file vanished or will not parse
+            // (`NoBuildableFiles`), or the package itself could not be written
+            // (the batch vanished mid-build, the disk is full). Nothing was
+            // written, nothing was recorded — say so, with the build's own
+            // sentence, instead of reporting an empty send.
             let msg = format!("{error:#}");
             tracing::error!(error = %msg, count = files.len(), "web library send: nothing buildable");
             Err((StatusCode::UNPROCESSABLE_ENTITY, msg))
