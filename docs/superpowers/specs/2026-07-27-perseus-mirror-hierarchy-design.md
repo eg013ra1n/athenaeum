@@ -29,10 +29,12 @@ Decisions ratified during brainstorming:
 
 ## §1 Setting + per-transfer stamping (Perseus)
 
-`[send] mirror_hierarchy = false` (default OFF) in the Perseus TOML +
-`config_template.toml`, surfaced as a checkbox in the web UI's To-Sync strip
-send-mode editor — the same panel that owns the 3-way mode radio (T14) —
-("Mirror capture folder hierarchy on receiver") with a short hint line. Edited
+`mirror_hierarchy = false` (default OFF) as a top-level key in the Perseus
+TOML + `config_template.toml` (the send keys — `mode`, `auto_quiet_secs`,
+`schedule_times`, `schedule_catchup` — are all top-level; there is no `[send]`
+table), surfaced as a checkbox in the web UI's To-Sync strip send-mode editor —
+the same panel that owns the 3-way mode radio (T14) — ("Mirror capture folder
+hierarchy on receiver") with a short hint line. Edited
 through the existing one-atomic-edit send-config PUT (T14 machinery) and the
 supervisor send-config reconcile seam (S3), so a hand-edited TOML reaches the
 running batcher without restart.
@@ -73,15 +75,22 @@ mock carries it exactly as the real transport does — no more, no less
 
 ## §3 Landing (receiver)
 
-The single behavioral change is in `resolve_landing_dir` (`sync/receiver.rs`):
+The single behavioral change is in `handle_announce` (`sync/receiver.rs`),
+which realizes the mirror layout by reusing the already-tested pre-v2 (v1)
+landing path: the receiver computes a `landing_override` only for a NAMED
+batch; when there is none, ingest lands under `<incoming_root>/<sender_slug>/<rel_path>`
+directly — which IS the mirror tree.
 
-- `layout == Mirror` → `landing_dir = <incoming_root>/<sender_slug>` — the
-  `<batch_slug>` layer is skipped, and the active-claim `_2`/`_3` directory
-  suffix loop is skipped too: concurrent mirror transfers from one sender MUST
-  share the tree (that is the feature).
-- `layout == Batch` → byte-for-byte today's behavior.
-- The resolved dir is persisted on the inbound row exactly as today, so
-  resume/restart lands into the same tree unchanged.
+- `layout == Mirror` → `landing_override = None`: the `<batch_slug>` layer and
+  its active-claim `_2`/`_3` directory suffix loop are skipped entirely
+  (concurrent mirror transfers from one sender MUST share the tree — that is
+  the feature); `resolve_landing_dir` is not called and is not modified. The
+  inbound row's `landing_dir` stays NULL (exactly like a v1 announce), and
+  ingest recomputes `<incoming_root>/<sender_slug>` per attempt — a sender
+  device rename between attempts moves the tree, same as v1 (accepted,
+  pre-existing behavior).
+- `layout == Batch` → byte-for-byte today's behavior (named batches still go
+  through `resolve_landing_dir`).
 
 `land_payload` (`sync/ingest.rs`) is **not modified**: it already does
 `create_dir_all` on the joined parent, tmp + atomic rename, and per-file
@@ -111,9 +120,10 @@ roots. Forward-slash rel_paths join correctly on Windows.
 
 ## §5 Testing
 
-- Unit, receiver: mirror arm of `resolve_landing_dir` (no batch slug, no
-  dir-suffix loop, persisted; batch arm byte-identical — pin with the existing
-  tests), landing shared by two concurrent mirror rows.
+- Unit, receiver: mirror announce produces `landing_override = None` (no batch
+  slug, no dir-suffix loop, `landing_dir` NULL on the row; batch arm
+  byte-identical — the existing `resolve_landing_dir` tests keep passing
+  untouched), landing shared by two concurrent mirror rows.
 - Unit, wire: `Announce4` golden pin; v1–v3 → `layout = Batch` fallback pin;
   loopback parity for the new field.
 - Unit, Perseus: stamp-at-enqueue for all three send paths; resend keeps the
