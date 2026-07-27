@@ -302,13 +302,79 @@ pub fn batch_display_name(rel_paths: &[String], date: &str) -> String {
     format!("Perseus {date} ({n} files)")
 }
 
+/// The marker error [`build_batch_package`] fails with when the **manifest pass**
+/// dropped every file in the batch — each one individually unparseable,
+/// unstattable or unhashable, so there is nothing on disk worth retrying.
+///
+/// A typed marker rather than a message the caller matches on: the batcher's
+/// flush decides whether a failed batch's files go BACK into the pending
+/// accumulator on exactly this distinction (a copy-pass failure is transient and
+/// re-queues; a batch of individually-bad frames must not spin forever), and a
+/// decision that load-bearing must not hang on prose.
+#[derive(Debug)]
+pub struct NoBuildableFiles;
+
+impl std::fmt::Display for NoBuildableFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("batch has no buildable files")
+    }
+}
+
+impl std::error::Error for NoBuildableFiles {}
+
+/// How many times the payload-copy pass is attempted for one batch. Each retry
+/// costs a full re-copy of everything that already landed, so the bound is small
+/// on purpose: the cheap pre-copy check below catches the ordinary "a file was
+/// deleted while the batch was hashing" case with no retry at all, and needing
+/// more than a couple of attempts means the failure is systemic (a full disk, a
+/// dying volume) — where failing the batch, so the flush re-queues it, is the
+/// right answer rather than dropping frame after frame.
+const MAX_WRITE_ATTEMPTS: usize = 3;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam (`cfg(test)` only): a one-shot hook run **between** the pre-copy
+    /// check and the payload-copy pass, so a test can stage the exact race the
+    /// copy-pass tolerance exists for — a file deleted mid-build, which is the
+    /// Library's headline feature happening at the worst possible moment.
+    ///
+    /// Thread-local rather than a global: every `#[tokio::test]` runs its runtime
+    /// on its own test thread, so a hook armed by one test can never fire inside
+    /// another test's concurrent build.
+    pub(crate) static MID_BUILD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_mid_build_hook() {
+    if let Some(hook) = MID_BUILD_HOOK.with(|h| h.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn run_mid_build_hook() {}
+
 /// Build ONE package containing a manifest record per `(capture_dir, file)` in
-/// `files`. A file that vanished, won't parse, or can't be hashed is dropped
-/// with a `warn!` and the batch continues — a single bad frame never fails the
-/// whole set. Returns `(pkg_dir, included)` where `included` is the capture-file
-/// paths whose records actually made it into the package, in order
-/// (`included.len()` is the packaged record count); empty input OR every file
-/// dropped is an error (a package with zero records is never written).
+/// `files`. Returns the capture-file paths whose records actually made it into
+/// the package, in order (`included.len()` is the packaged record count).
+///
+/// **Both passes are per-file tolerant.** A file that vanished, won't parse or
+/// can't be hashed is dropped from the *manifest* pass with a `warn!`; a file
+/// that then can't be *copied* into the package — deleted between the two passes
+/// (the Library's own delete, the retention sweep, an operator over SSH), a read
+/// error, a size that moved under a still-writing producer — is dropped from the
+/// copy pass with a `warn!` and the rest of the batch ships. A single bad frame
+/// never costs the night: before this, one `fs::copy` failure failed the whole
+/// package, and the drained files ended up in no store at all.
+///
+/// The failure modes are two, and the caller must tell them apart:
+///
+/// - every file dropped in the **manifest** pass → [`NoBuildableFiles`], a
+///   permanent verdict about the files themselves;
+/// - anything the **copy** pass could not overcome → an ordinary error, which is
+///   transient by construction (a full disk, an unwritable packages dir, a whole
+///   batch that vanished at once) and therefore worth re-queuing.
 ///
 /// Returning the *included* paths — not just a count — is what lets the batcher
 /// flush ([`crate::batcher`]) record as seen **only** the files it truly
@@ -321,12 +387,14 @@ pub fn batch_display_name(rel_paths: &[String], date: &str) -> String {
 /// `frame_uuid`, `origin_catalog_uuid == frame_uuid`, capture-dir-relative
 /// `rel_path`, full-file `xxh3`, header-derived `frame_meta`). The package dir
 /// is keyed by a fresh uuid (not any one frame's uuid) since it now carries N
-/// frames.
+/// frames — and a fresh one per attempt, so a retry never mixes its payload with
+/// the partial copies of the attempt before it.
 pub fn build_batch_package(
     config: &Config,
     files: &[(PathBuf /* capture_dir */, PathBuf /* file */)],
     origin_device: &str,
 ) -> Result<BuiltBatch> {
+    // ── Pass 1: the manifest records (parse + stat + hash), per-file tolerant.
     let mut records: Vec<(PathBuf, ManifestRecord)> = Vec::with_capacity(files.len());
     for (capture_dir, file_path) in files {
         match build_manifest_record(config, capture_dir, file_path, origin_device) {
@@ -340,15 +408,124 @@ pub fn build_batch_package(
     }
 
     if records.is_empty() {
-        anyhow::bail!("batch has no buildable files");
+        // Nothing on disk to send and nothing to retry — a permanent verdict the
+        // caller must not confuse with a failed write (see `NoBuildableFiles`).
+        return Err(anyhow::Error::new(NoBuildableFiles));
     }
 
-    // Everything derived from the surviving records is captured BEFORE `records`
-    // is moved into `write_package`: the included capture paths (the caller
-    // records exactly these as seen — see the fn docs), the per-file announce
-    // manifest, the rebuild source linkage, and the human batch name.
+    // ── Pass 2: the payload copies, per-file tolerant too.
+    let mut attempt = 0usize;
+    loop {
+        // Cheap first: re-stat every source. Hashing a night's batch takes
+        // minutes, and a file deleted in that window is the common case — dropping
+        // it here costs N stats, where discovering it inside `write_package` costs
+        // a full re-copy of everything that already landed.
+        drop_vanished_sources(&mut records);
+        if records.is_empty() {
+            anyhow::bail!("every file in the batch vanished before its payload was copied");
+        }
+
+        let pkg_dir = config.packages_dir().join(Uuid::new_v4().to_string());
+        run_mid_build_hook();
+        match write_package(&pkg_dir, records.clone()) {
+            Ok(_) => return Ok(finish_batch(pkg_dir, records)),
+            Err(error) => {
+                attempt += 1;
+                // Which record failed is read off the partial dir (the first whose
+                // payload did not land intact), never off the error's prose.
+                let culprit = first_unlanded(&pkg_dir, &records);
+                remove_partial_package(&pkg_dir);
+                let Some(index) = culprit.filter(|_| attempt < MAX_WRITE_ATTEMPTS) else {
+                    // Either nothing identifiable failed (the manifest write, the
+                    // dir itself) or we are out of attempts: give up and let the
+                    // caller re-queue the whole batch.
+                    return Err(error).with_context(|| {
+                        format!("write batch package ({} files, {attempt} attempts)", records.len())
+                    });
+                };
+                let (path, _) = records.remove(index);
+                tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    attempt,
+                    remaining = records.len(),
+                    "dropping a file that could not be copied into the batch; retrying without it"
+                );
+            }
+        }
+    }
+}
+
+/// Drop every record whose source file is gone, or whose size no longer matches
+/// the `byte_size` the manifest pass recorded — either way its `xxh3` is now a
+/// lie and [`write_package`]'s own size guard would fail the whole package on it.
+fn drop_vanished_sources(records: &mut Vec<(PathBuf, ManifestRecord)>) {
+    records.retain(|(path, record)| match std::fs::metadata(path) {
+        Ok(meta) if meta.len() == record.byte_size => true,
+        Ok(meta) => {
+            tracing::warn!(
+                path = %path.display(),
+                was = record.byte_size,
+                now = meta.len(),
+                "dropping a file whose size changed while the batch was being built"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "dropping a file that vanished while the batch was being built"
+            );
+            false
+        }
+    });
+}
+
+/// The index of the first record whose payload did not land in `pkg_dir` intact —
+/// the file that failed the copy pass. `None` means every payload is there, so
+/// the failure was not a per-file one (the manifest write, the root hash, the
+/// package dir itself) and dropping a file would fix nothing.
+///
+/// Records after the failing one are missing too (the writer stops at the first
+/// error), which is why only the FIRST is dropped. Under any other copy order the
+/// worst case is that a healthy file is dropped from this batch: it is never
+/// recorded seen, so it simply ships with the next one.
+fn first_unlanded(pkg_dir: &Path, records: &[(PathBuf, ManifestRecord)]) -> Option<usize> {
+    records.iter().position(|(_, record)| {
+        !matches!(
+            std::fs::metadata(pkg_dir.join(&record.rel_path)),
+            Ok(meta) if meta.len() == record.byte_size
+        )
+    })
+}
+
+/// Remove a package dir left half-written by a failed attempt. Best-effort: a
+/// failure here only leaks a directory (the next attempt mints its own uuid), so
+/// it warns rather than derailing the batch — but it is never swallowed, since a
+/// packages dir that keeps growing is exactly the kind of thing an observatory
+/// notices only when it runs out of disk.
+fn remove_partial_package(pkg_dir: &Path) {
+    match std::fs::remove_dir_all(pkg_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(
+                path = %pkg_dir.display(),
+                %error,
+                "failed to clean a partially-written package dir"
+            );
+        }
+    }
+}
+
+/// Everything derived from the records that actually made it into the written
+/// package: the included capture paths (the caller records exactly these as
+/// seen), the per-file announce manifest, the rebuild source linkage, and the
+/// human batch name.
+fn finish_batch(pkg_dir: PathBuf, records: Vec<(PathBuf, ManifestRecord)>) -> BuiltBatch {
     let included: Vec<PathBuf> = records.iter().map(|(path, _)| path.clone()).collect();
-    let announce_files: Vec<AnnounceFileEntry> = records
+    let files: Vec<AnnounceFileEntry> = records
         .iter()
         .map(|(_, r)| AnnounceFileEntry {
             rel_path: r.rel_path.clone(),
@@ -361,19 +538,14 @@ pub fn build_batch_package(
         .map(|(path, r)| (r.rel_path.clone(), path.clone()))
         .collect();
     let rel_paths: Vec<String> = records.iter().map(|(_, r)| r.rel_path.clone()).collect();
-    let display_name =
-        batch_display_name(&rel_paths, &Utc::now().format("%Y-%m-%d").to_string());
-
-    let pkg_dir = config.packages_dir().join(Uuid::new_v4().to_string());
-    write_package(&pkg_dir, records)
-        .with_context(|| format!("write batch package {}", pkg_dir.display()))?;
-    Ok(BuiltBatch {
+    let display_name = batch_display_name(&rel_paths, &Utc::now().format("%Y-%m-%d").to_string());
+    BuiltBatch {
         pkg_dir,
         included,
-        files: announce_files,
+        files,
         rel_sources,
         display_name,
-    })
+    }
 }
 
 /// Build the single manifest record for one capture file — the per-file work
