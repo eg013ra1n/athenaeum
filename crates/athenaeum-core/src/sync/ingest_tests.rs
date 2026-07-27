@@ -193,7 +193,7 @@ async fn ingest_mirrors_rel_path_under_authenticated_peer_slug() {
     );
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
     sender
-        .announce(receiver_node, &announce, "", "", &[])
+        .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     let receipts = wait_for_ack(
@@ -856,7 +856,7 @@ async fn ack_replay_from_receipt_log() {
 
     // First delivery: announce → receiver fetches, ingests, acks.
     sender
-        .announce(receiver_node, &announce, "", "", &[])
+        .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     let receipts1 = wait_for_ack(
@@ -902,7 +902,7 @@ async fn ack_replay_from_receipt_log() {
     // Second delivery of the SAME announce (same package_id): the receiver must
     // re-ack from the receipt log WITHOUT re-fetching or re-ingesting.
     sender
-        .announce(receiver_node, &announce, "", "", &[])
+        .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     let receipts2 = wait_for_ack(
@@ -1005,7 +1005,7 @@ async fn duplicate_announce_after_done_survives_failed_reack() {
 
     // First delivery: fetch → ingest → ack (Done). Snapshot generation + state.
     sender
-        .announce(receiver_node, &announce, "", "", &[])
+        .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     let receipts1 = wait_for_ack(
@@ -1043,7 +1043,7 @@ async fn duplicate_announce_after_done_survives_failed_reack() {
         ..Default::default()
     });
     sender
-        .announce(receiver_node, &announce, "", "", &[])
+        .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     {
@@ -1088,7 +1088,7 @@ async fn duplicate_announce_after_done_survives_failed_reack() {
     // Third announce (fault disarmed): the replay ack now succeeds and the row is
     // still Done, still generation-stable.
     sender
-        .announce(receiver_node, &announce, "", "", &[])
+        .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     let receipts3 = wait_for_ack(
@@ -1732,7 +1732,7 @@ async fn landing_root_is_resolved_live_per_package() {
         build_fixture_package_val(tmp.path(), "frame-live-a", "L_live_a.fits", "M42", 0.0);
     sender.serve(&announce1, &pkg1, None).await.unwrap();
     sender
-        .announce(receiver_node, &announce1, "", "", &[])
+        .announce(receiver_node, &announce1, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     let r1 = wait_for_ack(
@@ -1760,7 +1760,7 @@ async fn landing_root_is_resolved_live_per_package() {
         build_fixture_package_val(tmp.path(), "frame-live-b", "L_live_b.fits", "NGC7000", 1.0);
     sender.serve(&announce2, &pkg2, None).await.unwrap();
     sender
-        .announce(receiver_node, &announce2, "", "", &[])
+        .announce(receiver_node, &announce2, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     let r2 = wait_for_ack(
@@ -1844,7 +1844,7 @@ async fn receiver_drops_announce_from_unauthorized_peer() {
     );
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
     sender
-        .announce(receiver_node, &announce, "", "", &[])
+        .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -1907,7 +1907,7 @@ async fn receiver_ingests_from_authorized_peer() {
     );
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
     sender
-        .announce(receiver_node, &announce, "", "", &[])
+        .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
 

@@ -27,8 +27,9 @@
 //! Scope: the postcard control wire only — the `Msg` envelope (`proto.rs`) and
 //! every type it embeds (`PackageAnnounce`, `PackageId`, `FrameReceipt` with all
 //! four `ReceiptOutcome` variants, `OfferEntry`, `FullHashEntry`, the v2
-//! `PackageAnnounceV2` + `AnnounceFileEntry`, and the v3 `PackageAnnounceV3` +
-//! `RevokeReason`). `TransportEvent` / `StartInfo` are in-process only (no serde,
+//! `PackageAnnounceV2` + `AnnounceFileEntry`, the v3 `PackageAnnounceV3` +
+//! `RevokeReason`, and the v4 `PackageAnnounceV4` + `PackageLayout`).
+//! `TransportEvent` / `StartInfo` are in-process only (no serde,
 //! never serialized). The package manifest is JSON + `MANIFEST_VERSION`-versioned
 //! (field-named, not positional), so it is not part of this positional-fragility
 //! guard.
@@ -36,7 +37,7 @@
 use crate::sharing::iroh::proto::{announce_received_from_msg, FullHashEntry, Msg, OfferEntry};
 use crate::sharing::types::{
     AnnounceFileEntry, FrameReceipt, PackageAnnounce, PackageAnnounceV2, PackageAnnounceV3,
-    PackageId, ReceiptOutcome, RevokeReason, TransportEvent,
+    PackageAnnounceV4, PackageId, PackageLayout, ReceiptOutcome, RevokeReason, TransportEvent,
 };
 
 /// Render bytes as lowercase hex, matching the pinned-literal format below.
@@ -112,6 +113,21 @@ fn sample_announce_v3() -> PackageAnnounceV3 {
         batch_name: "Туманность".to_string(),
         batch_uuid: "batch-uuid-9".to_string(),
         files: vec![sample_announce_file_entry()],
+    }
+}
+
+/// V4 announce sample — the v3 fields + the receiver landing layout. Mirror on
+/// purpose: the sender only ever emits Announce4 for mirror transfers.
+fn sample_announce_v4() -> PackageAnnounceV4 {
+    PackageAnnounceV4 {
+        package_id: PackageId("pkg-uuid-1".to_string()),
+        root_hash: "blake3-collection-hash".to_string(),
+        byte_size: 4096,
+        frame_count: 3,
+        batch_name: "Туманность".to_string(),
+        batch_uuid: "batch-uuid-9".to_string(),
+        files: vec![sample_announce_file_entry()],
+        layout: PackageLayout::Mirror,
     }
 }
 
@@ -290,6 +306,14 @@ fn golden_cases() -> Vec<(&'static str, Vec<u8>, &'static str)> {
         // its whole byte image IS its discriminant — which makes this the cheapest
         // possible drift alarm for the tail of the enum.
         ("msg_presence", Msg::Presence.encode().unwrap(), "0a"),
+        // Perseus mirror-hierarchy: appended `Announce4` (disc 0b). The body is
+        // `msg_announce3`'s byte image verbatim, plus a trailing `01` — the
+        // `PackageLayout::Mirror` discriminant.
+        (
+            "msg_announce4",
+            Msg::Announce4(sample_announce_v4()).encode().unwrap(),
+            "0b0a706b672d757569642d3116626c616b65332d636f6c6c656374696f6e2d6861736880200314d0a2d183d0bcd0b0d0bdd0bdd0bed181d182d18c0c62617463682d757569642d39010f4d33312f4c5f303030312e666974730c0c6672616d652d757569642d3101",
+        ),
     ]
 }
 
@@ -314,7 +338,8 @@ fn wire_format_is_frozen() {
 #[test]
 fn all_wire_types_are_pinned() {
     // 12 embedded/standalone samples + 11 Msg variants = 23.
-    assert_eq!(golden_cases().len(), 23, "add a golden case for every new wire type");
+    // Perseus mirror-hierarchy: + the appended `Msg::Announce4` = 24.
+    assert_eq!(golden_cases().len(), 24, "add a golden case for every new wire type");
 }
 
 /// Migration guard (spec §D2): the FROZEN v1/v2 announce byte-pins still decode,
@@ -342,12 +367,15 @@ fn legacy_announce_bytes_decode_with_batch_uuid_fallback() {
             batch_name,
             files,
             announce,
+            layout,
             ..
         } => {
             assert_eq!(batch_uuid, announce.package_id.0);
             assert_eq!(batch_uuid, "pkg-uuid-1");
             assert!(batch_name.is_none());
             assert!(files.is_none());
+            // Mirror-hierarchy: v1 predates the layout — it lands as a batch.
+            assert_eq!(layout, PackageLayout::Batch);
         }
         other => panic!("expected AnnounceReceived, got {other:?}"),
     }
@@ -358,11 +386,13 @@ fn legacy_announce_bytes_decode_with_batch_uuid_fallback() {
             batch_uuid,
             batch_name,
             announce,
+            layout,
             ..
         } => {
             assert_eq!(batch_uuid, announce.package_id.0);
             assert_eq!(batch_uuid, "pkg-uuid-1");
             assert_eq!(batch_name.as_deref(), Some("Туманность"));
+            assert_eq!(layout, PackageLayout::Batch);
         }
         other => panic!("expected AnnounceReceived, got {other:?}"),
     }
@@ -372,10 +402,30 @@ fn legacy_announce_bytes_decode_with_batch_uuid_fallback() {
         TransportEvent::AnnounceReceived {
             batch_uuid,
             batch_name,
+            layout,
             ..
         } => {
             assert_eq!(batch_uuid, "batch-uuid-9");
             assert_eq!(batch_name.as_deref(), Some("Туманность"));
+            // v3 predates the layout too — the sender emits it only for Batch.
+            assert_eq!(layout, PackageLayout::Batch);
+        }
+        other => panic!("expected AnnounceReceived, got {other:?}"),
+    }
+
+    // v4 `Msg::Announce4` → batch_uuid AND the landing layout ride the wire.
+    match announce_received_from_msg(from, Msg::decode(&by_name("msg_announce4")).unwrap()) {
+        TransportEvent::AnnounceReceived {
+            batch_uuid,
+            batch_name,
+            files,
+            layout,
+            ..
+        } => {
+            assert_eq!(batch_uuid, "batch-uuid-9");
+            assert_eq!(batch_name.as_deref(), Some("Туманность"));
+            assert!(files.is_some());
+            assert_eq!(layout, PackageLayout::Mirror);
         }
         other => panic!("expected AnnounceReceived, got {other:?}"),
     }

@@ -15,8 +15,8 @@ use tokio::sync::mpsc::Receiver;
 use crate::package::{self, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use super::loopback::{FaultPlan, LoopbackNetwork};
 use super::types::{
-    AnnounceFileEntry, FetchEvent, FrameReceipt, PackageAnnounce, PackageId, ReceiptOutcome,
-    TransportEvent,
+    AnnounceFileEntry, FetchEvent, FrameReceipt, PackageAnnounce, PackageId, PackageLayout,
+    ReceiptOutcome, TransportEvent,
 };
 use super::{noop_fetch_sink, FetchSink, SharingTransport};
 
@@ -82,7 +82,7 @@ async fn loopback_announce_fetch_ack_roundtrip() {
 
     provider.serve(&pkg, src.path(), None).await.unwrap();
     provider
-        .announce(receiver_info.node_id, &pkg, "", "", &[])
+        .announce(receiver_info.node_id, &pkg, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -171,7 +171,14 @@ async fn loopback_announce_delivers_v2_extras() {
     ];
 
     provider
-        .announce(receiver_info.node_id, &pkg, "Туманность M31", "batch-M31", &files)
+        .announce(
+            receiver_info.node_id,
+            &pkg,
+            "Туманность M31",
+            "batch-M31",
+            &files,
+            PackageLayout::Batch,
+        )
         .await
         .unwrap();
 
@@ -182,6 +189,7 @@ async fn loopback_announce_delivers_v2_extras() {
             batch_name,
             batch_uuid,
             files: got_files,
+            layout,
         } => {
             assert_eq!(from, provider_info.node_id);
             assert_eq!(announce.package_id, pkg.package_id);
@@ -189,6 +197,8 @@ async fn loopback_announce_delivers_v2_extras() {
             // The durable batch identity threads end-to-end (spec §D2).
             assert_eq!(batch_uuid, "batch-M31");
             assert_eq!(got_files.as_deref(), Some(files.as_slice()));
+            // Mirror-hierarchy: the sent layout threads end-to-end too.
+            assert_eq!(layout, PackageLayout::Batch);
         }
         other => panic!("expected AnnounceReceived, got {other:?}"),
     }

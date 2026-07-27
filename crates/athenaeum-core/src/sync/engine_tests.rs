@@ -3089,8 +3089,11 @@ impl SharingTransport for NegotiateErrTransport {
         batch_name: &str,
         batch_uuid: &str,
         files: &[AnnounceFileEntry],
+        layout: PackageLayout,
     ) -> anyhow::Result<()> {
-        self.0.announce(to, a, batch_name, batch_uuid, files).await
+        self.0
+            .announce(to, a, batch_name, batch_uuid, files, layout)
+            .await
     }
     async fn fetch(
         &self,
@@ -3554,6 +3557,7 @@ impl SharingTransport for RetryProbeTransport {
         _batch_name: &str,
         _batch_uuid: &str,
         _files: &[AnnounceFileEntry],
+        _layout: PackageLayout,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -3731,6 +3735,7 @@ impl SharingTransport for ServeTickTransport {
         _batch_name: &str,
         _batch_uuid: &str,
         _files: &[AnnounceFileEntry],
+        _layout: PackageLayout,
     ) -> anyhow::Result<()> {
         self.announce_count.fetch_add(1, SeqCst);
         *self.announced_pid.lock().unwrap() = Some(a.package_id.clone());
@@ -4308,6 +4313,7 @@ impl SharingTransport for ReplaceProbeTransport {
         _batch_name: &str,
         _batch_uuid: &str,
         _files: &[AnnounceFileEntry],
+        _layout: PackageLayout,
     ) -> anyhow::Result<()> {
         // `classify_send_error` maps "timed out" → `ConnectClass::Timeout`, a
         // dead-addressing class that gates the Task 3.6 replace.
@@ -5935,8 +5941,11 @@ impl SharingTransport for SlowRevokeTransport {
         batch_name: &str,
         batch_uuid: &str,
         files: &[AnnounceFileEntry],
+        layout: PackageLayout,
     ) -> anyhow::Result<()> {
-        self.0.announce(to, a, batch_name, batch_uuid, files).await
+        self.0
+            .announce(to, a, batch_name, batch_uuid, files, layout)
+            .await
     }
     async fn revoke(
         &self,

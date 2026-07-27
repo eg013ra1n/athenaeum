@@ -55,8 +55,8 @@ use tokio::task::JoinHandle;
 
 use crate::account::keys::{device_key_lock_path, DeviceKey, DeviceKeyLock};
 use crate::sharing::types::{
-    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageId,
-    RevokeReason, StartInfo, TransportEvent,
+    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageAnnounceV4,
+    PackageId, PackageLayout, RevokeReason, StartInfo, TransportEvent,
 };
 use crate::sharing::{FetchSink, ProviderTelemetrySink, SharingTransport};
 use crate::sync::status::TransportHealth;
@@ -1868,6 +1868,7 @@ impl SharedIrohNode {
         batch_name: &str,
         batch_uuid: &str,
         files: &[AnnounceFileEntry],
+        layout: PackageLayout,
     ) -> Result<()> {
         let tag = role_package_tag(role.prefix(), &a.package_id);
         let mut wire = a.clone();
@@ -1881,19 +1882,37 @@ impl SharedIrohNode {
                 ),
             }
         }
-        // The app sender emits only v3: carry the batch name + durable batch_uuid
-        // + manifest.
-        let wire_v3 = PackageAnnounceV3 {
-            package_id: wire.package_id,
-            root_hash: wire.root_hash,
-            byte_size: wire.byte_size,
-            frame_count: wire.frame_count,
-            batch_name: batch_name.to_string(),
-            batch_uuid: batch_uuid.to_string(),
-            files: files.to_vec(),
+        // Wire version follows the layout (mirror-hierarchy): only a Mirror
+        // transfer needs the new field, so only it pays the compatibility cost.
+        let msg = match layout {
+            PackageLayout::Mirror => Msg::Announce4(PackageAnnounceV4 {
+                package_id: wire.package_id,
+                root_hash: wire.root_hash,
+                byte_size: wire.byte_size,
+                frame_count: wire.frame_count,
+                batch_name: batch_name.to_string(),
+                batch_uuid: batch_uuid.to_string(),
+                files: files.to_vec(),
+                layout,
+            }),
+            // Batch keeps the frozen v3 bytes — zero exposure for old peers.
+            PackageLayout::Batch => Msg::Announce3(PackageAnnounceV3 {
+                package_id: wire.package_id,
+                root_hash: wire.root_hash,
+                byte_size: wire.byte_size,
+                frame_count: wire.frame_count,
+                batch_name: batch_name.to_string(),
+                batch_uuid: batch_uuid.to_string(),
+                files: files.to_vec(),
+            }),
         };
-        self.send_control(to, Msg::Announce3(wire_v3)).await?;
-        tracing::debug!(to = %hex32(&to), package_id = %a.package_id.0, "iroh announce sent");
+        self.send_control(to, msg).await?;
+        tracing::debug!(
+            to = %hex32(&to),
+            package_id = %a.package_id.0,
+            layout = layout.as_str(),
+            "iroh announce sent"
+        );
         Ok(())
     }
 
@@ -2533,13 +2552,14 @@ impl SharingTransport for RoleHandle {
         batch_name: &str,
         batch_uuid: &str,
         files: &[AnnounceFileEntry],
+        layout: PackageLayout,
     ) -> Result<()> {
         // Claim the eventual ack for THIS handle before announcing; release the
         // claim if the announce itself fails (claims can't leak on the error path).
         self.claim_ack(to, &a.package_id);
         let res = self
             .node
-            .role_announce(self.role, to, a, batch_name, batch_uuid, files)
+            .role_announce(self.role, to, a, batch_name, batch_uuid, files, layout)
             .await;
         if res.is_err() {
             self.node.demux.release_claim(&(to, a.package_id.clone()));
@@ -3811,7 +3831,7 @@ mod tests {
         let mut out_events = out.events().await;
         let mut r_ev = recv.events().await;
 
-        out.announce(r_info.node_id, &announce, "", "", &[])
+        out.announce(r_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
         let wire = match recv_next(&mut r_ev).await {
@@ -3919,7 +3939,7 @@ mod tests {
         // route_serve_progress / route_serve_complete to target.
         let mut out_events = out.events().await;
         let mut r_ev = recv.events().await;
-        out.announce(r_info.node_id, &announce, "", "", &[])
+        out.announce(r_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
         let wire = match recv_next(&mut r_ev).await {
@@ -4061,7 +4081,7 @@ mod tests {
         // route_serve_file_progress to target.
         let mut out_events = out.events().await;
         let mut r_ev = recv.events().await;
-        out.announce(r_info.node_id, &announce, "", "", &[])
+        out.announce(r_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
         let wire = match recv_next(&mut r_ev).await {
@@ -4161,7 +4181,7 @@ mod tests {
 
         let mut out_events = out.events().await;
         let mut r_ev = recv.events().await;
-        out.announce(r_info.node_id, &announce, "", "", &[])
+        out.announce(r_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
         let wire = match recv_next(&mut r_ev).await {
@@ -4303,11 +4323,11 @@ mod tests {
         // Announce to the two distinct peers (delivery completes when each
         // receiver's Recv consumer receives the announce).
         out_a
-            .announce(r1_info.node_id, &p1, "", "", &[])
+            .announce(r1_info.node_id, &p1, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
         out_b
-            .announce(r2_info.node_id, &p2, "", "", &[])
+            .announce(r2_info.node_id, &p2, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -4395,10 +4415,10 @@ mod tests {
 
         // ONE package id, announced to two peers.
         let pkg = mk_announce("shared-pkg");
-        out.announce(r1_info.node_id, &pkg, "", "", &[])
+        out.announce(r1_info.node_id, &pkg, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
-        out.announce(r2_info.node_id, &pkg, "", "", &[])
+        out.announce(r2_info.node_id, &pkg, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
         assert_eq!(s.active_claims(), 2, "two distinct (peer, package) claims");
@@ -4475,7 +4495,7 @@ mod tests {
         let pkg = mk_announce("orphan-pkg");
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            out.announce(r_info.node_id, &pkg, "", "", &[]),
+            out.announce(r_info.node_id, &pkg, "", "", &[], PackageLayout::Batch),
         )
         .await;
         assert!(
@@ -4520,10 +4540,10 @@ mod tests {
         let mut r_ev = recv.events().await; // Recv consumer → announces deliver + ack
         let pkg = mk_announce("pool-pkg");
 
-        out.announce(r_info.node_id, &pkg, "", "", &[])
+        out.announce(r_info.node_id, &pkg, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
-        out.announce(r_info.node_id, &pkg, "", "", &[])
+        out.announce(r_info.node_id, &pkg, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -4684,7 +4704,7 @@ mod tests {
         let mut acks = out.events().await;
         let mut r_ev = recv.events().await;
         let pkg1 = mk_announce("pre-swap");
-        out.announce(r_info.node_id, &pkg1, "", "", &[])
+        out.announce(r_info.node_id, &pkg1, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
         let pid1 = match recv_next(&mut r_ev).await {
@@ -4742,7 +4762,7 @@ mod tests {
         // re-homed in place, its direct addr unchanged. A rebuild would have reset
         // the pool and forced a re-dial here.
         let pkg2 = mk_announce("post-swap");
-        out.announce(r_info.node_id, &pkg2, "", "", &[])
+        out.announce(r_info.node_id, &pkg2, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
         let pid2 = match recv_next(&mut r_ev).await {
@@ -4886,7 +4906,7 @@ mod tests {
         let pkg_denied = mk_announce("post-swap-denied");
         let outcome = tokio::time::timeout(
             Duration::from_secs(15),
-            out_denied.announce(r_info.node_id, &pkg_denied, "", "", &[]),
+            out_denied.announce(r_info.node_id, &pkg_denied, "", "", &[], PackageLayout::Batch),
         )
         .await;
         match outcome {
@@ -4906,7 +4926,7 @@ mod tests {
         // (2) An allowed peer is STILL admitted after the hot-swap.
         let pkg_allowed = mk_announce("post-swap-allowed");
         out_allowed
-            .announce(r_info.node_id, &pkg_allowed, "", "", &[])
+            .announce(r_info.node_id, &pkg_allowed, "", "", &[], PackageLayout::Batch)
             .await
             .expect("an allowed peer must still be admitted after the relay hot-swap");
         match recv_next(&mut r_events).await {

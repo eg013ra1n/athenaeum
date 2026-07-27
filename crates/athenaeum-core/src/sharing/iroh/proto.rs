@@ -28,8 +28,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::sharing::types::{
-    FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV2, PackageAnnounceV3, PackageId,
-    RevokeReason, TransportEvent,
+    FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV2, PackageAnnounceV3, PackageAnnounceV4,
+    PackageId, PackageLayout, RevokeReason, TransportEvent,
 };
 
 /// One frame the provider could send, as advertised in a [`Msg::Offer`].
@@ -149,16 +149,26 @@ pub enum Msg {
     // job is "someone you already trust is reachable again".
     /// Receiver announces that it is online and listening.
     Presence,
+    // Perseus mirror-hierarchy (spec 2026-07-27) — appended AFTER `Presence` as
+    // the LAST variant; every index above stays frozen (same append-only rule).
+    // The app sender emits `Announce4` ONLY for a Mirror-layout transfer;
+    // Batch transfers keep emitting `Announce3`, so peers that never enable
+    // the setting exchange no new bytes.
+    /// Provider advertises a fetchable package with its v4 landing layout.
+    Announce4(PackageAnnounceV4),
 }
 
 /// Map a decoded *announce* control message — `Announce` (v1), `Announce2` (v2),
-/// or `Announce3` (v3) — to its in-process
+/// `Announce3` (v3), or `Announce4` (v4) — to its in-process
 /// [`AnnounceReceived`](TransportEvent::AnnounceReceived) event, applying the
-/// batch-identity migration fallback (spec §D2 Migration): v3 carries
+/// batch-identity migration fallback (spec §D2 Migration): v3/v4 carry
 /// `batch_uuid` on the wire; a legacy v1/v2 announce predates it, so the receiver
 /// adopts the wire `package_id` as the `batch_uuid` (guaranteeing ONE stable
-/// per-transfer key on every path). Shared by the transport accept loop and its
-/// wire-golden fallback test so the mapping cannot drift.
+/// per-transfer key on every path). Only v4 carries the landing
+/// [`PackageLayout`]; v1/v2/v3 map to [`PackageLayout::Batch`], which is exactly
+/// what those senders mean (the app emits v4 ONLY for a `Mirror` transfer).
+/// Shared by the transport accept loop and its wire-golden fallback test so the
+/// mapping cannot drift.
 ///
 /// # Panics
 /// Only ever called on an announce variant (the accept loop guards the call);
@@ -175,6 +185,7 @@ pub(crate) fn announce_received_from_msg(from: NodeId, msg: Msg) -> TransportEve
                 batch_name: None,
                 batch_uuid,
                 files: None,
+                layout: PackageLayout::Batch,
             }
         }
         // v2 announce: split the manifest extras off the wire struct; batch key
@@ -200,6 +211,7 @@ pub(crate) fn announce_received_from_msg(from: NodeId, msg: Msg) -> TransportEve
                 batch_name: Some(batch_name),
                 batch_uuid,
                 files: Some(files),
+                layout: PackageLayout::Batch,
             }
         }
         // v3 announce: the durable `batch_uuid` rides the wire — use it verbatim.
@@ -224,6 +236,35 @@ pub(crate) fn announce_received_from_msg(from: NodeId, msg: Msg) -> TransportEve
                 batch_name: Some(batch_name),
                 batch_uuid,
                 files: Some(files),
+                // v3 predates the layout — and the app emits it only for Batch.
+                layout: PackageLayout::Batch,
+            }
+        }
+        // v4 announce (mirror-hierarchy): same shape as v3 plus the landing
+        // layout, which rides the wire — use it verbatim.
+        Msg::Announce4(v4) => {
+            let PackageAnnounceV4 {
+                package_id,
+                root_hash,
+                byte_size,
+                frame_count,
+                batch_name,
+                batch_uuid,
+                files,
+                layout,
+            } = v4;
+            TransportEvent::AnnounceReceived {
+                from,
+                announce: PackageAnnounce {
+                    package_id,
+                    root_hash,
+                    byte_size,
+                    frame_count,
+                },
+                batch_name: Some(batch_name),
+                batch_uuid,
+                files: Some(files),
+                layout,
             }
         }
         other => unreachable!("announce_received_from_msg called with non-announce Msg: {other:?}"),
@@ -401,6 +442,37 @@ mod tests {
         }
     }
 
+    fn sample_announce_v4(layout: PackageLayout) -> PackageAnnounceV4 {
+        let PackageAnnounceV3 {
+            package_id,
+            root_hash,
+            byte_size,
+            frame_count,
+            batch_name,
+            batch_uuid,
+            files,
+        } = sample_announce_v3();
+        PackageAnnounceV4 {
+            package_id,
+            root_hash,
+            byte_size,
+            frame_count,
+            batch_name,
+            batch_uuid,
+            files,
+            layout,
+        }
+    }
+
+    #[test]
+    fn announce4_roundtrips_through_postcard_for_every_layout() {
+        for layout in [PackageLayout::Batch, PackageLayout::Mirror] {
+            let msg = Msg::Announce4(sample_announce_v4(layout));
+            let back = Msg::decode(&msg.encode().unwrap()).unwrap();
+            assert_eq!(msg, back);
+        }
+    }
+
     #[test]
     fn revoke_roundtrips_through_postcard_for_every_reason() {
         for reason in [
@@ -421,19 +493,45 @@ mod tests {
     fn announce_received_from_msg_maps_every_version() {
         let from: NodeId = [7u8; 32];
 
-        // v3 carries the durable batch_uuid on the wire — use it verbatim.
-        match announce_received_from_msg(from, Msg::Announce3(sample_announce_v3())) {
+        // v4 carries the durable batch_uuid AND the landing layout on the wire.
+        match announce_received_from_msg(
+            from,
+            Msg::Announce4(sample_announce_v4(PackageLayout::Mirror)),
+        ) {
             TransportEvent::AnnounceReceived {
                 batch_uuid,
                 batch_name,
                 files,
                 announce,
+                layout,
                 ..
             } => {
                 assert_eq!(batch_uuid, "batch-uuid-9");
                 assert_eq!(batch_name.as_deref(), Some("Туманность M31"));
                 assert!(files.is_some());
                 assert_eq!(announce.package_id, PackageId("pkg-uuid-1".to_string()));
+                assert_eq!(layout, PackageLayout::Mirror);
+            }
+            other => panic!("expected AnnounceReceived, got {other:?}"),
+        }
+
+        // v3 carries the durable batch_uuid on the wire — use it verbatim. It
+        // predates the layout, so it maps to Batch (which is what it means: the
+        // app emits v3 only for a Batch transfer).
+        match announce_received_from_msg(from, Msg::Announce3(sample_announce_v3())) {
+            TransportEvent::AnnounceReceived {
+                batch_uuid,
+                batch_name,
+                files,
+                announce,
+                layout,
+                ..
+            } => {
+                assert_eq!(batch_uuid, "batch-uuid-9");
+                assert_eq!(batch_name.as_deref(), Some("Туманность M31"));
+                assert!(files.is_some());
+                assert_eq!(announce.package_id, PackageId("pkg-uuid-1".to_string()));
+                assert_eq!(layout, PackageLayout::Batch);
             }
             other => panic!("expected AnnounceReceived, got {other:?}"),
         }
@@ -443,10 +541,12 @@ mod tests {
             TransportEvent::AnnounceReceived {
                 batch_uuid,
                 batch_name,
+                layout,
                 ..
             } => {
                 assert_eq!(batch_uuid, "pkg-uuid-1");
                 assert_eq!(batch_name.as_deref(), Some("Туманность M31"));
+                assert_eq!(layout, PackageLayout::Batch);
             }
             other => panic!("expected AnnounceReceived, got {other:?}"),
         }
@@ -457,11 +557,13 @@ mod tests {
                 batch_uuid,
                 batch_name,
                 files,
+                layout,
                 ..
             } => {
                 assert_eq!(batch_uuid, "pkg-uuid-1");
                 assert!(batch_name.is_none());
                 assert!(files.is_none());
+                assert_eq!(layout, PackageLayout::Batch);
             }
             other => panic!("expected AnnounceReceived, got {other:?}"),
         }

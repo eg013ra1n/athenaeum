@@ -29,7 +29,8 @@ mod wire_golden_tests;
 
 pub use types::{
     AnnounceFileEntry, FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV2,
-    PackageAnnounceV3, PackageId, ReceiptOutcome, RevokeReason, StartInfo, TransportEvent,
+    PackageAnnounceV3, PackageAnnounceV4, PackageId, PackageLayout, ReceiptOutcome, RevokeReason,
+    StartInfo, TransportEvent,
 };
 
 /// A callback that receives live [`FetchEvent`]s while a [`fetch`] is in flight.
@@ -118,15 +119,20 @@ pub trait SharingTransport: Send + Sync {
 
     /// Broadcast a package announcement to peer `to`.
     ///
-    /// The app sender emits only v3: implementors encode a `Msg::Announce3`
-    /// carrying `a`'s fields plus `batch_name` (a human batch display name),
-    /// `batch_uuid` (the durable per-transfer identity, spec §D2), and `files`
-    /// (the full manifest). The engine passes the package-dir basename as
+    /// Implementors encode `a`'s fields plus `batch_name` (a human batch display
+    /// name), `batch_uuid` (the durable per-transfer identity, spec §D2), and
+    /// `files` (the full manifest). The engine passes the package-dir basename as
     /// `batch_uuid` — which per spec D1/B3 IS the final batch identity for an
-    /// outbound transfer, so it is the real value, not a placeholder. The receive
-    /// side accepts all three announce versions; a legacy v1 (`Msg::Announce`,
-    /// extras `None`) / v2 (`Msg::Announce2`) announce falls back to the wire
-    /// `package_id` as its `batch_uuid`.
+    /// outbound transfer, so it is the real value, not a placeholder.
+    ///
+    /// `layout` selects the WIRE VERSION (mirror-hierarchy): a
+    /// [`PackageLayout::Mirror`] transfer goes out as `Msg::Announce4` (the only
+    /// announce that carries the layout), a [`PackageLayout::Batch`] one keeps
+    /// emitting the frozen `Msg::Announce3` bytes — so a peer that never enables
+    /// the mirror setting sees no new bytes at all. The receive side accepts all
+    /// four announce versions; a legacy v1 (`Msg::Announce`, extras `None`) / v2
+    /// (`Msg::Announce2`) announce falls back to the wire `package_id` as its
+    /// `batch_uuid`, and v1/v2/v3 all map to `Batch`.
     async fn announce(
         &self,
         to: NodeId,
@@ -134,6 +140,7 @@ pub trait SharingTransport: Send + Sync {
         batch_name: &str,
         batch_uuid: &str,
         files: &[AnnounceFileEntry],
+        layout: PackageLayout,
     ) -> anyhow::Result<()>;
 
     /// Revoke an outstanding announce to peer `to` (spec §D2): tell the receiver

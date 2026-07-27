@@ -18,8 +18,8 @@ use tokio::sync::mpsc;
 
 use super::iroh::proto::OfferEntry;
 use super::types::{
-    AnnounceFileEntry, FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, RevokeReason,
-    StartInfo, TransportEvent,
+    AnnounceFileEntry, FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, PackageLayout,
+    RevokeReason, StartInfo, TransportEvent,
 };
 use super::{FetchSink, SharingTransport};
 use crate::package::MANIFEST_FILENAME;
@@ -243,24 +243,31 @@ impl SharingTransport for LoopbackTransport {
         batch_name: &str,
         batch_uuid: &str,
         files: &[AnnounceFileEntry],
+        layout: PackageLayout,
     ) -> anyhow::Result<()> {
         let tx = self.peer_tx(to)?;
-        // The loopback emulates the app sender, which emits only v3 — so the
-        // extras always arrive as `Some` (mirroring a `Msg::Announce3` decode) and
-        // `batch_uuid` threads straight through, even when a caller passes an empty
-        // manifest / basename placeholder.
+        // The loopback emulates the app sender, which emits v3 (Batch) / v4
+        // (Mirror) — so the extras always arrive as `Some` (mirroring an
+        // `Msg::Announce3`/`Msg::Announce4` decode) and `batch_uuid` threads
+        // straight through, even when a caller passes an empty manifest /
+        // basename placeholder. `layout` mirrors what the corresponding wire
+        // decode yields: v4 carries it verbatim, and a Batch send emits v3, whose
+        // decode maps to exactly `PackageLayout::Batch` — so passing it through
+        // is faithful for both, no more and no less than the real transport says.
         tx.send(TransportEvent::AnnounceReceived {
             from: self.node_id,
             announce: a.clone(),
             batch_name: Some(batch_name.to_string()),
             batch_uuid: batch_uuid.to_string(),
             files: Some(files.to_vec()),
+            layout,
         })
         .await
         .map_err(|_| anyhow!("peer event channel closed: {}", hex32(&to)))?;
         tracing::debug!(
             to = %hex32(&to),
             package_id = %a.package_id.0,
+            layout = layout.as_str(),
             "loopback announce delivered"
         );
         Ok(())

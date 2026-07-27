@@ -1389,7 +1389,9 @@ impl Worker {
                     _ => None,
                 });
 
-        // The personal-sync announce goes out as v2 (batch name + file manifest).
+        // The personal-sync announce carries a batch name + file manifest; the
+        // transport picks the wire version off `layout` below (v3 for Batch, v4
+        // for Mirror).
         // Batch name = the outbound row's `display_name` (set by the send path),
         // falling back to the package-dir basename for a row that never got a name
         // (a re-enqueued retry, a foreign package). File manifest = the package's
@@ -1407,15 +1409,24 @@ impl Worker {
         // final batch_uuid for an outbound transfer, stable across re-attempts, so
         // this is the real value the receiver keys ONE row on — not a placeholder.
         let batch_uuid = pkg_basename.clone();
-        let batch_name = match self.store.get_outbound(id) {
-            Ok(Some(row)) => row
-                .display_name
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(pkg_basename),
-            Ok(None) => pkg_basename,
+        // Mirror-hierarchy: the transfer's landing layout comes off the SAME row
+        // read as the display name, so one store hit answers both. A row we
+        // cannot read falls back to `Batch` — today's shape, and the safe
+        // direction: an unreadable row must never silently change where a peer
+        // lands its files.
+        let (batch_name, layout) = match self.store.get_outbound(id) {
+            Ok(Some(row)) => (
+                // `layout` is `Copy`, so reading it after the `display_name`
+                // partial move is fine — one row read, both values.
+                row.display_name
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(pkg_basename),
+                row.layout,
+            ),
+            Ok(None) => (pkg_basename, PackageLayout::Batch),
             Err(e) => {
                 tracing::warn!(package_id = id, error = %e, "read display_name for announce failed");
-                pkg_basename
+                (pkg_basename, PackageLayout::Batch)
             }
         };
         // The announce describes THIS ATTEMPT, and every part of it must describe
@@ -1475,6 +1486,7 @@ impl Worker {
                         &batch_name,
                         &batch_uuid,
                         &announce_files,
+                        layout,
                     )
                     .await
                     .context("announce package"),

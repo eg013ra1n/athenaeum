@@ -1207,12 +1207,17 @@ async fn process_receiver_event(ev: TransportEvent, deps: &ReceiverLaneDeps) {
         // the receiver keys ONE inbound row on across every attempt (B4):
         // v3 → the sender's package-dir basename; v1/v2 → the wire package
         // id (B1 fallback), which reproduces today's per-attempt rows.
+        // `layout` (mirror-hierarchy) rides in from T3 but is NOT consumed yet:
+        // the landing-path change is Task 4's, and this arm must stay
+        // byte-identical until then. Bound explicitly (not swallowed by `..`) so
+        // the consumer task cannot forget it exists.
         TransportEvent::AnnounceReceived {
             from,
             announce,
             batch_name,
             batch_uuid,
             files,
+            layout: _layout,
         } => {
             // Variant B: this announce has LEFT the lane queue — it is
             // being processed right now, so it must stop rendering as a
@@ -3751,7 +3756,7 @@ mod tests {
     // use it as a convenient inbound-row seeder.
     use super::super::store::upsert_inbound_announced;
     use crate::sharing::loopback::{FaultPlan, LoopbackNetwork};
-    use crate::sharing::types::{PackageAnnounce, PackageId};
+    use crate::sharing::types::{PackageAnnounce, PackageId, PackageLayout};
     use crate::sync::node_id_hex;
     use std::sync::Mutex;
 
@@ -4234,7 +4239,7 @@ mod tests {
         assert!(announce.byte_size > 0, "fixture package has non-zero bytes");
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce, "", "", &[])
+            .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -4347,7 +4352,7 @@ mod tests {
         let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce, "", "", &[])
+            .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -4412,7 +4417,7 @@ mod tests {
         let (pkg_dir, announce) = build_inbound_fixture(tmp.path());
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce, "", "", &[])
+            .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -4486,7 +4491,7 @@ mod tests {
         std::fs::remove_file(pkg_dir.join(crate::package::MANIFEST_FILENAME)).unwrap();
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce, "", "", &[])
+            .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -4587,6 +4592,7 @@ mod tests {
                 "M31 Lights",
                 "batch-ack-failure",
                 &files,
+                PackageLayout::Batch,
             )
             .await
             .unwrap();
@@ -4763,7 +4769,7 @@ mod tests {
         // Cancel BEFORE the announce, then announce.
         control.request_cancel(&announce.package_id.0);
         sender
-            .announce(receiver_node, &announce, "", "", &[])
+            .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -4829,7 +4835,7 @@ mod tests {
         //     now that the cancelled history count is UNCHANGED (a second epilogue
         //     would have duplicated the rows).
         sender
-            .announce(receiver_node, &announce, "", "", &[])
+            .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
         let (_pkg2, ack2) = recv_ack(&mut sender_events).await;
@@ -5293,7 +5299,7 @@ mod tests {
         let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce, "M31 Lights", "", &files)
+            .announce(receiver_node, &announce, "M31 Lights", "", &files, PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -5417,7 +5423,7 @@ mod tests {
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
         // v1: blank name, empty manifest (the loopback delivers Some("")/Some(vec![])).
         sender
-            .announce(receiver_node, &announce, "", "", &[])
+            .announce(receiver_node, &announce, "", "", &[], PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -5489,7 +5495,7 @@ mod tests {
         // Cancel BEFORE the announce → the epilogue runs (manifest still recorded).
         control.request_cancel(&announce.package_id.0);
         sender
-            .announce(receiver_node, &announce, "M31 Lights", "", &files)
+            .announce(receiver_node, &announce, "M31 Lights", "", &files, PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -5840,6 +5846,7 @@ mod tests {
                 "M31 Lights",
                 "batch-finished-on-failure",
                 &files,
+                PackageLayout::Batch,
             )
             .await
             .unwrap();
@@ -5947,6 +5954,7 @@ mod tests {
                 "M31 Lights",
                 "batch-local-fault",
                 &files,
+                PackageLayout::Batch,
             )
             .await
             .unwrap();
@@ -6032,7 +6040,7 @@ mod tests {
             ..Default::default()
         });
         sender
-            .announce(receiver_node, &announce1, "M31 Lights", BATCH, &files)
+            .announce(receiver_node, &announce1, "M31 Lights", BATCH, &files, PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -6066,7 +6074,7 @@ mod tests {
         let w2 = announce2.package_id.0.clone();
         sender.serve(&announce2, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce2, "M31 Lights", BATCH, &files)
+            .announce(receiver_node, &announce2, "M31 Lights", BATCH, &files, PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -6187,7 +6195,7 @@ mod tests {
             ..Default::default()
         });
         sender
-            .announce(receiver_node, &announce1, "M31 Lights", BATCH, &files)
+            .announce(receiver_node, &announce1, "M31 Lights", BATCH, &files, PackageLayout::Batch)
             .await
             .unwrap();
         let _ = poll_inbound(&store, &w1, InboundState::Waiting).await;
@@ -6206,7 +6214,7 @@ mod tests {
         );
         sender.serve(&announce2, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce2, "M31 Lights", BATCH, &files)
+            .announce(receiver_node, &announce2, "M31 Lights", BATCH, &files, PackageLayout::Batch)
             .await
             .unwrap();
         let row = poll_inbound(&store, &w2, InboundState::Done).await;
@@ -6287,7 +6295,7 @@ mod tests {
         sender.serve(&announce1, &pkg_dir, None).await.unwrap();
         control.request_cancel(&w1);
         sender
-            .announce(receiver_node, &announce1, "Declined", BATCH, &files)
+            .announce(receiver_node, &announce1, "Declined", BATCH, &files, PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -6322,7 +6330,7 @@ mod tests {
         let w2 = announce2.package_id.0.clone();
         sender.serve(&announce2, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce2, "Declined", BATCH, &files)
+            .announce(receiver_node, &announce2, "Declined", BATCH, &files, PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -6460,7 +6468,7 @@ mod tests {
         // served. The receiver must reset the row and deliver — not re-ack cancelled.
         sender.serve(&announce2, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce2, "M31 Lights", BATCH, &files)
+            .announce(receiver_node, &announce2, "M31 Lights", BATCH, &files, PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -6566,7 +6574,7 @@ mod tests {
         // a wrongly-diverted epilogue would be distinguishable from a delivery).
         sender.serve(&announce1, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce1, "Straggler", BATCH, &files)
+            .announce(receiver_node, &announce1, "Straggler", BATCH, &files, PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -6672,7 +6680,7 @@ mod tests {
         // under w2, anchor rotated, NO files landed.
         sender.serve(&announce2, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce2, "M31 Lights", BATCH, &files)
+            .announce(receiver_node, &announce2, "M31 Lights", BATCH, &files, PackageLayout::Batch)
             .await
             .unwrap();
         let row2 = poll_inbound(&store, &w2, InboundState::Cancelled).await;
@@ -6710,7 +6718,7 @@ mod tests {
         };
         let w3 = announce3.package_id.0.clone();
         sender
-            .announce(receiver_node, &announce3, "M31 Lights", BATCH, &files)
+            .announce(receiver_node, &announce3, "M31 Lights", BATCH, &files, PackageLayout::Batch)
             .await
             .unwrap();
         poll_cancelled_receipts(&store, &w3, n).await;
@@ -7303,7 +7311,14 @@ mod tests {
         let wire = announce.package_id.0.clone();
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce, "Live Batch", "batch-live", &files)
+            .announce(
+                receiver_node,
+                &announce,
+                "Live Batch",
+                "batch-live",
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
 
@@ -7623,6 +7638,7 @@ mod tests {
                 batch_name: None,
                 batch_uuid: "batch".into(),
                 files: None,
+                layout: PackageLayout::Batch,
             }),
             Some(from)
         );
@@ -7880,7 +7896,14 @@ mod tests {
         let wire_a = ann_a.package_id.0.clone();
         slow_sender.serve(&ann_a, &dir_a, None).await.unwrap();
         slow_sender
-            .announce(receiver_node, &ann_a, "Slow Batch", "batch-slow", &files_a)
+            .announce(
+                receiver_node,
+                &ann_a,
+                "Slow Batch",
+                "batch-slow",
+                &files_a,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
         poll_inbound(&store, &wire_a, InboundState::Fetching).await;
@@ -7892,7 +7915,14 @@ mod tests {
         let wire_b = ann_b.package_id.0.clone();
         fast_sender.serve(&ann_b, &dir_b, None).await.unwrap();
         fast_sender
-            .announce(receiver_node, &ann_b, "Fast Batch", "batch-fast", &files_b)
+            .announce(
+                receiver_node,
+                &ann_b,
+                "Fast Batch",
+                "batch-fast",
+                &files_b,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
 
@@ -8067,7 +8097,14 @@ mod tests {
         let wire_1 = ann_1.package_id.0.clone();
         sender.serve(&ann_1, &dir_1, None).await.unwrap();
         sender
-            .announce(receiver_node, &ann_1, "Busy Batch", "batch-busy", &files_1)
+            .announce(
+                receiver_node,
+                &ann_1,
+                "Busy Batch",
+                "batch-busy",
+                &files_1,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
         poll_inbound(&store, &wire_1, InboundState::Fetching).await;
@@ -8086,6 +8123,7 @@ mod tests {
                 "Queued Batch",
                 "batch-queued",
                 &files_2,
+                PackageLayout::Batch,
             )
             .await
             .unwrap();
@@ -8205,6 +8243,7 @@ mod tests {
                 "Abort Batch",
                 "batch-abort",
                 &files,
+                PackageLayout::Batch,
             )
             .await
             .unwrap();
@@ -8292,7 +8331,14 @@ mod tests {
         let wire = announce.package_id.0.clone();
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce, "Fifo Batch", "batch-fifo", &files)
+            .announce(
+                receiver_node,
+                &announce,
+                "Fifo Batch",
+                "batch-fifo",
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
 
@@ -8442,6 +8488,7 @@ mod tests {
                     &format!("Batch {tag}"),
                     &format!("batch-{tag}"),
                     &files,
+                    PackageLayout::Batch,
                 )
                 .await
                 .unwrap();
@@ -8583,6 +8630,7 @@ mod tests {
                 "Replay Batch",
                 "batch-replay",
                 &files_a,
+                PackageLayout::Batch,
             )
             .await
             .unwrap();
@@ -8609,6 +8657,7 @@ mod tests {
                     &format!("Batch {tag}"),
                     &format!("batch-{tag}"),
                     &files,
+                    PackageLayout::Batch,
                 )
                 .await
                 .unwrap();
@@ -8625,6 +8674,7 @@ mod tests {
                 "Replay Batch",
                 "batch-replay",
                 &files_a,
+                PackageLayout::Batch,
             )
             .await
             .unwrap();
@@ -8704,6 +8754,7 @@ mod tests {
                     &format!("Batch {tag}"),
                     &format!("batch-{tag}"),
                     &files,
+                    PackageLayout::Batch,
                 )
                 .await
                 .unwrap();
@@ -8802,7 +8853,14 @@ mod tests {
         let (_dir, ann, files) = build_lane_fixture(tmp.path(), "parked", 2);
         let wire = ann.package_id.0.clone();
         victim
-            .announce(receiver_node, &ann, "Parked Batch", "batch-parked", &files)
+            .announce(
+                receiver_node,
+                &ann,
+                "Parked Batch",
+                "batch-parked",
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
 
@@ -8972,6 +9030,7 @@ mod tests {
                     &format!("Batch {tag}"),
                     &format!("batch-{tag}"),
                     &files,
+                    PackageLayout::Batch,
                 )
                 .await
                 .unwrap();
@@ -9131,6 +9190,7 @@ mod tests {
                 "Revoked Batch",
                 "batch-revoked",
                 &files,
+                PackageLayout::Batch,
             )
             .await
             .unwrap();

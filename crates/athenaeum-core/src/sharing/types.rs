@@ -120,6 +120,26 @@ pub struct PackageAnnounceV3 {
     pub files: Vec<AnnounceFileEntry>,
 }
 
+/// V4 package announce: the [`PackageAnnounceV3`] fields plus the receiver
+/// landing [`PackageLayout`]. A SEPARATE type carried by the appended
+/// `Msg::Announce4` wire variant (older announce bytes stay frozen). The app
+/// sender emits v4 ONLY for `Mirror` transfers — `Batch` keeps emitting v3, so
+/// peers that never enable the setting have zero compatibility exposure. An
+/// old receiver cannot decode v4: the announce goes un-acked and the sender
+/// retries (documented "receiver must be upgraded" stance, same as the
+/// v2→v3 rollout). Byte image pinned by `sharing::wire_golden_tests`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageAnnounceV4 {
+    pub package_id: PackageId,
+    pub root_hash: String,
+    pub byte_size: u64,
+    pub frame_count: u32,
+    pub batch_name: String,
+    pub batch_uuid: String,
+    pub files: Vec<AnnounceFileEntry>,
+    pub layout: PackageLayout,
+}
+
 /// Why a sender revoked an outstanding announce (spec §D2). A one-shot,
 /// best-effort control signal (`Msg::Revoke`) telling the receiver to abort an
 /// in-flight or pending transfer: `Cancelled` (the user cancelled the send),
@@ -189,12 +209,18 @@ pub enum TransportEvent {
     /// the receive path falls back to the wire `package_id` (guaranteeing ONE
     /// stable batch key on every path). The receiver logic that keys a row on it
     /// lands in a later task (B4); here it is threaded through.
+    ///
+    /// `layout` is the sender's landing shape (mirror-hierarchy): a v4
+    /// `Msg::Announce4` carries it on the wire; v1/v2/v3 predate it and map to
+    /// [`PackageLayout::Batch`] — which is exactly what those senders mean,
+    /// since the app emits v4 ONLY for a `Mirror` transfer.
     AnnounceReceived {
         from: NodeId,
         announce: PackageAnnounce,
         batch_name: Option<String>,
         batch_uuid: String,
         files: Option<Vec<AnnounceFileEntry>>,
+        layout: PackageLayout,
     },
     /// A peer acknowledged a package we sent, returning per-frame receipts.
     AckReceived {

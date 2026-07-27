@@ -207,7 +207,7 @@ async fn iroh_roundtrip_two_endpoints_localhost() {
 
     provider.serve(&announce, &pkg_dir, None).await.unwrap();
     provider
-        .announce(receiver_info.node_id, &announce, "", "", &[])
+        .announce(receiver_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -362,7 +362,7 @@ async fn release_deletes_package_tags_on_both_sides() {
     // needs the wire announce. `package_id` is preserved, so the deterministic
     // tag name is unchanged on both sides.
     provider
-        .announce(ir.node_id, &announce, "", "", &[])
+        .announce(ir.node_id, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     let wire = match recv_next(&mut receiver_events).await {
@@ -560,7 +560,7 @@ async fn iroh_resume_after_endpoint_restart() {
     );
     provider.serve(&announce, &pkg_dir, None).await.unwrap();
     provider
-        .announce(receiver_info.node_id, &announce, "", "", &[])
+        .announce(receiver_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -878,7 +878,7 @@ async fn bare_node_id_without_a_peer_address_is_undialable() {
     sender.serve(&announce, &pkg_dir, None).await.unwrap();
 
     let err = sender
-        .announce(receiver_info.node_id, &announce, "", "", &[])
+        .announce(receiver_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .expect_err("a bare node id with no relay/direct address must fail to dial");
     let msg = format!("{err:#}");
@@ -1107,7 +1107,7 @@ async fn connection_path_established_line_carries_conn_type_field() {
     // task) AND drives the receiver's inbound accept (logged on its own task) —
     // both emit the establishment line.
     provider
-        .announce(receiver_info.node_id, &announce, "", "", &[])
+        .announce(receiver_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     // Await dispatch so the inbound accept path has certainly run before we read.
@@ -1335,7 +1335,7 @@ async fn subset_serve_transfers_only_want_frames() {
         .await
         .unwrap();
     provider
-        .announce(receiver_info.node_id, &announce, "", "", &[])
+        .announce(receiver_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -1451,7 +1451,7 @@ async fn connect_gate_refuses_control_dispatch_and_blocks_announce() {
     // connection fails the pending read almost immediately, never waits it out.
     let outcome = tokio::time::timeout(
         Duration::from_secs(15),
-        provider.announce(receiver_info.node_id, &announce, "", "", &[]),
+        provider.announce(receiver_info.node_id, &announce, "", "", &[], PackageLayout::Batch),
     )
     .await;
     match outcome {
@@ -1496,7 +1496,7 @@ async fn connect_gate_permits_when_predicate_allows() {
     provider.serve(&announce, &pkg_dir, None).await.unwrap();
 
     provider
-        .announce(receiver_info.node_id, &announce, "", "", &[])
+        .announce(receiver_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .expect("a permitting connect gate must not block the announce");
 
@@ -1535,7 +1535,7 @@ async fn connect_gate_refuses_blob_fetch() {
     // the real iroh collection hash — this test's point is the BLOB path, not
     // the control path (already covered above).
     provider
-        .announce(receiver_info.node_id, &announce, "", "", &[])
+        .announce(receiver_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     let wire = match recv_next(&mut receiver_events).await {
@@ -1752,7 +1752,7 @@ async fn successful_fetch_clears_in_flight_tag() {
     );
     provider.serve(&announce, &pkg_dir, None).await.unwrap();
     provider
-        .announce(receiver_info.node_id, &announce, "", "", &[])
+        .announce(receiver_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -1826,7 +1826,7 @@ async fn throttle_intercept_zero_rate_transfer_completes() {
 
     provider.serve(&announce, &pkg_dir, None).await.unwrap();
     provider
-        .announce(receiver_info.node_id, &announce, "", "", &[])
+        .announce(receiver_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     let wire = match recv_next(&mut receiver_events).await {
@@ -1886,7 +1886,7 @@ async fn upload_pacer_limits_real_transfer_wall_clock() {
 
     provider.serve(&announce, &pkg_dir, None).await.unwrap();
     provider
-        .announce(receiver_info.node_id, &announce, "", "", &[])
+        .announce(receiver_info.node_id, &announce, "", "", &[], PackageLayout::Batch)
         .await
         .unwrap();
     let wire = match recv_next(&mut receiver_events).await {

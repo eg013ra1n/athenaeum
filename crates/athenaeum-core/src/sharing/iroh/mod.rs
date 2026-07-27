@@ -61,8 +61,8 @@ use iroh_tickets::endpoint::EndpointTicket;
 use tokio::sync::mpsc;
 
 use super::types::{
-    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageId,
-    RevokeReason, StartInfo, TransportEvent,
+    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageAnnounceV3, PackageAnnounceV4,
+    PackageId, PackageLayout, RevokeReason, StartInfo, TransportEvent,
 };
 use super::{FetchSink, SharingTransport};
 use crate::sync::DedupResponder;
@@ -1222,6 +1222,7 @@ impl SharingTransport for IrohTransport {
         batch_name: &str,
         batch_uuid: &str,
         files: &[AnnounceFileEntry],
+        layout: PackageLayout,
     ) -> Result<()> {
         // Substitute the collection hash registered by `serve` so the receiver
         // can download by it; keep everything else (crucially `package_id`).
@@ -1236,19 +1237,37 @@ impl SharingTransport for IrohTransport {
                 ),
             }
         }
-        // The app sender emits only v3: carry the batch name + durable batch_uuid
-        // + manifest.
-        let wire_v3 = PackageAnnounceV3 {
-            package_id: wire.package_id,
-            root_hash: wire.root_hash,
-            byte_size: wire.byte_size,
-            frame_count: wire.frame_count,
-            batch_name: batch_name.to_string(),
-            batch_uuid: batch_uuid.to_string(),
-            files: files.to_vec(),
+        // Wire version follows the layout (mirror-hierarchy): only a Mirror
+        // transfer needs the new field, so only it pays the compatibility cost.
+        let msg = match layout {
+            PackageLayout::Mirror => Msg::Announce4(PackageAnnounceV4 {
+                package_id: wire.package_id,
+                root_hash: wire.root_hash,
+                byte_size: wire.byte_size,
+                frame_count: wire.frame_count,
+                batch_name: batch_name.to_string(),
+                batch_uuid: batch_uuid.to_string(),
+                files: files.to_vec(),
+                layout,
+            }),
+            // Batch keeps the frozen v3 bytes — zero exposure for old peers.
+            PackageLayout::Batch => Msg::Announce3(PackageAnnounceV3 {
+                package_id: wire.package_id,
+                root_hash: wire.root_hash,
+                byte_size: wire.byte_size,
+                frame_count: wire.frame_count,
+                batch_name: batch_name.to_string(),
+                batch_uuid: batch_uuid.to_string(),
+                files: files.to_vec(),
+            }),
         };
-        self.send_control(to, Msg::Announce3(wire_v3)).await?;
-        tracing::debug!(to = %hex32(&to), package_id = %a.package_id.0, "iroh announce sent");
+        self.send_control(to, msg).await?;
+        tracing::debug!(
+            to = %hex32(&to),
+            package_id = %a.package_id.0,
+            layout = layout.as_str(),
+            "iroh announce sent"
+        );
         Ok(())
     }
 
@@ -1707,13 +1726,15 @@ impl ProtocolHandler for SyncControlProtocol {
                 }
             };
             let event = match msg {
-                // Announce v1 (e.g. Perseus beta.3) / v2 / v3 → AnnounceReceived.
-                // The shared mapping splits the manifest extras off the wire struct
-                // and applies the batch-identity fallback (v1/v2 → wire package id),
-                // so downstream code is version-agnostic.
-                m @ (Msg::Announce(_) | Msg::Announce2(_) | Msg::Announce3(_)) => {
-                    announce_received_from_msg(from, m)
-                }
+                // Announce v1 (e.g. Perseus beta.3) / v2 / v3 / v4 →
+                // AnnounceReceived. The shared mapping splits the manifest extras
+                // off the wire struct and applies the batch-identity fallback
+                // (v1/v2 → wire package id) plus the layout fallback (v1/v2/v3 →
+                // Batch), so downstream code is version-agnostic.
+                m @ (Msg::Announce(_)
+                | Msg::Announce2(_)
+                | Msg::Announce3(_)
+                | Msg::Announce4(_)) => announce_received_from_msg(from, m),
                 Msg::Ack {
                     package_id,
                     receipts,
