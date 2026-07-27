@@ -1042,6 +1042,7 @@ mod tests {
             auto_quiet_secs: crate::config::DEFAULT_AUTO_QUIET_SECS,
             schedule_times: Vec::new(),
             schedule_catchup: true,
+            mirror_hierarchy: false,
             retention: RetentionConfig::default(),
             stability_secs: 1,
             poll_interval_secs: 1,

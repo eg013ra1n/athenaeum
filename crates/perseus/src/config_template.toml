@@ -8,6 +8,11 @@ mode = "auto"            # "auto" (send each capture), "manual" (queue; send fro
                          # or "scheduled" (queue; send at schedule_times below)
 auto_quiet_secs = 60     # auto: flush after N seconds with no new file
 
+# Land files on receiving devices in the same folder tree they occupy under the
+# capture dir (one stable tree per device) instead of one folder per send.
+# Receivers must run a version that understands this layout. Default false.
+# mirror_hierarchy = true
+
 # scheduled mode: wall-clock send times in THIS device's local time, "HH:MM".
 # Capture all night, ship once when the uplink is free. Required (at least one
 # entry) when mode = "scheduled"; ignored in the other modes. Editable on the web

@@ -71,6 +71,7 @@ fn test_config(capture_dir: &Path, data_dir: &Path) -> Config {
         auto_quiet_secs: 1,
         schedule_times: Vec::new(),
         schedule_catchup: true,
+        mirror_hierarchy: false,
         retention: RetentionConfig {
             policy: RetentionPolicy::KeepEverything,
             dry_run: true,
@@ -104,6 +105,7 @@ fn test_config_multi(capture_dirs: &[&Path], data_dir: &Path) -> Config {
         auto_quiet_secs: 1,
         schedule_times: Vec::new(),
         schedule_catchup: true,
+        mirror_hierarchy: false,
         retention: RetentionConfig {
             policy: RetentionPolicy::KeepEverything,
             dry_run: true,

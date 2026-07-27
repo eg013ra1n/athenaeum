@@ -1242,6 +1242,7 @@ mod tests {
             auto_quiet_secs: 60,
             schedule_times: times.to_vec(),
             schedule_catchup: catchup,
+            ..SendCfg::default()
         }
     }
 

@@ -108,9 +108,9 @@ function renderTransfersTab() {
   // The "To sync" strip: the pending accumulator as a rel_path tree (collapsed
   // by default, expanded by clicking the counter), the live three-way send-mode
   // control (0.5.1 T14: Immediately / On schedule / Manually), the auto
-  // quiet-window input, the schedule editor, and the "Send N pending now"
-  // button. Polled on the 2 s tick; the controls are not clobbered while the
-  // operator is inside the card or while a save is in flight.
+  // quiet-window input, the receiver-layout checkbox, the schedule editor, and
+  // the "Send N pending now" button. Polled on the 2 s tick; the controls are not
+  // clobbered while the operator is inside the card or while a save is in flight.
   // Below it, the `#transfers` section holds the unified one-row-per-batch list:
   // filter chips (with live counts), the list body, and the shared bottom detail
   // pane. Its body/chips/pane are re-rendered by refreshTransfers().
@@ -127,6 +127,7 @@ function renderTransfersTab() {
           quiet window (s)
           <input id="quietSecs" type="number" min="1" class="qty" aria-label="Auto quiet window in seconds" />
         </label>
+        <label class="inline-label" title="Receivers land every send in one folder tree that mirrors your capture folders, instead of a separate folder per send. The receiving device must run a build that understands this layout."><input id="mirrorHier" type="checkbox" /> Mirror capture folders on receiver</label>
         <button class="counter" id="pendingToggle" aria-expanded="false" aria-controls="pendingTree">
           <span id="pendingCaret">&#9656;</span> <span id="pendingCount">0</span> pending
         </button>
@@ -1060,13 +1061,17 @@ function renderScheduleTimes() {
     .join('');
 }
 
-function applyModeControls(mode, quietSecs, times, catchup) {
+function applyModeControls(mode, quietSecs, times, catchup, mirror) {
   $('modeScheduled').checked = mode === 'scheduled';
   $('modeManual').checked = mode === 'manual';
   $('modeAuto').checked = mode !== 'scheduled' && mode !== 'manual';
   // Never clobber an input while the operator is typing/toggling in it.
   if (document.activeElement !== $('quietSecs')) $('quietSecs').value = quietSecs;
   if (document.activeElement !== $('schedCatchup')) $('schedCatchup').checked = catchup !== false;
+  // The layout defaults OFF: `mirror === true` — not `!== false` — so an absent
+  // field (an older node that does not report it) paints the per-batch layout it
+  // actually uses, rather than a mirror the receiver would never see.
+  if (document.activeElement !== $('mirrorHier')) $('mirrorHier').checked = mirror === true;
   scheduleTimes = normalizeTimes(times);
   // This is the ONLY caller-agnostic proof the page has read the node's send
   // config: every path into here (the poll, a PUT echo, the post-rejection
@@ -1116,7 +1121,7 @@ async function refreshPending() {
     // and would visibly undo the edit); the tree + button label always reflect the
     // live count.
     if (!sendModeSaving && !schedArming && !$('tosync').contains(document.activeElement)) {
-      applyModeControls(p.mode, p.autoQuietSecs, p.scheduleTimes, p.scheduleCatchup);
+      applyModeControls(p.mode, p.autoQuietSecs, p.scheduleTimes, p.scheduleCatchup, p.mirrorHierarchy);
     } else updateSendButton();
     renderPendingTree(p.tree);
   } catch (e) {
@@ -1153,6 +1158,10 @@ async function saveSendMode() {
     // before the first read it would have erased the operator's send times.
     scheduleTimes: scheduleTimes.slice(),
     scheduleCatchup: $('schedCatchup').checked,
+    // Same gate: the checkbox only carries the node's layout once the card has
+    // been painted from server values, so an un-read page can never PUT its boot
+    // `false` over an operator's mirror setting.
+    mirrorHierarchy: $('mirrorHier').checked,
   };
   // Whatever this save does, the un-saved arming state is over: the request now
   // carries the operator's intent, and its outcome (or the next poll) is truth.
@@ -1172,7 +1181,7 @@ async function saveSendMode() {
     }
     if (!r.ok) throw new Error(await r.text());
     const m = await r.json();
-    applyModeControls(m.mode, m.autoQuietSecs, m.scheduleTimes, m.scheduleCatchup);
+    applyModeControls(m.mode, m.autoQuietSecs, m.scheduleTimes, m.scheduleCatchup, m.mirrorHierarchy);
     f.textContent = 'saved'; f.className = 'flash ok';
     // The armed deadline moves with the schedule; re-read it now rather than
     // waiting out the tick, so "Next scheduled send" agrees with what was saved.
@@ -1184,13 +1193,14 @@ async function saveSendMode() {
 // Re-read the send config and repaint the card without the poll's focus guard:
 // that guard protects an edit in progress, and this runs after an edit has
 // already been decided (and refused), so it would only preserve a fiction.
-// `applyModeControls` still leaves the two live inputs (`#quietSecs`,
-// `#schedCatchup`) alone if the caret is inside them — repainting under the
-// operator's fingers is a different hazard, and this path does not license it.
+// `applyModeControls` still leaves the three live inputs (`#quietSecs`,
+// `#schedCatchup`, `#mirrorHier`) alone if the caret is inside them — repainting
+// under the operator's fingers is a different hazard, and this path does not
+// license it.
 async function resyncSendMode() {
   try {
     const m = await getJson('/api/send-mode');
-    applyModeControls(m.mode, m.autoQuietSecs, m.scheduleTimes, m.scheduleCatchup);
+    applyModeControls(m.mode, m.autoQuietSecs, m.scheduleTimes, m.scheduleCatchup, m.mirrorHierarchy);
   } catch (e) {
     console.error('[tosync] could not re-read the send mode:', e);
   }
@@ -1282,6 +1292,7 @@ function wireTosync() {
     if (btn) schedRemoveTime(btn.dataset.schedDel);
   });
   $('schedCatchup').addEventListener('change', saveSendMode);
+  $('mirrorHier').addEventListener('change', saveSendMode);
   $('sendNow').addEventListener('click', sendNow);
   // The pending tree is collapsed by default; the counter toggles it.
   $('pendingToggle').addEventListener('click', () => {

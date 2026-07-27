@@ -273,7 +273,8 @@ pub fn apply_device_name_edit(config_path: &Path, name: &str) -> Result<Config> 
 
 /// Rewrite the top-level send `mode` + `auto_quiet_secs` keys in `config_path`
 /// — and, when the caller supplies them, the [`Mode::Scheduled`] knobs
-/// `schedule_times` + `schedule_catchup` — preserving all comments/layout
+/// `schedule_times` + `schedule_catchup` and the receiver landing layout
+/// `mirror_hierarchy` — preserving all comments/layout
 /// ([`toml_edit`]), then re-parse + validate the whole file and atomically
 /// replace it. Returns the freshly re-validated [`Config`] so the caller can
 /// publish the new [`crate::config::SendCfg`] onto the batcher's live `watch`
@@ -287,11 +288,12 @@ pub fn apply_device_name_edit(config_path: &Path, name: &str) -> Result<Config> 
 /// so a `scheduled` edit that brings its own times succeeds, and one that brings
 /// none is refused as a whole with the validator's own actionable message.
 ///
-/// `schedule_times = None` / `schedule_catchup = None` mean **leave that key
-/// exactly as it is** — a page (or a stale browser tab) that only knows about
-/// mode + quiet window must never silently erase an operator's schedule.
-/// `Some(&[])` is an explicit "clear the times", which the validator then
-/// refuses if the mode is `scheduled`.
+/// `schedule_times = None` / `schedule_catchup = None` / `mirror_hierarchy =
+/// None` mean **leave that key exactly as it is** — a page (or a stale browser
+/// tab) that only knows about mode + quiet window must never silently erase an
+/// operator's schedule or flip their receiver landing layout. `Some(&[])` is an
+/// explicit "clear the times", which the validator then refuses if the mode is
+/// `scheduled`.
 ///
 /// Supplied times are written **canonically** (zero-padded `HH:MM`, sorted,
 /// deduped) when every entry parses; if any entry does not, the list is written
@@ -306,6 +308,7 @@ pub fn apply_send_mode_edit(
     auto_quiet_secs: u64,
     schedule_times: Option<&[String]>,
     schedule_catchup: Option<bool>,
+    mirror_hierarchy: Option<bool>,
 ) -> Result<Config> {
     let original = std::fs::read_to_string(config_path)
         .with_context(|| format!("read {}", config_path.display()))?;
@@ -322,6 +325,9 @@ pub fn apply_send_mode_edit(
     }
     if let Some(catchup) = schedule_catchup {
         doc["schedule_catchup"] = toml_edit::value(catchup);
+    }
+    if let Some(mirror) = mirror_hierarchy {
+        doc["mirror_hierarchy"] = toml_edit::value(mirror);
     }
 
     let candidate = doc.to_string();
@@ -346,6 +352,7 @@ pub fn apply_send_mode_edit(
         auto_quiet_secs,
         schedule_points = schedule_times.map(<[String]>::len),
         schedule_catchup,
+        mirror_hierarchy,
         "send mode edited via web"
     );
     Ok(cfg)
@@ -671,7 +678,7 @@ i_have_verified_the_soak = false
     fn apply_send_mode_edit_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_min_config(dir.path());
-        let cfg = apply_send_mode_edit(&path, Mode::Manual, 30, None, None).unwrap();
+        let cfg = apply_send_mode_edit(&path, Mode::Manual, 30, None, None, None).unwrap();
         assert_eq!(cfg.mode, Mode::Manual);
         assert_eq!(cfg.auto_quiet_secs, 30);
         let reloaded = Config::load_lenient(&path).unwrap();
@@ -685,7 +692,7 @@ i_have_verified_the_soak = false
     fn apply_send_mode_edit_preserves_comments() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_min_config(dir.path());
-        apply_send_mode_edit(&path, Mode::Manual, 45, None, None).unwrap();
+        apply_send_mode_edit(&path, Mode::Manual, 45, None, None, None).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# top comment"), "top comment preserved: {text}");
         assert!(text.contains("device_name = \"old-name\""), "unrelated key preserved");
@@ -749,8 +756,8 @@ i_have_verified_the_soak = false
         let dir = tempfile::tempdir().unwrap();
         let path = write_min_config(dir.path());
         let times: Vec<String> = vec!["14:30".into(), "6:00".into(), "06:00".into()];
-        let cfg =
-            apply_send_mode_edit(&path, Mode::Scheduled, 30, Some(&times), Some(false)).unwrap();
+        let cfg = apply_send_mode_edit(&path, Mode::Scheduled, 30, Some(&times), Some(false), None)
+            .unwrap();
         assert_eq!(cfg.mode, Mode::Scheduled);
         assert_eq!(cfg.send_cfg().schedule_times, vec![(6, 0), (14, 30)]);
         assert!(!cfg.schedule_catchup);
@@ -776,7 +783,8 @@ i_have_verified_the_soak = false
         let path = write_min_config(dir.path());
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let err = apply_send_mode_edit(&path, Mode::Scheduled, 30, Some(&[]), None).unwrap_err();
+        let err =
+            apply_send_mode_edit(&path, Mode::Scheduled, 30, Some(&[]), None, None).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("at least one send time"),
@@ -803,7 +811,8 @@ i_have_verified_the_soak = false
         let before = std::fs::read_to_string(&path).unwrap();
 
         let times: Vec<String> = vec!["06:00".into(), "6h30".into()];
-        let err = apply_send_mode_edit(&path, Mode::Scheduled, 30, Some(&times), None).unwrap_err();
+        let err = apply_send_mode_edit(&path, Mode::Scheduled, 30, Some(&times), None, None)
+            .unwrap_err();
         assert!(
             format!("{err:#}").contains("6h30"),
             "the offending entry is named: {err:#}"
@@ -818,10 +827,10 @@ i_have_verified_the_soak = false
         let dir = tempfile::tempdir().unwrap();
         let path = write_min_config(dir.path());
         let times: Vec<String> = vec!["06:00".into()];
-        apply_send_mode_edit(&path, Mode::Scheduled, 30, Some(&times), Some(false)).unwrap();
+        apply_send_mode_edit(&path, Mode::Scheduled, 30, Some(&times), Some(false), None).unwrap();
 
         // A schedule-blind edit: mode + quiet only.
-        let cfg = apply_send_mode_edit(&path, Mode::Manual, 45, None, None).unwrap();
+        let cfg = apply_send_mode_edit(&path, Mode::Manual, 45, None, None, None).unwrap();
         assert_eq!(cfg.mode, Mode::Manual);
         assert_eq!(
             cfg.schedule_times,
@@ -829,6 +838,40 @@ i_have_verified_the_soak = false
             "the times survive a schedule-blind edit"
         );
         assert!(!cfg.schedule_catchup, "so does the catch-up flag");
+    }
+
+    /// Mirror-hierarchy T5: `Some(..)` writes `mirror_hierarchy`; `None` means
+    /// **leave that key exactly as it is** — neither inventing it on a config that
+    /// never had it, nor erasing an operator's `true` when a layout-blind client
+    /// (a browser tab loaded before this build) PUTs only mode + quiet window.
+    #[test]
+    fn send_mode_edit_writes_and_leaves_mirror_hierarchy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_min_config(dir.path());
+
+        // `None` on a config that never carried the key must not invent it.
+        apply_send_mode_edit(&path, Mode::Auto, 30, None, None, None).unwrap();
+        assert!(
+            !std::fs::read_to_string(&path).unwrap().contains("mirror_hierarchy"),
+            "an edit that passes no layout must not invent the key"
+        );
+
+        // `Some(true)` writes it, and it round-trips through the re-parse.
+        let cfg = apply_send_mode_edit(&path, Mode::Auto, 30, None, None, Some(true)).unwrap();
+        assert!(cfg.mirror_hierarchy, "the returned config carries the new layout");
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("mirror_hierarchy = true"),
+            "the key is written to disk"
+        );
+
+        // A later layout-blind edit leaves it alone.
+        let cfg = apply_send_mode_edit(&path, Mode::Manual, 45, None, None, None).unwrap();
+        assert_eq!(cfg.mode, Mode::Manual, "the mode still changes");
+        assert!(cfg.mirror_hierarchy, "the layout survives a layout-blind edit");
+        assert!(
+            Config::load_lenient(&path).unwrap().mirror_hierarchy,
+            "and it is still true on disk"
+        );
     }
 
     /// Clearing the cap back to `0` (unlimited) is a normal edit, not a removal —

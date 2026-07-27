@@ -12,6 +12,7 @@
 //! auto_quiet_secs = 60                       # auto: flush after N idle seconds
 //! schedule_times = ["06:00", "14:30"]        # scheduled: local wall-clock send times
 //! schedule_catchup = true                    # scheduled: catch up ONE missed point at startup
+//! mirror_hierarchy = false                   # land sends in the receiver's stable capture mirror
 //! device_name = "Observatory Pi"            # optional; defaults to the hostname
 //! max_upload_mbps = 8                        # cap sync upload (MB/s); 0/absent = unlimited
 //!
@@ -153,6 +154,10 @@ pub struct SendCfg {
     /// Whether a schedule point that elapsed while the agent was down triggers
     /// one catch-up send at startup (spec §3). Default `true`.
     pub schedule_catchup: bool,
+    /// Whether sends declare the **mirror** landing layout — the receiver lands
+    /// every file in one stable per-device tree that mirrors the capture folders,
+    /// instead of a folder per batch (spec 2026-07-27). Default `false`.
+    pub mirror_hierarchy: bool,
 }
 
 impl Default for SendCfg {
@@ -166,6 +171,7 @@ impl Default for SendCfg {
             auto_quiet_secs: DEFAULT_AUTO_QUIET_SECS,
             schedule_times: Vec::new(),
             schedule_catchup: true,
+            mirror_hierarchy: false,
         }
     }
 }
@@ -406,6 +412,11 @@ pub struct Config {
     /// at 05:50 still gets its 06:00 send.
     #[serde(default = "default_true")]
     pub schedule_catchup: bool,
+    /// Receiver landing layout: `true` = every send lands in the stable
+    /// capture-mirror tree on the receiver (spec 2026-07-27), `false` = the
+    /// per-batch folders. Top-level key like the other send keys.
+    #[serde(default)]
+    pub mirror_hierarchy: bool,
     #[serde(default)]
     pub retention: RetentionConfig,
     #[serde(default = "default_stability_secs")]
@@ -788,6 +799,7 @@ impl Config {
             auto_quiet_secs: self.auto_quiet_secs,
             schedule_times,
             schedule_catchup: self.schedule_catchup,
+            mirror_hierarchy: self.mirror_hierarchy,
         }
     }
 
@@ -861,6 +873,7 @@ impl Config {
             auto_quiet_secs: DEFAULT_AUTO_QUIET_SECS,
             schedule_times: Vec::new(),
             schedule_catchup: true,
+            mirror_hierarchy: false,
             retention: RetentionConfig::default(),
             stability_secs: DEFAULT_STABILITY_SECS,
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
@@ -1256,6 +1269,25 @@ mode = "auto"
         let cfg = Config::from_toml_str(&text).expect("valid config");
         assert!(!cfg.schedule_catchup);
         assert!(!cfg.send_cfg().schedule_catchup);
+    }
+
+    /// Mirror-hierarchy T5: `mirror_hierarchy` is an additive **top-level** send
+    /// key (like `auto_quiet_secs`, not inside any table) that defaults to
+    /// `false`, and an explicit `true` reaches the live [`SendCfg`] the batcher
+    /// reads. A config written before the key existed keeps the per-batch layout.
+    #[test]
+    fn mirror_hierarchy_defaults_false_and_parses() {
+        let capture = tempfile::tempdir().unwrap();
+        let cfg = Config::from_toml_str(&good_toml(capture.path())).unwrap();
+        assert!(!cfg.mirror_hierarchy, "absent key defaults to false");
+        assert!(!cfg.send_cfg().mirror_hierarchy, "and reaches SendCfg as false");
+
+        // `good_toml_top` is the top-level-keys-only form: a further top-level key
+        // must precede any table, and `[retention]` defaults when omitted.
+        let text = format!("{}mirror_hierarchy = true\n", good_toml_top(capture.path()));
+        let parsed = Config::from_toml_str(&text).expect("valid config");
+        assert!(parsed.mirror_hierarchy);
+        assert!(parsed.send_cfg().mirror_hierarchy);
     }
 
     /// `mode = "scheduled"` with no times is a broken config, not a silently

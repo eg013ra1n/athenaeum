@@ -1509,6 +1509,11 @@ struct PendingDto {
     /// Whether a schedule point missed while the agent was down fires once at
     /// startup.
     schedule_catchup: bool,
+    /// Whether sends declare the **mirror** receiver landing layout. Carried on
+    /// this poll for the same reason as the schedule: the To-Sync strip paints
+    /// its whole state — mode, quiet window, schedule, layout — off one fetch,
+    /// so it can never PUT a layout it never read.
+    mirror_hierarchy: bool,
     /// Total pending files — the batcher's accumulator length, i.e. the "N
     /// pending" the manual "send now" button acts on.
     count: usize,
@@ -1528,18 +1533,22 @@ struct SendModeDto {
     /// `scheduled` mode makes the batcher act on them.
     schedule_times: Vec<String>,
     schedule_catchup: bool,
+    /// The receiver landing layout: `true` = the stable capture-mirror tree,
+    /// `false` = one folder per send.
+    mirror_hierarchy: bool,
 }
 
 /// `PUT /api/send-mode` request body. `mode` is a free string (not the [`Mode`]
 /// enum) so an unknown value is a clean `400` from the handler rather than a
 /// `422` deserialization error from the extractor.
 ///
-/// The two schedule fields are `Option` and **absent means "leave it alone"**,
-/// not "clear it": a client that predates the scheduler (a browser tab loaded
-/// before this build, which still PUTs `{mode, autoQuietSecs}`) must not erase
-/// an operator's send times as a side effect of flipping the mode. Sending
-/// `scheduleTimes: []` explicitly IS a clear — and then the validator refuses it
-/// if the mode is `scheduled`.
+/// The two schedule fields and `mirrorHierarchy` are `Option` and **absent means
+/// "leave it alone"**, not "clear it": a client that predates the scheduler (a
+/// browser tab loaded before this build, which still PUTs `{mode,
+/// autoQuietSecs}`) must not erase an operator's send times — or silently flip
+/// their receiver landing layout back to per-batch folders — as a side effect of
+/// flipping the mode. Sending `scheduleTimes: []` explicitly IS a clear — and
+/// then the validator refuses it if the mode is `scheduled`.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SendModeEdit {
@@ -1549,6 +1558,8 @@ struct SendModeEdit {
     schedule_times: Option<Vec<String>>,
     #[serde(default)]
     schedule_catchup: Option<bool>,
+    #[serde(default)]
+    mirror_hierarchy: Option<bool>,
 }
 
 /// The wire form of a [`SendCfg`]'s schedule points: zero-padded `HH:MM`, in the
@@ -2371,6 +2382,7 @@ async fn api_get_pending(State(state): State<Arc<WebState>>) -> Json<PendingDto>
         auto_quiet_secs: send.auto_quiet_secs,
         schedule_times: schedule_times_wire(&send),
         schedule_catchup: send.schedule_catchup,
+        mirror_hierarchy: send.mirror_hierarchy,
         count,
     })
 }
@@ -2384,6 +2396,7 @@ async fn api_get_send_mode(State(state): State<Arc<WebState>>) -> Json<SendModeD
         auto_quiet_secs: send.auto_quiet_secs,
         schedule_times: schedule_times_wire(&send),
         schedule_catchup: send.schedule_catchup,
+        mirror_hierarchy: send.mirror_hierarchy,
     })
 }
 
@@ -2395,7 +2408,7 @@ async fn api_get_send_mode(State(state): State<Arc<WebState>>) -> Json<SendModeD
 /// and the new [`SendCfg`] is pushed onto the batcher's `send_cfg_tx` so the
 /// running batcher adopts it on its next select! turn — no restart. The
 /// supervisor is woken so its config view refreshes at once. Returns the applied
-/// `{mode, autoQuietSecs, scheduleTimes, scheduleCatchup}`.
+/// `{mode, autoQuietSecs, scheduleTimes, scheduleCatchup, mirrorHierarchy}`.
 ///
 /// Mode and schedule travel into **one** file edit: `scheduled` with no times is
 /// a validation error, so switching to it and supplying its times must be a
@@ -2420,6 +2433,7 @@ async fn api_put_send_mode(
         edit.auto_quiet_secs,
         edit.schedule_times.as_deref(),
         edit.schedule_catchup,
+        edit.mirror_hierarchy,
     )
     .map_err(|e| {
         let msg = format!("{e:#}");
@@ -2440,6 +2454,7 @@ async fn api_put_send_mode(
         auto_quiet_secs: send.auto_quiet_secs,
         schedule_times: schedule_times_wire(&send),
         schedule_catchup: send.schedule_catchup,
+        mirror_hierarchy: send.mirror_hierarchy,
     }))
 }
 
@@ -6197,6 +6212,7 @@ mod tests {
             auto_quiet_secs: crate::config::DEFAULT_AUTO_QUIET_SECS,
             schedule_times: Vec::new(),
             schedule_catchup: true,
+            mirror_hierarchy: false,
             retention: RetentionConfig::default(),
             stability_secs: 1,
             poll_interval_secs: 1,
@@ -6789,6 +6805,85 @@ mod tests {
         let v = body_json(res).await;
         assert_eq!(v["mode"], "auto");
         assert_eq!(v["scheduleTimes"], serde_json::json!(["06:00"]));
+    }
+
+    /// Mirror-hierarchy T5: `mirrorHierarchy` travels the whole seam — PUT →
+    /// `apply_send_mode_edit` → disk → the `SendModeDto` echo → the `/api/pending`
+    /// poll the To-Sync strip paints from. And, like the schedule fields, it is
+    /// **absent-means-leave-it-alone**: a layout-blind client (a tab loaded before
+    /// this build) must not flip an operator's receiver layout back to per-batch
+    /// folders as a side effect of changing the mode.
+    #[tokio::test]
+    async fn put_send_mode_mirror_hierarchy_roundtrips_and_survives_a_layout_blind_put() {
+        let (state, _tmp) = test_state().await;
+        let config_path = state.config_path.clone();
+        let app = build_router(state, None);
+
+        let put = |body: serde_json::Value| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    HttpRequest::builder()
+                        .method("PUT")
+                        .uri("/api/send-mode")
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Default: off, and reported off on both read paths.
+        let v = body_json(get(&app, "/api/send-mode").await).await;
+        assert_eq!(v["mirrorHierarchy"], false, "the layout defaults to per-batch");
+        let v = body_json(get(&app, "/api/pending").await).await;
+        assert_eq!(v["mirrorHierarchy"], false, "the 2 s poll carries it too");
+
+        // Turn it on.
+        let res = put(serde_json::json!({
+            "mode": "auto", "autoQuietSecs": 30, "mirrorHierarchy": true,
+        }))
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(res).await["mirrorHierarchy"],
+            true,
+            "the PUT echoes the applied layout"
+        );
+        let reloaded = Config::from_toml_str(&std::fs::read_to_string(&config_path).unwrap())
+            .expect("still parses");
+        assert!(reloaded.mirror_hierarchy, "written to disk");
+        assert_eq!(
+            body_json(get(&app, "/api/pending").await).await["mirrorHierarchy"],
+            true,
+            "the poll the page repaints from agrees"
+        );
+
+        // The layout-blind wire shape: mode + quiet only. It must not erase it.
+        let res = put(serde_json::json!({ "mode": "manual", "autoQuietSecs": 45 })).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(v["mode"], "manual", "the mode still changes");
+        assert_eq!(
+            v["mirrorHierarchy"], true,
+            "a layout-blind edit never flips the layout"
+        );
+        assert!(
+            Config::from_toml_str(&std::fs::read_to_string(&config_path).unwrap())
+                .unwrap()
+                .mirror_hierarchy,
+            "and it is still on disk"
+        );
+
+        // An explicit `false` is a real turn-off, not a no-op.
+        let res = put(serde_json::json!({
+            "mode": "manual", "autoQuietSecs": 45, "mirrorHierarchy": false,
+        }))
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await["mirrorHierarchy"], false);
     }
 
     /// An unknown `mode` string is a clean `400` (not a `422` extractor error nor
