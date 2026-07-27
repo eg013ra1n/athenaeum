@@ -29,7 +29,7 @@ Decisions ratified during brainstorming:
 
 ## §1 Setting + per-transfer stamping (Perseus)
 
-`mirror_hierarchy = false` (default OFF) as a top-level key in the Perseus
+`mirror_hierarchy` (default **ON** — owner decision 2026-07-27 post-ship; per-batch folders are the opt-out) as a top-level key in the Perseus
 TOML + `config_template.toml` (the send keys — `mode`, `auto_quiet_secs`,
 `schedule_times`, `schedule_catchup` — are all top-level; there is no `[send]`
 table), surfaced as a checkbox in the web UI's To-Sync strip send-mode editor —

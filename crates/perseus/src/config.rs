@@ -156,7 +156,8 @@ pub struct SendCfg {
     pub schedule_catchup: bool,
     /// Whether sends declare the **mirror** landing layout — the receiver lands
     /// every file in one stable per-device tree that mirrors the capture folders,
-    /// instead of a folder per batch (spec 2026-07-27). Default `false`.
+    /// instead of a folder per batch (spec 2026-07-27). Default `true` — the
+    /// mirror tree is the expected layout; per-batch folders are the opt-out.
     pub mirror_hierarchy: bool,
 }
 
@@ -171,7 +172,7 @@ impl Default for SendCfg {
             auto_quiet_secs: DEFAULT_AUTO_QUIET_SECS,
             schedule_times: Vec::new(),
             schedule_catchup: true,
-            mirror_hierarchy: false,
+            mirror_hierarchy: true,
         }
     }
 }
@@ -412,10 +413,12 @@ pub struct Config {
     /// at 05:50 still gets its 06:00 send.
     #[serde(default = "default_true")]
     pub schedule_catchup: bool,
-    /// Receiver landing layout: `true` = every send lands in the stable
-    /// capture-mirror tree on the receiver (spec 2026-07-27), `false` = the
-    /// per-batch folders. Top-level key like the other send keys.
-    #[serde(default)]
+    /// Receiver landing layout: `true` (default) = every send lands in the
+    /// stable capture-mirror tree on the receiver (spec 2026-07-27), `false` =
+    /// a folder per batch. Top-level key like the other send keys. NOTE: the
+    /// mirror announce (wire v4) needs a mirror-aware receiver — a pre-0.5.2
+    /// device never acks it; set `false` when sending to old receivers.
+    #[serde(default = "default_true")]
     pub mirror_hierarchy: bool,
     #[serde(default)]
     pub retention: RetentionConfig,
@@ -873,7 +876,7 @@ impl Config {
             auto_quiet_secs: DEFAULT_AUTO_QUIET_SECS,
             schedule_times: Vec::new(),
             schedule_catchup: true,
-            mirror_hierarchy: false,
+            mirror_hierarchy: true,
             retention: RetentionConfig::default(),
             stability_secs: DEFAULT_STABILITY_SECS,
             poll_interval_secs: DEFAULT_POLL_INTERVAL_SECS,
@@ -1271,23 +1274,24 @@ mode = "auto"
         assert!(!cfg.send_cfg().schedule_catchup);
     }
 
-    /// Mirror-hierarchy T5: `mirror_hierarchy` is an additive **top-level** send
+    /// Mirror-hierarchy: `mirror_hierarchy` is an additive **top-level** send
     /// key (like `auto_quiet_secs`, not inside any table) that defaults to
-    /// `false`, and an explicit `true` reaches the live [`SendCfg`] the batcher
-    /// reads. A config written before the key existed keeps the per-batch layout.
+    /// `true` (the mirror tree is the expected layout), and an explicit `false`
+    /// opts a node back into per-batch folders and reaches the live [`SendCfg`]
+    /// the batcher reads.
     #[test]
-    fn mirror_hierarchy_defaults_false_and_parses() {
+    fn mirror_hierarchy_defaults_true_and_false_opts_out() {
         let capture = tempfile::tempdir().unwrap();
         let cfg = Config::from_toml_str(&good_toml(capture.path())).unwrap();
-        assert!(!cfg.mirror_hierarchy, "absent key defaults to false");
-        assert!(!cfg.send_cfg().mirror_hierarchy, "and reaches SendCfg as false");
+        assert!(cfg.mirror_hierarchy, "absent key defaults to true");
+        assert!(cfg.send_cfg().mirror_hierarchy, "and reaches SendCfg as true");
 
         // `good_toml_top` is the top-level-keys-only form: a further top-level key
         // must precede any table, and `[retention]` defaults when omitted.
-        let text = format!("{}mirror_hierarchy = true\n", good_toml_top(capture.path()));
+        let text = format!("{}mirror_hierarchy = false\n", good_toml_top(capture.path()));
         let parsed = Config::from_toml_str(&text).expect("valid config");
-        assert!(parsed.mirror_hierarchy);
-        assert!(parsed.send_cfg().mirror_hierarchy);
+        assert!(!parsed.mirror_hierarchy);
+        assert!(!parsed.send_cfg().mirror_hierarchy);
     }
 
     /// `mode = "scheduled"` with no times is a broken config, not a silently

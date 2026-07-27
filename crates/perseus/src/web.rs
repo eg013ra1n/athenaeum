@@ -6817,8 +6817,8 @@ mod tests {
     /// `apply_send_mode_edit` → disk → the `SendModeDto` echo → the `/api/pending`
     /// poll the To-Sync strip paints from. And, like the schedule fields, it is
     /// **absent-means-leave-it-alone**: a layout-blind client (a tab loaded before
-    /// this build) must not flip an operator's receiver layout back to per-batch
-    /// folders as a side effect of changing the mode.
+    /// this build) must not flip an operator's opt-out back to the default-on
+    /// mirror layout as a side effect of changing the mode.
     #[tokio::test]
     async fn put_send_mode_mirror_hierarchy_roundtrips_and_survives_a_layout_blind_put() {
         let (state, _tmp) = test_state().await;
@@ -6841,55 +6841,56 @@ mod tests {
             }
         };
 
-        // Default: off, and reported off on both read paths.
+        // Default: ON (an absent key means the mirror layout), on both read paths.
         let v = body_json(get(&app, "/api/send-mode").await).await;
-        assert_eq!(v["mirrorHierarchy"], false, "the layout defaults to per-batch");
+        assert_eq!(v["mirrorHierarchy"], true, "absent key defaults to mirror");
         let v = body_json(get(&app, "/api/pending").await).await;
-        assert_eq!(v["mirrorHierarchy"], false, "the 2 s poll carries it too");
+        assert_eq!(v["mirrorHierarchy"], true, "the 2 s poll carries it too");
 
-        // Turn it on.
+        // An explicit `false` is a real opt-out, not a no-op.
         let res = put(serde_json::json!({
-            "mode": "auto", "autoQuietSecs": 30, "mirrorHierarchy": true,
+            "mode": "auto", "autoQuietSecs": 30, "mirrorHierarchy": false,
         }))
         .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             body_json(res).await["mirrorHierarchy"],
-            true,
+            false,
             "the PUT echoes the applied layout"
         );
         let reloaded = Config::from_toml_str(&std::fs::read_to_string(&config_path).unwrap())
             .expect("still parses");
-        assert!(reloaded.mirror_hierarchy, "written to disk");
+        assert!(!reloaded.mirror_hierarchy, "written to disk");
         assert_eq!(
             body_json(get(&app, "/api/pending").await).await["mirrorHierarchy"],
-            true,
+            false,
             "the poll the page repaints from agrees"
         );
 
-        // The layout-blind wire shape: mode + quiet only. It must not erase it.
+        // The layout-blind wire shape: mode + quiet only. It must not resurrect
+        // the default over an operator's explicit opt-out.
         let res = put(serde_json::json!({ "mode": "manual", "autoQuietSecs": 45 })).await;
         assert_eq!(res.status(), StatusCode::OK);
         let v = body_json(res).await;
         assert_eq!(v["mode"], "manual", "the mode still changes");
         assert_eq!(
-            v["mirrorHierarchy"], true,
+            v["mirrorHierarchy"], false,
             "a layout-blind edit never flips the layout"
         );
         assert!(
-            Config::from_toml_str(&std::fs::read_to_string(&config_path).unwrap())
+            !Config::from_toml_str(&std::fs::read_to_string(&config_path).unwrap())
                 .unwrap()
                 .mirror_hierarchy,
-            "and it is still on disk"
+            "and the opt-out is still on disk"
         );
 
-        // An explicit `false` is a real turn-off, not a no-op.
+        // And an explicit `true` turns it back on.
         let res = put(serde_json::json!({
-            "mode": "manual", "autoQuietSecs": 45, "mirrorHierarchy": false,
+            "mode": "manual", "autoQuietSecs": 45, "mirrorHierarchy": true,
         }))
         .await;
         assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(body_json(res).await["mirrorHierarchy"], false);
+        assert_eq!(body_json(res).await["mirrorHierarchy"], true);
     }
 
     /// An unknown `mode` string is a clean `400` (not a `422` extractor error nor

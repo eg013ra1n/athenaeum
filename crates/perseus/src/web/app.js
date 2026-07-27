@@ -1068,10 +1068,10 @@ function applyModeControls(mode, quietSecs, times, catchup, mirror) {
   // Never clobber an input while the operator is typing/toggling in it.
   if (document.activeElement !== $('quietSecs')) $('quietSecs').value = quietSecs;
   if (document.activeElement !== $('schedCatchup')) $('schedCatchup').checked = catchup !== false;
-  // The layout defaults OFF: `mirror === true` — not `!== false` — so an absent
-  // field (an older node that does not report it) paints the per-batch layout it
-  // actually uses, rather than a mirror the receiver would never see.
-  if (document.activeElement !== $('mirrorHier')) $('mirrorHier').checked = mirror === true;
+  // The layout defaults ON: `mirror !== false` — the `schedCatchup` pattern —
+  // so an absent field (an older node that does not report it) paints the
+  // default-on mirror layout a current node actually uses.
+  if (document.activeElement !== $('mirrorHier')) $('mirrorHier').checked = mirror !== false;
   scheduleTimes = normalizeTimes(times);
   // This is the ONLY caller-agnostic proof the page has read the node's send
   // config: every path into here (the poll, a PUT echo, the post-rejection

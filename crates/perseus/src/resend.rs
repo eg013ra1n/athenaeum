@@ -1172,7 +1172,11 @@ mod tests {
     fn divert_harness_with(layout: PackageLayout) -> DivertHarness {
         let tmp = tempfile::tempdir().unwrap();
         let cap = tmp.path().join("cap");
-        let config = config_with_dirs(tmp.path(), &[&cap]);
+        let mut config = config_with_dirs(tmp.path(), &[&cap]);
+        // The divert suite deliberately opts OUT of the (default-on) mirror
+        // layout: the clone test's discriminating combination is row=Mirror
+        // with a config that says batch — the row's own stamp must win.
+        config.mirror_hierarchy = false;
         let src = cap.join("declined.fits");
         std::fs::write(&src, b"declined-payload").unwrap();
 
