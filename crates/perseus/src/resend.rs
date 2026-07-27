@@ -595,6 +595,14 @@ impl From<anyhow::Error> for SendBatchError {
 /// **What happens to the source** is [`SourceDisposition`]'s call — and a
 /// `Retire` still copies rather than moves when a fan-out sibling's row shares
 /// the dir, because renaming would yank the payload out from under it.
+///
+/// **`layout`** is the receiver landing shape the new transfer asks for
+/// (mirror-hierarchy T6), and it is the CALLER's decision rather than a re-read
+/// of the setting, because the two callers legitimately want different answers:
+/// *Send to device…* mints a transfer the operator is asking for now, so it takes
+/// the current setting, while a declined re-ask
+/// ([`resend_declined_as_new`]) passes `row.layout` — re-asking for the delivery
+/// that was already described, not for whatever the setting says today.
 #[allow(clippy::too_many_arguments)]
 pub async fn send_batch_to_target(
     store: &StandaloneSyncStore,
@@ -605,6 +613,7 @@ pub async fn send_batch_to_target(
     seen: &SeenStore,
     row: &OutboundRow,
     disposition: SourceDisposition,
+    layout: PackageLayout,
 ) -> Result<SentBatch, SendBatchError> {
     let retire = disposition == SourceDisposition::Retire;
     let old_ref = row.package_ref.clone();
@@ -730,9 +739,8 @@ pub async fn send_batch_to_target(
 
     // The worker inserts the new row (+ per-file pending rows) in one
     // transaction and replies with its id — no pre-insert here.
-    // Mirror-hierarchy T2: placeholder — Task 6 wires the configured layout.
     let new_id = match engine
-        .enqueue_package(&new_dir, Some(display_name), files, PackageLayout::Batch)
+        .enqueue_package(&new_dir, Some(display_name), files, layout)
         .await
     {
         Ok(id) => id,
@@ -826,6 +834,11 @@ pub async fn send_batch_to_target(
 /// click). Everything else routes to [`resend_in_place`] (same `batch_uuid`) or,
 /// for a deliberate send elsewhere, to [`send_batch_to_target`] with
 /// [`SourceDisposition::Keep`].
+///
+/// The new transfer CLONES the declined row's own `layout` rather than reading
+/// the current `mirror_hierarchy` setting (mirror-hierarchy T6): this is one
+/// delivery re-asked, and a setting flipped since the decline must not silently
+/// re-shape where the receiver lands files the operator already described.
 #[allow(clippy::too_many_arguments)]
 pub async fn resend_declined_as_new(
     store: &StandaloneSyncStore,
@@ -848,6 +861,7 @@ pub async fn resend_declined_as_new(
         seen,
         row,
         SourceDisposition::Retire,
+        row.layout,
     )
     .await?;
     Ok(done.new_id)
@@ -1150,6 +1164,12 @@ mod tests {
     }
 
     fn divert_harness() -> DivertHarness {
+        divert_harness_with(PackageLayout::Batch)
+    }
+
+    /// [`divert_harness`] whose declined row carries `layout` — the stamp the
+    /// original transfer went out with, which the divert must clone.
+    fn divert_harness_with(layout: PackageLayout) -> DivertHarness {
         let tmp = tempfile::tempdir().unwrap();
         let cap = tmp.path().join("cap");
         let config = config_with_dirs(tmp.path(), &[&cap]);
@@ -1165,13 +1185,7 @@ mod tests {
         let seen = SeenStore::open(tmp.path().join("perseus.db")).unwrap();
         let batches = BatchStore::open(tmp.path().join("perseus.db")).unwrap();
         let row_id = store
-            .enqueue(
-                &pkg.to_string_lossy(),
-                PEER,
-                None,
-                &[],
-                PackageLayout::Batch,
-            )
+            .enqueue(&pkg.to_string_lossy(), PEER, None, &[], layout)
             .unwrap();
         store.set_state(row_id, OutboundState::Cancelled).unwrap();
         store
@@ -1261,6 +1275,40 @@ mod tests {
         )
         .await;
         assert!(second.is_err(), "a second divert of the same row is rejected");
+
+        h.engine.shutdown().await;
+    }
+
+    /// Mirror-hierarchy T6: the divert CLONES the declined transfer's own layout
+    /// stamp — it never re-reads the current setting. The operator's re-ask is the
+    /// delivery they already asked for, so a `mirror_hierarchy` turned off since
+    /// (as here: the config says batch) must not silently re-shape where the
+    /// receiver lands those files.
+    #[tokio::test]
+    async fn divert_declined_clones_the_source_rows_layout() {
+        let h = divert_harness_with(PackageLayout::Mirror);
+        assert!(
+            !h.config.mirror_hierarchy,
+            "the harness config asks for batch — the row's own stamp must win"
+        );
+        let row = h.store.get_outbound(h.row_id).unwrap().unwrap();
+        assert_eq!(
+            row.layout,
+            PackageLayout::Mirror,
+            "the declined row's own stamp"
+        );
+
+        let new_id = resend_declined_as_new(
+            &h.store, &h.engine, None, &h.config, &h.batches, &h.seen, &row,
+        )
+        .await
+        .expect("divert succeeds");
+
+        assert_eq!(
+            h.store.get_outbound(new_id).unwrap().unwrap().layout,
+            PackageLayout::Mirror,
+            "the new transfer keeps the original's landing shape"
+        );
 
         h.engine.shutdown().await;
     }
@@ -1479,6 +1527,7 @@ mod tests {
             &h.seen,
             &row,
             SourceDisposition::Keep,
+            PackageLayout::Batch,
         )
         .await
         .expect("the divert succeeds");
@@ -1562,6 +1611,7 @@ mod tests {
             &h.seen,
             &row,
             SourceDisposition::Keep,
+            PackageLayout::Batch,
         )
         .await
         .expect("a partial batch still sends");
@@ -1605,6 +1655,7 @@ mod tests {
             &h.seen,
             &row,
             SourceDisposition::Keep,
+            PackageLayout::Batch,
         )
         .await
         .expect_err("nothing left to send");
@@ -1643,6 +1694,7 @@ mod tests {
             &h.seen,
             &row,
             SourceDisposition::Keep,
+            PackageLayout::Batch,
         )
         .await
         .expect("the divert succeeds");
@@ -1658,6 +1710,43 @@ mod tests {
             std::fs::read(new_dir.join("a.fits")).unwrap(),
             std::fs::read(h.pkg.join("a.fits")).unwrap(),
             "byte-identical copy"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// Mirror-hierarchy T6: the transfer a *Send to device…* mints carries the
+    /// layout the CALLER chose (the route passes the current `mirror_hierarchy`
+    /// setting), not the source row's stamp — so a batch that originally shipped
+    /// as `batch` lands in the mirror tree once the operator has switched over.
+    #[tokio::test]
+    async fn send_to_stamps_the_layout_the_caller_chose() {
+        let h = send_to_harness(&["a.fits"], true);
+        let row = h.row();
+        assert_eq!(
+            row.layout,
+            PackageLayout::Batch,
+            "the source transfer shipped as batch"
+        );
+
+        let done = send_batch_to_target(
+            &h.store,
+            &h.engine_b,
+            None,
+            &h.config,
+            &h.batches,
+            &h.seen,
+            &row,
+            SourceDisposition::Keep,
+            PackageLayout::Mirror,
+        )
+        .await
+        .expect("the divert succeeds");
+
+        assert_eq!(
+            h.store.get_outbound(done.new_id).unwrap().unwrap().layout,
+            PackageLayout::Mirror,
+            "the new transfer asks for the layout this send chose"
         );
 
         h.shutdown().await;
@@ -1680,6 +1769,7 @@ mod tests {
             &h.seen,
             &row,
             SourceDisposition::Keep,
+            PackageLayout::Batch,
         )
         .await
         .expect("re-asking the same device is allowed");

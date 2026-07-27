@@ -324,6 +324,12 @@ pub struct SendContext {
     origin_device: String,
     /// Shared-payload cleanup coordinator, `Some` only for a ≥2-target fan-out.
     cleanup: Option<Arc<SharedPackageCleanup>>,
+    /// The **live** send config, read fresh on every delivery — the batcher loop's
+    /// own `cfg` is a snapshot it only refreshes on its `changed()` arm, and a
+    /// browser send does not run in that loop at all. Currently only the landing
+    /// layout is read here (`mirror_hierarchy`, see [`layout_from`]), which must
+    /// reflect an edit made while a build was already in flight.
+    send_cfg_rx: watch::Receiver<SendCfg>,
 }
 
 /// The result of one non-empty, delivered flush: the package it produced and how
@@ -386,13 +392,19 @@ async fn deliver_batch(
     // unbuildable); those are deliberately absent from `included`.
     let n = built.included.len();
 
-    // Mirror-hierarchy T2: placeholder — Task 6 wires the configured layout.
+    // The landing layout the operator has configured RIGHT NOW (mirror-hierarchy
+    // T6). Derived here, in the one shared delivery body, so every Perseus sender
+    // that funnels through it — the auto quiet timer, a scheduled point, the
+    // page's send-now, a library browser send — stamps the same live answer. The
+    // borrow is dropped inside the statement: never hold a watch guard across an
+    // await.
+    let layout = layout_from(ctx.send_cfg_rx.borrow().mirror_hierarchy);
     let (first_id, delivered) = enqueue_package_to_all(
         engines,
         &built.pkg_dir,
         Some(&built.display_name),
         &built.files,
-        PackageLayout::Batch,
+        layout,
     )
     .await;
     // Fan-out only: register the delivered target count so the shared payload is
@@ -458,6 +470,22 @@ async fn deliver_batch(
         package_ref,
         file_count: n,
     })
+}
+
+/// The receiver landing layout the `mirror_hierarchy` send setting selects
+/// (mirror-hierarchy T6). One function so every Perseus enqueue path spells the
+/// mapping the same way: `true` → the stable capture-mirror tree, `false` →
+/// today's per-batch folders.
+///
+/// Deliberately reads the setting at the moment of the enqueue, not at spawn: a
+/// live edit through `PUT /api/send-mode` must reach the next send without a
+/// restart, exactly like the mode and the schedule do.
+pub(crate) fn layout_from(mirror_hierarchy: bool) -> PackageLayout {
+    if mirror_hierarchy {
+        PackageLayout::Mirror
+    } else {
+        PackageLayout::Batch
+    }
 }
 
 /// The auto quiet window as a [`Duration`], **floored at 1s**. `auto_quiet_secs`
@@ -665,6 +693,10 @@ pub(crate) fn spawn_batcher_with_clock(
         config,
         origin_device,
         cleanup,
+        // A second reader of the same channel the loop below consumes: a browser
+        // send runs on the caller's task and never sees the loop's `changed()`
+        // arm, so it reads the live value itself.
+        send_cfg_rx: send_cfg_rx.clone(),
     });
     // The restore nudge: signalled by a handle that puts files back, awaited by
     // the loop's re-arm branch.
@@ -1427,6 +1459,18 @@ mod tests {
             self.batches.list().unwrap().len()
         }
 
+        /// The landing layout stamped on the most recently enqueued
+        /// `sync_outbound` row — "what the last delivery asked the receiver for"
+        /// (the store lists newest-first).
+        fn newest_outbound_layout(&self) -> PackageLayout {
+            self.store
+                .all_outbound(1)
+                .unwrap()
+                .first()
+                .expect("a delivery enqueued an outbound row")
+                .layout
+        }
+
         /// The persisted `last_scheduled_fire`, parsed back into local time.
         /// Panics if it was never written — every scheduled-mode start records at
         /// least a baseline.
@@ -1605,6 +1649,57 @@ mod tests {
                 .iter()
                 .all(|(rel, src)| src == &h.capture.join(rel)),
             "each rel_path links back to its source capture file"
+        );
+    }
+
+    /// Mirror-hierarchy T6: the **live** `mirror_hierarchy` setting stamps every
+    /// fresh enqueue. A batcher spawned with it on delivers `mirror`; a live edit
+    /// pushed onto the send-config watch is read by the very next delivery, with
+    /// no restart. Both entry points into [`deliver_batch`] are exercised — the
+    /// loop's own flush and a browser [`send_explicit`](BatcherHandle::send_explicit) —
+    /// because the layout is derived in the one shared body, not per caller.
+    #[tokio::test]
+    async fn deliver_batch_stamps_layout_from_live_send_cfg() {
+        // The `..SendCfg::default()` tail is layout-blind, so both halves of this
+        // test spell `mirror_hierarchy` out rather than leaning on the default.
+        let batch_cfg = SendCfg {
+            mode: Mode::Manual,
+            auto_quiet_secs: 60,
+            mirror_hierarchy: false,
+            ..SendCfg::default()
+        };
+        let h = Harness::spawn(SendCfg {
+            mirror_hierarchy: true,
+            ..batch_cfg.clone()
+        });
+
+        // (1) the flush path, with the setting ON at spawn.
+        h.feed(&[0]).await;
+        settle().await;
+        h.handle.flush_now().await;
+        wait_until(|| h.batch_count() == 1).await;
+        assert_eq!(
+            h.newest_outbound_layout(),
+            PackageLayout::Mirror,
+            "the flushed batch asks the receiver for the mirror tree"
+        );
+
+        // (2) a live edit reaches the very NEXT delivery — here the other entry
+        // into `deliver_batch`, a browser send.
+        h.cfg_tx.send(batch_cfg).unwrap();
+        settle().await;
+        let picked = vec![(h.capture.clone(), h.files[1].clone())];
+        assert!(
+            matches!(
+                h.handle.send_explicit(&picked, None).await,
+                Delivery::Sent(_)
+            ),
+            "the browser send delivered"
+        );
+        assert_eq!(
+            h.newest_outbound_layout(),
+            PackageLayout::Batch,
+            "the live edit took effect with no restart"
         );
     }
 

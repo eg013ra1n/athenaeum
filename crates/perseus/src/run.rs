@@ -1165,13 +1165,20 @@ impl Agent {
         let built =
             build_package_for_file(&self.config, &capture_dir, file_path, &self.origin_device)?;
         let engines = self.engine_handles();
-        // Mirror-hierarchy T2: placeholder — Task 6 wires the configured layout.
+        // The live landing layout (mirror-hierarchy T6), read from the same watch
+        // channel the batcher consumes and `PUT /api/send-mode` writes — NOT from
+        // `self.config`, which is this agent's boot snapshot and would freeze the
+        // setting until the next restart. The `Sender` half is the one Agent
+        // always holds (it exists even in enqueue-backlog mode, where there is no
+        // batcher to receive), and `borrow()` sees whatever was last sent. Bound
+        // to a local so no watch guard is held across the await below.
+        let layout = crate::batcher::layout_from(self.send_cfg_tx.borrow().mirror_hierarchy);
         let (first_id, delivered) = enqueue_package_to_all(
             &engines,
             &built.pkg_dir,
             Some(&built.display_name),
             &built.files,
-            PackageLayout::Batch,
+            layout,
         )
         .await;
         // Fan-out only: tell the coordinator how many targets actually received
@@ -3643,6 +3650,86 @@ mod multi_target_tests {
             .await
             .expect("agent starts with two targets");
         assert_eq!(agent.engine_count(), 2, "one engine per injected target");
+        agent.shutdown().await;
+    }
+
+    /// Mirror-hierarchy T6: the per-file enqueue path (`enqueue-backlog`, and the
+    /// watcher's own pre-batcher send) stamps the **live** `mirror_hierarchy`
+    /// setting. Read from the send-config watch channel — the one
+    /// `PUT /api/send-mode` writes and the supervisor reconciles — rather than
+    /// from the agent's boot config, so an edit made while a long backlog is
+    /// draining reaches the very next file instead of waiting for a restart.
+    #[tokio::test]
+    async fn enqueue_file_stamps_the_live_mirror_hierarchy_setting() {
+        use athenaeum_core::fits_writer::keywords::{FrameKind, HeaderBuilder};
+        use athenaeum_core::fits_writer::write_fits_f32;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cap = tmp.path().join("cap");
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&cap).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let write_frame = |name: &str| {
+            let cards = HeaderBuilder::new(FrameKind::Light)
+                .object("M42")
+                .exptime(60.0)
+                .filter("Ha")
+                .instrume("TestCam")
+                .build()
+                .expect("build header");
+            let path = cap.join(name);
+            write_fits_f32(&path, 8, 8, 1, &[0.0f32; 64], &cards).expect("write fixture fits");
+            path
+        };
+        let first = write_frame("a.fits");
+        let second = write_frame("b.fits");
+
+        // Booted with the setting ON. Manual mode so the batcher this agent also
+        // spawns never flushes on its own — the only rows here are the two
+        // `enqueue_file` calls below.
+        let toml = format!(
+            "capture_dir=\"{}\"\ndata_dir=\"{}\"\npairing_ticket=\"t\"\nmode=\"manual\"\n\
+             mirror_hierarchy=true\n[retention]\npolicy=\"keep_everything\"\ndry_run=true\n",
+            cap.display(),
+            data.display()
+        );
+        let config = Config::from_toml_str(&toml).unwrap();
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let sender_id = sender.node_id();
+        let transports: Vec<(NodeId, Arc<dyn SharingTransport>)> =
+            vec![([9u8; 32], Arc::new(net.endpoint()))];
+        let agent = Agent::start_with_transports(config, transports, sender_id, true, None)
+            .await
+            .expect("agent starts");
+
+        let id = agent
+            .enqueue_file(&first)
+            .await
+            .expect("first file enqueued");
+        assert_eq!(
+            agent.store().get_outbound(id).unwrap().unwrap().layout,
+            PackageLayout::Mirror,
+            "the configured layout reached the row"
+        );
+
+        // A live edit, pushed exactly the way the web PUT pushes it.
+        let cfg_tx = agent.send_cfg_tx();
+        let mut edited = cfg_tx.borrow().clone();
+        edited.mirror_hierarchy = false;
+        cfg_tx.send(edited).expect("the batcher is listening");
+
+        let id2 = agent
+            .enqueue_file(&second)
+            .await
+            .expect("second file enqueued");
+        assert_eq!(
+            agent.store().get_outbound(id2).unwrap().unwrap().layout,
+            PackageLayout::Batch,
+            "the next enqueue read the edit — no restart"
+        );
+
         agent.shutdown().await;
     }
 

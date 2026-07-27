@@ -3570,6 +3570,11 @@ async fn api_send_to(
     }
 
     let cleanup = state.cleanup.read().await.clone();
+    // A send-to is a NEW transfer the operator is asking for right now, so it
+    // takes the CURRENT `mirror_hierarchy` setting (mirror-hierarchy T6) — not
+    // the source row's stamp, which describes a delivery that already happened.
+    // `state.config` is swapped by `api_put_send_mode`, so this clone is live.
+    let layout = crate::batcher::layout_from(config.mirror_hierarchy);
     match resend::send_batch_to_target(
         &state.store,
         &engine,
@@ -3579,6 +3584,7 @@ async fn api_send_to(
         &state.seen,
         &row,
         resend::SourceDisposition::Keep,
+        layout,
     )
     .await
     {
