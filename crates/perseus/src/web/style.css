@@ -234,6 +234,18 @@ ul.tlog li:last-child { border-bottom: 0; }
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem; word-break: break-all; }
 .lib-file:hover { color: var(--accent); text-decoration: underline; }
 .lib-sel { width: 1.6rem; }
+/* Listing thumbnails (spec 2026-07-27 library-thumbs-selectall §1): a fixed
+   72x48 box so rows never reflow as blobs trickle in; the placeholder is the
+   same box in surface tone, the refused-frame glyph stays quiet. */
+.lib-th { width: 5rem; }
+.lib-thumb { display: block; width: 72px; height: 48px; object-fit: cover;
+  border-radius: 3px; background: var(--surface-hover); }
+img.lib-thumb { cursor: pointer; }
+img.lib-thumb:hover { outline: 1px solid var(--accent); }
+.lib-thumb-fail { position: relative; }
+.lib-thumb-fail::after { content: "\2205"; position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--content-muted); font-size: 0.9rem; }
 .lib-batches { font-size: 0.72rem; color: var(--content-muted); }
 /* T15 per-file retention fate — a quiet second line under the status chip. It
    must read as an annotation, never compete with the chip it sits below. */

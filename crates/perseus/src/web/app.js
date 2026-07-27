@@ -2273,6 +2273,7 @@ function renderLibListing() {
     return libRowMarkup(rel, (picked) => `
       <td class="lib-sel"><input type="checkbox" data-lib-pick="${esc(rel)}" data-lib-dir="1"
         aria-label="Select folder ${esc(name)} and everything under it"${picked ? ' checked' : ''} /></td>
+      <td class="lib-th"></td>
       <td><button class="lib-dir" data-lib-nav="${esc(rel)}">
         <span class="lib-caret" aria-hidden="true">&#9656;</span> ${esc(name)}/</button></td>
       <td class="muted">–</td><td class="muted">–</td><td class="muted">–</td>`);
@@ -2283,6 +2284,7 @@ function renderLibListing() {
     return libRowMarkup(rel, (picked) => `
       <td class="lib-sel"><input type="checkbox" data-lib-pick="${esc(rel)}"
         aria-label="Select ${esc(f.name)}"${picked ? ' checked' : ''} /></td>
+      <td class="lib-th">${libThumbCell(rel)}</td>
       <td><button class="lib-file mono" data-lib-pv="${esc(rel)}"
         title="Preview ${esc(f.name)}">${esc(f.name)}</button></td>
       <td>${esc(fmtSize(f.size))}</td>
@@ -2291,8 +2293,40 @@ function renderLibListing() {
   }).join('');
 
   body.innerHTML = `<div class="tablewrap"><table>
-    <thead><tr><th class="lib-sel"></th><th>name</th><th>size</th><th>modified</th><th>status</th></tr></thead>
+    <thead><tr><th class="lib-sel"><input type="checkbox" id="libSelAll"
+      aria-label="Select everything in this folder" title="Select everything in this folder" /></th>
+      <th class="lib-th"></th><th>name</th><th>size</th><th>modified</th><th>status</th></tr></thead>
     <tbody>${dirRows}${fileRows}</tbody></table></div>`;
+  libThumbObserve();
+  updateLibSelAll();
+}
+
+// The thumbnail cell as the listing renders it: an already-fetched blob URL
+// paints immediately, a renderer-refused frame keeps its static glyph, anything
+// else is a placeholder the IntersectionObserver picks up when it scrolls in.
+function libThumbCell(rel) {
+  const url = libThumbUrls.get(rel);
+  if (url) {
+    return `<img class="lib-thumb" src="${esc(url)}" alt="" data-lib-pv="${esc(rel)}" title="Preview" />`;
+  }
+  const failed = libThumbFailed.has(libThumbKey(rel));
+  return `<span class="lib-thumb lib-thumb-empty${failed ? ' lib-thumb-fail' : ''}"
+    ${failed ? '' : `data-lib-thumb="${esc(rel)}"`} aria-hidden="true"></span>`;
+}
+
+// Tri-state master checkbox (spec §2): checked = every pickable row of the
+// CURRENT listing is selected, indeterminate = some, empty = none. Recomputed
+// after every per-row toggle and every render — never re-rendering the rows, so
+// focus stays where the operator put it.
+function updateLibSelAll() {
+  const all = $('libSelAll');
+  if (!all) return;
+  const boxes = document.querySelectorAll('#libBody [data-lib-pick]');
+  let checked = 0;
+  boxes.forEach((b) => { if (b.checked) checked++; });
+  all.disabled = boxes.length === 0;
+  all.checked = boxes.length > 0 && checked === boxes.length;
+  all.indeterminate = checked > 0 && checked < boxes.length;
 }
 
 // ── render: selection footer ──
@@ -2393,6 +2427,7 @@ function libShowRoots() {
 async function libLoad(root, path) {
   const rel = path || '';
   if (root !== libState.root) libClearSelection();
+  libThumbsReset();               // orphan in-flight thumbs, revoke the old blobs
   libState.root = root;
   libRootPath = String(libRoots[root] ?? '');
   libState.path = rel;
@@ -2502,6 +2537,92 @@ function libOnStatus(s) {
 // `watcher::is_eligible`), and a second copy here would drift. A non-frame comes
 // back `415` and reads as "not a renderable frame" in the pane.
 const LIB_PREVIEW_WIDTH = 1200;     // one width for every frame → one cache entry each
+const LIB_THUMB_WIDTH = 96;         // listing thumbnails: one small width, one cache entry shape
+
+// ── listing thumbnails (spec 2026-07-27 library-thumbs-selectall §1) ──
+// Lazy + serial: an IntersectionObserver enqueues placeholder cells as they
+// scroll into view and ONE fetch runs at a time — the server renderer is
+// Semaphore(1), so a serial client queue keeps it drained without stacking
+// pending requests. `libThumbSeq` orphans everything on a directory change.
+let libThumbSeq = 0;                 // bumped on nav → in-flight results dropped
+let libThumbQueue = [];              // [{rel, el}] placeholders awaiting a fetch
+let libThumbBusy = false;            // one pump at a time
+let libThumbUrls = new Map();        // rel → blob object URL (current listing only)
+const libThumbFailed = new Set();    // "root:rel" the renderer refused — never retried
+let libThumbObserver = null;         // created once in wireLibrary
+
+function libThumbKey(rel) { return String(libState.root) + ':' + rel; }
+
+// Drop every thumbnail artifact of the listing we are leaving: orphan in-flight
+// fetches, forget the queue, revoke the blob URLs. Re-visits are cheap — the
+// server answers 304 before its render gate and the HTTP cache holds the bytes.
+function libThumbsReset() {
+  libThumbSeq++;
+  libThumbQueue = [];
+  libThumbBusy = false;
+  for (const url of libThumbUrls.values()) URL.revokeObjectURL(url);
+  libThumbUrls = new Map();
+}
+
+function libThumbObserve() {
+  if (!libThumbObserver) return;
+  document.querySelectorAll('#libBody [data-lib-thumb]').forEach((el) => {
+    libThumbObserver.observe(el);
+  });
+}
+
+function libThumbEnqueue(el) {
+  const rel = el.dataset.libThumb;
+  if (rel === undefined || libThumbUrls.has(rel)) return;
+  if (libThumbFailed.has(libThumbKey(rel))) return;
+  libThumbQueue.push({ rel, el });
+  libThumbPump();
+}
+
+async function libThumbPump() {
+  if (libThumbBusy) return;
+  libThumbBusy = true;
+  const seq = libThumbSeq;
+  while (libThumbQueue.length) {
+    const { rel, el } = libThumbQueue.shift();
+    if (seq !== libThumbSeq) break;                    // listing changed under us
+    if (libThumbUrls.has(rel) || libThumbFailed.has(libThumbKey(rel))) continue;
+    const url = '/api/library/preview?root=' + encodeURIComponent(libState.root)
+      + '&path=' + encodeURIComponent(rel) + '&w=' + LIB_THUMB_WIDTH;
+    let res = null;
+    try {
+      res = await api(url);
+    } catch (e) {
+      // Network-level failure: leave the placeholder; a listing refresh retries.
+      console.error('[library] thumb request failed:', rel, e);
+      continue;
+    }
+    if (seq !== libThumbSeq) break;
+    if (!res.ok) {
+      // The renderer refused (415 not a frame, 404 gone, …) — a static glyph,
+      // negative-cached for the tab so a re-render never hammers the endpoint.
+      libThumbFailed.add(libThumbKey(rel));
+      if (document.contains(el)) el.classList.add('lib-thumb-fail');
+      continue;
+    }
+    let blob = null;
+    try { blob = await res.blob(); } catch (e) { continue; }
+    if (seq !== libThumbSeq) break;
+    const objUrl = URL.createObjectURL(blob);
+    libThumbUrls.set(rel, objUrl);
+    if (document.contains(el)) {
+      const img = document.createElement('img');
+      img.className = 'lib-thumb';
+      img.src = objUrl;
+      img.alt = '';
+      img.dataset.libPv = rel;                          // click = open the pre-blink pane
+      img.title = 'Preview';
+      el.replaceWith(img);
+    }
+    // else: a re-render replaced the node — the next render paints from the map.
+  }
+  libThumbBusy = false;
+}
 
 let libPvState = { open: false, root: null, path: '', files: [], idx: -1 };
 let libPvSeq = 0;                   // monotonic; a stale frame never paints
@@ -3436,17 +3557,45 @@ function onLibraryClick(e) {
 }
 
 function onLibraryChange(e) {
+  // The master checkbox drives every pickable row of the current listing
+  // through the same per-row path, so the selection model and the footer stay
+  // authoritative (spec 2026-07-27 library-thumbs-selectall §2).
+  if (e.target.id === 'libSelAll') {
+    const want = e.target.checked;
+    document.querySelectorAll('#libBody [data-lib-pick]').forEach((b) => {
+      if (b.checked === want) return;
+      b.checked = want;
+      libTogglePick(b.dataset.libPick, b.dataset.libDir === '1', want);
+      const row = b.closest('tr');
+      if (row) row.classList.toggle('lib-picked', want);
+    });
+    updateLibSelAll();
+    return;
+  }
   const box = e.target.closest('[data-lib-pick]');
   if (!box) return;
   libTogglePick(box.dataset.libPick, box.dataset.libDir === '1', box.checked);
   const row = box.closest('tr');
   if (row) row.classList.toggle('lib-picked', box.checked);
+  updateLibSelAll();
 }
 
 function wireLibrary() {
   const panel = $('tab-library');
   panel.addEventListener('click', onLibraryClick);
   panel.addEventListener('change', onLibraryChange);
+  // Thumbnails load only for rows the operator can see (plus a 200px margin),
+  // one fetch at a time. Older engines without IntersectionObserver simply keep
+  // the empty placeholders — the listing itself is untouched.
+  if (typeof IntersectionObserver === 'function') {
+    libThumbObserver = new IntersectionObserver((entries) => {
+      entries.forEach((en) => {
+        if (!en.isIntersecting) return;
+        libThumbObserver.unobserve(en.target);
+        libThumbEnqueue(en.target);
+      });
+    }, { rootMargin: '200px' });
+  }
   // The preview overlay and the action dialogs live outside the panel
   // (index.html), so they get their own delegated handlers — bound once to the
   // stable hosts, never per open.
