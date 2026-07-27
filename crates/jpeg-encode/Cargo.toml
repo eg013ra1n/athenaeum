@@ -4,4 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# C libjpeg-turbo binding — same encoder and version as the rustafits
+# submodule, so cargo unifies the native build and the workspace carries one
+# JPEG codec. Needs cmake+nasm, which rustafits already requires. The parked
+# wip/pure-rust-jpeg branch replaces this with libjpeg-turbo-rs when its
+# 0.8.0 (trailing-MCU fix) is published.
+turbojpeg = "1.4"
