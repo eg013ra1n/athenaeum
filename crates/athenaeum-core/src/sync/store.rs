@@ -53,7 +53,8 @@ pub const DDL_OUTBOUND: &str = "CREATE TABLE IF NOT EXISTS sync_outbound (
 /// Idempotently add the trailing `sync_outbound` columns (`last_error` — Task 9,
 /// `next_retry_at` — Task 2, `wire_package_id` — zombie-inbound fix,
 /// `display_name` — Transfers Status Model v2 §D1, `project_id` — Transfers Batch
-/// Model §D6) to an existing table.
+/// Model §D6, `generation` — Transfers Batch Model §D5, `layout` — Perseus
+/// mirror-hierarchy) to an existing table.
 ///
 /// The guarded-ALTER twin of [`ensure_history_columns`]: `CREATE TABLE IF NOT
 /// EXISTS` never alters an already-materialised table, so a store opened over a
@@ -3867,10 +3868,12 @@ mod tests {
     }
 
     /// Mirror-hierarchy T1: a fresh DB carries `sync_outbound.layout`, and a row
-    /// inserted through the current (layout-less) enqueue signature reads back as
-    /// [`PackageLayout::Batch`] — the column's constant default. A row whose
-    /// column holds `'mirror'` decodes through the same read path as
-    /// [`PackageLayout::Mirror`], so the DB text repr is pinned end to end.
+    /// enqueued with [`PackageLayout::Batch`] reads back as `Batch` — the write
+    /// path round-trips the batch stamp. (The DDL's own `'batch'` default is
+    /// covered by the raw-INSERT/migration test
+    /// [`legacy_outbound_row_back_fills_layout_batch`], which inserts without the
+    /// column.) A row whose column holds `'mirror'` decodes through the same read
+    /// path as [`PackageLayout::Mirror`], so the DB text repr is pinned end to end.
     #[test]
     fn outbound_layout_column_exists_and_defaults_to_batch() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3879,8 +3882,8 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         assert!(cols(&conn, "sync_outbound").contains(&"layout".to_string()));
 
-        // Insert via the current signature (layout is not a parameter yet) — the
-        // column default must back-fill 'batch'.
+        // Enqueue with an explicit `Batch` — this pins the write path's batch
+        // stamp, not the DDL default (that is the raw-INSERT/migration test).
         let id = insert_outbound_with_files(
             &conn,
             "/tmp/pkg-x",
@@ -3891,7 +3894,11 @@ mod tests {
         )
         .unwrap();
         let row = outbound_row_by_id(&conn, id).unwrap().unwrap();
-        assert_eq!(row.layout, PackageLayout::Batch, "default layout is batch");
+        assert_eq!(
+            row.layout,
+            PackageLayout::Batch,
+            "an explicit Batch enqueue round-trips as batch"
+        );
 
         conn.execute(
             "UPDATE sync_outbound SET layout = 'mirror' WHERE id = ?1",

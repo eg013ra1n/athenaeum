@@ -5310,7 +5310,14 @@ mod tests {
         let (pkg_dir, announce, files) = build_v2_fixture(tmp.path());
         sender.serve(&announce, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce, "M31 Lights", "", &files, PackageLayout::Batch)
+            .announce(
+                receiver_node,
+                &announce,
+                "M31 Lights",
+                "",
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
 
@@ -5757,7 +5764,14 @@ mod tests {
         // Cancel BEFORE the announce → the epilogue runs (manifest still recorded).
         control.request_cancel(&announce.package_id.0);
         sender
-            .announce(receiver_node, &announce, "M31 Lights", "", &files, PackageLayout::Batch)
+            .announce(
+                receiver_node,
+                &announce,
+                "M31 Lights",
+                "",
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
 
@@ -6302,7 +6316,14 @@ mod tests {
             ..Default::default()
         });
         sender
-            .announce(receiver_node, &announce1, "M31 Lights", BATCH, &files, PackageLayout::Batch)
+            .announce(
+                receiver_node,
+                &announce1,
+                "M31 Lights",
+                BATCH,
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
 
@@ -6336,7 +6357,14 @@ mod tests {
         let w2 = announce2.package_id.0.clone();
         sender.serve(&announce2, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce2, "M31 Lights", BATCH, &files, PackageLayout::Batch)
+            .announce(
+                receiver_node,
+                &announce2,
+                "M31 Lights",
+                BATCH,
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
 
@@ -6457,7 +6485,14 @@ mod tests {
             ..Default::default()
         });
         sender
-            .announce(receiver_node, &announce1, "M31 Lights", BATCH, &files, PackageLayout::Batch)
+            .announce(
+                receiver_node,
+                &announce1,
+                "M31 Lights",
+                BATCH,
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
         let _ = poll_inbound(&store, &w1, InboundState::Waiting).await;
@@ -6476,7 +6511,14 @@ mod tests {
         );
         sender.serve(&announce2, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce2, "M31 Lights", BATCH, &files, PackageLayout::Batch)
+            .announce(
+                receiver_node,
+                &announce2,
+                "M31 Lights",
+                BATCH,
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
         let row = poll_inbound(&store, &w2, InboundState::Done).await;
@@ -6557,7 +6599,14 @@ mod tests {
         sender.serve(&announce1, &pkg_dir, None).await.unwrap();
         control.request_cancel(&w1);
         sender
-            .announce(receiver_node, &announce1, "Declined", BATCH, &files, PackageLayout::Batch)
+            .announce(
+                receiver_node,
+                &announce1,
+                "Declined",
+                BATCH,
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
 
@@ -6592,7 +6641,14 @@ mod tests {
         let w2 = announce2.package_id.0.clone();
         sender.serve(&announce2, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce2, "Declined", BATCH, &files, PackageLayout::Batch)
+            .announce(
+                receiver_node,
+                &announce2,
+                "Declined",
+                BATCH,
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
 
@@ -6730,7 +6786,14 @@ mod tests {
         // served. The receiver must reset the row and deliver — not re-ack cancelled.
         sender.serve(&announce2, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce2, "M31 Lights", BATCH, &files, PackageLayout::Batch)
+            .announce(
+                receiver_node,
+                &announce2,
+                "M31 Lights",
+                BATCH,
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
 
@@ -6836,7 +6899,14 @@ mod tests {
         // a wrongly-diverted epilogue would be distinguishable from a delivery).
         sender.serve(&announce1, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce1, "Straggler", BATCH, &files, PackageLayout::Batch)
+            .announce(
+                receiver_node,
+                &announce1,
+                "Straggler",
+                BATCH,
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
 
@@ -6942,7 +7012,14 @@ mod tests {
         // under w2, anchor rotated, NO files landed.
         sender.serve(&announce2, &pkg_dir, None).await.unwrap();
         sender
-            .announce(receiver_node, &announce2, "M31 Lights", BATCH, &files, PackageLayout::Batch)
+            .announce(
+                receiver_node,
+                &announce2,
+                "M31 Lights",
+                BATCH,
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
         let row2 = poll_inbound(&store, &w2, InboundState::Cancelled).await;
@@ -6980,7 +7057,14 @@ mod tests {
         };
         let w3 = announce3.package_id.0.clone();
         sender
-            .announce(receiver_node, &announce3, "M31 Lights", BATCH, &files, PackageLayout::Batch)
+            .announce(
+                receiver_node,
+                &announce3,
+                "M31 Lights",
+                BATCH,
+                &files,
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
         poll_cancelled_receipts(&store, &w3, n).await;

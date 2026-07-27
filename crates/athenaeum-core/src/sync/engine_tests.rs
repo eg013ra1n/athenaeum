@@ -3741,8 +3741,10 @@ impl SharingTransport for ServeTickTransport {
         layout: PackageLayout,
     ) -> anyhow::Result<()> {
         self.announce_count.fetch_add(1, SeqCst);
-        *self.announced_pid.lock().unwrap() = Some(a.package_id.clone());
+        // Ordering contract: layout is written BEFORE pid, so a waiter that parks on
+        // pid-is-Some can rely on layout already being Some (separate mutexes).
         *self.announced_layout.lock().unwrap() = Some(layout);
+        *self.announced_pid.lock().unwrap() = Some(a.package_id.clone());
         Ok(())
     }
     async fn fetch(

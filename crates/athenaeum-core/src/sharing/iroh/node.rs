@@ -4906,7 +4906,14 @@ mod tests {
         let pkg_denied = mk_announce("post-swap-denied");
         let outcome = tokio::time::timeout(
             Duration::from_secs(15),
-            out_denied.announce(r_info.node_id, &pkg_denied, "", "", &[], PackageLayout::Batch),
+            out_denied.announce(
+                r_info.node_id,
+                &pkg_denied,
+                "",
+                "",
+                &[],
+                PackageLayout::Batch,
+            ),
         )
         .await;
         match outcome {
@@ -4926,7 +4933,14 @@ mod tests {
         // (2) An allowed peer is STILL admitted after the hot-swap.
         let pkg_allowed = mk_announce("post-swap-allowed");
         out_allowed
-            .announce(r_info.node_id, &pkg_allowed, "", "", &[], PackageLayout::Batch)
+            .announce(
+                r_info.node_id,
+                &pkg_allowed,
+                "",
+                "",
+                &[],
+                PackageLayout::Batch,
+            )
             .await
             .expect("an allowed peer must still be admitted after the relay hot-swap");
         match recv_next(&mut r_events).await {

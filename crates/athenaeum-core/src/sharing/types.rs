@@ -201,8 +201,9 @@ pub enum TransportEvent {
     /// A peer announced a package to us.
     ///
     /// `batch_name` / `files` are the v2 extras: `Some` when the announce arrived
-    /// as `Msg::Announce2` / `Msg::Announce3` (or the loopback mock emulating a v2+
-    /// send), `None` for a v1 `Msg::Announce` (an old peer, e.g. Perseus beta.3).
+    /// as `Msg::Announce2` / `Msg::Announce3` / `Msg::Announce4` (or the loopback
+    /// mock emulating a v2+ send), `None` for a v1 `Msg::Announce` (an old peer,
+    /// e.g. Perseus beta.3).
     ///
     /// `batch_uuid` is the durable per-transfer identity (spec §D2): a v3
     /// `Msg::Announce3` carries it on the wire; a v1/v2 announce predates it, so

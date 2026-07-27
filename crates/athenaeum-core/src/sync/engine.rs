@@ -1425,7 +1425,7 @@ impl Worker {
             ),
             Ok(None) => (pkg_basename, PackageLayout::Batch),
             Err(e) => {
-                tracing::warn!(package_id = id, error = %e, "read display_name for announce failed");
+                tracing::warn!(package_id = id, error = %e, "read outbound row for announce failed; announcing with defaults");
                 (pkg_basename, PackageLayout::Batch)
             }
         };
