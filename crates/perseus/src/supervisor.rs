@@ -104,7 +104,14 @@ pub trait ManagedAgent: Send + 'static {
     /// `watch` path. The web `GET /api/pending` / `POST /api/send-now` drive it.
     fn batcher(&self) -> Option<BatcherHandle>;
     /// The send-config live-edit sender (the web `PUT /api/send-mode` writes here
-    /// so the running batcher live-applies an Auto↔Manual / quiet-window change).
+    /// so the running batcher live-applies an Auto↔Manual / quiet-window /
+    /// schedule change).
+    ///
+    /// The supervisor writes here too, once per pass and only on change, so an
+    /// edit that reached `perseus.toml` by any OTHER route — a hand edit over
+    /// SSH, a PUT that raced the launch — still reaches a running batcher without
+    /// a restart. The channel's own current value is the comparison baseline, so
+    /// whoever published last is already accounted for.
     fn send_cfg_tx(&self) -> watch::Sender<SendCfg>;
     /// The running watchers' aggregate forget handle (0.5.1 T9b) — the web
     /// deletion routes hand it every path they removed so a re-capture at that
@@ -404,6 +411,33 @@ fn spawn_with(
                     );
                     running_upload_bps = want;
                 }
+                // Same reconcile for the SEND config (mode / quiet window /
+                // schedule): the batcher reads it live from this watch channel, and
+                // the web `PUT /api/send-mode` is only ONE of the routes an edit
+                // arrives by. A `perseus.toml` hand-edited over SSH — the way the
+                // scheduled mode was documented to be set — would otherwise sit on
+                // disk until the next restart while the batcher kept the old
+                // calendar.
+                //
+                // The comparison is against the CHANNEL's own current value, not a
+                // locally-tracked copy: whoever published last (the web PUT
+                // included) is then already accounted for, so a PUT is never
+                // followed by a redundant re-publish that would reset the batcher's
+                // quiet window.
+                let send_cfg_tx = a.send_cfg_tx();
+                let want_send = config.send_cfg();
+                // The borrow guard ends with this statement — never hold it across
+                // the send (that would deadlock against the channel's write lock).
+                let send_cfg_changed = *send_cfg_tx.borrow() != want_send;
+                if send_cfg_changed {
+                    tracing::info!(
+                        mode = ?want_send.mode,
+                        auto_quiet_secs = want_send.auto_quiet_secs,
+                        schedule_points = want_send.schedule_times.len(),
+                        "send config pushed to running batcher"
+                    );
+                    let _ = send_cfg_tx.send(want_send);
+                }
                 match a.in_flight() {
                     Ok(n) => {
                         let n = n as u32;
@@ -651,6 +685,12 @@ mod tests {
         /// unconditional per-pass apply would clear the pacer's schedule each pass
         /// and leak a burst, so "exactly once per change" is the contract).
         upload_pushes: Arc<Mutex<Vec<u64>>>,
+        /// The agent's live send-config channel, seeded at launch from the config
+        /// the launcher was handed — exactly as `Agent::start` seeds the real one.
+        /// The send-config test watches the receiver: a publish IS the observable
+        /// behaviour (there is no batcher behind a fake to ask).
+        send_cfg: watch::Sender<SendCfg>,
+        send_cfg_rx: watch::Receiver<SendCfg>,
     }
 
     /// A fake [`ManagedAgent`] with no engine, watchers, or network — just the
@@ -660,6 +700,7 @@ mod tests {
         in_flight: Arc<AtomicUsize>,
         stopped: Arc<AtomicBool>,
         upload_pushes: Arc<Mutex<Vec<u64>>>,
+        send_cfg: watch::Sender<SendCfg>,
     }
 
     impl ManagedAgent for FakeAgent {
@@ -681,13 +722,11 @@ mod tests {
         fn batcher(&self) -> Option<BatcherHandle> {
             None
         }
+        /// The real channel, seeded at launch from the launcher's config — so the
+        /// supervisor's reconcile compares against what the running agent
+        /// actually holds, exactly as it does in production.
         fn send_cfg_tx(&self) -> watch::Sender<SendCfg> {
-            watch::channel(SendCfg {
-                mode: crate::config::Mode::Auto,
-                auto_quiet_secs: 0,
-                ..SendCfg::default()
-            })
-            .0
+            self.send_cfg.clone()
         }
         /// Record instead of touching a node: a unit test cannot bind a real
         /// [`SharedIrohNode`] (it opens a socket and takes the device-key lock),
@@ -735,8 +774,9 @@ mod tests {
             default_in_flight,
         });
         let st = Arc::clone(&state);
-        let launcher: Launcher = Arc::new(move |_config, _path| {
+        let launcher: Launcher = Arc::new(move |config, _path| {
             let st = Arc::clone(&st);
+            let launch_send_cfg = config.send_cfg();
             Box::pin(async move {
                 // Yield once so the supervisor's `Starting` publish is observable
                 // before the launch outcome lands (single-threaded test runtime).
@@ -751,10 +791,13 @@ mod tests {
                 match behavior {
                     Behavior::Fail(msg) => Err(anyhow::anyhow!(msg)),
                     Behavior::Launch(n) => {
+                        let (send_cfg, send_cfg_rx) = watch::channel(launch_send_cfg);
                         let rec = AgentRecord {
                             in_flight: Arc::new(AtomicUsize::new(n as usize)),
                             stopped: Arc::new(AtomicBool::new(false)),
                             upload_pushes: Arc::new(Mutex::new(Vec::new())),
+                            send_cfg,
+                            send_cfg_rx,
                         };
                         st.created.lock().unwrap().push(rec.clone());
                         let agent = FakeAgent {
@@ -762,6 +805,7 @@ mod tests {
                             in_flight: Arc::clone(&rec.in_flight),
                             stopped: Arc::clone(&rec.stopped),
                             upload_pushes: Arc::clone(&rec.upload_pushes),
+                            send_cfg: rec.send_cfg.clone(),
                         };
                         Ok(Box::new(agent) as Box<dyn ManagedAgent>)
                     }
@@ -810,14 +854,28 @@ mod tests {
     /// before the `[retention]` table, where TOML requires them). Used by the
     /// upload-limit test to vary `max_upload_mbps` on an otherwise identical file.
     fn write_ready_config_with(path: &Path, data_dir: &Path, dirs: &[&Path], extra: &str) {
+        write_ready_config_mode(path, data_dir, dirs, "auto", extra);
+    }
+
+    /// [`write_ready_config_with`] with the send `mode` spelled by the caller —
+    /// TOML has no duplicate keys, so a test that switches the mode cannot simply
+    /// splice one into `extra` beside the base file's own.
+    fn write_ready_config_mode(
+        path: &Path,
+        data_dir: &Path,
+        dirs: &[&Path],
+        mode: &str,
+        extra: &str,
+    ) {
         let dirs_toml = dirs
             .iter()
             .map(|d| format!("\"{}\"", d.display()))
             .collect::<Vec<_>>()
             .join(", ");
         let text = format!(
-            "data_dir = \"{}\"\nmode = \"auto\"\ncapture_dirs = [{}]\npairing_ticket = \"t\"\n{}[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
+            "data_dir = \"{}\"\nmode = \"{}\"\ncapture_dirs = [{}]\npairing_ticket = \"t\"\n{}[retention]\npolicy = \"keep_everything\"\ndry_run = true\n",
             data_dir.display(),
+            mode,
             dirs_toml,
             extra
         );
@@ -994,6 +1052,83 @@ mod tests {
             lstate.calls.load(Ordering::SeqCst),
             1,
             "an upload-limit edit is live — it must not restart the engine"
+        );
+        handle.shutdown().await;
+    }
+
+    /// The same reconcile for the SEND config (mode / quiet window / schedule).
+    /// The web `PUT /api/send-mode` is only one of the routes such an edit arrives
+    /// by: scheduled mode is documented as a `perseus.toml` setting, and a file
+    /// hand-edited over SSH has no PUT to publish it. Without this pass the
+    /// batcher would keep the launch-time calendar until the next restart.
+    ///
+    /// Both halves matter, as with the upload limit: the change IS published, and
+    /// it is published **only on change** — a re-publish every 20 ms tick would
+    /// reset the auto quiet window continuously and an Auto-mode agent would never
+    /// flush at all.
+    #[tokio::test]
+    async fn send_config_change_is_pushed_to_running_batcher_once() {
+        let data = tempfile::tempdir().unwrap();
+        let cap = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("perseus.toml");
+        write_ready_config_with(&cfg_path, data.path(), &[cap.path()], "auto_quiet_secs = 60\n");
+
+        let (launcher, lstate) = fake_launcher(vec![Behavior::Launch(0)], 0);
+        let (on_agent, _seen) = recording_on_agent();
+        let handle = spawn(cfg_path.clone(), launcher, fast_opts(), on_agent);
+        let mut state = handle.state.clone();
+
+        tokio::time::timeout(T, state.wait_for(|s| s.label() == "running"))
+            .await
+            .expect("never reached Running")
+            .unwrap();
+        let rec = lstate.created.lock().unwrap()[0].clone();
+        let mut rx = rec.send_cfg_rx.clone();
+
+        // Several steady-state passes at the launch value publish nothing: the
+        // agent was launched with exactly this send config.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(
+            !rx.has_changed().unwrap(),
+            "the launch-time send config must not be re-published"
+        );
+
+        // The hand-edit-over-SSH case: scheduled mode appears in the file with no
+        // web PUT involved.
+        write_ready_config_mode(
+            &cfg_path,
+            data.path(),
+            &[cap.path()],
+            "scheduled",
+            "auto_quiet_secs = 60\nschedule_times = [\"06:00\", \"14:30\"]\n",
+        );
+        handle.wake.notify_one();
+
+        tokio::time::timeout(T, rx.changed())
+            .await
+            .expect("the edited send config never reached the running batcher")
+            .unwrap();
+        {
+            let got = rx.borrow_and_update().clone();
+            assert_eq!(got.mode, crate::config::Mode::Scheduled);
+            assert_eq!(
+                got.schedule_times,
+                vec![(6u8, 0u8), (14u8, 30u8)],
+                "the edited calendar is what the batcher now holds"
+            );
+        }
+
+        // …and stays published exactly once across many further passes.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !rx.has_changed().unwrap(),
+            "an unchanged send config must never be re-published (it would reset the quiet window every pass)"
+        );
+        assert_eq!(
+            lstate.calls.load(Ordering::SeqCst),
+            1,
+            "a send-config edit is live — it must not restart the engine"
         );
         handle.shutdown().await;
     }

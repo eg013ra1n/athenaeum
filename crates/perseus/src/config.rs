@@ -123,10 +123,11 @@ pub enum Mode {
     /// Queue stabilized frames and flush them on a **wall-clock schedule**
     /// ([`Config::schedule_times`], local device time) — the observatory case:
     /// capture all night, ship once at 06:00 when the uplink is free (0.5.1 §3).
-    /// Set this in `perseus.toml`, not on the web page: until the scheduler UI
-    /// lands (T14) the page renders this mode as Auto and saving its mode panel
-    /// rewrites it. `POST /api/send-now` still flushes in this mode; only the
-    /// page's own "Send N pending now" button is hidden.
+    ///
+    /// Settable from either side: the web page's send-mode strip offers it as "On
+    /// schedule" with a times editor (T14), and a hand-edited `perseus.toml` over
+    /// SSH reaches a running batcher on the supervisor's next pass. "Send N
+    /// pending now" and `POST /api/send-now` still flush on demand in this mode.
     Scheduled,
 }
 
