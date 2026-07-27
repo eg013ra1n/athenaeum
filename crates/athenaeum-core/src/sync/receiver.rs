@@ -31,7 +31,7 @@ use tokio::task::JoinHandle;
 use crate::events::{emit_event, ProgressEmitter};
 use crate::sharing::iroh::node::{Role, SharedIrohNode};
 use crate::sharing::types::{
-    AnnounceFileEntry, FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId,
+    AnnounceFileEntry, FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, PackageLayout,
     ReceiptOutcome, RevokeReason, StartInfo, TransportEvent,
 };
 use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
@@ -1207,17 +1207,17 @@ async fn process_receiver_event(ev: TransportEvent, deps: &ReceiverLaneDeps) {
         // the receiver keys ONE inbound row on across every attempt (B4):
         // v3 → the sender's package-dir basename; v1/v2 → the wire package
         // id (B1 fallback), which reproduces today's per-attempt rows.
-        // `layout` (mirror-hierarchy) rides in from T3 but is NOT consumed yet:
-        // the landing-path change is Task 4's, and this arm must stay
-        // byte-identical until then. Bound explicitly (not swallowed by `..`) so
-        // the consumer task cannot forget it exists.
+        // `layout` (mirror-hierarchy) selects WHERE this transfer lands: a
+        // `Mirror` announce skips the batch level entirely (see the landing block
+        // in `handle_announce`). v1/v2/v3 announces decode as `Batch`, so the
+        // pre-mirror behavior is byte-identical.
         TransportEvent::AnnounceReceived {
             from,
             announce,
             batch_name,
             batch_uuid,
             files,
-            layout: _layout,
+            layout,
         } => {
             // Variant B: this announce has LEFT the lane queue — it is
             // being processed right now, so it must stop rendering as a
@@ -1259,6 +1259,7 @@ async fn process_receiver_event(ev: TransportEvent, deps: &ReceiverLaneDeps) {
                 batch_name,
                 batch_uuid,
                 files,
+                layout,
             )
             .await
             {
@@ -1872,6 +1873,7 @@ async fn handle_announce(
     batch_name: Option<String>,
     batch_uuid: String,
     files: Option<Vec<AnnounceFileEntry>>,
+    layout: PackageLayout,
 ) -> Result<()> {
     let peer_device = super::node_id_hex(&from);
     let package_id = announce.package_id.0.clone();
@@ -2437,8 +2439,15 @@ async fn handle_announce(
     // (collision-suffixed, persisted, resume-stable); an unnamed (v1) batch has no
     // override, so ingest lands under `<incoming_root>/<sender_slug>` — byte-identical
     // to the pre-v2 layout.
-    let landing_override: Option<PathBuf> =
-        match effective_name.as_deref().and_then(sanitize_batch_slug) {
+    //
+    // Mirror layout (spec 2026-07-27): NO batch landing level — land under
+    // `<incoming_root>/<sender_slug>` via the pre-v2 (v1) path, which IS the
+    // stable capture-mirror tree. resolve_landing_dir is deliberately not
+    // called: concurrent mirror transfers from one sender must share the tree,
+    // and per-file collisions are handled by ingest's unique_path.
+    let landing_override: Option<PathBuf> = match layout {
+        PackageLayout::Mirror => None,
+        PackageLayout::Batch => match effective_name.as_deref().and_then(sanitize_batch_slug) {
             Some(batch_slug) => {
                 let conn = store.lock_conn();
                 Some(resolve_landing_dir(
@@ -2450,7 +2459,8 @@ async fn handle_announce(
                 ))
             }
             None => None,
-        };
+        },
+    };
 
     // Ingest on a blocking thread (file I/O + SQLite); never block the runtime.
     {
@@ -3814,6 +3824,7 @@ mod tests {
             None,
             "unsafe-batch".to_string(),
             None,
+            PackageLayout::Batch,
         )
         .await
         .expect("an unsafe announce is rejected as a clean Ok, not an error");
@@ -5383,6 +5394,257 @@ mod tests {
                 "journal has {want}: {kinds:?}"
             );
         }
+    }
+
+    /// Build a mirror-layout fixture package in `root/<dir_name>` from `specs`
+    /// (`rel_path`, `frame_uuid`, pixel value — a distinct value gives distinct
+    /// bytes, hence a distinct xxh3, so ingest's content dedup lets it travel).
+    /// Returns `(pkg_dir, announce, files)` like [`build_v2_fixture`], but
+    /// parameterized so one test can drive SEVERAL sequential sends.
+    fn build_mirror_fixture(
+        root: &std::path::Path,
+        dir_name: &str,
+        specs: &[(&str, &str, f32)],
+    ) -> (std::path::PathBuf, PackageAnnounce, Vec<AnnounceFileEntry>) {
+        use crate::models::{Frame, ImageType};
+        use crate::package::{ManifestRecord, PayloadKind, MANIFEST_VERSION};
+
+        let src_dir = root.join(format!("{dir_name}-src"));
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let mut entries = Vec::new();
+        let mut items = Vec::new();
+        for (rel, uuid, val) in specs {
+            let src = src_dir.join(uuid); // unique flat source name
+            crate::fits_writer::write_fits_f32(&src, 4, 4, 1, &[*val; 16], &[]).unwrap();
+            let byte_size = std::fs::metadata(&src).unwrap().len();
+            let xxh3 = crate::package::xxh3_full_file(&src).unwrap();
+            let frame = Frame {
+                object: Some("M31".to_string()),
+                imagetyp: Some(ImageType::Light),
+                naxis1: Some(4),
+                naxis2: Some(4),
+                uuid: Some((*uuid).to_string()),
+                updated_at: Some("2026-01-16T10:00:00.000Z".to_string()),
+                ..Default::default()
+            };
+            let record = ManifestRecord {
+                v: MANIFEST_VERSION,
+                frame_uuid: (*uuid).to_string(),
+                origin_catalog_uuid: "catalog-uuid".to_string(),
+                origin_device: "aa".repeat(32),
+                payload_kind: PayloadKind::RawFrame,
+                rel_path: (*rel).to_string(),
+                byte_size,
+                xxh3,
+                frame_meta: serde_json::to_value(&frame).unwrap(),
+                analysis: None,
+                app_version: "test".to_string(),
+                project: None,
+            };
+            entries.push(afe(rel, uuid, byte_size));
+            items.push((src, record));
+        }
+        let pkg_dir = root.join(dir_name);
+        let announce = crate::package::write_package(&pkg_dir, items).unwrap();
+        (pkg_dir, announce, entries)
+    }
+
+    /// Mirror layout (mirror-hierarchy T4): two SEQUENTIAL mirror sends from one
+    /// sender land in ONE stable tree (no batch level, adjacent files) even though
+    /// each announce carries its own batch name + uuid, the inbound rows persist NO
+    /// landing_dir (v1-style), and a changed-content re-send of an existing
+    /// rel_path lands collision-suffixed `_2` instead of overwriting.
+    #[tokio::test]
+    async fn mirror_layout_lands_adjacent_across_batches_and_suffixes_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog_path = tmp.path().join("catalog.db");
+        let _assert_db = crate::db::Database::new(catalog_path.clone()).unwrap();
+        let store = Arc::new(CatalogSyncStore::open(&catalog_path).unwrap());
+
+        let sync_dir = tmp.path().join("sync");
+        let incoming = sync_dir.join("incoming");
+
+        let net = LoopbackNetwork::new();
+        let sender = Arc::new(net.endpoint());
+        let receiver_ep = Arc::new(net.endpoint());
+        let receiver_node: NodeId = receiver_ep.node_id();
+        sender.start().await.unwrap();
+
+        let (_info, _handle) = SyncReceiver::spawn(
+            Arc::clone(&store),
+            sync_dir.clone(),
+            {
+                let incoming = incoming.clone();
+                Arc::new(move || incoming.clone()) as IncomingResolver
+            },
+            allow_all_peers(),
+            Default::default(),
+            Arc::new(InboundControl::new()),
+            Arc::clone(&receiver_ep) as Arc<dyn SharingTransport>,
+            Arc::new(RecordingEmitter::default()),
+        )
+        .await
+        .unwrap();
+
+        // Every landed regular file under the incoming root, as paths RELATIVE to
+        // it — the shape the landing contract is stated in.
+        let landed_rel = || -> Vec<std::path::PathBuf> {
+            let mut v: Vec<std::path::PathBuf> = walkdir::WalkDir::new(&incoming)
+                .into_iter()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_file())
+                .map(|e| e.path().strip_prefix(&incoming).unwrap().to_path_buf())
+                .collect();
+            v.sort();
+            v
+        };
+
+        // 1. Batch A: two files under one capture-tree dir, announced Mirror with a
+        //    batch NAME and UUID of its own (a mirror send still carries both — the
+        //    layout, not their absence, is what must suppress the batch level).
+        let (dir_a, ann_a, files_a) = build_mirror_fixture(
+            tmp.path(),
+            "pkg-mirror-a",
+            &[
+                ("M31/L_0001.fits", "frame-mirror-a1", 0.25),
+                ("M31/L_0002.fits", "frame-mirror-a2", 0.5),
+            ],
+        );
+        sender.serve(&ann_a, &dir_a, None).await.unwrap();
+        sender
+            .announce(
+                receiver_node,
+                &ann_a,
+                "Night A",
+                "batch-mirror-a",
+                &files_a,
+                PackageLayout::Mirror,
+            )
+            .await
+            .unwrap();
+        let row_a = poll_inbound(&store, &ann_a.package_id.0, InboundState::Done).await;
+
+        // 2. Batch B: a THIRD file in the same capture-tree dir, a separate transfer.
+        let (dir_b, ann_b, files_b) = build_mirror_fixture(
+            tmp.path(),
+            "pkg-mirror-b",
+            &[("M31/L_0003.fits", "frame-mirror-b1", 0.75)],
+        );
+        sender.serve(&ann_b, &dir_b, None).await.unwrap();
+        sender
+            .announce(
+                receiver_node,
+                &ann_b,
+                "Night B",
+                "batch-mirror-b",
+                &files_b,
+                PackageLayout::Mirror,
+            )
+            .await
+            .unwrap();
+        let row_b = poll_inbound(&store, &ann_b.package_id.0, InboundState::Done).await;
+
+        // 3. All three files sit ADJACENT in one dir — `<sender_slug>/M31/…`, three
+        //    path components, no batch level from either transfer.
+        let rels = landed_rel();
+        assert_eq!(rels.len(), 3, "all three files landed: {rels:?}");
+        for rel in &rels {
+            let comps: Vec<String> = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .collect();
+            assert_eq!(
+                comps.len(),
+                3,
+                "mirror lands <sender_slug>/<rel_path> — no batch level: {rel:?}"
+            );
+            assert_eq!(
+                comps[1], "M31",
+                "the sender's own tree is preserved: {rel:?}"
+            );
+            for c in &comps {
+                for forbidden in [
+                    "Night A",
+                    "Night B",
+                    "Night_A",
+                    "Night_B",
+                    "batch-mirror-a",
+                    "batch-mirror-b",
+                ] {
+                    assert_ne!(
+                        c, forbidden,
+                        "no path component may carry a batch name/uuid: {rel:?}"
+                    );
+                }
+            }
+        }
+        let names: Vec<String> = rels
+            .iter()
+            .map(|r| r.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "L_0001.fits".to_string(),
+                "L_0002.fits".to_string(),
+                "L_0003.fits".to_string()
+            ],
+            "both batches' files are adjacent in one dir"
+        );
+
+        // 4. Neither row persisted a landing dir — a mirror transfer never claims one.
+        assert!(
+            row_a.landing_dir.is_none(),
+            "a mirror announce resolves no batch landing dir: {:?}",
+            row_a.landing_dir
+        );
+        assert!(
+            row_b.landing_dir.is_none(),
+            "a mirror announce resolves no batch landing dir: {:?}",
+            row_b.landing_dir
+        );
+
+        // 5. Batch C re-sends an EXISTING rel_path with different bytes (fresh uuid
+        //    + a different pixel value, so neither dedup rung catches it): it lands
+        //    `_2`-suffixed and the original file is byte-unchanged.
+        let m31_dir = incoming.join(rels[0].parent().unwrap());
+        let original = std::fs::read(m31_dir.join("L_0001.fits")).unwrap();
+        let (dir_c, ann_c, files_c) = build_mirror_fixture(
+            tmp.path(),
+            "pkg-mirror-c",
+            &[("M31/L_0001.fits", "frame-mirror-c1", 0.125)],
+        );
+        sender.serve(&ann_c, &dir_c, None).await.unwrap();
+        sender
+            .announce(
+                receiver_node,
+                &ann_c,
+                "Night C",
+                "batch-mirror-c",
+                &files_c,
+                PackageLayout::Mirror,
+            )
+            .await
+            .unwrap();
+        poll_inbound(&store, &ann_c.package_id.0, InboundState::Done).await;
+
+        let collided = m31_dir.join("L_0001_2.fits");
+        assert!(
+            collided.exists(),
+            "a same-rel_path re-send lands collision-suffixed: {:?}",
+            landed_rel()
+        );
+        assert_eq!(
+            std::fs::read(m31_dir.join("L_0001.fits")).unwrap(),
+            original,
+            "the original file is never overwritten"
+        );
+        assert_ne!(
+            std::fs::read(&collided).unwrap(),
+            original,
+            "the suffixed file carries the NEW bytes"
+        );
+        assert_eq!(landed_rel().len(), 4, "nothing else moved or vanished");
     }
 
     /// Item 1: a v1 announce (blank name, empty files) creates NO per-file rows and

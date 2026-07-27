@@ -3718,6 +3718,9 @@ struct ServeTickTransport {
     /// The `package_id` minted on the first announce (== the slot's announce id the
     /// engine correlates `ServeProgress` against).
     announced_pid: Arc<std::sync::Mutex<Option<PackageId>>>,
+    /// The `layout` the LAST announce carried (mirror-hierarchy) — the only
+    /// observable of what the engine actually put on the wire.
+    announced_layout: Arc<std::sync::Mutex<Option<PackageLayout>>>,
 }
 
 #[async_trait::async_trait]
@@ -3735,10 +3738,11 @@ impl SharingTransport for ServeTickTransport {
         _batch_name: &str,
         _batch_uuid: &str,
         _files: &[AnnounceFileEntry],
-        _layout: PackageLayout,
+        layout: PackageLayout,
     ) -> anyhow::Result<()> {
         self.announce_count.fetch_add(1, SeqCst);
         *self.announced_pid.lock().unwrap() = Some(a.package_id.clone());
+        *self.announced_layout.lock().unwrap() = Some(layout);
         Ok(())
     }
     async fn fetch(
@@ -3786,6 +3790,67 @@ impl SharingTransport for ServeTickTransport {
     }
 }
 
+/// Mirror-hierarchy T4 pin: the layout a package was ENQUEUED with reaches the
+/// transport's `announce` — the only executable coverage of the mirror emission
+/// path. Everything else in the feature is downstream of this one hand-off: if
+/// the engine dropped the row's `layout` on the floor, the receiver would be
+/// honoring a layout no sender ever puts on the wire, and every mirror test
+/// would still pass. The `Batch` direction is pinned in
+/// `actively_serving_reports_within_freshness_and_decays`.
+#[tokio::test]
+async fn a_mirror_enqueue_announces_the_mirror_layout() {
+    let tmp = tempdir().unwrap();
+    let peer: NodeId = *iroh::SecretKey::generate().public().as_bytes();
+
+    // `_keep_tx` is retained (not dropped) so the worker's event receiver stays
+    // open; no ack is ever sent through it.
+    let (_keep_tx, rx) = mpsc::channel::<TransportEvent>(64);
+    let announce_count = Arc::new(AtomicUsize::new(0));
+    let announced_pid = Arc::new(std::sync::Mutex::new(None::<PackageId>));
+    let announced_layout = Arc::new(std::sync::Mutex::new(None::<PackageLayout>));
+    let transport = Arc::new(ServeTickTransport {
+        node_id: peer,
+        rx: std::sync::Mutex::new(Some(rx)),
+        announce_count: Arc::clone(&announce_count),
+        announced_pid: Arc::clone(&announced_pid),
+        announced_layout: Arc::clone(&announced_layout),
+    });
+
+    let pkg = build_package(
+        &tmp.path().join("src-mirror"),
+        "uuid-mirror",
+        "L_0001.fits",
+        "M31",
+        1024,
+    );
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn_inner(
+        store.clone() as Arc<dyn SyncStore>,
+        transport as Arc<dyn SharingTransport>,
+        peer,
+        SyncConfig {
+            ack_timeout: Duration::from_secs(30),
+        },
+        None,
+        None,
+        None,
+    );
+
+    engine
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Mirror)
+        .await
+        .unwrap();
+
+    wait_until(|| announced_layout.lock().unwrap().is_some(), WAIT).await;
+    assert_eq!(
+        *announced_layout.lock().unwrap(),
+        Some(PackageLayout::Mirror),
+        "a Mirror enqueue must announce Mirror — the receiver's landing gate reads exactly this"
+    );
+
+    engine.shutdown().await;
+}
+
 /// Owner smoke 2026-07-25: after a dropped connection the sender's overall
 /// progress bar fell back to the start and counted the remainder as if it were the
 /// whole batch.
@@ -3804,11 +3869,13 @@ async fn a_resumed_pull_continues_the_progress_instead_of_restarting_it() {
     let (tx, rx) = mpsc::channel::<TransportEvent>(64);
     let announce_count = Arc::new(AtomicUsize::new(0));
     let announced_pid = Arc::new(std::sync::Mutex::new(None::<PackageId>));
+    let announced_layout = Arc::new(std::sync::Mutex::new(None::<PackageLayout>));
     let transport = Arc::new(ServeTickTransport {
         node_id: peer,
         rx: std::sync::Mutex::new(Some(rx)),
         announce_count: Arc::clone(&announce_count),
         announced_pid: Arc::clone(&announced_pid),
+        announced_layout: Arc::clone(&announced_layout),
     });
 
     let events = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3930,11 +3997,13 @@ async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
     let (tx, rx) = mpsc::channel::<TransportEvent>(64);
     let announce_count = Arc::new(AtomicUsize::new(0));
     let announced_pid = Arc::new(std::sync::Mutex::new(None::<PackageId>));
+    let announced_layout = Arc::new(std::sync::Mutex::new(None::<PackageLayout>));
     let transport = Arc::new(ServeTickTransport {
         node_id: peer,
         rx: std::sync::Mutex::new(Some(rx)),
         announce_count: Arc::clone(&announce_count),
         announced_pid: Arc::clone(&announced_pid),
+        announced_layout: Arc::clone(&announced_layout),
     });
 
     // Short-but-generous ack timeout (review fix: 200ms flaked under parallel-test
@@ -4202,11 +4271,13 @@ async fn actively_serving_reports_within_freshness_and_decays() {
     let (tx, rx) = mpsc::channel::<TransportEvent>(64);
     let announce_count = Arc::new(AtomicUsize::new(0));
     let announced_pid = Arc::new(std::sync::Mutex::new(None::<PackageId>));
+    let announced_layout = Arc::new(std::sync::Mutex::new(None::<PackageLayout>));
     let transport = Arc::new(ServeTickTransport {
         node_id: peer,
         rx: std::sync::Mutex::new(Some(rx)),
         announce_count: Arc::clone(&announce_count),
         announced_pid: Arc::clone(&announced_pid),
+        announced_layout: Arc::clone(&announced_layout),
     });
 
     let pkg = build_package(
@@ -4245,6 +4316,14 @@ async fn actively_serving_reports_within_freshness_and_decays() {
 
     wait_until(|| announced_pid.lock().unwrap().is_some(), WAIT).await;
     let pid = announced_pid.lock().unwrap().clone().unwrap();
+
+    // Mirror-hierarchy: the batch path is the default and must keep announcing
+    // `Batch` — the sibling of `a_mirror_enqueue_announces_the_mirror_layout`.
+    assert_eq!(
+        *announced_layout.lock().unwrap(),
+        Some(PackageLayout::Batch),
+        "a Batch enqueue announces Batch"
+    );
 
     tx.send(TransportEvent::ServeProgress {
         package_id: pid.clone(),
