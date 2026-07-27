@@ -86,9 +86,14 @@ function setTab(name) {
   // from the tab now on screen (and a dialog would still be holding a selection
   // snapshot nobody can see).
   else { libPvClose(); libDlgClose(); }
-  // Same rule for the Transfers tab's own dialog: it holds an Escape listener
-  // and, left open, its guard would freeze the list it is no longer over.
-  if (active !== 'transfers') sendToClose();
+  // Same rule for the Transfers tab's own dialogs — the Send-to dialog AND the
+  // one-line confirm. Both raise `transferDialogOpen`, which suspends the list
+  // re-render; left open behind another tab that guard never clears and the
+  // Transfers list freezes for the rest of the session.
+  if (active !== 'transfers') {
+    sendToClose();
+    if (transferConfirmClose) transferConfirmClose();
+  }
 }
 
 function wireTabs() {
@@ -1624,7 +1629,15 @@ async function onTransferAction(btn) {
 // The OK handler closes the dialog BEFORE running onConfirm so the action's
 // follow-up refreshTransfers()/renderTransfers() are not suppressed by the
 // dialog-open guard.
+//
+// `transferConfirmClose` publishes the open dialog's private `close` so a tab
+// switch can dismiss it (setTab). Left open behind another tab, its
+// `transferDialogOpen` guard freezes the transfer list permanently — the list
+// stops re-rendering and nothing on screen can clear it.
+let transferConfirmClose = null;
+
 function openConfirm({ title, bodyHtml, confirmLabel, danger, onConfirm }) {
+  if (transferConfirmClose) transferConfirmClose();   // never stack two
   transferDialogOpen = true;
   const overlay = document.createElement('div');
   overlay.className = 'tconfirm-overlay';
@@ -1637,7 +1650,8 @@ function openConfirm({ title, bodyHtml, confirmLabel, danger, onConfirm }) {
         <button class="${danger ? 'danger' : ''}" data-cd-ok>${esc(confirmLabel)}</button>
       </div>
     </div>`;
-  const close = () => { transferDialogOpen = false; overlay.remove(); };
+  const close = () => { transferDialogOpen = false; transferConfirmClose = null; overlay.remove(); };
+  transferConfirmClose = close;
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay || e.target.closest('[data-cd-cancel]')) { close(); return; }
     if (e.target.closest('[data-cd-ok]')) { close(); onConfirm(); }
@@ -1730,7 +1744,10 @@ async function doDeleteHistory(ref) {
 // Discipline mirrors the Library dialog: every round trip carries a ticket
 // (`sendToSeq`) so a late response never paints into a closed or reopened
 // dialog, Escape always closes (even mid-write — the request finishes on the
-// server and the list shows the truth), and Enter is deliberately unbound.
+// server and the list shows the truth), and Enter is deliberately unbound. A
+// response that lands after the close is still read (`sendToOrphanAnswer`) —
+// silently for a preview, but a failed SEND replaces the standing "still
+// running" flash rather than leaving it as the last word.
 let sendToDlg = null;   // the open dialog's whole state, or null
 let sendToSeq = 0;      // monotonic; a stale response never paints
 
@@ -1901,6 +1918,20 @@ function onSendToClick(e) {
   if (e.target.closest('[data-tsend="send"]')) { sendToStep(true); return; }
 }
 
+// A send whose dialog is gone. Only a CONFIRMED send matters — a preview is a
+// read nobody is waiting for any more. `sendToClose` left a green "send still
+// running — the list will show the result" flash standing, so a failure has to
+// replace it: otherwise the operator is told a transfer was created that never
+// was.
+function sendToOrphanAnswer(confirmed, error) {
+  if (!confirmed) return;
+  if (error) {
+    console.error('[transfers] send-to failed after its dialog closed:', error);
+    transferFlash('send to device failed: ' + error, false);
+  }
+  refreshTransfers();
+}
+
 // One step of the two-step route. `confirm:false` fills the preview, `true`
 // performs — the only difference on this side is which phase the answer lands in.
 async function sendToStep(confirm) {
@@ -1920,15 +1951,22 @@ async function sendToStep(confirm) {
       body: JSON.stringify({ id: d.id, target: d.picked, confirm }),
     });
   } catch (e) { error = (e && e.message) ? e.message : String(e); }
-  if (!sendToDlg || sendToDlg.seq !== seq) return;   // closed / reopened under us
   let gone = false;
   if (!error && !res.ok) {
     gone = res.status === 409;
     let body = '';
     try { body = await res.text(); } catch (e) { body = ''; }
-    if (!sendToDlg || sendToDlg.seq !== seq) return;
     error = String(body || '').trim() || ('HTTP ' + res.status);
   }
+  let rep = null;
+  if (!error) {
+    try { rep = await res.json(); } catch (e) { rep = {}; }
+  }
+  // Closed / reopened under us. The ticket decides only whether this PAINTS: the
+  // answer itself is read first, so a send that failed after the operator hit
+  // Escape replaces the standing "still running" line instead of hiding behind
+  // it.
+  if (!sendToDlg || sendToDlg.seq !== seq) { sendToOrphanAnswer(confirm, error); return; }
   if (error) {
     console.error('[transfers] send-to failed:', error);
     sendToDlg.busy = false;
@@ -1940,9 +1978,6 @@ async function sendToStep(confirm) {
     transferFlash('send to device failed: ' + error, false);
     return;
   }
-  let rep = null;
-  try { rep = await res.json(); } catch (e) { rep = {}; }
-  if (!sendToDlg || sendToDlg.seq !== seq) return;
   sendToDlg.busy = false;
   sendToDlg.sent = Number(rep.sent) || 0;
   sendToDlg.skipped = Number(rep.skipped) || 0;
@@ -2680,8 +2715,13 @@ async function libPvLoad(seq, cur) {
 
 // Bound only while the pane is open (added in libPvOpen, removed in libPvClose),
 // so nothing on this page loses its arrow keys the rest of the time.
+//
+// One Escape closes ONE thing. `libDlgOpen` already closes the preview, so the
+// two overlays should never coexist — but if a future caller stacks them, the
+// action dialog is on top (z-index 65 over 60) and owns the keyboard: this
+// handler stands down entirely rather than closing the pane underneath it.
 function onLibPvKey(e) {
-  if (!libPvState.open) return;
+  if (!libPvState.open || libDlg) return;
   // A held modifier belongs to the browser (⌘←  is Back, Alt+→ is Forward) —
   // never steal it.
   if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
@@ -2719,6 +2759,10 @@ function onLibPreviewClick(e) {
 //    reload. Closing over a live write leaves a standing flash saying it is still
 //    running, and the response, when it lands, paints nothing (its ticket is
 //    stale) but still re-reads the listing, which is where the truth now shows.
+//    An orphaned response is still READ before the ticket is checked
+//    (`libDlgOrphanAnswer`): a failure rewrites that standing line in the error
+//    tone, because "still running" is otherwise the last word on a write that
+//    did not happen.
 //  * Escape closes; **Enter never confirms**. The element focused on open is the
 //    safe one (Cancel on the delete confirm), so a stray Return dismisses.
 //  * No focus trap — Tab still reaches the page behind the scrim. That matches
@@ -2777,6 +2821,12 @@ function libDlgOpen(kind) {
   const host = $('libDialog');
   if (!host) return;
   if (libDlg) libDlgClose();              // never stack two (or two key listeners)
+  // The preview pane is the OTHER full-page overlay on this tab. Two stacked
+  // scrims mean two document-level Escape handlers and an operator who cannot
+  // tell which surface a keypress reaches — so opening an action dialog closes
+  // the preview outright. (The dialog also outranks the preview's z-index, so a
+  // pane opened some other way can never sit on top of a live modal.)
+  libPvClose();
   const seq = ++libDlgSeq;
   libDlg = {
     kind, items, seq,
@@ -2820,9 +2870,25 @@ function libDlgClose() {
   }
 }
 
-// The answer to a write whose dialog is gone. It must never paint into a dialog
-// that closed (or reopened for the other action) — but the listing is now the
-// only surface that can show what really happened, so re-read it.
+// The answer to a write whose dialog is gone.
+//
+// Closing over a live write leaves a STANDING GREEN line ("Send still running —
+// refresh the listing to see the result"). If the write then fails, that line is
+// the only thing on screen about it, and it says the opposite of the truth. So an
+// orphaned answer is still inspected: a failure rewrites the standing line in the
+// error tone with the server's own reason (and hits the console); a success keeps
+// the convergence it already promised. Neither paints into the dialog — the
+// ticket is what guarantees that, and it still holds.
+function libDlgOrphanAnswer(kind, error) {
+  if (error) {
+    console.error('[library] ' + kind + ' failed after its dialog closed:', error);
+    libSay((kind === 'send' ? 'Send' : 'Delete') + ' failed: ' + error, false);
+  }
+  libDlgOrphanDrop();
+}
+
+// Re-read the listing after an orphaned write: it is now the only surface that
+// can show what really happened.
 function libDlgOrphanDrop() {
   if (!libDlgOrphanedWrite) return;
   libDlgOrphanedWrite = false;
@@ -3032,14 +3098,19 @@ async function libSendSubmit() {
       body: JSON.stringify({ targets, items: d.items }),
     });
   } catch (e) { error = (e && e.message) ? e.message : String(e); }
-  // Closed (or reopened) under us: paint nothing, but converge the listing.
-  if (!libDlg || libDlg.seq !== seq) { libDlgOrphanDrop(); return; }
   if (!error && !res.ok) {
     let body = '';
     try { body = await res.text(); } catch (e) { body = ''; }
-    if (!libDlg || libDlg.seq !== seq) { libDlgOrphanDrop(); return; }
     error = String(body || '').trim() || ('HTTP ' + res.status);
   }
+  let rep = null;
+  if (!error) {
+    try { rep = await res.json(); } catch (e) { rep = {}; }
+  }
+  // The answer is fully in hand. ONLY NOW does the ticket decide whether it may
+  // PAINT — reading it first would drop a failure on the floor under the green
+  // "still running" line the close left standing.
+  if (!libDlg || libDlg.seq !== seq) { libDlgOrphanAnswer('send', error); return; }
   if (error) {
     // Including the 400 that names a configured target the engines never got:
     // `busy` clears, the picker re-renders with the same boxes still editable,
@@ -3051,9 +3122,6 @@ async function libSendSubmit() {
     libSay('send failed: ' + error, false);
     return;
   }
-  let rep = null;
-  try { rep = await res.json(); } catch (e) { rep = {}; }
-  if (!libDlg || libDlg.seq !== seq) { libDlgOrphanDrop(); return; }
   libDlg.busy = false;
   libDlg.sent = rep || {};
   libDlg.phase = 'result';
@@ -3266,15 +3334,20 @@ async function libDeleteSubmit() {
   let error = null;
   try { res = await libDeletePost(true); }
   catch (e) { error = (e && e.message) ? e.message : String(e); }
-  // Closed under us: the per-file outcomes are lost to the operator, so the
-  // listing re-read is the only thing that can still tell them what happened.
-  if (!libDlg || libDlg.seq !== seq) { libDlgOrphanDrop(); return; }
   if (!error && !res.ok) {
     let body = '';
     try { body = await res.text(); } catch (e) { body = ''; }
-    if (!libDlg || libDlg.seq !== seq) { libDlgOrphanDrop(); return; }
     error = String(body || '').trim() || ('HTTP ' + res.status);
   }
+  let rep = null;
+  if (!error) {
+    try { rep = await res.json(); } catch (e) { rep = {}; }
+  }
+  // Closed under us: the per-file outcomes are lost to the operator, so the
+  // listing re-read is the only thing that can still tell them what happened —
+  // and a FAILURE gets said out loud rather than left under the green line.
+  // Read the answer before the ticket, never after.
+  if (!libDlg || libDlg.seq !== seq) { libDlgOrphanAnswer('delete', error); return; }
   if (error) {
     console.error('[library] delete failed:', error);
     libDlg.busy = false;
@@ -3283,9 +3356,6 @@ async function libDeleteSubmit() {
     libSay('delete failed: ' + error, false);
     return;
   }
-  let rep = null;
-  try { rep = await res.json(); } catch (e) { rep = {}; }
-  if (!libDlg || libDlg.seq !== seq) { libDlgOrphanDrop(); return; }
   libDlg.busy = false;
   libDlg.outcomes = Array.isArray(rep.outcomes) ? rep.outcomes : [];
   libDlg.phase = 'result';

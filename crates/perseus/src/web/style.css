@@ -315,8 +315,14 @@ tr.lib-picked > td { background: var(--surface-hover); }
    Structure and buttons are the .tconfirm dialog above; `.lib-dlg` only widens
    it and lets a long file list scroll inside the body instead of pushing the
    actions off screen. `hidden` is the visibility switch here too, and the global
-   [hidden] rule beats the `display: flex` below — see the note at the top. */
-.lib-dlg-overlay { position: fixed; inset: 0; z-index: 55; background: var(--scrim);
+   [hidden] rule beats the `display: flex` below — see the note at the top.
+
+   The z-index outranks the preview overlay's 60 on purpose: an action dialog is
+   opened FROM the library (and closes the preview when it opens, see
+   libDlgOpen), so if the two are ever on screen together the dialog is the one
+   being acted on. Ordering it under the preview put a live modal behind a scrim
+   that swallowed its clicks. */
+.lib-dlg-overlay { position: fixed; inset: 0; z-index: 65; background: var(--scrim);
   display: flex; align-items: center; justify-content: center; padding: 1rem; }
 .lib-dlg { max-width: 40rem; }
 .lib-dlg-body { max-height: 60vh; overflow-y: auto; }
