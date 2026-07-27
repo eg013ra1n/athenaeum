@@ -31,7 +31,7 @@ use athenaeum_core::package::{
 };
 use athenaeum_core::sharing::iroh::node::{Role, SharedIrohNode};
 use athenaeum_core::sharing::iroh::random_secret;
-use athenaeum_core::sharing::types::{AnnounceFileEntry, NodeId};
+use athenaeum_core::sharing::types::{AnnounceFileEntry, NodeId, PackageLayout};
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::engine::AddrRefresher;
 use athenaeum_core::sync::store::{StandaloneSyncStore, SyncStore};
@@ -1165,11 +1165,13 @@ impl Agent {
         let built =
             build_package_for_file(&self.config, &capture_dir, file_path, &self.origin_device)?;
         let engines = self.engine_handles();
+        // Mirror-hierarchy T2: placeholder — Task 6 wires the configured layout.
         let (first_id, delivered) = enqueue_package_to_all(
             &engines,
             &built.pkg_dir,
             Some(&built.display_name),
             &built.files,
+            PackageLayout::Batch,
         )
         .await;
         // Fan-out only: tell the coordinator how many targets actually received
@@ -1478,11 +1480,15 @@ pub(crate) fn record_seen(seen: &SeenStore, path: &Path, package_ref: &str) {
 /// `pub(crate)` so the [`crate::batcher`] flush path fans one batch package out
 /// to every target, sharing the exact per-target failure isolation the per-file
 /// path uses.
+///
+/// `layout` is the landing shape stamped on every target's row (mirror-hierarchy
+/// T2) — one package, one shape, so a fan-out lands the same way everywhere.
 pub(crate) async fn enqueue_package_to_all(
     engines: &[Arc<SyncEngineHandle>],
     pkg_dir: &Path,
     display_name: Option<&str>,
     files: &[AnnounceFileEntry],
+    layout: PackageLayout,
 ) -> (Option<i64>, usize) {
     let mut first_id: Option<i64> = None;
     let mut delivered = 0usize;
@@ -1492,6 +1498,7 @@ pub(crate) async fn enqueue_package_to_all(
                 pkg_dir,
                 display_name.map(str::to_string),
                 files.to_vec(),
+                layout,
             )
             .await
         {
@@ -2392,8 +2399,10 @@ mod retention_tests {
             peer: NodeId,
             display_name: Option<&str>,
             files: &[athenaeum_core::sharing::types::AnnounceFileEntry],
+            layout: PackageLayout,
         ) -> Result<i64> {
-            self.0.enqueue(package_ref, peer, display_name, files)
+            self.0
+                .enqueue(package_ref, peer, display_name, files, layout)
         }
         fn replace_outbound_files(
             &self,
@@ -2524,7 +2533,15 @@ mod retention_tests {
         src: &Path,
     ) -> (PathBuf, i64) {
         let pkg = make_package(&config.packages_dir(), src, "M42");
-        let id = store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        let id = store
+            .enqueue(
+                &pkg.to_string_lossy(),
+                PEER,
+                None,
+                &[],
+                PackageLayout::Batch,
+            )
+            .unwrap();
         let meta = std::fs::metadata(src).unwrap();
         let mtime_ms = crate::seen::mtime_millis(meta.modified().ok());
         seen.mark_enqueued(src, meta.len(), mtime_ms, &pkg.to_string_lossy())
@@ -3260,6 +3277,7 @@ mod multi_target_tests {
             &pkg,
             None,
             &[],
+            PackageLayout::Batch,
         )
         .await;
         assert!(first_id.is_some(), "at least one target accepted the package");
@@ -3325,6 +3343,7 @@ mod multi_target_tests {
             &pkg,
             None,
             &[],
+            PackageLayout::Batch,
         )
         .await;
         assert!(first_id.is_some(), "the live target still accepted the package");
@@ -3376,8 +3395,14 @@ mod multi_target_tests {
         let pkg = make_pkg(tmp.path(), "uuid-off", "frame.fits");
         // The fan-out reached both targets → expected = 2.
         coord.register(&pkg, 2);
-        let _id_a = engine_a.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-        let id_b = engine_b.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+        let _id_a = engine_a
+            .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
+            .await
+            .unwrap();
+        let id_b = engine_b
+            .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
+            .await
+            .unwrap();
 
         // A confirms. Under the OLD code this deleted the shared payload.
         wait_until(|| {
@@ -3455,8 +3480,14 @@ mod multi_target_tests {
 
         let pkg = make_pkg(tmp.path(), "uuid-retry", "frame.fits");
         coord.register(&pkg, 2);
-        let id_a = engine_a.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-        let id_b = engine_b.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+        let id_a = engine_a
+            .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
+            .await
+            .unwrap();
+        let id_b = engine_b
+            .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
+            .await
+            .unwrap();
 
         // A confirms (terminal 1/2); B stays pending.
         wait_until(|| {
@@ -3536,8 +3567,14 @@ mod multi_target_tests {
         // root == the config's capture dir, so the rebuild reverse-maps to it.
         let pkg = make_pkg(tmp.path(), "uuid-reclean", "frame.fits");
         coord.register(&pkg, 2);
-        let id_a = engine_a.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
-        let id_b = engine_b.enqueue_package(&pkg, None, Vec::new()).await.unwrap();
+        let id_a = engine_a
+            .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
+            .await
+            .unwrap();
+        let id_b = engine_b
+            .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
+            .await
+            .unwrap();
 
         // Both confirm → all-terminal → the coordinator cleans (manifest-only).
         wait_until(|| !pkg.join("frame.fits").exists()).await;

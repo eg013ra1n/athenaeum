@@ -3818,6 +3818,7 @@ mod tests {
     use crate::supervisor::AgentState;
     use athenaeum_core::package::{ManifestRecord, PayloadKind, MANIFEST_VERSION};
     use athenaeum_core::sharing::loopback::LoopbackNetwork;
+    use athenaeum_core::sharing::types::PackageLayout;
     use athenaeum_core::sharing::SharingTransport;
     use athenaeum_core::sync::{node_id_hex, SyncEngine}; // Direction/HistoryRow come via `super::*`
     use axum::body::Body;
@@ -3846,9 +3847,13 @@ mod tests {
             PEER,
         ));
 
-        let confirmed = store.enqueue("pkg-confirmed", PEER, None, &[]).unwrap();
+        let confirmed = store
+            .enqueue("pkg-confirmed", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
         store.confirm(confirmed, &[]).unwrap();
-        let transferring = store.enqueue("pkg-transferring", PEER, None, &[]).unwrap();
+        let transferring = store
+            .enqueue("pkg-transferring", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
         store
             .set_state(transferring, OutboundState::Transferring)
             .unwrap();
@@ -4800,7 +4805,16 @@ mod tests {
             .collect();
         let refs: Vec<(&str, u64)> = sized.iter().map(|(p, s)| (p.as_str(), *s)).collect();
         let pkg = write_sized_manifest_package(&tmp.path().join("pkg-sized"), &refs);
-        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        let id = state
+            .store
+            .enqueue(
+                &pkg.to_string_lossy(),
+                PEER,
+                None,
+                &[],
+                PackageLayout::Batch,
+            )
+            .unwrap();
         state
             .store
             .set_next_retry_at(id, Some("2026-07-16T12:00:00Z"))
@@ -4881,10 +4895,19 @@ mod tests {
             byte_size: 10,
             frame_uuid: "u-a".into(),
         }];
-        let c = state.store.enqueue(pref, P1, None, &files).unwrap();
+        let c = state
+            .store
+            .enqueue(pref, P1, None, &files, PackageLayout::Batch)
+            .unwrap();
         state.store.confirm(c, &[]).unwrap();
-        let open = state.store.enqueue(pref, P2, None, &files).unwrap();
-        state.store.set_state(open, OutboundState::Announced).unwrap();
+        let open = state
+            .store
+            .enqueue(pref, P2, None, &files, PackageLayout::Batch)
+            .unwrap();
+        state
+            .store
+            .set_state(open, OutboundState::Announced)
+            .unwrap();
         state
             .batches
             .record(pref, "auto", "2026-07-23T10:00:00Z", 1)
@@ -4933,9 +4956,15 @@ mod tests {
             AnnounceFileEntry { rel_path: "a.fits".into(), byte_size: 10, frame_uuid: "u-a".into() },
             AnnounceFileEntry { rel_path: "b.fits".into(), byte_size: 20, frame_uuid: "u-b".into() },
         ];
-        let c1 = state.store.enqueue(pref, P1, None, &files).unwrap();
+        let c1 = state
+            .store
+            .enqueue(pref, P1, None, &files, PackageLayout::Batch)
+            .unwrap();
         state.store.confirm(c1, &[]).unwrap();
-        let c2 = state.store.enqueue(pref, P2, None, &files).unwrap();
+        let c2 = state
+            .store
+            .enqueue(pref, P2, None, &files, PackageLayout::Batch)
+            .unwrap();
         state.store.confirm(c2, &[]).unwrap();
         state
             .batches
@@ -5006,9 +5035,15 @@ mod tests {
             byte_size: 10,
             frame_uuid: "u-a".into(),
         }];
-        let c = state.store.enqueue(pref, P1, None, &files).unwrap();
+        let c = state
+            .store
+            .enqueue(pref, P1, None, &files, PackageLayout::Batch)
+            .unwrap();
         state.store.confirm(c, &[]).unwrap();
-        let d = state.store.enqueue(pref, P2, None, &files).unwrap();
+        let d = state
+            .store
+            .enqueue(pref, P2, None, &files, PackageLayout::Batch)
+            .unwrap();
         state.store.set_state(d, OutboundState::Cancelled).unwrap();
         state
             .store
@@ -5055,7 +5090,10 @@ mod tests {
             byte_size: 10,
             frame_uuid: "u-a".into(),
         }];
-        let c = state.store.enqueue(pref, P1, None, &files).unwrap();
+        let c = state
+            .store
+            .enqueue(pref, P1, None, &files, PackageLayout::Batch)
+            .unwrap();
         // Every per-file outcome is `duplicate` (Done, nothing on the wire), then
         // the batch confirms.
         state
@@ -5101,7 +5139,10 @@ mod tests {
             byte_size: 10,
             frame_uuid: "u-a".into(),
         }];
-        let c = state.store.enqueue(pref, P1, None, &files).unwrap();
+        let c = state
+            .store
+            .enqueue(pref, P1, None, &files, PackageLayout::Batch)
+            .unwrap();
         state.store.confirm(c, &[]).unwrap();
         state
             .batches
@@ -5154,7 +5195,10 @@ mod tests {
             byte_size: 10,
             frame_uuid: "u-a".into(),
         }];
-        let id = state.store.enqueue(pref, P1, None, &files).unwrap();
+        let id = state
+            .store
+            .enqueue(pref, P1, None, &files, PackageLayout::Batch)
+            .unwrap();
         state.store.confirm(id, &[]).unwrap();
         state
             .store
@@ -5215,7 +5259,10 @@ mod tests {
             byte_size: 10,
             frame_uuid: "u-a".into(),
         }];
-        let id = state.store.enqueue(pref, P1, None, &files).unwrap();
+        let id = state
+            .store
+            .enqueue(pref, P1, None, &files, PackageLayout::Batch)
+            .unwrap();
         state.store.set_state(id, OutboundState::Announced).unwrap();
         state
             .batches
@@ -5633,7 +5680,16 @@ mod tests {
     async fn resend_as_new_rejects_non_declined() {
         let (state, tmp) = test_state().await;
         let pkg = make_real_package_dir(tmp.path(), "pkg-plain-cancelled");
-        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        let id = state
+            .store
+            .enqueue(
+                &pkg.to_string_lossy(),
+                PEER,
+                None,
+                &[],
+                PackageLayout::Batch,
+            )
+            .unwrap();
         state.store.set_state(id, OutboundState::Cancelled).unwrap();
 
         let store = Arc::clone(&state.store);
@@ -5654,7 +5710,16 @@ mod tests {
     async fn resend_as_new_diverts_then_rejects_double_click() {
         let (state, tmp) = test_state().await;
         let pkg = make_real_package_dir(tmp.path(), "pkg-declined-divert");
-        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        let id = state
+            .store
+            .enqueue(
+                &pkg.to_string_lossy(),
+                PEER,
+                None,
+                &[],
+                PackageLayout::Batch,
+            )
+            .unwrap();
         state.store.set_state(id, OutboundState::Cancelled).unwrap();
         state
             .store
@@ -5692,7 +5757,16 @@ mod tests {
     async fn retry_failed_resets_same_row_same_id() {
         let (state, tmp) = test_state().await;
         let pkg = make_package_dir(tmp.path(), "pkg-failed-intact", false);
-        let old_id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        let old_id = state
+            .store
+            .enqueue(
+                &pkg.to_string_lossy(),
+                PEER,
+                None,
+                &[],
+                PackageLayout::Batch,
+            )
+            .unwrap();
         state
             .store
             .set_state(old_id, OutboundState::Failed)
@@ -5761,7 +5835,16 @@ mod tests {
     async fn retry_cancelled_resets_same_row_in_place() {
         let (state, tmp) = test_state().await;
         let pkg = make_package_dir(tmp.path(), "pkg-cancelled-intact", false);
-        let old_id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        let old_id = state
+            .store
+            .enqueue(
+                &pkg.to_string_lossy(),
+                PEER,
+                None,
+                &[],
+                PackageLayout::Batch,
+            )
+            .unwrap();
         state
             .store
             .set_state(old_id, OutboundState::Cancelled)
@@ -5789,7 +5872,16 @@ mod tests {
     async fn retry_declined_rejected_with_divert_hint() {
         let (state, tmp) = test_state().await;
         let pkg = make_package_dir(tmp.path(), "pkg-declined", false);
-        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        let id = state
+            .store
+            .enqueue(
+                &pkg.to_string_lossy(),
+                PEER,
+                None,
+                &[],
+                PackageLayout::Batch,
+            )
+            .unwrap();
         state.store.set_state(id, OutboundState::Cancelled).unwrap();
         state
             .store
@@ -5838,7 +5930,16 @@ mod tests {
             "app_version": "0.0.0"
         });
         std::fs::write(pkg.join(MANIFEST_FILENAME), format!("{rec}\n")).unwrap();
-        let id = state.store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        let id = state
+            .store
+            .enqueue(
+                &pkg.to_string_lossy(),
+                PEER,
+                None,
+                &[],
+                PackageLayout::Batch,
+            )
+            .unwrap();
         state.store.set_state(id, OutboundState::Failed).unwrap();
 
         let store = Arc::clone(&state.store);
@@ -5926,7 +6027,10 @@ mod tests {
     #[tokio::test]
     async fn status_counts_bucket_cancelled() {
         let (state, _tmp) = test_state().await;
-        let id = state.store.enqueue("pkg-cancelled", PEER, None, &[]).unwrap();
+        let id = state
+            .store
+            .enqueue("pkg-cancelled", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
         state.store.set_state(id, OutboundState::Cancelled).unwrap();
         let app = build_router(state, None);
         let v = body_json(get(&app, "/api/status").await).await;
@@ -6861,8 +6965,26 @@ mod tests {
         ];
         // Two outbound rows (one per target) under the same package_ref, each with
         // the same two-file manifest, plus the batch record that groups them.
-        state.store.enqueue("/data/packages/batch-xyz", P1, None, &files).unwrap();
-        state.store.enqueue("/data/packages/batch-xyz", P2, None, &files).unwrap();
+        state
+            .store
+            .enqueue(
+                "/data/packages/batch-xyz",
+                P1,
+                None,
+                &files,
+                PackageLayout::Batch,
+            )
+            .unwrap();
+        state
+            .store
+            .enqueue(
+                "/data/packages/batch-xyz",
+                P2,
+                None,
+                &files,
+                PackageLayout::Batch,
+            )
+            .unwrap();
         state
             .batches
             .record("/data/packages/batch-xyz", "auto", "2026-07-23T10:00:00Z", 2)
@@ -6982,8 +7104,14 @@ mod tests {
             g.insert(node_id_hex(&P1), "Studio".to_string());
             g.insert(node_id_hex(&P2), "NAS".to_string());
         }
-        let id1 = state.store.enqueue("/data/packages/evt", P1, None, &[]).unwrap();
-        let id2 = state.store.enqueue("/data/packages/evt", P2, None, &[]).unwrap();
+        let id1 = state
+            .store
+            .enqueue("/data/packages/evt", P1, None, &[], PackageLayout::Batch)
+            .unwrap();
+        let id2 = state
+            .store
+            .enqueue("/data/packages/evt", P2, None, &[], PackageLayout::Batch)
+            .unwrap();
 
         // Interleave the two journals; distinct kinds per target make the
         // name-attachment assertion independent of the (asserted) ts ordering.
@@ -7095,7 +7223,7 @@ mod tests {
         }
         let id_s = state
             .store
-            .enqueue("/pkg/sending", PEER, None, &[])
+            .enqueue("/pkg/sending", PEER, None, &[], PackageLayout::Batch)
             .unwrap();
         state
             .store
@@ -7103,12 +7231,12 @@ mod tests {
             .unwrap();
         let id_d = state
             .store
-            .enqueue("/pkg/delivered", PEER, None, &[])
+            .enqueue("/pkg/delivered", PEER, None, &[], PackageLayout::Batch)
             .unwrap();
         state.store.confirm(id_d, &[]).unwrap();
         let id_x = state
             .store
-            .enqueue("/pkg/declined", PEER, None, &[])
+            .enqueue("/pkg/declined", PEER, None, &[], PackageLayout::Batch)
             .unwrap();
         state
             .store
@@ -7259,7 +7387,7 @@ mod tests {
             .unwrap();
         let id = state
             .store
-            .enqueue("/pkg/delivered", PEER, None, &[])
+            .enqueue("/pkg/delivered", PEER, None, &[], PackageLayout::Batch)
             .unwrap();
         state.store.confirm(id, &[]).unwrap();
         // The live linkage the fate anchor reads (see the note in
@@ -8100,7 +8228,10 @@ mod tests {
                 &[("payload.fits".to_string(), source.to_path_buf())],
             )
             .unwrap();
-        let id = st.store.enqueue(&pkg_ref, PEER, None, &[]).unwrap();
+        let id = st
+            .store
+            .enqueue(&pkg_ref, PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
         if state == OutboundState::Confirmed {
             st.store.confirm(id, &[]).unwrap();
         } else {
@@ -8792,7 +8923,10 @@ mod tests {
         }
 
         let pkg_ref = pkg.display().to_string();
-        let row_id = state.store.enqueue(&pkg_ref, PEER, None, &[]).unwrap();
+        let row_id = state
+            .store
+            .enqueue(&pkg_ref, PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
         state.store.confirm(row_id, &[]).unwrap();
         state
             .batches
@@ -9029,7 +9163,10 @@ mod tests {
     #[tokio::test]
     async fn send_to_while_detached_is_503() {
         let (state, _tmp, _cap) = library_test_state().await;
-        let id = state.store.enqueue("pkg-x", PEER, None, &[]).unwrap();
+        let id = state
+            .store
+            .enqueue("pkg-x", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
         state.store.confirm(id, &[]).unwrap();
         let app = build_router(state, None);
         let res = post_json(&app, "/api/transfers/send-to", send_to_body(id, "obs-b", false)).await;

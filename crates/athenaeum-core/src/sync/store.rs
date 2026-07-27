@@ -553,12 +553,16 @@ pub trait SyncStore: Send + Sync {
     /// id. `display_name`/`files` may be `None`/empty (Perseus, a nameless retry).
     /// See [`insert_outbound_with_files`] for the race-kill rationale (Transfers
     /// Status Model v2 §D1/§D4).
+    ///
+    /// `layout` is the transfer's landing shape (mirror-hierarchy T2), stamped in
+    /// the same transaction as the row.
     fn enqueue(
         &self,
         package_ref: &str,
         peer: NodeId,
         display_name: Option<&str>,
         files: &[AnnounceFileEntry],
+        layout: PackageLayout,
     ) -> Result<i64>;
 
     /// Replace the whole per-file row set for an outbound batch (§D4). Delegates
@@ -2492,25 +2496,34 @@ pub fn delete_history_for_package(
 /// `files` are the per-payload `(rel_path, byte_size, frame_uuid)` triples
 /// ([`AnnounceFileEntry`]); each becomes a `pending` per-file row. An empty
 /// `files` (Perseus / a nameless retry) writes just the row + name.
+///
+/// `layout` is the transfer's landing shape ([`PackageLayout`], mirror-hierarchy
+/// T1/T2), stamped in this same transaction so the announce path can never read
+/// a row without it. It is decided ONCE, at enqueue: a resend reuses the row and
+/// therefore keeps the stamp — re-labelling an attempt mid-flight would move files
+/// the receiver already landed.
 pub fn insert_outbound_with_files(
     conn: &Connection,
     package_ref: &str,
     peer_hex: &str,
     display_name: Option<&str>,
     files: &[AnnounceFileEntry],
+    layout: PackageLayout,
 ) -> Result<i64> {
     let tx = conn
         .unchecked_transaction()
         .context("begin insert_outbound_with_files")?;
     tx.execute(
-        "INSERT INTO sync_outbound (package_ref, peer, state, attempts, created_at, display_name)
-         VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+        "INSERT INTO sync_outbound
+         (package_ref, peer, state, attempts, created_at, display_name, layout)
+         VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
         params![
             package_ref,
             peer_hex,
             OutboundState::Queued.as_str(),
             now_iso(),
             display_name,
+            layout.as_str(),
         ],
     )
     .context("insert sync_outbound")?;
@@ -2665,9 +2678,11 @@ impl SyncStore for StandaloneSyncStore {
         peer: NodeId,
         display_name: Option<&str>,
         files: &[AnnounceFileEntry],
+        layout: PackageLayout,
     ) -> Result<i64> {
         let conn = self.conn.lock().expect("sync store mutex poisoned");
-        insert_outbound_with_files(&conn, package_ref, &node_id_hex(&peer), display_name, files)
+        let peer_hex = node_id_hex(&peer);
+        insert_outbound_with_files(&conn, package_ref, &peer_hex, display_name, files, layout)
     }
 
     fn replace_outbound_files(&self, outbound_id: i64, files: &[OutboundFileRow]) -> Result<()> {
@@ -2993,9 +3008,11 @@ impl SyncStore for CatalogSyncStore {
         peer: NodeId,
         display_name: Option<&str>,
         files: &[AnnounceFileEntry],
+        layout: PackageLayout,
     ) -> Result<i64> {
         let conn = self.lock_conn();
-        insert_outbound_with_files(&conn, package_ref, &node_id_hex(&peer), display_name, files)
+        let peer_hex = node_id_hex(&peer);
+        insert_outbound_with_files(&conn, package_ref, &peer_hex, display_name, files, layout)
     }
 
     fn replace_outbound_files(&self, outbound_id: i64, files: &[OutboundFileRow]) -> Result<()> {
@@ -3199,9 +3216,15 @@ mod tests {
         let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
 
         // Three packages in distinct states.
-        let queued = store.enqueue("pkg-queued", PEER, None, &[]).unwrap();
-        let transferring = store.enqueue("pkg-transferring", PEER, None, &[]).unwrap();
-        let confirmed = store.enqueue("pkg-confirmed", PEER, None, &[]).unwrap();
+        let queued = store
+            .enqueue("pkg-queued", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
+        let transferring = store
+            .enqueue("pkg-transferring", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
+        let confirmed = store
+            .enqueue("pkg-confirmed", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
         store
             .set_state(transferring, OutboundState::Transferring)
             .unwrap();
@@ -3383,7 +3406,9 @@ mod tests {
     fn next_retry_at_roundtrips_and_clears() {
         let tmp = tempfile::tempdir().unwrap();
         let store = StandaloneSyncStore::open(tmp.path().join("s.db")).unwrap();
-        let id = store.enqueue("/tmp/pkg", [7u8; 32], None, &[]).unwrap();
+        let id = store
+            .enqueue("/tmp/pkg", [7u8; 32], None, &[], PackageLayout::Batch)
+            .unwrap();
         store
             .set_next_retry_at(id, Some("2026-07-15T12:00:00Z"))
             .unwrap();
@@ -3407,7 +3432,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
 
-        let id = store.enqueue("pkg", PEER, None, &[]).unwrap();
+        let id = store
+            .enqueue("pkg", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
         assert_eq!(
             store.get_outbound(id).unwrap().unwrap().last_error,
             None,
@@ -3854,8 +3881,15 @@ mod tests {
 
         // Insert via the current signature (layout is not a parameter yet) — the
         // column default must back-fill 'batch'.
-        let id = insert_outbound_with_files(&conn, "/tmp/pkg-x", &node_id_hex(&PEER), None, &[])
-            .unwrap();
+        let id = insert_outbound_with_files(
+            &conn,
+            "/tmp/pkg-x",
+            &node_id_hex(&PEER),
+            None,
+            &[],
+            PackageLayout::Batch,
+        )
+        .unwrap();
         let row = outbound_row_by_id(&conn, id).unwrap().unwrap();
         assert_eq!(row.layout, PackageLayout::Batch, "default layout is batch");
 
@@ -3911,6 +3945,85 @@ mod tests {
         // Idempotent: a second pass is a no-op, not an error.
         ensure_outbound_columns(&conn).unwrap();
         assert!(cols(&conn, "sync_outbound").contains(&"layout".to_string()));
+    }
+
+    /// Mirror-hierarchy T2: the layout the caller chose is stamped onto the row at
+    /// INSERT — inside the enqueue transaction, not by a later UPDATE — so the row
+    /// is never visible to the announce path without its landing shape. A resend
+    /// reset (a targeted UPDATE of the state/attempt columns) must leave that stamp
+    /// alone: an attempt re-sends the SAME transfer, and re-labelling its shape
+    /// mid-flight would move files the receiver already landed.
+    #[test]
+    fn enqueue_stamps_layout_on_the_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sync.db");
+        StandaloneSyncStore::open(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+
+        let id = insert_outbound_with_files(
+            &conn,
+            "/tmp/pkg-m",
+            &node_id_hex(&PEER),
+            Some("Night"),
+            &[],
+            PackageLayout::Mirror,
+        )
+        .unwrap();
+        assert_eq!(
+            outbound_row_by_id(&conn, id).unwrap().unwrap().layout,
+            PackageLayout::Mirror,
+            "the stamp is written at insert"
+        );
+
+        // A resend reset (targeted UPDATE) must preserve the stamp.
+        reset_outbound_for_resend(&conn, id, "new-wire-id").unwrap();
+        assert_eq!(
+            outbound_row_by_id(&conn, id).unwrap().unwrap().layout,
+            PackageLayout::Mirror,
+            "resend reset preserves layout"
+        );
+
+        // The other arm of the same path: a `Batch` caller stamps `batch`.
+        let bid = insert_outbound_with_files(
+            &conn,
+            "/tmp/pkg-b",
+            &node_id_hex(&PEER),
+            None,
+            &[],
+            PackageLayout::Batch,
+        )
+        .unwrap();
+        assert_eq!(
+            outbound_row_by_id(&conn, bid).unwrap().unwrap().layout,
+            PackageLayout::Batch,
+        );
+    }
+
+    /// Mirror-hierarchy T2: the stamp travels through the trait too — the engine
+    /// worker only ever reaches the column via [`SyncStore::enqueue`], so the
+    /// delegation is pinned here and not only at the free-function seam.
+    #[test]
+    fn store_enqueue_stamps_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sync.db");
+        let store = StandaloneSyncStore::open(&path).unwrap();
+
+        let mirror = store
+            .enqueue("pkg-mirror", PEER, None, &[], PackageLayout::Mirror)
+            .unwrap();
+        let batch = store
+            .enqueue("pkg-batch", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(
+            outbound_row_by_id(&conn, mirror).unwrap().unwrap().layout,
+            PackageLayout::Mirror
+        );
+        assert_eq!(
+            outbound_row_by_id(&conn, batch).unwrap().unwrap().layout,
+            PackageLayout::Batch
+        );
     }
 
     /// tv2 §D1: `display_name` write paths round-trip on both directions and clear
@@ -4339,7 +4452,9 @@ mod tests {
         let path = tmp.path().join("sync.db");
         let store = StandaloneSyncStore::open(&path).unwrap();
         // A row present on the fresh DB must survive a re-open (no spurious wipe).
-        let id = store.enqueue("pkg", PEER, None, &[]).unwrap();
+        let id = store
+            .enqueue("pkg", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
         drop(store);
         StandaloneSyncStore::open(&path).unwrap(); // second open — idempotent
 
@@ -4528,8 +4643,15 @@ mod tests {
                 frame_uuid: "u-b".into(),
             },
         ];
-        let id = insert_outbound_with_files(&conn, "pkg", &node_id_hex(&PEER), Some("M42"), &files)
-            .unwrap();
+        let id = insert_outbound_with_files(
+            &conn,
+            "pkg",
+            &node_id_hex(&PEER),
+            Some("M42"),
+            &files,
+            PackageLayout::Batch,
+        )
+        .unwrap();
         conn.execute("UPDATE sync_outbound SET attempts = 1, wire_package_id = 'wire-old', confirmed_at = 't0', last_error = 'boom', next_retry_at = 't1', state = 'confirmed' WHERE id = ?1", params![id]).unwrap();
         set_outbound_file_state(
             &conn,
@@ -4609,7 +4731,9 @@ mod tests {
     fn announce_retry_bumps_attempts_but_not_generation() {
         let tmp = tempfile::tempdir().unwrap();
         let store = StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap();
-        let id = store.enqueue("pkg", PEER, None, &[]).unwrap();
+        let id = store
+            .enqueue("pkg", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
 
         // Fresh enqueue → generation 1 (attempt 1), attempts 0.
         let row = store.get_outbound(id).unwrap().unwrap();
@@ -4904,9 +5028,11 @@ mod tests {
 
         // Two rows of one fan-out batch: same package_ref, two distinct peers.
         let peer2: NodeId = [9u8; 32];
-        let id1 = store.enqueue("pkg-fanout", PEER, Some("M42"), &[]).unwrap();
+        let id1 = store
+            .enqueue("pkg-fanout", PEER, Some("M42"), &[], PackageLayout::Batch)
+            .unwrap();
         let id2 = store
-            .enqueue("pkg-fanout", peer2, Some("M42"), &[])
+            .enqueue("pkg-fanout", peer2, Some("M42"), &[], PackageLayout::Batch)
             .unwrap();
 
         // Two per-file rows on each row (the row id is the parent key).
@@ -4971,7 +5097,9 @@ mod tests {
     fn list_sync_events_for_reads_the_sent_journal_of_one_row() {
         let tmp = tempfile::tempdir().unwrap();
         let store = StandaloneSyncStore::open(tmp.path().join("s.db")).unwrap();
-        let id = store.enqueue("pkg", PEER, None, &[]).unwrap();
+        let id = store
+            .enqueue("pkg", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
 
         store
             .append_sync_event(Direction::Sent, &id.to_string(), "enqueued", None)
@@ -5002,7 +5130,9 @@ mod tests {
         );
 
         // A different row's journal is never mixed in (scoped to one batch_key).
-        let other = store.enqueue("pkg2", PEER, None, &[]).unwrap();
+        let other = store
+            .enqueue("pkg2", PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
         store
             .append_sync_event(Direction::Sent, &other.to_string(), "enqueued", None)
             .unwrap();

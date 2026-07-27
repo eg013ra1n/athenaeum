@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use athenaeum_core::package::{self, read_manifest, ManifestRecord, MANIFEST_FILENAME};
-use athenaeum_core::sharing::types::AnnounceFileEntry;
+use athenaeum_core::sharing::types::{AnnounceFileEntry, PackageLayout};
 use athenaeum_core::sync::store::{StandaloneSyncStore, SyncStore};
 use athenaeum_core::sync::{
     OutboundFileRow, OutboundFileState, OutboundRow, OutboundState, SharedPackageCleanup,
@@ -730,8 +730,9 @@ pub async fn send_batch_to_target(
 
     // The worker inserts the new row (+ per-file pending rows) in one
     // transaction and replies with its id — no pre-insert here.
+    // Mirror-hierarchy T2: placeholder — Task 6 wires the configured layout.
     let new_id = match engine
-        .enqueue_package(&new_dir, Some(display_name), files)
+        .enqueue_package(&new_dir, Some(display_name), files, PackageLayout::Batch)
         .await
     {
         Ok(id) => id,
@@ -1163,7 +1164,15 @@ mod tests {
             Arc::new(StandaloneSyncStore::open(tmp.path().join("perseus.db")).unwrap());
         let seen = SeenStore::open(tmp.path().join("perseus.db")).unwrap();
         let batches = BatchStore::open(tmp.path().join("perseus.db")).unwrap();
-        let row_id = store.enqueue(&pkg.to_string_lossy(), PEER, None, &[]).unwrap();
+        let row_id = store
+            .enqueue(
+                &pkg.to_string_lossy(),
+                PEER,
+                None,
+                &[],
+                PackageLayout::Batch,
+            )
+            .unwrap();
         store.set_state(row_id, OutboundState::Cancelled).unwrap();
         store
             .set_last_error(row_id, Some(CANCELLED_BY_RECEIVER_DETAIL))
@@ -1266,7 +1275,13 @@ mod tests {
         // A sibling target's row on the SAME package dir.
         let sibling_peer: [u8; 32] = [0xCD; 32];
         h.store
-            .enqueue(&h.pkg.to_string_lossy(), sibling_peer, None, &[])
+            .enqueue(
+                &h.pkg.to_string_lossy(),
+                sibling_peer,
+                None,
+                &[],
+                PackageLayout::Batch,
+            )
             .unwrap();
         let coord = Arc::new(SharedPackageCleanup::new());
         coord.register(&h.pkg, 2);
@@ -1390,7 +1405,9 @@ mod tests {
         let seen = SeenStore::open(tmp.path().join("perseus.db")).unwrap();
         let batches = BatchStore::open(tmp.path().join("perseus.db")).unwrap();
         let pkg_ref = pkg.to_string_lossy().into_owned();
-        let row_id = store.enqueue(&pkg_ref, PEER, None, &[]).unwrap();
+        let row_id = store
+            .enqueue(&pkg_ref, PEER, None, &[], PackageLayout::Batch)
+            .unwrap();
         if delivered {
             store.confirm(row_id, &[]).unwrap();
         } else {

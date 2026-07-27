@@ -70,6 +70,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use athenaeum_core::sharing::types::PackageLayout;
 use athenaeum_core::sync::{SharedPackageCleanup, SyncEngineHandle};
 use chrono::{DateTime, Local};
 use tokio::sync::{mpsc, watch};
@@ -385,11 +386,13 @@ async fn deliver_batch(
     // unbuildable); those are deliberately absent from `included`.
     let n = built.included.len();
 
+    // Mirror-hierarchy T2: placeholder — Task 6 wires the configured layout.
     let (first_id, delivered) = enqueue_package_to_all(
         engines,
         &built.pkg_dir,
         Some(&built.display_name),
         &built.files,
+        PackageLayout::Batch,
     )
     .await;
     // Fan-out only: register the delivered target count so the shared payload is

@@ -27,8 +27,8 @@ use crate::package::{
 use crate::sharing::iroh::proto::{FullHashEntry, OfferEntry};
 use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
 use crate::sharing::types::{
-    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome,
-    RevokeReason, StartInfo, TransportEvent,
+    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, PackageLayout,
+    ReceiptOutcome, RevokeReason, StartInfo, TransportEvent,
 };
 use crate::sharing::{noop_fetch_sink, FetchSink, SharingTransport};
 use crate::sync::diagnostics::ConnectClass;
@@ -236,7 +236,7 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -290,6 +290,46 @@ async fn happy_path_reaches_confirmed_and_history_has_both_events() {
     engine.shutdown().await;
 }
 
+/// Mirror-hierarchy T2: the caller's landing shape survives the hop through
+/// `Command::Process` into the durable row. The engine is the ONLY producer of
+/// `sync_outbound` rows in production, so this closes the seam the store tests
+/// leave open — that `enqueue_package`'s argument is what the worker actually
+/// hands `SyncStore::enqueue`, and not a default silently substituted en route.
+///
+/// No receiver is spawned: the worker inserts the row inside the enqueue
+/// transaction and replies with its id BEFORE any announce, so the stamp is
+/// readable without a transfer completing.
+#[tokio::test]
+async fn enqueue_package_stamps_the_requested_layout_on_the_row() {
+    let tmp = tempdir().unwrap();
+    let net = LoopbackNetwork::new();
+
+    let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
+    let engine = SyncEngine::spawn(
+        store.clone() as Arc<dyn SyncStore>,
+        Arc::new(net.endpoint()),
+        [0xAAu8; 32],
+    );
+
+    for (name, layout) in [
+        ("uuid-mirror", PackageLayout::Mirror),
+        ("uuid-batch", PackageLayout::Batch),
+    ] {
+        let pkg = build_package(&tmp.path().join(name), name, "frame1.fits", "M42", 4096);
+        let id = engine
+            .enqueue_package(&pkg, None, Vec::new(), layout)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_outbound(id).unwrap().unwrap().layout,
+            layout,
+            "the row carries the layout the caller asked for ({layout:?})"
+        );
+    }
+
+    engine.shutdown().await;
+}
+
 /// tv2 §D1 (item 5): the outbound row's `display_name` is threaded onto every
 /// sent history row (`batch_name`) — so the transfer log shows the named batch on
 /// the send side too — after a full confirmed loopback transfer.
@@ -319,7 +359,12 @@ async fn sent_history_rows_carry_batch_name_after_confirm() {
 
     // Enqueue WITH a human batch name (the send path supplies it in production).
     let id = engine
-        .enqueue_package(&pkg, Some("My M42 Batch".to_string()), Vec::new())
+        .enqueue_package(
+            &pkg,
+            Some("My M42 Batch".to_string()),
+            Vec::new(),
+            PackageLayout::Batch,
+        )
         .await
         .unwrap();
     wait_until(
@@ -419,7 +464,7 @@ async fn confirmed_package_is_released_from_transport() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -508,7 +553,7 @@ async fn sender_emits_coarse_progress_and_finished_events() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -616,7 +661,7 @@ async fn sent_progress_carries_bytes() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -700,7 +745,7 @@ async fn sent_upload_complete_precedes_confirmed() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -794,7 +839,7 @@ async fn sent_per_file_upload_progress_keyed_by_row_id() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -882,7 +927,7 @@ async fn sent_per_file_upload_progress_emits_full_nested_rel_path() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -951,7 +996,7 @@ async fn mid_transfer_abort_leaves_transferring_then_resume_completes() {
         },
     );
     let id = engine_a
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -1077,7 +1122,7 @@ async fn resume_reannounce_reuses_same_wire_package_id() {
         },
     );
     let id = engine_a
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -1162,7 +1207,7 @@ async fn reenqueue_same_dir_mints_a_new_wire_package_id() {
 
     // First enqueue: a wire id is minted + persisted during the announce build.
     let id1 = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(|| wire_of(id1).is_some(), WAIT).await;
@@ -1170,7 +1215,7 @@ async fn reenqueue_same_dir_mints_a_new_wire_package_id() {
 
     // Re-enqueue the SAME dir → a DISTINCT row that mints its own fresh id.
     let id2 = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     assert_ne!(id1, id2, "a re-enqueue is a distinct outbound row");
@@ -1216,7 +1261,7 @@ async fn ack_lost_then_duplicate_ack_confirms_once() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -1288,7 +1333,7 @@ async fn absent_peer_probes_with_one_package_then_presence_releases_all() {
         );
         ids.push(
             engine
-                .enqueue_package(&pkg, None, Vec::new())
+                .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
                 .await
                 .unwrap(),
         );
@@ -1411,11 +1456,11 @@ async fn absent_head_is_re_elected_when_it_terminalizes() {
         1024,
     );
     let head = engine
-        .enqueue_package(&pkg_head, None, Vec::new())
+        .enqueue_package(&pkg_head, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     let tail = engine
-        .enqueue_package(&pkg_tail, None, Vec::new())
+        .enqueue_package(&pkg_tail, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -1472,7 +1517,7 @@ async fn presence_does_not_re_announce_a_package_awaiting_ack() {
         1024,
     );
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(|| attempts_of(&store, id) >= 1, WAIT).await;
@@ -1602,7 +1647,7 @@ async fn timeouts_back_off_forever_without_failing() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -1820,7 +1865,7 @@ async fn ack_timeout_backoff_log_carries_delay_and_next_retry() {
         },
     );
     let _id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -1901,7 +1946,7 @@ async fn missing_package_dir_fails_terminally() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -1990,7 +2035,7 @@ async fn peer_offline_backs_off_and_stays_pending() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -2067,7 +2112,7 @@ async fn failed_announce_last_error_carries_not_started_class_prefix() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -2132,7 +2177,7 @@ async fn first_attempt_peer_offline_then_online_completes() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -2224,7 +2269,7 @@ async fn cancel_moves_to_cancelled_state() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -2333,7 +2378,7 @@ async fn all_cancelled_ack_marks_cancelled_by_receiver() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -2450,7 +2495,7 @@ async fn confirm_cleans_payloads_to_manifest_only() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -2503,7 +2548,13 @@ async fn startup_heal_cleans_confirmed_payloads() {
     // Seed a confirmed outbound row pointing at the package dir.
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let id = store
-        .enqueue(&pkg.to_string_lossy(), receiver_id, None, &[])
+        .enqueue(
+            &pkg.to_string_lossy(),
+            receiver_id,
+            None,
+            &[],
+            PackageLayout::Batch,
+        )
         .unwrap();
     store.confirm(id, &[]).unwrap();
 
@@ -2573,7 +2624,7 @@ async fn cancelled_package_keeps_payloads() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -2640,7 +2691,7 @@ async fn sink_defers_shared_payload_cleanup_until_all_targets_terminal() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -2710,7 +2761,7 @@ async fn ack_from_unexpected_peer_does_not_confirm() {
     });
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2755,7 +2806,7 @@ async fn empty_ack_does_not_confirm() {
     });
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -2798,10 +2849,22 @@ async fn crash_resume_only_redrives_its_own_peers_rows() {
     // each bound to its own peer.
     let store = Arc::new(StandaloneSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let id_a = store
-        .enqueue(&pkg_a.to_string_lossy(), receiver_a_id, None, &[])
+        .enqueue(
+            &pkg_a.to_string_lossy(),
+            receiver_a_id,
+            None,
+            &[],
+            PackageLayout::Batch,
+        )
         .unwrap();
     let id_b = store
-        .enqueue(&pkg_b.to_string_lossy(), receiver_b_id, None, &[])
+        .enqueue(
+            &pkg_b.to_string_lossy(),
+            receiver_b_id,
+            None,
+            &[],
+            PackageLayout::Batch,
+        )
         .unwrap();
 
     // ONE engine, bound to peer A only.
@@ -2925,7 +2988,13 @@ async fn announce_carries_batch_name_and_file_manifest() {
     // sync tables the standalone store does.
     let store = Arc::new(super::store::CatalogSyncStore::open(tmp.path().join("sync.db")).unwrap());
     let id = store
-        .enqueue(&pkg.to_string_lossy(), receiver_id, None, &[])
+        .enqueue(
+            &pkg.to_string_lossy(),
+            receiver_id,
+            None,
+            &[],
+            PackageLayout::Batch,
+        )
         .unwrap();
     crate::sync::store::set_outbound_display_name(&store.lock_conn(), id, Some("Orion Nebula"))
         .unwrap();
@@ -3108,7 +3177,7 @@ async fn all_duplicate_package_terminalizes_without_announce() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -3185,7 +3254,7 @@ async fn negotiate_error_falls_back_to_full_announce() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -3262,7 +3331,7 @@ async fn mixed_batch_serves_only_want_subset() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -3402,7 +3471,7 @@ async fn project_package_announces_via_announce_project() {
         receiver_id,
     );
     let _id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -3585,7 +3654,7 @@ async fn retry_path_re_resolves_and_re_adds_peer_address() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     // The ack never comes, so the ack deadline elapses and the Retry path runs,
@@ -3775,7 +3844,7 @@ async fn a_resumed_pull_continues_the_progress_instead_of_restarting_it() {
         })
         .collect();
     let id = engine
-        .enqueue_package(&pkg, None, announce_files)
+        .enqueue_package(&pkg, None, announce_files, PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(|| announced_pid.lock().unwrap().is_some(), WAIT).await;
@@ -3888,7 +3957,7 @@ async fn serve_activity_defers_ack_timeout_and_cancels_armed_retry() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -4157,7 +4226,7 @@ async fn actively_serving_reports_within_freshness_and_decays() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -4355,7 +4424,7 @@ async fn retry_replaces_stale_addressing_after_classified_dial_failure() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -4452,7 +4521,7 @@ async fn retry_refresh_unavailable_warns_with_peer() {
         Some(refresher),
     );
     let _id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -4527,7 +4596,7 @@ async fn park_in_long_backoff(
     );
 
     let id = engine
-        .enqueue_package(&pkg, None, Vec::new())
+        .enqueue_package(&pkg, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -4704,11 +4773,11 @@ async fn kick_all_resets_every_pending_package() {
     );
 
     let id_a = engine
-        .enqueue_package(&pkg_a, None, Vec::new())
+        .enqueue_package(&pkg_a, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     let id_b = engine
-        .enqueue_package(&pkg_b, None, Vec::new())
+        .enqueue_package(&pkg_b, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -4975,7 +5044,12 @@ async fn enqueue_writes_row_files_and_name_before_first_announce() {
 
     let files = entries(&[("uuid-a", "a.fits", 2048), ("uuid-b", "b.fits", 4096)]);
     let id = engine
-        .enqueue_package(&pkg, Some("M42 — 2 lights".to_string()), files)
+        .enqueue_package(
+            &pkg,
+            Some("M42 — 2 lights".to_string()),
+            files,
+            PackageLayout::Batch,
+        )
         .await
         .unwrap();
 
@@ -5028,7 +5102,10 @@ async fn want_subset_settles_excluded_duplicate_and_wanted_ingested() {
         receiver_id,
     );
     let files = entries(&[("uuid-a", "a.fits", 2048), ("uuid-b", "b.fits", 4096)]);
-    let id = engine.enqueue_package(&pkg, None, files).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, files, PackageLayout::Batch)
+        .await
+        .unwrap();
 
     wait_until(
         || state_of(&store, id) == Some(OutboundState::Confirmed),
@@ -5089,7 +5166,10 @@ async fn serve_complete_persists_delivered_uploaded_then_restart_confirms() {
         receiver_id,
     );
     let files = entries(&[("uuid-a", "a.fits", 2048), ("uuid-b", "b.fits", 4096)]);
-    let id = engine_a.enqueue_package(&pkg, None, files).await.unwrap();
+    let id = engine_a
+        .enqueue_package(&pkg, None, files, PackageLayout::Batch)
+        .await
+        .unwrap();
 
     // Phase 1: the peer pulled everything (ServeComplete) but did not ack → the
     // batch persists `Delivered` and every file row is `uploaded`.
@@ -5162,7 +5242,12 @@ async fn ack_timeout_journals_retry_then_recovery_confirms_and_clears_error() {
         },
     );
     let id = engine
-        .enqueue_package(&pkg, None, entries(&[("uuid-to", "f.fits", 4096)]))
+        .enqueue_package(
+            &pkg,
+            None,
+            entries(&[("uuid-to", "f.fits", 4096)]),
+            PackageLayout::Batch,
+        )
         .await
         .unwrap();
 
@@ -5246,7 +5331,12 @@ async fn rejected_receipt_settles_file_with_rejected_outcome() {
         },
     );
     let id = engine
-        .enqueue_package(&pkg, None, entries(&[("uuid-r", "f.fits", 4096)]))
+        .enqueue_package(
+            &pkg,
+            None,
+            entries(&[("uuid-r", "f.fits", 4096)]),
+            PackageLayout::Batch,
+        )
         .await
         .unwrap();
 
@@ -5299,7 +5389,12 @@ async fn mid_transfer_abort_leaves_file_sending_then_resume_uploads() {
         },
     );
     let id = engine
-        .enqueue_package(&pkg, None, entries(&[("uuid-s", "f.fits", 4096)]))
+        .enqueue_package(
+            &pkg,
+            None,
+            entries(&[("uuid-s", "f.fits", 4096)]),
+            PackageLayout::Batch,
+        )
         .await
         .unwrap();
 
@@ -5475,7 +5570,7 @@ async fn resend_cycle_one_row_cancel_then_confirm() {
     );
 
     let id = engine
-        .enqueue_package(&pkg, Some("RC batch".into()), files)
+        .enqueue_package(&pkg, Some("RC batch".into()), files, PackageLayout::Batch)
         .await
         .unwrap();
 
@@ -5616,7 +5711,10 @@ async fn old_attempt_wire_id_ack_does_not_replay_onto_resend() {
         receiver_id,
     );
 
-    let id = engine.enqueue_package(&pkg, None, files).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, files, PackageLayout::Batch)
+        .await
+        .unwrap();
     wait_until(|| is_serving(&store, id), WAIT).await;
     let w1 = wire_of(&store, id).expect("attempt 1 wire id");
 
@@ -5727,7 +5825,10 @@ async fn revoke_superseded_on_all_duplicate_after_prior_announce() {
     );
 
     // Session 1: want-all → serve + announce → Transferring. Capture the wire id.
-    let id = engine1.enqueue_package(&pkg, None, files).await.unwrap();
+    let id = engine1
+        .enqueue_package(&pkg, None, files, PackageLayout::Batch)
+        .await
+        .unwrap();
     wait_until(|| is_serving(&store1, id), WAIT).await;
     let w1 = wire_of(&store1, id).expect("attempt 1 wire id");
 
@@ -5792,7 +5893,10 @@ async fn revoke_failed_on_local_terminal_failure() {
         receiver_id,
     );
 
-    let id = engine.enqueue_package(&pkg, None, files).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, files, PackageLayout::Batch)
+        .await
+        .unwrap();
     wait_until(|| is_serving(&store, id), WAIT).await;
     let w1 = wire_of(&store, id).expect("attempt 1 wire id");
 
@@ -5908,7 +6012,10 @@ async fn cancel_with_dead_peer_revoke_does_not_stall() {
     let sender = Arc::new(SlowRevokeTransport(Arc::new(net.endpoint())));
     let engine = SyncEngine::spawn(store.clone() as Arc<dyn SyncStore>, sender, receiver_id);
 
-    let id = engine.enqueue_package(&pkg, None, files).await.unwrap();
+    let id = engine
+        .enqueue_package(&pkg, None, files, PackageLayout::Batch)
+        .await
+        .unwrap();
     wait_until(|| is_serving(&store, id), WAIT).await;
 
     // Cancel and time how long the terminal transition takes: it must NOT wait on

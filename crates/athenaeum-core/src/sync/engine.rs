@@ -57,8 +57,8 @@ use crate::package::{self, ManifestRecord, MANIFEST_FILENAME};
 use crate::sharing::iroh::node::BoxFuture;
 use crate::sharing::iroh::proto::OfferEntry;
 use crate::sharing::types::{
-    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome,
-    RevokeReason, TransportEvent,
+    AnnounceFileEntry, FrameReceipt, NodeId, PackageAnnounce, PackageId, PackageLayout,
+    ReceiptOutcome, RevokeReason, TransportEvent,
 };
 use crate::sharing::SharingTransport;
 
@@ -245,11 +245,13 @@ enum Command {
     /// + `files` are the batch metadata (Transfers Status Model v2): the worker
     /// writes them in the SAME enqueue transaction as the row (kills the T3
     /// enqueue→announce race), so the row is never visible without its name +
-    /// per-file manifest.
+    /// per-file manifest. `layout` (mirror-hierarchy T2) rides that same
+    /// transaction — the caller's landing-shape choice, decided once at enqueue.
     Process {
         dir: PathBuf,
         display_name: Option<String>,
         files: Vec<AnnounceFileEntry>,
+        layout: PackageLayout,
         reply: oneshot::Sender<Result<i64>>,
     },
     /// Cancel an in-flight package → `Cancelled` (`cancelled` history outcome).
@@ -670,11 +672,18 @@ impl SyncEngineHandle {
     /// Pass `None` / `Vec::new()` for a nameless / file-manifest-less send
     /// (Perseus, a collab project package, a re-enqueued retry) — the announce's
     /// basename fallback still applies.
+    ///
+    /// `layout` is the transfer's landing shape (mirror-hierarchy T2): the
+    /// per-transfer `<sender>/<batch>/` folder ([`PackageLayout::Batch`]) or the
+    /// sender's own directory tree ([`PackageLayout::Mirror`]). It is stamped onto
+    /// the row in the enqueue transaction and never changes for that transfer — a
+    /// resend re-drives the SAME row, keeping the shape its files already landed in.
     pub async fn enqueue_package(
         &self,
         dir: impl AsRef<Path>,
         display_name: Option<String>,
         files: Vec<AnnounceFileEntry>,
+        layout: PackageLayout,
     ) -> Result<i64> {
         let dir = dir.as_ref().to_path_buf();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -683,6 +692,7 @@ impl SyncEngineHandle {
                 dir,
                 display_name,
                 files,
+                layout,
                 reply: reply_tx,
             })
             .await
@@ -969,13 +979,15 @@ impl Worker {
                     }
                 },
                 cmd = cmd_rx.recv() => match cmd {
-                    Some(Command::Process { dir, display_name, files, reply }) => {
+                    Some(Command::Process { dir, display_name, files, layout, reply }) => {
                         // The enqueue writes the row + its display_name + per-file
                         // `pending` rows in one transaction, so the row is never
                         // visible (to this worker's own `start_package`, to
                         // `status_snapshot`, or to a concurrent reader) without its
                         // name + manifest — the T3 enqueue→announce race is gone.
-                        match self.store.enqueue(&dir.to_string_lossy(), self.peer, display_name.as_deref(), &files) {
+                        // The landing-shape stamp (`layout`) rides that same
+                        // transaction (mirror-hierarchy T2).
+                        match self.store.enqueue(&dir.to_string_lossy(), self.peer, display_name.as_deref(), &files, layout) {
                             Ok(id) => {
                                 tracing::info!(package_id = id, state = "queued", "sync state");
                                 // §D6: stamp the collab `project_id` onto the row at

@@ -48,7 +48,7 @@ use crate::events::ProgressEmitter;
 use crate::export::models::WbppExportConfig;
 use crate::services::ServiceContext;
 use crate::sharing::iroh::node::Role;
-use crate::sharing::types::{NodeId, PackageId};
+use crate::sharing::types::{NodeId, PackageId, PackageLayout};
 use crate::sharing::{noop_fetch_sink, ProviderEvent, ProviderTelemetrySink, SharingTransport};
 use crate::sync::{
     node_id_hex, pairing, CatalogSyncStore, PackageCleanupSink, StartedSender, SyncEngine,
@@ -486,8 +486,12 @@ pub async fn handle_project_request(
     // Offer/Want dedup negotiation automatically (T1 behavior); terminal cleanup
     // routes through the `CollabCleanupSink`.
     let (engine, _origin) = ensure_collab_sender_engine(ctx, sender, from, emitter).await?;
+    // Mirror-hierarchy T2: collab packages are out of the v1 mirror scope — a
+    // project package lands through the collab ingest path, not the personal
+    // `<sender>/<batch>/` tree, so the stamp stays `Batch` (the column default,
+    // i.e. unchanged behavior).
     engine
-        .enqueue_package(&dir, None, Vec::new())
+        .enqueue_package(&dir, None, Vec::new(), PackageLayout::Batch)
         .await
         .with_context(|| format!("enqueue collab serve dir {}", dir.display()))?;
     tracing::info!(
@@ -3552,7 +3556,10 @@ mod tests {
             None,
         );
 
-        let id = a_engine.enqueue_package(&serve_dir, None, Vec::new()).await.unwrap();
+        let id = a_engine
+            .enqueue_package(&serve_dir, None, Vec::new(), PackageLayout::Batch)
+            .await
+            .unwrap();
         wait_until(
             || {
                 a_store.get_outbound(id).ok().flatten().map(|r| r.state)
@@ -4154,7 +4161,9 @@ mod tests {
                 let e = Arc::clone(&handler_engine);
                 let dir = handler_dir.clone();
                 tokio::spawn(async move {
-                    let _ = e.enqueue_package(&dir, None, Vec::new()).await;
+                    let _ = e
+                        .enqueue_package(&dir, None, Vec::new(), PackageLayout::Batch)
+                        .await;
                 });
             });
         let a_recv_store = Arc::new(CatalogSyncStore::open(a_tmp.path().join("a_recv.db")).unwrap());

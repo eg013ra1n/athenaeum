@@ -44,7 +44,8 @@ use tokio::time::Instant;
 
 use crate::package::{self, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::sharing::types::{
-    FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
+    FetchEvent, FrameReceipt, NodeId, PackageAnnounce, PackageId, PackageLayout, ReceiptOutcome,
+    TransportEvent,
 };
 use crate::sharing::{
     noop_fetch_sink, FetchSink, ProviderEvent, ProviderTelemetrySink, SharingTransport,
@@ -699,7 +700,7 @@ async fn engine_suite_over_iroh() {
     );
 
     let id = engine
-        .enqueue_package(&pkg_dir, None, Vec::new())
+        .enqueue_package(&pkg_dir, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(
@@ -810,7 +811,7 @@ async fn engine_dup_ack_confirms_once_over_iroh() {
     );
 
     let id = engine
-        .enqueue_package(&pkg_dir, None, Vec::new())
+        .enqueue_package(&pkg_dir, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
     wait_until(

@@ -28,7 +28,7 @@ use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::services::ServiceContext;
 use crate::settings::{defaults, keys};
 use crate::sharing::iroh::node::{RelayResolver, Role, SharedIrohNode};
-use crate::sharing::types::NodeId;
+use crate::sharing::types::{NodeId, PackageLayout};
 use crate::sharing::SharingTransport;
 use crate::sync::engine::SERVE_ACTIVITY_FRESHNESS;
 use crate::sync::status::outbound_display_state;
@@ -3125,8 +3125,10 @@ async fn build_and_enqueue_selection(
                 },
             )
             .collect();
+        // Desktop senders are out of the mirror-hierarchy v1 scope: a selection
+        // package is a curated batch, so it lands in the per-transfer batch folder.
         engine
-            .enqueue_package(dir, built.display_name.clone(), files)
+            .enqueue_package(dir, built.display_name.clone(), files, PackageLayout::Batch)
             .await
             .map_err(|e| ApiError::Internal(format!("enqueue selection package: {e:#}")))?;
     }
@@ -3419,7 +3421,7 @@ async fn resend_declined_as_new_transfer(
 
     // Steps 1–4 under ONE pooled connection, dropped before the async enqueue (no DB
     // handle is ever held across an `.await`).
-    let (files, display_name) = {
+    let (files, display_name, layout) = {
         let database = db(ctx)?;
         let conn = database.conn();
 
@@ -3446,8 +3448,14 @@ async fn resend_declined_as_new_transfer(
             })
             .collect();
         let display_name = row.display_name.clone().filter(|s| !s.trim().is_empty());
+        // Mirror-hierarchy T2: a declined resend mints a NEW transfer, so it does
+        // NOT inherit the stamp by row reuse the way an ordinary resend does —
+        // clone it explicitly, alongside the manifest and the name. The user chose
+        // this landing shape when the original was queued; a decline is not a
+        // re-choice of shape.
+        let layout = row.layout;
 
-        (files, display_name)
+        (files, display_name, layout)
     };
 
     // (5a) Resolve row.peer's engine BEFORE any side effect (review fix): engine
@@ -3504,7 +3512,10 @@ async fn resend_declined_as_new_transfer(
     }
     // The worker inserts the new `sync_outbound` row (+ per-file `pending` rows) in
     // one transaction and replies with its id — do NOT pre-insert here.
-    let new_id = match engine.enqueue_package(&new_dir, display_name, files).await {
+    let new_id = match engine
+        .enqueue_package(&new_dir, display_name, files, layout)
+        .await
+    {
         Ok(id) => id,
         Err(e) => {
             // Best-effort undo so the old row's Resend affordance stays live: rename
@@ -4928,6 +4939,7 @@ mod tests {
                 &peer,
                 Some("Batch A"),
                 &files("f1"),
+                PackageLayout::Batch,
             )
             .unwrap();
             a2 = insert_outbound_with_files(
@@ -4936,6 +4948,7 @@ mod tests {
                 &peer,
                 Some("Batch A"),
                 &files("f2"),
+                PackageLayout::Batch,
             )
             .unwrap();
             let b1 = insert_outbound_with_files(
@@ -4944,6 +4957,7 @@ mod tests {
                 &peer,
                 Some("Batch B"),
                 &files("g1"),
+                PackageLayout::Batch,
             )
             .unwrap();
             for id in [a1, a2, b1] {
@@ -5034,15 +5048,29 @@ mod tests {
                 frame_uuid: "x".into(),
             }];
             // Attempt 1 cancelled (terminal); attempt 2 transferring (non-terminal).
-            let done =
-                insert_outbound_with_files(&conn, "/pkgs/live", &peer, None, &files).unwrap();
+            let done = insert_outbound_with_files(
+                &conn,
+                "/pkgs/live",
+                &peer,
+                None,
+                &files,
+                PackageLayout::Batch,
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE sync_outbound SET state = 'cancelled' WHERE id = ?1",
                 [done],
             )
             .unwrap();
-            let live =
-                insert_outbound_with_files(&conn, "/pkgs/live", &peer, None, &files).unwrap();
+            let live = insert_outbound_with_files(
+                &conn,
+                "/pkgs/live",
+                &peer,
+                None,
+                &files,
+                PackageLayout::Batch,
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1",
                 [live],
@@ -5677,11 +5705,24 @@ mod tests {
                 }]
             };
             // Terminal sibling + a non-terminal orphan sharing the dir basename.
-            term = insert_outbound_with_files(&conn, "/pkgs/gone", &dead_peer, None, &files("f1"))
-                .unwrap();
-            orphan =
-                insert_outbound_with_files(&conn, "/pkgs/gone", &dead_peer, None, &files("f2"))
-                    .unwrap();
+            term = insert_outbound_with_files(
+                &conn,
+                "/pkgs/gone",
+                &dead_peer,
+                None,
+                &files("f1"),
+                PackageLayout::Batch,
+            )
+            .unwrap();
+            orphan = insert_outbound_with_files(
+                &conn,
+                "/pkgs/gone",
+                &dead_peer,
+                None,
+                &files("f2"),
+                PackageLayout::Batch,
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE sync_outbound SET state = 'cancelled' WHERE id = ?1",
                 [term],
@@ -5772,8 +5813,15 @@ mod tests {
                 byte_size: 4,
                 frame_uuid: "x".into(),
             }];
-            live =
-                insert_outbound_with_files(&conn, "/pkgs/live", &live_peer, None, &files).unwrap();
+            live = insert_outbound_with_files(
+                &conn,
+                "/pkgs/live",
+                &live_peer,
+                None,
+                &files,
+                PackageLayout::Batch,
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1",
                 [live],
@@ -5839,7 +5887,15 @@ mod tests {
                 byte_size: 4,
                 frame_uuid: "x".into(),
             }];
-            let id = insert_outbound_with_files(&conn, "/pkgs/cold", &peer, None, &files).unwrap();
+            let id = insert_outbound_with_files(
+                &conn,
+                "/pkgs/cold",
+                &peer,
+                None,
+                &files,
+                PackageLayout::Batch,
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE sync_outbound SET state = 'transferring' WHERE id = ?1",
                 [id],
@@ -5909,6 +5965,7 @@ mod tests {
                 &peer,
                 Some("Batch Z"),
                 &files,
+                PackageLayout::Batch,
             )
             .unwrap();
             conn.execute(
@@ -6129,6 +6186,7 @@ mod tests {
                 &peer,
                 Some("term"),
                 &files,
+                PackageLayout::Batch,
             )
             .unwrap();
             conn.execute(
@@ -6143,6 +6201,7 @@ mod tests {
                 &peer,
                 Some("live"),
                 &files,
+                PackageLayout::Batch,
             )
             .unwrap();
             // A non-terminal inbound row pins its in-flight tag ("live-wire").
@@ -6419,6 +6478,7 @@ mod tests {
                 &peer,
                 Some("failed"),
                 &files,
+                PackageLayout::Batch,
             )
             .unwrap();
             conn.execute(
@@ -6432,6 +6492,7 @@ mod tests {
                 &peer,
                 Some("live"),
                 &files,
+                PackageLayout::Batch,
             )
             .unwrap();
         }
@@ -6513,9 +6574,15 @@ mod tests {
                 byte_size: 4,
                 frame_uuid: "a".into(),
             }];
-            let sid =
-                insert_outbound_with_files(&conn, "/pkgs/batch-out", &peer, Some("Out"), &files)
-                    .unwrap();
+            let sid = insert_outbound_with_files(
+                &conn,
+                "/pkgs/batch-out",
+                &peer,
+                Some("Out"),
+                &files,
+                PackageLayout::Batch,
+            )
+            .unwrap();
             conn.execute(
                 "UPDATE sync_outbound SET state = 'confirmed' WHERE id = ?1",
                 [sid],
@@ -6695,15 +6762,25 @@ mod tests {
         let peer_c = node(0xcc);
 
         // peer_a: two non-terminal rows (queued + transferring).
-        store.enqueue("/pkgs/a1", peer_a, None, &[]).unwrap();
-        let a2 = store.enqueue("/pkgs/a2", peer_a, None, &[]).unwrap();
+        store
+            .enqueue("/pkgs/a1", peer_a, None, &[], PackageLayout::Batch)
+            .unwrap();
+        let a2 = store
+            .enqueue("/pkgs/a2", peer_a, None, &[], PackageLayout::Batch)
+            .unwrap();
         store.set_state(a2, OutboundState::Transferring).unwrap();
         // peer_b: one non-terminal row + one terminal (confirmed).
-        store.enqueue("/pkgs/b1", peer_b, None, &[]).unwrap();
-        let b2 = store.enqueue("/pkgs/b2", peer_b, None, &[]).unwrap();
+        store
+            .enqueue("/pkgs/b1", peer_b, None, &[], PackageLayout::Batch)
+            .unwrap();
+        let b2 = store
+            .enqueue("/pkgs/b2", peer_b, None, &[], PackageLayout::Batch)
+            .unwrap();
         store.set_state(b2, OutboundState::Confirmed).unwrap();
         // peer_c: every row terminal (failed) → must be excluded entirely.
-        let c1 = store.enqueue("/pkgs/c1", peer_c, None, &[]).unwrap();
+        let c1 = store
+            .enqueue("/pkgs/c1", peer_c, None, &[], PackageLayout::Batch)
+            .unwrap();
         store.set_state(c1, OutboundState::Failed).unwrap();
 
         let rows = store.non_terminal().unwrap();
@@ -6755,9 +6832,11 @@ mod tests {
 
         {
             let store = CatalogSyncStore::open(&db_path).unwrap();
-            store.enqueue("/pkgs/member", member, None, &[]).unwrap();
             store
-                .enqueue("/pkgs/stranger", stranger, None, &[])
+                .enqueue("/pkgs/member", member, None, &[], PackageLayout::Batch)
+                .unwrap();
+            store
+                .enqueue("/pkgs/stranger", stranger, None, &[], PackageLayout::Batch)
                 .unwrap();
         }
 
@@ -6811,8 +6890,12 @@ mod tests {
         let peer_x = node(0xcc);
         {
             let store = CatalogSyncStore::open(&db_path).unwrap();
-            let id1 = store.enqueue("/pkgs/one", peer_x, None, &[]).unwrap();
-            let id2 = store.enqueue("/pkgs/two", peer_x, None, &[]).unwrap();
+            let id1 = store
+                .enqueue("/pkgs/one", peer_x, None, &[], PackageLayout::Batch)
+                .unwrap();
+            let id2 = store
+                .enqueue("/pkgs/two", peer_x, None, &[], PackageLayout::Batch)
+                .unwrap();
             assert_eq!((id1, id2), (1, 2));
             store.set_state(id2, OutboundState::Transferring).unwrap();
         }
@@ -7519,7 +7602,12 @@ mod tests {
         // Enqueue WITH a name + file rows, then cancel → terminal Cancelled.
         let (engine, _) = sender.current_for(&peer).await.unwrap();
         let id = engine
-            .enqueue_package(&pkg_dir, Some(display.clone()), files.clone())
+            .enqueue_package(
+                &pkg_dir,
+                Some(display.clone()),
+                files.clone(),
+                PackageLayout::Batch,
+            )
             .await
             .unwrap();
         engine.cancel(id).await.unwrap();
@@ -7642,7 +7730,7 @@ mod tests {
         // Enqueue but do NOT cancel — the row is non-terminal (Queued/Announced).
         let (engine, _) = sender.current_for(&peer).await.unwrap();
         let id = engine
-            .enqueue_package(&pkg_dir, None, Vec::new())
+            .enqueue_package(&pkg_dir, None, Vec::new(), PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -7712,6 +7800,9 @@ mod tests {
                 &node_id_hex(&peer),
                 Some(&display),
                 &files,
+                // Mirror-hierarchy T2: seeded NON-default so the clone assertion
+                // below cannot pass on the column's `batch` default.
+                PackageLayout::Mirror,
             )
             .unwrap();
             conn.execute(
@@ -7758,6 +7849,20 @@ mod tests {
                 .package_ref
         };
         assert_ne!(new_ref, old_ref, "the new transfer has a fresh package_ref");
+
+        // Mirror-hierarchy T2: the landing shape is CLONED onto the new transfer.
+        // A decline is a receiver's "not this one", not a re-choice of where the
+        // files go — resending under a different shape would silently relocate
+        // them. Nothing else in the flow re-asks the user, so the stamp must ride
+        // along with the manifest and the name.
+        {
+            let store = CatalogSyncStore::open(&db_path).unwrap();
+            assert_eq!(
+                store.get_outbound(new_id).unwrap().unwrap().layout,
+                PackageLayout::Mirror,
+                "the declined transfer's layout is cloned onto the new one"
+            );
+        }
         assert!(
             !pkg_dir.exists(),
             "the declined payload dir was renamed away"
@@ -7999,7 +8104,7 @@ mod tests {
             receiver_id,
         );
         let id = engine
-            .enqueue_package(&pkg_dir, None, Vec::new())
+            .enqueue_package(&pkg_dir, None, Vec::new(), PackageLayout::Batch)
             .await
             .unwrap();
 
@@ -8089,6 +8194,7 @@ mod tests {
                 &peer_hex,
                 Some("Cancelled — payload intact"),
                 &[],
+                PackageLayout::Batch,
             )
             .unwrap();
             let swept = crate::sync::store::insert_outbound_with_files(
@@ -8097,6 +8203,7 @@ mod tests {
                 &peer_hex,
                 Some("Cancelled — payload swept"),
                 &[],
+                PackageLayout::Batch,
             )
             .unwrap();
             (intact, swept)
@@ -8149,7 +8256,13 @@ mod tests {
             drop(conn);
             let store = CatalogSyncStore::open(&db_path).unwrap();
             let id = store
-                .enqueue(&pkg_dir.to_string_lossy(), [9u8; 32], None, &[])
+                .enqueue(
+                    &pkg_dir.to_string_lossy(),
+                    [9u8; 32],
+                    None,
+                    &[],
+                    PackageLayout::Batch,
+                )
                 .unwrap();
             (pkg_dir, id)
         };
@@ -8289,20 +8402,33 @@ mod tests {
         let (queued_id, confirmed_id, failed_id, cancelled_id) = {
             let db = db(&ctx).unwrap();
             let conn = db.conn();
-            let queued =
-                insert_outbound_with_files(&conn, "/pkg/queued", &peer, Some("Queued batch"), &[])
-                    .unwrap();
+            let queued = insert_outbound_with_files(
+                &conn,
+                "/pkg/queued",
+                &peer,
+                Some("Queued batch"),
+                &[],
+                PackageLayout::Batch,
+            )
+            .unwrap();
             let confirmed = insert_outbound_with_files(
                 &conn,
                 "/pkg/confirmed",
                 &peer,
                 Some("Confirmed batch"),
                 &[],
+                PackageLayout::Batch,
             )
             .unwrap();
-            let failed =
-                insert_outbound_with_files(&conn, "/pkg/failed", &peer, Some("Failed batch"), &[])
-                    .unwrap();
+            let failed = insert_outbound_with_files(
+                &conn,
+                "/pkg/failed",
+                &peer,
+                Some("Failed batch"),
+                &[],
+                PackageLayout::Batch,
+            )
+            .unwrap();
             let files = [
                 AnnounceFileEntry {
                     rel_path: "cam/a.fits".into(),
@@ -8321,6 +8447,7 @@ mod tests {
                 &peer,
                 Some("Nightly batch"),
                 &files,
+                PackageLayout::Batch,
             )
             .unwrap();
             (queued, confirmed, failed, cancelled)

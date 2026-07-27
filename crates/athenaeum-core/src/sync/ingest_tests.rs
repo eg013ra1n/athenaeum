@@ -25,7 +25,7 @@ use crate::models::{Frame, ImageType};
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
 use crate::sharing::types::{
-    FrameReceipt, NodeId, PackageAnnounce, PackageId, ReceiptOutcome, TransportEvent,
+    FrameReceipt, NodeId, PackageAnnounce, PackageId, PackageLayout, ReceiptOutcome, TransportEvent,
 };
 use crate::sharing::SharingTransport;
 
@@ -1513,7 +1513,7 @@ async fn transit_corruption_repaired_then_redelivery_confirms() {
     );
 
     let id = engine
-        .enqueue_package(&pkg_dir, None, Vec::new())
+        .enqueue_package(&pkg_dir, None, Vec::new(), PackageLayout::Batch)
         .await
         .unwrap();
 

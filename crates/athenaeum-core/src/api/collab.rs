@@ -49,7 +49,7 @@ use crate::package::{
     MANIFEST_VERSION,
 };
 use crate::services::ServiceContext;
-use crate::sharing::types::NodeId;
+use crate::sharing::types::{NodeId, PackageLayout};
 
 /// Module-local `anyhow::Error → ApiError::Internal` mapper (house style —
 /// mirrors the blanket `From<anyhow::Error>` conversion so `.map_err(internal)`
@@ -1534,7 +1534,12 @@ pub async fn publish_collab_frames(
                 // Best-effort: the package is already announced + recorded, so a
                 // transient sender-build/enqueue failure must not undo the publish.
                 match ensure_collab_sender_engine(ctx, collab_sender, node, emitter.clone()).await {
-                    Ok((engine, _origin)) => match engine.enqueue_package(&pub_dir, None, Vec::new()).await {
+                    // Mirror-hierarchy T2: collab is out of the v1 mirror scope —
+                    // `Batch` is the column default, so behavior is unchanged.
+                    Ok((engine, _origin)) => match engine
+                        .enqueue_package(&pub_dir, None, Vec::new(), PackageLayout::Batch)
+                        .await
+                    {
                         Ok(_) => {
                             tracing::info!(
                                 project_id,
