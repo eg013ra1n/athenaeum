@@ -2627,9 +2627,158 @@ async function libThumbPump() {
 let libPvState = { open: false, root: null, path: '', files: [], idx: -1 };
 let libPvSeq = 0;                   // monotonic; a stale frame never paints
 let libPvAbort = null;              // in-flight request, aborted when superseded
-let libPvUrl = null;                // the ONE live object URL
 let libPvReturnFocus = null;        // element focus returns to on close
 let libPvRefreshed = new Set();     // rels whose 404 already cost one listing re-read
+
+// ── blink mode (spec 2026-07-27 library-blink) ──────────────────────────────
+// Decoded frames live in a small blob LRU so ←/→ and autoplay flip instantly;
+// a serial prefetch queue (one request at a time — the server renderer is
+// Semaphore(1)) fills it +3 ahead / −1 behind. `libPvGen` bumps on open/close
+// only (unlike the per-show `libPvSeq`), so stepping never orphans a prefetch.
+const LIB_PV_CACHE_CAP = 10;
+const LIB_PV_SPEEDS = [0.5, 1, 2, 4];   // frames per second
+let libPvGen = 0;
+let libPvCache = new Map();             // rel → blob URL; insertion order = LRU
+let libPvPrefetchQueue = [];
+let libPvPrefetchBusy = false;
+let libPvPlaying = false;
+let libPvSpeed = 1;                     // sticky across opens — an operator's pace
+let libPvTimer = null;
+
+function libPvFailedKey(rel) { return String(libPvState.root) + ':' + rel; }
+
+function libPvCachePut(rel, url) {
+  const old = libPvCache.get(rel);
+  if (old !== undefined) {
+    libPvCache.delete(rel);
+    if (old !== url) URL.revokeObjectURL(old);
+  }
+  libPvCache.set(rel, url);
+  const img = $('libPvImg');
+  const live = img ? img.src : '';
+  while (libPvCache.size > LIB_PV_CACHE_CAP) {
+    const oldest = libPvCache.entries().next().value;
+    if (!oldest) break;
+    const [k, v] = oldest;
+    if (v === live) {
+      // Never evict the frame on screen — rotate it to the young end instead.
+      libPvCache.delete(k);
+      libPvCache.set(k, v);
+      const second = libPvCache.entries().next().value;
+      if (!second || second[1] === live) break;
+      libPvCache.delete(second[0]);
+      URL.revokeObjectURL(second[1]);
+    } else {
+      libPvCache.delete(k);
+      URL.revokeObjectURL(v);
+    }
+  }
+}
+
+function libPvCacheClear() {
+  for (const url of libPvCache.values()) URL.revokeObjectURL(url);
+  libPvCache = new Map();
+  libPvPrefetchQueue = [];
+  libPvPrefetchBusy = false;
+}
+
+function libPvPrefetchWant(idx) {
+  const f = libPvState.files[idx];
+  if (!f || libPvCache.has(f.rel)) return;
+  if (libThumbFailed.has(libPvFailedKey(f.rel))) return;
+  if (libPvPrefetchQueue.some((q) => q === f.rel)) return;
+  libPvPrefetchQueue.push(f.rel);
+  libPvPrefetchPump();
+}
+
+// After every shown frame: the three the play head reaches next, then one back.
+function libPvPrefetch() {
+  const i = libPvState.idx;
+  libPvPrefetchWant(i + 1);
+  libPvPrefetchWant(i + 2);
+  libPvPrefetchWant(i + 3);
+  libPvPrefetchWant(i - 1);
+}
+
+async function libPvPrefetchPump() {
+  if (libPvPrefetchBusy) return;
+  libPvPrefetchBusy = true;
+  const gen = libPvGen;
+  while (libPvPrefetchQueue.length) {
+    if (gen !== libPvGen || !libPvState.open) break;
+    const rel = libPvPrefetchQueue.shift();
+    if (libPvCache.has(rel)) continue;
+    let res = null;
+    try {
+      res = await api(libPvUrlFor(libPvState.root, rel));
+    } catch (e) {
+      console.error('[library] blink prefetch failed:', rel, e);
+      continue;                       // the show path retries with its own errors
+    }
+    if (gen !== libPvGen) break;
+    if (!res.ok) {
+      // Refusals share the thumbnails' negative cache — one glyph, no storms.
+      if (res.status === 404 || res.status === 415) libThumbFailed.add(libPvFailedKey(rel));
+      continue;
+    }
+    let blob = null;
+    try { blob = await res.blob(); } catch (e) { continue; }
+    if (gen !== libPvGen) break;
+    libPvCachePut(rel, URL.createObjectURL(blob));
+  }
+  libPvPrefetchBusy = false;
+}
+
+function libPvSetPlaying(on) {
+  libPvPlaying = on;
+  if (libPvTimer) { clearTimeout(libPvTimer); libPvTimer = null; }
+  libPvRenderHead();
+  if (on) libPvSchedule(1000 / libPvSpeed);
+}
+
+function libPvSchedule(ms) {
+  if (libPvTimer) clearTimeout(libPvTimer);
+  libPvTimer = setTimeout(libPvTick, ms);
+}
+
+// Advance ONLY onto an already-decoded frame — a spinner mid-run breaks the
+// comparison blink exists for. A cache miss polls until the render lands (first
+// pass through a folder is render-bound by design; later passes fly).
+function libPvTick() {
+  libPvTimer = null;
+  if (!libPvState.open || !libPvPlaying) return;
+  if (libDlg) { libPvSetPlaying(false); return; }
+  const next = libPvState.idx + 1;
+  if (next >= libPvState.files.length) { libPvSetPlaying(false); return; }
+  const rel = libPvState.files[next].rel;
+  if (libPvCache.has(rel) || libThumbFailed.has(libPvFailedKey(rel))) {
+    libPvShow(next);                  // a refused frame shows its error at pace
+    libPvSchedule(1000 / libPvSpeed);
+  } else {
+    libPvPrefetchWant(next);
+    libPvSchedule(150);
+  }
+}
+
+// `X`: the current frame joins/leaves the SAME selection the listing checkboxes
+// drive — marks are visible as checked rows, the footer counts them, and the
+// delete dialog consumes them. No second marking concept.
+function libPvToggleMark() {
+  const cur = libPvState.files[libPvState.idx];
+  if (!cur) return;
+  const on = !libState.selected.has(cur.rel);
+  libTogglePick(cur.rel, false, on);
+  document.querySelectorAll('#libBody [data-lib-pick]').forEach((b) => {
+    if (b.dataset.libPick !== cur.rel) return;
+    b.checked = on;
+    const row = b.closest('tr');
+    if (row) row.classList.toggle('lib-picked', on);
+  });
+  updateLibSelAll();
+  const img = $('libPvImg');
+  if (img) img.classList.toggle('lib-pv-markedimg', on);
+  libPvRenderHead();
+}
 
 // The listed folder's files as the pane walks them: display name + wire rel.
 const libPvFiles = () => (libState.entries || []).map((f) => ({
@@ -2656,6 +2805,8 @@ function libPvOpen(rel) {
   // today; the guard is what keeps that true for the next caller.
   if (libPvState.open) libPvClose();
   libPvState = { open: true, root: libState.root, path: libState.path, files, idx };
+  libPvGen++;
+  libPvPlaying = false;               // speed stays sticky; playback never auto-starts
   libPvRefreshed = new Set();
   libPvReturnFocus = document.activeElement || null;
   host.innerHTML = `
@@ -2676,8 +2827,11 @@ function libPvOpen(rel) {
 function libPvClose() {
   if (!libPvState.open) return;
   libPvSeq++;                       // orphan every in-flight load
+  libPvGen++;                       // orphan every in-flight prefetch
+  libPvPlaying = false;
+  if (libPvTimer) { clearTimeout(libPvTimer); libPvTimer = null; }
   if (libPvAbort) { libPvAbort.abort(); libPvAbort = null; }
-  if (libPvUrl) { URL.revokeObjectURL(libPvUrl); libPvUrl = null; }
+  libPvCacheClear();                // revoke every cached blob URL
   document.removeEventListener('keydown', onLibPvKey);
   libPvState = { open: false, root: null, path: '', files: [], idx: -1 };
   libPvRefreshed = new Set();
@@ -2707,9 +2861,19 @@ function libPvRenderHead() {
   const n = libPvState.files.length;
   const i = libPvState.idx;
   const cur = libPvState.files[i];
+  const marked = cur ? libState.selected.has(cur.rel) : false;
+  const nSel = libState.selected.size;
   el.innerHTML = `
     <span class="lib-pv-name mono" title="${esc(cur ? cur.rel : '')}">${esc(cur ? cur.name : '')}</span>
+    ${marked ? '<span class="lib-pv-flag">marked</span>' : ''}
     <span class="spacer"></span>
+    <button class="ghost" data-pv-act="play" title="${libPvPlaying ? 'Pause (Space)' : 'Play (Space)'}"
+      aria-label="${libPvPlaying ? 'Pause playback' : 'Start playback'}">${libPvPlaying ? '&#10073;&#10073;' : '&#9654;'}</button>
+    <select id="libPvSpeedSel" class="lib-pv-speed" title="Blink speed, frames per second" aria-label="Blink speed">
+      ${LIB_PV_SPEEDS.map((s) => `<option value="${s}"${s === libPvSpeed ? ' selected' : ''}>${s}/s</option>`).join('')}
+    </select>
+    <button class="ghost" data-pv-act="mark" title="${marked ? 'Unmark this frame (X)' : 'Mark this frame for deletion (X)'}">${marked ? 'Unmark' : 'Mark'}</button>
+    <button class="ghost lib-pv-del" data-pv-act="delete" title="Delete the marked files"${nSel ? '' : ' disabled'}>Delete&nbsp;${nSel}</button>
     <span class="lib-pv-pos muted">${i + 1} / ${n}</span>
     <button class="ghost" data-pv-step="-1" title="Previous frame (←)" aria-label="Previous frame"${i <= 0 ? ' disabled' : ''}>&#8592;</button>
     <button class="ghost" data-pv-step="1" title="Next frame (→)" aria-label="Next frame"${i >= n - 1 ? ' disabled' : ''}>&#8594;</button>
@@ -2748,9 +2912,29 @@ function libPvShow(idx) {
   if (libPvAbort) { libPvAbort.abort(); libPvAbort = null; }
   libPvRenderHead();
   const img = $('libPvImg');
-  if (img) { img.hidden = true; img.alt = 'Preview of ' + cur.name; }
-  libPvSay('<span class="lib-pv-spin" aria-hidden="true"></span>rendering…');
-  libPvLoad(seq, cur);
+  const marked = libState.selected.has(cur.rel);
+  const cached = libPvCache.get(cur.rel);
+  if (cached && img) {
+    // Blink path: the frame is already decoded — paint it synchronously, no
+    // spinner, no network. The cache owns the URL's lifetime.
+    img.onload = null;
+    img.onerror = null;
+    img.alt = 'Preview of ' + cur.name;
+    img.classList.toggle('lib-pv-markedimg', marked);
+    img.src = cached;
+    img.hidden = false;
+    const note = $('libPvNote');
+    if (note) note.hidden = true;
+  } else {
+    if (img) {
+      img.hidden = true;
+      img.alt = 'Preview of ' + cur.name;
+      img.classList.toggle('lib-pv-markedimg', marked);
+    }
+    libPvSay('<span class="lib-pv-spin" aria-hidden="true"></span>rendering…');
+    libPvLoad(seq, cur);
+  }
+  libPvPrefetch();
 }
 
 function libPvUrlFor(root, rel) {
@@ -2817,9 +3001,10 @@ async function libPvLoad(seq, cur) {
   if (seq !== libPvSeq) return;                // never mint a URL for a frame nobody wants
   const img = $('libPvImg');
   if (!img) return;
-  const prev = libPvUrl;
   const next = URL.createObjectURL(blob);
-  libPvUrl = next;
+  // The blink cache owns every URL's lifetime now (eviction + close revoke);
+  // depositing the shown frame also makes an immediate re-visit instant.
+  libPvCachePut(cur.rel, next);
   // Both handlers answer for THIS source only: the ticket rules out a superseded
   // frame, the src comparison a handler left over from one. A browser that
   // reports the REPLACED load's abort as an error is the case neither can tell
@@ -2837,12 +3022,8 @@ async function libPvLoad(seq, cur) {
     console.error('[library] preview image did not decode:', cur.rel);
     libPvFail('Preview failed', 'the rendered image did not decode');
   };
+  img.classList.toggle('lib-pv-markedimg', libState.selected.has(cur.rel));
   img.src = next;
-  // Revoke the frame this one replaces only AFTER the swap. The <img> may still
-  // have been decoding it (the operator arrowed on mid-decode), and pulling the
-  // URL out from under a live load would surface as a decode failure for a frame
-  // nobody is looking at any more.
-  if (prev) URL.revokeObjectURL(prev);
 }
 
 // Bound only while the pane is open (added in libPvOpen, removed in libPvClose),
@@ -2859,7 +3040,13 @@ function onLibPvKey(e) {
   if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
   if (e.key === 'Escape') { e.preventDefault(); libPvClose(); return; }
   if (e.key === 'ArrowLeft') { e.preventDefault(); libPvStep(-1); return; }
-  if (e.key === 'ArrowRight') { e.preventDefault(); libPvStep(1); }
+  if (e.key === 'ArrowRight') { e.preventDefault(); libPvStep(1); return; }
+  // Layout-independent codes: Space and X work on any keyboard layout. The
+  // speed <select> keeps its own Space/typing — never steal keys from a form
+  // control the operator is focused on.
+  const inControl = e.target && /^(SELECT|INPUT|TEXTAREA|BUTTON)$/.test(e.target.tagName || '');
+  if (e.code === 'Space' && !inControl) { e.preventDefault(); libPvSetPlaying(!libPvPlaying); return; }
+  if (e.code === 'KeyX' && !inControl) { e.preventDefault(); libPvToggleMark(); }
 }
 
 function onLibPreviewClick(e) {
@@ -2870,6 +3057,23 @@ function onLibPreviewClick(e) {
   if (!act) return;
   if (act.dataset.pvAct === 'close') libPvClose();
   else if (act.dataset.pvAct === 'retry') libPvShow(libPvState.idx);
+  else if (act.dataset.pvAct === 'play') libPvSetPlaying(!libPvPlaying);
+  else if (act.dataset.pvAct === 'mark') libPvToggleMark();
+  else if (act.dataset.pvAct === 'delete') {
+    if (!libState.selected.size) return;
+    // Single-overlay invariant: libDlgOpen closes the pane first (and closing
+    // stops playback) — mark through the night, then delete the batch.
+    libDlgOpen('delete');
+  }
+}
+
+// The speed select is the pane's one form control; delegated like the clicks.
+function onLibPvChange(e) {
+  if (!e.target || e.target.id !== 'libPvSpeedSel') return;
+  const v = Number(e.target.value);
+  if (!LIB_PV_SPEEDS.includes(v)) return;
+  libPvSpeed = v;
+  if (libPvPlaying) libPvSchedule(1000 / libPvSpeed);
 }
 
 // ── library actions: the Send-to picker and the Delete confirm (T10) ────────
@@ -3600,6 +3804,7 @@ function wireLibrary() {
   // (index.html), so they get their own delegated handlers — bound once to the
   // stable hosts, never per open.
   $('libPreview').addEventListener('click', onLibPreviewClick);
+  $('libPreview').addEventListener('change', onLibPvChange);
   $('libDialog').addEventListener('click', onLibDialogClick);
   $('libDialog').addEventListener('change', onLibDialogChange);
 }

@@ -246,6 +246,16 @@ img.lib-thumb:hover { outline: 1px solid var(--accent); }
 .lib-thumb-fail::after { content: "\2205"; position: absolute; inset: 0;
   display: flex; align-items: center; justify-content: center;
   color: var(--content-muted); font-size: 0.9rem; }
+/* Blink mode (spec 2026-07-27 library-blink): playback + marking controls in
+   the pane head; a marked frame carries a red outline and a quiet chip. */
+.lib-pv-speed { background: var(--surface); color: var(--content);
+  border: 1px solid var(--border); border-radius: 4px;
+  font-size: 0.78rem; padding: 0.1rem 0.25rem; }
+.lib-pv-flag { color: var(--error); border: 1px solid var(--error);
+  border-radius: 3px; padding: 0 0.3rem; font-size: 0.72rem;
+  text-transform: uppercase; letter-spacing: 0.05em; align-self: center; }
+.lib-pv-markedimg { outline: 3px solid var(--error); outline-offset: -3px; }
+.lib-pv-del:not([disabled]) { color: var(--error); border-color: var(--error); }
 .lib-batches { font-size: 0.72rem; color: var(--content-muted); }
 /* T15 per-file retention fate — a quiet second line under the status chip. It
    must read as an annotation, never compete with the chip it sits below. */
