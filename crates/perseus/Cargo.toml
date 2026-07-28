@@ -85,7 +85,7 @@ tracing-appender = "0.2"
 # StandaloneSyncStore uses (safe: WAL mode, an explicitly supported SQLite
 # pattern for multiple connections to one file). Version pinned to match
 # athenaeum-core's rusqlite so cargo unifies the dependency.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # Timestamp formatting for perseus_seen.enqueued_at; version matches
 # athenaeum-core's chrono so cargo unifies the dependency.
 chrono = "0.4"

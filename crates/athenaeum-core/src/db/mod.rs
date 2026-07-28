@@ -22,7 +22,7 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, Result};
 use std::path::{Path, PathBuf};
 
-/// Custom r2d2 connection manager for rusqlite 0.32.
+/// Custom r2d2 connection manager for rusqlite 0.40.
 ///
 /// Each new connection gets PRAGMAs applied and SIN/COS functions registered.
 pub struct SqliteConnectionManager {
