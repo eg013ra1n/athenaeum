@@ -283,6 +283,10 @@ fn parse_xisf_xml_text(text: &str) -> HashMap<String, String> {
     let mut result: HashMap<String, String> = HashMap::new();
     let mut reader = Reader::from_str(text);
     reader.config_mut().trim_text(true);
+    // Permissive dangling-`&` retained deliberately (0.36-era behavior; XISF
+    // headers are machine-written but a malformed one should still render —
+    // cycle decision 2026-07-29).
+    reader.config_mut().allow_dangling_amp = true;
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
@@ -519,5 +523,30 @@ mod tests {
         assert_eq!(keys.get("EXPTIME"), Some(&"120.0".to_string()));
         assert_eq!(keys.get("CCD-TEMP"), Some(&"-10.0".to_string()));
         assert_eq!(keys.get("XBINNING"), Some(&"1".to_string()));
+    }
+
+    /// quick-xml 0.41 rejects a lone `&` (one not opening a character or
+    /// entity reference) in element text by default, where 0.36/0.37 read
+    /// straight through. We opt back into the permissive behavior, so a stored
+    /// header carrying one must still yield its keywords rather than silently
+    /// losing the whole snapshot.
+    #[test]
+    fn dangling_ampersand_in_xisf_text_still_yields_keywords() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xisf>
+  <Property id="note">Dark & Flat calibration</Property>
+  <FITSKeyword name="OBJECT" value="'M42'" comment="" />
+  <FITSKeyword name="EXPTIME" value="120.0" />
+</xisf>"#;
+        let keys = parse_xisf_xml_text(xml);
+
+        // Not just "no error": the FITSKeyword elements *after* the dangling
+        // `&` must still have been reached and read correctly.
+        assert_eq!(
+            keys.get("OBJECT"),
+            Some(&"M42".to_string()),
+            "keywords after a dangling `&` must still parse"
+        );
+        assert_eq!(keys.get("EXPTIME"), Some(&"120.0".to_string()));
     }
 }

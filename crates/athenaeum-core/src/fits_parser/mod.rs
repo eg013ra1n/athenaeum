@@ -172,6 +172,10 @@ pub fn extract_xisf_header(path: &Path) -> Result<String> {
     // Parse XML to extract FITSKeyword elements
     let mut reader = Reader::from_str(&xml_str);
     reader.config_mut().trim_text(true);
+    // Permissive dangling-`&` retained deliberately (0.36-era behavior; XISF
+    // headers are machine-written but a malformed one should still render —
+    // cycle decision 2026-07-29).
+    reader.config_mut().allow_dangling_amp = true;
 
     let mut header_text = String::new();
     header_text.push_str("XISF FITS Keywords:\n");
@@ -467,6 +471,10 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     // Parse XML to extract FITSKeyword elements
     let mut reader = Reader::from_str(&xml_str);
     reader.config_mut().trim_text(true);
+    // Permissive dangling-`&` retained deliberately (0.36-era behavior; XISF
+    // headers are machine-written but a malformed one should still render —
+    // cycle decision 2026-07-29).
+    reader.config_mut().allow_dangling_amp = true;
 
     let mut fits_keywords: HashMap<String, String> = HashMap::new();
     let mut xisf_geometry: Option<(i32, i32)> = None;
