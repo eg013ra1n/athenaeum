@@ -407,7 +407,7 @@ dependencies = [
  "memmap2",
  "n0-future",
  "postcard",
- "quick-xml 0.36.2",
+ "quick-xml 0.41.0",
  "r2d2",
  "rayon",
  "reqwest",
@@ -5552,15 +5552,6 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
-
-[[package]]
-name = "quick-xml"
-version = "0.36.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7649a7b4df05aed9ea7ec6f628c67c9953a43869b8bc50929569b2999d443fe"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "quick-xml"
