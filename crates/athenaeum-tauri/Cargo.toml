@@ -31,7 +31,14 @@ rayon = "1.10"
 anyhow = "1"
 rustafits = { path = "../../rustafits" }
 base64 = "0.22"
-reqwest = { version = "0.12", features = ["json"] }
+# Explicit TLS backend — see the reqwest comment in athenaeum-core/Cargo.toml.
+reqwest = { version = "0.13", default-features = false, features = [
+    "native-tls-no-alpn",
+    "charset",
+    "http2",
+    "system-proxy",
+    "json",
+] }
 uuid = { version = "1", features = ["v4"] }
 semver = "1"
 solvemyastro = { path = "../../solvemyastro" }
