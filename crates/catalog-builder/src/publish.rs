@@ -30,7 +30,9 @@ fn sha256_file(path: &Path) -> Result<String> {
         }
         h.update(&buf[..n]);
     }
-    Ok(format!("{:x}", h.finalize()))
+    // digest 0.11 dropped `LowerHex` on `Output` (generic-array ->
+    // hybrid-array); hex the bytes by hand — same lowercase digest string.
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Zip `out_dir/tier_<d>/stars.smac` as `tier_<d>/stars.smac` into the archive

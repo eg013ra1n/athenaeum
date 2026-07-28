@@ -25,8 +25,8 @@ rustafits = { path = "../../rustafits", features = ["debug-pipeline"], optional 
 # Standalone plate solver (clean-room quad-matching implementation). Path dep like
 # rustafits; Phase 3 adapter calls solvemyastro::solve / build_cache.
 solvemyastro = { path = "../../solvemyastro", optional = true }
-sha2 = "0.10"
-md-5 = "0.10"
+sha2 = "0.11"
+md-5 = "0.11"
 jpeg-encode = { path = "../jpeg-encode" }
 memmap2 = "0.9"
 byteorder = "1"
@@ -92,7 +92,7 @@ tracing-appender = "0.2"
 # (deserialize_with, skip_serializing_if, alias) and warns on every build;
 # the generated-output diff in tests/ts_contract.rs is the real guard.
 ts-rs = { version = "12", features = ["chrono-impl", "no-serde-warnings"] }
-base64 = "0.22"
+base64 = "0.23"
 # Cross-platform OS hostname for the default device name (Sync 2C). Small,
 # dependency-light; the name is cosmetic (renamable via the hub) so this only
 # needs a best-effort read, with a synthetic `<prefix>-<short6>` fallback.
@@ -135,6 +135,6 @@ solver = ["dep:solvemyastro"]
 [dev-dependencies]
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
-imageproc = { version = "0.25", default-features = false }
+imageproc = { version = "0.27", default-features = false }
 # Mock HTTP server for the account hub-client tests (task B4).
 wiremock = "0.6"

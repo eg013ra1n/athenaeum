@@ -91,7 +91,9 @@ impl AnalysisConfig {
         let json = serde_json::to_string(&for_hash).unwrap_or_default();
         let mut hasher = Sha256::new();
         hasher.update(json.as_bytes());
-        format!("{:x}", hasher.finalize())
+        // digest 0.11 dropped `LowerHex` on `Output` (generic-array ->
+        // hybrid-array); hex the bytes by hand — same lowercase digest string.
+        hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// Validate config values are within acceptable ranges.

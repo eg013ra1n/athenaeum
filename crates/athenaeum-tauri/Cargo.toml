@@ -30,7 +30,7 @@ chrono = { version = "0.4", features = ["serde"] }
 rayon = "1.10"
 anyhow = "1"
 rustafits = { path = "../../rustafits" }
-base64 = "0.22"
+base64 = "0.23"
 # Explicit TLS backend — see the reqwest comment in athenaeum-core/Cargo.toml.
 reqwest = { version = "0.13", default-features = false, features = [
     "native-tls-no-alpn",
