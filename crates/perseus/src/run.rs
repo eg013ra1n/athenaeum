@@ -2151,9 +2151,13 @@ pub struct LogGuard(#[allow(dead_code)] tracing_appender::non_blocking::WorkerGu
 /// (`portmapper`, `netwatch`, `noq_udp`, `net_report`) are quieted to `warn`.
 /// Left at `info` they bury the handful of real sync events — a single evening
 /// run produced ~71k `iroh::socket::transports` span-close events (>99% of log
-/// volume). Raise any of them explicitly via `ATHENAEUM_LOG`, which overrides
-/// this default entirely, e.g. `ATHENAEUM_LOG=info,iroh=debug`.
-const DEFAULT_LOG_FILTER: &str = "info,iroh=warn,iroh_relay=warn,iroh_blobs=warn,net_report=warn,portmapper=warn,netwatch=warn,noq_udp=warn";
+/// volume). `iroh::net_report` goes further, to `error`: behind a symmetric-NAT
+/// / multi-WAN network it warns "address detected by QAD varies by destination"
+/// every probe round, forever, and the verdict is advisory (mirrors the desktop
+/// baseline in `athenaeum_core::logging::config`). Raise any of them explicitly
+/// via `ATHENAEUM_LOG`, which overrides this default entirely, e.g.
+/// `ATHENAEUM_LOG=info,iroh=debug,iroh::net_report=debug`.
+const DEFAULT_LOG_FILTER: &str = "info,iroh=warn,iroh_relay=warn,iroh_blobs=warn,net_report=error,iroh::net_report=error,portmapper=warn,netwatch=warn,noq_udp=warn";
 
 /// Initialize tracing: rolling JSONL files under `<data_dir>/logs` with a
 /// `perseus.*` filename prefix (daily rotation, 14 files retained), plus a

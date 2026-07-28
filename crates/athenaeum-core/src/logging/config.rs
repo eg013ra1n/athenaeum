@@ -23,6 +23,17 @@ const THIRD_PARTY_QUIET: [&str; 7] = [
     "noq_udp",
 ];
 
+/// Network-probe targets demoted further, to `error`, in the baseline. Behind a
+/// symmetric-NAT / multi-WAN network (any office) `iroh::net_report` warns
+/// "IPv4 address detected by QAD varies by destination" on every probe round —
+/// every ~25 s, forever — and the verdict is advisory (path quality is already
+/// visible in our own `transport traffic` telemetry). Emitted AFTER the
+/// `THIRD_PARTY_QUIET` directives so the duplicate `net_report` target resolves
+/// last-wins to `error`. Still raisable from the UI: the `transport` module
+/// repeats both targets, and it must — `iroh=debug` alone could not beat
+/// `iroh::net_report=error`, because `EnvFilter` specificity outranks order.
+const THIRD_PARTY_ERROR_ONLY: [&str; 2] = ["net_report", "iroh::net_report"];
+
 /// UI module key -> tracing filter targets.
 const MODULE_TARGETS: [(&str, &[&str]); 5] = [
     ("scanner", &["athenaeum_core::scanner"]),
@@ -41,6 +52,9 @@ const MODULE_TARGETS: [(&str, &[&str]); 5] = [
     // quieted target is repeated here (a subset would leave part of the transport
     // silent) plus our own side of the seam, so one switch covers both;
     // `transport_module_covers_every_quieted_target` fails if the lists drift.
+    // `iroh::net_report` must be repeated verbatim: it is demoted to `error` by
+    // `THIRD_PARTY_ERROR_ONLY`, and only an equally-specific directive can win
+    // it back (specificity outranks order in `EnvFilter`).
     (
         "transport",
         &[
@@ -48,6 +62,7 @@ const MODULE_TARGETS: [(&str, &[&str]); 5] = [
             "iroh_relay",
             "iroh_blobs",
             "net_report",
+            "iroh::net_report",
             "portmapper",
             "netwatch",
             "noq_udp",
@@ -85,6 +100,9 @@ impl LoggingConfig {
         // module key would win over this via EnvFilter's last-directive-wins.
         for t in THIRD_PARTY_QUIET {
             out.push_str(&format!(",{t}=warn"));
+        }
+        for t in THIRD_PARTY_ERROR_ONLY {
+            out.push_str(&format!(",{t}=error"));
         }
         for (key, level) in &self.modules {
             if !LEVELS.contains(&level.as_str()) {
@@ -146,11 +164,17 @@ pub struct LoggingConfigResponse {
 mod tests {
     use super::*;
 
-    /// The `,iroh=warn,...` baseline suffix that `to_directives()` appends after
-    /// the base level (see `THIRD_PARTY_QUIET`), so assertions read against the
-    /// same source of truth as the implementation.
+    /// The `,iroh=warn,...,iroh::net_report=error` baseline suffix that
+    /// `to_directives()` appends after the base level (see `THIRD_PARTY_QUIET`
+    /// + `THIRD_PARTY_ERROR_ONLY`), so assertions read against the same source
+    /// of truth as the implementation.
     fn quiet_suffix() -> String {
-        THIRD_PARTY_QUIET.iter().map(|t| format!(",{t}=warn")).collect()
+        let warns: String = THIRD_PARTY_QUIET.iter().map(|t| format!(",{t}=warn")).collect();
+        let errors: String = THIRD_PARTY_ERROR_ONLY
+            .iter()
+            .map(|t| format!(",{t}=error"))
+            .collect();
+        format!("{warns}{errors}")
     }
 
     #[test]
@@ -217,12 +241,77 @@ mod tests {
             .iter()
             .find(|(k, _)| *k == "transport")
             .expect("transport module key");
-        for t in THIRD_PARTY_QUIET {
+        for t in THIRD_PARTY_QUIET.iter().chain(THIRD_PARTY_ERROR_ONLY.iter()) {
             assert!(
-                targets.contains(&t),
+                targets.contains(t),
                 "{t} is quieted by the baseline but not raisable via the transport module"
             );
         }
+    }
+
+    /// Functional pin for the `net_report` demotion — string asserts can't
+    /// catch `EnvFilter` specificity semantics, so run events through a real
+    /// filter. Default baseline: an `iroh::net_report` WARN is suppressed while
+    /// its ERROR and an ordinary `iroh` WARN still pass. With the `transport`
+    /// module raised to debug, the same WARN passes again (the equally-specific
+    /// `iroh::net_report=debug` beats the baseline's `=error` last-wins).
+    #[test]
+    fn net_report_warn_suppressed_by_default_but_raisable_via_transport() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::{layer::SubscriberExt, EnvFilter};
+
+        #[derive(Clone, Default)]
+        struct Seen(Arc<Mutex<Vec<(String, String)>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push((
+                    event.metadata().target().to_string(),
+                    event.metadata().level().to_string(),
+                ));
+            }
+        }
+
+        let run = |cfg: &LoggingConfig| -> Vec<(String, String)> {
+            let seen = Seen::default();
+            let filter = EnvFilter::new(cfg.to_directives());
+            let subscriber = tracing_subscriber::registry().with(filter).with(seen.clone());
+            // Macro callsites cache subscriber interest per process; force a
+            // recompute so the second run doesn't reuse the first filter's verdict.
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::callsite::rebuild_interest_cache();
+                tracing::warn!(target: "iroh::net_report::report", "varies by destination");
+                tracing::error!(target: "iroh::net_report::report", "probe failed");
+                tracing::warn!(target: "iroh::endpoint", "other transport warn");
+            });
+            let events = seen.0.lock().unwrap().clone();
+            events
+        };
+
+        let default_events = run(&LoggingConfig::default());
+        assert!(
+            !default_events.contains(&("iroh::net_report::report".into(), "WARN".into())),
+            "net_report WARN must be suppressed by default; got {default_events:?}"
+        );
+        assert!(
+            default_events.contains(&("iroh::net_report::report".into(), "ERROR".into())),
+            "net_report ERROR must still pass; got {default_events:?}"
+        );
+        assert!(
+            default_events.contains(&("iroh::endpoint".into(), "WARN".into())),
+            "ordinary iroh WARNs must stay in the baseline; got {default_events:?}"
+        );
+
+        let mut raised = LoggingConfig::default();
+        raised.modules.insert("transport".into(), "debug".into());
+        let raised_events = run(&raised);
+        assert!(
+            raised_events.contains(&("iroh::net_report::report".into(), "WARN".into())),
+            "transport=debug must re-raise net_report WARNs; got {raised_events:?}"
+        );
     }
 
     #[test]
