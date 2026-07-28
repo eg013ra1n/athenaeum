@@ -14,10 +14,20 @@ use ts_rs::TS;
 const HEADER: &str = "// AUTO-GENERATED from Rust by athenaeum-core/src/ts_export.rs — do not edit.\n\
                       // Regenerate: TS_RS_WRITE=1 cargo test -p athenaeum-core --test ts_contract\n\n";
 
+/// ts-rs 12 threads a `Config` through `TS::decl` (previously argument-less).
+/// Deliberately `Config::default()` and NOT `Config::from_env()`: this file is a
+/// checked-in contract diffed by tests/ts_contract.rs, so a stray
+/// `TS_RS_LARGE_INT` / `TS_RS_USE_V11_HASHMAP` in someone's shell must not
+/// silently regenerate different bindings. Generation stays hermetic.
+fn ts_config() -> ts_rs::Config {
+    ts_rs::Config::default()
+}
+
 macro_rules! decls {
     ($($t:ty),* $(,)?) => {{
+        let cfg = ts_config();
         let mut out = String::new();
-        $( out.push_str(&format!("export {}\n\n", <$t as TS>::decl())); )*
+        $( out.push_str(&format!("export {}\n\n", <$t as TS>::decl(&cfg))); )*
         out
     }};
 }

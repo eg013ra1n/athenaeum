@@ -37,7 +37,12 @@ export default function LoggingSettings() {
   const [level, setLevel] = useState('info');
   // Partial, not Record: LoggingConfig.modules is a HashMap-backed optional-
   // index map on the generated type ({ [key in string]?: string }).
-  const [modules, setModules] = useState<Partial<Record<string, string>>>({});
+  // Tracks the generated contract by reference rather than restating its shape:
+  // ts-rs 12 emits `modules` as an index signature (`{ [key in string]: string }`),
+  // where ts-rs 10 emitted the optional form. Keys are still genuinely absent at
+  // runtime for inherited modules, so the `?? INHERIT` read below stays load-bearing
+  // even though the index signature types the lookup as always-present.
+  const [modules, setModules] = useState<LoggingConfig['modules']>({});
   const [envOverrideActive, setEnvOverrideActive] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);

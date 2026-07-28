@@ -97,7 +97,7 @@ tracing-appender = "0.2"
 # no-serde-warnings: ts-rs cannot parse type-irrelevant serde attrs
 # (deserialize_with, skip_serializing_if, alias) and warns on every build;
 # the generated-output diff in tests/ts_contract.rs is the real guard.
-ts-rs = { version = "10", features = ["chrono-impl", "no-serde-warnings"] }
+ts-rs = { version = "12", features = ["chrono-impl", "no-serde-warnings"] }
 base64 = "0.22"
 # Cross-platform OS hostname for the default device name (Sync 2C). Small,
 # dependency-light; the name is cosmetic (renamable via the hub) so this only

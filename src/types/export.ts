@@ -209,7 +209,7 @@ masters: Array<MasterInfo>,
 /**
  * Map of set_id → master file path for reference
  */
-masterPaths: { [key in number]?: string }, };
+masterPaths: { [key in number]: string }, };
 
 export type MasterInfo = { 
 /**

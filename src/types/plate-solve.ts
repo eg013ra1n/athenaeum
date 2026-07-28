@@ -78,7 +78,7 @@ blind_scale_header_tol: number,
  * alone (two unknowns, one equation), so `frames.focallen` stays NULL.
  * Empty default → behaviour unchanged.
  */
-camera_defaults: { [key in string]?: number }, 
+camera_defaults: { [key in string]: number }, 
 /**
  * Path to the optional bright sub-catalog used by the solvemyastro
  * backend for fast quad matching (G<14 stars with per-HEALPix-cell

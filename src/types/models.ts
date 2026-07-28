@@ -398,7 +398,7 @@ export type StackingPrepProgressEvent = { frameId: number, current: number, tota
 
 export type StackingPrepCompleteEvent = { referenceFrameId: number, aligned: number, failed: number, total: number, };
 
-export type LoggingConfig = { level: string, modules: { [key in string]?: string }, };
+export type LoggingConfig = { level: string, modules: { [key in string]: string }, };
 
 export type LoggingConfigResponse = { config: LoggingConfig, envOverrideActive: boolean, };
 
@@ -1035,19 +1035,19 @@ peerDevice: string, frameCount: number,
  * exchange, else `None` for personal sync. Additive — the Transfers UI reads
  * it in Task 11 to route project transfers to the project view.
  */
-projectId: string | null, 
+projectId?: string | null, 
 /**
  * Cumulative fetched bytes at this tick (Task 11). Present only on the
  * `fetching`-stage ticks driven by the transport's batch progress; `None` on
  * the coarse stage ticks (`received`/`ingesting`/sender stages) that carry no
  * byte figure.
  */
-bytesDone: number | null, 
+bytesDone?: number | null, 
 /**
  * Total package bytes for the fetch (the announce's `byte_size`), paired with
  * [`bytes_done`](Self::bytes_done) on `fetching` ticks; `None` elsewhere.
  */
-bytesTotal: number | null, };
+bytesTotal?: number | null, };
 
 export type SyncFileProgressEvent = { packageId: string, 
 /**
@@ -1091,7 +1091,7 @@ newCount: number, duplicateCount: number,
  * exchange, else `None` for personal sync. Additive — Task 11 wires it to
  * the project-transfer UI/notification.
  */
-projectId: string | null, };
+projectId?: string | null, };
 
 export type SyncHistoryQuery = { 
 /**

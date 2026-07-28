@@ -169,15 +169,15 @@ darks: SourceTypeConfig,
 /**
  * Behavioral options per source type
  */
-behavioral_options: { [key in string]?: BehavioralOptions }, 
+behavioral_options: { [key in string]: BehavioralOptions }, 
 /**
  * Master preference per calibration type
  */
-master_preferences: { [key in string]?: MasterPreference }, 
+master_preferences: { [key in string]: MasterPreference }, 
 /**
  * Clustering configuration per calibration type
  */
-clustering: { [key in string]?: ClusteringConfig }, 
+clustering: { [key in string]: ClusteringConfig }, 
 /**
  * Scoring configuration
  */
