@@ -5,11 +5,14 @@
 //! coexist) and **never** in the catalog DB, logs, or any error message.
 //!
 //! Backend selection:
-//! - **macOS / Windows** — the native keychain (`keyring` crate,
-//!   `apple-native` / `windows-native`). If a keychain call fails at runtime
-//!   (locked, sandbox denial), it transparently falls back to the 0600 file.
-//! - **Linux / everything else** — a 0600 file directly (the `keyring` crate is
-//!   compiled without a secret-service/dbus backend, so there is no reliable
+//! - **macOS / Windows** — the native keychain (`keyring` 4 with its `v1`
+//!   compatibility surface, which selects the `apple-native-keyring-store` /
+//!   `windows-native-keyring-store` backends). If a keychain call fails at
+//!   runtime (locked, sandbox denial), it transparently falls back to the 0600
+//!   file.
+//! - **Linux / everything else** — a 0600 file directly (the `keyring`
+//!   dependency is target-scoped to mac/windows in `Cargo.toml`, so no
+//!   secret-service/dbus backend is ever compiled and there is no reliable
 //!   native store; the web/Docker and headless builds run here). This is the
 //!   documented file-0600 fallback (Perseus pattern).
 //!
@@ -115,8 +118,24 @@ impl TokenStore {
         self.file_delete()
     }
 
+    /// Build the keychain entry for this account (service + hub host).
+    ///
+    /// keyring 4 installs the platform store into a process-global slot the
+    /// first time an entry is built, and it flips its "installed" flag *before*
+    /// registering the store — a second thread entering that window gets
+    /// `NoDefaultStore`, which [`Self::load`] would read as "keychain
+    /// unavailable" and answer from the (normally absent) file fallback, i.e. a
+    /// spurious signed-out. keyring 3 had no such window (`OnceLock`), so we
+    /// close it ourselves: the first construction in the process is serialized,
+    /// every later one is uncontended. Building an entry is a pure value
+    /// construction — no keychain I/O — so doing it twice on that first call
+    /// costs nothing.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn keyring_entry(&self) -> Result<keyring::Entry, keyring::Error> {
+        static STORE_INIT: std::sync::Once = std::sync::Once::new();
+        STORE_INIT.call_once(|| {
+            let _ = keyring::Entry::new(KEYRING_SERVICE, &self.account);
+        });
         keyring::Entry::new(KEYRING_SERVICE, &self.account)
     }
 

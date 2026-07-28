@@ -49,12 +49,6 @@ reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "form",
 ] }
-# OS keychain for the hub device-token (task B4). Only the apple/windows native
-# stores are enabled — no secret-service/dbus backend, so the Linux (web/Docker)
-# and headless builds compile without any system D-Bus lib and simply use the
-# file-0600 fallback in `account::token_store` (see that module). The token is
-# NEVER written to logs or DB.
-keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native"] }
 tokio = { version = "1", features = ["sync", "time", "macros", "rt", "fs", "io-util"] }
 # Trait-object async methods for the transport-agnostic SharingTransport (sync
 # feature). Sanctioned mechanism per the Stage I sync plan; ungated so the
@@ -108,6 +102,27 @@ hostname = "0.4"
 # `disk_pct` retention policy can measure free space without a new dependency tree.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# OS keychain for the hub device-token (task B4). keyring 4 is a thin shim: the
+# platform stores moved into their own crates (`apple-native-keyring-store` /
+# `windows-native-keyring-store`) over a shared `keyring-core`, and the `v1`
+# feature is the compatibility surface that keeps v3's `Entry::new(service,
+# user)` API and picks exactly those two native stores.
+#
+# TARGET-SCOPED ON PURPOSE: `v1` also enables `zbus-secret-service-keyring-store`
+# on unix-non-mac, so an unconditional dependency would drag D-Bus/Secret Service
+# into the Linux (web/Docker) and headless builds. Scoping the dependency to
+# mac/windows keeps those builds free of any store crate at all — they use the
+# file-0600 fallback in `account::token_store` (see that module), which is the
+# only path that module compiles off-mac/windows anyway.
+#
+# Item addressing is unchanged from keyring 3, so tokens written by earlier
+# releases stay readable: macOS = generic password in the User (login) keychain
+# keyed on service+account; Windows = generic credential with target name
+# `{user}.{service}`, UTF-16 blob, CRED_PERSIST_ENTERPRISE. The token is NEVER
+# written to logs or DB.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+keyring = { version = "4", default-features = false, features = ["v1"] }
 
 [features]
 # `render` pulls the rustafits image pipeline; `solver` pulls the plate-solver.
