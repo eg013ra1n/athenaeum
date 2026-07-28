@@ -32,7 +32,7 @@ memmap2 = "0.9"
 byteorder = "1"
 cdshealpix = "0.9"
 flate2 = "1.0"
-zip = { version = "2", default-features = false, features = ["deflate", "time"] }
+zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 # OS keychain for the hub device-token (task B4). Only the apple/windows native
 # stores are enabled — no secret-service/dbus backend, so the Linux (web/Docker)
