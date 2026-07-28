@@ -51,7 +51,7 @@ async-trait = "0.1"
 # `sharing::iroh` transport (Perseus needs it). Default features keep the
 # pure-Rust `tls-ring` crypto backend (no cmake/aws-lc-rs) — ARM-friendly, pulls
 # no rustafits/solver/native-heavy deps.
-iroh = "=1.0.2"
+iroh = "=1.0.3"
 iroh-blobs = "=0.103.0"
 # Addressing ticket (EndpointTicket) used as the out-of-band pairing_ticket;
 # pinned to iroh's 1.x ticket crate. Transitive under iroh-blobs, named directly
@@ -69,10 +69,11 @@ n0-future = "0.3"
 # a native handle on Windows.
 fd-lock = "4"
 # ed25519 verification of hub-signed membership snapshots. MUST match the
-# version iroh 1.0.2 already carries transitively (one crate version in the
-# tree — owner rule): check `grep -A1 'name = "ed25519-dalek"' Cargo.lock`
-# and pin exactly that (3.0.0-rc.0 at the time of writing).
-ed25519-dalek = "3.0.0-rc.0"
+# version iroh 1.0.3 already carries transitively (one crate version in the
+# tree — owner rule): iroh 1.0.3 depends on `ed25519-dalek >=3.0.0-rc.0, <4.0.0`,
+# which resolves to the 3.0.0 stable release. Check
+# `grep -A1 'name = "ed25519-dalek"' Cargo.lock` and pin exactly that.
+ed25519-dalek = "3.0.0"
 # postcard wire encoding for the announce/ack control protocol (bidirectional QUIC stream).
 postcard = { version = "1", features = ["use-std"] }
 tracing = "0.1"

@@ -92,13 +92,13 @@ chrono = "0.4"
 # iroh types named directly at the transport-wiring seam (run.rs): RelayMode for
 # IrohTransport::new, EndpointTicket to derive the peer NodeId from the pairing
 # ticket. Pinned to the exact versions athenaeum-core uses so cargo unifies them.
-iroh = "=1.0.2"
+iroh = "=1.0.3"
 iroh-tickets = "=1.0.0"
 # Tray mode (feature `tray`, off by default). Versions pinned to the workspace
 # lock — tray-icon/tao/open already resolve there transitively via Tauri, so
 # cargo unifies them; auto-launch is new to the lock (start-at-login toggle).
-tray-icon = { version = "0.21", optional = true }
-tao = { version = "0.34", optional = true }
+tray-icon = { version = "0.24", optional = true }
+tao = { version = "0.35", optional = true }
 open = { version = "5.3", optional = true }
 auto-launch = { version = "0.5", optional = true }
 # Unix `statvfs` for the retention disk-usage probe (disk_pct policy) and the
