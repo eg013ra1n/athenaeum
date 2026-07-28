@@ -62,7 +62,7 @@ serde_json = "1"
 toml = "1"
 # Comment-/layout-preserving edits of the `[retention]` table for the web
 # settings page (config_edit.rs). Only the whitelisted keys are rewritten; the
-# file is re-parsed + validated and atomically replaced. 0.23.7 already resolves
+# file is re-parsed + validated and atomically replaced. 0.25.13 already resolves
 # in the workspace lock.
 toml_edit = "0.25"
 uuid = { version = "1", features = ["v4"] }

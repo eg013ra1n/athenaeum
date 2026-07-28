@@ -256,6 +256,25 @@ fn build_autolaunch() -> Option<auto_launch::AutoLaunch> {
     auto_launch::AutoLaunchBuilder::new()
         .set_app_name("Perseus")
         .set_app_path(&exe.to_string_lossy())
+        // Both modes are pinned to what auto-launch 0.5 did implicitly, because
+        // 0.6 flipped both defaults and an existing user's start-at-login state
+        // lives in the OLD mechanism. Switching mechanisms would strand it:
+        // `is_enabled` would read the new location (menu shows unchecked while
+        // the old registration still fires), enabling would add a SECOND
+        // registration (double launch), and `disable` would only remove the new
+        // one — leaving the old registration unreachable from the UI forever.
+        //
+        // macOS: 0.5's builder defaulted `use_launch_agent = false`, i.e. an
+        // AppleScript (System Events) login item; 0.6 defaults to a
+        // ~/Library/LaunchAgents plist. SMAppService is a third, opt-in variant
+        // — the smappservice-rs dep in the lock only *supports* it, it is never
+        // selected by default.
+        .set_macos_launch_mode(auto_launch::MacOSLaunchMode::AppleScript)
+        // Windows: 0.5 wrote HKEY_CURRENT_USER unconditionally; 0.6 defaults to
+        // `Dynamic`, which tries HKLM (all users, admin-only) first and falls
+        // back to HKCU on access-denied. CurrentUser keeps the per-user scope a
+        // headless capture node expects and needs no elevation.
+        .set_windows_enable_mode(auto_launch::WindowsEnableMode::CurrentUser)
         .build()
         .map_err(|error| tracing::warn!(%error, "autolaunch unavailable"))
         .ok()
