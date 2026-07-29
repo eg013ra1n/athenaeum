@@ -9,4 +9,4 @@ edition = "2021"
 # JPEG codec. Needs cmake+nasm, which rustafits already requires. The parked
 # wip/pure-rust-jpeg branch replaces this with libjpeg-turbo-rs when its
 # 0.8.0 (trailing-MCU fix) is published.
-turbojpeg = "1.4"
+turbojpeg = "1.5"
