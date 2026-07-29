@@ -5,11 +5,13 @@ FROM rust:1.96-bookworm AS rust-builder
 
 WORKDIR /build
 
-# rustafits → turbojpeg → turbojpeg-sys requires cmake + nasm to build
-# libjpeg-turbo from source. Matches rustafits's own release.yml setup.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends nasm cmake \
-    && rm -rf /var/lib/apt/lists/*
+# No `apt-get install nasm cmake` here on purpose. It used to be required
+# because rustafits and jpeg-encode both bound the C libjpeg-turbo via
+# turbojpeg-sys, which builds the library from source. Both now use the
+# pure-Rust libjpeg-turbo-rs, and turbojpeg-sys — the workspace's only user of
+# the `cmake` crate — is out of Cargo.lock entirely, so this stage needs
+# nothing beyond the Rust toolchain the base image ships. If a future dep
+# reintroduces a C build step, add it back here rather than assuming it exists.
 
 # Copy workspace manifests first for layer caching
 COPY Cargo.toml Cargo.lock ./
@@ -47,8 +49,10 @@ RUN sed -i '/"crates\/athenaeum-tauri",/d' Cargo.toml \
 # A `sed` patch of zune-jpeg's NEON upsampler used to live here (0.5.12 had
 # safe fns calling unsafe intrinsics — an aarch64 build failure on any stable
 # Rust). It is gone for two independent reasons: `608ae350` moved the JPEG
-# encoder onto turbojpeg, so zune-jpeg is no longer in Cargo.lock at all, and
-# upstream fixed the signatures in 0.5.15. Leaving the patch in place was
+# encoder off the `image` crate (whose `jpeg` feature was what pulled
+# zune-jpeg), so zune-jpeg is no longer in Cargo.lock at all — that stayed true
+# through the later move to libjpeg-turbo-rs — and upstream fixed the
+# signatures in 0.5.15. Leaving the patch in place was
 # actively fatal, not merely dead: with the crate unfetched the glob matched
 # nothing, sed got the literal pattern, and this RUN failed the whole build.
 RUN cargo fetch

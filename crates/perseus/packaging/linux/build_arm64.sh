@@ -21,8 +21,12 @@ docker run --rm --platform linux/arm64 \
   cd crates/perseus
   # `--no-default-features` drops the tray; `--features preview` puts the frame
   # renderer back. Without it the RPi package serves `/api/library/preview` as a
-  # 404 stub and the Library tab has no images. The renderer is pure Rust — no
-  # cmake/nasm — so nothing extra is installed in this container for it.
+  # 404 stub and the Library tab has no images. Nothing extra is installed in
+  # this container: the whole perseus graph — renderer included — is pure Rust
+  # now that rustafits AND jpeg-encode (an unconditional athenaeum-core dep, so
+  # it applied even to a preview-less build) use libjpeg-turbo-rs instead of the
+  # C libjpeg-turbo. While turbojpeg-sys was still in Cargo.lock this container
+  # would have needed cmake + nasm.
   cargo deb --variant headless --no-default-features --features preview -- -p perseus
   cd /work
   tar czf target/debian/perseus-'"$VERSION"'-linux-arm64.tar.gz -C target/release perseus

@@ -18,9 +18,12 @@ anyhow = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 quick-xml = "0.41"
 uuid = { version = "1", features = ["v4"] }
-# Optional submodule path deps (pull turbojpeg/nasm/cmake native builds). Gated
-# behind the `render`/`solver` features so headless consumers (e.g. Perseus) can
-# depend on athenaeum-core with `default-features = false` and skip them.
+# Optional submodule path deps. Gated behind the `render`/`solver` features so
+# headless consumers (e.g. Perseus) can depend on athenaeum-core with
+# `default-features = false` and skip them. Neither pulls a C toolchain any
+# more — rustafits's JPEG encoder moved to pure-Rust libjpeg-turbo-rs — so the
+# gate is now about compile time, binary size and unused subsystems, not about
+# cmake/nasm.
 rustafits = { path = "../../rustafits", features = ["debug-pipeline"], optional = true }
 # Standalone plate solver (clean-room quad-matching implementation). Path dep like
 # rustafits; Phase 3 adapter calls solvemyastro::solve / build_cache.

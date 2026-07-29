@@ -44,17 +44,14 @@ build:windows:
       - target/
       - .npm/
   script:
-    # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
-    # cmake and nasm are needed because turbojpeg-sys builds libjpeg-turbo
-    # from source on every fresh build. Idempotent: install only what's
-    # missing, then refresh PATH so this job sees the new binaries.
-    - |
-      $missing = @('cmake','nasm') | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
-      if ($missing) {
-        Write-Host "Installing missing build tools: $($missing -join ', ')"
-        choco install -y --no-progress $missing
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-      }
+    # No cmake/nasm bootstrap here any more. turbojpeg-sys (the only crate that
+    # needed cmake, and the only one that shelled out to nasm — via
+    # libjpeg-turbo's own build) is out of Cargo.lock since both rustafits and
+    # jpeg-encode moved to pure-Rust libjpeg-turbo-rs. `ring`, the other
+    # Windows crate with .asm in it, does NOT need a PATH nasm: the crates.io
+    # package ships no `.git`, so its build.rs takes the `pregenerated/` branch
+    # with prebuilt *-nasm.o objects, and even its git-checkout branch invokes a
+    # vendored `./target/tools/windows/nasm/nasm`, never PATH.
     - if (Test-Path "target\release\bundle") { Remove-Item -Recurse -Force "target\release\bundle" }
     - npm install
     - npm run tauri build
@@ -79,19 +76,12 @@ build:linux:
     APPIMAGE_EXTRACT_AND_RUN: "1"
   before_script:
     - source "$HOME/.cargo/env"
-    # cmake + nasm are required by rustafits → turbojpeg-sys → libjpeg-turbo (built from source).
-    # They must be pre-installed on the runner host because the gitlab-runner user
-    # cannot sudo non-interactively. One-time setup on the runner host:
-    #   sudo apt-get install -y cmake nasm
-    - |
-      missing=()
-      command -v cmake >/dev/null || missing+=(cmake)
-      command -v nasm  >/dev/null || missing+=(nasm)
-      if [ ${#missing[@]} -gt 0 ]; then
-        echo "ERROR: missing build deps on runner: ${missing[*]}"
-        echo "Run on the runner host: sudo apt-get install -y cmake nasm"
-        exit 1
-      fi
+    # The cmake/nasm host precheck that used to live here is gone: it guarded
+    # rustafits → turbojpeg-sys → libjpeg-turbo, and turbojpeg-sys left
+    # Cargo.lock when both rustafits and jpeg-encode moved to pure-Rust
+    # libjpeg-turbo-rs. On ELF targets `ring` assembles through cc/gas, not
+    # nasm. Nothing else in the tree uses the `cmake` crate. (The tools may
+    # still be installed on the runner host; this job simply no longer cares.)
   cache:
     key: "main-linux"
     # pull-push: see build:windows — releases keep their own cache warm.
@@ -115,12 +105,19 @@ build:linux:
 
 # --- Headless core guard ---
 # Perseus (the headless sync agent) depends on athenaeum-core with
-# `default-features = false`, omitting the rustafits/solvemyastro submodules
-# (which pull nasm/cmake/turbojpeg native builds). This job guards that the
-# core library keeps compiling without them. It deliberately installs NO native
-# build tools — if this job ever needs cmake/nasm, the feature-gating has
-# regressed. Runs on every main commit + tag (not `only: tags`) so a regression
-# is caught before release.
+# `default-features = false`, omitting the rustafits/solvemyastro submodules.
+# This job guards that the core library keeps compiling without them, and it
+# deliberately installs NO native build tools.
+#
+# That second half was a dead letter for a while: `jpeg-encode` is an
+# UNCONDITIONAL dep of athenaeum-core, so while it bound the C libjpeg-turbo
+# this job did need cmake/nasm and only passed because the linux runner host
+# happened to have them. With jpeg-encode on pure-Rust libjpeg-turbo-rs and
+# turbojpeg-sys out of Cargo.lock, the no-native-tools invariant is real again
+# and a regression here means a genuine C-toolchain dep crept in.
+#
+# Runs on every main commit + tag (not `only: tags`) so a regression is caught
+# before release.
 check:headless-core:
   stage: build
   tags:
@@ -221,10 +218,9 @@ build:macos:
       - target/
       - .npm/
   script:
-    # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
-    # cmake and nasm are needed because turbojpeg-sys builds libjpeg-turbo
-    # from source on every fresh build.
-    - for tool in cmake nasm; do command -v $tool >/dev/null || brew install $tool; done
+    # No `brew install cmake nasm` here any more — turbojpeg-sys is out of
+    # Cargo.lock (see build:windows). Apple targets never took `ring`'s nasm
+    # path anyway: its macosx/ios64 perlasm output assembles through cc.
     - export PATH="$HOME/.cargo/bin:$PATH"
     - which cargo && rustc --print sysroot
     - rustup target add x86_64-apple-darwin
@@ -274,13 +270,7 @@ update-cache:windows:
       - target/
       - .npm/
   script:
-    # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
-    - |
-      $missing = @('cmake','nasm') | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) }
-      if ($missing) {
-        choco install -y --no-progress $missing
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-      }
+    # No cmake/nasm bootstrap — see build:windows.
     - npm install
     - npm run tauri build
 
@@ -293,16 +283,7 @@ update-cache:linux:
   when: manual
   before_script:
     - source "$HOME/.cargo/env"
-    # cmake + nasm must be pre-installed on the runner host (see build:linux for details).
-    - |
-      missing=()
-      command -v cmake >/dev/null || missing+=(cmake)
-      command -v nasm  >/dev/null || missing+=(nasm)
-      if [ ${#missing[@]} -gt 0 ]; then
-        echo "ERROR: missing build deps on runner: ${missing[*]}"
-        echo "Run on the runner host: sudo apt-get install -y cmake nasm"
-        exit 1
-      fi
+    # No cmake/nasm host precheck — see build:linux.
   cache:
     key: "main-linux"
     policy: push
@@ -332,8 +313,7 @@ update-cache:macos:
       - target/
       - .npm/
   script:
-    # --- Ensure native build deps for turbojpeg-sys (libjpeg-turbo) ---
-    - for tool in cmake nasm; do command -v $tool >/dev/null || brew install $tool; done
+    # No cmake/nasm bootstrap — see build:macos.
     - export PATH="$HOME/.cargo/bin:$PATH"
     - rustup target add x86_64-apple-darwin
     - npm install
@@ -341,9 +321,23 @@ update-cache:macos:
     - npm run tauri build -- --target x86_64-apple-darwin
 
 # --- Perseus (headless sync agent) — desktop installers (tags only) ---
-# Perseus ships as its own set of installers alongside Athenaeum. Each job builds
-# `perseus --features tray` (headless core; no rustafits/turbojpeg, so no
-# cmake/nasm). Signed/notarized on macOS via the shared .macos_signing_setup; the
+# Perseus ships as its own set of installers alongside Athenaeum. What each job
+# builds differs: macOS (via packaging/macos/build_app.sh) and Windows build
+# `-p perseus --features tray`; Linux builds the headless binary first
+# (`--no-default-features --features preview`) for the tar.gz, then `cargo deb`
+# for the tray variant.
+#
+# rustafits is in the graph in every one of those: perseus takes a DIRECT
+# optional dep on the submodule behind its own `preview` feature (on by default,
+# and passed explicitly in the headless build). That is separate from
+# athenaeum-core's `render` feature — `athenaeum-core = { default-features =
+# false }` drops both of core's gated deps, i.e. the `render` (rustafits image
+# pipeline) and `solver` (solvemyastro) modules, none of which a capture node
+# uses.
+#
+# No C toolchain in any variant since the JPEG encoder went pure-Rust, which is
+# what lets these jobs and the arm64 container build with only the Rust
+# toolchain. Signed/notarized on macOS via the shared .macos_signing_setup; the
 # deploy job renames + uploads the artifacts and creates stable-named aliases.
 
 build:perseus:macos:
