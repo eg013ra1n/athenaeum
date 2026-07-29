@@ -197,10 +197,10 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
 
     try {
       const imageData = isTauri
-        ? await api.invoke<Uint8Array>("read_fits_image_rustafits", {
+        ? await api.invoke<Uint8Array<ArrayBuffer>>("read_fits_image_rustafits", {
             path: frame.file.path,
           })
-        : await api.invoke<Uint8Array>("get_frame_preview", {
+        : await api.invoke<Uint8Array<ArrayBuffer>>("get_frame_preview", {
             frameId: frame.file.id,
           });
 
@@ -521,11 +521,11 @@ const BlinkViewer: React.FC<BlinkViewerProps> = ({
     setLoadingFullRes(true);
     try {
       const imageData = isTauri
-        ? await api.invoke<Uint8Array>("read_fits_image_rustafits", {
+        ? await api.invoke<Uint8Array<ArrayBuffer>>("read_fits_image_rustafits", {
             path: frame.file.path,
             resolution: "full",
           })
-        : await api.invoke<Uint8Array>("get_frame_preview", {
+        : await api.invoke<Uint8Array<ArrayBuffer>>("get_frame_preview", {
             frameId: frame.file.id,
             resolution: "full",
           });
