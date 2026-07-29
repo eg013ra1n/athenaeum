@@ -254,6 +254,18 @@ pub async fn validate_folder_candidate(
         .map_err(api_err)
 }
 
+/// POST /api/get_folder_overview
+///
+/// Per-folder stats (file counts/bytes, archive set counts/zip bytes) for the
+/// Folders tab — one call for the whole rail. No args; the client's `{}` body
+/// is ignored.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn get_folder_overview(
+    State(state): State<WebAppState>,
+) -> Result<Json<athenaeum_core::api::scan_roots::FolderOverview>, (StatusCode, String)> {
+    api::get_folder_overview(&state.ctx).map(Json).map_err(api_err)
+}
+
 /// POST /api/delete_scan_root
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn delete_scan_root(

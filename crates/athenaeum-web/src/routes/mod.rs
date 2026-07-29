@@ -58,6 +58,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/set_collaboration_dir", post(scan_roots::set_collaboration_dir))
         .route("/api/clear_collaboration_dir", post(scan_roots::clear_collaboration_dir))
         .route("/api/validate_folder_candidate", post(scan_roots::validate_folder_candidate))
+        .route("/api/get_folder_overview", post(scan_roots::get_folder_overview))
         .route("/api/delete_scan_root", post(scan_roots::delete_scan_root))
         .route("/api/start_scan", post(scan_roots::start_scan))
         .route("/api/start_scan_with_progress", post(scan_roots::start_scan_with_progress))

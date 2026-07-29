@@ -1385,6 +1385,102 @@ pub fn get_missing_files_counts(ctx: &ServiceContext) -> Result<HashMap<i64, i64
     Ok(counts)
 }
 
+/// Per-folder stats for the Folders rail/inspector (spec §8.3) — one call,
+/// no N+1 from the frontend.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+pub struct ScanRootOverview {
+    pub root_id: i64,
+    pub file_count: i64,
+    pub total_bytes: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+pub struct ArchiveRootOverview {
+    pub archive_root_id: i64,
+    pub path: String,
+    pub set_count: i64,
+    /// Sum of on-disk sizes of the distinct zips recorded for operations
+    /// under this root; missing zips contribute 0 (mirrors `list_archive_zips`).
+    pub total_zip_bytes: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+pub struct FolderOverview {
+    pub scan_roots: Vec<ScanRootOverview>,
+    pub archive_roots: Vec<ArchiveRootOverview>,
+}
+
+pub fn get_folder_overview(ctx: &ServiceContext) -> Result<FolderOverview, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+
+    let mut scan_roots = Vec::new();
+    for root in crate::db::get_scan_roots(&conn)? {
+        let Some(root_id) = root.id else { continue };
+        // Separator-safe prefix match (`/data/Set1` must not capture `/data/Set10`).
+        let (file_count, total_bytes): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files WHERE path LIKE ?1 || '/%' OR path LIKE ?1 || '\\%'",
+                rusqlite::params![root.path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| ApiError::Internal(format!("overview query failed: {e}")))?;
+        scan_roots.push(ScanRootOverview {
+            root_id,
+            file_count,
+            total_bytes,
+        });
+    }
+
+    let mut archive_roots = Vec::new();
+    let mut stmt = conn
+        .prepare("SELECT id, path FROM archive_roots ORDER BY id")
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let roots: Vec<(i64, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(|e| ApiError::Internal(e.to_string()))?
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    for (id, path) in roots {
+        let set_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM frames_set fs
+                 JOIN archive_operations op ON fs.archive_operation_id = op.id
+                 WHERE fs.archived_at IS NOT NULL AND op.archive_root_path = ?1",
+                rusqlite::params![path],
+                |row| row.get(0),
+            )
+            .map_err(|e| ApiError::Internal(format!("archive set count failed: {e}")))?;
+        let mut zstmt = conn
+            .prepare(
+                "SELECT DISTINCT aof.target_zip_path FROM archive_operation_files aof
+                 JOIN archive_operations op ON aof.operation_id = op.id
+                 WHERE op.archive_root_path = ?1",
+            )
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let zips: Vec<String> = zstmt
+            .query_map(rusqlite::params![path], |row| row.get(0))
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let total_zip_bytes = zips
+            .iter()
+            .map(|z| std::fs::metadata(z).map(|m| m.len() as i64).unwrap_or(0))
+            .sum();
+        archive_roots.push(ArchiveRootOverview {
+            archive_root_id: id,
+            path,
+            set_count,
+            total_zip_bytes,
+        });
+    }
+
+    Ok(FolderOverview {
+        scan_roots,
+        archive_roots,
+    })
+}
+
 /// Task 9 fix round — api-level coverage for `add_scan_root`'s kind checks.
 /// The two checks run at different points in `add_scan_root`'s flow (Invalid
 /// before any path/DB work; Conflict after overlap validation), so they were
@@ -2153,5 +2249,145 @@ mod switch_library_tests {
             get_calibration_library_dir(&ctx).unwrap().as_deref(),
             Some(new.as_str())
         );
+    }
+}
+
+/// Task 3 — [`get_folder_overview`] aggregates. Runs against a real
+/// `ServiceContext` (the handler walks `db::get_scan_roots`, so a bare
+/// `Connection` would not exercise it) and pins the separator-safe prefix
+/// match with a sibling row whose path shares the root's prefix without the
+/// separator (`<root>2/x.fits`) — a naive `LIKE root || '%'` would fold its
+/// 999 bytes into the total.
+#[cfg(test)]
+mod overview_tests {
+    use super::*;
+
+    #[test]
+    fn overview_counts_files_and_bytes_per_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let root = tmp.path().join("astro");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap().to_string_lossy().to_string();
+        let added = add_scan_root(&ctx, root.clone(), &PathPolicy::AllowAll, None).unwrap();
+        {
+            let db = ctx.db.get().unwrap();
+            let conn = db.conn();
+            for (name, size) in [("a.fits", 100_i64), ("b.fits", 50)] {
+                conn.execute(
+                    "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', 'FITS')",
+                    rusqlite::params![format!("{root}/{name}"), name, size],
+                )
+                .unwrap();
+            }
+            // Boundary trap: a sibling whose path shares the prefix without the separator.
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'x.fits', 999, '2026-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![format!("{root}2/x.fits")],
+            )
+            .unwrap();
+        }
+        let ov = get_folder_overview(&ctx).unwrap();
+        let s = ov
+            .scan_roots
+            .iter()
+            .find(|s| s.root_id == added.id.unwrap())
+            .unwrap();
+        assert_eq!(s.file_count, 2);
+        assert_eq!(s.total_bytes, 150);
+        assert!(ov.archive_roots.is_empty());
+    }
+
+    /// The archive branch of the same handler, against real rows: the two
+    /// per-root queries are only reached when `archive_roots` is non-empty, so
+    /// without this the column names in them are unverified. Pins the three
+    /// documented behaviours: archived sets are counted per root (unzipped
+    /// sets and other roots' operations excluded), zips are summed DISTINCT,
+    /// and a recorded-but-missing zip contributes 0.
+    #[test]
+    fn overview_counts_archived_sets_and_distinct_zip_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let arc = tmp.path().join("archive");
+        std::fs::create_dir_all(&arc).unwrap();
+        let arc = arc.canonicalize().unwrap().to_string_lossy().to_string();
+        let other = tmp.path().join("archive_other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other = other.canonicalize().unwrap().to_string_lossy().to_string();
+
+        // Two real zips (10 + 20 bytes) plus one recorded path that is gone.
+        let zip_a = format!("{arc}/lights.zip");
+        let zip_b = format!("{arc}/flats.zip");
+        let zip_gone = format!("{arc}/vanished.zip");
+        std::fs::write(&zip_a, [0u8; 10]).unwrap();
+        std::fs::write(&zip_b, [0u8; 20]).unwrap();
+
+        {
+            let db = ctx.db.get().unwrap();
+            let conn = db.conn();
+            for path in [&arc, &other] {
+                conn.execute(
+                    "INSERT INTO archive_roots (path) VALUES (?1)",
+                    rusqlite::params![path],
+                )
+                .unwrap();
+            }
+            let op_id = |root: &str| -> i64 {
+                conn.execute(
+                    "INSERT INTO archive_operations (archive_root_path, compression, status, started_at)
+                     VALUES (?1, 'deflate', 'completed', '2026-01-01T00:00:00Z')",
+                    rusqlite::params![root],
+                )
+                .unwrap();
+                conn.last_insert_rowid()
+            };
+            let op = op_id(&arc);
+            let op_other = op_id(&other);
+
+            // Two zipped sets under `arc`, one unzipped (archived_at NULL) that
+            // must not count, and one zipped set under the other root.
+            for (name, archived_at, operation) in [
+                ("set-a", Some("2026-01-02T00:00:00Z"), op),
+                ("set-b", Some("2026-01-03T00:00:00Z"), op),
+                ("set-staged", None, op),
+                ("set-other", Some("2026-01-04T00:00:00Z"), op_other),
+            ] {
+                conn.execute(
+                    "INSERT INTO frames_set (name, archived_at, archive_operation_id) VALUES (?1, ?2, ?3)",
+                    rusqlite::params![name, archived_at, operation],
+                )
+                .unwrap();
+            }
+
+            // Three files across two zips (so DISTINCT matters) + one row
+            // pointing at the missing zip; one file under the other root's
+            // operation.
+            for (operation, zip, name) in [
+                (op, &zip_a, "a.fits"),
+                (op, &zip_a, "b.fits"),
+                (op, &zip_b, "c.fits"),
+                (op, &zip_gone, "d.fits"),
+                (op_other, &zip_a, "e.fits"),
+            ] {
+                conn.execute(
+                    "INSERT INTO archive_operation_files
+                        (operation_id, source_path, target_zip_path, target_path_in_zip,
+                         expected_hash, disposition, frame_role, file_size_bytes)
+                     VALUES (?1, ?2, ?3, ?4, 'deadbeef', 'move', 'light', 1)",
+                    rusqlite::params![operation, format!("/src/{name}"), zip, name],
+                )
+                .unwrap();
+            }
+        }
+
+        let ov = get_folder_overview(&ctx).unwrap();
+        assert_eq!(ov.archive_roots.len(), 2);
+        let a = ov.archive_roots.iter().find(|r| r.path == arc).unwrap();
+        assert_eq!(a.set_count, 2);
+        // 10 + 20 + 0 for the vanished zip; zip_a counted once, not twice.
+        assert_eq!(a.total_zip_bytes, 30);
+        let o = ov.archive_roots.iter().find(|r| r.path == other).unwrap();
+        assert_eq!(o.set_count, 1);
+        assert_eq!(o.total_zip_bytes, 10);
     }
 }

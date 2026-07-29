@@ -42,6 +42,17 @@ conflicting_path: string | null,
  */
 placement: string | null, };
 
+export type ScanRootOverview = { root_id: number, file_count: number, total_bytes: number, };
+
+export type ArchiveRootOverview = { archive_root_id: number, path: string, set_count: number, 
+/**
+ * Sum of on-disk sizes of the distinct zips recorded for operations
+ * under this root; missing zips contribute 0 (mirrors `list_archive_zips`).
+ */
+total_zip_bytes: number, };
+
+export type FolderOverview = { scan_roots: Array<ScanRootOverview>, archive_roots: Array<ArchiveRootOverview>, };
+
 export type DuplicateFile = { fileId: number, path: string, filename: string, modifiedAt: string, 
 /**
  * Longest-prefix match against `scan_roots.path`. `None` when the file

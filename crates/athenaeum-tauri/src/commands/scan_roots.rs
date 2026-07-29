@@ -132,6 +132,16 @@ pub async fn validate_folder_candidate(
         .map_err(|e| e.to_string())
 }
 
+pub use athenaeum_core::api::scan_roots::FolderOverview;
+
+/// Per-folder stats (file counts/bytes, archive set counts/zip bytes) for
+/// the Folders tab — one call for the whole rail.
+#[tauri::command]
+#[tracing::instrument(skip_all, err, level = "debug")]
+pub async fn get_folder_overview(state: State<'_, AppState>) -> Result<FolderOverview, String> {
+    api::get_folder_overview(&state.ctx).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn delete_scan_root(id: i64, state: State<'_, AppState>) -> Result<(), String> {
