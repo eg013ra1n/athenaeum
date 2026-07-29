@@ -109,12 +109,14 @@ build:linux:
 # This job guards that the core library keeps compiling without them, and it
 # deliberately installs NO native build tools.
 #
-# That second half was a dead letter for a while: `jpeg-encode` is an
-# UNCONDITIONAL dep of athenaeum-core, so while it bound the C libjpeg-turbo
-# this job did need cmake/nasm and only passed because the linux runner host
-# happened to have them. With jpeg-encode on pure-Rust libjpeg-turbo-rs and
-# turbojpeg-sys out of Cargo.lock, the no-native-tools invariant is real again
-# and a regression here means a genuine C-toolchain dep crept in.
+# That second half was a dead letter for a while: the old `jpeg-encode` helper
+# crate was an UNCONDITIONAL dep of athenaeum-core, so while it bound the C
+# libjpeg-turbo this job did need cmake/nasm and only passed because the linux
+# runner host happened to have them. jpeg-encode is gone entirely now — JPEG
+# encoding lives in the render-gated rustafits submodule (pure-Rust
+# libjpeg-turbo-rs), so the headless build carries no JPEG encoder at all and
+# the no-native-tools invariant is real: a regression here means a genuine
+# C-toolchain dep crept in.
 #
 # Runs on every main commit + tag (not `only: tags`) so a regression is caught
 # before release.

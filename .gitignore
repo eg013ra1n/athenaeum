@@ -25,10 +25,6 @@ dist-ssr
 
 # Rust / Cargo workspace
 /target/
-# jpeg-encode is workspace-excluded, so `cargo test` inside it mints its own
-# target/ and Cargo.lock — never commit either.
-crates/jpeg-encode/target/
-crates/jpeg-encode/Cargo.lock
 
 # Database
 *.db

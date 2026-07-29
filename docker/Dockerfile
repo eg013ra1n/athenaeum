@@ -6,18 +6,18 @@ FROM rust:1.96-bookworm AS rust-builder
 WORKDIR /build
 
 # No `apt-get install nasm cmake` here on purpose. It used to be required
-# because rustafits and jpeg-encode both bound the C libjpeg-turbo via
-# turbojpeg-sys, which builds the library from source. Both now use the
-# pure-Rust libjpeg-turbo-rs, and turbojpeg-sys — the workspace's only user of
-# the `cmake` crate — is out of Cargo.lock entirely, so this stage needs
-# nothing beyond the Rust toolchain the base image ships. If a future dep
-# reintroduces a C build step, add it back here rather than assuming it exists.
+# because JPEG encoding bound the C libjpeg-turbo via turbojpeg-sys, which
+# builds the library from source. The encoder is now the pure-Rust
+# libjpeg-turbo-rs (inside the rustafits submodule), and turbojpeg-sys — the
+# workspace's only user of the `cmake` crate — is out of Cargo.lock entirely,
+# so this stage needs nothing beyond the Rust toolchain the base image ships.
+# If a future dep reintroduces a C build step, add it back here rather than
+# assuming it exists.
 
 # Copy workspace manifests first for layer caching
 COPY Cargo.toml Cargo.lock ./
 COPY crates/athenaeum-core/Cargo.toml crates/athenaeum-core/Cargo.toml
 COPY crates/athenaeum-web/Cargo.toml crates/athenaeum-web/Cargo.toml
-COPY crates/jpeg-encode/Cargo.toml crates/jpeg-encode/Cargo.toml
 
 # Copy rustafits submodule in full — it's a path dep workspace member.
 # Cannot use the dummy-src trick because rustafits has a renamed [lib]
@@ -32,8 +32,7 @@ COPY solvemyastro/ solvemyastro/
 
 # Create dummy lib/main to cache dependency compilation
 RUN mkdir -p crates/athenaeum-core/src && echo "pub fn _dummy() {}" > crates/athenaeum-core/src/lib.rs \
-    && mkdir -p crates/athenaeum-web/src && echo "fn main() {}" > crates/athenaeum-web/src/main.rs \
-    && mkdir -p crates/jpeg-encode/src && echo "pub fn _dummy() {}" > crates/jpeg-encode/src/lib.rs
+    && mkdir -p crates/athenaeum-web/src && echo "fn main() {}" > crates/athenaeum-web/src/main.rs
 
 # Exclude athenaeum-tauri (desktop shell), catalog-builder (offline dev
 # tooling), log-mcp (dev-time log query server), and perseus (headless capture
@@ -62,10 +61,9 @@ RUN cargo build --release --package athenaeum-web 2>/dev/null || true
 # Copy real source and build
 COPY crates/athenaeum-core/ crates/athenaeum-core/
 COPY crates/athenaeum-web/ crates/athenaeum-web/
-COPY crates/jpeg-encode/ crates/jpeg-encode/
 
 # Touch source files to invalidate the dummy build cache
-RUN touch crates/athenaeum-core/src/lib.rs crates/athenaeum-web/src/main.rs crates/jpeg-encode/src/lib.rs
+RUN touch crates/athenaeum-core/src/lib.rs crates/athenaeum-web/src/main.rs
 
 RUN cargo build --release --package athenaeum-web
 

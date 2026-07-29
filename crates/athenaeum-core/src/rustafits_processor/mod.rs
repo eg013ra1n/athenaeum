@@ -81,7 +81,7 @@ pub struct ProcessedImage {
 /// Process a FITS/XISF file to JPEG entirely in memory (no temp files).
 ///
 /// Uses `converter.process()` to get raw RGB pixels, then encodes JPEG
-/// in-process via the `jpeg-encode` crate (pure-Rust libjpeg-turbo-rs),
+/// in-process via rustafits's own `encode_jpeg` (pure-Rust libjpeg-turbo-rs),
 /// returning a `Vec<u8>`.
 ///
 /// Note: rustafits 0.2+ handles Bayer/color detection internally for both FITS and XISF
@@ -121,25 +121,19 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
     let height = processed.height as u32;
     let is_color = processed.is_color;
 
-    // In practice this is always `Rgb`: nothing in Athenaeum calls rustafits's
-    // `with_rgba_output`, and the converter defaults to 3 channels. The Rgba
-    // arm preserves the capability the previous defensive `channels == 4`
-    // branch had — but where that branch de-interleaved to RGB with a W*H*3
-    // copy, the encoder now reads RGBA and drops alpha itself. So if RGBA
-    // output is ever switched on, it costs one less full-frame copy per
-    // preview; today neither path runs.
-    let layout = match processed.channels {
-        3 => jpeg_encode::Layout::Rgb,
-        4 => jpeg_encode::Layout::Rgba,
-        n => anyhow::bail!("unsupported channel count from rustafits: {n}"),
-    };
-
-    // Encode JPEG in memory via jpeg-encode crate (compiled outside workspace
-    // so the encoder gets full optimisation without incremental compilation penalty)
+    // Encode in memory via rustafits's own encoder. It accepts 3 (RGB) or
+    // 4 (RGBA) channels and rejects anything else; for RGBA the encoder reads
+    // 4 bytes per pixel and drops alpha itself, so no de-interleaving copy. In
+    // practice this is always RGB: nothing in Athenaeum calls rustafits's
+    // `with_rgba_output`, and the converter defaults to 3 channels.
     let jpeg_quality = resolution.jpeg_quality(quality);
-    let image_data =
-        jpeg_encode::encode_to_jpeg(&processed.data, width, height, layout, jpeg_quality)
-            .map_err(|e| anyhow::anyhow!(e))?;
+    let image_data = astroimage::encode_jpeg(
+        &processed.data,
+        processed.width,
+        processed.height,
+        processed.channels as usize,
+        jpeg_quality,
+    )?;
 
     Ok(ProcessedImage {
         image_data,

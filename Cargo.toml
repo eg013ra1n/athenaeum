@@ -10,22 +10,6 @@ members = [
     "rustafits",
     "solvemyastro",
 ]
-# jpeg-encode is kept OUT of the workspace as a stable seam for swapping the
-# JPEG backend without touching workspace profiles.
-#
-# The original reason was performance and no longer applies: the crate used to
-# host the `image` crate's generic `JpegEncoder` monomorphization, which needed
-# external-dep treatment ([profile.dev.package."*"] opt-level=2, no incremental)
-# to avoid being ~4x slower. The backend is now libjpeg-turbo-rs, whose
-# `compress` is a non-generic fn in a registry crate — already covered by
-# package."*" whether or not this crate is excluded. What is left here is a
-# ~40-line wrapper where opt-level is irrelevant.
-#
-# KNOWN COST of the exclusion: `cargo test --workspace` does NOT run
-# jpeg-encode's tests. Run `cargo test` inside crates/jpeg-encode when touching
-# it.
-exclude = ["crates/jpeg-encode"]
-
 [profile.dev.package."*"]
 opt-level = 2
 

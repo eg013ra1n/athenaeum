@@ -30,7 +30,6 @@ rustafits = { path = "../../rustafits", features = ["debug-pipeline"], optional 
 solvemyastro = { path = "../../solvemyastro", optional = true }
 sha2 = "0.11"
 md-5 = "0.11"
-jpeg-encode = { path = "../jpeg-encode" }
 memmap2 = "0.9"
 byteorder = "1"
 cdshealpix = "0.9"
