@@ -70,6 +70,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::models::File,
             crate::models::Frame,
             crate::models::ScanRoot,
+            crate::api::scan_roots::FolderCandidateVerdict,
             crate::models::DuplicateFile,
             crate::models::DuplicateGroup,
             crate::models::BulkMoveResult,

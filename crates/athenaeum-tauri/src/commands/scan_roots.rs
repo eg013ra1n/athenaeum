@@ -110,6 +110,20 @@ pub async fn clear_collaboration_dir(state: State<'_, AppState>) -> Result<(), S
     api::clear_collaboration_dir(&state.ctx).map_err(|e| e.to_string())
 }
 
+pub use athenaeum_core::api::scan_roots::FolderCandidateVerdict;
+
+/// Dry-run placement validation for the Add Folder dialog (spec §8.2).
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn validate_folder_candidate(
+    kind: String,
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<FolderCandidateVerdict, String> {
+    api::validate_folder_candidate(&state.ctx, kind, path, &PathPolicy::AllowAll)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn delete_scan_root(id: i64, state: State<'_, AppState>) -> Result<(), String> {

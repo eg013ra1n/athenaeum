@@ -52,6 +52,12 @@ pub struct SetSpecialRootDirArgs {
 }
 
 #[derive(serde::Deserialize)]
+pub struct ValidateFolderCandidateArgs {
+    pub kind: String,
+    pub path: String,
+}
+
+#[derive(serde::Deserialize)]
 pub struct StartScanArgs {
     #[serde(rename = "rootId")]
     pub root_id: i64,
@@ -216,6 +222,20 @@ pub async fn clear_collaboration_dir(
     _body: Json<serde_json::Value>,
 ) -> Result<Json<()>, (StatusCode, String)> {
     api::clear_collaboration_dir(&state.ctx).map(Json).map_err(api_err)
+}
+
+/// POST /api/validate_folder_candidate
+///
+/// Dry-run placement validation for the Add Folder dialog — never writes.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn validate_folder_candidate(
+    State(state): State<WebAppState>,
+    Json(args): Json<ValidateFolderCandidateArgs>,
+) -> Result<Json<athenaeum_core::api::scan_roots::FolderCandidateVerdict>, (StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    api::validate_folder_candidate(&state.ctx, args.kind, args.path, &policy)
+        .map(Json)
+        .map_err(api_err)
 }
 
 /// POST /api/delete_scan_root

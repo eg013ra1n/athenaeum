@@ -264,6 +264,7 @@ pub fn run() {
             commands::get_collaboration_dir,
             commands::set_collaboration_dir,
             commands::clear_collaboration_dir,
+            commands::validate_folder_candidate,
             commands::delete_scan_root,
             commands::start_scan,
             commands::start_scan_with_progress,

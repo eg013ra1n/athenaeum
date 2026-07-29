@@ -130,6 +130,117 @@ pub(crate) fn check_special_root_uniqueness(
     Ok(())
 }
 
+/// Dry-run verdict for an Add Folder candidate (teaching dialog, spec §6).
+/// `ok == false` carries a machine-readable `reason` the dialog maps to copy.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+pub struct FolderCandidateVerdict {
+    pub ok: bool,
+    /// `not_found` | `not_a_directory` | `already_monitored` |
+    /// `inside_existing` | `contains_existing` | `role_taken`
+    pub reason: Option<String>,
+    /// Conflicting monitored path (`inside_existing`/`contains_existing`) or
+    /// the current role path (`role_taken`).
+    pub conflicting_path: Option<String>,
+    /// Calibration-library only: `covered` (stored as a setting; the parent
+    /// root provides scan coverage) or `standalone` (becomes its own root).
+    pub placement: Option<String>,
+}
+
+fn verdict_fail(reason: &str, conflicting: Option<String>) -> FolderCandidateVerdict {
+    FolderCandidateVerdict {
+        ok: false,
+        reason: Some(reason.to_string()),
+        conflicting_path: conflicting,
+        placement: None,
+    }
+}
+
+fn verdict_ok(placement: Option<&str>) -> FolderCandidateVerdict {
+    FolderCandidateVerdict {
+        ok: true,
+        reason: None,
+        conflicting_path: None,
+        placement: placement.map(str::to_string),
+    }
+}
+
+/// Connection-level classifier behind [`validate_folder_candidate`] —
+/// mirrors `add_scan_root`'s overlap/uniqueness checks (and
+/// `set_calibration_library_dir`'s covered-placement rule) WITHOUT writing.
+/// `candidate` must already be canonicalized. `kind == "archive"` skips
+/// placement checks entirely (archive destinations are never scanned).
+pub(crate) fn classify_folder_candidate(
+    conn: &rusqlite::Connection,
+    kind: &str,
+    candidate: &Path,
+) -> Result<FolderCandidateVerdict, ApiError> {
+    if kind == "archive" {
+        return Ok(verdict_ok(None));
+    }
+    validate_scan_root_kind(kind)?;
+
+    // Role already assigned? (calibration resolves settings-key-aware)
+    if kind == "calibration_library" {
+        if let Some(dir) = resolve_calibration_library_dir(conn)? {
+            return Ok(verdict_fail("role_taken", Some(dir)));
+        }
+    } else if SPECIAL_ROOT_KINDS.contains(&kind) {
+        if let Some(dir) = resolve_special_root_dir(conn, kind)? {
+            return Ok(verdict_fail("role_taken", Some(dir)));
+        }
+    }
+
+    let is_calibration = kind == "calibration_library";
+    for root in crate::db::get_scan_roots(conn)?.iter() {
+        let existing = canonical_or_raw(&root.path);
+        if candidate == existing {
+            return Ok(if is_calibration {
+                verdict_ok(Some("covered"))
+            } else {
+                verdict_fail("already_monitored", Some(root.path.clone()))
+            });
+        }
+        if candidate.starts_with(&existing) {
+            return Ok(if is_calibration {
+                verdict_ok(Some("covered"))
+            } else {
+                verdict_fail("inside_existing", Some(root.path.clone()))
+            });
+        }
+        if existing.starts_with(candidate) {
+            return Ok(verdict_fail("contains_existing", Some(root.path.clone())));
+        }
+    }
+    Ok(verdict_ok(is_calibration.then_some("standalone")))
+}
+
+/// Dry-run validation for the Add Folder dialog. Never writes; the actual
+/// add/set command remains authoritative (a TOCTOU between validate and add
+/// is acceptable — the add's own error still surfaces).
+pub fn validate_folder_candidate(
+    ctx: &ServiceContext,
+    kind: String,
+    path: String,
+    policy: &PathPolicy,
+) -> Result<FolderCandidateVerdict, ApiError> {
+    let path_buf = Path::new(&path);
+    if !path_buf.exists() {
+        return Ok(verdict_fail("not_found", None));
+    }
+    if !path_buf.is_dir() {
+        return Ok(verdict_fail("not_a_directory", None));
+    }
+    let canon = normalize_path(
+        &path_buf
+            .canonicalize()
+            .map_err(|e| ApiError::Internal(format!("Failed to resolve path: {}", e)))?,
+    );
+    policy.check(&canon)?;
+    let db = db(ctx)?;
+    let conn = db.conn();
+    classify_folder_candidate(&conn, &kind, &canon)
+}
+
 /// Validates the path exists, canonicalizes it (resolving `..`/symlinks),
 /// sandboxes it against `policy` (desktop: `AllowAll`; web: `AllowedRoots`
 /// built from the caller's *canonicalized* allowed roots — see
@@ -1544,5 +1655,121 @@ mod special_root_tests {
         // after clear demotes it to 'normal', plain delete is allowed
         clear_sync_incoming_dir(&ctx).unwrap();
         assert!(delete_scan_root(&ctx, id).is_ok());
+    }
+}
+
+/// Folders-screen redesign Task 1 — `classify_folder_candidate`, the dry-run
+/// classifier behind `validate_folder_candidate`. Exercised at `Connection`
+/// level with real temp dirs (the classifier canonicalizes registered paths
+/// for comparison), following this module's established "test the extracted
+/// real logic, not a local re-implementation" convention.
+///
+/// Registered roots are upserted with their CANONICALIZED path so the
+/// `conflicting_path` assertions can be exact: the verdict echoes the path as
+/// stored, and on macOS a tempdir's `/var/folders/…` canonicalizes to
+/// `/private/var/folders/…`.
+#[cfg(test)]
+mod candidate_tests {
+    use super::*;
+
+    fn conn() -> rusqlite::Connection {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&c).unwrap();
+        c
+    }
+
+    /// Canonicalized path string of an existing directory — used both for the
+    /// `upsert_scan_root` write and the `conflicting_path` assertion.
+    fn canon(path: &Path) -> String {
+        path.canonicalize().unwrap().to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn normal_inside_existing_root_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let c = conn();
+        crate::db::upsert_scan_root(&c, &canon(&root), "normal").unwrap();
+        let v = classify_folder_candidate(&c, "normal", &sub.canonicalize().unwrap()).unwrap();
+        assert!(!v.ok);
+        assert_eq!(v.reason.as_deref(), Some("inside_existing"));
+        assert_eq!(v.conflicting_path.as_deref(), Some(canon(&root).as_str()));
+    }
+
+    #[test]
+    fn normal_containing_existing_root_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path().join("parent");
+        let root = parent.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let c = conn();
+        crate::db::upsert_scan_root(&c, &canon(&root), "normal").unwrap();
+        let v = classify_folder_candidate(&c, "normal", &parent.canonicalize().unwrap()).unwrap();
+        assert_eq!(v.reason.as_deref(), Some("contains_existing"));
+    }
+
+    #[test]
+    fn normal_duplicate_is_already_monitored() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let c = conn();
+        crate::db::upsert_scan_root(&c, &canon(&root), "normal").unwrap();
+        let v = classify_folder_candidate(&c, "normal", &root.canonicalize().unwrap()).unwrap();
+        assert_eq!(v.reason.as_deref(), Some("already_monitored"));
+    }
+
+    #[test]
+    fn calibration_inside_existing_is_ok_covered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let sub = root.join("masters");
+        std::fs::create_dir_all(&sub).unwrap();
+        let c = conn();
+        crate::db::upsert_scan_root(&c, &canon(&root), "normal").unwrap();
+        let v = classify_folder_candidate(&c, "calibration_library", &sub.canonicalize().unwrap())
+            .unwrap();
+        assert!(v.ok);
+        assert_eq!(v.placement.as_deref(), Some("covered"));
+    }
+
+    #[test]
+    fn calibration_standalone_is_ok_standalone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("masters");
+        std::fs::create_dir_all(&dir).unwrap();
+        let v =
+            classify_folder_candidate(&conn(), "calibration_library", &dir.canonicalize().unwrap())
+                .unwrap();
+        assert!(v.ok);
+        assert_eq!(v.placement.as_deref(), Some("standalone"));
+    }
+
+    #[test]
+    fn taken_role_is_role_taken() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let c = conn();
+        crate::db::upsert_scan_root(&c, &canon(&a), "sync_incoming").unwrap();
+        let v = classify_folder_candidate(&c, "sync_incoming", &b.canonicalize().unwrap()).unwrap();
+        assert_eq!(v.reason.as_deref(), Some("role_taken"));
+        assert_eq!(v.conflicting_path.as_deref(), Some(canon(&a).as_str()));
+    }
+
+    #[test]
+    fn archive_kind_skips_placement_checks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let sub = root.join("archive");
+        std::fs::create_dir_all(&sub).unwrap();
+        let c = conn();
+        crate::db::upsert_scan_root(&c, &canon(&root), "normal").unwrap();
+        let v = classify_folder_candidate(&c, "archive", &sub.canonicalize().unwrap()).unwrap();
+        assert!(v.ok);
     }
 }

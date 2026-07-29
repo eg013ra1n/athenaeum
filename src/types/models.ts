@@ -25,6 +25,23 @@ export type ScanRoot = { id: number | null, path: string, enabled: boolean, find
  */
 kind: string, };
 
+export type FolderCandidateVerdict = { ok: boolean, 
+/**
+ * `not_found` | `not_a_directory` | `already_monitored` |
+ * `inside_existing` | `contains_existing` | `role_taken`
+ */
+reason: string | null, 
+/**
+ * Conflicting monitored path (`inside_existing`/`contains_existing`) or
+ * the current role path (`role_taken`).
+ */
+conflicting_path: string | null, 
+/**
+ * Calibration-library only: `covered` (stored as a setting; the parent
+ * root provides scan coverage) or `standalone` (becomes its own root).
+ */
+placement: string | null, };
+
 export type DuplicateFile = { fileId: number, path: string, filename: string, modifiedAt: string, 
 /**
  * Longest-prefix match against `scan_roots.path`. `None` when the file
