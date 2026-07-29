@@ -515,23 +515,100 @@ pub fn clear_calibration_library_dir(ctx: &ServiceContext) -> Result<(), ApiErro
     Ok(())
 }
 
-/// One-step calibration-library move (spec §8.1): removes the old dedicated
-/// `calibration_library` root (catalog purge — same semantics as deleting it
-/// from the folder list; files on disk untouched), then delegates to
-/// [`set_calibration_library_dir`] for the covered/standalone placement of
-/// the new folder. Replaces the old clear → remove-root → set dance.
+/// Placement pre-flight for [`switch_calibration_library_dir`] — answers
+/// "where would `new_path` land?" against every root EXCEPT the one about to
+/// be replaced (`excluded_root_id`), WITHOUT writing. Returns `covered` (the
+/// new folder is equal to or nested inside a surviving root, so the switch is
+/// settings-key-only) or an error the delegate would have raised anyway.
+///
+/// Its whole reason to exist is ORDERING: `set_calibration_library_dir`'s own
+/// coverage probe hard-errors on any registered root it cannot `canonicalize`
+/// (an offline drive), and its standalone branch rejects a folder that
+/// swallows an existing root — both AFTER the delete would already have
+/// purged the old library's catalog rows. Running the same checks here moves
+/// those failures in front of the destructive step.
+///
+/// Not `classify_folder_candidate`: that one's `role_taken` arm would trip on
+/// the very root being replaced.
+///
+/// Two passes, deliberately: `covered` is decided over ALL surviving roots
+/// before any conflict is raised, so this can never reject a placement the
+/// delegate would have accepted (with valid non-overlapping roots the two
+/// passes cannot both fire; the ordering makes that robust anyway).
+fn preflight_library_placement(
+    conn: &rusqlite::Connection,
+    new_path: &Path,
+    excluded_root_id: Option<i64>,
+) -> Result<bool, ApiError> {
+    let mut survivors = Vec::new();
+    for root in crate::db::get_scan_roots(conn)? {
+        if excluded_root_id.is_some() && root.id == excluded_root_id {
+            continue;
+        }
+        // Same canonicalize-or-hard-error semantics as the delegate's probe:
+        // an unresolvable root is a real failure, it just belongs HERE.
+        let canon = normalize_path(&Path::new(&root.path).canonicalize().map_err(|e| {
+            ApiError::Internal(format!("Failed to resolve existing root path: {}", e))
+        })?);
+        survivors.push((root.path, canon));
+    }
+
+    // `starts_with` is true for equality too — an equal-or-nested folder is
+    // COVERED by that root (settings-key-only placement), never a conflict.
+    let covered = survivors
+        .iter()
+        .any(|(_, canon)| new_path.starts_with(canon));
+    if covered {
+        return Ok(true);
+    }
+
+    // Standalone placement: the folder will become its own scan root, so it
+    // must not swallow an existing one. Same message `add_scan_root` raises.
+    for (raw, canon) in survivors.iter() {
+        if canon.starts_with(new_path) {
+            return Err(ApiError::Conflict(format!(
+                "Cannot add directory: existing scan root '{}' is a subdirectory of it",
+                raw
+            )));
+        }
+    }
+    Ok(false)
+}
+
+/// One-step calibration-library move (spec §8.1): validates the new path,
+/// removes the old dedicated `calibration_library` root (catalog purge — same
+/// semantics as deleting it from the folder list; files on disk untouched),
+/// then delegates to [`set_calibration_library_dir`] for the covered/standalone
+/// placement of the new folder. Replaces the old clear → remove-root → set
+/// dance.
 ///
 /// Deliberately bypasses [`guard_against_special_root_deletion`]: the guard
 /// exists to stop an operator removing the library out from under the role;
-/// here removing it IS the requested operation. Not atomic across the two
-/// phases — if the final set fails, the old root is already gone and no
-/// library is configured; the UI confirmation warns about the removal, and
-/// the error from the set phase surfaces verbatim.
+/// here removing it IS the requested operation.
+///
+/// **Validate before destroy.** The new path's placement is resolved by
+/// [`preflight_library_placement`] against the roots that will survive, BEFORE
+/// the delete — otherwise a switch that the delegate was always going to
+/// reject (offline registered root, or a folder containing an existing root)
+/// would purge the old library's catalog rows on its way to failing. Residual
+/// window: the two phases are still not one transaction, so a delegate failure
+/// after a passed pre-flight means a rare TOCTOU (the disk changed in between).
+/// If that happens the old root is gone AND the `calibration.library_dir`
+/// setting still names the removed folder — the delegate errors before it
+/// persists anything. Recovery is to designate the library again; the error
+/// from the set phase surfaces verbatim.
 ///
 /// Re-picking the folder that is already the library is a no-op keep: the old
 /// root is left alone (it equals the new path), and the delegate's
 /// covered-placement branch simply re-persists the settings key — so the
 /// single-library uniqueness check is never reached.
+///
+/// Note for confirmation-dialog copy: the purge target is the
+/// `calibration_library`-KIND root, which is not necessarily the effective
+/// library dir. For a covered library the kind root can be an ancestor of it
+/// (or an unrelated vestigial root), so the purge scope can exceed the
+/// displayed library path — name [`get_calibration_library_root`]'s path in
+/// the warning, not the resolved library dir.
 pub fn switch_calibration_library_dir(
     ctx: &ServiceContext,
     path: String,
@@ -552,9 +629,10 @@ pub fn switch_calibration_library_dir(
             let id = old.id.ok_or_else(|| {
                 ApiError::Internal("calibration library root has no id".to_string())
             })?;
-            tracing::info!(src = %old.path, dest = %new_path.display(), "switching calibration library — removing old dedicated root");
             let db = db(ctx)?;
             let conn = db.conn();
+            let covered = preflight_library_placement(&conn, &new_path, Some(id))?;
+            tracing::info!(src = %old.path, dest = %new_path.display(), covered_by_existing_root = covered, "switching calibration library — removing old dedicated root");
             crate::db::delete_scan_root(&conn, id).map_err(|e| {
                 tracing::error!(root_id = id, error = %e, "failed to remove old calibration library root");
                 ApiError::Internal(format!("Failed to remove old calibration library root: {e}"))
@@ -1848,6 +1926,39 @@ mod switch_library_tests {
         p.canonicalize().unwrap().to_string_lossy().to_string()
     }
 
+    fn insert_file(ctx: &ServiceContext, path: &str) {
+        let db = ctx.db.get().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'm.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![path],
+            )
+            .unwrap();
+    }
+
+    fn file_paths(ctx: &ServiceContext) -> Vec<String> {
+        let db = ctx.db.get().unwrap();
+        let conn = db.conn();
+        let mut stmt = conn
+            .prepare("SELECT path FROM files ORDER BY path")
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    }
+
+    fn library_root_paths(ctx: &ServiceContext) -> Vec<String> {
+        get_scan_roots(ctx)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == "calibration_library")
+            .map(|r| r.path)
+            .collect()
+    }
+
     #[test]
     fn standalone_to_standalone_replaces_root_and_purges_catalog() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1856,15 +1967,13 @@ mod switch_library_tests {
         let new = mkdirs(&tmp, "lib_new");
         set_calibration_library_dir(&ctx, old.clone(), &PathPolicy::AllowAll).unwrap();
         // A cataloged file under the old library — must be purged with the root.
-        {
-            let db = ctx.db.get().unwrap();
-            db.conn()
-                .execute(
-                    "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'm.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
-                    rusqlite::params![format!("{old}/m.fits")],
-                )
-                .unwrap();
-        }
+        insert_file(&ctx, &format!("{old}/m.fits"));
+        // …and one OUTSIDE it, which must survive: the purge is a path-prefix
+        // byte-range delete, not a table wipe. `elsewhere` also sorts below
+        // `lib_old` (`e` < `l`), so it is outside the prefix range as well as
+        // outside the subtree.
+        let keep = format!("{}/keep.fits", mkdirs(&tmp, "elsewhere"));
+        insert_file(&ctx, &keep);
         let effective =
             switch_calibration_library_dir(&ctx, new.clone(), &PathPolicy::AllowAll).unwrap();
         assert_eq!(effective, new);
@@ -1879,12 +1988,11 @@ mod switch_library_tests {
             get_calibration_library_dir(&ctx).unwrap().as_deref(),
             Some(new.as_str())
         );
-        let db = ctx.db.get().unwrap();
-        let n: i64 = db
-            .conn()
-            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(n, 0, "old library's catalog rows must be purged");
+        assert_eq!(
+            file_paths(&ctx),
+            vec![keep],
+            "only the old library's own catalog rows may be purged"
+        );
     }
 
     #[test]
@@ -1936,6 +2044,114 @@ mod switch_library_tests {
                 .filter(|r| r.kind == "calibration_library")
                 .count(),
             1
+        );
+    }
+
+    // ── Validate-before-delete (Important-1 fix round) ───────────────────
+    //
+    // Both cases fail INSIDE the delegated `set_calibration_library_dir`, so
+    // before the pre-flight they failed only AFTER the old root had already
+    // been deleted and its catalog rows purged. The intactness assertions are
+    // the point of these tests — the error-kind assertions alone passed even
+    // with the destructive ordering.
+
+    #[test]
+    fn unresolvable_registered_root_aborts_before_the_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let old = mkdirs(&tmp, "lib_old");
+        let new = mkdirs(&tmp, "lib_new");
+        set_calibration_library_dir(&ctx, old.clone(), &PathPolicy::AllowAll).unwrap();
+        insert_file(&ctx, &format!("{old}/m.fits"));
+        // A monitored root on disconnected storage: `canonicalize()` fails on
+        // it, so the placement probe hard-errors. Inserted directly — the
+        // public add path stat-checks the folder and would refuse it.
+        {
+            let db = ctx.db.get().unwrap();
+            crate::db::upsert_scan_root(
+                &db.conn(),
+                &tmp.path().join("offline_root").to_string_lossy(),
+                "normal",
+            )
+            .unwrap();
+        }
+
+        let err = switch_calibration_library_dir(&ctx, new, &PathPolicy::AllowAll)
+            .expect_err("an unresolvable registered root must abort the switch");
+        assert!(matches!(err, ApiError::Internal(_)), "unexpected: {err:?}");
+        assert_eq!(
+            library_root_paths(&ctx),
+            vec![old.clone()],
+            "the old library root must survive a rejected switch"
+        );
+        assert_eq!(
+            file_paths(&ctx),
+            vec![format!("{old}/m.fits")],
+            "a rejected switch must not purge the old library's catalog rows"
+        );
+        assert_eq!(
+            get_calibration_library_dir(&ctx).unwrap().as_deref(),
+            Some(old.as_str())
+        );
+    }
+
+    #[test]
+    fn folder_containing_an_existing_root_aborts_before_the_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let old = mkdirs(&tmp, "lib_old");
+        let parent = mkdirs(&tmp, "parent");
+        let child = mkdirs(&tmp, "parent/child");
+        add_scan_root(&ctx, child, &PathPolicy::AllowAll, None).unwrap();
+        set_calibration_library_dir(&ctx, old.clone(), &PathPolicy::AllowAll).unwrap();
+        insert_file(&ctx, &format!("{old}/m.fits"));
+
+        let err = switch_calibration_library_dir(&ctx, parent, &PathPolicy::AllowAll)
+            .expect_err("a folder containing an existing root must abort the switch");
+        assert!(matches!(err, ApiError::Conflict(_)), "unexpected: {err:?}");
+        assert_eq!(
+            library_root_paths(&ctx),
+            vec![old.clone()],
+            "the old library root must survive a rejected switch"
+        );
+        assert_eq!(
+            file_paths(&ctx),
+            vec![format!("{old}/m.fits")],
+            "a rejected switch must not purge the old library's catalog rows"
+        );
+    }
+
+    /// The pre-flight's `excluded_root_id` is load-bearing, not cosmetic:
+    /// without it, moving the library OFF a disconnected drive would abort on
+    /// the old root's own unresolvable path — the one case where the operator
+    /// most needs the switch to work. Registered directly (the public add path
+    /// stat-checks the folder).
+    #[test]
+    fn switching_away_from_an_offline_library_root_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let new = mkdirs(&tmp, "lib_new");
+        let offline = tmp.path().join("offline_lib").to_string_lossy().to_string();
+        {
+            let db = ctx.db.get().unwrap();
+            let conn = db.conn();
+            crate::db::upsert_scan_root(&conn, &offline, "calibration_library").unwrap();
+            ctx.settings
+                .persist_setting(
+                    &conn,
+                    crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                    &offline,
+                )
+                .unwrap();
+        }
+
+        let effective =
+            switch_calibration_library_dir(&ctx, new.clone(), &PathPolicy::AllowAll).unwrap();
+        assert_eq!(effective, new);
+        assert_eq!(library_root_paths(&ctx), vec![new.clone()]);
+        assert_eq!(
+            get_calibration_library_dir(&ctx).unwrap().as_deref(),
+            Some(new.as_str())
         );
     }
 }
