@@ -313,7 +313,10 @@ fn parse_xisf_xml_text(text: &str) -> HashMap<String, String> {
                 }
             }
             Ok(Event::Eof) => break,
-            Err(_) => break,
+            Err(e) => {
+                tracing::warn!(error = %e, "stored XISF header parse aborted");
+                break;
+            }
             _ => {}
         }
         buf.clear();

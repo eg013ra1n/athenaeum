@@ -256,9 +256,10 @@ fn build_autolaunch() -> Option<auto_launch::AutoLaunch> {
     auto_launch::AutoLaunchBuilder::new()
         .set_app_name("Perseus")
         .set_app_path(&exe.to_string_lossy())
-        // Both modes are pinned to what auto-launch 0.5 did implicitly, because
-        // 0.6 flipped both defaults and an existing user's start-at-login state
-        // lives in the OLD mechanism. Switching mechanisms would strand it:
+        // All three modes are pinned to what auto-launch 0.5 did implicitly,
+        // because 0.6 flipped the macOS and Windows defaults and an existing
+        // user's start-at-login state lives in the OLD mechanism. Switching
+        // mechanisms would strand it:
         // `is_enabled` would read the new location (menu shows unchecked while
         // the old registration still fires), enabling would add a SECOND
         // registration (double launch), and `disable` would only remove the new
@@ -275,6 +276,11 @@ fn build_autolaunch() -> Option<auto_launch::AutoLaunch> {
         // back to HKCU on access-denied. CurrentUser keeps the per-user scope a
         // headless capture node expects and needs no elevation.
         .set_windows_enable_mode(auto_launch::WindowsEnableMode::CurrentUser)
+        // Linux: the ~/.config/autostart/*.desktop file was 0.5's only
+        // mechanism and is still 0.6's default — systemd user units are the new
+        // opt-in alternative. Stated explicitly anyway so a future default flip
+        // cannot strand existing registrations the way the two above would have.
+        .set_linux_launch_mode(auto_launch::LinuxLaunchMode::XdgAutostart)
         .build()
         .map_err(|error| tracing::warn!(%error, "autolaunch unavailable"))
         .ok()

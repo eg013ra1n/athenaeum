@@ -134,7 +134,9 @@ impl TokenStore {
     fn keyring_entry(&self) -> Result<keyring::Entry, keyring::Error> {
         static STORE_INIT: std::sync::Once = std::sync::Once::new();
         STORE_INIT.call_once(|| {
-            let _ = keyring::Entry::new(KEYRING_SERVICE, &self.account);
+            if let Err(e) = keyring::Entry::new(KEYRING_SERVICE, &self.account) {
+                tracing::debug!(error = %e, "keychain store init probe failed");
+            }
         });
         keyring::Entry::new(KEYRING_SERVICE, &self.account)
     }

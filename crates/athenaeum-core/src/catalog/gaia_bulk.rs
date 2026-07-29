@@ -904,6 +904,21 @@ not-a-hash _disclaimer.txt
         assert_eq!(md5_of_file(&p2).unwrap(), "900150983cd24fb0d6963f7d28e17f72");
     }
 
+    /// Sibling of the MD5 pin above, for the other published digest: the
+    /// `.sha256` sidecar `gaia_prebuilt::sha256_file` writes next to every
+    /// catalog archive is an EXTERNAL contract (users verify downloads against
+    /// it), so pin `sha2` to FIPS 180-4's "abc" vector — a future bump that
+    /// changed the output would be caught here, not by a failed user download.
+    #[test]
+    fn sha256_matches_known_digest() {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"abc");
+        assert_eq!(
+            hex_lower(&hasher.finalize()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
     #[test]
     fn manifest_cache_round_trip() {
         use tempfile::TempDir;

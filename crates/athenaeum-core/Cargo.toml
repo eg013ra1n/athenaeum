@@ -36,10 +36,13 @@ zip = { version = "8", default-features = false, features = ["deflate", "time"] 
 # TLS backend is selected EXPLICITLY. reqwest 0.13 changed `default-tls` to
 # rustls-with-aws-lc-rs, which would drag aws-lc-sys (cmake + nasm) into every
 # build — the native dep the iroh stack deliberately avoids. `native-tls-no-alpn`
-# + charset/http2/system-proxy reproduces reqwest 0.12's default feature set
-# exactly, so the TLS backend is unchanged from 0.12 (schannel / Security.framework
-# / openssl, already in the tree). iroh's own clients are unaffected by the shared
-# default: it always calls `tls_backend_preconfigured()` with its ring rustls config.
+# + charset/http2/system-proxy stands in for reqwest 0.12's default set with the
+# TLS backend held where it was (schannel / Security.framework / openssl, already
+# in the tree). blocking/json/form/query are this crate's own opt-ins on top —
+# `query` because 0.13 moved `RequestBuilder::query` behind a feature that 0.12
+# compiled unconditionally, so without it the 0.12 API surface is not fully
+# restored. iroh's own clients are unaffected by the shared default: it always
+# calls `tls_backend_preconfigured()` with its ring rustls config.
 reqwest = { version = "0.13", default-features = false, features = [
     "native-tls-no-alpn",
     "charset",
@@ -48,6 +51,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "blocking",
     "json",
     "form",
+    "query",
 ] }
 tokio = { version = "1", features = ["sync", "time", "macros", "rt", "fs", "io-util"] }
 # Trait-object async methods for the transport-agnostic SharingTransport (sync

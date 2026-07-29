@@ -32,10 +32,14 @@ macro_rules! decls {
     }};
 }
 
-/// ts-rs 10 maps `i64`/`u64` to TS `bigint` (only `usize`/`isize`/`f32`/`f64`
-/// map to `number`) — there is no crate feature or `#[ts(..)]` container
-/// attribute to change this globally, only a per-field `#[ts(type = "..")]`
-/// override. Every `i64`/`u64` field in this codebase is a SQLite
+/// ts-rs 12 maps `i64`/`u64` (and `i128`/`u128`) to TS `bigint`; only
+/// `usize`/`isize`/`f32`/`f64` map to `number`. Since ts-rs 12 that mapping IS
+/// globally configurable — `Config::with_large_int("number")`, or its
+/// `TS_RS_LARGE_INT` env equivalent, which `ts_config()` above deliberately
+/// does not read — alongside the per-field `#[ts(type = "..")]` override that
+/// was the only lever on ts-rs 10.
+///
+/// Every `i64`/`u64` field in this codebase is a SQLite
 /// `INTEGER PRIMARY KEY` / row count / byte size that (a) crosses the Tauri
 /// IPC boundary as a plain `serde_json` number, never a JS `BigInt`, and (b)
 /// never approaches `Number.MAX_SAFE_INTEGER`. The pre-Task-6 hand-written
@@ -43,10 +47,14 @@ macro_rules! decls {
 /// HEAD:src/types/*.ts`), and the frontend already does plain numeric
 /// arithmetic/comparisons on ids — switching ~150 occurrences to `bigint`
 /// would both misrepresent the wire format and require rewriting arithmetic
-/// across dozens of consumer files for no behavioral benefit. Rather than
+/// across dozens of consumer files for no behavioral benefit. This
+/// harness-level substitution keeps the fix in one place instead of
 /// bulk-adding `#[ts(type = "number")]` to every affected field (100+ sites
-/// across models.rs/export/models.rs/archive/models.rs), this harness-level
-/// substitution keeps the fix in one place. Safe as a plain literal
+/// across models.rs/export/models.rs/archive/models.rs); on ts-rs 12
+/// `ts_config().with_large_int("number")` is an equivalent one-line
+/// replacement for it (checked: with the substitution disabled it reproduces
+/// the checked-in bindings byte-for-byte), left for its own change rather than
+/// folded into a dependency refresh. Safe as a plain literal
 /// replacement: `bigint` does not otherwise appear anywhere in this crate's
 /// source (verified via grep), so there is no risk of clobbering a doc
 /// comment or identifier that happens to contain the substring.
