@@ -258,6 +258,7 @@ pub fn run() {
             commands::get_calibration_library_dir,
             commands::set_calibration_library_dir,
             commands::clear_calibration_library_dir,
+            commands::switch_calibration_library_dir,
             commands::get_sync_incoming_dir,
             commands::set_sync_incoming_dir,
             commands::clear_sync_incoming_dir,

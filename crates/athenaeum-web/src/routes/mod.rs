@@ -50,6 +50,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_calibration_library_dir", post(scan_roots::get_calibration_library_dir))
         .route("/api/set_calibration_library_dir", post(scan_roots::set_calibration_library_dir))
         .route("/api/clear_calibration_library_dir", post(scan_roots::clear_calibration_library_dir))
+        .route("/api/switch_calibration_library_dir", post(scan_roots::switch_calibration_library_dir))
         .route("/api/get_sync_incoming_dir", post(scan_roots::get_sync_incoming_dir))
         .route("/api/set_sync_incoming_dir", post(scan_roots::set_sync_incoming_dir))
         .route("/api/clear_sync_incoming_dir", post(scan_roots::clear_sync_incoming_dir))

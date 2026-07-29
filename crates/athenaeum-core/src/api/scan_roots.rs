@@ -515,6 +515,56 @@ pub fn clear_calibration_library_dir(ctx: &ServiceContext) -> Result<(), ApiErro
     Ok(())
 }
 
+/// One-step calibration-library move (spec §8.1): removes the old dedicated
+/// `calibration_library` root (catalog purge — same semantics as deleting it
+/// from the folder list; files on disk untouched), then delegates to
+/// [`set_calibration_library_dir`] for the covered/standalone placement of
+/// the new folder. Replaces the old clear → remove-root → set dance.
+///
+/// Deliberately bypasses [`guard_against_special_root_deletion`]: the guard
+/// exists to stop an operator removing the library out from under the role;
+/// here removing it IS the requested operation. Not atomic across the two
+/// phases — if the final set fails, the old root is already gone and no
+/// library is configured; the UI confirmation warns about the removal, and
+/// the error from the set phase surfaces verbatim.
+///
+/// Re-picking the folder that is already the library is a no-op keep: the old
+/// root is left alone (it equals the new path), and the delegate's
+/// covered-placement branch simply re-persists the settings key — so the
+/// single-library uniqueness check is never reached.
+pub fn switch_calibration_library_dir(
+    ctx: &ServiceContext,
+    path: String,
+    policy: &PathPolicy,
+) -> Result<String, ApiError> {
+    let path_buf = Path::new(&path);
+    validate_library_dir_candidate(path_buf)?;
+    let new_path = normalize_path(
+        &path_buf
+            .canonicalize()
+            .map_err(|e| ApiError::Internal(format!("Failed to resolve path: {}", e)))?,
+    );
+    policy.check(&new_path)?;
+
+    let old_root = get_calibration_library_root(ctx)?;
+    if let Some(old) = old_root {
+        if canonical_or_raw(&old.path) != new_path {
+            let id = old.id.ok_or_else(|| {
+                ApiError::Internal("calibration library root has no id".to_string())
+            })?;
+            tracing::info!(src = %old.path, dest = %new_path.display(), "switching calibration library — removing old dedicated root");
+            let db = db(ctx)?;
+            let conn = db.conn();
+            crate::db::delete_scan_root(&conn, id).map_err(|e| {
+                tracing::error!(root_id = id, error = %e, "failed to remove old calibration library root");
+                ApiError::Internal(format!("Failed to remove old calibration library root: {e}"))
+            })?;
+        }
+    }
+
+    set_calibration_library_dir(ctx, new_path.to_string_lossy().to_string(), policy)
+}
+
 // ── Sync-incoming / collaboration special roots (Task 4) ────────────────────
 //
 // Same designate/get/clear shape as the calibration library, but a simpler
@@ -1771,5 +1821,121 @@ mod candidate_tests {
         crate::db::upsert_scan_root(&c, &canon(&root), "normal").unwrap();
         let v = classify_folder_candidate(&c, "archive", &sub.canonicalize().unwrap()).unwrap();
         assert!(v.ok);
+    }
+}
+
+/// Folders-screen redesign Task 2 — [`switch_calibration_library_dir`], the
+/// one-step library move. Exercised at the `ServiceContext` level (real temp
+/// catalog + real temp folders) because the switch composes
+/// `get_calibration_library_root` → `db::delete_scan_root` →
+/// `set_calibration_library_dir`, all of which stat/canonicalize on disk —
+/// same rationale as `special_root_tests` above.
+///
+/// Folder paths are CANONICALIZED by the helper so the returned-path and
+/// settings-key assertions can be exact (on macOS a tempdir's `/var/folders/…`
+/// canonicalizes to `/private/var/folders/…`).
+#[cfg(test)]
+mod switch_library_tests {
+    use super::*;
+
+    fn ctx(tmp: &tempfile::TempDir) -> ServiceContext {
+        ServiceContext::new_for_tests(tmp.path().join("catalog.db"))
+    }
+
+    fn mkdirs(tmp: &tempfile::TempDir, name: &str) -> String {
+        let p = tmp.path().join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        p.canonicalize().unwrap().to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn standalone_to_standalone_replaces_root_and_purges_catalog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let old = mkdirs(&tmp, "lib_old");
+        let new = mkdirs(&tmp, "lib_new");
+        set_calibration_library_dir(&ctx, old.clone(), &PathPolicy::AllowAll).unwrap();
+        // A cataloged file under the old library — must be purged with the root.
+        {
+            let db = ctx.db.get().unwrap();
+            db.conn()
+                .execute(
+                    "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'm.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+                    rusqlite::params![format!("{old}/m.fits")],
+                )
+                .unwrap();
+        }
+        let effective =
+            switch_calibration_library_dir(&ctx, new.clone(), &PathPolicy::AllowAll).unwrap();
+        assert_eq!(effective, new);
+        let roots = get_scan_roots(&ctx).unwrap();
+        let libs: Vec<_> = roots
+            .iter()
+            .filter(|r| r.kind == "calibration_library")
+            .collect();
+        assert_eq!(libs.len(), 1);
+        assert_eq!(libs[0].path, new);
+        assert_eq!(
+            get_calibration_library_dir(&ctx).unwrap().as_deref(),
+            Some(new.as_str())
+        );
+        let db = ctx.db.get().unwrap();
+        let n: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "old library's catalog rows must be purged");
+    }
+
+    #[test]
+    fn standalone_to_covered_removes_old_root_and_keeps_setting_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let monitored = mkdirs(&tmp, "astro");
+        let covered = mkdirs(&tmp, "astro/masters");
+        let old = mkdirs(&tmp, "lib_old");
+        add_scan_root(&ctx, monitored.clone(), &PathPolicy::AllowAll, None).unwrap();
+        set_calibration_library_dir(&ctx, old, &PathPolicy::AllowAll).unwrap();
+        switch_calibration_library_dir(&ctx, covered.clone(), &PathPolicy::AllowAll).unwrap();
+        let roots = get_scan_roots(&ctx).unwrap();
+        assert!(
+            roots.iter().all(|r| r.kind != "calibration_library"),
+            "no dedicated root for a covered library"
+        );
+        assert_eq!(
+            get_calibration_library_dir(&ctx).unwrap().as_deref(),
+            Some(covered.as_str())
+        );
+    }
+
+    #[test]
+    fn switch_with_no_previous_library_behaves_like_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let new = mkdirs(&tmp, "lib");
+        let effective =
+            switch_calibration_library_dir(&ctx, new.clone(), &PathPolicy::AllowAll).unwrap();
+        assert_eq!(effective, new);
+        assert_eq!(
+            get_calibration_library_dir(&ctx).unwrap().as_deref(),
+            Some(new.as_str())
+        );
+    }
+
+    #[test]
+    fn repicking_the_same_folder_is_a_noop_keep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let lib = mkdirs(&tmp, "lib");
+        set_calibration_library_dir(&ctx, lib.clone(), &PathPolicy::AllowAll).unwrap();
+        switch_calibration_library_dir(&ctx, lib.clone(), &PathPolicy::AllowAll).unwrap();
+        let roots = get_scan_roots(&ctx).unwrap();
+        assert_eq!(
+            roots
+                .iter()
+                .filter(|r| r.kind == "calibration_library")
+                .count(),
+            1
+        );
     }
 }

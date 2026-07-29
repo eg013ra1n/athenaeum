@@ -65,6 +65,14 @@ pub async fn clear_calibration_library_dir(state: State<'_, AppState>) -> Result
     api::clear_calibration_library_dir(&state.ctx).map_err(|e| e.to_string())
 }
 
+/// One-step calibration-library move: removes the old dedicated root
+/// (catalog purge; files untouched) and designates the new folder.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn switch_calibration_library_dir(path: String, state: State<'_, AppState>) -> Result<String, String> {
+    api::switch_calibration_library_dir(&state.ctx, path, &PathPolicy::AllowAll).map_err(|e| e.to_string())
+}
+
 /// The sync-incoming folder (personal-sync receiver write destination), if
 /// configured.
 #[tauri::command]

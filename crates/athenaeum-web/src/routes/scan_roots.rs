@@ -155,6 +155,22 @@ pub async fn clear_calibration_library_dir(
     api::clear_calibration_library_dir(&state.ctx).map(Json).map_err(api_err)
 }
 
+/// POST /api/switch_calibration_library_dir
+///
+/// One-step calibration-library move: removes the old dedicated root (catalog
+/// purge; files untouched) and designates the new folder. Returns the
+/// normalized effective path.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn switch_calibration_library_dir(
+    State(state): State<WebAppState>,
+    Json(args): Json<SetCalibrationLibraryDirArgs>,
+) -> Result<Json<String>, (StatusCode, String)> {
+    let policy = allowed_roots_policy(&state.allowed_paths);
+    api::switch_calibration_library_dir(&state.ctx, args.path, &policy)
+        .map(Json)
+        .map_err(api_err)
+}
+
 /// POST /api/get_sync_incoming_dir
 ///
 /// The sync-incoming folder (personal-sync receiver write destination), if
