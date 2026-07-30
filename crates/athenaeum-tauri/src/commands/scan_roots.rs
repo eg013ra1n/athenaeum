@@ -13,7 +13,9 @@ use athenaeum_core::api::PathPolicy;
 
 use super::AppState;
 
-pub use athenaeum_core::api::scan_roots::{RescanResultDto, ScanResultDto};
+pub use athenaeum_core::api::scan_roots::{
+    FolderCandidateVerdict, FolderOverview, RescanResultDto, ScanResultDto,
+};
 
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
@@ -41,7 +43,7 @@ pub async fn get_calibration_library_root(state: State<'_, AppState>) -> Result<
 }
 
 /// Effective calibration-library directory (master-frame write destination) —
-/// used by the File Manager's "Calibration Folder" section.
+/// used by File Manager → Folders.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn get_calibration_library_dir(state: State<'_, AppState>) -> Result<Option<String>, String> {
@@ -118,8 +120,6 @@ pub async fn clear_collaboration_dir(state: State<'_, AppState>) -> Result<(), S
     api::clear_collaboration_dir(&state.ctx).map_err(|e| e.to_string())
 }
 
-pub use athenaeum_core::api::scan_roots::FolderCandidateVerdict;
-
 /// Dry-run placement validation for the Add Folder dialog (spec §8.2).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
@@ -131,8 +131,6 @@ pub async fn validate_folder_candidate(
     api::validate_folder_candidate(&state.ctx, kind, path, &PathPolicy::AllowAll)
         .map_err(|e| e.to_string())
 }
-
-pub use athenaeum_core::api::scan_roots::FolderOverview;
 
 /// Per-folder stats (file counts/bytes, archive set counts/zip bytes) for
 /// the Folders tab — one call for the whole rail.

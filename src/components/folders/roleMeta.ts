@@ -1,5 +1,7 @@
 import { Folder, Library, Inbox, Users, Archive, type LucideIcon } from 'lucide-react';
 
+export type { LucideIcon };
+
 export type RoleKind = 'calibration_library' | 'sync_incoming' | 'collaboration';
 export type AddableKind = 'normal' | 'archive' | RoleKind;
 

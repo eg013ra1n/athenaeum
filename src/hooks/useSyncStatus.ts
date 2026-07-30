@@ -156,7 +156,7 @@ export function notifyFinished(p: SyncFinishedEvent, notify: NotifyLike): void {
             notify({
               title: 'Received files are landing in the app data folder',
               detail:
-                'Designate a Sync Incoming Folder in File Manager to keep them with your image library.',
+                'Designate a Sync Incoming Folder in File Manager → Folders to keep them with your image library.',
               kind: 'sync',
               tone: 'warning',
               link: '/files',

@@ -1305,6 +1305,7 @@ export default function Settings() {
                   onClick={() => revealItemInDir(dbPath)}
                   className="text-content-muted hover:text-content transition flex-shrink-0"
                   title="Reveal in file manager"
+                  aria-label="Reveal in file manager"
                 >
                   <FolderOpen size={16} />
                 </button>

@@ -121,7 +121,7 @@ pub async fn get_calibration_library_root(
 /// POST /api/get_calibration_library_dir
 ///
 /// Effective calibration-library directory (master-frame write destination) —
-/// used by the File Manager's "Calibration Folder" section.
+/// used by File Manager → Folders.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn get_calibration_library_dir(
     State(state): State<WebAppState>,

@@ -11,7 +11,7 @@ import type {
 import type { ScanRootWithAvailability, ScanResult } from '../types/helpers';
 
 /**
- * Manage scan roots (monitored directories)
+ * Manage scan roots (the Folders workspace)
  */
 export function useScanRoots() {
   const [scanRoots, setScanRoots] = useState<ScanRoot[]>([]);

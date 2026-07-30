@@ -1,7 +1,7 @@
 import { Plus, RefreshCw, Star } from 'lucide-react';
 import type { ScanRootWithAvailability, ArchiveRoot, ArchivedFrameSetSummary } from '../../types/helpers';
 import type { FolderOverview } from '../../types/models';
-import { ROLE_META, ROLE_ORDER, KIND_META, isRoleKind, type RailSelection, type RoleKind, type AddableKind } from './roleMeta';
+import { ROLE_META, ROLE_ORDER, KIND_META, isRoleKind, type RailSelection, type RoleKind, type AddableKind, type LucideIcon } from './roleMeta';
 import { basename, parentPath, formatBytes } from './format';
 
 interface FolderRailProps {
@@ -35,7 +35,7 @@ function GroupHeader({ label }: { label: string }) {
 
 function ScanRow({ root, sub, tint, Icon, selected, onClick, onRescan, scanning, percent, missing }: {
   root: ScanRootWithAvailability; sub: string; tint: string;
-  Icon: React.ComponentType<{ size?: number; className?: string }>;
+  Icon: LucideIcon;
   selected: boolean; onClick: () => void; onRescan: () => void;
   scanning: boolean; percent: number | null; missing: number;
 }) {
@@ -102,27 +102,33 @@ export function FolderRail({
 
       <GroupHeader label="Monitored" />
       {monitored.length === 0 && <p className="px-2 text-xs text-content-muted">No monitored folders yet.</p>}
-      {monitored.map((root) => (
-        <ScanRow
-          key={root.id}
-          root={root}
-          sub={parentPath(root.path)}
-          tint={KIND_META.normal.tint}
-          Icon={KIND_META.normal.icon}
-          selected={isSel(selection, { type: 'scan', id: root.id! })}
-          onClick={() => onSelect({ type: 'scan', id: root.id! })}
-          onRescan={() => onRescan(root.id!)}
-          scanning={root.id ? isScanning(root.id) : false}
-          percent={root.id ? scanPercent(root.id) : null}
-          missing={root.id ? (missingCounts[root.id] ?? 0) : 0}
-        />
-      ))}
+      {monitored.map((root) => {
+        const id = root.id;
+        if (id == null) return null;
+        return (
+          <ScanRow
+            key={id}
+            root={root}
+            sub={parentPath(root.path)}
+            tint={KIND_META.normal.tint}
+            Icon={KIND_META.normal.icon}
+            selected={isSel(selection, { type: 'scan', id })}
+            onClick={() => onSelect({ type: 'scan', id })}
+            onRescan={() => onRescan(id)}
+            scanning={isScanning(id)}
+            percent={scanPercent(id)}
+            missing={missingCounts[id] ?? 0}
+          />
+        );
+      })}
 
       <GroupHeader label="Special roles" />
       {ROLE_ORDER.map((kind) => {
         const meta = ROLE_META[kind];
         const root = roleRoots.get(kind);
         if (root) {
+          const id = root.id;
+          if (id == null) return null;
           return (
             <ScanRow
               key={kind}
@@ -130,12 +136,12 @@ export function FolderRail({
               sub={`${meta.label} · ${parentPath(root.path)}`}
               tint={meta.tint}
               Icon={meta.icon}
-              selected={isSel(selection, { type: 'scan', id: root.id! })}
-              onClick={() => onSelect({ type: 'scan', id: root.id! })}
-              onRescan={() => onRescan(root.id!)}
-              scanning={root.id ? isScanning(root.id) : false}
-              percent={root.id ? scanPercent(root.id) : null}
-              missing={root.id ? (missingCounts[root.id] ?? 0) : 0}
+              selected={isSel(selection, { type: 'scan', id })}
+              onClick={() => onSelect({ type: 'scan', id })}
+              onRescan={() => onRescan(id)}
+              scanning={isScanning(id)}
+              percent={scanPercent(id)}
+              missing={missingCounts[id] ?? 0}
             />
           );
         }

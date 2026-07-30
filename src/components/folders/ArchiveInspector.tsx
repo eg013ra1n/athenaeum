@@ -53,14 +53,14 @@ export function ArchiveInspector({ root, archivedSets, totalZipBytes, onSetDefau
           <div className="flex items-center gap-2 text-lg font-bold text-content">
             <span className="truncate">{basename(root.path)}</span>
             {root.is_default
-              ? <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-warning/20 text-warning border border-warning/40">★ Default destination</span>
+              ? <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-warning/20 text-warning border border-warning/40 flex items-center gap-1"><Star size={10} fill="currentColor" /> Default destination</span>
               : <button onClick={onSetDefault} className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-surface-hover text-content-muted border border-border hover:text-warning transition flex items-center gap-1"><Star size={10} /> Make default</button>}
           </div>
           <div className="flex items-center gap-2 font-mono text-xs text-content-muted">
             <span className="truncate">{root.path}</span>
             {isTauri && (
               <button onClick={() => revealItemInDir(root.path).catch((e) => console.error('[ArchiveInspector] reveal failed:', e))}
-                title="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>
+                title="Reveal in file manager" aria-label="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>
             )}
           </div>
         </div>
@@ -72,7 +72,7 @@ export function ArchiveInspector({ root, archivedSets, totalZipBytes, onSetDefau
 
       <div className="flex flex-wrap gap-2 mt-3">
         <Stat label="archived frame sets" value={String(sets.length)} />
-        <Stat label="total size" value={totalZipBytes > 0 ? formatBytes(totalZipBytes) : '—'} />
+        <Stat label="frame-set zips" value={totalZipBytes > 0 ? formatBytes(totalZipBytes) : '—'} />
       </div>
 
       <Section title="Contents">
@@ -98,7 +98,7 @@ export function ArchiveInspector({ root, archivedSets, totalZipBytes, onSetDefau
                         {!z.exists && <span className="text-error whitespace-nowrap">missing</span>}
                         {isTauri && z.exists && (
                           <button onClick={() => revealItemInDir(z.path).catch((e) => console.error('[ArchiveInspector] reveal failed:', e))}
-                            title="Reveal in file manager" className="p-0.5 rounded text-content-muted hover:text-accent transition"><ExternalLink size={11} /></button>
+                            title="Reveal in file manager" aria-label="Reveal in file manager" className="p-0.5 rounded text-content-muted hover:text-accent transition"><ExternalLink size={11} /></button>
                         )}
                       </li>
                     ))}

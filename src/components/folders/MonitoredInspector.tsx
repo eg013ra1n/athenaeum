@@ -37,9 +37,9 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
   const [errorsOpen, setErrorsOpen] = useState(false);
   const displayErrors = scanResult?.errors ?? root.last_scan_errors ?? [];
   // Missing-file actions (recheck / delete / relocate) mutate the catalog, so they are
-  // offline read-only per spec §5.4. `null` also covers an unpersisted root (id === null),
+  // offline read-only per spec §5.4. `root.id == null` also covers an unpersisted root,
   // which nothing can be fetched for. The parse-error log below stays visible offline.
-  const missingRootId = !offline && missingCount > 0 ? root.id : null;
+  const showMissing = !offline && missingCount > 0 && root.id != null;
 
   useEffect(() => { setMissingOpen(false); setMissingFiles(null); setMissingError(null); setErrorsOpen(false); }, [root.id]);
 
@@ -68,7 +68,7 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
             <span className="truncate">{root.path}</span>
             {isTauri && !offline && (
               <button onClick={() => revealItemInDir(root.path).catch((e) => console.error('[MonitoredInspector] reveal failed:', e))}
-                title="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>
+                title="Reveal in file manager" aria-label="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>
             )}
           </div>
         </div>
@@ -97,7 +97,7 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
               {overview ? ` ${overview.file_count.toLocaleString()}` : ''} files — Relink points them to the new location;
               frame sets, calibration links and tags survive.
             </p>
-            <button onClick={props.onRelink} disabled={relinking}
+            <button onClick={props.onRelink} disabled={relinking || isScanning}
               className="flex items-center gap-2 px-3 py-1.5 bg-error hover:brightness-90 text-surface rounded text-sm transition disabled:opacity-50">
               <RefreshCw size={14} className={relinking ? 'animate-spin' : ''} /> {relinking ? 'Relinking…' : 'Relink — point to new location…'}
             </button>
@@ -144,41 +144,49 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
         </Section>
       )}
 
-      {(missingRootId !== null || displayErrors.length > 0) && (
+      {(showMissing || displayErrors.length > 0) && (
         <Section title="Needs attention">
-          {missingRootId !== null && (
-            <div className="rounded-lg border border-orange/40 bg-surface">
-              <button onClick={() => { const next = !missingOpen; setMissingOpen(next); if (next && !missingFiles) void loadMissing(); }}
-                className="w-full flex items-center gap-2 p-2.5 text-left text-sm text-orange hover:bg-orange/10 rounded-lg transition">
-                {missingOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                <AlertTriangle size={14} /> {missingCount} file{missingCount !== 1 ? 's' : ''} missing from disk
-              </button>
-              {missingOpen && (missingError
-                ? <div className="p-3 flex items-center gap-2 text-xs text-error">
-                    <AlertCircle size={12} className="shrink-0" />
-                    <span className="flex-1 min-w-0 break-all">Could not load the missing-file list — {missingError}</span>
-                    <button onClick={() => { setMissingError(null); void loadMissing(); }}
-                      className="shrink-0 px-2 py-0.5 rounded border border-error/50 hover:bg-error-muted transition">Retry</button>
+          <div className="space-y-2">
+            {showMissing && (
+              <div className="rounded-lg border border-orange/40 bg-surface">
+                <button onClick={() => { const next = !missingOpen; setMissingOpen(next); if (next && !missingFiles) void loadMissing(); }}
+                  aria-expanded={missingOpen} aria-controls={`missing-files-panel-${root.id ?? 'unsaved'}`}
+                  className="w-full flex items-center gap-2 p-2.5 text-left text-sm text-orange hover:bg-orange/10 rounded-lg transition">
+                  {missingOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  <AlertTriangle size={14} /> {missingCount} file{missingCount !== 1 ? 's' : ''} missing from disk
+                </button>
+                {missingOpen && (
+                  <div id={`missing-files-panel-${root.id ?? 'unsaved'}`}>
+                    {missingError
+                      ? <div className="p-3 flex items-center gap-2 text-xs text-error">
+                          <AlertCircle size={12} className="shrink-0" />
+                          <span className="flex-1 min-w-0 break-all">Could not load the missing-file list — {missingError}</span>
+                          <button onClick={() => { setMissingError(null); void loadMissing(); }}
+                            className="shrink-0 px-2 py-0.5 rounded border border-error/50 hover:bg-error-muted transition">Retry</button>
+                        </div>
+                      : missingFiles && root.id != null
+                        ? <div className="p-2"><MissingFilesPanel rootId={root.id} missingFiles={missingFiles} onRefresh={() => { void loadMissing(); props.onMissingChanged(); }} /></div>
+                        : <div className="p-3 text-xs text-content-muted flex items-center gap-2"><Loader2 size={12} className="animate-spin" /> loading…</div>}
                   </div>
-                : missingFiles
-                  ? <div className="p-2"><MissingFilesPanel rootId={missingRootId} missingFiles={missingFiles} onRefresh={() => { void loadMissing(); props.onMissingChanged(); }} /></div>
-                  : <div className="p-3 text-xs text-content-muted flex items-center gap-2"><Loader2 size={12} className="animate-spin" /> loading…</div>)}
-            </div>
-          )}
-          {displayErrors.length > 0 && (
-            <div className="rounded-lg border border-error/30 bg-surface mt-2">
-              <button onClick={() => setErrorsOpen((v) => !v)}
-                className="w-full flex items-center gap-2 p-2.5 text-left text-sm text-error hover:bg-error-muted rounded-lg transition">
-                {errorsOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                <AlertCircle size={14} /> {displayErrors.length} file{displayErrors.length !== 1 ? 's' : ''} failed in last scan
-              </button>
-              {errorsOpen && (
-                <div className="px-3 py-2 max-h-40 overflow-y-auto space-y-1">
-                  {displayErrors.map((err, i) => <p key={i} className="text-xs text-error/80 font-mono break-all">{err}</p>)}
-                </div>
-              )}
-            </div>
-          )}
+                )}
+              </div>
+            )}
+            {displayErrors.length > 0 && (
+              <div className="rounded-lg border border-error/30 bg-surface">
+                <button onClick={() => setErrorsOpen((v) => !v)}
+                  aria-expanded={errorsOpen} aria-controls={`scan-errors-panel-${root.id ?? 'unsaved'}`}
+                  className="w-full flex items-center gap-2 p-2.5 text-left text-sm text-error hover:bg-error-muted rounded-lg transition">
+                  {errorsOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                  <AlertCircle size={14} /> {displayErrors.length} file{displayErrors.length !== 1 ? 's' : ''} failed in last scan
+                </button>
+                {errorsOpen && (
+                  <div id={`scan-errors-panel-${root.id ?? 'unsaved'}`} className="px-3 py-2 max-h-40 overflow-y-auto space-y-1">
+                    {displayErrors.map((err, i) => <p key={i} className="text-xs text-error/80 font-mono break-all">{err}</p>)}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </Section>
       )}
 

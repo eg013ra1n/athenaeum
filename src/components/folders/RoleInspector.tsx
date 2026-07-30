@@ -52,7 +52,7 @@ export function RoleInspector(props: RoleInspectorProps) {
             <span className="truncate">{dir}</span>
             {isTauri && !offline && (
               <button onClick={() => revealItemInDir(dir).catch((e) => console.error('[RoleInspector] reveal failed:', e))}
-                title="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>
+                title="Reveal in file manager" aria-label="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>
             )}
           </div>
         </div>

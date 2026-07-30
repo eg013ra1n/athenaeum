@@ -214,8 +214,10 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
    * Reconcile the held selection against the refreshed model:
    * - a placeholder whose role now HAS a root → promote to that row (role setup
    *   completed while its placeholder was selected);
-   * - a placeholder for the calibration library stays valid while
-   *   `coveredCalibrationDir` is set — the covered row is that same selection;
+   * - a placeholder for the calibration library is otherwise left alone — this
+   *   branch only ever promotes or leaves as-is, so the covered case (no
+   *   scan-root row for that kind) is preserved by the absence of a matching
+   *   root, not by consulting `coveredCalibrationDir` here;
    * - a scan/archive id that no longer exists → drop to `null` so the
    *   default-selection effect re-picks (removals, dedicated→covered moves).
    */
@@ -231,7 +233,7 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
       ? scanRoots.some((r) => r.id === selection.id)
       : archiveRoots.some((r) => r.id === selection.id);
     if (!stillThere) setSelection(null);
-  }, [scanRoots, archiveRoots, coveredCalibrationDir, rootsLoading, selection]);
+  }, [scanRoots, archiveRoots, rootsLoading, selection]);
 
   const scanPercent = useCallback((rootId: number) => {
     const p = activeScans.get(rootId)?.progress;
@@ -520,7 +522,7 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
             onClick={clearRootsError}
             aria-label="Dismiss"
             title="Dismiss"
-            className="ml-2 shrink-0 p-1 rounded hover:bg-surface-hover text-content-muted transition"
+            className="shrink-0 p-1 rounded hover:bg-surface-hover text-content-muted transition"
           >
             <X size={14} />
           </button>

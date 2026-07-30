@@ -47,10 +47,12 @@ export default function FileManager() {
   }, [location.state, location.pathname, navigate]);
 
   // Deep-link from the `/transfers` app-data warning strip (UX-1): land on the
-  // Folders tab and select the Sync Incoming role. The token is a monotonic
-  // counter (0 = never requested) so FoldersTab can latch each request exactly
-  // once — clearing the navigation state below must not cancel a pending
-  // selection, and a repeat deep-link must still re-select the role.
+  // Folders tab and select the Sync Incoming role.
+  // Raise/consume token: the parent raises it to 1, FoldersTab selects the
+  // role and calls onSyncIncomingHandled, which lowers it to 0 — the 0 also
+  // re-arms the child's latch so a repeat deep-link reusing 1 reads as new.
+  // Do NOT make this monotonic again: that reintroduces the replay bug fixed
+  // in 91da41bf.
   const [syncIncomingToken, setSyncIncomingToken] = useState(0);
   useEffect(() => {
     const state = location.state as { focusSyncIncoming?: boolean } | null;
@@ -123,7 +125,7 @@ export default function FileManager() {
         <h2 className="text-2xl font-bold">
           File Manager
           <span className="text-sm font-normal text-content-muted ml-3">
-            Manage monitored directories and view FITS/XISF metadata
+            Manage folders, roles and archive destinations; browse FITS/XISF files and metadata
           </span>
         </h2>
       </div>
