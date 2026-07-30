@@ -1326,6 +1326,31 @@ pub fn set_scan_root_monitor_enabled(
     Ok(())
 }
 
+/// Calibration-frame `(frame_id, imagetyp)` rows under `root_path`,
+/// separator-strict. Extracted from `recreate_calibration_sets_for_root` so
+/// the sibling-root boundary is unit-testable without driving the whole
+/// set-rebuild machinery. The delete step this rebuild pairs with
+/// (`db::delete_calibration_sets_for_root`) has been byte-range-strict since
+/// 81aedae7 — the rebuild sweeping wider than the delete folded a sibling
+/// root's darks/flats into this root's rebuilt sets.
+fn calibration_frame_rows_under_root(
+    conn: &rusqlite::Connection,
+    root_path: &str,
+) -> Result<Vec<(i64, String)>, rusqlite::Error> {
+    let (pred, values) = crate::db::scan_root_prefix_predicate("f.path", &[root_path.to_string()]);
+    let sql = format!(
+        "SELECT fr.id, fr.imagetyp FROM frames fr
+         JOIN files f ON fr.file_id = f.id
+         WHERE ({pred})
+           AND fr.imagetyp IN ('Flat','Dark','Bias','DarkFlat','MasterFlat','MasterDark','MasterBias','MasterDarkFlat')"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.collect()
+}
+
 /// Query calibration frame IDs under a scan root and recreate calibration
 /// sets. Single copy — was copy-pasted across `commands/scan_roots.rs` and
 /// `routes/scan_roots.rs` pre-conversion; merged here now per Task 9 BINDING
@@ -1345,28 +1370,16 @@ fn recreate_calibration_sets_for_root(
         |row| row.get(0),
     )?;
 
-    let like_pattern = format!("{}%", root_path);
-
-    // Query all calibration frame IDs under this root, grouped by imagetyp
-    let mut stmt = conn.prepare(
-        "SELECT fr.id, fr.imagetyp FROM frames fr
-         JOIN files f ON fr.file_id = f.id
-         WHERE f.path LIKE ?1
-           AND fr.imagetyp IN ('Flat','Dark','Bias','DarkFlat','MasterFlat','MasterDark','MasterBias','MasterDarkFlat')"
-    )?;
-
     let mut flat_ids = Vec::new();
     let mut dark_ids = Vec::new();
     let mut bias_ids = Vec::new();
     let mut darkflat_ids = Vec::new();
     let mut master_ids = MasterFrameIds::default();
 
-    let rows = stmt.query_map(rusqlite::params![like_pattern], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
+    // Query all calibration frame IDs under this root, grouped by imagetyp
+    let rows = calibration_frame_rows_under_root(conn, &root_path)?;
 
-    for row in rows {
-        let (frame_id, imagetyp) = row?;
+    for (frame_id, imagetyp) in rows {
         match imagetyp.as_str() {
             "Flat" => flat_ids.push(frame_id),
             "Dark" => dark_ids.push(frame_id),
@@ -3007,5 +3020,44 @@ mod overview_tests {
         let o = ov.archive_roots.iter().find(|r| r.path == other).unwrap();
         assert_eq!(o.set_count, 1);
         assert_eq!(o.total_zip_bytes, 10);
+    }
+}
+
+#[cfg(test)]
+mod calibration_rebuild_tests {
+    use super::*;
+
+    #[test]
+    fn calibration_frame_query_excludes_sibling_and_case_variant_roots() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let mk = |path: &str, imagetyp: &str| {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'd.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![path],
+            ).unwrap();
+            let fid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp) VALUES (?1, ?2)",
+                rusqlite::params![fid, imagetyp],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let mine = mk(r"C:\Astro\dark1.fits", "Dark");
+        let sibling = mk(r"C:\Astro_backup\dark2.fits", "Dark");
+        let case_variant = mk(r"C:\astro\dark3.fits", "Dark");
+
+        let rows = calibration_frame_rows_under_root(&conn, r"C:\Astro").unwrap();
+        let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&mine));
+        assert!(
+            !ids.contains(&sibling),
+            "name-prefix sibling root leaked in"
+        );
+        assert!(
+            !ids.contains(&case_variant),
+            "case-variant root leaked in (LIKE was case-insensitive)"
+        );
     }
 }
