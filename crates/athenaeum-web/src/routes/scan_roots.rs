@@ -259,7 +259,7 @@ pub async fn validate_folder_candidate(
 /// Per-folder stats (file counts/bytes, archive set counts/zip bytes) for the
 /// Folders tab — one call for the whole rail. No args; the client's `{}` body
 /// is ignored.
-#[tracing::instrument(skip_all, err(Debug))]
+#[tracing::instrument(skip_all, err(Debug), level = "debug")]
 pub async fn get_folder_overview(
     State(state): State<WebAppState>,
 ) -> Result<Json<athenaeum_core::api::scan_roots::FolderOverview>, (StatusCode, String)> {

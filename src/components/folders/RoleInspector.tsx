@@ -1,4 +1,4 @@
-import { ExternalLink, RefreshCw } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, ExternalLink, RefreshCw } from 'lucide-react';
 import { revealItemInDir } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
 import { formatTimestamp } from '../../utils/dateFormatting';
@@ -7,7 +7,7 @@ import { Stat, Section } from './MonitoredInspector';
 import { basename, formatBytes } from './format';
 import { ROLE_META, type RoleKind } from './roleMeta';
 import type { ScanRootWithAvailability } from '../../types/helpers';
-import type { ScanRootOverview } from '../../types/models';
+import type { RelinkResult, ScanRootOverview } from '../../types/models';
 
 interface RoleInspectorProps {
   kind: RoleKind;
@@ -24,11 +24,20 @@ interface RoleInspectorProps {
   onReleaseRole: () => void;
   onToggleDuplicates: (v: boolean) => void;
   onToggleMonitor: (v: boolean) => void;
+  /**
+   * Relink (spec §5.4) — a role folder on a drive that went away is just as
+   * relinkable as a plain monitored one. Optional: a COVERED calibration
+   * library (`root === null`) has no root to relink, and the banner that hosts
+   * the button only renders for a non-null offline root anyway.
+   */
+  relinking?: boolean;
+  relinkResult?: RelinkResult | null;
+  onRelink?: () => void;
 }
 
 export function RoleInspector(props: RoleInspectorProps) {
   const meta = ROLE_META[props.kind];
-  const { root, dir, coveredBy, overview } = props;
+  const { root, dir, coveredBy, overview, relinking, relinkResult } = props;
   const offline = root ? !root.is_available : false;
   return (
     <div className="flex-1 min-w-0 bg-surface-elevated rounded-lg p-5 overflow-y-auto">
@@ -54,6 +63,37 @@ export function RoleInspector(props: RoleInspectorProps) {
           </button>
         )}
       </div>
+
+      {/* Offline banner + relink (spec §5.4) — same affordance a plain
+          monitored folder gets; a role must not make a lost drive unfixable. */}
+      {root && offline && (
+        <div className="mt-4 p-4 bg-error-muted border border-error/50 rounded-lg flex items-start gap-3">
+          <AlertTriangle className="text-error shrink-0 mt-0.5" size={18} />
+          <div className="flex-1">
+            <p className="text-sm font-semibold text-error">Folder not reachable</p>
+            <p className="text-xs text-error/80 mt-0.5 mb-2">
+              Drive unmounted, renamed or moved. Relink points the catalog to the new location.
+            </p>
+            {props.onRelink && (
+              <button onClick={props.onRelink} disabled={relinking}
+                className="flex items-center gap-2 px-3 py-1.5 bg-error hover:brightness-90 text-surface rounded text-sm transition disabled:opacity-50">
+                <RefreshCw size={14} className={relinking ? 'animate-spin' : ''} /> {relinking ? 'Relinking…' : 'Relink — point to new location…'}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {relinkResult && (
+        <div className="mt-4 p-4 bg-surface rounded-lg border border-border">
+          <h4 className="text-sm font-semibold text-content flex items-center gap-2 mb-2"><CheckCircle2 className="text-success" size={16} /> Relinking complete</h4>
+          <div className="grid grid-cols-3 gap-4 text-sm">
+            <div><p className="text-content-muted text-xs">Matched</p><p className="text-lg font-bold text-success">{relinkResult.files_matched}</p></div>
+            <div><p className="text-content-muted text-xs">New files</p><p className="text-lg font-bold text-accent">{relinkResult.files_new}</p></div>
+            <div><p className="text-content-muted text-xs">Orphaned</p><p className="text-lg font-bold text-warning">{relinkResult.files_orphaned}</p></div>
+          </div>
+        </div>
+      )}
 
       <div className={`mt-4 p-3 rounded-lg bg-surface border text-xs text-content-muted ${props.kind === 'calibration_library' ? 'border-purple/40' : 'border-border'}`}>
         {meta.explainer}

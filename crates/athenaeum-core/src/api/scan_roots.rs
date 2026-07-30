@@ -479,13 +479,14 @@ pub fn set_calibration_library_dir(
                 // conflicts (subdirectory/parent/duplicate) pass through
                 // unchanged — those are unambiguous already.
                 ApiError::Conflict(msg) if msg.starts_with("A Calibration Library root already exists") => {
-                    // Order matters: the deletion guard blocks removing the old
-                    // root while the setting still resolves to it, so Clear
-                    // must come first. And be honest about the purge: removing
-                    // the root deletes its masters' CATALOG rows (files on
-                    // disk survive; a rescan of a covering root re-imports).
+                    // Near-unreachable since Release demotes the old kind row
+                    // (see `clear_calibration_library_dir`) and Change folder
+                    // goes through `switch_calibration_library_dir` — but it
+                    // must still name a flow that EXISTS. Release is the one
+                    // action that frees the role, and it is catalog-preserving:
+                    // no purge to warn about.
                     ApiError::Conflict(format!(
-                        "{msg}. Clear the Calibration Folder first, then remove the old dedicated library root under Monitored Directories (master files on disk are kept; their catalog entries are removed with the root)."
+                        "{msg}. Release the Calibration Library role from its folder row first, then assign the new folder."
                     ))
                 }
                 other => other,
@@ -500,18 +501,31 @@ pub fn set_calibration_library_dir(
     Ok(path_str)
 }
 
-/// Clear the calibration-library directory setting. Writes an EMPTY value
-/// (not a delete) so the legacy `calibration_library`-root fallback stays
-/// blocked — see [`get_calibration_library_dir`]. Never deletes any scan
-/// root: if the library was a dedicated root it remains a monitored
-/// directory, removable through the regular scan-root list (which is also
-/// where its catalog-purge consequences are already understood).
+/// Release the calibration-library role. Two writes, both required:
+///
+/// 1. The `calibration.library_dir` setting gets an EMPTY value (not a delete)
+///    so the legacy `calibration_library`-root fallback stays blocked — see
+///    [`get_calibration_library_dir`].
+/// 2. A dedicated `calibration_library`-kind root is DEMOTED to `'normal'`
+///    (same shape as [`clear_special_root_dir`]) — the released folder becomes
+///    a plain monitored directory (spec §5.2), where the regular scan-root list
+///    can remove it and its catalog-purge consequences are already understood.
+///
+/// Never deletes a scan root — Release is catalog-preserving. The demote is not
+/// cosmetic: the Folders rail routes every non-normal root to a Special-roles
+/// row with no Remove, so a surviving kind row would strand the released folder
+/// there while the role reads as free, and the next assignment would die on
+/// `check_special_root_uniqueness`.
 pub fn clear_calibration_library_dir(ctx: &ServiceContext) -> Result<(), ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
     ctx.settings
         .persist_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR, "")?;
-    tracing::info!("calibration library dir cleared");
+    let demoted = conn.execute(
+        "UPDATE scan_roots SET kind = 'normal' WHERE kind = 'calibration_library'",
+        [],
+    )?;
+    tracing::info!(demoted_roots = demoted, "calibration library dir cleared");
     Ok(())
 }
 
@@ -2287,6 +2301,58 @@ mod switch_library_tests {
         assert_eq!(
             get_calibration_library_dir(&ctx).unwrap().as_deref(),
             Some(new.as_str())
+        );
+    }
+
+    // ── Release (Critical-1 fix round) ───────────────────────────────────
+    //
+    // Shares this module's ServiceContext fixtures. Clearing a STANDALONE
+    // library used to write the empty settings key and stop there, leaving the
+    // `calibration_library`-kind row behind: the Folders rail routes every
+    // non-normal root to a Special-roles entry (no Remove), so the released
+    // folder stayed pinned there forever while the dialog reported the role
+    // free — and re-assigning died on `check_special_root_uniqueness`.
+    #[test]
+    fn releasing_a_standalone_library_demotes_the_root_and_frees_the_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let lib = mkdirs(&tmp, "lib_old");
+        set_calibration_library_dir(&ctx, lib.clone(), &PathPolicy::AllowAll).unwrap();
+        // A cataloged file under it — Release must never purge anything.
+        insert_file(&ctx, &format!("{lib}/m.fits"));
+
+        clear_calibration_library_dir(&ctx).unwrap();
+
+        let roots = get_scan_roots(&ctx).unwrap();
+        let released = roots
+            .iter()
+            .find(|r| r.path == lib)
+            .expect("Release never deletes the scan root — the folder stays monitored");
+        assert_eq!(
+            released.kind, "normal",
+            "the released folder must be demoted to a plain monitored directory"
+        );
+        assert!(
+            library_root_paths(&ctx).is_empty(),
+            "no calibration_library-kind root may survive a Release"
+        );
+        assert_eq!(get_calibration_library_dir(&ctx).unwrap(), None);
+        assert_eq!(
+            file_paths(&ctx),
+            vec![format!("{lib}/m.fits")],
+            "Release is catalog-preserving — it is not a removal"
+        );
+
+        // …and the role is genuinely free again: a NEW standalone folder can
+        // take it without tripping the single-library uniqueness Conflict.
+        let next = mkdirs(&tmp, "lib_new");
+        let effective =
+            set_calibration_library_dir(&ctx, next.clone(), &PathPolicy::AllowAll).unwrap();
+        assert_eq!(effective, next);
+        assert_eq!(library_root_paths(&ctx), vec![next.clone()]);
+        assert_eq!(
+            get_calibration_library_dir(&ctx).unwrap().as_deref(),
+            Some(next.as_str())
         );
     }
 }

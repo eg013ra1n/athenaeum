@@ -62,6 +62,14 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
    * pre-load `null` as "role free".
    */
   const [calibrationDir, setCalibrationDir] = useState<string | null | undefined>(undefined);
+  /**
+   * First `refreshAux` has settled. Gates the "No folders yet" screen: archive
+   * roots and the calibration dir arrive on a separate async pass from the scan
+   * roots, so their pre-load empties would otherwise read as "nothing
+   * configured" for one paint — the empty state offers Add Folder to someone
+   * who already has folders.
+   */
+  const [auxLoaded, setAuxLoaded] = useState(false);
   const [selection, setSelection] = useState<RailSelection | null>(null);
   const [addDialog, setAddDialog] = useState<{ open: boolean; preselect?: AddableKind }>({ open: false });
   const [scanResultMap, setScanResultMap] = useState<Record<number, ScanResult>>({});
@@ -100,6 +108,10 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
     else console.error('[FoldersTab] get_missing_files_counts failed:', counts.reason);
     if (calDir.status === 'fulfilled') setCalibrationDir(calDir.value ?? null);
     else console.error('[FoldersTab] get_calibration_library_dir failed:', calDir.reason);
+    // `allSettled` always resolves, so this marks "the pass ran", not "the pass
+    // succeeded" — a backend that keeps failing must still reach a usable
+    // screen rather than hang on a spinner-shaped nothing.
+    setAuxLoaded(true);
   }, []);
 
   useEffect(() => { void refreshAux(); }, [refreshAux]);
@@ -343,9 +355,16 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
       }
     };
     if (kind === 'calibration_library') {
+      // The purge only happens when there IS a dedicated library root to
+      // remove. A covered (settings-only) library has no row of its own, so the
+      // move is a pure setting rewrite — warning about deleted catalog entries
+      // there would describe something the backend will not do.
+      const dedicated = scanRoots.some((r) => r.kind === 'calibration_library');
       setConfirm({
         title: 'Move Calibration Library',
-        message: 'The old library folder is removed from the catalog (its masters’ catalog entries are deleted; files on disk are kept). The new folder becomes the master destination in one step.',
+        message: dedicated
+          ? 'The old library folder is removed from the catalog (its masters’ catalog entries are deleted; files on disk are kept). The new folder becomes the master destination in one step.'
+          : 'The Calibration Library destination moves to the new folder. Files on disk are not touched.',
         danger: true,
         onConfirm: proceed,
       });
@@ -370,7 +389,10 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
     },
   });
 
-  const empty = !rootsLoading && scanRoots.length === 0 && archiveRoots.length === 0;
+  // A covered calibration library is a configured folder with no scan-root row
+  // of its own — counting only rows would show "No folders yet" over it.
+  const empty = auxLoaded && !rootsLoading && scanRoots.length === 0
+    && archiveRoots.length === 0 && !coveredCalibrationDir;
 
   // ── Inspector resolution ──────────────────────────────────────────────────
   let inspector: ReactNode = null;
@@ -408,7 +430,10 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
             coveredBy={null}
             overview={ov}
             isScanning={root.id ? isScanning(root.id) : false}
+            relinking={relinkingRootId === root.id}
+            relinkResult={relinkResult?.rootId === root.id ? relinkResult.result : null}
             onScan={() => root.id && handleScan(root.id)}
+            onRelink={() => root.id && handleRelink(root.id)}
             onChangeFolder={() => handleChangeRoleFolder(kind)}
             onReleaseRole={() => handleReleaseRole(kind)}
             onToggleDuplicates={(v) => { if (root.id) void toggleDuplicatesFlag(root.id, v).catch((e) => console.error('[FoldersTab] duplicates toggle failed:', e)); }}
