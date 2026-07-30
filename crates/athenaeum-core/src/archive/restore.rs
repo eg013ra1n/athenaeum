@@ -597,6 +597,51 @@ pub(crate) mod tests {
     use rusqlite::params;
     use tempfile::TempDir;
 
+    fn op_file(source_path: &str) -> ArchiveOperationFile {
+        ArchiveOperationFile {
+            id: 0,
+            operation_id: 0,
+            file_id: None,
+            source_path: source_path.to_string(),
+            target_zip_path: String::new(),
+            target_path_in_zip: String::new(),
+            expected_hash: String::new(),
+            disposition: "move".to_string(),
+            frame_role: "light".to_string(),
+            file_size_bytes: 0,
+        }
+    }
+
+    /// `astro2` is a sibling of `astro`, not a child — a plain string/prefix
+    /// compare would call this "restore to original" and write the files back
+    /// to a root the user did not pick.
+    #[test]
+    fn classify_target_rejects_sibling_name_prefix() {
+        let files = vec![
+            op_file("/photos/astro2/M31/x.fits"),
+            op_file("/photos/astro2/M31/y.fits"),
+        ];
+        assert!(matches!(
+            classify_target(Path::new("/photos/astro"), &files),
+            RestoreTargetMode::UnderRoot(_)
+        ));
+    }
+
+    /// On a case-insensitive host `/data/astro` and `/data/Astro` are one
+    /// directory, so this IS a restore-to-original.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn classify_target_folds_case_on_case_insensitive_hosts() {
+        let files = vec![
+            op_file("/data/astro/M31/x.fits"),
+            op_file("/data/astro/M31/y.fits"),
+        ];
+        assert!(matches!(
+            classify_target(Path::new("/data/Astro"), &files),
+            RestoreTargetMode::Original
+        ));
+    }
+
     /// End-to-end smoke test: archive a single light, restore to an alternate
     /// target, verify the catalog points at the new location.
     #[test]

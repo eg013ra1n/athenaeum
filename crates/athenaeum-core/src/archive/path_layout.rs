@@ -105,7 +105,17 @@ pub fn resolve_scan_root_prefixes(scan_root_paths: &[String]) -> std::collection
 /// `<UniqueRootName>/<rel-path-from-root>` with forward slashes (zip convention).
 /// If the source file is not under `scan_root`, falls back to just `<UniqueRootName>/<basename>`.
 pub fn path_in_zip(unique_root_name: &str, scan_root: &Path, source_file: &Path) -> String {
-    let rel = source_file.strip_prefix(scan_root).ok();
+    // The rel-path derivation must fold case exactly like `path_starts_with_fold`,
+    // which is what DECIDES that this scan root matched in the first place. If a
+    // root matches case-insensitively but the exact-case `strip_prefix` here does
+    // not, every file drops to the basename fallback and the whole subtree
+    // flattens into `<Root>/<basename>` inside the zip (then trips the planner's
+    // in-zip collision guard, turning a case mismatch into a hard plan failure).
+    let rel = source_file
+        .strip_prefix(scan_root)
+        .ok()
+        .map(|p| p.to_path_buf())
+        .or_else(|| strip_prefix_fold(source_file, scan_root));
     let mut buf = PathBuf::from(unique_root_name);
     match rel {
         Some(p) => buf.push(p),
@@ -162,6 +172,26 @@ pub(crate) fn path_starts_with_fold(path: &Path, root: &Path) -> bool {
     };
     let (a, b) = (comps(path), comps(root));
     a.len() >= b.len() && a[..b.len()] == b[..]
+}
+
+/// Case-folded component-wise `Path::strip_prefix`, the rel-path counterpart of
+/// [`path_starts_with_fold`] (same hosts, same comparison). Returns `None` off
+/// case-insensitive hosts, and for anything that is not a STRICT descendant of
+/// `root` — a path equal to the root has no remainder to place in a zip.
+fn strip_prefix_fold(path: &Path, root: &Path) -> Option<PathBuf> {
+    if !cfg!(any(windows, target_os = "macos")) {
+        return None;
+    }
+    let p: Vec<_> = path.components().collect();
+    let r: Vec<_> = root.components().collect();
+    if p.len() <= r.len() {
+        return None;
+    }
+    let fold = |c: &std::path::Component| c.as_os_str().to_string_lossy().to_lowercase();
+    if p[..r.len()].iter().map(fold).ne(r.iter().map(fold)) {
+        return None;
+    }
+    Some(p[r.len()..].iter().map(|c| c.as_os_str()).collect())
 }
 
 /// Join an always-'/'-separated `path_in_zip` under `root` component-wise, so
@@ -315,6 +345,30 @@ mod tests {
             Path::new("/Other/foo.fits"),
         );
         assert_eq!(zip_path, "Lights/foo.fits");
+    }
+
+    /// The fold-aware root match in the planner is only half the fix: if the
+    /// rel-path strip stays exact-case, a matched root flattens its whole
+    /// subtree onto the basename fallback.
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn path_in_zip_strips_case_variant_root() {
+        let z = path_in_zip(
+            "Astro",
+            Path::new("/data/Astro"),
+            Path::new("/data/astro/M31/L/x.fits"),
+        );
+        assert_eq!(z, "Astro/M31/L/x.fits");
+    }
+
+    #[test]
+    fn path_in_zip_non_descendant_still_falls_back_to_basename() {
+        let z = path_in_zip(
+            "Root",
+            Path::new("/data/Astro"),
+            Path::new("/elsewhere/x.fits"),
+        );
+        assert_eq!(z, "Root/x.fits");
     }
 
     #[test]

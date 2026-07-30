@@ -13,6 +13,26 @@ use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Refuse a plan in which two files map to one in-zip path. The protected
+/// namespace is the per-OPERATION staging dir (staging.rs joins path_in_zip
+/// under one op_<id> dir across every role zip), so the key deliberately
+/// ignores which zip a file belongs to. Case-insensitive on every platform —
+/// zip entries differing only by case explode on Windows extraction anyway.
+fn ensure_unique_in_zip(files: &[ArchiveOperationFile]) -> Result<()> {
+    let mut seen: HashMap<String, &str> = HashMap::new();
+    for f in files {
+        if let Some(first) = seen.insert(f.target_path_in_zip.to_lowercase(), &f.source_path) {
+            return Err(anyhow!(
+                "two files map to the same in-zip path '{}' ('{}' and '{}') — the archive staging area would silently collapse them; check for duplicate filenames under unregistered or differently-cased roots",
+                f.target_path_in_zip,
+                first,
+                f.source_path
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Per-file row used internally before we resolve target paths.
 #[derive(Debug, Clone)]
 struct CandidateFile {
@@ -180,26 +200,7 @@ pub fn build_plan(
         });
     }
 
-    // Two files must never map to one in-zip entry: staging would silently
-    // overwrite the first and the archive dies later with a misleading
-    // hash-mismatch. Case-insensitive on every platform — zip entries that
-    // differ only by case explode on Windows extraction anyway.
-    {
-        let mut seen = std::collections::HashSet::new();
-        for f in &files {
-            let key = (
-                f.target_zip_path.to_lowercase(),
-                f.target_path_in_zip.to_lowercase(),
-            );
-            if !seen.insert(key) {
-                return Err(anyhow!(
-                    "two files map to the same in-zip path '{}' in {} — check for duplicate filenames under unregistered or differently-cased roots",
-                    f.target_path_in_zip,
-                    f.target_zip_path
-                ));
-            }
-        }
-    }
+    ensure_unique_in_zip(&files)?;
 
     let zips: Vec<PlannedZip> = zips_by_role
         .into_iter()
@@ -391,26 +392,7 @@ pub fn build_calibration_set_plan(
         });
     }
 
-    // Two files must never map to one in-zip entry: staging would silently
-    // overwrite the first and the archive dies later with a misleading
-    // hash-mismatch. Case-insensitive on every platform — zip entries that
-    // differ only by case explode on Windows extraction anyway.
-    {
-        let mut seen = std::collections::HashSet::new();
-        for f in &files {
-            let key = (
-                f.target_zip_path.to_lowercase(),
-                f.target_path_in_zip.to_lowercase(),
-            );
-            if !seen.insert(key) {
-                return Err(anyhow!(
-                    "two files map to the same in-zip path '{}' in {} — check for duplicate filenames under unregistered or differently-cased roots",
-                    f.target_path_in_zip,
-                    f.target_zip_path
-                ));
-            }
-        }
-    }
+    ensure_unique_in_zip(&files)?;
 
     let zips = vec![PlannedZip {
         zip_path: zip_path.to_string_lossy().to_string(),
@@ -664,6 +646,46 @@ mod tests {
     use crate::archive::models::ArchiveCompression;
     use crate::db::schema::init_db;
     use tempfile::TempDir;
+
+    fn op_file(source_path: &str, zip: &str, in_zip: &str) -> ArchiveOperationFile {
+        ArchiveOperationFile {
+            id: 0,
+            operation_id: 0,
+            file_id: None,
+            source_path: source_path.to_string(),
+            target_zip_path: zip.to_string(),
+            target_path_in_zip: in_zip.to_string(),
+            expected_hash: String::new(),
+            disposition: "move".to_string(),
+            frame_role: "light".to_string(),
+            file_size_bytes: 0,
+        }
+    }
+
+    /// Staging is flat per OPERATION, not per zip — two files landing on one
+    /// in-zip path collide there even when they belong to different role zips.
+    #[test]
+    fn unique_in_zip_guard_ignores_the_zip_a_file_belongs_to() {
+        let files = vec![
+            op_file("/a/Root/x.fits", "/arch/Lights.zip", "Root/x.fits"),
+            op_file("/b/Root/x.fits", "/arch/Darks.zip", "Root/x.fits"),
+        ];
+        let err = ensure_unique_in_zip(&files).unwrap_err().to_string();
+        assert!(
+            err.contains("/a/Root/x.fits"),
+            "missing first source: {err}"
+        );
+        assert!(
+            err.contains("/b/Root/x.fits"),
+            "missing second source: {err}"
+        );
+
+        let ok = vec![
+            op_file("/a/Root/x.fits", "/arch/Lights.zip", "Root/x.fits"),
+            op_file("/a/Root/y.fits", "/arch/Darks.zip", "Root/y.fits"),
+        ];
+        assert!(ensure_unique_in_zip(&ok).is_ok());
+    }
 
     /// Build a tiny SQLite + filesystem fixture: one frame_set with two LIGHT
     /// frames and one master DARK linked to both. Returns (conn, archive_dir, scan_root).
