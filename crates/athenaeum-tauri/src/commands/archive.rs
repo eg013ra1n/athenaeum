@@ -604,7 +604,7 @@ pub async fn delete_archive(
             let p = std::path::Path::new(&f.target_zip_path);
             if p.exists() {
                 if let Err(e) = std::fs::remove_file(p) {
-                    tracing::error!(path = %f.target_zip_path, error = %e, "failed to delete archive zip");
+                    tracing::error!(operation_id, path = %f.target_zip_path, error = %e, "failed to delete archive zip");
                     failed.push(format!("{}: {}", f.target_zip_path, e));
                 }
             }
@@ -612,7 +612,7 @@ pub async fn delete_archive(
     }
     if !failed.is_empty() {
         return Err(format!(
-            "could not delete {} zip file(s); catalog rows left untouched so the archive stays restorable: {}",
+            "could not delete {} zip file(s); catalog rows kept — any zip already removed in this pass is not restorable: {}",
             failed.len(),
             failed.join("; ")
         ));
