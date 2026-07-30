@@ -91,7 +91,9 @@ pub(crate) fn native_separator_of(path: &str) -> char {
 /// never falls inside another root's range. No `files.path` row is ever
 /// equal to a root path (roots are directories), so requiring the separator
 /// loses nothing legitimate.
-pub(crate) fn scan_root_prefix_predicate(
+///
+/// `pub` for the Axum mirrors, which inline this query shape.
+pub fn scan_root_prefix_predicate(
     column: &str,
     roots: &[String],
 ) -> (String, Vec<rusqlite::types::Value>) {

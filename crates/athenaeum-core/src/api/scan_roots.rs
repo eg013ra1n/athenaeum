@@ -1222,19 +1222,20 @@ pub fn check_missing_files_in_scan_root<E: crate::events::ProgressEmitter>(
         // them as "missing" would fill the missing_files table with false
         // positives the user has to manually clear.
         // Use LEFT JOIN instead of subqueries to avoid N+1 query problem.
-        let mut stmt = conn.prepare(
+        let (pred, values) = crate::db::scan_root_prefix_predicate("f.path", &[path.clone()]);
+        let sql = format!(
             "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
                         CASE WHEN fr.id IS NOT NULL THEN 1 ELSE 0 END as has_frame,
                         fr.object,
                         fr.date_obs
                  FROM files f
                  LEFT JOIN frames fr ON fr.file_id = f.id
-                 WHERE f.path LIKE ?1 AND f.archived_in_operation IS NULL",
-        )?;
+                 WHERE ({pred}) AND f.archived_in_operation IS NULL"
+        );
+        let mut stmt = conn.prepare(&sql)?;
 
-        let path_prefix = format!("{}%", path);
         let result: Vec<OrphanedFile> = stmt
-            .query_map(rusqlite::params![path_prefix], |row| {
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
                 Ok(OrphanedFile {
                     id: row.get(0)?,
                     path: row.get(1)?,
@@ -3058,6 +3059,52 @@ mod calibration_rebuild_tests {
         assert!(
             !ids.contains(&case_variant),
             "case-variant root leaked in (LIKE was case-insensitive)"
+        );
+    }
+}
+
+/// Missing-files scoping: the "which rows belong to this root" question is the
+/// same byte-range one the relink/rebuild sites answer, so a sibling root that
+/// merely shares a name prefix (`my_astro` vs `my_astroXY`) must not have its
+/// rows swept into this root's missing list. The old `f.path LIKE '<root>%'`
+/// had two holes at once — no separator boundary, and `_`/`%` in an ordinary
+/// folder name acting as LIKE wildcards.
+#[cfg(test)]
+mod missing_files_tests {
+    use super::*;
+
+    #[test]
+    fn find_missing_files_ignores_sibling_root_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let root = tmp.path().join("my_astro");
+        std::fs::create_dir_all(&root).unwrap();
+        let root_str = root.canonicalize().unwrap().to_string_lossy().to_string();
+        let added = add_scan_root(&ctx, root_str.clone(), &PathPolicy::AllowAll, None).unwrap();
+        {
+            let db = ctx.db.get().unwrap();
+            let conn = db.conn();
+            // Missing file genuinely under the root (never created on disk):
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'gone.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![format!("{root_str}/gone.fits")],
+            )
+            .unwrap();
+            // Sibling-root row, also absent on disk — must NOT be reported under this root.
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'x.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![format!("{root_str}XY/x.fits")],
+            )
+            .unwrap();
+        }
+        let missing =
+            check_missing_files_in_scan_root(&ctx, added.id.unwrap(), &crate::events::NullEmitter)
+                .unwrap();
+        let paths: Vec<&str> = missing.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.iter().any(|p| p.ends_with("gone.fits")));
+        assert!(
+            !paths.iter().any(|p| p.contains("XY")),
+            "sibling-root file reported as missing: {paths:?}"
         );
     }
 }

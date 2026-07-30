@@ -107,33 +107,39 @@ pub async fn check_missing_files_in_scan_root(
         // Exclude files known to be inside an archive zip — their on-disk
         // paths intentionally don't exist post-archive, so the existence
         // check below would falsely flag them as missing.
-        let mut stmt = conn
-            .prepare(
-                "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
+        // Scoped separator-strict via the shared core predicate (mirrors
+        // `api::scan_roots::check_missing_files_in_scan_root`): `LIKE '<root>%'`
+        // had no separator boundary and treated `_`/`%` in an ordinary folder
+        // name as wildcards, so a sibling root's rows landed in this root's
+        // missing list.
+        let (pred, values) =
+            athenaeum_core::db::scan_root_prefix_predicate("f.path", &[path.clone()]);
+        let sql = format!(
+            "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
                         CASE WHEN fr.id IS NOT NULL THEN 1 ELSE 0 END as has_frame,
                         fr.object, fr.date_obs
                  FROM files f
                  LEFT JOIN frames fr ON fr.file_id = f.id
-                 WHERE f.path LIKE ?1 AND f.archived_in_operation IS NULL",
-            )
-            .map_err(db_err)?;
+                 WHERE ({pred}) AND f.archived_in_operation IS NULL"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(db_err)?;
 
-        let path_prefix = format!("{}%", path);
-        let rows = stmt.query_map(rusqlite::params![path_prefix], |row| {
-            Ok(OrphanedFile {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                filename: row.get(2)?,
-                size: row.get(3)?,
-                modified_at: row.get(4)?,
-                has_frame: row.get::<_, i64>(5)? != 0,
-                object: row.get(6).ok(),
-                date_obs: row.get(7).ok(),
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(values.iter()), |row| {
+                Ok(OrphanedFile {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    filename: row.get(2)?,
+                    size: row.get(3)?,
+                    modified_at: row.get(4)?,
+                    has_frame: row.get::<_, i64>(5)? != 0,
+                    object: row.get(6).ok(),
+                    date_obs: row.get(7).ok(),
+                })
             })
-        })
-        .map_err(db_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_err)?;
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
         rows
     };
 
