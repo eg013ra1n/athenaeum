@@ -1398,9 +1398,19 @@ pub struct ScanRootOverview {
 pub struct ArchiveRootOverview {
     pub archive_root_id: i64,
     pub path: String,
+    /// Zipped FRAME SETS under this root (`frames_set.archived_at IS NOT NULL`
+    /// whose operation targeted this root). Phase-2 calibration-originals
+    /// archives (`archive_operations.calibration_set_id`, no `frames_set` link)
+    /// are deliberately excluded here AND from [`Self::total_zip_bytes`], so
+    /// the two numbers describe the same subject as the Folders inspector's
+    /// Contents list. Named follow-up if the UI ever surfaces calibration
+    /// archives: give them their own count/bytes pair rather than folding them
+    /// into these.
     pub set_count: i64,
-    /// Sum of on-disk sizes of the distinct zips recorded for operations
-    /// under this root; missing zips contribute 0 (mirrors `list_archive_zips`).
+    /// Sum of on-disk sizes of the distinct zips recorded for this root's
+    /// frame-set operations; missing zips contribute 0 (mirrors
+    /// `list_archive_zips`). Calibration-originals archives are excluded for
+    /// the reason documented on [`Self::set_count`].
     pub total_zip_bytes: i64,
 }
 
@@ -1410,6 +1420,21 @@ pub struct FolderOverview {
     pub archive_roots: Vec<ArchiveRootOverview>,
 }
 
+/// On-disk size of one archive zip, or 0 when it cannot be measured. A missing
+/// file is an expected state (the zip was deleted, or the archive volume is
+/// detached) and stays silent; any other error still contributes 0 but is
+/// logged, because a total that silently shrinks otherwise reads as data loss.
+fn zip_size_bytes(path: &str) -> i64 {
+    match std::fs::metadata(path) {
+        Ok(m) => m.len() as i64,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            tracing::warn!(path = %path, error = %e, "zip size unavailable");
+            0
+        }
+    }
+}
+
 pub fn get_folder_overview(ctx: &ServiceContext) -> Result<FolderOverview, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
@@ -1417,10 +1442,22 @@ pub fn get_folder_overview(ctx: &ServiceContext) -> Result<FolderOverview, ApiEr
     let mut scan_roots = Vec::new();
     for root in crate::db::get_scan_roots(&conn)? {
         let Some(root_id) = root.id else { continue };
-        // Separator-safe prefix match (`/data/Set1` must not capture `/data/Set10`).
+        // Separator-safe byte-range prefix match, one arm per native separator
+        // (catalog paths are stored as absolute native paths, so a POSIX and a
+        // Windows root can both live in one catalog — see
+        // `db::operations::native_separator_of`). The upper bound bumps the
+        // SEPARATOR by one code point (`'/'`+1 = `'0'`, `'\'`+1 = `']'`), so
+        // the range is exactly `<root><sep>…`: `/data/Set1` still excludes
+        // `/data/Set10`, and — unlike the `LIKE ?1 || '/%'` form this replaces
+        // — `_`/`%` inside a folder name stay literal instead of acting as
+        // wildcards. Exact-case, index-seekable on `idx_files_path`; same
+        // semantics as `db::operations::scan_root_prefix_predicate`, plus the
+        // separator strictness that helper deliberately drops.
         let (file_count, total_bytes): (i64, i64) = conn
             .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files WHERE path LIKE ?1 || '/%' OR path LIKE ?1 || '\\%'",
+                "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files
+                 WHERE (path >= ?1 || '/' AND path < ?1 || '0')
+                    OR (path >= ?1 || '\\' AND path < ?1 || ']')",
                 rusqlite::params![root.path],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -1441,6 +1478,18 @@ pub fn get_folder_overview(ctx: &ServiceContext) -> Result<FolderOverview, ApiEr
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .collect::<rusqlite::Result<_>>()
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    // Prepared once and reused per root — `query_map` resets the statement.
+    // The `frames_set` join mirrors the `set_count` query above it: both
+    // fields must describe frame-set archives only (see `set_count`'s doc).
+    let mut zstmt = conn
+        .prepare(
+            "SELECT DISTINCT aof.target_zip_path FROM archive_operation_files aof
+             JOIN archive_operations op ON aof.operation_id = op.id
+             JOIN frames_set fs ON fs.archive_operation_id = op.id
+                                AND fs.archived_at IS NOT NULL
+             WHERE op.archive_root_path = ?1",
+        )
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     for (id, path) in roots {
         let set_count: i64 = conn
             .query_row(
@@ -1451,22 +1500,12 @@ pub fn get_folder_overview(ctx: &ServiceContext) -> Result<FolderOverview, ApiEr
                 |row| row.get(0),
             )
             .map_err(|e| ApiError::Internal(format!("archive set count failed: {e}")))?;
-        let mut zstmt = conn
-            .prepare(
-                "SELECT DISTINCT aof.target_zip_path FROM archive_operation_files aof
-                 JOIN archive_operations op ON aof.operation_id = op.id
-                 WHERE op.archive_root_path = ?1",
-            )
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
         let zips: Vec<String> = zstmt
             .query_map(rusqlite::params![path], |row| row.get(0))
             .map_err(|e| ApiError::Internal(e.to_string()))?
             .collect::<rusqlite::Result<_>>()
             .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let total_zip_bytes = zips
-            .iter()
-            .map(|z| std::fs::metadata(z).map(|m| m.len() as i64).unwrap_or(0))
-            .sum();
+        let total_zip_bytes = zips.iter().map(|z| zip_size_bytes(z)).sum();
         archive_roots.push(ArchiveRootOverview {
             archive_root_id: id,
             path,
@@ -2298,12 +2337,103 @@ mod overview_tests {
         assert!(ov.archive_roots.is_empty());
     }
 
+    /// Review fix (Important-1): the root predicate must compare bytes, not
+    /// match a `LIKE` pattern. `_` is a LIKE single-character wildcard, so a
+    /// perfectly ordinary root name like `my_astro` used to also count files
+    /// under a sibling `myXastro` (`%` in a folder name is the same hole,
+    /// unbounded). Stats are display-only, but folder names with underscores
+    /// are the norm, so this is pinned.
+    #[test]
+    fn overview_prefix_match_treats_underscore_in_root_as_literal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let root = tmp.path().join("my_astro");
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap().to_string_lossy().to_string();
+        let added = add_scan_root(&ctx, root.clone(), &PathPolicy::AllowAll, None).unwrap();
+        // Sibling that differs from the root only where the `_` sits — derived
+        // from the canonicalized root's parent so the two are true siblings.
+        let parent = Path::new(&root)
+            .parent()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let sibling = format!("{parent}/myXastro");
+        {
+            let db = ctx.db.get().unwrap();
+            let conn = db.conn();
+            for (path, name, size) in [
+                (format!("{root}/a.fits"), "a.fits", 100_i64),
+                (format!("{sibling}/x.fits"), "x.fits", 999),
+            ] {
+                conn.execute(
+                    "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', 'FITS')",
+                    rusqlite::params![path, name, size],
+                )
+                .unwrap();
+            }
+        }
+        let ov = get_folder_overview(&ctx).unwrap();
+        let s = ov
+            .scan_roots
+            .iter()
+            .find(|s| s.root_id == added.id.unwrap())
+            .unwrap();
+        assert_eq!(
+            s.file_count, 1,
+            "sibling myXastro/x.fits must not be counted"
+        );
+        assert_eq!(s.total_bytes, 100);
+    }
+
+    /// The byte-range predicate's second arm — the one keyed on `\` — with
+    /// Windows-shaped fixtures, runnable from any host (same approach as
+    /// `db::operations::native_separator_of`, whose doc calls out that catalog
+    /// paths are native and the leading character decides). Rows are written
+    /// straight to `scan_roots`/`files`: `add_scan_root` canonicalizes a real
+    /// directory, which cannot produce a `C:\…` path on a POSIX host, and the
+    /// handler itself never canonicalizes. Also re-checks the boundary trap on
+    /// this arm (`C:\Astro2` must stay out of `C:\Astro`).
+    #[test]
+    fn overview_prefix_match_covers_windows_separator_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let root = r"C:\Astro";
+        {
+            let db = ctx.db.get().unwrap();
+            let conn = db.conn();
+            crate::db::upsert_scan_root(&conn, root, "normal").unwrap();
+            for (path, name, size) in [
+                (r"C:\Astro\a.fits", "a.fits", 100_i64),
+                (r"C:\Astro\sub\b.fits", "b.fits", 50),
+                (r"C:\Astro2\x.fits", "x.fits", 999),
+            ] {
+                conn.execute(
+                    "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', 'FITS')",
+                    rusqlite::params![path, name, size],
+                )
+                .unwrap();
+            }
+        }
+        let ov = get_folder_overview(&ctx).unwrap();
+        let s = ov
+            .scan_roots
+            .iter()
+            .find(|s| s.root_id == get_scan_roots(&ctx).unwrap()[0].id.unwrap())
+            .unwrap();
+        assert_eq!(s.file_count, 2, r"C:\Astro2\x.fits must not be counted");
+        assert_eq!(s.total_bytes, 150);
+    }
+
     /// The archive branch of the same handler, against real rows: the two
     /// per-root queries are only reached when `archive_roots` is non-empty, so
-    /// without this the column names in them are unverified. Pins the three
+    /// without this the column names in them are unverified. Pins the four
     /// documented behaviours: archived sets are counted per root (unzipped
-    /// sets and other roots' operations excluded), zips are summed DISTINCT,
-    /// and a recorded-but-missing zip contributes 0.
+    /// sets and other roots' operations excluded), zips are summed DISTINCT, a
+    /// recorded-but-missing zip contributes 0, and a calibration-originals
+    /// operation (no `frames_set` link) contributes to NEITHER field — review
+    /// fix Important-2, which is what keeps the two numbers describing the same
+    /// thing instead of reading "0 sets · 4.2 GB".
     #[test]
     fn overview_counts_archived_sets_and_distinct_zip_bytes() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2315,12 +2445,15 @@ mod overview_tests {
         std::fs::create_dir_all(&other).unwrap();
         let other = other.canonicalize().unwrap().to_string_lossy().to_string();
 
-        // Two real zips (10 + 20 bytes) plus one recorded path that is gone.
+        // Two real zips (10 + 20 bytes) plus one recorded path that is gone,
+        // and a 40-byte zip belonging to a calibration-originals operation.
         let zip_a = format!("{arc}/lights.zip");
         let zip_b = format!("{arc}/flats.zip");
         let zip_gone = format!("{arc}/vanished.zip");
+        let zip_cal = format!("{arc}/calibration_originals.zip");
         std::fs::write(&zip_a, [0u8; 10]).unwrap();
         std::fs::write(&zip_b, [0u8; 20]).unwrap();
+        std::fs::write(&zip_cal, [0u8; 40]).unwrap();
 
         {
             let db = ctx.db.get().unwrap();
@@ -2344,6 +2477,24 @@ mod overview_tests {
             let op = op_id(&arc);
             let op_other = op_id(&other);
 
+            // Phase-2 calibration-originals archive under `arc`: a real
+            // operation with a `calibration_set_id` subject and NO `frames_set`
+            // row pointing at it.
+            conn.execute(
+                "INSERT INTO calibration_set (imagetyp, date) VALUES ('DARK', '2026-01-01')",
+                [],
+            )
+            .unwrap();
+            let cal_set = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO archive_operations
+                    (calibration_set_id, archive_root_path, compression, status, started_at)
+                 VALUES (?1, ?2, 'deflate', 'completed', '2026-01-05T00:00:00Z')",
+                rusqlite::params![cal_set, arc],
+            )
+            .unwrap();
+            let op_cal = conn.last_insert_rowid();
+
             // Two zipped sets under `arc`, one unzipped (archived_at NULL) that
             // must not count, and one zipped set under the other root.
             for (name, archived_at, operation) in [
@@ -2361,13 +2512,14 @@ mod overview_tests {
 
             // Three files across two zips (so DISTINCT matters) + one row
             // pointing at the missing zip; one file under the other root's
-            // operation.
+            // operation; one under the calibration-originals operation.
             for (operation, zip, name) in [
                 (op, &zip_a, "a.fits"),
                 (op, &zip_a, "b.fits"),
                 (op, &zip_b, "c.fits"),
                 (op, &zip_gone, "d.fits"),
                 (op_other, &zip_a, "e.fits"),
+                (op_cal, &zip_cal, "dark.fits"),
             ] {
                 conn.execute(
                     "INSERT INTO archive_operation_files
@@ -2384,8 +2536,12 @@ mod overview_tests {
         assert_eq!(ov.archive_roots.len(), 2);
         let a = ov.archive_roots.iter().find(|r| r.path == arc).unwrap();
         assert_eq!(a.set_count, 2);
-        // 10 + 20 + 0 for the vanished zip; zip_a counted once, not twice.
-        assert_eq!(a.total_zip_bytes, 30);
+        // 10 + 20 + 0 for the vanished zip; zip_a counted once, not twice, and
+        // the 40-byte calibration-originals zip excluded with its operation.
+        assert_eq!(
+            a.total_zip_bytes, 30,
+            "calibration-originals zip must be excluded, like its set is"
+        );
         let o = ov.archive_roots.iter().find(|r| r.path == other).unwrap();
         assert_eq!(o.set_count, 1);
         assert_eq!(o.total_zip_bytes, 10);

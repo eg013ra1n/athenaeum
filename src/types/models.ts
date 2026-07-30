@@ -44,10 +44,23 @@ placement: string | null, };
 
 export type ScanRootOverview = { root_id: number, file_count: number, total_bytes: number, };
 
-export type ArchiveRootOverview = { archive_root_id: number, path: string, set_count: number, 
+export type ArchiveRootOverview = { archive_root_id: number, path: string, 
 /**
- * Sum of on-disk sizes of the distinct zips recorded for operations
- * under this root; missing zips contribute 0 (mirrors `list_archive_zips`).
+ * Zipped FRAME SETS under this root (`frames_set.archived_at IS NOT NULL`
+ * whose operation targeted this root). Phase-2 calibration-originals
+ * archives (`archive_operations.calibration_set_id`, no `frames_set` link)
+ * are deliberately excluded here AND from [`Self::total_zip_bytes`], so
+ * the two numbers describe the same subject as the Folders inspector's
+ * Contents list. Named follow-up if the UI ever surfaces calibration
+ * archives: give them their own count/bytes pair rather than folding them
+ * into these.
+ */
+set_count: number, 
+/**
+ * Sum of on-disk sizes of the distinct zips recorded for this root's
+ * frame-set operations; missing zips contribute 0 (mirrors
+ * `list_archive_zips`). Calibration-originals archives are excluded for
+ * the reason documented on [`Self::set_count`].
  */
 total_zip_bytes: number, };
 
