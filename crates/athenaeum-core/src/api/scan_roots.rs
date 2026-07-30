@@ -1465,8 +1465,9 @@ pub fn get_folder_overview(ctx: &ServiceContext) -> Result<FolderOverview, ApiEr
         // `/data/Set10`, and — unlike the `LIKE ?1 || '/%'` form this replaces
         // — `_`/`%` inside a folder name stay literal instead of acting as
         // wildcards. Exact-case, index-seekable on `idx_files_path`; same
-        // semantics as `db::operations::scan_root_prefix_predicate`, plus the
-        // separator strictness that helper deliberately drops.
+        // semantics as `db::operations::scan_root_prefix_predicate`, which is
+        // separator-strict too (both close the same name-prefix-sibling
+        // hazard — see the `name_prefix_sibling` tests in `db/operations.rs`).
         let (file_count, total_bytes): (i64, i64) = conn
             .query_row(
                 "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files
@@ -2391,6 +2392,17 @@ mod overview_tests {
                 rusqlite::params![format!("{root}2/x.fits")],
             )
             .unwrap();
+            // Exact-boundary pin (task-1-brief §6): the POSIX arm's upper
+            // bound is `root || '0'` ('/' + 1 == '0'), so a path starting
+            // with exactly that byte string is the tightest possible probe
+            // of the bound itself — an off-by-one in the upper-bound literal
+            // or a `<=` typo would let this leak in where `root2/...` above
+            // would not.
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'x.fits', 999, '2026-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![format!("{root}0/x.fits")],
+            )
+            .unwrap();
         }
         let ov = get_folder_overview(&ctx).unwrap();
         let s = ov
@@ -2398,7 +2410,10 @@ mod overview_tests {
             .iter()
             .find(|s| s.root_id == added.id.unwrap())
             .unwrap();
-        assert_eq!(s.file_count, 2);
+        assert_eq!(
+            s.file_count, 2,
+            "neither boundary-trap sibling must be counted"
+        );
         assert_eq!(s.total_bytes, 150);
         assert!(ov.archive_roots.is_empty());
     }
@@ -2473,6 +2488,11 @@ mod overview_tests {
                 (r"C:\Astro\a.fits", "a.fits", 100_i64),
                 (r"C:\Astro\sub\b.fits", "b.fits", 50),
                 (r"C:\Astro2\x.fits", "x.fits", 999),
+                // Exact-boundary pin (task-1-brief §6): the Windows arm's
+                // upper bound is `root || ']'` ('\' + 1 == ']'), so a path
+                // starting with exactly that byte string is the tightest
+                // possible probe of the bound itself.
+                (r"C:\Astro]x\f.fits", "f.fits", 999),
             ] {
                 conn.execute(
                     "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, ?2, ?3, '2026-01-01T00:00:00Z', 'FITS')",
@@ -2487,7 +2507,10 @@ mod overview_tests {
             .iter()
             .find(|s| s.root_id == get_scan_roots(&ctx).unwrap()[0].id.unwrap())
             .unwrap();
-        assert_eq!(s.file_count, 2, r"C:\Astro2\x.fits must not be counted");
+        assert_eq!(
+            s.file_count, 2,
+            r"neither C:\Astro2\x.fits nor C:\Astro]x\f.fits must be counted"
+        );
         assert_eq!(s.total_bytes, 150);
     }
 

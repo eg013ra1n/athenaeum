@@ -84,6 +84,13 @@ pub(crate) fn native_separator_of(path: &str) -> char {
 /// params: "under one of zero eligible roots" matches nothing, mirroring the
 /// original `EXISTS (SELECT 1 FROM scan_roots sr WHERE ...)` semantics when
 /// no scan root satisfies the caller's filter.
+///
+/// Separator-strict, same pattern as `frame_ids_under_paths` and the three
+/// destructive sites above: each per-root prefix carries a trailing native
+/// separator, so a name-prefix sibling root (`/data/M31` vs `/data/M31_Ha`)
+/// never falls inside another root's range. No `files.path` row is ever
+/// equal to a root path (roots are directories), so requiring the separator
+/// loses nothing legitimate.
 pub(crate) fn scan_root_prefix_predicate(
     column: &str,
     roots: &[String],
@@ -94,9 +101,16 @@ pub(crate) fn scan_root_prefix_predicate(
     let mut clauses = Vec::with_capacity(roots.len());
     let mut values: Vec<rusqlite::types::Value> = Vec::with_capacity(roots.len() * 3);
     for root in roots {
-        clauses.push(format!("({col} >= ? AND (? IS NULL OR {col} < ?))", col = column));
-        values.push(rusqlite::types::Value::Text(root.clone()));
-        let hi = path_prefix_upper(root).map(rusqlite::types::Value::Text).unwrap_or(rusqlite::types::Value::Null);
+        let sep = native_separator_of(root);
+        let prefix = format!("{}{}", root.trim_end_matches(sep), sep);
+        clauses.push(format!(
+            "({col} >= ? AND (? IS NULL OR {col} < ?))",
+            col = column
+        ));
+        values.push(rusqlite::types::Value::Text(prefix.clone()));
+        let hi = path_prefix_upper(&prefix)
+            .map(rusqlite::types::Value::Text)
+            .unwrap_or(rusqlite::types::Value::Null);
         values.push(hi.clone());
         values.push(hi);
     }
@@ -387,7 +401,12 @@ pub fn delete_calibration_sets_for_root(
         |row| row.get(0),
     )?;
 
-    let path_hi = path_prefix_upper(&root_path);
+    // Byte-range bounds must carry the trailing separator: without it the
+    // range for /lib_old also swallows sibling /lib_old2/* (see the
+    // name_prefix_sibling tests). Same pattern as frame_ids_under_paths.
+    let sep = native_separator_of(&root_path);
+    let root_prefix = format!("{}{}", root_path.trim_end_matches(sep), sep);
+    let path_hi = path_prefix_upper(&root_prefix);
 
     // Find affected calibration set IDs (sets containing frames under this root)
     let affected_set_ids: Vec<i64> = {
@@ -398,7 +417,7 @@ pub fn delete_calibration_sets_for_root(
              JOIN files f ON fr.file_id = f.id
              WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)"
         )?;
-        let rows = stmt.query_map(params![root_path, path_hi], |row| row.get(0))?;
+        let rows = stmt.query_map(params![root_prefix, path_hi], |row| row.get(0))?;
         rows.filter_map(|r| r.ok()).collect()
     };
 
@@ -445,7 +464,7 @@ pub fn delete_calibration_sets_for_root(
              JOIN files f ON fr.file_id = f.id
              WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)
            )",
-        params![root_path, path_hi],
+        params![root_prefix, path_hi],
     )?;
 
     Ok(calibration_sets_deleted)
@@ -465,7 +484,12 @@ pub fn reconcile_unique_camera_instrume(
     )?;
 
     let suffix = format!(" N{}", root_id);
-    let path_hi = path_prefix_upper(&root_path);
+    // Byte-range bounds must carry the trailing separator: without it the
+    // range for /lib_old also swallows sibling /lib_old2/* (see the
+    // name_prefix_sibling tests). Same pattern as frame_ids_under_paths.
+    let sep = native_separator_of(&root_path);
+    let root_prefix = format!("{}{}", root_path.trim_end_matches(sep), sep);
+    let path_hi = path_prefix_upper(&root_prefix);
 
     let sp = SavepointGuard::new(conn, "reconcile_unique_camera")?;
 
@@ -483,7 +507,7 @@ pub fn reconcile_unique_camera_instrume(
                  JOIN files f ON fr.file_id = f.id
                  WHERE f.path >= ?2 AND (?3 IS NULL OR f.path < ?3)
                )",
-            params![suffix, root_path, path_hi],
+            params![suffix, root_prefix, path_hi],
         )?
     } else {
         // Strip suffix — only from frames that have it
@@ -497,7 +521,7 @@ pub fn reconcile_unique_camera_instrume(
                  JOIN files f ON fr.file_id = f.id
                  WHERE f.path >= ?3 AND (?4 IS NULL OR f.path < ?4)
                )",
-            params![suffix_len, suffix, root_path, path_hi],
+            params![suffix_len, suffix, root_prefix, path_hi],
         )?
     };
 
@@ -523,7 +547,7 @@ pub fn reconcile_unique_camera_instrume(
                JOIN files f ON fr.file_id = f.id
                WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)
              )",
-            params![root_path, path_hi],
+            params![root_prefix, path_hi],
         )?;
     }
 
@@ -573,11 +597,15 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
     // Start transaction for atomicity and performance
     let sp = SavepointGuard::new(conn, "delete_scan_root")?;
 
-    // Pre-compute file IDs to delete (single byte-range query)
+    // Pre-compute file IDs to delete (single byte-range query). The prefix
+    // carries the trailing separator so name-prefix siblings (/lib_old vs
+    // /lib_old2) are never swept — see the name_prefix_sibling tests.
     let file_ids: Vec<i64> = {
-        let path_hi = path_prefix_upper(&path);
+        let sep = native_separator_of(&path);
+        let prefix = format!("{}{}", path.trim_end_matches(sep), sep);
+        let path_hi = path_prefix_upper(&prefix);
         let mut stmt = conn.prepare("SELECT id FROM files WHERE path >= ?1 AND (?2 IS NULL OR path < ?2)")?;
-        let rows = stmt.query_map(params![path, path_hi], |row| row.get(0))?;
+        let rows = stmt.query_map(params![prefix, path_hi], |row| row.get(0))?;
         rows.filter_map(|r| r.ok()).collect()
     };
 
@@ -4976,6 +5004,172 @@ mod path_prefix_range_tests {
         );
     }
 
+    // -- separator strictness on the three destructive byte-range sites -----
+    // `add_scan_root`'s overlap guard is component-wise (`Path::starts_with`),
+    // so two roots sharing a NAME prefix (`/data/M31` + `/data/M31_Ha`) are an
+    // ordinary, legal configuration. A range built from the bare root path
+    // spans them both, because every character that can follow the name sorts
+    // above the separator.
+
+    #[test]
+    fn delete_scan_root_does_not_purge_name_prefix_sibling_root() {
+        // Without a trailing separator the byte range for /data/M31 is
+        // ["/data/M31", "/data/M32"), which CONTAINS the sibling root
+        // /data/M31_Ha ('_' 0x5F sorts above '/' 0x2F). The predicate must
+        // require the separator so only true descendants are swept.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/M31')", [])
+            .unwrap();
+        let root_id: i64 = conn
+            .query_row(
+                "SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_file(&conn, "/data/M31/a.fits");
+        insert_file(&conn, "/data/M31_Ha/b.fits");
+
+        delete_scan_root(&conn, root_id).unwrap();
+
+        assert_eq!(
+            all_paths(&conn),
+            vec!["/data/M31_Ha/b.fits".to_string()],
+            "sibling root sharing the name prefix must survive the cascade"
+        );
+    }
+
+    #[test]
+    fn delete_scan_root_does_not_purge_name_prefix_sibling_root_windows() {
+        // Windows arm: range for C:\Astro without separator is
+        // ["C:\Astro", "C:\Astrp") — contains C:\Astro_backup. With the
+        // separator it is ["C:\Astro\", "C:\Astro]") — excludes it.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('C:\\Astro')", [])
+            .unwrap();
+        let root_id: i64 = conn
+            .query_row(
+                "SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_file(&conn, "C:\\Astro\\a.fits");
+        insert_file(&conn, "C:\\Astro_backup\\b.fits");
+
+        delete_scan_root(&conn, root_id).unwrap();
+
+        assert_eq!(
+            all_paths(&conn),
+            vec!["C:\\Astro_backup\\b.fits".to_string()]
+        );
+    }
+
+    #[test]
+    fn reconcile_unique_camera_leaves_name_prefix_sibling_untouched() {
+        // reconcile runs on EVERY scan — pre-fix it suffixes the SIBLING
+        // root's frames.instrume and then deletes the sibling's calibration
+        // sets via the same broken range.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (path, unique_camera) VALUES ('/data/M31', 1)",
+            [],
+        )
+        .unwrap();
+        let root_id: i64 = conn
+            .query_row(
+                "SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_file(&conn, "/data/M31/a.fits");
+        insert_file(&conn, "/data/M31_Ha/b.fits");
+        conn.execute(
+            "INSERT INTO frames (file_id, instrume) SELECT id, 'CAM' FROM files",
+            [],
+        )
+        .unwrap();
+
+        reconcile_unique_camera_instrume(&conn, root_id).unwrap();
+
+        let own: String = conn
+            .query_row(
+                "SELECT fr.instrume FROM frames fr JOIN files f ON fr.file_id = f.id WHERE f.path = '/data/M31/a.fits'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(own, format!("CAM N{root_id}"));
+        let sibling: String = conn
+            .query_row(
+                "SELECT fr.instrume FROM frames fr JOIN files f ON fr.file_id = f.id WHERE f.path = '/data/M31_Ha/b.fits'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sibling, "CAM",
+            "sibling root's frames must not receive the suffix"
+        );
+    }
+
+    #[test]
+    fn delete_calibration_sets_for_root_spares_name_prefix_sibling_sets() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/M31')", [])
+            .unwrap();
+        let root_id: i64 = conn
+            .query_row(
+                "SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        insert_file(&conn, "/data/M31_Ha/dark.fits");
+        conn.execute(
+            "INSERT INTO frames (file_id) SELECT id FROM files WHERE path = '/data/M31_Ha/dark.fits'",
+            [],
+        )
+        .unwrap();
+        let frame_id: i64 = conn
+            .query_row("SELECT id FROM frames ORDER BY id DESC LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // Column set mirrors `delete_scan_root_preserves_master_source_lineage`:
+        // `imagetyp` + `date` are the table's two NOT NULL columns.
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let set_id: i64 = conn
+            .query_row(
+                "SELECT id FROM calibration_set ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            params![set_id, frame_id],
+        )
+        .unwrap();
+
+        let deleted = delete_calibration_sets_for_root(&conn, root_id).unwrap();
+
+        assert_eq!(deleted, 0, "no set lives under /data/M31");
+        let sets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibration_set", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sets, 1, "sibling's calibration set must survive");
+    }
+
     #[test]
     fn delete_scan_root_preserves_master_source_lineage() {
         // Regression: a scan root holding raw calibration frames that fed a
@@ -5143,6 +5337,51 @@ mod path_prefix_range_tests {
         let (predicate, values) = scan_root_prefix_predicate("f.path", &[]);
         assert_eq!(predicate, "0");
         assert!(values.is_empty());
+    }
+
+    // Step 5 decision (task-1-brief §5): nothing pinned the lax (no-separator)
+    // behavior, so `scan_root_prefix_predicate` was made separator-strict —
+    // same pattern as the three destructive sites above. Consequence of the
+    // old behavior was over-inclusion, not destruction: a name-prefix sibling
+    // root with `find_duplicates = 0` used to leak into duplicate detection
+    // through the eligible root's byte range.
+    #[test]
+    fn find_duplicate_groups_excludes_name_prefix_sibling_root() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // /data/M31 is eligible; /data/M31_Ha is NOT (find_duplicates = 0)
+        // but shares the name prefix ('_' 0x5F sorts above '/' 0x2F).
+        conn.execute(
+            "INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/M31', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/M31_Ha', 0)",
+            [],
+        )
+        .unwrap();
+
+        for (p, fname) in [
+            ("/data/M31/dup1.fits", "dup1.fits"),
+            ("/data/M31_Ha/dup2.fits", "dup2.fits"),
+        ] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at, content_hash)
+                 VALUES (?1, ?2, 100, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z', 'HASH1')",
+                rusqlite::params![p, fname],
+            ).unwrap();
+        }
+
+        let groups = find_duplicate_groups(&conn, true).unwrap();
+        assert!(
+            groups.is_empty(),
+            "the M31_Ha file must not be pulled in through M31's range, so no pair forms"
+        );
+
+        let created = rebuild_duplicate_groups_cache(&conn, true).unwrap();
+        assert_eq!(created, 0, "cache rebuild must likewise find no groups");
     }
 
     #[test]
