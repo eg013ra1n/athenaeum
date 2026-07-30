@@ -258,6 +258,33 @@ fn place_at(
     }
 }
 
+/// Destinations claimed within one export run, keyed case-insensitively —
+/// on NTFS/APFS `L_0001.fits` and `l_0001.FITS` are ONE file, so the second
+/// placement used to hit copy_or_link's exists-skip, get counted as
+/// organized, and silently vanish from the export.
+#[derive(Default)]
+struct DestClaims(std::collections::HashSet<String>);
+
+impl DestClaims {
+    fn claim(&mut self, rel_dir: &str, filename: &str) -> String {
+        let key = |f: &str| format!("{}/{}", rel_dir.to_lowercase(), f.to_lowercase());
+        if self.0.insert(key(filename)) {
+            return filename.to_string();
+        }
+        let mut n = 2;
+        loop {
+            let candidate = match filename.rsplit_once('.') {
+                Some((stem, ext)) => format!("{stem}_{n}.{ext}"),
+                None => format!("{filename}_{n}"),
+            };
+            if self.0.insert(key(&candidate)) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+}
+
 /// Organize files for PixInsight WBPP export
 ///
 /// Creates a nested folder structure where parent calibrates child,
@@ -318,6 +345,7 @@ pub fn organize_files_wbpp(
         }
     };
 
+    let mut claims = DestClaims::default();
     for placement in &placements {
         if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -328,13 +356,14 @@ pub fn organize_files_wbpp(
             dest_dir.push(comp);
         }
         fs::create_dir_all(&dest_dir)?;
-        let dest = dest_dir.join(&placement.filename);
+        let filename = claims.claim(&placement.rel_dir, &placement.filename);
+        let dest = dest_dir.join(&filename);
         match copy_or_link(&placement.file_path, &dest, use_symlinks) {
             Ok(_) => {
                 files_organized += 1;
-                emit_progress(files_organized as usize, Some(&placement.filename));
+                emit_progress(files_organized as usize, Some(&filename));
             }
-            Err(e) => warnings.push(format!("Failed to copy {}: {}", placement.filename, e)),
+            Err(e) => warnings.push(format!("Failed to copy {}: {}", filename, e)),
         }
     }
 
@@ -640,6 +669,16 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn dest_claims_disambiguates_case_collisions() {
+        let mut claims = DestClaims::default();
+        assert_eq!(claims.claim("lights", "L_0001.fits"), "L_0001.fits");
+        assert_eq!(claims.claim("lights", "l_0001.FITS"), "l_0001_2.FITS");
+        assert_eq!(claims.claim("lights", "L_0001.fits"), "L_0001_3.fits");
+        // Different directory — no rename.
+        assert_eq!(claims.claim("FLAT_1", "L_0001.fits"), "L_0001.fits");
     }
 
     /// Minimal recursive file walker for the layout pin (avoids a walkdir dep).
