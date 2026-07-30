@@ -10,6 +10,13 @@ interface FolderRailProps {
   archivedSets: ArchivedFrameSetSummary[];
   overview: FolderOverview | null;
   missingCounts: Record<number, number>;
+  /**
+   * Effective calibration-library dir when it is settings-only ("covered" — the
+   * folder sits inside a monitored root, so it has no scan-root row of its own).
+   * Renders as an assigned role row; selection reuses the placeholder variant
+   * and `FoldersTab` disambiguates it against the truly-unset state.
+   */
+  coveredCalibrationDir?: string | null;
   selection: RailSelection | null;
   onSelect: (sel: RailSelection) => void;
   onAdd: (preselect?: AddableKind) => void;
@@ -66,7 +73,7 @@ function ScanRow({ root, sub, tint, Icon, selected, onClick, onRescan, scanning,
 }
 
 export function FolderRail({
-  scanRoots, archiveRoots, archivedSets, overview, missingCounts,
+  scanRoots, archiveRoots, archivedSets, overview, missingCounts, coveredCalibrationDir,
   selection, onSelect, onAdd, onRescan, isScanning, scanPercent,
 }: FolderRailProps) {
   const monitored = scanRoots
@@ -130,6 +137,23 @@ export function FolderRail({
           );
         }
         const selected = isSel(selection, { type: 'placeholder', kind });
+        if (kind === 'calibration_library' && coveredCalibrationDir) {
+          // Assigned, but settings-only: it lives inside a monitored folder, so
+          // there is no root of its own to rescan — the covering folder does it.
+          return (
+            <div
+              key={kind}
+              onClick={() => onSelect({ type: 'placeholder', kind })}
+              className={`flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer transition ${selected ? 'bg-surface-hover shadow-[inset_2px_0_0] shadow-accent' : 'hover:bg-surface-hover/50'}`}
+            >
+              <meta.icon size={16} className={`${meta.tint} shrink-0`} />
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-semibold text-content truncate">{basename(coveredCalibrationDir)}</div>
+                <div className="text-[11px] text-content-muted truncate">{meta.label} · inside {parentPath(coveredCalibrationDir)}</div>
+              </div>
+            </div>
+          );
+        }
         return (
           <div
             key={kind}

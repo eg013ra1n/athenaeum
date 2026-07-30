@@ -14,7 +14,11 @@ interface AddFolderDialogProps {
   /** Pre-select a type (e.g. a role's "Set up…" row) and jump to step 2. */
   preselect?: AddableKind;
   scanRoots: ScanRoot[];
-  /** Effective calibration-library dir when it is settings-only (covered) — no scan-root row exists for it. */
+  /**
+   * Effective calibration-library dir as the backend resolver reports it
+   * (settings key first, dedicated root only as fallback). `null` = unset or
+   * explicitly cleared, `undefined` = not wired (fall back to scan-root evidence).
+   */
   coveredCalibrationDir?: string | null;
   onClose: () => void;
   onAdded: () => void;
@@ -47,9 +51,13 @@ export function AddFolderDialog({ isOpen, preselect, scanRoots, coveredCalibrati
 
   const takenRolePath = (role: RoleKind): string | undefined => {
     const fromRoots = scanRoots.find((r) => r.kind === role)?.path;
-    // A "covered" calibration library (inside a monitored root) is settings-only — it has no
-    // scan-root row, so the effective dir is the only evidence the role is already taken.
-    if (role === 'calibration_library') return fromRoots ?? coveredCalibrationDir ?? undefined;
+    // When wired, `coveredCalibrationDir` IS the backend's effective answer
+    // (settings-first, matching the resolver), so it wins over the root row: a
+    // covered library reads as taken, and a cleared setting with a leftover
+    // dedicated root reads as free — exactly what a subsequent add would do.
+    if (role === 'calibration_library') {
+      return coveredCalibrationDir !== undefined ? (coveredCalibrationDir ?? undefined) : fromRoots;
+    }
     return fromRoots;
   };
 
