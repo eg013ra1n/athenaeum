@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { Folder, Filter, Trash2, CheckCircle2, Loader2, Copy, FolderOpen, AlertCircle } from 'lucide-react';
 import { useScanRootsWithAvailability, useDuplicates, useDuplicateFolders, moveToBlackHole } from '../hooks/useTauri';
@@ -20,8 +20,11 @@ const isInFolder = (path: string, folder: string) =>
 
 export default function FileManager() {
   // The Folders tab owns its own scan-root state; this instance exists for the
-  // Browse Files tab, which hands the roots to the dual-pane browser.
-  const { scanRoots, error: rootsError } = useScanRootsWithAvailability();
+  // Browse Files tab, which hands the roots to the dual-pane browser. The two
+  // instances are kept in step by the `onRootsChanged` callback below — without
+  // it, a folder added on the Folders tab stays invisible to Browse Files until
+  // this page remounts.
+  const { scanRoots, error: rootsError, refresh: refreshScanRoots } = useScanRootsWithAvailability();
   const { duplicates, loading: dupsLoading, error: dupsError, load: loadDuplicates, refresh: refreshDuplicates } = useDuplicates();
   const { folders: duplicateFolders, loading: foldersLoading, error: foldersError, load: loadFolders, refresh: refreshFolders } = useDuplicateFolders(70);
   const [activeTab, setActiveTab] = useState<TabMode>('directories');
@@ -56,6 +59,13 @@ export default function FileManager() {
     setSyncIncomingToken((t) => t + 1);
     navigate(location.pathname, { replace: true, state: null });
   }, [location.state, location.pathname, navigate]);
+
+  // Both callbacks are stable so the child's dependency arrays don't churn.
+  // Lowering the token once FoldersTab has consumed it is what stops the
+  // selection from being re-forced every time the user returns to the tab
+  // (FoldersTab unmounts on tab switch, taking its own latch with it).
+  const handleSyncIncomingHandled = useCallback(() => setSyncIncomingToken(0), []);
+  const handleFolderRootsChanged = useCallback(() => { void refreshScanRoots(); }, [refreshScanRoots]);
 
   const [duplicatesView, setDuplicatesView] = useState<DuplicatesViewMode>('files');
   const [missingMetadataCount, setMissingMetadataCount] = useState<number | null>(null);
@@ -183,7 +193,13 @@ export default function FileManager() {
       )}
 
       {/* Tab Content */}
-      {activeTab === 'directories' && <FoldersTab selectSyncIncomingToken={syncIncomingToken} />}
+      {activeTab === 'directories' && (
+        <FoldersTab
+          selectSyncIncomingToken={syncIncomingToken}
+          onRootsChanged={handleFolderRootsChanged}
+          onSyncIncomingHandled={handleSyncIncomingHandled}
+        />
+      )}
 
       {activeTab === 'browse' && (
         /* Directory View Tab */

@@ -23,12 +23,26 @@ import type { FolderOverview, RelinkResult } from '../../types/models';
 interface FoldersTabProps {
   /** Increments when the Transfers deep-link asks to focus Sync Incoming. */
   selectSyncIncomingToken: number;
+  /**
+   * Fired after any mutation kicks off a model refresh, so a parent holding its
+   * own scan-root copy (FileManager, which feeds the Browse Files tab) can
+   * resync. Optional — this component is self-sufficient without it.
+   */
+  onRootsChanged?: () => void;
+  /**
+   * Fired once the deep-link token has actually been consumed, so the parent can
+   * lower it back to 0. Required for correctness across tab switches: this
+   * component unmounts when the user leaves the Folders tab and the latch ref
+   * below resets with it, so a token left raised would re-select Sync Incoming
+   * on every return. Optional — standalone use just never lowers the token.
+   */
+  onSyncIncomingHandled?: () => void;
 }
 
 /** Strip trailing separators so prefix comparisons are exact. */
 const stripTrailing = (p: string) => p.replace(/[\\/]+$/, '');
 
-export default function FoldersTab({ selectSyncIncomingToken }: FoldersTabProps) {
+export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, onSyncIncomingHandled }: FoldersTabProps) {
   const {
     scanRoots, loading: rootsLoading, error: rootsError, clearError: clearRootsError,
     deleteScanRoot, toggleDuplicatesFlag, toggleUniqueCameraFlag, toggleMonitorEnabled,
@@ -90,7 +104,13 @@ export default function FoldersTab({ selectSyncIncomingToken }: FoldersTabProps)
 
   useEffect(() => { void refreshAux(); }, [refreshAux]);
 
-  const refreshAll = useCallback(() => { void refreshScanRoots(); void refreshAux(); }, [refreshScanRoots, refreshAux]);
+  const refreshAll = useCallback(() => {
+    void refreshScanRoots();
+    void refreshAux();
+    // Fire-and-forget: the parent's copy is a separate hook instance with its
+    // own fetch, so nothing here depends on when it settles.
+    onRootsChanged?.();
+  }, [refreshScanRoots, refreshAux, onRootsChanged]);
 
   /**
    * The resolver's answer, normalized once: `undefined` = not fetched yet (fall
@@ -138,21 +158,33 @@ export default function FoldersTab({ selectSyncIncomingToken }: FoldersTabProps)
    * this effect would yank the user's selection back on each of them. The latch
    * is set only once a row (or, with roots loaded, the placeholder) was actually
    * selected — a token arriving before the roots do still resolves on arrival.
+   * `onSyncIncomingHandled` fires at exactly those two latch points so the
+   * parent can lower the token; the ref keeps guarding repeat runs (StrictMode
+   * double-fire, refresh churn) in the window before that lands.
    */
   const handledSyncToken = useRef(0);
   useEffect(() => {
-    if (selectSyncIncomingToken === 0 || handledSyncToken.current === selectSyncIncomingToken) return;
+    if (selectSyncIncomingToken === 0) {
+      // Token consumed (or never raised) — re-arm, so a later deep-link that
+      // reuses the value 1 still reads as new within this same mount.
+      handledSyncToken.current = 0;
+      return;
+    }
+    if (handledSyncToken.current === selectSyncIncomingToken) return;
     const root = scanRoots.find((r) => r.kind === 'sync_incoming');
     if (root?.id) {
       setSelection({ type: 'scan', id: root.id });
       handledSyncToken.current = selectSyncIncomingToken;
+      onSyncIncomingHandled?.();
       return;
     }
-    // Still loading: the row may exist but isn't known yet — don't latch.
+    // Still loading: the row may exist but isn't known yet — don't latch, and
+    // leave the token raised so it resolves once the roots arrive.
     if (rootsLoading) return;
     setSelection({ type: 'placeholder', kind: 'sync_incoming' });
     handledSyncToken.current = selectSyncIncomingToken;
-  }, [selectSyncIncomingToken, scanRoots, rootsLoading]);
+    onSyncIncomingHandled?.();
+  }, [selectSyncIncomingToken, scanRoots, rootsLoading, onSyncIncomingHandled]);
 
   /**
    * Reconcile the held selection against the refreshed model:
