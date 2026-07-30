@@ -13,8 +13,8 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use crate::api::{db, ApiError, PathPolicy};
-use crate::monitor::MonitorService;
 use crate::models::{OrphanedFile, RelinkResult, ScanRoot};
+use crate::monitor::MonitorService;
 use crate::services::ServiceContext;
 
 // ── Response DTOs (single-sourced; both wrapper crates import these) ────────
@@ -301,15 +301,15 @@ pub fn add_scan_root(
     let existing_roots = crate::db::get_scan_roots(&conn)?;
 
     for root in existing_roots.iter() {
-        let existing_path = normalize_path(
-            &Path::new(&root.path)
-                .canonicalize()
-                .map_err(|e| ApiError::Internal(format!("Failed to resolve existing root path: {}", e)))?,
-        );
+        let existing_path = normalize_path(&Path::new(&root.path).canonicalize().map_err(|e| {
+            ApiError::Internal(format!("Failed to resolve existing root path: {}", e))
+        })?);
 
         // Check exact match
         if new_path == existing_path {
-            return Err(ApiError::Conflict("This directory is already being monitored".to_string()));
+            return Err(ApiError::Conflict(
+                "This directory is already being monitored".to_string(),
+            ));
         }
 
         // Check if new path is a subdirectory of existing root
@@ -454,9 +454,10 @@ pub fn set_calibration_library_dir(
         let existing_roots = crate::db::get_scan_roots(&conn)?;
         let mut covered = false;
         for root in existing_roots.iter() {
-            let existing_path = normalize_path(&Path::new(&root.path).canonicalize().map_err(
-                |e| ApiError::Internal(format!("Failed to resolve existing root path: {}", e)),
-            )?);
+            let existing_path =
+                normalize_path(&Path::new(&root.path).canonicalize().map_err(|e| {
+                    ApiError::Internal(format!("Failed to resolve existing root path: {}", e))
+                })?);
             if new_path.starts_with(&existing_path) {
                 covered = true;
                 break;
@@ -495,8 +496,11 @@ pub fn set_calibration_library_dir(
 
     let db = db(ctx)?;
     let conn = db.conn();
-    ctx.settings
-        .persist_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR, &path_str)?;
+    ctx.settings.persist_setting(
+        &conn,
+        crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+        &path_str,
+    )?;
     tracing::info!(path = %path_str, covered_by_existing_root = covered, "calibration library dir set");
     Ok(path_str)
 }
@@ -607,10 +611,9 @@ fn preflight_library_placement(
 /// would purge the old library's catalog rows on its way to failing. Residual
 /// window: the two phases are still not one transaction, so a delegate failure
 /// after a passed pre-flight means a rare TOCTOU (the disk changed in between).
-/// If that happens the old root is gone AND the `calibration.library_dir`
-/// setting still names the removed folder — the delegate errors before it
-/// persists anything. Recovery is to designate the library again; the error
-/// from the set phase surfaces verbatim.
+/// If that happens the old root is gone; the key is cleared and the role reads
+/// unassigned; designate again to recover. The error from the set phase
+/// surfaces verbatim.
 ///
 /// Re-picking the folder that is already the library is a no-op keep: the old
 /// root is left alone (it equals the new path), and the delegate's
@@ -638,6 +641,7 @@ pub fn switch_calibration_library_dir(
     policy.check(&new_path)?;
 
     let old_root = get_calibration_library_root(ctx)?;
+    let mut removed_old_root = false;
     if let Some(old) = old_root {
         if canonical_or_raw(&old.path) != new_path {
             let id = old.id.ok_or_else(|| {
@@ -651,10 +655,34 @@ pub fn switch_calibration_library_dir(
                 tracing::error!(root_id = id, error = %e, "failed to remove old calibration library root");
                 ApiError::Internal(format!("Failed to remove old calibration library root: {e}"))
             })?;
+            removed_old_root = true;
         }
     }
 
-    set_calibration_library_dir(ctx, new_path.to_string_lossy().to_string(), policy)
+    set_calibration_library_dir(ctx, new_path.to_string_lossy().to_string(), policy).map_err(|e| {
+        if removed_old_root {
+            // The old root is already purged; a key naming a removed folder
+            // is the one state no screen can explain. Demote to "role
+            // unassigned" — designating again is the documented recovery.
+            match db(ctx) {
+                Ok(db) => {
+                    let conn = db.conn();
+                    if let Err(e2) = ctx.settings.persist_setting(
+                        &conn,
+                        crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                        "",
+                    ) {
+                        tracing::error!(error = %e2, "failed to clear stale calibration library key after failed switch");
+                    }
+                }
+                Err(e2) => {
+                    tracing::error!(error = %e2, "no db handle to clear stale calibration library key after failed switch");
+                }
+            }
+            tracing::error!(error = %e, "library switch failed after old root removal — role left unassigned");
+        }
+        e
+    })
 }
 
 // ── Sync-incoming / collaboration special roots (Task 4) ────────────────────
@@ -803,7 +831,7 @@ pub(crate) fn guard_against_special_root_deletion(
     if let Some(lib_dir) = resolve_calibration_library_dir(conn)? {
         if canonical_or_raw(&lib_dir).starts_with(&root_canon) {
             return Err(ApiError::Conflict(format!(
-                "This directory contains your Calibration Folder ({lib_dir}). Clear or move the Calibration Folder in File Manager first, then remove the directory."
+                "This directory contains your Calibration Folder ({lib_dir}). Clear or move the Calibration Folder in File Manager → Folders first, then remove the directory."
             )));
         }
     }
@@ -816,7 +844,7 @@ pub(crate) fn guard_against_special_root_deletion(
             if canonical_or_raw(&dir).starts_with(&root_canon) {
                 let label = special_root_label(kind);
                 return Err(ApiError::Conflict(format!(
-                    "This directory is your {label} ({dir}). Clear the {label} in File Manager first, then remove the directory."
+                    "This directory is your {label} ({dir}). Clear the {label} in File Manager → Folders first, then remove the directory."
                 )));
             }
         }
@@ -874,7 +902,12 @@ pub fn start_scan(ctx: &ServiceContext, root_id: i64) -> Result<ScanResultDto, A
     // `duplicates.use_content_hash` setting now governs ONLY the Duplicates-view
     // grouping (`find_duplicate_groups`), never whether the scanner hashes.
     let mut result = crate::scanner::scan_directory(
-        Path::new(&root.path), &conn, None, true, root.unique_camera, root_id,
+        Path::new(&root.path),
+        &conn,
+        None,
+        true,
+        root.unique_camera,
+        root_id,
     );
 
     // If reconciliation changed frames, wipe and rebuild calibration sets.
@@ -954,7 +987,11 @@ pub fn rescan_all_for_content_hash(ctx: &ServiceContext) -> Result<RescanResultD
                     Ok(_) => {
                         updated += 1;
                         if updated % 100 == 0 {
-                            tracing::debug!(current = updated + skipped + missing, total, "content hash rescan progress");
+                            tracing::debug!(
+                                current = updated + skipped + missing,
+                                total,
+                                "content hash rescan progress"
+                            );
                         }
                     }
                     Err(e) => {
@@ -1051,11 +1088,10 @@ pub fn relink_scan_root(
     tracing::info!(root_id, old_path = %old_path, new_path = %new_path, "relinking scan root");
 
     // Perform relinking
-    let result = crate::relinking::relink_files(&conn, &old_path, &new_path)
-        .map_err(|e| {
-            tracing::error!(root_id, path = %new_path, error = %e, "relinking failed");
-            ApiError::Internal(format!("Relinking failed: {}", e))
-        })?;
+    let result = crate::relinking::relink_files(&conn, &old_path, &new_path).map_err(|e| {
+        tracing::error!(root_id, path = %new_path, error = %e, "relinking failed");
+        ApiError::Internal(format!("Relinking failed: {}", e))
+    })?;
 
     // Update scan root path if all files were matched
     if result.files_orphaned == 0 || result.files_matched > 0 {
@@ -1068,13 +1104,35 @@ pub fn relink_scan_root(
             ApiError::Internal(format!("Failed to update scan root path: {}", e))
         })?;
         tracing::info!(root_id, new_path = %new_path, "updated scan root path");
+
+        // The calibration library is the only role stored as a SECOND copy
+        // of a path (settings key) rather than as the root row itself — a
+        // relink that moves the covering root must move the key too, or it
+        // orphans: masters keep landing at the old path and the Folders
+        // rail loses the covered-library row.
+        if let Some(dir) = resolve_calibration_library_dir(&conn)? {
+            let sep = if old_path.starts_with('/') { '/' } else { '\\' };
+            let old_prefix = format!("{}{}", old_path.trim_end_matches(sep), sep);
+            if dir == old_path || dir.starts_with(&old_prefix) {
+                let moved = format!("{}{}", new_path, &dir[old_path.len()..]);
+                ctx.settings
+                    .persist_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR, &moved)
+                    .map_err(|e| {
+                        tracing::error!(root_id, error = %e, "failed to move calibration library key with relinked root");
+                        ApiError::Internal(format!("Relinked, but failed to move the Calibration Library setting: {e}"))
+                    })?;
+                tracing::info!(root_id, src = %dir, dest = %moved, "calibration library dir followed relinked root");
+            }
+        }
     }
 
     Ok(result)
 }
 
 /// Check availability of all scan roots
-pub fn check_all_scan_roots_availability(ctx: &ServiceContext) -> Result<Vec<(i64, bool)>, ApiError> {
+pub fn check_all_scan_roots_availability(
+    ctx: &ServiceContext,
+) -> Result<Vec<(i64, bool)>, ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
 
@@ -1127,16 +1185,15 @@ pub fn check_missing_files_in_scan_root<E: crate::events::ProgressEmitter>(
         // them as "missing" would fill the missing_files table with false
         // positives the user has to manually clear.
         // Use LEFT JOIN instead of subqueries to avoid N+1 query problem.
-        let mut stmt = conn
-            .prepare(
-                "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
+        let mut stmt = conn.prepare(
+            "SELECT f.id, f.path, f.filename, f.size, f.modified_at,
                         CASE WHEN fr.id IS NOT NULL THEN 1 ELSE 0 END as has_frame,
                         fr.object,
                         fr.date_obs
                  FROM files f
                  LEFT JOIN frames fr ON fr.file_id = f.id
-                 WHERE f.path LIKE ?1 AND f.archived_in_operation IS NULL"
-            )?;
+                 WHERE f.path LIKE ?1 AND f.archived_in_operation IS NULL",
+        )?;
 
         let path_prefix = format!("{}%", path);
         let result: Vec<OrphanedFile> = stmt
@@ -1167,7 +1224,14 @@ pub fn check_missing_files_in_scan_root<E: crate::events::ProgressEmitter>(
         .collect();
 
     // Emit final progress
-    crate::scanner::emit_progress(emitter, root_id, total_files, total_files, None, "verifying");
+    crate::scanner::emit_progress(
+        emitter,
+        root_id,
+        total_files,
+        total_files,
+        None,
+        "verifying",
+    );
 
     Ok(missing_files)
 }
@@ -1177,7 +1241,11 @@ pub fn check_missing_files_in_scan_root<E: crate::events::ProgressEmitter>(
 /// Web-side counterpart lives in `routes/duplicates.rs` (not
 /// `routes/scan_roots.rs`) and was NOT converted in Task 9 — out of that
 /// file's declared scope; see Task 9 report for the gap.
-pub fn set_scan_root_unique_camera_flag(ctx: &ServiceContext, id: i64, enabled: bool) -> Result<(), ApiError> {
+pub fn set_scan_root_unique_camera_flag(
+    ctx: &ServiceContext,
+    id: i64,
+    enabled: bool,
+) -> Result<(), ApiError> {
     let db = db(ctx)?;
     let conn = db.conn();
 
@@ -1206,7 +1274,11 @@ pub fn set_scan_root_monitor_enabled(
 
     crate::db::set_scan_root_monitor_enabled(&conn, id, enabled)?;
 
-    tracing::info!(root_id = id, monitor_enabled = enabled, "scan root monitor toggled");
+    tracing::info!(
+        root_id = id,
+        monitor_enabled = enabled,
+        "scan root monitor toggled"
+    );
 
     // Wake the monitor loop so the user gets an immediate scan instead of
     // waiting for the current sleep to finish. Only relevant when enabling.
@@ -1271,8 +1343,11 @@ fn recreate_calibration_sets_for_root(
         }
     }
 
-    let total_cal_frames = flat_ids.len() + dark_ids.len() + bias_ids.len()
-        + darkflat_ids.len() + master_ids.total_count();
+    let total_cal_frames = flat_ids.len()
+        + dark_ids.len()
+        + bias_ids.len()
+        + darkflat_ids.len()
+        + master_ids.total_count();
 
     if total_cal_frames == 0 {
         return Ok(0);
@@ -1289,7 +1364,12 @@ fn recreate_calibration_sets_for_root(
     );
 
     let scan_result = create_calibration_sets_from_scan_with_masters(
-        conn, flat_ids, dark_ids, bias_ids, darkflat_ids, master_ids,
+        conn,
+        flat_ids,
+        dark_ids,
+        bias_ids,
+        darkflat_ids,
+        master_ids,
     )?;
 
     Ok(scan_result.sets_created as usize)
@@ -1369,7 +1449,9 @@ pub fn cancel_scan(ctx: &ServiceContext, root_id: i64) -> Result<(), ApiError> {
         handle.cancel_flag.store(true, Ordering::SeqCst);
         Ok(())
     } else {
-        Err(ApiError::NotFound("No active scan for this root".to_string()))
+        Err(ApiError::NotFound(
+            "No active scan for this root".to_string(),
+        ))
     }
 }
 
@@ -1662,7 +1744,12 @@ mod delete_guard_tests {
         std::fs::create_dir_all(&calib).unwrap();
 
         let conn = test_conn();
-        let root_path = root.path().canonicalize().unwrap().to_string_lossy().to_string();
+        let root_path = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         crate::db::upsert_scan_root(&conn, &root_path, "normal").unwrap();
         crate::db::set_setting(
             &conn,
@@ -1683,7 +1770,12 @@ mod delete_guard_tests {
         let lib = TempDir::new().unwrap();
 
         let conn = test_conn();
-        let root_a_path = root_a.path().canonicalize().unwrap().to_string_lossy().to_string();
+        let root_a_path = root_a
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         crate::db::upsert_scan_root(&conn, &root_a_path, "normal").unwrap();
         crate::db::set_setting(
             &conn,
@@ -1700,7 +1792,12 @@ mod delete_guard_tests {
         let lib_root = TempDir::new().unwrap();
 
         let conn = test_conn();
-        let lib_root_path = lib_root.path().canonicalize().unwrap().to_string_lossy().to_string();
+        let lib_root_path = lib_root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         // No `calibration.library_dir` setting — resolve falls back to the
         // legacy `calibration_library`-kind root, which IS the one being
         // deleted here.
@@ -1718,7 +1815,12 @@ mod delete_guard_tests {
         let new_lib = TempDir::new().unwrap();
 
         let conn = test_conn();
-        let old_lib_root_path = old_lib_root.path().canonicalize().unwrap().to_string_lossy().to_string();
+        let old_lib_root_path = old_lib_root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         // Vestigial: still registered as a calibration_library-kind root,
         // but the settings key has since moved on to somewhere else.
         crate::db::upsert_scan_root(&conn, &old_lib_root_path, "calibration_library").unwrap();
@@ -1739,7 +1841,12 @@ mod delete_guard_tests {
         std::fs::create_dir_all(&calib).unwrap();
 
         let conn = test_conn();
-        let root_path = root.path().canonicalize().unwrap().to_string_lossy().to_string();
+        let root_path = root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         crate::db::upsert_scan_root(&conn, &root_path, "normal").unwrap();
         crate::db::set_setting(
             &conn,
@@ -2354,6 +2461,135 @@ mod switch_library_tests {
         assert_eq!(
             get_calibration_library_dir(&ctx).unwrap().as_deref(),
             Some(next.as_str())
+        );
+    }
+
+    // ── Relink-follows-root (Task 2 fix round) ────────────────────────────
+    //
+    // Relink is the one write path that moves a covering root's `path`
+    // without going through this module's set/switch/clear trio — so the
+    // `calibration.library_dir` settings key (a SECOND copy of a path, not
+    // derived from the root row) needs its own follow logic here.
+
+    #[test]
+    fn relink_scan_root_carries_calibration_library_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let root_id: i64;
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            conn.execute("INSERT INTO scan_roots (path) VALUES ('/gone/root')", [])
+                .unwrap();
+            root_id = conn
+                .query_row(
+                    "SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                "/gone/root/masters",
+            )
+            .unwrap();
+        }
+        let new = mkdirs(&tmp, "newroot");
+
+        relink_scan_root(&ctx, root_id, new.clone(), &PathPolicy::AllowAll).unwrap();
+
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let got =
+            crate::db::get_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(format!("{new}/masters").as_str()),
+            "library key must follow the relinked covering root"
+        );
+    }
+
+    #[test]
+    fn relink_scan_root_leaves_unrelated_calibration_library_key_alone() {
+        // Name-prefix sibling of the relinked root: /gone/rootX is NOT
+        // covered by /gone/root — the key must not move.
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let root_id: i64;
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            conn.execute("INSERT INTO scan_roots (path) VALUES ('/gone/root')", [])
+                .unwrap();
+            root_id = conn
+                .query_row(
+                    "SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                "/gone/rootX/masters",
+            )
+            .unwrap();
+        }
+        let new = mkdirs(&tmp, "newroot");
+
+        relink_scan_root(&ctx, root_id, new, &PathPolicy::AllowAll).unwrap();
+
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let got =
+            crate::db::get_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR).unwrap();
+        assert_eq!(got.as_deref(), Some("/gone/rootX/masters"));
+    }
+
+    // ── Switch-failure demote (Task 2 fix round, closes the #8 residual) ──
+    //
+    // Deterministic delegate-fails-after-delete lever: TWO calibration_library
+    // kind rows. `switch_calibration_library_dir`'s own preflight has no
+    // uniqueness arm (that lives in `check_special_root_uniqueness`, reached
+    // only inside the delegated `set_calibration_library_dir` → `add_scan_root`
+    // call), so the old root is purged before the delegate rejects the second
+    // standalone root. The key must demote to "" rather than keep naming the
+    // now-removed folder.
+
+    #[test]
+    fn switch_failure_after_delete_demotes_key_instead_of_orphaning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let old = mkdirs(&tmp, "lib_old");
+        let stray = mkdirs(&tmp, "lib_stray");
+        let new = mkdirs(&tmp, "lib_new");
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO scan_roots (path, kind) VALUES (?1, 'calibration_library'), (?2, 'calibration_library')",
+                rusqlite::params![old, stray],
+            )
+            .unwrap();
+            crate::db::set_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR, &old)
+                .unwrap();
+        }
+
+        let err = switch_calibration_library_dir(&ctx, new, &PathPolicy::AllowAll);
+
+        assert!(
+            err.is_err(),
+            "delegate uniqueness check must reject the stray second library root"
+        );
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let got =
+            crate::db::get_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(""),
+            "key must be demoted, not orphaned"
         );
     }
 }

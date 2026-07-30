@@ -204,15 +204,25 @@ struct MasterBuildCompleteEvent {
 
 /// spec §2/§9: bias-like N>=15 Average+Winsorized else Median; flat N>=15
 /// Average+Winsorized else Average+Percentile. Explicit override always wins.
-pub fn resolve_recipe(explicit: Option<IntegrationRecipe>, imagetyp: &str, n: i64) -> IntegrationRecipe {
+pub fn resolve_recipe(
+    explicit: Option<IntegrationRecipe>,
+    imagetyp: &str,
+    n: i64,
+) -> IntegrationRecipe {
     if let Some(recipe) = explicit {
         return recipe;
     }
     let is_flat = imagetyp == "Flat";
     if n >= 15 {
-        IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 })
+        IntegrationRecipe::average(Rejection::WinsorizedSigma {
+            sigma_low: 3.0,
+            sigma_high: 3.0,
+        })
     } else if is_flat {
-        IntegrationRecipe::average(Rejection::PercentileClip { low: 0.2, high: 0.02 })
+        IntegrationRecipe::average(Rejection::PercentileClip {
+            low: 0.2,
+            high: 0.02,
+        })
     } else {
         IntegrationRecipe::median(Rejection::None)
     }
@@ -260,9 +270,15 @@ impl PrecalChoice {
     /// "darkflat master #12 (MasterDarkFlat)" or "synthetic bias 500 ADU".
     fn describe(&self) -> Option<String> {
         match self {
-            PrecalChoice::Master { set_id, imagetyp, cal_type, .. } => {
-                Some(format!("{} master #{set_id} ({imagetyp})", cal_type.to_lowercase()))
-            }
+            PrecalChoice::Master {
+                set_id,
+                imagetyp,
+                cal_type,
+                ..
+            } => Some(format!(
+                "{} master #{set_id} ({imagetyp})",
+                cal_type.to_lowercase()
+            )),
             PrecalChoice::Synthetic(b) => Some(format!("synthetic bias {b} ADU")),
             PrecalChoice::None => Option::None,
         }
@@ -311,19 +327,24 @@ fn select_flat_precal(
     let mut raw_candidates = Vec::new();
     // sub-cal links of this flat set, by type preference
     for cal_type in ["DarkFlat", "Dark", "Bias"] {
-        let row: Option<(i64, String, i64, Option<f64>, i64)> = conn.query_row(
-            "SELECT cs.id, cs.imagetyp, cs.is_master_library, cs.exptime, cs.frame_count
+        let row: Option<(i64, String, i64, Option<f64>, i64)> = conn
+            .query_row(
+                "SELECT cs.id, cs.imagetyp, cs.is_master_library, cs.exptime, cs.frame_count
              FROM calibration_set_to_frames l
              JOIN calibration_set cs ON cs.id = l.calibration_set_id
              WHERE l.source_id = ?1 AND l.source_type = 'calibration_set'
                AND l.calibration_type = ?2",
-            rusqlite::params![set_id, cal_type],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        ).optional()?;
-        let Some((precal_set, imagetyp, is_master, precal_expt, precal_frame_count)) = row else { continue };
+                rusqlite::params![set_id, cal_type],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((precal_set, imagetyp, is_master, precal_expt, precal_frame_count)) = row else {
+            continue;
+        };
         if is_master != 1 {
             warnings.push(format!(
-                "linked {cal_type} set #{precal_set} is raw — build its master first (skipped)"));
+                "linked {cal_type} set #{precal_set} is raw — build its master first (skipped)"
+            ));
             raw_candidates.push(RawPrecalCandidate {
                 set_id: precal_set,
                 cal_type: cal_type.to_string(),
@@ -348,19 +369,33 @@ fn select_flat_precal(
              JOIN frames f ON f.id = csf.frame_id
              JOIN files fi ON fi.id = f.file_id
              WHERE csf.set_id = ?1 LIMIT 1",
-            [precal_set], |r| r.get(0),
+            [precal_set],
+            |r| r.get(0),
         )?;
         return Ok(PrecalSelection {
-            choice: PrecalChoice::Master { set_id: precal_set, imagetyp, cal_type, path },
+            choice: PrecalChoice::Master {
+                set_id: precal_set,
+                imagetyp,
+                cal_type,
+                path,
+            },
             warnings,
             raw_candidates,
         });
     }
     if let Some(b) = synthetic_bias {
-        return Ok(PrecalSelection { choice: PrecalChoice::Synthetic(b), warnings, raw_candidates });
+        return Ok(PrecalSelection {
+            choice: PrecalChoice::Synthetic(b),
+            warnings,
+            raw_candidates,
+        });
     }
     warnings.push("no pre-calibration master linked and no synthetic bias set — flat combined un-pre-calibrated (vignetting zero level slightly off)".into());
-    Ok(PrecalSelection { choice: PrecalChoice::None, warnings, raw_candidates })
+    Ok(PrecalSelection {
+        choice: PrecalChoice::None,
+        warnings,
+        raw_candidates,
+    })
 }
 
 /// Materializes a `PrecalChoice` into engine-ready pixels. The Master arm
@@ -370,13 +405,18 @@ fn select_flat_precal(
 fn load_precal_pixels(choice: &PrecalChoice, scratch: &Path) -> Result<FlatPrecal, ApiError> {
     match choice {
         PrecalChoice::Master { path, .. } => {
-            let mut src = crate::integration::banded::BandSource::open(
-                &[PathBuf::from(path)], scratch,
-            ).map_err(|e| ApiError::Internal(format!("pre-cal master unreadable: {e}")))?;
+            let mut src =
+                crate::integration::banded::BandSource::open(&[PathBuf::from(path)], scratch)
+                    .map_err(|e| ApiError::Internal(format!("pre-cal master unreadable: {e}")))?;
             let (w, h) = (src.width(), src.height());
             let mut bufs = vec![Vec::new()];
-            src.read_band(0, h, &mut bufs).map_err(|e| ApiError::Internal(e.to_string()))?;
-            Ok(FlatPrecal::MasterFrame { data: std::mem::take(&mut bufs[0]), width: w, height: h })
+            src.read_band(0, h, &mut bufs)
+                .map_err(|e| ApiError::Internal(e.to_string()))?;
+            Ok(FlatPrecal::MasterFrame {
+                data: std::mem::take(&mut bufs[0]),
+                width: w,
+                height: h,
+            })
         }
         PrecalChoice::Synthetic(b) => Ok(FlatPrecal::SyntheticBias(*b as f32)),
         PrecalChoice::None => Ok(FlatPrecal::None),
@@ -431,21 +471,49 @@ fn validate_buildable_set(
 }
 
 fn load_and_validate_set(conn: &rusqlite::Connection, set_id: i64) -> Result<SetRow, ApiError> {
-    let row: Option<(String, Option<i64>, i64, i64, Option<f64>, Option<String>, String)> = conn.query_row(
-        "SELECT imagetyp, superseded_by_set_id, is_master_library, frame_count,
+    let row: Option<(
+        String,
+        Option<i64>,
+        i64,
+        i64,
+        Option<f64>,
+        Option<String>,
+        String,
+    )> = conn
+        .query_row(
+            "SELECT imagetyp, superseded_by_set_id, is_master_library, frame_count,
                 exptime, binning, date
          FROM calibration_set WHERE id = ?1",
-        [set_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
-    ).optional()?;
+            [set_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        )
+        .optional()?;
 
     let Some((imagetyp, superseded, is_master, frame_count, exptime, binning, date)) = row else {
-        return Err(ApiError::NotFound(format!("calibration set {set_id} not found")));
+        return Err(ApiError::NotFound(format!(
+            "calibration set {set_id} not found"
+        )));
     };
 
     validate_buildable_set(superseded, is_master, frame_count)?;
 
-    Ok(SetRow { imagetyp, exptime, binning, date, frame_count })
+    Ok(SetRow {
+        imagetyp,
+        exptime,
+        binning,
+        date,
+        frame_count,
+    })
 }
 
 /// Same field set as `load_and_validate_set`, but WITHOUT
@@ -466,10 +534,18 @@ fn load_set_row(conn: &rusqlite::Connection, set_id: i64) -> Result<SetRow, ApiE
     ).optional()?;
 
     let Some((imagetyp, exptime, binning, date, frame_count)) = row else {
-        return Err(ApiError::NotFound(format!("calibration set {set_id} not found")));
+        return Err(ApiError::NotFound(format!(
+            "calibration set {set_id} not found"
+        )));
     };
 
-    Ok(SetRow { imagetyp, exptime, binning, date, frame_count })
+    Ok(SetRow {
+        imagetyp,
+        exptime,
+        binning,
+        date,
+        frame_count,
+    })
 }
 
 /// Rebuild precondition (Task 13): every member frame of the source set must
@@ -480,7 +556,10 @@ fn load_set_row(conn: &rusqlite::Connection, set_id: i64) -> Result<SetRow, ApiE
 /// `plan_batch` is. Distinguishes "archived" (actionable: restore first)
 /// from "missing" (the file is just gone) when cheap to do so via
 /// `files.archived_in_operation`.
-fn check_rebuild_source_ready(conn: &rusqlite::Connection, source_set_id: i64) -> Result<(), ApiError> {
+fn check_rebuild_source_ready(
+    conn: &rusqlite::Connection,
+    source_set_id: i64,
+) -> Result<(), ApiError> {
     let mut stmt = conn.prepare(
         "SELECT fi.path, fi.archived_in_operation FROM calibration_set_frames csf
          JOIN frames f ON f.id = csf.frame_id
@@ -501,9 +580,13 @@ fn check_rebuild_source_ready(conn: &rusqlite::Connection, source_set_id: i64) -
         return Ok(());
     }
     if rows.iter().any(|(_, archived)| archived.is_some()) {
-        Err(ApiError::Invalid("originals are archived — restore them first".into()))
+        Err(ApiError::Invalid(
+            "originals are archived — restore them first".into(),
+        ))
     } else {
-        Err(ApiError::Invalid("original source frames are missing on disk".into()))
+        Err(ApiError::Invalid(
+            "original source frames are missing on disk".into(),
+        ))
     }
 }
 
@@ -517,7 +600,7 @@ fn check_rebuild_source_ready(conn: &rusqlite::Connection, source_set_id: i64) -
 pub(crate) fn check_library_dir_exists(dir: &str) -> Result<(), ApiError> {
     if !Path::new(dir).is_dir() {
         return Err(ApiError::Invalid(format!(
-            "Calibration folder no longer exists on disk: {dir} — reconfigure it in File Manager → Calibration Folder"
+            "Calibration folder no longer exists on disk: {dir} — reconfigure it in File Manager → Folders"
         )));
     }
     Ok(())
@@ -545,11 +628,14 @@ pub(crate) fn check_library_dir_exists(dir: &str) -> Result<(), ApiError> {
 /// `pub(crate)` so the light-calibration orchestration (`api::lights`) resolves
 /// the calibrated-output root through the exact same precedence + on-disk
 /// existence check as master builds.
-pub(crate) fn library_dir_or_err(conn: &rusqlite::Connection) -> Result<std::path::PathBuf, ApiError> {
-    let dir = crate::api::scan_roots::resolve_calibration_library_dir(conn)?
-        .ok_or_else(|| ApiError::Invalid(
+pub(crate) fn library_dir_or_err(
+    conn: &rusqlite::Connection,
+) -> Result<std::path::PathBuf, ApiError> {
+    let dir = crate::api::scan_roots::resolve_calibration_library_dir(conn)?.ok_or_else(|| {
+        ApiError::Invalid(
             "no calibration library folder configured — set one before building masters".into(),
-        ))?;
+        )
+    })?;
     check_library_dir_exists(&dir)?;
     Ok(std::path::PathBuf::from(dir))
 }
@@ -579,11 +665,15 @@ pub fn preview_master_build(
     // Selection only (pure DB) — preview never loads precal pixels.
     let (flat_precal, warnings, raw_precal_sets) = if is_flat {
         let sel = select_flat_precal(&conn, set_id, set.exptime, recipe.synthetic_bias)?;
-        let raw_precal_sets = sel.raw_candidates.into_iter().map(|c| RawPrecalSetDto {
-            set_id: c.set_id,
-            cal_type: c.cal_type,
-            frame_count: c.frame_count,
-        }).collect();
+        let raw_precal_sets = sel
+            .raw_candidates
+            .into_iter()
+            .map(|c| RawPrecalSetDto {
+                set_id: c.set_id,
+                cal_type: c.cal_type,
+                frame_count: c.frame_count,
+            })
+            .collect();
         (sel.choice.describe(), sel.warnings, raw_precal_sets)
     } else {
         (None, Vec::new(), Vec::new())
@@ -630,19 +720,29 @@ enum BuildStepError {
 }
 
 impl From<ApiError> for BuildStepError {
-    fn from(e: ApiError) -> Self { BuildStepError::Other(e.to_string()) }
+    fn from(e: ApiError) -> Self {
+        BuildStepError::Other(e.to_string())
+    }
 }
 impl From<rusqlite::Error> for BuildStepError {
-    fn from(e: rusqlite::Error) -> Self { BuildStepError::Other(e.to_string()) }
+    fn from(e: rusqlite::Error) -> Self {
+        BuildStepError::Other(e.to_string())
+    }
 }
 impl From<anyhow::Error> for BuildStepError {
-    fn from(e: anyhow::Error) -> Self { BuildStepError::Other(format!("{e:#}")) }
+    fn from(e: anyhow::Error) -> Self {
+        BuildStepError::Other(format!("{e:#}"))
+    }
 }
 impl From<crate::fits_writer::FitsWriteError> for BuildStepError {
-    fn from(e: crate::fits_writer::FitsWriteError) -> Self { BuildStepError::Other(e.to_string()) }
+    fn from(e: crate::fits_writer::FitsWriteError) -> Self {
+        BuildStepError::Other(e.to_string())
+    }
 }
 impl From<std::io::Error> for BuildStepError {
-    fn from(e: std::io::Error) -> Self { BuildStepError::Other(e.to_string()) }
+    fn from(e: std::io::Error) -> Self {
+        BuildStepError::Other(e.to_string())
+    }
 }
 impl From<IntegrationError> for BuildStepError {
     fn from(e: IntegrationError) -> Self {
@@ -760,10 +860,22 @@ fn run_build(
     let pool = ctx.image_pool.as_ref();
     let scratch = std::env::temp_dir();
     let on_band = |current: usize, total: usize| {
-        let percent = if total > 0 { (current as f64 / total as f64) * 100.0 } else { 100.0 };
-        emit_event(emitter, "master-build-progress", &MasterBuildProgressEvent {
-            set_id, stage: "integrating", current, total, percent,
-        });
+        let percent = if total > 0 {
+            (current as f64 / total as f64) * 100.0
+        } else {
+            100.0
+        };
+        emit_event(
+            emitter,
+            "master-build-progress",
+            &MasterBuildProgressEvent {
+                set_id,
+                stage: "integrating",
+                current,
+                total,
+                percent,
+            },
+        );
     };
     let progress = EngineProgress { on_band: &on_band };
 
@@ -771,14 +883,37 @@ fn run_build(
         // Pixel materialization of the selected precal happens HERE, on the
         // build thread — the only place `load_precal_pixels` is called.
         let precal = load_precal_pixels(&precal_choice, &scratch)?;
-        integrate_flat(&paths, &precal, resolved_combine, pool, &scratch, cancel_flag.as_ref(), progress)?
+        integrate_flat(
+            &paths,
+            &precal,
+            resolved_combine,
+            pool,
+            &scratch,
+            cancel_flag.as_ref(),
+            progress,
+        )?
     } else {
-        integrate_bias_like(&paths, resolved_combine, pool, &scratch, cancel_flag.as_ref(), progress)?
+        integrate_bias_like(
+            &paths,
+            resolved_combine,
+            pool,
+            &scratch,
+            cancel_flag.as_ref(),
+            progress,
+        )?
     };
 
-    emit_event(emitter, "master-build-progress", &MasterBuildProgressEvent {
-        set_id, stage: "writing", current: 0, total: 0, percent: 0.0,
-    });
+    emit_event(
+        emitter,
+        "master-build-progress",
+        &MasterBuildProgressEvent {
+            set_id,
+            stage: "writing",
+            current: 0,
+            total: 0,
+            percent: 0.0,
+        },
+    );
 
     let db_handle = db(ctx)?;
     let conn = db_handle.conn();
@@ -786,7 +921,13 @@ fn run_build(
     let inputs = load_header_inputs(&conn, set_id)?;
     let (member_hash_str, _uuids) = member_hash(&conn, set_id)?;
     let recipe_summary = recipe_summary_string(resolved_combine, set.frame_count);
-    let cards = build_master_cards(&inputs, app_version, &recipe_summary, &member_hash_str, out.flat_norm)?;
+    let cards = build_master_cards(
+        &inputs,
+        app_version,
+        &recipe_summary,
+        &member_hash_str,
+        out.flat_norm,
+    )?;
 
     let target_abs = match &target {
         BuildTarget::New => {
@@ -814,9 +955,17 @@ fn run_build(
     }
     write_fits_f32(&target_abs, out.width, out.height, 1, &out.data, &cards)?;
 
-    emit_event(emitter, "master-build-progress", &MasterBuildProgressEvent {
-        set_id, stage: "registering", current: 0, total: 0, percent: 0.0,
-    });
+    emit_event(
+        emitter,
+        "master-build-progress",
+        &MasterBuildProgressEvent {
+            set_id,
+            stage: "registering",
+            current: 0,
+            total: 0,
+            percent: 0.0,
+        },
+    );
 
     let recipe_json = serde_json::json!({
         "combine": resolved_combine,
@@ -825,7 +974,8 @@ fn run_build(
         "rejectedFraction": out.rejected_fraction,
         "engine": "athenaeum",
         "version": app_version,
-    }).to_string();
+    })
+    .to_string();
 
     match target {
         BuildTarget::New => match register_master(&conn, set_id, &target_abs, &recipe_json) {
@@ -842,14 +992,23 @@ fn run_build(
                 )))
             }
         },
-        BuildTarget::Rebuild { master_set_id, master_file_id, .. } => {
+        BuildTarget::Rebuild {
+            master_set_id,
+            master_file_id,
+            ..
+        } => {
             // Everything after `write_fits_f32`'s atomic rename, in ONE
             // closure so every possible failure in this window (tx open,
             // update_rebuild, metadata read, files UPDATE, commit) funnels
             // through the single metadata-drift error log below.
             let finalize = || -> Result<(), BuildStepError> {
                 let tx = conn.unchecked_transaction()?;
-                crate::db::master_provenance::update_rebuild(&tx, master_set_id, &recipe_json, &member_hash_str)?;
+                crate::db::master_provenance::update_rebuild(
+                    &tx,
+                    master_set_id,
+                    &recipe_json,
+                    &member_hash_str,
+                )?;
                 let meta = std::fs::metadata(&target_abs)?;
                 let modified_at = chrono::DateTime::<chrono::Utc>::from(meta.modified()?);
                 tx.execute(
@@ -932,7 +1091,15 @@ fn run_master_build_thread(
     // path (handle removal + error-outcome event) handles it identically to any
     // other build failure. Mirrors `run_light_cal_thread`'s finally discipline.
     let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_build(&ctx, emitter.as_ref(), &app_version, set_id, &recipe, &cancel_flag, target)
+        run_build(
+            &ctx,
+            emitter.as_ref(),
+            &app_version,
+            set_id,
+            &recipe,
+            &cancel_flag,
+            target,
+        )
     })) {
         Ok(r) => r,
         Err(panic) => {
@@ -983,9 +1150,17 @@ fn run_master_build_thread(
         }
     };
 
-    emit_event(emitter.as_ref(), "master-build-complete", &MasterBuildCompleteEvent {
-        set_id, master_set_id, success, cancelled, error,
-    });
+    emit_event(
+        emitter.as_ref(),
+        "master-build-complete",
+        &MasterBuildCompleteEvent {
+            set_id,
+            master_set_id,
+            success,
+            cancelled,
+            error,
+        },
+    );
 }
 
 // ── Public start/batch/rebuild/cancel/provenance API ─────────────────────────
@@ -1014,7 +1189,12 @@ pub fn start_master_build(
                 "a master build is already in progress for calibration set {set_id}"
             )));
         }
-        active.insert(set_id, MasterBuildHandle { cancel_flag: cancel_flag.clone() });
+        active.insert(
+            set_id,
+            MasterBuildHandle {
+                cancel_flag: cancel_flag.clone(),
+            },
+        );
     }
 
     let thread_ctx = ctx.clone();
@@ -1022,7 +1202,13 @@ pub fn start_master_build(
         .name(format!("master-build-{set_id}"))
         .spawn(move || {
             run_master_build_thread(
-                thread_ctx, emitter, app_version, set_id, recipe, cancel_flag, BuildTarget::New,
+                thread_ctx,
+                emitter,
+                app_version,
+                set_id,
+                recipe,
+                cancel_flag,
+                BuildTarget::New,
             );
         });
 
@@ -1030,7 +1216,9 @@ pub fn start_master_build(
         // The thread never started, so nothing will ever remove this handle
         // or emit master-build-complete — clean up right here instead.
         ctx.active_master_builds.lock().unwrap().remove(&set_id);
-        return Err(ApiError::Internal(format!("failed to spawn master-build thread: {e}")));
+        return Err(ApiError::Internal(format!(
+            "failed to spawn master-build thread: {e}"
+        )));
     }
 
     Ok(())
@@ -1056,24 +1244,35 @@ fn plan_batch(
     let mut skipped: Vec<BatchSkip> = Vec::new();
 
     for &set_id in set_ids {
-        let row: Option<(String, i64, Option<i64>, i64)> = conn.query_row(
-            "SELECT imagetyp, frame_count, superseded_by_set_id, is_master_library
+        let row: Option<(String, i64, Option<i64>, i64)> = conn
+            .query_row(
+                "SELECT imagetyp, frame_count, superseded_by_set_id, is_master_library
              FROM calibration_set WHERE id = ?1",
-            [set_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        ).optional()?;
+                [set_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
 
         let Some((imagetyp, frame_count, superseded_by_set_id, is_master_library)) = row else {
-            skipped.push(BatchSkip { set_id, reason: "unknown set".into() });
+            skipped.push(BatchSkip {
+                set_id,
+                reason: "unknown set".into(),
+            });
             continue;
         };
 
         if superseded_by_set_id.is_some() {
-            skipped.push(BatchSkip { set_id, reason: "already has a master".into() });
+            skipped.push(BatchSkip {
+                set_id,
+                reason: "already has a master".into(),
+            });
             continue;
         }
         if is_master_library != 0 {
-            skipped.push(BatchSkip { set_id, reason: "is itself a master".into() });
+            skipped.push(BatchSkip {
+                set_id,
+                reason: "is itself a master".into(),
+            });
             continue;
         }
         if frame_count < MIN_MASTER_FRAMES {
@@ -1147,13 +1346,25 @@ pub fn start_master_builds_batch(
 
     let mut started_set_ids = Vec::new();
     for (set_id, _imagetyp) in ready {
-        match start_master_build(ctx.clone(), emitter.clone(), app_version.clone(), set_id, recipe.clone()) {
+        match start_master_build(
+            ctx.clone(),
+            emitter.clone(),
+            app_version.clone(),
+            set_id,
+            recipe.clone(),
+        ) {
             Ok(()) => started_set_ids.push(set_id),
-            Err(e) => skipped.push(BatchSkip { set_id, reason: e.to_string() }),
+            Err(e) => skipped.push(BatchSkip {
+                set_id,
+                reason: e.to_string(),
+            }),
         }
     }
 
-    Ok(BatchBuildReport { started_set_ids, skipped })
+    Ok(BatchBuildReport {
+        started_set_ids,
+        skipped,
+    })
 }
 
 /// Re-integrate an existing Athenaeum-built master IN PLACE from the SAME
@@ -1186,13 +1397,16 @@ pub fn rebuild_master(
         let db = db(&ctx)?;
         let conn = db.conn();
 
-        let prov = crate::db::master_provenance::get(&conn, master_set_id)?
-            .ok_or_else(|| ApiError::Invalid(
+        let prov = crate::db::master_provenance::get(&conn, master_set_id)?.ok_or_else(|| {
+            ApiError::Invalid(
                 "master was not built by Athenaeum — no provenance recorded, cannot rebuild".into(),
-            ))?;
-        let source_set_id = prov.source_set_id.ok_or_else(|| ApiError::Invalid(
-            "master was not built by Athenaeum — no source set recorded, cannot rebuild".into(),
-        ))?;
+            )
+        })?;
+        let source_set_id = prov.source_set_id.ok_or_else(|| {
+            ApiError::Invalid(
+                "master was not built by Athenaeum — no source set recorded, cannot rebuild".into(),
+            )
+        })?;
 
         check_rebuild_source_ready(&conn, source_set_id)?;
 
@@ -1200,14 +1414,16 @@ pub fn rebuild_master(
         // one member frame), so this never actually needs to disambiguate —
         // matches `select_flat_precal`'s defensive `LIMIT 1` on the same
         // shape of query.
-        let master_file: Option<(i64, String)> = conn.query_row(
-            "SELECT fi.id, fi.path FROM calibration_set_frames csf
+        let master_file: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT fi.id, fi.path FROM calibration_set_frames csf
              JOIN frames f ON f.id = csf.frame_id
              JOIN files fi ON fi.id = f.file_id
              WHERE csf.set_id = ?1 LIMIT 1",
-            [master_set_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ).optional()?;
+                [master_set_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
         let (master_file_id, target_path) = master_file.ok_or_else(|| {
             ApiError::NotFound(format!("master set {master_set_id} has no file on record"))
         })?;
@@ -1228,10 +1444,19 @@ pub fn rebuild_master(
                 "a master build is already in progress for calibration set {source_set_id}"
             )));
         }
-        active.insert(source_set_id, MasterBuildHandle { cancel_flag: cancel_flag.clone() });
+        active.insert(
+            source_set_id,
+            MasterBuildHandle {
+                cancel_flag: cancel_flag.clone(),
+            },
+        );
     }
 
-    let recipe = MasterRecipe { combine: None, synthetic_bias: None, archive_after: false };
+    let recipe = MasterRecipe {
+        combine: None,
+        synthetic_bias: None,
+        archive_after: false,
+    };
     let target = BuildTarget::Rebuild {
         master_set_id,
         master_file_id,
@@ -1243,13 +1468,24 @@ pub fn rebuild_master(
         .name(format!("master-build-{source_set_id}"))
         .spawn(move || {
             run_master_build_thread(
-                thread_ctx, emitter, app_version, source_set_id, recipe, cancel_flag, target,
+                thread_ctx,
+                emitter,
+                app_version,
+                source_set_id,
+                recipe,
+                cancel_flag,
+                target,
             );
         });
 
     if let Err(e) = spawn_result {
-        ctx.active_master_builds.lock().unwrap().remove(&source_set_id);
-        return Err(ApiError::Internal(format!("failed to spawn master-build thread: {e}")));
+        ctx.active_master_builds
+            .lock()
+            .unwrap()
+            .remove(&source_set_id);
+        return Err(ApiError::Internal(format!(
+            "failed to spawn master-build thread: {e}"
+        )));
     }
 
     Ok(())
@@ -1304,7 +1540,10 @@ pub fn archive_originals(
             .unwrap_or(ArchiveCompression::Store);
 
         let plan = planner::build_calibration_set_plan(
-            &conn, calibration_set_id, Path::new(&root), compression,
+            &conn,
+            calibration_set_id,
+            Path::new(&root),
+            compression,
         )?;
         planner::commit_plan(&conn, &plan, ConflictResolution::AddSuffix)?
     };
@@ -1312,7 +1551,13 @@ pub fn archive_originals(
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
         let mut map = ctx.active_archives.lock().unwrap();
-        map.insert(op_id, ArchiveHandle { operation_id: op_id, cancel_flag: cancel_flag.clone() });
+        map.insert(
+            op_id,
+            ArchiveHandle {
+                operation_id: op_id,
+                cancel_flag: cancel_flag.clone(),
+            },
+        );
     }
 
     let ctx_for_worker = ctx.clone();
@@ -1372,7 +1617,9 @@ pub fn cancel_master_build(ctx: &ServiceContext, set_id: i64) -> Result<(), ApiE
         handle.cancel_flag.store(true, Ordering::SeqCst);
         Ok(())
     } else {
-        Err(ApiError::NotFound(format!("no active master build for calibration set {set_id}")))
+        Err(ApiError::NotFound(format!(
+            "no active master build for calibration set {set_id}"
+        )))
     }
 }
 
@@ -1393,32 +1640,39 @@ pub fn get_master_provenance(
         .map(|v| v.len())
         .unwrap_or(0);
 
-    let (originals_archived, source_frames_on_disk, archive_operation_id, archive_zip_path, archive_zip_missing) =
-        if let Some(src_id) = prov.source_set_id {
-            let archived_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM calibration_set_frames csf
+    let (
+        originals_archived,
+        source_frames_on_disk,
+        archive_operation_id,
+        archive_zip_path,
+        archive_zip_missing,
+    ) = if let Some(src_id) = prov.source_set_id {
+        let archived_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set_frames csf
                  JOIN frames f ON f.id = csf.frame_id
                  JOIN files fi ON fi.id = f.file_id
                  WHERE csf.set_id = ?1 AND fi.archived_in_operation IS NOT NULL",
-                [src_id],
-                |r| r.get(0),
-            )?;
+            [src_id],
+            |r| r.get(0),
+        )?;
 
-            let mut stmt = conn.prepare(
-                "SELECT fi.path FROM calibration_set_frames csf
+        let mut stmt = conn.prepare(
+            "SELECT fi.path FROM calibration_set_frames csf
                  JOIN frames f ON f.id = csf.frame_id
                  JOIN files fi ON fi.id = f.file_id
                  WHERE csf.set_id = ?1",
-            )?;
-            let paths: Vec<String> = stmt
-                .query_map([src_id], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            let source_frames_on_disk = !paths.is_empty() && paths.iter().all(|p| Path::new(p).exists());
-            drop(stmt);
+        )?;
+        let paths: Vec<String> = stmt
+            .query_map([src_id], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let source_frames_on_disk =
+            !paths.is_empty() && paths.iter().all(|p| Path::new(p).exists());
+        drop(stmt);
 
-            // Any ONE member's markers — see the field doc comments above for
-            // why every member shares the same op id / zip path.
-            let marker: Option<(Option<i64>, Option<String>)> = conn.query_row(
+        // Any ONE member's markers — see the field doc comments above for
+        // why every member shares the same op id / zip path.
+        let marker: Option<(Option<i64>, Option<String>)> = conn
+            .query_row(
                 "SELECT fi.archived_in_operation, fi.archive_zip_path
                  FROM calibration_set_frames csf
                  JOIN frames f ON f.id = csf.frame_id
@@ -1427,17 +1681,24 @@ pub fn get_master_provenance(
                  LIMIT 1",
                 [src_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
-            ).optional()?;
-            let (archive_operation_id, archive_zip_path) = marker.unwrap_or((None, None));
-            let archive_zip_missing = archive_zip_path
-                .as_deref()
-                .map(|p| !Path::new(p).exists())
-                .unwrap_or(false);
+            )
+            .optional()?;
+        let (archive_operation_id, archive_zip_path) = marker.unwrap_or((None, None));
+        let archive_zip_missing = archive_zip_path
+            .as_deref()
+            .map(|p| !Path::new(p).exists())
+            .unwrap_or(false);
 
-            (archived_count > 0, source_frames_on_disk, archive_operation_id, archive_zip_path, archive_zip_missing)
-        } else {
-            (false, false, None, None, false)
-        };
+        (
+            archived_count > 0,
+            source_frames_on_disk,
+            archive_operation_id,
+            archive_zip_path,
+            archive_zip_missing,
+        )
+    } else {
+        (false, false, None, None, false)
+    };
 
     Ok(Some(MasterProvenanceInfo {
         master_set_id: prov.master_set_id,
@@ -1469,9 +1730,10 @@ pub fn get_master_provenance(
 fn common_source_dir(paths: &[PathBuf]) -> PathBuf {
     match paths.split_first() {
         None => PathBuf::new(),
-        Some((first, rest)) if rest.is_empty() => {
-            first.parent().map(Path::to_path_buf).unwrap_or_else(|| first.clone())
-        }
+        Some((first, rest)) if rest.is_empty() => first
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| first.clone()),
         Some((first, rest)) => {
             let first_components: Vec<_> = first.components().collect();
             let mut common_len = first_components.len();
@@ -1545,7 +1807,9 @@ pub fn restore_originals(
              WHERE csf.set_id = ?1",
         )?;
         let rows: Vec<(String, Option<i64>, Option<String>)> = stmt
-            .query_map([calibration_set_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .query_map([calibration_set_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(stmt);
 
@@ -1582,7 +1846,13 @@ pub fn restore_originals(
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
         let mut map = ctx.active_archives.lock().unwrap();
-        map.insert(op_id, ArchiveHandle { operation_id: op_id, cancel_flag: cancel_flag.clone() });
+        map.insert(
+            op_id,
+            ArchiveHandle {
+                operation_id: op_id,
+                cancel_flag: cancel_flag.clone(),
+            },
+        );
     }
 
     let ctx_for_worker = ctx.clone();
@@ -1697,7 +1967,9 @@ pub fn clear_stale_archive_markers(
     // doc comment — but checking every row costs nothing and stays correct
     // even if that invariant ever bends.)
     if marked.iter().any(|(_, zip)| {
-        zip.as_deref().map(|p| Path::new(p).exists()).unwrap_or(false)
+        zip.as_deref()
+            .map(|p| Path::new(p).exists())
+            .unwrap_or(false)
     }) {
         return Err(ApiError::Conflict(
             "archive zip still exists on disk — use Restore originals instead".into(),
@@ -1730,17 +2002,41 @@ mod tests {
     fn auto_recipe_rules() {
         // spec §2/§9: bias-like N>=15 Average+Winsorized else Median; flat
         // N>=15 Average+Winsorized else Average+Percentile.
-        assert_eq!(resolve_recipe(None, "Dark", 20),
-            IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }));
-        assert_eq!(resolve_recipe(None, "Dark", 5), IntegrationRecipe::median(Rejection::None));
-        assert_eq!(resolve_recipe(None, "Bias", 14), IntegrationRecipe::median(Rejection::None));
-        assert_eq!(resolve_recipe(None, "Flat", 20),
-            IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }));
-        assert_eq!(resolve_recipe(None, "Flat", 6),
-            IntegrationRecipe::average(Rejection::PercentileClip { low: 0.2, high: 0.02 }));
+        assert_eq!(
+            resolve_recipe(None, "Dark", 20),
+            IntegrationRecipe::average(Rejection::WinsorizedSigma {
+                sigma_low: 3.0,
+                sigma_high: 3.0
+            })
+        );
+        assert_eq!(
+            resolve_recipe(None, "Dark", 5),
+            IntegrationRecipe::median(Rejection::None)
+        );
+        assert_eq!(
+            resolve_recipe(None, "Bias", 14),
+            IntegrationRecipe::median(Rejection::None)
+        );
+        assert_eq!(
+            resolve_recipe(None, "Flat", 20),
+            IntegrationRecipe::average(Rejection::WinsorizedSigma {
+                sigma_low: 3.0,
+                sigma_high: 3.0
+            })
+        );
+        assert_eq!(
+            resolve_recipe(None, "Flat", 6),
+            IntegrationRecipe::average(Rejection::PercentileClip {
+                low: 0.2,
+                high: 0.02
+            })
+        );
         // explicit override wins
         let override_recipe = IntegrationRecipe::average(Rejection::None);
-        assert_eq!(resolve_recipe(Some(override_recipe), "Flat", 6), override_recipe);
+        assert_eq!(
+            resolve_recipe(Some(override_recipe), "Flat", 6),
+            override_recipe
+        );
     }
 
     #[test]
@@ -1769,19 +2065,26 @@ mod tests {
             "INSERT INTO calibration_set (imagetyp, exptime, date, frame_count)
              VALUES ('Flat', ?1, '2026-06-28', 5)",
             [exptime],
-        ).unwrap();
+        )
+        .unwrap();
         conn.last_insert_rowid()
     }
 
     /// A precal calibration set with one member file — the member row is
     /// what `select_flat_precal`'s path lookup resolves against (the path
     /// itself is a dummy string; selection never touches disk).
-    fn seed_precal_set(conn: &Connection, imagetyp: &str, is_master: i64, exptime: Option<f64>) -> i64 {
+    fn seed_precal_set(
+        conn: &Connection,
+        imagetyp: &str,
+        is_master: i64,
+        exptime: Option<f64>,
+    ) -> i64 {
         conn.execute(
             "INSERT INTO calibration_set (imagetyp, exptime, date, is_master_library, frame_count)
              VALUES (?1, ?2, '2026-06-28', ?3, 1)",
             rusqlite::params![imagetyp, exptime, is_master],
-        ).unwrap();
+        )
+        .unwrap();
         let set_id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO files (path, filename, size, modified_at, format)
@@ -1790,17 +2093,20 @@ mod tests {
                 format!("/library/{imagetyp}_{set_id}.fits"),
                 format!("{imagetyp}_{set_id}.fits")
             ],
-        ).unwrap();
+        )
+        .unwrap();
         let file_id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO frames (file_id, imagetyp) VALUES (?1, ?2)",
             rusqlite::params![file_id, imagetyp],
-        ).unwrap();
+        )
+        .unwrap();
         let frame_id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
             rusqlite::params![set_id, frame_id],
-        ).unwrap();
+        )
+        .unwrap();
         set_id
     }
 
@@ -1810,7 +2116,8 @@ mod tests {
              (source_id, source_type, calibration_set_id, calibration_type)
              VALUES (?1, 'calibration_set', ?2, ?3)",
             rusqlite::params![flat_set, precal_set, cal_type],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1826,14 +2133,19 @@ mod tests {
         let sel = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
         assert!(sel.warnings.is_empty(), "{:?}", sel.warnings);
         match &sel.choice {
-            PrecalChoice::Master { set_id, cal_type, .. } => {
+            PrecalChoice::Master {
+                set_id, cal_type, ..
+            } => {
                 assert_eq!(*set_id, df);
                 assert_eq!(*cal_type, "DarkFlat");
             }
             other => panic!("expected darkflat master, got {other:?}"),
         }
-        assert!(sel.choice.describe().unwrap().contains("darkflat master"),
-            "{:?}", sel.choice.describe());
+        assert!(
+            sel.choice.describe().unwrap().contains("darkflat master"),
+            "{:?}",
+            sel.choice.describe()
+        );
         assert!(sel.raw_candidates.is_empty(), "{:?}", sel.raw_candidates);
     }
 
@@ -1846,7 +2158,17 @@ mod tests {
 
         let sel = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
         assert!(sel.warnings.is_empty(), "{:?}", sel.warnings);
-        assert!(matches!(sel.choice, PrecalChoice::Master { cal_type: "Dark", .. }), "{:?}", sel.choice);
+        assert!(
+            matches!(
+                sel.choice,
+                PrecalChoice::Master {
+                    cal_type: "Dark",
+                    ..
+                }
+            ),
+            "{:?}",
+            sel.choice
+        );
         assert!(sel.raw_candidates.is_empty(), "{:?}", sel.raw_candidates);
     }
 
@@ -1859,9 +2181,19 @@ mod tests {
 
         let sel = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
         assert!(matches!(sel.choice, PrecalChoice::None), "{:?}", sel.choice);
-        assert!(sel.warnings.iter().any(|w| w.contains("exposure does not match")), "{:?}", sel.warnings);
+        assert!(
+            sel.warnings
+                .iter()
+                .any(|w| w.contains("exposure does not match")),
+            "{:?}",
+            sel.warnings
+        );
         // fell all the way through: also carries the un-pre-calibrated warning
-        assert!(sel.warnings.iter().any(|w| w.contains("un-pre-calibrated")), "{:?}", sel.warnings);
+        assert!(
+            sel.warnings.iter().any(|w| w.contains("un-pre-calibrated")),
+            "{:?}",
+            sel.warnings
+        );
         // a mismatched-exposure dark master is skipped for a different reason
         // than "raw" — it's not a build-a-master-first candidate.
         assert!(sel.raw_candidates.is_empty(), "{:?}", sel.raw_candidates);
@@ -1876,15 +2208,29 @@ mod tests {
         // Give the raw set a realistic member count (seed_precal_set hardcodes
         // 1, since it's normally a 1:1 MASTER set) so the reported
         // `frame_count` is actually exercised.
-        conn.execute("UPDATE calibration_set SET frame_count = 12 WHERE id = ?1", [raw_df]).unwrap();
+        conn.execute(
+            "UPDATE calibration_set SET frame_count = 12 WHERE id = ?1",
+            [raw_df],
+        )
+        .unwrap();
         let bias = seed_precal_set(&conn, "MasterBias", 1, None);
         link(&conn, flat, bias, "Bias");
 
-        let PrecalSelection { choice, warnings, raw_candidates } =
-            select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
-        assert!(warnings.iter().any(|w| w.contains("build its master first")), "{warnings:?}");
+        let PrecalSelection {
+            choice,
+            warnings,
+            raw_candidates,
+        } = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("build its master first")),
+            "{warnings:?}"
+        );
         match &choice {
-            PrecalChoice::Master { set_id, cal_type, .. } => {
+            PrecalChoice::Master {
+                set_id, cal_type, ..
+            } => {
                 assert_eq!(*set_id, bias);
                 assert_eq!(*cal_type, "Bias");
             }
@@ -1892,11 +2238,14 @@ mod tests {
         }
         // The skipped raw darkflat is reported as a "build its master first"
         // candidate, not silently dropped.
-        assert_eq!(raw_candidates, vec![RawPrecalCandidate {
-            set_id: raw_df,
-            cal_type: "DarkFlat".to_string(),
-            frame_count: 12,
-        }]);
+        assert_eq!(
+            raw_candidates,
+            vec![RawPrecalCandidate {
+                set_id: raw_df,
+                cal_type: "DarkFlat".to_string(),
+                frame_count: 12,
+            }]
+        );
     }
 
     #[test]
@@ -1908,8 +2257,22 @@ mod tests {
 
         let sel = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
         assert!(sel.warnings.is_empty(), "{:?}", sel.warnings);
-        assert!(matches!(sel.choice, PrecalChoice::Master { cal_type: "Bias", .. }), "{:?}", sel.choice);
-        assert!(sel.choice.describe().unwrap().contains("bias master"), "{:?}", sel.choice.describe());
+        assert!(
+            matches!(
+                sel.choice,
+                PrecalChoice::Master {
+                    cal_type: "Bias",
+                    ..
+                }
+            ),
+            "{:?}",
+            sel.choice
+        );
+        assert!(
+            sel.choice.describe().unwrap().contains("bias master"),
+            "{:?}",
+            sel.choice.describe()
+        );
         assert!(sel.raw_candidates.is_empty(), "{:?}", sel.raw_candidates);
     }
 
@@ -1921,7 +2284,10 @@ mod tests {
         let sel = select_flat_precal(&conn, flat, Some(2.0), Some(500.0)).unwrap();
         assert!(sel.warnings.is_empty(), "{:?}", sel.warnings);
         assert_eq!(sel.choice, PrecalChoice::Synthetic(500.0));
-        assert_eq!(sel.choice.describe().as_deref(), Some("synthetic bias 500 ADU"));
+        assert_eq!(
+            sel.choice.describe().as_deref(),
+            Some("synthetic bias 500 ADU")
+        );
         assert!(sel.raw_candidates.is_empty(), "{:?}", sel.raw_candidates);
     }
 
@@ -1933,7 +2299,11 @@ mod tests {
         let sel = select_flat_precal(&conn, flat, Some(2.0), None).unwrap();
         assert!(matches!(sel.choice, PrecalChoice::None), "{:?}", sel.choice);
         assert_eq!(sel.choice.describe(), Option::None);
-        assert!(sel.warnings.iter().any(|w| w.contains("un-pre-calibrated")), "{:?}", sel.warnings);
+        assert!(
+            sel.warnings.iter().any(|w| w.contains("un-pre-calibrated")),
+            "{:?}",
+            sel.warnings
+        );
         assert!(sel.raw_candidates.is_empty(), "{:?}", sel.raw_candidates);
     }
 
@@ -1969,7 +2339,8 @@ mod tests {
         let bias = seed_set(&conn, "Bias", 5, None, 0);
         let darkflat_a = seed_set(&conn, "DarkFlat", 5, None, 0);
 
-        let (ready, skipped) = plan_batch(&conn, &[flat, dark, darkflat_b, bias, darkflat_a]).unwrap();
+        let (ready, skipped) =
+            plan_batch(&conn, &[flat, dark, darkflat_b, bias, darkflat_a]).unwrap();
         assert!(skipped.is_empty(), "{skipped:?}");
         let ordered_ids: Vec<i64> = ready.iter().map(|(id, _)| *id).collect();
         // rank 0 (Bias/DarkFlat) sorted by id, then rank 1 (Dark), then rank 2 (Flat).
@@ -1989,7 +2360,13 @@ mod tests {
 
         let (ready, skipped) = plan_batch(&conn, &[raw]).unwrap();
         assert!(ready.is_empty());
-        assert_eq!(skipped, vec![BatchSkip { set_id: raw, reason: "already has a master".into() }]);
+        assert_eq!(
+            skipped,
+            vec![BatchSkip {
+                set_id: raw,
+                reason: "already has a master".into()
+            }]
+        );
     }
 
     #[test]
@@ -2001,7 +2378,10 @@ mod tests {
         assert!(ready.is_empty());
         assert_eq!(
             skipped,
-            vec![BatchSkip { set_id: raw, reason: "only 2 frames (minimum 3)".into() }],
+            vec![BatchSkip {
+                set_id: raw,
+                reason: "only 2 frames (minimum 3)".into()
+            }],
         );
     }
 
@@ -2015,7 +2395,13 @@ mod tests {
 
         let (ready, skipped) = plan_batch(&conn, &[master]).unwrap();
         assert!(ready.is_empty());
-        assert_eq!(skipped, vec![BatchSkip { set_id: master, reason: "is itself a master".into() }]);
+        assert_eq!(
+            skipped,
+            vec![BatchSkip {
+                set_id: master,
+                reason: "is itself a master".into()
+            }]
+        );
     }
 
     #[test]
@@ -2023,7 +2409,13 @@ mod tests {
         let conn = test_conn();
         let (ready, skipped) = plan_batch(&conn, &[999_999]).unwrap();
         assert!(ready.is_empty());
-        assert_eq!(skipped, vec![BatchSkip { set_id: 999_999, reason: "unknown set".into() }]);
+        assert_eq!(
+            skipped,
+            vec![BatchSkip {
+                set_id: 999_999,
+                reason: "unknown set".into()
+            }]
+        );
     }
 
     #[test]
@@ -2036,9 +2428,15 @@ mod tests {
         let (ready, skipped) = plan_batch(&conn, &[dark, master, too_small, 424242]).unwrap();
         assert_eq!(ready, vec![(dark, "Dark".to_string())]);
         assert_eq!(skipped.len(), 3);
-        assert!(skipped.iter().any(|s| s.set_id == master && s.reason == "is itself a master"));
-        assert!(skipped.iter().any(|s| s.set_id == too_small && s.reason.contains("minimum 3")));
-        assert!(skipped.iter().any(|s| s.set_id == 424242 && s.reason == "unknown set"));
+        assert!(skipped
+            .iter()
+            .any(|s| s.set_id == master && s.reason == "is itself a master"));
+        assert!(skipped
+            .iter()
+            .any(|s| s.set_id == too_small && s.reason.contains("minimum 3")));
+        assert!(skipped
+            .iter()
+            .any(|s| s.set_id == 424242 && s.reason == "unknown set"));
     }
 
     // ── check_rebuild_source_ready (pure DB + Path::exists) ─────────────────
@@ -2047,7 +2445,12 @@ mod tests {
     /// real (but possibly not actually created) path so `Path::exists` has
     /// something concrete to check. `archived` marks every member's
     /// `files.archived_in_operation` as set (non-NULL) or not.
-    fn seed_source_with_files(conn: &Connection, dir: &std::path::Path, n: usize, archived: bool) -> i64 {
+    fn seed_source_with_files(
+        conn: &Connection,
+        dir: &std::path::Path,
+        n: usize,
+        archived: bool,
+    ) -> i64 {
         conn.execute(
             "INSERT INTO calibration_set (imagetyp, date, frame_count) VALUES ('Dark', '2026-06-28', ?1)",
             [n as i64],
@@ -2055,7 +2458,11 @@ mod tests {
         let set_id = conn.last_insert_rowid();
         for i in 0..n {
             let p = dir.join(format!("raw{i}.fits"));
-            std::fs::write(&p, b"not a real fits file, existence is all that matters here").unwrap();
+            std::fs::write(
+                &p,
+                b"not a real fits file, existence is all that matters here",
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO files (path, filename, size, modified_at, format, archived_in_operation)
                  VALUES (?1, ?2, 10, '2026-06-28', 'FITS', ?3)",
@@ -2067,12 +2474,14 @@ mod tests {
             conn.execute(
                 "INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'Dark')",
                 [file_id],
-            ).unwrap();
+            )
+            .unwrap();
             let frame_id = conn.last_insert_rowid();
             conn.execute(
                 "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
                 rusqlite::params![set_id, frame_id],
-            ).unwrap();
+            )
+            .unwrap();
         }
         set_id
     }
@@ -2140,7 +2549,10 @@ mod tests {
         let err = check_library_dir_exists(&path).unwrap_err();
         assert!(matches!(err, ApiError::Invalid(_)));
         assert!(err.to_string().contains(&path), "{err}");
-        assert!(err.to_string().contains("reconfigure it in File Manager"), "{err}");
+        assert!(
+            err.to_string().contains("reconfigure it in File Manager"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2203,7 +2615,8 @@ mod tests {
                 &conn,
                 crate::settings::keys::CALIBRATION_LIBRARY_DIR,
                 &lib_dir.to_string_lossy(),
-            ).unwrap();
+            )
+            .unwrap();
             set_id
         };
 
@@ -2224,7 +2637,12 @@ mod tests {
             dso_catalog: Arc::new(RwLock::new(None)),
             star_cache: Arc::new(RwLock::new(None)),
             bright_cache: Arc::new(RwLock::new(None)),
-            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -2233,7 +2651,11 @@ mod tests {
         // Pool max_size is 8 — exceed it so, pre-fix, every task grabs one
         // connection and then blocks forever on a second.
         const N: usize = 12;
-        let recipe = MasterRecipe { combine: None, synthetic_bias: None, archive_after: false };
+        let recipe = MasterRecipe {
+            combine: None,
+            synthetic_bias: None,
+            archive_after: false,
+        };
         let start = Instant::now();
         let handles: Vec<_> = (0..N)
             .map(|_| {
@@ -2244,8 +2666,9 @@ mod tests {
             .collect();
 
         for h in handles {
-            let result = h.join().expect(
-                "preview_master_build thread panicked — pool-checkout deadlock regression");
+            let result = h
+                .join()
+                .expect("preview_master_build thread panicked — pool-checkout deadlock regression");
             result.expect("preview_master_build returned an error");
         }
 
@@ -2297,12 +2720,14 @@ mod tests {
             conn.execute(
                 "INSERT INTO scan_roots (path) VALUES (?1)",
                 [raw_dir.to_string_lossy()],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
                  VALUES (999, 'MasterDark', '2026-06-28', 1)",
                 [],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO calibration_set
                     (imagetyp, date, instrume, gain, exptime, date_start, date_end, superseded_by_set_id)
@@ -2318,14 +2743,20 @@ mod tests {
                 "INSERT INTO files (path, filename, size, modified_at, format)
                  VALUES (?1, 'd1.fits', 4, '2026-06-28', 'FITS')",
                 [f.to_string_lossy()],
-            ).unwrap();
+            )
+            .unwrap();
             let file_id = conn.last_insert_rowid();
-            conn.execute("INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'Dark')", [file_id]).unwrap();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'Dark')",
+                [file_id],
+            )
+            .unwrap();
             let frame_id = conn.last_insert_rowid();
             conn.execute(
                 "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
                 rusqlite::params![set_id, frame_id],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO master_provenance
                     (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
@@ -2354,7 +2785,12 @@ mod tests {
             dso_catalog: Arc::new(RwLock::new(None)),
             star_cache: Arc::new(RwLock::new(None)),
             bright_cache: Arc::new(RwLock::new(None)),
-            image_pool: Arc::new(rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap()),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
             operation_queue: OperationQueue::start(),
             compute_queue: ComputeQueue::new(),
             iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -2367,8 +2803,12 @@ mod tests {
             let db_handle = db(&ctx).unwrap();
             let conn = db_handle.conn();
             let plan = build_calibration_set_plan(
-                &conn, calibration_set_id, &archive_dir, ArchiveCompression::Store,
-            ).unwrap();
+                &conn,
+                calibration_set_id,
+                &archive_dir,
+                ArchiveCompression::Store,
+            )
+            .unwrap();
             let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
             let cancel = Arc::new(AtomicBool::new(false));
             crate::archive::executor::run_operation(&conn, op_id, &cancel, &NullEmitter).unwrap();
@@ -2398,8 +2838,14 @@ mod tests {
         // (a) provenance now reports the gap instead of silently claiming the
         // originals are still one click away from being restored.
         let prov_after = get_master_provenance(&ctx, master_set_id).unwrap().unwrap();
-        assert!(prov_after.archive_zip_missing, "must detect the deleted zip");
-        assert!(prov_after.originals_archived, "markers are still present — only the zip vanished");
+        assert!(
+            prov_after.archive_zip_missing,
+            "must detect the deleted zip"
+        );
+        assert!(
+            prov_after.originals_archived,
+            "markers are still present — only the zip vanished"
+        );
 
         // (b) a restore attempt fails with an actionable Invalid, not an io
         // panic — this is what the UI's `archiveZipMissing` gate exists to
@@ -2429,8 +2875,14 @@ mod tests {
         assert_eq!(cleared, 1, "exactly the one member file's markers cleared");
 
         let prov_final = get_master_provenance(&ctx, master_set_id).unwrap().unwrap();
-        assert!(!prov_final.originals_archived, "markers gone — no longer 'archived'");
-        assert!(!prov_final.archive_zip_missing, "nothing archived => nothing missing");
+        assert!(
+            !prov_final.originals_archived,
+            "markers gone — no longer 'archived'"
+        );
+        assert!(
+            !prov_final.archive_zip_missing,
+            "nothing archived => nothing missing"
+        );
         assert_eq!(prov_final.archive_operation_id, None);
         assert_eq!(prov_final.archive_zip_path, None);
         assert!(
