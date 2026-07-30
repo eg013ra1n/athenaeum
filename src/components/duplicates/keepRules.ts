@@ -39,7 +39,8 @@ export const RULE_KIND_META: Record<RuleKind, RuleKindMeta> = {
   shortest_path: {
     kind: 'shortest_path',
     name: 'Shortest path wins',
-    description: 'Keep the file with the shortest full path. Final tiebreaker.',
+    description:
+      'Keep the file in the shallowest folder (fewest path segments); character length breaks ties. Final tiebreaker.',
   },
 };
 

@@ -160,7 +160,11 @@ pub fn original_parent_for_restore(source_path: &str, path_in_zip: &str) -> Opti
         end = source_path[..end].rfind(['/', '\\'])?;
     }
     let parent = source_path[..end].trim_end_matches(['/', '\\']);
-    if parent.is_empty() {
+    // A separator-free remainder is never a usable absolute directory: it can
+    // only be a drive-relative designator (`C:`, which resolves against the
+    // process's per-drive CWD) or a bare name. Suggest nothing rather than a
+    // destination that lands somewhere unpredictable.
+    if parent.is_empty() || !parent.contains(['/', '\\']) {
         None
     } else {
         Some(parent.to_string())
@@ -499,10 +503,11 @@ mod tests {
             None
         );
         // Fallback two-component zip path over a shallow source: strips both
-        // components, leaving the bare drive designator.
+        // components, leaving the bare drive designator `C:` — drive-relative,
+        // not an absolute directory, so no suggestion is offered.
         assert_eq!(
             original_parent_for_restore(r"C:\stray\x.fits", "Root/x.fits"),
-            Some("C:".to_string())
+            None
         );
     }
 

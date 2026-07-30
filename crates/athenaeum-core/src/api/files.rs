@@ -677,8 +677,16 @@ fn dir_rename_prefixes(old_str: &str, new_str: &str) -> (String, String) {
 /// True when `new` names the SAME on-disk file as `old` (case-insensitive
 /// filesystems: renaming `m31.fits` → `M31.fits` makes `new.exists()` true
 /// for the very file being renamed — that is not a collision).
+///
+/// Gated on the two file NAMES differing only by case: canonicalize alone
+/// resolves symlinks and hardlink aliases, so a genuinely distinct
+/// destination that merely POINTS at `old` (e.g. `link.fits` → `a.fits`)
+/// would otherwise be waved through the collision check and overwritten.
 pub(crate) fn is_same_file_case_variant(old: &Path, new: &Path) -> bool {
-    new.exists()
+    old.file_name()
+        .zip(new.file_name())
+        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+        && new.exists()
         && old.exists()
         && matches!(
             (std::fs::canonicalize(old), std::fs::canonicalize(new)),
@@ -965,5 +973,18 @@ mod dir_rename_prefix_tests {
             !is_same_file_case_variant(&a, &b),
             "distinct files are never the same"
         );
+
+        // A symlink ALIASING the source canonicalizes to the same target, but
+        // it is a real, distinct destination name — renaming onto it is a
+        // collision, not a case-only rename.
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.fits");
+            std::os::unix::fs::symlink(&a, &link).unwrap();
+            assert!(
+                !is_same_file_case_variant(&a, &link),
+                "a symlink aliasing the source is not a case variant of it"
+            );
+        }
     }
 }

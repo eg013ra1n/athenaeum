@@ -82,7 +82,16 @@ pub fn rollback_operation(
         if seen_zips.insert(f.target_zip_path.clone()) {
             let zp = Path::new(&f.target_zip_path);
             if zp.exists() {
-                let _ = std::fs::remove_file(zp);
+                // Best-effort by design — a locked zip (Windows sharing
+                // violation) must not fail the rollback — but never silent.
+                if let Err(e) = std::fs::remove_file(zp) {
+                    tracing::warn!(
+                        operation_id,
+                        path = %zp.display(),
+                        error = %e,
+                        "failed to remove partial zip during rollback"
+                    );
+                }
             }
         }
     }

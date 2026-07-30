@@ -38,7 +38,7 @@ fn validate(width: usize, height: usize, channels: usize, data_len: usize) -> Re
 /// MOVEFILE_REPLACE_EXISTING), but on Windows it fails with a sharing
 /// violation while another process (AV real-time scan, indexer, a stacker
 /// with the master open) holds the destination without FILE_SHARE_DELETE —
-/// POSIX rename never does. Bounded retry: 5 attempts, 50→800 ms backoff.
+/// POSIX rename never does. Bounded retry: 5 attempts, 50→400 ms backoff.
 #[cfg(windows)]
 pub(crate) fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     const ERROR_ACCESS_DENIED: i32 = 5;

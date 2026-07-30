@@ -637,7 +637,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_files_content_hash ON files(content_hash)",
         [],
     )?;
-    // Path index for LIKE prefix queries (e.g., path LIKE '/foo/bar%')
+    // Path index for separator-strict byte-range prefix queries
+    // (path >= ? AND path < ?)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)",
         [],

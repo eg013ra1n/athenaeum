@@ -155,7 +155,7 @@ Fix: byte-range form (`native_separator_of` + `trim_end_matches(sep)` + `path_pr
 
 ## Status (2026-07-30 fix cycle)
 
-Plan: `docs/superpowers/plans/2026-07-30-cross-platform-path-fixes.md` (19 tasks). All 4 Critical and all 24 Important findings are fixed on branch `0.5.1`, commits `a1040617..b3634a78`. The Minor group was swept selectively — the entries still open are listed under *Deferred* below.
+Plan: `docs/superpowers/plans/2026-07-30-cross-platform-path-fixes.md` (19 tasks). All 4 Critical and all 24 Important findings are fixed on branch `0.5.1`, commits `a1040617..b3634a78`. The Minor group was swept selectively. *Deferred* below is the true residual ledger: it carries both the items deliberately queued out of this cycle **and** the remainder of the Minor group, which was left untouched — it is not a claim that everything else in Minor was fixed.
 
 ### Critical
 
@@ -212,6 +212,20 @@ Carried out of this cycle deliberately — none is a correctness regression, eac
 - TS path sort unification (`BlackHole.tsx` vs `MissingMetadataTable.tsx`).
 - Case-folded root equality in the Folders UI (`FolderRail.tsx`, `ArchiveInspector.tsx`).
 
+Remainder of the Minor group — not swept, no work started:
+
+- `native_separator_of` fails open to `\` for empty/relative input (`db/operations.rs:74-76`). The related `C:/`-spelled mixed-separator blind spot (audit item I4/T2) is now PARTLY covered: `normalize_separators` folds the spelling at the rename boundary, so that entry point is handled — every other caller of the sniffer still is not.
+- `is_inside_any` reports "not inside any scan root" for nonexistent sources — `exists()` check ordering (`file_op/planner.rs:252`).
+- No intra-plan duplicate-destination detection (`file_op/planner.rs:140-162`) — two plan rows targeting one destination are caught late at execute, leaving a half-done operation.
+- `relocate_missing_file` stores the raw user path (separator-folded only; no canonicalize, no `normalize_path`, no `PathPolicy` check).
+- `master_relative_path` interpolates `date` unsanitized (`calibration_library/paths.rs:82`), unlike the light path's `date_part()`.
+- `c_<original_filename>` used verbatim (`calibration_library/paths.rs:109-121`) — POSIX-legal, NTFS-illegal characters survive from a synced or foreign catalog.
+- `File::create` over a locked zip in Overwrite mode → sharing violation (`archive/zip_writer.rs`).
+- `output_path_exists` byte-compares over a case-insensitive namespace (`db/light_calibrations.rs`) — mitigated in both live call paths by `Path::exists()`.
+- `DuplicateGroupCard.tsx:49` `startsWith` without a component boundary (display only).
+- `types.ts` path-helper root edges — `getParentPath('C:\astro')` → `C:`, `parentPath('/data')` returns itself, `joinPath` sniffs the separator via `includes('\\')`. T17 fixed only the `BlackHole.tsx` / `MissingMetadataTable.tsx` basename helpers; `types.ts` was left as-is.
+- `useTauri.ts:352` passes snake_case `directory_path` (latent — no callers today).
+
 Discovered during the cycle, deferred with it:
 
 - OBJECT disambiguator is still `?`-mangled — needs a lenient scanner compare (I22's reversible encoding covers the identity cards, not this one).
@@ -229,6 +243,10 @@ Discovered during the cycle, deferred with it:
 - Duplicate keep-rule auto-delete sets may shift now that "path contains" actually matches on Windows — re-review before running.
 - Pre-existing `?`-mangled calibrated-light headers are unrecoverable until those frames are re-calibrated.
 - Windows long paths need the OS policy `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled=1` **in addition to** the shipped manifest.
+- Moves that previously aborted on Linux bind mounts / Windows folder-mounted volumes now succeed via copy-verify-delete (slower per file).
+- Deleting an archive now fails loudly if a zip can't be removed (catalog rows kept) instead of orphaning the zip.
+- Case-only renames (`m31.fits` → `M31.fits`) now work on Windows/macOS.
+- On Linux, an archive plan with two files whose in-zip paths differ only by case is now refused (zip portability).
 
 ### Still open from the plan
 
