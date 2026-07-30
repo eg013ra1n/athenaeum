@@ -611,8 +611,13 @@ fn preflight_library_placement(
 /// would purge the old library's catalog rows on its way to failing. Residual
 /// window: the two phases are still not one transaction, so a delegate failure
 /// after a passed pre-flight means a rare TOCTOU (the disk changed in between).
-/// If that happens the old root is gone; the key is cleared and the role reads
-/// unassigned; designate again to recover. The error from the set phase
+/// If that happens the old root is gone; IF the `calibration.library_dir`
+/// setting was the one naming it (equal to it, or nested under it), it is
+/// best-effort demoted to `""` (a failure to clear is logged) and the role
+/// reads unassigned — a key that names something else entirely (e.g. a still-
+/// working covered library, orphaned only because an unrelated vestigial
+/// `calibration_library`-kind root got deleted in the same call) is left
+/// untouched. Designate again to recover. The error from the set phase
 /// surfaces verbatim.
 ///
 /// Re-picking the folder that is already the library is a no-op keep: the old
@@ -641,7 +646,7 @@ pub fn switch_calibration_library_dir(
     policy.check(&new_path)?;
 
     let old_root = get_calibration_library_root(ctx)?;
-    let mut removed_old_root = false;
+    let mut removed_root_path: Option<String> = None;
     if let Some(old) = old_root {
         if canonical_or_raw(&old.path) != new_path {
             let id = old.id.ok_or_else(|| {
@@ -655,31 +660,57 @@ pub fn switch_calibration_library_dir(
                 tracing::error!(root_id = id, error = %e, "failed to remove old calibration library root");
                 ApiError::Internal(format!("Failed to remove old calibration library root: {e}"))
             })?;
-            removed_old_root = true;
+            removed_root_path = Some(old.path.clone());
         }
     }
 
     set_calibration_library_dir(ctx, new_path.to_string_lossy().to_string(), policy).map_err(|e| {
-        if removed_old_root {
-            // The old root is already purged; a key naming a removed folder
-            // is the one state no screen can explain. Demote to "role
-            // unassigned" — designating again is the documented recovery.
+        if let Some(removed) = removed_root_path.as_deref() {
+            // The root we just deleted is gone — but the settings key is a
+            // SECOND, independent copy of a path, and `get_calibration_library_root`
+            // only returns the FIRST `calibration_library`-kind row: a vestigial
+            // second row (Minor-5, deliberately left in place) can be the one
+            // that got deleted here while the working key names a completely
+            // different, still-intact covered library. Only demote when the
+            // CURRENT resolved key is actually the one we just orphaned — equal
+            // to the removed root's path, or nested under it (same
+            // separator-strict prefix test the relink guard uses) — never an
+            // unrelated key.
             match db(ctx) {
                 Ok(db) => {
                     let conn = db.conn();
-                    if let Err(e2) = ctx.settings.persist_setting(
-                        &conn,
-                        crate::settings::keys::CALIBRATION_LIBRARY_DIR,
-                        "",
-                    ) {
-                        tracing::error!(error = %e2, "failed to clear stale calibration library key after failed switch");
+                    match resolve_calibration_library_dir(&conn) {
+                        Ok(Some(dir)) => {
+                            let sep = if removed.starts_with('/') { '/' } else { '\\' };
+                            let trimmed = removed.trim_end_matches(sep);
+                            let removed_prefix = format!("{}{}", trimmed, sep);
+                            if dir == *removed || dir.starts_with(&removed_prefix) {
+                                // The old root is already purged; a key naming
+                                // it is the one state no screen can explain.
+                                // Demote to "role unassigned" — designating
+                                // again is the documented recovery.
+                                if let Err(e2) = ctx.settings.persist_setting(
+                                    &conn,
+                                    crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                                    "",
+                                ) {
+                                    tracing::error!(error = %e2, "failed to clear stale calibration library key after failed switch");
+                                }
+                                tracing::error!(error = %e, "library switch failed after old root removal — role left unassigned");
+                            }
+                        }
+                        Ok(None) => {
+                            // Already empty/unset — nothing to demote.
+                        }
+                        Err(e2) => {
+                            tracing::error!(error = %e2, "failed to resolve calibration library dir while checking demote gate after failed switch");
+                        }
                     }
                 }
                 Err(e2) => {
-                    tracing::error!(error = %e2, "no db handle to clear stale calibration library key after failed switch");
+                    tracing::error!(error = %e2, "no db handle to check/clear stale calibration library key after failed switch");
                 }
             }
-            tracing::error!(error = %e, "library switch failed after old root removal — role left unassigned");
         }
         e
     })
@@ -1112,9 +1143,15 @@ pub fn relink_scan_root(
         // rail loses the covered-library row.
         if let Some(dir) = resolve_calibration_library_dir(&conn)? {
             let sep = if old_path.starts_with('/') { '/' } else { '\\' };
-            let old_prefix = format!("{}{}", old_path.trim_end_matches(sep), sep);
+            let trimmed = old_path.trim_end_matches(sep);
+            let old_prefix = format!("{}{}", trimmed, sep);
             if dir == old_path || dir.starts_with(&old_prefix) {
-                let moved = format!("{}{}", new_path, &dir[old_path.len()..]);
+                // Slice at the TRIMMED length, not `old_path.len()`: a
+                // (defensive-only — paths are canonicalized on write)
+                // trailing-separator `old_path` would otherwise either eat the
+                // remainder's leading separator (`/new/rootmasters`) or, with
+                // multiple trailing separators, slice past a char boundary.
+                let moved = format!("{}{}", new_path, &dir[trimmed.len()..]);
                 ctx.settings
                     .persist_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR, &moved)
                     .map_err(|e| {
@@ -2590,6 +2627,106 @@ mod switch_library_tests {
             got.as_deref(),
             Some(""),
             "key must be demoted, not orphaned"
+        );
+    }
+
+    /// Reviewer-flagged Important fix: `get_calibration_library_root` returns
+    /// only the FIRST `calibration_library`-kind row it finds. With two such
+    /// rows present (Minor-5's vestigial-row state), deleting the FIRST one
+    /// during a switch must not demote a settings key that names a completely
+    /// different, still-working covered library. Negative-space companion to
+    /// `switch_failure_after_delete_demotes_key_instead_of_orphaning` above —
+    /// this is the case where the demote gate must stay CLOSED.
+    #[test]
+    fn switch_failure_after_delete_leaves_unrelated_covered_key_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let monitored = mkdirs(&tmp, "astro");
+        let covered = mkdirs(&tmp, "astro/masters");
+        let vestige1 = mkdirs(&tmp, "vestige1");
+        let vestige2 = mkdirs(&tmp, "vestige2");
+        let new = mkdirs(&tmp, "lib_new");
+        add_scan_root(&ctx, monitored, &PathPolicy::AllowAll, None).unwrap();
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO scan_roots (path, kind) VALUES (?1, 'calibration_library'), (?2, 'calibration_library')",
+                rusqlite::params![vestige1, vestige2],
+            )
+            .unwrap();
+            // The WORKING key: a covered library under the monitored root —
+            // unrelated to either vestigial dedicated root.
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &covered,
+            )
+            .unwrap();
+        }
+
+        let err = switch_calibration_library_dir(&ctx, new, &PathPolicy::AllowAll);
+
+        assert!(
+            err.is_err(),
+            "delegate uniqueness check must still reject the surviving vestigial root"
+        );
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let got =
+            crate::db::get_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(covered.as_str()),
+            "a vestigial root's deletion must never clear an unrelated, still-working covered-library key"
+        );
+    }
+
+    /// Negative fixture (Minor-2): with NO `calibration_library`-kind root at
+    /// all, `get_calibration_library_root` returns `None`, so the delete
+    /// branch never runs and `removed_root_path` stays `None` — the demote
+    /// gate must never even be consulted. Without the `if let Some(removed)`
+    /// gate this would still pass (there's no delete to react to), but it
+    /// pins the baseline the Important fix's `Some` branch is layered on top
+    /// of, so a future refactor that starts demoting unconditionally trips it.
+    #[test]
+    fn switch_failure_without_any_previous_library_root_never_touches_an_unrelated_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx(&tmp);
+        let monitored = mkdirs(&tmp, "astro");
+        let covered = mkdirs(&tmp, "astro/masters");
+        let other = mkdirs(&tmp, "other");
+        let child = mkdirs(&tmp, "other/child");
+        add_scan_root(&ctx, monitored, &PathPolicy::AllowAll, None).unwrap();
+        add_scan_root(&ctx, child.clone(), &PathPolicy::AllowAll, None).unwrap();
+        {
+            let db = db(&ctx).unwrap();
+            let conn = db.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &covered,
+            )
+            .unwrap();
+        }
+        // No calibration_library-kind root exists at all — get_calibration_library_root
+        // returns None, so switch's delete branch is never entered.
+        assert!(get_calibration_library_root(&ctx).unwrap().is_none());
+
+        let err = switch_calibration_library_dir(&ctx, other, &PathPolicy::AllowAll);
+
+        assert!(
+            err.is_err(),
+            "a folder containing an existing root ('{child}') must be rejected"
+        );
+        let db = db(&ctx).unwrap();
+        let conn = db.conn();
+        let got =
+            crate::db::get_setting(&conn, crate::settings::keys::CALIBRATION_LIBRARY_DIR).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some(covered.as_str()),
+            "no root was ever deleted — the key must be untouched"
         );
     }
 }
