@@ -1601,12 +1601,18 @@ pub fn get_folder_overview(ctx: &ServiceContext) -> Result<FolderOverview, ApiEr
         // semantics as `db::operations::scan_root_prefix_predicate`, which is
         // separator-strict too (both close the same name-prefix-sibling
         // hazard — see the `name_prefix_sibling` tests in `db/operations.rs`).
+        //
+        // Trim any trailing separator BEFORE the SQL appends its own — a root
+        // stored as `C:\`, `D:\` or `/` otherwise builds a doubled-separator
+        // lower bound that matches nothing (same normalization every other
+        // prefix site does via `trim_end_matches`).
+        let root_trimmed = root.path.trim_end_matches(['/', '\\']);
         let (file_count, total_bytes): (i64, i64) = conn
             .query_row(
                 "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM files
                  WHERE (path >= ?1 || '/' AND path < ?1 || '0')
                     OR (path >= ?1 || '\\' AND path < ?1 || ']')",
-                rusqlite::params![root.path],
+                rusqlite::params![root_trimmed],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|e| ApiError::Internal(format!("overview query failed: {e}")))?;
@@ -3021,6 +3027,44 @@ mod overview_tests {
         let o = ov.archive_roots.iter().find(|r| r.path == other).unwrap();
         assert_eq!(o.set_count, 1);
         assert_eq!(o.total_zip_bytes, 10);
+    }
+
+    /// Roots stored WITH a trailing separator — a Windows drive root (`C:\`)
+    /// and the POSIX filesystem root (`/`), both real user configurations.
+    /// The SQL appends its own separator to the bound, so without trimming
+    /// first the lower bound becomes `C:\\` / `//` and the root counts zero of
+    /// its own files. DB-fixture level: `C:\` can't be a real directory on the
+    /// dev host, so the `scan_roots` rows are inserted directly.
+    #[test]
+    fn overview_counts_files_under_trailing_separator_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let db = ctx.db.get().unwrap();
+        {
+            let conn = db.conn();
+            conn.execute(
+                "INSERT INTO scan_roots (path, enabled) VALUES (?1, 1), (?2, 1)",
+                rusqlite::params![r"C:\", "/"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'a.fits', 100, '2026-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![r"C:\Astro\a.fits"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'b.fits', 50, '2026-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params!["/b.fits"],
+            )
+            .unwrap();
+        }
+        let ov = get_folder_overview(&ctx).unwrap();
+        let counts: Vec<i64> = ov.scan_roots.iter().map(|s| s.file_count).collect();
+        assert_eq!(
+            counts,
+            vec![1, 1],
+            "trailing-separator roots must still own their descendants: {ov:?}"
+        );
     }
 }
 

@@ -853,12 +853,15 @@ pub fn get_files_by_directory(
         None => String::new(),
     };
 
-    // Find files that are directly in this directory (not in subdirectories)
-    // Use OS path separator for cross-platform compatibility (/ on macOS/Linux, \ on Windows)
-    let sep = std::path::MAIN_SEPARATOR.to_string();
-    let path_prefix = format!("{}{}", directory_path, sep);
+    // Find files that are directly in this directory (not in subdirectories).
+    // Data-derived separator (native_separator_of doc: the leading character
+    // decides, not the build OS) + trailing-separator trim so a drive root
+    // (`D:\`) or `/` still lists its direct children.
+    let sep = native_separator_of(directory_path).to_string();
+    let dir = directory_path.trim_end_matches(['/', '\\']);
+    let path_prefix = format!("{}{}", dir, sep);
     let path_hi = path_prefix_upper(&path_prefix);
-    let expected_depth = directory_path.matches(sep.as_str()).count() as i64 + 1;
+    let expected_depth = dir.matches(sep.as_str()).count() as i64 + 1;
 
     let query = format!(
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
@@ -968,10 +971,13 @@ pub fn get_files_by_directory_for_camera(
         None => String::new(),
     };
 
-    let sep = std::path::MAIN_SEPARATOR.to_string();
-    let path_prefix = format!("{}{}", directory_path, sep);
+    // Same data-derived separator + trailing-separator trim as
+    // `get_files_by_directory` above.
+    let sep = native_separator_of(directory_path).to_string();
+    let dir = directory_path.trim_end_matches(['/', '\\']);
+    let path_prefix = format!("{}{}", dir, sep);
     let path_hi = path_prefix_upper(&path_prefix);
-    let expected_depth = directory_path.matches(sep.as_str()).count() as i64 + 1;
+    let expected_depth = dir.matches(sep.as_str()).count() as i64 + 1;
 
     let query = format!(
         "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
@@ -1724,7 +1730,10 @@ fn enrich_duplicate_groups(conn: &Connection, groups: &mut [DuplicateGroup]) -> 
             let Some(r) = by_id.get(file_id) else { continue };
             let (scan_root_id, scan_root_path) = scan_roots
                 .iter()
-                .find(|(_, sr_path)| r.path.starts_with(sr_path.as_str()))
+                // Separator-boundary-safe (scanner helper): with roots /data
+                // and /data/M31x, the file /data/M31xyz/a.fits belongs to
+                // /data, not /data/M31x — a bare starts_with mis-attributed it.
+                .find(|(_, sr_path)| crate::scanner::path_has_root_prefix(&r.path, sr_path))
                 .map(|(id, sr_path)| (Some(*id), Some(sr_path.clone())))
                 .unwrap_or((None, None));
             files.push(crate::models::DuplicateFile {
@@ -5481,6 +5490,109 @@ mod path_prefix_range_tests {
             m31.iter().map(|(f, _)| f.path.clone()).collect::<Vec<_>>(),
             vec!["/data/M31_Ha/c.fits".to_string()],
             "'_' must be treated literally, not as a single-char LIKE wildcard"
+        );
+    }
+
+    /// Windows-shaped rows listed from a POSIX host: the separator must come
+    /// from the DATA (`native_separator_of`), not from the build OS, and the
+    /// directory must be trimmed so a drive root (`C:\`) still lists its
+    /// direct children instead of building a `C:\\` prefix.
+    #[test]
+    fn get_files_by_directory_uses_data_separator_and_handles_drive_root() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        for (path, name) in [
+            (r"C:\Astro\a.fits", "a.fits"),
+            (r"C:\Astro\sub\b.fits", "b.fits"),
+            (r"C:\root_level.fits", "root_level.fits"),
+        ] {
+            // `created_at` is supplied explicitly (like `insert_file_with_instrume`
+            // above): the column's SQLite default is not RFC3339, and the row
+            // mapper parses it strictly.
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+                 VALUES (?1, ?2, 1, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+                rusqlite::params![path, name],
+            )
+            .unwrap();
+        }
+        // Direct children only, keyed off the DATA's separator (not the build OS's):
+        let in_astro = get_files_by_directory(&conn, r"C:\Astro", None).unwrap();
+        assert_eq!(in_astro.len(), 1, "only the direct child, not sub\\b.fits");
+        assert_eq!(in_astro[0].0.filename, "a.fits");
+        // Drive root with its trailing separator:
+        let at_root = get_files_by_directory(&conn, r"C:\", None).unwrap();
+        assert_eq!(at_root.len(), 1);
+        assert_eq!(at_root[0].0.filename, "root_level.fits");
+    }
+
+    /// Duplicate-group scan-root attribution must respect the separator
+    /// boundary. `enrich_duplicate_groups` walks the roots longest-first, so
+    /// with roots `/data` and `/data/M31x` the bare `starts_with` it used to
+    /// do matched `/data/M31x` against `/data/M31xyz/a.fits` and reported the
+    /// wrong owning root in the duplicates UI. Driven through
+    /// `enrich_duplicate_groups` directly rather than `find_duplicate_groups`
+    /// — the latter needs real content hashes, and the helper's own boundary
+    /// cases are already pinned in the scanner tests.
+    #[test]
+    fn duplicate_group_attribution_respects_separator_boundary() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for root in ["/data", "/data/M31x"] {
+            conn.execute(
+                "INSERT INTO scan_roots (path, enabled) VALUES (?1, 1)",
+                [root],
+            )
+            .unwrap();
+        }
+        // The trap file (name-prefix sibling of the deeper root) plus a file
+        // genuinely under `/data/M31x`, so the assert proves the boundary is
+        // enforced without simply defeating the deeper root everywhere.
+        let mut file_ids = Vec::new();
+        for path in ["/data/M31xyz/a.fits", "/data/M31x/b.fits"] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+                 VALUES (?1, 'dup.fits', 1, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+                [path],
+            )
+            .unwrap();
+            file_ids.push(conn.last_insert_rowid());
+        }
+
+        let mut groups = vec![DuplicateGroup {
+            id: None,
+            size: 1,
+            content_hash: "deadbeef".to_string(),
+            file_count: 2,
+            file_paths: vec![
+                "/data/M31xyz/a.fits".to_string(),
+                "/data/M31x/b.fits".to_string(),
+            ],
+            file_ids: file_ids.clone(),
+            files: Vec::new(),
+        }];
+        enrich_duplicate_groups(&conn, &mut groups).unwrap();
+
+        let trap = groups[0]
+            .files
+            .iter()
+            .find(|f| f.path == "/data/M31xyz/a.fits")
+            .expect("trap file must be enriched");
+        assert_eq!(
+            trap.scan_root_path.as_deref(),
+            Some("/data"),
+            "name-prefix sibling root /data/M31x must not claim /data/M31xyz/a.fits"
+        );
+
+        let genuine = groups[0]
+            .files
+            .iter()
+            .find(|f| f.path == "/data/M31x/b.fits")
+            .expect("genuine child must be enriched");
+        assert_eq!(
+            genuine.scan_root_path.as_deref(),
+            Some("/data/M31x"),
+            "longest-prefix attribution must still win for a true descendant"
         );
     }
 }

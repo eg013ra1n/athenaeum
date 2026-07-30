@@ -47,7 +47,7 @@ pub(crate) fn path_to_utf8(path: &std::path::Path) -> anyhow::Result<String> {
 /// that doesn't itself start with a separator. Degenerate case: root `/`
 /// trims to `""`, so every absolute unix path matches it — a root of `/`
 /// legitimately owns the whole filesystem.
-fn path_has_root_prefix(path: &str, root: &str) -> bool {
+pub(crate) fn path_has_root_prefix(path: &str, root: &str) -> bool {
     let root = root.trim_end_matches(['/', '\\']);
     if path == root {
         return true;
