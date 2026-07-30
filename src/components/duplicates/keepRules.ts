@@ -62,6 +62,15 @@ export function groupKey(group: DuplicateGroup): string {
   return `hash:${group.content_hash}:${group.size}`;
 }
 
+/** Fold both separator styles to '/'. User patterns like "Backup/2023" must
+ *  match Windows catalog paths (`C:\...\Backup\2023\...`); an unmatched rule
+ *  silently ABSTAINS and the chain falls through to a different rule — the
+ *  user gets a different deletion set than configured. */
+const normalizeSeparators = (s: string) => s.replace(/\\/g, '/');
+
+/** Path depth in segments, separator-agnostic. */
+const pathDepth = (p: string) => p.split(/[/\\]/).filter(Boolean).length;
+
 // ── Per-rule evaluators ──────────────────────────────────────────────────────
 //
 // Each evaluator returns the set of file IDs the rule would mark for deletion
@@ -92,13 +101,14 @@ function evalPathContains(
   if (cleaned.length === 0) return new Set();
 
   const caseSensitive = rule.config.caseSensitive;
-  const normalizedPatterns = caseSensitive
-    ? cleaned
-    : cleaned.map((p) => p.toLowerCase());
+  const normalizedPatterns = cleaned
+    .map(normalizeSeparators)
+    .map((p) => (caseSensitive ? p : p.toLowerCase()));
 
   const out = new Set<number>();
   for (const f of files) {
-    const haystack = caseSensitive ? f.path : f.path.toLowerCase();
+    const folded = normalizeSeparators(f.path);
+    const haystack = caseSensitive ? folded : folded.toLowerCase();
     if (normalizedPatterns.some((p) => haystack.includes(p))) {
       out.add(f.fileId);
     }
@@ -123,13 +133,26 @@ function evalOldestMtime(files: DuplicateFile[]): Set<number> {
 }
 
 function evalShortestPath(files: DuplicateFile[]): Set<number> {
-  let min = Number.POSITIVE_INFINITY;
+  // Segment count first, character length only as a tie-break. Ranking by
+  // character length alone made a UNC copy (`\\nas\astro\a.fits`) "longer" than
+  // a drive-letter copy of equal depth, so the network copy was systematically
+  // marked for deletion. Files tied with the best (depth, length) are all kept —
+  // only strictly-worse ones enter the deletion set.
+  let bestDepth = Number.POSITIVE_INFINITY;
+  let bestLen = Number.POSITIVE_INFINITY;
   for (const f of files) {
-    if (f.path.length < min) min = f.path.length;
+    const d = pathDepth(f.path);
+    if (d < bestDepth || (d === bestDepth && f.path.length < bestLen)) {
+      bestDepth = d;
+      bestLen = f.path.length;
+    }
   }
   const out = new Set<number>();
   for (const f of files) {
-    if (f.path.length > min) out.add(f.fileId);
+    const d = pathDepth(f.path);
+    if (d > bestDepth || (d === bestDepth && f.path.length > bestLen)) {
+      out.add(f.fileId);
+    }
   }
   return out;
 }
