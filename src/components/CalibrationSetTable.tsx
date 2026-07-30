@@ -639,8 +639,7 @@ function MasterProvenanceBlock({ setId }: { setId: number }) {
 
   // Escape hatch from the missing-zip dead end: clears the stale archive
   // markers (backend re-checks the zip really is gone — 409 otherwise).
-  // window.confirm matches this codebase's destructive-action pattern
-  // (CalibrationFolderSection, ArchiveFoldersSection).
+  // window.confirm matches this codebase's destructive-action pattern.
   const forgetArchive = async () => {
     if (prov.sourceSetId == null) return;
     if (!window.confirm(

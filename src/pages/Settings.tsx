@@ -549,8 +549,7 @@ export default function Settings() {
       </div>
 
       {/* Calibration Tab. The calibration-folder picker lives in File
-          Manager → Monitored Directories (CalibrationFolderSection), next to
-          the Archive Folders section. */}
+          Manager → Folders, on the Calibration Library rail entry. */}
       {activeTab === 'calibration' && (
         <div className="bg-surface-elevated rounded-lg p-6 mt-6">
           <h3 className="text-xl font-semibold mb-4">Calibration Matching Configuration</h3>
