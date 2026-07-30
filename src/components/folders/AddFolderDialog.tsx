@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { X, Check, Info, AlertCircle, FolderOpen, Loader2 } from 'lucide-react';
 import { api } from '../../api';
 import { pickDirectory } from '../../api/desktop';
@@ -14,11 +14,13 @@ interface AddFolderDialogProps {
   /** Pre-select a type (e.g. a role's "Set up…" row) and jump to step 2. */
   preselect?: AddableKind;
   scanRoots: ScanRoot[];
+  /** Effective calibration-library dir when it is settings-only (covered) — no scan-root row exists for it. */
+  coveredCalibrationDir?: string | null;
   onClose: () => void;
   onAdded: () => void;
 }
 
-export function AddFolderDialog({ isOpen, preselect, scanRoots, onClose, onAdded }: AddFolderDialogProps) {
+export function AddFolderDialog({ isOpen, preselect, scanRoots, coveredCalibrationDir, onClose, onAdded }: AddFolderDialogProps) {
   const { notify } = useNotifications();
   const [kind, setKind] = useState<AddableKind | null>(null);
   const [pickedPath, setPickedPath] = useState<string | null>(null);
@@ -26,30 +28,43 @@ export function AddFolderDialog({ isOpen, preselect, scanRoots, onClose, onAdded
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showBrowser, setShowBrowser] = useState(false);
+  /** Bumped on every validate/reset; a late reply whose ticket moved must not paint. */
+  const validateSeq = useRef(0);
 
   useEffect(() => {
     if (isOpen) {
+      validateSeq.current++;
       setKind(preselect ?? null);
       setPickedPath(null);
       setVerdict(null);
       setError(null);
+      setShowBrowser(false);
+      setBusy(false);
     }
   }, [isOpen, preselect]);
 
   if (!isOpen) return null;
 
-  const takenRolePath = (role: RoleKind): string | undefined =>
-    scanRoots.find((r) => r.kind === role)?.path;
+  const takenRolePath = (role: RoleKind): string | undefined => {
+    const fromRoots = scanRoots.find((r) => r.kind === role)?.path;
+    // A "covered" calibration library (inside a monitored root) is settings-only — it has no
+    // scan-root row, so the effective dir is the only evidence the role is already taken.
+    if (role === 'calibration_library') return fromRoots ?? coveredCalibrationDir ?? undefined;
+    return fromRoots;
+  };
 
   const validate = async (candidateKind: AddableKind, path: string) => {
+    const seq = ++validateSeq.current;
     setError(null);
     setPickedPath(path);
     setVerdict(null);
     try {
       const v = await api.invoke<FolderCandidateVerdict>('validate_folder_candidate', { kind: candidateKind, path });
+      if (seq !== validateSeq.current) return; // superseded by a newer pick/reset
       setVerdict(v);
     } catch (e) {
       console.error('[AddFolderDialog] validate failed:', e);
+      if (seq !== validateSeq.current) return;
       setError(typeof e === 'string' ? e : String(e));
     }
   };
@@ -57,8 +72,13 @@ export function AddFolderDialog({ isOpen, preselect, scanRoots, onClose, onAdded
   const pick = async () => {
     if (!kind) return;
     if (!isTauri) { setShowBrowser(true); return; }
-    const picked = await pickDirectory();
-    if (picked && typeof picked === 'string') await validate(kind, picked);
+    try {
+      const picked = await pickDirectory();
+      if (picked && typeof picked === 'string') await validate(kind, picked);
+    } catch (e) {
+      console.error('[AddFolderDialog] pick failed:', e);
+      setError(typeof e === 'string' ? e : String(e));
+    }
   };
 
   const confirmAdd = async () => {
@@ -130,7 +150,7 @@ export function AddFolderDialog({ isOpen, preselect, scanRoots, onClose, onAdded
           <div className="space-y-3">
             <div className="flex items-center gap-2 text-sm font-semibold text-content">
               <KindIcon k={kind} /> {meta.label}
-              <button onClick={() => { setKind(null); setPickedPath(null); setVerdict(null); setError(null); }} className="ml-auto text-xs text-accent hover:underline">change type</button>
+              <button onClick={() => { validateSeq.current++; setKind(null); setPickedPath(null); setVerdict(null); setError(null); }} className="ml-auto text-xs text-accent hover:underline">change type</button>
             </div>
             <div className="flex items-start gap-2 p-3 rounded-lg bg-surface border border-accent/30 text-xs text-content-muted">
               <Info size={14} className="text-accent shrink-0 mt-0.5" />
@@ -174,7 +194,11 @@ export function AddFolderDialog({ isOpen, preselect, scanRoots, onClose, onAdded
         <FolderBrowserModal
           isOpen={showBrowser}
           scope="scan"
-          onSelect={(path) => { setShowBrowser(false); if (kind) void validate(kind, path); }}
+          onSelect={(path) => {
+            setShowBrowser(false);
+            if (kind) void validate(kind, path);
+            else console.error('[AddFolderDialog] onSelect with no kind — dropping', path);
+          }}
           onClose={() => setShowBrowser(false)}
         />
       </div>
