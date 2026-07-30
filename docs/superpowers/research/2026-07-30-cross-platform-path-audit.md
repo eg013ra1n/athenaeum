@@ -137,8 +137,8 @@ Fix: byte-range form (`native_separator_of` + `trim_end_matches(sep)` + `path_pr
 
 ## Stale documentation noted en route
 
-- CLAUDE.md: the Delete pipeline (`enqueue_delete_operation`, `MoveStrategy::Delete`, deepest-first rmdir, `OperationKind::FileOpDelete`) no longer exists — user-facing delete is Black Hole; real `OperationKind` variants are `ZipArchive`, `FileOpMove`, `FileOpReconcile`. The "`/Volumes` vs `/private/Volumes` edge cases" survival is structural, not special-cased.
-- `archive/planner.rs:612-617` `available_disk_space` always errors by design → the "insufficient disk space" guard is dead code on every platform (behavioral, not platform).
+- CLAUDE.md: the Delete pipeline (`enqueue_delete_operation`, `MoveStrategy::Delete`, deepest-first rmdir, `OperationKind::FileOpDelete`) no longer exists — user-facing delete is Black Hole; real `OperationKind` variants are `ZipArchive`, `FileOpMove`, `FileOpReconcile`. The "`/Volumes` vs `/private/Volumes` edge cases" survival is structural, not special-cased. **Resolved** in the Task 18 doc truth-up (see Status below); `list_unfinished_file_operations` was also stale and was removed in the same pass. Note the `MoveStrategy::Delete` and `FileOpKind::Delete` *variants* do still exist in `file_op/models.rs` — they are unreachable (planner never emits them, `executor::run_operation` rejects `kind='delete'` loudly), which is how CLAUDE.md now describes them.
+- `archive/planner.rs:612-617` `available_disk_space` always errors by design → the "insufficient disk space" guard is dead code on every platform (behavioral, not platform). Still open after this cycle.
 
 ## Proposed fix grouping (for the plan)
 
@@ -150,3 +150,87 @@ Fix: byte-range form (`native_separator_of` + `trim_end_matches(sep)` + `path_pr
 6. **Export/light-cal Windows hardening** (I18 sanitizer, I19 case-collision dedup, I20 longPathAware manifest, I21 rename retry, I22 reversible identity encoding).
 7. **Minors sweep + CLAUDE.md refresh** (stale Delete pipeline, dead disk-space guard note).
 8. **One-time gate**: run `cargo check --workspace` on a Windows runner to convert the by-inspection compile claim into a compiler fact (local cross-check dies in `ring`'s MSVC build).
+
+---
+
+## Status (2026-07-30 fix cycle)
+
+Plan: `docs/superpowers/plans/2026-07-30-cross-platform-path-fixes.md` (19 tasks). All 4 Critical and all 24 Important findings are fixed on branch `0.5.1`, commits `a1040617..b3634a78`. The Minor group was swept selectively — the entries still open are listed under *Deferred* below.
+
+### Critical
+
+| Finding | Status | Commit(s) |
+| ---- | ---- | ---- |
+| C1 — `relink_files` sweeps sibling roots | Fixed | `a1040617` |
+| C2 — `recreate_calibration_sets_for_root` groups sibling roots | Fixed | `0ac0f047` |
+| C3 — restore-to-original unreachable on Windows | Fixed | `f205a04e` |
+| C4 — `relink_scan_root` persists `\\?\` verbatim paths | Fixed | `9e0fefa1` |
+
+### Important
+
+| Finding | Status | Commit(s) |
+| ---- | ---- | ---- |
+| I1 — `find_missing_files` unbounded `LIKE`, both backends | Fixed | `ddea802f` |
+| I2 — `get_folder_overview` trailing-separator root → 0 rows | Fixed | `aed53f1a` |
+| I3 — `get_files_by_directory{,_for_camera}` build-OS separator | Fixed | `aed53f1a` |
+| I4 — `native_separator_of` sniffs only the first char | Fixed | `c45a1b6a` |
+| I5 — `enrich_duplicate_groups` bare `starts_with` attribution | Fixed | `aed53f1a` |
+| I6 — same-device ≠ rename-works (EXDEV) | Fixed | `c45a1b6a` |
+| I7 — case-only rename rejected on Windows/macOS | Fixed | `c45a1b6a` |
+| I8 — move hot-sync silently succeeds at zero rows | Fixed | `c45a1b6a` |
+| I9 — `browse_directories` returns `\\?\C:\…` to the frontend | Fixed | `9e0fefa1` |
+| I10 — `PathPolicy` denies everything on a Windows-hosted web build | Fixed | `9e0fefa1` |
+| I11 — `relink_files` stores lossy (U+FFFD) paths | Fixed | `a1040617` |
+| I12 — relink WalkDir lacks the scanner's `.max_depth(64)` cap | Fixed | `a1040617` |
+| I13 — `classify_target` raw string `starts_with` | Fixed | `ae507068` + `11860a98` |
+| I14 — mixed separators persisted on restore | Fixed | `ae507068` + `11860a98` |
+| I15 — case-sensitive planner root match → flattened zip → hash abort | Fixed | `ae507068` + `11860a98` (fix round: fold-aware `path_in_zip` strip + per-operation collision guard) |
+| I16 — `archive_roots` matched by exact SQL string | Fixed | `6e036ba5` |
+| I17 — swallowed `remove_file` results | Fixed | `46ae5ddc` + `9fe5f881` |
+| I18 — `sanitize_display_folder_name` lacks Windows rules; `..` escapes | Fixed | `ca860ed0` (F8 date-token bypass fully closed in `2e489184`) |
+| I19 — WBPP export silently drops case-colliding frames | Fixed | `f69d57f2` |
+| I20 — MAX_PATH: no `longPathAware` manifest | Fixed | `0f412913` |
+| I21 — atomic replace lacks a sharing-violation retry | Fixed | `d01c85f2` + `f6d9974a` (`stamp.rs` too) |
+| I22 — non-ASCII → `?` in identity header cards breaks adoption | Fixed | `2970e24c` |
+| I23 — duplicates keep-rule "path contains" never matches on Windows | Fixed | `2ef09f57` |
+| I24 — breadcrumbs drop the UNC `\\` prefix | Fixed | `b3634a78` |
+
+### Deferred
+
+Carried out of this cycle deliberately — none is a correctness regression, each is scoped work with its own trade-off:
+
+- Frontend platform-detection for the symlink checkbox (source platform from the backend, not `navigator.userAgent`).
+- `use_symlinks` server-side reject on a Windows web host (+ error when `files_organized == 0 && !warnings.is_empty()`).
+- Path-util consolidation into `src/utils/path.ts` (six divergent basename impls, shadowed `splitPath` export).
+- Duplicate groups transported as `'|'`-joined `GROUP_CONCAT` — `|` is legal on POSIX.
+- Non-UTF-8 discovery filter (filter once at discovery instead of per-scan re-reporting).
+- Component-length caps (NTFS 255 UTF-16 units vs ext4 255 bytes).
+- `path_in_zip` blanket `replace('\\', "/")` — needs a `cfg`-gate so legal POSIX backslash filenames survive.
+- In-zip Windows sanitization so a Linux-built archive extracts on Windows with foreign tools.
+- Staging path-length trims.
+- `browse_directories` `"/"` root sentinel displayed on Windows.
+- TS path sort unification (`BlackHole.tsx` vs `MissingMetadataTable.tsx`).
+- Case-folded root equality in the Folders UI (`FolderRail.tsx`, `ArchiveInspector.tsx`).
+
+Discovered during the cycle, deferred with it:
+
+- OBJECT disambiguator is still `?`-mangled — needs a lenient scanner compare (I22's reversible encoding covers the identity cards, not this one).
+- `delete_archive` should be hoisted out of the command layer into `core::api`.
+- `archive_roots` row back-fill migration, plus a verbatim writer for `migrate_legacy_archive_root`.
+- `relink_files` wants an enclosing transaction.
+- `stamp.rs` fixed tmp suffix is concurrency-unsafe.
+
+### Release-note lines owed
+
+- Pre-fix `missing_files` rows clear on re-run (sibling-root false positives were persisted).
+- Exact-case matching is a safer **under**-report, not a silent rewrite — expect fewer, not more, matches.
+- Re-export naming migration for frame-set names with dots or Windows reserved names (folder names change).
+- On Linux, plans over case-only-distinct roots are now refused loudly instead of merging.
+- Duplicate keep-rule auto-delete sets may shift now that "path contains" actually matches on Windows — re-review before running.
+- Pre-existing `?`-mangled calibrated-light headers are unrecoverable until those frames are re-calibrated.
+- Windows long paths need the OS policy `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled=1` **in addition to** the shipped manifest.
+
+### Still open from the plan
+
+- Task 19 / audit item 8: `cargo check --workspace` on a Windows runner, to turn the by-inspection compile claim into a compiler fact.
+- `archive/planner.rs` `available_disk_space` always errors by design → the "insufficient disk space" guard remains dead code on every platform (behavioral, not platform-specific; untouched by this cycle).
