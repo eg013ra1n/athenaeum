@@ -787,12 +787,19 @@ pub fn browse_directories(path: Option<String>, root_paths: &[PathBuf]) -> Resul
     }
 
     let target = PathBuf::from(&path_str);
-    let canonical = target.canonicalize().map_err(|e| ApiError::Invalid(format!("Invalid path: {}", e)))?;
+    let canonical = crate::api::scan_roots::normalize_path(
+        &target.canonicalize().map_err(|e| ApiError::Invalid(format!("Invalid path: {}", e)))?,
+    );
 
-    // Security: validate path is within scope roots
-    let is_allowed = root_paths
-        .iter()
-        .any(|allowed| allowed.canonicalize().map(|a| canonical.starts_with(&a)).unwrap_or(false));
+    // Security: validate path is within scope roots (both sides normalized —
+    // this is the one canonicalize in the domain whose result ESCAPES to the
+    // frontend and comes back through add_scan_root / export_to_wbpp).
+    let is_allowed = root_paths.iter().any(|allowed| {
+        allowed
+            .canonicalize()
+            .map(|a| canonical.starts_with(crate::api::scan_roots::normalize_path(&a)))
+            .unwrap_or(false)
+    });
 
     if !is_allowed {
         return Err(ApiError::Forbidden("Path is outside allowed directories".to_string()));
@@ -822,8 +829,12 @@ pub fn browse_directories(path: Option<String>, root_paths: &[PathBuf]) -> Resul
     let parent = canonical.parent().and_then(|p| {
         let parent_str = p.to_string_lossy().to_string();
         // Only return parent if it's still within a scope root
-        let parent_within =
-            root_paths.iter().any(|allowed| allowed.canonicalize().map(|a| p.starts_with(&a)).unwrap_or(false));
+        let parent_within = root_paths.iter().any(|allowed| {
+            allowed
+                .canonicalize()
+                .map(|a| p.starts_with(crate::api::scan_roots::normalize_path(&a)))
+                .unwrap_or(false)
+        });
         if parent_within {
             Some(parent_str)
         } else {

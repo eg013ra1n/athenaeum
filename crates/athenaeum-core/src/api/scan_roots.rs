@@ -61,7 +61,10 @@ pub struct RescanResultDto {
 ///
 /// Moved from `athenaeum-tauri::commands::utils::normalize_path` (only ever
 /// called from `add_scan_root`) — pure `std::path`, no Tauri dependency.
-fn normalize_path(path: &Path) -> std::path::PathBuf {
+///
+/// pub: also used by PathPolicy, browse_directories, and the archive-root
+/// commands — every place a canonicalized path escapes or is compared.
+pub fn normalize_path(path: &Path) -> std::path::PathBuf {
     #[cfg(windows)]
     {
         let s = path.to_string_lossy();
@@ -1088,10 +1091,14 @@ pub fn relink_scan_root(
         return Err(ApiError::Invalid("Path is not a directory".to_string()));
     }
 
-    let canonical = new_path_buf.canonicalize().map_err(|e| {
+    // normalize_path: canonicalize() on Windows returns \\?\-verbatim paths;
+    // every other path-writing site in this file strips the prefix before the
+    // path reaches scan_roots.path / files.path. Relink was the one writer
+    // that didn't — splitting one catalog into two spellings of the same tree.
+    let canonical = normalize_path(&new_path_buf.canonicalize().map_err(|e| {
         tracing::error!(root_id, path = %new_path, error = %e, "failed to resolve relink target path");
         ApiError::Internal(format!("Failed to resolve path: {}", e))
-    })?;
+    })?);
 
     policy.check(&canonical)?;
 

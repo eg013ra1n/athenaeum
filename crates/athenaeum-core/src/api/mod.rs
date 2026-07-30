@@ -96,7 +96,16 @@ impl PathPolicy {
         match self {
             PathPolicy::AllowAll => Ok(()),
             PathPolicy::AllowedRoots(roots) => {
-                if roots.iter().any(|r| p.starts_with(r)) {
+                // Windows canonicalize() yields \\?\-verbatim paths. Candidate
+                // and roots are canonicalized at DIFFERENT sites, so one side
+                // can be verbatim while the other is not — and
+                // Prefix::VerbatimDisk never component-matches Prefix::Disk,
+                // turning the sandbox into deny-all. Fold both sides first.
+                let candidate = crate::api::scan_roots::normalize_path(p);
+                if roots
+                    .iter()
+                    .any(|r| candidate.starts_with(crate::api::scan_roots::normalize_path(r)))
+                {
                     Ok(())
                 } else {
                     Err(ApiError::Forbidden(format!(
@@ -138,5 +147,24 @@ mod tests {
         assert!(p.check(Path::new("/data/astro/lights")).is_ok());
         assert!(matches!(p.check(Path::new("/etc/passwd")), Err(ApiError::Forbidden(_))));
         assert!(PathPolicy::AllowAll.check(Path::new("/anything")).is_ok());
+    }
+
+    #[test]
+    fn path_policy_allows_inside_and_refuses_sibling() {
+        let policy = PathPolicy::AllowedRoots(vec![PathBuf::from("/data/M31")]);
+        assert!(policy.check(Path::new("/data/M31/x.fits")).is_ok());
+        assert!(
+            policy.check(Path::new("/data/M31_Ha/x.fits")).is_err(),
+            "component-wise, not string prefix"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_policy_matches_across_verbatim_and_plain_spellings() {
+        let policy = PathPolicy::AllowedRoots(vec![PathBuf::from(r"\\?\C:\data")]);
+        assert!(policy.check(Path::new(r"C:\data\x.fits")).is_ok());
+        let policy2 = PathPolicy::AllowedRoots(vec![PathBuf::from(r"C:\data")]);
+        assert!(policy2.check(Path::new(r"\\?\C:\data\x.fits")).is_ok());
     }
 }
