@@ -42,7 +42,7 @@ export function RoleInspector(props: RoleInspectorProps) {
           <div className="flex items-center gap-2 font-mono text-xs text-content-muted">
             <span className="truncate">{dir}</span>
             {isTauri && !offline && (
-              <button onClick={() => revealItemInDir(dir).catch((e) => console.error('reveal failed:', e))}
+              <button onClick={() => revealItemInDir(dir).catch((e) => console.error('[RoleInspector] reveal failed:', e))}
                 title="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>
             )}
           </div>
@@ -55,7 +55,7 @@ export function RoleInspector(props: RoleInspectorProps) {
         )}
       </div>
 
-      <div className={`mt-4 p-3 rounded-lg bg-surface border text-xs text-content-muted ${meta.chip.includes('purple') ? 'border-purple/40' : 'border-border'}`}>
+      <div className={`mt-4 p-3 rounded-lg bg-surface border text-xs text-content-muted ${props.kind === 'calibration_library' ? 'border-purple/40' : 'border-border'}`}>
         {meta.explainer}
         {overview && <span className="font-semibold text-content"> {overview.file_count.toLocaleString()} files cataloged.</span>}
       </div>

@@ -18,9 +18,14 @@ interface ArchiveInspectorProps {
 export function ArchiveInspector({ root, archivedSets, totalZipBytes, onSetDefault, onRemove }: ArchiveInspectorProps) {
   const sets = archivedSets.filter((s) => (s.archive_root_path ?? '') === root.path);
   const [zipsBySet, setZipsBySet] = useState<Record<number, ArchiveZip[]>>({});
+  const [zipsError, setZipsError] = useState<string | null>(null);
+  // The set list is the real dependency: a held selection must pick up sets that
+  // arrive after mount (async load) and re-read after a Move-and-ZIP or a delete.
+  const setsKey = sets.map((s) => s.operation_id).join(',');
 
   useEffect(() => {
     setZipsBySet({});
+    setZipsError(null);
     let cancelled = false;
     (async () => {
       for (const s of sets) {
@@ -31,12 +36,15 @@ export function ArchiveInspector({ root, archivedSets, totalZipBytes, onSetDefau
           setZipsBySet((prev) => ({ ...prev, [s.operation_id!]: zips }));
         } catch (e) {
           console.error('[ArchiveInspector] list zips failed:', e);
+          if (cancelled) return;
+          setZipsError(String(e));
         }
       }
     })();
     return () => { cancelled = true; };
+    // `sets` is a fresh array each render — `setsKey` is its identity here.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [root.id]);
+  }, [root.id, setsKey]);
 
   return (
     <div className="flex-1 min-w-0 bg-surface-elevated rounded-lg p-5 overflow-y-auto">
@@ -51,7 +59,7 @@ export function ArchiveInspector({ root, archivedSets, totalZipBytes, onSetDefau
           <div className="flex items-center gap-2 font-mono text-xs text-content-muted">
             <span className="truncate">{root.path}</span>
             {isTauri && (
-              <button onClick={() => revealItemInDir(root.path).catch((e) => console.error('reveal failed:', e))}
+              <button onClick={() => revealItemInDir(root.path).catch((e) => console.error('[ArchiveInspector] reveal failed:', e))}
                 title="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>
             )}
           </div>
@@ -63,12 +71,13 @@ export function ArchiveInspector({ root, archivedSets, totalZipBytes, onSetDefau
       </div>
 
       <div className="flex flex-wrap gap-2 mt-3">
-        <Stat label="archived sets" value={String(sets.length)} />
+        <Stat label="archived frame sets" value={String(sets.length)} />
         <Stat label="total size" value={totalZipBytes > 0 ? formatBytes(totalZipBytes) : '—'} />
       </div>
 
       <Section title="Contents">
         {sets.length === 0 && <p className="text-xs text-content-muted">No archived frame sets stored in this folder yet.</p>}
+        {zipsError && <p className="text-xs text-error mb-2 break-all">Some zip lists could not be loaded — {zipsError}</p>}
         <div className="space-y-2">
           {sets.map((set) => {
             const zips = set.operation_id ? zipsBySet[set.operation_id] : undefined;
@@ -88,7 +97,7 @@ export function ArchiveInspector({ root, archivedSets, totalZipBytes, onSetDefau
                         <span className="text-content-muted whitespace-nowrap">{formatBytes(z.size_bytes)}</span>
                         {!z.exists && <span className="text-error whitespace-nowrap">missing</span>}
                         {isTauri && z.exists && (
-                          <button onClick={() => revealItemInDir(z.path).catch((e) => console.error('reveal failed:', e))}
+                          <button onClick={() => revealItemInDir(z.path).catch((e) => console.error('[ArchiveInspector] reveal failed:', e))}
                             title="Reveal in file manager" className="p-0.5 rounded text-content-muted hover:text-accent transition"><ExternalLink size={11} /></button>
                         )}
                       </li>
