@@ -549,7 +549,9 @@ fn run_restore_inner(
         };
         let cleanup_total = zip_paths.len();
         for (idx, zp) in zip_paths.iter().enumerate() {
-            let _ = std::fs::remove_file(zp);
+            if let Err(e) = std::fs::remove_file(zp) {
+                tracing::warn!(path = %zp, error = %e, "failed to remove zip after restore; file left in place");
+            }
             emit(
                 emitter,
                 "cleanup",
@@ -582,7 +584,9 @@ fn record_conflict_step(
 
 fn cleanup_temp(temp_dir: &Path) {
     if temp_dir.exists() {
-        let _ = std::fs::remove_dir_all(temp_dir);
+        if let Err(e) = std::fs::remove_dir_all(temp_dir) {
+            tracing::warn!(path = %temp_dir.display(), error = %e, "failed to remove restore temp dir");
+        }
     }
 }
 

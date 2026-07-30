@@ -592,13 +592,30 @@ pub async fn delete_archive(
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    // Delete zip files
+    // Delete zip files. A zip we could not delete (Windows sharing violation,
+    // read-only volume) must abort the whole command BEFORE any catalog row
+    // goes away — otherwise the zip is orphaned on disk with nothing pointing
+    // at it and the archive becomes unrestorable.
     let files = adb::list_operation_files(&conn, operation_id).map_err(|e| e.to_string())?;
     let mut seen = std::collections::HashSet::new();
+    let mut failed: Vec<String> = Vec::new();
     for f in &files {
         if seen.insert(f.target_zip_path.clone()) {
-            let _ = std::fs::remove_file(&f.target_zip_path);
+            let p = std::path::Path::new(&f.target_zip_path);
+            if p.exists() {
+                if let Err(e) = std::fs::remove_file(p) {
+                    tracing::error!(path = %f.target_zip_path, error = %e, "failed to delete archive zip");
+                    failed.push(format!("{}: {}", f.target_zip_path, e));
+                }
+            }
         }
+    }
+    if !failed.is_empty() {
+        return Err(format!(
+            "could not delete {} zip file(s); catalog rows left untouched so the archive stays restorable: {}",
+            failed.len(),
+            failed.join("; ")
+        ));
     }
 
     // Get frames_set_id, then delete frame set + cascading rows.

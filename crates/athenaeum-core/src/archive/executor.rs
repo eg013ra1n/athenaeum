@@ -465,8 +465,16 @@ fn finalize_phase(
         });
     }
 
-    // Cleanup staging
-    staging::cleanup_staging(archive_root, operation_id)?;
+    // Cleanup staging.
+    // Best-effort: at this point every source is verified inside the zip —
+    // a locked staging dir (AV holding a handle) must not mark a functionally
+    // complete archive Failed and trigger rollback.
+    if let Err(e) = staging::cleanup_staging(archive_root, operation_id) {
+        // `{:#}` — cleanup_staging wraps the io error in anyhow context, and
+        // plain Display would drop the OS cause ("Access is denied") that is
+        // the whole diagnostic value on a sharing violation.
+        tracing::warn!(operation_id, error = %format!("{:#}", e), "staging cleanup failed after successful archive; leftover .athenaeum_staging dir");
+    }
     adb::update_step(conn, sid, StepStatus::Done, None, None)?;
     done_units += 1;
 

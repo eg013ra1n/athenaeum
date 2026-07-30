@@ -627,13 +627,34 @@ pub async fn delete_archive(
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "db not init".into()))?;
     let conn = db.conn();
 
+    // Delete zip files. A zip we could not delete (Windows sharing violation,
+    // read-only volume) must abort the whole request BEFORE any catalog row
+    // goes away — otherwise the zip is orphaned on disk with nothing pointing
+    // at it and the archive becomes unrestorable.
     let files = adb::list_operation_files(&conn, req.operation_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut seen = std::collections::HashSet::new();
+    let mut failed: Vec<String> = Vec::new();
     for f in &files {
         if seen.insert(f.target_zip_path.clone()) {
-            let _ = std::fs::remove_file(&f.target_zip_path);
+            let p = std::path::Path::new(&f.target_zip_path);
+            if p.exists() {
+                if let Err(e) = std::fs::remove_file(p) {
+                    tracing::error!(path = %f.target_zip_path, error = %e, "failed to delete archive zip");
+                    failed.push(format!("{}: {}", f.target_zip_path, e));
+                }
+            }
         }
+    }
+    if !failed.is_empty() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "could not delete {} zip file(s); catalog rows left untouched so the archive stays restorable: {}",
+                failed.len(),
+                failed.join("; ")
+            ),
+        ));
     }
 
     let op = adb::get_operation(&conn, req.operation_id)
