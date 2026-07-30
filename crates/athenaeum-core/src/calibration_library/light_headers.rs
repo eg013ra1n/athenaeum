@@ -5,6 +5,7 @@
 //! appends the CALSTAT/ATH_C* provenance cards. No FITS I/O here — Task 3's
 //! engine calls this to build the card list it hands to `write_fits_f32`.
 
+use crate::fits_parser::calibrated_light::encode_ident;
 use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
 use crate::fits_writer::{Card, CardValue, FitsWriteError};
 use anyhow::Result;
@@ -79,7 +80,12 @@ fn master_ref_card(
     uuid: &str,
     path: &str,
 ) -> std::result::Result<Card, FitsWriteError> {
-    Card::new(keyword, CardValue::Str(format!("{uuid} {path}")))
+    // Path percent-encoded (see encode_ident): keeps non-ASCII identities
+    // reversible and the value space-free past the fixed uuid separator.
+    Card::new(
+        keyword,
+        CardValue::Str(format!("{uuid} {}", encode_ident(path))),
+    )
 }
 
 /// Build the full header card list for a calibrated-light output (§7):
@@ -101,11 +107,16 @@ pub fn build_light_cal_cards(
     // unbounded (a long filename), so a trailing `/ comment` on the final
     // CONTINUE record can overflow the 80-char card and hard-fail the write
     // (`FitsWriteError::CommentTooLong`). The keyword is self-documenting.
+    //
+    // ATH_CSRC (the source frame uuid) is raw ASCII by construction and stays
+    // verbatim; ATH_CSRN is a user-supplied filename, so it is percent-encoded
+    // (see `encode_ident`) — the writer's lossy '?' sanitization would
+    // otherwise destroy a non-ASCII name and strand adoption forever.
     b = b
         .custom(Card::new("ATH_CSRC", CardValue::Str(inputs.source_uuid.clone()))?)
         .custom(Card::new(
             "ATH_CSRN",
-            CardValue::Str(inputs.source_filename.clone()),
+            CardValue::Str(encode_ident(&inputs.source_filename)),
         )?);
 
     if let Some((uuid, path)) = &inputs.dark {
@@ -174,20 +185,90 @@ mod tests {
         }
     }
 
-    /// A master under a non-ASCII path (Cyrillic Windows username is the
-    /// common field case) must never brick the output write — the path chars
-    /// degrade to '?' placeholders instead.
+    /// A master under a non-ASCII path (Cyrillic Windows username is the common
+    /// field case) must never brick the output write AND must come back
+    /// byte-identical on read. Before the reversible percent-encoding, the
+    /// writer's lossy ASCII sanitizer turned every Cyrillic char into '?', so
+    /// the stamped path could never be matched to the master file again —
+    /// scanner adoption deferred forever and `resolve_master_set_id`'s path
+    /// fallback silently missed. This pin asserts the ROUND TRIP (it previously
+    /// asserted the '?' replacement).
     #[test]
-    fn cyrillic_master_path_sanitized_not_fatal() {
+    fn cyrillic_master_path_round_trips_through_card_and_parser() {
+        use crate::fits_parser::{calibrated_light_identity, FitsHeader};
         use crate::fits_writer::card::format_card;
-        let c = master_ref_card(
-            "ATH_CDRK",
-            "abcd-1234",
-            r"C:\Users\Пользователь\Athenaeum\master_dark.fits",
-        )
-        .unwrap();
-        let line = String::from_utf8_lossy(&format_card(&c).unwrap()[0]).into_owned();
-        assert!(line.contains(r"C:\Users\????????????\Athenaeum\master_dark.fits"), "got {line:?}");
+        use std::collections::HashMap;
+
+        let path = r"C:\Users\Пользователь\Athenaeum\master_dark.fits";
+        let c = master_ref_card("ATH_CDRK", "abcd-1234", path).unwrap();
+
+        // The card must format cleanly — no lossy placeholders, no length error.
+        let records = format_card(&c).expect("master-ref card must format");
+        for r in &records {
+            let line = String::from_utf8_lossy(r).into_owned();
+            assert!(
+                !line.contains('?'),
+                "no lossy '?' placeholders left: {line:?}"
+            );
+        }
+
+        // ...and read back through the real FITS reader (CONTINUE reassembly
+        // included) to the ORIGINAL path.
+        let mut block: Vec<u8> = records.iter().flat_map(|r| r.iter().copied()).collect();
+        let mut end = [b' '; 80];
+        end[..3].copy_from_slice(b"END");
+        block.extend_from_slice(&end);
+
+        let header = FitsHeader::parse_header(&block).expect("header parses");
+        let value = header.get_str("ATH_CDRK").expect("ATH_CDRK present");
+        let keys: HashMap<String, String> = [
+            ("CALSTAT".to_string(), "BDF".to_string()),
+            ("ATH_CSRC".to_string(), "abcd-1234".to_string()),
+            ("ATH_CDRK".to_string(), value),
+        ]
+        .into_iter()
+        .collect();
+
+        let id = calibrated_light_identity(&keys).expect("identity present");
+        let dark = id.dark.expect("dark ref");
+        assert_eq!(dark.uuid, "abcd-1234", "uuid half is raw ASCII");
+        assert_eq!(
+            dark.path, path,
+            "Cyrillic master path survives the round trip"
+        );
+    }
+
+    /// The same round trip for `ATH_CSRN`: a Cyrillic source filename is the
+    /// adoption fallback key, so a lossy '?' there stranded the file forever.
+    #[test]
+    fn cyrillic_source_filename_round_trips() {
+        use crate::fits_parser::{calibrated_light_identity, FitsHeader};
+        use crate::fits_writer::card::format_card;
+        use std::collections::HashMap;
+
+        let filename = "Снимок 0001.fits";
+        let mut inputs = base_inputs();
+        inputs.source_filename = filename.to_string();
+        let cards = build_light_cal_cards(&[], &inputs).unwrap();
+
+        let mut block: Vec<u8> = Vec::new();
+        for c in &cards {
+            for r in format_card(c).unwrap_or_else(|e| panic!("{} must format: {e:?}", c.keyword)) {
+                block.extend_from_slice(&r);
+            }
+        }
+        let mut end = [b' '; 80];
+        end[..3].copy_from_slice(b"END");
+        block.extend_from_slice(&end);
+
+        let header = FitsHeader::parse_header(&block).expect("header parses");
+        let keys: HashMap<String, String> = ["CALSTAT", "ATH_CSRC", "ATH_CSRN"]
+            .into_iter()
+            .filter_map(|k| header.get_str(k).map(|v| (k.to_string(), v)))
+            .collect();
+
+        let id = calibrated_light_identity(&keys).expect("identity present");
+        assert_eq!(id.source_filename.as_deref(), Some(filename));
     }
 
     #[test]
