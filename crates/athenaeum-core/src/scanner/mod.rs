@@ -25,7 +25,7 @@ use walkdir::WalkDir;
 /// Convert a path to UTF-8 string for DB persistence.
 /// Rejects non-UTF-8 paths instead of silently corrupting them via U+FFFD
 /// replacement (which would break any subsequent path-based lookup).
-fn path_to_utf8(path: &std::path::Path) -> anyhow::Result<String> {
+pub(crate) fn path_to_utf8(path: &std::path::Path) -> anyhow::Result<String> {
     path.to_str()
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow::anyhow!(

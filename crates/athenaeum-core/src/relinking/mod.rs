@@ -4,7 +4,6 @@
 /// monitored directories change location. Files are matched by their FITS header
 /// fingerprints to ensure accurate relinking even when filenames or directory
 /// structures change.
-
 use crate::fingerprint::compute_header_fingerprint;
 use crate::fits_parser::{extract_fits_header, extract_xisf_header};
 use crate::models::{FileFormat, RelinkResult};
@@ -50,20 +49,26 @@ pub fn relink_files(
     // Step 1: Build fingerprint map for files under old root
     let mut fingerprint_map: HashMap<String, (i64, String)> = HashMap::new();
 
-    let mut stmt = conn.prepare(
+    // Separator-strict byte-range prefix (same helper as every destructive
+    // root-scoped site since 81aedae7): a name-prefix sibling root
+    // (/data/M31_Ha), a case-variant root (/data/m31 — LIKE is ASCII
+    // case-insensitive), or a `_`/`%` in the root name can no longer pull
+    // foreign rows into the fingerprint map and get their paths rewritten.
+    let (pred, values) =
+        crate::db::scan_root_prefix_predicate("f.path", &[old_root_path.to_string()]);
+    let sql = format!(
         "SELECT f.id, f.path, f.filename, fh.header_fingerprint
          FROM files f
          INNER JOIN fits_header fh ON f.id = fh.file_id
-         WHERE f.path LIKE ?1 AND fh.header_fingerprint IS NOT NULL",
-    )?;
-
-    let old_root_prefix = format!("{}%", old_root_path);
-    let rows = stmt.query_map(params![old_root_prefix], |row| {
+         WHERE ({pred}) AND fh.header_fingerprint IS NOT NULL"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| {
         Ok((
-            row.get::<_, i64>(0)?,      // id
-            row.get::<_, String>(1)?,   // path
-            row.get::<_, String>(2)?,   // filename
-            row.get::<_, String>(3)?,   // header_fingerprint
+            row.get::<_, i64>(0)?,    // id
+            row.get::<_, String>(1)?, // path
+            row.get::<_, String>(2)?, // filename
+            row.get::<_, String>(3)?, // header_fingerprint
         ))
     })?;
 
@@ -88,8 +93,12 @@ pub fn relink_files(
     let mut files_new = 0;
     let mut matched_file_ids = std::collections::HashSet::new();
 
+    // max_depth caps recursion in case follow_links hits a pathological
+    // symlink loop (walkdir's loop detection isn't bulletproof on every
+    // filesystem); 64 is well past any realistic archive.
     for entry in WalkDir::new(new_root)
         .follow_links(true)
+        .max_depth(64)
         .into_iter()
         .filter_map(|e| e.ok())
     {
@@ -131,12 +140,24 @@ pub fn relink_files(
 
         // Try to match with old files
         if let Some((file_id, old_path)) = fingerprint_map.get(&fingerprint) {
-            let new_path_str = path.to_string_lossy().to_string();
+            // Same invariant as the scanner (path_to_utf8): a U+FFFD-mangled
+            // path would break every later exact/prefix lookup and std::fs open.
+            let new_path_str = match crate::scanner::path_to_utf8(path) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "skipping non-UTF-8 path during relink");
+                    continue;
+                }
+            };
+            let new_filename = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| new_path_str.clone());
 
             // Update the file path in database
             conn.execute(
-                "UPDATE files SET path = ?1 WHERE id = ?2",
-                params![new_path_str, file_id],
+                "UPDATE files SET path = ?1, filename = ?2 WHERE id = ?3",
+                params![new_path_str, new_filename, file_id],
             )
             .context("Failed to update file path")?;
 
@@ -182,26 +203,29 @@ pub fn relink_files(
 ///
 /// This checks which files in the database still exist on disk at the current location.
 /// Returns a result showing how many files are still present vs. orphaned.
-fn verify_files_at_location(
-    conn: &Connection,
-    root_path: &str,
-) -> Result<RelinkResult> {
+fn verify_files_at_location(conn: &Connection, root_path: &str) -> Result<RelinkResult> {
     let mut fingerprint_map: HashMap<String, (i64, String)> = HashMap::new();
 
-    let mut stmt = conn.prepare(
+    // Separator-strict byte-range prefix (same helper as every destructive
+    // root-scoped site since 81aedae7): a name-prefix sibling root
+    // (/data/M31_Ha), a case-variant root (/data/m31 — LIKE is ASCII
+    // case-insensitive), or a `_`/`%` in the root name can no longer pull
+    // foreign rows into the fingerprint map and get reported as orphans of
+    // this root (which the caller may then delete from the catalog).
+    let (pred, values) = crate::db::scan_root_prefix_predicate("f.path", &[root_path.to_string()]);
+    let sql = format!(
         "SELECT f.id, f.path, f.filename, fh.header_fingerprint
          FROM files f
          INNER JOIN fits_header fh ON f.id = fh.file_id
-         WHERE f.path LIKE ?1 AND fh.header_fingerprint IS NOT NULL",
-    )?;
-
-    let root_prefix = format!("{}%", root_path);
-    let rows = stmt.query_map(params![root_prefix], |row| {
+         WHERE ({pred}) AND fh.header_fingerprint IS NOT NULL"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| {
         Ok((
-            row.get::<_, i64>(0)?,      // id
-            row.get::<_, String>(1)?,   // path
-            row.get::<_, String>(2)?,   // filename
-            row.get::<_, String>(3)?,   // header_fingerprint
+            row.get::<_, i64>(0)?,    // id
+            row.get::<_, String>(1)?, // path
+            row.get::<_, String>(2)?, // filename
+            row.get::<_, String>(3)?, // header_fingerprint
         ))
     })?;
 
@@ -341,5 +365,88 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let result = delete_orphaned_files(&conn, &[]).unwrap();
         assert_eq!(result, 0);
+    }
+
+    #[test]
+    fn relink_does_not_sweep_sibling_or_case_variant_roots() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+
+        // Real tiny FITS in the NEW location so the walk yields a fingerprint.
+        let dir = tempfile::tempdir().unwrap();
+        let new_root = dir.path().join("relocated");
+        std::fs::create_dir_all(&new_root).unwrap();
+        let walked = new_root.join("x.fits");
+        crate::fits_writer::write_fits_f32(&walked, 4, 4, 1, &vec![0.0f32; 16], &[]).unwrap();
+        let header = extract_fits_header(&walked).unwrap();
+        let fp = compute_header_fingerprint(&header);
+
+        // Catalog rows under a NAME-PREFIX SIBLING root and a CASE-VARIANT root of
+        // old root "/data/M31" — both must be invisible to the relink of /data/M31.
+        let mut sibling_ids = Vec::new();
+        for path in ["/data/M31_Ha/x.fits", "/data/m31/x.fits"] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format) VALUES (?1, 'x.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![path],
+            ).unwrap();
+            let id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, 'H', ?2)",
+                rusqlite::params![id, fp],
+            ).unwrap();
+            sibling_ids.push((id, path.to_string()));
+        }
+
+        let res = relink_files(&conn, "/data/M31", new_root.to_str().unwrap()).unwrap();
+        assert_eq!(
+            res.files_matched, 0,
+            "sibling fingerprints must not enter the map"
+        );
+        assert_eq!(res.files_new, 1);
+        for (id, original) in &sibling_ids {
+            let path: String = conn
+                .query_row("SELECT path FROM files WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(&path, original, "sibling row must be untouched");
+        }
+    }
+
+    #[test]
+    fn relink_updates_path_and_filename_for_a_real_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let new_root = dir.path().join("relocated");
+        std::fs::create_dir_all(&new_root).unwrap();
+        let walked = new_root.join("renamed_on_disk.fits");
+        crate::fits_writer::write_fits_f32(&walked, 4, 4, 1, &vec![0.0f32; 16], &[]).unwrap();
+        let fp = compute_header_fingerprint(&extract_fits_header(&walked).unwrap());
+
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format) VALUES ('/data/M31/orig.fits', 'orig.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+            [],
+        ).unwrap();
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO fits_header (file_id, header, header_fingerprint) VALUES (?1, 'H', ?2)",
+            rusqlite::params![id, fp],
+        )
+        .unwrap();
+
+        let res = relink_files(&conn, "/data/M31", new_root.to_str().unwrap()).unwrap();
+        assert_eq!(res.files_matched, 1);
+        let (path, filename): (String, String) = conn
+            .query_row(
+                "SELECT path, filename FROM files WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(path, walked.to_string_lossy());
+        assert_eq!(
+            filename, "renamed_on_disk.fits",
+            "filename must follow the path"
+        );
     }
 }
