@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useState, type ReactNode } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { FolderPlus } from 'lucide-react';
 import { api } from '../../api';
 import { pickDirectory } from '../../api/desktop';
@@ -62,23 +62,30 @@ export default function FoldersTab({ selectSyncIncomingToken }: FoldersTabProps)
 
   const showAlert = (title: string, message: string) => setAlert({ title, message, variant: 'error' });
 
+  /**
+   * Five independent reads, applied independently: one failing call must not
+   * blank the others' state — an emptied archive-root list would fake the
+   * "No folders yet" screen, and a dropped calibration dir would hide an
+   * assigned role. Every rejection is logged; none is shown as a banner.
+   */
   const refreshAux = useCallback(async () => {
-    try {
-      const [roots, sets, ov, counts, calDir] = await Promise.all([
-        listArchiveRoots(),
-        listArchivedFrameSets(),
-        api.invoke<FolderOverview>('get_folder_overview'),
-        api.invoke<Record<number, number>>('get_missing_files_counts'),
-        api.invoke<string | null>('get_calibration_library_dir'),
-      ]);
-      setArchiveRoots(roots);
-      setArchivedSets(sets);
-      setOverview(ov);
-      setMissingCounts(counts);
-      setCalibrationDir(calDir ?? null);
-    } catch (e) {
-      console.error('[FoldersTab] aux refresh failed:', e);
-    }
+    const [roots, sets, ov, counts, calDir] = await Promise.allSettled([
+      listArchiveRoots(),
+      listArchivedFrameSets(),
+      api.invoke<FolderOverview>('get_folder_overview'),
+      api.invoke<Record<number, number>>('get_missing_files_counts'),
+      api.invoke<string | null>(ROLE_META.calibration_library.getCommand),
+    ]);
+    if (roots.status === 'fulfilled') setArchiveRoots(roots.value);
+    else console.error('[FoldersTab] list_archive_roots failed:', roots.reason);
+    if (sets.status === 'fulfilled') setArchivedSets(sets.value);
+    else console.error('[FoldersTab] list_archived_frame_sets failed:', sets.reason);
+    if (ov.status === 'fulfilled') setOverview(ov.value);
+    else console.error('[FoldersTab] get_folder_overview failed:', ov.reason);
+    if (counts.status === 'fulfilled') setMissingCounts(counts.value);
+    else console.error('[FoldersTab] get_missing_files_counts failed:', counts.reason);
+    if (calDir.status === 'fulfilled') setCalibrationDir(calDir.value ?? null);
+    else console.error('[FoldersTab] get_calibration_library_dir failed:', calDir.reason);
   }, []);
 
   useEffect(() => { void refreshAux(); }, [refreshAux]);
@@ -86,13 +93,22 @@ export default function FoldersTab({ selectSyncIncomingToken }: FoldersTabProps)
   const refreshAll = useCallback(() => { void refreshScanRoots(); void refreshAux(); }, [refreshScanRoots, refreshAux]);
 
   /**
+   * The resolver's answer, normalized once: `undefined` = not fetched yet (fall
+   * back to scan-root evidence), `null` = unset or explicitly cleared. Both the
+   * rail derivation below and the Add-dialog prop read this, so "empty" means
+   * the same thing in both places.
+   */
+  const effectiveCalibrationDir: string | null | undefined =
+    calibrationDir === undefined ? undefined : (calibrationDir?.trim() ? calibrationDir : null);
+
+  /**
    * A "covered" calibration library: the effective dir is stored as a setting
    * because the folder sits inside a monitored root, so it has NO scan-root row
    * of its own. It is still an assigned role and must be visible + inspectable.
    */
   const coveredCalibrationDir: string | null =
-    calibrationDir && calibrationDir.trim() !== '' && !scanRoots.some((r) => r.kind === 'calibration_library')
-      ? calibrationDir
+    effectiveCalibrationDir && !scanRoots.some((r) => r.kind === 'calibration_library')
+      ? effectiveCalibrationDir
       : null;
 
   /** Longest monitored path that contains `dir` — the folder that scans it. */
@@ -116,12 +132,50 @@ export default function FoldersTab({ selectSyncIncomingToken }: FoldersTabProps)
     if (first?.id) setSelection({ type: 'scan', id: first.id });
   }, [scanRoots, rootsLoading, selection]);
 
-  // Transfers deep-link → select Sync Incoming (root or placeholder).
+  /**
+   * Transfers deep-link → select Sync Incoming (root or placeholder). Latched:
+   * `scanRoots` is a fresh array on every refresh/toggle, so without the latch
+   * this effect would yank the user's selection back on each of them. The latch
+   * is set only once a row (or, with roots loaded, the placeholder) was actually
+   * selected — a token arriving before the roots do still resolves on arrival.
+   */
+  const handledSyncToken = useRef(0);
   useEffect(() => {
-    if (selectSyncIncomingToken === 0) return;
+    if (selectSyncIncomingToken === 0 || handledSyncToken.current === selectSyncIncomingToken) return;
     const root = scanRoots.find((r) => r.kind === 'sync_incoming');
-    setSelection(root?.id ? { type: 'scan', id: root.id } : { type: 'placeholder', kind: 'sync_incoming' });
-  }, [selectSyncIncomingToken, scanRoots]);
+    if (root?.id) {
+      setSelection({ type: 'scan', id: root.id });
+      handledSyncToken.current = selectSyncIncomingToken;
+      return;
+    }
+    // Still loading: the row may exist but isn't known yet — don't latch.
+    if (rootsLoading) return;
+    setSelection({ type: 'placeholder', kind: 'sync_incoming' });
+    handledSyncToken.current = selectSyncIncomingToken;
+  }, [selectSyncIncomingToken, scanRoots, rootsLoading]);
+
+  /**
+   * Reconcile the held selection against the refreshed model:
+   * - a placeholder whose role now HAS a root → promote to that row (role setup
+   *   completed while its placeholder was selected);
+   * - a placeholder for the calibration library stays valid while
+   *   `coveredCalibrationDir` is set — the covered row is that same selection;
+   * - a scan/archive id that no longer exists → drop to `null` so the
+   *   default-selection effect re-picks (removals, dedicated→covered moves).
+   */
+  useEffect(() => {
+    if (!selection) return;
+    if (selection.type === 'placeholder') {
+      const promoted = scanRoots.find((r) => r.kind === selection.kind);
+      if (promoted?.id) setSelection({ type: 'scan', id: promoted.id });
+      return;
+    }
+    if (rootsLoading) return;
+    const stillThere = selection.type === 'scan'
+      ? scanRoots.some((r) => r.id === selection.id)
+      : archiveRoots.some((r) => r.id === selection.id);
+    if (!stillThere) setSelection(null);
+  }, [scanRoots, archiveRoots, coveredCalibrationDir, rootsLoading, selection]);
 
   const scanPercent = useCallback((rootId: number) => {
     const p = activeScans.get(rootId)?.progress;
@@ -161,8 +215,13 @@ export default function FoldersTab({ selectSyncIncomingToken }: FoldersTabProps)
 
   const handleRelink = async (rootId: number) => {
     if (!isTauri) { setRelinkResult(null); setRelinkBrowserRootId(rootId); return; }
-    const picked = await pickDirectory();
-    if (picked && typeof picked === 'string') await finishRelink(rootId, picked);
+    try {
+      const picked = await pickDirectory();
+      if (picked && typeof picked === 'string') await finishRelink(rootId, picked);
+    } catch (e) {
+      console.error('[FoldersTab] relink folder pick failed:', e);
+      showAlert('Could not open the folder picker', typeof e === 'string' ? e : String(e));
+    }
   };
 
   const handleRemoveScanRoot = (id: number) => setConfirm({
@@ -198,27 +257,58 @@ export default function FoldersTab({ selectSyncIncomingToken }: FoldersTabProps)
   });
 
   const applyRoleChange = async (kind: RoleKind, path: string) => {
+    const meta = ROLE_META[kind];
+    const errText = (e: unknown) => (typeof e === 'string' ? e : String(e));
     try {
       if (kind === 'calibration_library') {
-        await api.invoke<string>('switch_calibration_library_dir', { path });
-      } else {
-        await api.invoke(ROLE_META[kind].clearCommand);
-        await api.invoke<string>(ROLE_META[kind].setCommand, { path });
+        // One backend call — it either lands whole or changes nothing.
+        try {
+          await api.invoke<string>('switch_calibration_library_dir', { path });
+        } catch (e) {
+          console.error('[FoldersTab] change role folder failed:', e);
+          const msg = errText(e);
+          showAlert('Change folder failed', msg);
+          notify({ title: `Could not move ${meta.label}`, detail: msg, kind: 'files', tone: 'warning', hasErrors: true });
+        }
+        return;
       }
+      // Sync/collab move is release-then-assign, and the two failures mean
+      // different things (spec §7). A failed release changed nothing; a failed
+      // assign left the role UNASSIGNED — say so instead of implying the old
+      // folder still holds it.
+      try {
+        await api.invoke(meta.clearCommand);
+      } catch (e) {
+        console.error('[FoldersTab] release before role move failed:', e);
+        const msg = errText(e);
+        showAlert('Change folder failed', `${meta.label} was not moved — ${msg}`);
+        notify({ title: `Could not move ${meta.label}`, detail: msg, kind: 'files', tone: 'warning', hasErrors: true });
+        return;
+      }
+      try {
+        await api.invoke<string>(meta.setCommand, { path });
+      } catch (e) {
+        console.error('[FoldersTab] assign after release failed:', e);
+        const detail = `The role was released, but assigning the new folder failed: ${errText(e)}. The old folder remains monitored; assign a folder again from its row.`;
+        showAlert(`${meta.label} role released`, detail);
+        notify({ title: `${meta.label} is now unassigned`, detail, kind: 'files', tone: 'warning', hasErrors: true });
+      }
+    } finally {
+      // Every outcome — moved, half-applied, refused — must reach the rail.
       refreshAll();
-    } catch (e) {
-      console.error('[FoldersTab] change role folder failed:', e);
-      const msg = typeof e === 'string' ? e : String(e);
-      showAlert('Change folder failed', msg);
-      notify({ title: `Could not move ${ROLE_META[kind].label}`, detail: msg, kind: 'files', tone: 'warning', hasErrors: true });
     }
   };
 
   const handleChangeRoleFolder = (kind: RoleKind) => {
     const proceed = async () => {
       if (!isTauri) { setRoleChangeBrowser(kind); return; }
-      const picked = await pickDirectory();
-      if (picked && typeof picked === 'string') await applyRoleChange(kind, picked);
+      try {
+        const picked = await pickDirectory();
+        if (picked && typeof picked === 'string') await applyRoleChange(kind, picked);
+      } catch (e) {
+        console.error('[FoldersTab] role-change folder pick failed:', e);
+        showAlert('Could not open the folder picker', typeof e === 'string' ? e : String(e));
+      }
     };
     if (kind === 'calibration_library') {
       setConfirm({
@@ -269,7 +359,7 @@ export default function FoldersTab({ selectSyncIncomingToken }: FoldersTabProps)
             onScan={() => root.id && handleScan(root.id)}
             onRelink={() => root.id && handleRelink(root.id)}
             onShowScanDetails={() => root.id && setScanSummary({ rootId: root.id, rootPath: root.path })}
-            onToggleDuplicates={(v) => root.id && toggleDuplicatesFlag(root.id, v)}
+            onToggleDuplicates={(v) => { if (root.id) void toggleDuplicatesFlag(root.id, v).catch((e) => console.error('[FoldersTab] duplicates toggle failed:', e)); }}
             onToggleUniqueCamera={(v) => { if (root.id) void toggleUniqueCameraFlag(root.id, v).catch((e) => console.error('[FoldersTab] unique-camera toggle failed:', e)); }}
             onToggleMonitor={(v) => { if (root.id) void toggleMonitorEnabled(root.id, v).catch((e) => console.error('[FoldersTab] monitor toggle failed:', e)); }}
             onRemove={() => root.id && handleRemoveScanRoot(root.id)}
@@ -289,7 +379,7 @@ export default function FoldersTab({ selectSyncIncomingToken }: FoldersTabProps)
             onScan={() => root.id && handleScan(root.id)}
             onChangeFolder={() => handleChangeRoleFolder(kind)}
             onReleaseRole={() => handleReleaseRole(kind)}
-            onToggleDuplicates={(v) => root.id && toggleDuplicatesFlag(root.id, v)}
+            onToggleDuplicates={(v) => { if (root.id) void toggleDuplicatesFlag(root.id, v).catch((e) => console.error('[FoldersTab] duplicates toggle failed:', e)); }}
             onToggleMonitor={(v) => { if (root.id) void toggleMonitorEnabled(root.id, v).catch((e) => console.error('[FoldersTab] monitor toggle failed:', e)); }}
           />
         );
@@ -399,7 +489,7 @@ export default function FoldersTab({ selectSyncIncomingToken }: FoldersTabProps)
         isOpen={addDialog.open}
         preselect={addDialog.preselect}
         scanRoots={scanRoots}
-        coveredCalibrationDir={calibrationDir === undefined ? undefined : (calibrationDir || null)}
+        coveredCalibrationDir={effectiveCalibrationDir}
         onClose={() => setAddDialog({ open: false })}
         onAdded={refreshAll}
       />
