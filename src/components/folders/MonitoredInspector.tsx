@@ -65,7 +65,7 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
             <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-surface-hover text-content-muted border border-border">Monitored</span>
           </div>
           <div className="flex items-center gap-2 font-mono text-xs text-content-muted">
-            <span className="truncate">{root.path}</span>
+            <span className="truncate" title={root.path}>{root.path}</span>
             {isTauri && !offline && (
               <button onClick={() => revealItemInDir(root.path).catch((e) => console.error('[MonitoredInspector] reveal failed:', e))}
                 title="Reveal in file manager" aria-label="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>

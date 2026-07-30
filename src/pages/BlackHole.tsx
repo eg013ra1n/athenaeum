@@ -121,10 +121,15 @@ export default function BlackHole() {
       .sort((a, b) => a.path.localeCompare(b.path));
   }, [entries]);
 
-  // Get folder path from full file path
+  // Get folder path from full file path. Root edges: 'C:\a.fits' → 'C:\',
+  // '/a.fits' → '/' (the old `lastSlash > 0` check returned the whole path
+  // for POSIX-root files and drive-relative 'C:' for drive-root files).
   function getFolderPath(fullPath: string): string {
     const lastSlash = Math.max(fullPath.lastIndexOf('/'), fullPath.lastIndexOf('\\'));
-    return lastSlash > 0 ? fullPath.substring(0, lastSlash) : fullPath;
+    if (lastSlash < 0) return fullPath;
+    if (lastSlash === 0) return fullPath[0];
+    const head = fullPath.substring(0, lastSlash);
+    return /^[A-Za-z]:$/.test(head) ? head + '\\' : head;
   }
 
   // Format file size

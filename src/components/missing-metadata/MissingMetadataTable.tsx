@@ -2,11 +2,14 @@ import React, { useMemo, useState } from 'react';
 import { CheckCircle2, ChevronDown, ChevronRight, Loader2, Pencil } from 'lucide-react';
 import type { Frame, MissingMetadataRow } from '../../types/models';
 
-/** Returns the parent directory of a file path (without trailing slash). */
+/** Returns the parent directory of a file path (without trailing slash;
+ *  root edges: '/a.fits' → '/', 'C:\a.fits' → 'C:\'). */
 function dirname(filePath: string): string {
   const idx = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
-  if (idx <= 0) return '.';
-  return filePath.slice(0, idx);
+  if (idx < 0) return '.';
+  if (idx === 0) return filePath[0];
+  const head = filePath.slice(0, idx);
+  return /^[A-Za-z]:$/.test(head) ? head + '\\' : head;
 }
 
 /** All the "missing" field predicates, matching the SQL in operations.rs. */

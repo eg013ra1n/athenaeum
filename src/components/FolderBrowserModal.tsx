@@ -164,7 +164,10 @@ export const FolderBrowserModal: React.FC<FolderBrowserModalProps> = ({
 
         {/* Footer */}
         <div className="flex items-center justify-between p-4 border-t border-border">
-          <span className="text-xs text-content-muted truncate mr-4 font-mono">
+          <span
+            className="text-xs text-content-muted truncate mr-4 font-mono"
+            title={isRoot ? undefined : currentPath}
+          >
             {isRoot ? 'Select a directory' : currentPath}
           </span>
           <div className="flex gap-3 flex-shrink-0">

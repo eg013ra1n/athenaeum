@@ -1299,7 +1299,7 @@ export default function Settings() {
           <div className="bg-surface-secondary rounded p-4 text-sm font-mono space-y-3">
             <div className="flex items-center gap-3">
               <span className="text-content-muted min-w-[80px]">Database:</span>
-              <span className="text-content truncate flex-1">{dbPath || '—'}</span>
+              <span className="text-content truncate flex-1" title={dbPath || undefined}>{dbPath || '—'}</span>
               {dbPath && (
                 <button
                   onClick={() => revealItemInDir(dbPath)}
@@ -1313,7 +1313,7 @@ export default function Settings() {
             </div>
             <div className="flex items-center gap-3">
               <span className="text-content-muted min-w-[80px]">Log folder:</span>
-              <span className="text-content truncate flex-1">{logDir || '—'}</span>
+              <span className="text-content truncate flex-1" title={logDir || undefined}>{logDir || '—'}</span>
               {logDir && (
                 <button
                   onClick={() => openPath(logDir)}

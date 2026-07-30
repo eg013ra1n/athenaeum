@@ -121,7 +121,7 @@ export function ArchiveDispositionDialog(props: Props) {
           </p>
         ) : archiveRoots.length === 1 ? (
           <div className="mb-4 text-xs text-content-muted">
-            Destination: <span className="font-mono text-content">{archiveRoots[0].path}</span>
+            Destination: <span className="font-mono text-content" title={archiveRoots[0].path}>{archiveRoots[0].path}</span>
           </div>
         ) : (
           <>
@@ -132,7 +132,7 @@ export function ArchiveDispositionDialog(props: Props) {
               className="w-full bg-surface-hover border border-border rounded-lg px-3 py-1.5 text-sm text-content mb-4 focus:outline-none focus:border-accent"
             >
               {archiveRoots.map((r) => (
-                <option key={r.id} value={r.path}>
+                <option key={r.id} value={r.path} title={r.path}>
                   {r.path}{r.is_default ? '  (default)' : ''}
                 </option>
               ))}

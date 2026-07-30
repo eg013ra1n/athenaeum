@@ -57,7 +57,7 @@ export function ArchiveInspector({ root, archivedSets, totalZipBytes, onSetDefau
               : <button onClick={onSetDefault} className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-surface-hover text-content-muted border border-border hover:text-warning transition flex items-center gap-1"><Star size={10} /> Make default</button>}
           </div>
           <div className="flex items-center gap-2 font-mono text-xs text-content-muted">
-            <span className="truncate">{root.path}</span>
+            <span className="truncate" title={root.path}>{root.path}</span>
             {isTauri && (
               <button onClick={() => revealItemInDir(root.path).catch((e) => console.error('[ArchiveInspector] reveal failed:', e))}
                 title="Reveal in file manager" aria-label="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>

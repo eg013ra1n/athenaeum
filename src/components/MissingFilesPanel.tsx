@@ -135,7 +135,9 @@ export function MissingFilesPanel({ rootId, missingFiles, onRefresh }: MissingFi
       const selected = await pickFile({
         title: `Locate ${file.filename}`,
         filters: [
-          { name: 'FITS/XISF Files', extensions: ['fits', 'fit', 'xisf'] },
+          // GTK file-dialog filters are case-sensitive globs — a '.FITS' file
+          // is invisible on Linux unless the uppercase form is listed too.
+          { name: 'FITS/XISF Files', extensions: ['fits', 'fit', 'xisf', 'FITS', 'FIT', 'XISF'] },
           { name: 'All Files', extensions: ['*'] },
         ],
       });

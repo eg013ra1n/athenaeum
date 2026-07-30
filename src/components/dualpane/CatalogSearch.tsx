@@ -109,7 +109,7 @@ export default function CatalogSearch({ onReveal, instrumeFilter }: CatalogSearc
               className="w-full text-left px-3 py-2 hover:bg-surface border-b border-border last:border-0 text-sm"
             >
               <div className="font-mono text-content truncate">{hit.filename}</div>
-              <div className="text-xs text-content-muted truncate">{hit.path}</div>
+              <div className="text-xs text-content-muted truncate" title={hit.path}>{hit.path}</div>
               <div className="flex gap-3 mt-0.5 text-xs text-content-muted">
                 {hit.object && <span>OBJECT: {hit.object}</span>}
                 {hit.filter && <span>FILTER: {hit.filter}</span>}

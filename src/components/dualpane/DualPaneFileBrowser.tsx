@@ -2003,6 +2003,11 @@ interface BreadcrumbProps {
 function Breadcrumb({ path, root, onNavigate }: BreadcrumbProps) {
   if (!path || !root) return null;
   const sep = path.includes('\\') ? '\\' : '/';
+  // Preserve the absolute prefix: '/' for POSIX, '\\' for UNC shares —
+  // filter(Boolean) eats the leading empty segments of '\\nas\astro' and the
+  // old re-add branch only restored a POSIX '/', rebuilding a RELATIVE path
+  // whose breadcrumb clicks then failed.
+  const lead = path.match(/^[/\\]+/)?.[0] ?? '';
   const allParts = path.split(/[/\\]/).filter(Boolean);
   const rootParts = root.split(/[/\\]/).filter(Boolean);
   // Only show segments that come AFTER the scan root.
@@ -2011,7 +2016,7 @@ function Breadcrumb({ path, root, onNavigate }: BreadcrumbProps) {
   const segments = descendantParts.map((part, i) => {
     // Reconstruct the absolute path for this segment.
     const fullParts = [...rootParts, ...descendantParts.slice(0, i + 1)];
-    const target = (sep === '/' ? '/' : '') + fullParts.join(sep);
+    const target = lead + fullParts.join(sep);
     return { name: part, path: target };
   });
   return (
