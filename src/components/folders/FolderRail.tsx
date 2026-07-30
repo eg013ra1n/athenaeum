@@ -1,7 +1,7 @@
 import { Plus, RefreshCw, Star } from 'lucide-react';
 import type { ScanRootWithAvailability, ArchiveRoot, ArchivedFrameSetSummary } from '../../types/helpers';
 import type { FolderOverview } from '../../types/models';
-import { ROLE_META, ROLE_ORDER, KIND_META, type RailSelection, type RoleKind, type AddableKind } from './roleMeta';
+import { ROLE_META, ROLE_ORDER, KIND_META, isRoleKind, type RailSelection, type RoleKind, type AddableKind } from './roleMeta';
 import { basename, parentPath, formatBytes } from './format';
 
 interface FolderRailProps {
@@ -76,10 +76,13 @@ export function FolderRail({
   scanRoots, archiveRoots, archivedSets, overview, missingCounts, coveredCalibrationDir,
   selection, onSelect, onAdd, onRescan, isScanning, scanPercent,
 }: FolderRailProps) {
+  // Anything that is not a known role lands in Monitored — including a kind this
+  // build has never heard of (version downgrade). It must stay VISIBLE as a
+  // generic monitored row rather than vanish from the rail.
   const monitored = scanRoots
-    .filter((r) => r.kind === 'normal')
+    .filter((r) => !isRoleKind(r.kind))
     .sort((a, b) => basename(a.path).localeCompare(basename(b.path)));
-  const roleRoots = new Map(scanRoots.filter((r) => r.kind !== 'normal').map((r) => [r.kind as RoleKind, r]));
+  const roleRoots = new Map(scanRoots.filter((r) => isRoleKind(r.kind)).map((r) => [r.kind as RoleKind, r]));
   const sortedArchive = [...archiveRoots].sort((a, b) =>
     a.is_default === b.is_default ? basename(a.path).localeCompare(basename(b.path)) : a.is_default ? -1 : 1);
 

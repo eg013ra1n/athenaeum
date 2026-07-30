@@ -78,6 +78,14 @@ export const ROLE_META: Record<RoleKind, RoleMeta> = {
   },
 };
 
+/**
+ * Narrowing guard: DB `scan_roots.kind` is an open string — a newer build's kind
+ * (version downgrade) must fall back to the generic monitored UI, never reach
+ * `ROLE_META[kind]` undefined (white screen — there is no ErrorBoundary).
+ * `'normal'` is not a `ROLE_META` key, so it reads as "not a role" too.
+ */
+export const isRoleKind = (k: string): k is RoleKind => k in ROLE_META;
+
 export const KIND_META = {
   normal: {
     label: 'Monitored folder',

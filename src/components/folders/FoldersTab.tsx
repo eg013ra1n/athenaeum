@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { FolderPlus } from 'lucide-react';
+import { FolderPlus, X } from 'lucide-react';
 import { api } from '../../api';
 import { pickDirectory } from '../../api/desktop';
 import { isTauri } from '../../utils/platform';
@@ -16,7 +16,7 @@ import { AddFolderDialog } from './AddFolderDialog';
 import { MonitoredInspector } from './MonitoredInspector';
 import { RoleInspector, RolePlaceholderInspector } from './RoleInspector';
 import { ArchiveInspector } from './ArchiveInspector';
-import { ROLE_META, type RailSelection, type RoleKind, type AddableKind } from './roleMeta';
+import { ROLE_META, isRoleKind, type RailSelection, type RoleKind, type AddableKind } from './roleMeta';
 import type { ArchiveRoot, ArchivedFrameSetSummary, ScanResult } from '../../types/helpers';
 import type { FolderOverview, RelinkResult } from '../../types/models';
 
@@ -83,6 +83,18 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
   const [alert, setAlert] = useState<{ title: string; message: string; variant: 'error' | 'warning' | 'info' } | null>(null);
 
   const showAlert = (title: string, message: string) => setAlert({ title, message, variant: 'error' });
+
+  /**
+   * A failed behavior toggle rejects AND leaves the hook's `error` set, which
+   * paints the global "Error loading folders" banner — wrong noun, wrong cause,
+   * and the switch silently snapped back. Clear that banner and report the real
+   * failure through the same alert the remove-root path uses.
+   */
+  const reportToggleFailure = (what: string, e: unknown) => {
+    console.error(`[FoldersTab] ${what} toggle failed:`, e);
+    clearRootsError();
+    showAlert('Could not change setting', typeof e === 'string' ? e : String(e));
+  };
 
   /**
    * Five independent reads, applied independently: one failing call must not
@@ -400,7 +412,9 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
     const root = scanRoots.find((r) => r.id === selection.id);
     if (root) {
       const ov = overview?.scan_roots.find((s) => s.root_id === root.id);
-      if (root.kind === 'normal') {
+      // `kind` is an open DB string: an unknown one (version downgrade) gets the
+      // generic monitored inspector rather than a `ROLE_META[kind]` deref.
+      if (root.kind === 'normal' || !isRoleKind(root.kind)) {
         inspector = (
           <MonitoredInspector
             root={root}
@@ -413,15 +427,16 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
             onScan={() => root.id && handleScan(root.id)}
             onRelink={() => root.id && handleRelink(root.id)}
             onShowScanDetails={() => root.id && setScanSummary({ rootId: root.id, rootPath: root.path })}
-            onToggleDuplicates={(v) => { if (root.id) void toggleDuplicatesFlag(root.id, v).catch((e) => console.error('[FoldersTab] duplicates toggle failed:', e)); }}
-            onToggleUniqueCamera={(v) => { if (root.id) void toggleUniqueCameraFlag(root.id, v).catch((e) => console.error('[FoldersTab] unique-camera toggle failed:', e)); }}
-            onToggleMonitor={(v) => { if (root.id) void toggleMonitorEnabled(root.id, v).catch((e) => console.error('[FoldersTab] monitor toggle failed:', e)); }}
+            onToggleDuplicates={(v) => { if (root.id) void toggleDuplicatesFlag(root.id, v).catch((e) => reportToggleFailure('duplicates', e)); }}
+            onToggleUniqueCamera={(v) => { if (root.id) void toggleUniqueCameraFlag(root.id, v).catch((e) => reportToggleFailure('unique-camera', e)); }}
+            onToggleMonitor={(v) => { if (root.id) void toggleMonitorEnabled(root.id, v).catch((e) => reportToggleFailure('monitor', e)); }}
             onRemove={() => root.id && handleRemoveScanRoot(root.id)}
             onMissingChanged={() => void refreshAux()}
           />
         );
       } else {
-        const kind = root.kind as RoleKind;
+        // Narrowed by `isRoleKind` above — safe to index `ROLE_META` downstream.
+        const kind = root.kind;
         inspector = (
           <RoleInspector
             kind={kind}
@@ -436,8 +451,8 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
             onRelink={() => root.id && handleRelink(root.id)}
             onChangeFolder={() => handleChangeRoleFolder(kind)}
             onReleaseRole={() => handleReleaseRole(kind)}
-            onToggleDuplicates={(v) => { if (root.id) void toggleDuplicatesFlag(root.id, v).catch((e) => console.error('[FoldersTab] duplicates toggle failed:', e)); }}
-            onToggleMonitor={(v) => { if (root.id) void toggleMonitorEnabled(root.id, v).catch((e) => console.error('[FoldersTab] monitor toggle failed:', e)); }}
+            onToggleDuplicates={(v) => { if (root.id) void toggleDuplicatesFlag(root.id, v).catch((e) => reportToggleFailure('duplicates', e)); }}
+            onToggleMonitor={(v) => { if (root.id) void toggleMonitorEnabled(root.id, v).catch((e) => reportToggleFailure('monitor', e)); }}
           />
         );
       }
@@ -499,8 +514,16 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
   return (
     <div className="flex-1 min-h-0 flex flex-col">
       {rootsError && (
-        <div className="mb-3 p-3 bg-error-muted border border-error/50 rounded-lg">
-          <p className="text-error text-sm">Error loading folders: {String(rootsError)}</p>
+        <div className="mb-3 p-3 bg-error-muted border border-error/50 rounded-lg flex items-start gap-2">
+          <p className="flex-1 min-w-0 text-error text-sm">Error loading folders: {String(rootsError)}</p>
+          <button
+            onClick={clearRootsError}
+            aria-label="Dismiss"
+            title="Dismiss"
+            className="ml-2 shrink-0 p-1 rounded hover:bg-surface-hover text-content-muted transition"
+          >
+            <X size={14} />
+          </button>
         </div>
       )}
 
