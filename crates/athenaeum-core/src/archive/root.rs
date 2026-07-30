@@ -40,12 +40,28 @@ pub fn resolve_archive_root(
 ) -> Result<String> {
     migrate_legacy_archive_root(conn, settings)?;
     if let Some(p) = requested {
-        let known: i64 =
-            conn.query_row("SELECT COUNT(*) FROM archive_roots WHERE path = ?1", [p], |r| r.get(0))?;
-        if known == 0 {
-            anyhow::bail!("'{}' is not a configured archive folder", p);
+        let known = |candidate: &str| -> Result<bool> {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM archive_roots WHERE path = ?1",
+                [candidate],
+                |r| r.get::<_, i64>(0),
+            )? > 0)
+        };
+        if known(p)? {
+            return Ok(p.to_string());
         }
-        return Ok(p.to_string());
+        // The caller may hand back a different spelling of a configured root
+        // (case variant on a case-insensitive FS, verbatim prefix, trailing
+        // separator). Retry with the canonical normalized form before rejecting.
+        if let Ok(c) = std::path::Path::new(p).canonicalize() {
+            let normalized = crate::api::scan_roots::normalize_path(&c)
+                .to_string_lossy()
+                .to_string();
+            if known(&normalized)? {
+                return Ok(normalized);
+            }
+        }
+        anyhow::bail!("'{}' is not a configured archive folder", p);
     }
     let rows: Vec<(String, i32)> = {
         let mut stmt = conn.prepare("SELECT path, is_default FROM archive_roots ORDER BY id")?;
@@ -121,5 +137,31 @@ mod tests {
         );
         let err = resolve_archive_root(&conn, &settings, Some("/not-known")).unwrap_err();
         assert!(format!("{err:#}").contains("not a configured archive folder"));
+    }
+
+    #[test]
+    fn resolve_accepts_respelled_configured_root() {
+        let (conn, settings) = test_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        conn.execute(
+            "INSERT INTO archive_roots (path, label, is_default) VALUES (?1, NULL, 1)",
+            [&canonical],
+        )
+        .unwrap();
+        // Same folder, different spelling (trailing separator) — must resolve.
+        let respelled = format!("{}{}", canonical, std::path::MAIN_SEPARATOR);
+        let resolved = resolve_archive_root(&conn, &settings, Some(&respelled)).unwrap();
+        assert_eq!(resolved, canonical);
+        // A genuinely unknown folder still errors.
+        let other = tempfile::tempdir().unwrap();
+        assert!(
+            resolve_archive_root(&conn, &settings, Some(other.path().to_str().unwrap())).is_err()
+        );
     }
 }

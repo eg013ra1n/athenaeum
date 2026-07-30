@@ -693,6 +693,22 @@ pub async fn add_archive_root(
     if !std::path::Path::new(&req.path).is_dir() {
         return Err((StatusCode::BAD_REQUEST, format!("'{}' is not a directory", req.path)));
     }
+    // Store the canonical normalized spelling — archive roots were the one
+    // root table whose rows were inserted verbatim from the picker, so
+    // `C:\Archive` vs `c:\Archive` (or a \\?\-verbatim form) could coexist as
+    // two rows and the exact-string lookup in resolve_archive_root rejected
+    // legitimate re-picks of the same folder.
+    let path = match std::path::Path::new(&req.path).canonicalize() {
+        Ok(c) => athenaeum_core::api::scan_roots::normalize_path(&c)
+            .to_string_lossy()
+            .to_string(),
+        Err(e) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("failed to resolve '{}': {}", req.path, e),
+            ))
+        }
+    };
     let db = state
         .ctx
         .db
@@ -707,7 +723,7 @@ pub async fn add_archive_root(
     let is_default = if count == 0 { 1 } else { 0 };
     conn.execute(
         "INSERT INTO archive_roots (path, label, is_default) VALUES (?1, ?2, ?3)",
-        rusqlite::params![req.path, req.label, is_default],
+        rusqlite::params![path, req.label, is_default],
     )
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(conn.last_insert_rowid()))

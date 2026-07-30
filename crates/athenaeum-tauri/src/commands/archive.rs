@@ -67,6 +67,17 @@ pub async fn add_archive_root(
     if !std::path::Path::new(&path).is_dir() {
         return Err(format!("'{}' is not a directory", path));
     }
+    // Store the canonical normalized spelling — archive roots were the one
+    // root table whose rows were inserted verbatim from the picker, so
+    // `C:\Archive` vs `c:\Archive` (or a \\?\-verbatim form) could coexist as
+    // two rows and the exact-string lookup in resolve_archive_root rejected
+    // legitimate re-picks of the same folder.
+    let path = match std::path::Path::new(&path).canonicalize() {
+        Ok(c) => athenaeum_core::api::scan_roots::normalize_path(&c)
+            .to_string_lossy()
+            .to_string(),
+        Err(e) => return Err(format!("failed to resolve '{}': {}", path, e)),
+    };
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
     migrate_legacy_archive_root(&conn, &state.ctx.settings)?;
