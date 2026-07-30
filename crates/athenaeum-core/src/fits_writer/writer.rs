@@ -34,6 +34,41 @@ fn validate(width: usize, height: usize, channels: usize, data_len: usize) -> Re
     Ok(())
 }
 
+/// `fs::rename` replaces an existing destination on every platform (Windows:
+/// MOVEFILE_REPLACE_EXISTING), but on Windows it fails with a sharing
+/// violation while another process (AV real-time scan, indexer, a stacker
+/// with the master open) holds the destination without FILE_SHARE_DELETE —
+/// POSIX rename never does. Bounded retry: 5 attempts, 50→800 ms backoff.
+#[cfg(windows)]
+fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    let mut delay = std::time::Duration::from_millis(50);
+    let mut last: Option<std::io::Error> = None;
+    for _ in 0..5 {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if matches!(
+                    e.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION) | Some(ERROR_ACCESS_DENIED)
+                ) =>
+            {
+                last = Some(e);
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.expect("loop ran at least once"))
+}
+
+#[cfg(not(windows))]
+fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
 /// Write a FITS file at `path`, replacing any existing file only after the write
 /// fully succeeds. Validates first (so a bad call never touches `path`), then
 /// writes to a sibling temp file and atomically renames it into place — a
@@ -70,7 +105,7 @@ pub fn write_fits_f32(
         return Err(e);
     }
 
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) = rename_replace(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
