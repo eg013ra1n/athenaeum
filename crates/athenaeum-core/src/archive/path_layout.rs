@@ -243,6 +243,17 @@ pub fn calibration_zip_dir(instrume: Option<&str>, date_start: &str) -> PathBuf 
     PathBuf::from("Calibration_Archive").join(cam).join(date)
 }
 
+/// Sanitize a `DATE-OBS`-derived 10-char date prefix into a single filename
+/// token, falling back to `x` when it sanitizes away to nothing.
+fn sanitized_date_token(date: &str) -> String {
+    let t = sanitize_for_filename(date.get(..10).unwrap_or(""));
+    if t.is_empty() {
+        "x".to_string()
+    } else {
+        t
+    }
+}
+
 /// Compute the zip filename for a calibration-set archive-of-originals plan
 /// (Task 14): `<Camera>_<Type>_g<gain>_<exptime>s_<date_start>_<date_end>.zip`.
 /// Missing optional tokens (gain, exptime) simply collapse out rather than
@@ -268,8 +279,12 @@ pub fn calibration_zip_filename(
     if let Some(e) = exptime {
         parts.push(format!("{}s", e));
     }
-    parts.push(date_start.get(..10).unwrap_or("x").to_string());
-    parts.push(date_end.get(..10).unwrap_or("x").to_string());
+    // DATE-OBS is file-supplied text: sanitize the date prefixes exactly like
+    // `calibration_zip_dir` does, or a value such as `../../../etc` would put
+    // separators into a name later fed to `PathBuf::join` (audit F8). A
+    // well-formed ISO date survives verbatim (hyphens are preserved).
+    parts.push(sanitized_date_token(date_start));
+    parts.push(sanitized_date_token(date_end));
     format!("{}.zip", parts.join("_"))
 }
 
@@ -427,6 +442,34 @@ mod tests {
             "2026-06-28T20:00:00Z", "2026-06-28T21:00:00Z",
         );
         assert_eq!(f, "ASI2600MM_Dark_g100_300s_2026-06-28_2026-06-28.zip");
+    }
+
+    #[test]
+    fn calibration_zip_filename_sanitizes_date_tokens() {
+        // Well-formed ISO dates must survive verbatim (hyphens are preserved).
+        let ok = calibration_zip_filename(
+            Some("ASI2600MM"), "Dark", None, None,
+            "2025-10-12T20:00:00Z", "2025-10-12T21:00:00Z",
+        );
+        assert_eq!(ok, "ASI2600MM_Dark_2025-10-12_2025-10-12.zip");
+
+        // DATE-OBS is file-supplied: a traversal payload must not survive as
+        // separators, so joining the name can never climb out of the archive
+        // root (audit F8).
+        let evil = calibration_zip_filename(
+            Some("ASI2600MM"), "Dark", None, None,
+            "../../../etc", "2025-10-12T21:00:00Z",
+        );
+        assert!(!evil.contains('/'), "no '/': {evil}");
+        assert!(!evil.contains('\\'), "no '\\': {evil}");
+        // The whole thing stays ONE path component, so joining it under a root
+        // leaves that root as the parent — nothing climbed.
+        let joined = Path::new("/archive/root").join(&evil);
+        assert_eq!(joined.parent(), Some(Path::new("/archive/root")));
+        assert!(
+            !Path::new(&evil).components().any(|c| c.as_os_str() == ".."),
+            "no '..' component: {evil}"
+        );
     }
 
     #[test]
