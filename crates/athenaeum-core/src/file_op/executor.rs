@@ -208,6 +208,21 @@ fn run_atomic_rename_step(
     if commit_done.contains(&f.id) {
         return Ok(());
     }
+
+    // An earlier run may already have degraded this row to the cross-volume
+    // pipeline (EXDEV, below) and been interrupted part-way. Resume there
+    // directly: the resume detection under this block reads a partially
+    // copied destination as a foreign-file collision and would strand the
+    // row. A Copy step on an AtomicRename row can only exist because that
+    // degradation happened — the planner never plans one.
+    if prior_step_exists(conn, operation_id, f.id, FileOpStage::Copy)? {
+        tracing::info!(
+            src = %source.display(), dest = %dest.display(),
+            "resuming EXDEV-degraded row on the cross-volume pipeline"
+        );
+        return run_cross_volume_fallback(conn, operation_id, f, source, dest);
+    }
+
     let step_id = fdb::insert_step(conn, operation_id, Some(f.id), FileOpStage::CommitMove)?;
     fdb::update_step(conn, step_id, StepStatus::InProgress, None, None)?;
 
@@ -242,6 +257,39 @@ fn run_atomic_rename_step(
         })?;
     }
     if let Err(e) = fs::rename(source, dest) {
+        if e.kind() == std::io::ErrorKind::CrossesDevices {
+            // Same device id ≠ rename works: Linux bind mounts share st_dev
+            // yet rename(2) returns EXDEV across mount points (reachable in
+            // the Docker build's compose volumes), and Windows folder-mounted
+            // volumes canonicalize into the hosting drive. Degrade this row
+            // to the cross-volume pipeline instead of failing the batch.
+            tracing::warn!(src = %source.display(), dest = %dest.display(),
+                "rename crossed a device boundary; degrading to copy+verify+delete");
+            let outcome = run_cross_volume_fallback(conn, operation_id, f, source, dest);
+            // Status keyed on the fallback's OUTCOME, never stamped up front:
+            // a `Done` here lands the row in `done_file_ids_for_stage`, and a
+            // resume after an interrupted fallback would then skip the file
+            // whole while it is still sitting at the source.
+            match &outcome {
+                Ok(()) => fdb::update_step(
+                    conn,
+                    step_id,
+                    StepStatus::Done,
+                    None,
+                    Some("EXDEV — degraded to copy+verify+delete"),
+                )?,
+                Err(err) => fdb::update_step(
+                    conn,
+                    step_id,
+                    StepStatus::Failed,
+                    None,
+                    Some(&format!(
+                        "EXDEV — degraded to copy+verify+delete, which failed: {err:#}"
+                    )),
+                )?,
+            }
+            return outcome;
+        }
         let msg = format!("rename {} → {}: {}", source.display(), dest.display(), e);
         fdb::update_step(conn, step_id, StepStatus::Failed, None, Some(&msg))?;
         fdb::update_file_disposition(conn, f.id, FileDisposition::Failed)?;
@@ -260,6 +308,38 @@ fn run_atomic_rename_step(
 
     fdb::update_step(conn, step_id, StepStatus::Done, None, None)?;
     Ok(())
+}
+
+/// EXDEV degradation path: hash the still-present source, persist the hash on
+/// the row, then run the standard cross-volume steps. Idempotent on resume:
+/// re-entry (via the prior-Copy-step route at the top of
+/// `run_atomic_rename_step`) reuses the persisted hash and `run_copy_step`'s
+/// prior-Copy-step check treats an existing dest as our own partial.
+fn run_cross_volume_fallback(
+    conn: &Connection,
+    operation_id: i64,
+    f: &FileOperationFile,
+    source: &Path,
+    dest: &Path,
+) -> Result<()> {
+    // The planner only hashes CopyVerifyDelete rows, so on an AtomicRename row
+    // a `Some` here can only be one WE persisted on an earlier degradation of
+    // this same row — reusing it is both safe and necessary, since a resume
+    // can re-enter after the source file is already gone.
+    let hash = match f.expected_hash.clone() {
+        Some(h) => h,
+        None => {
+            let h = compute_xxhash(source)
+                .with_context(|| format!("hashing {} for EXDEV fallback", source.display()))?;
+            fdb::set_expected_hash(conn, f.id, &h)?;
+            h
+        }
+    };
+    let mut f2 = f.clone();
+    f2.expected_hash = Some(hash);
+    run_copy_step(conn, operation_id, &f2, source, dest)?;
+    run_verify_step(conn, operation_id, &f2, dest)?;
+    run_cross_volume_commit_step(conn, operation_id, &f2, source, dest)
 }
 
 /// Cross-volume: copy source bytes to dest. Detects already-copied dest by
@@ -434,6 +514,26 @@ fn sync_catalog_path(conn: &Connection, f: &FileOperationFile, new_path: &Path) 
     if updated_by_path == 0 {
         if let Some(file_id) = f.catalog_file_id {
             fdb::update_files_path(conn, file_id, &new_path_str, &new_filename)?;
+        }
+    }
+
+    if updated_by_path == 0 && f.catalog_file_id.is_none() {
+        // Both mechanisms missing together is the path-spelling-drift
+        // signature (sidecar/non-catalog files are expected misses — only
+        // catalog-eligible formats get the warn).
+        let eligible = new_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| {
+                matches!(
+                    e.to_ascii_lowercase().as_str(),
+                    "fits" | "fit" | "fts" | "xisf"
+                )
+            })
+            .unwrap_or(false);
+        if eligible {
+            tracing::warn!(src = %f.source_path, dest = %new_path_str,
+                "move hot-sync matched no catalog row for catalog-eligible file");
         }
     }
 

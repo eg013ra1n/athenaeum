@@ -208,6 +208,17 @@ pub fn list_operation_files(conn: &Connection, operation_id: i64) -> Result<Vec<
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.into())
 }
 
+/// Backfill `expected_hash` for a row that degraded from AtomicRename to the
+/// cross-volume pipeline at execute time (EXDEV) — rename rows are planned
+/// without a hash.
+pub fn set_expected_hash(conn: &Connection, file_row_id: i64, hash: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE file_operation_files SET expected_hash = ?1 WHERE id = ?2",
+        params![hash, file_row_id],
+    )?;
+    Ok(())
+}
+
 /// Insert a step row in Pending state. Returns its id.
 pub fn insert_step(
     conn: &Connection,

@@ -75,6 +75,20 @@ pub(crate) fn native_separator_of(path: &str) -> char {
     if path.starts_with('/') { '/' } else { '\\' }
 }
 
+/// Fold '/'-spelled separators in a user/tool-supplied Windows path to the
+/// native '\' form before it participates in catalog-path comparisons — the
+/// filesystem accepts `C:/Astro/Old` but every stored row spells it
+/// `C:\Astro\Old`, so a '/'-spelled input silently updated zero rows.
+/// Lossless on Windows (filenames cannot contain '/' or '\'); the identity on
+/// POSIX hosts ('\' is a legal filename char there — never rewrite it).
+pub fn normalize_separators(path: &str) -> String {
+    if cfg!(windows) {
+        path.replace('/', "\\")
+    } else {
+        path.to_string()
+    }
+}
+
 /// Build a `(col >= ? AND (? IS NULL OR col < ?)) OR ...` SQL fragment that
 /// matches any row whose `column` falls under one of `roots` as an
 /// exact-case byte-range prefix, plus the values to bind (three per root, in
@@ -5979,3 +5993,24 @@ mod scan_root_kind_tests {
     }
 }
 
+/// Task 10 (cross-platform path fixes) — `normalize_separators` boundary fold.
+#[cfg(test)]
+mod normalize_separators_tests {
+    use super::normalize_separators;
+
+    #[test]
+    fn normalize_separators_is_identity_on_posix() {
+        if !cfg!(windows) {
+            assert_eq!(
+                normalize_separators(r"/data/weird\name/x.fits"),
+                r"/data/weird\name/x.fits"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_separators_folds_forward_slashes() {
+        assert_eq!(normalize_separators("C:/Astro/Old"), r"C:\Astro\Old");
+    }
+}

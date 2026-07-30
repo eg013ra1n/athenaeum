@@ -663,9 +663,27 @@ pub fn mkdir_in_scan_root(ctx: &ServiceContext, path: String, policy: &PathPolic
 /// Directory-rename prefixes for `rename_files_path_prefix`, built with the
 /// path's own native separator (the doc contract there requires a trailing
 /// separator; hardcoding '/' silently matched zero rows on Windows).
+///
+/// Trailing separators are trimmed off the inputs first: a caller-supplied
+/// `/data/Old/` would otherwise build the prefix `/data/Old//`, which matches
+/// zero stored rows.
 fn dir_rename_prefixes(old_str: &str, new_str: &str) -> (String, String) {
     let sep = crate::db::native_separator_of(old_str);
-    (format!("{old_str}{sep}"), format!("{new_str}{sep}"))
+    let old = old_str.trim_end_matches(sep);
+    let new = new_str.trim_end_matches(sep);
+    (format!("{old}{sep}"), format!("{new}{sep}"))
+}
+
+/// True when `new` names the SAME on-disk file as `old` (case-insensitive
+/// filesystems: renaming `m31.fits` → `M31.fits` makes `new.exists()` true
+/// for the very file being renamed — that is not a collision).
+pub(crate) fn is_same_file_case_variant(old: &Path, new: &Path) -> bool {
+    new.exists()
+        && old.exists()
+        && matches!(
+            (std::fs::canonicalize(old), std::fs::canonicalize(new)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// Rename a file or directory in place. Same-folder rename only (i.e., no
@@ -689,6 +707,12 @@ fn dir_rename_prefixes(old_str: &str, new_str: &str) -> (String, String) {
 /// filesystem rename has already happened by the time this step runs, so a
 /// hot-sync failure still leaves the catalog stale relative to disk either
 /// way) — it only changes whether the caller is told about it.
+///
+/// `old_path` is separator-folded on entry (`db::normalize_separators`) so a
+/// '/'-spelled Windows path — which the filesystem accepts — still matches the
+/// '\'-spelled rows the catalog stores. A case-only rename
+/// (`m31.fits` → `M31.fits`) is allowed rather than reported as a collision;
+/// see `is_same_file_case_variant`.
 pub fn rename_path(
     ctx: &ServiceContext,
     old_path: String,
@@ -698,6 +722,8 @@ pub fn rename_path(
     if new_name.contains('/') || new_name.contains('\\') || new_name.trim().is_empty() {
         return Err(ApiError::Invalid("new name must be a single path component".into()));
     }
+
+    let old_path = crate::db::normalize_separators(&old_path);
 
     let old = PathBuf::from(&old_path);
 
@@ -712,7 +738,7 @@ pub fn rename_path(
         .ok_or_else(|| ApiError::Invalid("source has no parent directory".to_string()))?
         .to_path_buf();
     let new = parent.join(&new_name);
-    if new.exists() {
+    if new.exists() && !is_same_file_case_variant(&old, &new) {
         return Err(ApiError::Conflict(format!("target already exists: {}", new.display())));
     }
 
@@ -905,6 +931,39 @@ mod dir_rename_prefix_tests {
         assert_eq!(
             dir_rename_prefixes("/data/Old", "/data/New"),
             ("/data/Old/".to_string(), "/data/New/".to_string())
+        );
+    }
+
+    /// A caller-supplied trailing separator must not double up — `/data/Old//`
+    /// as a prefix matches nothing.
+    #[test]
+    fn dir_rename_prefixes_trim_caller_supplied_trailing_separator() {
+        assert_eq!(
+            dir_rename_prefixes("/data/Old/", "/data/New/"),
+            ("/data/Old/".to_string(), "/data/New/".to_string())
+        );
+        assert_eq!(
+            dir_rename_prefixes(r"C:\data\Old\", r"C:\data\New\"),
+            (r"C:\data\Old\".to_string(), r"C:\data\New\".to_string())
+        );
+    }
+
+    #[test]
+    fn case_variant_identity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.fits");
+        std::fs::write(&a, b"x").unwrap();
+        let upper = dir.path().join("A.FITS");
+        let volume_is_case_insensitive = upper.exists();
+        assert_eq!(
+            is_same_file_case_variant(&a, &upper),
+            volume_is_case_insensitive
+        );
+        let b = dir.path().join("b.fits");
+        std::fs::write(&b, b"y").unwrap();
+        assert!(
+            !is_same_file_case_variant(&a, &b),
+            "distinct files are never the same"
         );
     }
 }

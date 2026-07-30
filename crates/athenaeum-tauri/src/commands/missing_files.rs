@@ -343,6 +343,7 @@ pub async fn relocate_missing_file(
     new_path: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let new_path = athenaeum_core::db::normalize_separators(&new_path);
     // Verify the new path exists
     if !Path::new(&new_path).exists() {
         return Err(format!("File does not exist at path: {}", new_path));
