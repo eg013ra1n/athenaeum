@@ -365,7 +365,7 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
         message: dedicated
           ? 'The old library folder is removed from the catalog (its masters’ catalog entries are deleted; files on disk are kept). The new folder becomes the master destination in one step.'
           : 'The Calibration Library destination moves to the new folder. Files on disk are not touched.',
-        danger: true,
+        danger: dedicated,
         onConfirm: proceed,
       });
     } else {
