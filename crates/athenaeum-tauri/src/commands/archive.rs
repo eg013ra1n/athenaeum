@@ -356,12 +356,12 @@ pub async fn get_restore_suggestions(
             |row| {
                 let source_path: String = row.get(0)?;
                 let path_in_zip: String = row.get(1)?;
-                if let Some(stripped) = source_path.strip_suffix(&path_in_zip) {
-                    let trimmed = stripped.trim_end_matches('/');
-                    Ok(if trimmed.is_empty() { None } else { Some(trimmed.to_string()) })
-                } else {
-                    Ok(None)
-                }
+                Ok(
+                    athenaeum_core::archive::path_layout::original_parent_for_restore(
+                        &source_path,
+                        &path_in_zip,
+                    ),
+                )
             },
         )
         .map_err(|e| e.to_string())?;

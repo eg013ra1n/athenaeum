@@ -120,6 +120,29 @@ pub fn path_in_zip(unique_root_name: &str, scan_root: &Path, source_file: &Path)
     buf.to_string_lossy().replace('\\', "/")
 }
 
+/// Reverse of [`path_in_zip`] for the restore-suggestion UI: strip as many
+/// trailing components off `source_path` as `path_in_zip` carries, yielding
+/// the directory the archive layout was rooted at (the scan root's parent).
+/// Component-COUNT based and separator-agnostic: `path_in_zip` is always
+/// '/'-separated (zip convention) while `source_path` is a native OS path —
+/// the old `strip_suffix(&path_in_zip)` string compare could never match a
+/// '\'-separated source, so on Windows the "Original location" restore option
+/// was permanently disabled and the dialog fell back to relocating the data
+/// under an arbitrary scan root.
+pub fn original_parent_for_restore(source_path: &str, path_in_zip: &str) -> Option<String> {
+    let n = path_in_zip.split('/').filter(|c| !c.is_empty()).count();
+    let mut end = source_path.trim_end_matches(['/', '\\']).len();
+    for _ in 0..n {
+        end = source_path[..end].rfind(['/', '\\'])?;
+    }
+    let parent = source_path[..end].trim_end_matches(['/', '\\']);
+    if parent.is_empty() {
+        None
+    } else {
+        Some(parent.to_string())
+    }
+}
+
 /// Compute the archive directory for a calibration-set archive-of-originals
 /// plan (Task 14): `Calibration_Archive/<Camera>/<YYYY-MM-DD>`, relative to
 /// the archive root. Falls back to `UnknownCamera` / `unknown-date` the same
@@ -288,6 +311,32 @@ mod tests {
             None, "Bias", None, None, "2026-06-28T20:00:00Z", "2026-06-28T21:00:00Z",
         );
         assert_eq!(f, "UnknownCamera_Bias_2026-06-28_2026-06-28.zip");
+    }
+
+    #[test]
+    fn original_parent_component_based_both_separator_styles() {
+        // POSIX source vs '/'-separated zip path:
+        assert_eq!(
+            original_parent_for_restore("/data/Astro/M31/x.fits", "Astro/M31/x.fits"),
+            Some("/data".to_string())
+        );
+        // Windows source vs the SAME '/'-separated zip path — the old string
+        // strip_suffix could never match this:
+        assert_eq!(
+            original_parent_for_restore(r"C:\data\Astro\M31\x.fits", "Astro/M31/x.fits"),
+            Some(r"C:\data".to_string())
+        );
+        // Stripping consumes the whole path -> None (parity with the old code).
+        assert_eq!(
+            original_parent_for_restore("/Astro/M31/x.fits", "Astro/M31/x.fits"),
+            None
+        );
+        // Fallback two-component zip path over a shallow source: strips both
+        // components, leaving the bare drive designator.
+        assert_eq!(
+            original_parent_for_restore(r"C:\stray\x.fits", "Root/x.fits"),
+            Some("C:".to_string())
+        );
     }
 
     #[test]
