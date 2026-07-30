@@ -20,17 +20,28 @@ pub fn sanitize_for_filename(s: &str) -> String {
     while out.contains("__") {
         out = out.replace("__", "_");
     }
-    let out = out.trim_matches('_').trim_end_matches(['.', ' ']).to_string();
-    // Windows reserves CON/PRN/AUX/NUL/COM1-9/LPT1-9 as any path segment,
-    // case-insensitive, with or without an extension. The device is resolved
-    // from the component BEFORE THE FIRST DOT (`NUL.txt` ≡ `NUL`), so the
-    // underscore must break THAT token — not the tail of the whole string.
+    let out = out.trim_matches('_').to_string();
+    windows_safe_component(&out, "")
+}
+
+/// Windows-safety tail shared by every generated folder/file-name sanitizer:
+/// trim trailing dots/spaces (Win32 silently strips them, desyncing the
+/// on-disk name from the catalog's), defuse reserved DOS device basenames
+/// (CON/PRN/AUX/NUL/COM0-9/LPT0-9 plus the superscript COM¹²³/LPT¹²³ forms —
+/// resolved from the pre-first-dot token), and substitute `fallback` for a
+/// component that sanitized away to nothing ("", ".", ".." all end here —
+/// ".." would otherwise climb OUT of the chosen output folder).
+pub fn windows_safe_component(s: &str, fallback: &str) -> String {
+    let out = s.trim_end_matches(['.', ' ']).to_string();
+    if out.is_empty() {
+        return fallback.to_string();
+    }
     let base = out.split('.').next().unwrap_or("");
     let upper = base.to_ascii_uppercase();
     let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (upper.len() == 4
+        || (upper.chars().count() == 4
             && (upper.starts_with("COM") || upper.starts_with("LPT"))
-            && matches!(upper.as_bytes()[3], b'1'..=b'9'));
+            && matches!(upper.chars().nth(3), Some('0'..='9' | '¹' | '²' | '³')));
     if reserved {
         match out.find('.') {
             // "NUL.txt" → "NUL_.txt": break the pre-first-dot component.
@@ -43,12 +54,15 @@ pub fn sanitize_for_filename(s: &str) -> String {
 }
 
 /// Token, with a "Unknown" fallback when the value is None or empty.
+/// Sanitizes FIRST: a value that is non-empty but sanitizes away to nothing
+/// (e.g. "???", "..") must fall back to `Unknown` too, not leave an empty
+/// token that collapses two `_` separators in the zip filename.
 fn token(value: Option<&str>) -> String {
-    let s = value.unwrap_or("").trim();
+    let s = sanitize_for_filename(value.unwrap_or(""));
     if s.is_empty() {
         "Unknown".to_string()
     } else {
-        sanitize_for_filename(s)
+        s
     }
 }
 
@@ -217,7 +231,15 @@ pub fn calibration_zip_dir(instrume: Option<&str>, date_start: &str) -> PathBuf 
         .map(sanitize_for_filename)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "UnknownCamera".into());
-    let date = date_start.get(..10).unwrap_or("unknown-date");
+    // The date segment is a path component like the camera one: sanitize it the
+    // same way (a malformed/short DATE-OBS prefix must not smuggle separators or
+    // reserved forms into the archive layout) and fall back when it empties out.
+    let date_raw = sanitize_for_filename(date_start.get(..10).unwrap_or(""));
+    let date = if date_raw.is_empty() {
+        "unknown-date".to_string()
+    } else {
+        date_raw
+    };
     PathBuf::from("Calibration_Archive").join(cam).join(date)
 }
 
@@ -287,11 +309,26 @@ mod tests {
         assert_eq!(sanitize_for_filename("COM3"), "COM3_");
         assert_eq!(sanitize_for_filename("lpt9.fits"), "lpt9_.fits");
         assert_eq!(sanitize_for_filename("NUL.txt"), "NUL_.txt");
-        // Not reserved: COM0, COM10, plain names, inner dots.
-        assert_eq!(sanitize_for_filename("COM0"), "COM0");
+        // Microsoft's CURRENT reserved list also covers COM0/LPT0 and the
+        // superscript COM¹²³/LPT¹²³ forms — defused like the rest.
+        assert_eq!(sanitize_for_filename("COM0"), "COM0_");
+        assert_eq!(sanitize_for_filename("lpt0"), "lpt0_");
+        assert_eq!(sanitize_for_filename("COM³"), "COM³_");
+        // Not reserved: COM10 (two digits), plain names, inner dots.
         assert_eq!(sanitize_for_filename("com10"), "com10");
         assert_eq!(sanitize_for_filename("M31"), "M31");
         assert_eq!(sanitize_for_filename("DMK 41AU02.AS"), "DMK_41AU02.AS");
+    }
+
+    #[test]
+    fn windows_safe_component_covers_current_reserved_list() {
+        assert_eq!(windows_safe_component("COM0", "X"), "COM0_");
+        assert_eq!(windows_safe_component("LPT0", "X"), "LPT0_");
+        assert_eq!(windows_safe_component("LPT²", "X"), "LPT²_");
+        assert_eq!(windows_safe_component("COM10", "X"), "COM10");
+        assert_eq!(windows_safe_component("M31.", "X"), "M31");
+        assert_eq!(windows_safe_component("..", "X"), "X");
+        assert_eq!(windows_safe_component("", "X"), "X");
     }
 
     #[test]

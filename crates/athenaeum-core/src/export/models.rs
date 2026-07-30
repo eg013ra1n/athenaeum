@@ -243,11 +243,10 @@ pub fn sanitize_display_folder_name(name: &str) -> String {
     let sanitized: String = name
         .trim()
         .chars()
-        .map(|c| {
-            match c {
-                ':' | '/' | '\\' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-                _ => c,
-            }
+        .filter(|c| !c.is_control())
+        .map(|c| match c {
+            ':' | '/' | '\\' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
         })
         .collect();
     // Collapse consecutive underscores
@@ -264,7 +263,11 @@ pub fn sanitize_display_folder_name(name: &str) -> String {
             prev_underscore = false;
         }
     }
-    result
+    // Frame-set names are free user text and become a directory under the
+    // user-chosen output folder: ".." must not climb out of it, "CON"/"NUL"
+    // must not abort the export on Windows, and a trailing dot must not make
+    // Win32 silently create a differently-named directory.
+    crate::archive::path_layout::windows_safe_component(&result, "Unknown")
 }
 
 // ============================================================================
@@ -773,4 +776,18 @@ pub struct WbppKeywordInstruction {
     pub pre_checked: bool,
     /// Description of what this keyword controls
     pub description: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_folder_name_is_windows_safe() {
+        assert_eq!(sanitize_display_folder_name(".."), "Unknown");
+        assert_eq!(sanitize_display_folder_name("CON"), "CON_");
+        assert_eq!(sanitize_display_folder_name("M31."), "M31");
+        assert_eq!(sanitize_display_folder_name("M31 Panel 1"), "M31 Panel 1");
+        assert_eq!(sanitize_display_folder_name("a\u{7}b"), "ab");
+    }
 }
