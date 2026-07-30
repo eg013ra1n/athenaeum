@@ -129,7 +129,7 @@ pub fn build_plan(
         }
         let scan_root = scan_roots
             .iter()
-            .find(|r| src.starts_with(r))
+            .find(|r| path_layout::path_starts_with_fold(src, Path::new(r.as_str())))
             .cloned()
             .unwrap_or_else(|| {
                 src.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
@@ -178,6 +178,27 @@ pub fn build_plan(
             frame_role: candidate.role.as_str().to_string(),
             file_size_bytes: candidate.file_size,
         });
+    }
+
+    // Two files must never map to one in-zip entry: staging would silently
+    // overwrite the first and the archive dies later with a misleading
+    // hash-mismatch. Case-insensitive on every platform — zip entries that
+    // differ only by case explode on Windows extraction anyway.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for f in &files {
+            let key = (
+                f.target_zip_path.to_lowercase(),
+                f.target_path_in_zip.to_lowercase(),
+            );
+            if !seen.insert(key) {
+                return Err(anyhow!(
+                    "two files map to the same in-zip path '{}' in {} — check for duplicate filenames under unregistered or differently-cased roots",
+                    f.target_path_in_zip,
+                    f.target_zip_path
+                ));
+            }
+        }
     }
 
     let zips: Vec<PlannedZip> = zips_by_role
@@ -337,7 +358,7 @@ pub fn build_calibration_set_plan(
         }
         let scan_root = scan_roots
             .iter()
-            .find(|r| src.starts_with(r))
+            .find(|r| path_layout::path_starts_with_fold(src, Path::new(r.as_str())))
             .cloned()
             .unwrap_or_else(|| {
                 src.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()
@@ -368,6 +389,27 @@ pub fn build_calibration_set_plan(
             frame_role: role.as_str().to_string(),
             file_size_bytes: *size,
         });
+    }
+
+    // Two files must never map to one in-zip entry: staging would silently
+    // overwrite the first and the archive dies later with a misleading
+    // hash-mismatch. Case-insensitive on every platform — zip entries that
+    // differ only by case explode on Windows extraction anyway.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for f in &files {
+            let key = (
+                f.target_zip_path.to_lowercase(),
+                f.target_path_in_zip.to_lowercase(),
+            );
+            if !seen.insert(key) {
+                return Err(anyhow!(
+                    "two files map to the same in-zip path '{}' in {} — check for duplicate filenames under unregistered or differently-cased roots",
+                    f.target_path_in_zip,
+                    f.target_zip_path
+                ));
+            }
+        }
     }
 
     let zips = vec![PlannedZip {

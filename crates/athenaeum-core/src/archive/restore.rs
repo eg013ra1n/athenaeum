@@ -81,8 +81,12 @@ fn classify_target<'a>(
     target_root_path: &'a Path,
     files: &[crate::archive::models::ArchiveOperationFile],
 ) -> RestoreTargetMode<'a> {
-    let target = target_root_path.to_string_lossy();
-    let all_under = files.iter().all(|f| f.source_path.starts_with(target.as_ref()));
+    let all_under = files.iter().all(|f| {
+        crate::archive::path_layout::path_starts_with_fold(
+            Path::new(&f.source_path),
+            target_root_path,
+        )
+    });
     if all_under {
         RestoreTargetMode::Original
     } else {
@@ -333,7 +337,9 @@ fn run_restore_inner(
         // Pick the destination path based on mode.
         let dest = match mode {
             RestoreTargetMode::Original => original.to_path_buf(),
-            RestoreTargetMode::UnderRoot(root) => root.join(&f.target_path_in_zip),
+            RestoreTargetMode::UnderRoot(root) => {
+                crate::archive::path_layout::dest_under_root(root, &f.target_path_in_zip)
+            }
         };
 
         if dest.exists() && !overwrite_existing {

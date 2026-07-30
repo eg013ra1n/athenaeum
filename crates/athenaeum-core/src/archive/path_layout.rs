@@ -143,6 +143,39 @@ pub fn original_parent_for_restore(source_path: &str, path_in_zip: &str) -> Opti
     }
 }
 
+/// Component-wise "is `path` under (or equal to) `root`", case-folded on
+/// case-insensitive hosts (Windows/macOS). Plain `Path::starts_with` is
+/// exact-case, which classified `C:\astro\…` as OUTSIDE root `C:\Astro` even
+/// though NTFS treats them as one directory — flipping a restore from
+/// "put files back" to "relocate under root", and flattening archive layouts.
+pub(crate) fn path_starts_with_fold(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    if !cfg!(any(windows, target_os = "macos")) {
+        return false;
+    }
+    let comps = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    let (a, b) = (comps(path), comps(root));
+    a.len() >= b.len() && a[..b.len()] == b[..]
+}
+
+/// Join an always-'/'-separated `path_in_zip` under `root` component-wise, so
+/// the resulting (and later CATALOG-PERSISTED) path uses only native
+/// separators — `root.join(path_in_zip)` on Windows produced the mixed
+/// spelling `C:\root\Lights/M31/x.fits` in `files.path`.
+pub(crate) fn dest_under_root(root: &Path, path_in_zip: &str) -> PathBuf {
+    let mut d = root.to_path_buf();
+    for comp in path_in_zip.split('/').filter(|c| !c.is_empty()) {
+        d.push(comp);
+    }
+    d
+}
+
 /// Compute the archive directory for a calibration-set archive-of-originals
 /// plan (Task 14): `Calibration_Archive/<Camera>/<YYYY-MM-DD>`, relative to
 /// the archive root. Falls back to `UnknownCamera` / `unknown-date` the same
@@ -337,6 +370,37 @@ mod tests {
             original_parent_for_restore(r"C:\stray\x.fits", "Root/x.fits"),
             Some("C:".to_string())
         );
+    }
+
+    #[test]
+    fn starts_with_fold_is_component_wise() {
+        assert!(path_starts_with_fold(
+            Path::new("/photos/astro/x.fits"),
+            Path::new("/photos/astro")
+        ));
+        assert!(!path_starts_with_fold(
+            Path::new("/photos/astro2/x.fits"),
+            Path::new("/photos/astro")
+        ));
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn starts_with_fold_case_folds_on_case_insensitive_hosts() {
+        assert!(path_starts_with_fold(
+            Path::new("/data/astro/x.fits"),
+            Path::new("/data/Astro")
+        ));
+    }
+
+    #[test]
+    fn dest_under_root_joins_component_wise() {
+        let d = dest_under_root(Path::new("/r"), "Lights/M31/x.fits");
+        let comps: Vec<_> = d
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect();
+        assert!(comps.ends_with(&["r".into(), "Lights".into(), "M31".into(), "x.fits".into()]));
     }
 
     #[test]
