@@ -33,17 +33,25 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
   const offline = !root.is_available;
   const [missingOpen, setMissingOpen] = useState(false);
   const [missingFiles, setMissingFiles] = useState<MissingFileRecord[] | null>(null);
+  const [missingError, setMissingError] = useState<string | null>(null);
   const [errorsOpen, setErrorsOpen] = useState(false);
   const displayErrors = scanResult?.errors ?? root.last_scan_errors ?? [];
+  // Missing-file actions (recheck / delete / relocate) mutate the catalog, so they are
+  // offline read-only per spec §5.4. `null` also covers an unpersisted root (id === null),
+  // which nothing can be fetched for. The parse-error log below stays visible offline.
+  const missingRootId = !offline && missingCount > 0 ? root.id : null;
 
-  useEffect(() => { setMissingOpen(false); setMissingFiles(null); setErrorsOpen(false); }, [root.id]);
+  useEffect(() => { setMissingOpen(false); setMissingFiles(null); setMissingError(null); setErrorsOpen(false); }, [root.id]);
 
   const loadMissing = async () => {
+    if (root.id == null) return;
     try {
       const files = await api.invoke<MissingFileRecord[]>('get_missing_files', { rootId: root.id });
       setMissingFiles(files);
+      setMissingError(null);
     } catch (e) {
       console.error('[MonitoredInspector] get_missing_files failed:', e);
+      setMissingError(String(e));
     }
   };
 
@@ -59,18 +67,18 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
           <div className="flex items-center gap-2 font-mono text-xs text-content-muted">
             <span className="truncate">{root.path}</span>
             {isTauri && !offline && (
-              <button onClick={() => revealItemInDir(root.path).catch((e) => console.error('reveal failed:', e))}
+              <button onClick={() => revealItemInDir(root.path).catch((e) => console.error('[MonitoredInspector] reveal failed:', e))}
                 title="Reveal in file manager" className="p-0.5 rounded hover:text-accent transition"><ExternalLink size={12} /></button>
             )}
           </div>
         </div>
         {!offline && (
           <div className="flex gap-2 shrink-0">
-            <button onClick={props.onScan} disabled={isScanning}
+            <button onClick={props.onScan} disabled={isScanning || relinking}
               className="flex items-center gap-2 px-3 py-2 bg-accent hover:bg-accent-hover text-surface font-semibold rounded-lg text-sm transition disabled:opacity-50">
               <RefreshCw size={14} className={isScanning ? 'animate-spin' : ''} /> {isScanning ? 'Scanning…' : 'Scan now'}
             </button>
-            <button onClick={props.onRelink} disabled={relinking}
+            <button onClick={props.onRelink} disabled={isScanning || relinking}
               className="px-3 py-2 bg-surface-hover hover:brightness-110 rounded-lg text-sm text-content transition disabled:opacity-50">
               {relinking ? 'Relinking…' : 'Relink…'}
             </button>
@@ -90,7 +98,7 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
               frame sets, calibration links and tags survive.
             </p>
             <button onClick={props.onRelink} disabled={relinking}
-              className="flex items-center gap-2 px-3 py-1.5 bg-error hover:brightness-90 text-white rounded text-sm transition disabled:opacity-50">
+              className="flex items-center gap-2 px-3 py-1.5 bg-error hover:brightness-90 text-surface rounded text-sm transition disabled:opacity-50">
               <RefreshCw size={14} className={relinking ? 'animate-spin' : ''} /> {relinking ? 'Relinking…' : 'Relink — point to new location…'}
             </button>
           </div>
@@ -136,18 +144,25 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
         </Section>
       )}
 
-      {(missingCount > 0 || displayErrors.length > 0) && (
+      {(missingRootId !== null || displayErrors.length > 0) && (
         <Section title="Needs attention">
-          {missingCount > 0 && (
+          {missingRootId !== null && (
             <div className="rounded-lg border border-orange/40 bg-surface">
               <button onClick={() => { const next = !missingOpen; setMissingOpen(next); if (next && !missingFiles) void loadMissing(); }}
                 className="w-full flex items-center gap-2 p-2.5 text-left text-sm text-orange hover:bg-orange/10 rounded-lg transition">
                 {missingOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                 <AlertTriangle size={14} /> {missingCount} file{missingCount !== 1 ? 's' : ''} missing from disk
               </button>
-              {missingOpen && (missingFiles
-                ? <div className="p-2"><MissingFilesPanel rootId={root.id!} missingFiles={missingFiles} onRefresh={() => { void loadMissing(); props.onMissingChanged(); }} /></div>
-                : <div className="p-3 text-xs text-content-muted flex items-center gap-2"><Loader2 size={12} className="animate-spin" /> loading…</div>)}
+              {missingOpen && (missingError
+                ? <div className="p-3 flex items-center gap-2 text-xs text-error">
+                    <AlertCircle size={12} className="shrink-0" />
+                    <span className="flex-1 min-w-0 break-all">Could not load the missing-file list — {missingError}</span>
+                    <button onClick={() => { setMissingError(null); void loadMissing(); }}
+                      className="shrink-0 px-2 py-0.5 rounded border border-error/50 hover:bg-error-muted transition">Retry</button>
+                  </div>
+                : missingFiles
+                  ? <div className="p-2"><MissingFilesPanel rootId={missingRootId} missingFiles={missingFiles} onRefresh={() => { void loadMissing(); props.onMissingChanged(); }} /></div>
+                  : <div className="p-3 text-xs text-content-muted flex items-center gap-2"><Loader2 size={12} className="animate-spin" /> loading…</div>)}
             </div>
           )}
           {displayErrors.length > 0 && (
