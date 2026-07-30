@@ -57,7 +57,7 @@ function ScanRow({ root, sub, tint, Icon, selected, onClick, onRescan, scanning,
         onClick={(e) => { e.stopPropagation(); if (!offline && !scanning) onRescan(); }}
         disabled={offline || scanning}
         title={offline ? 'Folder is offline' : 'Rescan this folder'}
-        className={`p-1 rounded shrink-0 transition ${offline ? 'opacity-30 cursor-not-allowed text-content-muted' : 'text-content-muted hover:text-accent hover:bg-surface-hover'}`}
+        className={`p-1 rounded shrink-0 transition ${offline ? 'opacity-30 cursor-not-allowed text-content-muted' : scanning ? 'cursor-not-allowed text-content-muted' : 'text-content-muted hover:text-accent hover:bg-surface-hover'}`}
       >
         <RefreshCw size={14} className={scanning ? 'animate-spin text-accent' : ''} />
       </button>
@@ -76,9 +76,10 @@ export function FolderRail({
   const sortedArchive = [...archiveRoots].sort((a, b) =>
     a.is_default === b.is_default ? basename(a.path).localeCompare(basename(b.path)) : a.is_default ? -1 : 1);
 
-  const setCount = (root: ArchiveRoot) => archivedSets.filter((s) => (s.archive_root_path ?? '') === root.path).length;
-  const archiveBytes = (root: ArchiveRoot) =>
-    overview?.archive_roots.find((a) => a.archive_root_id === root.id)?.total_zip_bytes ?? 0;
+  const archiveRow = (root: ArchiveRoot) => overview?.archive_roots.find((a) => a.archive_root_id === root.id);
+  const setCount = (root: ArchiveRoot) =>
+    archiveRow(root)?.set_count ?? archivedSets.filter((s) => (s.archive_root_path ?? '') === root.path).length;
+  const archiveBytes = (root: ArchiveRoot) => archiveRow(root)?.total_zip_bytes ?? 0;
 
   return (
     <div className="w-[300px] shrink-0 bg-surface-elevated rounded-lg p-3 overflow-y-auto">
