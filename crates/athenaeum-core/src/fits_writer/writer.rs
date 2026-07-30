@@ -40,12 +40,12 @@ fn validate(width: usize, height: usize, channels: usize, data_len: usize) -> Re
 /// with the master open) holds the destination without FILE_SHARE_DELETE —
 /// POSIX rename never does. Bounded retry: 5 attempts, 50→800 ms backoff.
 #[cfg(windows)]
-fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_SHARING_VIOLATION: i32 = 32;
     let mut delay = std::time::Duration::from_millis(50);
     let mut last: Option<std::io::Error> = None;
-    for _ in 0..5 {
+    for attempt in 0..5 {
         match std::fs::rename(from, to) {
             Ok(()) => return Ok(()),
             Err(e)
@@ -55,8 +55,12 @@ fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
                 ) =>
             {
                 last = Some(e);
-                std::thread::sleep(delay);
-                delay *= 2;
+                // Only back off when another attempt actually follows —
+                // sleeping after the last one is pure wasted latency.
+                if attempt < 4 {
+                    std::thread::sleep(delay);
+                    delay *= 2;
+                }
             }
             Err(e) => return Err(e),
         }
@@ -65,7 +69,7 @@ fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(windows))]
-fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+pub(crate) fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::rename(from, to)
 }
 

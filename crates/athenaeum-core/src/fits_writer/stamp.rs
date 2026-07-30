@@ -53,7 +53,7 @@ pub fn stamp_extra_card(src: &Path, dest: &Path, card: &Card) -> Result<(), Fits
         std::io::copy(&mut reader, &mut w).map_err(FitsWriteError::Io)?; // data region verbatim
         w.flush().map_err(FitsWriteError::Io)?;
     }
-    std::fs::rename(&tmp, dest).map_err(FitsWriteError::Io)?;
+    super::writer::rename_replace(&tmp, dest).map_err(FitsWriteError::Io)?;
     Ok(())
 }
 
