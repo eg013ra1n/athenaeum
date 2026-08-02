@@ -424,14 +424,33 @@ pub fn delete_calibration_sets_for_root(
     let root_prefix = format!("{}{}", root_path.trim_end_matches(sep), sep);
     let path_hi = path_prefix_upper(&root_prefix);
 
-    // Find affected calibration set IDs (sets containing frames under this root)
+    // Find affected calibration set IDs (sets containing frames under this root).
+    //
+    // The lineage guard mirrors `prune_orphaned_calibration_sets` (db/schema.rs)
+    // exemption-for-exemption: master shells, superseded raw sets, and
+    // provenance-anchored sets are frozen lineage and must never be swept up
+    // here. Both `calibration_set.superseded_by_set_id` and
+    // `master_provenance.source_set_id` are NO-ACTION FKs, so deleting one end
+    // while the other survives (the real-world shape: raw darks under the
+    // toggled imaging root, their master in the Calibration Library root) aborts
+    // with "FOREIGN KEY constraint failed" — and since this runs inside
+    // `reconcile_unique_camera_instrume`'s savepoint, the instrume rename rolls
+    // back too and EVERY subsequent scan of the root fails identically. Where no
+    // FK fires (an imported master whose own file lives under the root),
+    // `archive_operations.calibration_set_id` (ON DELETE CASCADE) would instead
+    // destroy the archive audit rows silently.
     let affected_set_ids: Vec<i64> = {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT csf.set_id
              FROM calibration_set_frames csf
              JOIN frames fr ON csf.frame_id = fr.id
              JOIN files f ON fr.file_id = f.id
-             WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)"
+             JOIN calibration_set cs ON cs.id = csf.set_id
+             WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)
+               AND COALESCE(cs.is_master_library, 0) = 0
+               AND cs.superseded_by_set_id IS NULL
+               AND cs.id NOT IN (SELECT source_set_id FROM master_provenance
+                                  WHERE source_set_id IS NOT NULL)"
         )?;
         let rows = stmt.query_map(params![root_prefix, path_hi], |row| row.get(0))?;
         rows.filter_map(|r| r.ok()).collect()
@@ -5193,6 +5212,213 @@ mod path_prefix_range_tests {
             .query_row("SELECT COUNT(*) FROM calibration_set", [], |r| r.get(0))
             .unwrap();
         assert_eq!(sets, 1, "sibling's calibration set must survive");
+    }
+
+    #[test]
+    fn unique_camera_recluster_spares_master_source_lineage() {
+        // Regression: `reconcile_unique_camera_instrume` runs on EVERY scan and
+        // cascades into `delete_calibration_sets_for_root`. Pre-fix that delete
+        // swept in every set holding a frame under the root, master lineage
+        // included. Real-world shape: the raw darks sit under the imaging root
+        // being toggled, their master sits in the Calibration Library root — so
+        // deleting the raw set leaves `master_provenance.source_set_id`
+        // (NO ACTION) dangling and the statement aborts with "FOREIGN KEY
+        // constraint failed". The whole reconcile runs inside a SavepointGuard,
+        // so the instrume rename rolled back with it and EVERY subsequent scan
+        // of the root failed identically. An imported master whose own file
+        // lives under the root (set 705) had no FK to abort on — it was silently
+        // deleted, taking `archive_operations.calibration_set_id`
+        // (ON DELETE CASCADE) audit rows with it.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO scan_roots (path, unique_camera) VALUES ('/data/lib', 1)",
+            [],
+        )
+        .unwrap();
+        let root_id: i64 = conn
+            .query_row("SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+
+        // Four files under the root (all get their instrume suffixed) plus the
+        // master's own file and a bias member, both OUTSIDE the root.
+        for (file_id, frame_id, path) in [
+            (900i64, 901i64, "/data/lib/dark_raw.fits"),
+            (920, 921, "/data/lib/bias_raw.fits"),
+            (930, 931, "/data/lib/light.fits"),
+            (950, 951, "/data/lib/imported_master.fits"),
+            (910, 911, "/library/master_dark.fits"),
+            (940, 941, "/other/bias.fits"),
+        ] {
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format, created_at)
+                 VALUES (?1, ?2, 'x.fits', 0, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+                params![file_id, path],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, instrume) VALUES (?1, ?2, 'CAM')",
+                params![frame_id, file_id],
+            )
+            .unwrap();
+        }
+
+        // 700 = raw dark set under the root, superseded by master 701 (outside);
+        // 702 = plain raw bias set (no lineage, must still be deleted);
+        // 703 = a bias set 705 links to as a sub-calibration, member outside;
+        // 705 = an imported master whose own file lives under the root.
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date) VALUES (700, 'Dark', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (701, 'MasterDark', '2026-01-01', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date) VALUES (702, 'Bias', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date) VALUES (703, 'Bias', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (705, 'MasterFlat', '2026-01-01', 1)",
+            [],
+        )
+        .unwrap();
+        for (set_id, frame_id) in [(700i64, 901i64), (701, 911), (702, 921), (703, 941), (705, 951)]
+        {
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                params![set_id, frame_id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = 701 WHERE id = 700",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO master_provenance
+                (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+             VALUES (701, 700, '{}', '[]', 'h', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // The under-the-root master's own sub-calibration link.
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+                (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (705, 'calibration_set', 703, 'Bias', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // A light under the root consuming the master.
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+                (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+             VALUES (931, 'frame', 701, 'Dark', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // Archive audit row for the under-the-root master (archive-of-originals).
+        conn.execute(
+            "INSERT INTO archive_operations
+                (id, calibration_set_id, archive_root_path, compression, status, started_at)
+             VALUES (800, 705, '/archive', 'stored', 'completed', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // Pre-fix this returned Err("FOREIGN KEY constraint failed").
+        let result = reconcile_unique_camera_instrume(&conn, root_id)
+            .expect("reconcile must not trip over master provenance references");
+
+        // The rename committed — the savepoint was not rolled back.
+        assert_eq!(result.frames_renamed, 4, "every frame under the root is renamed");
+        let renamed: String = conn
+            .query_row("SELECT instrume FROM frames WHERE id = 901", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(renamed, format!("CAM N{root_id}"));
+
+        // Lineage survives; the plain raw set is the only casualty.
+        assert_eq!(result.calibration_sets_deleted, 1, "only the lineage-free set is deleted");
+        let surviving: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM calibration_set ORDER BY id")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(
+            surviving,
+            vec![700, 701, 703, 705],
+            "superseded raw set, both masters and the sub-calibration target survive; 702 is deleted"
+        );
+
+        // Members of the spared sets are untouched (the cascade never saw them).
+        let members: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_frames WHERE set_id IN (700, 705)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 2, "spared sets keep their member frames");
+
+        // Provenance + archive audit rows survive.
+        let prov: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM master_provenance WHERE master_set_id = 701",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prov, 1, "the provenance row must survive");
+        let ops: i64 = conn
+            .query_row("SELECT COUNT(*) FROM archive_operations WHERE id = 800", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ops, 1, "the archive audit row must not be CASCADE-dropped");
+
+        // The under-the-root master's sub-calibration link survives — it is only
+        // deleted when the master's own id lands in the affected set, which it
+        // no longer can.
+        let sub_link: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_to_frames
+                  WHERE source_type = 'calibration_set' AND source_id = 705",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sub_link, 1, "the master's sub-calibration link must survive");
+
+        // BY DESIGN, unchanged by this fix: the trailing per-frame link cleanup
+        // is unconditional on the target set, so a light under the root loses
+        // its link to the surviving master too. The reconcile rewrote every
+        // frames.instrume under the root, which invalidates every parameter
+        // match — the links are re-established by auto-find
+        // (`calibration::processor::process_frame_set`), not by the scan's
+        // set rebuild, which only re-creates sets.
+        let light_link: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_to_frames
+                  WHERE source_type = 'frame' AND source_id = 931",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(light_link, 0, "per-frame links under the root are cleared wholesale");
     }
 
     #[test]
