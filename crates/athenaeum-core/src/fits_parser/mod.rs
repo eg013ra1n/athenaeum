@@ -598,9 +598,10 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     let swcreate = fits_keywords.get("SWCREATE").cloned();
     let bayerpat = fits_keywords.get("BAYERPAT").cloned();
     // CFA phase offsets + row order — kept in lock-step with the FITS card
-    // path above, including its tolerance for the "1.0" spelling (get_i32
-    // falls back to a float read). Absent keywords stay None; 0 is a real
-    // phase, not a default.
+    // path above: the float fallback below is equivalent for realistic offset
+    // spellings (`get_i32` routes its fallback through `parse_fits_f64`, which
+    // additionally accepts Fortran D-notation — never seen on these cards).
+    // Absent keywords stay None; 0 is a real phase, not a default.
     let parse_offset = |s: &String| -> Option<i64> {
         let s = s.trim();
         s.parse::<i64>().ok().or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
@@ -994,6 +995,32 @@ mod tests {
         assert_eq!(frame.xbayroff, None, "absent XBAYROFF must not become 0");
         assert_eq!(frame.ybayroff, None, "absent YBAYROFF must not become 0");
         assert_eq!(frame.roworder, None);
+    }
+
+    /// The riskiest cross-software variant: an integer written as a quoted
+    /// FITS string. Dropping it would report "unknown phase" for a header that
+    /// plainly declares one.
+    #[test]
+    fn quoted_int_bayer_offsets_are_parsed() {
+        let header = header_with_cards(&[
+            "BAYERPAT= 'RGGB    '",
+            "XBAYROFF= '1       '",
+            "YBAYROFF= '0       '",
+        ]);
+        let path = std::path::Path::new("/tmp/test.fits");
+        let frame = build_frame_from_header(&header, 1, path).unwrap();
+        assert_eq!(frame.xbayroff, Some(1));
+        assert_eq!(frame.ybayroff, Some(0));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let xisf = dir.path().join("osc_quoted.xisf");
+        write_xisf_with_keywords(
+            &xisf,
+            &[("BAYERPAT", "'RGGB'"), ("XBAYROFF", "'1'"), ("YBAYROFF", "'0'")],
+        );
+        let frame = parse_xisf(&xisf, 1).unwrap();
+        assert_eq!(frame.xbayroff, Some(1));
+        assert_eq!(frame.ybayroff, Some(0));
     }
 
     /// Some writers spell an integer-valued card as a float ("1.0"). Both

@@ -94,14 +94,26 @@ pub struct Frame {
     /// `None` means the source did not declare one — never substitute 0: a
     /// fabricated phase silently swaps the color channels of every consumer
     /// that debayers the frame.
+    ///
+    /// NOTE: index-based list readers currently leave this None regardless of
+    /// the stored value — consumers needing the real value must query
+    /// frames.xbayroff/ybayroff/roworder directly.
     pub xbayroff: Option<i64>,
     /// CFA phase offset along Y (YBAYROFF). Same "absent stays None" rule as
     /// `xbayroff`.
+    ///
+    /// NOTE: index-based list readers currently leave this None regardless of
+    /// the stored value — consumers needing the real value must query
+    /// frames.xbayroff/ybayroff/roworder directly.
     pub ybayroff: Option<i64>,
     /// Row order as declared by the source header (`ROWORDER`, e.g.
     /// "TOP-DOWN" / "BOTTOM-UP"), stored verbatim. `None` means the header is
     /// silent — the astronomical bottom-up default is a *rendering* decision
     /// (see `orientation.rs`), not something to write back into the catalog.
+    ///
+    /// NOTE: index-based list readers currently leave this None regardless of
+    /// the stored value — consumers needing the real value must query
+    /// frames.xbayroff/ybayroff/roworder directly.
     pub roworder: Option<String>,
     /// Image position angle in degrees (North through East)
     /// Extracted from CROTA2 or computed from CD matrix

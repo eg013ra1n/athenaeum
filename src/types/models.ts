@@ -18,11 +18,19 @@ bayerpat: string | null,
  * `None` means the source did not declare one — never substitute 0: a
  * fabricated phase silently swaps the color channels of every consumer
  * that debayers the frame.
+ *
+ * NOTE: index-based list readers currently leave this None regardless of
+ * the stored value — consumers needing the real value must query
+ * frames.xbayroff/ybayroff/roworder directly.
  */
 xbayroff: number | null, 
 /**
  * CFA phase offset along Y (YBAYROFF). Same "absent stays None" rule as
  * `xbayroff`.
+ *
+ * NOTE: index-based list readers currently leave this None regardless of
+ * the stored value — consumers needing the real value must query
+ * frames.xbayroff/ybayroff/roworder directly.
  */
 ybayroff: number | null, 
 /**
@@ -30,6 +38,10 @@ ybayroff: number | null,
  * "TOP-DOWN" / "BOTTOM-UP"), stored verbatim. `None` means the header is
  * silent — the astronomical bottom-up default is a *rendering* decision
  * (see `orientation.rs`), not something to write back into the catalog.
+ *
+ * NOTE: index-based list readers currently leave this None regardless of
+ * the stored value — consumers needing the real value must query
+ * frames.xbayroff/ybayroff/roworder directly.
  */
 roworder: string | null, 
 /**
