@@ -1050,6 +1050,10 @@ fn calibrate_one_inner(
         dest = %output_abs.display(),
         calstat = %row.calstat,
         floored_flat_pixels = outcome.floored_flat_pixels,
+        // The BITPIX-derived divisor this frame was actually scaled by (== the
+        // stamped ATH_CSCL card), so a mis-scaled artifact is diagnosable from
+        // the log without re-reading the output header.
+        scale_divisor,
         "light calibration recorded"
     );
     Ok(false)

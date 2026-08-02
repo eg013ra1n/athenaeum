@@ -212,7 +212,11 @@ pub fn claim_collision_free(
 pub fn release_claim(p: &Path) {
     if let Ok(m) = std::fs::metadata(p) {
         if m.len() == 0 {
-            let _ = std::fs::remove_file(p);
+            // A leaked placeholder makes its name permanently unclaimable, so a
+            // failed unlink is a real (if minor) consequence — never swallowed.
+            if let Err(e) = std::fs::remove_file(p) {
+                tracing::warn!(path = %p.display(), error = %e, "claim release failed");
+            }
         }
     }
 }

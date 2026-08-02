@@ -19,6 +19,7 @@ import { BlackholedFramesSection } from './calibration/BlackholedFramesSection';
 import { CreateMasterDialog } from './calibration/CreateMasterDialog';
 import { useMasterBuildContext } from '../contexts/MasterBuildContext';
 import { useLightCalibrationContext } from '../contexts/LightCalibrationContext';
+import { useNotifications } from '../contexts/NotificationContext';
 
 interface CalibrationHierarchyViewProps {
   data: CalibrationHierarchyViewData;
@@ -77,6 +78,8 @@ export function CalibrationHierarchyView({
 
   const { isCalibrating } = useLightCalibrationContext();
   const calibratingLights = frameSetId != null && isCalibrating(frameSetId);
+
+  const { notify } = useNotifications();
 
   // View mode: by-night (date→camera→filter) or by-camera (camera→filter)
   const [viewMode, setViewMode] = useState<'by-night' | 'by-camera'>('by-night');
@@ -253,13 +256,29 @@ export function CalibrationHierarchyView({
   // explicitly deselected (clear that type's link), a number = assign it.
   const handleManualCalibrationApply = useCallback(
     async (flatSetId: ManualPick, darkSetId: ManualPick, biasSetId: ManualPick) => {
+      // `clear_manual_calibration_override` deletes MANUAL links only, so a
+      // deselect aimed at an auto-matched link deletes nothing and the backend
+      // keeps the link. Say so (audit I6) instead of blanking the slot locally
+      // and letting the modal claim a change that never happened.
+      let autoMatchedNoop = false;
+      const clearOverride = async (calibrationType: 'Flat' | 'Dark' | 'Bias'): Promise<boolean> => {
+        const cleared = await api.invoke<number>('clear_manual_calibration_override', {
+          frameIds: manualModalFrameIds,
+          calibrationType,
+        });
+        if (cleared === 0) {
+          console.warn(
+            `[CalibrationHierarchyView] deselect of ${calibrationType} cleared 0 rows — the link is auto-matched, not a manual override`
+          );
+          autoMatchedNoop = true;
+          return false;
+        }
+        return true;
+      };
+
       try {
         if (flatSetId === 'clear') {
-          await api.invoke('clear_manual_calibration_override', {
-            frameIds: manualModalFrameIds,
-            calibrationType: 'Flat',
-          });
-          setManualModalCurrentFlat(null);
+          if (await clearOverride('Flat')) setManualModalCurrentFlat(null);
         } else if (flatSetId !== null && flatSetId !== manualModalCurrentFlat) {
           await api.invoke('manual_assign_calibration', {
             frameIds: manualModalFrameIds,
@@ -269,11 +288,7 @@ export function CalibrationHierarchyView({
           setManualModalCurrentFlat(flatSetId);
         }
         if (darkSetId === 'clear') {
-          await api.invoke('clear_manual_calibration_override', {
-            frameIds: manualModalFrameIds,
-            calibrationType: 'Dark',
-          });
-          setManualModalCurrentDark(null);
+          if (await clearOverride('Dark')) setManualModalCurrentDark(null);
         } else if (darkSetId !== null && darkSetId !== manualModalCurrentDark) {
           await api.invoke('manual_assign_calibration', {
             frameIds: manualModalFrameIds,
@@ -283,11 +298,7 @@ export function CalibrationHierarchyView({
           setManualModalCurrentDark(darkSetId);
         }
         if (biasSetId === 'clear') {
-          await api.invoke('clear_manual_calibration_override', {
-            frameIds: manualModalFrameIds,
-            calibrationType: 'Bias',
-          });
-          setManualModalCurrentBias(null);
+          if (await clearOverride('Bias')) setManualModalCurrentBias(null);
         } else if (biasSetId !== null && biasSetId !== manualModalCurrentBias) {
           await api.invoke('manual_assign_calibration', {
             frameIds: manualModalFrameIds,
@@ -295,6 +306,17 @@ export function CalibrationHierarchyView({
             calibrationType: 'Bias',
           });
           setManualModalCurrentBias(biasSetId);
+        }
+
+        // One notice per apply, however many slots were auto-matched — the
+        // wording is the same for each, so three toasts would only be noise.
+        if (autoMatchedNoop) {
+          notify({
+            title: 'Link not cleared',
+            detail: 'This link was auto-matched — deselect only affects manual assignments.',
+            kind: 'generic',
+            tone: 'info',
+          });
         }
 
         setManualModalOpen(false);
@@ -306,7 +328,7 @@ export function CalibrationHierarchyView({
         console.error('Failed to apply manual calibration:', error);
       }
     },
-    [manualModalFrameIds, manualModalCurrentFlat, manualModalCurrentDark, manualModalCurrentBias, onRefresh]
+    [manualModalFrameIds, manualModalCurrentFlat, manualModalCurrentDark, manualModalCurrentBias, onRefresh, notify]
   );
 
   const showFilterActionBar = checkedKeys.size > 0 && (onSplit || onCreateCustomSet);
