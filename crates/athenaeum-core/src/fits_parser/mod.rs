@@ -489,6 +489,7 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     let mut fits_keywords: HashMap<String, String> = HashMap::new();
     let mut xisf_geometry: Option<(i32, i32)> = None;
     let mut xisf_properties: HashMap<String, String> = HashMap::new();
+    let mut xisf_cfa_pattern: Option<String> = None;
     let mut buf = Vec::new();
 
     loop {
@@ -550,6 +551,18 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
                     xisf_properties.insert(prop_id, prop_value);
                 }
             }
+            // Native XISF CFA declaration: <ColorFilterArray pattern="RGGB"
+            // width="2" height="2" name="RGGB"/>. Taken raw here; validated and
+            // adopted below, only when no BAYERPAT keyword is present.
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
+                if e.name().as_ref() == b"ColorFilterArray" =>
+            {
+                for attr in e.attributes().flatten() {
+                    if attr.key.as_ref() == b"pattern" {
+                        xisf_cfa_pattern = Some(String::from_utf8_lossy(&attr.value).to_string());
+                    }
+                }
+            }
             Ok(Event::Eof) => break,
             Err(e) => {
                 tracing::error!(
@@ -597,6 +610,23 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         .and_then(|s| s.parse::<f64>().ok());
     let swcreate = fits_keywords.get("SWCREATE").cloned();
     let bayerpat = fits_keywords.get("BAYERPAT").cloned();
+    // Fall back to the native XISF <ColorFilterArray> element: a writer that
+    // emits the XISF 1.0 element and no BAYERPAT keyword is declaring a mosaic
+    // just as plainly, and treating it as MONO poisons everything downstream.
+    // An explicit BAYERPAT keyword keeps precedence. The element carries no
+    // phase offsets, so xbayroff/ybayroff stay None below — an assumed phase
+    // misaligns the CFA grid, and absent beats fabricated.
+    let bayerpat = bayerpat.or_else(|| {
+        let raw = xisf_cfa_pattern.as_ref()?;
+        let pattern = raw.trim().to_uppercase();
+        if !pattern.is_empty() && pattern.bytes().all(|b| matches!(b, b'R' | b'G' | b'B')) {
+            tracing::debug!(path = %path.display(), file_id, pattern = %pattern, "adopted cfa pattern from xisf element");
+            Some(pattern)
+        } else {
+            tracing::warn!(path = %path.display(), file_id, pattern = %raw, "unrecognized xisf cfa pattern");
+            None
+        }
+    });
     // CFA phase offsets + row order — kept in lock-step with the FITS card
     // path above: the float fallback below is equivalent for realistic offset
     // spellings (`get_i32` routes its fallback through `parse_fits_f64`, which
@@ -1053,16 +1083,25 @@ mod tests {
     /// given FITSKeyword name/value pairs. Values are passed through verbatim,
     /// so a caller can spell a string value with the XISF `'...'` quoting.
     fn write_xisf_with_keywords(path: &std::path::Path, keywords: &[(&str, &str)]) {
-        let mut xml = String::from(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xisf version=\"1.0\">\n<Image geometry=\"100:100:1\">\n",
-        );
+        let mut body = String::new();
         for (name, value) in keywords {
-            xml.push_str(&format!(
+            body.push_str(&format!(
                 "<FITSKeyword name=\"{}\" value=\"{}\" comment=\"\"/>\n",
                 name, value
             ));
         }
-        xml.push_str("</Image>\n</xisf>");
+        write_xisf_with_image_body(path, &body);
+    }
+
+    /// Same minimal XISF container, but the `<Image>` body is passed verbatim —
+    /// the general form behind `write_xisf_with_keywords`, used by the CFA tests
+    /// to place a native `<ColorFilterArray …/>` next to (or instead of) the
+    /// FITSKeyword cards.
+    fn write_xisf_with_image_body(path: &std::path::Path, body: &str) {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xisf version=\"1.0\">\n<Image geometry=\"100:100:1\">\n{}</Image>\n</xisf>",
+            body
+        );
 
         let xml_bytes = xml.as_bytes();
         let mut out: Vec<u8> = Vec::with_capacity(16 + xml_bytes.len());
@@ -1107,5 +1146,68 @@ mod tests {
         assert_eq!(frame.xbayroff, None, "absent XBAYROFF must not become 0");
         assert_eq!(frame.ybayroff, None, "absent YBAYROFF must not become 0");
         assert_eq!(frame.roworder, None);
+    }
+
+    /// The native XISF CFA declaration. Files written with only
+    /// `<ColorFilterArray …/>` and no BAYERPAT FITSKeyword are common, and
+    /// without this they read as MONO end-to-end.
+    #[test]
+    fn xisf_colorfilterarray_pattern_is_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cfa_only.xisf");
+        write_xisf_with_image_body(
+            &path,
+            "<FITSKeyword name=\"OBJECT\" value=\"'M42'\" comment=\"\"/>\n\
+             <ColorFilterArray pattern=\"RGGB\" width=\"2\" height=\"2\" name=\"RGGB\"/>\n",
+        );
+
+        let frame = parse_xisf(&path, 1).unwrap();
+        assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"));
+        // The element carries no phase offsets — assuming (0,0) would misalign
+        // the CFA grid just as surely as a wrong pattern would.
+        assert_eq!(frame.xbayroff, None, "the CFA element declares no phase");
+        assert_eq!(frame.ybayroff, None, "the CFA element declares no phase");
+    }
+
+    /// A BAYERPAT FITSKeyword is the explicit statement and outranks the
+    /// element — the two disagreeing is a real (if rare) shape.
+    #[test]
+    fn xisf_bayerpat_keyword_outranks_colorfilterarray() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cfa_both.xisf");
+        write_xisf_with_image_body(
+            &path,
+            "<FITSKeyword name=\"BAYERPAT\" value=\"'BGGR'\" comment=\"\"/>\n\
+             <ColorFilterArray pattern=\"RGGB\" width=\"2\" height=\"2\" name=\"RGGB\"/>\n",
+        );
+
+        let frame = parse_xisf(&path, 1).unwrap();
+        assert_eq!(frame.bayerpat.as_deref(), Some("BGGR"));
+    }
+
+    /// A pattern we cannot interpret is reported and dropped — a bogus mosaic
+    /// declaration is worse than none, and must not panic the scan.
+    #[test]
+    fn xisf_unrecognized_colorfilterarray_pattern_is_dropped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cfa_garbage.xisf");
+        write_xisf_with_image_body(
+            &path,
+            "<ColorFilterArray pattern=\"XYZW\" width=\"2\" height=\"2\" name=\"XYZW\"/>\n",
+        );
+
+        let frame = parse_xisf(&path, 1).unwrap();
+        assert_eq!(frame.bayerpat, None);
+    }
+
+    /// Neither declaration present — the frame stays mono, no invented pattern.
+    #[test]
+    fn xisf_without_cfa_declaration_stays_mono() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mono_nocfa.xisf");
+        write_xisf_with_keywords(&path, &[("OBJECT", "'M33'")]);
+
+        let frame = parse_xisf(&path, 1).unwrap();
+        assert_eq!(frame.bayerpat, None);
     }
 }
