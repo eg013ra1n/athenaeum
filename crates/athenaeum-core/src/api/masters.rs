@@ -1182,18 +1182,33 @@ fn run_master_build_thread(
     // a successful master build into a reported failure. Log-and-continue.
     if was_new_build && recipe.archive_after {
         if result.is_ok() {
-            match archive_originals(ctx.clone(), emitter.clone(), set_id) {
-                Ok(archive_op_id) => {
+            // Same catch_unwind discipline as run_build above: a panic in the
+            // archive chain must never skip handle removal / completion emission.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                archive_originals(ctx.clone(), emitter.clone(), set_id)
+            })) {
+                Ok(Ok(archive_op_id)) => {
                     tracing::info!(
                         set_id, archive_op_id,
                         "archive_after: queued archive-of-originals for the just-superseded source set"
                     );
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     tracing::error!(
                         set_id, error = %e,
                         "archive_after: failed to queue archive-of-originals for the just-superseded \
                          source set — the master build itself still succeeded; originals were left in place"
+                    );
+                }
+                Err(panic) => {
+                    let detail = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    tracing::error!(
+                        set_id, error = %detail,
+                        "archive_after: PANICKED — build still reported as succeeded; originals left in place"
                     );
                 }
             }
