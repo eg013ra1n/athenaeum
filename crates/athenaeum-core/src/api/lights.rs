@@ -672,9 +672,12 @@ fn card_from_kv(keyword: &str, value: &str) -> Option<Card> {
 
 /// Rebuild the source frame's header cards from the scanner-stored
 /// `fits_header` blob (format-aware, so an XISF source works too). Pure DB — no
-/// disk re-read of the (possibly huge) light file. Missing blob → no cards.
+/// disk re-read of the (possibly huge) light file. Missing blob → no cards (and
+/// a warn: an output with no copied-through metadata is a real, visible loss,
+/// never a silent one).
 fn source_cards_for_file(
     conn: &Connection,
+    frame_id: i64,
     file_id: i64,
     format: FileFormat,
 ) -> Result<Vec<Card>, ApiError> {
@@ -686,13 +689,96 @@ fn source_cards_for_file(
         )
         .optional()?;
     let Some(header_text) = header_text else {
+        tracing::warn!(
+            file_id,
+            "no stored header for light — calibrated output will carry no copied-through cards"
+        );
         return Ok(Vec::new());
     };
     let keys = parse_stored_header_keys(format, &header_text);
-    Ok(keys
+    let mut cards: Vec<Card> = keys
         .iter()
         .filter_map(|(k, v)| card_from_kv(k, v))
-        .collect())
+        .collect();
+    append_bayer_cards_from_columns(conn, frame_id, file_id, &mut cards)?;
+    Ok(cards)
+}
+
+/// Bayer/CFA cards the stored blob can legitimately lack while the catalog
+/// columns hold the truth: an XISF that declares its CFA only through the
+/// `<ColorFilterArray>` element populates `frames.bayerpat` but has no
+/// BAYERPAT line anywhere in its raw XML blob — and the blob is what
+/// copy-through reads. Without this fallback the calibrated output of such a
+/// source would ship with no CFA geometry at all.
+///
+/// Rules, in order:
+/// - a card parsed from the blob always wins (the file's own declaration);
+/// - a NULL/blank column adds nothing — absent beats fabricated, exactly as in
+///   `headers.rs::load_bayer_consensus`;
+/// - the blob itself is never touched. `fits_header` stays the raw
+///   scan-time record; only the OUTPUT header gains the derived card.
+///
+/// The columns are read directly rather than through a `Frame`: the index-based
+/// list readers hardcode `None` for xbayroff/ybayroff/roworder regardless of
+/// what is stored (see `models.rs`), so a `Frame` round-trip would erase them.
+fn append_bayer_cards_from_columns(
+    conn: &Connection,
+    frame_id: i64,
+    file_id: i64,
+    cards: &mut Vec<Card>,
+) -> Result<(), ApiError> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(Option<String>, Option<i64>, Option<i64>, Option<String>)> = conn
+        .query_row(
+            "SELECT bayerpat, xbayroff, ybayroff, roworder FROM frames WHERE id = ?1",
+            params![frame_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((bayerpat, xbayroff, ybayroff, roworder)) = row else {
+        return Ok(());
+    };
+
+    let text = |v: Option<String>| -> Option<String> {
+        v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    let candidates: Vec<(&str, CardValue)> = [
+        text(bayerpat).map(|v| ("BAYERPAT", CardValue::Str(v))),
+        xbayroff.map(|v| ("XBAYROFF", CardValue::Integer(v))),
+        ybayroff.map(|v| ("YBAYROFF", CardValue::Integer(v))),
+        text(roworder).map(|v| ("ROWORDER", CardValue::Str(v))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    for (keyword, value) in candidates {
+        if cards.iter().any(|c| c.keyword == keyword) {
+            continue; // the file's own card wins
+        }
+        // These four keywords are all writer-legal by construction, so a
+        // rejection here means something changed underneath us — log it rather
+        // than dropping the CFA geometry silently.
+        let card = match Card::new(keyword, value) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    file_id,
+                    field = keyword,
+                    error = %e,
+                    "derived bayer card rejected by the writer — omitted"
+                );
+                continue;
+            }
+        };
+        tracing::debug!(
+            file_id,
+            field = keyword,
+            "bayer card derived from catalog column (absent from stored header)"
+        );
+        cards.push(card);
+    }
+    Ok(())
 }
 
 /// YYYY-MM-DD from a DATE-OBS string (`2026-07-05T20:30:00Z` → `2026-07-05`).
@@ -757,7 +843,7 @@ fn resolve_frame_inputs(
     } else {
         FileFormat::FITS
     };
-    let source_cards = source_cards_for_file(conn, file_id, format)?;
+    let source_cards = source_cards_for_file(conn, frame_id, file_id, format)?;
 
     let links = get_links_for_frame(conn, frame_id)?;
     let dark = resolve_type(conn, &links, frame_id, "Dark")?;
@@ -3079,5 +3165,122 @@ mod tests {
         let active: Arc<Mutex<HashMap<i64, ()>>> = Arc::new(Mutex::new(HashMap::new()));
         let cancel = Arc::new(AtomicBool::new(false));
         assert!(!wait_for_preflight_builds(&active, &[], &cancel));
+    }
+
+    // ── Bayer copy-through: catalog-column fallback ─────────────────────────
+
+    /// Seed a stored header blob + the frame's Bayer columns for frame 1.
+    fn seed_header_and_bayer(
+        conn: &Connection,
+        file_id: i64,
+        header: &str,
+        bayerpat: Option<&str>,
+        xbayroff: Option<i64>,
+        ybayroff: Option<i64>,
+        roworder: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO fits_header (file_id, header) VALUES (?1, ?2)",
+            params![file_id, header],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE frames SET bayerpat = ?2, xbayroff = ?3, ybayroff = ?4, roworder = ?5
+             WHERE file_id = ?1",
+            params![file_id, bayerpat, xbayroff, ybayroff, roworder],
+        )
+        .unwrap();
+    }
+
+    fn card_str(cards: &[Card], keyword: &str) -> Option<String> {
+        cards.iter().find(|c| c.keyword == keyword).and_then(|c| match &c.value {
+            Some(CardValue::Str(s)) => Some(s.clone()),
+            _ => None,
+        })
+    }
+
+    fn card_int(cards: &[Card], keyword: &str) -> Option<i64> {
+        cards.iter().find(|c| c.keyword == keyword).and_then(|c| match &c.value {
+            Some(CardValue::Integer(i)) => Some(*i),
+            _ => None,
+        })
+    }
+
+    /// An XISF whose CFA is declared only by the `<ColorFilterArray>` element
+    /// populates `frames.bayerpat` but leaves the stored blob (raw XML) without
+    /// any BAYERPAT line. Copy-through reads the blob, so without the column
+    /// fallback the calibrated output would carry no CFA geometry at all and
+    /// could not be debayered downstream. A NULL column still adds nothing.
+    #[test]
+    fn bayer_cards_derived_from_columns_when_blob_is_silent() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let file_id = 1 + 1_000_000;
+        seed_header_and_bayer(
+            &conn,
+            file_id,
+            "INSTRUME= 'TestCam'\nEXPTIME = 120.0\nEND",
+            Some("RGGB"),
+            Some(0),
+            Some(1),
+            None, // roworder unknown → nothing to derive
+        );
+
+        let cards = source_cards_for_file(&conn, 1, file_id, FileFormat::FITS).unwrap();
+        assert_eq!(card_str(&cards, "BAYERPAT").as_deref(), Some("RGGB"));
+        assert_eq!(card_int(&cards, "XBAYROFF"), Some(0), "phase 0 is a real value, not absence");
+        assert_eq!(card_int(&cards, "YBAYROFF"), Some(1));
+        assert!(
+            !cards.iter().any(|c| c.keyword == "ROWORDER"),
+            "a NULL column must never be fabricated into a card"
+        );
+        // The blob's own cards are still there — the fallback appends, never replaces.
+        assert_eq!(card_str(&cards, "INSTRUME").as_deref(), Some("TestCam"));
+    }
+
+    /// Precedence: whatever the file's own header declared wins. The column is
+    /// a fallback for a silent blob, not an override of a present card.
+    #[test]
+    fn stored_header_bayer_cards_win_over_catalog_columns() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let file_id = 1 + 1_000_000;
+        seed_header_and_bayer(
+            &conn,
+            file_id,
+            "BAYERPAT= 'GRBG'\nXBAYROFF= 1\nROWORDER= 'BOTTOM-UP'\nEND",
+            Some("RGGB"),
+            Some(0),
+            Some(1),
+            Some("TOP-DOWN"),
+        );
+
+        let cards = source_cards_for_file(&conn, 1, file_id, FileFormat::FITS).unwrap();
+        assert_eq!(card_str(&cards, "BAYERPAT").as_deref(), Some("GRBG"));
+        assert_eq!(card_int(&cards, "XBAYROFF"), Some(1));
+        assert_eq!(card_str(&cards, "ROWORDER").as_deref(), Some("BOTTOM-UP"));
+        // ...and only the blob one is present — no duplicate keyword pair.
+        for kw in ["BAYERPAT", "XBAYROFF", "ROWORDER"] {
+            assert_eq!(
+                cards.iter().filter(|c| c.keyword == kw).count(),
+                1,
+                "{kw} must appear exactly once"
+            );
+        }
+        // The one keyword the blob did NOT declare still comes from its column.
+        assert_eq!(card_int(&cards, "YBAYROFF"), Some(1));
+    }
+
+    /// No stored header blob at all: no cards, and the caller is warned rather
+    /// than silently shipping a bare calibrated header.
+    #[test]
+    fn missing_header_blob_yields_no_cards() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let cards = source_cards_for_file(&conn, 1, 1 + 1_000_000, FileFormat::FITS).unwrap();
+        assert!(cards.is_empty(), "no blob -> no copied-through cards");
     }
 }

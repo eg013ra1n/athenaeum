@@ -83,9 +83,13 @@ fn spill_via_read_raw(path: &Path, scratch_dir: &Path, idx: usize)
 {
     let (meta, pixels) = astroimage::ImageConverter::read_raw(path)
         .map_err(|e| IntegrationError::Decode(format!("{}: {e:#}", path.display())))?;
+    // Every consumer of this reader (master build AND light calibration) works
+    // strictly per-(x,y) on a 1-channel plane, so the message must not claim to
+    // be about calibration *frames* only — it surfaces verbatim to a user whose
+    // LIGHT is the multi-channel file.
     if meta.channels != 1 {
         return Err(IntegrationError::BadInput(format!(
-            "{}: {}-channel image — calibration frames must be 1-channel (CFA mosaics included)",
+            "{}: {}-channel image — frames must be 1-channel for calibration (CFA mosaics stay 1-channel; debayered files cannot be calibrated)",
             path.display(), meta.channels
         )));
     }

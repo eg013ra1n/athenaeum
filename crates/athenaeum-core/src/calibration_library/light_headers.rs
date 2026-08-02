@@ -21,7 +21,10 @@ use anyhow::Result;
 ///   FILTER, … — taken here directly from the raw source cards since a
 ///   calibrated light has no structured equivalent input.
 /// - Session/target: OBJECT, coordinates, site, observer.
-/// - Bayer/CFA geometry (mosaic preserved un-debayered per §2).
+/// - Bayer/CFA geometry (mosaic preserved un-debayered per §2). ROWORDER
+///   belongs to this group: the CFA pattern is only interpretable together
+///   with the row direction it was declared in, so dropping it flips the
+///   phase (and the colors) of every consumer that debayers the output.
 ///
 /// Anything not listed here (IMAGETYP, CALSTAT, ATH_* provenance) is either
 /// replaced or freshly derived by [`build_light_cal_cards`], never copied
@@ -37,7 +40,7 @@ const COPY_THROUGH_KEYWORDS: &[&str] = &[
     "DATE-OBS", // Session / target
     "OBJECT", "OBJCTRA", "OBJCTDEC", "RA", "DEC", "SITELAT", "SITELONG", "SITEELEV", "OBSERVER",
     // Bayer / CFA geometry
-    "BAYERPAT", "XBAYROFF", "YBAYROFF",
+    "BAYERPAT", "XBAYROFF", "YBAYROFF", "ROWORDER",
 ];
 
 /// Inputs specific to one calibrated-light run, not derivable from the
@@ -351,6 +354,7 @@ mod tests {
             Card::new("BAYERPAT", CardValue::Str("RGGB".into())).unwrap(),
             Card::new("XBAYROFF", CardValue::Integer(0)).unwrap(),
             Card::new("YBAYROFF", CardValue::Integer(1)).unwrap(),
+            Card::new("ROWORDER", CardValue::Str("TOP-DOWN".into())).unwrap(),
             // Not in the copy-through whitelist — must NOT be forwarded.
             Card::new("SWCREATE", CardValue::Str("some other app".into())).unwrap(),
         ];
@@ -362,6 +366,11 @@ mod tests {
         assert!(matches!(&bp.value, Some(CardValue::Str(v)) if v == "RGGB"));
         assert!(find("XBAYROFF").is_some(), "XBAYROFF copied through");
         assert!(find("YBAYROFF").is_some(), "YBAYROFF copied through");
+        // ROWORDER pins the mosaic's row direction: without it a debayering
+        // consumer flips the CFA phase and swaps the color channels of the
+        // calibrated output.
+        let ro = find("ROWORDER").expect("ROWORDER copied through");
+        assert!(matches!(&ro.value, Some(CardValue::Str(v)) if v == "TOP-DOWN"));
         assert!(
             find("SWCREATE").is_none(),
             "SWCREATE is not in the copy-through whitelist"
