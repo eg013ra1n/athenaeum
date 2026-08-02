@@ -158,6 +158,65 @@ pub fn resolve_collision_free(abs: &Path, is_taken: &dyn Fn(&str) -> bool) -> Pa
     unreachable!()
 }
 
+/// Resolve AND atomically claim an output path: the chosen name is created as
+/// a zero-byte placeholder with `create_new`, so two concurrent builds can
+/// never resolve to the same target. [`resolve_collision_free`] only *looks*
+/// (check-then-write) — at `compute.max_concurrent > 1` both builds saw the
+/// same name free and the loser's atomic rename silently replaced the
+/// winner's master, leaving catalog metadata describing foreign pixels
+/// (2026-08-02 audit I7). Claiming makes the winner's name unavailable to
+/// everyone else the instant it is chosen.
+///
+/// The caller's own atomic tmp+rename overwrites the placeholder; on any
+/// failure before those bytes land, call [`release_claim`]. The parent
+/// directory must exist — a claim is a file creation, not a resolution.
+///
+/// `is_taken` is the catalog-side predicate [`resolve_collision_free`]
+/// documents (audit F4b); a name it rejects is skipped WITHOUT minting a
+/// placeholder for it.
+pub fn claim_collision_free(
+    abs: &Path,
+    is_taken: &dyn Fn(&str) -> bool,
+) -> std::io::Result<PathBuf> {
+    fn try_claim(p: &Path) -> std::io::Result<bool> {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p)
+        {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+    if !is_taken(&abs.to_string_lossy()) && try_claim(abs)? {
+        return Ok(abs.to_path_buf());
+    }
+    let stem = abs.file_stem().and_then(|s| s.to_str()).unwrap_or("master");
+    let ext = abs.extension().and_then(|s| s.to_str()).unwrap_or("fits");
+    for n in 2u32.. {
+        let candidate = abs.with_file_name(format!("{stem}_{n}.{ext}"));
+        if !is_taken(&candidate.to_string_lossy()) && try_claim(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    unreachable!()
+}
+
+/// Remove a still-EMPTY claim placeholder minted by [`claim_collision_free`],
+/// and only that: a real output is never zero bytes, so this can never delete
+/// a fully built file (the F4b stance documented on
+/// [`resolve_collision_free`] — the failure path used to delete the freshly
+/// built master, making the divergence permanent). A missing path or a
+/// non-empty file is a silent no-op, so it is safe to call on any exit.
+pub fn release_claim(p: &Path) {
+    if let Ok(m) = std::fs::metadata(p) {
+        if m.len() == 0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +332,65 @@ mod tests {
             resolve_collision_free(&abs, &taken_none),
             dir.path().join("master_dark_300s_2.fits")
         );
+    }
+
+    #[test]
+    fn claim_collision_free_hands_concurrent_builds_different_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join("master_dark_300s.fits");
+        let taken_none = |_: &str| false;
+
+        // First builder wins the base name — and the name is now HELD on disk
+        // as a zero-byte placeholder, not merely "observed to be free".
+        let first = claim_collision_free(&abs, &taken_none).unwrap();
+        assert_eq!(first, abs);
+        assert_eq!(std::fs::metadata(&first).unwrap().len(), 0);
+
+        // Second builder resolving the same base name (audit I7: with
+        // check-then-write resolve_collision_free it got `abs` BACK and its
+        // rename silently overwrote the first builder's master).
+        let second = claim_collision_free(&abs, &taken_none).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(second, dir.path().join("master_dark_300s_2.fits"));
+        assert_eq!(std::fs::metadata(&second).unwrap().len(), 0);
+
+        // …and a third keeps counting.
+        let third = claim_collision_free(&abs, &taken_none).unwrap();
+        assert_eq!(third, dir.path().join("master_dark_300s_3.fits"));
+    }
+
+    #[test]
+    fn claim_collision_free_skips_catalog_taken_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join("m.fits");
+        let phantom = abs.to_string_lossy().to_string();
+        let taken_phantom = move |p: &str| p == phantom;
+
+        // Same F4b rule as resolve_collision_free: a catalog row that outlived
+        // its file makes the name unusable — and no placeholder is minted for
+        // it either (claiming it would strand a 0-byte file forever).
+        let got = claim_collision_free(&abs, &taken_phantom).unwrap();
+        assert_eq!(got, dir.path().join("m_2.fits"));
+        assert!(!abs.exists(), "catalog-taken name must not be claimed");
+    }
+
+    #[test]
+    fn release_claim_removes_only_empty_placeholders() {
+        let dir = tempfile::tempdir().unwrap();
+        let claim = dir.path().join("claim.fits");
+        let built = dir.path().join("built.fits");
+        claim_collision_free(&claim, &|_: &str| false).unwrap();
+        std::fs::write(&built, b"SIMPLE  =                    T").unwrap();
+
+        release_claim(&claim);
+        assert!(!claim.exists(), "an empty claim must be released");
+
+        // The "never delete a fully built file" stance (F4b) holds by
+        // construction: a real master is never zero bytes.
+        release_claim(&built);
+        assert!(built.exists(), "a non-empty output must survive");
+
+        // Idempotent on an already-gone path.
+        release_claim(&claim);
     }
 }

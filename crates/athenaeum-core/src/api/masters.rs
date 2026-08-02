@@ -42,7 +42,8 @@ use serde::{Deserialize, Serialize};
 use crate::api::{db, ApiError};
 use crate::calibration_library::headers::{build_master_cards, load_header_inputs};
 use crate::calibration_library::paths::{
-    master_relative_path, resolve_collision_free, MasterPathParams,
+    claim_collision_free, master_relative_path, release_claim, resolve_collision_free,
+    MasterPathParams,
 };
 use crate::calibration_library::register::{member_hash, register_master};
 use crate::events::{emit_event, ProgressEmitter};
@@ -799,12 +800,43 @@ enum BuildTarget {
     },
 }
 
+/// Owns the zero-byte placeholder [`claim_collision_free`] mints for a `New`
+/// build's output name (audit I7), from the moment the name is claimed until
+/// the real bytes replace it. Every exit in that window releases the claim —
+/// the `?` on `write_fits_f32` AND an unwinding panic inside it, which no
+/// explicit `release_claim` call could cover (the panic is only caught one
+/// frame up, in `run_master_build_thread`, where the path no longer exists).
+/// A stranded placeholder is not cosmetic: it sits on disk under the master's
+/// name, so it would shift every future build of that set to `_2`, `_3`… and
+/// present an unparseable 0-byte "master" to the next library scan.
+///
+/// [`ClaimGuard::disarm`] is called the instant the write succeeds, so from
+/// there on nothing can remove the file — a strictly stronger form of the
+/// "never delete a fully built master" stance (audit F4b) that
+/// `release_claim`'s empty-only rule already guarantees on its own.
+struct ClaimGuard(Option<PathBuf>);
+
+impl ClaimGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            release_claim(&p);
+        }
+    }
+}
+
 /// The whole build: acquire queue slot -> load member paths/set row ->
 /// resolve combine/precal -> integrate -> write -> register (or, for a
 /// rebuild, update-in-place — see `BuildTarget`). Every early exit is a
 /// plain `?`/`Err` return — `run_master_build_thread` (the only caller)
 /// always removes the handle and always emits `master-build-complete`
-/// afterward, so there's no cleanup duty here.
+/// afterward, so there's no cleanup duty here beyond the filename claim,
+/// which `ClaimGuard` releases by RAII on every exit (`?`, `Err`, panic).
 ///
 /// On success returns `(master_set_id, build_warning)` — the warning is the
 /// non-fatal "the data had undefined pixels" note (audit C2) that the single
@@ -990,7 +1022,7 @@ fn run_build(
         out.flat_norm,
     )?;
 
-    let target_abs = match &target {
+    let (target_abs, mut claim) = match &target {
         BuildTarget::New => {
             let library_dir = library_dir_or_err(&conn)?;
             let target_rel = master_relative_path(&MasterPathParams {
@@ -1003,18 +1035,38 @@ fn run_build(
                 binning: set.binning.as_deref(),
                 date: &set.date,
             });
-            resolve_collision_free(&library_dir.join(&target_rel), &|p| {
+            let desired = library_dir.join(&target_rel);
+            // create_dir_all runs BEFORE name resolution, not after: claiming
+            // a name means CREATING the placeholder file, which needs its
+            // directory to exist.
+            if let Some(parent) = desired.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Claim, don't just look: two builds running concurrently
+            // (compute.max_concurrent > 1) used to resolve to the same free
+            // name and the loser's rename silently replaced the winner's
+            // master (audit I7). The claim is held by `ClaimGuard` until the
+            // write lands.
+            let claimed = claim_collision_free(&desired, &|p| {
                 crate::db::file_exists(&conn, p).unwrap_or(false)
-            })
+            })?;
+            (claimed.clone(), ClaimGuard(Some(claimed)))
         }
-        // Same path the master already lives at — no collision resolution:
-        // `write_fits_f32` replaces the existing file atomically.
-        BuildTarget::Rebuild { target_path, .. } => target_path.clone(),
+        // Same path the master already lives at — no collision resolution and
+        // nothing to claim (the name was claimed by the build that created
+        // it): `write_fits_f32` replaces the existing file atomically.
+        BuildTarget::Rebuild { target_path, .. } => {
+            if let Some(parent) = target_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            (target_path.clone(), ClaimGuard(None))
+        }
     };
-    if let Some(parent) = target_abs.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     write_fits_f32(&target_abs, out.width, out.height, 1, &out.data, &cards)?;
+    // The master's real bytes are on disk now (atomic rename inside
+    // `write_fits_f32` replaced the placeholder), so the name belongs to the
+    // file, not to the claim: nothing below this line may delete it.
+    claim.disarm();
 
     emit_event(
         emitter,
@@ -1047,6 +1099,8 @@ fn run_build(
                 // failure (permanent build loop, audit F4b). The next library
                 // scan ingests it as an imported master instead — visible, not
                 // lost. The path in the error makes user reports actionable.
+                // The filename claim was disarmed right after the write, so
+                // nothing on this path can remove the file either.
                 Err(BuildStepError::Other(format!(
                     "register master at {}: {e:#}",
                     target_abs.display()
