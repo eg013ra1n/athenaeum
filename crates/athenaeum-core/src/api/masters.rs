@@ -1198,6 +1198,15 @@ fn finalize_rebuild(
     crate::db::master_provenance::update_rebuild(&tx, master_set_id, recipe_json, member_hash_str)?;
     crate::scanner::resync_catalog_rows_from_disk(&tx, master_file_id, target_abs)?;
     tx.commit()?;
+    // After the commit: the refresh is only a fact once it is durable, and
+    // this is the counterpart of the drift `error!` at the call site — the
+    // pair tells the whole story of the post-write window at debug level.
+    tracing::debug!(
+        master_set_id,
+        master_file_id,
+        path = %target_abs.display(),
+        "rebuild resynced catalog rows from disk"
+    );
     Ok(())
 }
 
@@ -3502,6 +3511,104 @@ mod tests {
         );
     }
 
+    // ── rebuild finalize (provenance + catalog resync) ─────────────────────
+
+    /// Write a master FITS whose CFA cards are the caller's choice. `side`
+    /// varies the geometry so a rewrite also moves `files.size`/`naxis1`.
+    fn write_master_file(
+        path: &std::path::Path,
+        bayer: crate::fits_writer::keywords::Bayer,
+        xoff: i64,
+        roworder: &str,
+        side: usize,
+    ) {
+        use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
+        let cards = HeaderBuilder::new(FrameKind::MasterDark)
+            .instrume("TestCam")
+            .exptime(300.0)
+            .bayer(bayer, xoff, 0)
+            .roworder(roworder)
+            .build()
+            .unwrap();
+        write_fits_f32(path, side, side, 1, &vec![100.0f32; side * side], &cards).unwrap();
+    }
+
+    /// A raw Dark set for `register_master` to supersede.
+    fn seed_raw_dark_set(conn: &Connection) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-08-01')",
+            [],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn stored_header(conn: &Connection, file_id: i64) -> String {
+        conn.query_row(
+            "SELECT header FROM fits_header WHERE file_id = ?1",
+            [file_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn frame_bayerpat(conn: &Connection, file_id: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT bayerpat FROM frames WHERE file_id = ?1",
+            [file_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Collect `(level, message)` of every event emitted on THIS thread inside
+    /// `f`. Same scoped-`with_default` + custom-`Layer` pattern
+    /// `logging::config`'s tests use, including the interest-cache rebuild
+    /// (macro callsites cache their verdict per process, so a callsite first
+    /// hit with no subscriber would otherwise stay disabled).
+    fn capture_events<T>(f: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Seen(Arc<Mutex<Vec<(String, String)>>>);
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(
+                &mut self,
+                field: &tracing::field::Field,
+                value: &dyn std::fmt::Debug,
+            ) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Seen {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut msg = Message(String::new());
+                event.record(&mut msg);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((event.metadata().level().to_string(), msg.0));
+            }
+        }
+
+        let seen = Seen::default();
+        let subscriber = tracing_subscriber::registry().with(seen.clone());
+        let out = tracing::subscriber::with_default(subscriber, || {
+            tracing::callsite::rebuild_interest_cache();
+            f()
+        });
+        let events = seen.0.lock().unwrap().clone();
+        (out, events)
+    }
+
     /// A rebuild rewrites the master's HEADER as well as its pixels — since
     /// the Bayer cards are built from the member consensus, BAYERPAT /
     /// XBAYROFF / YBAYROFF / ROWORDER can all differ from what the original
@@ -3510,39 +3617,18 @@ mod tests {
     /// a stale non-blank card there wins over the frames-column fallback.
     #[test]
     fn rebuild_finalize_syncs_frames_and_stored_header_with_the_rewritten_file() {
-        use crate::fits_writer::keywords::{Bayer, FrameKind, HeaderBuilder};
+        use crate::fits_writer::keywords::Bayer;
 
         let tmp = tempfile::tempdir().unwrap();
         let master_path = tmp.path().join("master_dark_300s.fits");
         let conn = test_conn();
-
-        // The raw source set `register_master` supersedes.
-        conn.execute(
-            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-08-01')",
-            [],
-        )
-        .unwrap();
-        let raw_set = conn.last_insert_rowid();
+        let raw_set = seed_raw_dark_set(&conn);
 
         // ── Build #1: RGGB, no phase offsets, BOTTOM-UP, 4x4.
-        let cards1 = HeaderBuilder::new(FrameKind::MasterDark)
-            .instrume("TestCam")
-            .exptime(300.0)
-            .bayer(Bayer::Rggb, 0, 0)
-            .roworder("BOTTOM-UP")
-            .build()
-            .unwrap();
-        write_fits_f32(&master_path, 4, 4, 1, &vec![100.0f32; 16], &cards1).unwrap();
+        write_master_file(&master_path, Bayer::Rggb, 0, "BOTTOM-UP", 4);
         let reg = register_master(&conn, raw_set, &master_path, r#"{"combine":"median"}"#).unwrap();
 
-        let stored = |conn: &Connection, file_id: i64| -> String {
-            conn.query_row(
-                "SELECT header FROM fits_header WHERE file_id = ?1",
-                [file_id],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
+        let stored = stored_header;
         assert!(
             stored(&conn, reg.master_file_id).contains("BAYERPAT= 'RGGB"),
             "sanity: registration stored the first build's header"
@@ -3551,14 +3637,7 @@ mod tests {
         // ── Rebuild: SAME path, different consensus cards, different geometry
         // (so files.size moves too). Only the file is rewritten here — the
         // catalog refresh is entirely `finalize_rebuild`'s job.
-        let cards2 = HeaderBuilder::new(FrameKind::MasterDark)
-            .instrume("TestCam")
-            .exptime(300.0)
-            .bayer(Bayer::Grbg, 1, 0)
-            .roworder("TOP-DOWN")
-            .build()
-            .unwrap();
-        write_fits_f32(&master_path, 64, 64, 1, &vec![250.0f32; 4096], &cards2).unwrap();
+        write_master_file(&master_path, Bayer::Grbg, 1, "TOP-DOWN", 64);
 
         finalize_rebuild(
             &conn,
@@ -3653,6 +3732,153 @@ mod tests {
             prov.source_set_id,
             Some(raw_set),
             "rebuild must not relink to a different source"
+        );
+    }
+
+    /// The chosen precedence when the user has edited a master's metadata:
+    /// `frames.override = 1` keeps the frames columns, the stored header still
+    /// follows the rewritten file. This INVERTS the usual drift (blob new,
+    /// columns old), and it is reachable —
+    /// `bulk_update_calibration_metadata` sets override = 1 on every member of
+    /// an edited calibration set, and a master is the sole member of its own
+    /// set — so the skip must be announced, not silent.
+    #[test]
+    fn rebuild_finalize_keeps_user_override_columns_and_warns_about_the_skip() {
+        use crate::fits_writer::keywords::Bayer;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let master_path = tmp.path().join("master_dark_300s.fits");
+        let conn = test_conn();
+        let raw_set = seed_raw_dark_set(&conn);
+
+        write_master_file(&master_path, Bayer::Rggb, 0, "BOTTOM-UP", 4);
+        let reg = register_master(&conn, raw_set, &master_path, r#"{"combine":"median"}"#).unwrap();
+
+        // The user edited this master's metadata (Equipment page → bulk
+        // calibration edit), so the scanner — and the rebuild resync with it —
+        // must not overwrite the frames columns.
+        conn.execute(
+            "UPDATE frames SET override = 1 WHERE id = ?1",
+            [reg.master_frame_id],
+        )
+        .unwrap();
+
+        write_master_file(&master_path, Bayer::Grbg, 1, "TOP-DOWN", 64);
+        let (result, events) = capture_events(|| {
+            finalize_rebuild(
+                &conn,
+                reg.master_set_id,
+                reg.master_file_id,
+                &master_path,
+                r#"{"combine":"mean","rebuilt":true}"#,
+                "hash-after-rebuild",
+            )
+        });
+        result.unwrap();
+
+        assert_eq!(
+            frame_bayerpat(&conn, reg.master_file_id).as_deref(),
+            Some("RGGB"),
+            "user edits outrank the rewritten header — frames columns stay put"
+        );
+        let (override_flag, roworder): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT override, roworder FROM frames WHERE file_id = ?1",
+                [reg.master_file_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(override_flag, 1, "the override flag itself survives");
+        assert_eq!(
+            roworder.as_deref(),
+            Some("BOTTOM-UP"),
+            "no header-derived column is refreshed under override"
+        );
+
+        // The snapshot still describes the bytes now on disk — that is what
+        // per-field revert and move detection read.
+        let header = stored_header(&conn, reg.master_file_id);
+        assert!(
+            header.contains("BAYERPAT= 'GRBG"),
+            "the stored header still follows disk under override, got: {header}"
+        );
+
+        assert!(
+            events.iter().any(|(level, msg)| level == "WARN"
+                && msg.contains("rebuild resync skipped frames columns")),
+            "the inverted drift must be announced; captured: {events:?}"
+        );
+    }
+
+    /// All-or-nothing: if anything in the post-write window fails, the catalog
+    /// must look exactly as it did before — provenance included. The resync's
+    /// parse runs BEFORE it touches a row, so a file that cannot be read back
+    /// takes the whole transaction down with it (`update_rebuild` included).
+    #[test]
+    fn rebuild_finalize_failure_leaves_provenance_frames_and_header_untouched() {
+        use crate::fits_writer::keywords::Bayer;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let master_path = tmp.path().join("master_dark_300s.fits");
+        let conn = test_conn();
+        let raw_set = seed_raw_dark_set(&conn);
+
+        write_master_file(&master_path, Bayer::Rggb, 0, "BOTTOM-UP", 4);
+        let reg = register_master(&conn, raw_set, &master_path, r#"{"combine":"median"}"#).unwrap();
+        let before = crate::db::master_provenance::get(&conn, reg.master_set_id)
+            .unwrap()
+            .unwrap();
+        let size_before: i64 = conn
+            .query_row(
+                "SELECT size FROM files WHERE id = ?1",
+                [reg.master_file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // What is at the master's path can no longer be read back as FITS.
+        std::fs::write(&master_path, b"NOT A FITS FILE").unwrap();
+
+        let err = finalize_rebuild(
+            &conn,
+            reg.master_set_id,
+            reg.master_file_id,
+            &master_path,
+            r#"{"combine":"mean","rebuilt":true}"#,
+            "hash-that-must-not-land",
+        )
+        .expect_err("an unreadable master must fail the finalize, not pass silently");
+        assert!(
+            matches!(err, BuildStepError::Other(_)),
+            "expected a plain failure, got {err:?}"
+        );
+
+        let after = crate::db::master_provenance::get(&conn, reg.master_set_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.member_hash, before.member_hash, "provenance rolled back");
+        assert_eq!(after.recipe_json, before.recipe_json);
+        assert_eq!(after.created_at, before.created_at);
+
+        assert_eq!(
+            frame_bayerpat(&conn, reg.master_file_id).as_deref(),
+            Some("RGGB"),
+            "frames row untouched"
+        );
+        assert!(
+            stored_header(&conn, reg.master_file_id).contains("BAYERPAT= 'RGGB"),
+            "stored header untouched"
+        );
+        let size_after: i64 = conn
+            .query_row(
+                "SELECT size FROM files WHERE id = ?1",
+                [reg.master_file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            size_after, size_before,
+            "files row untouched — the failure must not half-apply"
         );
     }
 }

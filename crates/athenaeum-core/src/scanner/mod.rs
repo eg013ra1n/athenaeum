@@ -267,7 +267,7 @@ pub fn scan_directory(
             // bookkeeping (junction tables, calibration links) stays
             // valid; just record the error and move on.
             match reparse_and_update_in_place(
-                file_path, file_id, conn, use_content_hash, unique_camera, root_id,
+                file_path, file_id, conn, use_content_hash, unique_camera, root_id, false,
             ) {
                 Ok(()) => {
                     *processed.lock().unwrap() += 1;
@@ -1046,6 +1046,12 @@ fn resolve_master_set_id(conn: &Connection, master: &crate::fits_parser::MasterR
 /// Returns Ok(()) on success. On parse failure, leaves the DB row untouched
 /// and returns Err — the caller should log it as a non-fatal error so the
 /// rest of the scan continues.
+///
+/// `warn_override_skip` is for callers re-reading a file **Athenaeum itself
+/// rewrote** (`resync_catalog_rows_from_disk`), where hitting the
+/// `frames.override` skip is a notable event rather than the routine outcome
+/// it is on an ordinary scan — see that function's docs.
+#[allow(clippy::too_many_arguments)]
 fn reparse_and_update_in_place(
     path: &Path,
     file_id: i64,
@@ -1053,6 +1059,7 @@ fn reparse_and_update_in_place(
     use_content_hash: bool,
     unique_camera: bool,
     root_id: i64,
+    warn_override_skip: bool,
 ) -> anyhow::Result<()> {
     let metadata = std::fs::metadata(path)?;
     let size = metadata.len() as i64;
@@ -1175,6 +1182,20 @@ fn reparse_and_update_in_place(
     } else {
         false
     };
+    if user_override && warn_override_skip {
+        // The file was rewritten by Athenaeum (master rebuild), so its header
+        // and the frames row now disagree BY DESIGN: user edits outrank header
+        // values, but the stored header snapshot below still gets the new
+        // bytes. Reachable in practice — `bulk_update_calibration_metadata`
+        // sets override = 1 on every member of an edited calibration set, and
+        // a master is the sole member of its own set. Not an error, but the
+        // one place the catalog deliberately stops tracking the file.
+        tracing::warn!(
+            file_id,
+            path = %path.display(),
+            "rebuild resync skipped frames columns — user override"
+        );
+    }
 
     // Wrap all DB writes in a SAVEPOINT so a process kill / error mid-update
     // can't leave a half-updated row (e.g. files synced but frames stale, or
@@ -1247,13 +1268,18 @@ fn reparse_and_update_in_place(
 /// frame's metadata, the frames row is left alone and only files + the stored
 /// header snapshot are refreshed. That is the intended precedence — user edits
 /// outrank header values, and the snapshot must still describe the bytes now
-/// on disk.
+/// on disk — but on THIS path it inverts the usual drift: the blob follows the
+/// rewritten file while the frames columns deliberately do not. It is
+/// reachable (`bulk_update_calibration_metadata` sets override = 1 on every
+/// member of an edited calibration set, and a master is the sole member of its
+/// own set), so the skip warns rather than passing silently; ordinary scans,
+/// where the skip is routine, stay quiet.
 pub fn resync_catalog_rows_from_disk(
     conn: &Connection,
     file_id: i64,
     path: &Path,
 ) -> anyhow::Result<()> {
-    reparse_and_update_in_place(path, file_id, conn, false, false, 0)
+    reparse_and_update_in_place(path, file_id, conn, false, false, 0, true)
 }
 
 /// The write half of `reparse_and_update_in_place`. Runs inside the
@@ -2105,7 +2131,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
         if let Some(&file_id) = modified_files_by_path.get(&file_result.file.path) {
             let path_buf = PathBuf::from(&file_result.file.path);
             match reparse_and_update_in_place(
-                &path_buf, file_id, conn, use_content_hash, unique_camera, root_id,
+                &path_buf, file_id, conn, use_content_hash, unique_camera, root_id, false,
             ) {
                 Ok(()) => {
                     result.files_processed += 1;
@@ -2757,9 +2783,10 @@ mod inplace_tests {
     }
 
     /// Same invariant as `rescan_after_mtime_change_preserves_session_members`
-    /// but exercises `scan_directory_parallel` — the path monitoring uses. Until
-    /// Task 5 lands, this test fails because the parallel scan still does
-    /// DELETE + re-INSERT in the classification phase.
+    /// but exercises `scan_directory_parallel` — the path monitoring uses. That
+    /// path used to DELETE + re-INSERT the rows in its classification phase,
+    /// which broke every junction-table linkage; this pins that it goes through
+    /// the in-place re-parse like the serial scan does.
     #[test]
     fn parallel_rescan_after_mtime_change_preserves_session_members() {
         let scan = TempDir::new().unwrap();
