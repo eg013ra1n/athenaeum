@@ -4,6 +4,7 @@
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_writer::keywords::{Bayer, FrameKind, HeaderBuilder};
 use crate::fits_writer::{Card, FitsWriteError};
+use crate::integration::cfa::{central_third_channel_means, CfaGeometry};
 use crate::models::FileFormat;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -45,7 +46,7 @@ pub struct MasterHeaderInputs {
 /// Produced by [`load_bayer_consensus`]; every field is `None` unless at
 /// least one member actually declared it.
 #[derive(Debug, Default, PartialEq)]
-pub struct BayerConsensus {
+pub(crate) struct BayerConsensus {
     pub bayerpat: Option<String>,
     pub xbayroff: Option<i64>,
     pub ybayroff: Option<i64>,
@@ -65,6 +66,12 @@ pub struct BayerConsensus {
 /// `count DESC, value ASC`, so a tie breaks deterministically and the same set
 /// always consolidates to the same master header.
 ///
+/// `fold_case` groups a text column on `UPPER(TRIM(...))` and returns the
+/// folded spelling. Capture software disagrees about spelling, not about the
+/// sensor: `"rggb"` and `" RGGB "` are one claim, and counting them apart
+/// reported a disagreement that does not exist and then let a genuine
+/// minority value win the tie-break. Integer columns compare as stored.
+///
 /// `col` is interpolated into the SQL. Every call site passes one of four
 /// hard-coded literals (`bayerpat`, `xbayroff`, `ybayroff`, `roworder`); it is
 /// never user input.
@@ -72,12 +79,18 @@ fn consensus<T: rusqlite::types::FromSql>(
     conn: &Connection,
     set_id: i64,
     col: &'static str,
+    fold_case: bool,
 ) -> Result<(Option<T>, bool)> {
+    let key = if fold_case {
+        format!("UPPER(TRIM(fr.{col}))")
+    } else {
+        format!("fr.{col}")
+    };
     let mut stmt = conn.prepare(&format!(
-        "SELECT fr.{col}, COUNT(*) c FROM calibration_set_frames csf
+        "SELECT {key} k, COUNT(*) c FROM calibration_set_frames csf
          JOIN frames fr ON fr.id = csf.frame_id
          WHERE csf.set_id = ?1 AND fr.{col} IS NOT NULL
-         GROUP BY fr.{col} ORDER BY c DESC, fr.{col} ASC"
+         GROUP BY k ORDER BY c DESC, k ASC"
     ))?;
     let values: Vec<T> = stmt
         .query_map([set_id], |r| r.get(0))?
@@ -96,12 +109,12 @@ fn consensus<T: rusqlite::types::FromSql>(
 /// index-based list readers hardcode `None` for these four fields regardless of
 /// what is stored (see `models.rs`), so a `Frame` round-trip would silently
 /// erase them.
-pub fn load_bayer_consensus(conn: &Connection, set_id: i64) -> Result<BayerConsensus> {
+pub(crate) fn load_bayer_consensus(conn: &Connection, set_id: i64) -> Result<BayerConsensus> {
     let mut out = BayerConsensus::default();
-    let (bayerpat, dis_pat) = consensus::<String>(conn, set_id, "bayerpat")?;
-    let (xbayroff, dis_x) = consensus::<i64>(conn, set_id, "xbayroff")?;
-    let (ybayroff, dis_y) = consensus::<i64>(conn, set_id, "ybayroff")?;
-    let (roworder, dis_row) = consensus::<String>(conn, set_id, "roworder")?;
+    let (bayerpat, dis_pat) = consensus::<String>(conn, set_id, "bayerpat", true)?;
+    let (xbayroff, dis_x) = consensus::<i64>(conn, set_id, "xbayroff", false)?;
+    let (ybayroff, dis_y) = consensus::<i64>(conn, set_id, "ybayroff", false)?;
+    let (roworder, dis_row) = consensus::<String>(conn, set_id, "roworder", true)?;
     for (col, dis) in [
         ("bayerpat", dis_pat), ("xbayroff", dis_x), ("ybayroff", dis_y), ("roworder", dis_row),
     ] {
@@ -136,26 +149,39 @@ pub fn load_bayer_consensus(conn: &Connection, set_id: i64) -> Result<BayerConse
 /// handles all of them (same call pattern as db::operations'
 /// `clear_override_for_unchanged_frames` / `get_frame_metadata_originals`).
 fn bayerpat_from_stored_header(conn: &Connection, set_id: i64) -> Option<String> {
-    conn.query_row(
+    // ORDER BY csf.frame_id: this reads ONE arbitrary member, but which one
+    // must not be left to SQLite's row order — two runs over the same set
+    // would otherwise be free to consolidate differently.
+    let row = conn.query_row(
         "SELECT fi.format, fh.header FROM calibration_set_frames csf
          JOIN frames f ON f.id = csf.frame_id
          JOIN files fi ON fi.id = f.file_id
          JOIN fits_header fh ON fh.file_id = f.file_id
-         WHERE csf.set_id = ?1 LIMIT 1",
+         WHERE csf.set_id = ?1 ORDER BY csf.frame_id LIMIT 1",
         [set_id],
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-    )
-    .ok()
-    .and_then(|(format_str, header)| {
-        let format = match format_str.as_str() {
-            "FITS" => FileFormat::FITS,
-            "XISF" => FileFormat::XISF,
-            _ => return None, // Unknown format — skip rather than guess.
-        };
-        // Returned map is keyed UPPERCASE (see parse_stored_header_keys docs).
-        parse_stored_header_keys(format, &header).remove("BAYERPAT")
-    })
-    .filter(|s| !s.trim().is_empty())
+    );
+    let (format_str, header) = match row {
+        Ok(v) => v,
+        // No member has a stored header — the ordinary shape, nothing to say.
+        Err(rusqlite::Error::QueryReturnedNoRows) => return None,
+        Err(e) => {
+            // Everything else (a locked or corrupt catalog) used to collapse
+            // into the same silent None as "no blob". Same behavior — the
+            // fallback is best-effort — but no longer invisible.
+            debug!(set_id, error = %e, "stored-header read failed — bayerpat blob fallback skipped");
+            return None;
+        }
+    };
+    let format = match format_str.as_str() {
+        "FITS" => FileFormat::FITS,
+        "XISF" => FileFormat::XISF,
+        _ => return None, // Unknown format — skip rather than guess.
+    };
+    // Returned map is keyed UPPERCASE (see parse_stored_header_keys docs).
+    parse_stored_header_keys(format, &header)
+        .remove("BAYERPAT")
+        .filter(|s| !s.trim().is_empty())
 }
 
 fn master_kind_for(imagetyp: &str) -> Option<FrameKind> {
@@ -249,12 +275,79 @@ fn parse_dt(s: Option<&str>) -> Option<DateTime<Utc>> {
     s.and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&Utc))
 }
 
+/// The one reader of a stored CFA pattern string. `frames.bayerpat` keeps
+/// whatever the source parser yielded, and quoting/case vary by writer, so
+/// normalize before matching. `None` = a value we cannot vouch for; each call
+/// site decides whether that deserves a warning (emission does, measurement
+/// does not — the same inputs go through both).
+pub(crate) fn parse_bayer(s: &str) -> Option<Bayer> {
+    match s.trim().trim_matches('\'').trim().to_ascii_uppercase().as_str() {
+        "RGGB" => Some(Bayer::Rggb),
+        "BGGR" => Some(Bayer::Bggr),
+        "GBRG" => Some(Bayer::Gbrg),
+        "GRBG" => Some(Bayer::Grbg),
+        _ => None,
+    }
+}
+
+/// Per-channel central-third means of a freshly integrated master flat — the
+/// `[R, G, B]` values behind `ATH_FNR`/`ATH_FNG`/`ATH_FNB`. `data` is the
+/// master's own plane, in the same units and over the same window as the
+/// global `ATH_FNRM`.
+///
+/// `None` means "stamp nothing per channel": the set declares no CFA pattern
+/// (mono, or a spelling [`parse_bayer`] cannot vouch for — `build_master_cards`
+/// warns about that same value), or the measurement came back degenerate.
+/// These constants are DIVISORS downstream, so a non-finite or non-positive
+/// one is worse than absent: without them a consumer falls back to the global
+/// constant, with them it would divide a whole channel by garbage.
+///
+/// **The CFA phase defaults to (0, 0) when the members declared none.** That
+/// is a guess, and it is allowed here and nowhere else: it only decides which
+/// pixels are averaged together — a wrong guess costs a colour cast the
+/// operator can see — whereas the same guess written into `XBAYROFF` would be
+/// a fabricated claim every future debayer acts on.
+pub(crate) fn measure_flat_channel_norms(
+    inputs: &MasterHeaderInputs,
+    data: &[f32],
+    width: usize,
+    height: usize,
+) -> Option<[f64; 3]> {
+    let set_id = inputs.source_set_id;
+    let pattern = parse_bayer(inputs.bayerpat.as_deref()?)?;
+    let assumed = match (inputs.xbayroff, inputs.ybayroff) {
+        (Some(_), Some(_)) => None,
+        (None, Some(_)) => Some("xbayroff"),
+        (Some(_), None) => Some("ybayroff"),
+        (None, None) => Some("xbayroff,ybayroff"),
+    };
+    if let Some(field) = assumed {
+        debug!(set_id, field, "cfa phase not declared — per-channel flat means assume 0");
+    }
+    let geom = CfaGeometry {
+        pattern,
+        xoff: inputs.xbayroff.unwrap_or(0),
+        yoff: inputs.ybayroff.unwrap_or(0),
+    };
+    let means = central_third_channel_means(data, width, height, geom);
+    if !means.iter().all(|m| m.is_finite() && *m > 0.0) {
+        warn!(set_id, value = ?means, "per-channel flat constants degenerate — omitted");
+        return None;
+    }
+    Some(means)
+}
+
 pub fn build_master_cards(
     inputs: &MasterHeaderInputs,
     app_version: &str,
     recipe_summary: &str, // e.g. "winsorized(3.0,3.0) n=24"
     member_hash: &str,
     flat_norm: Option<f64>, // stamps ATH_FNRM when Some
+    // stamps ATH_FNR/ATH_FNG/ATH_FNB when Some — see
+    // `measure_flat_channel_norms`, which is what produces a vouched-for
+    // triple. Ignored without `flat_norm`: the per-channel constants qualify
+    // the global one and are meaningless on their own.
+    flat_channel_norms: Option<[f64; 3]>,
 ) -> std::result::Result<Vec<Card>, FitsWriteError> {
     let mut b = HeaderBuilder::new(inputs.kind).swcreate(app_version);
     if let Some(v) = inputs.exptime {
@@ -292,14 +385,7 @@ pub fn build_master_cards(
     }
     let set_id = inputs.source_set_id;
     if let Some(p) = &inputs.bayerpat {
-        let bayer = match p.trim().trim_matches('\'').trim().to_ascii_uppercase().as_str() {
-            "RGGB" => Some(Bayer::Rggb),
-            "BGGR" => Some(Bayer::Bggr),
-            "GBRG" => Some(Bayer::Gbrg),
-            "GRBG" => Some(Bayer::Grbg),
-            _ => None,
-        };
-        match bayer {
+        match parse_bayer(p) {
             Some(bp) => {
                 b = b.bayer_pattern(bp);
                 // The offsets are the CFA phase of THAT pattern, so they ride
@@ -318,6 +404,12 @@ pub fn build_master_cards(
                 "unrecognized bayer pattern — bayer cards omitted from master"
             ),
         }
+    } else if inputs.xbayroff.is_some() || inputs.ybayroff.is_some() {
+        // An offset is the phase OF a pattern; with no pattern to attach it
+        // to it describes nothing a debayer can act on, so it is dropped.
+        // Correct — but it is the signature of a half-populated header, so
+        // say it rather than leave the operator wondering where it went.
+        debug!(set_id, "bayer offsets without a pattern — offset cards omitted");
     }
     // ROWORDER is independent of the CFA pattern (mono frames have a row order
     // too) and the integration engine writes bands in source order, so the
@@ -348,6 +440,17 @@ pub fn build_master_cards(
             Card::new("ATH_FNRM", crate::fits_writer::CardValue::Real(n))?
                 .with_comment("central-third mean of this master flat"),
         );
+        // The per-channel constants ride WITH the global one: same window,
+        // same units, and every reader needs ATH_FNRM as its fallback anyway
+        // (mono masters and imported flats never carry these three).
+        if let Some(ch) = flat_channel_norms {
+            for (kw, v) in [("ATH_FNR", ch[0]), ("ATH_FNG", ch[1]), ("ATH_FNB", ch[2])] {
+                b = b.custom(
+                    Card::new(kw, crate::fits_writer::CardValue::Real(v))?
+                        .with_comment("per-channel flat normalization constant"),
+                );
+            }
+        }
     }
     b.build()
 }
@@ -412,7 +515,7 @@ mod tests {
         ];
         for r in recipes {
             let summary = format!("{} n=24", r.describe());
-            let cards = build_master_cards(&inputs, "0.5.0", &summary, "cafe", None).unwrap();
+            let cards = build_master_cards(&inputs, "0.5.0", &summary, "cafe", None, None).unwrap();
             for c in &cards {
                 format_card(c).unwrap_or_else(|e| {
                     panic!("card {} failed to format for summary {summary:?}: {e}", c.keyword)
@@ -430,7 +533,7 @@ mod tests {
         assert_eq!(inputs.frame_count, 2);
         // midpoint of 20:00 and 22:00 is 21:00
         assert_eq!(inputs.date_obs_midpoint.unwrap().to_rfc3339(), "2026-06-28T21:00:00+00:00");
-        let cards = build_master_cards(&inputs, "0.2.5", "winsorized(3.0,3.0) n=2", "cafe", None).unwrap();
+        let cards = build_master_cards(&inputs, "0.2.5", "winsorized(3.0,3.0) n=2", "cafe", None, None).unwrap();
         let find = |k: &str| cards.iter().find(|c| c.keyword == k);
         assert!(find("IMAGETYP").is_some());
         assert!(find("INSTRUME").is_some());
@@ -452,7 +555,7 @@ mod tests {
         conn.execute("UPDATE calibration_set SET imagetyp='Flat', filter='L' WHERE id=?1", [set_id]).unwrap();
         let inputs = load_header_inputs(&conn, set_id).unwrap();
         assert_eq!(inputs.kind, FrameKind::MasterFlat);
-        let cards = build_master_cards(&inputs, "0.2.5", "percentile(0.2,0.02) n=2", "cafe", Some(1234.5)).unwrap();
+        let cards = build_master_cards(&inputs, "0.2.5", "percentile(0.2,0.02) n=2", "cafe", Some(1234.5), None).unwrap();
         let f = cards.iter().find(|c| c.keyword == "ATH_FNRM").expect("ATH_FNRM");
         assert!(matches!(f.value, Some(crate::fits_writer::CardValue::Real(v)) if (v - 1234.5).abs() < 1e-9));
         assert!(cards.iter().any(|c| c.keyword == "FILTER"));
@@ -508,7 +611,7 @@ mod tests {
 
     fn cards_for(conn: &Connection, set_id: i64) -> Vec<Card> {
         let inputs = load_header_inputs(conn, set_id).unwrap();
-        build_master_cards(&inputs, "0.2.5", "median n=3", "cafe", None).unwrap()
+        build_master_cards(&inputs, "0.2.5", "median n=3", "cafe", None, None).unwrap()
     }
 
     fn card_str<'a>(cards: &'a [Card], kw: &str) -> Option<&'a str> {
@@ -521,6 +624,13 @@ mod tests {
     fn card_int(cards: &[Card], kw: &str) -> Option<i64> {
         cards.iter().find(|c| c.keyword == kw).and_then(|c| match &c.value {
             Some(crate::fits_writer::CardValue::Integer(v)) => Some(*v),
+            _ => None,
+        })
+    }
+
+    fn card_real(cards: &[Card], kw: &str) -> Option<f64> {
+        cards.iter().find(|c| c.keyword == kw).and_then(|c| match &c.value {
+            Some(crate::fits_writer::CardValue::Real(v)) => Some(*v),
             _ => None,
         })
     }
@@ -605,6 +715,59 @@ mod tests {
         let bayer = load_bayer_consensus(&conn, set_id).unwrap();
         assert_eq!(bayer.bayerpat.as_deref(), Some("BGGR"), "ties break on value ASC");
         assert_eq!(bayer.disagreements, vec!["bayerpat"]);
+    }
+
+    /// Writers disagree about SPELLING, not about the sensor: `"rggb"`,
+    /// `" RGGB "` and `"RGGB"` are one claim. Counting them as three groups
+    /// reported a disagreement that does not exist and then handed the answer
+    /// to whichever spelling sorted first.
+    #[test]
+    fn spelling_variants_are_one_consensus_group_not_a_disagreement() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        add_member(&conn, set_id, "f2", "2026-06-28T21:00:00Z");
+        set_member_bayer(
+            &conn,
+            set_id,
+            &[
+                (Some("rggb"), None, None, Some("top-down")),
+                (Some(" RGGB "), None, None, Some("TOP-DOWN")),
+                (Some("RGGB"), None, None, Some(" top-down ")),
+            ],
+        );
+        let bayer = load_bayer_consensus(&conn, set_id).unwrap();
+        assert_eq!(bayer.bayerpat.as_deref(), Some("RGGB"), "one claim, canonically spelled");
+        assert_eq!(bayer.roworder.as_deref(), Some("TOP-DOWN"));
+        assert!(
+            bayer.disagreements.is_empty(),
+            "one claim spelled three ways is not a disagreement, got {:?}",
+            bayer.disagreements
+        );
+        let cards = cards_for(&conn, set_id);
+        assert_eq!(card_str(&cards, "BAYERPAT"), Some("RGGB"));
+        assert_eq!(card_str(&cards, "ROWORDER"), Some("TOP-DOWN"));
+    }
+
+    /// The same folding decides the majority: two members spelling RGGB
+    /// differently outvote one genuine BGGR. Ungrouped they were 1-1-1, and
+    /// the tie-break handed the set to the minority pattern.
+    #[test]
+    fn spelling_variants_count_together_toward_the_majority() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        add_member(&conn, set_id, "f2", "2026-06-28T21:00:00Z");
+        set_member_bayer(
+            &conn,
+            set_id,
+            &[
+                (Some("rggb"), None, None, None),
+                (Some("RGGB"), None, None, None),
+                (Some("BGGR"), None, None, None),
+            ],
+        );
+        let bayer = load_bayer_consensus(&conn, set_id).unwrap();
+        assert_eq!(bayer.bayerpat.as_deref(), Some("RGGB"), "2 spellings of one claim beat 1 of another");
+        assert_eq!(bayer.disagreements, vec!["bayerpat"], "BGGR is a real disagreement");
     }
 
     /// A rescanned catalog has both the column and the old blob. The column
@@ -712,6 +875,158 @@ mod tests {
         assert!(!has_card(&cards, "YBAYROFF"), "no offset consensus — no YBAYROFF card");
     }
 
+    /// A 6x6 RGGB mosaic painted from the pattern definition itself — even
+    /// column/even row is R, odd/odd is B, the diagonal is G — one constant
+    /// per colour. Painted here rather than via `cfa_channel_at` so the
+    /// assertions below test the mapping instead of restating it.
+    fn mosaic_rggb_6x6(r: f32, g: f32, blue: f32) -> Vec<f32> {
+        let mut data = vec![0f32; 36];
+        for y in 0..6usize {
+            for x in 0..6usize {
+                data[y * 6 + x] = match (x % 2 == 0, y % 2 == 0) {
+                    (true, true) => r,
+                    (false, false) => blue,
+                    _ => g,
+                };
+            }
+        }
+        data
+    }
+
+    /// Turn the seeded set into a flat and stamp one Bayer tuple on every
+    /// member. Returns the loaded header inputs.
+    fn cfa_flat_inputs(
+        conn: &Connection,
+        set_id: i64,
+        bayerpat: Option<&str>,
+        xoff: Option<i64>,
+        yoff: Option<i64>,
+    ) -> MasterHeaderInputs {
+        conn.execute("UPDATE calibration_set SET imagetyp='Flat' WHERE id=?1", [set_id]).unwrap();
+        let row = (bayerpat, xoff, yoff, None);
+        set_member_bayer(conn, set_id, &[row, row]);
+        load_header_inputs(conn, set_id).unwrap()
+    }
+
+    /// The point of Package 2: a CFA master flat carries the level of each
+    /// colour, not only the blend of all three. A consumer dividing a mosaic
+    /// by the blend leaves the flat's own colour response in the light.
+    #[test]
+    fn cfa_master_flat_stamps_per_channel_constants_beside_the_global_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        let inputs = cfa_flat_inputs(&conn, set_id, Some("RGGB"), Some(0), Some(0));
+        let data = mosaic_rggb_6x6(2000.0, 4000.0, 1000.0);
+        let channels =
+            measure_flat_channel_norms(&inputs, &data, 6, 6).expect("an RGGB flat has channel constants");
+        let global = crate::integration::engine::central_third_mean(&data, 6, 6);
+        let cards =
+            build_master_cards(&inputs, "0.2.5", "percentile(0.2,0.02) n=2", "cafe", Some(global), Some(channels))
+                .unwrap();
+        // The central-third window is x,y in 2..4: one R, two G, one B — so
+        // the global constant is their blend and each channel keeps its own.
+        assert_eq!(card_real(&cards, "ATH_FNRM"), Some(2750.0));
+        assert_eq!(card_real(&cards, "ATH_FNR"), Some(2000.0));
+        assert_eq!(card_real(&cards, "ATH_FNG"), Some(4000.0));
+        assert_eq!(card_real(&cards, "ATH_FNB"), Some(1000.0));
+        // Keyword + comment must fit one 80-column card: a CommentTooLong
+        // here would fail the write AFTER the whole integration ran.
+        for c in &cards {
+            crate::fits_writer::card::format_card(c)
+                .unwrap_or_else(|e| panic!("card {} failed to format: {e}", c.keyword));
+        }
+    }
+
+    /// Mono flats are untouched: no pattern, no per-channel claim, and the
+    /// global constant every existing consumer reads is still there.
+    #[test]
+    fn mono_master_flat_keeps_the_global_constant_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        // `seed` leaves every Bayer column NULL — that IS the mono shape.
+        let inputs = cfa_flat_inputs(&conn, set_id, None, None, None);
+        let data = vec![1000.0f32; 36];
+        assert!(
+            measure_flat_channel_norms(&inputs, &data, 6, 6).is_none(),
+            "no pattern — nothing to measure per channel"
+        );
+        let cards = build_master_cards(&inputs, "0.2.5", "median n=2", "cafe", Some(1000.0), None).unwrap();
+        assert_eq!(card_real(&cards, "ATH_FNRM"), Some(1000.0));
+        for kw in ["ATH_FNR", "ATH_FNG", "ATH_FNB"] {
+            assert!(!has_card(&cards, kw), "{kw} must be absent on a mono flat");
+        }
+    }
+
+    /// The declared phase reaches the MATH, not just the header: read one
+    /// column out of phase, the same pixels are labelled differently and the
+    /// constants change accordingly.
+    #[test]
+    fn per_channel_constants_follow_the_declared_cfa_phase() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        let inputs = cfa_flat_inputs(&conn, set_id, Some("RGGB"), Some(1), Some(0));
+        let data = mosaic_rggb_6x6(2000.0, 4000.0, 1000.0);
+        let channels = measure_flat_channel_norms(&inputs, &data, 6, 6).expect("channel constants");
+        // Window pixels (2,2)/(3,2)/(2,3)/(3,3) are painted R/G/G/B; at xoff=1
+        // they are labelled G/R/B/G, so R reads the G paint and G averages the
+        // R and B paints.
+        assert_eq!(channels, [4000.0, 1500.0, 4000.0]);
+        let cards = build_master_cards(&inputs, "0.2.5", "median n=2", "cafe", Some(2750.0), Some(channels)).unwrap();
+        assert_eq!(card_int(&cards, "XBAYROFF"), Some(1), "the same phase is what the header declares");
+    }
+
+    /// The one place a missing CFA phase may be assumed: the measurement
+    /// picks pixels at phase 0 and says so in the log, while the header still
+    /// refuses to invent XBAYROFF/YBAYROFF.
+    #[test]
+    fn absent_cfa_phase_is_assumed_for_the_math_but_never_for_the_header() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        let inputs = cfa_flat_inputs(&conn, set_id, Some("RGGB"), None, None);
+        let data = mosaic_rggb_6x6(2000.0, 4000.0, 1000.0);
+        let channels = measure_flat_channel_norms(&inputs, &data, 6, 6).expect("phase 0 is assumed for the math");
+        assert_eq!(channels, [2000.0, 4000.0, 1000.0]);
+        let cards = build_master_cards(&inputs, "0.2.5", "median n=2", "cafe", Some(2750.0), Some(channels)).unwrap();
+        assert_eq!(card_str(&cards, "BAYERPAT"), Some("RGGB"));
+        assert!(!has_card(&cards, "XBAYROFF"), "an assumed phase must not become a claim");
+        assert!(!has_card(&cards, "YBAYROFF"), "an assumed phase must not become a claim");
+    }
+
+    /// A channel constant is a DIVISOR downstream. A zero (or negative, or
+    /// non-finite) one is worse than absent, so the three cards are dropped
+    /// together and the consumer falls back to the global constant.
+    #[test]
+    fn degenerate_channel_constants_are_omitted_and_the_global_one_survives() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        let inputs = cfa_flat_inputs(&conn, set_id, Some("RGGB"), Some(0), Some(0));
+        // Blue never got light — the whole channel reads 0.
+        let data = mosaic_rggb_6x6(2000.0, 4000.0, 0.0);
+        assert!(
+            measure_flat_channel_norms(&inputs, &data, 6, 6).is_none(),
+            "a zero channel must not be stamped as a divisor"
+        );
+        let cards = build_master_cards(&inputs, "0.2.5", "median n=2", "cafe", Some(2500.0), None).unwrap();
+        assert_eq!(card_real(&cards, "ATH_FNRM"), Some(2500.0));
+        for kw in ["ATH_FNR", "ATH_FNG", "ATH_FNB"] {
+            assert!(!has_card(&cards, kw), "{kw} must be dropped with its siblings");
+        }
+    }
+
+    /// A master that is not a flat has no flat constant, so the per-channel
+    /// ones have nothing to qualify — they ride with ATH_FNRM or not at all.
+    #[test]
+    fn per_channel_constants_never_appear_without_the_global_one() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        let inputs = load_header_inputs(&conn, set_id).unwrap();
+        let cards =
+            build_master_cards(&inputs, "0.2.5", "median n=2", "cafe", None, Some([2000.0, 4000.0, 1000.0])).unwrap();
+        for kw in ["ATH_FNRM", "ATH_FNR", "ATH_FNG", "ATH_FNB"] {
+            assert!(!has_card(&cards, kw), "{kw} must be absent on a dark");
+        }
+    }
+
     /// Attach the same stored-header blob (and format) to every member file
     /// of the set — the BAYERPAT blob fallback uses `LIMIT 1` with no ORDER
     /// BY, so seeding all members keeps the test deterministic regardless of
@@ -744,7 +1059,7 @@ mod tests {
         assert!(bayer.bayerpat_from_blob, "column is NULL — this is the fallback path");
         let inputs = load_header_inputs(conn, set_id).unwrap();
         assert_eq!(inputs.bayerpat.as_deref(), Some("RGGB"));
-        let cards = build_master_cards(&inputs, "0.2.5", "winsorized(3.0,3.0) n=2", "cafe", None).unwrap();
+        let cards = build_master_cards(&inputs, "0.2.5", "winsorized(3.0,3.0) n=2", "cafe", None, None).unwrap();
         assert_eq!(card_str(&cards, "BAYERPAT"), Some("RGGB"));
         assert!(!has_card(&cards, "XBAYROFF"), "no offset in the blob era — no XBAYROFF card");
         assert!(!has_card(&cards, "YBAYROFF"), "no offset in the blob era — no YBAYROFF card");
@@ -777,6 +1092,39 @@ mod tests {
         let dump = "Captured FITS Keywords:\n=======================\n\nBAYERPAT = RGGB\nXBINNING = 1\n";
         seed_stored_headers(&conn, set_id, "FITS", dump);
         assert_bayer_consolidated(&conn, set_id);
+    }
+
+    /// The blob fallback reads ONE member's raw text. Which one must not be
+    /// left to SQLite's row order — the lowest frame id wins, every run, so a
+    /// set whose members' blobs disagree still consolidates the same way twice.
+    #[test]
+    fn blob_fallback_reads_the_lowest_frame_id_member() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        let members: Vec<(i64, i64)> = conn
+            .prepare(
+                "SELECT csf.frame_id, f.file_id FROM calibration_set_frames csf
+                 JOIN frames f ON f.id = csf.frame_id WHERE csf.set_id = ?1 ORDER BY csf.frame_id",
+            )
+            .unwrap()
+            .query_map([set_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(members.len(), 2);
+        for ((_, file_id), pat) in members.iter().zip(["RGGB", "BGGR"]) {
+            conn.execute(
+                "INSERT INTO fits_header (file_id, header) VALUES (?1, ?2)",
+                rusqlite::params![
+                    file_id,
+                    format!("{:<80}\n{:<80}", format!("BAYERPAT= '{pat}    '"), "END")
+                ],
+            )
+            .unwrap();
+        }
+        let bayer = load_bayer_consensus(&conn, set_id).unwrap();
+        assert!(bayer.bayerpat_from_blob, "columns are NULL — this is the fallback path");
+        assert_eq!(bayer.bayerpat.as_deref(), Some("RGGB"), "the lowest frame id decides, not row order");
     }
 
     #[test]

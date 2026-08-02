@@ -40,7 +40,9 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::api::{db, ApiError};
-use crate::calibration_library::headers::{build_master_cards, load_header_inputs};
+use crate::calibration_library::headers::{
+    build_master_cards, load_header_inputs, measure_flat_channel_norms,
+};
 use crate::calibration_library::paths::{
     claim_collision_free, master_relative_path, release_claim, resolve_collision_free,
     MasterPathParams,
@@ -1015,12 +1017,26 @@ fn run_build(
     let inputs = load_header_inputs(&conn, set_id)?;
     let (member_hash_str, _uuids) = member_hash(&conn, set_id)?;
     let recipe_summary = recipe_summary_string(resolved_combine, set.frame_count);
+    // Per-channel flat constants (ATH_FNR/G/B) describe the same measurement
+    // ATH_FNRM does, so they are a flat-only affair — and a CFA-only one: a
+    // mono set declares no pattern, so this returns None and its master is
+    // stamped exactly as before. Measured off `out.data`, the very plane
+    // written a few lines down and the one ATH_FNRM came from, so all four
+    // constants share their units. The engine's flux equalization is a global
+    // per-frame scale, so it cannot have moved the channels relative to one
+    // another.
+    let channel_norms = if is_flat {
+        measure_flat_channel_norms(&inputs, &out.data, out.width, out.height)
+    } else {
+        None
+    };
     let cards = build_master_cards(
         &inputs,
         app_version,
         &recipe_summary,
         &member_hash_str,
         out.flat_norm,
+        channel_norms,
     )?;
 
     let (target_abs, mut claim) = match &target {

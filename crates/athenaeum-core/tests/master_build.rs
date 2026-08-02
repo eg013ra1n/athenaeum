@@ -112,7 +112,7 @@ fn synchronous_build_produces_registered_master_with_correct_header() {
     let inputs = load_header_inputs(&conn, set_id).unwrap();
     let (hash, uuids) = member_hash(&conn, set_id).unwrap();
     assert_eq!(uuids.len(), 3);
-    let cards = build_master_cards(&inputs, "0.2.5-test", "median n=3", &hash, out.flat_norm).unwrap();
+    let cards = build_master_cards(&inputs, "0.2.5-test", "median n=3", &hash, out.flat_norm, None).unwrap();
 
     let target_rel = master_relative_path(&MasterPathParams {
         instrume: inputs.instrume.as_deref(),
@@ -220,7 +220,7 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
     let out1 = integrate(&paths);
     let inputs = load_header_inputs(&conn, set_id).unwrap();
     let (hash1, _uuids) = member_hash(&conn, set_id).unwrap();
-    let cards1 = build_master_cards(&inputs, "0.2.5-test", "mean n=3", &hash1, out1.flat_norm).unwrap();
+    let cards1 = build_master_cards(&inputs, "0.2.5-test", "mean n=3", &hash1, out1.flat_norm, None).unwrap();
     let target_rel = master_relative_path(&MasterPathParams {
         instrume: inputs.instrume.as_deref(),
         master_kind: inputs.kind,
@@ -268,7 +268,7 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_inta
     assert_ne!(out1.data, out2.data, "rebuild must re-read the now-changed source frame");
 
     let (hash2, _uuids2) = member_hash(&conn, set_id).unwrap();
-    let cards2 = build_master_cards(&inputs, "0.2.5-test", "mean n=3", &hash2, out2.flat_norm).unwrap();
+    let cards2 = build_master_cards(&inputs, "0.2.5-test", "mean n=3", &hash2, out2.flat_norm, None).unwrap();
     write_fits_f32(&target_abs, out2.width, out2.height, 1, &out2.data, &cards2).unwrap();
 
     let recipe_json_2 = r#"{"combine":"median","rebuilt":true}"#;
