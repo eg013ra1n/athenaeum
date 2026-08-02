@@ -111,10 +111,22 @@ impl HeaderBuilder {
         self.push("XPIXSZ", CardValue::Real(x_um), "[um] pixel width after binning");
         self.push("YPIXSZ", CardValue::Real(y_um), "[um] pixel height after binning"); self
     }
-    pub fn bayer(mut self, b: Bayer, xoff: i64, yoff: i64) -> Self {
-        self.push_str("BAYERPAT", b.as_str(), "Bayer color pattern");
-        self.push("XBAYROFF", CardValue::Integer(xoff), "Bayer X offset");
+    /// BAYERPAT alone. The offsets are deliberately separate: a source that
+    /// declares a pattern but no phase must yield a pattern-only header —
+    /// XBAYROFF=0 is a real phase claim, not a neutral default, and a wrong
+    /// one swaps colour channels on debayer.
+    pub fn bayer_pattern(mut self, b: Bayer) -> Self {
+        self.push_str("BAYERPAT", b.as_str(), "Bayer color pattern"); self
+    }
+    pub fn bayer_x_offset(mut self, xoff: i64) -> Self {
+        self.push("XBAYROFF", CardValue::Integer(xoff), "Bayer X offset"); self
+    }
+    pub fn bayer_y_offset(mut self, yoff: i64) -> Self {
         self.push("YBAYROFF", CardValue::Integer(yoff), "Bayer Y offset"); self
+    }
+    /// Convenience for callers that know all three (pattern + both offsets).
+    pub fn bayer(self, b: Bayer, xoff: i64, yoff: i64) -> Self {
+        self.bayer_pattern(b).bayer_x_offset(xoff).bayer_y_offset(yoff)
     }
     pub fn radec(mut self, ra_deg: f64, dec_deg: f64) -> Self {
         self.push("RA", CardValue::Real(ra_deg), "[deg] right ascension");
@@ -127,7 +139,11 @@ impl HeaderBuilder {
     pub fn focallen(mut self, mm: f64) -> Self { self.push("FOCALLEN", CardValue::Real(mm), "[mm] focal length"); self }
     pub fn filter(mut self, v: &str) -> Self { self.push_str("FILTER", v, "filter name"); self }
     pub fn object(mut self, v: &str) -> Self { self.push_str("OBJECT", v, "target name"); self }
-    pub fn roworder_top_down(mut self) -> Self { self.push_str("ROWORDER", "TOP-DOWN", "image row order"); self }
+    /// ROWORDER verbatim. Callers pass the canonical `TOP-DOWN` / `BOTTOM-UP`
+    /// spellings; validating the value is the caller's job (a master's row
+    /// order is decided by its members, not by this builder).
+    pub fn roworder(mut self, v: &str) -> Self { self.push_str("ROWORDER", v, "image row order"); self }
+    pub fn roworder_top_down(self) -> Self { self.roworder("TOP-DOWN") }
     pub fn calstat(mut self, flags: &str) -> Self { self.push_str("CALSTAT", flags, "calibration state (B/D/F)"); self }
     pub fn pedestal(mut self, p: i64) -> Self { self.push("PEDESTAL", CardValue::Integer(p), "add to ADU for zero base"); self }
 

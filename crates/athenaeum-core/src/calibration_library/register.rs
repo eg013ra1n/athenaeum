@@ -234,7 +234,7 @@ pub fn register_master(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
+    use crate::fits_writer::keywords::{Bayer, FrameKind, HeaderBuilder};
     use crate::fits_writer::write_fits_f32;
     use rusqlite::Connection;
 
@@ -315,11 +315,15 @@ mod tests {
         flat_set_id
     }
 
+    /// Carries the Bayer geometry a consolidated master header now stamps
+    /// (real phase + row order, not fabricated zeros) so the round-trip below
+    /// pins that those cards survive write -> re-parse -> `frames` columns.
     fn write_master(dir: &std::path::Path) -> std::path::PathBuf {
         let p = dir.join("master_dark.fits");
         let cards = HeaderBuilder::new(FrameKind::MasterDark)
             .instrume("TestCam").exptime(300.0).gain(100).offset(50)
             .binning(1, 1).ccd_temp(-10.0)
+            .bayer(Bayer::Rggb, 1, 0).roworder("BOTTOM-UP")
             .build().unwrap();
         write_fits_f32(&p, 8, 8, 1, &vec![100.0; 64], &cards).unwrap();
         p
@@ -349,6 +353,22 @@ mod tests {
         let path: String = conn.query_row(
             "SELECT path FROM files WHERE id=?1", [reg.master_file_id], |r| r.get(0)).unwrap();
         assert_eq!(path, master_path.to_string_lossy());
+
+        // The Bayer cards the header consolidator now stamps must land in the
+        // master's OWN frame row, verbatim — registration re-parses the file it
+        // just wrote, so a phase of 1 has to come back as 1 (a 0 here would be
+        // the fabrication bug reappearing one layer down).
+        let (bayerpat, xbayroff, ybayroff, roworder): (
+            Option<String>, Option<i64>, Option<i64>, Option<String>,
+        ) = conn.query_row(
+            "SELECT bayerpat, xbayroff, ybayroff, roworder FROM frames WHERE id=?1",
+            [reg.master_frame_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).unwrap();
+        assert_eq!(bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(xbayroff, Some(1), "real phase must survive the write/re-parse round trip");
+        assert_eq!(ybayroff, Some(0));
+        assert_eq!(roworder.as_deref(), Some("BOTTOM-UP"));
 
         // relink: the light's Dark link now points at the master, manual flag preserved
         let (set_id, manual): (i64, i64) = conn.query_row(

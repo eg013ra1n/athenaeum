@@ -8,11 +8,15 @@ use crate::models::FileFormat;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
+use tracing::{debug, warn};
 
 /// Everything needed to consolidate a master header from its source set.
 /// Loaded with [`load_header_inputs`].
 pub struct MasterHeaderInputs {
     pub kind: FrameKind,
+    /// The `calibration_set.id` these inputs came from — kept so the card
+    /// builder's degraded-path warnings can name the set.
+    pub source_set_id: i64,
     pub instrume: Option<String>,
     pub telescop: Option<String>,
     pub filter: Option<String>,
@@ -28,12 +32,130 @@ pub struct MasterHeaderInputs {
     pub bayerpat: Option<String>,
     pub xbayroff: Option<i64>,
     pub ybayroff: Option<i64>,
+    pub roworder: Option<String>,
     pub temp_mean: Option<f64>,
     pub temp_min: Option<f64>,
     pub temp_max: Option<f64>,
     pub date_obs_midpoint: Option<DateTime<Utc>>,
     pub frame_count: u32,
     pub source_set_uuid: String,
+}
+
+/// The Bayer/CFA geometry a calibration set's member frames agree on.
+/// Produced by [`load_bayer_consensus`]; every field is `None` unless at
+/// least one member actually declared it.
+#[derive(Debug, Default, PartialEq)]
+pub struct BayerConsensus {
+    pub bayerpat: Option<String>,
+    pub xbayroff: Option<i64>,
+    pub ybayroff: Option<i64>,
+    pub roworder: Option<String>,
+    /// Column names whose members did not all agree — the majority was taken
+    /// and a `warn!` was emitted for each. Empty is the normal case.
+    pub disagreements: Vec<&'static str>,
+    /// True when BAYERPAT came from the stored-header blob instead of the
+    /// `frames.bayerpat` column (pre-Task-1 catalogs that have not rescanned).
+    pub bayerpat_from_blob: bool,
+}
+
+/// Majority value of one `frames` column across a calibration set's members.
+///
+/// Returns `(winner, disagreement)`. NULLs are excluded, so a column no member
+/// declared yields `None` — never a fabricated default. Ordering is
+/// `count DESC, value ASC`, so a tie breaks deterministically and the same set
+/// always consolidates to the same master header.
+///
+/// `col` is interpolated into the SQL. Every call site passes one of four
+/// hard-coded literals (`bayerpat`, `xbayroff`, `ybayroff`, `roworder`); it is
+/// never user input.
+fn consensus<T: rusqlite::types::FromSql>(
+    conn: &Connection,
+    set_id: i64,
+    col: &'static str,
+) -> Result<(Option<T>, bool)> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT fr.{col}, COUNT(*) c FROM calibration_set_frames csf
+         JOIN frames fr ON fr.id = csf.frame_id
+         WHERE csf.set_id = ?1 AND fr.{col} IS NOT NULL
+         GROUP BY fr.{col} ORDER BY c DESC, fr.{col} ASC"
+    ))?;
+    let values: Vec<T> = stmt
+        .query_map([set_id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let disagreement = values.len() > 1;
+    if disagreement {
+        warn!(set_id, field = col, "bayer metadata disagrees across set members — using majority");
+    }
+    Ok((values.into_iter().next(), disagreement))
+}
+
+/// Consolidate the members' Bayer columns (Task 1: `frames.bayerpat`,
+/// `xbayroff`, `ybayroff`, `roworder`) into one set-level answer.
+///
+/// The columns are queried directly rather than through a `Frame` struct: the
+/// index-based list readers hardcode `None` for these four fields regardless of
+/// what is stored (see `models.rs`), so a `Frame` round-trip would silently
+/// erase them.
+pub fn load_bayer_consensus(conn: &Connection, set_id: i64) -> Result<BayerConsensus> {
+    let mut out = BayerConsensus::default();
+    let (bayerpat, dis_pat) = consensus::<String>(conn, set_id, "bayerpat")?;
+    let (xbayroff, dis_x) = consensus::<i64>(conn, set_id, "xbayroff")?;
+    let (ybayroff, dis_y) = consensus::<i64>(conn, set_id, "ybayroff")?;
+    let (roworder, dis_row) = consensus::<String>(conn, set_id, "roworder")?;
+    for (col, dis) in [
+        ("bayerpat", dis_pat), ("xbayroff", dis_x), ("ybayroff", dis_y), ("roworder", dis_row),
+    ] {
+        if dis {
+            out.disagreements.push(col);
+        }
+    }
+    out.bayerpat = bayerpat.filter(|s| !s.trim().is_empty());
+    out.xbayroff = xbayroff;
+    out.ybayroff = ybayroff;
+    out.roworder = roworder.filter(|s| !s.trim().is_empty());
+
+    // Fallback, BAYERPAT only: a catalog scanned before the columns existed
+    // has them all NULL until a rescan, but its stored raw header still holds
+    // the pattern. There is deliberately NO blob fallback for the offsets or
+    // row order — those were never parsed before, so re-reading one arbitrary
+    // member's blob here would reintroduce exactly the LIMIT-1 nondeterminism
+    // this consensus replaces. Absent beats guessed.
+    if out.bayerpat.is_none() {
+        out.bayerpat = bayerpat_from_stored_header(conn, set_id);
+        if out.bayerpat.is_some() {
+            out.bayerpat_from_blob = true;
+            debug!(set_id, "bayerpat column empty for all members — using stored-header blob fallback");
+        }
+    }
+    Ok(out)
+}
+
+/// BAYERPAT out of one member's raw stored header. `fits_header.header` stores
+/// three shapes (FITS 80-col cards, raw XISF XML, ASIAIR-style "KEY = value"
+/// dumps) and `parse_stored_header_keys` is the format-aware accessor that
+/// handles all of them (same call pattern as db::operations'
+/// `clear_override_for_unchanged_frames` / `get_frame_metadata_originals`).
+fn bayerpat_from_stored_header(conn: &Connection, set_id: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT fi.format, fh.header FROM calibration_set_frames csf
+         JOIN frames f ON f.id = csf.frame_id
+         JOIN files fi ON fi.id = f.file_id
+         JOIN fits_header fh ON fh.file_id = f.file_id
+         WHERE csf.set_id = ?1 LIMIT 1",
+        [set_id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    )
+    .ok()
+    .and_then(|(format_str, header)| {
+        let format = match format_str.as_str() {
+            "FITS" => FileFormat::FITS,
+            "XISF" => FileFormat::XISF,
+            _ => return None, // Unknown format — skip rather than guess.
+        };
+        // Returned map is keyed UPPERCASE (see parse_stored_header_keys docs).
+        parse_stored_header_keys(format, &header).remove("BAYERPAT")
+    })
+    .filter(|s| !s.trim().is_empty())
 }
 
 fn master_kind_for(imagetyp: &str) -> Option<FrameKind> {
@@ -69,9 +191,9 @@ pub fn load_header_inputs(conn: &Connection, source_set_id: i64) -> Result<Maste
         .ok_or_else(|| anyhow!("set {source_set_id} has non-calibration imagetyp {imagetyp}"))?;
 
     // Frame-level aggregates: temp mean, date midpoint, binning ints, pixel size.
-    // Exactly the 7 real frame aggregates — BAYERPAT is NOT one of them (frames
-    // has no bayerpat column); it is fetched separately below from the raw
-    // stored header of a member file.
+    // Exactly the 7 real frame aggregates. The Bayer columns are NOT among them
+    // — MAX() over a CFA pattern is meaningless; they go through
+    // load_bayer_consensus (majority per column) below.
     let (temp_mean, min_dt, max_dt, xbin, ybin, xpixsz, ypixsz): (
         Option<f64>, Option<String>, Option<String>, Option<i64>, Option<i64>,
         Option<f64>, Option<f64>,
@@ -84,34 +206,9 @@ pub fn load_header_inputs(conn: &Connection, source_set_id: i64) -> Result<Maste
         [source_set_id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
     )?;
-    // frames has no bayerpat column — BAYERPAT lives in the stored raw
-    // header. Fetch it from fits_header of the first member file, joining
-    // files for the format: fits_header.header stores three shapes (FITS
-    // 80-col cards, raw XISF XML, ASIAIR-style "KEY = value" dumps), and
-    // parse_stored_header_keys is the format-aware accessor that handles
-    // all of them (same call pattern as db::operations'
-    // clear_override_for_unchanged_frames / get_frame_metadata_originals).
-    let bayerpat: Option<String> = conn
-        .query_row(
-            "SELECT fi.format, fh.header FROM calibration_set_frames csf
-             JOIN frames f ON f.id = csf.frame_id
-             JOIN files fi ON fi.id = f.file_id
-             JOIN fits_header fh ON fh.file_id = f.file_id
-             WHERE csf.set_id = ?1 LIMIT 1",
-            [source_set_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        )
-        .ok()
-        .and_then(|(format_str, header)| {
-            let format = match format_str.as_str() {
-                "FITS" => FileFormat::FITS,
-                "XISF" => FileFormat::XISF,
-                _ => return None, // Unknown format — skip rather than guess.
-            };
-            // Returned map is keyed UPPERCASE (see parse_stored_header_keys docs).
-            parse_stored_header_keys(format, &header).remove("BAYERPAT")
-        })
-        .filter(|s| !s.trim().is_empty());
+    // Bayer/CFA geometry by member majority (frames.bayerpat/xbayroff/
+    // ybayroff/roworder — all four are real columns since Task 1).
+    let bayer = load_bayer_consensus(conn, source_set_id)?;
 
     let midpoint = match (parse_dt(min_dt.as_deref()), parse_dt(max_dt.as_deref())) {
         (Some(a), Some(b)) => Some(a + (b - a) / 2),
@@ -121,19 +218,31 @@ pub fn load_header_inputs(conn: &Connection, source_set_id: i64) -> Result<Maste
 
     Ok(MasterHeaderInputs {
         kind,
+        source_set_id,
         instrume, telescop, filter, exptime,
         gain, offset,
         xbinning: xbin, ybinning: ybin,
         xpixsz, ypixsz, focallen,
         egain: None, // EGAIN is not columnized; omitted from masters (additive later)
-        bayerpat,
-        xbayroff: None, ybayroff: None,
+        bayerpat: bayer.bayerpat,
+        xbayroff: bayer.xbayroff, ybayroff: bayer.ybayroff,
+        roworder: bayer.roworder,
         temp_mean: temp_mean.or(ccd_temp),
         temp_min, temp_max,
         date_obs_midpoint: midpoint,
         frame_count: frame_count as u32,
         source_set_uuid: uuid,
     })
+}
+
+/// CFA phase is mod 2, so an offset outside {0, 1} means the source header (or
+/// our reading of it) is off. Emit it verbatim anyway — normalizing silently
+/// would substitute our guess for the camera's statement — but say so.
+fn checked_offset(set_id: i64, field: &'static str, value: i64) -> i64 {
+    if !(0..=1).contains(&value) {
+        warn!(set_id, field, value, "bayer offset outside 0/1 — emitting verbatim");
+    }
+    value
 }
 
 fn parse_dt(s: Option<&str>) -> Option<DateTime<Utc>> {
@@ -181,16 +290,48 @@ pub fn build_master_cards(
     if let Some(v) = &inputs.filter {
         b = b.filter(v);
     }
+    let set_id = inputs.source_set_id;
     if let Some(p) = &inputs.bayerpat {
-        let bayer = match p.to_ascii_uppercase().as_str() {
+        let bayer = match p.trim().trim_matches('\'').trim().to_ascii_uppercase().as_str() {
             "RGGB" => Some(Bayer::Rggb),
             "BGGR" => Some(Bayer::Bggr),
             "GBRG" => Some(Bayer::Gbrg),
             "GRBG" => Some(Bayer::Grbg),
             _ => None,
         };
-        if let Some(bp) = bayer {
-            b = b.bayer(bp, inputs.xbayroff.unwrap_or(0), inputs.ybayroff.unwrap_or(0));
+        match bayer {
+            Some(bp) => {
+                b = b.bayer_pattern(bp);
+                // The offsets are the CFA phase of THAT pattern, so they ride
+                // with it — and only when the members actually declared one.
+                // A missing offset stays missing: XBAYROFF=0 is a positive
+                // claim about the mosaic, and a wrong one swaps R and B.
+                if let Some(x) = inputs.xbayroff {
+                    b = b.bayer_x_offset(checked_offset(set_id, "xbayroff", x));
+                }
+                if let Some(y) = inputs.ybayroff {
+                    b = b.bayer_y_offset(checked_offset(set_id, "ybayroff", y));
+                }
+            }
+            None => warn!(
+                set_id, bayerpat = %p,
+                "unrecognized bayer pattern — bayer cards omitted from master"
+            ),
+        }
+    }
+    // ROWORDER is independent of the CFA pattern (mono frames have a row order
+    // too) and the integration engine writes bands in source order, so the
+    // members' row order carries into the master unchanged.
+    if let Some(r) = &inputs.roworder {
+        // The column stores the parsed value verbatim; normalize quoting and
+        // case before matching, and emit the canonical spelling.
+        let normalized = r.trim().trim_matches('\'').trim().to_ascii_uppercase();
+        match normalized.as_str() {
+            "TOP-DOWN" | "BOTTOM-UP" => b = b.roworder(&normalized),
+            _ => warn!(
+                set_id, roworder = %r,
+                "unrecognized row order — ROWORDER omitted from master"
+            ),
         }
     }
     b = b
@@ -317,10 +458,264 @@ mod tests {
         assert!(cards.iter().any(|c| c.keyword == "FILTER"));
     }
 
+    /// Appends one more member frame to a set seeded by [`seed`]. The majority
+    /// tests need three members for a majority to exist at all; [`seed`] is
+    /// left at two so the date-midpoint assertion above keeps its fixture.
+    fn add_member(conn: &Connection, set_id: i64, tag: &str, date_obs: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES (?1, ?2, 10, '2026-06-28', 'FITS')",
+            rusqlite::params![format!("/d/{tag}.fits"), format!("{tag}.fits")],
+        ).unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO frames (file_id, imagetyp, instrume, exptime, gain, offset,
+                                 binning, xbinning, ybinning, ccd_temp, date_obs, xpixsz, ypixsz)
+             VALUES (?1, 'Dark', 'TestCam', 300.0, 100.0, 50.0, '1x1', 1, 1, -10.0, ?2, 3.76, 3.76)",
+            rusqlite::params![file_id, date_obs],
+        ).unwrap();
+        let frame_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            rusqlite::params![set_id, frame_id],
+        ).unwrap();
+        frame_id
+    }
+
+    /// Stamp Task-1's per-frame Bayer columns on the set's members, one tuple
+    /// (bayerpat, xbayroff, ybayroff, roworder) per member in frame-id order.
+    fn set_member_bayer(
+        conn: &Connection,
+        set_id: i64,
+        rows: &[(Option<&str>, Option<i64>, Option<i64>, Option<&str>)],
+    ) {
+        let ids: Vec<i64> = conn
+            .prepare("SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1 ORDER BY frame_id")
+            .unwrap()
+            .query_map([set_id], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids.len(), rows.len(), "fixture must cover every member frame");
+        for (id, (bp, x, y, ro)) in ids.into_iter().zip(rows) {
+            conn.execute(
+                "UPDATE frames SET bayerpat = ?2, xbayroff = ?3, ybayroff = ?4, roworder = ?5
+                 WHERE id = ?1",
+                rusqlite::params![id, bp, x, y, ro],
+            ).unwrap();
+        }
+    }
+
+    fn cards_for(conn: &Connection, set_id: i64) -> Vec<Card> {
+        let inputs = load_header_inputs(conn, set_id).unwrap();
+        build_master_cards(&inputs, "0.2.5", "median n=3", "cafe", None).unwrap()
+    }
+
+    fn card_str<'a>(cards: &'a [Card], kw: &str) -> Option<&'a str> {
+        cards.iter().find(|c| c.keyword == kw).and_then(|c| match &c.value {
+            Some(crate::fits_writer::CardValue::Str(v)) => Some(v.as_str()),
+            _ => None,
+        })
+    }
+
+    fn card_int(cards: &[Card], kw: &str) -> Option<i64> {
+        cards.iter().find(|c| c.keyword == kw).and_then(|c| match &c.value {
+            Some(crate::fits_writer::CardValue::Integer(v)) => Some(*v),
+            _ => None,
+        })
+    }
+
+    fn has_card(cards: &[Card], kw: &str) -> bool {
+        cards.iter().any(|c| c.keyword == kw)
+    }
+
+    /// The whole point of the columns: a master must carry the members' REAL
+    /// CFA phase and row order as VALUES, not merely "some card is present".
+    /// A fabricated XBAYROFF=0 on a genuinely phase-1 sensor swaps colour
+    /// channels for every downstream debayer.
+    #[test]
+    fn master_bayer_cards_carry_real_offsets_and_roworder() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        add_member(&conn, set_id, "f2", "2026-06-28T21:00:00Z");
+        set_member_bayer(
+            &conn,
+            set_id,
+            &[
+                (Some("RGGB"), Some(1), Some(0), Some("BOTTOM-UP")),
+                (Some("RGGB"), Some(1), Some(0), Some("BOTTOM-UP")),
+                (Some("RGGB"), Some(1), Some(0), Some("BOTTOM-UP")),
+            ],
+        );
+        let cards = cards_for(&conn, set_id);
+        assert_eq!(card_str(&cards, "BAYERPAT"), Some("RGGB"));
+        assert_eq!(card_int(&cards, "XBAYROFF"), Some(1), "real phase, not a fabricated 0");
+        assert_eq!(card_int(&cards, "YBAYROFF"), Some(0));
+        assert_eq!(card_str(&cards, "ROWORDER"), Some("BOTTOM-UP"));
+    }
+
+    /// Members can disagree (a set re-grouped across a firmware change, a
+    /// hand-edited header). Majority wins, deterministically, and the
+    /// disagreement is reported — never silently averaged away.
+    #[test]
+    fn member_disagreement_warns_and_uses_majority() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        add_member(&conn, set_id, "f2", "2026-06-28T21:00:00Z");
+        set_member_bayer(
+            &conn,
+            set_id,
+            &[
+                (Some("RGGB"), Some(1), None, None),
+                (Some("RGGB"), Some(1), None, None),
+                (Some("BGGR"), Some(0), None, None),
+            ],
+        );
+        let bayer = load_bayer_consensus(&conn, set_id).unwrap();
+        assert_eq!(bayer.bayerpat.as_deref(), Some("RGGB"), "majority pattern");
+        assert_eq!(bayer.xbayroff, Some(1), "majority offset");
+        assert_eq!(
+            bayer.disagreements, vec!["bayerpat", "xbayroff"],
+            "both split columns must be reported, silent columns must not"
+        );
+        let cards = cards_for(&conn, set_id);
+        assert_eq!(card_str(&cards, "BAYERPAT"), Some("RGGB"));
+        assert_eq!(card_int(&cards, "XBAYROFF"), Some(1));
+    }
+
+    /// A 2-vs-2 split has no majority. The tie-break is `value ASC`, so the
+    /// same set always consolidates to the same master header instead of
+    /// depending on SQLite's row order.
+    #[test]
+    fn tied_disagreement_breaks_deterministically() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        add_member(&conn, set_id, "f2", "2026-06-28T21:00:00Z");
+        add_member(&conn, set_id, "f3", "2026-06-28T21:30:00Z");
+        set_member_bayer(
+            &conn,
+            set_id,
+            &[
+                (Some("RGGB"), None, None, None),
+                (Some("BGGR"), None, None, None),
+                (Some("BGGR"), None, None, None),
+                (Some("RGGB"), None, None, None),
+            ],
+        );
+        let bayer = load_bayer_consensus(&conn, set_id).unwrap();
+        assert_eq!(bayer.bayerpat.as_deref(), Some("BGGR"), "ties break on value ASC");
+        assert_eq!(bayer.disagreements, vec!["bayerpat"]);
+    }
+
+    /// A rescanned catalog has both the column and the old blob. The column
+    /// wins — it is the consensus of every member, the blob is one arbitrary
+    /// member's raw text.
+    #[test]
+    fn column_consensus_beats_stored_header_blob() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        let header = format!(
+            "{:<80}\n{:<80}",
+            "BAYERPAT= 'GBRG    '           / Bayer color pattern", "END",
+        );
+        seed_stored_headers(&conn, set_id, "FITS", &header);
+        set_member_bayer(
+            &conn,
+            set_id,
+            &[(Some("RGGB"), Some(1), Some(1), None), (Some("RGGB"), Some(1), Some(1), None)],
+        );
+        let bayer = load_bayer_consensus(&conn, set_id).unwrap();
+        assert!(!bayer.bayerpat_from_blob, "column present — no fallback");
+        assert_eq!(bayer.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(card_str(&cards_for(&conn, set_id), "BAYERPAT"), Some("RGGB"));
+    }
+
+    /// Values we cannot vouch for are omitted, not guessed at — and the rest
+    /// of the header still lands.
+    #[test]
+    fn unknown_pattern_and_row_order_are_omitted_not_guessed() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        set_member_bayer(
+            &conn,
+            set_id,
+            &[
+                (Some("XYZW"), Some(1), Some(0), Some("SIDEWAYS")),
+                (Some("XYZW"), Some(1), Some(0), Some("SIDEWAYS")),
+            ],
+        );
+        let cards = cards_for(&conn, set_id);
+        for kw in ["BAYERPAT", "XBAYROFF", "YBAYROFF", "ROWORDER"] {
+            assert!(!has_card(&cards, kw), "{kw} must be omitted for an unvouchable value");
+        }
+        assert!(has_card(&cards, "IMAGETYP"), "the rest of the header still builds");
+    }
+
+    /// An out-of-domain phase (CFA phase is mod 2) is reported but still
+    /// emitted verbatim — silently rewriting the camera's statement would be
+    /// its own fabrication.
+    #[test]
+    fn out_of_domain_offset_is_emitted_verbatim() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        set_member_bayer(
+            &conn,
+            set_id,
+            &[(Some("RGGB"), Some(3), Some(0), None), (Some("RGGB"), Some(3), Some(0), None)],
+        );
+        assert_eq!(card_int(&cards_for(&conn, set_id), "XBAYROFF"), Some(3));
+    }
+
+    /// The parsers strip quotes, but the column stores whatever they yielded —
+    /// normalize on the way out so a quoted/lowercase spelling still produces
+    /// a canonical card rather than being dropped as unrecognized.
+    #[test]
+    fn row_order_spelling_is_normalized() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        set_member_bayer(
+            &conn,
+            set_id,
+            &[(None, None, None, Some("'top-down' ")), (None, None, None, Some("'top-down' "))],
+        );
+        assert_eq!(card_str(&cards_for(&conn, set_id), "ROWORDER"), Some("TOP-DOWN"));
+    }
+
+    /// Nothing declared by any member → no Bayer cards at all. A master that
+    /// says nothing is honest; one that says XBAYROFF=0 is a lie a debayer
+    /// will act on.
+    #[test]
+    fn missing_bayer_data_emits_no_bayer_cards_and_no_zero_fabrication() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        let cards = cards_for(&conn, set_id);
+        for kw in ["BAYERPAT", "XBAYROFF", "YBAYROFF", "ROWORDER"] {
+            assert!(!has_card(&cards, kw), "{kw} must be absent when no member declares it");
+        }
+    }
+
+    /// The exact shape the old `.unwrap_or(0)` got wrong: the pattern is
+    /// known but the phase is not. Emit BAYERPAT alone — absent beats
+    /// fabricated.
+    #[test]
+    fn pattern_without_offsets_emits_no_fabricated_zeros() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        set_member_bayer(
+            &conn,
+            set_id,
+            &[(Some("RGGB"), None, None, None), (Some("RGGB"), None, None, None)],
+        );
+        let cards = cards_for(&conn, set_id);
+        assert_eq!(card_str(&cards, "BAYERPAT"), Some("RGGB"));
+        assert!(!has_card(&cards, "XBAYROFF"), "no offset consensus — no XBAYROFF card");
+        assert!(!has_card(&cards, "YBAYROFF"), "no offset consensus — no YBAYROFF card");
+    }
+
     /// Attach the same stored-header blob (and format) to every member file
-    /// of the set — the BAYERPAT lookup uses `LIMIT 1` with no ORDER BY, so
-    /// seeding all members keeps the test deterministic regardless of which
-    /// row SQLite returns first.
+    /// of the set — the BAYERPAT blob fallback uses `LIMIT 1` with no ORDER
+    /// BY, so seeding all members keeps the test deterministic regardless of
+    /// which row SQLite returns first.
     fn seed_stored_headers(conn: &Connection, set_id: i64, format: &str, header: &str) {
         conn.execute(
             &format!(
@@ -340,18 +735,19 @@ mod tests {
         ).unwrap();
     }
 
+    /// Blob-fallback shape: `frames.bayerpat` is NULL (a pre-Task-1 catalog
+    /// that has not rescanned), so BAYERPAT comes off the stored header — and
+    /// nothing else does. The offsets were never parsed into those blobs'
+    /// era of the catalog, so they must stay ABSENT rather than become zeros.
     fn assert_bayer_consolidated(conn: &Connection, set_id: i64) {
+        let bayer = load_bayer_consensus(conn, set_id).unwrap();
+        assert!(bayer.bayerpat_from_blob, "column is NULL — this is the fallback path");
         let inputs = load_header_inputs(conn, set_id).unwrap();
         assert_eq!(inputs.bayerpat.as_deref(), Some("RGGB"));
         let cards = build_master_cards(&inputs, "0.2.5", "winsorized(3.0,3.0) n=2", "cafe", None).unwrap();
-        let find = |k: &str| cards.iter().find(|c| c.keyword == k);
-        let bp = find("BAYERPAT").expect("BAYERPAT card");
-        assert!(
-            matches!(&bp.value, Some(crate::fits_writer::CardValue::Str(v)) if v == "RGGB"),
-            "{:?}", bp.value
-        );
-        assert!(find("XBAYROFF").is_some(), "XBAYROFF card");
-        assert!(find("YBAYROFF").is_some(), "YBAYROFF card");
+        assert_eq!(card_str(&cards, "BAYERPAT"), Some("RGGB"));
+        assert!(!has_card(&cards, "XBAYROFF"), "no offset in the blob era — no XBAYROFF card");
+        assert!(!has_card(&cards, "YBAYROFF"), "no offset in the blob era — no YBAYROFF card");
     }
 
     #[test]
