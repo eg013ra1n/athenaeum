@@ -30,7 +30,7 @@ impl FrameKind {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bayer { Rggb, Bggr, Gbrg, Grbg }
 impl Bayer {
     pub fn as_str(&self) -> &'static str {

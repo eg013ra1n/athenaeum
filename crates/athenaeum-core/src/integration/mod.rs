@@ -3,6 +3,7 @@
 //! N full frames in RAM — the working set is N × one band.
 
 pub mod banded;
+pub mod cfa;
 pub mod combine;
 pub mod engine;
 
