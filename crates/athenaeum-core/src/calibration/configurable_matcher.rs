@@ -306,6 +306,7 @@ pub fn find_calibration_sets(
 ///
 /// Behavior in `OnlyCompatible` mode:
 /// - Drops candidates that fail any Exact / Warning parameter check.
+/// - Masters are always candidates; `master_preferences` orders, never filters.
 /// - Honors `master_preferences`:
 ///   - `PreferMaster`  → masters first, then framesets.
 ///   - `PreferFrameset` → framesets first, then masters.
@@ -486,16 +487,14 @@ pub fn find_calibration_candidates(
     incompatible.sort_by(by_score_desc);
 
     // Master preference applies inside the compatible group.
-    let mut compatible = apply_master_preference(compatible, master_pref.clone());
+    let mut compatible = apply_master_preference(compatible, master_pref);
 
     match mode {
         CandidateMode::OnlyCompatible => {
-            // Preserve historic auto-link semantics: when master_pref is
-            // NoPreference, callers don't expect masters mixed into auto-link
-            // results. PreferMaster / PreferFrameset already include both.
-            if master_pref == MasterPreference::NoPreference {
-                compatible.retain(|c| !c.is_master);
-            }
+            // Masters are ALWAYS auto-link candidates (2026-08-02 audit C1): a
+            // superseded raw set is excluded by the candidate query, so hiding its
+            // master too left whole lineages unmatchable and re-matching minted
+            // duplicate raw sets. `master_preferences` only orders the list now.
             Ok(compatible)
         }
         CandidateMode::IncludeIncompatible => {
@@ -1176,14 +1175,18 @@ mod tests {
     }
 
     #[test]
-    fn engine_no_preference_excludes_masters_for_auto_only() {
-        // OnlyCompatible + NoPreference: auto-link should not consider masters.
-        // IncludeIncompatible: masters still appear so the modal can show them.
+    fn engine_no_preference_includes_masters_for_auto_link() {
+        // One raw Dark set + one MasterDark set, both parameter-compatible with
+        // the frame. Under NoPreference the master must APPEAR in
+        // OnlyCompatible results — `master_preferences` orders, never filters.
         use crate::calibration::config::{BehavioralOptions, ParameterConfig};
 
+        const RAW_SET_ID: i64 = 1;
+        const MASTER_SET_ID: i64 = 2;
+
         let conn = engine_test_db();
-        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
-        insert_dark_set(&conn, 2, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 1, "MasterDark");
+        insert_dark_set(&conn, RAW_SET_ID, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(&conn, MASTER_SET_ID, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 1, "MasterDark");
 
         let frame = light_frame_for_dark();
         let mut config = CalibrationMatchingConfig::default();
@@ -1203,16 +1206,55 @@ mod tests {
             tc.filter = ParameterConfig::ignore();
         }
 
-        let compatible = find_calibration_candidates(
+        let ids: Vec<i64> = find_calibration_candidates(
             &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
-        ).unwrap();
-        let ids: Vec<i64> = compatible.iter().map(|c| c.set_id).collect();
-        assert_eq!(ids, vec![1], "NoPreference should drop masters from auto-link results");
+        ).unwrap().into_iter().map(|c| c.set_id).collect();
+        assert!(ids.contains(&MASTER_SET_ID), "master must be an auto-link candidate: got {:?}", ids);
+        assert!(ids.contains(&RAW_SET_ID), "raw set still competes on score: got {:?}", ids);
 
         let all = find_calibration_candidates(
             &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
         ).unwrap();
         let all_ids: Vec<i64> = all.iter().map(|c| c.set_id).collect();
-        assert!(all_ids.contains(&2), "IncludeIncompatible should still surface masters: got {:?}", all_ids);
+        assert!(all_ids.contains(&MASTER_SET_ID), "IncludeIncompatible should still surface masters: got {:?}", all_ids);
+    }
+
+    #[test]
+    fn engine_prefer_master_orders_master_first_for_auto_link() {
+        // The shipped default is PreferMaster: with a raw and a master set of
+        // equal score, auto-link must see the master at the head of the list
+        // (and the raw set must still be there as a fallback).
+        use crate::calibration::config::{BehavioralOptions, ParameterConfig};
+
+        const RAW_SET_ID: i64 = 1;
+        const MASTER_SET_ID: i64 = 2;
+
+        let conn = engine_test_db();
+        insert_dark_set(&conn, RAW_SET_ID, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(&conn, MASTER_SET_ID, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 1, "MasterDark");
+
+        let frame = light_frame_for_dark();
+        // No master_preferences override — this pins the SHIPPED default.
+        let mut config = CalibrationMatchingConfig::default();
+        config.behavioral_options.insert(
+            "darks".to_string(),
+            BehavioralOptions {
+                use_bias_for_dark_optimization: false,
+                use_bias_if_no_darks: false,
+                fallback_chain: Vec::new(),
+            },
+        );
+        if let Some(tc) = config.lights.dark.as_mut() {
+            tc.filter = ParameterConfig::ignore();
+        }
+
+        let ids: Vec<i64> = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
+        ).unwrap().into_iter().map(|c| c.set_id).collect();
+        assert_eq!(
+            ids,
+            vec![MASTER_SET_ID, RAW_SET_ID],
+            "default preference must order the master first without dropping the raw set"
+        );
     }
 }

@@ -164,9 +164,9 @@ if !is_manual && existing_is_manual {
 
 ```rust
 pub enum MasterPreference {
-    PreferMaster,    // Prioritize master calibration sets
+    PreferMaster,    // Prioritize master calibration sets (default)
     PreferFrameset,  // Prioritize regular frame sets
-    NoPreference,    // Use score alone (default)
+    NoPreference,    // Use score alone
 }
 ```
 
@@ -175,10 +175,10 @@ pub enum MasterPreference {
 pub master_preferences: HashMap<String, MasterPreference>,
 
 // Defaults:
-config.master_preferences.insert("flat".to_string(), MasterPreference::NoPreference);
-config.master_preferences.insert("dark".to_string(), MasterPreference::NoPreference);
-config.master_preferences.insert("bias".to_string(), MasterPreference::NoPreference);
-config.master_preferences.insert("darkflat".to_string(), MasterPreference::NoPreference);
+config.master_preferences.insert("flat".to_string(), MasterPreference::PreferMaster);
+config.master_preferences.insert("dark".to_string(), MasterPreference::PreferMaster);
+config.master_preferences.insert("bias".to_string(), MasterPreference::PreferMaster);
+config.master_preferences.insert("darkflat".to_string(), MasterPreference::PreferMaster);
 ```
 
 ### Selection Algorithm

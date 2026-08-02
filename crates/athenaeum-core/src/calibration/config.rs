@@ -242,7 +242,7 @@ pub enum MasterPreference {
 
 impl Default for MasterPreference {
     fn default() -> Self {
-        MasterPreference::NoPreference
+        MasterPreference::PreferMaster
     }
 }
 
@@ -469,11 +469,12 @@ impl Default for CalibrationMatchingConfig {
         darks_opts.use_bias_for_dark_optimization = true;
         config.behavioral_options.insert("darks".to_string(), darks_opts);
 
-        // Master preferences (default to NoPreference)
-        config.master_preferences.insert("flat".to_string(), MasterPreference::NoPreference);
-        config.master_preferences.insert("dark".to_string(), MasterPreference::NoPreference);
-        config.master_preferences.insert("bias".to_string(), MasterPreference::NoPreference);
-        config.master_preferences.insert("darkflat".to_string(), MasterPreference::NoPreference);
+        // Master preferences (default to PreferMaster: masters are always
+        // candidates, the preference only orders them ahead of raw sets)
+        config.master_preferences.insert("flat".to_string(), MasterPreference::PreferMaster);
+        config.master_preferences.insert("dark".to_string(), MasterPreference::PreferMaster);
+        config.master_preferences.insert("bias".to_string(), MasterPreference::PreferMaster);
+        config.master_preferences.insert("darkflat".to_string(), MasterPreference::PreferMaster);
 
         // Clustering defaults
         // Flat: 30 days max age, 30 minutes time cluster (session-based)

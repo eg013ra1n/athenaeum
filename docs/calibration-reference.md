@@ -565,13 +565,13 @@ Version history:
 
 ### Master Preferences
 
-Controls whether master frames or regular frame sets are preferred when both are available:
+Controls whether master frames or regular frame sets are preferred when both are available. Masters are always candidates for auto-link — this setting only orders the result list, it never filters:
 
 | Option | Meaning |
 | ---- | ---- |
-| PreferMaster | Return master calibration sets first |
+| PreferMaster | Return master calibration sets first (default for all types) |
 | PreferFrameset | Return regular frame sets first |
-| NoPreference | No sorting preference (default for all types) |
+| NoPreference | No sorting preference — score order only |
 
 ### Behavioral Options
 
