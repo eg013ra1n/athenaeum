@@ -19,17 +19,63 @@ pub struct BulkMoveProgressEvent {
     pub current_file: Option<String>,
 }
 
+/// A master's file leaving the library through the generic delete path must not
+/// strand its lineage (2026-08-02 audit C3): un-supersede the raw source set and
+/// restore its consumer links, exactly like `api::masters::delete_master` does,
+/// before the file is black-holed or voided. Without this, the raw set stays
+/// superseded — invisible to the matcher — by a master whose file is gone, and
+/// nothing in the UI can undo it.
+///
+/// Only the calibration rows are undone here; `files`/`frames` are left to the
+/// caller, which is what each black-hole path wants: a black-holed ex-master
+/// stays an ordinary catalog file (a restore or a later re-scan re-ingests it as
+/// an *imported* master, with no provenance — the same honest outcome
+/// `delete_master`'s warning describes), and `send_to_void` drops the rows
+/// itself.
+///
+/// A no-op for ordinary files. A failed *lookup* is logged and treated as "not a
+/// master": refusing to delete a file because one SELECT failed would be a worse
+/// outcome than the stranding this guards against. A failed *unregister* is
+/// returned — the caller decides (abort this file, keep the batch going).
+fn unregister_master_if_any(conn: &Connection, file_id: i64) -> Result<()> {
+    let master_set_id = match crate::db::master_unregister::master_set_id_for_file(conn, file_id) {
+        Ok(Some(id)) => id,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::error!(file_id, error = %e, "master lookup before black-hole/void failed");
+            return Ok(());
+        }
+    };
+
+    crate::db::master_unregister::unregister_master_set(conn, master_set_id).map_err(|e| {
+        tracing::error!(file_id, master_set_id, error = %e,
+            "failed to unregister master before black-hole/void");
+        e
+    })?;
+
+    // The primitive logs the unregister itself, but not which file triggered it
+    // — this line is the trail from "user deleted a file" to "lineage changed".
+    tracing::info!(file_id, master_set_id, "master unregistered before black-hole/void");
+    Ok(())
+}
+
 /// Add a file to the black hole (soft delete).
 ///
 /// Idempotent: a `UNIQUE(file_id)` index guarantees one row per file, and
 /// `INSERT OR IGNORE` makes re-blackholing an already-blackholed file a no-op
 /// rather than a duplicate row. Returns the canonical row id either way.
+///
+/// If the file is a master library file, its registration is undone first (see
+/// [`unregister_master_if_any`]) — still idempotent, because a repeat call finds
+/// no master left to unregister.
 pub fn add_to_black_hole(
     conn: &Connection,
     file_id: i64,
     from_where: &str,
     original_path: &str,
 ) -> Result<i64> {
+    unregister_master_if_any(conn, file_id)?;
+
     let now = Utc::now().to_rfc3339();
 
     conn.execute(
@@ -90,6 +136,13 @@ pub fn bulk_move_to_black_hole(
                 continue;
             }
         };
+
+        // A master file gives up its registration before it is black-holed;
+        // a failure there fails THIS file only, never the batch.
+        if let Err(e) = unregister_master_if_any(conn, *file_id) {
+            failed.push((*file_id, format!("master unregister failed: {}", e)));
+            continue;
+        }
 
         let insert = conn.execute(
             "INSERT OR IGNORE INTO black_hole (file_id, from_where, moved_at, original_path)
@@ -196,6 +249,10 @@ pub fn remove_from_black_hole(conn: &Connection, file_id: i64) -> Result<()> {
 }
 
 /// Permanently delete a file from disk and database (send to void)
+///
+/// A master library file gives up its registration first (see
+/// [`unregister_master_if_any`]) — before the disk file goes, so a failure there
+/// leaves everything intact.
 pub fn send_to_void(conn: &Connection, file_id: i64) -> Result<()> {
     // Get file path before deletion
     let path: String = conn.query_row(
@@ -203,6 +260,8 @@ pub fn send_to_void(conn: &Connection, file_id: i64) -> Result<()> {
         params![file_id],
         |row| row.get(0),
     )?;
+
+    unregister_master_if_any(conn, file_id)?;
 
     // Delete physical file
     if std::path::Path::new(&path).exists() {
@@ -435,5 +494,302 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM black_hole", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 2, "one row per file, no duplicates");
+    }
+
+    // ── Master interception (audit C3) ───────────────────────────────────────
+
+    /// A `files` + `frames` pair, returning `(file_id, frame_id)`. FK
+    /// enforcement is on, so both rows must exist before any calibration
+    /// junction row can reference them.
+    fn seed_file(conn: &Connection, path: &str, imagetyp: &str) -> (i64, i64) {
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES (?1, ?2, 100, '2026-08-01T00:00:00Z', 'FITS')",
+            params![path, path.rsplit('/').next().unwrap()],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO frames (file_id, imagetyp) VALUES (?1, ?2)",
+            params![file_id, imagetyp],
+        )
+        .unwrap();
+        (file_id, conn.last_insert_rowid())
+    }
+
+    struct MasterFixture {
+        raw_set_id: i64,
+        master_set_id: i64,
+        master_file_id: i64,
+        consumer_frame_id: i64,
+    }
+
+    /// The end state `register_master` leaves behind: a raw source set
+    /// superseded by a master set that owns one file at `master_path`, carries
+    /// provenance, and has inherited the raw set's consumer link.
+    fn seed_registered_master(conn: &Connection, master_path: &str) -> MasterFixture {
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-08-01')",
+            [],
+        )
+        .unwrap();
+        let raw_set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, is_master_library)
+             VALUES ('MasterDark', '2026-08-01', 1)",
+            [],
+        )
+        .unwrap();
+        let master_set_id = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = ?1 WHERE id = ?2",
+            params![master_set_id, raw_set_id],
+        )
+        .unwrap();
+
+        let (master_file_id, master_frame_id) = seed_file(conn, master_path, "MASTERDARK");
+        conn.execute(
+            "UPDATE frames SET is_master = 1 WHERE id = ?1",
+            params![master_frame_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            params![master_set_id, master_frame_id],
+        )
+        .unwrap();
+
+        // The raw members the master was integrated from — untouched by any of
+        // this, and the reason the raw set is worth restoring.
+        let (_, raw_frame_id) = seed_file(conn, "/lib/raw1.fits", "DARK");
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            params![raw_set_id, raw_frame_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO master_provenance
+             (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+             VALUES (?1, ?2, '{}', '[]', 'h', '2026-08-02T00:00:00Z')",
+            params![master_set_id, raw_set_id],
+        )
+        .unwrap();
+
+        let (_, consumer_frame_id) = seed_file(conn, "/lib/light.fits", "LIGHT");
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, match_score, is_manual_override)
+             VALUES (?1, 'frame', ?2, 'Dark', 0.9, 1)",
+            params![consumer_frame_id, master_set_id],
+        )
+        .unwrap();
+
+        MasterFixture {
+            raw_set_id,
+            master_set_id,
+            master_file_id,
+            consumer_frame_id,
+        }
+    }
+
+    /// Everything `unregister_master_set` is supposed to have undone by the
+    /// time the black-hole/void path proceeds with the file itself.
+    fn assert_lineage_restored(conn: &Connection, fx: &MasterFixture) {
+        let target: i64 = conn
+            .query_row(
+                "SELECT calibration_set_id FROM calibration_set_to_frames
+                  WHERE source_id = ?1 AND source_type = 'frame'",
+                [fx.consumer_frame_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            target, fx.raw_set_id,
+            "consumer link repointed back to the raw set"
+        );
+
+        let sup: Option<i64> = conn
+            .query_row(
+                "SELECT superseded_by_set_id FROM calibration_set WHERE id = ?1",
+                [fx.raw_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sup, None, "raw set is matchable again");
+
+        let masters: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = ?1",
+                [fx.master_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(masters, 0, "master shell row is gone");
+
+        let prov: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM master_provenance WHERE master_set_id = ?1",
+                [fx.master_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prov, 0, "master provenance dropped");
+    }
+
+    /// Voiding a master's file must restore the lineage first — otherwise the
+    /// raw set stays superseded by a set (and a file) that no longer exists.
+    #[test]
+    fn send_to_void_unregisters_a_master_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let master_path = dir.path().join("master_dark.fits");
+        std::fs::write(&master_path, b"master").unwrap();
+
+        let conn = setup();
+        let fx = seed_registered_master(&conn, master_path.to_str().unwrap());
+
+        send_to_void(&conn, fx.master_file_id).unwrap();
+
+        assert_lineage_restored(&conn, &fx);
+
+        let files: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE id = ?1",
+                [fx.master_file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(files, 0, "voided file row is gone");
+        assert!(!master_path.exists(), "voided file is gone from disk");
+    }
+
+    /// Black-holing a master's file restores the lineage too, but the file row
+    /// SURVIVES: the ex-master is now an ordinary catalog file sitting in the
+    /// Black Hole, restorable like any other.
+    #[test]
+    fn bulk_move_to_black_hole_unregisters_a_master_first() {
+        let conn = setup();
+        let fx = seed_registered_master(&conn, "/lib/master_dark.fits");
+
+        let res = bulk_move_to_black_hole(&conn, &[fx.master_file_id], "test", None).unwrap();
+        assert_eq!(res.moved, 1);
+        assert!(res.failed.is_empty(), "{:?}", res.failed);
+
+        assert_lineage_restored(&conn, &fx);
+
+        let files: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE id = ?1",
+                [fx.master_file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(files, 1, "black-holed file row survives");
+
+        let bh: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM black_hole WHERE file_id = ?1",
+                [fx.master_file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bh, 1, "the file really is in the black hole");
+    }
+
+    /// The single-file path (`move_to_black_hole` command → `add_to_black_hole`)
+    /// intercepts identically, and stays idempotent on a repeat call.
+    #[test]
+    fn add_to_black_hole_unregisters_a_master_first() {
+        let conn = setup();
+        let path = "/lib/master_dark.fits";
+        let fx = seed_registered_master(&conn, path);
+
+        let id1 = add_to_black_hole(&conn, fx.master_file_id, "test", path).unwrap();
+        assert_lineage_restored(&conn, &fx);
+
+        // Second call: no master left to unregister, still the same row.
+        let id2 = add_to_black_hole(&conn, fx.master_file_id, "test", path).unwrap();
+        assert_eq!(id1, id2, "repeat blackhole of an ex-master is still idempotent");
+
+        let files: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE id = ?1",
+                [fx.master_file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(files, 1, "black-holed file row survives");
+    }
+
+    /// The guard is a no-op for ordinary catalog files: an ordinary calibration
+    /// set losing a member to the Black Hole (or the void) keeps its row, its
+    /// remaining members and its consumer link exactly as they were.
+    #[test]
+    fn non_master_files_pass_through_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let voided = dir.path().join("d3.fits");
+        std::fs::write(&voided, b"dark").unwrap();
+
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-08-01')",
+            [],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+
+        let mut member_files = Vec::new();
+        for path in ["/lib/d1.fits", "/lib/d2.fits", voided.to_str().unwrap()] {
+            let (file_id, frame_id) = seed_file(&conn, path, "DARK");
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                params![set_id, frame_id],
+            )
+            .unwrap();
+            member_files.push(file_id);
+        }
+        let (_, consumer_frame_id) = seed_file(&conn, "/lib/light.fits", "LIGHT");
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type)
+             VALUES (?1, 'frame', ?2, 'Dark')",
+            params![consumer_frame_id, set_id],
+        )
+        .unwrap();
+
+        // One member down each of the three delete paths.
+        add_to_black_hole(&conn, member_files[0], "test", "/lib/d1.fits").unwrap();
+        let res = bulk_move_to_black_hole(&conn, &[member_files[1]], "test", None).unwrap();
+        assert!(res.failed.is_empty(), "{:?}", res.failed);
+        send_to_void(&conn, member_files[2]).unwrap();
+
+        let alive: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = ?1",
+                [set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alive, 1, "an ordinary calibration set is never unregistered");
+
+        let target: i64 = conn
+            .query_row(
+                "SELECT calibration_set_id FROM calibration_set_to_frames
+                  WHERE source_id = ?1 AND source_type = 'frame'",
+                [consumer_frame_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(target, set_id, "consumer link untouched");
+
+        // Only the voided member's membership row goes (files CASCADE); the two
+        // black-holed ones keep theirs.
+        let members: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1",
+                [set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 2, "black-holed members keep their membership rows");
     }
 }
