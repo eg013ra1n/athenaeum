@@ -323,6 +323,13 @@ pub fn get_orphaned_file_details(
 
 /// Delete orphaned files from the database
 ///
+/// A purged file is one the user has confirmed is gone from disk, so a master
+/// library file arriving here gets full `delete_master` semantics: its raw
+/// source set is un-superseded and its consumers repointed before the row goes
+/// (2026-08-02 audit C3). Without that, the raw frames stay invisible to the
+/// matcher forever — superseded by a master that exists neither on disk nor in
+/// the catalog, with nothing left in the UI to undo it.
+///
 /// # Arguments
 ///
 /// * `conn` - Database connection
@@ -336,10 +343,42 @@ pub fn delete_orphaned_files(conn: &Connection, file_ids: &[i64]) -> Result<usiz
         return Ok(0);
     }
 
-    let placeholders = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    // Per-file, and per-file-fallible: one file whose unregister fails is
+    // dropped from the purge (its row survives, so the lineage is still
+    // undoable) rather than aborting the whole batch or being stranded. A failed
+    // LOOKUP is logged and the file treated as ordinary — same stance as the
+    // Black Hole paths: refusing a purge because one SELECT failed is worse than
+    // the stranding this guards against.
+    let mut deletable: Vec<i64> = Vec::with_capacity(file_ids.len());
+    for &file_id in file_ids {
+        match crate::db::master_unregister::master_set_id_for_file(conn, file_id) {
+            Ok(Some(master_set_id)) => {
+                match crate::db::master_unregister::unregister_master_set(conn, master_set_id) {
+                    Ok(_) => tracing::info!(
+                        file_id,
+                        master_set_id,
+                        "master unregistered before orphan purge"
+                    ),
+                    Err(e) => {
+                        tracing::error!(file_id, master_set_id, error = %e,
+                            "failed to unregister master before orphan purge — file kept");
+                        continue;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::error!(file_id, error = %e, "master lookup before orphan purge failed"),
+        }
+        deletable.push(file_id);
+    }
+    if deletable.is_empty() {
+        return Ok(0);
+    }
+
+    let placeholders = deletable.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let query = format!("DELETE FROM files WHERE id IN ({})", placeholders);
 
-    let params: Vec<&dyn rusqlite::ToSql> = file_ids
+    let params: Vec<&dyn rusqlite::ToSql> = deletable
         .iter()
         .map(|id| id as &dyn rusqlite::ToSql)
         .collect();
@@ -365,6 +404,162 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let result = delete_orphaned_files(&conn, &[]).unwrap();
         assert_eq!(result, 0);
+    }
+
+    /// Purging a missing master's row must un-supersede the raw set it replaced
+    /// (2026-08-02 audit C3) — otherwise those raw frames stay invisible to the
+    /// matcher forever, superseded by a master that is gone from disk AND from
+    /// the catalog.
+    #[test]
+    fn orphan_purge_unregisters_a_purged_master() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+
+        let seed_file = |path: &str, imagetyp: &str| -> i64 {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?1, 100, '2026-08-01T00:00:00Z', 'FITS')",
+                params![path],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp) VALUES (?1, ?2)",
+                params![file_id, imagetyp],
+            )
+            .unwrap();
+            file_id
+        };
+
+        // The state register_master leaves behind: raw set superseded by a
+        // master that owns one (now missing) file and inherited the consumer link.
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-08-01')",
+            [],
+        )
+        .unwrap();
+        let raw_set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, is_master_library)
+             VALUES ('MasterDark', '2026-08-01', 1)",
+            [],
+        )
+        .unwrap();
+        let master_set_id = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = ?1 WHERE id = ?2",
+            params![master_set_id, raw_set_id],
+        )
+        .unwrap();
+
+        let master_file_id = seed_file("/lib/master_dark.fits", "MASTERDARK");
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id)
+             VALUES (?1, (SELECT id FROM frames WHERE file_id = ?2))",
+            params![master_set_id, master_file_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO master_provenance
+             (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+             VALUES (?1, ?2, '{}', '[]', 'h', '2026-08-02T00:00:00Z')",
+            params![master_set_id, raw_set_id],
+        )
+        .unwrap();
+
+        let consumer_file_id = seed_file("/lib/light.fits", "LIGHT");
+        let consumer_frame_id: i64 = conn
+            .query_row(
+                "SELECT id FROM frames WHERE file_id = ?1",
+                params![consumer_file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type)
+             VALUES (?1, 'frame', ?2, 'Dark')",
+            params![consumer_frame_id, master_set_id],
+        )
+        .unwrap();
+
+        let deleted = delete_orphaned_files(&conn, &[master_file_id]).unwrap();
+        assert_eq!(deleted, 1, "the purged file row is gone");
+
+        let sup: Option<i64> = conn
+            .query_row(
+                "SELECT superseded_by_set_id FROM calibration_set WHERE id = ?1",
+                [raw_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sup, None, "raw set is matchable again");
+
+        let target: i64 = conn
+            .query_row(
+                "SELECT calibration_set_id FROM calibration_set_to_frames
+                  WHERE source_id = ?1 AND source_type = 'frame'",
+                [consumer_frame_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(target, raw_set_id, "consumer link repointed to the raw set");
+
+        let masters: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = ?1",
+                [master_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(masters, 0, "master shell row is gone");
+    }
+
+    /// The guard is inert for ordinary files: purging a plain orphan neither
+    /// touches its calibration set nor stops at the master lookup.
+    #[test]
+    fn orphan_purge_leaves_ordinary_files_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-08-01')",
+            [],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+
+        let mut ids = Vec::new();
+        for name in ["/lib/d1.fits", "/lib/d2.fits"] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?1, 100, '2026-08-01T00:00:00Z', 'FITS')",
+                params![name],
+            )
+            .unwrap();
+            let file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'DARK')",
+                params![file_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                params![set_id, conn.last_insert_rowid()],
+            )
+            .unwrap();
+            ids.push(file_id);
+        }
+
+        assert_eq!(delete_orphaned_files(&conn, &ids[..1]).unwrap(), 1);
+
+        let alive: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = ?1",
+                [set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alive, 1, "an ordinary calibration set is never unregistered");
     }
 
     #[test]

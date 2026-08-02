@@ -272,3 +272,6 @@ future enhancement, not part of this fix cycle.
 - Moved-output detection for re-calibration without a rescan.
 - Percentile-clip near-zero-median normalization (manual-recipe-only).
 - snake_case calibration-config wire format (documented deviation).
+- Scan-root deletion leaves master/superseded shells with dangling supersede
+  pointers when the deleted root held master files — un-supersede-on-root-delete
+  semantics need an owner decision (re-added roots re-ingest masters as NEW sets).
