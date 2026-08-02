@@ -672,9 +672,15 @@ fn card_from_kv(keyword: &str, value: &str) -> Option<Card> {
 
 /// Rebuild the source frame's header cards from the scanner-stored
 /// `fits_header` blob (format-aware, so an XISF source works too). Pure DB — no
-/// disk re-read of the (possibly huge) light file. Missing blob → no cards (and
-/// a warn: an output with no copied-through metadata is a real, visible loss,
-/// never a silent one).
+/// disk re-read of the (possibly huge) light file. Missing blob → a warn (an
+/// output stripped of its source metadata is a real, visible loss, never a
+/// silent one) and the catalog-derived Bayer cards only.
+///
+/// The Bayer fallback runs on BOTH paths deliberately: sync-ingest inserts an
+/// EMPTY `fits_header` row while three scanner branches insert no row at all —
+/// the same information state (no header keywords, populated `frames` columns)
+/// reached two ways. Skipping the fallback on the row-less path would give
+/// those two identical states opposite CFA outcomes.
 fn source_cards_for_file(
     conn: &Connection,
     frame_id: i64,
@@ -691,9 +697,11 @@ fn source_cards_for_file(
     let Some(header_text) = header_text else {
         tracing::warn!(
             file_id,
-            "no stored header for light — calibrated output will carry no copied-through cards"
+            "no stored header for light — calibrated output will carry only catalog-derived cards"
         );
-        return Ok(Vec::new());
+        let mut cards = Vec::new();
+        append_bayer_cards_from_columns(conn, frame_id, file_id, &mut cards)?;
+        return Ok(cards);
     };
     let keys = parse_stored_header_keys(format, &header_text);
     let mut cards: Vec<Card> = keys
@@ -712,7 +720,12 @@ fn source_cards_for_file(
 /// source would ship with no CFA geometry at all.
 ///
 /// Rules, in order:
-/// - a card parsed from the blob always wins (the file's own declaration);
+/// - a card parsed from the blob wins — but only if it actually carries a
+///   value. A BLANK card does not: the XISF stored-header parser has no
+///   empty-value check, so `<FITSKeyword name="BAYERPAT" value=""/>` lands as
+///   `Str("")`, which says nothing and must not out-rank a real column value.
+///   Such a card is REPLACED in place (never left beside the derived one — two
+///   cards for one keyword would contradict each other in the output header);
 /// - a NULL/blank column adds nothing — absent beats fabricated, exactly as in
 ///   `headers.rs::load_bayer_consensus`;
 /// - the blob itself is never touched. `fits_header` stays the raw
@@ -736,6 +749,11 @@ fn append_bayer_cards_from_columns(
         )
         .optional()?;
     let Some((bayerpat, xbayroff, ybayroff, roworder)) = row else {
+        tracing::debug!(
+            frame_id,
+            file_id,
+            "no frames row for light — no catalog-derived bayer cards"
+        );
         return Ok(());
     };
 
@@ -752,10 +770,22 @@ fn append_bayer_cards_from_columns(
     .flatten()
     .collect();
 
+    // A card carrying no usable value: either valueless, or a `Str` that is
+    // empty/whitespace (the XISF `value=""` case). Such a card conveys nothing,
+    // so it must not out-rank a real catalog column.
+    let is_blank = |c: &Card| match &c.value {
+        Some(CardValue::Str(s)) => s.trim().is_empty(),
+        Some(_) => false,
+        None => true, // valueless card (COMMENT/HISTORY shape) — no CFA info
+    };
+
     for (keyword, value) in candidates {
-        if cards.iter().any(|c| c.keyword == keyword) {
-            continue; // the file's own card wins
-        }
+        let existing = cards.iter().position(|c| c.keyword == keyword);
+        let blank_at = match existing {
+            Some(i) if !is_blank(&cards[i]) => continue, // the file's own card wins
+            Some(i) => Some(i),
+            None => None,
+        };
         // These four keywords are all writer-legal by construction, so a
         // rejection here means something changed underneath us — log it rather
         // than dropping the CFA geometry silently.
@@ -763,6 +793,7 @@ fn append_bayer_cards_from_columns(
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
+                    frame_id,
                     file_id,
                     field = keyword,
                     error = %e,
@@ -771,12 +802,26 @@ fn append_bayer_cards_from_columns(
                 continue;
             }
         };
-        tracing::debug!(
-            file_id,
-            field = keyword,
-            "bayer card derived from catalog column (absent from stored header)"
-        );
-        cards.push(card);
+        match blank_at {
+            Some(i) => {
+                tracing::debug!(
+                    frame_id,
+                    file_id,
+                    field = keyword,
+                    "bayer card derived from catalog column (stored header value blank)"
+                );
+                cards[i] = card;
+            }
+            None => {
+                tracing::debug!(
+                    frame_id,
+                    file_id,
+                    field = keyword,
+                    "bayer card derived from catalog column (absent from stored header)"
+                );
+                cards.push(card);
+            }
+        }
     }
     Ok(())
 }
@@ -3273,14 +3318,92 @@ mod tests {
         assert_eq!(card_int(&cards, "YBAYROFF"), Some(1));
     }
 
-    /// No stored header blob at all: no cards, and the caller is warned rather
-    /// than silently shipping a bare calibrated header.
+    /// No stored header blob at all: nothing to copy through (and the caller is
+    /// warned rather than silently shipping a bare calibrated header) — but the
+    /// catalog columns are still derived. Sync-ingest inserts an EMPTY
+    /// `fits_header` row while three scanner branches insert no row at all; the
+    /// same information state must not produce opposite CFA outcomes.
     #[test]
-    fn missing_header_blob_yields_no_cards() {
+    fn missing_header_blob_still_derives_bayer_cards_from_columns() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let file_id = 1 + 1_000_000;
+        conn.execute(
+            "UPDATE frames SET bayerpat = 'RGGB', xbayroff = 0, ybayroff = 1,
+             roworder = 'TOP-DOWN' WHERE file_id = ?1",
+            params![file_id],
+        )
+        .unwrap();
+
+        let cards = source_cards_for_file(&conn, 1, file_id, FileFormat::FITS).unwrap();
+        assert_eq!(card_str(&cards, "BAYERPAT").as_deref(), Some("RGGB"));
+        assert_eq!(card_int(&cards, "XBAYROFF"), Some(0));
+        assert_eq!(card_int(&cards, "YBAYROFF"), Some(1));
+        assert_eq!(card_str(&cards, "ROWORDER").as_deref(), Some("TOP-DOWN"));
+        assert_eq!(cards.len(), 4, "only the derived cards — nothing to copy through");
+    }
+
+    /// …and with nothing in the columns either, a missing blob really does mean
+    /// no cards: absence is never padded out with fabricated values.
+    #[test]
+    fn missing_header_blob_and_empty_columns_yield_no_cards() {
         let conn = seed_db();
         let session = seed_frame_set(&conn, 1);
         seed_light(&conn, 1, session);
         let cards = source_cards_for_file(&conn, 1, 1 + 1_000_000, FileFormat::FITS).unwrap();
-        assert!(cards.is_empty(), "no blob -> no copied-through cards");
+        assert!(cards.is_empty(), "no blob + no columns -> no cards");
+    }
+
+    /// A blank stored value is not a declaration. The XISF stored-header parser
+    /// has no empty-value check, so `<FITSKeyword name="BAYERPAT" value=""/>`
+    /// lands as an empty-string card — it must NOT out-rank a real
+    /// `frames.bayerpat`, and it must be replaced rather than left beside the
+    /// derived card (two cards for one keyword would contradict each other in
+    /// the output header).
+    #[test]
+    fn blank_stored_header_value_loses_to_catalog_column() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        let file_id = 1 + 1_000_000;
+        seed_header_and_bayer(
+            &conn,
+            file_id,
+            "<xisf><FITSKeyword name=\"BAYERPAT\" value=\"\"/>\
+             <FITSKeyword name=\"ROWORDER\" value=\"'  '\"/>\
+             <FITSKeyword name=\"INSTRUME\" value=\"'TestCam'\"/></xisf>",
+            Some("RGGB"),
+            None,
+            None,
+            Some("TOP-DOWN"),
+        );
+
+        // Sanity: the parser really does hand back a blank BAYERPAT card here —
+        // if that ever changes, this test's premise is gone, not just its assert.
+        let raw: HashMap<String, String> = parse_stored_header_keys(
+            FileFormat::XISF,
+            &conn
+                .query_row(
+                    "SELECT header FROM fits_header WHERE file_id = ?1",
+                    params![file_id],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap(),
+        );
+        assert_eq!(raw.get("BAYERPAT").map(String::as_str), Some(""));
+
+        let cards = source_cards_for_file(&conn, 1, file_id, FileFormat::XISF).unwrap();
+        assert_eq!(card_str(&cards, "BAYERPAT").as_deref(), Some("RGGB"));
+        assert_eq!(card_str(&cards, "ROWORDER").as_deref(), Some("TOP-DOWN"));
+        for kw in ["BAYERPAT", "ROWORDER"] {
+            assert_eq!(
+                cards.iter().filter(|c| c.keyword == kw).count(),
+                1,
+                "{kw}: the blank card must be replaced, not duplicated"
+            );
+        }
+        // A non-blank blob card in the same header still wins its keyword.
+        assert_eq!(card_str(&cards, "INSTRUME").as_deref(), Some("TestCam"));
     }
 }
