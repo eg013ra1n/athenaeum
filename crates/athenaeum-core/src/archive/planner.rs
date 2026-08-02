@@ -50,6 +50,10 @@ struct CandidateFile {
 /// - For each calibration type with disposition=Move|Copy, collects the linked
 ///   calibration set's frames (master or single-file).
 /// - Skip dispositions are skipped entirely.
+/// - A file reachable through a master library calibration set is FORCED to
+///   disposition=Copy when the caller asked for Move — a frame-set archive
+///   never removes a master from the Calibration Library (2026-08-02 audit
+///   C4). Skip still wins over the force.
 /// - Deduplicates by file_id, keeping the highest-priority role (light > flat > darkflat > dark > bias).
 /// - If a file with disposition=Move on its winning role is detected as shared, a
 ///   `SharedCalibrationWarning` is added (the executor will reject Move without
@@ -109,13 +113,27 @@ pub fn build_plan(
         if d == ArchiveDisposition::Skip {
             continue;
         }
-        for (file_id, path, size) in collect_calibration_files(conn, frames_set_id, role)? {
+        for (file_id, path, size, is_master) in collect_calibration_files(conn, frames_set_id, role)? {
+            // A library master is never moved out of the Calibration Library
+            // by a frame-set archive (2026-08-02 audit C4): the zip gets a
+            // copy, the library keeps the original — a Move would delete the
+            // file that every other frame set's links still point at, while
+            // files.path still claims the library location. Enforced here,
+            // server-side, because the client-side shared-calibration guard
+            // only sees a master with 2+ consumers. Skip stays Skip: a role
+            // the user excluded must not come back as a copy.
+            let disposition = if is_master && d == ArchiveDisposition::Move {
+                tracing::info!(file_id, path = %path, "master file: forcing Copy disposition in frame-set archive");
+                ArchiveDisposition::Copy
+            } else {
+                d
+            };
             candidates.push(CandidateFile {
                 file_id,
                 file_path: path,
                 file_size: size,
                 role,
-                disposition: d,
+                disposition,
             });
         }
     }
@@ -598,12 +616,20 @@ fn collect_light_files(conn: &Connection, frames_set_id: i64) -> Result<Vec<(i64
     Ok(rows)
 }
 
-/// Calibration files reachable from a frame set, for a given role.
+/// Calibration files reachable from a frame set, for a given role:
+/// (file_id, path, size, is_master).
+///
+/// `is_master` is `true` when the file belongs to at least one master library
+/// calibration set (`calibration_set.is_master_library = 1`) among the sets
+/// this role reaches it through — hence `MAX(...)` over the group rather than
+/// `SELECT DISTINCT`: the conservative answer wins if a file is reachable both
+/// as a library master and as a plain set member. `build_plan` uses it to
+/// refuse a Move (see the loop in `build_plan`).
 fn collect_calibration_files(
     conn: &Connection,
     frames_set_id: i64,
     role: FrameRole,
-) -> Result<Vec<(i64, String, i64)>> {
+) -> Result<Vec<(i64, String, i64, bool)>> {
     let cal_type = match role {
         FrameRole::Flat => "Flat",
         FrameRole::Dark => "Dark",
@@ -612,10 +638,11 @@ fn collect_calibration_files(
         FrameRole::Light => return Ok(vec![]),
     };
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT fi.id, fi.path, fi.size
+        "SELECT fi.id, fi.path, fi.size, MAX(COALESCE(cs.is_master_library, 0))
          FROM files fi
          JOIN frames f ON f.file_id = fi.id
          JOIN calibration_set_frames csf ON csf.frame_id = f.id
+         JOIN calibration_set cs ON cs.id = csf.set_id
          JOIN calibration_set_to_frames cstf ON cstf.calibration_set_id = csf.set_id
          JOIN frames lf ON lf.id = cstf.source_id AND cstf.source_type = 'frame'
          JOIN session_members sm ON sm.frame_id = lf.id
@@ -623,10 +650,11 @@ fn collect_calibration_files(
          JOIN imaging_nights n ON n.id = s.imaging_night_id
          WHERE n.frames_set_id = ?1
            AND cstf.calibration_type = ?2
+         GROUP BY fi.id, fi.path, fi.size
          ORDER BY fi.path",
     )?;
-    let rows: Vec<(i64, String, i64)> = stmt.query_map(params![frames_set_id, cal_type], |r| {
-        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    let rows: Vec<(i64, String, i64, bool)> = stmt.query_map(params![frames_set_id, cal_type], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? > 0))
     })?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -822,6 +850,216 @@ mod tests {
             &conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store,
         ).unwrap();
         assert!(plan.files.iter().all(|f| f.frame_role != "dark"));
+    }
+
+    /// Extend the base fixture with a master-library FLAT set (one file) and
+    /// a raw BIAS set (one file), both linked to the two light frames.
+    /// Returns (master_flat_file_id, raw_bias_file_id). Neither role is
+    /// touched by the other tests in this module (their dispositions are
+    /// `None`), so the base fixture's expectations are unaffected.
+    fn add_master_flat_and_raw_bias(conn: &Connection, scan_dir: &TempDir) -> (i64, i64) {
+        let mf = scan_dir.path().join("Library/ASI2600MM/MasterFlat/master_flat_L.fits");
+        std::fs::create_dir_all(mf.parent().unwrap()).unwrap();
+        std::fs::write(&mf, b"master-flat-content").unwrap();
+        let rb = scan_dir.path().join("Cal/bias_001.fits");
+        std::fs::create_dir_all(rb.parent().unwrap()).unwrap();
+        std::fs::write(&rb, b"raw-bias-content").unwrap();
+
+        // Master flat: one file, own set, is_master_library = 1.
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (3000, ?1, 'master_flat_L.fits', 19, '2025-10-11T00:00:00Z', 'FITS')",
+            [mf.to_str().unwrap()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, instrume, imagetyp, is_master)
+             VALUES (30000, 3000, 'ASI2600MM', 'Flat', 1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (600, 'MasterFlat', '2025-10-11', 1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (600, 30000)",
+            [],
+        ).unwrap();
+
+        // Raw bias: one file, ordinary set, is_master_library = 0.
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (3001, ?1, 'bias_001.fits', 16, '2025-10-11T00:00:00Z', 'FITS')",
+            [rb.to_str().unwrap()],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, instrume, imagetyp)
+             VALUES (30001, 3001, 'ASI2600MM', 'Bias')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (700, 'Bias', '2025-10-11', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (700, 30001)",
+            [],
+        ).unwrap();
+
+        for fid in [10000, 10001] {
+            conn.execute(
+                "INSERT INTO calibration_set_to_frames
+                 (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+                 VALUES (?1, 'frame', 600, 'Flat', '2025-10-12')",
+                [fid],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set_to_frames
+                 (source_id, source_type, calibration_set_id, calibration_type, matched_at)
+                 VALUES (?1, 'frame', 700, 'Bias', '2025-10-12')",
+                [fid],
+            ).unwrap();
+        }
+
+        (3000, 3001)
+    }
+
+    /// A file belonging to a master-library calibration set is never MOVED
+    /// out of the Calibration Library by a frame-set archive (2026-08-02
+    /// audit C4): the zip gets a copy, the library keeps the original. Raw
+    /// calibration files in the same plan keep the requested Move.
+    #[test]
+    fn build_plan_forces_copy_for_master_library_files() {
+        let (conn, arch_dir, scan_dir) = fixture();
+        let (master_flat_id, raw_bias_id) = add_master_flat_and_raw_bias(&conn, &scan_dir);
+
+        let dispositions = Dispositions {
+            flats: Some(ArchiveDisposition::Move),
+            darks: Some(ArchiveDisposition::Move),
+            bias: Some(ArchiveDisposition::Move),
+            darkflats: None,
+        };
+        let plan = build_plan(
+            &conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store,
+        ).unwrap();
+
+        let flat = plan.files.iter()
+            .find(|f| f.file_id == Some(master_flat_id))
+            .expect("master flat must be in the plan");
+        assert_eq!(
+            flat.disposition, "copy",
+            "a master library file must never be moved out of the library",
+        );
+
+        let bias = plan.files.iter()
+            .find(|f| f.file_id == Some(raw_bias_id))
+            .expect("raw bias must be in the plan");
+        assert_eq!(bias.disposition, "move", "a raw calibration file keeps the requested Move");
+
+        assert!(
+            plan.files.iter().filter(|f| f.frame_role == "light").all(|f| f.disposition == "move"),
+            "lights are always move",
+        );
+    }
+
+    /// Skip stays Skip — forcing Copy must not resurrect a role the user
+    /// deliberately excluded.
+    #[test]
+    fn build_plan_skip_keeps_master_library_file_out_of_the_plan() {
+        let (conn, arch_dir, scan_dir) = fixture();
+        let (master_flat_id, _raw_bias_id) = add_master_flat_and_raw_bias(&conn, &scan_dir);
+
+        let dispositions = Dispositions {
+            flats: Some(ArchiveDisposition::Skip),
+            darks: None,
+            bias: None,
+            darkflats: None,
+        };
+        let plan = build_plan(
+            &conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store,
+        ).unwrap();
+
+        assert!(
+            plan.files.iter().all(|f| f.file_id != Some(master_flat_id)),
+            "a skipped role must not contribute files, master or not",
+        );
+        assert!(plan.files.iter().all(|f| f.frame_role != "flat"));
+    }
+
+    /// Copy is already the forced outcome — an explicit Copy passes through
+    /// unchanged for master and raw files alike.
+    #[test]
+    fn build_plan_copy_unchanged_for_master_library_file() {
+        let (conn, arch_dir, scan_dir) = fixture();
+        let (master_flat_id, raw_bias_id) = add_master_flat_and_raw_bias(&conn, &scan_dir);
+
+        let dispositions = Dispositions {
+            flats: Some(ArchiveDisposition::Copy),
+            darks: None,
+            bias: Some(ArchiveDisposition::Copy),
+            darkflats: None,
+        };
+        let plan = build_plan(
+            &conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store,
+        ).unwrap();
+
+        let flat = plan.files.iter()
+            .find(|f| f.file_id == Some(master_flat_id))
+            .expect("master flat must be in the plan");
+        assert_eq!(flat.disposition, "copy");
+        let bias = plan.files.iter()
+            .find(|f| f.file_id == Some(raw_bias_id))
+            .expect("raw bias must be in the plan");
+        assert_eq!(bias.disposition, "copy");
+    }
+
+    /// End-to-end guard for the audit finding itself: after the operation
+    /// runs, the master's file is still on disk where `files.path` claims it
+    /// is and carries no archive markers, while the raw bias asked to Move
+    /// really did move into the zip.
+    #[test]
+    fn executed_archive_leaves_master_library_file_in_the_library() {
+        let (conn, arch_dir, scan_dir) = fixture();
+        let (master_flat_id, raw_bias_id) = add_master_flat_and_raw_bias(&conn, &scan_dir);
+
+        let dispositions = Dispositions {
+            flats: Some(ArchiveDisposition::Move),
+            darks: Some(ArchiveDisposition::Skip),
+            bias: Some(ArchiveDisposition::Move),
+            darkflats: None,
+        };
+        let plan = build_plan(
+            &conn, 1, arch_dir.path(), &dispositions, ArchiveCompression::Store,
+        ).unwrap();
+        let op_id = commit_plan(&conn, &plan, ConflictResolution::Overwrite).unwrap();
+
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::archive::executor::run_operation(
+            &conn, op_id, &cancel, &crate::events::NullEmitter,
+        ).unwrap();
+
+        let master_path: String = conn.query_row(
+            "SELECT path FROM files WHERE id = ?1", [master_flat_id], |r| r.get(0),
+        ).unwrap();
+        assert!(
+            Path::new(&master_path).is_file(),
+            "the master must still be in the Calibration Library: {master_path}",
+        );
+        let (zip_path, archived_op): (Option<String>, Option<i64>) = conn.query_row(
+            "SELECT archive_zip_path, archived_in_operation FROM files WHERE id = ?1",
+            [master_flat_id], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+        assert!(zip_path.is_none(), "a copied master must not be flagged as archived");
+        assert!(archived_op.is_none());
+
+        let bias_path: String = conn.query_row(
+            "SELECT path FROM files WHERE id = ?1", [raw_bias_id], |r| r.get(0),
+        ).unwrap();
+        assert!(
+            !Path::new(&bias_path).exists(),
+            "the raw bias asked to Move should have moved into the zip: {bias_path}",
+        );
     }
 
     #[test]
