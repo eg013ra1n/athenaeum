@@ -33,6 +33,20 @@ impl CfaChannel {
 /// `xoff`/`yoff` come straight from `XBAYROFF`/`YBAYROFF` and are applied as
 /// a shift of the pattern relative to pixel (0, 0). They are signed and
 /// unbounded on the wire, so the mapping folds them modulo 2.
+///
+/// **Row order.** `BAYERPAT` is treated here as describing the mosaic in FILE
+/// row order — the dominant capture-software convention. A declared
+/// `ROWORDER` changes display orientation, not the layout this math walks, so
+/// it is deliberately not folded into the geometry. This is the one error
+/// class that does not cancel: a vertical flip is a one-row phase shift, and
+/// a one-row shift of RGGB is GBRG — a different family, not a relabelling of
+/// the same one. If a writer declares `BAYERPAT` in display orientation
+/// instead, the R and B classes mix and per-channel statistics degrade toward
+/// the global-scalar answer; never worse than the global normalization that
+/// preceded them, but no longer per-channel. Should folding a row flip in
+/// ever become necessary, the exact correction is `yoff += h - 1`
+/// (`rem_euclid` absorbs the magnitude: +1 of phase for even heights, 0 for
+/// odd) — `h - 1 - y` and `h - 1 + y` are congruent modulo 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CfaGeometry {
     pub pattern: Bayer,
@@ -258,28 +272,36 @@ mod tests {
     }
 
     /// Same window as the mono `central_third_mean`: recombining the channel
-    /// means by their pixel counts reproduces it.
+    /// means by their pixel counts reproduces it, over a ramp where any
+    /// difference in window bounds moves the answer.
+    ///
+    /// Sizes are chosen so the assertion can see a mis-spelled window: at a
+    /// multiple of 3 the two obvious spellings `(2 * w) / 3` and `w - w / 3`
+    /// agree, so 9x9 alone proves nothing about which one is in force. 10x10
+    /// (6 vs 7) and 7x5 (4 vs 5 columns, 3 vs 4 rows) separate them.
     #[test]
     fn window_matches_mono_central_third_mean() {
-        let (w, h) = (9usize, 9usize);
-        let data: Vec<f32> = (0..w * h).map(|i| i as f32 * 1.5 + 3.0).collect();
-        let g = geom(Bayer::Rggb, 0, 0);
-        let means = central_third_channel_means(&data, w, h, g);
+        for (w, h, expected_pixels) in [(9usize, 9usize, 9u64), (10, 10, 9), (7, 5, 4)] {
+            let data: Vec<f32> = (0..w * h).map(|i| i as f32 * 1.5 + 3.0).collect();
+            let g = geom(Bayer::Rggb, 0, 0);
+            let means = central_third_channel_means(&data, w, h, g);
 
-        let mut counts = [0u64; 3];
-        for y in h / 3..(2 * h) / 3 {
-            for x in w / 3..(2 * w) / 3 {
-                counts[cfa_channel_at(x, y, g).idx()] += 1;
+            let mut counts = [0u64; 3];
+            for y in h / 3..(2 * h) / 3 {
+                for x in w / 3..(2 * w) / 3 {
+                    counts[cfa_channel_at(x, y, g).idx()] += 1;
+                }
             }
+            let total: u64 = counts.iter().sum();
+            assert_eq!(total, expected_pixels, "window size for {w}x{h}");
+            let recombined =
+                (0..3).map(|c| means[c] * counts[c] as f64).sum::<f64>() / total as f64;
+            let mono = super::super::engine::central_third_mean(&data, w, h);
+            assert!(
+                (recombined - mono).abs() < 1e-9,
+                "{w}x{h}: recombined {recombined} vs mono {mono}"
+            );
         }
-        let total: u64 = counts.iter().sum();
-        assert_eq!(total, 9, "central third of a 9x9 is 3x3");
-        let recombined = (0..3).map(|c| means[c] * counts[c] as f64).sum::<f64>() / total as f64;
-        let mono = super::super::engine::central_third_mean(&data, w, h);
-        assert!(
-            (recombined - mono).abs() < 1e-9,
-            "recombined {recombined} vs mono {mono}"
-        );
     }
 
     /// A window too small to contain every colour reports 0.0 for the missing
