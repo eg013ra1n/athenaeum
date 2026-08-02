@@ -160,6 +160,7 @@ pub fn generated_files() -> Vec<(&'static str, String)> {
             crate::api::masters::MasterProvenanceInfo,
             crate::api::masters::BatchBuildReport,
             crate::api::masters::BatchSkip,
+            crate::api::masters::DeleteMasterResult,
             crate::api::lights::LightFrameReadiness,
             crate::api::lights::LightCalReadiness,
             crate::api::lights::ExportReadiness,

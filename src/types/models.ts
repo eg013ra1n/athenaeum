@@ -532,6 +532,8 @@ export type BatchBuildReport = { startedSetIds: Array<number>, skipped: Array<Ba
 
 export type BatchSkip = { setId: number, reason: string, };
 
+export type DeleteMasterResult = { masterSetId: number, restoredRawSetId: number | null, linksRepointed: number, filesDeleted: number, };
+
 export type LightFrameReadiness = { frameId: number, filename: string, 
 /**
  * `db::light_calibrations::derive_status` mapped to the frontend's

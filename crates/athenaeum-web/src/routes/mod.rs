@@ -242,6 +242,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/start_master_builds_batch", post(masters::start_master_builds_batch))
         .route("/api/rebuild_master", post(masters::rebuild_master))
         .route("/api/cancel_master_build", post(masters::cancel_master_build))
+        .route("/api/delete_master", post(masters::delete_master))
         .route("/api/get_master_provenance", post(masters::get_master_provenance))
         .route("/api/archive_calibration_originals", post(masters::archive_calibration_originals))
         .route("/api/restore_calibration_originals", post(masters::restore_calibration_originals))

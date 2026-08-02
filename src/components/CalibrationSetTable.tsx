@@ -1,12 +1,14 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
-import { ChevronUp, ChevronDown, ChevronsUpDown, Eye, Settings, Star, Pencil, Hammer } from "lucide-react";
-import type { CalibrationSetDetail, CalibrationSetConsumer, FileWithFrame, MasterProvenanceInfo } from "../types/models";
+import { ChevronUp, ChevronDown, ChevronsUpDown, Eye, Settings, Star, Pencil, Hammer, Trash2 } from "lucide-react";
+import type { CalibrationSetDetail, CalibrationSetConsumer, FileWithFrame, MasterProvenanceInfo, DeleteMasterResult } from "../types/models";
 import { ImageTypeValues, isMasterType } from "../types/helpers";
 import { format } from "date-fns";
 import { api } from '../api';
+import { useNotifications } from '../contexts/NotificationContext';
 import { describeRecipeJson } from '../utils/recipeFormat';
 import BlinkViewer from "./BlinkViewer";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { ArchiveProgress } from "./archive/ArchiveProgress";
 
 const CONSUMER_INITIAL_VISIBLE = 8;
@@ -48,7 +50,14 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
   const [consumersBySet, setConsumersBySet] = useState<Map<number, ConsumerState>>(new Map());
   // Per-set "show all" toggle for the chip strip.
   const [expandedConsumers, setExpandedConsumers] = useState<Set<number>>(new Set());
+  // Delete-master flow: the row awaiting confirmation, the file names we
+  // resolved for it (null while still loading), and an in-flight guard so a
+  // double-click on Delete can't fire the command twice.
+  const [deleteTarget, setDeleteTarget] = useState<CalibrationSetDetail | null>(null);
+  const [deleteFileNames, setDeleteFileNames] = useState<string[] | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const navigate = useNavigate();
+  const { notify } = useNotifications();
 
   const fetchConsumers = useCallback(async (setId: number) => {
     setConsumersBySet(prev => {
@@ -138,6 +147,73 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
       setLoadingFrames(null);
     }
   };
+
+  // ── Delete master ─────────────────────────────────────────────────────────
+  //
+  // Destructive and irreversible (the file leaves the disk), so it goes
+  // through ConfirmDialog rather than a bare click. The dialog names the
+  // actual file: CalibrationSetDetail carries no path, so we resolve it with
+  // the same `get_calibration_set_frames` call the View button uses while the
+  // dialog is already open.
+
+  const openDeleteDialog = (set: CalibrationSetDetail, event: React.MouseEvent) => {
+    event.stopPropagation();
+    setDeleteTarget(set);
+    setDeleteFileNames(null);
+    api.invoke<FileWithFrame[]>('get_calibration_set_frames', { setId: set.id })
+      .then(frames => setDeleteFileNames(frames.map(f => f.file.filename)))
+      .catch(err => {
+        // Non-fatal: the confirmation just falls back to naming the set.
+        console.error('Failed to resolve master file name:', err);
+        setDeleteFileNames([]);
+      });
+  };
+
+  const handleConfirmDelete = async () => {
+    const set = deleteTarget;
+    if (!set || set.id == null) return;
+    setDeleting(true);
+    try {
+      const res = await api.invoke<DeleteMasterResult>('delete_master', { masterSetId: set.id });
+      notify({
+        title: 'Master deleted',
+        detail: res.restoredRawSetId != null
+          ? `Raw set #${res.restoredRawSetId} restored; ${res.linksRepointed} link(s) repointed`
+          : `${res.linksRepointed} link(s) removed (imported master)`,
+        kind: 'masterbuild',
+        tone: 'success',
+      });
+      // Both lists changed shape (master row gone, source set un-superseded) —
+      // same refresh signal `useMasterBuilds` fires after a build completes.
+      window.dispatchEvent(new Event('library-updated'));
+    } catch (err) {
+      console.error('Failed to delete master:', err);
+      notify({
+        title: 'Delete master failed',
+        detail: String(err),
+        kind: 'masterbuild',
+        tone: 'warning',
+        hasErrors: true,
+      });
+    } finally {
+      setDeleting(false);
+      setDeleteTarget(null);
+      setDeleteFileNames(null);
+    }
+  };
+
+  const deleteMessage = deleteTarget
+    ? [
+        deleteFileNames === null
+          ? 'Resolving file…'
+          : deleteFileNames.length > 0
+            ? `${deleteFileNames.join(', ')} will be permanently deleted from disk.`
+            : `The file of master set #${deleteTarget.id} (${deleteTarget.imagetyp}) will be permanently deleted from disk.`,
+        '',
+        'The raw source set becomes matchable again and every calibration link that pointed at this master moves back to it.',
+        'Calibrated lights that used this master will show as stale.',
+      ].join('\n')
+    : '';
 
   // Sort sets
   const sortedSets = [...sets].sort((a, b) => {
@@ -449,6 +525,20 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
                           {buildingSetIds?.includes(set.id) ? 'Building…' : 'Create Master'}
                         </button>
                       )}
+                      {/* `buildingSetIds` tracks SOURCE set ids, never a master's own id, so
+                          it can't gate this row — the in-flight-build guard is the backend's
+                          (409), and it checks the whole lineage. */}
+                      {set.id != null && isMasterType(set.imagetyp) && (
+                        <button
+                          onClick={(e) => openDeleteDialog(set, e)}
+                          disabled={deleting}
+                          className="inline-flex items-center gap-1 px-2 py-1 bg-surface-hover hover:brightness-110 text-error text-xs rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                          title="Delete this master and restore its raw source set"
+                        >
+                          <Trash2 size={14} />
+                          Delete
+                        </button>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -548,6 +638,17 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
           })}
         </tbody>
       </table>
+
+      {/* Delete-master confirmation */}
+      <ConfirmDialog
+        isOpen={deleteTarget != null}
+        title="Delete master?"
+        message={deleteMessage}
+        confirmText={deleting ? 'Deleting…' : 'Delete master'}
+        confirmDanger
+        onConfirm={() => { if (!deleting) void handleConfirmDelete(); }}
+        onCancel={() => { if (!deleting) { setDeleteTarget(null); setDeleteFileNames(null); } }}
+      />
 
       {/* BlinkViewer Modal */}
       {blinkFrames && (

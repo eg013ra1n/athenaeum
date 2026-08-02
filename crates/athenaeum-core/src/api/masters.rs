@@ -159,6 +159,22 @@ pub struct BatchSkip {
     pub reason: String,
 }
 
+/// What `delete_master` undid, for the confirmation the UI shows afterwards.
+///
+/// `links_repointed` is deliberately one field for two outcomes, matching
+/// `MasterUnregisterSummary`: with a raw set to fall back to (i.e.
+/// `restored_raw_set_id.is_some()`) the consumer links MOVED back onto it;
+/// for an imported master there is no lineage, so the same count is links
+/// DELETED. Callers must branch on `restored_raw_set_id` before wording it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteMasterResult {
+    pub master_set_id: i64,
+    pub restored_raw_set_id: Option<i64>,
+    pub links_repointed: usize,
+    pub files_deleted: usize,
+}
+
 // ── Progress / completion event payloads (snake_case, analysis precedent) ───
 
 /// `master-build-progress` event payload. `stage` is one of "reading" |
@@ -1669,6 +1685,154 @@ pub fn cancel_master_build(ctx: &ServiceContext, set_id: i64) -> Result<(), ApiE
     }
 }
 
+// ── Delete a master (audit C3) ───────────────────────────────────────────────
+
+/// Delete a built or imported master: un-supersede its raw source set and
+/// repoint every consumer back onto it (Task 7's `unregister_master_set`),
+/// drop the master's own catalog rows, and remove its file from disk.
+///
+/// The audit's C3: without this there is no way back from a bad master — the
+/// raw set stays superseded (invisible to the matcher) forever, so its whole
+/// lineage is locked.
+///
+/// Known, intended side effect: `light_calibrations.{dark,flat,bias}_set_id`
+/// are `ON DELETE SET NULL`, so calibrated lights that used this master flip
+/// to stale/partial in `derive_status` — an honest "re-calibrate me" prompt
+/// rather than a lie about what produced them. The UI says so before asking
+/// for confirmation.
+pub fn delete_master(
+    ctx: &ServiceContext,
+    master_set_id: i64,
+) -> Result<DeleteMasterResult, ApiError> {
+    let db = db(ctx)?;
+    let conn = db.conn();
+
+    // Refuse up front on the two user-level errors, so the web boundary can
+    // answer 404/400 instead of turning them into a 500 via the catch-all
+    // mapping of `unregister_master_set`'s anyhow error below.
+    let is_master: i64 = conn
+        .query_row(
+            "SELECT COALESCE(is_master_library, 0) FROM calibration_set WHERE id = ?1",
+            rusqlite::params![master_set_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| ApiError::NotFound(format!("calibration set {master_set_id} not found")))?;
+    if is_master == 0 {
+        return Err(ApiError::Invalid(format!(
+            "calibration set {master_set_id} is not a master — only masters can be deleted this way"
+        )));
+    }
+
+    // Duplicate-work guard. `active_master_builds` is keyed by the SOURCE set
+    // id, never by the master's: a build that is about to PRODUCE this master
+    // and a `rebuild_master` OF it both register under the raw set (see
+    // `rebuild_master`'s comment), so checking `master_set_id` alone would
+    // miss precisely the case this guard exists for — a rebuild finishing
+    // after the catalog rows are gone, leaving an untracked file in the
+    // library root. A TOCTOU window remains (a build could start between this
+    // check and the transaction below); it is the same accepted shape as
+    // `api::scan_roots::check_library_root_uniqueness`, and its worst outcome
+    // is that untracked file, not catalog corruption.
+    let mut busy_keys = vec![master_set_id];
+    if let Some(src) = conn
+        .query_row(
+            "SELECT source_set_id FROM master_provenance WHERE master_set_id = ?1",
+            rusqlite::params![master_set_id],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .flatten()
+    {
+        busy_keys.push(src);
+    }
+    if let Some(raw) = conn
+        .query_row(
+            "SELECT id FROM calibration_set WHERE superseded_by_set_id = ?1 ORDER BY id LIMIT 1",
+            rusqlite::params![master_set_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        busy_keys.push(raw);
+    }
+    {
+        let active = ctx.active_master_builds.lock().unwrap();
+        if let Some(busy) = busy_keys.iter().find(|k| active.contains_key(k)) {
+            return Err(ApiError::Conflict(format!(
+                "a master build is in progress for calibration set {busy} — cancel it first"
+            )));
+        }
+    }
+
+    let tx = conn.unchecked_transaction()?;
+
+    let summary = crate::db::master_unregister::unregister_master_set(&tx, master_set_id)
+        .map_err(|e| {
+            tracing::error!(master_set_id, error = %e, "master unregister failed");
+            ApiError::Internal(format!("{e:#}"))
+        })?;
+
+    // Resolve paths, then drop the file rows (frames / fits_header / the rest
+    // cascade off `files`) inside the same transaction — so a failure here
+    // rolls the un-supersede back too rather than half-deleting a master.
+    let mut paths: Vec<String> = Vec::new();
+    for fid in &summary.file_ids {
+        match tx
+            .query_row(
+                "SELECT path FROM files WHERE id = ?1",
+                rusqlite::params![fid],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            Some(p) => paths.push(p),
+            // A master set whose member frame has no `files` row is a catalog
+            // inconsistency, not a reason to abort the delete — say so and
+            // carry on removing the rows.
+            None => tracing::warn!(
+                master_set_id,
+                file_id = fid,
+                "master member has no files row"
+            ),
+        }
+        tx.execute("DELETE FROM files WHERE id = ?1", rusqlite::params![fid])?;
+    }
+    tx.commit()?;
+
+    // Disk last, deliberately: the catalog is the source of truth, so the
+    // benign failure mode is an orphan file on disk (logged, visible), not a
+    // catalog row pointing at a file that is already gone.
+    let mut files_deleted = 0usize;
+    for p in &paths {
+        match std::fs::remove_file(p) {
+            Ok(()) => files_deleted += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::warn!(path = %p, "master file already absent on disk");
+            }
+            Err(e) => tracing::error!(
+                path = %p,
+                error = %e,
+                "master file delete failed, catalog rows already removed"
+            ),
+        }
+    }
+
+    tracing::info!(
+        master_set_id,
+        restored_raw_set_id = ?summary.restored_raw_set_id,
+        links_repointed = summary.links_repointed,
+        files_deleted,
+        "master deleted, lineage restored"
+    );
+    Ok(DeleteMasterResult {
+        master_set_id,
+        restored_raw_set_id: summary.restored_raw_set_id,
+        links_repointed: summary.links_repointed,
+        files_deleted,
+    })
+}
+
 /// Provenance + rebuildability info for a master set. `None` if the set
 /// isn't a master built by Athenaeum (no `master_provenance` row).
 pub fn get_master_provenance(
@@ -2991,5 +3155,258 @@ mod tests {
         // Empty input → empty path (restore_originals bails on empty member
         // lists long before calling this; pinned for totality).
         assert_eq!(common_source_dir(&[]), PathBuf::new());
+    }
+
+    // ── delete_master (audit C3) ────────────────────────────────────────────
+    //
+    // The end-to-end reversal: Task 7's `unregister_master_set` puts the
+    // catalog back, `delete_master` adds the two things the primitive
+    // deliberately leaves to its caller — the `files` rows and the file on
+    // disk. Fixture shape mirrors `db::master_unregister`'s
+    // `seed_registered_master`, except the master's `files.path` points at a
+    // REAL file in a temp dir (the whole point of testing at this layer).
+    #[test]
+    fn delete_master_removes_the_file_and_restores_the_raw_lineage() {
+        use crate::cache::MemoryImageCache;
+        use crate::services::compute_queue::ComputeQueue;
+        use crate::services::operation_queue::OperationQueue;
+        use crate::services::MasterBuildHandle;
+        use crate::settings::SettingsManager;
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock, RwLock};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let lib_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let master_path = lib_dir.join("master_dark_300s_-10C_g100_bin1x1_2026-08-01.fits");
+        std::fs::write(&master_path, b"master pixels").unwrap();
+
+        // Named `catalog_db` so it doesn't shadow the `db(ctx)` helper fn —
+        // same pitfall noted in `archive_zip_missing_is_detected_...` above.
+        let catalog_db = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+
+        let (raw_set, master_set, master_file_id, raw_file_id, consumer_frame_id) = {
+            let conn = catalog_db.conn();
+
+            conn.execute(
+                "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-08-01')",
+                [],
+            )
+            .unwrap();
+            let raw_set = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set (imagetyp, date, is_master_library)
+                 VALUES ('MasterDark', '2026-08-01', 1)",
+                [],
+            )
+            .unwrap();
+            let master_set = conn.last_insert_rowid();
+            conn.execute(
+                "UPDATE calibration_set SET superseded_by_set_id = ?1 WHERE id = ?2",
+                rusqlite::params![master_set, raw_set],
+            )
+            .unwrap();
+
+            // The master's own file — on disk, in the catalog, in the set.
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, 'master.fits', 13, '2026-08-01', 'FITS')",
+                [master_path.to_string_lossy()],
+            )
+            .unwrap();
+            let master_file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp, is_master) VALUES (?1, 'MASTERDARK', 1)",
+                [master_file_id],
+            )
+            .unwrap();
+            let master_frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![master_set, master_frame_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO master_provenance
+                    (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+                 VALUES (?1, ?2, '{}', '[]', 'h', '2026-08-01T00:00:00Z')",
+                rusqlite::params![master_set, raw_set],
+            )
+            .unwrap();
+
+            // A raw member of the source set — its file is on disk too and
+            // must survive untouched (deleting the master must never eat the
+            // frames it was integrated from).
+            let raw_path = tmp.path().join("d1.fits");
+            std::fs::write(&raw_path, b"raw pixels").unwrap();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, 'd1.fits', 10, '2026-08-01', 'FITS')",
+                [raw_path.to_string_lossy()],
+            )
+            .unwrap();
+            let raw_file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'Dark')",
+                [raw_file_id],
+            )
+            .unwrap();
+            let raw_frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![raw_set, raw_frame_id],
+            )
+            .unwrap();
+
+            // A Light frame whose calibration link register_master moved onto
+            // the master — this is what has to come back to the raw set.
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES ('/lights/l1.fits', 'l1.fits', 10, '2026-08-01', 'FITS')",
+                [],
+            )
+            .unwrap();
+            let light_file_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'LIGHT')",
+                [light_file_id],
+            )
+            .unwrap();
+            let consumer_frame_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set_to_frames
+                    (source_id, source_type, calibration_set_id, calibration_type, match_score, is_manual_override)
+                 VALUES (?1, 'frame', ?2, 'Dark', 0.9, 1)",
+                rusqlite::params![consumer_frame_id, master_set],
+            )
+            .unwrap();
+
+            (
+                raw_set,
+                master_set,
+                master_file_id,
+                raw_file_id,
+                consumer_frame_id,
+            )
+        };
+
+        let db_cell = OnceLock::new();
+        let _ = db_cell.set(catalog_db);
+        let ctx = Arc::new(ServiceContext {
+            db: db_cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
+            dso_catalog: Arc::new(RwLock::new(None)),
+            star_cache: Arc::new(RwLock::new(None)),
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(1)
+                    .build()
+                    .unwrap(),
+            ),
+            operation_queue: OperationQueue::start(),
+            compute_queue: ComputeQueue::new(),
+            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        });
+
+        // (a) An in-flight build blocks the delete. `active_master_builds` is
+        // keyed by the SOURCE set id (see `rebuild_master`'s comment) — a
+        // rebuild of THIS master registers under `raw_set`, not `master_set`,
+        // so the guard has to look under both or it misses the very case it
+        // exists for.
+        for busy_key in [raw_set, master_set] {
+            ctx.active_master_builds.lock().unwrap().insert(
+                busy_key,
+                MasterBuildHandle {
+                    cancel_flag: Arc::new(AtomicBool::new(false)),
+                },
+            );
+            let err = delete_master(&ctx, master_set).unwrap_err();
+            assert!(
+                matches!(&err, ApiError::Conflict(m) if m.contains("in progress")),
+                "expected a Conflict while a build is registered under {busy_key}, got {err:?}"
+            );
+            assert!(
+                master_path.exists(),
+                "a refused delete must not touch the file on disk"
+            );
+            ctx.active_master_builds.lock().unwrap().remove(&busy_key);
+        }
+
+        // (b) The real delete.
+        let res = delete_master(&ctx, master_set).unwrap();
+        assert_eq!(res.master_set_id, master_set);
+        assert_eq!(res.restored_raw_set_id, Some(raw_set));
+        assert_eq!(res.links_repointed, 1);
+        assert_eq!(res.files_deleted, 1);
+
+        assert!(!master_path.exists(), "the master file is gone from disk");
+
+        let conn = db(&ctx).unwrap().conn();
+        let master_files: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE id = ?1",
+                [master_file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(master_files, 0, "the master's files row is gone");
+        let master_frames: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM frames WHERE file_id = ?1",
+                [master_file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(master_frames, 0, "its frames row cascaded away with it");
+
+        let sup: Option<i64> = conn
+            .query_row(
+                "SELECT superseded_by_set_id FROM calibration_set WHERE id = ?1",
+                [raw_set],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sup, None, "the raw set is matchable again");
+
+        let (target, manual): (i64, i64) = conn
+            .query_row(
+                "SELECT calibration_set_id, is_manual_override FROM calibration_set_to_frames
+                  WHERE source_id = ?1 AND source_type = 'frame'",
+                [consumer_frame_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(target, raw_set, "the consumer link came back to the raw set");
+        assert_eq!(manual, 1, "the manual-override flag rode along");
+
+        let raw_files: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE id = ?1",
+                [raw_file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_files, 1, "the source frames are untouched");
+        assert!(
+            tmp.path().join("d1.fits").exists(),
+            "and still on disk — only the master's own file is deleted"
+        );
+
+        // (c) Second call: the set is gone, so this is a plain NotFound-shaped
+        // failure, not a silent success that pretends to have deleted something.
+        assert!(
+            delete_master(&ctx, master_set).is_err(),
+            "deleting an already-deleted master must fail loudly"
+        );
     }
 }

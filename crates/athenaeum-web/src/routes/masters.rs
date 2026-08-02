@@ -17,7 +17,7 @@ use crate::routes::api_err;
 use crate::WebAppState;
 
 pub use athenaeum_core::api::masters::{
-    BatchBuildReport, MasterBuildPreview, MasterProvenanceInfo, MasterRecipe,
+    BatchBuildReport, DeleteMasterResult, MasterBuildPreview, MasterProvenanceInfo, MasterRecipe,
 };
 
 // ── Request structs ───────────────────────────────────────────────────────
@@ -53,6 +53,12 @@ pub struct RebuildMasterArgs {
 #[serde(rename_all = "camelCase")]
 pub struct CancelMasterBuildArgs {
     pub set_id: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteMasterArgs {
+    pub master_set_id: i64,
 }
 
 #[derive(Deserialize)]
@@ -177,6 +183,19 @@ pub async fn cancel_master_build(
     Json(args): Json<CancelMasterBuildArgs>,
 ) -> Result<Json<()>, (StatusCode, String)> {
     api::cancel_master_build(&state.ctx, args.set_id).map(Json).map_err(api_err)
+}
+
+/// POST /api/delete_master
+///
+/// Un-supersede the master's raw source set, repoint consumers back onto it,
+/// drop the master's catalog rows and its file from disk. 409 while a build
+/// for the same lineage is in flight.
+#[tracing::instrument(skip_all, err(Debug))]
+pub async fn delete_master(
+    State(state): State<WebAppState>,
+    Json(args): Json<DeleteMasterArgs>,
+) -> Result<Json<DeleteMasterResult>, (StatusCode, String)> {
+    api::delete_master(&state.ctx, args.master_set_id).map(Json).map_err(api_err)
 }
 
 /// POST /api/get_master_provenance

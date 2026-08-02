@@ -399,6 +399,7 @@ pub fn run() {
             commands::start_master_builds_batch,
             commands::rebuild_master,
             commands::cancel_master_build,
+            commands::delete_master,
             commands::get_master_provenance,
             commands::archive_calibration_originals,
             commands::restore_calibration_originals,

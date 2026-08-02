@@ -16,7 +16,7 @@ use crate::tauri_events::TauriProgressEmitter;
 use super::AppState;
 
 pub use athenaeum_core::api::masters::{
-    BatchBuildReport, MasterBuildPreview, MasterProvenanceInfo, MasterRecipe,
+    BatchBuildReport, DeleteMasterResult, MasterBuildPreview, MasterProvenanceInfo, MasterRecipe,
 };
 
 /// Preview a master build: validation + recipe/precal selection + target
@@ -108,6 +108,18 @@ pub async fn rebuild_master(
 #[tracing::instrument(skip_all, err)]
 pub async fn cancel_master_build(state: State<'_, AppState>, set_id: i64) -> Result<(), String> {
     api::cancel_master_build(&state.ctx, set_id).map_err(|e| e.to_string())
+}
+
+/// Delete a master: un-supersede its raw source set, repoint consumers back
+/// onto it, drop the master's catalog rows and its file from disk. Refuses
+/// while a build for the same lineage is in flight.
+#[tauri::command]
+#[tracing::instrument(skip_all, err)]
+pub async fn delete_master(
+    state: State<'_, AppState>,
+    master_set_id: i64,
+) -> Result<DeleteMasterResult, String> {
+    api::delete_master(&state.ctx, master_set_id).map_err(|e| e.to_string())
 }
 
 /// Provenance + rebuildability info for a master calibration set.
