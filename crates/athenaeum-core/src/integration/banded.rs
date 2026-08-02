@@ -220,10 +220,13 @@ impl BandSource {
 }
 
 /// Band height so that (frame_count+2) * band_rows * width * 4 bytes stays
-/// under budget_bytes (default caller passes 256 MiB), min 16 rows.
+/// under budget_bytes (default caller passes 256 MiB).
 pub fn band_rows_for_budget(width: usize, frame_count: usize, budget_bytes: usize) -> usize {
     let per_row = (frame_count + 2).saturating_mul(width).saturating_mul(4).max(1);
-    (budget_bytes / per_row).max(16)
+    // Floor of 1 (not 16): the floor must never override the budget — at very
+    // large frame counts a 16-row floor grows band memory unbounded
+    // (2026-08-02 audit I5). One row per band is slow but bounded.
+    (budget_bytes / per_row).max(1)
 }
 
 #[cfg(test)]
@@ -362,5 +365,15 @@ mod tests {
         let rows = band_rows_for_budget(6248, 100, 256 * 1024 * 1024);
         assert!(rows >= 16 && rows <= 256, "{rows}");
         assert_eq!(band_rows_for_budget(10, 1, usize::MAX), usize::MAX.min(band_rows_for_budget(10, 1, usize::MAX))); // no panic on huge budgets
+    }
+
+    #[test]
+    fn band_rows_floor_never_overrides_budget() {
+        // 3000 frames of width 9576, budget 256 MiB: a hardcoded 16-row floor
+        // blows past the budget by ~7x (2026-08-02 audit I5) — the floor must
+        // yield once a single row already exceeds it.
+        let rows = band_rows_for_budget(9576, 3000, 256 * 1024 * 1024);
+        let bytes = (rows as u64) * (3000 + 2) * 9576 * 4;
+        assert!(bytes <= 256 * 1024 * 1024 || rows == 1, "{rows} rows -> {bytes} bytes");
     }
 }
