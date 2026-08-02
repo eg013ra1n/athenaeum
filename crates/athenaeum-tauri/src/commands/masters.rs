@@ -113,13 +113,21 @@ pub async fn cancel_master_build(state: State<'_, AppState>, set_id: i64) -> Res
 /// Delete a master: un-supersede its raw source set, repoint consumers back
 /// onto it, drop the master's catalog rows and its file from disk. Refuses
 /// while a build for the same lineage is in flight.
+///
+/// DB transaction + a disk unlink, so it runs under `spawn_blocking` to keep
+/// both off the async executor (same reasoning as `preview_master_build`
+/// above, which does far less blocking work than this).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn delete_master(
     state: State<'_, AppState>,
     master_set_id: i64,
 ) -> Result<DeleteMasterResult, String> {
-    api::delete_master(&state.ctx, master_set_id).map_err(|e| e.to_string())
+    let ctx = state.ctx.clone();
+    tokio::task::spawn_blocking(move || api::delete_master(&ctx, master_set_id))
+        .await
+        .map_err(|e| format!("Delete task panicked: {}", e))?
+        .map_err(|e| e.to_string())
 }
 
 /// Provenance + rebuildability info for a master calibration set.

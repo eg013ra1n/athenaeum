@@ -55,6 +55,10 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
   // double-click on Delete can't fire the command twice.
   const [deleteTarget, setDeleteTarget] = useState<CalibrationSetDetail | null>(null);
   const [deleteFileNames, setDeleteFileNames] = useState<string[] | null>(null);
+  // true = imported master (no provenance) → links are DELETED, nothing is
+  // restored; false = built here → lineage comes back. null = not resolved
+  // yet or the lookup failed, which falls back to the generic wording.
+  const [deleteImported, setDeleteImported] = useState<boolean | null>(null);
   const [deleting, setDeleting] = useState(false);
   const navigate = useNavigate();
   const { notify } = useNotifications();
@@ -160,12 +164,24 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
     event.stopPropagation();
     setDeleteTarget(set);
     setDeleteFileNames(null);
+    setDeleteImported(null);
     api.invoke<FileWithFrame[]>('get_calibration_set_frames', { setId: set.id })
       .then(frames => setDeleteFileNames(frames.map(f => f.file.filename)))
       .catch(err => {
         // Non-fatal: the confirmation just falls back to naming the set.
         console.error('Failed to resolve master file name:', err);
         setDeleteFileNames([]);
+      });
+    // What the user is consenting to differs by lineage: a null provenance
+    // means an imported master, whose consumer links are DELETED rather than
+    // moved back onto a raw set (there is none). Promising a restore there
+    // would be a lie.
+    api.invoke<MasterProvenanceInfo | null>('get_master_provenance', { masterSetId: set.id })
+      .then(p => setDeleteImported(p === null))
+      .catch(err => {
+        // Non-fatal: unknown lineage keeps the generic wording.
+        console.error('Failed to resolve master provenance:', err);
+        setDeleteImported(null);
       });
   };
 
@@ -175,14 +191,28 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
     setDeleting(true);
     try {
       const res = await api.invoke<DeleteMasterResult>('delete_master', { masterSetId: set.id });
-      notify({
-        title: 'Master deleted',
-        detail: res.restoredRawSetId != null
-          ? `Raw set #${res.restoredRawSetId} restored; ${res.linksRepointed} link(s) repointed`
-          : `${res.linksRepointed} link(s) removed (imported master)`,
-        kind: 'masterbuild',
-        tone: 'success',
-      });
+      const linkDetail = res.restoredRawSetId != null
+        ? `Raw set #${res.restoredRawSetId} restored; ${res.linksRepointed} link(s) repointed`
+        : `${res.linksRepointed} link(s) removed (imported master)`;
+      if (res.filesDeleted === 0) {
+        // The catalog rows are gone but nothing left the disk. Reporting a
+        // plain success here would hide the consequence: a file still sitting
+        // in the library root gets re-ingested as an imported master.
+        notify({
+          title: 'Master deleted from catalog',
+          detail: `${linkDetail}. No file was removed from disk (missing or locked); if it still exists it will re-appear as an imported master on the next scan.`,
+          kind: 'masterbuild',
+          tone: 'warning',
+          hasErrors: true,
+        });
+      } else {
+        notify({
+          title: 'Master deleted',
+          detail: linkDetail,
+          kind: 'masterbuild',
+          tone: 'success',
+        });
+      }
       // Both lists changed shape (master row gone, source set un-superseded) —
       // same refresh signal `useMasterBuilds` fires after a build completes.
       window.dispatchEvent(new Event('library-updated'));
@@ -199,6 +229,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
       setDeleting(false);
       setDeleteTarget(null);
       setDeleteFileNames(null);
+      setDeleteImported(null);
     }
   };
 
@@ -210,7 +241,9 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
             ? `${deleteFileNames.join(', ')} will be permanently deleted from disk.`
             : `The file of master set #${deleteTarget.id} (${deleteTarget.imagetyp}) will be permanently deleted from disk.`,
         '',
-        'The raw source set becomes matchable again and every calibration link that pointed at this master moves back to it.',
+        deleteImported === true
+          ? 'This master was imported; its calibration link(s) will be removed and nothing is restored.'
+          : 'The raw source set becomes matchable again and every calibration link that pointed at this master moves back to it.',
         'Calibrated lights that used this master will show as stale.',
       ].join('\n')
     : '';
@@ -647,7 +680,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
         confirmText={deleting ? 'Deleting…' : 'Delete master'}
         confirmDanger
         onConfirm={() => { if (!deleting) void handleConfirmDelete(); }}
-        onCancel={() => { if (!deleting) { setDeleteTarget(null); setDeleteFileNames(null); } }}
+        onCancel={() => { if (!deleting) { setDeleteTarget(null); setDeleteFileNames(null); setDeleteImported(null); } }}
       />
 
       {/* BlinkViewer Modal */}

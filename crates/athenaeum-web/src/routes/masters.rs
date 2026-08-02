@@ -190,12 +190,22 @@ pub async fn cancel_master_build(
 /// Un-supersede the master's raw source set, repoint consumers back onto it,
 /// drop the master's catalog rows and its file from disk. 409 while a build
 /// for the same lineage is in flight.
+///
+/// DB transaction + a disk unlink, so it runs under `spawn_blocking` to keep
+/// both off the async executor (same reasoning as `preview_master_build`
+/// above, which does far less blocking work than this).
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn delete_master(
     State(state): State<WebAppState>,
     Json(args): Json<DeleteMasterArgs>,
 ) -> Result<Json<DeleteMasterResult>, (StatusCode, String)> {
-    api::delete_master(&state.ctx, args.master_set_id).map(Json).map_err(api_err)
+    let ctx = state.ctx.clone();
+    let result = tokio::task::spawn_blocking(move || api::delete_master(&ctx, args.master_set_id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Delete task panicked: {}", e)))?
+        .map_err(api_err)?;
+
+    Ok(Json(result))
 }
 
 /// POST /api/get_master_provenance
