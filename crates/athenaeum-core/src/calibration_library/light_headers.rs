@@ -55,7 +55,16 @@ pub struct LightCalCardInputs {
     pub flat: Option<(String, String)>,
     pub bias: Option<(String, String)>,
     pub scale_divisor: f64,
+    /// The global-equivalent flat-norm divisor → `ATH_CFNM`. In per-channel
+    /// mode it is the mean of [`LightCalCardInputs::flat_channel_divisors`], so
+    /// a reader that only knows `ATH_CFNM` still gets a meaningful number.
     pub flat_norm_divisor: f64,
+    /// The `[R, G, B]` constants when the flat was normalized per CFA channel
+    /// → `ATH_CFNR`/`ATH_CFNG`/`ATH_CFNB` plus `ATH_CCFA = T`. `None` (mono
+    /// light, toggle off, `pixinsightTrimmed`, or degenerate constants) stamps
+    /// none of the four, so a globally-normalized output's header is byte-for-
+    /// byte what it was before per-channel scaling existed.
+    pub flat_channel_divisors: Option<[f64; 3]>,
     /// Output pedestal in DN (advanced param, spec §2). Stamped as `ATH_CPED`
     /// ALWAYS — even when 0 — so the value that produced this file is on record.
     pub pedestal_dn: f64,
@@ -157,6 +166,23 @@ pub fn build_light_cal_cards(
             .with_comment("calibration engine version"),
         );
 
+    // Per-channel flat scaling: the three constants actually applied, plus a
+    // logical flag a consumer can test without parsing three reals. Stamped
+    // ONLY when per-channel scaling was applied, so a mono/global output's
+    // header is unchanged by this feature. `ATH_CFNM` above already carries
+    // their mean, which is what a reader unaware of these four falls back to.
+    if let Some(ch) = inputs.flat_channel_divisors {
+        b = b.custom(
+            Card::new("ATH_CCFA", CardValue::Logical(true))?
+                .with_comment("flat normalized per CFA channel"),
+        );
+        for (kw, v) in [("ATH_CFNR", ch[0]), ("ATH_CFNG", ch[1]), ("ATH_CFNB", ch[2])] {
+            b = b.custom(
+                Card::new(kw, CardValue::Real(v))?.with_comment("per-channel flat-norm divisor"),
+            );
+        }
+    }
+
     // The per-tail trim fraction is provenance only in pixinsightTrimmed mode —
     // stamped only when that statistic was actually used (spec §2).
     if let Some(trim) = inputs.trim_fraction {
@@ -183,6 +209,7 @@ mod tests {
             bias: None,
             scale_divisor: 65535.0,
             flat_norm_divisor: 1234.5,
+            flat_channel_divisors: None,
             pedestal_dn: 0.0,
             trim_fraction: None,
         }
@@ -317,12 +344,54 @@ mod tests {
         assert!(matches!(ped.value, Some(CardValue::Real(v)) if v.abs() < 1e-9));
         assert!(find("ATH_CTRM").is_none(), "trim_fraction None -> no ATH_CTRM card");
 
+        // A globally-normalized output carries none of the per-channel cards.
+        for kw in ["ATH_CCFA", "ATH_CFNR", "ATH_CFNG", "ATH_CFNB"] {
+            assert!(find(kw).is_none(), "{kw} must be absent without per-channel scaling");
+        }
+
         // Every new keyword respects the 8-char FITS limit.
         for kw in [
             "CALSTAT", "ATH_CSRC", "ATH_CSRN", "ATH_CDRK", "ATH_CFLT", "ATH_CBIA", "ATH_CSCL",
-            "ATH_CFNM", "ATH_CPED", "ATH_CTRM", "ATH_CVER",
+            "ATH_CFNM", "ATH_CPED", "ATH_CTRM", "ATH_CVER", "ATH_CCFA", "ATH_CFNR", "ATH_CFNG",
+            "ATH_CFNB",
         ] {
             assert!(kw.len() <= 8, "{kw}");
+        }
+    }
+
+    /// Per-channel mode stamps the three applied constants plus the logical
+    /// flag, and keeps `ATH_CFNM` (their mean) so a reader that knows only the
+    /// global card still gets a meaningful number.
+    #[test]
+    fn per_channel_cards_stamped_with_the_applied_constants() {
+        let mut inputs = base_inputs();
+        inputs.flat_channel_divisors = Some([2000.0, 4000.0, 1000.0]);
+        inputs.flat_norm_divisor = (2000.0 + 4000.0 + 1000.0) / 3.0;
+        let cards = build_light_cal_cards(&[], &inputs).unwrap();
+        let find = |k: &str| cards.iter().find(|c| c.keyword == k);
+
+        let ccfa = find("ATH_CCFA").expect("ATH_CCFA card");
+        assert!(
+            matches!(ccfa.value, Some(CardValue::Logical(true))),
+            "ATH_CCFA must be logical T, got {:?}",
+            ccfa.value
+        );
+        for (kw, want) in [("ATH_CFNR", 2000.0), ("ATH_CFNG", 4000.0), ("ATH_CFNB", 1000.0)] {
+            let c = find(kw).unwrap_or_else(|| panic!("{kw} card"));
+            assert!(
+                matches!(c.value, Some(CardValue::Real(v)) if (v - want).abs() < 1e-9),
+                "{kw} = {:?}, want {want}",
+                c.value
+            );
+        }
+        let fnm = find("ATH_CFNM").expect("ATH_CFNM stays for continuity");
+        assert!(matches!(fnm.value, Some(CardValue::Real(v)) if (v - 7000.0 / 3.0).abs() < 1e-9));
+
+        // All four must render — a Logical card and three fixed-width reals with
+        // short comments, well inside the 80-char card.
+        for kw in ["ATH_CCFA", "ATH_CFNR", "ATH_CFNG", "ATH_CFNB"] {
+            crate::fits_writer::card::format_card(find(kw).unwrap())
+                .unwrap_or_else(|e| panic!("{kw} must format cleanly: {e:?}"));
         }
     }
 

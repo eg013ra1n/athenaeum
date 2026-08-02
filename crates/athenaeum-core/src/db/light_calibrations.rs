@@ -37,11 +37,12 @@ pub use crate::models::{BiasFallback, LightCalParams};
 
 /// Column list shared by every read query, so `row_from_sql`'s index-based
 /// `row.get(N)` calls can't silently drift out of sync with the SELECT.
-/// `cal_params` is appended LAST (index 14) so the two joined disambiguation
-/// columns in [`find_by_identity_disambiguated`] shift to 15/16.
+/// New columns are appended LAST (`cal_params` = 14, `cfa_scaling_applied` =
+/// 15) so the two joined disambiguation columns in
+/// [`find_by_identity_disambiguated`] simply shift after them.
 const SELECT_COLS: &str = "id, frame_id, source_uuid, source_filename, output_path, \
     dark_set_id, flat_set_id, bias_set_id, calstat, flat_norm_applied, flat_norm_mode, \
-    output_hash, engine_version, created_at, cal_params";
+    output_hash, engine_version, created_at, cal_params, cfa_scaling_applied";
 
 /// One tracked calibrated-light output.
 #[derive(Debug, Clone, PartialEq)]
@@ -71,6 +72,15 @@ pub struct LightCalRow {
     /// row carries `'{}'`, which parses to [`LightCalParams::default`]; never
     /// string-compared for staleness (parse both sides — see [`derive_status`]).
     pub cal_params: String,
+    /// Whether the flat was normalized per CFA channel. `None` = a row written
+    /// before per-channel scaling existed, read as `false` by [`derive_status`]
+    /// (global is what those rows in fact got).
+    ///
+    /// Deliberately NOT derived from `cal_params.cfa_flat_scaling`: that field
+    /// is what was REQUESTED, and the request is satisfied globally for a mono
+    /// light, a `pixinsightTrimmed` run, or a flat whose channel constants came
+    /// back degenerate. This column is what actually happened.
+    pub cfa_scaling_applied: Option<bool>,
 }
 
 fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<LightCalRow> {
@@ -90,6 +100,7 @@ fn row_from_sql(row: &rusqlite::Row) -> rusqlite::Result<LightCalRow> {
         engine_version: row.get(12)?,
         created_at: row.get(13)?,
         cal_params: row.get(14)?,
+        cfa_scaling_applied: row.get::<_, Option<i64>>(15)?.map(|v| v != 0),
     })
 }
 
@@ -111,8 +122,8 @@ pub fn upsert_light_calibration(conn: &Connection, row: &LightCalRow) -> Result<
         "INSERT INTO light_calibrations
          (frame_id, source_uuid, source_filename, output_path, dark_set_id, flat_set_id,
           bias_set_id, calstat, flat_norm_applied, flat_norm_mode, cal_params, output_hash,
-          engine_version, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+          engine_version, created_at, cfa_scaling_applied)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT({conflict_col}) DO UPDATE SET
             frame_id = excluded.frame_id,
             source_uuid = excluded.source_uuid,
@@ -127,7 +138,8 @@ pub fn upsert_light_calibration(conn: &Connection, row: &LightCalRow) -> Result<
             cal_params = excluded.cal_params,
             output_hash = excluded.output_hash,
             engine_version = excluded.engine_version,
-            created_at = excluded.created_at"
+            created_at = excluded.created_at,
+            cfa_scaling_applied = excluded.cfa_scaling_applied"
     );
     conn.execute(
         &sql,
@@ -146,6 +158,7 @@ pub fn upsert_light_calibration(conn: &Connection, row: &LightCalRow) -> Result<
             row.output_hash,
             row.engine_version,
             row.created_at,
+            row.cfa_scaling_applied.map(|v| v as i64),
         ],
     )?;
 
@@ -261,7 +274,7 @@ pub fn find_by_identity_disambiguated(
     // Every tracking row sharing this filename, LEFT-joined to its source frame
     // so a frameless (adopted-orphan) row surfaces NULL object/date_obs and is
     // filtered out whenever the caller carries a disambiguator. Column indices
-    // 0..=14 are the SELECT_COLS in order (read by `row_from_sql`); 15/16 are the
+    // 0..=15 are the SELECT_COLS in order (read by `row_from_sql`); 16/17 are the
     // joined frame's object/date_obs.
     let prefixed = SELECT_COLS
         .split(", ")
@@ -278,8 +291,8 @@ pub fn find_by_identity_disambiguated(
     let candidates = stmt
         .query_map(params![filename], |row| {
             let lc = row_from_sql(row)?;
-            let object: Option<String> = row.get(15)?;
-            let date_obs: Option<String> = row.get(16)?;
+            let object: Option<String> = row.get(16)?;
+            let date_obs: Option<String> = row.get(17)?;
             Ok((lc, object, date_obs))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -360,6 +373,30 @@ pub fn update_output_path(conn: &Connection, id: i64, new_path: &str) -> Result<
     Ok(())
 }
 
+/// Whether the frame declares a CFA pattern this codebase can act on — i.e.
+/// whether per-channel flat scaling could have changed its output at all.
+///
+/// Reads `frames.bayerpat` directly and through the SAME `Bayer::parse` the
+/// engine's geometry resolution uses: a pattern spelling the parser cannot
+/// vouch for yields no geometry there, so treating the frame as CFA here would
+/// derive Stale on every pass for an output that can never change. (The column
+/// is read raw rather than via a `Frame`: the index-based list readers hardcode
+/// `None` for the Bayer offsets.)
+fn frame_declares_cfa(conn: &Connection, frame_id: i64) -> Result<bool> {
+    let bayerpat: Option<String> = conn
+        .query_row(
+            "SELECT bayerpat FROM frames WHERE id = ?1",
+            params![frame_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(bayerpat
+        .as_deref()
+        .and_then(crate::fits_writer::keywords::Bayer::parse)
+        .is_some())
+}
+
 /// Derived (never stored) calibration status for a light frame — design §5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LightCalStatus {
@@ -401,6 +438,10 @@ pub enum LightCalStatus {
 /// - `trim_fraction` matters ONLY when the row applied a normalized flat AND the
 ///   caller still wants normalization in `pixinsightTrimmed` mode (the only mode
 ///   the fraction affects; central-third and norm-off runs ignore it).
+/// - `cfa_flat_scaling` is compared against the row's own `cfa_scaling_applied`
+///   COLUMN (not its `cal_params`), and only where per-channel scaling can act:
+///   a normalized flat, central-third mode, and a frame that declares a CFA
+///   pattern. A mono frame never goes stale on this toggle.
 pub fn derive_status(
     conn: &Connection,
     frame_id: i64,
@@ -472,12 +513,37 @@ pub fn derive_status(
         || row_params.bias_fallback != params_wanted.bias_fallback
         || (trim_matters && row_params.trim_fraction != params_wanted.trim_fraction);
 
+    // Per-channel flat scaling changes the output only where it can act: a
+    // normalized flat, in central-third mode, on a frame whose CFA pattern the
+    // catalog can vouch for. Anywhere else the toggle is inert, and comparing it
+    // there would derive Stale forever for every mono frame (the same trap the
+    // flat-norm arm above sidesteps). The frame's Bayer column is only read once
+    // the cheap conditions hold, so mono/dark-only frames cost no query.
+    //
+    // The row's column is the comparison, never `cal_params.cfa_flat_scaling`:
+    // a `'{}'` from before this feature decodes to the new default (`true`) and
+    // would claim every old row ran per-channel. NULL reads as `false`, which is
+    // what those rows in fact got. This does mean a CFA frame calibrated before
+    // the feature reads Stale once — correct, its output would differ — and that
+    // a flat with degenerate channel constants re-reads Stale on every pass
+    // (a harmless, idempotent re-calibration, same class as the `bias_fallback`
+    // comparison above; degenerate constants need a window smaller than a 2x2
+    // cell, which no real frame reaches).
+    let cfa_can_act = row.flat_set_id.is_some()
+        && row.flat_norm_applied
+        && flat_norm_wanted
+        && flat_norm_mode_wanted != FlatNormMode::PixinsightTrimmed;
+    let cfa_mismatch = cfa_can_act
+        && row.cfa_scaling_applied.unwrap_or(false) != params_wanted.cfa_flat_scaling
+        && frame_declares_cfa(conn, frame_id)?;
+
     if mismatch
         || master_rebuilt
         || row.engine_version < LIGHT_CAL_ENGINE_VERSION
         || flat_norm_mismatch
         || flat_norm_mode_mismatch
         || params_mismatch
+        || cfa_mismatch
     {
         return Ok(LightCalStatus::Stale);
     }
@@ -578,6 +644,9 @@ mod tests {
             output_hash: "deadbeef".to_string(),
             engine_version: LIGHT_CAL_ENGINE_VERSION,
             created_at: "2026-07-05T00:00:00Z".to_string(),
+            // Pre-feature shape: the column did not exist, so NULL is what an
+            // existing row carries. `derive_status` reads it as "global".
+            cfa_scaling_applied: None,
         }
     }
 
@@ -602,6 +671,7 @@ mod tests {
             engine_version: LIGHT_CAL_ENGINE_VERSION,
             created_at: "2026-01-01T00:00:00Z".into(),
             cal_params: "{}".into(),
+            cfa_scaling_applied: None,
         };
         upsert_light_calibration(&conn, &row).unwrap();
         assert!(output_path_exists(&conn, "/lib/M31/c_a.fits").unwrap());
@@ -1007,6 +1077,162 @@ mod tests {
         );
     }
 
+    /// Stamp a CFA pattern on an already-seeded frame, making it a colour frame
+    /// for `frame_declares_cfa`.
+    fn set_bayerpat(conn: &Connection, frame_id: i64, bayerpat: Option<&str>) {
+        conn.execute(
+            "UPDATE frames SET bayerpat = ?2 WHERE id = ?1",
+            params![frame_id, bayerpat],
+        )
+        .unwrap();
+    }
+
+    /// A flat row with per-channel scaling recorded either way, so the CFA
+    /// staleness arm has both directions to compare.
+    fn cfa_flat_row(frame_id: i64, path: &str, set_id: i64, applied: Option<bool>) -> LightCalRow {
+        let mut row = base_row(Some(frame_id), path);
+        row.flat_set_id = Some(set_id);
+        row.flat_norm_applied = true;
+        row.flat_norm_mode = FlatNormMode::CentralThird.as_wire_str().to_string();
+        row.cfa_scaling_applied = applied;
+        row
+    }
+
+    fn params_with_cfa(cfa_flat_scaling: bool) -> LightCalParams {
+        LightCalParams {
+            cfa_flat_scaling,
+            ..LightCalParams::default()
+        }
+    }
+
+    /// The per-channel-scaling toggle makes a CFA frame stale in BOTH
+    /// directions, and never touches a mono frame.
+    #[test]
+    fn derive_status_cfa_scaling_mismatch_both_ways_and_mono_exemption() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_calibration_set(&conn, 11, "Flat");
+        let flat_links = vec![link("Flat", 11)];
+
+        // ---- CFA frame, row applied per-channel; caller now wants it OFF ----
+        seed_frame(&conn, 1);
+        set_bayerpat(&conn, 1, Some("RGGB"));
+        upsert_light_calibration(&conn, &cfa_flat_row(1, "/lib/1.fits", 11, Some(true))).unwrap();
+        assert_eq!(
+            derive_status(&conn, 1, &flat_links, true, FlatNormMode::CentralThird, &params_with_cfa(true)).unwrap(),
+            LightCalStatus::Calibrated,
+            "matching toggle stays calibrated"
+        );
+        assert_eq!(
+            derive_status(&conn, 1, &flat_links, true, FlatNormMode::CentralThird, &params_with_cfa(false)).unwrap(),
+            LightCalStatus::Stale,
+            "a per-channel-scaled frame is stale once global is wanted"
+        );
+
+        // ---- CFA frame, row applied GLOBALLY; caller now wants per-channel ----
+        seed_frame(&conn, 2);
+        set_bayerpat(&conn, 2, Some("BGGR"));
+        upsert_light_calibration(&conn, &cfa_flat_row(2, "/lib/2.fits", 11, Some(false))).unwrap();
+        assert_eq!(
+            derive_status(&conn, 2, &flat_links, true, FlatNormMode::CentralThird, &params_with_cfa(true)).unwrap(),
+            LightCalStatus::Stale,
+            "a globally-scaled CFA frame is stale once per-channel is wanted"
+        );
+        assert_eq!(
+            derive_status(&conn, 2, &flat_links, true, FlatNormMode::CentralThird, &params_with_cfa(false)).unwrap(),
+            LightCalStatus::Calibrated
+        );
+
+        // ---- MONO frame (no bayerpat): the toggle is inert either way ----
+        seed_frame(&conn, 3);
+        upsert_light_calibration(&conn, &cfa_flat_row(3, "/lib/3.fits", 11, Some(false))).unwrap();
+        for wanted in [true, false] {
+            assert_eq!(
+                derive_status(&conn, 3, &flat_links, true, FlatNormMode::CentralThird, &params_with_cfa(wanted)).unwrap(),
+                LightCalStatus::Calibrated,
+                "a mono frame must never go stale on the CFA toggle (wanted = {wanted})"
+            );
+        }
+
+        // ---- A pattern the parser cannot vouch for is not a CFA frame: the
+        // engine would resolve no geometry, so the output can never change ----
+        seed_frame(&conn, 4);
+        set_bayerpat(&conn, 4, Some("NOTAPAT"));
+        upsert_light_calibration(&conn, &cfa_flat_row(4, "/lib/4.fits", 11, Some(false))).unwrap();
+        assert_eq!(
+            derive_status(&conn, 4, &flat_links, true, FlatNormMode::CentralThird, &params_with_cfa(true)).unwrap(),
+            LightCalStatus::Calibrated,
+            "an unparseable BAYERPAT must not derive Stale forever"
+        );
+
+        // ---- A pre-feature row (NULL column) on a CFA frame reads as global,
+        // so the default-ON toggle correctly marks it stale ----
+        seed_frame(&conn, 5);
+        set_bayerpat(&conn, 5, Some("RGGB"));
+        upsert_light_calibration(&conn, &cfa_flat_row(5, "/lib/5.fits", 11, None)).unwrap();
+        assert_eq!(
+            derive_status(&conn, 5, &flat_links, true, FlatNormMode::CentralThird, &params_with_cfa(true)).unwrap(),
+            LightCalStatus::Stale,
+            "NULL (pre-feature) must read as global, not as the new default"
+        );
+        assert_eq!(
+            derive_status(&conn, 5, &flat_links, true, FlatNormMode::CentralThird, &params_with_cfa(false)).unwrap(),
+            LightCalStatus::Calibrated
+        );
+    }
+
+    /// The CFA toggle is inert wherever per-channel scaling cannot act: a
+    /// norm-off run, a `pixinsightTrimmed` run, and a dark-only frame — even on
+    /// a CFA frame.
+    #[test]
+    fn derive_status_cfa_scaling_only_where_it_can_act() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_calibration_set(&conn, 11, "Flat");
+        seed_calibration_set(&conn, 10, "Dark");
+        let flat_links = vec![link("Flat", 11)];
+
+        // Norm OFF: the row applied no normalization, so there is no divisor to
+        // split per channel. (flat_norm_wanted = false matches the row.)
+        seed_frame(&conn, 1);
+        set_bayerpat(&conn, 1, Some("RGGB"));
+        let mut nonorm = cfa_flat_row(1, "/lib/1.fits", 11, Some(false));
+        nonorm.flat_norm_applied = false;
+        upsert_light_calibration(&conn, &nonorm).unwrap();
+        assert_eq!(
+            derive_status(&conn, 1, &flat_links, false, FlatNormMode::CentralThird, &params_with_cfa(true)).unwrap(),
+            LightCalStatus::Calibrated,
+            "normalization off → the CFA toggle is inert"
+        );
+
+        // pixinsightTrimmed: a whole-frame statistic, per-channel is ignored, so
+        // a row that ran global there must not read stale under the default-ON
+        // toggle.
+        seed_frame(&conn, 2);
+        set_bayerpat(&conn, 2, Some("RGGB"));
+        let mut pi = cfa_flat_row(2, "/lib/2.fits", 11, Some(false));
+        pi.flat_norm_mode = FlatNormMode::PixinsightTrimmed.as_wire_str().to_string();
+        upsert_light_calibration(&conn, &pi).unwrap();
+        assert_eq!(
+            derive_status(&conn, 2, &flat_links, true, FlatNormMode::PixinsightTrimmed, &params_with_cfa(true)).unwrap(),
+            LightCalStatus::Calibrated,
+            "pixinsightTrimmed ignores per-channel scaling → never stale on it"
+        );
+
+        // Dark-only CFA frame: no flat at all.
+        seed_frame(&conn, 3);
+        set_bayerpat(&conn, 3, Some("RGGB"));
+        let mut dark_only = base_row(Some(3), "/lib/3.fits");
+        dark_only.dark_set_id = Some(10);
+        dark_only.cfa_scaling_applied = Some(false);
+        upsert_light_calibration(&conn, &dark_only).unwrap();
+        assert_eq!(
+            derive_status(&conn, 3, &[link("Dark", 10)], true, FlatNormMode::CentralThird, &params_with_cfa(true)).unwrap(),
+            LightCalStatus::Calibrated,
+            "a dark-only frame has no flat to scale"
+        );
+    }
+
     /// Seed a `frames` (+ backing `files`) row carrying OBJECT/DATE-OBS so the
     /// disambiguated identity match has something to join against.
     fn seed_frame_obj(conn: &Connection, frame_id: i64, filename: &str, object: &str, date_obs: &str) {
@@ -1146,6 +1372,7 @@ mod tests {
                 flat_norm_applied INTEGER NOT NULL,
                 flat_norm_mode    TEXT NOT NULL DEFAULT 'centralThird',
                 cal_params        TEXT NOT NULL DEFAULT '{}',
+                cfa_scaling_applied INTEGER,
                 output_hash       TEXT NOT NULL,
                 engine_version    INTEGER NOT NULL,
                 created_at        TEXT NOT NULL
@@ -1177,10 +1404,79 @@ mod tests {
         let got = get_light_calibration_for_frame(&conn, 1).unwrap().unwrap();
         assert_eq!(got.dark_set_id, Some(10), "row survived the rebuild");
         assert_eq!(got.output_path, "/lib/mig.fits");
+        // The FK rebuild's explicit-column INSERT..SELECT has to carry
+        // `cfa_scaling_applied` across, or every row's per-channel record would
+        // be silently reset by an unrelated migration.
+        assert_eq!(
+            got.cfa_scaling_applied, None,
+            "a row's per-channel record must survive the rebuild"
+        );
 
         // And a set delete now nulls instead of aborting.
         conn.execute("DELETE FROM calibration_set WHERE id = 10", []).unwrap();
         let after = get_light_calibration_for_frame(&conn, 1).unwrap().unwrap();
         assert_eq!(after.dark_set_id, None);
+    }
+
+    /// A dev DB whose `light_calibrations` predates per-channel flat scaling
+    /// gains the column through `init_db`'s guarded ALTER, and its existing rows
+    /// keep reading as "not recorded" (NULL) rather than being back-filled with
+    /// the new default — which would claim they had been per-channel scaled.
+    #[test]
+    fn init_db_adds_cfa_scaling_column_to_pre_feature_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Rebuild the table exactly as it stood before the column existed (FK
+        // actions already correct, so the FK rebuild path stays out of the way).
+        conn.execute_batch(
+            "DROP TABLE light_calibrations;
+             CREATE TABLE light_calibrations (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                frame_id          INTEGER UNIQUE REFERENCES frames(id) ON DELETE CASCADE,
+                source_uuid       TEXT,
+                source_filename   TEXT,
+                output_path       TEXT NOT NULL UNIQUE,
+                dark_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
+                flat_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
+                bias_set_id       INTEGER REFERENCES calibration_set(id) ON DELETE SET NULL,
+                calstat           TEXT NOT NULL,
+                flat_norm_applied INTEGER NOT NULL,
+                flat_norm_mode    TEXT NOT NULL DEFAULT 'centralThird',
+                cal_params        TEXT NOT NULL DEFAULT '{}',
+                output_hash       TEXT NOT NULL,
+                engine_version    INTEGER NOT NULL,
+                created_at        TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        seed_frame(&conn, 1);
+        // Raw INSERT: the current `upsert_light_calibration` writes the new
+        // column, which this pre-feature table does not have yet.
+        conn.execute(
+            "INSERT INTO light_calibrations
+             (frame_id, output_path, calstat, flat_norm_applied, output_hash, engine_version, created_at)
+             VALUES (1, '/lib/pre.fits', 'BDF', 1, 'hash', ?1, '2026-07-05T00:00:00Z')",
+            params![LIGHT_CAL_ENGINE_VERSION],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let got = get_light_calibration_for_frame(&conn, 1).unwrap().unwrap();
+        assert_eq!(
+            got.cfa_scaling_applied, None,
+            "an existing row must read NULL — never back-filled with the new default"
+        );
+        assert_eq!(got.output_path, "/lib/pre.fits", "the row itself survives");
+
+        // …and the column is really there: a normal upsert round-trips through it.
+        let mut row = base_row(Some(1), "/lib/pre.fits");
+        row.cfa_scaling_applied = Some(true);
+        upsert_light_calibration(&conn, &row).unwrap();
+        assert_eq!(
+            get_light_calibration_for_frame(&conn, 1).unwrap().unwrap().cfa_scaling_applied,
+            Some(true)
+        );
     }
 }

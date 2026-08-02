@@ -563,6 +563,7 @@ mod tests {
                 engine_version: LIGHT_CAL_ENGINE_VERSION,
                 created_at: "2026-07-10T00:00:00Z".into(),
                 cal_params: "{}".into(),
+                cfa_scaling_applied: None,
             },
         )
         .unwrap();

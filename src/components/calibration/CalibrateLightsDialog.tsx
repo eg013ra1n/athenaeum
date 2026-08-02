@@ -19,6 +19,7 @@ export const DEFAULT_LIGHTCAL_PARAMS: LightCalParams = {
   trimFraction: 0.05,
   pedestalDn: 0,
   biasFallback: 'subtractBias',
+  cfaFlatScaling: true,
 };
 
 /** Read the persisted Advanced parameters, coercing every field into range and
@@ -40,7 +41,10 @@ export function readLightCalParamsPref(): LightCalParams {
         : DEFAULT_LIGHTCAL_PARAMS.pedestalDn;
     const biasFallback: BiasFallback =
       parsed.biasFallback === 'skipFrame' ? 'skipFrame' : 'subtractBias';
-    return { trimFraction, pedestalDn, biasFallback };
+    // Default ON, so a preference blob written before this option existed keeps
+    // the recommended behavior instead of silently opting out of it.
+    const cfaFlatScaling = parsed.cfaFlatScaling !== false;
+    return { trimFraction, pedestalDn, biasFallback, cfaFlatScaling };
   } catch {
     return { ...DEFAULT_LIGHTCAL_PARAMS };
   }
@@ -281,6 +285,30 @@ export function CalibrateLightsDialog({ setId, setName, onClose }: CalibrateLigh
                 />
                 Full-frame trimmed mean (5% per tail)
               </label>
+
+              {/* Per-channel CFA scaling — a refinement OF the normalization,
+                  so it lives under the statistic it refines. Unavailable in the
+                  PixInsight-trimmed mode, which is a whole-frame statistic. */}
+              <label
+                className={`flex items-center gap-2 text-xs pt-1 ${
+                  flatNormMode === 'pixinsightTrimmed'
+                    ? 'text-content-muted cursor-not-allowed'
+                    : 'text-content-secondary'
+                }`}
+              >
+                <input
+                  type="checkbox"
+                  checked={params.cfaFlatScaling && flatNormMode !== 'pixinsightTrimmed'}
+                  disabled={flatNormMode === 'pixinsightTrimmed'}
+                  onChange={e => setParams(p => ({ ...p, cfaFlatScaling: e.target.checked }))}
+                />
+                Per-channel CFA flat scaling
+              </label>
+              <p className="text-[11px] text-content-muted ml-6">
+                {flatNormMode === 'pixinsightTrimmed'
+                  ? 'Not available with the full-frame trimmed mean — that statistic is measured across all channels at once.'
+                  : 'Applies to color (CFA) lights; mono lights are unaffected.'}
+              </p>
             </div>
           )}
         </div>

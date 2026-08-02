@@ -2394,6 +2394,7 @@ mod export_mode_tests {
             engine_version: LIGHT_CAL_ENGINE_VERSION,
             created_at: "2026-07-05T21:00:00Z".to_string(),
             cal_params: "{}".to_string(),
+            cfa_scaling_applied: None,
         }
     }
 

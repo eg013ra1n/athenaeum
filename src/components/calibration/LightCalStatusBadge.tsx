@@ -53,6 +53,15 @@ export function lightCalRecipeTooltip(detail: LightCalDetails): string {
       ? `Normalization: ${flatNormModeLabel(detail.flatNormMode)} (applied)`
       : 'Normalization: off (plain flat division)',
   ];
+  // Per-channel scaling changes every pixel of a color frame, so the recipe has
+  // to say which one ran. A row that predates the option (null) says nothing.
+  if (detail.flatNormApplied && detail.cfaScalingApplied != null) {
+    lines.push(
+      detail.cfaScalingApplied
+        ? 'CFA scaling: per channel'
+        : 'CFA scaling: off (single whole-frame divisor)',
+    );
+  }
   if (pedestal != null && pedestal > 0) lines.push(`Pedestal: ${pedestal} DN`);
   if (trim != null && detail.flatNormApplied && detail.flatNormMode === 'pixinsightTrimmed') {
     lines.push(`Trim: ${trim} per tail`);

@@ -809,6 +809,12 @@ fn reconcile_calibrated_light(
         // same harmless-for-staleness tradeoff as `flat_norm_mode` above; a real
         // divergence just prompts a (correct) re-calibrate.
         cal_params: "{}".to_string(),
+        // Recoverable, unlike the two above: per-channel scaling stamps
+        // `ATH_CCFA` on the output, so an adopted file can say what it got. An
+        // absent card is "not stated" (a globally-normalized output, or one from
+        // before the feature) and stays NULL — which `derive_status` reads as
+        // global, the honest answer for both.
+        cfa_scaling_applied: identity.cfa_scaling_applied,
         output_hash,
         // Carry the file's own engine version so staleness derivation (§5)
         // correctly flags a file built by an older engine.
@@ -3288,6 +3294,7 @@ mod calibrated_light_scan_tests {
             bias: owned(bias),
             scale_divisor: 65535.0,
             flat_norm_divisor: 1.0,
+            flat_channel_divisors: None,
             pedestal_dn: 0.0,
             trim_fraction: None,
         };
@@ -3360,6 +3367,7 @@ mod calibrated_light_scan_tests {
             flat_norm_applied: false,
             flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
             cal_params: "{}".to_string(),
+            cfa_scaling_applied: None,
             output_hash: "seed".to_string(),
             engine_version: LIGHT_CAL_ENGINE_VERSION,
             created_at: "2026-07-05T00:00:00Z".to_string(),
@@ -3520,6 +3528,7 @@ mod calibrated_light_scan_tests {
                 engine_version: LIGHT_CAL_ENGINE_VERSION,
                 created_at: "2026-01-01T00:00:00Z".into(),
                 cal_params: "{}".into(),
+                cfa_scaling_applied: None,
             },
         )
         .unwrap();
@@ -3534,6 +3543,7 @@ mod calibrated_light_scan_tests {
             flat: None,
             bias: None,
             flat_norm_divisor: None,
+            cfa_scaling_applied: None,
             engine_version: None,
             project_id: None,
         };
@@ -3784,6 +3794,7 @@ mod calibrated_light_scan_tests {
             flat_norm_applied: false,
             flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
             cal_params: "{}".to_string(),
+            cfa_scaling_applied: None,
             output_hash: "seed".to_string(),
             engine_version: LIGHT_CAL_ENGINE_VERSION,
             created_at: "2026-07-05T00:00:00Z".to_string(),
@@ -3934,6 +3945,7 @@ mod calibrated_light_scan_tests {
             bias: None,
             scale_divisor: 65535.0,
             flat_norm_divisor: 1.0,
+            flat_channel_divisors: None,
             pedestal_dn: 0.0,
             trim_fraction: None,
         };

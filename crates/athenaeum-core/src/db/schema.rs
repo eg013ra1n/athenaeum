@@ -1492,6 +1492,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             flat_norm_applied INTEGER NOT NULL,
             flat_norm_mode    TEXT NOT NULL DEFAULT 'centralThird',
             cal_params        TEXT NOT NULL DEFAULT '{}',
+            cfa_scaling_applied INTEGER,
             output_hash       TEXT NOT NULL,
             engine_version    INTEGER NOT NULL,
             created_at        TEXT NOT NULL
@@ -1535,6 +1536,23 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // CFA hardening (2026-08-03): whether the flat was normalized per CFA
+    // channel. NULLABLE with no default, unlike the two ADD COLUMNs above: a
+    // pre-existing row was written by an engine that had no per-channel mode, so
+    // NULL is the honest "not recorded" — `derive_status` reads it as "global
+    // was applied", which is what those rows in fact got. It deliberately does
+    // NOT live in `cal_params`: that column stores what was REQUESTED, and a
+    // request for per-channel scaling on a mono light (or on a flat with
+    // degenerate channel constants) is satisfied globally. Must run BEFORE the
+    // FK rebuild below so that rebuild's explicit-column INSERT..SELECT finds
+    // the column on the source table.
+    if !column_exists(conn, "light_calibrations", "cfa_scaling_applied")? {
+        conn.execute(
+            "ALTER TABLE light_calibrations ADD COLUMN cfa_scaling_applied INTEGER",
+            [],
+        )?;
+    }
+
     // Guarded migration for dev DBs created before the `ON DELETE SET NULL`
     // fix (v0.2.5 is unreleased, so only dev DBs can carry the old no-action
     // FK). Detect via the pragma FK list: if any of the three set-id FKs
@@ -1574,6 +1592,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
                 flat_norm_applied INTEGER NOT NULL,
                 flat_norm_mode    TEXT NOT NULL DEFAULT 'centralThird',
                 cal_params        TEXT NOT NULL DEFAULT '{}',
+                cfa_scaling_applied INTEGER,
                 output_hash       TEXT NOT NULL,
                 engine_version    INTEGER NOT NULL,
                 created_at        TEXT NOT NULL
@@ -1581,10 +1600,10 @@ pub fn init_db(conn: &Connection) -> Result<()> {
              INSERT INTO light_calibrations_new
                 (id, frame_id, source_uuid, source_filename, output_path, dark_set_id,
                  flat_set_id, bias_set_id, calstat, flat_norm_applied, flat_norm_mode, cal_params,
-                 output_hash, engine_version, created_at)
+                 cfa_scaling_applied, output_hash, engine_version, created_at)
                 SELECT id, frame_id, source_uuid, source_filename, output_path, dark_set_id,
                        flat_set_id, bias_set_id, calstat, flat_norm_applied, flat_norm_mode, cal_params,
-                       output_hash, engine_version, created_at
+                       cfa_scaling_applied, output_hash, engine_version, created_at
                 FROM light_calibrations;
              DROP TABLE light_calibrations;
              ALTER TABLE light_calibrations_new RENAME TO light_calibrations;

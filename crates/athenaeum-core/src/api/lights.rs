@@ -31,7 +31,8 @@ use serde::{Deserialize, Serialize};
 use crate::api::masters::{library_dir_or_err, start_master_builds_batch, MasterRecipe};
 use crate::api::{db, ApiError};
 use crate::calibration_library::light_cal::{
-    calibrate_light, flat_norm_constant, scale_divisor_for_bitpix, LightCalInputs,
+    calibrate_light, resolve_flat_norm_divisor, scale_divisor_for_bitpix, FlatNormDivisor,
+    LightCalInputs,
 };
 // Re-export the flat-normalization statistic + advanced-parameter types so the
 // thin Tauri/Axum wrappers can name them via `api::lights::…` (their canonical
@@ -47,7 +48,9 @@ use crate::db::light_calibrations::{
 use crate::events::{emit_event, ProgressEmitter};
 use crate::export::models::ExportMode;
 use crate::fits_parser::stored_header::parse_stored_header_keys;
+use crate::fits_writer::keywords::Bayer;
 use crate::fits_writer::{Card, CardValue};
+use crate::integration::cfa::CfaGeometry;
 use crate::integration::IntegrationError;
 use crate::models::{CalibrationLink, FileFormat};
 use crate::services::compute_queue::ComputeJobKind;
@@ -139,6 +142,11 @@ pub struct LightCalDetails {
     pub flat_norm_mode: String,
     /// Canonical JSON of the advanced parameters actually applied.
     pub cal_params: String,
+    /// Whether the flat was normalized per CFA channel. `None` = the row
+    /// predates per-channel scaling and does not say. Comes from the row's own
+    /// column, NOT from `cal_params` — that field records what was requested,
+    /// which a mono light satisfies globally.
+    pub cfa_scaling_applied: Option<bool>,
     pub engine_version: i64,
     /// RFC3339 timestamp the tracking row was written.
     pub calibrated_at: String,
@@ -247,7 +255,14 @@ pub(crate) fn frame_cal_status(
     } else {
         FlatNormMode::CentralThird
     };
-    let params = serde_json::from_str::<LightCalParams>(&row.cal_params).unwrap_or_default();
+    let mut params = serde_json::from_str::<LightCalParams>(&row.cal_params).unwrap_or_default();
+    // `cal_params` records what was REQUESTED; the CFA arm compares what was
+    // APPLIED, so the self-consistency policy has to feed it the row's own
+    // column or the check stops being vacuous. It would otherwise fire on every
+    // pre-feature CFA row: their `'{}'` decodes to today's default (`true`)
+    // while the column says NULL/global — a disagreement with the caller's
+    // dialog, which is exactly what this policy exists to ignore.
+    params.cfa_flat_scaling = row.cfa_scaling_applied.unwrap_or(false);
     derive_status(
         conn,
         frame_id,
@@ -521,6 +536,7 @@ fn compute_details(
             flat_norm_applied: row.flat_norm_applied,
             flat_norm_mode: row.flat_norm_mode,
             cal_params: row.cal_params,
+            cfa_scaling_applied: row.cfa_scaling_applied,
             engine_version: row.engine_version,
             calibrated_at: row.created_at,
             output_path: row.output_path,
@@ -591,6 +607,9 @@ struct ResolvedFrameInputs {
     /// Still-valid header cards copied from the source (WCS/optics/session);
     /// [`build_light_cal_cards`] filters these to its whitelist.
     source_cards: Vec<Card>,
+    /// The light's own mosaic phase when it declares a CFA pattern the parser
+    /// can vouch for — what makes per-channel flat scaling applicable.
+    cfa_geometry: Option<CfaGeometry>,
     dark: Option<ResolvedMaster>,
     flat: Option<ResolvedMaster>,
     bias: Option<ResolvedMaster>,
@@ -826,6 +845,64 @@ fn append_bayer_cards_from_columns(
     Ok(())
 }
 
+/// The LIGHT frame's mosaic phase for per-channel flat scaling, or `None` when
+/// it declares no CFA pattern (mono) or one [`Bayer::parse`] cannot vouch for.
+///
+/// Read straight from the `frames` columns, NOT through a `Frame`: the
+/// index-based list readers hardcode `None` for `xbayroff`/`ybayroff` whatever
+/// is stored, so a `Frame` round-trip would silently erase the phase and put
+/// every offset light one row/column out — swapping R and B.
+///
+/// A missing offset defaults to 0 with a `debug!`. That guess is allowed here
+/// for the same reason `measure_flat_channel_norms` allows it and
+/// `build_master_cards` does not: it only decides which pixels are grouped for
+/// a divisor — a wrong guess costs a colour cast the operator can see — whereas
+/// writing the guess into `XBAYROFF` would be a fabricated claim every future
+/// debayer acts on.
+///
+/// `ROWORDER` is deliberately not folded in: `BAYERPAT` describes the mosaic in
+/// FILE row order (see [`CfaGeometry`]'s own rustdoc, which ratifies this).
+fn resolve_cfa_geometry(
+    conn: &Connection,
+    frame_id: i64,
+) -> Result<Option<CfaGeometry>, ApiError> {
+    let row: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
+        .query_row(
+            "SELECT bayerpat, xbayroff, ybayroff FROM frames WHERE id = ?1",
+            params![frame_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((bayerpat, xbayroff, ybayroff)) = row else {
+        return Ok(None);
+    };
+    let Some(raw) = bayerpat.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None); // mono — the common case, not worth a log line
+    };
+    let Some(pattern) = Bayer::parse(raw) else {
+        tracing::warn!(
+            frame_id,
+            bayerpat = %raw,
+            "unrecognized bayer pattern — per-channel flat scaling not applied to this light"
+        );
+        return Ok(None);
+    };
+    let assumed = match (xbayroff, ybayroff) {
+        (Some(_), Some(_)) => None,
+        (None, Some(_)) => Some("xbayroff"),
+        (Some(_), None) => Some("ybayroff"),
+        (None, None) => Some("xbayroff,ybayroff"),
+    };
+    if let Some(field) = assumed {
+        tracing::debug!(frame_id, field, "cfa phase not declared — per-channel flat scaling assumes 0");
+    }
+    Ok(Some(CfaGeometry {
+        pattern,
+        xoff: xbayroff.unwrap_or(0),
+        yoff: ybayroff.unwrap_or(0),
+    }))
+}
+
 /// YYYY-MM-DD from a DATE-OBS string (`2026-07-05T20:30:00Z` → `2026-07-05`).
 /// The result becomes a path segment, so it goes through the shared
 /// sanitizer — a malformed non-ISO DATE-OBS must not nest directories ('/')
@@ -904,6 +981,7 @@ fn resolve_frame_inputs(
         instrume: instrume.unwrap_or_default(),
         date_obs_date: date_part(date_obs.as_deref()),
         source_cards,
+        cfa_geometry: resolve_cfa_geometry(conn, frame_id)?,
         dark,
         flat,
         bias,
@@ -1045,15 +1123,21 @@ fn calibrate_one_inner(
 
     let calstat = compute_calstat(dark_applied, bias_applied, flat_applied);
 
-    // Flat-normalization divisor for the ATH_CFNM card, resolved BEFORE the
-    // engine (which recomputes the identical value) so the card list is complete
-    // at write time. 1.0 when normalization is off or no flat applies.
-    let flat_norm_divisor = match (&resolved.flat, flat_norm) {
-        (Some(m), true) => {
-            flat_norm_constant(Path::new(&m.path), scratch, flat_norm_mode, params.trim_fraction)?
-        }
-        _ => 1.0,
+    // Flat-normalization divisor for the ATH_CFNM / ATH_CFN[RGB] / ATH_CCFA
+    // cards, resolved BEFORE the engine (which resolves the identical value
+    // through the same function) so the card list is complete at write time.
+    // Global(1.0) when normalization is off or no flat applies.
+    let divisor = match (&resolved.flat, flat_norm) {
+        (Some(m), true) => resolve_flat_norm_divisor(
+            Path::new(&m.path),
+            scratch,
+            flat_norm_mode,
+            &params,
+            resolved.cfa_geometry,
+        )?,
+        _ => FlatNormDivisor::Global(1.0),
     };
+    let flat_norm_divisor = divisor.global_value();
 
     // Output scale divisor from the LIGHT's own bit depth (spec §2), resolved
     // once so the stamped ATH_CSCL card and the value the engine divides by are
@@ -1083,6 +1167,10 @@ fn calibrate_one_inner(
         },
         scale_divisor,
         flat_norm_divisor,
+        // The three per-channel constants + ATH_CCFA, stamped only when the
+        // flat was actually normalized per CFA channel (mono lights, global
+        // runs and pixinsightTrimmed stamp none of them).
+        flat_channel_divisors: divisor.channel_values(),
         // ATH_CPED is stamped always (spec §2); the DN value that produced this
         // file, even when 0.
         pedestal_dn: params.pedestal_dn,
@@ -1131,6 +1219,7 @@ fn calibrate_one_inner(
         flat_path: resolved.flat.as_ref().map(|m| PathBuf::from(&m.path)),
         flat_norm,
         flat_norm_mode,
+        cfa_geometry: resolved.cfa_geometry,
         params,
         scale_divisor,
         output_path: output_abs.clone(),
@@ -1165,6 +1254,11 @@ fn calibrate_one_inner(
         // parsed back for staleness comparison, so serialization must not fail —
         // fall back to '{}' (== Default) if it somehow does.
         cal_params: serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string()),
+        // What the ENGINE actually did, not what `params` asked for — a mono
+        // light, a pixinsightTrimmed run or a flat with degenerate channel
+        // constants all satisfy a per-channel request globally, and the row has
+        // to say so or `derive_status` would read it back wrong.
+        cfa_scaling_applied: Some(outcome.cfa_scaling_applied),
         output_hash: outcome.output_hash.clone(),
         engine_version: LIGHT_CAL_ENGINE_VERSION,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -1181,6 +1275,7 @@ fn calibrate_one_inner(
         dest = %output_abs.display(),
         calstat = %row.calstat,
         floored_flat_pixels = outcome.floored_flat_pixels,
+        cfa_scaling_applied = outcome.cfa_scaling_applied,
         // The BITPIX-derived divisor this frame was actually scaled by (== the
         // stamped ATH_CSCL card), so a mis-scaled artifact is diagnosable from
         // the log without re-reading the output header.
@@ -2072,6 +2167,126 @@ mod orchestration_tests {
         assert_eq!(scl, 1.0, "ATH_CSCL must report the divisor the engine used");
     }
 
+    /// End-to-end for per-channel flat scaling: a light that declares RGGB,
+    /// divided by a flat carrying its own strong colour. The orchestrator has to
+    /// (a) read the CFA phase off the `frames` columns, (b) hand it to the
+    /// engine, (c) stamp the per-channel provenance cards, and (d) record what
+    /// was applied on the tracking row — a break anywhere in that chain silently
+    /// reverts to the colour-flattening global divisor.
+    #[test]
+    fn cfa_light_calibrates_per_channel_end_to_end() {
+        use crate::integration::banded::BandSource;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+
+        // 6x6 RGGB mosaics. Light R=1000/G=2000/B=500, flat R=2000/G=4000/B=1000
+        // — the flat is exactly 2x the light in every channel, so per-channel
+        // scaling returns the light verbatim while a global divisor (the
+        // central-third blend, 2750) would flatten all three onto one value.
+        let (w, h) = (6usize, 6usize);
+        let mosaic = |r: f32, g: f32, b: f32| {
+            let mut data = vec![0f32; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    data[y * w + x] = match (x % 2 == 0, y % 2 == 0) {
+                        (true, true) => r,
+                        (false, false) => b,
+                        _ => g,
+                    };
+                }
+            }
+            data
+        };
+        let write_mosaic = |name: &str, data: Vec<f32>, cards: &[Card]| {
+            let p = src.join(name);
+            write_fits_f32(&p, w, h, 1, &data, cards).unwrap();
+            p
+        };
+
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            let session = seed_frame_set(&conn, 1);
+            // No ATH_FN* cards on the flat: this exercises the recompute path an
+            // imported master flat takes.
+            let flat_path = write_mosaic("master_flat.fits", mosaic(2000.0, 4000.0, 1000.0), &[]);
+            let flat = seed_master_set_with_file(&conn, 101, "MasterFlat", &flat_path);
+            let lp = write_mosaic("light_1.fits", mosaic(1000.0, 2000.0, 500.0), &[]);
+            seed_light_with_file(&conn, 1, session, &lp);
+            // The CFA phase lives on `frames`, which is where the orchestrator
+            // must read it from (the Frame list-readers drop the offsets).
+            conn.execute(
+                "UPDATE frames SET bayerpat = 'RGGB', xbayroff = 0, ybayroff = 0 WHERE id = 1",
+                [],
+            )
+            .unwrap();
+            add_link(&conn, 1, flat, "Flat");
+        }
+        let ctx = test_ctx(database);
+
+        let emitter = run_thread_body(&ctx, 1, false);
+        assert_eq!(emitter.first("calibration-finished")["outcome"], "success");
+
+        let db_handle = db(&ctx).unwrap();
+        let row = {
+            let conn = db_handle.conn();
+            get_light_calibration_for_frame(&conn, 1).unwrap().unwrap()
+        };
+        assert_eq!(
+            row.cfa_scaling_applied,
+            Some(true),
+            "the tracking row must record that per-channel scaling was applied"
+        );
+        assert_eq!(row.calstat, "F");
+
+        // Pixels: each colour divided by its own constant → the light verbatim
+        // (the source is 32-bit float, so no scale divisor either).
+        let out = PathBuf::from(&row.output_path);
+        let mut band = BandSource::open(&[out.clone()], tmp.path()).unwrap();
+        let mut bufs = vec![Vec::new()];
+        band.read_band(0, h, &mut bufs).unwrap();
+        let data = &bufs[0];
+        for y in 0..h {
+            for x in 0..w {
+                let want = match (x % 2 == 0, y % 2 == 0) {
+                    (true, true) => 1000.0,
+                    (false, false) => 500.0,
+                    _ => 2000.0,
+                };
+                assert_eq!(data[y * w + x], want, "pixel ({x},{y})");
+            }
+        }
+
+        // Provenance: the applied constants and the CFA flag, plus ATH_CFNM as
+        // their mean for a reader that knows only the global card.
+        let (_f, text) = crate::fits_parser::parse_fits_with_header(&out, 0).unwrap();
+        let keys = parse_stored_header_keys(FileFormat::FITS, &text);
+        assert_eq!(
+            keys.get("ATH_CCFA").map(|s| s.trim().trim_matches('\'').trim().to_string()),
+            Some("T".to_string()),
+            "ATH_CCFA must be stamped T"
+        );
+        for (kw, want) in [("ATH_CFNR", 2000.0), ("ATH_CFNG", 4000.0), ("ATH_CFNB", 1000.0)] {
+            let got: f64 = keys.get(kw).unwrap_or_else(|| panic!("{kw} card")).trim().parse().unwrap();
+            assert!((got - want).abs() < 1e-6, "{kw} = {got}, want {want}");
+        }
+        let fnm: f64 = keys.get("ATH_CFNM").expect("ATH_CFNM card").trim().parse().unwrap();
+        assert!(
+            (fnm - 7000.0 / 3.0).abs() < 1e-6,
+            "ATH_CFNM must be the mean of the channel constants, got {fnm}"
+        );
+    }
+
     #[test]
     fn recalibration_overwrites_in_place() {
         let (_tmp, ctx, _lib, set_id, light_ids) = build_smoke_fixture();
@@ -2924,6 +3139,73 @@ mod tests {
         seed_set(conn, 102, "MasterBias", true);
     }
 
+    /// The collab gate's self-consistency policy judges a contribution by its
+    /// OWN recorded settings, never by a dialog preference — so the CFA arm has
+    /// to stay vacuous through `frame_cal_status`. The trap: a row written
+    /// before per-channel scaling carries `cal_params = '{}'`, which decodes to
+    /// today's default (`cfa_flat_scaling = true`) while its column says
+    /// NULL/global. Reading the request instead of the column would flag every
+    /// pre-feature CFA contribution Stale.
+    #[test]
+    fn frame_cal_status_ignores_the_cfa_toggle_on_a_pre_feature_row() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        // A colour frame with a normalized flat — every condition the CFA
+        // staleness arm needs in order to fire.
+        conn.execute("UPDATE frames SET bayerpat = 'RGGB' WHERE id = 1", []).unwrap();
+        seed_masters(&conn);
+        add_link(&conn, 1, 101, "Flat");
+
+        let mut row = LightCalRow {
+            id: 0,
+            frame_id: Some(1),
+            source_uuid: None,
+            source_filename: None,
+            output_path: "/lib/c_light_1.fits".to_string(),
+            dark_set_id: None,
+            flat_set_id: Some(101),
+            bias_set_id: None,
+            calstat: "F".to_string(),
+            flat_norm_applied: true,
+            flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
+            cal_params: "{}".to_string(), // the pre-feature shape
+            cfa_scaling_applied: None,    // …and its NULL column
+            output_hash: "hash".to_string(),
+            engine_version: LIGHT_CAL_ENGINE_VERSION,
+            created_at: "2026-07-05T00:00:00Z".to_string(),
+        };
+        upsert_light_calibration(&conn, &row).unwrap();
+        assert_eq!(
+            frame_cal_status(&conn, 1).unwrap(),
+            LightCalStatus::Calibrated,
+            "a pre-feature CFA row must stay self-consistent"
+        );
+
+        // Same for a row that DID record per-channel scaling: judged against
+        // itself, it is consistent whatever the local default happens to be.
+        row.cfa_scaling_applied = Some(true);
+        upsert_light_calibration(&conn, &row).unwrap();
+        assert_eq!(frame_cal_status(&conn, 1).unwrap(), LightCalStatus::Calibrated);
+
+        // …while the dialog-driven path (caller's wanted params) DOES see the
+        // difference — that is the policy split this test guards.
+        let links = current_calibration_links(&conn, 1).unwrap();
+        assert_eq!(
+            derive_status(
+                &conn,
+                1,
+                &links,
+                true,
+                FlatNormMode::CentralThird,
+                &LightCalParams { cfa_flat_scaling: false, ..LightCalParams::default() },
+            )
+            .unwrap(),
+            LightCalStatus::Stale,
+            "the caller-driven path still compares the toggle"
+        );
+    }
+
     #[test]
     fn date_part_sanitizes_non_iso_values() {
         assert_eq!(date_part(Some("2026-07-05T20:30:00Z")), "2026-07-05");
@@ -2961,6 +3243,7 @@ mod tests {
                 flat_norm_applied: false,
                 flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
                 cal_params: "{}".to_string(),
+                cfa_scaling_applied: None,
                 output_hash: "deadbeef".to_string(),
                 engine_version: LIGHT_CAL_ENGINE_VERSION,
                 created_at: "2026-07-05T00:00:00Z".to_string(),
@@ -3105,6 +3388,7 @@ mod tests {
                 flat_norm_applied: true,
                 flat_norm_mode: FlatNormMode::CentralThird.as_wire_str().to_string(),
                 cal_params: "{}".to_string(),
+                cfa_scaling_applied: None,
                 output_hash: "deadbeef".to_string(),
                 engine_version: LIGHT_CAL_ENGINE_VERSION,
                 created_at: "2026-07-05T00:00:00Z".to_string(),

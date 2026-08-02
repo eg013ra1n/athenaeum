@@ -9,7 +9,10 @@
 //! ```
 //! where `S` = master dark if linked, else master bias, else no subtraction;
 //! `F` = master flat when linked (division skipped otherwise); `divisor` =
-//! the flat-normalization constant when normalization is on, else `1.0`;
+//! the flat-normalization constant when normalization is on, else `1.0` — one
+//! number for the whole plane, or one per CFA colour when the light is a mosaic
+//! and per-channel scaling applies ([`resolve_flat_norm_divisor`] owns that
+//! choice, [`FlatNormDivisor`] carries it);
 //! `scale_divisor` is the SOURCE's bit-depth maximum
 //! ([`scale_divisor_for_bitpix`], resolved by the caller — `65535.0` for the
 //! common 16-bit case, `1.0` for an already-physical float source) so the
@@ -42,6 +45,7 @@ use crate::fits_parser::parse_fits_with_header;
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_writer::{write_fits_f32, Card};
 use crate::integration::banded::{band_rows_for_budget, BandSource};
+use crate::integration::cfa::{cfa_channel_at, central_third_channel_means, CfaGeometry};
 use crate::integration::engine::{central_third_mean, BAND_BUDGET_BYTES};
 use crate::integration::IntegrationError;
 use crate::models::FileFormat;
@@ -89,7 +93,9 @@ pub fn scale_divisor_for_bitpix(bitpix: Option<i32>) -> f64 {
 /// denominator is the RAW flat value — at typical flat levels nothing but a
 /// zero, negative, or non-finite pixel can reach it. So
 /// [`LightCalOutcome::floored_flat_pixels`] is not comparable across the two
-/// modes.
+/// modes. Per-channel scaling does not change the floor's reach: the
+/// denominator is still `flat / <constant>`, only the constant differs by
+/// colour, and each channel's normalizes around 1.0 the same way.
 pub const FLAT_DENOM_FLOOR: f64 = 2.0e-5;
 
 /// Everything the engine needs to calibrate one LIGHT frame.
@@ -110,6 +116,17 @@ pub struct LightCalInputs {
     /// Which statistic computes the normalization divisor when `flat_norm` is on
     /// (spec §2). Ignored when `flat_norm` is `false` or no flat is applied.
     pub flat_norm_mode: FlatNormMode,
+    /// The LIGHT frame's own mosaic phase, when it declares one the catalog can
+    /// vouch for. `None` = mono (or an unrecognized `BAYERPAT`), which makes
+    /// per-channel flat scaling inapplicable however
+    /// [`LightCalParams::cfa_flat_scaling`] is set.
+    ///
+    /// Pure data: the *policy* (is per-channel scaling wanted, is the mode
+    /// eligible, do the constants hold up) lives in
+    /// [`resolve_flat_norm_divisor`], so the engine and the orchestration layer
+    /// — which resolves the same divisor a second time to stamp the header —
+    /// can never disagree about what was applied.
+    pub cfa_geometry: Option<CfaGeometry>,
     /// Advanced per-run parameters (spec §2). The engine acts on
     /// `trim_fraction` (feeds `pixinsightTrimmed` normalization) and
     /// `pedestal_dn` (added after the scale divide); `bias_fallback` is enforced
@@ -127,6 +144,48 @@ pub struct LightCalInputs {
     pub scratch_dir: PathBuf,
 }
 
+/// How the master flat's normalization divisor is applied across the frame.
+///
+/// One value for the whole plane ([`FlatNormDivisor::Global`], the mono and
+/// pre-CFA behavior), or one per mosaic colour
+/// ([`FlatNormDivisor::PerChannel`]) so a CFA flat's own colour response is
+/// divided out of each channel separately instead of tinting the result.
+///
+/// Resolved once by [`resolve_flat_norm_divisor`] — a frame is never
+/// mixed-mode: if any channel constant fails to hold up, the WHOLE frame falls
+/// back to `Global`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FlatNormDivisor {
+    Global(f64),
+    PerChannel { geom: CfaGeometry, k: [f64; 3] },
+}
+
+impl FlatNormDivisor {
+    /// The single number that describes this divisor for the tracking row and
+    /// the `ATH_CFNM` card: the constant itself in `Global` mode, the mean of
+    /// the three channel constants in `PerChannel` mode. Per-channel runs also
+    /// stamp the three constants individually (`ATH_CFNR`/`ATH_CFNG`/`ATH_CFNB`),
+    /// so the mean is a continuity value, not the whole story.
+    pub fn global_value(self) -> f64 {
+        match self {
+            FlatNormDivisor::Global(k) => k,
+            FlatNormDivisor::PerChannel { k, .. } => (k[0] + k[1] + k[2]) / 3.0,
+        }
+    }
+
+    /// The `[R, G, B]` constants when scaling per channel, else `None`.
+    pub fn channel_values(self) -> Option<[f64; 3]> {
+        match self {
+            FlatNormDivisor::Global(_) => None,
+            FlatNormDivisor::PerChannel { k, .. } => Some(k),
+        }
+    }
+
+    pub fn is_per_channel(self) -> bool {
+        matches!(self, FlatNormDivisor::PerChannel { .. })
+    }
+}
+
 /// What the engine actually applied, for the tracking row + progress summary.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LightCalOutcome {
@@ -134,7 +193,18 @@ pub struct LightCalOutcome {
     pub calstat: String,
     /// Divisor actually used for flat normalization: the `ATH_FNRM` value when
     /// normalization was on, else `1.0` (also `1.0` when no flat was applied).
+    /// In per-channel mode this is the mean of the three channel constants —
+    /// the global-equivalent number, kept so the row column and the `ATH_CFNM`
+    /// card mean the same thing in both modes.
     pub flat_norm_divisor: f64,
+    /// The `[R, G, B]` constants when the flat was normalized per CFA channel,
+    /// else `None`. `Some` implies [`LightCalOutcome::cfa_scaling_applied`].
+    pub flat_channel_divisors: Option<[f64; 3]>,
+    /// Whether per-channel scaling was ACTUALLY applied — not merely requested.
+    /// `false` for a mono light, a `pixinsightTrimmed` run, a flat whose channel
+    /// constants came back degenerate, or the toggle simply being off. This is
+    /// what the tracking row records.
+    pub cfa_scaling_applied: bool,
     /// xxh3 of the written output file.
     pub output_hash: String,
     /// How many pixels hit [`FLAT_DENOM_FLOOR`] because the flat's value there
@@ -150,6 +220,17 @@ pub struct LightCalOutcome {
 pub fn calibrate_light(
     inputs: &LightCalInputs,
     cancel: &AtomicBool,
+) -> Result<LightCalOutcome, IntegrationError> {
+    calibrate_light_inner(inputs, cancel, BAND_BUDGET_BYTES)
+}
+
+/// [`calibrate_light`] with the band-memory budget as a parameter, so tests can
+/// force a multi-band run on a small fixture (the integration engine's
+/// `integrate_flat_inner` takes its band size the same way).
+fn calibrate_light_inner(
+    inputs: &LightCalInputs,
+    cancel: &AtomicBool,
+    band_budget_bytes: usize,
 ) -> Result<LightCalOutcome, IntegrationError> {
     // Subtrahend: dark preferred, else bias (spec §2 fallback order). The
     // calstat prefix records what was actually subtracted.
@@ -168,17 +249,26 @@ pub fn calibrate_light(
         ));
     }
 
-    // Flat-normalization divisor actually applied: ATH_FNRM when on, else 1.0
-    // (also 1.0 when no flat). Resolved before the read so a missing flat or a
-    // bad ATH_FNRM fails fast, before any output work.
-    let flat_norm_divisor = match (&inputs.flat_path, inputs.flat_norm) {
-        (Some(flat), true) => flat_norm_constant(
+    // Flat-normalization divisor actually applied: one global constant, or one
+    // per CFA channel (spec §2 + the CFA hardening cycle). Resolved before the
+    // read so a missing flat or an unusable constant fails fast, before any
+    // output work.
+    let divisor = match (&inputs.flat_path, inputs.flat_norm) {
+        (Some(flat), true) => resolve_flat_norm_divisor(
             flat,
             &inputs.scratch_dir,
             inputs.flat_norm_mode,
-            inputs.params.trim_fraction,
+            &inputs.params,
+            inputs.cfa_geometry,
         )?,
-        _ => 1.0,
+        _ => FlatNormDivisor::Global(1.0),
+    };
+    let flat_norm_divisor = divisor.global_value();
+    // Hoisted out of the pixel loop: the per-channel arm needs the pixel's
+    // (x, y), the global arm never does.
+    let per_channel = match divisor {
+        FlatNormDivisor::Global(_) => None,
+        FlatNormDivisor::PerChannel { geom, k } => Some((geom, k)),
     };
 
     // Output pedestal (spec §2): DN added AFTER the scale divide. Precomputed in
@@ -201,7 +291,7 @@ pub fn calibrate_light(
 
     let mut src = BandSource::open(&paths, &inputs.scratch_dir)?;
     let (w, h, n) = (src.width(), src.height(), src.frame_count());
-    let band_rows = band_rows_for_budget(w, n, BAND_BUDGET_BYTES).min(h);
+    let band_rows = band_rows_for_budget(w, n, band_budget_bytes).min(h);
     let mut band_bufs: Vec<Vec<f32>> = vec![Vec::new(); n];
     let mut out = vec![0f32; w * h];
 
@@ -225,13 +315,26 @@ pub fn calibrate_light(
                 v -= band_bufs[si][idx] as f64;
             }
             if let Some(fi) = flat_idx {
+                // The constant this pixel divides by. In per-channel mode it is
+                // the constant of the pixel's own mosaic colour, which needs the
+                // pixel's position in the FRAME — `idx` is band-local, so the
+                // row is the band's start plus the band-local row. A band-local
+                // row would shift the CFA phase by one on every odd-height band
+                // and swap R with B from the second band onward.
+                let k = match per_channel {
+                    None => flat_norm_divisor,
+                    Some((geom, k)) => {
+                        let (x, gy) = (idx % w, y + idx / w);
+                        k[cfa_channel_at(x, gy, geom).idx()]
+                    }
+                };
                 // A dead (0.0), negative, or non-finite flat pixel would make
                 // this division Inf/NaN or flip the light's sign. Floor the
                 // denominator instead and count the hit — the frame stays
                 // usable and the count is warned about below. A master flat
                 // built here writes an all-undefined pixel as exactly 0.0, so
                 // the zero case is reachable, not hypothetical.
-                let denom = band_bufs[fi][idx] as f64 / flat_norm_divisor;
+                let denom = band_bufs[fi][idx] as f64 / k;
                 if denom.is_finite() && denom >= FLAT_DENOM_FLOOR {
                     v /= denom;
                 } else {
@@ -276,6 +379,7 @@ pub fn calibrate_light(
         dest = %inputs.output_path.display(),
         calstat = %calstat,
         flat_norm_divisor,
+        cfa_scaling_applied = divisor.is_per_channel(),
         width = w,
         height = h,
         floored_flat_pixels,
@@ -285,9 +389,108 @@ pub fn calibrate_light(
     Ok(LightCalOutcome {
         calstat,
         flat_norm_divisor,
+        flat_channel_divisors: divisor.channel_values(),
+        cfa_scaling_applied: divisor.is_per_channel(),
         output_hash,
         floored_flat_pixels,
     })
+}
+
+/// Resolve how `flat_path` normalizes: one constant for the whole frame, or one
+/// per CFA channel. THE single decision point — the engine and the orchestration
+/// layer (which resolves again to stamp the header) both call this, so the
+/// written cards and the applied math cannot drift.
+///
+/// Per-channel scaling applies only when ALL of these hold; any miss falls back
+/// to [`FlatNormDivisor::Global`] for the WHOLE frame (never mixed-mode, where
+/// two channels would be per-channel-scaled and the third not):
+///
+/// 1. [`LightCalParams::cfa_flat_scaling`] is on (default),
+/// 2. the LIGHT declares a mosaic phase (`cfa` is `Some` — mono lights have no
+///    channels to separate),
+/// 3. the mode is [`FlatNormMode::CentralThird`] — `pixinsightTrimmed` is a
+///    whole-frame tool-parity statistic and is left alone (`debug!`),
+/// 4. the three constants hold up as divisors, resolved in this order:
+///    a. the master flat's stamped `ATH_FNR`/`ATH_FNG`/`ATH_FNB` cards (all
+///       three finite and > 0), else
+///    b. recomputed from the flat's own pixels over the same central-third
+///       window the global constant uses (the imported-flat path), else
+///    c. degenerate → `warn!` and fall back to global.
+///
+/// Reading the plane at most once is deliberate: this runs per LIGHT frame, and
+/// a master flat can be hundreds of megabytes. The card path reads no pixels at
+/// all, and the recompute path reads the plane exactly once — the same cost the
+/// global constant already paid for a card-less flat. One case does get slower
+/// than before: an Athenaeum master built BEFORE the per-channel cards existed
+/// carries `ATH_FNRM` but not `ATH_FNR/G/B`, so a CFA run recomputes from its
+/// pixels for every light instead of reading one card. Rebuilding that master
+/// stamps the cards and the reads go away; a master built since always has them.
+pub fn resolve_flat_norm_divisor(
+    flat_path: &Path,
+    scratch_dir: &Path,
+    mode: FlatNormMode,
+    params: &LightCalParams,
+    cfa: Option<CfaGeometry>,
+) -> Result<FlatNormDivisor, IntegrationError> {
+    let global =
+        || flat_norm_constant(flat_path, scratch_dir, mode, params.trim_fraction).map(FlatNormDivisor::Global);
+
+    if !params.cfa_flat_scaling {
+        return global();
+    }
+    let Some(geom) = cfa else {
+        // Mono: nothing to separate. Not worth a log line — it is the majority
+        // of frames and says nothing about this run.
+        return global();
+    };
+    if mode == FlatNormMode::PixinsightTrimmed {
+        tracing::debug!(
+            path = %flat_path.display(),
+            "per-channel flat scaling ignored in pixinsightTrimmed mode (whole-frame statistic)"
+        );
+        return global();
+    }
+
+    let k = match read_ath_channel_norms(flat_path) {
+        Some(k) => {
+            tracing::debug!(path = %flat_path.display(), value = ?k, "per-channel flat normalization from ATH_FNR/G/B cards");
+            k
+        }
+        None => {
+            let (w, h, data) = read_full_flat_plane(flat_path, scratch_dir)?;
+            let k = central_third_channel_means(&data, w, h, geom);
+            tracing::debug!(path = %flat_path.display(), value = ?k, "per-channel flat normalization recomputed (cards absent)");
+            k
+        }
+    };
+    if k.iter().all(|v| v.is_finite() && *v > 0.0) {
+        Ok(FlatNormDivisor::PerChannel { geom, k })
+    } else {
+        // A channel with no usable constant cannot be divided by it, and
+        // scaling only the OTHER channels would tint the frame worse than not
+        // scaling at all. Fall back whole-frame, loudly.
+        tracing::warn!(
+            path = %flat_path.display(),
+            value = ?k,
+            "per-channel flat constants degenerate — falling back to global normalization"
+        );
+        global()
+    }
+}
+
+/// Best-effort read of a master flat's per-channel `ATH_FNR`/`ATH_FNG`/`ATH_FNB`
+/// cards. All three must be present and usable as divisors (finite, > 0) — a
+/// partial or broken triple counts as absent, so the caller recomputes from the
+/// pixels rather than mixing a stamped constant with a recomputed one.
+fn read_ath_channel_norms(flat_path: &Path) -> Option<[f64; 3]> {
+    let (_, header_text) = parse_fits_with_header(flat_path, 0).ok()?;
+    let keys = parse_stored_header_keys(FileFormat::FITS, &header_text);
+    let read = |kw: &str| -> Option<f64> {
+        keys.get(kw)
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|n| n.is_finite() && *n > 0.0)
+    };
+    Some([read("ATH_FNR")?, read("ATH_FNG")?, read("ATH_FNB")?])
 }
 
 /// The flat-normalization divisor for `flat_path` under `mode` (spec §2):
@@ -426,6 +629,7 @@ fn io_err(msg: String) -> IntegrationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fits_writer::keywords::Bayer;
     use crate::fits_writer::{Card, CardValue};
     use std::path::Path;
 
@@ -508,6 +712,9 @@ mod tests {
             flat_path: flat,
             flat_norm,
             flat_norm_mode: FlatNormMode::CentralThird,
+            // Mono by default: the CFA fixtures below opt in explicitly, so
+            // every pre-existing expectation stays on the global path.
+            cfa_geometry: None,
             params: LightCalParams::default(),
             // The fixtures below assert against `expect_px`, which mirrors the
             // engine with this same divisor; the per-BITPIX resolution itself is
@@ -945,6 +1152,303 @@ mod tests {
         // historic 16-bit divisor rather than guessing.
         assert_eq!(scale_divisor_for_bitpix(None), 65535.0);
         assert_eq!(scale_divisor_for_bitpix(Some(0)), OUTPUT_SCALE_DIVISOR);
+    }
+
+    // ── Per-channel (CFA) flat scaling ───────────────────────────────────────
+
+    /// Paint a `w`x`h` RGGB mosaic at zero phase with one constant per colour.
+    /// Painted from the pattern definition directly (even/even = R, odd/odd = B,
+    /// the diagonal = G), NOT via `cfa_channel_at`, so the assertions test the
+    /// engine's mapping instead of restating it.
+    fn rggb_fill(r: f32, g: f32, blue: f32) -> impl Fn(usize, usize) -> f32 {
+        move |x, y| match (x % 2 == 0, y % 2 == 0) {
+            (true, true) => r,
+            (false, false) => blue,
+            _ => g,
+        }
+    }
+
+    fn rggb_geom() -> CfaGeometry {
+        CfaGeometry {
+            pattern: Bayer::Rggb,
+            xoff: 0,
+            yoff: 0,
+        }
+    }
+
+    /// Run the engine over an RGGB light divided by an RGGB flat, with
+    /// per-channel scaling on or off. No dark; the flat carries no `ATH_FN*`
+    /// cards, so both modes exercise the recompute-from-pixels path.
+    fn run_cfa(
+        w: usize,
+        h: usize,
+        light: (f32, f32, f32),
+        flat: (f32, f32, f32),
+        cfa_flat_scaling: bool,
+    ) -> (tempfile::TempDir, LightCalOutcome, Vec<f32>) {
+        let dir = tempfile::tempdir().unwrap();
+        let light_path = write_fill(dir.path(), "light.fits", w, h, rggb_fill(light.0, light.1, light.2), &[]);
+        let flat_path = write_fill(dir.path(), "flat.fits", w, h, rggb_fill(flat.0, flat.1, flat.2), &[]);
+        let out = dir.path().join("out.fits");
+        let mut cfg = inputs(dir.path(), light_path, None, None, Some(flat_path), true, out.clone());
+        cfg.params.cfa_flat_scaling = cfa_flat_scaling;
+        cfg.cfa_geometry = Some(rggb_geom());
+
+        let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
+        let (_, _, data) = read_all(&out, dir.path());
+        (dir, outcome, data)
+    }
+
+    /// THE tool-parity pin. A flat that carries a strong colour of its own (the
+    /// normal case: a CFA flat's R/G/B levels differ by the sensor's own colour
+    /// response) must divide each colour by ITS OWN level, so the light's
+    /// channel ratios survive calibration.
+    ///
+    /// Fixture: light R=1000 / G=2000 / B=500, flat R=2000 / G=4000 / B=1000 —
+    /// the flat is exactly 2x the light in every channel. Per-channel: every
+    /// pixel divides by its own channel constant (denominator exactly 1.0), so
+    /// the output IS the light, ratios 2:4:1 intact. Globally: one constant
+    /// (the central-third blend 2750) divides all three, and because this flat's
+    /// colour matches the light's, every channel lands on the SAME value —
+    /// 1375/65535 — the light's colour flattened out of existence. That
+    /// collapse is the bug this feature fixes, so both arms are pinned exactly.
+    #[test]
+    fn per_channel_scaling_preserves_the_lights_channel_ratios() {
+        let (w, h) = (6usize, 6usize);
+        let (light, flat) = ((1000.0, 2000.0, 500.0), (2000.0, 4000.0, 1000.0));
+
+        // ---- per-channel ON ----
+        let (dir, outcome, data) = run_cfa(w, h, light, flat, true);
+        assert_eq!(outcome.calstat, "F");
+        assert!(outcome.cfa_scaling_applied, "an RGGB light + flat must scale per channel");
+        // The per-channel constants are the painted flat levels, so ATH_CFNM
+        // (their mean) is the flat's own blend.
+        let want_mean = (2000.0 + 4000.0 + 1000.0) / 3.0;
+        assert!(
+            (outcome.flat_norm_divisor - want_mean).abs() < 1e-9,
+            "global-equivalent divisor {} must be the mean of the channel constants",
+            outcome.flat_norm_divisor
+        );
+
+        // Bit-exact per pixel, through the same f64 mirror the global tests use:
+        // each channel's denominator is flat_c / k_c = 1.0.
+        let expect_on = |px: f64, k: f64| expect_px(px, None, Some(k), k);
+        let on_r = expect_on(1000.0, 2000.0);
+        let on_g = expect_on(2000.0, 4000.0);
+        let on_b = expect_on(500.0, 1000.0);
+        for y in 0..h {
+            for x in 0..w {
+                let want = match (x % 2 == 0, y % 2 == 0) {
+                    (true, true) => on_r,
+                    (false, false) => on_b,
+                    _ => on_g,
+                };
+                assert_eq!(data[y * w + x], want, "per-channel pixel ({x},{y})");
+            }
+        }
+        // The whole point: the light's colour ratios survive. 2:4:1 in, 2:4:1 out.
+        assert!((on_g as f64 / on_r as f64 - 2.0).abs() < 1e-6, "G/R must stay 2");
+        assert!((on_r as f64 / on_b as f64 - 2.0).abs() < 1e-6, "R/B must stay 2");
+        drop(dir);
+
+        // ---- per-channel OFF (global, the pre-feature behavior) ----
+        let (dir, outcome, data) = run_cfa(w, h, light, flat, false);
+        assert!(!outcome.cfa_scaling_applied, "the toggle must turn it off");
+        // Central-third window is x,y in 2..4 → one R, two G, one B.
+        let global = (2000.0 + 4000.0 + 4000.0 + 1000.0) / 4.0;
+        assert_eq!(global, 2750.0, "fixture's global constant");
+        assert!((outcome.flat_norm_divisor - global).abs() < 1e-9);
+
+        let off_r = expect_px(1000.0, None, Some(2000.0), global);
+        let off_g = expect_px(2000.0, None, Some(4000.0), global);
+        let off_b = expect_px(500.0, None, Some(1000.0), global);
+        for y in 0..h {
+            for x in 0..w {
+                let want = match (x % 2 == 0, y % 2 == 0) {
+                    (true, true) => off_r,
+                    (false, false) => off_b,
+                    _ => off_g,
+                };
+                assert_eq!(data[y * w + x], want, "global pixel ({x},{y})");
+            }
+        }
+        // …and this is what that costs: the flat's colour has white-balanced the
+        // light's away — all three channels land on one value.
+        assert_eq!(off_r, off_g, "global scaling flattens R and G together");
+        assert_eq!(off_r, off_b, "global scaling flattens R and B together");
+        assert_eq!(off_r, expect_px(1000.0, None, Some(2000.0), 2750.0));
+        drop(dir);
+    }
+
+    /// The stamped `ATH_FNR`/`ATH_FNG`/`ATH_FNB` cards win over recomputation,
+    /// exactly as `ATH_FNRM` does for the global constant. Cards deliberately
+    /// disagree with the pixels so precedence is visible.
+    #[test]
+    fn per_channel_constants_read_from_the_master_cards_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (6usize, 6usize);
+        let light = write_fill(dir.path(), "light.fits", w, h, rggb_fill(1000.0, 2000.0, 500.0), &[]);
+        let cards = [
+            Card::new("ATH_FNRM", CardValue::Real(2750.0)).unwrap(),
+            Card::new("ATH_FNR", CardValue::Real(200.0)).unwrap(),
+            Card::new("ATH_FNG", CardValue::Real(400.0)).unwrap(),
+            Card::new("ATH_FNB", CardValue::Real(100.0)).unwrap(),
+        ];
+        let flat = write_fill(dir.path(), "flat.fits", w, h, rggb_fill(2000.0, 4000.0, 1000.0), &cards);
+        let out = dir.path().join("out.fits");
+        let mut cfg = inputs(dir.path(), light, None, None, Some(flat), true, out.clone());
+        cfg.cfa_geometry = Some(rggb_geom());
+
+        let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
+        assert!(outcome.cfa_scaling_applied);
+        assert_eq!(
+            outcome.flat_channel_divisors,
+            Some([200.0, 400.0, 100.0]),
+            "the stamped cards must win over recomputation"
+        );
+        let (_, _, data) = read_all(&out, dir.path());
+        // R pixel: 1000 / (2000/200) = 100, i.e. 10x the recomputed answer.
+        assert_eq!(data[0], expect_px(1000.0, None, Some(2000.0), 200.0));
+    }
+
+    /// A mono light (no CFA geometry) is untouched by the toggle: same output,
+    /// same row flag, whatever `cfa_flat_scaling` says.
+    #[test]
+    fn mono_light_is_unaffected_by_the_toggle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (6usize, 6usize);
+        let light = write_plane(dir.path(), "light.fits", w, h, 1000.0, &[]);
+        let flat = write_plane(dir.path(), "flat.fits", w, h, 2000.0, &[]);
+
+        let mut outputs = Vec::new();
+        for (i, on) in [true, false].into_iter().enumerate() {
+            let out = dir.path().join(format!("out{i}.fits"));
+            let mut cfg = inputs(
+                dir.path(),
+                light.clone(),
+                None,
+                None,
+                Some(flat.clone()),
+                true,
+                out.clone(),
+            );
+            cfg.params.cfa_flat_scaling = on;
+            cfg.cfa_geometry = None; // mono: no pattern declared
+            let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
+            assert!(!outcome.cfa_scaling_applied, "mono can never scale per channel");
+            assert!(outcome.flat_channel_divisors.is_none());
+            let (_, _, data) = read_all(&out, dir.path());
+            outputs.push(data);
+        }
+        assert_eq!(outputs[0], outputs[1], "mono output must not depend on the toggle");
+        assert_eq!(outputs[0][0], expect_px(1000.0, None, Some(2000.0), 2000.0));
+    }
+
+    /// `pixinsightTrimmed` is a whole-frame parity statistic — per-channel
+    /// scaling is ignored there, so the output matches the toggle-off run
+    /// bit-for-bit and the row records that nothing per-channel was applied.
+    #[test]
+    fn pixinsight_trimmed_mode_ignores_per_channel_scaling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (6usize, 6usize);
+        let light = write_fill(dir.path(), "light.fits", w, h, rggb_fill(1000.0, 2000.0, 500.0), &[]);
+        let flat = write_fill(dir.path(), "flat.fits", w, h, rggb_fill(2000.0, 4000.0, 1000.0), &[]);
+
+        let mut outputs = Vec::new();
+        for (i, on) in [true, false].into_iter().enumerate() {
+            let out = dir.path().join(format!("out{i}.fits"));
+            let mut cfg = inputs(
+                dir.path(),
+                light.clone(),
+                None,
+                None,
+                Some(flat.clone()),
+                true,
+                out.clone(),
+            );
+            cfg.flat_norm_mode = FlatNormMode::PixinsightTrimmed;
+            cfg.params.cfa_flat_scaling = on;
+            cfg.cfa_geometry = Some(rggb_geom());
+            let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
+            assert!(
+                !outcome.cfa_scaling_applied,
+                "pixinsightTrimmed must stay whole-frame (toggle = {on})"
+            );
+            let (_, _, data) = read_all(&out, dir.path());
+            outputs.push(data);
+        }
+        assert_eq!(outputs[0], outputs[1], "the toggle must not change PI-mode output");
+    }
+
+    /// A degenerate channel constant (the flat has no pixels of one colour at
+    /// any usable level) must not divide a whole channel by garbage: the frame
+    /// falls back to the GLOBAL constant as a whole — never mixed-mode, where
+    /// two channels would be per-channel-scaled and the third not.
+    #[test]
+    fn degenerate_channel_falls_back_to_global_for_the_whole_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (6usize, 6usize);
+        let light = write_fill(dir.path(), "light.fits", w, h, rggb_fill(1000.0, 2000.0, 500.0), &[]);
+        // B is 0.0 everywhere → its channel mean is 0.0, unusable as a divisor.
+        let flat = write_fill(dir.path(), "flat.fits", w, h, rggb_fill(2000.0, 4000.0, 0.0), &[]);
+        let out = dir.path().join("out.fits");
+        let mut cfg = inputs(dir.path(), light, None, None, Some(flat), true, out.clone());
+        cfg.cfa_geometry = Some(rggb_geom());
+
+        let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
+        assert!(!outcome.cfa_scaling_applied, "a degenerate channel disables per-channel scaling");
+        assert!(outcome.flat_channel_divisors.is_none());
+        // Global constant over the central third: one R (2000), two G (4000),
+        // one B (0) → 2500.
+        assert!((outcome.flat_norm_divisor - 2500.0).abs() < 1e-9, "{}", outcome.flat_norm_divisor);
+        let (_, _, data) = read_all(&out, dir.path());
+        // The healthy R channel is scaled globally too — not per-channel.
+        assert_eq!(data[0], expect_px(1000.0, None, Some(2000.0), 2500.0));
+    }
+
+    /// The band loop indexes pixels within a band, but the CFA phase is a
+    /// property of the frame's GLOBAL row. A band whose height is odd shifts
+    /// every following band's phase by one row, so a band-local `y` swaps R and
+    /// B from band 2 onward. Forced multi-band here via a tall frame and a tiny
+    /// budget-equivalent, and asserted against the same painted expectation the
+    /// single-band test uses.
+    #[test]
+    fn multi_band_run_keeps_the_global_cfa_row_phase() {
+        // A frame tall enough that the engine's real budget still yields one
+        // band would prove nothing, so drive the band size directly.
+        let dir = tempfile::tempdir().unwrap();
+        // 6 wide, not 4: the central-third window of a 4-wide frame is a single
+        // column, which contains no R pixel at all — the constants would come
+        // back degenerate and the run would (correctly) fall back to global,
+        // proving nothing about band phase.
+        let (w, h) = (6usize, 12usize);
+        let light = write_fill(dir.path(), "light.fits", w, h, rggb_fill(1000.0, 2000.0, 500.0), &[]);
+        let flat = write_fill(dir.path(), "flat.fits", w, h, rggb_fill(2000.0, 4000.0, 1000.0), &[]);
+        let out = dir.path().join("out.fits");
+        let mut cfg = inputs(dir.path(), light, None, None, Some(flat), true, out.clone());
+        cfg.cfa_geometry = Some(rggb_geom());
+
+        // 3 rows per band → 4 bands, and an ODD band height so a band-local row
+        // index lands on the wrong phase from band 2 onward. Driven through the
+        // budget the same way `integrate_flat_inner` is: per_row = (n+2)*w*4 =
+        // 96 bytes here, so 300 bytes buys exactly 3 rows.
+        assert_eq!(band_rows_for_budget(w, 2, 300), 3, "fixture must produce 3-row bands");
+        let outcome = calibrate_light_inner(&cfg, &AtomicBool::new(false), 300).unwrap();
+        assert!(outcome.cfa_scaling_applied);
+        let (_, _, data) = read_all(&out, dir.path());
+        let on_r = expect_px(1000.0, None, Some(2000.0), 2000.0);
+        let on_g = expect_px(2000.0, None, Some(4000.0), 4000.0);
+        let on_b = expect_px(500.0, None, Some(1000.0), 1000.0);
+        for y in 0..h {
+            for x in 0..w {
+                let want = match (x % 2 == 0, y % 2 == 0) {
+                    (true, true) => on_r,
+                    (false, false) => on_b,
+                    _ => on_g,
+                };
+                assert_eq!(data[y * w + x], want, "pixel ({x},{y}) in band {}", y / 3);
+            }
+        }
     }
 
     #[test]

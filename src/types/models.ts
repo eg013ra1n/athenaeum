@@ -626,7 +626,14 @@ flatNormMode: string,
 /**
  * Canonical JSON of the advanced parameters actually applied.
  */
-calParams: string, engineVersion: number, 
+calParams: string, 
+/**
+ * Whether the flat was normalized per CFA channel. `None` = the row
+ * predates per-channel scaling and does not say. Comes from the row's own
+ * column, NOT from `cal_params` — that field records what was requested,
+ * which a mono light satisfies globally.
+ */
+cfaScalingApplied: boolean | null, engineVersion: number, 
 /**
  * RFC3339 timestamp the tracking row was written.
  */
@@ -658,7 +665,19 @@ pedestalDn: number,
 /**
  * What to do for a light with no dark master (default `subtractBias`).
  */
-biasFallback: BiasFallback, };
+biasFallback: BiasFallback, 
+/**
+ * Normalize a master flat per CFA channel instead of by one whole-frame
+ * constant (default ON). Only ever acts on a light that declares a CFA
+ * pattern: a mono light has no channels to separate, so the flag is
+ * inert there and the frame is calibrated exactly as before.
+ *
+ * Ignored in [`FlatNormMode::PixinsightTrimmed`], which is a
+ * tool-parity statistic over the whole frame — splitting it per channel
+ * would no longer be the statistic it promises. That combination logs a
+ * `debug!` and normalizes globally.
+ */
+cfaFlatScaling: boolean, };
 
 export type BiasFallback = "subtractBias" | "skipFrame";
 

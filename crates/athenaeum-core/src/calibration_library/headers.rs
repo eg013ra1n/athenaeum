@@ -4,6 +4,10 @@
 use crate::fits_parser::stored_header::parse_stored_header_keys;
 use crate::fits_writer::keywords::{Bayer, FrameKind, HeaderBuilder};
 use crate::fits_writer::{Card, FitsWriteError};
+// The per-channel measurement streams master pixels through the render-gated
+// integration engine; the card BUILDER below is ungated (it only ever receives
+// the finished `[R, G, B]` triple), so only the measurement is gated.
+#[cfg(feature = "render")]
 use crate::integration::cfa::{central_third_channel_means, CfaGeometry};
 use crate::models::FileFormat;
 use anyhow::{anyhow, Result};
@@ -275,28 +279,13 @@ fn parse_dt(s: Option<&str>) -> Option<DateTime<Utc>> {
     s.and_then(|s| DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&Utc))
 }
 
-/// The one reader of a stored CFA pattern string. `frames.bayerpat` keeps
-/// whatever the source parser yielded, and quoting/case vary by writer, so
-/// normalize before matching. `None` = a value we cannot vouch for; each call
-/// site decides whether that deserves a warning (emission does, measurement
-/// does not — the same inputs go through both).
-pub(crate) fn parse_bayer(s: &str) -> Option<Bayer> {
-    match s.trim().trim_matches('\'').trim().to_ascii_uppercase().as_str() {
-        "RGGB" => Some(Bayer::Rggb),
-        "BGGR" => Some(Bayer::Bggr),
-        "GBRG" => Some(Bayer::Gbrg),
-        "GRBG" => Some(Bayer::Grbg),
-        _ => None,
-    }
-}
-
 /// Per-channel central-third means of a freshly integrated master flat — the
 /// `[R, G, B]` values behind `ATH_FNR`/`ATH_FNG`/`ATH_FNB`. `data` is the
 /// master's own plane, in the same units and over the same window as the
 /// global `ATH_FNRM`.
 ///
 /// `None` means "stamp nothing per channel": the set declares no CFA pattern
-/// (mono, or a spelling [`parse_bayer`] cannot vouch for — `build_master_cards`
+/// (mono, or a spelling [`Bayer::parse`] cannot vouch for — `build_master_cards`
 /// warns about that same value), or the measurement came back degenerate.
 /// These constants are DIVISORS downstream, so a non-finite or non-positive
 /// one is worse than absent: without them a consumer falls back to the global
@@ -307,6 +296,7 @@ pub(crate) fn parse_bayer(s: &str) -> Option<Bayer> {
 /// pixels are averaged together — a wrong guess costs a colour cast the
 /// operator can see — whereas the same guess written into `XBAYROFF` would be
 /// a fabricated claim every future debayer acts on.
+#[cfg(feature = "render")]
 pub(crate) fn measure_flat_channel_norms(
     inputs: &MasterHeaderInputs,
     data: &[f32],
@@ -314,7 +304,7 @@ pub(crate) fn measure_flat_channel_norms(
     height: usize,
 ) -> Option<[f64; 3]> {
     let set_id = inputs.source_set_id;
-    let pattern = parse_bayer(inputs.bayerpat.as_deref()?)?;
+    let pattern = Bayer::parse(inputs.bayerpat.as_deref()?)?;
     let assumed = match (inputs.xbayroff, inputs.ybayroff) {
         (Some(_), Some(_)) => None,
         (None, Some(_)) => Some("xbayroff"),
@@ -385,7 +375,7 @@ pub fn build_master_cards(
     }
     let set_id = inputs.source_set_id;
     if let Some(p) = &inputs.bayerpat {
-        match parse_bayer(p) {
+        match Bayer::parse(p) {
             Some(bp) => {
                 b = b.bayer_pattern(bp);
                 // The offsets are the CFA phase of THAT pattern, so they ride
@@ -879,6 +869,7 @@ mod tests {
     /// column/even row is R, odd/odd is B, the diagonal is G — one constant
     /// per colour. Painted here rather than via `cfa_channel_at` so the
     /// assertions below test the mapping instead of restating it.
+    #[cfg(feature = "render")]
     fn mosaic_rggb_6x6(r: f32, g: f32, blue: f32) -> Vec<f32> {
         let mut data = vec![0f32; 36];
         for y in 0..6usize {
@@ -895,6 +886,7 @@ mod tests {
 
     /// Turn the seeded set into a flat and stamp one Bayer tuple on every
     /// member. Returns the loaded header inputs.
+    #[cfg(feature = "render")]
     fn cfa_flat_inputs(
         conn: &Connection,
         set_id: i64,
@@ -912,6 +904,7 @@ mod tests {
     /// colour, not only the blend of all three. A consumer dividing a mosaic
     /// by the blend leaves the flat's own colour response in the light.
     #[test]
+    #[cfg(feature = "render")]
     fn cfa_master_flat_stamps_per_channel_constants_beside_the_global_one() {
         let conn = Connection::open_in_memory().unwrap();
         let set_id = seed(&conn);
@@ -940,6 +933,7 @@ mod tests {
     /// Mono flats are untouched: no pattern, no per-channel claim, and the
     /// global constant every existing consumer reads is still there.
     #[test]
+    #[cfg(feature = "render")]
     fn mono_master_flat_keeps_the_global_constant_alone() {
         let conn = Connection::open_in_memory().unwrap();
         let set_id = seed(&conn);
@@ -961,6 +955,7 @@ mod tests {
     /// column out of phase, the same pixels are labelled differently and the
     /// constants change accordingly.
     #[test]
+    #[cfg(feature = "render")]
     fn per_channel_constants_follow_the_declared_cfa_phase() {
         let conn = Connection::open_in_memory().unwrap();
         let set_id = seed(&conn);
@@ -979,6 +974,7 @@ mod tests {
     /// picks pixels at phase 0 and says so in the log, while the header still
     /// refuses to invent XBAYROFF/YBAYROFF.
     #[test]
+    #[cfg(feature = "render")]
     fn absent_cfa_phase_is_assumed_for_the_math_but_never_for_the_header() {
         let conn = Connection::open_in_memory().unwrap();
         let set_id = seed(&conn);
@@ -996,6 +992,7 @@ mod tests {
     /// non-finite) one is worse than absent, so the three cards are dropped
     /// together and the consumer falls back to the global constant.
     #[test]
+    #[cfg(feature = "render")]
     fn degenerate_channel_constants_are_omitted_and_the_global_one_survives() {
         let conn = Connection::open_in_memory().unwrap();
         let set_id = seed(&conn);

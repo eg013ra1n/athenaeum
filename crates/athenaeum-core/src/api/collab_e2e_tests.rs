@@ -262,6 +262,7 @@ fn seed_publishable_set(
                 engine_version: LIGHT_CAL_ENGINE_VERSION,
                 created_at: "2026-07-10T00:00:00Z".to_string(),
                 cal_params: "{}".to_string(),
+                cfa_scaling_applied: None,
             },
         )
         .unwrap();

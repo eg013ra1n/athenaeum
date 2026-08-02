@@ -1198,6 +1198,17 @@ fn default_trim_fraction() -> f64 {
     PI_TRIM_FRACTION
 }
 
+/// serde default for [`LightCalParams::cfa_flat_scaling`] — ON, so an omitted
+/// wire field decodes to the recommended behavior for colour sensors. NOTE the
+/// asymmetry with the other defaults: a stored `'{}'` (a row written before this
+/// field existed) also decodes to `true`, which is NOT what that row was
+/// calibrated with. That is why staleness reads the row's own
+/// `cfa_scaling_applied` column and never `cal_params` — see
+/// `db::light_calibrations::derive_status`.
+fn default_true() -> bool {
+    true
+}
+
 /// Advanced per-run light-calibration parameters (spec §2 "Advanced
 /// parameters"). Every field is optional on the wire (`#[serde(default)]`) with
 /// a default equal to the current behavior, so an omitted field — or the
@@ -1221,6 +1232,17 @@ pub struct LightCalParams {
     /// What to do for a light with no dark master (default `subtractBias`).
     #[serde(default)]
     pub bias_fallback: BiasFallback,
+    /// Normalize a master flat per CFA channel instead of by one whole-frame
+    /// constant (default ON). Only ever acts on a light that declares a CFA
+    /// pattern: a mono light has no channels to separate, so the flag is
+    /// inert there and the frame is calibrated exactly as before.
+    ///
+    /// Ignored in [`FlatNormMode::PixinsightTrimmed`], which is a
+    /// tool-parity statistic over the whole frame — splitting it per channel
+    /// would no longer be the statistic it promises. That combination logs a
+    /// `debug!` and normalizes globally.
+    #[serde(default = "default_true")]
+    pub cfa_flat_scaling: bool,
 }
 
 impl Default for LightCalParams {
@@ -1229,6 +1251,7 @@ impl Default for LightCalParams {
             trim_fraction: PI_TRIM_FRACTION,
             pedestal_dn: 0.0,
             bias_fallback: BiasFallback::SubtractBias,
+            cfa_flat_scaling: true,
         }
     }
 }

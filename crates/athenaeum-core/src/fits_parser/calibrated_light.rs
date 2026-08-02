@@ -50,6 +50,12 @@ pub struct CalibratedIdentity {
     pub bias: Option<MasterRef>,
     /// `ATH_CFNM` — flat-normalization divisor actually applied (`1.0` = off).
     pub flat_norm_divisor: Option<f64>,
+    /// `ATH_CCFA` — whether the flat was normalized per CFA channel. `None`
+    /// when the card is absent: either the file predates per-channel scaling or
+    /// it was normalized globally (the card is stamped only when per-channel
+    /// scaling was applied). Both read the same downstream, so absence is
+    /// recorded as "not stated" rather than guessed into a `false`.
+    pub cfa_scaling_applied: Option<bool>,
     /// `ATH_CVER` — engine version the file was built with.
     pub engine_version: Option<i64>,
     /// `ATH_PRJ` — Stage-II project id stamped at publish (slice 4). Present ONLY
@@ -135,6 +141,18 @@ fn parse_master_ref(keys: &HashMap<String, String>, key: &str) -> Option<MasterR
 /// empty string when the source frame had no uuid, in which case adoption
 /// falls back to the filename). Any other file (a normal light, a master, a
 /// raw calibration frame) returns `None` and flows through normal ingestion.
+/// A FITS logical value as the stored-header key map hands it over. The
+/// standard spells it `T`/`F`; quoting and case vary by the path the value took
+/// to get here (a raw card, an XISF `<FITSKeyword value="'T'">`), and anything
+/// else is not a logical value we can vouch for.
+fn parse_logical(s: &str) -> Option<bool> {
+    match s.trim().trim_matches('\'').trim().to_ascii_uppercase().as_str() {
+        "T" | "TRUE" => Some(true),
+        "F" | "FALSE" => Some(false),
+        _ => None,
+    }
+}
+
 pub fn calibrated_light_identity(keys: &HashMap<String, String>) -> Option<CalibratedIdentity> {
     let calstat = non_empty(keys, "CALSTAT")?;
     let source_uuid = non_empty(keys, "ATH_CSRC");
@@ -154,6 +172,7 @@ pub fn calibrated_light_identity(keys: &HashMap<String, String>) -> Option<Calib
         flat: parse_master_ref(keys, "ATH_CFLT"),
         bias: parse_master_ref(keys, "ATH_CBIA"),
         flat_norm_divisor: keys.get("ATH_CFNM").and_then(|s| s.trim().parse::<f64>().ok()),
+        cfa_scaling_applied: keys.get("ATH_CCFA").and_then(|s| parse_logical(s)),
         engine_version: keys.get("ATH_CVER").and_then(|s| s.trim().parse::<i64>().ok()),
         project_id: non_empty(keys, "ATH_PRJ"),
     })
