@@ -1034,6 +1034,16 @@ fn calibrate_one_inner(
         let conn = db.conn();
         upsert_light_calibration(&conn, &row)?;
     }
+    // Report-only: the floored-pixel count is not persisted (no schema change),
+    // so the per-frame record of it lives here alongside the row write. The
+    // engine already warns when the count is non-zero.
+    tracing::debug!(
+        frame_id = resolved.frame_id,
+        dest = %output_abs.display(),
+        calstat = %row.calstat,
+        floored_flat_pixels = outcome.floored_flat_pixels,
+        "light calibration recorded"
+    );
     Ok(false)
 }
 

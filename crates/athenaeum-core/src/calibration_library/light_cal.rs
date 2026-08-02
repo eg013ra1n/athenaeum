@@ -14,6 +14,11 @@
 //! `pedestal_dn` (advanced param, default 0 = off) is a DN offset added AFTER
 //! the scale divide for consumers that clip negatives.
 //!
+//! The flat denominator is floored at [`FLAT_DENOM_FLOOR`] so a dead, negative,
+//! or non-finite flat pixel cannot produce Inf/NaN or flip the light's sign;
+//! the hits are counted into [`LightCalOutcome::floored_flat_pixels`] and
+//! warned about, never turned into a frame failure.
+//!
 //! Memory is bounded: the source frames are streamed one row-band at a time
 //! (same budget policy as the master-integration engine), and only the single
 //! output plane is held in RAM — mirroring what a master build already does
@@ -52,6 +57,11 @@ pub use crate::models::{
 /// constant so the scale decision lives in exactly one place. Only the
 /// render-gated engine uses it, so it stays here rather than in `models`.
 pub const OUTPUT_SCALE_DIVISOR: f64 = 65535.0;
+
+/// Floor for the flat denominator in normalized units. A dead / negative flat
+/// pixel must not produce Inf/NaN or flip the light's sign; established
+/// stacking tools floor this division the same way and count the hits.
+pub const FLAT_DENOM_FLOOR: f64 = 2.0e-5;
 
 /// Everything the engine needs to calibrate one LIGHT frame.
 ///
@@ -92,6 +102,10 @@ pub struct LightCalOutcome {
     pub flat_norm_divisor: f64,
     /// xxh3 of the written output file.
     pub output_hash: String,
+    /// How many pixels hit [`FLAT_DENOM_FLOOR`] because the flat's value there
+    /// was dead, negative, or non-finite. Reported/logged only — a floored
+    /// pixel is a warning, never a frame failure.
+    pub floored_flat_pixels: u64,
 }
 
 /// Calibrate one LIGHT frame and write the result to `inputs.output_path`.
@@ -156,6 +170,10 @@ pub fn calibrate_light(
     let mut band_bufs: Vec<Vec<f32>> = vec![Vec::new(); n];
     let mut out = vec![0f32; w * h];
 
+    // Dead/negative flat pixels that hit FLAT_DENOM_FLOOR. The band loop is
+    // serial, so a plain counter is correct.
+    let mut floored_flat_pixels: u64 = 0;
+
     let mut y = 0;
     while y < h {
         if cancel.load(Ordering::Relaxed) {
@@ -172,7 +190,19 @@ pub fn calibrate_light(
                 v -= band_bufs[si][idx] as f64;
             }
             if let Some(fi) = flat_idx {
-                v /= band_bufs[fi][idx] as f64 / flat_norm_divisor;
+                // A dead (0.0), negative, or non-finite flat pixel would make
+                // this division Inf/NaN or flip the light's sign. Floor the
+                // denominator instead and count the hit — the frame stays
+                // usable and the count is warned about below. A master flat
+                // built here writes an all-undefined pixel as exactly 0.0, so
+                // the zero case is reachable, not hypothetical.
+                let denom = band_bufs[fi][idx] as f64 / flat_norm_divisor;
+                if denom.is_finite() && denom >= FLAT_DENOM_FLOOR {
+                    v /= denom;
+                } else {
+                    v /= FLAT_DENOM_FLOOR;
+                    floored_flat_pixels += 1;
+                }
             }
             v /= OUTPUT_SCALE_DIVISOR;
             if add_pedestal {
@@ -181,6 +211,14 @@ pub fn calibrate_light(
             *out_px = v as f32;
         }
         y += rows;
+    }
+
+    if floored_flat_pixels > 0 {
+        tracing::warn!(
+            src = %inputs.light_path.display(),
+            count = floored_flat_pixels,
+            "flat denominator floored (dead/negative flat pixels)"
+        );
     }
 
     write_fits_f32(&inputs.output_path, w, h, 1, &out, &inputs.cards)
@@ -201,6 +239,7 @@ pub fn calibrate_light(
         flat_norm_divisor,
         width = w,
         height = h,
+        floored_flat_pixels,
         "light calibrated"
     );
 
@@ -208,6 +247,7 @@ pub fn calibrate_light(
         calstat,
         flat_norm_divisor,
         output_hash,
+        floored_flat_pixels,
     })
 }
 
@@ -225,6 +265,11 @@ pub fn calibrate_light(
 /// central-third path never trims); callers in central-third mode may pass
 /// [`PI_TRIM_FRACTION`].
 ///
+/// Whatever the mode, the resolved constant must be finite and strictly
+/// positive to serve as a divisor — anything else is
+/// [`IntegrationError::BadInput`]. An `ATH_FNRM` card that fails that test
+/// counts as absent and falls through to recomputation.
+///
 /// Both paths band-read the flat one row-band at a time, so memory stays
 /// bounded regardless of frame size.
 pub fn flat_norm_constant(
@@ -233,17 +278,19 @@ pub fn flat_norm_constant(
     mode: FlatNormMode,
     trim_fraction: f64,
 ) -> Result<f64, IntegrationError> {
-    match mode {
+    let n = match mode {
         FlatNormMode::CentralThird => {
             if let Some(n) = read_ath_fnrm(flat_path) {
                 tracing::debug!(path = %flat_path.display(), ath_fnrm = n, "flat normalization from ATH_FNRM card");
-                return Ok(n);
+                n
+            } else {
+                // Imported master without a usable card: recompute the
+                // central-third mean.
+                let (w, h, data) = read_full_flat_plane(flat_path, scratch_dir)?;
+                let mean = central_third_mean(&data, w, h);
+                tracing::debug!(path = %flat_path.display(), recomputed = mean, "flat normalization recomputed (ATH_FNRM absent)");
+                mean
             }
-            // Imported master without the card: recompute the central-third mean.
-            let (w, h, data) = read_full_flat_plane(flat_path, scratch_dir)?;
-            let mean = central_third_mean(&data, w, h);
-            tracing::debug!(path = %flat_path.display(), recomputed = mean, "flat normalization recomputed (ATH_FNRM absent)");
-            Ok(mean)
         }
         FlatNormMode::PixinsightTrimmed => {
             // PixInsight parity: the card's meaning (central-third) does not
@@ -252,9 +299,24 @@ pub fn flat_norm_constant(
             let (_w, _h, data) = read_full_flat_plane(flat_path, scratch_dir)?;
             let mean = pixinsight_trimmed_mean(&data, trim_fraction);
             tracing::debug!(path = %flat_path.display(), trimmed_mean = mean, trim_fraction, "flat normalization from full-frame trimmed mean (pixinsightTrimmed)");
-            Ok(mean)
+            mean
         }
+    };
+    validate_norm_constant(n, flat_path)
+}
+
+/// A normalization constant is only meaningful as a divisor when it is finite
+/// and strictly positive. A degenerate flat (all-zero, NaN-filled) would
+/// otherwise silently scale the whole frame to Inf/NaN, so it fails the frame
+/// loudly instead — per-frame, the batch continues.
+fn validate_norm_constant(n: f64, flat_path: &Path) -> Result<f64, IntegrationError> {
+    if !(n.is_finite() && n > 0.0) {
+        return Err(IntegrationError::BadInput(format!(
+            "flat normalization constant {n} is not a positive finite number ({})",
+            flat_path.display()
+        )));
     }
+    Ok(n)
 }
 
 /// Band-read the entire flat plane into one `Vec<f32>` (bounded memory: one
@@ -305,11 +367,15 @@ fn pixinsight_trimmed_mean(data: &[f32], trim_fraction: f64) -> f64 {
 
 /// Best-effort read of a flat's `ATH_FNRM` card. Any failure (unreadable
 /// header, card absent, unparseable value) returns `None` so the caller falls
-/// back to recomputing the constant.
+/// back to recomputing the constant. A card that parses but cannot serve as a
+/// divisor (non-finite, zero, negative) counts as absent for the same reason —
+/// recomputing from the pixels beats trusting a broken stamp.
 fn read_ath_fnrm(flat_path: &Path) -> Option<f64> {
     let (_, header_text) = parse_fits_with_header(flat_path, 0).ok()?;
     let keys = parse_stored_header_keys(FileFormat::FITS, &header_text);
-    keys.get("ATH_FNRM").and_then(|s| s.parse::<f64>().ok())
+    keys.get("ATH_FNRM")
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|n| n.is_finite() && *n > 0.0)
 }
 
 /// Wrap a non-`IntegrationError` failure (FITS write / hashing) as an IO
@@ -693,6 +759,86 @@ mod tests {
 
         let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::PixinsightTrimmed, PI_TRIM_FRACTION).unwrap();
         assert!((got - expected).abs() < 1e-3, "engine path {got} vs direct formula {expected}");
+    }
+
+    /// Run the engine over a 2x2 light of 100.0 divided by an explicit 4-pixel
+    /// flat plane, returning the outcome plus the written pixels. With
+    /// `flat_norm` off the divisor stays 1.0, so `flat_px` ARE the denominators.
+    fn run_engine_with_flat(flat_px: &[f32], flat_norm: bool) -> (LightCalOutcome, Vec<f32>) {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (2usize, 2usize);
+        assert_eq!(flat_px.len(), w * h, "fixture must be a full 2x2 plane");
+        let light = write_plane(dir.path(), "light.fits", w, h, 100.0, &[]);
+        let flat = write_fill(dir.path(), "flat.fits", w, h, |x, y| flat_px[y * w + x], &[]);
+        let out = dir.path().join("out.fits");
+        let cfg = inputs(dir.path(), light, None, None, Some(flat), flat_norm, out.clone());
+
+        let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
+        let (_, _, data) = read_all(&out, dir.path());
+        (outcome, data)
+    }
+
+    #[test]
+    fn zero_and_negative_flat_pixels_are_floored_not_inf() {
+        // Pixel 0 = 0.0 is the master-build seam: a pixel whose every sample was
+        // rejected as non-finite arrives here as 0.0 in a built master flat.
+        // Pixel 1 = -0.5 is the sign-flip case. Both must floor, neither may
+        // produce Inf/NaN or turn a positive light negative.
+        let (outcome, data) = run_engine_with_flat(&[0.0, -0.5, 1.0, 1.0], false);
+        assert_eq!(outcome.calstat, "F");
+        assert!(data.iter().all(|v| v.is_finite()), "no Inf/NaN survives the floor: {data:?}");
+        assert!(data[0] > 0.0 && data[1] > 0.0, "no sign flips: {} {}", data[0], data[1]);
+        assert_eq!(outcome.floored_flat_pixels, 2, "exactly the dead + negative pixels");
+
+        // Both floored pixels divide by the same FLAT_DENOM_FLOOR, so they land
+        // on the identical value; the healthy pixels are untouched.
+        let floored = expect_px(100.0, None, Some(FLAT_DENOM_FLOOR), 1.0);
+        assert_eq!(data[0], floored, "dead flat pixel must divide by the floor");
+        assert_eq!(data[1], floored, "negative flat pixel must divide by the floor");
+        let healthy = expect_px(100.0, None, Some(1.0), 1.0);
+        assert_eq!(data[2], healthy);
+        assert_eq!(data[3], healthy);
+    }
+
+    #[test]
+    fn healthy_flat_never_counts_a_floored_pixel() {
+        // Regression guard on the counter: a flat whose smallest pixel is still
+        // above the floor must report zero hits (the warn must stay silent).
+        let (outcome, data) = run_engine_with_flat(&[1.0, 0.5, 2.0, 1e-4], false);
+        assert_eq!(outcome.floored_flat_pixels, 0);
+        assert!(data.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn bogus_ath_fnrm_card_falls_back_to_recompute() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (9usize, 9usize);
+        let fill = |x: usize, _y: usize| 100.0 + x as f32;
+        // A non-positive ATH_FNRM is unusable as a divisor — treated as absent,
+        // so the constant is recomputed from the pixels instead.
+        let flat = write_fill(dir.path(), "flat_zero_card.fits", w, h, fill, &[fnrm_card(0.0)]);
+        let mut fdata = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                fdata[y * w + x] = fill(x, y);
+            }
+        }
+        let expected = central_third_mean(&fdata, w, h);
+
+        let got = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, PI_TRIM_FRACTION).unwrap();
+        assert!((got - expected).abs() < 1e-9, "bogus card must fall through to recompute: {got} vs {expected}");
+    }
+
+    #[test]
+    fn non_positive_normalization_constant_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (9usize, 9usize);
+        // An all-zero flat: no card, and the recomputed mean is 0.0 — dividing
+        // by it is meaningless, so the run fails loudly instead of silently
+        // producing Inf.
+        let flat = write_plane(dir.path(), "flat_dead.fits", w, h, 0.0, &[]);
+        let r = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, PI_TRIM_FRACTION);
+        assert!(matches!(r, Err(IntegrationError::BadInput(_))), "expected BadInput, got {r:?}");
     }
 
     #[test]
