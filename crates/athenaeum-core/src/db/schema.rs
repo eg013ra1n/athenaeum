@@ -1038,6 +1038,46 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Add xbayroff/ybayroff/roworder to frames table (migration for existing databases)
+    // CFA phase offsets (XBAYROFF/YBAYROFF) and row order (ROWORDER) as
+    // declared by the source header. NULL means "the source didn't say" —
+    // consumers must not read a missing offset as 0.
+    let has_xbayroff: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames') WHERE name='xbayroff'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_xbayroff {
+        conn.execute(
+            "ALTER TABLE frames ADD COLUMN xbayroff INTEGER",
+            [],
+        )?;
+    }
+
+    let has_ybayroff: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames') WHERE name='ybayroff'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_ybayroff {
+        conn.execute(
+            "ALTER TABLE frames ADD COLUMN ybayroff INTEGER",
+            [],
+        )?;
+    }
+
+    let has_roworder: Result<i64, _> = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('frames') WHERE name='roworder'",
+        [],
+        |row| row.get(0),
+    );
+    if let Ok(0) = has_roworder {
+        conn.execute(
+            "ALTER TABLE frames ADD COLUMN roworder TEXT",
+            [],
+        )?;
+    }
+
     // Add rotation to frames table (migration for existing databases)
     // Stores image position angle in degrees (N through E), extracted from CROTA2 or CD matrix
     let has_rotation: Result<i64, _> = conn.query_row(

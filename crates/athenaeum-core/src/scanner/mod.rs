@@ -1249,8 +1249,9 @@ fn write_reparse_rows(
     } else if frame_count == 1 {
         // Mirrors insert_frame's column list. Note that imagetyp is stored
         // as the Debug form of ImageType (matches insert_frame),
-        // is_master/override are written as i64 booleans, and bayerpat is
-        // included (added via migration; see schema.rs).
+        // is_master/override are written as i64 booleans, and the
+        // migration-added columns (bayerpat, xbayroff, ybayroff, roworder —
+        // see schema.rs) are included.
         let imagetyp_str = frame.imagetyp.as_ref().map(|t| format!("{:?}", t));
         let date_obs_str = frame.date_obs.as_ref().map(|d| d.to_rfc3339());
         let is_master_int = if frame.is_master { 1i64 } else { 0i64 };
@@ -1264,8 +1265,9 @@ fn write_reparse_rows(
                 xpixsz = ?17, ypixsz = ?18, naxis1 = ?19, naxis2 = ?20,
                 ra = ?21, dec = ?22, sitelat = ?23, lat_obs = ?24,
                 sitelong = ?25, long_obs = ?26, objctra = ?27, objctdec = ?28,
-                override = ?29, swcreate = ?30, bayerpat = ?31, rotation = ?32
-             WHERE file_id = ?33",
+                override = ?29, swcreate = ?30, bayerpat = ?31, rotation = ?32,
+                xbayroff = ?33, ybayroff = ?34, roworder = ?35
+             WHERE file_id = ?36",
             rusqlite::params![
                 frame.object,
                 date_obs_str,
@@ -1299,6 +1301,9 @@ fn write_reparse_rows(
                 frame.swcreate,
                 frame.bayerpat,
                 frame.rotation,
+                frame.xbayroff,
+                frame.ybayroff,
+                frame.roworder,
                 file_id,
             ],
         )?;
@@ -2515,6 +2520,109 @@ mod inplace_tests {
             )
             .unwrap();
         assert_eq!(frame_count, 1, "orphaned files row must get a fresh frames row");
+    }
+
+    /// Write a one-block FITS header with the shared minimal cards plus the
+    /// caller's extra 80-column cards (OSC/CFA hardening Task 1).
+    fn write_fits_with_extra_cards(path: &Path, extra: &[&str]) {
+        fn card(s: &str) -> [u8; 80] {
+            assert!(s.len() <= 80, "card too long: {:?} ({} bytes)", s, s.len());
+            let mut out = [b' '; 80];
+            out[..s.len()].copy_from_slice(s.as_bytes());
+            out
+        }
+
+        let mut header: Vec<u8> = Vec::with_capacity(2880);
+        for c in [
+            "SIMPLE  =                    T / file conforms to FITS standard",
+            "BITPIX  =                    8 / number of bits per data pixel",
+            "NAXIS   =                    0 / number of data axes",
+            "OBJECT  = 'M33     '           / target name",
+            "TELESCOP= 'T       '",
+            "INSTRUME= 'C       '",
+            "IMAGETYP= 'Light   '",
+        ] {
+            header.extend_from_slice(&card(c));
+        }
+        for c in extra {
+            header.extend_from_slice(&card(c));
+        }
+        header.extend_from_slice(&card("END"));
+        while header.len() < 2880 {
+            header.push(b' ');
+        }
+        std::fs::write(path, header).unwrap();
+    }
+
+    /// An in-place re-parse must carry the CFA phase offsets and row order into
+    /// the existing frames row. A user who re-shot the header (driver upgrade,
+    /// hand-edit) gets the new values; before this the columns would keep
+    /// whatever the first ingest wrote.
+    #[test]
+    fn rescan_updates_bayer_offsets_and_roworder_in_place() {
+        let scan = TempDir::new().unwrap();
+        let f = scan.path().join("OSC/L_001.fits");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        // First ingest: an OSC frame whose header declares no offsets.
+        write_fits_with_extra_cards(&f, &["BAYERPAT= 'RGGB    '"]);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [scan.path().to_str().unwrap()],
+        )
+        .unwrap();
+
+        let scan1 = scan_directory(scan.path(), &conn, None, false, false, 1);
+        assert!(scan1.errors.is_empty(), "first scan must succeed: {:?}", scan1.errors);
+
+        let (frame_id, xbayroff, ybayroff, roworder): (i64, Option<i64>, Option<i64>, Option<String>) =
+            conn.query_row(
+                "SELECT f.id, f.xbayroff, f.ybayroff, f.roworder
+                 FROM frames f JOIN files fi ON fi.id = f.file_id WHERE fi.path = ?1",
+                [f.to_str().unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(xbayroff, None, "absent XBAYROFF must not become 0 on ingest");
+        assert_eq!(ybayroff, None, "absent YBAYROFF must not become 0 on ingest");
+        assert_eq!(roworder, None);
+
+        // Re-write the same file with the offsets present; mtime advances, so
+        // the scanner re-parses and UPDATEs the existing rows in place.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write_fits_with_extra_cards(
+            &f,
+            &[
+                "BAYERPAT= 'RGGB    '",
+                "XBAYROFF=                    1",
+                "YBAYROFF=                    0",
+                "ROWORDER= 'TOP-DOWN'",
+            ],
+        );
+
+        let scan2 = scan_directory(scan.path(), &conn, None, false, false, 1);
+        assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
+        assert_eq!(scan2.files_processed, 1, "the modified file must be re-parsed");
+
+        let (frame_id_after, xbayroff, ybayroff, roworder): (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT f.id, f.xbayroff, f.ybayroff, f.roworder
+                 FROM frames f JOIN files fi ON fi.id = f.file_id WHERE fi.path = ?1",
+                [f.to_str().unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(frame_id, frame_id_after, "in-place re-parse must preserve frames.id");
+        assert_eq!(xbayroff, Some(1));
+        assert_eq!(ybayroff, Some(0));
+        assert_eq!(roworder.as_deref(), Some("TOP-DOWN"));
     }
 
     /// Same invariant as `rescan_after_mtime_change_preserves_session_members`

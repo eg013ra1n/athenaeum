@@ -271,8 +271,15 @@ pub(crate) fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &
     let focallen = header.get_f64("FOCALLEN");
     let swcreate = header.get_str("SWCREATE");
 
-    // Bayer pattern for OSC (one-shot color) cameras
+    // Bayer pattern for OSC (one-shot color) cameras, plus the CFA phase
+    // offsets and row order that go with it. All three stay None when the
+    // header is silent — a fabricated offset misaligns the CFA grid.
+    // `get_i32` is reused for the numeric reads (it also tolerates the "1.0"
+    // spelling some writers emit); the catalog stores them as i64.
     let bayerpat = header.get_str("BAYERPAT");
+    let xbayroff = header.get_i32("XBAYROFF").map(i64::from);
+    let ybayroff = header.get_i32("YBAYROFF").map(i64::from);
+    let roworder = header.get_str("ROWORDER");
 
     // Pixel size (with PIXSIZE1/PIXSIZE2 fallback)
     let xpixsz = header.get_f64("XPIXSZ")
@@ -436,6 +443,9 @@ pub(crate) fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &
         override_: false,
         swcreate,
         bayerpat,
+        xbayroff,
+        ybayroff,
+        roworder,
         rotation,
         uuid: None,
         updated_at: None,
@@ -587,6 +597,19 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         .and_then(|s| s.parse::<f64>().ok());
     let swcreate = fits_keywords.get("SWCREATE").cloned();
     let bayerpat = fits_keywords.get("BAYERPAT").cloned();
+    // CFA phase offsets + row order — kept in lock-step with the FITS card
+    // path above, including its tolerance for the "1.0" spelling (get_i32
+    // falls back to a float read). Absent keywords stay None; 0 is a real
+    // phase, not a default.
+    let parse_offset = |s: &String| -> Option<i64> {
+        let s = s.trim();
+        s.parse::<i64>().ok().or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
+    };
+    let xbayroff = fits_keywords.get("XBAYROFF").and_then(parse_offset);
+    let ybayroff = fits_keywords.get("YBAYROFF").and_then(parse_offset);
+    let roworder = fits_keywords.get("ROWORDER")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let xpixsz = fits_keywords.get("XPIXSZ")
         .and_then(|s| s.parse::<f64>().ok())
         .or_else(|| fits_keywords.get("PIXSIZE1").and_then(|s| s.parse::<f64>().ok()))
@@ -780,6 +803,9 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         override_: false,
         swcreate,
         bayerpat,
+        xbayroff,
+        ybayroff,
+        roworder,
         rotation,
         uuid: None,
         updated_at: None,
@@ -903,5 +929,156 @@ mod tests {
         let path = std::path::Path::new("/tmp/test.fits");
         let frame = build_frame_from_header(&header, 1, path).unwrap();
         assert_eq!(frame.exptime, Some(60.0));
+    }
+
+    /// Build a one-block FITS header out of already-formatted 80-column cards.
+    /// SIMPLE/BITPIX/NAXIS are prepended and END appended, so callers only
+    /// pass the cards under test.
+    fn header_with_cards(cards: &[&str]) -> FitsHeader {
+        const BLOCK_SIZE: usize = 2880;
+        const CARD_SIZE: usize = 80;
+        let mut block = vec![b' '; BLOCK_SIZE];
+
+        let mut write_card = |index: usize, card: &str| {
+            let start = index * CARD_SIZE;
+            for (i, &b) in card.as_bytes().iter().enumerate() {
+                if start + i < block.len() {
+                    block[start + i] = b;
+                }
+            }
+        };
+
+        write_card(0, "SIMPLE  =                    T / Standard FITS");
+        write_card(1, "BITPIX  =                   16 / bits per pixel");
+        write_card(2, "NAXIS   =                    2 / number of axes");
+        for (i, card) in cards.iter().enumerate() {
+            write_card(3 + i, card);
+        }
+        write_card(3 + cards.len(), "END");
+
+        FitsHeader::parse_header(&block).unwrap()
+    }
+
+    /// The CFA phase offsets and the row order must reach the Frame from the
+    /// FITS card path — masters and light calibration need the source frame's
+    /// real phase, not an assumed one.
+    #[test]
+    fn bayer_offsets_and_roworder_are_parsed() {
+        let header = header_with_cards(&[
+            "BAYERPAT= 'RGGB    '           / Bayer color pattern",
+            "XBAYROFF=                    1 / Bayer X offset",
+            "YBAYROFF=                    0 / Bayer Y offset",
+            "ROWORDER= 'TOP-DOWN'           / image row order",
+        ]);
+        let path = std::path::Path::new("/tmp/test.fits");
+        let frame = build_frame_from_header(&header, 1, path).unwrap();
+
+        assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(frame.xbayroff, Some(1));
+        assert_eq!(frame.ybayroff, Some(0));
+        assert_eq!(frame.roworder.as_deref(), Some("TOP-DOWN"));
+    }
+
+    /// A header that declares a Bayer pattern but no offsets leaves them
+    /// `None`. Defaulting them to 0 would be a fabricated CFA phase — the very
+    /// bug this plumbing exists to make impossible.
+    #[test]
+    fn absent_bayer_offsets_stay_none() {
+        let header = header_with_cards(&[
+            "BAYERPAT= 'RGGB    '           / Bayer color pattern",
+        ]);
+        let path = std::path::Path::new("/tmp/test.fits");
+        let frame = build_frame_from_header(&header, 1, path).unwrap();
+
+        assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(frame.xbayroff, None, "absent XBAYROFF must not become 0");
+        assert_eq!(frame.ybayroff, None, "absent YBAYROFF must not become 0");
+        assert_eq!(frame.roworder, None);
+    }
+
+    /// Some writers spell an integer-valued card as a float ("1.0"). Both
+    /// parser paths must still land an offset rather than silently dropping it
+    /// to "unknown".
+    #[test]
+    fn float_spelled_bayer_offsets_are_parsed() {
+        let header = header_with_cards(&[
+            "BAYERPAT= 'RGGB    '",
+            "XBAYROFF=                  1.0",
+            "YBAYROFF=                  0.0",
+        ]);
+        let path = std::path::Path::new("/tmp/test.fits");
+        let frame = build_frame_from_header(&header, 1, path).unwrap();
+        assert_eq!(frame.xbayroff, Some(1));
+        assert_eq!(frame.ybayroff, Some(0));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let xisf = dir.path().join("osc_float.xisf");
+        write_xisf_with_keywords(
+            &xisf,
+            &[("BAYERPAT", "'RGGB'"), ("XBAYROFF", "1.0"), ("YBAYROFF", "0.0")],
+        );
+        let frame = parse_xisf(&xisf, 1).unwrap();
+        assert_eq!(frame.xbayroff, Some(1));
+        assert_eq!(frame.ybayroff, Some(0));
+    }
+
+    /// Write a minimal XISF file (16-byte binary header + XML) carrying the
+    /// given FITSKeyword name/value pairs. Values are passed through verbatim,
+    /// so a caller can spell a string value with the XISF `'...'` quoting.
+    fn write_xisf_with_keywords(path: &std::path::Path, keywords: &[(&str, &str)]) {
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xisf version=\"1.0\">\n<Image geometry=\"100:100:1\">\n",
+        );
+        for (name, value) in keywords {
+            xml.push_str(&format!(
+                "<FITSKeyword name=\"{}\" value=\"{}\" comment=\"\"/>\n",
+                name, value
+            ));
+        }
+        xml.push_str("</Image>\n</xisf>");
+
+        let xml_bytes = xml.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(16 + xml_bytes.len());
+        out.extend_from_slice(b"XISF0100");
+        out.extend_from_slice(&(xml_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]); // reserved
+        out.extend_from_slice(xml_bytes);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// Same contract on the XISF keyword path — the two parsers must stay in
+    /// lock-step.
+    #[test]
+    fn xisf_bayer_offsets_and_roworder_are_parsed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("osc.xisf");
+        write_xisf_with_keywords(
+            &path,
+            &[
+                ("BAYERPAT", "'RGGB'"),
+                ("XBAYROFF", "1"),
+                ("YBAYROFF", "0"),
+                ("ROWORDER", "'TOP-DOWN'"),
+            ],
+        );
+
+        let frame = parse_xisf(&path, 1).unwrap();
+        assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(frame.xbayroff, Some(1));
+        assert_eq!(frame.ybayroff, Some(0));
+        assert_eq!(frame.roworder.as_deref(), Some("TOP-DOWN"));
+    }
+
+    /// XISF absence case — same "never fabricate 0" rule as the FITS path.
+    #[test]
+    fn xisf_absent_bayer_offsets_stay_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("mono.xisf");
+        write_xisf_with_keywords(&path, &[("OBJECT", "'M33'")]);
+
+        let frame = parse_xisf(&path, 1).unwrap();
+        assert_eq!(frame.xbayroff, None, "absent XBAYROFF must not become 0");
+        assert_eq!(frame.ybayroff, None, "absent YBAYROFF must not become 0");
+        assert_eq!(frame.roworder, None);
     }
 }

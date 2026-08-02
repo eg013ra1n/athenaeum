@@ -14,6 +14,25 @@ export type Frame = { id: number | null, file_id: number, object: string | null,
  */
 bayerpat: string | null, 
 /**
+ * CFA phase offset along X (XBAYROFF), as declared by the source header.
+ * `None` means the source did not declare one — never substitute 0: a
+ * fabricated phase silently swaps the color channels of every consumer
+ * that debayers the frame.
+ */
+xbayroff: number | null, 
+/**
+ * CFA phase offset along Y (YBAYROFF). Same "absent stays None" rule as
+ * `xbayroff`.
+ */
+ybayroff: number | null, 
+/**
+ * Row order as declared by the source header (`ROWORDER`, e.g.
+ * "TOP-DOWN" / "BOTTOM-UP"), stored verbatim. `None` means the header is
+ * silent — the astronomical bottom-up default is a *rendering* decision
+ * (see `orientation.rs`), not something to write back into the catalog.
+ */
+roworder: string | null, 
+/**
  * Image position angle in degrees (North through East)
  * Extracted from CROTA2 or computed from CD matrix
  */

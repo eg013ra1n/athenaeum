@@ -90,6 +90,19 @@ pub struct Frame {
     /// Bayer pattern for OSC cameras (e.g., "RGGB", "BGGR")
     /// None indicates a mono camera
     pub bayerpat: Option<String>,
+    /// CFA phase offset along X (XBAYROFF), as declared by the source header.
+    /// `None` means the source did not declare one — never substitute 0: a
+    /// fabricated phase silently swaps the color channels of every consumer
+    /// that debayers the frame.
+    pub xbayroff: Option<i64>,
+    /// CFA phase offset along Y (YBAYROFF). Same "absent stays None" rule as
+    /// `xbayroff`.
+    pub ybayroff: Option<i64>,
+    /// Row order as declared by the source header (`ROWORDER`, e.g.
+    /// "TOP-DOWN" / "BOTTOM-UP"), stored verbatim. `None` means the header is
+    /// silent — the astronomical bottom-up default is a *rendering* decision
+    /// (see `orientation.rs`), not something to write back into the catalog.
+    pub roworder: Option<String>,
     /// Image position angle in degrees (North through East)
     /// Extracted from CROTA2 or computed from CD matrix
     pub rotation: Option<f64>,

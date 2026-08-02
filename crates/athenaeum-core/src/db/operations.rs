@@ -252,9 +252,10 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
     let mut stmt = conn.prepare_cached(
         "INSERT INTO frames (file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp, is_master,
          gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp, focallen, xpixsz, ypixsz,
-         naxis1, naxis2, ra, dec, sitelat, lat_obs, sitelong, long_obs, objctra, objctdec, override, swcreate, bayerpat, rotation)
+         naxis1, naxis2, ra, dec, sitelat, lat_obs, sitelong, long_obs, objctra, objctdec, override, swcreate, bayerpat, rotation,
+         xbayroff, ybayroff, roworder)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19,
-         ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)",
+         ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36)",
     )?;
     stmt.execute(params![
         frame.file_id,
@@ -290,6 +291,9 @@ pub fn insert_frame(conn: &Connection, frame: &Frame) -> Result<i64> {
         frame.swcreate,
         frame.bayerpat,
         frame.rotation,
+        frame.xbayroff,
+        frame.ybayroff,
+        frame.roworder,
     ])?;
     Ok(conn.last_insert_rowid())
 }
@@ -861,6 +865,9 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
                 override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
                 swcreate: row.get(42).ok(),
                 bayerpat: row.get(43).ok(),
+                xbayroff: None,
+                ybayroff: None,
+                roworder: None,
                 rotation: row.get(44).ok(),
                 uuid: row.get(47).ok(),
                 updated_at: row.get(48).ok(),
@@ -978,6 +985,9 @@ pub fn get_files_by_directory(
                 override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
                 swcreate: row.get(42).ok(),
                 bayerpat: row.get(43).ok(),
+                xbayroff: None,
+                ybayroff: None,
+                roworder: None,
                 rotation: row.get(44).ok(),
                 uuid: row.get(47).ok(),
                 updated_at: row.get(48).ok(),
@@ -1094,6 +1104,9 @@ pub fn get_files_by_directory_for_camera(
             override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
             swcreate: row.get(42).ok(),
             bayerpat: row.get(43).ok(),
+            xbayroff: None,
+            ybayroff: None,
+            roworder: None,
             rotation: row.get(44).ok(),
             uuid: row.get(47).ok(),
             updated_at: row.get(48).ok(),
@@ -1187,6 +1200,9 @@ fn map_missing_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Missing
         override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
         swcreate: row.get(42).ok(),
         bayerpat: row.get(43).ok(),
+        xbayroff: None,
+        ybayroff: None,
+        roworder: None,
         rotation: row.get(44).ok(),
         uuid: row.get(47).ok(),
         updated_at: row.get(48).ok(),
@@ -2253,6 +2269,9 @@ pub fn get_light_frames_for_project(
             override_: row.get::<_, i32>(31)? == 1,
             swcreate: None,
             bayerpat: None,
+            xbayroff: None,
+            ybayroff: None,
+            roworder: None,
             rotation: None,
             uuid: row.get(32)?,
             updated_at: row.get(33)?,
@@ -2716,6 +2735,9 @@ pub fn get_frames_with_files_by_ids(
             override_: row.get::<_, i32>(42)? == 1,
             swcreate: None,
             bayerpat: None,
+            xbayroff: None,
+            ybayroff: None,
+            roworder: None,
             rotation: None,
             uuid: row.get(45)?,
             updated_at: row.get(46)?,
@@ -2867,6 +2889,9 @@ pub fn get_imaging_nights_with_sessions(
                     override_: row.get::<_, i32>(42)? == 1,
                     swcreate: None,
                     bayerpat: None,
+                    xbayroff: None,
+                    ybayroff: None,
+                    roworder: None,
                     rotation: None,
                     uuid: row.get(45)?,
                     updated_at: row.get(46)?,
@@ -6238,5 +6263,86 @@ mod normalize_separators_tests {
     #[test]
     fn normalize_separators_folds_forward_slashes() {
         assert_eq!(normalize_separators("C:/Astro/Old"), r"C:\Astro\Old");
+    }
+}
+
+/// OSC/CFA hardening Task 1 — the CFA phase offsets and row order survive a
+/// write/read round-trip through the `frames` table.
+#[cfg(test)]
+mod bayer_column_tests {
+    use crate::db::schema::init_db;
+    use crate::models::Frame;
+    use rusqlite::Connection;
+
+    fn conn_with_file() -> (Connection, i64) {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, format, modified_at)
+             VALUES ('/astro/osc_001.fits', 'osc_001.fits', 100, 'FITS', '2026-08-02T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        (conn, file_id)
+    }
+
+    #[test]
+    fn insert_frame_round_trips_bayer_offsets_and_roworder() {
+        let (conn, file_id) = conn_with_file();
+
+        let frame = Frame {
+            file_id,
+            bayerpat: Some("RGGB".to_string()),
+            xbayroff: Some(1),
+            ybayroff: Some(0),
+            roworder: Some("TOP-DOWN".to_string()),
+            ..Default::default()
+        };
+        let frame_id = super::insert_frame(&conn, &frame).unwrap();
+
+        let (bayerpat, xbayroff, ybayroff, roworder): (
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT bayerpat, xbayroff, ybayroff, roworder FROM frames WHERE id = ?1",
+                [frame_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(xbayroff, Some(1));
+        assert_eq!(ybayroff, Some(0));
+        assert_eq!(roworder.as_deref(), Some("TOP-DOWN"));
+    }
+
+    /// A frame whose header declared no offsets stores SQL NULL, not 0 — the
+    /// "unknown phase" state has to survive into the catalog.
+    #[test]
+    fn insert_frame_keeps_absent_offsets_null() {
+        let (conn, file_id) = conn_with_file();
+
+        let frame = Frame {
+            file_id,
+            bayerpat: Some("RGGB".to_string()),
+            ..Default::default()
+        };
+        let frame_id = super::insert_frame(&conn, &frame).unwrap();
+
+        let (xbayroff, ybayroff, roworder): (Option<i64>, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT xbayroff, ybayroff, roworder FROM frames WHERE id = ?1",
+                [frame_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(xbayroff, None, "absent XBAYROFF must store NULL, not 0");
+        assert_eq!(ybayroff, None, "absent YBAYROFF must store NULL, not 0");
+        assert_eq!(roworder, None);
     }
 }
