@@ -441,15 +441,10 @@ pub fn create_flat_calibration_set(
     focallen_tolerance: Option<f64>,
 ) -> Result<i64> {
     // See `create_dark_calibration_set` — a master already replaced this lineage.
-    if let Some(master_id) =
+    if let Some(m) =
         crate::calibration::superseded_guard::superseding_master_for_frames(conn, &flat_group.frame_ids)?
     {
-        tracing::info!(
-            master_set_id = master_id,
-            frames = flat_group.frame_ids.len(),
-            "group belongs to a superseded lineage — reusing its master instead of minting a duplicate raw set"
-        );
-        return Ok(master_id);
+        return Ok(m.master_set_id);
     }
 
     // Check if set already exists with same parameters
@@ -816,5 +811,15 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM calibration_set", [], |r| r.get(0))
             .unwrap();
         assert_eq!(after, before, "no new calibration_set row may be minted");
+
+        // The guard must never link the raw frames into the master it returns.
+        let master_members: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1",
+                [master_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(master_members, 0, "raw frames must not be linked into the master set");
     }
 }

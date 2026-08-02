@@ -295,6 +295,15 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // The PK is (set_id, frame_id), so a frame_id-leading lookup can't use it.
+    // The superseded guard (calibration::superseded_guard) queries
+    // `WHERE frame_id IN (…)` once per cluster per scan — without this index
+    // that is a full junction scan each time.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_calibration_set_frames_frame ON calibration_set_frames(frame_id)",
+        [],
+    )?;
+
     // Export templates table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS export_templates (

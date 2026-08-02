@@ -830,16 +830,12 @@ pub fn create_dark_calibration_set(
 ) -> Result<i64> {
     // A superseded lineage must never be re-minted: `check_for_existing_dark_set`
     // deliberately skips superseded rows, so without this guard the group would
-    // fall through and create a duplicate raw set alongside its master.
-    if let Some(master_id) =
+    // fall through and create a duplicate raw set alongside its master. The
+    // guard logs (including the partial-coverage warning) on our behalf.
+    if let Some(m) =
         crate::calibration::superseded_guard::superseding_master_for_frames(conn, &dark_group.frame_ids)?
     {
-        tracing::info!(
-            master_set_id = master_id,
-            frames = dark_group.frame_ids.len(),
-            "group belongs to a superseded lineage — reusing its master instead of minting a duplicate raw set"
-        );
-        return Ok(master_id);
+        return Ok(m.master_set_id);
     }
 
     // Check if set already exists with same parameters
@@ -959,15 +955,10 @@ pub fn create_bias_calibration_set(
     allow_modify: bool,
 ) -> Result<i64> {
     // See `create_dark_calibration_set` — a master already replaced this lineage.
-    if let Some(master_id) =
+    if let Some(m) =
         crate::calibration::superseded_guard::superseding_master_for_frames(conn, &bias_group.frame_ids)?
     {
-        tracing::info!(
-            master_set_id = master_id,
-            frames = bias_group.frame_ids.len(),
-            "group belongs to a superseded lineage — reusing its master instead of minting a duplicate raw set"
-        );
-        return Ok(master_id);
+        return Ok(m.master_set_id);
     }
 
     // Check if set already exists with same parameters
@@ -1539,6 +1530,16 @@ mod tests {
         conn.query_row("SELECT COUNT(*) FROM calibration_set", [], |r| r.get(0)).unwrap()
     }
 
+    /// Members linked to a set. The guard must never link the raw frames into
+    /// the master it returns — masters own their own single master frame.
+    fn member_count(conn: &Connection, set_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1",
+            [set_id],
+            |r| r.get(0),
+        ).unwrap()
+    }
+
     #[test]
     fn create_dark_set_reuses_superseding_master_instead_of_minting_duplicate() {
         // C1 regression: re-clustering the frames of a superseded raw dark set
@@ -1567,6 +1568,10 @@ mod tests {
         let returned = create_dark_calibration_set(&conn, &group, true).unwrap();
         assert_eq!(returned, master_id, "must return the superseding master's id");
         assert_eq!(set_count(&conn), before, "no new calibration_set row may be minted");
+        assert_eq!(
+            member_count(&conn, master_id), 0,
+            "raw frames must not be linked into the master set"
+        );
     }
 
     #[test]
@@ -1595,6 +1600,10 @@ mod tests {
         let returned = create_bias_calibration_set(&conn, &group, true).unwrap();
         assert_eq!(returned, master_id, "must return the superseding master's id");
         assert_eq!(set_count(&conn), before, "no new calibration_set row may be minted");
+        assert_eq!(
+            member_count(&conn, master_id), 0,
+            "raw frames must not be linked into the master set"
+        );
     }
 
     #[test]

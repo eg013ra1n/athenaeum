@@ -695,16 +695,10 @@ fn create_dark_calibration_set_with_type(
     // Same guard as the on-demand creation paths: the existence query below
     // excludes superseded rows, so a re-scan of a lineage a master already
     // replaced would fall through and mint a duplicate raw set.
-    if let Some(master_id) =
+    if let Some(m) =
         crate::calibration::superseded_guard::superseding_master_for_frames(conn, &dark_group.frame_ids)?
     {
-        tracing::info!(
-            master_set_id = master_id,
-            frames = dark_group.frame_ids.len(),
-            imagetyp,
-            "group belongs to a superseded lineage — reusing its master instead of minting a duplicate raw set"
-        );
-        return Ok(master_id);
+        return Ok(m.master_set_id);
     }
 
     // Check if set already exists with same parameters using date range overlap
@@ -1041,6 +1035,16 @@ mod tests {
         conn.query_row("SELECT COUNT(*) FROM calibration_set", [], |r| r.get(0)).unwrap()
     }
 
+    /// Members linked to a set. The guard must never link the raw frames into
+    /// the master it returns.
+    fn member_count(conn: &Connection, set_id: i64) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1",
+            [set_id],
+            |r| r.get(0),
+        ).unwrap()
+    }
+
     #[test]
     fn scanner_dark_set_creation_reuses_superseding_master_instead_of_minting_duplicate() {
         // C1 regression, scanner Dark path. This function's own existence query
@@ -1057,6 +1061,10 @@ mod tests {
 
         assert_eq!(returned, master_id, "must return the superseding master's id");
         assert_eq!(set_count(&conn), before, "no new calibration_set row may be minted");
+        assert_eq!(
+            member_count(&conn, master_id), 0,
+            "raw frames must not be linked into the master set"
+        );
     }
 
     #[test]
@@ -1072,5 +1080,9 @@ mod tests {
 
         assert_eq!(returned, master_id, "must return the superseding master's id");
         assert_eq!(set_count(&conn), before, "no new calibration_set row may be minted");
+        assert_eq!(
+            member_count(&conn, master_id), 0,
+            "raw frames must not be linked into the master set"
+        );
     }
 }
