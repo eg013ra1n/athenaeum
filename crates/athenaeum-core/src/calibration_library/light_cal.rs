@@ -43,6 +43,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::duplicates::compute_xxhash;
 use crate::fits_parser::parse_fits_with_header;
 use crate::fits_parser::stored_header::parse_stored_header_keys;
+use crate::fits_writer::keywords::Bayer;
 use crate::fits_writer::{write_fits_f32, Card};
 use crate::integration::banded::{band_rows_for_budget, BandSource};
 use crate::integration::cfa::{cfa_channel_at, central_third_channel_means, CfaGeometry};
@@ -162,14 +163,19 @@ pub enum FlatNormDivisor {
 
 impl FlatNormDivisor {
     /// The single number that describes this divisor for the tracking row and
-    /// the `ATH_CFNM` card: the constant itself in `Global` mode, the mean of
-    /// the three channel constants in `PerChannel` mode. Per-channel runs also
-    /// stamp the three constants individually (`ATH_CFNR`/`ATH_CFNG`/`ATH_CFNB`),
-    /// so the mean is a continuity value, not the whole story.
+    /// the `ATH_CFNM` card: the constant itself in `Global` mode, and in
+    /// `PerChannel` mode the constants blended **by their share of the mosaic** —
+    /// `(R + 2G + B) / 4`, since a Bayer cell is half green. That weighting is
+    /// what makes the number continuous with the global constant it stands in
+    /// for: the global central-third mean averages the window's pixels, which
+    /// are green half the time, so an unweighted `(R+G+B)/3` would sit somewhere
+    /// the global path never produces. Per-channel runs also stamp the three
+    /// constants individually (`ATH_CFNR`/`ATH_CFNG`/`ATH_CFNB`), so this
+    /// remains a continuity value, not the whole story.
     pub fn global_value(self) -> f64 {
         match self {
             FlatNormDivisor::Global(k) => k,
-            FlatNormDivisor::PerChannel { k, .. } => (k[0] + k[1] + k[2]) / 3.0,
+            FlatNormDivisor::PerChannel { k, .. } => (k[0] + 2.0 * k[1] + k[2]) / 4.0,
         }
     }
 
@@ -193,9 +199,10 @@ pub struct LightCalOutcome {
     pub calstat: String,
     /// Divisor actually used for flat normalization: the `ATH_FNRM` value when
     /// normalization was on, else `1.0` (also `1.0` when no flat was applied).
-    /// In per-channel mode this is the mean of the three channel constants —
-    /// the global-equivalent number, kept so the row column and the `ATH_CFNM`
-    /// card mean the same thing in both modes.
+    /// In per-channel mode this is the mosaic-weighted blend of the three
+    /// channel constants ([`FlatNormDivisor::global_value`]) — the
+    /// global-equivalent number, kept so the row column and the `ATH_CFNM` card
+    /// mean the same thing in both modes.
     pub flat_norm_divisor: f64,
     /// The `[R, G, B]` constants when the flat was normalized per CFA channel,
     /// else `None`. `Some` implies [`LightCalOutcome::cfa_scaling_applied`].
@@ -411,10 +418,12 @@ fn calibrate_light_inner(
 /// 3. the mode is [`FlatNormMode::CentralThird`] — `pixinsightTrimmed` is a
 ///    whole-frame tool-parity statistic and is left alone (`debug!`),
 /// 4. the three constants hold up as divisors, resolved in this order:
-///    a. the master flat's stamped `ATH_FNR`/`ATH_FNG`/`ATH_FNB` cards (all
-///       three finite and > 0), else
+///    a. the master flat's stamped `ATH_FNR`/`ATH_FNG`/`ATH_FNB` cards — all
+///       three finite and > 0, AND the flat's own declared mosaic phase (the
+///       phase they were measured under) agreeing with the light's, else
 ///    b. recomputed from the flat's own pixels over the same central-third
-///       window the global constant uses (the imported-flat path), else
+///       window the global constant uses, under the LIGHT's geometry (the
+///       imported-flat path, and the phase-disagreement path), else
 ///    c. degenerate → `warn!` and fall back to global.
 ///
 /// Reading the plane at most once is deliberate: this runs per LIGHT frame, and
@@ -451,7 +460,7 @@ pub fn resolve_flat_norm_divisor(
         return global();
     }
 
-    let k = match read_ath_channel_norms(flat_path) {
+    let k = match read_ath_channel_norms(flat_path, geom) {
         Some(k) => {
             tracing::debug!(path = %flat_path.display(), value = ?k, "per-channel flat normalization from ATH_FNR/G/B cards");
             k
@@ -478,11 +487,41 @@ pub fn resolve_flat_norm_divisor(
     }
 }
 
+/// Whether two mosaic phases are the same. Offsets compare MODULO 2 because
+/// [`cfa_channel_at`] folds them that way — an `XBAYROFF` of 2 and one of 0 are
+/// the same phase, and calling that a disagreement would push a perfectly good
+/// flat onto the recompute path for nothing.
+fn same_cfa_phase(a: CfaGeometry, b: CfaGeometry) -> bool {
+    a.pattern == b.pattern
+        && a.xoff.rem_euclid(2) == b.xoff.rem_euclid(2)
+        && a.yoff.rem_euclid(2) == b.yoff.rem_euclid(2)
+}
+
 /// Best-effort read of a master flat's per-channel `ATH_FNR`/`ATH_FNG`/`ATH_FNB`
 /// cards. All three must be present and usable as divisors (finite, > 0) — a
 /// partial or broken triple counts as absent, so the caller recomputes from the
 /// pixels rather than mixing a stamped constant with a recomputed one.
-fn read_ath_channel_norms(flat_path: &Path) -> Option<[f64; 3]> {
+///
+/// **The stamped constants are only usable if the flat's mosaic phase matches
+/// the light's.** They were measured under the FLAT set's own consensus
+/// geometry, while the pixel loop selects among them by the LIGHT's geometry —
+/// so a disagreement (say the flat's members declared no `XBAYROFF`, making the
+/// build assume 0, while this light declares 1) would feed every R pixel the B
+/// constant and vice versa, silently, with `cfa_scaling_applied = true`
+/// claiming it went fine. `build_master_cards` writes `BAYERPAT` (+ the offsets
+/// it was given) into this same header in the same branch that produces the
+/// constants, so the phase they were measured under is recoverable right here,
+/// from the parse already being done. On a mismatch this returns `None`, which
+/// drops the caller onto the recompute path — self-consistent by construction,
+/// because that path measures the flat's pixels under the LIGHT's geometry.
+///
+/// A missing `XBAYROFF`/`YBAYROFF` reads as 0: that is exactly what
+/// `measure_flat_channel_norms` assumed when it computed the constants, so it
+/// reconstructs the build-time phase rather than guessing a new one. A flat
+/// with the constants but no `BAYERPAT` cannot be verified at all and is
+/// treated as a mismatch — unreachable for an Athenaeum-built master (the
+/// pattern and the constants ride together, both gated on the same parse).
+fn read_ath_channel_norms(flat_path: &Path, light: CfaGeometry) -> Option<[f64; 3]> {
     let (_, header_text) = parse_fits_with_header(flat_path, 0).ok()?;
     let keys = parse_stored_header_keys(FileFormat::FITS, &header_text);
     let read = |kw: &str| -> Option<f64> {
@@ -490,7 +529,33 @@ fn read_ath_channel_norms(flat_path: &Path) -> Option<[f64; 3]> {
             .and_then(|s| s.parse::<f64>().ok())
             .filter(|n| n.is_finite() && *n > 0.0)
     };
-    Some([read("ATH_FNR")?, read("ATH_FNG")?, read("ATH_FNB")?])
+    let k = [read("ATH_FNR")?, read("ATH_FNG")?, read("ATH_FNB")?];
+
+    let offset = |kw: &str| -> i64 {
+        keys.get(kw)
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+    let flat_geom = keys
+        .get("BAYERPAT")
+        .and_then(|p| Bayer::parse(p))
+        .map(|pattern| CfaGeometry {
+            pattern,
+            xoff: offset("XBAYROFF"),
+            yoff: offset("YBAYROFF"),
+        });
+    match flat_geom {
+        Some(g) if same_cfa_phase(g, light) => Some(k),
+        _ => {
+            tracing::warn!(
+                path = %flat_path.display(),
+                flat_pattern = flat_geom.map(|g| g.pattern.as_str()).unwrap_or("none"),
+                light_pattern = light.pattern.as_str(),
+                "flat card geometry disagrees with light — per-channel constants recomputed from the flat plane"
+            );
+            None
+        }
+    }
 }
 
 /// The flat-normalization divisor for `flat_path` under `mode` (spec §2):
@@ -1221,12 +1286,15 @@ mod tests {
         let (dir, outcome, data) = run_cfa(w, h, light, flat, true);
         assert_eq!(outcome.calstat, "F");
         assert!(outcome.cfa_scaling_applied, "an RGGB light + flat must scale per channel");
-        // The per-channel constants are the painted flat levels, so ATH_CFNM
-        // (their mean) is the flat's own blend.
-        let want_mean = (2000.0 + 4000.0 + 1000.0) / 3.0;
+        // The per-channel constants are the painted flat levels, so the
+        // global-equivalent number is their mosaic-weighted blend — and on this
+        // fixture that lands exactly on the central-third global constant
+        // (2750, asserted below), which is the point of weighting by G twice.
+        let want_blend = (2000.0 + 2.0 * 4000.0 + 1000.0) / 4.0;
+        assert_eq!(want_blend, 2750.0);
         assert!(
-            (outcome.flat_norm_divisor - want_mean).abs() < 1e-9,
-            "global-equivalent divisor {} must be the mean of the channel constants",
+            (outcome.flat_norm_divisor - want_blend).abs() < 1e-9,
+            "global-equivalent divisor {} must be the mosaic-weighted blend",
             outcome.flat_norm_divisor
         );
 
@@ -1280,20 +1348,37 @@ mod tests {
         drop(dir);
     }
 
+    /// A master flat as `build_master_cards` writes one: the per-channel
+    /// constants ride WITH the `BAYERPAT` (+ offsets) they were measured under,
+    /// because that phase is what makes them interpretable.
+    fn master_flat_cards(pattern: &str, xoff: Option<i64>, yoff: Option<i64>, k: [f64; 3]) -> Vec<Card> {
+        let mut cards = vec![
+            Card::new("BAYERPAT", CardValue::Str(pattern.into())).unwrap(),
+            Card::new("ATH_FNRM", CardValue::Real(2750.0)).unwrap(),
+            Card::new("ATH_FNR", CardValue::Real(k[0])).unwrap(),
+            Card::new("ATH_FNG", CardValue::Real(k[1])).unwrap(),
+            Card::new("ATH_FNB", CardValue::Real(k[2])).unwrap(),
+        ];
+        // Offsets are stamped only when the members declared them — an absent
+        // card means the build assumed 0, exactly as this reader does.
+        if let Some(x) = xoff {
+            cards.push(Card::new("XBAYROFF", CardValue::Integer(x)).unwrap());
+        }
+        if let Some(y) = yoff {
+            cards.push(Card::new("YBAYROFF", CardValue::Integer(y)).unwrap());
+        }
+        cards
+    }
+
     /// The stamped `ATH_FNR`/`ATH_FNG`/`ATH_FNB` cards win over recomputation,
     /// exactly as `ATH_FNRM` does for the global constant. Cards deliberately
-    /// disagree with the pixels so precedence is visible.
+    /// disagree with the pixels (10x off) so precedence is visible.
     #[test]
     fn per_channel_constants_read_from_the_master_cards_when_present() {
         let dir = tempfile::tempdir().unwrap();
         let (w, h) = (6usize, 6usize);
         let light = write_fill(dir.path(), "light.fits", w, h, rggb_fill(1000.0, 2000.0, 500.0), &[]);
-        let cards = [
-            Card::new("ATH_FNRM", CardValue::Real(2750.0)).unwrap(),
-            Card::new("ATH_FNR", CardValue::Real(200.0)).unwrap(),
-            Card::new("ATH_FNG", CardValue::Real(400.0)).unwrap(),
-            Card::new("ATH_FNB", CardValue::Real(100.0)).unwrap(),
-        ];
+        let cards = master_flat_cards("RGGB", Some(0), Some(0), [200.0, 400.0, 100.0]);
         let flat = write_fill(dir.path(), "flat.fits", w, h, rggb_fill(2000.0, 4000.0, 1000.0), &cards);
         let out = dir.path().join("out.fits");
         let mut cfg = inputs(dir.path(), light, None, None, Some(flat), true, out.clone());
@@ -1309,6 +1394,109 @@ mod tests {
         let (_, _, data) = read_all(&out, dir.path());
         // R pixel: 1000 / (2000/200) = 100, i.e. 10x the recomputed answer.
         assert_eq!(data[0], expect_px(1000.0, None, Some(2000.0), 200.0));
+    }
+
+    /// The stamped constants are only meaningful under the phase they were
+    /// MEASURED in. The flat's cards say RGGB at phase (0,0); this light
+    /// declares xoff=1 — so index 0 of the triple is the flat's R while pixel
+    /// (0,0) of the light is a G. Using the cards anyway would divide every
+    /// channel by another channel's level and report success. The engine must
+    /// fall through to recomputation, which measures the flat's own pixels under
+    /// the LIGHT's geometry and is therefore self-consistent by construction.
+    #[test]
+    fn card_constants_rejected_when_flat_phase_disagrees_with_the_light() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (6usize, 6usize);
+        let light = write_fill(dir.path(), "light.fits", w, h, rggb_fill(1000.0, 2000.0, 500.0), &[]);
+        let cards = master_flat_cards("RGGB", Some(0), Some(0), [200.0, 400.0, 100.0]);
+        let flat = write_fill(dir.path(), "flat.fits", w, h, rggb_fill(2000.0, 4000.0, 1000.0), &cards);
+        let out = dir.path().join("out.fits");
+        let mut cfg = inputs(dir.path(), light, None, None, Some(flat), true, out.clone());
+        cfg.cfa_geometry = Some(CfaGeometry {
+            pattern: Bayer::Rggb,
+            xoff: 1, // one column out of phase with the flat's cards
+            yoff: 0,
+        });
+
+        let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
+        assert!(outcome.cfa_scaling_applied, "still per-channel, just not from the cards");
+        // Recomputed under xoff=1 over the painted 6x6 mosaic: the window's
+        // pixels relabel to G, R, B, G, giving [4000, 1500, 4000] — nothing like
+        // the stamped [200, 400, 100], so the assertion cannot pass by accident.
+        let k = outcome.flat_channel_divisors.expect("per-channel constants");
+        assert_eq!(k, [4000.0, 1500.0, 4000.0], "must be recomputed under the light's phase");
+        assert_ne!(k, [200.0, 400.0, 100.0], "the disagreeing cards must not be used");
+
+        // A pattern mismatch is rejected for the same reason, phase aside.
+        let mut cfg2 = LightCalInputs {
+            output_path: dir.path().join("out2.fits"),
+            ..cfg
+        };
+        cfg2.cfa_geometry = Some(CfaGeometry {
+            pattern: Bayer::Bggr,
+            xoff: 0,
+            yoff: 0,
+        });
+        let outcome2 = calibrate_light(&cfg2, &AtomicBool::new(false)).unwrap();
+        assert_ne!(
+            outcome2.flat_channel_divisors,
+            Some([200.0, 400.0, 100.0]),
+            "a different pattern must not read the flat's cards either"
+        );
+    }
+
+    /// An offset that differs only by a multiple of 2 is the SAME phase —
+    /// `cfa_channel_at` folds offsets modulo 2 — so it must not be treated as a
+    /// disagreement and must keep using the stamped cards.
+    #[test]
+    fn offsets_congruent_modulo_two_still_use_the_cards() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (6usize, 6usize);
+        let light = write_fill(dir.path(), "light.fits", w, h, rggb_fill(1000.0, 2000.0, 500.0), &[]);
+        let cards = master_flat_cards("RGGB", Some(0), Some(0), [200.0, 400.0, 100.0]);
+        let flat = write_fill(dir.path(), "flat.fits", w, h, rggb_fill(2000.0, 4000.0, 1000.0), &cards);
+        let out = dir.path().join("out.fits");
+        let mut cfg = inputs(dir.path(), light, None, None, Some(flat), true, out.clone());
+        cfg.cfa_geometry = Some(CfaGeometry {
+            pattern: Bayer::Rggb,
+            xoff: 2,
+            yoff: -2,
+        });
+
+        let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            outcome.flat_channel_divisors,
+            Some([200.0, 400.0, 100.0]),
+            "phase (2,-2) is phase (0,0) — the cards stay usable"
+        );
+    }
+
+    /// A flat carrying the constants but NO `BAYERPAT` cannot have its phase
+    /// verified, so the constants are unusable and the engine recomputes.
+    /// (`build_master_cards` never emits that shape — both come out of the same
+    /// parse — so this guards a hand-edited or foreign header.)
+    #[test]
+    fn card_constants_without_a_pattern_are_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (6usize, 6usize);
+        let light = write_fill(dir.path(), "light.fits", w, h, rggb_fill(1000.0, 2000.0, 500.0), &[]);
+        let cards = [
+            Card::new("ATH_FNRM", CardValue::Real(2750.0)).unwrap(),
+            Card::new("ATH_FNR", CardValue::Real(200.0)).unwrap(),
+            Card::new("ATH_FNG", CardValue::Real(400.0)).unwrap(),
+            Card::new("ATH_FNB", CardValue::Real(100.0)).unwrap(),
+        ];
+        let flat = write_fill(dir.path(), "flat.fits", w, h, rggb_fill(2000.0, 4000.0, 1000.0), &cards);
+        let out = dir.path().join("out.fits");
+        let mut cfg = inputs(dir.path(), light, None, None, Some(flat), true, out.clone());
+        cfg.cfa_geometry = Some(rggb_geom());
+
+        let outcome = calibrate_light(&cfg, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            outcome.flat_channel_divisors,
+            Some([2000.0, 4000.0, 1000.0]),
+            "unverifiable constants must be recomputed, not trusted"
+        );
     }
 
     /// A mono light (no CFA geometry) is untouched by the toggle: same output,

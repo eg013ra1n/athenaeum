@@ -2282,8 +2282,8 @@ mod orchestration_tests {
         }
         let fnm: f64 = keys.get("ATH_CFNM").expect("ATH_CFNM card").trim().parse().unwrap();
         assert!(
-            (fnm - 7000.0 / 3.0).abs() < 1e-6,
-            "ATH_CFNM must be the mean of the channel constants, got {fnm}"
+            (fnm - 2750.0).abs() < 1e-6,
+            "ATH_CFNM must be the mosaic-weighted blend (R+2G+B)/4, got {fnm}"
         );
     }
 

@@ -56,8 +56,9 @@ pub struct LightCalCardInputs {
     pub bias: Option<(String, String)>,
     pub scale_divisor: f64,
     /// The global-equivalent flat-norm divisor → `ATH_CFNM`. In per-channel
-    /// mode it is the mean of [`LightCalCardInputs::flat_channel_divisors`], so
-    /// a reader that only knows `ATH_CFNM` still gets a meaningful number.
+    /// mode it is [`LightCalCardInputs::flat_channel_divisors`] blended by their
+    /// share of the mosaic (`(R + 2G + B) / 4`), so a reader that only knows
+    /// `ATH_CFNM` still gets a number continuous with the global constant.
     pub flat_norm_divisor: f64,
     /// The `[R, G, B]` constants when the flat was normalized per CFA channel
     /// → `ATH_CFNR`/`ATH_CFNG`/`ATH_CFNB` plus `ATH_CCFA = T`. `None` (mono
@@ -360,13 +361,13 @@ mod tests {
     }
 
     /// Per-channel mode stamps the three applied constants plus the logical
-    /// flag, and keeps `ATH_CFNM` (their mean) so a reader that knows only the
-    /// global card still gets a meaningful number.
+    /// flag, and keeps `ATH_CFNM` (their mosaic-weighted blend) so a reader that
+    /// knows only the global card still gets a meaningful number.
     #[test]
     fn per_channel_cards_stamped_with_the_applied_constants() {
         let mut inputs = base_inputs();
         inputs.flat_channel_divisors = Some([2000.0, 4000.0, 1000.0]);
-        inputs.flat_norm_divisor = (2000.0 + 4000.0 + 1000.0) / 3.0;
+        inputs.flat_norm_divisor = (2000.0 + 2.0 * 4000.0 + 1000.0) / 4.0;
         let cards = build_light_cal_cards(&[], &inputs).unwrap();
         let find = |k: &str| cards.iter().find(|c| c.keyword == k);
 
@@ -385,7 +386,7 @@ mod tests {
             );
         }
         let fnm = find("ATH_CFNM").expect("ATH_CFNM stays for continuity");
-        assert!(matches!(fnm.value, Some(CardValue::Real(v)) if (v - 7000.0 / 3.0).abs() < 1e-9));
+        assert!(matches!(fnm.value, Some(CardValue::Real(v)) if (v - 2750.0).abs() < 1e-9));
 
         // All four must render — a Logical card and three fixed-width reals with
         // short comments, well inside the 80-char card.

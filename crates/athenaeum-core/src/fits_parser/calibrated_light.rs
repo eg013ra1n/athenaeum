@@ -134,13 +134,6 @@ fn parse_master_ref(keys: &HashMap<String, String>, key: &str) -> Option<MasterR
     })
 }
 
-/// Recognize a calibrated-LIGHT artifact from its parsed header keywords.
-///
-/// Present iff `CALSTAT` is set AND at least one identity key is usable —
-/// `ATH_CSRC` non-empty OR `ATH_CSRN` present (design §4: `ATH_CSRC` may be an
-/// empty string when the source frame had no uuid, in which case adoption
-/// falls back to the filename). Any other file (a normal light, a master, a
-/// raw calibration frame) returns `None` and flows through normal ingestion.
 /// A FITS logical value as the stored-header key map hands it over. The
 /// standard spells it `T`/`F`; quoting and case vary by the path the value took
 /// to get here (a raw card, an XISF `<FITSKeyword value="'T'">`), and anything
@@ -153,6 +146,13 @@ fn parse_logical(s: &str) -> Option<bool> {
     }
 }
 
+/// Recognize a calibrated-LIGHT artifact from its parsed header keywords.
+///
+/// Present iff `CALSTAT` is set AND at least one identity key is usable —
+/// `ATH_CSRC` non-empty OR `ATH_CSRN` present (design §4: `ATH_CSRC` may be an
+/// empty string when the source frame had no uuid, in which case adoption
+/// falls back to the filename). Any other file (a normal light, a master, a
+/// raw calibration frame) returns `None` and flows through normal ingestion.
 pub fn calibrated_light_identity(keys: &HashMap<String, String>) -> Option<CalibratedIdentity> {
     let calstat = non_empty(keys, "CALSTAT")?;
     let source_uuid = non_empty(keys, "ATH_CSRC");
