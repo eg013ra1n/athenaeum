@@ -1109,7 +1109,10 @@ pub struct CatalogMeta {
 /// Bump when the calibration math changes — every existing tracking row then
 /// derives as stale (see `crate::db::light_calibrations::derive_status`, which
 /// re-exports this constant). Single definition lives here.
-pub const LIGHT_CAL_ENGINE_VERSION: i64 = 1;
+///
+/// - `2`: flat denominator floored at `FLAT_DENOM_FLOOR`, and the output scale
+///   divisor follows the source's BITPIX instead of a hardcoded 65535.
+pub const LIGHT_CAL_ENGINE_VERSION: i64 = 2;
 
 /// Fraction of pixels discarded from EACH tail by the PixInsight-compatible
 /// trimmed mean (`FlatNormMode::PixinsightTrimmed`). Matches PixInsight

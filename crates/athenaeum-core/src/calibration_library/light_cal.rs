@@ -5,12 +5,15 @@
 //!
 //! Math (spec §2, verbatim):
 //! ```text
-//! L_c = ((L − S) / (F / divisor)) / OUTPUT_SCALE_DIVISOR + pedestal_dn / OUTPUT_SCALE_DIVISOR
+//! L_c = ((L − S) / (F / divisor)) / scale_divisor + pedestal_dn / scale_divisor
 //! ```
 //! where `S` = master dark if linked, else master bias, else no subtraction;
 //! `F` = master flat when linked (division skipped otherwise); `divisor` =
 //! the flat-normalization constant when normalization is on, else `1.0`;
-//! `OUTPUT_SCALE_DIVISOR = 65535.0` normalizes 16-bit sources to ~[0,1]; and
+//! `scale_divisor` is the SOURCE's bit-depth maximum
+//! ([`scale_divisor_for_bitpix`], resolved by the caller — `65535.0` for the
+//! common 16-bit case, `1.0` for an already-physical float source) so the
+//! output lands in ~[0,1] whatever the light was stored as; and
 //! `pedestal_dn` (advanced param, default 0 = off) is a DN offset added AFTER
 //! the scale divide for consumers that clip negatives.
 //!
@@ -53,14 +56,40 @@ pub use crate::models::{
 };
 
 /// Divisor that normalizes a 16-bit source's counts to roughly `[0, 1]`
-/// (spec §2; stamped into the output header as `ATH_CSCL`). Kept as a single
-/// constant so the scale decision lives in exactly one place. Only the
+/// (spec §2; stamped into the output header as `ATH_CSCL`). Also the fallback
+/// for a source whose bit depth cannot be read — see
+/// [`scale_divisor_for_bitpix`], which owns the per-source decision. Only the
 /// render-gated engine uses it, so it stays here rather than in `models`.
 pub const OUTPUT_SCALE_DIVISOR: f64 = 65535.0;
+
+/// Output scale divisor for a source of the given BITPIX (spec §2: "the source
+/// bit-depth maximum"), so an 8-bit or 32-bit-integer light is not silently
+/// mis-scaled by the 16-bit constant. Float sources (`-32`/`-64`) already carry
+/// physical values and are passed through unscaled (`1.0`). An unknown depth —
+/// `None` from [`crate::integration::banded::probe_bitpix`] for the
+/// decode-and-spill formats, or a BITPIX outside the FITS set — keeps the
+/// historic [`OUTPUT_SCALE_DIVISOR`] rather than guessing.
+pub fn scale_divisor_for_bitpix(bitpix: Option<i32>) -> f64 {
+    match bitpix {
+        Some(8) => 255.0,
+        Some(16) => 65535.0,
+        Some(32) => 4294967295.0,
+        Some(-32) | Some(-64) => 1.0,
+        _ => OUTPUT_SCALE_DIVISOR,
+    }
+}
 
 /// Floor for the flat denominator in normalized units. A dead / negative flat
 /// pixel must not produce Inf/NaN or flip the light's sign; established
 /// stacking tools floor this division the same way and count the hits.
+///
+/// The floor's reach is mode-dependent: with flat normalization ON the
+/// denominator is `flat / ATH_FNRM` (values around 1.0, so the floor only
+/// catches genuinely dead/negative pixels), while with normalization OFF the
+/// denominator is the RAW flat value — at typical flat levels nothing but a
+/// zero, negative, or non-finite pixel can reach it. So
+/// [`LightCalOutcome::floored_flat_pixels`] is not comparable across the two
+/// modes.
 pub const FLAT_DENOM_FLOOR: f64 = 2.0e-5;
 
 /// Everything the engine needs to calibrate one LIGHT frame.
@@ -87,6 +116,12 @@ pub struct LightCalInputs {
     /// by the orchestration layer BEFORE the engine runs, so the engine is
     /// agnostic to it.
     pub params: LightCalParams,
+    /// Divisor applied AFTER the calibration arithmetic to bring the output to
+    /// ~[0,1] — the light source's own bit-depth maximum, resolved by the
+    /// caller via [`scale_divisor_for_bitpix`] (the engine never re-reads the
+    /// source header for it) and stamped as `ATH_CSCL` by the header builder,
+    /// so the written card and the applied value are the same number.
+    pub scale_divisor: f64,
     pub output_path: PathBuf,
     pub cards: Vec<Card>,
     pub scratch_dir: PathBuf,
@@ -149,7 +184,7 @@ pub fn calibrate_light(
     // Output pedestal (spec §2): DN added AFTER the scale divide. Precomputed in
     // output units once; the add is skipped entirely when the pedestal is 0.
     let add_pedestal = inputs.params.pedestal_dn != 0.0;
-    let pedestal_offset = inputs.params.pedestal_dn / OUTPUT_SCALE_DIVISOR;
+    let pedestal_offset = inputs.params.pedestal_dn / inputs.scale_divisor;
 
     // One BandSource over light + subtrahend? + flat?, remembering each frame's
     // index. BandSource::open validates geometry itself and rejects mixed
@@ -204,7 +239,7 @@ pub fn calibrate_light(
                     floored_flat_pixels += 1;
                 }
             }
-            v /= OUTPUT_SCALE_DIVISOR;
+            v /= inputs.scale_divisor;
             if add_pedestal {
                 v += pedestal_offset;
             }
@@ -217,6 +252,10 @@ pub fn calibrate_light(
         tracing::warn!(
             src = %inputs.light_path.display(),
             count = floored_flat_pixels,
+            // Frame pixel count, so `count` reads as a fraction rather than a
+            // bare number (a few hundred hits mean something different on a
+            // 1 MP frame than on a 60 MP one).
+            total = (w * h) as u64,
             "flat denominator floored (dead/negative flat pixels)"
         );
     }
@@ -470,6 +509,10 @@ mod tests {
             flat_norm,
             flat_norm_mode: FlatNormMode::CentralThird,
             params: LightCalParams::default(),
+            // The fixtures below assert against `expect_px`, which mirrors the
+            // engine with this same divisor; the per-BITPIX resolution itself is
+            // covered by `scale_divisor_follows_source_bit_depth`.
+            scale_divisor: OUTPUT_SCALE_DIVISOR,
             output_path: out,
             cards: vec![],
             scratch_dir: dir.to_path_buf(),
@@ -763,7 +806,9 @@ mod tests {
 
     /// Run the engine over a 2x2 light of 100.0 divided by an explicit 4-pixel
     /// flat plane, returning the outcome plus the written pixels. With
-    /// `flat_norm` off the divisor stays 1.0, so `flat_px` ARE the denominators.
+    /// `flat_norm` off the divisor stays 1.0, so `flat_px` ARE the denominators;
+    /// with it on the flat carries no `ATH_FNRM` card, so the divisor is the
+    /// recomputed central-third mean — which on a 2x2 plane is `flat_px[0]`.
     fn run_engine_with_flat(flat_px: &[f32], flat_norm: bool) -> (LightCalOutcome, Vec<f32>) {
         let dir = tempfile::tempdir().unwrap();
         let (w, h) = (2usize, 2usize);
@@ -798,6 +843,54 @@ mod tests {
         let healthy = expect_px(100.0, None, Some(1.0), 1.0);
         assert_eq!(data[2], healthy);
         assert_eq!(data[3], healthy);
+    }
+
+    #[test]
+    fn floor_applies_with_flat_normalization_on() {
+        // The default-ON mode: the floor is compared against the NORMALIZED
+        // denominator (flat / ATH_FNRM), not the raw flat value. Divisor =
+        // central-third mean = flat_px[0] = 1000.0, so the healthy pixels
+        // normalize to 1.0 while the dead (0.0) and negative (-5.0) ones stay
+        // below the floor and must be floored exactly as in the off mode.
+        let (outcome, data) = run_engine_with_flat(&[1000.0, 0.0, -5.0, 1000.0], true);
+        assert_eq!(outcome.calstat, "F");
+        assert!(
+            (outcome.flat_norm_divisor - 1000.0).abs() < 1e-9,
+            "divisor {} must be the recomputed central-third mean",
+            outcome.flat_norm_divisor
+        );
+        assert_eq!(outcome.floored_flat_pixels, 2, "exactly the dead + negative pixels");
+        assert!(data.iter().all(|v| v.is_finite()), "no Inf/NaN survives the floor: {data:?}");
+        assert!(data.iter().all(|&v| v > 0.0), "no sign flips: {data:?}");
+
+        let floored = expect_px(100.0, None, Some(FLAT_DENOM_FLOOR), 1.0);
+        assert_eq!(data[1], floored, "dead flat pixel must divide by the floor");
+        assert_eq!(data[2], floored, "negative flat pixel must divide by the floor");
+        // The healthy pixels normalize to exactly 1.0 — untouched by the floor.
+        let healthy = expect_px(100.0, None, Some(1000.0), 1000.0);
+        assert_eq!(data[0], healthy);
+        assert_eq!(data[3], healthy);
+    }
+
+    #[test]
+    fn denominator_exactly_at_the_floor_is_not_floored() {
+        // Boundary pin on the `denom >= FLAT_DENOM_FLOOR` test. An f32 flat
+        // pixel can never *be* 2.0e-5 exactly, but a normalized one can:
+        // 2.0 / 100000.0 rounds to the same f64 as the FLAT_DENOM_FLOOR
+        // literal, so pixel 1 sits exactly ON the boundary. It must take the
+        // unfloored arm (count 0) while landing on the arithmetically
+        // identical value the floored arm would have produced.
+        let (outcome, data) = run_engine_with_flat(&[100000.0, 2.0, 100000.0, 100000.0], true);
+        assert_eq!(2.0f64 / 100000.0, FLAT_DENOM_FLOOR, "fixture must sit exactly on the floor");
+        assert_eq!(
+            outcome.floored_flat_pixels, 0,
+            "a denominator equal to the floor is not a floored pixel"
+        );
+        assert_eq!(
+            data[1],
+            expect_px(100.0, None, Some(FLAT_DENOM_FLOOR), 1.0),
+            "on-boundary pixel must equal the floored-arm value"
+        );
     }
 
     #[test]
@@ -839,6 +932,19 @@ mod tests {
         let flat = write_plane(dir.path(), "flat_dead.fits", w, h, 0.0, &[]);
         let r = flat_norm_constant(&flat, dir.path(), FlatNormMode::CentralThird, PI_TRIM_FRACTION);
         assert!(matches!(r, Err(IntegrationError::BadInput(_))), "expected BadInput, got {r:?}");
+    }
+
+    #[test]
+    fn scale_divisor_follows_source_bit_depth() {
+        assert_eq!(scale_divisor_for_bitpix(Some(8)), 255.0);
+        assert_eq!(scale_divisor_for_bitpix(Some(16)), 65535.0);
+        assert_eq!(scale_divisor_for_bitpix(Some(32)), 4294967295.0);
+        assert_eq!(scale_divisor_for_bitpix(Some(-32)), 1.0);
+        assert_eq!(scale_divisor_for_bitpix(Some(-64)), 1.0);
+        // Unknown depth (spill-path formats, unreadable header) keeps the
+        // historic 16-bit divisor rather than guessing.
+        assert_eq!(scale_divisor_for_bitpix(None), 65535.0);
+        assert_eq!(scale_divisor_for_bitpix(Some(0)), OUTPUT_SCALE_DIVISOR);
     }
 
     #[test]

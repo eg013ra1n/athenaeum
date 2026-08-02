@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::masters::{library_dir_or_err, start_master_builds_batch, MasterRecipe};
 use crate::api::{db, ApiError};
 use crate::calibration_library::light_cal::{
-    calibrate_light, flat_norm_constant, LightCalInputs, OUTPUT_SCALE_DIVISOR,
+    calibrate_light, flat_norm_constant, scale_divisor_for_bitpix, LightCalInputs,
 };
 // Re-export the flat-normalization statistic + advanced-parameter types so the
 // thin Tauri/Axum wrappers can name them via `api::lights::…` (their canonical
@@ -924,6 +924,13 @@ fn calibrate_one_inner(
         _ => 1.0,
     };
 
+    // Output scale divisor from the LIGHT's own bit depth (spec §2), resolved
+    // once so the stamped ATH_CSCL card and the value the engine divides by are
+    // the same number. An unreadable / decode-and-spill source yields None and
+    // keeps the historic 16-bit divisor.
+    let scale_divisor =
+        scale_divisor_for_bitpix(crate::integration::banded::probe_bitpix(&resolved.light_path));
+
     let card_inputs = LightCalCardInputs {
         source_uuid: resolved.source_uuid.clone().unwrap_or_default(),
         source_filename: resolved.source_filename.clone(),
@@ -943,7 +950,7 @@ fn calibrate_one_inner(
         } else {
             None
         },
-        scale_divisor: OUTPUT_SCALE_DIVISOR,
+        scale_divisor,
         flat_norm_divisor,
         // ATH_CPED is stamped always (spec §2); the DN value that produced this
         // file, even when 0.
@@ -994,6 +1001,7 @@ fn calibrate_one_inner(
         flat_norm,
         flat_norm_mode,
         params,
+        scale_divisor,
         output_path: output_abs.clone(),
         cards,
         scratch_dir: scratch.to_path_buf(),
@@ -1884,6 +1892,51 @@ mod orchestration_tests {
         );
     }
 
+    /// End-to-end: the output scale divisor follows the LIGHT's own bit depth,
+    /// not a hardcoded 16-bit constant. The fixture's lights are 32-bit float
+    /// (BITPIX −32) — already physical values — so nothing is scaled: every
+    /// output pixel is exactly `(L − D) / (F / ATH_FNRM)`, and the stamped
+    /// `ATH_CSCL` card reports the same `1.0` the engine divided by (a
+    /// mis-scaled file that still claimed 65535 would be invisible downstream).
+    #[test]
+    fn float_source_is_written_unscaled_and_stamps_its_divisor() {
+        use crate::integration::banded::BandSource;
+
+        let (_tmp, ctx, _lib, set_id, light_ids) = build_smoke_fixture();
+        let emitter = run_thread_body(&ctx, set_id, false);
+        assert_eq!(emitter.first("calibration-finished")["outcome"], "success");
+
+        let db_handle = db(&ctx).unwrap();
+        let out = {
+            let conn = db_handle.conn();
+            PathBuf::from(
+                get_light_calibration_for_frame(&conn, light_ids[0]).unwrap().unwrap().output_path,
+            )
+        };
+
+        // Pixels: (1100 − 100) / (2.0 / 2.0) = 1000.0, undivided by any scale.
+        let scratch = std::env::temp_dir();
+        let mut src = BandSource::open(&[out.clone()], &scratch).unwrap();
+        let h = src.height();
+        let mut bufs = vec![Vec::new()];
+        src.read_band(0, h, &mut bufs).unwrap();
+        assert!(
+            bufs[0].iter().all(|&v| v == 1000.0),
+            "a float source must not be scaled by 65535: got {}",
+            bufs[0][0]
+        );
+
+        // …and the header agrees with what was actually applied.
+        let (_f, text) = crate::fits_parser::parse_fits_with_header(&out, 0).unwrap();
+        let keys = parse_stored_header_keys(FileFormat::FITS, &text);
+        let scl: f64 = keys
+            .get("ATH_CSCL")
+            .expect("ATH_CSCL card")
+            .parse()
+            .expect("ATH_CSCL parses as a real");
+        assert_eq!(scl, 1.0, "ATH_CSCL must report the divisor the engine used");
+    }
+
     #[test]
     fn recalibration_overwrites_in_place() {
         let (_tmp, ctx, _lib, set_id, light_ids) = build_smoke_fixture();
@@ -2557,12 +2610,17 @@ mod orchestration_tests {
             );
             assert!(mean > 0.0 && mean < 1.0, "background mean {mean} out of (0,1)");
 
-            // Spot-check the §2 formula on a spread of pixels.
+            // Spot-check the §2 formula on a spread of pixels. The scale
+            // divisor follows the real light's own bit depth, so it is probed
+            // here exactly as the engine's caller probes it.
+            let scale_divisor = scale_divisor_for_bitpix(
+                crate::integration::banded::probe_bitpix(Path::new(&light_path)),
+            );
             let n = opix.len();
             for i in [0usize, n / 4, n / 2, (3 * n) / 4, n - 1] {
                 let expect = (((lpix[i] as f64) - (dpix[i] as f64))
                     / ((fpix[i] as f64) / fnrm))
-                    / OUTPUT_SCALE_DIVISOR;
+                    / scale_divisor;
                 let got = opix[i] as f64;
                 let tol = 1e-4 * expect.abs().max(1e-6);
                 assert!(

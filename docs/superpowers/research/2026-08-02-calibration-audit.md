@@ -255,6 +255,14 @@ future enhancement, not part of this fix cycle.
    `warn!` — a group only partly covered by a superseded lineage still reuses
    the master, and these fields make the orphaned remainder visible instead of
    silent.
+6. **I1 log fields:** `floored_flat_pixels` (pixel count, on the per-frame
+   `light calibrated` / `light calibration recorded` debug events) and `total`
+   (the frame's pixel count, paired with `count` on the flat-denominator floor
+   `warn!` so the count reads as a fraction) are added to the canonical field
+   dictionary. The count is not comparable across flat-normalization modes —
+   normalization ON compares the floor against `flat/ATH_FNRM`, OFF against the
+   raw flat value — so `total` is always the emitting frame's own denominator,
+   never a cross-frame or cross-mode rate.
 
 ## Deferred follow-ups (not in the fix plan)
 

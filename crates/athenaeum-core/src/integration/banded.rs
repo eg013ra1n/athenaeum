@@ -70,6 +70,14 @@ fn probe_fits(path: &Path) -> Option<FitsInfo> {
     }
 }
 
+/// BITPIX of a FITS file's primary HDU, for callers that need the source bit
+/// depth without opening a full `BandSource` (`None`: unreadable / non-simple —
+/// exactly the files the decode-and-spill fallback covers, whose original bit
+/// depth this probe cannot speak for).
+pub fn probe_bitpix(path: &Path) -> Option<i32> {
+    probe_fits(path).map(|i| i.bitpix)
+}
+
 fn spill_via_read_raw(path: &Path, scratch_dir: &Path, idx: usize)
     -> Result<(File, usize, usize), IntegrationError>
 {
@@ -330,6 +338,21 @@ mod tests {
         let t2 = std::thread::spawn(move || run(2.0, sd2));
         t1.join().unwrap();
         t2.join().unwrap();
+    }
+
+    #[test]
+    fn probe_bitpix_reports_source_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let f32_file = f32_fixture(dir.path(), "float.fits", 8, 8, |_, _| 1.0);
+        assert_eq!(probe_bitpix(&f32_file), Some(-32));
+        let u16_file = u16_fixture(dir.path(), "u16.fits", 8, 8, 1000);
+        assert_eq!(probe_bitpix(&u16_file), Some(16));
+        // Unreadable / non-FITS: None, so callers keep their own default rather
+        // than acting on a guessed depth.
+        assert_eq!(probe_bitpix(&dir.path().join("missing.fits")), None);
+        let not_fits = dir.path().join("notfits.bin");
+        std::fs::write(&not_fits, vec![0u8; 4096]).unwrap();
+        assert_eq!(probe_bitpix(&not_fits), None);
     }
 
     #[test]
