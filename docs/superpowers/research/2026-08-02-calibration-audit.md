@@ -275,3 +275,60 @@ future enhancement, not part of this fix cycle.
 - Scan-root deletion leaves master/superseded shells with dangling supersede
   pointers when the deleted root held master files — un-supersede-on-root-delete
   semantics need an owner decision (re-added roots re-ingest masters as NEW sets).
+
+## Post-cycle follow-ups (from the 2026-08-02 final whole-branch review)
+
+Owner decisions queued:
+
+- **Deselecting an AUTO-matched link in the Manual Calibration modal** now shows
+  an honest "Link not cleared — auto-matched" notice instead of a fake success,
+  but truly removing an auto link needs a manual-block concept (auto-find would
+  otherwise re-add it) — new feature, owner call.
+- **`frames.is_master = 1` with `is_master_library = 0`** (a master frame not in
+  a library set) is NOT force-Copied by frame-set archives — the ratified
+  predicate keys on the set flag. Confirm this shape is acceptable or widen.
+
+Engineering follow-ups (none block a release):
+
+- XISF / decode-and-spill float lights still take the 65535 scale-divisor
+  fallback (`probe_bitpix` → None) — bit-depth probe for the spill path.
+- Stranded 0-byte claim placeholder after a hard crash re-reports a parse error
+  on every library scan until swept — claim-sweeper at startup.
+- Promote a shared `unregister_master_for_file` helper (the interception loop
+  is duplicated at the relinking door).
+- Archive planner: cross-role dedup could theoretically out-vote the master
+  force-Copy (no production path); zip self-containment untested via
+  `zip_reader`; "N master(s) copied, not moved" dialog line per the (N of M)
+  convention.
+- `calibration_set.instrume` drift on spared superseded sets after a
+  unique_camera rename (cosmetic; matcher excludes superseded sets).
+- Show All: parameters after a skipping param render as unmatched without
+  having been compared (`check_calibration_match` early-return).
+- delete_master dialog enrichment staleness race (no per-target guard);
+  ConfirmDialog lacks a disabled prop; LIMIT 1 multi-raw-set lookup.
+- NFS: `O_EXCL` claim reliability assumption if network library roots ever
+  become supported.
+- `send_all_to_void` swallows per-file results (`let _`) — pre-existing,
+  now hides more.
+- Log-level/naming polish: guard lookup-failure `error!`→`warn!`; guard event
+  `set_id` vs `master_set_id` ambiguity; duplicate per-frame light-cal debug
+  events; warn-emission not log-asserted (docs/logging pattern exists).
+
+Release-note lines owed (next `RELEASE_NOTES.md` rewrite):
+
+- Masters are now always auto-link candidates; fresh default preference is
+  PreferMaster; routine re-matching keeps lights on their masters.
+- New: Delete Master (Equipment) — un-supersedes and restores the raw set;
+  deleting a master's file via Black Hole does the same.
+- Light-calibration engine v2: BITPIX-aware output scaling + dead-flat-pixel
+  floor — existing calibrated lights show as *stale* and can be re-run once.
+- Master builds now exclude undefined (NaN/Inf) pixels with a per-build
+  warning instead of failing or silently poisoning the master.
+- A failed disk delete of a master is reported honestly (the file would
+  otherwise re-ingest as an imported master on the next scan).
+
+Owner smoke list (consolidated): the 7 scenarios in the fix plan's final gates,
+plus: delete an auto-matched link → "Link not cleared" notice; delete_master
+on a real library (3 scenarios in task-8 report); junk flat in a real library
+(degenerate-flat per-frame failure); Black-Hole restore of an ex-master
+re-ingests as imported; Windows pass for the claim/rename path.
