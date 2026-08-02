@@ -8,6 +8,7 @@ import type {
   LightCalDetails,
 } from '../types/models';
 import { ManualCalibrationModal } from './ManualCalibrationModal';
+import type { ManualPick } from './ManualCalibrationModal';
 import { CameraFilterTree } from './calibration/CameraFilterTree';
 import { MergedCameraFilterTree } from './calibration/MergedCameraFilterTree';
 import type { EnrichedLightFrame } from './calibration/LightsAnalysisTable';
@@ -247,11 +248,19 @@ export function CalibrationHierarchyView({
     setManualModalOpen(true);
   }, []);
 
-  // Handle manual calibration apply
+  // Handle manual calibration apply.
+  // Each slot arrives as a ManualPick: `null` = untouched (skip), `'clear'` =
+  // explicitly deselected (clear that type's link), a number = assign it.
   const handleManualCalibrationApply = useCallback(
-    async (flatSetId: number | null, darkSetId: number | null, biasSetId: number | null) => {
+    async (flatSetId: ManualPick, darkSetId: ManualPick, biasSetId: ManualPick) => {
       try {
-        if (flatSetId !== null && flatSetId !== manualModalCurrentFlat) {
+        if (flatSetId === 'clear') {
+          await api.invoke('clear_manual_calibration_override', {
+            frameIds: manualModalFrameIds,
+            calibrationType: 'Flat',
+          });
+          setManualModalCurrentFlat(null);
+        } else if (flatSetId !== null && flatSetId !== manualModalCurrentFlat) {
           await api.invoke('manual_assign_calibration', {
             frameIds: manualModalFrameIds,
             calibrationSetId: flatSetId,
@@ -259,7 +268,13 @@ export function CalibrationHierarchyView({
           });
           setManualModalCurrentFlat(flatSetId);
         }
-        if (darkSetId !== null && darkSetId !== manualModalCurrentDark) {
+        if (darkSetId === 'clear') {
+          await api.invoke('clear_manual_calibration_override', {
+            frameIds: manualModalFrameIds,
+            calibrationType: 'Dark',
+          });
+          setManualModalCurrentDark(null);
+        } else if (darkSetId !== null && darkSetId !== manualModalCurrentDark) {
           await api.invoke('manual_assign_calibration', {
             frameIds: manualModalFrameIds,
             calibrationSetId: darkSetId,
@@ -267,7 +282,13 @@ export function CalibrationHierarchyView({
           });
           setManualModalCurrentDark(darkSetId);
         }
-        if (biasSetId !== null && biasSetId !== manualModalCurrentBias) {
+        if (biasSetId === 'clear') {
+          await api.invoke('clear_manual_calibration_override', {
+            frameIds: manualModalFrameIds,
+            calibrationType: 'Bias',
+          });
+          setManualModalCurrentBias(null);
+        } else if (biasSetId !== null && biasSetId !== manualModalCurrentBias) {
           await api.invoke('manual_assign_calibration', {
             frameIds: manualModalFrameIds,
             calibrationSetId: biasSetId,

@@ -22,6 +22,24 @@ import type {
   CalibrationSetWithScore,
 } from '../types/models';
 
+/**
+ * What the user did to one calibration slot before pressing Apply.
+ *
+ * - `number` — a set was picked (or swapped) → assign it.
+ * - `null`   — the slot was not touched → the parent must do nothing.
+ * - `'clear'` — the slot was explicitly deselected → the parent must clear
+ *   the link for that type. Without this third state a deselect is
+ *   indistinguishable from "untouched" and silently does nothing.
+ */
+export type ManualPick = number | null | 'clear';
+
+/** Map a slot's selection against the backend truth onto a {@link ManualPick}. */
+const pick = (selected: number | null, current: number | null): ManualPick => {
+  if (selected === current) return null; // untouched
+  if (selected === null) return 'clear'; // user explicitly deselected
+  return selected;
+};
+
 interface ManualCalibrationModalProps {
   isOpen: boolean;
   frameIds: number[];
@@ -30,7 +48,7 @@ interface ManualCalibrationModalProps {
   currentDarkSetId?: number | null;
   currentBiasSetId?: number | null;
   useBiasForDarkOptimization: boolean;
-  onApply: (flatSetId: number | null, darkSetId: number | null, biasSetId: number | null) => void;
+  onApply: (flatSetId: ManualPick, darkSetId: ManualPick, biasSetId: ManualPick) => void;
   onClose: () => void;
   /** Reload the hierarchy — same refresh path the save (onApply) flow uses. */
   onRefresh?: () => void;
@@ -129,18 +147,21 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
     }
   };
 
-  // Use backend data as source of truth for detecting changes
-  const currentFlatFromBackend = lightParams?.current_flat_set_id ?? currentFlatSetId;
-  const currentDarkFromBackend = lightParams?.current_dark_set_id ?? currentDarkSetId;
-  const currentBiasFromBackend = lightParams?.current_bias_set_id ?? currentBiasSetId;
+  // Use backend data as source of truth for detecting changes. Normalized to
+  // `null` so an omitted prop can never read as a change against a `null`
+  // selection (the selections themselves are always `number | null`).
+  const currentFlatFromBackend = lightParams?.current_flat_set_id ?? currentFlatSetId ?? null;
+  const currentDarkFromBackend = lightParams?.current_dark_set_id ?? currentDarkSetId ?? null;
+  const currentBiasFromBackend = lightParams?.current_bias_set_id ?? currentBiasSetId ?? null;
 
-  // Only forward values the user actually changed. Unchanged dropdowns come back
-  // as null so the parent's null-skip prevents accidental manual_assigns.
+  // Only forward slots the user actually changed: untouched slots come back as
+  // `null` (parent skips them), an explicit deselect comes back as `'clear'`
+  // (parent clears that type's link).
   const handleApply = () => {
     onApply(
-      selectedFlatId !== currentFlatFromBackend ? selectedFlatId : null,
-      selectedDarkId !== currentDarkFromBackend ? selectedDarkId : null,
-      selectedBiasId !== currentBiasFromBackend ? selectedBiasId : null,
+      pick(selectedFlatId, currentFlatFromBackend),
+      pick(selectedDarkId, currentDarkFromBackend),
+      pick(selectedBiasId, currentBiasFromBackend),
     );
   };
 
