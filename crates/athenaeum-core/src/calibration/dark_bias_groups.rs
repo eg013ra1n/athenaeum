@@ -828,6 +828,20 @@ pub fn create_dark_calibration_set(
     dark_group: &DarkGroup,
     allow_modify: bool,
 ) -> Result<i64> {
+    // A superseded lineage must never be re-minted: `check_for_existing_dark_set`
+    // deliberately skips superseded rows, so without this guard the group would
+    // fall through and create a duplicate raw set alongside its master.
+    if let Some(master_id) =
+        crate::calibration::superseded_guard::superseding_master_for_frames(conn, &dark_group.frame_ids)?
+    {
+        tracing::info!(
+            master_set_id = master_id,
+            frames = dark_group.frame_ids.len(),
+            "group belongs to a superseded lineage — reusing its master instead of minting a duplicate raw set"
+        );
+        return Ok(master_id);
+    }
+
     // Check if set already exists with same parameters
     let existing_set_id = check_for_existing_dark_set(conn, dark_group)?;
     tracing::debug!(existing_set_id = existing_set_id.unwrap_or(-1), "existing dark set check");
@@ -944,6 +958,18 @@ pub fn create_bias_calibration_set(
     bias_group: &BiasGroup,
     allow_modify: bool,
 ) -> Result<i64> {
+    // See `create_dark_calibration_set` — a master already replaced this lineage.
+    if let Some(master_id) =
+        crate::calibration::superseded_guard::superseding_master_for_frames(conn, &bias_group.frame_ids)?
+    {
+        tracing::info!(
+            master_set_id = master_id,
+            frames = bias_group.frame_ids.len(),
+            "group belongs to a superseded lineage — reusing its master instead of minting a duplicate raw set"
+        );
+        return Ok(master_id);
+    }
+
     // Check if set already exists with same parameters
     let existing_set_id = check_for_existing_bias_set(conn, bias_group)?;
     tracing::debug!(existing_set_id = existing_set_id.unwrap_or(-1), "existing bias set check");
@@ -1452,6 +1478,123 @@ mod tests {
             frames, 30, "TestCamera", "1x1", Some(56.0), Some(50.0), Some(300.0), None, None,
         );
         assert_eq!(groups.len(), 1, "None threshold preserves single-cluster behavior");
+    }
+
+    /// Seeds a raw calibration set that a master already replaced, plus the
+    /// master itself. Returns the master's set id.
+    ///
+    /// `check_for_existing_{dark,bias}_set` deliberately skips superseded rows,
+    /// so before the C1 guard a re-cluster of these frames fell straight through
+    /// to the INSERT and minted a duplicate raw set next to the master.
+    fn seed_superseded_lineage(
+        conn: &Connection,
+        raw_id: i64,
+        master_id: i64,
+        raw_type: &str,
+        master_type: &str,
+        frame_ids: &[i64],
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (?1, ?2, '2025-01-01', 0)",
+            rusqlite::params![raw_id, raw_type],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (?1, ?2, '2025-01-01', 1)",
+            rusqlite::params![master_id, master_type],
+        ).unwrap();
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = ?1 WHERE id = ?2",
+            rusqlite::params![master_id, raw_id],
+        ).unwrap();
+        for frame_id in frame_ids {
+            let file_id = frame_id + 100_000;
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 0, '2025-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![
+                    file_id,
+                    format!("/test/sup_{}.fits", frame_id),
+                    format!("sup_{}.fits", frame_id),
+                ],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp) VALUES (?1, ?2, ?3)",
+                rusqlite::params![frame_id, file_id, raw_type.to_uppercase()],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![raw_id, frame_id],
+            ).unwrap();
+        }
+        master_id
+    }
+
+    fn test_time() -> DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339("2025-09-25T00:00:00+00:00").unwrap().with_timezone(&Utc)
+    }
+
+    fn set_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM calibration_set", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn create_dark_set_reuses_superseding_master_instead_of_minting_duplicate() {
+        // C1 regression: re-clustering the frames of a superseded raw dark set
+        // must return the master's id, not create a second raw set.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let master_id = seed_superseded_lineage(&conn, 10, 11, "Dark", "MasterDark", &[100, 101]);
+        let before = set_count(&conn);
+
+        let group = DarkGroup {
+            frame_ids: vec![100, 101],
+            start_time: test_time(),
+            end_time: test_time(),
+            avg_temp: Some(-10.0),
+            temp_min: Some(-10.0),
+            temp_max: Some(-10.0),
+            frame_count: 2,
+            instrume: Some("TestCamera".to_string()),
+            binning: Some("1x1".to_string()),
+            gain: Some(56.0),
+            offset: Some(50.0),
+            exptime: Some(300.0),
+            focal_length: None,
+        };
+
+        let returned = create_dark_calibration_set(&conn, &group, true).unwrap();
+        assert_eq!(returned, master_id, "must return the superseding master's id");
+        assert_eq!(set_count(&conn), before, "no new calibration_set row may be minted");
+    }
+
+    #[test]
+    fn create_bias_set_reuses_superseding_master_instead_of_minting_duplicate() {
+        // C1 regression, bias path.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let master_id = seed_superseded_lineage(&conn, 20, 21, "Bias", "MasterBias", &[200, 201]);
+        let before = set_count(&conn);
+
+        let group = BiasGroup {
+            frame_ids: vec![200, 201],
+            start_time: test_time(),
+            end_time: test_time(),
+            avg_temp: Some(-10.0),
+            temp_min: Some(-10.0),
+            temp_max: Some(-10.0),
+            frame_count: 2,
+            instrume: Some("TestCamera".to_string()),
+            binning: Some("1x1".to_string()),
+            gain: Some(56.0),
+            offset: Some(50.0),
+            focal_length: None,
+        };
+
+        let returned = create_bias_calibration_set(&conn, &group, true).unwrap();
+        assert_eq!(returned, master_id, "must return the superseding master's id");
+        assert_eq!(set_count(&conn), before, "no new calibration_set row may be minted");
     }
 
     #[test]

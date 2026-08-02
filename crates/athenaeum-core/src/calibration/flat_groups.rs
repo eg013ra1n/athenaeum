@@ -440,6 +440,18 @@ pub fn create_flat_calibration_set(
     allow_modify: bool,
     focallen_tolerance: Option<f64>,
 ) -> Result<i64> {
+    // See `create_dark_calibration_set` — a master already replaced this lineage.
+    if let Some(master_id) =
+        crate::calibration::superseded_guard::superseding_master_for_frames(conn, &flat_group.frame_ids)?
+    {
+        tracing::info!(
+            master_set_id = master_id,
+            frames = flat_group.frame_ids.len(),
+            "group belongs to a superseded lineage — reusing its master instead of minting a duplicate raw set"
+        );
+        return Ok(master_id);
+    }
+
     // Check if set already exists with same parameters
     let existing_set_id = check_for_existing_flat_set(conn, flat_group, focallen_tolerance)?;
     tracing::debug!(existing_set_id = existing_set_id.unwrap_or(-1), "existing flat set check");
@@ -729,5 +741,80 @@ mod tests {
         assert_eq!(groups.len(), 0);
     }
 
-    // Additional tests would go here with mock frames
+    #[test]
+    fn create_flat_set_reuses_superseding_master_instead_of_minting_duplicate() {
+        // C1 regression: `check_for_existing_flat_set` deliberately skips
+        // superseded rows, so before the guard a re-cluster of a superseded
+        // lineage's frames minted a duplicate raw set beside its master.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+
+        let (raw_id, master_id) = (30i64, 31i64);
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (?1, 'Flat', '2025-01-01', 0)",
+            [raw_id],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (?1, 'MasterFlat', '2025-01-01', 1)",
+            [master_id],
+        ).unwrap();
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = ?1 WHERE id = ?2",
+            rusqlite::params![master_id, raw_id],
+        ).unwrap();
+        for frame_id in [300i64, 301i64] {
+            let file_id = frame_id + 100_000;
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 0, '2025-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![
+                    file_id,
+                    format!("/test/sup_{}.fits", frame_id),
+                    format!("sup_{}.fits", frame_id),
+                ],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp) VALUES (?1, ?2, 'FLAT')",
+                rusqlite::params![frame_id, file_id],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![raw_id, frame_id],
+            ).unwrap();
+        }
+
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibration_set", [], |r| r.get(0))
+            .unwrap();
+
+        let now = chrono::DateTime::parse_from_rfc3339("2025-09-25T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let group = FlatGroup {
+            frame_ids: vec![300, 301],
+            start_time: now,
+            end_time: now,
+            avg_temp: Some(-10.0),
+            temp_min: Some(-10.0),
+            temp_max: Some(-10.0),
+            frame_count: 2,
+            filter: Some("L".to_string()),
+            instrume: Some("TestCamera".to_string()),
+            binning: Some("1x1".to_string()),
+            gain: Some(56.0),
+            offset: Some(50.0),
+            exptime: Some(2.0),
+            focal_length: Some(530.0),
+        };
+
+        let returned = create_flat_calibration_set(&conn, &group, true, Some(0.0)).unwrap();
+        assert_eq!(returned, master_id, "must return the superseding master's id");
+
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibration_set", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, before, "no new calibration_set row may be minted");
+    }
 }
