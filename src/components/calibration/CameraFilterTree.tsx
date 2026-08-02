@@ -241,7 +241,7 @@ export function CameraFilterTree({ nodes, checkedKeys, onCheckedChange, classNam
                   ) : (
                     <ChevronRight size={14} className="text-content-muted flex-shrink-0" />
                   )}
-                  <Calendar size={14} className="text-purple-400 flex-shrink-0" />
+                  <Calendar size={14} className="text-purple flex-shrink-0" />
                   <span className="flex-1 min-w-0 text-sm text-content-secondary truncate">
                     {dateNode.dateDisplay}
                   </span>

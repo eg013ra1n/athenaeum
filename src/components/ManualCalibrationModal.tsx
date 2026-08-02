@@ -333,7 +333,7 @@ export const ManualCalibrationModal: React.FC<ManualCalibrationModalProps> = ({
             <span className="text-[10px] px-1.5 py-px rounded bg-surface-hover text-content-secondary">Current</span>
           )}
           {set.is_master && (
-            <span className="text-[10px] px-1.5 py-px rounded bg-yellow-500/20 text-yellow-400">Master</span>
+            <span className="text-[10px] px-1.5 py-px rounded bg-warning/20 text-warning">Master</span>
           )}
           {isLongSpan && (
             <span

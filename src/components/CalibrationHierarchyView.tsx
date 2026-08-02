@@ -94,7 +94,7 @@ export function CalibrationHierarchyView({
   const handleViewModeChange = useCallback((mode: 'by-night' | 'by-camera') => {
     setViewMode(mode);
     setCheckedKeys(new Set());
-    api.invoke('set_setting', { key: 'ui.tree_view_mode', value: mode }).catch(() => {});
+    api.invoke('set_setting', { key: 'ui.tree_view_mode', value: mode }).catch((err) => console.error('[CalibrationHierarchyView] set_setting ui.tree_view_mode failed:', err));
   }, []);
 
   // ── Create Master (Task 17) ────────────────────────────────────────────

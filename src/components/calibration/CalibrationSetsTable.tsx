@@ -96,7 +96,7 @@ function CalSetRow({
             <span className="text-xs text-content-muted">#{set.id}</span>
           )}
           {set.is_master && (
-            <span className="px-1 py-0.5 text-[10px] font-medium bg-amber-500/20 text-amber-400 border border-amber-500/40 rounded whitespace-nowrap">
+            <span className="px-1 py-0.5 text-[10px] font-medium bg-warning/20 text-warning border border-warning/40 rounded whitespace-nowrap">
               Master
             </span>
           )}
@@ -184,7 +184,7 @@ function SubCalRow({
             <span className="text-xs text-content-muted">#{sub.set.id}</span>
           )}
           {sub.set.is_master && (
-            <span className="px-1 py-0.5 text-[10px] font-medium bg-amber-500/20 text-amber-400 border border-amber-500/40 rounded whitespace-nowrap">
+            <span className="px-1 py-0.5 text-[10px] font-medium bg-warning/20 text-warning border border-warning/40 rounded whitespace-nowrap">
               Master
             </span>
           )}

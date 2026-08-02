@@ -146,7 +146,7 @@ export default function CalibrationSetTable({ sets, showFilterColumn = false, on
       setBlinkFrames(frames);
     } catch (err) {
       console.error('Failed to load calibration frames:', err);
-      alert(`Failed to load frames: ${err}`);
+      notify({ title: 'Failed to load frames', detail: String(err), kind: 'files', tone: 'warning', hasErrors: true });
     } finally {
       setLoadingFrames(null);
     }

@@ -141,7 +141,7 @@ export default function MatchingMatrixTable({
               step="0.1"
               min="0"
               title="Warning threshold - triggers warning display"
-              className="w-full px-1.5 py-0.5 bg-orange-950/40 border border-orange-700/50 rounded text-xs text-orange-200 placeholder-orange-400/50"
+              className="w-full px-1.5 py-0.5 bg-orange/10 border border-orange/40 rounded text-xs text-orange placeholder-orange/50"
             />
             <input
               type="number"
@@ -151,7 +151,7 @@ export default function MatchingMatrixTable({
               step="0.1"
               min="0"
               title="Matching threshold - rejects match if exceeded"
-              className="w-full px-1.5 py-0.5 bg-rose-950/40 border border-rose-700/50 rounded text-xs text-rose-200 placeholder-rose-400/50"
+              className="w-full px-1.5 py-0.5 bg-error/10 border border-error/40 rounded text-xs text-error placeholder-error/50"
             />
             {validationError && (
               <div className="flex items-center gap-1 text-error text-xs">
@@ -272,8 +272,8 @@ export default function MatchingMatrixTable({
           </p>
           <p>
             <span className="text-warning font-medium">≈</span> <strong>Threshold</strong>:
-            Matches within the <span className="text-rose-300">Max</span> threshold, but shows a warning if the <span className="text-orange-300">Warn</span> threshold
-            is exceeded. Match is rejected if outside <span className="text-rose-300">Max</span>.
+            Matches within the <span className="text-error">Max</span> threshold, but shows a warning if the <span className="text-orange">Warn</span> threshold
+            is exceeded. Match is rejected if outside <span className="text-error">Max</span>.
           </p>
           <p>
             <span className="text-content-muted font-medium">-</span> <strong>Ignored</strong>:

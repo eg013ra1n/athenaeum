@@ -173,7 +173,7 @@ export function BlackholedFramesSection({ frames, analysisData, onBlink }: Black
                             ? "Directional trail detected (RA drift)"
                             : "Guiding issue (wind/vibration)"
                           }>
-                            <AlertTriangle size={14} className="text-amber-400" />
+                            <AlertTriangle size={14} className="text-warning" />
                           </span>
                         )}
                       </span>
