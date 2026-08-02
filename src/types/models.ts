@@ -597,7 +597,16 @@ export type LightCalReadiness = { frames: Array<LightFrameReadiness>, readyCount
  * is the number of master builds; `raw_set_count` is the number of
  * affected frames (a single raw set can serve many frames).
  */
-rawSetIdsToBuild: Array<number>, };
+rawSetIdsToBuild: Array<number>, 
+/**
+ * ADVISORY notes about CFA compatibility between the set's light frames
+ * and the masters they link — a mono master flat against an OSC light, a
+ * mosaic phase shift, a pattern that does not match. Empty = nothing to
+ * say. Purely informational: it never blocks the run, never changes the
+ * counts above, and a failure to compute it leaves the list empty rather
+ * than failing readiness.
+ */
+cfaWarnings: Array<string>, };
 
 export type ExportReadiness = { total: number, calibrated: number, stale: number, missing: number, };
 

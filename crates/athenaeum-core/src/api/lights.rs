@@ -16,6 +16,11 @@
 //! - **output status** (`status`, via `db::light_calibrations::derive_status`):
 //!   is the already-written calibrated file fresh, partial, or stale?
 //!
+//! Alongside them, at the SET level, `cfa_warnings` carries purely advisory
+//! notes about mosaic compatibility between the lights and the masters they
+//! link (a mono master flat over an OSC light, a phase shift). It never feeds
+//! the counts or gates the run — see the "Advisory CFA compatibility" block.
+//!
 //! The core logic lives in `compute_readiness(&Connection, …)` so it is
 //! unit-testable against a seeded in-memory connection (the `api/calibration.rs`
 //! inner-fn precedent); the public handler is a thin `ctx` → `conn` wrapper.
@@ -101,6 +106,13 @@ pub struct LightCalReadiness {
     /// is the number of master builds; `raw_set_count` is the number of
     /// affected frames (a single raw set can serve many frames).
     pub raw_set_ids_to_build: Vec<i64>,
+    /// ADVISORY notes about CFA compatibility between the set's light frames
+    /// and the masters they link — a mono master flat against an OSC light, a
+    /// mosaic phase shift, a pattern that does not match. Empty = nothing to
+    /// say. Purely informational: it never blocks the run, never changes the
+    /// counts above, and a failure to compute it leaves the list empty rather
+    /// than failing readiness.
+    pub cfa_warnings: Vec<String>,
 }
 
 /// Export-readiness tallies for the WBPP export dialog's mode selector
@@ -207,6 +219,306 @@ fn classify(
             }
         }
     }
+}
+
+// ── Advisory CFA compatibility ───────────────────────────────────────────────
+//
+// Nothing else validates that the masters a light frame links actually share
+// its mosaic layout: a MONO master flat divides an OSC light without a word,
+// and a one-pixel phase shift swaps R and B invisibly. This block states that
+// comparison for the operator — at readiness time, before any pixel is read.
+//
+// **Advisory only.** It never blocks, never changes classification, counts,
+// the build list, or what the engine does; a failure to compute it is logged
+// and dropped, never propagated. The one behavioural CFA guard lives in the
+// divisor path (`light_cal::read_ath_channel_norms`), which falls back to
+// recomputing from the flat's own pixels; this is the user-visible layer on
+// top of it, and both share `CfaGeometry::same_phase` so they cannot drift.
+
+/// What a catalog row's CFA columns declare, for advisory comparison.
+///
+/// Offsets are folded modulo 2 at construction — the [`CfaGeometry::same_phase`]
+/// rule — and an UNDECLARED offset reads as 0, matching what every other CFA
+/// reader in the codebase assumes (`resolve_cfa_geometry`,
+/// `read_ath_channel_norms`, `measure_flat_channel_norms`). So two declarations
+/// that describe the same mosaic phase compare equal however their
+/// `XBAYROFF`/`YBAYROFF` happen to be spelled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclaredCfa {
+    /// No `BAYERPAT` — the row declares itself mono.
+    Mono,
+    /// A pattern [`Bayer::parse`] can vouch for, at its folded phase.
+    Cfa(CfaGeometry),
+    /// A `BAYERPAT` string the parser does not recognize. Deliberately NOT
+    /// folded into `Mono`: "declares nothing" and "declares something we
+    /// cannot read" are different facts, and only the second is worth telling
+    /// the operator about.
+    Unrecognized(String),
+}
+
+impl DeclaredCfa {
+    fn from_columns(bayerpat: Option<String>, xoff: Option<i64>, yoff: Option<i64>) -> Self {
+        let Some(raw) = bayerpat.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+            return DeclaredCfa::Mono;
+        };
+        match Bayer::parse(raw) {
+            Some(pattern) => DeclaredCfa::Cfa(CfaGeometry {
+                pattern,
+                xoff: xoff.unwrap_or(0).rem_euclid(2),
+                yoff: yoff.unwrap_or(0).rem_euclid(2),
+            }),
+            None => DeclaredCfa::Unrecognized(raw.to_string()),
+        }
+    }
+
+    /// Short human label — `RGGB`, `RGGB at (1, 0)`, `mono`, `unrecognized
+    /// 'XTRANS'`. Used both in the sentences and as the log field value, so a
+    /// log line and the dialog say the same thing.
+    fn label(&self) -> String {
+        match self {
+            DeclaredCfa::Mono => "mono".to_string(),
+            DeclaredCfa::Cfa(g) if g.xoff == 0 && g.yoff == 0 => g.pattern.as_str().to_string(),
+            DeclaredCfa::Cfa(g) => {
+                format!("{} at ({}, {})", g.pattern.as_str(), g.xoff, g.yoff)
+            }
+            DeclaredCfa::Unrecognized(p) => format!("unrecognized '{p}'"),
+        }
+    }
+}
+
+/// One advisory note. `message` is the operator-facing sentence (the readiness
+/// payload carries only these); the rest are log fields for the calibrate-time
+/// emission, so the same finding reads identically in the dialog and the log.
+struct CfaAdvisory {
+    /// `"lights"` | `"dark"` | `"flat"` | `"bias"`.
+    kind: &'static str,
+    light_pattern: String,
+    /// Empty for a `"lights"`-kind note (nothing was compared against).
+    master_pattern: String,
+    message: String,
+}
+
+/// The distinct CFA layouts declared by a frame set's LIGHT members, most
+/// common first (ties broken by the pattern string, so the result is stable).
+/// One query for the whole set — this runs per readiness call and must not cost
+/// a query per frame.
+fn light_cfa_declarations(
+    conn: &Connection,
+    set_id: i64,
+) -> Result<Vec<(DeclaredCfa, i64)>, ApiError> {
+    let mut stmt = conn.prepare(
+        "SELECT f.bayerpat, f.xbayroff, f.ybayroff, COUNT(DISTINCT sm.frame_id) AS n
+         FROM session_members sm
+         JOIN sessions s ON s.id = sm.session_id
+         JOIN imaging_nights ino ON ino.id = s.imaging_night_id
+         JOIN frames f ON f.id = sm.frame_id
+         WHERE ino.frames_set_id = ?1 AND f.imagetyp = 'Light'
+         GROUP BY f.bayerpat, f.xbayroff, f.ybayroff
+         ORDER BY n DESC, f.bayerpat, f.xbayroff, f.ybayroff",
+    )?;
+    let rows = stmt
+        .query_map(params![set_id], |r| {
+            Ok((
+                DeclaredCfa::from_columns(r.get(0)?, r.get(1)?, r.get(2)?),
+                r.get::<_, i64>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // SQL grouped on the RAW columns; fold the rows that describe the same
+    // phase into one (an XBAYROFF of 2 and one of 0, a NULL and a 0) so the
+    // consensus and the "more than one layout" check see phases, not spellings.
+    let mut folded: Vec<(DeclaredCfa, i64)> = Vec::new();
+    for (declared, n) in rows {
+        match folded.iter_mut().find(|(d, _)| *d == declared) {
+            Some((_, count)) => *count += n,
+            None => folded.push((declared, n)),
+        }
+    }
+    folded.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(folded)
+}
+
+/// Distinct `(calibration_type, calibration_set_id)` pairs the frame set's
+/// LIGHT members link, for the three types a light can apply.
+fn light_calibration_links_for_set(
+    conn: &Connection,
+    set_id: i64,
+) -> Result<Vec<(String, i64)>, ApiError> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT l.calibration_type, l.calibration_set_id
+         FROM session_members sm
+         JOIN sessions s ON s.id = sm.session_id
+         JOIN imaging_nights ino ON ino.id = s.imaging_night_id
+         JOIN frames f ON f.id = sm.frame_id
+         JOIN calibration_set_to_frames l
+           ON l.source_id = f.id AND l.source_type = 'frame'
+         WHERE ino.frames_set_id = ?1 AND f.imagetyp = 'Light'
+           AND l.calibration_type IN ('Dark', 'Flat', 'Bias')
+         ORDER BY l.calibration_type, l.calibration_set_id",
+    )?;
+    let rows = stmt
+        .query_map(params![set_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<(String, i64)>>>()?;
+    Ok(rows)
+}
+
+/// The MASTER set a link actually resolves to: the set itself when it is one,
+/// its supersede target when the link still names the raw set (Phase 2 repoints
+/// links on supersede, but a stale link resolves the same way `classify` does).
+/// `None` for a raw, unbuilt set — its master does not exist yet, so its layout
+/// is not a fact to report on.
+fn effective_master_set_id(conn: &Connection, set_id: i64) -> Result<Option<i64>, ApiError> {
+    let row: Option<(i64, Option<i64>)> = conn
+        .query_row(
+            "SELECT is_master_library, superseded_by_set_id FROM calibration_set WHERE id = ?1",
+            params![set_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    Ok(match row {
+        Some((1, _)) => Some(set_id),
+        Some((_, Some(master_id))) => Some(master_id),
+        _ => None,
+    })
+}
+
+/// What a calibration set's member frame declares. Mirrors [`resolve_master`]'s
+/// `LIMIT 1` — a master library set holds exactly one member — and reads the
+/// `frames` columns directly, because the index-based list readers hardcode
+/// `None` for `xbayroff`/`ybayroff` whatever is stored (see `models.rs`), which
+/// would erase every phase and make the check report agreement it never saw.
+fn set_member_cfa(conn: &Connection, set_id: i64) -> Result<Option<DeclaredCfa>, ApiError> {
+    let row: Option<(Option<String>, Option<i64>, Option<i64>)> = conn
+        .query_row(
+            "SELECT fr.bayerpat, fr.xbayroff, fr.ybayroff
+             FROM calibration_set_frames csf
+             JOIN frames fr ON fr.id = csf.frame_id
+             WHERE csf.set_id = ?1
+             LIMIT 1",
+            params![set_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(row.map(|(pat, x, y)| DeclaredCfa::from_columns(pat, x, y)))
+}
+
+/// The advisory sentence for one (lights, master) pair, or `None` when they
+/// agree. `label` is the master's display name ("Flat master", …).
+fn advisory_message(label: &str, lights: &DeclaredCfa, master: &DeclaredCfa) -> Option<String> {
+    match (lights, master) {
+        // Both mono, or the same mosaic — the two quiet cases.
+        (DeclaredCfa::Mono, DeclaredCfa::Mono) => None,
+        (DeclaredCfa::Cfa(l), DeclaredCfa::Cfa(m)) if l.same_phase(*m) => None,
+
+        (DeclaredCfa::Cfa(l), DeclaredCfa::Cfa(m)) if l.pattern != m.pattern => Some(format!(
+            "{label} is {} while the light frames are {} — the colour channels do not line up. Check that the right master is linked.",
+            m.pattern.as_str(),
+            l.pattern.as_str()
+        )),
+        // Same pattern, different phase: the invisible one — R and B swap.
+        (DeclaredCfa::Cfa(l), DeclaredCfa::Cfa(m)) => Some(format!(
+            "{label} is {} at CFA offset ({}, {}) while the light frames declare ({}, {}) — the mosaic phase differs by a pixel. Check that the right master is linked.",
+            m.pattern.as_str(),
+            m.xoff,
+            m.yoff,
+            l.xoff,
+            l.yoff
+        )),
+        (DeclaredCfa::Cfa(l), DeclaredCfa::Mono) => Some(format!(
+            "{label} declares no CFA pattern (mono) while the light frames are {} — check that the right master is linked.",
+            l.pattern.as_str()
+        )),
+        (DeclaredCfa::Mono, DeclaredCfa::Cfa(m)) => Some(format!(
+            "{label} is {} while the light frames declare no CFA pattern (mono) — check that the right master is linked.",
+            m.pattern.as_str()
+        )),
+        (_, DeclaredCfa::Unrecognized(p)) => Some(format!(
+            "{label} declares an unrecognized CFA pattern '{p}' — CFA compatibility cannot be checked."
+        )),
+        // The lights' own unreadable pattern is reported once, at the set
+        // level, and short-circuits the master comparison before this point.
+        (DeclaredCfa::Unrecognized(_), _) => None,
+    }
+}
+
+/// Compare the frame set's LIGHT consensus against every master it will apply.
+/// Pure DB work, a handful of queries, no pixel I/O — shared verbatim by
+/// readiness (which surfaces the sentences) and the calibrate batch (which logs
+/// them once at start).
+///
+/// Consensus = the layout declared by the most light frames. When the lights
+/// disagree among themselves that is its own advisory line, and the master
+/// comparison still runs against the majority: an OSC set with one stray mono
+/// frame must not lose its mono-flat warning.
+fn collect_cfa_advisories(conn: &Connection, set_id: i64) -> Result<Vec<CfaAdvisory>, ApiError> {
+    let declarations = light_cfa_declarations(conn, set_id)?;
+    let Some((consensus, _)) = declarations.first().cloned() else {
+        return Ok(Vec::new()); // no lights — nothing to compare
+    };
+    let mut out: Vec<CfaAdvisory> = Vec::new();
+
+    if declarations.len() > 1 {
+        let listed = declarations
+            .iter()
+            .map(|(d, n)| format!("{} ({n})", d.label()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(CfaAdvisory {
+            kind: "lights",
+            light_pattern: listed.clone(),
+            master_pattern: String::new(),
+            message: format!(
+                "Light frames in this set declare more than one CFA layout: {listed}. Master comparison uses {}.",
+                consensus.label()
+            ),
+        });
+    }
+
+    if let DeclaredCfa::Unrecognized(pattern) = &consensus {
+        // Nothing can be said about a layout we cannot read — say THAT, and
+        // stop rather than emitting three meaningless per-master lines.
+        out.push(CfaAdvisory {
+            kind: "lights",
+            light_pattern: consensus.label(),
+            master_pattern: String::new(),
+            message: format!(
+                "Light frames declare an unrecognized CFA pattern '{pattern}' — CFA compatibility cannot be checked."
+            ),
+        });
+        return Ok(out);
+    }
+
+    let links = light_calibration_links_for_set(conn, set_id)?;
+    for (cal_type, kind, label) in [
+        ("Dark", "dark", "Dark master"),
+        ("Flat", "flat", "Flat master"),
+        ("Bias", "bias", "Bias master"),
+    ] {
+        for (_, linked_set_id) in links.iter().filter(|(t, _)| t == cal_type) {
+            let Some(master_set_id) = effective_master_set_id(conn, *linked_set_id)? else {
+                continue; // raw and unbuilt, or a dangling link — not a fact yet
+            };
+            let Some(master_cfa) = set_member_cfa(conn, master_set_id)? else {
+                continue; // memberless set — nothing declared to compare
+            };
+            let Some(message) = advisory_message(label, &consensus, &master_cfa) else {
+                continue;
+            };
+            // Different lights can link different masters of one type; an
+            // identical sentence twice would just be noise.
+            if out.iter().any(|a| a.message == message) {
+                continue;
+            }
+            out.push(CfaAdvisory {
+                kind,
+                light_pattern: consensus.label(),
+                master_pattern: master_cfa.label(),
+                message,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Map the derived status enum to the frontend's verbatim camelCase strings.
@@ -363,6 +675,17 @@ fn compute_readiness(
         });
     }
 
+    // Advisory only: a failure here must not cost the operator the dialog, so
+    // it is logged and dropped rather than propagated (the readiness answer is
+    // complete without it).
+    let cfa_warnings: Vec<String> = match collect_cfa_advisories(conn, set_id) {
+        Ok(advisories) => advisories.into_iter().map(|a| a.message).collect(),
+        Err(e) => {
+            tracing::warn!(set_id, error = %e, "cfa compatibility check failed — readiness reported without it");
+            Vec::new()
+        }
+    };
+
     tracing::debug!(
         set_id,
         total = frames.len() as i64,
@@ -370,6 +693,7 @@ fn compute_readiness(
         raw_set_count,
         missing_count,
         to_build = raw_set_ids_to_build.len() as i64,
+        cfa_warnings = cfa_warnings.len() as i64,
         "light calibration readiness computed"
     );
 
@@ -379,6 +703,7 @@ fn compute_readiness(
         raw_set_count,
         missing_count,
         raw_set_ids_to_build,
+        cfa_warnings,
     })
 }
 
@@ -1466,6 +1791,40 @@ fn run_light_cal(
         bias_fallback = ?params.bias_fallback,
         "light calibration batch started"
     );
+
+    // Advisory CFA compatibility, once per (set, master type) at batch start —
+    // NOT per frame: the divisor path already warns per frame when a flat's
+    // stamped constants disagree with the light, and repeating that here for
+    // every frame would bury it. Never blocks; a failed check is logged and the
+    // batch runs on.
+    {
+        let conn = db.conn();
+        match collect_cfa_advisories(&conn, set_id) {
+            Ok(advisories) => {
+                for advisory in advisories {
+                    if advisory.kind == "lights" {
+                        tracing::warn!(
+                            set_id,
+                            kind = advisory.kind,
+                            light_pattern = %advisory.light_pattern,
+                            "cfa layouts disagree among light frames"
+                        );
+                    } else {
+                        tracing::warn!(
+                            set_id,
+                            kind = advisory.kind,
+                            light_pattern = %advisory.light_pattern,
+                            master_pattern = %advisory.master_pattern,
+                            "cfa mismatch between light set and master"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(set_id, error = %e, "cfa compatibility check failed — calibrating anyway")
+            }
+        }
+    }
 
     for (index, (frame_id, filename)) in members.iter().enumerate() {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -3354,6 +3713,228 @@ mod tests {
             params![set_id, frame_id],
         )
         .unwrap();
+    }
+
+    // ── Advisory CFA compatibility (readiness) ──────────────────────────────
+
+    /// CFA columns on a master set's single member frame (the row
+    /// [`seed_master_with_file`] created).
+    fn set_master_bayer(
+        conn: &Connection,
+        set_id: i64,
+        bayerpat: Option<&str>,
+        xoff: Option<i64>,
+        yoff: Option<i64>,
+    ) {
+        conn.execute(
+            "UPDATE frames SET bayerpat = ?2, xbayroff = ?3, ybayroff = ?4 WHERE id = ?1",
+            params![set_id + 6_000_000, bayerpat, xoff, yoff],
+        )
+        .unwrap();
+    }
+
+    /// CFA columns on a LIGHT frame seeded by [`seed_light`].
+    fn set_light_bayer(
+        conn: &Connection,
+        frame_id: i64,
+        bayerpat: Option<&str>,
+        xoff: Option<i64>,
+        yoff: Option<i64>,
+    ) {
+        conn.execute(
+            "UPDATE frames SET bayerpat = ?2, xbayroff = ?3, ybayroff = ?4 WHERE id = ?1",
+            params![frame_id, bayerpat, xoff, yoff],
+        )
+        .unwrap();
+    }
+
+    fn readiness_for(conn: &Connection, set_id: i64) -> LightCalReadiness {
+        compute_readiness(conn, set_id, true, FlatNormMode::CentralThird, LightCalParams::default())
+            .unwrap()
+    }
+
+    /// The finding this advisory closes: a MONO master flat divides an OSC
+    /// light silently. Readiness must say so — once, for the flat, naming both
+    /// layouts — while leaving the classification and the counts untouched
+    /// (advisory never blocks).
+    #[test]
+    fn readiness_warns_when_a_mono_flat_master_meets_osc_lights() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        set_light_bayer(&conn, 1, Some("RGGB"), Some(0), Some(0));
+
+        seed_master_with_file(&conn, 100, "MasterDark", "master_dark.fits");
+        set_master_bayer(&conn, 100, Some("RGGB"), Some(0), Some(0)); // agrees
+        seed_master_with_file(&conn, 101, "MasterFlat", "master_flat.fits"); // mono
+        add_link(&conn, 1, 100, "Dark");
+        add_link(&conn, 1, 101, "Flat");
+
+        let r = readiness_for(&conn, 1);
+        assert_eq!(r.cfa_warnings.len(), 1, "only the flat mismatches: {:?}", r.cfa_warnings);
+        let w = &r.cfa_warnings[0];
+        assert!(w.contains("Flat master"), "names the offending master: {w}");
+        assert!(w.contains("mono"), "says the master is mono: {w}");
+        assert!(w.contains("RGGB"), "names the lights' layout: {w}");
+
+        // Advisory ONLY: classification, counts and the build list are as if
+        // the check did not exist.
+        assert_eq!(r.frames[0].flat, MASTER);
+        assert_eq!(r.frames[0].dark, MASTER);
+        assert_eq!(r.ready_count, 1);
+        assert_eq!(r.missing_count, 0);
+        assert!(r.raw_set_ids_to_build.is_empty());
+    }
+
+    /// The reversed mismatch is just as wrong and just as invisible: a CFA
+    /// master against mono lights.
+    #[test]
+    fn readiness_warns_when_a_cfa_master_meets_mono_lights() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session); // mono light — no bayerpat
+        seed_master_with_file(&conn, 101, "MasterFlat", "master_flat.fits");
+        set_master_bayer(&conn, 101, Some("RGGB"), Some(0), Some(0));
+        add_link(&conn, 1, 101, "Flat");
+
+        let r = readiness_for(&conn, 1);
+        assert_eq!(r.cfa_warnings.len(), 1, "{:?}", r.cfa_warnings);
+        assert!(r.cfa_warnings[0].contains("RGGB"), "{}", r.cfa_warnings[0]);
+        assert!(r.cfa_warnings[0].contains("mono"), "{}", r.cfa_warnings[0]);
+    }
+
+    /// Agreement is silent — including the two spellings of agreement that a
+    /// naive comparison would call a mismatch: an UNDECLARED offset (compares
+    /// as 0) and an offset of 2 (same phase modulo 2).
+    #[test]
+    fn readiness_is_silent_when_light_and_master_cfa_agree() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        set_light_bayer(&conn, 1, Some("RGGB"), Some(0), Some(0));
+
+        seed_master_with_file(&conn, 100, "MasterDark", "master_dark.fits");
+        set_master_bayer(&conn, 100, Some("RGGB"), Some(2), Some(-2)); // == (0,0)
+        seed_master_with_file(&conn, 101, "MasterFlat", "master_flat.fits");
+        set_master_bayer(&conn, 101, Some("rggb"), None, None); // undeclared == 0
+        add_link(&conn, 1, 100, "Dark");
+        add_link(&conn, 1, 101, "Flat");
+
+        assert!(readiness_for(&conn, 1).cfa_warnings.is_empty());
+    }
+
+    /// A mono set (the majority of rigs) must never produce an advisory.
+    #[test]
+    fn readiness_is_silent_for_a_mono_set() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        seed_master_with_file(&conn, 100, "MasterDark", "master_dark.fits");
+        seed_master_with_file(&conn, 101, "MasterFlat", "master_flat.fits");
+        add_link(&conn, 1, 100, "Dark");
+        add_link(&conn, 1, 101, "Flat");
+
+        assert!(readiness_for(&conn, 1).cfa_warnings.is_empty());
+    }
+
+    /// Same pattern, different phase — the invisible one. R and B swap, and
+    /// nothing downstream says a word without this.
+    #[test]
+    fn readiness_warns_on_a_cfa_phase_shift() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        set_light_bayer(&conn, 1, Some("RGGB"), Some(1), Some(0));
+        seed_master_with_file(&conn, 101, "MasterFlat", "master_flat.fits");
+        set_master_bayer(&conn, 101, Some("RGGB"), Some(0), Some(0));
+        add_link(&conn, 1, 101, "Flat");
+
+        let r = readiness_for(&conn, 1);
+        assert_eq!(r.cfa_warnings.len(), 1, "{:?}", r.cfa_warnings);
+        let w = &r.cfa_warnings[0];
+        assert!(w.contains("phase"), "says it is a phase shift: {w}");
+        assert!(w.contains("RGGB"), "{w}");
+    }
+
+    /// A different PATTERN is its own message — the channels do not line up at
+    /// all, which is a stronger statement than a phase shift.
+    #[test]
+    fn readiness_warns_on_a_different_pattern() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        set_light_bayer(&conn, 1, Some("RGGB"), Some(0), Some(0));
+        seed_master_with_file(&conn, 101, "MasterFlat", "master_flat.fits");
+        set_master_bayer(&conn, 101, Some("BGGR"), Some(0), Some(0));
+        add_link(&conn, 1, 101, "Flat");
+
+        let r = readiness_for(&conn, 1);
+        assert_eq!(r.cfa_warnings.len(), 1, "{:?}", r.cfa_warnings);
+        assert!(r.cfa_warnings[0].contains("BGGR"), "{}", r.cfa_warnings[0]);
+        assert!(r.cfa_warnings[0].contains("RGGB"), "{}", r.cfa_warnings[0]);
+    }
+
+    /// Lights that disagree AMONG THEMSELVES get their own line; the master
+    /// comparison then runs against the majority layout, so a master matching
+    /// the majority adds nothing on top.
+    #[test]
+    fn readiness_warns_when_the_lights_disagree_among_themselves() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        for id in 1..=3 {
+            seed_light(&conn, id, session);
+        }
+        set_light_bayer(&conn, 1, Some("RGGB"), Some(0), Some(0));
+        set_light_bayer(&conn, 2, Some("RGGB"), Some(0), Some(0));
+        // …and one stray mono light.
+        seed_master_with_file(&conn, 101, "MasterFlat", "master_flat.fits");
+        set_master_bayer(&conn, 101, Some("RGGB"), Some(0), Some(0));
+        for id in 1..=3 {
+            add_link(&conn, id, 101, "Flat");
+        }
+
+        let r = readiness_for(&conn, 1);
+        assert_eq!(r.cfa_warnings.len(), 1, "{:?}", r.cfa_warnings);
+        let w = &r.cfa_warnings[0];
+        assert!(w.contains("more than one"), "{w}");
+        assert!(w.contains("RGGB") && w.contains("mono"), "lists both layouts: {w}");
+    }
+
+    /// A raw, unbuilt set has no master to compare against yet — its layout is
+    /// decided when the preflight builds it, so readiness stays quiet rather
+    /// than reporting a fact that is not one.
+    #[test]
+    fn readiness_skips_cfa_advisories_for_unbuilt_raw_sets() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        set_light_bayer(&conn, 1, Some("RGGB"), Some(0), Some(0));
+        seed_master_with_file(&conn, 200, "Flat", "flat_001.fits"); // mono member
+        conn.execute("UPDATE calibration_set SET is_master_library = 0 WHERE id = 200", [])
+            .unwrap();
+        add_link(&conn, 1, 200, "Flat");
+
+        let r = readiness_for(&conn, 1);
+        assert_eq!(r.frames[0].flat, RAW_SET, "precondition: an unbuilt raw link");
+        assert!(r.cfa_warnings.is_empty(), "{:?}", r.cfa_warnings);
+    }
+
+    /// A superseded raw link resolves to its MASTER, and that master is what
+    /// gets compared — the same set the engine will actually apply.
+    #[test]
+    fn readiness_compares_the_master_behind_a_superseded_link() {
+        let conn = seed_db();
+        let session = seed_frame_set(&conn, 1);
+        seed_light(&conn, 1, session);
+        set_light_bayer(&conn, 1, Some("RGGB"), Some(0), Some(0));
+        seed_master_with_file(&conn, 101, "MasterFlat", "master_flat.fits"); // mono
+        seed_set(&conn, 300, "Flat", false);
+        supersede(&conn, 300, 101);
+        add_link(&conn, 1, 300, "Flat"); // link still on the raw set
+
+        let r = readiness_for(&conn, 1);
+        assert_eq!(r.cfa_warnings.len(), 1, "{:?}", r.cfa_warnings);
+        assert!(r.cfa_warnings[0].contains("Flat master"), "{}", r.cfa_warnings[0]);
     }
 
     /// spec §12.1: details report the tracking-row recipe (calstat, master

@@ -54,6 +54,23 @@ pub struct CfaGeometry {
     pub yoff: i64,
 }
 
+impl CfaGeometry {
+    /// Whether two declarations describe the SAME mosaic: same pattern, and
+    /// offsets equal MODULO 2 — because [`cfa_channel_at`] folds them that way.
+    /// An `XBAYROFF` of 2 and one of 0 are the same phase, and calling that a
+    /// disagreement would push a perfectly good flat onto the recompute path
+    /// (or raise a compatibility warning) for nothing.
+    ///
+    /// THE single home of the parity rule: the flat-card check
+    /// (`light_cal::read_ath_channel_norms`) and the advisory light-vs-master
+    /// comparison (`api::lights`) both call it, so the two can never drift.
+    pub fn same_phase(self, other: CfaGeometry) -> bool {
+        self.pattern == other.pattern
+            && self.xoff.rem_euclid(2) == other.xoff.rem_euclid(2)
+            && self.yoff.rem_euclid(2) == other.yoff.rem_euclid(2)
+    }
+}
+
 /// Which colour pixel `(x, y)` carries under geometry `g`.
 pub fn cfa_channel_at(x: usize, y: usize, g: CfaGeometry) -> CfaChannel {
     // 2x2 cell grids, row-major (row 0 = top row of the pattern string).
@@ -127,6 +144,32 @@ mod tests {
             pattern,
             xoff,
             yoff,
+        }
+    }
+
+    /// The parity rule: offsets compare modulo 2 (so 2 == 0, -1 == 1), the
+    /// pattern compares exactly. Same folding [`cfa_channel_at`] applies, which
+    /// is what makes "same phase" mean "same pixel-to-colour mapping".
+    #[test]
+    fn same_phase_folds_offsets_and_pins_the_pattern() {
+        let base = geom(Bayer::Rggb, 0, 0);
+        assert!(base.same_phase(geom(Bayer::Rggb, 2, -2)));
+        assert!(base.same_phase(geom(Bayer::Rggb, 0, 0)));
+        assert!(!base.same_phase(geom(Bayer::Rggb, 1, 0)));
+        assert!(!base.same_phase(geom(Bayer::Rggb, 0, -1)));
+        assert!(!base.same_phase(geom(Bayer::Bggr, 0, 0)), "pattern must match too");
+
+        // Agreement is exactly "every pixel maps to the same colour".
+        for (a, b) in [
+            (geom(Bayer::Rggb, 0, 0), geom(Bayer::Rggb, 2, 4)),
+            (geom(Bayer::Grbg, -1, 3), geom(Bayer::Grbg, 1, 1)),
+        ] {
+            assert!(a.same_phase(b));
+            for y in 0..4usize {
+                for x in 0..4usize {
+                    assert_eq!(cfa_channel_at(x, y, a), cfa_channel_at(x, y, b));
+                }
+            }
         }
     }
 

@@ -487,16 +487,6 @@ pub fn resolve_flat_norm_divisor(
     }
 }
 
-/// Whether two mosaic phases are the same. Offsets compare MODULO 2 because
-/// [`cfa_channel_at`] folds them that way — an `XBAYROFF` of 2 and one of 0 are
-/// the same phase, and calling that a disagreement would push a perfectly good
-/// flat onto the recompute path for nothing.
-fn same_cfa_phase(a: CfaGeometry, b: CfaGeometry) -> bool {
-    a.pattern == b.pattern
-        && a.xoff.rem_euclid(2) == b.xoff.rem_euclid(2)
-        && a.yoff.rem_euclid(2) == b.yoff.rem_euclid(2)
-}
-
 /// Best-effort read of a master flat's per-channel `ATH_FNR`/`ATH_FNG`/`ATH_FNB`
 /// cards. All three must be present and usable as divisors (finite, > 0) — a
 /// partial or broken triple counts as absent, so the caller recomputes from the
@@ -544,8 +534,12 @@ fn read_ath_channel_norms(flat_path: &Path, light: CfaGeometry) -> Option<[f64; 
             xoff: offset("XBAYROFF"),
             yoff: offset("YBAYROFF"),
         });
+    // Offsets compare modulo 2 ([`CfaGeometry::same_phase`], which the advisory
+    // light-vs-master check in `api::lights` shares): an `XBAYROFF` of 2 and one
+    // of 0 are the same phase, and calling that a disagreement would push a
+    // perfectly good flat onto the recompute path for nothing.
     match flat_geom {
-        Some(g) if same_cfa_phase(g, light) => Some(k),
+        Some(g) if g.same_phase(light) => Some(k),
         _ => {
             tracing::warn!(
                 path = %flat_path.display(),

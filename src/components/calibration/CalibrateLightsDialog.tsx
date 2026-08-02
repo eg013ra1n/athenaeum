@@ -240,6 +240,16 @@ export function CalibrateLightsDialog({ setId, setName, onClose }: CalibrateLigh
                 <span>{missing.bias} frame{missing.bias === 1 ? '' : 's'} without a bias link — optional, raw master darks already include bias.</span>
               </div>
             )}
+
+            {/* CFA compatibility — ADVISORY: light-vs-master mosaic mismatches
+                (a mono master flat over an OSC light, a phase shift). Never
+                blocks the run; the Calibrate button ignores these entirely. */}
+            {readiness.cfaWarnings.map((warning, i) => (
+              <div key={i} className="flex items-start gap-1.5 text-warning">
+                <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+                <span>{warning}</span>
+              </div>
+            ))}
           </div>
         ) : null}
 
