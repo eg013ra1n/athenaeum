@@ -405,16 +405,6 @@ pub fn find_calibration_candidates(
             focallen, &filter, set_temp, type_config,
         );
 
-        // `skip_matching` fires per-candidate when an Exact+required parameter
-        // can't be compared (frame missing the value, or set missing it).
-        // Treat it the same way the original `find_calibration_sets` did:
-        // skip THIS candidate and keep iterating. Aborting the whole search
-        // breaks real-world DBs where any single malformed calibration row
-        // would otherwise hide every legitimate match.
-        if match_result.skip_matching {
-            continue;
-        }
-
         // Diffs for the engine score. These are also surfaced via details so
         // both UIs can display them consistently.
         let date_diff = calculate_date_diff(frame.date_obs, &date_start, &date_end);
@@ -436,6 +426,12 @@ pub fn find_calibration_candidates(
         let date_warning = check_date_warning_days(date_diff, calibration_type, config);
         let temp_warning = match_result.warnings.iter().any(|w| w.contains("ccd_temp"));
 
+        // `skip_matching` fires per-candidate when an Exact+required parameter
+        // can't be COMPARED at all (frame missing the value, or set missing it —
+        // e.g. a CCD set with no GAIN header). That is a hard-filter failure,
+        // not an invisibility cloak: auto-link must not offer it, but the manual
+        // modal's "Show All" must still list it so the user can pick it by hand.
+        // The `OnlyCompatible` gate below is the one and only place it drops out.
         let passed_hard_filter = match_result.matches && !match_result.skip_matching;
 
         if mode == CandidateMode::OnlyCompatible && !passed_hard_filter {
@@ -1142,8 +1138,10 @@ mod tests {
     fn engine_skip_matching_does_not_abort_search() {
         // Regression: a calibration set with NULL on a required-Exact param
         // (e.g., gain) used to make the engine return Vec::new() and hide every
-        // valid candidate behind it. Make sure those rows are skipped, not
-        // fatal.
+        // valid candidate behind it. Make sure such a row only costs itself an
+        // auto-link slot — it must never suppress the rest of the search. (Its
+        // own visibility in "Show All" is pinned by
+        // `engine_skip_matching_set_is_incompatible_not_invisible`.)
         let conn = engine_test_db();
 
         // Set 1: malformed — NULL gain. With config.gain Exact+required, the
@@ -1172,6 +1170,71 @@ mod tests {
             ids, vec![2],
             "skip_matching on one row must not hide other valid candidates"
         );
+    }
+
+    #[test]
+    fn engine_skip_matching_set_is_incompatible_not_invisible() {
+        // A set that can't be COMPARED on an Exact+required parameter (here:
+        // NULL gain, the classic CCD-without-GAIN case) is not a match — but it
+        // is still a set the user may legitimately want to pick by hand. It
+        // must be absent from auto-link (`OnlyCompatible`) and present in the
+        // manual modal's "Show All" (`IncludeIncompatible`) flagged as
+        // incompatible, instead of vanishing from both.
+        let conn = engine_test_db();
+
+        const NULL_GAIN_SET_ID: i64 = 1;
+        const VALID_SET_ID: i64 = 2;
+
+        conn.execute(
+            "INSERT INTO calibration_set
+             (id, imagetyp, exptime, ccd_temp, temp_min, temp_max, gain, offset,
+              binning, instrume, date, date_start, date_end, frame_count, is_master_library)
+             VALUES (?1, 'Dark', 300.0, -10.0, -10.0, -10.0, NULL, 50.0, '1x1', 'ASI2600MM',
+                     '2025-09-25T00:00:00+00:00', '2025-09-25T00:00:00+00:00',
+                     '2025-09-25T00:00:00+00:00', 10, 0)",
+            params![NULL_GAIN_SET_ID],
+        ).unwrap();
+        insert_dark_set(&conn, VALID_SET_ID, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+
+        let frame = light_frame_for_dark();
+        let config = CalibrationMatchingConfig::default();
+        // Pin the premise: gain is Exact + required, so the NULL-gain set is
+        // genuinely incomparable rather than merely mismatched.
+        let gain_cfg = &config.get_type_config("lights", "dark").unwrap().gain;
+        assert_eq!(gain_cfg.mode, MatchMode::Exact);
+        assert!(gain_cfg.required, "test premise: gain must be Exact + required");
+
+        // Auto-link: incomparable set must NOT be offered.
+        let auto = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
+        ).unwrap();
+        let auto_ids: Vec<i64> = auto.iter().map(|c| c.set_id).collect();
+        assert!(
+            !auto_ids.contains(&NULL_GAIN_SET_ID),
+            "auto-link must not offer an incomparable set: got {:?}", auto_ids
+        );
+        assert!(auto_ids.contains(&VALID_SET_ID), "valid set still auto-links: got {:?}", auto_ids);
+
+        // Show All: incomparable set must be visible, flagged incompatible.
+        let manual = find_calibration_candidates(
+            &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
+        ).unwrap();
+        let incomparable = manual
+            .iter()
+            .find(|c| c.set_id == NULL_GAIN_SET_ID)
+            .expect("Show All must surface the incomparable set so the user can pick it by hand");
+        assert!(
+            !incomparable.passed_hard_filter,
+            "incomparable set must be flagged incompatible, not presented as a match"
+        );
+        assert_eq!(
+            incomparable.match_score, 0.0,
+            "incomparable set must score 0 like every other hard-filter reject"
+        );
+        // The un-comparable parameter is rendered honestly: frame has a value,
+        // the set does not, and it did not match.
+        assert!(!incomparable.details.gain.matched);
+        assert!(incomparable.details.gain.set_value.is_none());
     }
 
     #[test]
