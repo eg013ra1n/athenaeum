@@ -294,18 +294,24 @@ pub fn find_calibration_for_dark_set(
 /// once the raw flats it superseded are gone from the catalog the light frame
 /// ends up with no flat at all (2026-08-02 audit, C1 flats arm).
 ///
-/// Returns the best *master* flat the configurable matcher accepts for this
-/// light frame, or `None` so the caller falls back to pattern-based grouping.
-/// Note the master is taken whenever one is compatible: `master_preferences`
-/// orders the candidate list but never filters it (Task 1 contract), and raw
-/// flat sets keep going through the grouping path, which is the only one that
-/// models flat timing patterns.
+/// Honors `master_preferences`: the candidate list comes back already ordered
+/// by `apply_master_preference`, and only its TOP entry is considered. A
+/// top-ranked raw set is deliberately left to the grouping path — that path
+/// finds/reuses the very same set (and the superseded-lineage guard still
+/// redirects a superseded group to its master), so a master is the only
+/// candidate worth short-circuiting on. PreferMaster (the default) therefore
+/// takes any compatible master; NoPreference takes one only when it tops the
+/// score order; PreferFrameset defers to any compatible raw set yet still
+/// reaches the master when no raw set exists.
+///
+/// Returns the master's set id, or `None` so the caller falls back to
+/// pattern-based grouping.
 fn find_master_flat_for_light(
     conn: &Connection,
     light_frame: &Frame,
     config: &CalibrationMatchingConfig,
 ) -> Result<Option<i64>> {
-    let master = find_calibration_candidates(
+    let top = find_calibration_candidates(
         conn,
         light_frame,
         "lights",
@@ -314,9 +320,9 @@ fn find_master_flat_for_light(
         CandidateMode::OnlyCompatible,
     )?
     .into_iter()
-    .find(|c| c.is_master);
+    .next();
 
-    Ok(master.map(|c| c.set_id))
+    Ok(top.filter(|c| c.is_master).map(|c| c.set_id))
 }
 
 /// Build complete calibration hierarchy for a light frame
@@ -370,7 +376,10 @@ pub fn build_complete_hierarchy(
         // Master flats exist only as calibration_set rows (their MASTERFLAT
         // frame is invisible to raw-frame grouping), so consult the
         // configurable matcher first; fall back to pattern-based grouping
-        // when no master matches (2026-08-02 audit C1, flats arm).
+        // when its top-ranked candidate isn't a master (2026-08-02 audit C1,
+        // flats arm). Short-circuiting only on a master keeps
+        // `master_preferences` honored: a top-ranked raw set falls through to
+        // grouping, which finds/reuses that same set.
         tracing::debug!(frame_id, set_id = master_set_id, "auto-linked master flat via configurable matcher");
         Some(master_set_id)
     } else {
@@ -1013,6 +1022,7 @@ mod tests {
     // is a MasterFlat (invisible to raw-frame grouping) — could never be
     // auto-linked once its raw frames had been superseded away.
 
+    use crate::calibration::config::MasterPreference;
     use crate::db::schema::init_db;
     use rusqlite::params;
 
@@ -1191,6 +1201,99 @@ mod tests {
             "an incompatible master must not hijack the auto flat path"
         );
         assert_eq!(hierarchy.flat_sets[0].set.filter.as_deref(), Some("Ha"));
+    }
+
+    /// Persist a lights→flat master preference the way the UI does: one
+    /// `CalibrationMatchingConfig` JSON under `calibration.matching_config`,
+    /// which `load_config` reads inside `build_complete_hierarchy`.
+    fn set_flat_master_preference(conn: &Connection, preference: MasterPreference) {
+        let mut config = CalibrationMatchingConfig::default();
+        config.master_preferences.insert("flat".to_string(), preference);
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('calibration.matching_config', ?1)",
+            params![config.to_json().unwrap()],
+        ).unwrap();
+    }
+
+    #[test]
+    fn prefer_frameset_defers_to_a_compatible_raw_flat_set() {
+        let conn = auto_flat_test_db();
+        set_flat_master_preference(&conn, MasterPreference::PreferFrameset);
+
+        // Both a compatible master AND a compatible raw flat set (with its
+        // raw frames still in the catalog) are available.
+        insert_flat_set(&conn, 100, "MasterFlat", "Ha", 1, None);
+        insert_frame_row(&conn, 100, "MasterFlat", "Ha", "2025-09-25T00:00:00+00:00", 1);
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (100, 100)",
+            [],
+        ).unwrap();
+
+        insert_flat_set(&conn, 200, "Flat", "Ha", 0, None);
+        insert_frame_row(&conn, 30, "Flat", "Ha", "2025-09-25T20:00:00+00:00", 0);
+        insert_frame_row(&conn, 31, "Flat", "Ha", "2025-09-25T20:01:00+00:00", 0);
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (200, 30), (200, 31)",
+            [],
+        ).unwrap();
+
+        let light = light_frame_for_flat();
+        let hierarchy = build_complete_hierarchy(
+            &conn,
+            &light,
+            &CalibrationTolerance::default(),
+            None,
+            None,
+            None,
+            365,
+            240,
+            1.0,
+        ).unwrap();
+
+        assert_eq!(hierarchy.flat_sets.len(), 1);
+        assert!(
+            !hierarchy.flat_sets[0].set.is_master,
+            "PreferFrameset must defer to the raw flat set, got set {:?}",
+            hierarchy.flat_sets[0].set.id
+        );
+    }
+
+    #[test]
+    fn prefer_frameset_still_reaches_the_master_when_no_raw_set_exists() {
+        // The lineage must never be stranded: with the raw flats superseded
+        // away there is nothing for grouping to find, so even PreferFrameset
+        // has to land on the master.
+        let conn = auto_flat_test_db();
+        set_flat_master_preference(&conn, MasterPreference::PreferFrameset);
+
+        insert_flat_set(&conn, 100, "MasterFlat", "Ha", 1, None);
+        insert_frame_row(&conn, 100, "MasterFlat", "Ha", "2025-09-25T00:00:00+00:00", 1);
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (100, 100)",
+            [],
+        ).unwrap();
+        insert_flat_set(&conn, 101, "Flat", "Ha", 0, Some(100));
+
+        let light = light_frame_for_flat();
+        let hierarchy = build_complete_hierarchy(
+            &conn,
+            &light,
+            &CalibrationTolerance::default(),
+            None,
+            None,
+            None,
+            365,
+            240,
+            1.0,
+        ).unwrap();
+
+        assert_eq!(
+            hierarchy.flat_sets.len(), 1,
+            "master must stay reachable under PreferFrameset, got missing: {:?}",
+            hierarchy.missing_calibration
+        );
+        assert_eq!(hierarchy.flat_sets[0].set.id, Some(100));
+        assert!(hierarchy.flat_sets[0].set.is_master);
     }
 
     #[test]
