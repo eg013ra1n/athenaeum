@@ -692,6 +692,21 @@ fn create_dark_calibration_set_with_type(
     dark_group: &DarkGroup,
     imagetyp: &str,
 ) -> Result<i64> {
+    // Same guard as the on-demand creation paths: the existence query below
+    // excludes superseded rows, so a re-scan of a lineage a master already
+    // replaced would fall through and mint a duplicate raw set.
+    if let Some(master_id) =
+        crate::calibration::superseded_guard::superseding_master_for_frames(conn, &dark_group.frame_ids)?
+    {
+        tracing::info!(
+            master_set_id = master_id,
+            frames = dark_group.frame_ids.len(),
+            imagetyp,
+            "group belongs to a superseded lineage — reusing its master instead of minting a duplicate raw set"
+        );
+        return Ok(master_id);
+    }
+
     // Check if set already exists with same parameters using date range overlap
     let cluster_start = dark_group.start_time.to_rfc3339();
     let cluster_end = dark_group.end_time.to_rfc3339();
@@ -950,4 +965,112 @@ pub fn create_master_sets_from_frames(
 
     tracing::debug!(count = sets_created, imagetyp, "created master calibration sets from scan");
     Ok(sets_created)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Seeds a raw dark/darkflat set a master already replaced, plus the master.
+    /// Returns the master's set id.
+    fn seed_superseded_dark_lineage(
+        conn: &Connection,
+        raw_id: i64,
+        master_id: i64,
+        imagetyp: &str,
+        frame_ids: &[i64],
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, date_start, date_end, is_master_library)
+             VALUES (?1, ?2, '2025-09-25', '2025-09-25T00:00:00+00:00', '2025-09-25T00:10:00+00:00', 0)",
+            rusqlite::params![raw_id, imagetyp],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (?1, ?2, '2025-09-25', 1)",
+            rusqlite::params![master_id, format!("Master{}", imagetyp)],
+        ).unwrap();
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = ?1 WHERE id = ?2",
+            rusqlite::params![master_id, raw_id],
+        ).unwrap();
+        for frame_id in frame_ids {
+            let file_id = frame_id + 100_000;
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, ?3, 0, '2025-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![
+                    file_id,
+                    format!("/test/scan_sup_{}.fits", frame_id),
+                    format!("scan_sup_{}.fits", frame_id),
+                ],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp) VALUES (?1, ?2, ?3)",
+                rusqlite::params![frame_id, file_id, imagetyp.to_uppercase()],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![raw_id, frame_id],
+            ).unwrap();
+        }
+        master_id
+    }
+
+    fn dark_group_for(frame_ids: Vec<i64>) -> DarkGroup {
+        let t = chrono::DateTime::parse_from_rfc3339("2025-09-25T00:00:00+00:00").unwrap().with_timezone(&Utc);
+        let frame_count = frame_ids.len();
+        DarkGroup {
+            frame_ids,
+            start_time: t,
+            end_time: t,
+            avg_temp: Some(-10.0),
+            temp_min: Some(-10.0),
+            temp_max: Some(-10.0),
+            frame_count,
+            instrume: Some("TestCamera".to_string()),
+            binning: Some("1x1".to_string()),
+            gain: Some(56.0),
+            offset: Some(50.0),
+            exptime: Some(300.0),
+            focal_length: None,
+        }
+    }
+
+    fn set_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM calibration_set", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn scanner_dark_set_creation_reuses_superseding_master_instead_of_minting_duplicate() {
+        // C1 regression, scanner Dark path. This function's own existence query
+        // excludes superseded rows, so without the guard a re-scan of an already
+        // superseded lineage falls through to the INSERT and mints a duplicate
+        // raw set beside the master.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let master_id = seed_superseded_dark_lineage(&conn, 40, 41, "Dark", &[400, 401]);
+        let before = set_count(&conn);
+
+        let returned =
+            create_dark_calibration_set_with_type(&conn, &dark_group_for(vec![400, 401]), "Dark").unwrap();
+
+        assert_eq!(returned, master_id, "must return the superseding master's id");
+        assert_eq!(set_count(&conn), before, "no new calibration_set row may be minted");
+    }
+
+    #[test]
+    fn scanner_darkflat_set_creation_reuses_superseding_master_instead_of_minting_duplicate() {
+        // Same path, DarkFlat imagetyp — the scanner routes both through here.
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let master_id = seed_superseded_dark_lineage(&conn, 50, 51, "DarkFlat", &[500, 501]);
+        let before = set_count(&conn);
+
+        let returned =
+            create_dark_calibration_set_with_type(&conn, &dark_group_for(vec![500, 501]), "DarkFlat").unwrap();
+
+        assert_eq!(returned, master_id, "must return the superseding master's id");
+        assert_eq!(set_count(&conn), before, "no new calibration_set row may be minted");
+    }
 }
