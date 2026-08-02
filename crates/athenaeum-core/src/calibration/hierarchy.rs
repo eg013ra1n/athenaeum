@@ -1,7 +1,8 @@
 // Calibration hierarchy builder - constructs complete calibration trees
-use crate::calibration::finder::CalibrationCandidate;
+use crate::calibration::finder::{CalibrationCandidate, CandidateMode};
 use crate::calibration::configurable_matcher::{
     load_config, find_dark_for_light, find_calibration_for_flat, find_calibration_for_dark,
+    find_calibration_candidates,
 };
 use crate::calibration::config::{CalibrationMatchingConfig, MatchMode};
 use crate::calibration::flat_matcher::{
@@ -285,6 +286,39 @@ pub fn find_calibration_for_dark_set(
     Ok(candidates)
 }
 
+/// Auto-link pre-step for the flats arm.
+///
+/// A Master Flat exists in the catalog only as a `calibration_set` row — its
+/// MASTERFLAT frame is invisible to raw-frame flat grouping — so the
+/// pattern-based path in `build_complete_hierarchy` can never reach one, and
+/// once the raw flats it superseded are gone from the catalog the light frame
+/// ends up with no flat at all (2026-08-02 audit, C1 flats arm).
+///
+/// Returns the best *master* flat the configurable matcher accepts for this
+/// light frame, or `None` so the caller falls back to pattern-based grouping.
+/// Note the master is taken whenever one is compatible: `master_preferences`
+/// orders the candidate list but never filters it (Task 1 contract), and raw
+/// flat sets keep going through the grouping path, which is the only one that
+/// models flat timing patterns.
+fn find_master_flat_for_light(
+    conn: &Connection,
+    light_frame: &Frame,
+    config: &CalibrationMatchingConfig,
+) -> Result<Option<i64>> {
+    let master = find_calibration_candidates(
+        conn,
+        light_frame,
+        "lights",
+        "flat",
+        config,
+        CandidateMode::OnlyCompatible,
+    )?
+    .into_iter()
+    .find(|c| c.is_master);
+
+    Ok(master.map(|c| c.set_id))
+}
+
 /// Build complete calibration hierarchy for a light frame
 /// Returns hierarchy including all flats, darks, and their sub-calibrations
 ///
@@ -332,6 +366,13 @@ pub fn build_complete_hierarchy(
     let flat_set_id = if let Some(set_id) = manual_flat_set_id {
         // Manual selection - use the provided set ID directly
         Some(set_id)
+    } else if let Some(master_set_id) = find_master_flat_for_light(conn, light_frame, &config)? {
+        // Master flats exist only as calibration_set rows (their MASTERFLAT
+        // frame is invisible to raw-frame grouping), so consult the
+        // configurable matcher first; fall back to pattern-based grouping
+        // when no master matches (2026-08-02 audit C1, flats arm).
+        tracing::debug!(frame_id, set_id = master_set_id, "auto-linked master flat via configurable matcher");
+        Some(master_set_id)
     } else {
         // Auto-detect using pattern-based matching
         let flat_matches = find_flat_groups_for_light_frame(
@@ -963,5 +1004,232 @@ mod tests {
             .filter(|w| w.warning_type == "temperature")
             .collect();
         assert_eq!(temp_warnings.len(), 1);
+    }
+
+    // ── Auto flat path: master flats ────────────────────────────────────
+    // 2026-08-02 audit C1 (flats arm). The auto flat path resolved flats
+    // exclusively by grouping RAW flat frames, so a Master Flat — which
+    // lives in the catalog as a calibration_set row whose only member frame
+    // is a MasterFlat (invisible to raw-frame grouping) — could never be
+    // auto-linked once its raw frames had been superseded away.
+
+    use crate::db::schema::init_db;
+    use rusqlite::params;
+
+    fn auto_flat_test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn
+    }
+
+    /// Insert a flat calibration_set row carrying every parameter the
+    /// lights→flat config checks Exact (instrume / binning / gain / offset /
+    /// filter) plus focallen (Warning mode, 5mm warn / 10mm reject).
+    fn insert_flat_set(
+        conn: &Connection,
+        id: i64,
+        imagetyp: &str,
+        filter: &str,
+        is_master_library: i32,
+        superseded_by: Option<i64>,
+    ) {
+        conn.execute(
+            "INSERT INTO calibration_set
+             (id, imagetyp, exptime, filter, ccd_temp, temp_min, temp_max, gain, offset,
+              binning, instrume, focallen, date, date_start, date_end, frame_count,
+              is_master_library, superseded_by_set_id)
+             VALUES (?1, ?2, 2.0, ?3, -10.0, -10.0, -10.0, 100.0, 30.0,
+                     '1x1', 'ASI2600MM', 448.0, '2025-09-25', '2025-09-25T00:00:00+00:00',
+                     '2025-09-25T00:10:00+00:00', 20, ?4, ?5)",
+            params![id, imagetyp, filter, is_master_library, superseded_by],
+        ).unwrap();
+    }
+
+    /// Insert a file + frame pair. `imagetyp` is written verbatim so callers
+    /// can create both raw ('Flat') and master ('MasterFlat') rows.
+    fn insert_frame_row(
+        conn: &Connection,
+        id: i64,
+        imagetyp: &str,
+        filter: &str,
+        date_obs: &str,
+        is_master: i32,
+    ) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 1024, '2025-09-25T00:00:00+00:00', 'FITS')",
+            params![id, format!("/data/frame_{}.fits", id), format!("frame_{}.fits", id)],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO frames
+             (id, file_id, date_obs, instrume, exptime, filter, gain, offset, binning,
+              xbinning, ybinning, ccd_temp, focallen, imagetyp, is_master)
+             VALUES (?1, ?1, ?2, 'ASI2600MM', 2.0, ?3, 100.0, 30.0, '1x1',
+                     1, 1, -10.0, 448.0, ?4, ?5)",
+            params![id, date_obs, filter, imagetyp, is_master],
+        ).unwrap();
+    }
+
+    fn light_frame_for_flat() -> Frame {
+        Frame {
+            id: Some(1),
+            file_id: 1,
+            object: Some("M42".to_string()),
+            date_obs: Some(
+                DateTime::parse_from_rfc3339("2025-10-01T00:00:00+00:00")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
+            telescop: None,
+            instrume: Some("ASI2600MM".to_string()),
+            exptime: Some(300.0),
+            filter: Some("Ha".to_string()),
+            imagetyp: Some(ImageType::Light),
+            is_master: false,
+            gain: Some(100.0),
+            offset: Some(30.0),
+            binning: Some("1x1".to_string()),
+            xbinning: Some(1),
+            ybinning: Some(1),
+            ccd_temp: Some(-10.0),
+            set_temp: None,
+            focallen: Some(448.0),
+            xpixsz: None,
+            ypixsz: None,
+            naxis1: None,
+            naxis2: None,
+            ra: None,
+            dec: None,
+            sitelat: None,
+            lat_obs: None,
+            sitelong: None,
+            long_obs: None,
+            objctra: None,
+            objctdec: None,
+            override_: false,
+            swcreate: None,
+            bayerpat: None,
+            rotation: None,
+            uuid: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn auto_flat_reaches_master_when_raw_flat_frames_are_gone() {
+        let conn = auto_flat_test_db();
+
+        // Master flat (set 100) + its MasterFlat member frame. The raw set it
+        // superseded (set 101) survives as a row, but its raw Flat frames are
+        // no longer in the catalog — the only state raw-frame grouping can
+        // see is nothing at all.
+        insert_flat_set(&conn, 100, "MasterFlat", "Ha", 1, None);
+        insert_frame_row(&conn, 100, "MasterFlat", "Ha", "2025-09-25T00:00:00+00:00", 1);
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (100, 100)",
+            [],
+        ).unwrap();
+        insert_flat_set(&conn, 101, "Flat", "Ha", 0, Some(100));
+
+        let light = light_frame_for_flat();
+        let hierarchy = build_complete_hierarchy(
+            &conn,
+            &light,
+            &CalibrationTolerance::default(),
+            None,
+            None,
+            None,
+            365,
+            240,
+            1.0,
+        ).unwrap();
+
+        assert_eq!(
+            hierarchy.flat_sets.len(), 1,
+            "auto path must land on the master flat, got missing: {:?}",
+            hierarchy.missing_calibration
+        );
+        assert_eq!(hierarchy.flat_sets[0].set.id, Some(100));
+        assert!(hierarchy.flat_sets[0].set.is_master, "auto path must land on the master flat");
+        assert!(!hierarchy.missing_calibration.contains(&"Flat".to_string()));
+    }
+
+    #[test]
+    fn auto_flat_falls_back_to_raw_grouping_when_no_master_matches() {
+        let conn = auto_flat_test_db();
+
+        // A master flat for a DIFFERENT filter — incompatible per the Exact
+        // filter rule, so the matcher must decline it and the legacy
+        // raw-frame grouping path must still produce a set.
+        insert_flat_set(&conn, 100, "MasterFlat", "OIII", 1, None);
+        insert_frame_row(&conn, 100, "MasterFlat", "OIII", "2025-09-25T00:00:00+00:00", 1);
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (100, 100)",
+            [],
+        ).unwrap();
+
+        // Raw Ha flats the light frame can actually use.
+        insert_frame_row(&conn, 10, "Flat", "Ha", "2025-09-25T20:00:00+00:00", 0);
+        insert_frame_row(&conn, 11, "Flat", "Ha", "2025-09-25T20:01:00+00:00", 0);
+
+        let light = light_frame_for_flat();
+        let hierarchy = build_complete_hierarchy(
+            &conn,
+            &light,
+            &CalibrationTolerance::default(),
+            None,
+            None,
+            None,
+            365,
+            240,
+            1.0,
+        ).unwrap();
+
+        assert_eq!(hierarchy.flat_sets.len(), 1, "raw grouping must still resolve a flat set");
+        assert!(
+            !hierarchy.flat_sets[0].set.is_master,
+            "an incompatible master must not hijack the auto flat path"
+        );
+        assert_eq!(hierarchy.flat_sets[0].set.filter.as_deref(), Some("Ha"));
+    }
+
+    #[test]
+    fn manual_flat_selection_wins_over_a_compatible_master() {
+        let conn = auto_flat_test_db();
+
+        // A compatible master exists, but the user picked a specific raw set.
+        insert_flat_set(&conn, 100, "MasterFlat", "Ha", 1, None);
+        insert_frame_row(&conn, 100, "MasterFlat", "Ha", "2025-09-25T00:00:00+00:00", 1);
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (100, 100)",
+            [],
+        ).unwrap();
+
+        insert_flat_set(&conn, 200, "Flat", "Ha", 0, None);
+        insert_frame_row(&conn, 20, "Flat", "Ha", "2025-09-25T20:00:00+00:00", 0);
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (200, 20)",
+            [],
+        ).unwrap();
+
+        let light = light_frame_for_flat();
+        let hierarchy = build_complete_hierarchy(
+            &conn,
+            &light,
+            &CalibrationTolerance::default(),
+            None,
+            Some(200),
+            None,
+            365,
+            240,
+            1.0,
+        ).unwrap();
+
+        assert_eq!(hierarchy.flat_sets.len(), 1);
+        assert_eq!(
+            hierarchy.flat_sets[0].set.id, Some(200),
+            "manual selection must be used verbatim"
+        );
+        assert!(!hierarchy.flat_sets[0].set.is_master);
     }
 }
