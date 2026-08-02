@@ -39,15 +39,23 @@ export function useMasterBuilds() {
         if (cancelled) return;
         setBuildStates(prev => new Map(prev).set(payload.set_id, { phase: 'done', result: payload }));
 
+        // Non-fatal build warning (e.g. undefined pixels excluded from the
+        // integration) rides along with the outcome line — the build still
+        // succeeded, so it never changes the tone or the error styling.
+        const outcome = payload.success
+          ? `Set #${payload.set_id} → master set #${payload.master_set_id}`
+          : (payload.error ?? '');
+        const detail = payload.warning
+          ? (outcome ? `${outcome} — ${payload.warning}` : payload.warning)
+          : outcome;
+
         notify({
           title: payload.cancelled
             ? 'Master build cancelled'
             : payload.success
               ? 'Master created'
               : 'Master build failed',
-          detail: payload.success
-            ? `Set #${payload.set_id} → master set #${payload.master_set_id}`
-            : (payload.error ?? ''),
+          detail,
           kind: 'masterbuild',
           hasErrors: !payload.success && !payload.cancelled,
           tone: payload.success ? 'success' : payload.cancelled ? 'info' : 'warning',

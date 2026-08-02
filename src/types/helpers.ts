@@ -364,13 +364,19 @@ export interface MasterBuildProgressEvent {
  *  emitted exactly once per `start_master_build` call regardless of outcome
  *  (success, error, cancelled). `set_id` is the SOURCE calibration set id,
  *  not `master_set_id` — see the Rust doc comment for why (rebuild keys off
- *  the same source set). */
+ *  the same source set).
+ *
+ *  `warning` is the non-fatal counterpart of `error`: the build succeeded but
+ *  the source data had something worth reporting (today: non-finite samples
+ *  excluded from the integration). Optional because the hook also synthesizes
+ *  local failure events that never carry one. */
 export interface MasterBuildCompleteEvent {
   set_id: number;
   master_set_id: number | null;
   success: boolean;
   cancelled: boolean;
   error: string | null;
+  warning?: string | null;
 }
 
 /** Registration status for a single frame. Note: the generated

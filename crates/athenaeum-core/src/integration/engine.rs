@@ -19,6 +19,15 @@ pub struct IntegrationOutput {
     pub data: Vec<f32>,
     pub rejected_fraction: f64,
     pub flat_norm: Option<f64>,
+    /// How many samples of frame i were dropped as non-finite (NaN/±Inf after
+    /// pre-calibration and scaling). Indexed by the caller's `paths` order —
+    /// same order `BandSource::open` was given. Never a build failure: FITS
+    /// calls these "undefined pixels", so they are excluded from the stack the
+    /// way an out-of-range rejection is, and reported.
+    pub bad_samples_per_frame: Vec<usize>,
+    /// Output pixels whose ENTIRE stack was non-finite — nothing left to
+    /// combine, so 0.0 was written.
+    pub all_bad_pixels: usize,
 }
 
 pub struct EngineProgress<'a> {
@@ -66,6 +75,11 @@ fn run_banded(
     let bands_total = h.div_ceil(band_rows);
     let mut out = vec![0f32; w * h];
     let rejected = AtomicUsize::new(0);
+    // Non-finite accounting (audit C2). Plain counters shared across the rayon
+    // rows, so Relaxed is enough — nothing else is published through them, and
+    // the reads below happen after every worker has joined.
+    let bad_samples: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+    let all_bad = AtomicUsize::new(0);
     let mut band_bufs: Vec<Vec<f32>> = vec![Vec::new(); n];
 
     for (band_idx, y0) in (0..h).step_by(band_rows).enumerate() {
@@ -103,15 +117,40 @@ fn run_banded(
                                 }
                             }
                             v *= scales[i];
+                            if !v.is_finite() {
+                                // FITS: NaN in float data means "undefined
+                                // pixel" — excluded from the stack (with
+                                // accounting), exactly like an out-of-range
+                                // rejection. Passing it on would panic the
+                                // winsorized estimator (`f64::clamp` with NaN
+                                // bounds) or bake NaN into the master.
+                                bad_samples[i].fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            }
                             column.push(v);
                         }
-                        let (val, rej) = combine_pixel(&mut column, recipe);
-                        *out_px = val;
-                        if rej > 0 { rejected.fetch_add(rej, Ordering::Relaxed); }
+                        if column.is_empty() {
+                            *out_px = 0.0;
+                            all_bad.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            let (val, rej) = combine_pixel(&mut column, recipe);
+                            *out_px = val;
+                            if rej > 0 { rejected.fetch_add(rej, Ordering::Relaxed); }
+                        }
                     }
                 });
         });
         (progress.on_band)(band_idx + 1, bands_total);
+    }
+
+    // Every input sample was finiteness-checked above, so a non-finite OUTPUT
+    // could only come out of the combiner itself — unreachable by
+    // construction. Checked anyway: a hard error beats shipping a poisoned
+    // master that silently corrupts every light it calibrates.
+    if let Some(bad) = out.iter().find(|v| !v.is_finite()) {
+        return Err(IntegrationError::Decode(format!(
+            "internal: non-finite value {bad} survived input filtering"
+        )));
     }
 
     let total_samples = (w * h * n).max(1);
@@ -121,6 +160,8 @@ fn run_banded(
         data: out,
         rejected_fraction: rejected.load(Ordering::Relaxed) as f64 / total_samples as f64,
         flat_norm: None,
+        bad_samples_per_frame: bad_samples.into_iter().map(|a| a.into_inner()).collect(),
+        all_bad_pixels: all_bad.into_inner(),
     })
 }
 
@@ -204,6 +245,13 @@ fn integrate_flat_inner(
                         FlatPrecal::SyntheticBias(b) => v -= *b as f64,
                         FlatPrecal::None => {}
                     }
+                    // Same undefined-pixel policy as the combine pass: a single
+                    // non-finite sample must not poison this frame's mean —
+                    // that mean IS its normalization scale, so a NaN here would
+                    // scale EVERY sample of the frame to NaN and the whole
+                    // master would come out as zeros. Counting happens in pass
+                    // 2 (which walks the full image), not here.
+                    if !v.is_finite() { continue; }
                     sums[i] += v;
                     counts[i] += 1;
                 }
@@ -434,5 +482,66 @@ mod tests {
             "every normalized sample must be (v - 500) * scale = 1500; got {}",
             out.data[0]
         );
+    }
+
+    /// Audit C2: a single NaN/Inf sample used to either PANIC the build
+    /// (`f64::clamp` with NaN bounds inside the winsorized estimator — the
+    /// Auto recipe for N>=15) or bake a non-finite value into the master.
+    /// Policy: non-finite samples are FITS "undefined pixels" — dropped from
+    /// the per-pixel stack with accounting, never a build failure.
+    #[test]
+    fn non_finite_samples_are_excluded_not_propagated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (4usize, 4usize);
+        let mut paths = Vec::new();
+        for i in 0..16 {
+            let mut data = vec![100.0f32; w * h];
+            if i == 3 { data[5] = f32::NAN; }   // one bad sample in ONE frame
+            data[9] = f32::INFINITY;            // pixel 9: bad in EVERY frame
+            let p = dir.path().join(format!("f{i}.fits"));
+            write_fits_f32(&p, w, h, 1, &data, &[]).unwrap();
+            paths.push(p);
+        }
+        let on_band = nop();
+        let out = integrate_bias_like(
+            &paths,
+            IntegrationRecipe::average(Rejection::WinsorizedSigma { sigma_low: 3.0, sigma_high: 3.0 }),
+            &pool(), dir.path(), &AtomicBool::new(false),
+            EngineProgress { on_band: &on_band },
+        ).unwrap();
+        assert!(out.data.iter().all(|v| v.is_finite()), "master must never contain non-finite pixels");
+        assert!((out.data[5] - 100.0).abs() < 1e-3, "pixel 5 combines the 15 good samples");
+        assert_eq!(out.data[9], 0.0, "all-bad pixel becomes 0");
+        assert_eq!(out.bad_samples_per_frame[3], 2, "frame 3: its own NaN + the shared Inf pixel");
+        assert_eq!(out.bad_samples_per_frame[0], 1, "every other frame: just the shared Inf pixel");
+        assert_eq!(out.all_bad_pixels, 1);
+    }
+
+    /// The flat path's pass 1 (per-frame central-third mean, the source of the
+    /// normalization scale) must skip non-finite samples too — otherwise ONE
+    /// NaN poisons that frame's mean, hence its scale, hence EVERY one of its
+    /// samples, and the "exclude with accounting" policy degenerates into an
+    /// all-zero master. The NaN here sits inside the central third on purpose.
+    #[test]
+    fn flat_non_finite_sample_does_not_poison_the_frame_scale() {
+        let dir = tempfile::tempdir().unwrap();
+        let (w, h) = (24usize, 24usize);
+        let paths = vec![
+            write(dir.path(), "f1.fits", w, h, |_, _| 1000.0),
+            write(dir.path(), "f2.fits", w, h, |x, y| if (x, y) == (12, 12) { f32::NAN } else { 1000.0 }),
+            write(dir.path(), "f3.fits", w, h, |_, _| 1000.0),
+        ];
+        let on_band = nop();
+        let out = integrate_flat(
+            &paths, &FlatPrecal::None, IntegrationRecipe::median(Rejection::None),
+            &pool(), dir.path(), &AtomicBool::new(false),
+            EngineProgress { on_band: &on_band },
+        ).unwrap();
+        assert!(out.data.iter().all(|v| v.is_finite()));
+        assert!(out.data.iter().all(|&v| (v - 1000.0).abs() < 1e-3),
+            "flat master stays at the (equal) frame level; got {}", out.data[0]);
+        assert_eq!(out.bad_samples_per_frame, vec![0, 1, 0]);
+        assert_eq!(out.all_bad_pixels, 0, "the pixel still has 2 valid samples");
+        assert!(out.flat_norm.is_some_and(|n| (n - 1000.0).abs() < 1e-3));
     }
 }

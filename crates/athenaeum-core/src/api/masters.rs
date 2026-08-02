@@ -191,6 +191,11 @@ struct MasterBuildProgressEvent {
 /// registering. `master_set_id` keeps its existing meaning: "the master
 /// that resulted from this build" — for a rebuild that's always the master
 /// that was passed in, echoed back.
+///
+/// `warning` is the non-fatal counterpart of `error`: the build SUCCEEDED but
+/// something in the source data was worth telling the operator about (today:
+/// non-finite samples excluded from the integration — audit C2). Always `None`
+/// on a failed or cancelled build.
 #[derive(Clone, serde::Serialize)]
 struct MasterBuildCompleteEvent {
     set_id: i64,
@@ -198,6 +203,7 @@ struct MasterBuildCompleteEvent {
     success: bool,
     cancelled: bool,
     error: Option<String>,
+    warning: Option<String>,
 }
 
 // ── Recipe resolution (pure, unit-tested) ────────────────────────────────────
@@ -783,6 +789,10 @@ enum BuildTarget {
 /// plain `?`/`Err` return — `run_master_build_thread` (the only caller)
 /// always removes the handle and always emits `master-build-complete`
 /// afterward, so there's no cleanup duty here.
+///
+/// On success returns `(master_set_id, build_warning)` — the warning is the
+/// non-fatal "the data had undefined pixels" note (audit C2) that the single
+/// exit path puts on `master-build-complete`.
 #[allow(clippy::too_many_arguments)]
 fn run_build(
     ctx: &ServiceContext,
@@ -792,7 +802,7 @@ fn run_build(
     recipe: &MasterRecipe,
     cancel_flag: &Arc<AtomicBool>,
     target: BuildTarget,
-) -> Result<i64, BuildStepError> {
+) -> Result<(i64, Option<String>), BuildStepError> {
     let label = format!("Master build: calibration set {set_id}");
     // Bound (not discarded with `_`) so the permit's Drop — which releases
     // the concurrency slot — fires at the end of THIS function's scope,
@@ -903,6 +913,41 @@ fn run_build(
         )?
     };
 
+    // Audit C2: the engine drops non-finite samples ("undefined pixels") from
+    // the per-pixel stack instead of panicking or baking NaN into the master.
+    // That is never a build failure — but it IS data loss the operator must
+    // hear about, per frame in the log and once in the completion event.
+    // `bad_samples_per_frame` is indexed by `paths` order (the same slice the
+    // engine was handed), so index i names the file at paths[i].
+    let bad_total: usize = out.bad_samples_per_frame.iter().sum();
+    let build_warning = if bad_total > 0 || out.all_bad_pixels > 0 {
+        for (i, &count) in out.bad_samples_per_frame.iter().enumerate() {
+            if count > 0 {
+                tracing::warn!(
+                    set_id, path = %paths[i].display(), count,
+                    "non-finite samples excluded from integration"
+                );
+            }
+        }
+        if out.all_bad_pixels > 0 {
+            tracing::warn!(
+                set_id, count = out.all_bad_pixels,
+                "pixels with no valid sample written as 0"
+            );
+        }
+        let frames_touched = out.bad_samples_per_frame.iter().filter(|&&c| c > 0).count();
+        Some(format!(
+            "{bad_total} undefined sample(s) excluded across {frames_touched} frame(s){}",
+            if out.all_bad_pixels > 0 {
+                format!("; {} pixel(s) had no valid data", out.all_bad_pixels)
+            } else {
+                String::new()
+            }
+        ))
+    } else {
+        None
+    };
+
     emit_event(
         emitter,
         "master-build-progress",
@@ -979,7 +1024,7 @@ fn run_build(
 
     match target {
         BuildTarget::New => match register_master(&conn, set_id, &target_abs, &recipe_json) {
-            Ok(reg) => Ok(reg.master_set_id),
+            Ok(reg) => Ok((reg.master_set_id, build_warning)),
             Err(e) => {
                 // Keep the written master on disk: deleting it on a catalog
                 // conflict re-created the exact divergence that caused the
@@ -1058,7 +1103,7 @@ fn run_build(
             // above: new pixels on disk, stale provenance/files rows in the
             // DB until a later rebuild succeeds. That trade (stale metadata
             // over destroyed data) is intentional.
-            Ok(master_set_id)
+            Ok((master_set_id, build_warning))
         }
     }
 }
@@ -1120,7 +1165,7 @@ fn run_master_build_thread(
     // build, not part of the build itself, so a failure here must never turn
     // a successful master build into a reported failure. Log-and-continue.
     if was_new_build && recipe.archive_after {
-        if let Ok(_master_set_id) = &result {
+        if result.is_ok() {
             match archive_originals(ctx.clone(), emitter.clone(), set_id) {
                 Ok(archive_op_id) => {
                     tracing::info!(
@@ -1141,12 +1186,12 @@ fn run_master_build_thread(
 
     ctx.active_master_builds.lock().unwrap().remove(&set_id);
 
-    let (master_set_id, success, cancelled, error) = match result {
-        Ok(id) => (Some(id), true, false, None),
-        Err(BuildStepError::Cancelled) => (None, false, true, None),
+    let (master_set_id, success, cancelled, error, warning) = match result {
+        Ok((id, warning)) => (Some(id), true, false, None, warning),
+        Err(BuildStepError::Cancelled) => (None, false, true, None, None),
         Err(BuildStepError::Other(msg)) => {
             tracing::error!(set_id, error = %msg, "master build failed");
-            (None, false, false, Some(msg))
+            (None, false, false, Some(msg), None)
         }
     };
 
@@ -1159,6 +1204,7 @@ fn run_master_build_thread(
             success,
             cancelled,
             error,
+            warning,
         },
     );
 }
