@@ -737,6 +737,7 @@ pub fn preview_master_build(
 /// mode into "cancelled" (queue-cancel or mid-integration cancel — both
 /// surface identically to the caller) or "other" (a message suitable for
 /// the `master-build-complete` event's `error` field).
+#[derive(Debug)]
 enum BuildStepError {
     Cancelled,
     Other(String),
@@ -1112,38 +1113,27 @@ fn run_build(
             master_file_id,
             ..
         } => {
-            // Everything after `write_fits_f32`'s atomic rename, in ONE
-            // closure so every possible failure in this window (tx open,
-            // update_rebuild, metadata read, files UPDATE, commit) funnels
-            // through the single metadata-drift error log below.
-            let finalize = || -> Result<(), BuildStepError> {
-                let tx = conn.unchecked_transaction()?;
-                crate::db::master_provenance::update_rebuild(
-                    &tx,
-                    master_set_id,
-                    &recipe_json,
-                    &member_hash_str,
-                )?;
-                let meta = std::fs::metadata(&target_abs)?;
-                let modified_at = chrono::DateTime::<chrono::Utc>::from(meta.modified()?);
-                tx.execute(
-                    "UPDATE files SET size = ?1, modified_at = ?2 WHERE id = ?3",
-                    rusqlite::params![meta.len() as i64, modified_at.to_rfc3339(), master_file_id],
-                )?;
-                tx.commit()?;
-                Ok(())
-            };
-            if let Err(e) = finalize() {
+            if let Err(e) = finalize_rebuild(
+                &conn,
+                master_set_id,
+                master_file_id,
+                &target_abs,
+                &recipe_json,
+                &member_hash_str,
+            ) {
                 // METADATA-DRIFT WINDOW: the on-disk master file HAS already
                 // been replaced (atomic rename inside `write_fits_f32`), but
                 // the catalog metadata was NOT refreshed — the
-                // master_provenance row (recipe/hash/created_at) and the
-                // files row (size/modified_at) still describe the PREVIOUS
-                // build, and the `master-build-complete` event will report
-                // failure. The drift is metadata-only (pixels on disk are
-                // the new, valid rebuild) and self-heals on the next
-                // successful rebuild of the same master. Logged loudly here
-                // — this is the one state where DB and disk disagree.
+                // master_provenance row (recipe/hash/created_at), the files
+                // row (size/modified_at) and the frames row + stored header
+                // still describe the PREVIOUS build, and the
+                // `master-build-complete` event will report failure. The
+                // drift is metadata-only (pixels on disk are the new, valid
+                // rebuild) and self-heals on the next successful rebuild of
+                // the same master — or on the next library scan, which sees
+                // the size/mtime drift and re-parses the file in place.
+                // Logged loudly here — this is the one state where DB and
+                // disk disagree.
                 let err_msg = match &e {
                     BuildStepError::Cancelled => "cancelled".to_string(),
                     BuildStepError::Other(m) => m.clone(),
@@ -1154,8 +1144,8 @@ fn run_build(
                     master_path = %target_abs.display(),
                     error = %err_msg,
                     "rebuild metadata refresh failed AFTER the on-disk master was atomically replaced — \
-                     the file now holds the rebuilt pixels but master_provenance/files still describe \
-                     the previous build; a subsequent successful rebuild self-heals this drift"
+                     the file now holds the rebuilt pixels but master_provenance/files/frames still \
+                     describe the previous build; a subsequent successful rebuild self-heals this drift"
                 );
                 return Err(e);
             }
@@ -1176,6 +1166,39 @@ fn run_build(
             Ok((master_set_id, build_warning))
         }
     }
+}
+
+/// Everything a rebuild does AFTER `write_fits_f32`'s atomic rename, in ONE
+/// function and ONE transaction so every possible failure in that window (tx
+/// open, provenance update, re-parse, commit) funnels through the single
+/// metadata-drift error log at the call site, and so no half-refreshed catalog
+/// state can be observed.
+///
+/// A rebuild rewrites the master's HEADER as well as its pixels — the cards
+/// are rebuilt from the current member consensus, so BAYERPAT/XBAYROFF/
+/// YBAYROFF/ROWORDER/ATH_FNRM can all differ from what the original
+/// registration parsed. Refreshing only `files.size`/`modified_at` therefore
+/// used to leave the `frames` row and the `fits_header` snapshot describing
+/// the PREVIOUS build's header; light-calibration copy-through reads that
+/// stored header, so the drift was user-visible in the calibrated output's
+/// CFA cards. `scanner::resync_catalog_rows_from_disk` re-parses the file that
+/// was just written and UPDATEs files/frames/fits_header in place, preserving
+/// `files.id` and `frames.id` — the master's calibration_set membership and
+/// every consumer link in `calibration_set_to_frames` are keyed on those ids
+/// and stay untouched.
+fn finalize_rebuild(
+    conn: &rusqlite::Connection,
+    master_set_id: i64,
+    master_file_id: i64,
+    target_abs: &Path,
+    recipe_json: &str,
+    member_hash_str: &str,
+) -> Result<(), BuildStepError> {
+    let tx = conn.unchecked_transaction()?;
+    crate::db::master_provenance::update_rebuild(&tx, master_set_id, recipe_json, member_hash_str)?;
+    crate::scanner::resync_catalog_rows_from_disk(&tx, master_file_id, target_abs)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Runs on the dedicated `master-build-{set_id}` thread. The single exit
@@ -3476,6 +3499,160 @@ mod tests {
         assert!(
             delete_master(&ctx, master_set).is_err(),
             "deleting an already-deleted master must fail loudly"
+        );
+    }
+
+    /// A rebuild rewrites the master's HEADER as well as its pixels — since
+    /// the Bayer cards are built from the member consensus, BAYERPAT /
+    /// XBAYROFF / YBAYROFF / ROWORDER can all differ from what the original
+    /// registration parsed. `finalize_rebuild` therefore re-reads the file it
+    /// just wrote: light-calibration copy-through reads the STORED header, and
+    /// a stale non-blank card there wins over the frames-column fallback.
+    #[test]
+    fn rebuild_finalize_syncs_frames_and_stored_header_with_the_rewritten_file() {
+        use crate::fits_writer::keywords::{Bayer, FrameKind, HeaderBuilder};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let master_path = tmp.path().join("master_dark_300s.fits");
+        let conn = test_conn();
+
+        // The raw source set `register_master` supersedes.
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-08-01')",
+            [],
+        )
+        .unwrap();
+        let raw_set = conn.last_insert_rowid();
+
+        // ── Build #1: RGGB, no phase offsets, BOTTOM-UP, 4x4.
+        let cards1 = HeaderBuilder::new(FrameKind::MasterDark)
+            .instrume("TestCam")
+            .exptime(300.0)
+            .bayer(Bayer::Rggb, 0, 0)
+            .roworder("BOTTOM-UP")
+            .build()
+            .unwrap();
+        write_fits_f32(&master_path, 4, 4, 1, &vec![100.0f32; 16], &cards1).unwrap();
+        let reg = register_master(&conn, raw_set, &master_path, r#"{"combine":"median"}"#).unwrap();
+
+        let stored = |conn: &Connection, file_id: i64| -> String {
+            conn.query_row(
+                "SELECT header FROM fits_header WHERE file_id = ?1",
+                [file_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(
+            stored(&conn, reg.master_file_id).contains("BAYERPAT= 'RGGB"),
+            "sanity: registration stored the first build's header"
+        );
+
+        // ── Rebuild: SAME path, different consensus cards, different geometry
+        // (so files.size moves too). Only the file is rewritten here — the
+        // catalog refresh is entirely `finalize_rebuild`'s job.
+        let cards2 = HeaderBuilder::new(FrameKind::MasterDark)
+            .instrume("TestCam")
+            .exptime(300.0)
+            .bayer(Bayer::Grbg, 1, 0)
+            .roworder("TOP-DOWN")
+            .build()
+            .unwrap();
+        write_fits_f32(&master_path, 64, 64, 1, &vec![250.0f32; 4096], &cards2).unwrap();
+
+        finalize_rebuild(
+            &conn,
+            reg.master_set_id,
+            reg.master_file_id,
+            &master_path,
+            r#"{"combine":"mean","rebuilt":true}"#,
+            "hash-after-rebuild",
+        )
+        .unwrap();
+
+        // frames row: same id (every junction link is keyed on it), new cards.
+        let (frame_id, bayerpat, xbayroff, ybayroff, roworder, naxis1): (
+            i64,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT id, bayerpat, xbayroff, ybayroff, roworder, naxis1
+                 FROM frames WHERE file_id = ?1",
+                [reg.master_file_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(frame_id, reg.master_frame_id, "rebuild must preserve frames.id");
+        assert_eq!(bayerpat.as_deref(), Some("GRBG"));
+        assert_eq!(xbayroff, Some(1));
+        assert_eq!(ybayroff, Some(0));
+        assert_eq!(roworder.as_deref(), Some("TOP-DOWN"));
+        assert_eq!(naxis1, Some(64), "geometry follows the rewritten file");
+
+        // Stored header: the blob light-cal copy-through reads.
+        let header = stored(&conn, reg.master_file_id);
+        assert!(
+            header.contains("BAYERPAT= 'GRBG"),
+            "stored header must follow disk, got: {header}"
+        );
+        assert!(
+            !header.contains("BAYERPAT= 'RGGB"),
+            "the pre-rebuild CFA card must not survive in the blob"
+        );
+        let header_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fits_header WHERE file_id = ?1",
+                [reg.master_file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(header_rows, 1, "the refresh must not duplicate the blob row");
+
+        // files row: size follows disk — that is what makes the next library
+        // scan classify the rebuilt master as unchanged instead of re-parsing.
+        let size: i64 = conn
+            .query_row(
+                "SELECT size FROM files WHERE id = ?1",
+                [reg.master_file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            size,
+            std::fs::metadata(&master_path).unwrap().len() as i64,
+            "files.size must follow the rewritten file"
+        );
+
+        // Set membership + provenance: untouched / refreshed as before.
+        let member: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1 AND frame_id = ?2",
+                rusqlite::params![reg.master_set_id, reg.master_frame_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(member, 1, "the master's calibration_set membership survives");
+        let prov = crate::db::master_provenance::get(&conn, reg.master_set_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prov.member_hash, "hash-after-rebuild");
+        assert_eq!(
+            prov.source_set_id,
+            Some(raw_set),
+            "rebuild must not relink to a different source"
         );
     }
 }

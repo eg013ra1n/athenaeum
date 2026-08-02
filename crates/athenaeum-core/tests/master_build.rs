@@ -145,18 +145,22 @@ fn synchronous_build_produces_registered_master_with_correct_header() {
 /// Runs the SAME sequence `api::masters::run_build`'s `BuildTarget::Rebuild`
 /// arm performs (re-integrate the source set's member frames -> write to
 /// the master's EXISTING path -> `master_provenance::update_rebuild` +
-/// direct `files` row refresh) — minus the `ServiceContext`-only plumbing
-/// (queue admission, thread spawn, progress/completion events), which is
-/// exactly what `synchronous_build_produces_registered_master_with_correct_header`
+/// `scanner::resync_catalog_rows_from_disk`) — minus the
+/// `ServiceContext`-only plumbing (queue admission, thread spawn,
+/// progress/completion events), which is exactly what
+/// `synchronous_build_produces_registered_master_with_correct_header`
 /// above already does for the New path. What this test pins, per Task 13's
 /// self-review requirement: a rebuild (a) actually re-reads changed source
-/// pixels rather than being a no-op, (b) leaves the master's `frames` row,
-/// `calibration_set` row, and every existing consumer link in
-/// `calibration_set_to_frames` untouched, and (c) refreshes
-/// `master_provenance` (recipe/hash) and the master's `files` row
-/// (size/modified_at) while preserving `source_set_id`.
+/// pixels rather than being a no-op, (b) leaves the master's identity — its
+/// `frames.id`/`imagetyp`/`is_master`, its `calibration_set` row, and every
+/// existing consumer link in `calibration_set_to_frames` — untouched, and (c)
+/// refreshes `master_provenance` (recipe/hash) and the master's `files` row
+/// (size/modified_at) while preserving `source_set_id`. The header-derived
+/// frames columns and the stored header blob DO get refreshed from the
+/// rewritten file — that part is pinned by
+/// `api::masters::tests::rebuild_finalize_syncs_frames_and_stored_header_with_the_rewritten_file`.
 #[test]
-fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_frames_untouched() {
+fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_identity_intact() {
     let dir = tempfile::tempdir().unwrap();
     let library_dir = tempfile::tempdir().unwrap();
     let scratch = tempfile::tempdir().unwrap();
@@ -269,14 +273,10 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_frames_untouc
 
     let recipe_json_2 = r#"{"combine":"median","rebuilt":true}"#;
     athenaeum_core::db::master_provenance::update_rebuild(&conn, reg.master_set_id, recipe_json_2, &hash2).unwrap();
-    let meta = std::fs::metadata(&target_abs).unwrap();
-    let modified_at = chrono::DateTime::<chrono::Utc>::from(meta.modified().unwrap()).to_rfc3339();
-    conn.execute(
-        "UPDATE files SET size = ?1, modified_at = ?2 WHERE id = ?3",
-        rusqlite::params![meta.len() as i64, modified_at, reg.master_file_id],
-    ).unwrap();
+    athenaeum_core::scanner::resync_catalog_rows_from_disk(&conn, reg.master_file_id, &target_abs)
+        .unwrap();
 
-    // ── Links / frames / calibration_set: untouched. ──
+    // ── Links / frames identity / calibration_set: untouched. ──
     let link_set_after: i64 = conn.query_row(
         "SELECT calibration_set_id FROM calibration_set_to_frames
          WHERE source_id = ?1 AND source_type = 'frame'",
@@ -288,7 +288,17 @@ fn rebuild_in_place_updates_pixels_and_provenance_leaves_links_and_frames_untouc
         "SELECT imagetyp, is_master FROM frames WHERE id = ?1",
         [reg.master_frame_id], |r| Ok((r.get(0)?, r.get(1)?)),
     ).unwrap();
-    assert_eq!(frame_row_after, frame_row_before, "rebuild must not touch the master's frames row");
+    assert_eq!(
+        frame_row_after, frame_row_before,
+        "rebuild must not change what the master IS (imagetyp/is_master) — only refresh its header-derived columns",
+    );
+
+    // The refresh is id-preserving: the frames row every junction table points
+    // at is the same row, UPDATEd in place, never re-inserted.
+    let frame_id_after: i64 = conn.query_row(
+        "SELECT id FROM frames WHERE file_id = ?1", [reg.master_file_id], |r| r.get(0),
+    ).unwrap();
+    assert_eq!(frame_id_after, reg.master_frame_id, "rebuild must preserve frames.id");
 
     let set_row_after: (i64, i64) = conn.query_row(
         "SELECT frame_count, is_master_library FROM calibration_set WHERE id = ?1",

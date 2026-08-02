@@ -1047,7 +1047,7 @@ fn resolve_master_set_id(conn: &Connection, master: &crate::fits_parser::MasterR
 /// and returns Err — the caller should log it as a non-fatal error so the
 /// rest of the scan continues.
 fn reparse_and_update_in_place(
-    path: &PathBuf,
+    path: &Path,
     file_id: i64,
     conn: &Connection,
     use_content_hash: bool,
@@ -1079,7 +1079,23 @@ fn reparse_and_update_in_place(
         }
         FileFormat::XISF => {
             let f = parse_xisf(path, file_id)?;
-            let h = extract_xisf_header(path).ok();
+            // A failed header extraction is the ONE way this function can
+            // leave the stored header blob describing different bytes than the
+            // frames columns it is about to write (light-cal copy-through
+            // reads that blob). Keeping the previous snapshot beats deleting
+            // it — per-field revert still works — but it must not be silent.
+            let h = match extract_xisf_header(path) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    tracing::warn!(
+                        file_id,
+                        path = %path.display(),
+                        error = %e,
+                        "xisf header extraction failed on re-parse — stored header keeps its previous contents"
+                    );
+                    None
+                }
+            };
             (f, h)
         }
     };
@@ -1200,6 +1216,44 @@ fn reparse_and_update_in_place(
             Err(e)
         }
     }
+}
+
+/// Refresh the catalog rows of a file **Athenaeum itself just rewrote** from
+/// what is now on disk: `files` (size/mtime/format/hashes), `frames` (every
+/// header-derived column) and the `fits_header` snapshot, all in place, all in
+/// one savepoint, preserving `files.id` and `frames.id` — and therefore every
+/// junction-table linkage (calibration_set_frames, calibration_set_to_frames,
+/// session_members, frame_tags).
+///
+/// Same writer the scanner's drift re-parse uses, so a rewritten file lands
+/// exactly the rows a fresh ingest would have produced. The master-rebuild
+/// path (`api::masters`) is the caller: a rebuild replaces the master file's
+/// pixels AND its header cards, so without this the catalog would keep
+/// describing the previous build's header.
+///
+/// Fixed argument choices, matching what `register_master` writes for a
+/// freshly built master:
+/// - `use_content_hash = false` — registration never stores one, and the
+///   rewrite invalidates any value a hashing scan had filled in. The re-parse
+///   writes NULL, which is honest and recoverable (the content-hash backfill
+///   fills NULLs); a retained stale hash would not be.
+/// - `unique_camera = false` / `root_id = 0` — `register_master` stores
+///   INSTRUME exactly as parsed, with no " N<root_id>" suffix, and later
+///   library scans classify the file as unchanged so they never add one.
+///   Passing the suffix here would make a rebuilt master's INSTRUME differ
+///   from a newly built one's.
+///
+/// Inherits the re-parse's `frames.override` rule: if the user has edited this
+/// frame's metadata, the frames row is left alone and only files + the stored
+/// header snapshot are refreshed. That is the intended precedence — user edits
+/// outrank header values, and the snapshot must still describe the bytes now
+/// on disk.
+pub fn resync_catalog_rows_from_disk(
+    conn: &Connection,
+    file_id: i64,
+    path: &Path,
+) -> anyhow::Result<()> {
+    reparse_and_update_in_place(path, file_id, conn, false, false, 0)
 }
 
 /// The write half of `reparse_and_update_in_place`. Runs inside the
@@ -2623,6 +2677,83 @@ mod inplace_tests {
         assert_eq!(xbayroff, Some(1));
         assert_eq!(ybayroff, Some(0));
         assert_eq!(roworder.as_deref(), Some("TOP-DOWN"));
+    }
+
+    /// The stored header blob is what light-calibration copy-through reads for
+    /// the CFA cards, so it must never be left describing the PREVIOUS bytes
+    /// while the frames columns describe the new ones — a stale non-blank blob
+    /// card wins over the column fallback. Pins both halves of the documented
+    /// re-parse contract ("files/frames/fits_header in one transaction") on a
+    /// file whose BAYERPAT actually changed on disk.
+    #[test]
+    fn rescan_syncs_stored_header_blob_with_frames_columns() {
+        let scan = TempDir::new().unwrap();
+        let f = scan.path().join("OSC/L_001.fits");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        write_fits_with_extra_cards(&f, &["BAYERPAT= 'RGGB    '"]);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [scan.path().to_str().unwrap()],
+        )
+        .unwrap();
+
+        let scan1 = scan_directory(scan.path(), &conn, None, false, false, 1);
+        assert!(scan1.errors.is_empty(), "first scan must succeed: {:?}", scan1.errors);
+
+        let stored_header = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT h.header FROM fits_header h
+                 JOIN files fi ON fi.id = h.file_id WHERE fi.path = ?1",
+                [f.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(stored_header(&conn).contains("BAYERPAT= 'RGGB"));
+
+        // The camera driver now reports a different CFA phase — same file,
+        // new header bytes, advanced mtime.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        write_fits_with_extra_cards(&f, &["BAYERPAT= 'GRBG    '"]);
+
+        let scan2 = scan_directory(scan.path(), &conn, None, false, false, 1);
+        assert!(scan2.errors.is_empty(), "rescan must succeed: {:?}", scan2.errors);
+        assert_eq!(scan2.files_processed, 1, "the modified file must be re-parsed");
+
+        let bayerpat: Option<String> = conn
+            .query_row(
+                "SELECT f.bayerpat FROM frames f JOIN files fi ON fi.id = f.file_id
+                 WHERE fi.path = ?1",
+                [f.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bayerpat.as_deref(), Some("GRBG"), "frames column must follow disk");
+
+        let header = stored_header(&conn);
+        assert!(
+            header.contains("BAYERPAT= 'GRBG"),
+            "stored header blob must follow disk too, got: {header}"
+        );
+        assert!(
+            !header.contains("BAYERPAT= 'RGGB"),
+            "the previous ingest's CFA card must not survive in the blob"
+        );
+
+        // Exactly one blob row — the DELETE-then-INSERT is what enforces it
+        // (fits_header has no UNIQUE(file_id)).
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fits_header h JOIN files fi ON fi.id = h.file_id
+                 WHERE fi.path = ?1",
+                [f.to_str().unwrap()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "re-parse must not duplicate the stored header row");
     }
 
     /// Same invariant as `rescan_after_mtime_change_preserves_session_members`
