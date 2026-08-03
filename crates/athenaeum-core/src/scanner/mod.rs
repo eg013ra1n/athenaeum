@@ -2165,59 +2165,98 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             }
         }
 
-        // New file path — existing INSERT behavior.
-        match insert_file(conn, &file_result.file) {
-            Ok(file_id) => {
-                // Update frame file_id in place (avoids clone of 32-field struct)
-                file_result.frame.file_id = file_id;
-
-                // Apply unique camera suffix to INSTRUME if enabled
-                if unique_camera {
-                    if let Some(ref instrume) = file_result.frame.instrume {
-                        file_result.frame.instrume = Some(format!("{} N{}", instrume, root_id));
-                    }
-                }
-
-                match insert_frame(conn, &file_result.frame) {
-                    Ok(frame_id) => {
-                        result.files_processed += 1;
-                        // A genuinely new file+frame row — eligible for auto-mode sync.
-                        new_file_ids.push(file_id);
-
-                        // Track by image type
-                        if let Some(ref imagetyp) = file_result.imagetyp {
-                            match imagetyp {
-                                ImageType::Light => lights_count += 1,
-                                ImageType::Flat => flat_frame_ids.push(frame_id),
-                                ImageType::Dark => dark_frame_ids.push(frame_id),
-                                ImageType::Bias => bias_frame_ids.push(frame_id),
-                                ImageType::DarkFlat => darkflat_frame_ids.push(frame_id),
-                                ImageType::MasterDark => master_dark_ids.push(frame_id),
-                                ImageType::MasterFlat => master_flat_ids.push(frame_id),
-                                ImageType::MasterBias => master_bias_ids.push(frame_id),
-                                ImageType::MasterDarkFlat => master_darkflat_ids.push(frame_id),
-                                _ => {}
-                            }
-                        }
-
-                        // Insert header if available
-                        if let Some(ref header) = file_result.header {
-                            let _ = insert_fits_header(conn, file_id, header);
-                        }
-                    }
-                    Err(e) => {
-                        errors.lock().unwrap().push(format!(
-                            "{}: Failed to insert frame: {}",
-                            file_result.file.path, e
-                        ));
-                    }
-                }
+        // New file path — atomic per file: files + frames + fits_header
+        // either all commit or none do (SAVEPOINT nests inside the batch
+        // transaction). Previously an insert_frame/insert_fits_header
+        // failure after a successful insert_file committed a frameless or
+        // headerless files row that every later scan classified as
+        // "unchanged" and never repaired.
+        let sp = match crate::db::SavepointGuard::new(conn, "scan_new_file") {
+            Ok(sp) => sp,
+            Err(e) => {
+                errors.lock().unwrap().push(format!(
+                    "{}: failed to open savepoint: {}",
+                    file_result.file.path, e
+                ));
+                continue;
             }
+        };
+        let file_id = match insert_file(conn, &file_result.file) {
+            Ok(id) => id,
             Err(e) => {
                 errors.lock().unwrap().push(format!(
                     "{}: Failed to insert file: {}",
                     file_result.file.path, e
                 ));
+                continue; // sp drops → rollback
+            }
+        };
+        // Update frame file_id in place (avoids clone of 32-field struct)
+        file_result.frame.file_id = file_id;
+
+        // Apply unique camera suffix to INSTRUME if enabled
+        if unique_camera {
+            if let Some(ref instrume) = file_result.frame.instrume {
+                file_result.frame.instrume = Some(format!("{} N{}", instrume, root_id));
+            }
+        }
+
+        let frame_id = match insert_frame(conn, &file_result.frame) {
+            Ok(id) => id,
+            Err(e) => {
+                errors.lock().unwrap().push(format!(
+                    "{}: Failed to insert frame: {}",
+                    file_result.file.path, e
+                ));
+                continue; // sp drops → the files row rolls back too
+            }
+        };
+
+        // Insert header if available — a failure here rolls the whole file
+        // back so the next scan retries it, instead of committing a frame
+        // whose header blob (metadata revert, light-cal copy-through) is
+        // silently missing.
+        if let Some(ref header) = file_result.header {
+            if let Err(e) = insert_fits_header(conn, file_id, header) {
+                tracing::error!(
+                    file_id,
+                    path = %file_result.file.path,
+                    error = %e,
+                    "failed to insert fits header; rolling file back"
+                );
+                errors.lock().unwrap().push(format!(
+                    "{}: Failed to insert header: {}",
+                    file_result.file.path, e
+                ));
+                continue; // sp drops → rollback
+            }
+        }
+
+        if let Err(e) = sp.commit() {
+            errors.lock().unwrap().push(format!(
+                "{}: failed to commit file savepoint: {}",
+                file_result.file.path, e
+            ));
+            continue;
+        }
+
+        result.files_processed += 1;
+        // A genuinely new file+frame row — eligible for auto-mode sync.
+        new_file_ids.push(file_id);
+
+        // Track by image type
+        if let Some(ref imagetyp) = file_result.imagetyp {
+            match imagetyp {
+                ImageType::Light => lights_count += 1,
+                ImageType::Flat => flat_frame_ids.push(frame_id),
+                ImageType::Dark => dark_frame_ids.push(frame_id),
+                ImageType::Bias => bias_frame_ids.push(frame_id),
+                ImageType::DarkFlat => darkflat_frame_ids.push(frame_id),
+                ImageType::MasterDark => master_dark_ids.push(frame_id),
+                ImageType::MasterFlat => master_flat_ids.push(frame_id),
+                ImageType::MasterBias => master_bias_ids.push(frame_id),
+                ImageType::MasterDarkFlat => master_darkflat_ids.push(frame_id),
+                _ => {}
             }
         }
     }
