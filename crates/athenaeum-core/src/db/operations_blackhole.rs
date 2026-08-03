@@ -464,16 +464,22 @@ pub fn rebuild_folder_similarity_cache(
     conn: &Connection,
     similarity_threshold: f64,
 ) -> Result<usize> {
-    // Start transaction
-    conn.execute("BEGIN TRANSACTION", [])?;
+    // Compute OUTSIDE the transaction: the pairwise folder comparison is
+    // in-memory CPU work and previously ran while holding SQLite's sole
+    // write lock, starving every other writer for its whole runtime
+    // (audit C4). Only the DELETE + INSERTs need the lock.
+    let similarities = find_duplicate_folders(conn, similarity_threshold)?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // The old raw `BEGIN`/`COMMIT` pair had no rollback on any error path, so a
+    // failing INSERT returned with an open write transaction left on the
+    // pooled connection; it also could not nest inside a caller's transaction.
+    let sp = crate::db::SavepointGuard::new(conn, "folder_similarity_rebuild")?;
 
     // Clear existing cache
     conn.execute("DELETE FROM folder_similarity", [])?;
 
-    // Compute folder similarities (reuse existing logic)
-    let similarities = find_duplicate_folders(conn, similarity_threshold)?;
-
-    let now = chrono::Utc::now().to_rfc3339();
     let mut count = 0;
 
     for sim in similarities {
@@ -495,7 +501,7 @@ pub fn rebuild_folder_similarity_cache(
         count += 1;
     }
 
-    conn.execute("COMMIT", [])?;
+    sp.commit()?;
     Ok(count)
 }
 
@@ -1106,5 +1112,22 @@ mod tests {
         // And a legitimate filter still works.
         let rows = get_black_hole_files(&conn, Some("duplicates".into())).unwrap();
         assert_eq!(rows.len(), 1);
+    }
+
+    // ── Similarity-cache rebuild composes (audit C4) ─────────────────────────
+
+    /// The rebuild runs at the end of every scan, from inside the scanner's own
+    /// work: it must nest instead of erroring with "cannot start a transaction
+    /// within a transaction" the way the old raw `BEGIN TRANSACTION` did — and
+    /// the failure path must not strand an open write transaction on the
+    /// pooled connection.
+    #[test]
+    fn similarity_rebuild_nests_inside_an_outer_transaction() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        // Raw BEGIN inside the function would error here; savepoints nest.
+        let tx = conn.unchecked_transaction().unwrap();
+        rebuild_folder_similarity_cache(&conn, 50.0).unwrap();
+        tx.commit().unwrap();
     }
 }
