@@ -30,7 +30,6 @@ use athenaeum_core::package::{
     self, read_manifest, write_package, ManifestRecord, PayloadKind, MANIFEST_VERSION,
 };
 use athenaeum_core::sharing::iroh::node::{Role, SharedIrohNode};
-use athenaeum_core::sharing::iroh::random_secret;
 use athenaeum_core::sharing::types::{AnnounceFileEntry, NodeId, PackageLayout};
 use athenaeum_core::sharing::SharingTransport;
 use athenaeum_core::sync::engine::AddrRefresher;
@@ -132,79 +131,6 @@ fn build_target_addr_refresher(config: Config) -> AddrRefresher {
             }
         })
     })
-}
-
-/// Load the persisted 32-byte device secret, creating it (mode 0600) on first
-/// run. On every load of an existing key, permissions are re-checked and
-/// tightened back to 0600 if a group/world bit has crept in (backup restore,
-/// a loose umask, manual copy) — the identity secret must never be readable
-/// by anyone but the service user.
-pub fn load_or_create_device_key(path: &Path) -> Result<[u8; 32]> {
-    if path.exists() {
-        tighten_permissions_if_needed(path)?;
-        let bytes =
-            std::fs::read(path).with_context(|| format!("read device key {}", path.display()))?;
-        let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
-            anyhow::anyhow!(
-                "device key {} is {} bytes, expected 32 — delete it to regenerate",
-                path.display(),
-                bytes.len()
-            )
-        })?;
-        Ok(arr)
-    } else {
-        let secret = random_secret();
-        write_secret_0600(path, &secret)?;
-        tracing::info!(path = %path.display(), "generated new device key");
-        Ok(secret)
-    }
-}
-
-/// Re-check an existing device key's permissions and tighten to 0600 if any
-/// group/other bit is set. No-op on non-Unix (no POSIX mode bits to check).
-#[cfg(unix)]
-fn tighten_permissions_if_needed(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta =
-        std::fs::metadata(path).with_context(|| format!("stat device key {}", path.display()))?;
-    let mode = meta.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("tighten device key permissions {}", path.display()))?;
-        tracing::warn!(
-            path = %path.display(),
-            old_mode = format!("{mode:o}"),
-            "device key permissions tightened"
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn tighten_permissions_if_needed(_path: &Path) -> Result<()> {
-    // No POSIX permission bits on this platform; nothing to tighten.
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_secret_0600(path: &Path, secret: &[u8; 32]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("create device key {}", path.display()))?;
-    f.write_all(secret)
-        .with_context(|| format!("write device key {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_secret_0600(path: &Path, secret: &[u8; 32]) -> Result<()> {
-    std::fs::write(path, secret).with_context(|| format!("write device key {}", path.display()))?;
-    Ok(())
 }
 
 /// Build a one-frame package for a single capture file and return its directory.
@@ -1579,43 +1505,6 @@ fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-/// Current disk usage of the volume holding `path`, as a whole percent
-/// (`0..=100`). Only the `disk_pct` retention policy consults it.
-///
-/// Fails **safe**: any error, or a platform without `statvfs`, returns `0`
-/// ("empty disk") so retention's disk-pressure gate can never *trigger* a
-/// deletion off a bad reading — it can only ever decline to delete.
-#[cfg(unix)]
-fn disk_usage_pct(path: &Path) -> u8 {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let Ok(cpath) = CString::new(path.as_os_str().as_bytes()) else {
-        return 0;
-    };
-    // SAFETY: `stat` is zero-initialised and only read after a successful call;
-    // `cpath` is a valid NUL-terminated C string living for the call's duration.
-    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(cpath.as_ptr(), &mut stat) };
-    if rc != 0 {
-        tracing::warn!(path = %path.display(), "statvfs failed; disk probe returns 0%");
-        return 0;
-    }
-    let total = stat.f_blocks as u128;
-    let avail = stat.f_bavail as u128;
-    if total == 0 {
-        return 0;
-    }
-    let used = total.saturating_sub(avail);
-    ((used * 100) / total).min(100) as u8
-}
-
-#[cfg(not(unix))]
-fn disk_usage_pct(_path: &Path) -> u8 {
-    // No statvfs; treat as empty so retention never deletes on disk pressure.
-    0
-}
-
 /// Pure guard: does `current_size`/`current_mtime_ms` match the `(size,
 /// mtime_ms)` perseus recorded for this source at enqueue time? Extracted as a
 /// free function purely so the TOCTOU-guard test can drive the comparison
@@ -2051,7 +1940,12 @@ fn spawn_retention_task(
             let res = tokio::task::spawn_blocking(move || {
                 // Probe every capture volume and take the MAX usage: disk
                 // pressure on any one watched directory should trigger the gate.
-                let disk_probe = move || dirs.iter().map(|d| disk_usage_pct(d)).max().unwrap_or(0);
+                let disk_probe = move || {
+                    dirs.iter()
+                        .map(|d| athenaeum_core::api::retention::disk_usage_pct(d))
+                        .max()
+                        .unwrap_or(0)
+                };
                 run_retention_once(
                     &pass_config,
                     &store,
@@ -2294,51 +2188,6 @@ mod rel_path_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    /// IMPORTANT #1 (review): an existing device key with group/world-readable
-    /// permissions (backup restore, loose umask) must be tightened back to
-    /// 0600 on load, not silently trusted.
-    #[test]
-    fn insecure_existing_key_permissions_are_tightened_on_load() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("device_key");
-        std::fs::write(&path, [7u8; 32]).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        let key = load_or_create_device_key(&path).expect("load existing key");
-        assert_eq!(key, [7u8; 32], "the key's bytes must be unchanged");
-
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "permissions must be tightened to 0600 on load");
-    }
-
-    /// A key already at 0600 is left alone (no spurious rewrite/log noise).
-    #[test]
-    fn already_secure_key_permissions_are_left_alone() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("device_key");
-        std::fs::write(&path, [9u8; 32]).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-        let key = load_or_create_device_key(&path).expect("load existing key");
-        assert_eq!(key, [9u8; 32]);
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-    }
-
-    /// A freshly created key is written 0600 (existing behavior, guarded here
-    /// too so a regression in either path is caught).
-    #[test]
-    fn newly_created_key_is_0600() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("device_key");
-        assert!(!path.exists());
-
-        load_or_create_device_key(&path).expect("create key");
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-    }
 
     /// Review finding (non-fatal web bind): a port conflict on the OPTIONAL
     /// status page must NOT halt the agent's primary function (watch + sync).
