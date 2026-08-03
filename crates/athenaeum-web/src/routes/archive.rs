@@ -419,7 +419,7 @@ pub async fn rollback_archive_operation(
             let emitter = SseProgressEmitter::new(event_tx);
             let db = ctx_for_worker.db.get().expect("db");
             let conn = db.conn();
-            if let Err(e) = rollback::rollback_operation(&conn, op_id, &emitter) {
+            if let Err(e) = rollback::rollback_operation_standalone(&conn, op_id, &emitter) {
                 tracing::error!(operation_id = op_id, error = ?e, "archive rollback failed");
             }
         }),

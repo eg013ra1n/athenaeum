@@ -406,7 +406,7 @@ pub async fn rollback_archive_operation(
             let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
             let db = ctx_for_worker.db.get().expect("db");
             let conn = db.conn();
-            if let Err(e) = rollback::rollback_operation(&conn, operation_id, &emitter) {
+            if let Err(e) = rollback::rollback_operation_standalone(&conn, operation_id, &emitter) {
                 tracing::error!(operation_id, error = ?e, "archive rollback failed");
             }
         }),

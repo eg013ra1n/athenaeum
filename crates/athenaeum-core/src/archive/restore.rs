@@ -178,7 +178,6 @@ fn run_restore_inner(
             message: msg,
         };
         emit_event(emitter, "archive-progress", &prog);
-        emit_event(emitter, "archive-restore-progress", &prog);
     };
 
     // Stage: extract -----------------------------------------------------------

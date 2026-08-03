@@ -14,8 +14,9 @@ interface FinishedEvent {
   operation_id: number;
   outcome: 'completed' | 'completed_with_conflicts' | 'cancelled' | 'failed' | string;
   /** Optional discriminator: when set to "restore", the worker was running a
-   *  restore (Unarchive). The widget tweaks its title accordingly. */
-  kind?: 'restore' | string;
+   *  restore (Unarchive); "rollback" means a user-initiated roll back of an
+   *  interrupted operation. The widget tweaks its title accordingly. */
+  kind?: 'restore' | 'rollback' | string;
   /** Restore only: number of files left in conflict — an on-disk file at the
    *  original path didn't hash-verify against the archived copy, so it was
    *  left untouched (not overwritten, archive markers not cleared). The
@@ -25,6 +26,8 @@ interface FinishedEvent {
 
 // Restore-stage labels emitted by the Rust restore module.
 const RESTORE_STAGES = new Set(['extract', 'verify', 'update_catalog', 'cleanup']);
+// The only stage the Rust rollback module emits — restoring a moved source.
+const ROLLBACK_STAGE = 'restore_source';
 
 export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
   const [progress, setProgress] = useState<ArchiveProgressEvent | null>(null);
@@ -46,7 +49,12 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
       if (payload.operation_id !== operationId) return;
       setFinished(payload);
       onFinished?.(payload.outcome);
-      const verb = payload.kind === 'restore' ? 'Restore' : 'Archive';
+      const verb =
+        payload.kind === 'restore'
+          ? 'Restore'
+          : payload.kind === 'rollback'
+            ? 'Rollback'
+            : 'Archive';
       const conflictCount = payload.conflicts ?? 0;
       const hasConflicts = payload.outcome === 'completed_with_conflicts' || conflictCount > 0;
       notify({
@@ -64,7 +72,11 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
               : hasConflicts
                 ? 'warning'
                 : 'success',
-        dedupeKey: `archive-finished-${payload.operation_id}`,
+        // The kind belongs in the key: the dedupe set persists to
+        // localStorage, so an "Archive failed" notification from an earlier
+        // session would otherwise swallow the rollback/restore of that same
+        // operation id.
+        dedupeKey: `archive-finished-${payload.operation_id}-${payload.kind ?? 'archive'}`,
       });
       // Brief pause so the user sees the final state, then dismiss.
       window.setTimeout(() => { onClose?.(); }, 1500);
@@ -88,14 +100,27 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
   // pick a different terminal label depending on whether the worker was an
   // archive (rollback restores sources) or a restore (no rollback).
   const isRestoreFinish = finished?.kind === 'restore';
+  // A rollback is its own operation: it can't itself be rolled back, and
+  // "Completed" would read as if the archive had succeeded. Before a terminal
+  // event the only signal is the stage (an archive worker that fails rolls
+  // back too); once it arrives, its `kind` is authoritative — a failed archive
+  // stays an archive even though it emitted rollback progress on the way out.
+  const isRollbackFinish = finished?.kind === 'rollback';
+  const isRollbackRun = finished
+    ? isRollbackFinish
+    : progress?.stage === ROLLBACK_STAGE;
   const statusLabel = finished
-    ? finished.outcome === 'completed'
-      ? 'Completed'
-      : finished.outcome === 'completed_with_conflicts'
-        ? `Completed — ${finished.conflicts ?? 0} conflict${(finished.conflicts ?? 0) === 1 ? '' : 's'}`
-        : finished.outcome === 'cancelled'
-          ? isRestoreFinish ? 'Cancelled' : 'Cancelled — rolled back'
-          : isRestoreFinish ? 'Failed' : 'Failed — rolled back'
+    ? isRollbackFinish
+      ? finished.outcome === 'completed'
+        ? 'Rolled back'
+        : 'Rollback failed'
+      : finished.outcome === 'completed'
+        ? 'Completed'
+        : finished.outcome === 'completed_with_conflicts'
+          ? `Completed — ${finished.conflicts ?? 0} conflict${(finished.conflicts ?? 0) === 1 ? '' : 's'}`
+          : finished.outcome === 'cancelled'
+            ? isRestoreFinish ? 'Cancelled' : 'Cancelled — rolled back'
+            : isRestoreFinish ? 'Failed' : 'Failed — rolled back'
     : progress?.message ?? 'Starting…';
 
   const barColor = finished
@@ -114,10 +139,13 @@ export function ArchiveProgress({ operationId, onClose, onFinished }: Props) {
             const isRestore =
               finished?.kind === 'restore' ||
               (progress?.stage && RESTORE_STAGES.has(progress.stage));
-            return `${isRestore ? 'Restore' : 'Archive'} operation #${operationId}`;
+            const mode = isRestore ? 'Restore' : isRollbackRun ? 'Rollback' : 'Archive';
+            return `${mode} operation #${operationId}`;
           })()}
         </span>
-        {!finished && (
+        {/* A rollback runs outside the cancellable-operation registry — there
+            is nothing to cancel, so don't offer a button that can only fail. */}
+        {!finished && !isRollbackRun && (
           <button
             onClick={async () => {
               try {

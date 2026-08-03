@@ -28,6 +28,34 @@ pub struct RollbackProgress {
     pub message: String,
 }
 
+#[derive(Serialize)]
+struct RollbackFinished<'a> {
+    operation_id: i64,
+    outcome: &'a str,
+    kind: &'a str,
+}
+
+/// User-initiated rollback: the rollback *is* the whole operation, so it owns
+/// the terminal `archive-finished` event the progress widget waits for.
+///
+/// The failure-path callers (the archive / resume workers, which roll back
+/// after their own failure) must keep calling [`rollback_operation`] instead —
+/// they emit their own `archive-finished` carrying the real outcome, and a
+/// second terminal event would mask it in the UI.
+pub fn rollback_operation_standalone(
+    conn: &Connection,
+    operation_id: i64,
+    emitter: &dyn ProgressEmitter,
+) -> Result<()> {
+    let result = rollback_operation(conn, operation_id, emitter);
+    emit_event(emitter, "archive-finished", &RollbackFinished {
+        operation_id,
+        outcome: if result.is_ok() { "completed" } else { "failed" },
+        kind: "rollback",
+    });
+    result
+}
+
 /// Roll back a forward operation. Idempotent: re-running on a partially-rolled-back
 /// op is safe.
 pub fn rollback_operation(
@@ -51,7 +79,7 @@ pub fn rollback_operation(
         if f.disposition != "move" {
             continue;
         }
-        emit_event(emitter, "archive-rollback-progress", &RollbackProgress {
+        emit_event(emitter, "archive-progress", &RollbackProgress {
             operation_id,
             stage: "restore_source".into(),
             current: idx + 1,
@@ -145,8 +173,20 @@ mod tests {
     use crate::events::NullEmitter;
     use rusqlite::params;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
+
+    /// Records every emitted `(event_name, payload)` pair so tests can assert
+    /// on the wire names the frontend actually listens to.
+    #[derive(Default)]
+    struct CapturingEmitter(Mutex<Vec<(String, serde_json::Value)>>);
+
+    impl ProgressEmitter for CapturingEmitter {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            self.0.lock().unwrap().push((event_name.to_string(), payload));
+        }
+    }
 
     /// Builds the same fixture as the executor tests.
     fn fixture() -> (Connection, TempDir, TempDir, i64) {
@@ -230,6 +270,72 @@ mod tests {
         assert!(archived_at.is_none());
 
         let _ = cancel; // unused in this path
+    }
+
+    /// Drives the fixture up to "sources deleted, staging populated" so a
+    /// rollback has restore work to do (and therefore emits progress).
+    fn stage_deleted_sources(conn: &Connection, arch: &TempDir, op_id: i64) {
+        let files = adb::list_operation_files(conn, op_id).unwrap();
+        crate::archive::staging::ensure_staging_dir(arch.path(), op_id).unwrap();
+        for f in &files {
+            crate::archive::staging::copy_into_staging(
+                arch.path(),
+                op_id,
+                std::path::Path::new(&f.source_path),
+                &f.target_path_in_zip,
+            )
+            .unwrap();
+            std::fs::remove_file(&f.source_path).unwrap();
+            let sid =
+                adb::insert_step(conn, op_id, Some(f.id), ArchiveStage::DeleteSource).unwrap();
+            adb::update_step(conn, sid, StepStatus::Done, None, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn rollback_emits_unified_progress_and_finished_events() {
+        let (conn, arch, _scan, op_id) = fixture();
+        stage_deleted_sources(&conn, &arch, op_id);
+
+        let emitter = CapturingEmitter::default();
+        rollback_operation_standalone(&conn, op_id, &emitter).unwrap();
+
+        let events = emitter.0.lock().unwrap();
+        assert!(
+            events.iter().any(|(n, _)| n == "archive-progress"),
+            "rollback must emit on the channel the UI listens to: {events:?}"
+        );
+        let (_, fin) = events
+            .iter()
+            .find(|(n, _)| n == "archive-finished")
+            .expect("finished event");
+        assert_eq!(fin["operation_id"], op_id);
+        assert_eq!(fin["outcome"], "completed");
+        assert_eq!(fin["kind"], "rollback");
+        assert!(
+            events.iter().all(|(n, _)| n != "archive-rollback-progress"),
+            "the unlistened legacy channel must be gone: {events:?}"
+        );
+    }
+
+    /// The failure-path callers (archive/resume workers) emit their own
+    /// `archive-finished` after rolling back — the inner rollback must stay
+    /// silent there or the UI would see a spurious "rollback completed"
+    /// terminal event for an operation that actually failed.
+    #[test]
+    fn inner_rollback_emits_no_finished_event() {
+        let (conn, arch, _scan, op_id) = fixture();
+        stage_deleted_sources(&conn, &arch, op_id);
+
+        let emitter = CapturingEmitter::default();
+        rollback_operation(&conn, op_id, &emitter).unwrap();
+
+        let events = emitter.0.lock().unwrap();
+        assert!(events.iter().any(|(n, _)| n == "archive-progress"));
+        assert!(
+            events.iter().all(|(n, _)| n != "archive-finished"),
+            "inner rollback must not emit a terminal event: {events:?}"
+        );
     }
 
     #[test]
