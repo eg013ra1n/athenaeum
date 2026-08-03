@@ -40,7 +40,9 @@ pub fn get_camera_dark_library(
     conn: &Connection,
     instrume: &str,
 ) -> Result<Vec<CalibrationSetDetail>> {
-    // Query calibration sets with extended frame metadata from first frame in each set
+    // Query calibration sets with extended frame metadata from the first member =
+    // lowest frame id, deterministic (audit I7 — the old bare-column GROUP BY
+    // returned an arbitrary member).
     let mut stmt = conn.prepare(
         "SELECT
             cs.id,
@@ -69,12 +71,15 @@ pub fn get_camera_dark_library(
             cs.updated_at,
             cs.superseded_by_set_id
         FROM calibration_set cs
-        LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
-        LEFT JOIN frames f ON f.id = csf.frame_id
+        LEFT JOIN (
+            SELECT set_id, MIN(frame_id) AS frame_id
+            FROM calibration_set_frames
+            GROUP BY set_id
+        ) first_member ON first_member.set_id = cs.id
+        LEFT JOIN frames f ON f.id = first_member.frame_id
         LEFT JOIN files fi ON fi.id = f.file_id
         WHERE cs.instrume = ?1
         AND cs.is_master_library = 0
-        GROUP BY cs.id
         ORDER BY cs.imagetyp, cs.exptime, cs.ccd_temp"
     )?;
 
@@ -142,6 +147,9 @@ pub fn get_camera_master_dark_library(
     conn: &Connection,
     instrume: &str,
 ) -> Result<Vec<CalibrationSetDetail>> {
+    // Extended frame metadata comes from the first member = lowest frame id,
+    // deterministic (audit I7 — the old bare-column GROUP BY returned an
+    // arbitrary member).
     let mut stmt = conn.prepare(
         "SELECT
             cs.id,
@@ -170,13 +178,16 @@ pub fn get_camera_master_dark_library(
             cs.updated_at,
             cs.superseded_by_set_id
         FROM calibration_set cs
-        LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
-        LEFT JOIN frames f ON f.id = csf.frame_id
+        LEFT JOIN (
+            SELECT set_id, MIN(frame_id) AS frame_id
+            FROM calibration_set_frames
+            GROUP BY set_id
+        ) first_member ON first_member.set_id = cs.id
+        LEFT JOIN frames f ON f.id = first_member.frame_id
         LEFT JOIN files fi ON fi.id = f.file_id
         WHERE cs.instrume = ?1
         AND cs.is_master_library = 1
         AND cs.imagetyp IN ('MasterDark', 'MasterBias', 'MasterDarkFlat')
-        GROUP BY cs.id
         ORDER BY cs.imagetyp, cs.exptime, cs.ccd_temp"
     )?;
 
@@ -247,6 +258,9 @@ pub fn get_camera_master_flat_library(
     conn: &Connection,
     instrume: &str,
 ) -> Result<Vec<CalibrationSetDetail>> {
+    // Extended frame metadata comes from the first member = lowest frame id,
+    // deterministic (audit I7 — the old bare-column GROUP BY returned an
+    // arbitrary member).
     let mut stmt = conn.prepare(
         "SELECT
             cs.id,
@@ -275,13 +289,16 @@ pub fn get_camera_master_flat_library(
             cs.updated_at,
             cs.superseded_by_set_id
         FROM calibration_set cs
-        LEFT JOIN calibration_set_frames csf ON csf.set_id = cs.id
-        LEFT JOIN frames f ON f.id = csf.frame_id
+        LEFT JOIN (
+            SELECT set_id, MIN(frame_id) AS frame_id
+            FROM calibration_set_frames
+            GROUP BY set_id
+        ) first_member ON first_member.set_id = cs.id
+        LEFT JOIN frames f ON f.id = first_member.frame_id
         LEFT JOIN files fi ON fi.id = f.file_id
         WHERE cs.instrume = ?1
         AND cs.is_master_library = 1
         AND cs.imagetyp = 'MasterFlat'
-        GROUP BY cs.id
         ORDER BY cs.filter, cs.exptime, cs.ccd_temp"
     )?;
 
@@ -508,5 +525,56 @@ mod stored_timestamp_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file.modified_at, DateTime::<Utc>::UNIX_EPOCH);
         assert_eq!(rows[0].file.created_at, DateTime::<Utc>::UNIX_EPOCH);
+    }
+}
+
+/// DB-hygiene Task 15 (2026-08-03 audit I7) — the three library queries used to
+/// select bare, non-aggregated frame columns beside `GROUP BY cs.id`. Per
+/// SQLite's documented semantics those values come from an *arbitrary* member
+/// row, not the first one the comments claimed. The `MIN(frame_id)` subquery
+/// makes "first member" mean something.
+#[cfg(test)]
+mod first_member_tests {
+    use super::get_camera_dark_library;
+    use rusqlite::Connection;
+
+    #[test]
+    fn library_metadata_comes_from_the_lowest_frame_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, instrume, date_start, date_end)
+         VALUES ('Dark','2026-01-01','CamX','2026-01-01T00:00:00Z','2026-01-01T01:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+        for (name, naxis1) in [("d1", 6000_i64), ("d2", 9999_i64)] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES (?1, ?2, 1, '2026-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![format!("/t/{name}.fits"), format!("{name}.fits")],
+            )
+            .unwrap();
+            let fid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO frames (file_id, naxis1, instrume) VALUES (?1, ?2, 'CamX')",
+                rusqlite::params![fid, naxis1],
+            )
+            .unwrap();
+            let frid = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                rusqlite::params![set_id, frid],
+            )
+            .unwrap();
+        }
+        let sets = get_camera_dark_library(&conn, "CamX").unwrap();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(
+            sets[0].naxis1,
+            Some(6000),
+            "must be the FIRST member (lowest frame id), not an arbitrary one"
+        );
     }
 }
