@@ -261,3 +261,134 @@ fn row_to_analysis(row: &rusqlite::Row) -> Result<FrameAnalysis> {
         analyzed_at: row.get(22)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::schema::init_db;
+
+    /// Insert a `files` + `frames` row pair, returning `(file_id, frame_id)`.
+    fn insert_frame(conn: &Connection, path: &str) -> (i64, i64) {
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+             VALUES (?1, 'a.fits', 0, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+            [path],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files WHERE path = ?1", [path], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO frames (file_id, imagetyp) VALUES (?1, 'Light')",
+            [file_id],
+        )
+        .unwrap();
+        let frame_id = conn
+            .query_row("SELECT id FROM frames WHERE file_id = ?1", [file_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        (file_id, frame_id)
+    }
+
+    fn analysis(frame_id: i64, file_id: i64) -> FrameAnalysis {
+        FrameAnalysis {
+            id: None,
+            frame_id,
+            file_id,
+            stars_detected: 42,
+            median_fwhm: 3.1,
+            median_eccentricity: 0.4,
+            median_snr: 12.0,
+            median_hfr: 1.8,
+            frame_snr: 25.0,
+            snr_weight: 1.0,
+            psf_signal: 100.0,
+            background: 500.0,
+            noise: 5.0,
+            detection_threshold: 20.0,
+            width: 4096,
+            height: 4096,
+            source_channels: 1,
+            trail_r_squared: 0.1,
+            possibly_trailed: false,
+            median_beta: None,
+            quality_score: Some(0.9),
+            config_hash: None,
+            analyzed_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    fn star(analysis_id: i64) -> StarMetric {
+        StarMetric {
+            id: None,
+            frame_analysis_id: analysis_id,
+            x: 10.0,
+            y: 20.0,
+            peak: 1000.0,
+            flux: 5000.0,
+            fwhm: 3.0,
+            fwhm_x: 3.0,
+            fwhm_y: 3.0,
+            eccentricity: 0.2,
+            snr: 30.0,
+            hfr: 1.5,
+            theta: 0.0,
+            beta: None,
+            fit_method: "gaussian".into(),
+            fit_residual: 0.01,
+        }
+    }
+
+    fn counts(conn: &Connection) -> (i64, i64) {
+        let a = conn
+            .query_row("SELECT COUNT(*) FROM frame_analysis", [], |r| r.get(0))
+            .unwrap();
+        let s = conn
+            .query_row("SELECT COUNT(*) FROM star_metrics", [], |r| r.get(0))
+            .unwrap();
+        (a, s)
+    }
+
+    /// Happy path: the persist loop's two writes land together on commit.
+    #[test]
+    fn persist_unit_commits_analyses_and_their_stars() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (file_id, frame_id) = insert_frame(&conn, "/x/a.fits");
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let analysis_id = upsert_frame_analysis(&conn, &analysis(frame_id, file_id)).unwrap();
+        upsert_star_metrics(&conn, analysis_id, &[star(analysis_id)]).unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(counts(&conn), (1, 1));
+    }
+
+    /// audit M11: the analysis persist phase is ONE unit. A mid-loop failure
+    /// (or a failed COMMIT) returns early and drops the transaction — every
+    /// analysis AND its star metrics must vanish with it. The old code
+    /// hand-rolled `ROLLBACK` inside `map_err` closures, which left the
+    /// COMMIT-failure path entirely unguarded.
+    #[test]
+    fn dropped_persist_transaction_rolls_back_analyses_and_stars() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (file_a, frame_a) = insert_frame(&conn, "/x/a.fits");
+        let (file_b, frame_b) = insert_frame(&conn, "/x/b.fits");
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let id_a = upsert_frame_analysis(&conn, &analysis(frame_a, file_a)).unwrap();
+        upsert_star_metrics(&conn, id_a, &[star(id_a)]).unwrap();
+        upsert_frame_analysis(&conn, &analysis(frame_b, file_b)).unwrap();
+        assert_eq!(counts(&conn), (2, 1), "writes are visible inside the tx");
+
+        drop(tx); // the `?` early-return path — rollback, no manual ROLLBACK
+
+        assert_eq!(
+            counts(&conn),
+            (0, 0),
+            "dropping the persist transaction must undo analyses and stars alike"
+        );
+    }
+}

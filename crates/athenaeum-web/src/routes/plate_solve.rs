@@ -348,9 +348,18 @@ pub async fn plate_solve_batch(
         let mut failed = 0usize;
         {
             let conn = db.conn();
-            if let Err(e) = conn.execute_batch("BEGIN") {
-                tracing::error!(error = %e, "plate solve persist: BEGIN failed");
-            }
+            // Drop-safe: an early return or panic rolls back instead of leaking
+            // an open transaction onto the pooled connection. A failed BEGIN
+            // falls back to per-row autocommit — losing atomicity, never the
+            // batch's computed results (audit I12: same shape as the Tauri
+            // backend, so both persist identically).
+            let tx = match conn.unchecked_transaction() {
+                Ok(tx) => Some(tx),
+                Err(e) => {
+                    tracing::error!(error = %e, "plate solve persist: BEGIN failed; persisting per-row");
+                    None
+                }
+            };
             for r in &results {
                 match r {
                     WorkResult::Solved { frame_id, result, filename } => {
@@ -394,8 +403,12 @@ pub async fn plate_solve_batch(
                     }
                 }
             }
-            if let Err(e) = conn.execute_batch("COMMIT") {
-                tracing::error!(error = %e, "plate solve persist: COMMIT failed");
+            // No `?`-to-response path inside the worker: a log is the terminal
+            // report here, and the Drop rollback closes the transaction.
+            if let Some(tx) = tx {
+                if let Err(e) = tx.commit() {
+                    tracing::error!(error = %e, "plate solve persist: COMMIT failed; batch results rolled back");
+                }
             }
         }
 

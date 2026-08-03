@@ -438,7 +438,18 @@ pub async fn plate_solve_batch(
     {
         let db = state.ctx.db.get().ok_or("Database not initialized")?;
         let conn = db.conn();
-        conn.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+        // Drop-safe: an early return or panic rolls back instead of leaking
+        // an open transaction onto the pooled connection. A failed BEGIN
+        // falls back to per-row autocommit — losing atomicity, never the
+        // batch's computed results (audit I12: the old `?` discarded every
+        // solve result on a BEGIN failure).
+        let tx = match conn.unchecked_transaction() {
+            Ok(tx) => Some(tx),
+            Err(e) => {
+                tracing::error!(error = %e, "plate solve persist: BEGIN failed; persisting per-row");
+                None
+            }
+        };
         for r in &results {
             match r {
                 WorkResult::Solved { frame_id, result, filename } => {
@@ -481,7 +492,12 @@ pub async fn plate_solve_batch(
                 }
             }
         }
-        conn.execute_batch("COMMIT").map_err(|e| e.to_string())?;
+        if let Some(tx) = tx {
+            tx.commit().map_err(|e| {
+                tracing::error!(error = %e, "plate solve persist: COMMIT failed; batch results rolled back");
+                e.to_string()
+            })?;
+        }
     }
 
     // Clean up the cancel handle.

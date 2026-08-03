@@ -353,20 +353,18 @@ pub fn analyze_frame_set(
         let conn = db.conn();
 
         if !analyses.is_empty() {
-            conn.execute_batch("BEGIN")?;
+            // Drop-rollback replaces the manual ROLLBACK-in-map_err dance and
+            // also covers the previously-unguarded COMMIT failure (audit M11).
+            let tx = conn.unchecked_transaction()?;
             for a in &analyses {
-                let analysis_id = db_analysis::upsert_frame_analysis(&conn, a).map_err(|e| {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    ApiError::Internal(e.to_string())
-                })?;
+                let analysis_id = db_analysis::upsert_frame_analysis(&conn, a)
+                    .map_err(|e| ApiError::Internal(e.to_string()))?;
                 if let Some(stars) = stars_by_frame.get(&a.frame_id) {
-                    db_analysis::upsert_star_metrics(&conn, analysis_id, stars).map_err(|e| {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        ApiError::Internal(e.to_string())
-                    })?;
+                    db_analysis::upsert_star_metrics(&conn, analysis_id, stars)
+                        .map_err(|e| ApiError::Internal(e.to_string()))?;
                 }
             }
-            conn.execute_batch("COMMIT")?;
+            tx.commit()?;
         }
     }
 
