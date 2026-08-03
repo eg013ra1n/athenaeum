@@ -76,6 +76,15 @@ pub(crate) struct BayerConsensus {
 /// reported a disagreement that does not exist and then let a genuine
 /// minority value win the tie-break. Integer columns compare as stored.
 ///
+/// A BLANK text value is not a claim and gets no vote. A writer that emits
+/// `BAYERPAT= ''` (or an XISF `<FITSKeyword name="BAYERPAT" value=""/>`) said
+/// nothing about the sensor, yet two such members used to outvote one genuine
+/// `RGGB` — the winning `""` was then dropped further down and the master
+/// shipped with no BAYERPAT at all, having also reported a "disagreement"
+/// between a claim and a silence. Excluded from the GROUP BY rather than after
+/// the vote, so the counting itself is honest. Integer columns keep every
+/// non-NULL row: 0 is a real CFA phase, not a blank.
+///
 /// `col` is interpolated into the SQL. Every call site passes one of four
 /// hard-coded literals (`bayerpat`, `xbayroff`, `ybayroff`, `roworder`); it is
 /// never user input.
@@ -90,10 +99,15 @@ fn consensus<T: rusqlite::types::FromSql>(
     } else {
         format!("fr.{col}")
     };
+    let blank_guard = if fold_case {
+        format!(" AND TRIM(fr.{col}) <> ''")
+    } else {
+        String::new()
+    };
     let mut stmt = conn.prepare(&format!(
         "SELECT {key} k, COUNT(*) c FROM calibration_set_frames csf
          JOIN frames fr ON fr.id = csf.frame_id
-         WHERE csf.set_id = ?1 AND fr.{col} IS NOT NULL
+         WHERE csf.set_id = ?1 AND fr.{col} IS NOT NULL{blank_guard}
          GROUP BY k ORDER BY c DESC, k ASC"
     ))?;
     let values: Vec<T> = stmt
@@ -126,6 +140,9 @@ pub(crate) fn load_bayer_consensus(conn: &Connection, set_id: i64) -> Result<Bay
             out.disagreements.push(col);
         }
     }
+    // The vote already dropped blanks; this catches the residue SQLite's TRIM()
+    // does not — it strips spaces only, so a tab- or newline-only value is still
+    // a group there while Rust's `trim` calls it empty.
     out.bayerpat = bayerpat.filter(|s| !s.trim().is_empty());
     out.xbayroff = xbayroff;
     out.ybayroff = ybayroff;
@@ -758,6 +775,39 @@ mod tests {
         let bayer = load_bayer_consensus(&conn, set_id).unwrap();
         assert_eq!(bayer.bayerpat.as_deref(), Some("RGGB"), "2 spellings of one claim beat 1 of another");
         assert_eq!(bayer.disagreements, vec!["bayerpat"], "BGGR is a real disagreement");
+    }
+
+    /// A blank column is a SILENCE, not a vote. Two members carrying an empty
+    /// BAYERPAT used to outvote the one that actually declared RGGB; the
+    /// winning `""` was then dropped on the way out, so a genuinely declared
+    /// mosaic shipped as a master with no BAYERPAT at all — and warned about a
+    /// "disagreement" nobody had.
+    #[test]
+    fn blank_values_never_vote_against_a_real_declaration() {
+        let conn = Connection::open_in_memory().unwrap();
+        let set_id = seed(&conn);
+        add_member(&conn, set_id, "f2", "2026-06-28T21:00:00Z");
+        set_member_bayer(
+            &conn,
+            set_id,
+            &[
+                (Some(""), None, None, Some("")),
+                (Some("   "), None, None, Some("  ")),
+                (Some("RGGB"), None, None, Some("TOP-DOWN")),
+            ],
+        );
+        let bayer = load_bayer_consensus(&conn, set_id).unwrap();
+        assert_eq!(bayer.bayerpat.as_deref(), Some("RGGB"), "2 blanks must not outvote 1 declaration");
+        assert_eq!(bayer.roworder.as_deref(), Some("TOP-DOWN"));
+        assert!(!bayer.bayerpat_from_blob, "the column answered — no blob fallback");
+        assert!(
+            bayer.disagreements.is_empty(),
+            "a blank contradicts nothing, got {:?}",
+            bayer.disagreements
+        );
+        let cards = cards_for(&conn, set_id);
+        assert_eq!(card_str(&cards, "BAYERPAT"), Some("RGGB"));
+        assert_eq!(card_str(&cards, "ROWORDER"), Some("TOP-DOWN"));
     }
 
     /// A rescanned catalog has both the column and the old blob. The column

@@ -609,7 +609,12 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
     let focallen = fits_keywords.get("FOCALLEN")
         .and_then(|s| s.parse::<f64>().ok());
     let swcreate = fits_keywords.get("SWCREATE").cloned();
-    let bayerpat = fits_keywords.get("BAYERPAT").cloned();
+    // A blank keyword is not a declaration — same rule as ROWORDER below and as
+    // the FITS path's `get_str`. `<FITSKeyword name="BAYERPAT" value=""/>` used
+    // to land as `Some("")` in `frames.bayerpat`, where it outvoted real
+    // patterns in the master-header consensus and blocked the element fallback
+    // right below from ever running.
+    let bayerpat = fits_keywords.get("BAYERPAT").cloned().filter(|s| !s.trim().is_empty());
     // Fall back to the native XISF <ColorFilterArray> element: a writer that
     // emits the XISF 1.0 element and no BAYERPAT keyword is declaring a mosaic
     // just as plainly, and treating it as MONO poisons everything downstream.
@@ -1183,6 +1188,36 @@ mod tests {
 
         let frame = parse_xisf(&path, 1).unwrap();
         assert_eq!(frame.bayerpat.as_deref(), Some("BGGR"));
+    }
+
+    /// A BLANK keyword is not a statement, so it must not outrank the element
+    /// that is one. Writers do emit `value=""` cards, and the keyword used to
+    /// win on presence alone — leaving a declared mosaic reading as mono.
+    #[test]
+    fn xisf_blank_bayerpat_keyword_defers_to_colorfilterarray() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cfa_blank_kw.xisf");
+        write_xisf_with_image_body(
+            &path,
+            "<FITSKeyword name=\"BAYERPAT\" value=\"\" comment=\"\"/>\n\
+             <ColorFilterArray pattern=\"RGGB\" width=\"2\" height=\"2\" name=\"RGGB\"/>\n",
+        );
+
+        let frame = parse_xisf(&path, 1).unwrap();
+        assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"), "the element is the only declaration present");
+    }
+
+    /// The same blank with nothing to fall back to: `None`, never `Some("")`.
+    /// A stored empty string is a value downstream — it voted in the
+    /// master-header consensus and could beat a real pattern.
+    #[test]
+    fn xisf_blank_bayerpat_keyword_alone_stays_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("blank_kw.xisf");
+        write_xisf_with_keywords(&path, &[("BAYERPAT", "'   '"), ("OBJECT", "'M33'")]);
+
+        let frame = parse_xisf(&path, 1).unwrap();
+        assert_eq!(frame.bayerpat, None, "a blank keyword declares nothing");
     }
 
     /// A pattern we cannot interpret is reported and dropped — a bogus mosaic

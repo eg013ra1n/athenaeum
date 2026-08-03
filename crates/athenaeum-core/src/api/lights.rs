@@ -1040,6 +1040,7 @@ fn source_cards_for_file(
         .optional()?;
     let Some(header_text) = header_text else {
         tracing::warn!(
+            frame_id,
             file_id,
             "no stored header for light — calibrated output will carry only catalog-derived cards"
         );
