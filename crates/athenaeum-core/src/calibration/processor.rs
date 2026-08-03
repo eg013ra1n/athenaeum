@@ -119,7 +119,7 @@ pub fn get_light_frames_from_frame_set(
                 f.exptime, f.filter, f.imagetyp, f.is_master, f.ra, f.dec, f.objctra, f.objctdec,
                 f.gain, f.offset, f.xbinning, f.ybinning, f.ccd_temp, f.set_temp,
                 f.focallen, f.xpixsz, f.ypixsz, f.naxis1, f.naxis2, f.sitelat, f.lat_obs, f.sitelong, f.long_obs,
-                f.uuid, f.updated_at
+                f.uuid, f.updated_at, f.bayerpat, f.xbayroff, f.ybayroff, f.roworder
          FROM frames f
          JOIN session_members sm ON f.id = sm.frame_id
          JOIN sessions s ON sm.session_id = s.id
@@ -180,10 +180,14 @@ pub fn get_light_frames_from_frame_set(
             long_obs: row.get(28)?,
             override_: false,
             swcreate: None,
-            bayerpat: None,
-            xbayroff: None,
-            ybayroff: None,
-            roworder: None,
+            // CFA columns are load-bearing here: the flat matcher's
+            // `is_mono_with_ambiguous_filter` check reads `bayerpat`, so a
+            // light loaded without it is treated as a mono frame. Absent
+            // values stay None — never fabricated.
+            bayerpat: row.get(31)?,
+            xbayroff: row.get(32)?,
+            ybayroff: row.get(33)?,
+            roworder: row.get(34)?,
             rotation: None,
             uuid: row.get(29)?,
             updated_at: row.get(30)?,
@@ -542,5 +546,54 @@ mod tests {
         assert_eq!(stats.frames_with_darks_only, 0);
         assert_eq!(stats.total_flat_sets_linked, 1);
         assert_eq!(stats.total_dark_sets_linked, 1);
+    }
+
+    /// The frames this loader returns are handed straight to the flat matcher,
+    /// whose `is_mono_with_ambiguous_filter` check reads `bayerpat` — a light
+    /// loaded without it looks like a mono frame, so every OSC light drew a
+    /// spurious "filter-ambiguous mono frame" warning on every match run.
+    #[test]
+    fn light_loader_carries_cfa_metadata() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (1, '/data/light.fits', 'light.fits', 1024, '2025-09-25T00:00:00+00:00', 'FITS')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO frames
+             (id, file_id, date_obs, instrume, exptime, imagetyp, is_master,
+              bayerpat, xbayroff, ybayroff, roworder)
+             VALUES (1, 1, '2025-09-25T00:00:00+00:00', 'ASI2600MC', 300.0, 'Light', 0,
+                     'RGGB', 1, 0, 'BOTTOM-UP')",
+            [],
+        ).unwrap();
+        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'TestSet')", []).unwrap();
+        conn.execute(
+            "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
+             VALUES (1, 1, '2025-09-25', '2025-09-25')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (1, 1, 'ASI2600MC')",
+            [],
+        ).unwrap();
+        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (1, 1)", [])
+            .unwrap();
+
+        let frames = get_light_frames_from_frame_set(&conn, 1).unwrap();
+        assert_eq!(frames.len(), 1);
+        let f = &frames[0];
+
+        assert_eq!(f.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(f.xbayroff, Some(1));
+        assert_eq!(f.ybayroff, Some(0));
+        assert_eq!(f.roworder.as_deref(), Some("BOTTOM-UP"));
+        assert!(
+            !crate::models::is_mono_with_ambiguous_filter(&f.bayerpat, &f.filter),
+            "a light that declares a CFA pattern must never be classified as filter-ambiguous mono"
+        );
     }
 }

@@ -58,7 +58,7 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
                 gain, offset, binning, xbinning, ybinning, ccd_temp, set_temp,
                 focallen, xpixsz, ypixsz, naxis1, naxis2, ra, dec, sitelat, lat_obs,
                 sitelong, long_obs, objctra, objctdec, override, imagetyp, is_master,
-                uuid, updated_at
+                uuid, updated_at, bayerpat, xbayroff, ybayroff, roworder
          FROM frames
          WHERE id = ?1"
     )?;
@@ -104,10 +104,14 @@ fn get_frame_by_id(conn: &Connection, frame_id: i64) -> Result<Frame> {
             },
             is_master: row.get::<_, i32>(30)? != 0,
             swcreate: None,
-            bayerpat: None,
-            xbayroff: None,
-            ybayroff: None,
-            roworder: None,
+            // Same contract as the light loader in `calibration::processor`:
+            // the matcher's mono/ambiguous-filter check reads `bayerpat`, so
+            // these columns are selected rather than assumed. Absent values
+            // stay None — never fabricated.
+            bayerpat: row.get(33)?,
+            xbayroff: row.get(34)?,
+            ybayroff: row.get(35)?,
+            roworder: row.get(36)?,
             rotation: None,
             uuid: row.get(31)?,
             updated_at: row.get(32)?,
@@ -1456,5 +1460,38 @@ mod tests {
             "manual selection must be used verbatim"
         );
         assert!(!hierarchy.flat_sets[0].set.is_master);
+    }
+
+    /// The representative frame of a flat/dark set goes into the configurable
+    /// matcher, which shares the flat matcher's mono/ambiguous-filter check —
+    /// so the loader must carry the CFA columns rather than assume mono.
+    #[test]
+    fn representative_frame_carries_cfa_metadata() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (7, '/data/flat.fits', 'flat.fits', 1024, '2025-09-25T00:00:00+00:00', 'FITS')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO frames
+             (id, file_id, date_obs, instrume, exptime, imagetyp, is_master,
+              bayerpat, xbayroff, ybayroff, roworder)
+             VALUES (7, 7, '2025-09-25T00:00:00+00:00', 'ASI2600MC', 2.0, 'Flat', 0,
+                     'RGGB', 0, 1, 'TOP-DOWN')",
+            [],
+        ).unwrap();
+
+        let frame = get_frame_by_id(&conn, 7).unwrap();
+
+        assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(frame.xbayroff, Some(0));
+        assert_eq!(frame.ybayroff, Some(1));
+        assert_eq!(frame.roworder.as_deref(), Some("TOP-DOWN"));
+        assert!(
+            !crate::models::is_mono_with_ambiguous_filter(&frame.bayerpat, &frame.filter),
+            "a frame that declares a CFA pattern must never be classified as filter-ambiguous mono"
+        );
     }
 }
