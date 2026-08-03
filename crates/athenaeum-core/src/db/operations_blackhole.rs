@@ -356,10 +356,14 @@ pub fn send_all_to_void(conn: &Connection) -> Result<usize> {
 
     let count = file_ids.len();
 
-    // Delete each file
+    // Delete each file. One file's failure must not stop the batch — but it is
+    // never silent: after the catalog-first ordering a disk-unlink failure
+    // leaves the file orphaned on disk, so it gets its own error line.
     for file_id in file_ids {
-        // Ignore errors (file might already be gone)
-        let _ = send_to_void(conn, file_id);
+        if let Err(e) = send_to_void(conn, file_id) {
+            tracing::error!(file_id, error = %e,
+                "send_all_to_void: file removed from catalog but disk delete failed; file remains on disk");
+        }
     }
 
     Ok(count)

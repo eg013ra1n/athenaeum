@@ -446,7 +446,7 @@ pub async fn plate_solve_batch(
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => Some(tx),
             Err(e) => {
-                tracing::error!(error = %e, "plate solve persist: BEGIN failed; persisting per-row");
+                tracing::warn!(error = %e, "plate solve persist: BEGIN failed; persisting per-row");
                 None
             }
         };

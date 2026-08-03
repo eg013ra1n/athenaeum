@@ -364,7 +364,7 @@ pub async fn plate_solve_batch(
                 let tx = match conn.unchecked_transaction() {
                     Ok(tx) => Some(tx),
                     Err(e) => {
-                        tracing::error!(error = %e, "plate solve persist: BEGIN failed; persisting per-row");
+                        tracing::warn!(error = %e, "plate solve persist: BEGIN failed; persisting per-row");
                         None
                     }
                 };
@@ -444,7 +444,7 @@ pub async fn plate_solve_batch(
                 .map(|s| s.to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_string());
-            tracing::error!(panic = %msg, "plate solve batch worker panicked");
+            tracing::error!(error = %msg, "plate solve batch worker panicked");
             cleanup_ctx.active_plate_solves.lock().unwrap().remove(&0);
             let _ = cleanup_tx.send(SseEvent {
                 event_name: "plate-solve-complete".into(),
@@ -644,6 +644,22 @@ pub async fn autofind_objects_from_coordinates(
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "autofind batch failed");
+                    // Without this the progress UI never resolves — same
+                    // symptom the panic shell below fixes, one arm down.
+                    let _ = event_tx.send(SseEvent {
+                        event_name: "autofind-objects-complete".into(),
+                        data: serde_json::to_value(AutofindCompleteEvent {
+                            total: 0,
+                            labeled: 0,
+                            no_match: 0,
+                            already_labeled: 0,
+                            missing_coords: 0,
+                            errors: 1,
+                            cancelled: false,
+                            total_time_ms: start.elapsed().as_millis() as u64,
+                        })
+                        .unwrap_or_default(),
+                    });
                 }
             }
         }));
@@ -653,7 +669,7 @@ pub async fn autofind_objects_from_coordinates(
                 .map(|s| s.to_string())
                 .or_else(|| panic.downcast_ref::<String>().cloned())
                 .unwrap_or_else(|| "unknown panic".to_string());
-            tracing::error!(panic = %msg, "autofind batch worker panicked");
+            tracing::error!(error = %msg, "autofind batch worker panicked");
             cleanup_ctx.active_plate_solves.lock().unwrap().remove(&1);
             let _ = cleanup_tx.send(SseEvent {
                 event_name: "autofind-objects-complete".into(),
