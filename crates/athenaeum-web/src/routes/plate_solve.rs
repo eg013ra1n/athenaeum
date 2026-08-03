@@ -220,213 +220,243 @@ pub async fn plate_solve_batch(
 
     // ── Phase 2: parallel solve on a scoped thread pool inside spawn_blocking ──
     tokio::task::spawn_blocking(move || {
-        let start = std::time::Instant::now();
-        let completed = Arc::new(AtomicUsize::new(0));
+        // Fire-and-forget by design (progress rides SSE) — which is exactly
+        // why a panic must be caught here: a dropped JoinHandle swallows it,
+        // leaving no log, no completion event, and a stuck cancel handle
+        // (audit C6). The Tauri twin awaits its join; this shell is the
+        // web-side equivalent.
+        let cleanup_ctx = ctx.clone();
+        let cleanup_tx = event_tx.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let start = std::time::Instant::now();
+            let completed = Arc::new(AtomicUsize::new(0));
 
-        let results: Vec<WorkResult> = {
-            let work = Mutex::new(work_items.into_iter());
-            let results: Mutex<Vec<WorkResult>> = Mutex::new(Vec::with_capacity(total));
+            let results: Vec<WorkResult> = {
+                let work = Mutex::new(work_items.into_iter());
+                let results: Mutex<Vec<WorkResult>> = Mutex::new(Vec::with_capacity(total));
 
-            std::thread::scope(|s| {
-                for _ in 0..concurrency {
-                    s.spawn(|| loop {
-                        if cancel_flag.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let Some(item) = work.lock().unwrap().next() else { break };
-
-                        let outcome = match item {
-                            WorkItem::LoadFailed { frame_id, error } => {
-                                WorkResult::Failed { frame_id, error, code: None, filename: None }
+                std::thread::scope(|s| {
+                    for _ in 0..concurrency {
+                        s.spawn(|| loop {
+                            if cancel_flag.load(Ordering::Relaxed) {
+                                break;
                             }
-                            WorkItem::Ready { frame_id, frame, file_path, hints } => {
-                                let filename = std::path::Path::new(&file_path)
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_else(|| file_path.clone());
+                            let Some(item) = work.lock().unwrap().next() else { break };
 
-                                let done_so_far = completed.load(Ordering::Relaxed);
-                                let _ = event_tx.send(SseEvent {
-                                    event_name: "plate-solve-progress".into(),
-                                    data: serde_json::to_value(PlateSolveProgressEvent {
-                                        frame_id,
-                                        current: done_so_far,
-                                        total,
-                                        status: "solving".into(),
-                                        matched_stars: None,
-                                        rms_arcsec: None,
-                                        error: None,
-                                        failure_code: None,
-                                        filename: Some(filename.clone()),
-                                    })
-                                    .unwrap_or_default(),
-                                });
+                            let outcome = match item {
+                                WorkItem::LoadFailed { frame_id, error } => {
+                                    WorkResult::Failed { frame_id, error, code: None, filename: None }
+                                }
+                                WorkItem::Ready { frame_id, frame, file_path, hints } => {
+                                    let filename = std::path::Path::new(&file_path)
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| file_path.clone());
 
-                                let layer_refs: Vec<&solvemyastro::StarCache> =
-                                    layer_caches.iter().map(|a| a.as_ref()).collect();
-                                let caches = solvemyastro::Caches::layered(&layer_refs);
-                                match service::solve_frame_with_hints(
-                                    &frame,
-                                    &file_path,
-                                    &hints,
-                                    &caches,
-                                    ps_config.as_ref(),
-                                    Some(cancel_flag.as_ref()),
-                                ) {
-                                    Ok(result) => WorkResult::Solved { frame_id, result, filename },
-                                    Err(e) => {
-                                        let info = describe_solve_failure(&e);
-                                        tracing::warn!(
+                                    let done_so_far = completed.load(Ordering::Relaxed);
+                                    let _ = event_tx.send(SseEvent {
+                                        event_name: "plate-solve-progress".into(),
+                                        data: serde_json::to_value(PlateSolveProgressEvent {
                                             frame_id,
-                                            filename = %filename,
-                                            stage = "solve",
-                                            outcome = "failed",
-                                            code = info.code.as_deref().unwrap_or("?"),
-                                            error = %info.message,
-                                            "plate solve failed"
-                                        );
-                                        WorkResult::Failed {
-                                            frame_id,
-                                            error: info.message,
-                                            code: info.code,
-                                            filename: Some(filename),
+                                            current: done_so_far,
+                                            total,
+                                            status: "solving".into(),
+                                            matched_stars: None,
+                                            rms_arcsec: None,
+                                            error: None,
+                                            failure_code: None,
+                                            filename: Some(filename.clone()),
+                                        })
+                                        .unwrap_or_default(),
+                                    });
+
+                                    let layer_refs: Vec<&solvemyastro::StarCache> =
+                                        layer_caches.iter().map(|a| a.as_ref()).collect();
+                                    let caches = solvemyastro::Caches::layered(&layer_refs);
+                                    match service::solve_frame_with_hints(
+                                        &frame,
+                                        &file_path,
+                                        &hints,
+                                        &caches,
+                                        ps_config.as_ref(),
+                                        Some(cancel_flag.as_ref()),
+                                    ) {
+                                        Ok(result) => WorkResult::Solved { frame_id, result, filename },
+                                        Err(e) => {
+                                            let info = describe_solve_failure(&e);
+                                            tracing::warn!(
+                                                frame_id,
+                                                filename = %filename,
+                                                stage = "solve",
+                                                outcome = "failed",
+                                                code = info.code.as_deref().unwrap_or("?"),
+                                                error = %info.message,
+                                                "plate solve failed"
+                                            );
+                                            WorkResult::Failed {
+                                                frame_id,
+                                                error: info.message,
+                                                code: info.code,
+                                                filename: Some(filename),
+                                            }
                                         }
                                     }
                                 }
+                            };
+
+                            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                            match &outcome {
+                                WorkResult::Solved { frame_id, result, filename } => {
+                                    let _ = event_tx.send(SseEvent {
+                                        event_name: "plate-solve-progress".into(),
+                                        data: serde_json::to_value(PlateSolveProgressEvent {
+                                            frame_id: *frame_id,
+                                            current: done,
+                                            total,
+                                            status: "solved".into(),
+                                            matched_stars: Some(result.matched_stars),
+                                            rms_arcsec: Some(result.rms_residual_arcsec),
+                                            error: None,
+                                            failure_code: None,
+                                            filename: Some(filename.clone()),
+                                        })
+                                        .unwrap_or_default(),
+                                    });
+                                }
+                                WorkResult::Failed { frame_id, error, code, filename } => {
+                                    let _ = event_tx.send(SseEvent {
+                                        event_name: "plate-solve-progress".into(),
+                                        data: serde_json::to_value(PlateSolveProgressEvent {
+                                            frame_id: *frame_id,
+                                            current: done,
+                                            total,
+                                            status: "failed".into(),
+                                            matched_stars: None,
+                                            rms_arcsec: None,
+                                            error: Some(error.clone()),
+                                            failure_code: code.clone(),
+                                            filename: filename.clone(),
+                                        })
+                                        .unwrap_or_default(),
+                                    });
+                                }
                             }
-                        };
 
-                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                        match &outcome {
-                            WorkResult::Solved { frame_id, result, filename } => {
-                                let _ = event_tx.send(SseEvent {
-                                    event_name: "plate-solve-progress".into(),
-                                    data: serde_json::to_value(PlateSolveProgressEvent {
-                                        frame_id: *frame_id,
-                                        current: done,
-                                        total,
-                                        status: "solved".into(),
-                                        matched_stars: Some(result.matched_stars),
-                                        rms_arcsec: Some(result.rms_residual_arcsec),
-                                        error: None,
-                                        failure_code: None,
-                                        filename: Some(filename.clone()),
-                                    })
-                                    .unwrap_or_default(),
-                                });
-                            }
-                            WorkResult::Failed { frame_id, error, code, filename } => {
-                                let _ = event_tx.send(SseEvent {
-                                    event_name: "plate-solve-progress".into(),
-                                    data: serde_json::to_value(PlateSolveProgressEvent {
-                                        frame_id: *frame_id,
-                                        current: done,
-                                        total,
-                                        status: "failed".into(),
-                                        matched_stars: None,
-                                        rms_arcsec: None,
-                                        error: Some(error.clone()),
-                                        failure_code: code.clone(),
-                                        filename: filename.clone(),
-                                    })
-                                    .unwrap_or_default(),
-                                });
-                            }
-                        }
+                            results.lock().unwrap().push(outcome);
+                        });
+                    }
+                });
 
-                        results.lock().unwrap().push(outcome);
-                    });
-                }
-            });
-
-            results.into_inner().unwrap()
-        };
-
-        // ── Phase 3: persist all solved frames in a single DB transaction ──
-        let db = ctx.db.get().expect("DB not initialized");
-        let mut solved = 0usize;
-        let mut failed = 0usize;
-        {
-            let conn = db.conn();
-            // Drop-safe: an early return or panic rolls back instead of leaking
-            // an open transaction onto the pooled connection. A failed BEGIN
-            // falls back to per-row autocommit — losing atomicity, never the
-            // batch's computed results (audit I12: same shape as the Tauri
-            // backend, so both persist identically).
-            let tx = match conn.unchecked_transaction() {
-                Ok(tx) => Some(tx),
-                Err(e) => {
-                    tracing::error!(error = %e, "plate solve persist: BEGIN failed; persisting per-row");
-                    None
-                }
+                results.into_inner().unwrap()
             };
-            for r in &results {
-                match r {
-                    WorkResult::Solved { frame_id, result, filename } => {
-                        match service::store_result(
-                            &conn,
-                            *frame_id,
-                            result,
-                            dso.as_deref(),
-                            ps_config.as_ref(),
-                        ) {
-                            Ok(StoreOutcome::Persisted) => solved += 1,
-                            Ok(StoreOutcome::RejectedLowConfidence { reason }) => {
-                                // The Phase-2 "solved" event already reached the
-                                // UI; emit a correction so the frame flips to
-                                // failed with the rejection reason.
-                                failed += 1;
-                                let _ = event_tx.send(SseEvent {
-                                    event_name: "plate-solve-progress".into(),
-                                    data: serde_json::to_value(PlateSolveProgressEvent {
-                                        frame_id: *frame_id,
-                                        current: total,
-                                        total,
-                                        status: "failed".into(),
-                                        matched_stars: None,
-                                        rms_arcsec: None,
-                                        error: Some(reason),
-                                        failure_code: Some("REJECTED_LOW_CONFIDENCE".to_string()),
-                                        filename: Some(filename.clone()),
-                                    })
-                                    .unwrap_or_default(),
-                                });
-                            }
-                            Err(e) => {
-                                tracing::error!(frame_id, error = %e, "failed to store plate solve result, solve outcome lost");
-                                failed += 1;
+
+            // ── Phase 3: persist all solved frames in a single DB transaction ──
+            let db = ctx.db.get().expect("DB not initialized");
+            let mut solved = 0usize;
+            let mut failed = 0usize;
+            {
+                let conn = db.conn();
+                // Drop-safe: an early return or panic rolls back instead of leaking
+                // an open transaction onto the pooled connection. A failed BEGIN
+                // falls back to per-row autocommit — losing atomicity, never the
+                // batch's computed results (audit I12: same shape as the Tauri
+                // backend, so both persist identically).
+                let tx = match conn.unchecked_transaction() {
+                    Ok(tx) => Some(tx),
+                    Err(e) => {
+                        tracing::error!(error = %e, "plate solve persist: BEGIN failed; persisting per-row");
+                        None
+                    }
+                };
+                for r in &results {
+                    match r {
+                        WorkResult::Solved { frame_id, result, filename } => {
+                            match service::store_result(
+                                &conn,
+                                *frame_id,
+                                result,
+                                dso.as_deref(),
+                                ps_config.as_ref(),
+                            ) {
+                                Ok(StoreOutcome::Persisted) => solved += 1,
+                                Ok(StoreOutcome::RejectedLowConfidence { reason }) => {
+                                    // The Phase-2 "solved" event already reached the
+                                    // UI; emit a correction so the frame flips to
+                                    // failed with the rejection reason.
+                                    failed += 1;
+                                    let _ = event_tx.send(SseEvent {
+                                        event_name: "plate-solve-progress".into(),
+                                        data: serde_json::to_value(PlateSolveProgressEvent {
+                                            frame_id: *frame_id,
+                                            current: total,
+                                            total,
+                                            status: "failed".into(),
+                                            matched_stars: None,
+                                            rms_arcsec: None,
+                                            error: Some(reason),
+                                            failure_code: Some(
+                                                "REJECTED_LOW_CONFIDENCE".to_string(),
+                                            ),
+                                            filename: Some(filename.clone()),
+                                        })
+                                        .unwrap_or_default(),
+                                    });
+                                }
+                                Err(e) => {
+                                    tracing::error!(frame_id, error = %e, "failed to store plate solve result, solve outcome lost");
+                                    failed += 1;
+                                }
                             }
                         }
+                        WorkResult::Failed { .. } => {
+                            failed += 1;
+                        }
                     }
-                    WorkResult::Failed { .. } => {
-                        failed += 1;
+                }
+                // No `?`-to-response path inside the worker: a log is the terminal
+                // report here, and the Drop rollback closes the transaction.
+                if let Some(tx) = tx {
+                    if let Err(e) = tx.commit() {
+                        tracing::error!(error = %e, "plate solve persist: COMMIT failed; batch results rolled back");
                     }
                 }
             }
-            // No `?`-to-response path inside the worker: a log is the terminal
-            // report here, and the Drop rollback closes the transaction.
-            if let Some(tx) = tx {
-                if let Err(e) = tx.commit() {
-                    tracing::error!(error = %e, "plate solve persist: COMMIT failed; batch results rolled back");
-                }
+
+            {
+                let mut solves = ctx.active_plate_solves.lock().unwrap();
+                solves.remove(&0);
             }
-        }
 
-        {
-            let mut solves = ctx.active_plate_solves.lock().unwrap();
-            solves.remove(&0);
+            let _ = event_tx.send(SseEvent {
+                event_name: "plate-solve-complete".into(),
+                data: serde_json::to_value(PlateSolveCompleteEvent {
+                    solved,
+                    failed,
+                    total,
+                    total_time_ms: start.elapsed().as_millis() as u64,
+                })
+                .unwrap_or_default(),
+            });
+        }));
+        if let Err(panic) = outcome {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            tracing::error!(panic = %msg, "plate solve batch worker panicked");
+            cleanup_ctx.active_plate_solves.lock().unwrap().remove(&0);
+            let _ = cleanup_tx.send(SseEvent {
+                event_name: "plate-solve-complete".into(),
+                data: serde_json::to_value(PlateSolveCompleteEvent {
+                    solved: 0,
+                    failed: total,
+                    total,
+                    total_time_ms: 0,
+                })
+                .unwrap_or_default(),
+            });
         }
-
-        let _ = event_tx.send(SseEvent {
-            event_name: "plate-solve-complete".into(),
-            data: serde_json::to_value(PlateSolveCompleteEvent {
-                solved,
-                failed,
-                total,
-                total_time_ms: start.elapsed().as_millis() as u64,
-            })
-            .unwrap_or_default(),
-        });
     });
 
     Ok(Json(()))
@@ -537,75 +567,108 @@ pub async fn autofind_objects_from_coordinates(
     let frame_ids = args.frame_ids;
 
     tokio::task::spawn_blocking(move || {
-        let db = ctx.db.get().expect("DB not initialized");
-        let start = std::time::Instant::now();
+        // Fire-and-forget by design (progress rides SSE) — which is exactly
+        // why a panic must be caught here: a dropped JoinHandle swallows it,
+        // leaving no log, no completion event, and a stuck cancel handle
+        // (audit C6). The `expect("DB not initialized")` below stays loud on
+        // purpose (a missing DB here is a startup bug) — this shell is what
+        // keeps it from also hanging the progress UI forever.
+        let cleanup_ctx = ctx.clone();
+        let cleanup_tx = event_tx.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let db = ctx.db.get().expect("DB not initialized");
+            let start = std::time::Instant::now();
 
-        let progress = {
-            let event_tx = event_tx.clone();
-            move |p: AutofindProgress| {
-                let status = match p.status {
-                    AutofindStatus::Processing => "processing",
-                    AutofindStatus::Labeled => "labeled",
-                    AutofindStatus::NoMatch => "no_match",
-                    AutofindStatus::AlreadyLabeled => "already_labeled",
-                    AutofindStatus::MissingCoords => "missing_coords",
-                    AutofindStatus::Error => "error",
-                };
-                let _ = event_tx.send(SseEvent {
-                    event_name: "autofind-objects-progress".into(),
-                    data: serde_json::to_value(AutofindProgressEvent {
-                        frame_id: p.frame_id,
-                        current: p.current,
-                        total: p.total,
-                        status: status.into(),
-                        designation: p.designation,
-                        distance_deg: p.distance_deg,
-                        reason: p.reason,
-                        frame_ra: p.frame_ra,
-                        frame_dec: p.frame_dec,
-                        closest_designation: p.closest_designation,
-                        closest_distance_deg: p.closest_distance_deg,
-                    }).unwrap_or_default(),
-                });
+            let progress = {
+                let event_tx = event_tx.clone();
+                move |p: AutofindProgress| {
+                    let status = match p.status {
+                        AutofindStatus::Processing => "processing",
+                        AutofindStatus::Labeled => "labeled",
+                        AutofindStatus::NoMatch => "no_match",
+                        AutofindStatus::AlreadyLabeled => "already_labeled",
+                        AutofindStatus::MissingCoords => "missing_coords",
+                        AutofindStatus::Error => "error",
+                    };
+                    let _ = event_tx.send(SseEvent {
+                        event_name: "autofind-objects-progress".into(),
+                        data: serde_json::to_value(AutofindProgressEvent {
+                            frame_id: p.frame_id,
+                            current: p.current,
+                            total: p.total,
+                            status: status.into(),
+                            designation: p.designation,
+                            distance_deg: p.distance_deg,
+                            reason: p.reason,
+                            frame_ra: p.frame_ra,
+                            frame_dec: p.frame_dec,
+                            closest_designation: p.closest_designation,
+                            closest_distance_deg: p.closest_distance_deg,
+                        }).unwrap_or_default(),
+                    });
+                }
+            };
+
+            let summary = {
+                let conn = db.conn();
+                object_fill::autofind_objects_from_coordinates(
+                    &conn,
+                    &dso,
+                    &frame_ids,
+                    tolerance_deg,
+                    cancel_flag,
+                    &progress,
+                )
+            };
+
+            {
+                let mut handles = ctx.active_plate_solves.lock().unwrap();
+                handles.remove(&1);
             }
-        };
 
-        let summary = {
-            let conn = db.conn();
-            object_fill::autofind_objects_from_coordinates(
-                &conn,
-                &dso,
-                &frame_ids,
-                tolerance_deg,
-                cancel_flag,
-                &progress,
-            )
-        };
-
-        {
-            let mut handles = ctx.active_plate_solves.lock().unwrap();
-            handles.remove(&1);
-        }
-
-        match summary {
-            Ok(s) => {
-                let _ = event_tx.send(SseEvent {
-                    event_name: "autofind-objects-complete".into(),
-                    data: serde_json::to_value(AutofindCompleteEvent {
-                        total: s.total,
-                        labeled: s.labeled,
-                        no_match: s.no_match,
-                        already_labeled: s.already_labeled,
-                        missing_coords: s.missing_coords,
-                        errors: s.errors,
-                        cancelled: s.cancelled,
-                        total_time_ms: start.elapsed().as_millis() as u64,
-                    }).unwrap_or_default(),
-                });
+            match summary {
+                Ok(s) => {
+                    let _ = event_tx.send(SseEvent {
+                        event_name: "autofind-objects-complete".into(),
+                        data: serde_json::to_value(AutofindCompleteEvent {
+                            total: s.total,
+                            labeled: s.labeled,
+                            no_match: s.no_match,
+                            already_labeled: s.already_labeled,
+                            missing_coords: s.missing_coords,
+                            errors: s.errors,
+                            cancelled: s.cancelled,
+                            total_time_ms: start.elapsed().as_millis() as u64,
+                        }).unwrap_or_default(),
+                    });
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "autofind batch failed");
+                }
             }
-            Err(e) => {
-                tracing::error!(error = %e, "autofind batch failed");
-            }
+        }));
+        if let Err(panic) = outcome {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            tracing::error!(panic = %msg, "autofind batch worker panicked");
+            cleanup_ctx.active_plate_solves.lock().unwrap().remove(&1);
+            let _ = cleanup_tx.send(SseEvent {
+                event_name: "autofind-objects-complete".into(),
+                data: serde_json::to_value(AutofindCompleteEvent {
+                    total: 0,
+                    labeled: 0,
+                    no_match: 0,
+                    already_labeled: 0,
+                    missing_coords: 0,
+                    errors: 0,
+                    cancelled: false,
+                    total_time_ms: 0,
+                })
+                .unwrap_or_default(),
+            });
         }
     });
 
