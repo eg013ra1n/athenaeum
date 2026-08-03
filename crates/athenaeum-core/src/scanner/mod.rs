@@ -240,12 +240,21 @@ pub fn scan_directory(
         let path_str = file_path.to_string_lossy().to_string();
         let existing = conn
             .query_row(
-                "SELECT id, size, modified_at FROM files WHERE path = ?1",
+                "SELECT id, size, modified_at,
+                        EXISTS(SELECT 1 FROM frames WHERE file_id = files.id)
+                 FROM files WHERE path = ?1",
                 rusqlite::params![path_str],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, bool>(3)?,
+                    ))
+                },
             )
             .ok();
-        if let Some((file_id, db_size, db_modified)) = existing {
+        if let Some((file_id, db_size, db_modified, has_frame)) = existing {
             let on_disk = std::fs::metadata(file_path).ok().map(|m| {
                 let size = m.len() as i64;
                 let modified = m
@@ -254,10 +263,14 @@ pub fn scan_directory(
                     .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339());
                 (size, modified)
             });
-            let unchanged = matches!(
-                on_disk.as_ref(),
-                Some((s, Some(m))) if *s == db_size && m.as_str() == db_modified
-            );
+            // A files row with no frames row is never "unchanged" — route it
+            // through re-parse so the frame_count == 0 self-heal in
+            // reparse_and_update_in_place can recreate the frame (audit C3).
+            let unchanged = has_frame
+                && matches!(
+                    on_disk.as_ref(),
+                    Some((s, Some(m))) if *s == db_size && m.as_str() == db_modified
+                );
             if unchanged {
                 *skipped.lock().unwrap() += 1;
                 continue;
@@ -1708,17 +1721,22 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
     }
 
     // Build a map of existing file paths to their stored (id, size,
-    // modified_at). We use this to classify each on-disk file as new /
-    // unchanged / modified so that in-place modifications get re-parsed
-    // instead of silently skipped (the previous path-only filter).
+    // modified_at, has_frame). We use this to classify each on-disk file as
+    // new / unchanged / modified so that in-place modifications get
+    // re-parsed instead of silently skipped (the previous path-only filter).
     // modified_at is stored as RFC3339 in the DB and compared as a string
     // for an exact-match check. The `id` is carried through so the write
     // loop below can dispatch UPDATE-in-place without a per-file
-    // `SELECT id FROM files` (N+1) query.
+    // `SELECT id FROM files` (N+1) query. `has_frame` is the C3 guard: a
+    // files row with no frames row is never "unchanged" (see below).
     tracing::debug!(root_id, "building existing files map from DB");
-    let existing_files: std::collections::HashMap<String, (i64, i64, String)> = {
+    let existing_files: std::collections::HashMap<String, (i64, i64, String, bool)> = {
         let mut map = std::collections::HashMap::new();
-        match conn.prepare("SELECT path, id, size, modified_at FROM files") {
+        match conn.prepare(
+            "SELECT f.path, f.id, f.size, f.modified_at,
+                    EXISTS(SELECT 1 FROM frames fr WHERE fr.file_id = f.id)
+             FROM files f",
+        ) {
             Ok(mut stmt) => {
                 match stmt.query_map([], |row| {
                     Ok((
@@ -1726,11 +1744,12 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, bool>(4)?,
                     ))
                 }) {
                     Ok(rows) => {
                         for entry in rows.flatten() {
-                            map.insert(entry.0, (entry.1, entry.2, entry.3));
+                            map.insert(entry.0, (entry.1, entry.2, entry.3, entry.4));
                         }
                     }
                     Err(e) => {
@@ -1758,7 +1777,7 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
             let path_str = p.to_string_lossy().to_string();
             match existing_files.get(&path_str) {
                 None => true,
-                Some((db_id, db_size, db_modified)) => {
+                Some((db_id, db_size, db_modified, has_frame)) => {
                     match std::fs::metadata(p) {
                         Ok(meta) => {
                             let on_disk_size = meta.len() as i64;
@@ -1766,8 +1785,14 @@ pub fn scan_directory_parallel<E: ProgressEmitter>(
                                 .modified()
                                 .ok()
                                 .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339());
+                            // A files row with no frames row is never
+                            // "unchanged" — route it through re-parse so the
+                            // frame_count == 0 self-heal in
+                            // reparse_and_update_in_place can recreate the
+                            // frame (audit C3).
                             let unchanged = on_disk_size == *db_size
-                                && on_disk_modified.as_deref() == Some(db_modified.as_str());
+                                && on_disk_modified.as_deref() == Some(db_modified.as_str())
+                                && *has_frame;
                             if unchanged {
                                 false
                             } else {
@@ -2962,6 +2987,68 @@ mod inplace_tests {
         .to_rfc3339();
         assert_eq!(db_mtime, on_disk_mtime,
             "files.modified_at must be refreshed even when override = 1");
+    }
+
+    /// Audit C3: a `files` row with no `frames` row must never be classified
+    /// as "unchanged". Size and mtime still match, so the old classification
+    /// skipped it on every subsequent scan and the orphan was stuck forever.
+    /// It must route through re-parse so the `frame_count == 0` self-heal in
+    /// `reparse_and_update_in_place` recreates the frame, with `files.id`
+    /// preserved.
+    #[test]
+    fn scan_heals_a_frameless_files_row() {
+        use crate::events::NullEmitter;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("L_001.fits");
+        crate::archive::restore::tests::write_minimal_fits(&f);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [dir.path().to_str().unwrap()],
+        )
+        .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let r1 = scan_directory_parallel(
+            dir.path(),
+            1,
+            &conn,
+            &NullEmitter,
+            false,
+            cancel.clone(),
+            false,
+        );
+        assert!(r1.errors.is_empty(), "first scan clean: {:?}", r1.errors);
+        let file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE filename = 'L_001.fits'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // Simulate the historical C3 orphan: files row present, frames row gone.
+        conn.execute("DELETE FROM frames WHERE file_id = ?1", [file_id])
+            .unwrap();
+
+        // Size and mtime are unchanged — the old classification skipped this
+        // file forever. It must now be re-parsed and the frames row recreated,
+        // with files.id preserved.
+        let r2 = scan_directory_parallel(dir.path(), 1, &conn, &NullEmitter, false, cancel, false);
+        assert!(r2.errors.is_empty(), "healing scan clean: {:?}", r2.errors);
+        let frames: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM frames WHERE file_id = ?1",
+                [file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(frames, 1, "frameless files row must be re-parsed");
     }
 }
 
