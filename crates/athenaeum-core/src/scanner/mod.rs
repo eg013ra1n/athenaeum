@@ -3050,6 +3050,51 @@ mod inplace_tests {
             .unwrap();
         assert_eq!(frames, 1, "frameless files row must be re-parsed");
     }
+
+    /// Sequential sibling of `scan_heals_a_frameless_files_row`. `scan_directory`
+    /// is production code (`api::scan_roots`, `calibration_library::register`),
+    /// so the C3 guard has to hold on that path too.
+    #[test]
+    fn sequential_scan_heals_a_frameless_files_row() {
+        let dir = TempDir::new().unwrap();
+        let f = dir.path().join("L_004.fits");
+        crate::archive::restore::tests::write_minimal_fits(&f);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [dir.path().to_str().unwrap()],
+        )
+        .unwrap();
+
+        let r1 = scan_directory(dir.path(), &conn, None, false, false, 1);
+        assert!(r1.errors.is_empty(), "first scan clean: {:?}", r1.errors);
+        let file_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE filename = 'L_004.fits'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // The historical C3 orphan: files row present, frames row gone, size
+        // and mtime untouched.
+        conn.execute("DELETE FROM frames WHERE file_id = ?1", [file_id])
+            .unwrap();
+
+        let r2 = scan_directory(dir.path(), &conn, None, false, false, 1);
+        assert!(r2.errors.is_empty(), "healing scan clean: {:?}", r2.errors);
+        assert_eq!(r2.files_skipped, 0, "the frameless row must not be skipped");
+        let frames: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM frames WHERE file_id = ?1",
+                [file_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(frames, 1, "frameless files row must be re-parsed");
+    }
 }
 
 /// Volume-aware move-detection guard + its two-site wiring. Uses the real
