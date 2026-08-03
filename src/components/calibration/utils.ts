@@ -1,6 +1,5 @@
 import type {
   CalibrationHierarchyView,
-  CalibrationFilterGroup,
 } from '../../types/models';
 import type { EnrichedLightFrame } from './LightsAnalysisTable';
 
@@ -39,67 +38,6 @@ export interface MergedCameraFilterData {
   nodes: MergedCameraFilterNode[];
   framesByKey: Map<string, EnrichedLightFrame[]>;
   allFrames: EnrichedLightFrame[];
-}
-
-/**
- * Build a unique filter key that includes exptime to differentiate same filter with different exposures.
- */
-export function buildFilterKey(filterGroup: CalibrationFilterGroup): string {
-  const baseFilter = filterGroup.filter ?? '__no_filter__';
-  return filterGroup.exptime !== null
-    ? `${baseFilter}:${filterGroup.exptime}`
-    : baseFilter;
-}
-
-/**
- * Collect warnings from a filter group.
- */
-export function collectFilterGroupWarnings(filterGroup: CalibrationFilterGroup): AggregatedWarning[] {
-  const warnings: AggregatedWarning[] = [];
-
-  const hasFlats = filterGroup.flat_sets.length > 0;
-  const hasDarks = filterGroup.dark_sets.length > 0;
-  const pluralSuffix = filterGroup.frame_count !== 1 ? 's' : '';
-
-  if (!hasFlats && !hasDarks) {
-    warnings.push({
-      message: `No calibration linked (${filterGroup.frame_count} frame${pluralSuffix})`,
-      type: 'missing_calibration',
-      filter: filterGroup.filter ?? undefined,
-    });
-  } else {
-    if (!hasFlats) {
-      warnings.push({
-        message: `Missing Flat calibration (${filterGroup.frame_count} frame${pluralSuffix})`,
-        type: 'missing_calibration',
-        filter: filterGroup.filter ?? undefined,
-      });
-    }
-    if (!hasDarks) {
-      warnings.push({
-        message: `Missing Dark calibration (${filterGroup.frame_count} frame${pluralSuffix})`,
-        type: 'missing_calibration',
-        filter: filterGroup.filter ?? undefined,
-      });
-    }
-  }
-
-  const addSetWarnings = (sets: typeof filterGroup.flat_sets, setType: string) => {
-    for (const setWithCount of sets) {
-      for (const warning of setWithCount.warnings) {
-        warnings.push({
-          message: `${setType}: ${warning.message}`,
-          type: warning.warning_type as 'date' | 'temperature',
-          filter: filterGroup.filter ?? undefined,
-        });
-      }
-    }
-  };
-
-  addSetWarnings(filterGroup.flat_sets, 'Flat');
-  addSetWarnings(filterGroup.dark_sets, 'Dark');
-
-  return warnings;
 }
 
 /**
