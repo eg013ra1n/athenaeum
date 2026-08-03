@@ -15,6 +15,19 @@ use chrono::NaiveDate;
 ///
 /// If `is_manual_override = false` (auto-find), this will skip updating existing manual overrides.
 /// If `is_manual_override = true` (manual assignment), this will always update.
+///
+/// The manual-override protection is enforced twice, deliberately:
+/// the `SELECT` pre-check below is the **fast path** — it short-circuits the
+/// write entirely and emits the `skipping auto-find, manual override exists`
+/// debug log; the `DO UPDATE … WHERE` clause on the upsert is the **atomic
+/// guarantee**. The pre-check alone is check-then-act: an auto-find pass on one
+/// connection can read "no manual override", then a user's manual assignment
+/// commits on another connection, and the auto write would clobber it. The
+/// `WHERE excluded.is_manual_override = 1 OR calibration_set_to_frames.is_manual_override = 0`
+/// guard re-evaluates the stored row inside the same statement, so a manual pick
+/// can never be overwritten by an auto link no matter how the two interleave
+/// (audit I8). A manual write has `excluded.is_manual_override = 1` and always
+/// passes the guard.
 pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Result<i64> {
     let matched_at = link.matched_at.clone();
     let date_warning = if link.date_warning { 1 } else { 0 };
@@ -60,7 +73,9 @@ pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Res
          date_warning = excluded.date_warning,
          temp_warning = excluded.temp_warning,
          matched_at = excluded.matched_at,
-         is_manual_override = excluded.is_manual_override",
+         is_manual_override = excluded.is_manual_override
+         WHERE excluded.is_manual_override = 1
+            OR calibration_set_to_frames.is_manual_override = 0",
         params![
             link.source_id,
             &link.source_type,
@@ -1654,6 +1669,64 @@ mod tests {
         let remaining = get_links_for_frame(&conn, 1).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].calibration_type, "Bias");
+    }
+
+    #[test]
+    fn auto_upsert_cannot_clobber_manual_override_even_without_precheck() {
+        let conn = create_test_db();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark','2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let set_a = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark','2026-01-02')",
+            [],
+        )
+        .unwrap();
+        let set_b = conn.last_insert_rowid();
+
+        // Manual link exists.
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, is_manual_override)
+             VALUES (42, 'frame', ?1, 'Dark', 1)",
+            [set_a],
+        )
+        .unwrap();
+
+        // Simulate the audit-I8 race: the auto-find upsert fires AFTER the
+        // manual write, without its SELECT pre-check seeing it. Run the raw
+        // upsert exactly as insert_calibration_link builds it for an auto link.
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type, matched_at, match_score, date_warning, temp_warning, is_manual_override)
+             VALUES (42, 'frame', ?1, 'Dark', '2026-08-03T00:00:00Z', 0.9, 0, 0, 0)
+             ON CONFLICT(source_id, source_type, calibration_type) DO UPDATE SET
+             calibration_set_id = excluded.calibration_set_id,
+             match_score = excluded.match_score,
+             date_warning = excluded.date_warning,
+             temp_warning = excluded.temp_warning,
+             matched_at = excluded.matched_at,
+             is_manual_override = excluded.is_manual_override
+             WHERE excluded.is_manual_override = 1
+                OR calibration_set_to_frames.is_manual_override = 0",
+            [set_b]).unwrap();
+
+        let (linked, manual): (i64, i64) = conn
+            .query_row(
+                "SELECT calibration_set_id, is_manual_override FROM calibration_set_to_frames
+             WHERE source_id = 42 AND source_type = 'frame' AND calibration_type = 'Dark'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (linked, manual),
+            (set_a, 1),
+            "manual pick must survive the auto upsert"
+        );
     }
 
     #[test]
