@@ -283,19 +283,26 @@ future enhancement, not part of this fix cycle.
 
    **Two of these names COLLIDE with pre-existing fields of an unrelated
    meaning, and the collision is live.** `pattern` already means the flat
-   *selection* pattern — `FlatPattern::Before/After/Both/Automatic`, emitted
-   as `pattern = ?flat_pattern` at `calibration/hierarchy.rs` ×3 — and
-   `flat_pattern` already means the same enum at `api/calibration.rs:146`. So
-   `pattern=RGGB` now shares a field name with `pattern=After`, and
-   `flat_pattern=RGGB` with `flat_pattern=After` — a log query on either name
-   returns two unrelated populations. Registered as-is rather than renamed
-   under review; the rename is in the deferred list below. (The `= ?` Debug
-   form is why an exact-string sweep of the cycle diff missed the pre-existing
-   pair. On re-sweep against `7a84c8c9~1`, `pattern` and `flat_pattern` are
-   the ONLY collisions: `bayerpat`, `light_pattern`, `master_pattern`,
-   `light_patterns`, `cfa_warnings`, `field` and `value` have no prior
-   tracing-field use — their pre-cycle hits are all local bindings, SQL
-   fragments or struct-literal fields.)
+   *selection* pattern — `FlatPattern { Automatic, LongTerm, Manual }`
+   (`calibration/flat_matcher.rs:48-55`; the legacy `before_session`-style
+   strings are migration inputs that all parse to `Automatic`) — emitted as
+   the parsed enum at `calibration/hierarchy.rs:447` and as raw setting
+   strings (`pattern=Some("long_term")`) at `hierarchy.rs:403/422`; and
+   `flat_pattern` already means the same concept at `api/calibration.rs:146`
+   (`flat_pattern=Some("automatic")`). So `pattern=RGGB` now shares a field
+   name with `pattern=Automatic`, and `flat_pattern=RGGB` with
+   `flat_pattern=Some("automatic")` — a log query on either name returns two
+   unrelated populations. Registered as-is rather than renamed under review;
+   the rename is in the deferred list below. (The `= ?` Debug form is why an
+   exact-string sweep of the cycle diff missed the pre-existing pair. On
+   re-sweep against `7a84c8c9~1`, `pattern` and `flat_pattern` are the only
+   collisions within athenaeum-core/tauri/web: `bayerpat`, `light_pattern`,
+   `master_pattern`, `light_patterns`, `cfa_warnings` and `field` have no
+   prior tracing-field use there — their pre-cycle hits are all local
+   bindings, SQL fragments or struct-literal fields. `value` has prior
+   tracing use in the Perseus batcher (`crates/perseus/src/batcher.rs:1092,
+   1165`) in a compatible "offending value + error" sense, in a separate
+   binary's log stream.)
 
 ## Deferred follow-ups (not in the fix plan)
 

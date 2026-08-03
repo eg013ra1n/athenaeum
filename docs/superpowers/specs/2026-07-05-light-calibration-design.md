@@ -248,9 +248,10 @@ blank value: an XISF declaring its mosaic only via `<ColorFilterArray>`,
 sync-ingest's empty `fits_header` row, and the three scanner branches that
 insert no header row at all. The fallback needs populated columns beside a
 silent blob, so it is inert on the reverse shape (a pre-columns scan, whose
-columns are NULL — that one is served by the master-side blob fallback in
-`load_bayer_consensus` instead). An offset the source never declared is never
-invented. Added:
+columns are NULL — there the blob itself still carries the cards, so ordinary
+copy-through handles it and no fallback is needed; the master-side counterpart
+for that shape is `load_bayer_consensus`'s BAYERPAT-only blob fallback). An
+offset the source never declared is never invented. Added:
 
 | card | value |
 | ---- | ----- |
