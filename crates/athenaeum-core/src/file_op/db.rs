@@ -47,10 +47,7 @@ pub fn update_operation_status(
     };
     let is_terminal = matches!(
         status,
-        FileOpStatus::Completed
-            | FileOpStatus::Cancelled
-            | FileOpStatus::RolledBack
-            | FileOpStatus::Failed
+        FileOpStatus::Completed | FileOpStatus::Cancelled | FileOpStatus::Failed
     );
     let finished_at_clause = if is_terminal { Some(now) } else { None };
     conn.execute(
@@ -119,7 +116,7 @@ pub fn list_unfinished_operations(conn: &Connection) -> Result<Vec<FileOperation
         "SELECT id, kind, status, source_root, dest_dir, total_files, total_bytes,
                 created_at, started_at, finished_at, error_message
          FROM file_operations
-         WHERE status IN ('pending','running','rolling_back')
+         WHERE status IN ('pending','running')
          ORDER BY id",
     )?;
     let rows = stmt.query_map([], |row| {

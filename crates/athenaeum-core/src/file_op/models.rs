@@ -35,8 +35,6 @@ pub enum FileOpStatus {
     Running,
     Completed,
     Cancelled,
-    RollingBack,
-    RolledBack,
     Failed,
 }
 
@@ -47,8 +45,6 @@ impl FileOpStatus {
             FileOpStatus::Running => "running",
             FileOpStatus::Completed => "completed",
             FileOpStatus::Cancelled => "cancelled",
-            FileOpStatus::RollingBack => "rolling_back",
-            FileOpStatus::RolledBack => "rolled_back",
             FileOpStatus::Failed => "failed",
         }
     }
@@ -56,10 +52,7 @@ impl FileOpStatus {
     pub fn is_unfinished(&self) -> bool {
         !matches!(
             self,
-            FileOpStatus::Completed
-                | FileOpStatus::Cancelled
-                | FileOpStatus::RolledBack
-                | FileOpStatus::Failed
+            FileOpStatus::Completed | FileOpStatus::Cancelled | FileOpStatus::Failed
         )
     }
 }
@@ -134,10 +127,6 @@ pub enum FileOpStage {
     /// Hot-sync: update files.path in DB and either rename(2) (atomic) or
     /// delete-source (cross-volume) inside the same transaction.
     CommitMove,
-    /// Phase 2: delete kind — remove DB row + file from disk.
-    CommitDelete,
-    /// Rollback: restore source from staging or undo path update.
-    RollbackRestore,
 }
 
 impl FileOpStage {
@@ -146,8 +135,6 @@ impl FileOpStage {
             FileOpStage::Copy => "copy",
             FileOpStage::Verify => "verify",
             FileOpStage::CommitMove => "commit_move",
-            FileOpStage::CommitDelete => "commit_delete",
-            FileOpStage::RollbackRestore => "rollback_restore",
         }
     }
 }
