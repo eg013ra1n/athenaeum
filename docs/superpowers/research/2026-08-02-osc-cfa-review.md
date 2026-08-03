@@ -110,5 +110,8 @@ cards on files actually written to disk.
 `pixinsightTrimmed` per-channel variant; the Flat Analysis contour plot on CFA
 data (display-only); a matcher-level `bayerpat` parameter; whether a mono flat
 on OSC lights should ever hard block (currently advisory); a per-batch divisor
-memo (perf only); and phase-class canonicalization, so `GRBG` at (0, 0) and
-`RGGB` at (1, 0) stop reading as different mosaics.
+memo (perf only); phase-class canonicalization, so `GRBG` at (0, 0) and
+`RGGB` at (1, 0) stop reading as different mosaics; renaming the CFA log sites
+off the `pattern` / `flat_pattern` names they now share with the unrelated
+flat-selection `FlatPattern` enum; and splitting the two set-level CFA
+advisories, which share one `kind` and therefore one log branch.

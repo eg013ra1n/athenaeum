@@ -242,11 +242,15 @@ best-effort per policy.
 ## 7. Output headers
 
 Copied from the source light: WCS, optics, `DATE-OBS`, session cards,
-`BAYERPAT`/`XBAYROFF`/`YBAYROFF`/`ROWORDER`. The Bayer four fall back to the
-`frames` columns when the stored header blob is silent or carries a blank
-value (an XISF declaring its mosaic only via `<ColorFilterArray>`, a
-pre-columns scan); an offset the source never declared is never invented.
-Added:
+`BAYERPAT`/`XBAYROFF`/`YBAYROFF`/`ROWORDER`. Those four Bayer cards fall back
+to the `frames` columns when the stored header blob is silent or carries a
+blank value: an XISF declaring its mosaic only via `<ColorFilterArray>`,
+sync-ingest's empty `fits_header` row, and the three scanner branches that
+insert no header row at all. The fallback needs populated columns beside a
+silent blob, so it is inert on the reverse shape (a pre-columns scan, whose
+columns are NULL — that one is served by the master-side blob fallback in
+`load_bayer_consensus` instead). An offset the source never declared is never
+invented. Added:
 
 | card | value |
 | ---- | ----- |
@@ -257,7 +261,7 @@ Added:
 | `ATH_CSCL` | numeric-scale divisor (e.g. 65535.0) |
 | `ATH_CFNM` | flat-normalization divisor actually applied (`ATH_FNRM` value, or 1.0 when normalization is off). Per-channel runs stamp the mosaic-weighted blend of the three constants below, `(R + 2G + B) / 4` — G is half the mosaic — so a reader that knows only this card still gets a number continuous with the global constant |
 | `ATH_CCFA` | logical `T`, stamped only when the flat was normalized per CFA channel |
-| `ATH_CFNR` / `ATH_CFNG` / `ATH_CFNB` | the per-channel flat-norm divisors actually applied. All four CFA cards are omitted entirely on a mono / global run, so such an output's header is byte-for-byte what it was before per-channel scaling existed |
+| `ATH_CFNR` / `ATH_CFNG` / `ATH_CFNB` | the per-channel flat-norm divisors actually applied. These three and `ATH_CCFA` are omitted entirely on a mono / global run (the copied-through Bayer cards above are unaffected), so such an output's header is byte-for-byte what it was before per-channel scaling existed |
 | `ATH_CVER` | engine version |
 
 All `ATH_*` names respect the 8-char FITS keyword limit and extend the

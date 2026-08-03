@@ -263,20 +263,39 @@ future enhancement, not part of this fix cycle.
    normalization ON compares the floor against `flat/ATH_FNRM`, OFF against the
    raw flat value — so `total` is always the emitting frame's own denominator,
    never a cross-frame or cross-mode rate.
-7. **OSC/CFA cycle log fields** added to the canonical field dictionary:
-   `pattern` (a CFA pattern string as a source declared it — the XISF
-   `<ColorFilterArray>` adopt/reject pair) and `bayerpat` (the same, where the
-   value is one the parser could not vouch for); `light_pattern` /
-   `master_pattern` / `flat_pattern` — ONE layout label each (`RGGB`,
-   `RGGB at (1, 0)`, `mono`, `unrecognized 'XTRANS'`), the same string the
-   readiness dialog shows, so a log line and the UI never disagree;
-   `light_patterns`, plural, for the JOINED list on the set-level
-   "lights declare more than one layout" note — a distinct name precisely
-   because the singular field is a single label and one name for two shapes
-   makes the field unqueryable; `field` (which keyword or column a note is
-   about) with `value` (the offending value) on the Bayer-consensus,
-   offset-range and channel-constant warns; and `cfa_warnings` (a count) on
-   the readiness debug event.
+7. **OSC/CFA cycle log fields** added to the canonical field dictionary.
+   Genuinely new names: `light_pattern` / `master_pattern` — one CFA layout
+   label each (`RGGB`, `RGGB at (1, 0)`, `mono`, `unrecognized 'XTRANS'`); at
+   the `api::lights` advisory sites that string is the one the readiness
+   dialog shows, so log and UI cannot disagree, but the `light_cal`
+   flat-vs-light warn reuses `light_pattern` (with `flat_pattern`) for a BARE
+   pattern name and is log-only — a reader must not assume the dialog
+   spelling. `bayerpat`: a raw pattern string the parser could not vouch for.
+   `field` (which keyword or column a note is about) with `value` (the
+   offending value) on the Bayer-consensus, offset-range and channel-constant
+   warns. `cfa_warnings` (a count) on the readiness debug event.
+   `light_patterns`, plural, for the set-level note — deliberately distinct
+   from the singular, but it does **not** yet carry one shape: the
+   `kind == "lights"` log branch serves BOTH set-level advisories, the
+   multi-layout one (a joined list, `"RGGB (3), mono (1)"`) and the
+   unrecognized-consensus one (a single label), so a reader must still
+   tolerate both. Splitting them is in the deferred list below.
+
+   **Two of these names COLLIDE with pre-existing fields of an unrelated
+   meaning, and the collision is live.** `pattern` already means the flat
+   *selection* pattern — `FlatPattern::Before/After/Both/Automatic`, emitted
+   as `pattern = ?flat_pattern` at `calibration/hierarchy.rs` ×3 — and
+   `flat_pattern` already means the same enum at `api/calibration.rs:146`. So
+   `pattern=RGGB` now shares a field name with `pattern=After`, and
+   `flat_pattern=RGGB` with `flat_pattern=After` — a log query on either name
+   returns two unrelated populations. Registered as-is rather than renamed
+   under review; the rename is in the deferred list below. (The `= ?` Debug
+   form is why an exact-string sweep of the cycle diff missed the pre-existing
+   pair. On re-sweep against `7a84c8c9~1`, `pattern` and `flat_pattern` are
+   the ONLY collisions: `bayerpat`, `light_pattern`, `master_pattern`,
+   `light_patterns`, `cfa_warnings`, `field` and `value` have no prior
+   tracing-field use — their pre-cycle hits are all local bindings, SQL
+   fragments or struct-literal fields.)
 
 ## Deferred follow-ups (not in the fix plan)
 
@@ -317,6 +336,21 @@ From the 2026-08-02 OSC/CFA hardening cycle:
   onto the recompute path. There is exactly one place to land the fix:
   `CfaGeometry::same_phase`, which the flat-card check and the advisory
   comparison already share.
+- **Rename the CFA sites off the colliding `pattern` / `flat_pattern` names**
+  (ratified decision 7): `cfa_pattern` for the XISF `<ColorFilterArray>`
+  adopt/reject pair, `cfa_flat_pattern` for the `light_cal` flat-vs-light
+  warn. Mechanical, but it touches the field dictionary, so it is a decision
+  rather than a cleanup — the pre-existing `FlatPattern` sites keep the plain
+  names, since they are the older claim on them.
+- **Split the two set-level CFA advisories** so `light_patterns` carries one
+  shape. `collect_cfa_advisories` gives both the multi-layout note (joined
+  list) and the unrecognized-consensus note (single label) `kind: "lights"`,
+  so the batch-start log branch cannot tell them apart: the unrecognized case
+  is logged under the plural field AND under the multi-layout message,
+  *"cfa layouts disagree among light frames"*, which is wrong for it. The fix
+  is a third `kind` (a wire change — `kind` rides the readiness payload) or a
+  discriminator on `CfaAdvisory`; message text and field name both move with
+  it, so it wants doing in one go.
 
 ## Post-cycle follow-ups (from the 2026-08-02 final whole-branch review)
 
