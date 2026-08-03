@@ -900,6 +900,37 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // I9: mirror of calibration_set_subcal_cleanup for the OTHER side of the
+    // polymorphic (source_id, source_type) reference. When a `frames` row dies
+    // — direct DELETE or files→frames FK CASCADE; cascade deletes DO fire
+    // AFTER DELETE triggers — its consumer links must not linger. Before this
+    // trigger, send_to_void, the relinking orphan purge and
+    // delete_missing_files each leaked one calibration_set_to_frames row per
+    // deleted linked frame, forever (2026-08-03 audit I9); the manual DELETEs
+    // in delete_scan_root / bulk_update_frame_metadata are now
+    // redundant-but-harmless. DROP+CREATE is the codebase's authoritative
+    // trigger-evolution mechanism (see the UUID triggers) and is safe here
+    // because the whole init_db body is serialized by INIT_DB_LOCK.
+    conn.execute("DROP TRIGGER IF EXISTS frame_subcal_cleanup", [])?;
+    conn.execute(
+        "CREATE TRIGGER frame_subcal_cleanup
+         AFTER DELETE ON frames
+         FOR EACH ROW
+         BEGIN
+            DELETE FROM calibration_set_to_frames
+             WHERE source_type = 'frame'
+               AND source_id = OLD.id;
+         END",
+        [],
+    )?;
+    // Idempotent sweep of orphans leaked before the trigger existed.
+    conn.execute(
+        "DELETE FROM calibration_set_to_frames
+         WHERE source_type = 'frame'
+           AND source_id NOT IN (SELECT id FROM frames)",
+        [],
+    )?;
+
     // B2 (empty-set prune trigger + startup sweep) lives further down, after
     // the Phase 2 migration block: its WHEN clause references
     // `superseded_by_set_id` and `master_provenance`, which must exist first.
@@ -2654,6 +2685,110 @@ mod archive_schema_tests {
             "SELECT COUNT(*) FROM calibration_set_to_frames WHERE source_id=100 AND source_type='calibration_set'",
             [], |r| r.get(0)).unwrap();
         assert_eq!(after, 0, "trigger must have removed the orphaned sub-cal link");
+    }
+
+    #[test]
+    fn deleting_a_frame_cleans_its_consumer_links() {
+        // I9 regression (mirror of the A5 test above, other side of the
+        // polymorphic reference): `calibration_set_to_frames.source_id` has no
+        // FK, so a deleted frame used to leave its consumer link behind
+        // forever — send_to_void, the relinking orphan purge and
+        // delete_missing_files all forgot the manual DELETE.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES ('/t/l.fits','l.fits',1,'2026-01-01T00:00:00Z','FITS')",
+            [],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+        conn.execute("INSERT INTO frames (file_id) VALUES (?1)", [file_id])
+            .unwrap();
+        let frame_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark','2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type)
+             VALUES (?1, 'frame', ?2, 'Dark')",
+            rusqlite::params![frame_id, set_id],
+        )
+        .unwrap();
+
+        // Kill the frame via the files→frames CASCADE (the send_to_void shape).
+        conn.execute("DELETE FROM files WHERE id = ?1", [file_id])
+            .unwrap();
+
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibration_set_to_frames", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(left, 0, "consumer link must die with its frame");
+        // …and it must be the frames-side trigger that removed it, not the
+        // calibration_set_id CASCADE: the target set has no member frames of
+        // its own here, so nothing may have pruned it.
+        let target_alive: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = ?1",
+                [set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(target_alive, 1, "the target calibration_set must survive");
+    }
+
+    #[test]
+    fn init_db_sweeps_frame_consumer_links_leaked_before_the_trigger() {
+        // The other half of I9: databases written by older builds already carry
+        // orphaned links. Reproduce one by removing the trigger (the pre-I9
+        // shape), then assert a second init_db run both sweeps it and
+        // reinstalls the trigger — init_db must stay idempotent.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_dummy_calibration_set(&conn, 900, "Dark");
+        insert_dummy_frame(&conn, 9000);
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type)
+             VALUES (9000, 'frame', 900, 'Dark')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute("DROP TRIGGER frame_subcal_cleanup", [])
+            .unwrap();
+        conn.execute("DELETE FROM files WHERE id = ?1", [9000_i64 + 100_000])
+            .unwrap();
+        let leaked: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibration_set_to_frames", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(leaked, 1, "fixture must reproduce the pre-I9 orphan");
+
+        init_db(&conn).unwrap();
+
+        let swept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibration_set_to_frames", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(swept, 0, "init_db must sweep pre-existing frame orphans");
+        let trigger: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type='trigger' AND name='frame_subcal_cleanup'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger, 1, "DROP+CREATE must leave exactly one trigger");
     }
 
     fn insert_dummy_frame(conn: &Connection, id: i64) {
