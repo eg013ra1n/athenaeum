@@ -146,11 +146,6 @@ export interface FileOpReconciledPayload {
   operationIds: number[];
 }
 
-/** Split a path on / or \ separators. */
-export function splitPath(p: string): string[] {
-  return p.split(/[/\\]/).filter(Boolean);
-}
-
 /** Parent of a path, preserving the dominant separator. */
 export function getParentPath(p: string): string {
   const sep = p.includes('\\') ? '\\' : '/';
@@ -167,14 +162,6 @@ export function getParentPath(p: string): string {
 export function getBasename(p: string): string {
   const parts = p.split(/[/\\]/).filter(Boolean);
   return parts[parts.length - 1] || p;
-}
-
-/** Join a directory and a child name with whichever separator the dir uses. */
-export function joinPath(dir: string, child: string): string {
-  if (!dir) return child;
-  const sep = dir.includes('\\') ? '\\' : '/';
-  if (dir.endsWith(sep)) return dir + child;
-  return dir + sep + child;
 }
 
 /**

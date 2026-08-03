@@ -17,10 +17,6 @@ export async function getArchiveSettings(): Promise<ArchiveSettings> {
   return api.invoke<ArchiveSettings>('get_archive_settings');
 }
 
-export async function setArchiveRootPath(path: string): Promise<void> {
-  await api.invoke('set_archive_root_path', { path });
-}
-
 export async function setArchiveCompression(compression: ArchiveCompression): Promise<void> {
   await api.invoke('set_archive_compression', { compression });
 }
@@ -109,10 +105,6 @@ export async function startRestoreOperation(
     overwriteExisting,
     keepZipAfterRestore,
   });
-}
-
-export async function deleteArchive(operationId: number): Promise<void> {
-  await api.invoke('delete_archive', { operationId });
 }
 
 export interface RestoreSuggestions {

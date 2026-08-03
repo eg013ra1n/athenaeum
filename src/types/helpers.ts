@@ -15,16 +15,14 @@
 
 import type {
   ImageType,
-  FileWithFrame,
   FramesSet,
-  FrameCalibrationStatus,
   ScanRoot,
   CalendarMonthData,
 } from './models';
 import type { ArchiveCompression, FrameRole } from './archive';
 import type { MatchMode, ParameterConfig, MasterPreference } from './calibration-config';
 import type { AutofindStatus } from './plate-solve';
-import type { AnalysisConfig, AnnotationSettings } from './analysis-config';
+import type { AnnotationSettings } from './analysis-config';
 
 // ============================================================================
 // models.ts TS-ONLY material
@@ -71,54 +69,8 @@ export function isMasterType(imagetyp: ImageType | string): boolean {
   );
 }
 
-export interface Day {
-  id: number | null;
-  date: string; // ISO 8601 date (YYYY-MM-DD)
-  frame_count: number;
-}
-
-export interface Setup {
-  id: number | null;
-  telescop: string | null;
-  instrume: string | null;
-  filter: string | null;
-  binning: string | null;
-  gain: number | null;
-}
-
-export interface CalibrationSet {
-  id: number | null;
-  imagetyp: ImageType;
-  exptime: number | null;
-  filter: string | null;
-  ccd_temp: number | null;
-  gain: number | null;
-  binning: string | null;
-  instrume: string | null;
-  date: string;
-  frame_ids: number[];
-}
-
-export interface Tag {
-  id: number | null;
-  name: string;
-  color: string | null;
-}
-
-export interface FrameTag {
-  frame_id: number;
-  tag_id: number;
-}
-
 export interface ScanRootWithAvailability extends ScanRoot {
   is_available: boolean;
-}
-
-export interface ExportTemplate {
-  id: number | null;
-  name: string;
-  template: string;
-  description: string | null;
 }
 
 // ── Duplicates picker rule chain ─────────────────────────────────────────────
@@ -189,27 +141,6 @@ export interface ScanResult {
   cancelled: boolean;
 }
 
-export interface DirectoryContents {
-  subdirectories: string[];
-  files: FileWithFrame[];
-}
-
-export interface Project {
-  id: number | null;
-  name: string;
-}
-
-export interface FramesSetMember {
-  frames_set_id: number;
-  frame_id: number;
-}
-
-export interface FitsHeader {
-  id: number | null;
-  file_id: number;
-  header: string;
-}
-
 // Frame Sets DTOs
 export interface AutoGenerateResult {
   sets_created: number;
@@ -222,33 +153,6 @@ export interface AutoGenerateResult {
 export interface FramesSetWithCount {
   frames_set: FramesSet;
   member_count: number;
-}
-
-export interface SessionWithMetadata {
-  id: number | null;
-  imaging_night_id: number;
-  instrume: string;
-  frame_count: number;
-  total_exp_time: number | null;
-  created_at: string | null;
-  start_date: string | null;
-  end_date: string | null;
-  avg_ra: string | null;
-  avg_dec: string | null;
-}
-
-export interface SessionMember {
-  session_id: number;
-  frame_id: number;
-}
-
-// FITS Image Data for Blink Viewer
-export interface FitsImageData {
-  image_base64: string;
-  width: number;
-  height: number;
-  is_color: boolean;
-  bit_depth: number;
 }
 
 // Missing file record with status from the database
@@ -270,52 +174,11 @@ export interface MissingFileRecord {
   date_obs: string | null;
 }
 
-// Frame Set Refresh
-export interface SetUpdateReport {
-  set_id: number;
-  set_name: string;
-  frames_added: number;
-  nights_created: number;
-  nights_updated: number;
-  frame_ids_added: number[];
-  frame_names_added: string[];
-}
-
-export interface RefreshResult {
-  frames_added: number;
-  sets_updated: SetUpdateReport[];
-  frames_unassigned: number;
-}
-
-export interface CalibrationMatchResult {
-  frames_processed: number;
-  frames_with_calibration: number;
-  frames_partial_calibration: number;
-  frames_no_calibration: number;
-  sets_linked: number;
-  warnings_count: number;
-  processing_time_ms: number;
-  frame_statuses: FrameCalibrationStatus[];
-}
-
-export interface FilterPeriod {
-  filter: string | null;
-  start_time: string; // ISO 8601 datetime
-  end_time: string; // ISO 8601 datetime
-  frame_count: number;
-}
-
 export interface CalendarYearData {
   year: number;
   months: CalendarMonthData[]; // Only months with data
   totalFrameCount: number;
   totalExposureSeconds: number;
-}
-
-/** Result of reclassifying excluded frames */
-export interface ReclassifyResult {
-  frames_updated: number;
-  cameras_refreshed: string[];
 }
 
 /** Result of batch frame set analysis */
@@ -496,72 +359,6 @@ export const MasterPreferenceValues = {
   NoPreference: 'no_preference',
 } as const satisfies Record<string, MasterPreference>;
 
-/** Helper to create a default ParameterConfig */
-export function createParameterConfig(
-  mode: MatchMode = MatchModeValues.Ignore,
-  options: {
-    required?: boolean;
-    warning_threshold?: number;
-    matching_threshold?: number;
-    locked?: boolean;
-    supports_warning?: boolean;
-  } = {}
-): ParameterConfig {
-  return {
-    mode,
-    required: options.required ?? false,
-    warning_threshold: options.warning_threshold,
-    matching_threshold: options.matching_threshold,
-    locked: options.locked ?? false,
-    supports_warning: options.supports_warning ?? false,
-  };
-}
-
-/** Helper to create exact match config (can be changed to ignore) */
-export function exactMatch(required: boolean = true): ParameterConfig {
-  return {
-    mode: MatchModeValues.Exact,
-    required,
-    locked: false,
-    supports_warning: false,
-  };
-}
-
-/** Helper to create warning match config with dual thresholds */
-export function warningMatch(
-  warningThreshold: number,
-  matchingThreshold: number
-): ParameterConfig {
-  return {
-    mode: MatchModeValues.Warning,
-    required: false,
-    warning_threshold: warningThreshold,
-    matching_threshold: matchingThreshold,
-    locked: false,
-    supports_warning: true,
-  };
-}
-
-/** Helper to create ignore config */
-export function ignoreParam(): ParameterConfig {
-  return {
-    mode: MatchModeValues.Ignore,
-    required: false,
-    locked: false,
-    supports_warning: false,
-  };
-}
-
-/** Helper to create ignore config that supports warning mode */
-export function ignoreWithWarningSupport(): ParameterConfig {
-  return {
-    mode: MatchModeValues.Ignore,
-    required: false,
-    locked: false,
-    supports_warning: true,
-  };
-}
-
 /** Validate that warning_threshold <= matching_threshold */
 export function validateThresholds(config: ParameterConfig): string | null {
   if (config.mode === MatchModeValues.Warning) {
@@ -590,16 +387,6 @@ export function getParameterLabel(param: string): string {
   return labels[param] || param;
 }
 
-/** Parameters that can be exact or disabled (no warning mode) */
-export const EXACT_OR_DISABLED_PARAMETERS = [
-  "instrume",
-  "binning",
-  "gain",
-  "offset",
-  "telescop",
-  "filter",
-] as const;
-
 /** Parameters that support warning mode with dual thresholds */
 export const WARNING_CAPABLE_PARAMETERS = [
   "exptime",
@@ -620,9 +407,6 @@ export const CONFIGURABLE_PARAMETERS = [
   "ccd_temp",
 ] as const;
 
-export type ConfigurableParameter = (typeof CONFIGURABLE_PARAMETERS)[number];
-export type ExactOrDisabledParameter =
-  (typeof EXACT_OR_DISABLED_PARAMETERS)[number];
 export type WarningCapableParameter =
   (typeof WARNING_CAPABLE_PARAMETERS)[number];
 
@@ -631,13 +415,6 @@ export function supportsWarningMode(
   param: string
 ): param is WarningCapableParameter {
   return (WARNING_CAPABLE_PARAMETERS as readonly string[]).includes(param);
-}
-
-/** Check if a parameter is exact-or-disabled (no warning mode) */
-export function isExactOrDisabled(
-  param: string
-): param is ExactOrDisabledParameter {
-  return (EXACT_OR_DISABLED_PARAMETERS as readonly string[]).includes(param);
 }
 
 // ============================================================================
@@ -720,22 +497,6 @@ export interface AutofindCompleteEvent {
 // ============================================================================
 // analysis-config.ts TS-ONLY material
 // ============================================================================
-
-/** Default analysis configuration values */
-export const DEFAULT_ANALYSIS_CONFIG: AnalysisConfig = {
-  detection_sigma: 5.0,
-  min_star_area: 5,
-  max_star_area: 2000,
-  saturation_fraction: 0.95,
-  max_stars: 500,
-  trail_threshold: 0.5,
-  mrs_layers: 0,
-  measure_cap: 2000,
-  fit_max_iter: 25,
-  fit_tolerance: 1e-4,
-  fit_max_rejects: 5,
-  batch_concurrency: 3,
-};
 
 /** Default annotation settings matching rustafits defaults */
 export const DEFAULT_ANNOTATION_SETTINGS: AnnotationSettings = {

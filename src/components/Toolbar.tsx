@@ -18,24 +18,6 @@ export function ToolbarContainer({ children }: ToolbarContainerProps) {
 }
 
 // ---------------------------------------------------------------------------
-// ToolbarGroup
-// ---------------------------------------------------------------------------
-
-interface ToolbarGroupProps {
-  label: string;
-  children: ReactNode;
-}
-
-export function ToolbarGroup({ label, children }: ToolbarGroupProps) {
-  return (
-    <div className="flex flex-col items-center gap-0.5 flex-shrink-0">
-      {children}
-      <span className="text-[10px] text-content-muted leading-tight">{label}</span>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // ToolbarButton
 // ---------------------------------------------------------------------------
 
