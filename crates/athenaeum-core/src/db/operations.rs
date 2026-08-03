@@ -599,6 +599,65 @@ pub fn reconcile_unique_camera_instrume(
     })
 }
 
+/// Reconcile the `missing_files` table with a scan's still-missing list.
+///
+/// Extracted from the (formerly duplicated) Tauri/Axum command bodies so the
+/// multi-statement reconcile is atomic: any failure rolls the whole pass
+/// back via the savepoint instead of leaking an open raw transaction onto
+/// the pooled connection (2026-08-03 audit I2). Semantics unchanged:
+/// files absent from `file_ids` lose their 'missing' rows ('ignored' rows
+/// are kept), present files get last_checked_at bumped or a fresh row.
+pub fn sync_missing_files(conn: &Connection, root_id: i64, file_ids: &[i64]) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let sp = SavepointGuard::new(conn, "sync_missing_files")?;
+
+    if file_ids.is_empty() {
+        // All files are present — drop every 'missing' row for this root.
+        conn.execute(
+            "DELETE FROM missing_files WHERE scan_root_id = ?1 AND status = 'missing'",
+            [root_id],
+        )?;
+    } else {
+        // Files that are no longer missing lose their row; 'ignored' rows stay.
+        let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let delete_sql = format!(
+            "DELETE FROM missing_files
+             WHERE scan_root_id = ?1 AND status = 'missing' AND file_id NOT IN ({placeholders})"
+        );
+        let mut params: Vec<rusqlite::types::Value> = vec![root_id.into()];
+        for id in file_ids {
+            params.push((*id).into());
+        }
+        conn.execute(&delete_sql, rusqlite::params_from_iter(params))?;
+
+        for file_id in file_ids {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM missing_files WHERE file_id = ?1",
+                    [file_id],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if exists {
+                // Bump the check timestamp only — an 'ignored' status stands.
+                conn.execute(
+                    "UPDATE missing_files SET last_checked_at = ?1 WHERE file_id = ?2",
+                    params![&now, file_id],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT INTO missing_files (file_id, scan_root_id, detected_at, last_checked_at, status)
+                     VALUES (?1, ?2, ?3, ?4, 'missing')",
+                    params![file_id, root_id, &now, &now],
+                )?;
+            }
+        }
+    }
+
+    sp.commit()?;
+    Ok(())
+}
+
 /// Update scan root last_scan timestamp
 pub fn update_scan_root_timestamp(conn: &Connection, id: i64) -> Result<()> {
     let now = Utc::now().to_rfc3339();
@@ -6474,5 +6533,85 @@ mod bayer_column_tests {
         assert_eq!(xbayroff, None, "absent XBAYROFF must store NULL, not 0");
         assert_eq!(ybayroff, None, "absent YBAYROFF must store NULL, not 0");
         assert_eq!(roworder, None);
+    }
+}
+
+/// DB-hygiene Task 9 (audit I2) — `sync_missing_files` moved here out of the
+/// two duplicated command bodies, where it ran on a raw `BEGIN`/`COMMIT` pair
+/// that leaked an open transaction onto the pooled connection whenever a
+/// statement mid-pass failed.
+#[cfg(test)]
+mod sync_missing_files_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn conn_with_three_files() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute("INSERT INTO scan_roots (id, path) VALUES (7, '/t')", [])
+            .unwrap();
+        for name in ["a", "b", "c"] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 1, '2026-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![format!("/t/{name}.fits"), format!("{name}.fits")],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn sync_missing_files_reconciles_and_preserves_ignored() {
+        let conn = conn_with_three_files();
+        let ids: Vec<i64> = (1..=3).collect();
+
+        // First sync: all three missing.
+        sync_missing_files(&conn, 7, &ids).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM missing_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 3);
+
+        // User ignores file 2; file 3 reappears on disk (drops out of the list).
+        conn.execute(
+            "UPDATE missing_files SET status = 'ignored' WHERE file_id = 2",
+            [],
+        )
+        .unwrap();
+        sync_missing_files(&conn, 7, &[1]).unwrap();
+
+        let still: Vec<(i64, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT file_id, status FROM missing_files ORDER BY file_id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        // 1 stays missing, 2 stays ignored, 3 is gone.
+        assert_eq!(
+            still,
+            vec![(1, "missing".to_string()), (2, "ignored".to_string())]
+        );
+    }
+
+    /// The point of the move: the reconcile now nests. A raw `BEGIN` (what
+    /// both command bodies used to run) errors with "cannot start a
+    /// transaction within a transaction" here.
+    #[test]
+    fn sync_missing_files_nests_inside_outer_transaction() {
+        let conn = conn_with_three_files();
+
+        let outer = conn.unchecked_transaction().unwrap();
+        sync_missing_files(&conn, 7, &[1, 2])
+            .expect("SAVEPOINT must nest inside an already-open outer transaction");
+        outer.commit().unwrap();
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM missing_files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "the reconcile's writes must survive the outer commit");
     }
 }

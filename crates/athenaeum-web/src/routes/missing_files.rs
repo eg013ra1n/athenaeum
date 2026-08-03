@@ -163,56 +163,7 @@ pub async fn sync_missing_files(
 ) -> Result<Json<()>, (StatusCode, String)> {
     let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    conn.execute("BEGIN TRANSACTION", []).map_err(db_err)?;
-
-    if args.file_ids.is_empty() {
-        conn.execute(
-            "DELETE FROM missing_files WHERE scan_root_id = ?1 AND status = 'missing'",
-            [args.root_id],
-        )
-        .map_err(db_err)?;
-    } else {
-        let placeholders: Vec<String> = args.file_ids.iter().map(|_| "?".to_string()).collect();
-        let delete_sql = format!(
-            "DELETE FROM missing_files WHERE scan_root_id = ?1 AND status = 'missing' AND file_id NOT IN ({})",
-            placeholders.join(",")
-        );
-        let mut params: Vec<rusqlite::types::Value> = vec![args.root_id.into()];
-        for id in &args.file_ids {
-            params.push((*id).into());
-        }
-        conn.execute(&delete_sql, rusqlite::params_from_iter(params))
-            .map_err(db_err)?;
-    }
-
-    for file_id in &args.file_ids {
-        let exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM missing_files WHERE file_id = ?1",
-                [file_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if exists {
-            conn.execute(
-                "UPDATE missing_files SET last_checked_at = ?1 WHERE file_id = ?2",
-                rusqlite::params![&now, file_id],
-            )
-            .map_err(db_err)?;
-        } else {
-            conn.execute(
-                "INSERT INTO missing_files (file_id, scan_root_id, detected_at, last_checked_at, status)
-                 VALUES (?1, ?2, ?3, ?4, 'missing')",
-                rusqlite::params![file_id, args.root_id, &now, &now],
-            )
-            .map_err(db_err)?;
-        }
-    }
-
-    conn.execute("COMMIT", []).map_err(db_err)?;
+    athenaeum_core::db::sync_missing_files(&conn, args.root_id, &args.file_ids).map_err(db_err)?;
     Ok(Json(()))
 }
 

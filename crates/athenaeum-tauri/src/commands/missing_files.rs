@@ -36,71 +36,7 @@ pub async fn sync_missing_files(
 ) -> Result<(), String> {
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
-    let now = chrono::Utc::now().to_rfc3339();
-
-    // Start a transaction
-    conn.execute("BEGIN TRANSACTION", [])
-        .map_err(|e| e.to_string())?;
-
-    // Remove any files that are no longer missing (they exist on disk now)
-    // by deleting records where file_id is NOT in the new missing list
-    // and status is 'missing' (not 'ignored')
-    if file_ids.is_empty() {
-        // All files are present - remove all 'missing' status entries for this root
-        conn.execute(
-            "DELETE FROM missing_files WHERE scan_root_id = ?1 AND status = 'missing'",
-            [root_id],
-        )
-        .map_err(|e| e.to_string())?;
-    } else {
-        // Build placeholders for the IN clause
-        let placeholders: Vec<String> = file_ids.iter().map(|_| "?".to_string()).collect();
-        let placeholders_str = placeholders.join(",");
-
-        // Delete records for files that are no longer missing (but keep 'ignored' ones)
-        let delete_sql = format!(
-            "DELETE FROM missing_files WHERE scan_root_id = ?1 AND status = 'missing' AND file_id NOT IN ({})",
-            placeholders_str
-        );
-        let mut params: Vec<rusqlite::types::Value> = vec![root_id.into()];
-        for id in &file_ids {
-            params.push((*id).into());
-        }
-        conn.execute(&delete_sql, rusqlite::params_from_iter(params))
-            .map_err(|e| e.to_string())?;
-    }
-
-    // Insert or update missing files
-    for file_id in &file_ids {
-        // Check if already exists
-        let exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM missing_files WHERE file_id = ?1",
-                [file_id],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-
-        if exists {
-            // Update last_checked_at, but don't change status if it's 'ignored'
-            conn.execute(
-                "UPDATE missing_files SET last_checked_at = ?1 WHERE file_id = ?2",
-                rusqlite::params![&now, file_id],
-            )
-            .map_err(|e| e.to_string())?;
-        } else {
-            // Insert new missing file record
-            conn.execute(
-                "INSERT INTO missing_files (file_id, scan_root_id, detected_at, last_checked_at, status)
-                 VALUES (?1, ?2, ?3, ?4, 'missing')",
-                rusqlite::params![file_id, root_id, &now, &now],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-    }
-
-    conn.execute("COMMIT", []).map_err(|e| e.to_string())?;
-    Ok(())
+    athenaeum_core::db::sync_missing_files(&conn, root_id, &file_ids).map_err(|e| e.to_string())
 }
 
 /// Get missing files for a specific scan root with full details
