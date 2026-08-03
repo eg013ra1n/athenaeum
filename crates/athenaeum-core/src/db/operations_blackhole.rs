@@ -68,12 +68,22 @@ fn unregister_master_if_any(conn: &Connection, file_id: i64) -> Result<()> {
 /// If the file is a master library file, its registration is undone first (see
 /// [`unregister_master_if_any`]) — still idempotent, because a repeat call finds
 /// no master left to unregister.
+///
+/// Atomic: the unregister sequence and the black-hole insert are one savepoint,
+/// so a mid-sequence failure leaves the calibration lineage exactly as it was.
+/// The savepoint nests, so this composes inside a caller's transaction.
 pub fn add_to_black_hole(
     conn: &Connection,
     file_id: i64,
     from_where: &str,
     original_path: &str,
 ) -> Result<i64> {
+    // One atomic unit: the master-unregister sequence (6 statements, doc
+    // contract: "runs in the CALLER's transaction") plus the black-hole
+    // insert. Without this, a failure mid-unregister left the calibration
+    // lineage permanently half-rewired (audit C5).
+    let sp = crate::db::SavepointGuard::new(conn, "add_to_black_hole")?;
+
     unregister_master_if_any(conn, file_id)?;
 
     let now = Utc::now().to_rfc3339();
@@ -92,6 +102,7 @@ pub fn add_to_black_hole(
         |row| row.get(0),
     )?;
 
+    sp.commit()?;
     Ok(id)
 }
 
@@ -248,11 +259,15 @@ pub fn remove_from_black_hole(conn: &Connection, file_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Permanently delete a file from disk and database (send to void)
+/// Permanently delete a file from database and disk (send to void)
 ///
-/// A master library file gives up its registration first (see
-/// [`unregister_master_if_any`]) — before the disk file goes, so a failure there
-/// leaves everything intact.
+/// Catalog first, disk second — the same stance as `api::masters::delete_master`
+/// — and every catalog write (the master unregister of
+/// [`unregister_master_if_any`] included) is one savepoint. A crash between the
+/// two halves leaves an orphan file on disk, which a later scan simply
+/// re-ingests; it can never leave a catalog row pointing at a file that is gone
+/// forever, nor a half-rewired calibration lineage. The savepoint nests, so this
+/// composes inside a caller's transaction.
 pub fn send_to_void(conn: &Connection, file_id: i64) -> Result<()> {
     // Get file path before deletion
     let path: String = conn.query_row(
@@ -261,24 +276,28 @@ pub fn send_to_void(conn: &Connection, file_id: i64) -> Result<()> {
         |row| row.get(0),
     )?;
 
+    // Catalog first, disk second (same stance as api::masters::delete_master):
+    // the benign crash leftover is an orphan file on disk — which a later
+    // scan simply re-ingests — never a catalog row pointing at a file that
+    // is gone forever. All catalog writes are one atomic unit so the
+    // master-unregister sequence can't half-commit (audit C5/I3).
+    let sp = crate::db::SavepointGuard::new(conn, "send_to_void")?;
     unregister_master_if_any(conn, file_id)?;
-
-    // Delete physical file
-    if std::path::Path::new(&path).exists() {
-        std::fs::remove_file(&path)?;
-    }
-
-    // Delete from black_hole table (CASCADE will handle this, but explicit is clearer)
     conn.execute(
         "DELETE FROM black_hole WHERE file_id = ?1",
         params![file_id],
     )?;
+    // files delete cascades to frames, frame_tags, etc.
+    conn.execute("DELETE FROM files WHERE id = ?1", params![file_id])?;
+    sp.commit()?;
 
-    // Delete from files table (will cascade to frames, frame_tags, etc.)
-    conn.execute(
-        "DELETE FROM files WHERE id = ?1",
-        params![file_id],
-    )?;
+    if std::path::Path::new(&path).exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::error!(file_id, path = %path, error = %e,
+                "send_to_void: catalog rows removed but disk delete failed; file remains on disk");
+            return Err(e.into());
+        }
+    }
 
     Ok(())
 }
@@ -791,6 +810,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(members, 2, "black-holed members keep their membership rows");
+    }
+
+    // ── Atomicity / nesting (audit C5 + I3) ──────────────────────────────────
+
+    /// Both single-file delete paths must compose inside a caller's
+    /// transaction: they wrap their catalog writes in a savepoint, and a
+    /// savepoint nests where a raw `BEGIN` would error with "cannot start a
+    /// transaction within a transaction". The outer rollback must take the
+    /// inner writes with it.
+    #[test]
+    fn black_hole_and_void_nest_inside_an_outer_transaction() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES ('/t/v.fits','v.fits',1,'2026-01-01T00:00:00Z','FITS')",
+            [],
+        )
+        .unwrap();
+        let fid = conn.last_insert_rowid();
+
+        // Raw BEGIN inside the functions would error with "cannot start a
+        // transaction within a transaction"; savepoints must nest.
+        let tx = conn.unchecked_transaction().unwrap();
+        add_to_black_hole(&conn, fid, "duplicates", "/t/v.fits").unwrap();
+        send_to_void(&conn, fid).unwrap();
+        drop(tx); // rollback
+
+        // The outer rollback must take the inner writes with it.
+        let files: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(files, 1, "outer rollback must restore the files row");
+        let bh: i64 = conn
+            .query_row("SELECT COUNT(*) FROM black_hole", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bh, 0);
     }
 
     // ── Source filter is data, not SQL (audit C1) ────────────────────────────
