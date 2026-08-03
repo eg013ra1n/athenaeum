@@ -200,26 +200,26 @@ pub fn get_black_hole_files(
     conn: &Connection,
     filter_by_source: Option<String>,
 ) -> Result<Vec<BlackHoleEntry>> {
-    let query = if let Some(source) = filter_by_source {
-        format!(
-            "SELECT bh.id, bh.file_id, f.filename, bh.original_path, bh.from_where, bh.moved_at, f.size
-             FROM black_hole bh
-             JOIN files f ON bh.file_id = f.id
-             WHERE bh.from_where = '{}'
-             ORDER BY bh.moved_at DESC",
-            source
-        )
+    let query = if filter_by_source.is_some() {
+        "SELECT bh.id, bh.file_id, f.filename, bh.original_path, bh.from_where, bh.moved_at, f.size
+         FROM black_hole bh
+         JOIN files f ON bh.file_id = f.id
+         WHERE bh.from_where = ?1
+         ORDER BY bh.moved_at DESC"
     } else {
         "SELECT bh.id, bh.file_id, f.filename, bh.original_path, bh.from_where, bh.moved_at, f.size
          FROM black_hole bh
          JOIN files f ON bh.file_id = f.id
          ORDER BY bh.moved_at DESC"
-            .to_string()
+    };
+    let params: Vec<rusqlite::types::Value> = match filter_by_source {
+        Some(s) => vec![s.into()],
+        None => vec![],
     };
 
-    let mut stmt = conn.prepare(&query)?;
+    let mut stmt = conn.prepare(query)?;
 
-    let entries = stmt.query_map([], |row| {
+    let entries = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
         let moved_at_str: String = row.get(5)?;
         let moved_at = chrono::DateTime::parse_from_rfc3339(&moved_at_str)
             .map(|dt| dt.with_timezone(&Utc))
@@ -791,5 +791,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(members, 2, "black-holed members keep their membership rows");
+    }
+
+    // ── Source filter is data, not SQL (audit C1) ────────────────────────────
+
+    /// The `from_where` filter arrives from the UI (and, on the web build, from
+    /// an HTTP request body): it must reach SQLite as a bound value, never as
+    /// query text.
+    #[test]
+    fn black_hole_filter_is_bound_not_spliced() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES ('/t/a.fits','a.fits',1,'2026-01-01T00:00:00Z','FITS')",
+            [],
+        )
+        .unwrap();
+        let fid = conn.last_insert_rowid();
+        add_to_black_hole(&conn, fid, "duplicates", "/t/a.fits").unwrap();
+
+        // A single quote in the filter must be data, not syntax: no SQL error,
+        // zero rows (no source is literally named this).
+        let evil = "x' UNION SELECT 1,1,'p','p','w','2026-01-01T00:00:00Z',1 --".to_string();
+        let rows = get_black_hole_files(&conn, Some(evil)).unwrap();
+        assert!(
+            rows.is_empty(),
+            "injection text must match nothing: {rows:?}"
+        );
+
+        // And a legitimate filter still works.
+        let rows = get_black_hole_files(&conn, Some("duplicates".into())).unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }
