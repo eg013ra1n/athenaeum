@@ -35,13 +35,24 @@ struct RollbackFinished<'a> {
     kind: &'a str,
 }
 
-/// User-initiated rollback: the rollback *is* the whole operation, so it owns
-/// the terminal `archive-finished` event the progress widget waits for.
+/// User-initiated rollback (the "Roll back" action on an interrupted
+/// operation): the rollback *is* the whole operation, so it owns the terminal
+/// `archive-finished` event the progress widget waits for.
 ///
-/// The failure-path callers (the archive / resume workers, which roll back
-/// after their own failure) must keep calling [`rollback_operation`] instead —
-/// they emit their own `archive-finished` carrying the real outcome, and a
-/// second terminal event would mask it in the UI.
+/// The failure-path callers keep calling [`rollback_operation`] instead,
+/// because there a rollback is a sub-step of a failed operation, not that
+/// operation's terminal state — the outcome the UI must end on is the archive's
+/// (`failed` / `cancelled`), not the rollback's.
+///
+/// For the record, those callers are inconsistent today, and this split is
+/// deliberately agnostic to that:
+/// - emit their own terminal event: the desktop archive worker
+///   (`athenaeum-tauri` `commands/archive.rs`) and the calibration-archive
+///   worker (`api::masters::archive_originals`).
+/// - emit none at all: the web archive worker (`athenaeum-web`
+///   `routes/archive.rs`) and both resume workers (desktop + web). That gap
+///   predates this function — those widgets never auto-dismissed — and is
+///   tracked separately; do not paper over it from in here.
 pub fn rollback_operation_standalone(
     conn: &Connection,
     operation_id: i64,
@@ -70,21 +81,34 @@ pub fn rollback_operation(
     adb::update_operation_status(conn, operation_id, ArchiveStatus::RollingBack, None)?;
 
     // 1. Restore any deleted sources from staging.
+    //
+    // `total` counts only the files this loop will actually restore, and
+    // `restored` counts them off as it goes — neither may be derived from the
+    // position in `files`. Partial deletion is the normal rollback shape (an
+    // interrupted operation deleted a prefix of the batch), and a Done
+    // DeleteSource step is *not* the same as "a source was deleted": a
+    // copy-disposition calibration gets that step too, with nothing removed
+    // from disk (see `executor::delete_sources_phase`).
     let deleted_file_ids = file_ids_with_done_step(conn, operation_id, ArchiveStage::DeleteSource)?;
-    let total = deleted_file_ids.len();
-    for (idx, f) in files.iter().enumerate() {
+    let total = files
+        .iter()
+        .filter(|f| deleted_file_ids.contains(&f.id) && f.disposition == "move")
+        .count();
+    let mut restored = 0usize;
+    for f in files.iter() {
         if !deleted_file_ids.contains(&f.id) {
             continue;
         }
         if f.disposition != "move" {
             continue;
         }
+        restored += 1;
         emit_event(emitter, "archive-progress", &RollbackProgress {
             operation_id,
             stage: "restore_source".into(),
-            current: idx + 1,
+            current: restored,
             total,
-            message: format!("Restoring source {}/{}", idx + 1, total),
+            message: format!("Restoring source {}/{}", restored, total),
         });
 
         let staged = staging::staging_file_path(&archive_root, operation_id, &f.target_path_in_zip);
@@ -195,9 +219,13 @@ mod tests {
 
         let l1 = scan.path().join("M31/L_001.fits");
         let l2 = scan.path().join("M31/L_002.fits");
+        // Three files, so a partially-deleted batch can leave a gap that a
+        // position-derived progress counter would get wrong.
+        let l3 = scan.path().join("M31/L_003.fits");
         std::fs::create_dir_all(l1.parent().unwrap()).unwrap();
         std::fs::write(&l1, b"light-1").unwrap();
         std::fs::write(&l2, b"light-2").unwrap();
+        std::fs::write(&l3, b"light-3").unwrap();
 
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -207,7 +235,9 @@ mod tests {
         conn.execute("INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
              VALUES (10, 1, '2025-10-12', '2025-10-13')", []).unwrap();
         conn.execute("INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (100, 10, 'C')", []).unwrap();
-        for (file_id, path, frame_id) in [(1000i64, &l1, 10000i64), (1001, &l2, 10001)] {
+        for (file_id, path, frame_id) in
+            [(1000i64, &l1, 10000i64), (1001, &l2, 10001), (1002, &l3, 10002)]
+        {
             conn.execute(
                 "INSERT INTO files (id, path, filename, size, modified_at, format)
                  VALUES (?1, ?2, ?3, 7, '2025-10-12', 'FITS')",
@@ -260,6 +290,7 @@ mod tests {
         // Sources restored
         assert!(scan.path().join("M31/L_001.fits").exists());
         assert!(scan.path().join("M31/L_002.fits").exists());
+        assert!(scan.path().join("M31/L_003.fits").exists());
         // Operation status updated
         let op = adb::get_operation(&conn, op_id).unwrap();
         assert_eq!(op.status, "rolled_back");
@@ -274,10 +305,21 @@ mod tests {
 
     /// Drives the fixture up to "sources deleted, staging populated" so a
     /// rollback has restore work to do (and therefore emits progress).
-    fn stage_deleted_sources(conn: &Connection, arch: &TempDir, op_id: i64) {
+    ///
+    /// `skip_leading` files are left untouched — no staging copy, no deletion,
+    /// no Done DeleteSource step. That is the normal interrupted-archive shape:
+    /// the operation died partway through `delete_sources_phase`, so only part
+    /// of the batch needs restoring. Returns how many files were staged, which
+    /// is the `total` every progress event must carry.
+    fn stage_deleted_sources(
+        conn: &Connection,
+        arch: &TempDir,
+        op_id: i64,
+        skip_leading: usize,
+    ) -> usize {
         let files = adb::list_operation_files(conn, op_id).unwrap();
         crate::archive::staging::ensure_staging_dir(arch.path(), op_id).unwrap();
-        for f in &files {
+        for f in files.iter().skip(skip_leading) {
             crate::archive::staging::copy_into_staging(
                 arch.path(),
                 op_id,
@@ -290,12 +332,24 @@ mod tests {
                 adb::insert_step(conn, op_id, Some(f.id), ArchiveStage::DeleteSource).unwrap();
             adb::update_step(conn, sid, StepStatus::Done, None, None).unwrap();
         }
+        files.len() - skip_leading
+    }
+
+    /// The `(current, total)` pairs of every `archive-progress` event, in order.
+    fn progress_counters(events: &[(String, serde_json::Value)]) -> Vec<(u64, u64)> {
+        events
+            .iter()
+            .filter(|(n, _)| n == "archive-progress")
+            .map(|(_, p)| (p["current"].as_u64().unwrap(), p["total"].as_u64().unwrap()))
+            .collect()
     }
 
     #[test]
     fn rollback_emits_unified_progress_and_finished_events() {
         let (conn, arch, _scan, op_id) = fixture();
-        stage_deleted_sources(&conn, &arch, op_id);
+        // Leave the first file alone: an interrupted operation deletes a
+        // prefix of the batch, so the restore loop starts partway in.
+        let expected_total = stage_deleted_sources(&conn, &arch, op_id, 1);
 
         let emitter = CapturingEmitter::default();
         rollback_operation_standalone(&conn, op_id, &emitter).unwrap();
@@ -305,6 +359,17 @@ mod tests {
             events.iter().any(|(n, _)| n == "archive-progress"),
             "rollback must emit on the channel the UI listens to: {events:?}"
         );
+        // The counter must count restored files, not positions in the batch —
+        // deriving it from the loop index reports e.g. "3/2" (150%) whenever
+        // the operation died partway through deleting sources.
+        let counters = progress_counters(&events);
+        let expected: Vec<(u64, u64)> = (1..=expected_total as u64)
+            .map(|c| (c, expected_total as u64))
+            .collect();
+        assert_eq!(counters, expected, "progress counters: {events:?}");
+        assert!(counters.iter().all(|(c, t)| c >= &1 && c <= t));
+        assert_eq!(counters.last().unwrap().0, expected_total as u64);
+
         let (_, fin) = events
             .iter()
             .find(|(n, _)| n == "archive-finished")
@@ -318,14 +383,43 @@ mod tests {
         );
     }
 
-    /// The failure-path callers (archive/resume workers) emit their own
-    /// `archive-finished` after rolling back — the inner rollback must stay
-    /// silent there or the UI would see a spurious "rollback completed"
-    /// terminal event for an operation that actually failed.
+    /// A copy-disposition file gets a Done DeleteSource step too (nothing was
+    /// deleted for it — see `executor::delete_sources_phase`), so it must not
+    /// inflate the denominator of a rollback that never touches it.
+    #[test]
+    fn rollback_progress_ignores_copy_disposition_files() {
+        let (conn, arch, _scan, op_id) = fixture();
+        let staged = stage_deleted_sources(&conn, &arch, op_id, 0);
+        // Turn the last file into a copied calibration after the fact: its
+        // source stays on disk, its DeleteSource step is Done all the same.
+        let files = adb::list_operation_files(&conn, op_id).unwrap();
+        let copied = files.last().unwrap();
+        conn.execute(
+            "UPDATE archive_operation_files SET disposition = 'copy' WHERE id = ?1",
+            [copied.id],
+        )
+        .unwrap();
+
+        let emitter = CapturingEmitter::default();
+        rollback_operation(&conn, op_id, &emitter).unwrap();
+
+        let events = emitter.0.lock().unwrap();
+        let counters = progress_counters(&events);
+        let expected_total = (staged - 1) as u64;
+        assert_eq!(
+            counters,
+            (1..=expected_total).map(|c| (c, expected_total)).collect::<Vec<_>>(),
+            "copied file must not be counted: {events:?}"
+        );
+    }
+
+    /// A rollback on the failure path is a sub-step of a failed operation, not
+    /// its terminal state — the caller decides what the operation ended as, so
+    /// the inner rollback must not emit a terminal event of its own.
     #[test]
     fn inner_rollback_emits_no_finished_event() {
         let (conn, arch, _scan, op_id) = fixture();
-        stage_deleted_sources(&conn, &arch, op_id);
+        stage_deleted_sources(&conn, &arch, op_id, 0);
 
         let emitter = CapturingEmitter::default();
         rollback_operation(&conn, op_id, &emitter).unwrap();
