@@ -112,10 +112,17 @@ pub fn add_to_black_hole(
 /// Files already in the black hole are skipped as idempotent no-ops (the
 /// `UNIQUE(file_id)` index + `INSERT OR IGNORE` mean no duplicate row is
 /// created) and are counted as neither `moved` nor `failed`. Genuine per-file
-/// failures (e.g. file row missing) are logged to stderr and collected into
-/// `BulkMoveResult::failed` — they do NOT abort the whole batch. A
-/// connection-level error (transaction begin/commit fails) returns `Err` and
-/// leaves the DB unchanged.
+/// failures (a missing file row, a master-unregister that dies mid-sequence)
+/// are logged and collected into `BulkMoveResult::failed` — they do NOT abort
+/// the whole batch.
+///
+/// Atomic at both levels: the loop runs in one savepoint and each file's
+/// unregister-plus-insert sequence in a nested one, so a file listed in
+/// `failed` has contributed ZERO committed writes. Previously its partial
+/// writes rode the batch `COMMIT` anyway while the file was reported as failed
+/// (audit C5). A batch-level savepoint failure returns `Err` and leaves the DB
+/// unchanged; the savepoint nests, so this composes inside a caller's
+/// transaction where the old raw `BEGIN` would have errored.
 pub fn bulk_move_to_black_hole(
     conn: &Connection,
     file_ids: &[i64],
@@ -125,7 +132,7 @@ pub fn bulk_move_to_black_hole(
     let total = file_ids.len();
     let now = Utc::now().to_rfc3339();
 
-    conn.execute("BEGIN TRANSACTION", [])?;
+    let outer = crate::db::SavepointGuard::new(conn, "bulk_black_hole")?;
 
     let mut moved: usize = 0;
     let mut failed: Vec<(i64, String)> = Vec::new();
@@ -148,11 +155,24 @@ pub fn bulk_move_to_black_hole(
             }
         };
 
+        // Per-file savepoint: a file that fails mid-sequence (e.g. its
+        // master-unregister dies on statement 4 of 6) must contribute ZERO
+        // committed writes — previously its partial writes rode the batch
+        // COMMIT while the file was reported as failed (audit C5).
+        let sp = match crate::db::SavepointGuard::new(conn, "bulk_black_hole_file") {
+            Ok(sp) => sp,
+            Err(e) => {
+                tracing::error!(file_id, error = %e, "bulk_move_to_black_hole: savepoint open failed");
+                failed.push((*file_id, format!("savepoint open failed: {}", e)));
+                continue;
+            }
+        };
+
         // A master file gives up its registration before it is black-holed;
         // a failure there fails THIS file only, never the batch.
         if let Err(e) = unregister_master_if_any(conn, *file_id) {
             failed.push((*file_id, format!("master unregister failed: {}", e)));
-            continue;
+            continue; // sp drops → this file's partial writes roll back
         }
 
         let insert = conn.execute(
@@ -164,14 +184,22 @@ pub fn bulk_move_to_black_hole(
         match insert {
             // changed == 0 means the file was already in the black hole — a
             // silent idempotent no-op (not a move, not a failure).
-            Ok(changed) => {
-                if changed > 0 {
-                    moved += 1;
+            Ok(changed) => match sp.commit() {
+                Ok(()) => {
+                    if changed > 0 {
+                        moved += 1;
+                    }
                 }
-            }
+                Err(e) => {
+                    tracing::error!(file_id, error = %e, "bulk_move_to_black_hole: savepoint commit failed");
+                    failed.push((*file_id, format!("savepoint commit failed: {}", e)));
+                    continue;
+                }
+            },
             Err(e) => {
                 tracing::error!(file_id, path = %path, error = %e, "bulk_move_to_black_hole: failed to move file");
                 failed.push((*file_id, e.to_string()));
+                continue; // sp drops → rollback
             }
         }
 
@@ -201,7 +229,7 @@ pub fn bulk_move_to_black_hole(
         }
     }
 
-    conn.execute("COMMIT", [])?;
+    outer.commit()?;
 
     Ok(BulkMoveResult { moved, failed })
 }
@@ -863,6 +891,134 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM black_hole", [], |r| r.get(0))
             .unwrap();
         assert_eq!(bh, 0);
+    }
+
+    /// One file's failure must not take the batch down with it: the good file
+    /// still moves, the bad one is reported, and the batch commits. Pinned
+    /// across the per-file-savepoint refactor — the savepoints must isolate
+    /// failures, never turn a per-file failure into a batch abort.
+    #[test]
+    fn bulk_move_failed_file_leaves_no_partial_writes() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES ('/t/b.fits','b.fits',1,'2026-01-01T00:00:00Z','FITS')",
+            [],
+        )
+        .unwrap();
+        let good = conn.last_insert_rowid();
+
+        // file_id 9999 has no files row → its path lookup fails → it must land
+        // in `failed` while the good file still moves, and the batch commits.
+        let r = bulk_move_to_black_hole(&conn, &[good, 9999], "duplicates", None).unwrap();
+        assert_eq!(r.moved, 1);
+        assert_eq!(r.failed.len(), 1);
+        assert_eq!(r.failed[0].0, 9999);
+        let bh: i64 = conn
+            .query_row("SELECT COUNT(*) FROM black_hole", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bh, 1, "only the good file is in the black hole");
+    }
+
+    /// The produced contract, pinned against a REAL mid-sequence failure: a
+    /// file reported in `failed` must have committed nothing.
+    ///
+    /// The forced failure needs no fault injection — `master_provenance
+    /// .source_set_id` is a NO-ACTION FK, so a second-generation master whose
+    /// provenance names this master set as its source pins that row: the
+    /// unregister's closing `DELETE FROM calibration_set` fails *after* it has
+    /// already repointed the consumer link, un-superseded the raw set and
+    /// dropped its own provenance. Before the per-file savepoint those three
+    /// writes rode the batch COMMIT while the file was reported as failed —
+    /// the raw set left matchable again by a master that never went anywhere
+    /// (audit C5).
+    #[test]
+    fn bulk_move_rolls_back_a_file_that_fails_mid_unregister() {
+        let conn = setup();
+        let fx = seed_registered_master(&conn, "/lib/master_dark.fits");
+
+        // Generation-2 master whose provenance sources fx's master set — the
+        // NO-ACTION FK that will block fx's shell-row DELETE.
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, is_master_library)
+             VALUES ('MasterDark', '2026-08-02', 1)",
+            [],
+        )
+        .unwrap();
+        let gen2_set_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO master_provenance
+             (master_set_id, source_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+             VALUES (?1, ?2, '{}', '[]', 'h2', '2026-08-03T00:00:00Z')",
+            params![gen2_set_id, fx.master_set_id],
+        )
+        .unwrap();
+
+        let res = bulk_move_to_black_hole(&conn, &[fx.master_file_id], "test", None).unwrap();
+        assert_eq!(res.moved, 0, "the file never moved");
+        assert_eq!(res.failed.len(), 1, "{:?}", res.failed);
+        assert_eq!(res.failed[0].0, fx.master_file_id);
+
+        // Every write the half-run unregister made must be gone.
+        let sup: Option<i64> = conn
+            .query_row(
+                "SELECT superseded_by_set_id FROM calibration_set WHERE id = ?1",
+                [fx.raw_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sup,
+            Some(fx.master_set_id),
+            "raw set must still be superseded — the un-supersede rolled back"
+        );
+
+        let target: i64 = conn
+            .query_row(
+                "SELECT calibration_set_id FROM calibration_set_to_frames
+                  WHERE source_id = ?1 AND source_type = 'frame'",
+                [fx.consumer_frame_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            target, fx.master_set_id,
+            "consumer link must still point at the master — the repoint rolled back"
+        );
+
+        let prov: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM master_provenance WHERE master_set_id = ?1",
+                [fx.master_set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prov, 1, "the master's own provenance delete rolled back");
+
+        let bh: i64 = conn
+            .query_row("SELECT COUNT(*) FROM black_hole", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bh, 0, "a failed file is not in the black hole");
+    }
+
+    /// The batch path composes inside a caller's transaction too: the outer
+    /// savepoint nests where the old raw `BEGIN TRANSACTION` would have errored
+    /// with "cannot start a transaction within a transaction".
+    #[test]
+    fn bulk_move_nests_inside_an_outer_transaction() {
+        let conn = setup();
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let res = bulk_move_to_black_hole(&conn, &[1], "duplicates", None).unwrap();
+        assert_eq!(res.moved, 1);
+        assert!(res.failed.is_empty(), "{:?}", res.failed);
+        drop(tx); // rollback
+
+        let bh: i64 = conn
+            .query_row("SELECT COUNT(*) FROM black_hole", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bh, 0, "outer rollback must take the batch's writes with it");
     }
 
     /// The ordering itself, pinned: catalog rows are committed BEFORE the disk
