@@ -392,17 +392,13 @@ pub fn get_frames_for_calibration_set(
             path: row.get(1)?,
             filename: row.get(2)?,
             size: row.get(3)?,
-            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-                .unwrap()
-                .with_timezone(&Utc),
+            modified_at: crate::db::parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
             format: if row.get::<_, String>(5)? == "FITS" {
                 crate::models::FileFormat::FITS
             } else {
                 crate::models::FileFormat::XISF
             },
-            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
-                .unwrap()
-                .with_timezone(&Utc),
+            created_at: crate::db::parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
             metadata_hash: row.get(7)?,
             content_hash: row.get(8)?,
             archived_in_operation: row.get(9)?,
@@ -463,4 +459,54 @@ pub fn get_frames_for_calibration_set(
     })?;
 
     frames.collect::<Result<Vec<_>, _>>().map_err(|e| e.into())
+}
+
+/// DB-hygiene Task 13 (2026-08-03 audit I6) — the calibration-set frame
+/// listing maps the same `files.modified_at`/`created_at` columns as
+/// `db::operations`, and used the same panicking `.unwrap()`. One malformed
+/// string must not take down the whole set view.
+#[cfg(test)]
+mod stored_timestamp_tests {
+    use crate::db::schema::init_db;
+    use chrono::{DateTime, Utc};
+    use rusqlite::Connection;
+
+    #[test]
+    fn malformed_stored_timestamp_does_not_panic_calibration_set_listing() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+             VALUES ('/t/bias.fits','bias.fits',1,'not-a-timestamp','FITS','also-bad')",
+            [],
+        )
+        .unwrap();
+        let file_id: i64 = conn
+            .query_row("SELECT id FROM files", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO frames (file_id, imagetyp, instrume) VALUES (?1, 'BIAS', 'CamA')",
+            [file_id],
+        )
+        .unwrap();
+        let frame_id: i64 = conn
+            .query_row("SELECT id FROM frames", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date) VALUES (1, 'BIAS', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (1, ?1)",
+            [frame_id],
+        )
+        .unwrap();
+
+        // Previously: thread panic on DateTime::parse_from_rfc3339(...).unwrap().
+        let rows = super::get_frames_for_calibration_set(&conn, 1).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file.modified_at, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(rows[0].file.created_at, DateTime::<Utc>::UNIX_EPOCH);
+    }
 }

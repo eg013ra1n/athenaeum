@@ -181,6 +181,20 @@ impl Drop for SavepointGuard<'_> {
     }
 }
 
+/// Parse a stored RFC3339 timestamp defensively: a malformed value logs a
+/// warning and falls back to the UNIX epoch instead of panicking every read
+/// of that row (2026-08-03 audit I6 — `frames.date_obs` was already parsed
+/// defensively; `files.modified_at`/`created_at` were not, so one bad string
+/// took down every listing, search and metadata read that touched the row).
+pub(crate) fn parse_stored_ts(field: &'static str, raw: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|e| {
+            tracing::warn!(field, raw, error = %e, "malformed stored timestamp; substituting epoch");
+            DateTime::<Utc>::UNIX_EPOCH
+        })
+}
+
 /// Insert a new file record
 /// Uses prepare_cached() for better performance during bulk inserts
 pub fn insert_file(conn: &Connection, file: &File) -> Result<i64> {
@@ -814,17 +828,13 @@ pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<File> {
                 path: row.get(1)?,
                 filename: row.get(2)?,
                 size: row.get(3)?,
-                modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-                    .unwrap()
-                    .with_timezone(&Utc),
+                modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
                 format: match row.get::<_, String>(5)?.as_str() {
                     "FITS" => FileFormat::FITS,
                     "XISF" => FileFormat::XISF,
                     _ => FileFormat::FITS,
                 },
-                created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
-                    .unwrap()
-                    .with_timezone(&Utc),
+                created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
                 metadata_hash: row.get(7)?,
                 content_hash: row.get(8)?,
                 archived_in_operation: row.get(9)?,
@@ -867,17 +877,13 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
             path: row.get(1)?,
             filename: row.get(2)?,
             size: row.get(3)?,
-            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-                .unwrap()
-                .with_timezone(&Utc),
+            modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
             format: if row.get::<_, String>(5)? == "FITS" {
                 FileFormat::FITS
             } else {
                 FileFormat::XISF
             },
-            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
-                .unwrap()
-                .with_timezone(&Utc),
+            created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
             metadata_hash: row.get(7)?,
             content_hash: row.get(8)?,
             archived_in_operation: row.get(9)?,
@@ -987,17 +993,13 @@ pub fn get_files_by_directory(
             path: row.get(1)?,
             filename: row.get(2)?,
             size: row.get(3)?,
-            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-                .unwrap()
-                .with_timezone(&Utc),
+            modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
             format: if row.get::<_, String>(5)? == "FITS" {
                 FileFormat::FITS
             } else {
                 FileFormat::XISF
             },
-            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
-                .unwrap()
-                .with_timezone(&Utc),
+            created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
             metadata_hash: row.get(7)?,
             content_hash: row.get(8)?,
             archived_in_operation: row.get(9)?,
@@ -1107,17 +1109,13 @@ pub fn get_files_by_directory_for_camera(
             path: row.get(1)?,
             filename: row.get(2)?,
             size: row.get(3)?,
-            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-                .unwrap()
-                .with_timezone(&Utc),
+            modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
             format: if row.get::<_, String>(5)? == "FITS" {
                 FileFormat::FITS
             } else {
                 FileFormat::XISF
             },
-            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
-                .unwrap()
-                .with_timezone(&Utc),
+            created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
             metadata_hash: row.get(7)?,
             content_hash: row.get(8)?,
             archived_in_operation: row.get(9)?,
@@ -1203,17 +1201,13 @@ fn map_missing_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Missing
         path: row.get(1)?,
         filename: row.get(2)?,
         size: row.get(3)?,
-        modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-            .unwrap()
-            .with_timezone(&Utc),
+        modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
         format: if row.get::<_, String>(5)? == "FITS" {
             FileFormat::FITS
         } else {
             FileFormat::XISF
         },
-        created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
-            .unwrap()
-            .with_timezone(&Utc),
+        created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
         metadata_hash: row.get(7)?,
         content_hash: row.get(8)?,
         archived_in_operation: row.get(9)?,
@@ -2745,17 +2739,13 @@ pub fn get_frames_with_files_by_ids(
             path: row.get(1)?,
             filename: row.get(2)?,
             size: row.get(3)?,
-            modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-                .unwrap()
-                .with_timezone(&Utc),
+            modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
             format: if row.get::<_, String>(5)? == "FITS" {
                 crate::models::FileFormat::FITS
             } else {
                 crate::models::FileFormat::XISF
             },
-            created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
-                .unwrap()
-                .with_timezone(&Utc),
+            created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
             metadata_hash: row.get(7)?,
             content_hash: row.get(8)?,
             archived_in_operation: row.get(9)?,
@@ -2901,17 +2891,13 @@ pub fn get_imaging_nights_with_sessions(
                     path: row.get(1)?,
                     filename: row.get(2)?,
                     size: row.get(3)?,
-                    modified_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(4)?)
-                        .unwrap()
-                        .with_timezone(&Utc),
+                    modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
                     format: if row.get::<_, String>(5)? == "FITS" {
                         crate::models::FileFormat::FITS
                     } else {
                         crate::models::FileFormat::XISF
                     },
-                    created_at: DateTime::parse_from_rfc3339(&row.get::<_, String>(6)?)
-                        .unwrap()
-                        .with_timezone(&Utc),
+                    created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
                     metadata_hash: row.get(7)?,
                     content_hash: row.get(8)?,
                     archived_in_operation: row.get(9)?,
@@ -6613,5 +6599,70 @@ mod sync_missing_files_tests {
             .query_row("SELECT COUNT(*) FROM missing_files", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2, "the reconcile's writes must survive the outer commit");
+    }
+}
+
+/// DB-hygiene Task 13 (2026-08-03 audit I6) — a malformed
+/// `files.modified_at`/`files.created_at` string must degrade to the UNIX
+/// epoch with a `warn!`, not panic every read of that row. `frames.date_obs`
+/// was already parsed defensively; these two columns were not.
+#[cfg(test)]
+mod stored_timestamp_tests {
+    use super::parse_stored_ts;
+    use chrono::{DateTime, TimeZone, Utc};
+    use rusqlite::Connection;
+
+    fn conn_with_malformed_file() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+             VALUES ('/t/x.fits','x.fits',1,'not-a-timestamp','FITS','also-bad')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn parse_stored_ts_round_trips_valid_and_falls_back_on_garbage() {
+        assert_eq!(
+            parse_stored_ts("files.modified_at", "2026-01-02T03:04:05Z"),
+            Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap()
+        );
+        // A non-UTC offset still normalizes to UTC, as the old code did.
+        assert_eq!(
+            parse_stored_ts("files.modified_at", "2026-01-02T05:04:05+02:00"),
+            Utc.with_ymd_and_hms(2026, 1, 2, 3, 4, 5).unwrap()
+        );
+        assert_eq!(
+            parse_stored_ts("files.modified_at", "not-a-timestamp"),
+            DateTime::<Utc>::UNIX_EPOCH
+        );
+        assert_eq!(
+            parse_stored_ts("files.created_at", ""),
+            DateTime::<Utc>::UNIX_EPOCH
+        );
+    }
+
+    #[test]
+    fn malformed_stored_timestamp_does_not_panic_reads() {
+        let conn = conn_with_malformed_file();
+
+        // Previously: thread panic on DateTime::parse_from_rfc3339(...).unwrap().
+        let f = crate::db::get_file_by_path(&conn, "/t/x.fits").unwrap();
+        assert_eq!(f.path, "/t/x.fits");
+        assert_eq!(f.modified_at, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(f.created_at, DateTime::<Utc>::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn malformed_stored_timestamp_does_not_panic_listings() {
+        let conn = conn_with_malformed_file();
+
+        let listed = crate::db::get_files(&conn, None).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0.modified_at, DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(listed[0].0.created_at, DateTime::<Utc>::UNIX_EPOCH);
     }
 }
