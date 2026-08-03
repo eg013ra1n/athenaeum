@@ -3897,4 +3897,241 @@ mod tests {
             "files row untouched — the failure must not half-apply"
         );
     }
+
+    // ── CFA master flat, end-to-end through `run_build` (Task 10) ────────────
+
+    /// The mosaic colour index of pixel `(x, y)` for RGGB at CFA phase (1, 0).
+    /// Spelled out rather than routed through `cfa_channel_at` so the fixture
+    /// states the layout INDEPENDENTLY of the production mapping it is used to
+    /// check. `0` = R, `1` = G, `2` = B. (`api::lights`' orchestration tests
+    /// carry the same three lines for their own fixtures; sharing them would
+    /// mean exporting a test helper across two modules to save six lines.)
+    fn rggb_at_phase_1_0(x: usize, y: usize) -> usize {
+        // grid[y % 2][(x + 1) % 2] over [[R, G], [G, B]].
+        match (x % 2 == 1, y % 2 == 0) {
+            (true, true) => 0,
+            (false, false) => 2,
+            _ => 1,
+        }
+    }
+
+    fn build_test_ctx(db: crate::db::Database) -> Arc<ServiceContext> {
+        use crate::cache::MemoryImageCache;
+        use crate::services::compute_queue::ComputeQueue;
+        use crate::services::operation_queue::OperationQueue;
+        use crate::settings::SettingsManager;
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock, RwLock};
+
+        let cell = OnceLock::new();
+        let _ = cell.set(db);
+        Arc::new(ServiceContext {
+            db: cell,
+            settings: Arc::new(SettingsManager::new()),
+            memory_cache: Arc::new(Mutex::new(MemoryImageCache::new(10, 5))),
+            active_scans: Arc::new(Mutex::new(HashMap::new())),
+            active_exports: Arc::new(Mutex::new(HashMap::new())),
+            active_analyses: Arc::new(Mutex::new(HashMap::new())),
+            active_plate_solves: Arc::new(Mutex::new(HashMap::new())),
+            active_registrations: Arc::new(Mutex::new(HashMap::new())),
+            active_archives: Arc::new(Mutex::new(HashMap::new())),
+            active_master_builds: Arc::new(Mutex::new(HashMap::new())),
+            active_light_cal: Arc::new(Mutex::new(HashMap::new())),
+            dso_catalog: Arc::new(RwLock::new(None)),
+            star_cache: Arc::new(RwLock::new(None)),
+            bright_cache: Arc::new(RwLock::new(None)),
+            image_pool: Arc::new(
+                rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap(),
+            ),
+            operation_queue: OperationQueue::start(),
+            compute_queue: ComputeQueue::new(),
+            iroh_node: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        })
+    }
+
+    /// A master flat built from real mosaic subs whose headers declare
+    /// `RGGB`/`XBAYROFF=1`/`YBAYROFF=0`/`BOTTOM-UP`, driven through the REAL
+    /// `run_build` and asserted against the FILE it wrote.
+    ///
+    /// The consensus rule and the per-channel measurement are unit-pinned in
+    /// `calibration_library::headers`; what this adds is the composition —
+    /// `is_flat` gating `measure_flat_channel_norms`, the consensus reaching
+    /// `build_master_cards`, and the writer emitting `XBAYROFF` as a real
+    /// INTEGER card. A phase-1 sensor whose master claims phase 0 swaps R and
+    /// B in every light it ever calibrates, and nothing about the pixels looks
+    /// wrong while it happens.
+    #[test]
+    fn cfa_master_flat_build_writes_consensus_bayer_cards_and_channel_constants() {
+        use crate::fits_parser::FitsHeader;
+        use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
+        use crate::fits_writer::{Card, CardValue};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+
+        let (w, h) = (6usize, 6usize);
+        // Channel levels chosen so the three central-third constants are all
+        // different: a build that mixed the channels (the pre-cycle global
+        // scalar) would land on their blend, 2750, for all three.
+        let mut data = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                data[y * w + x] = [2000.0f32, 4000.0, 1000.0][rggb_at_phase_1_0(x, y)];
+            }
+        }
+
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        let set_id = {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO calibration_set
+                 (imagetyp, exptime, date, date_start, date_end, instrume, binning, frame_count)
+                 VALUES ('Flat', 3.0, '2026-06-28', '2026-06-28T20:00:00Z',
+                         '2026-06-28T20:10:00Z', 'TestCam', '1x1', 3)",
+                [],
+            )
+            .unwrap();
+            let set_id = conn.last_insert_rowid();
+
+            for i in 0..3 {
+                let p = src.join(format!("flat{i}.fits"));
+                let mut cards = HeaderBuilder::new(FrameKind::Flat)
+                    .instrume("TestCam")
+                    .exptime(3.0)
+                    .binning(1, 1)
+                    .build()
+                    .unwrap();
+                // The four CFA cards a real OSC capture writes. Phase (1, 0),
+                // not (0, 0): a fixture at phase 0 cannot tell a consensus
+                // offset from a fabricated one.
+                cards.extend([
+                    Card::new("BAYERPAT", CardValue::Str("RGGB".into())).unwrap(),
+                    Card::new("XBAYROFF", CardValue::Integer(1)).unwrap(),
+                    Card::new("YBAYROFF", CardValue::Integer(0)).unwrap(),
+                    Card::new("ROWORDER", CardValue::Str("BOTTOM-UP".into())).unwrap(),
+                ]);
+                crate::fits_writer::write_fits_f32(&p, w, h, 1, &data, &cards).unwrap();
+
+                // Ingested through the real parser, so the Bayer columns the
+                // consensus reads are exactly what a scan of these files
+                // produces — not values hand-typed to match the assertion.
+                let (parsed, header_text) =
+                    crate::fits_parser::parse_fits_with_header(&p, 0).unwrap();
+                assert_eq!(parsed.xbayroff, Some(1), "fixture sanity: parsed phase");
+                conn.execute(
+                    "INSERT INTO files (path, filename, size, modified_at, format)
+                     VALUES (?1, ?2, 100, '2026-06-28', 'FITS')",
+                    rusqlite::params![p.to_string_lossy(), format!("flat{i}.fits")],
+                )
+                .unwrap();
+                let file_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO frames (file_id, imagetyp, instrume, exptime, binning, date_obs,
+                                         bayerpat, xbayroff, ybayroff, roworder)
+                     VALUES (?1, 'Flat', 'TestCam', 3.0, '1x1', '2026-06-28T20:05:00Z',
+                             ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        file_id,
+                        parsed.bayerpat,
+                        parsed.xbayroff,
+                        parsed.ybayroff,
+                        parsed.roworder
+                    ],
+                )
+                .unwrap();
+                let frame_id = conn.last_insert_rowid();
+                conn.execute(
+                    "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+                    rusqlite::params![set_id, frame_id],
+                )
+                .unwrap();
+                crate::db::insert_fits_header(&conn, file_id, &header_text).unwrap();
+            }
+            set_id
+        };
+
+        let ctx = build_test_ctx(database);
+        let recipe = MasterRecipe {
+            // Explicit, not Auto: at n = 3 the flat rule resolves to
+            // percentile-clip, and this test is about metadata, not about
+            // which rejection an identical stack happens to survive.
+            combine: Some(IntegrationRecipe::average(Rejection::None)),
+            synthetic_bias: None,
+            archive_after: false,
+        };
+        let (master_set_id, _warning) = run_build(
+            &ctx,
+            &crate::events::NullEmitter,
+            "0.5.1-test",
+            set_id,
+            &recipe,
+            &Arc::new(AtomicBool::new(false)),
+            BuildTarget::New,
+        )
+        .expect("the master flat must build");
+
+        let master_path: PathBuf = {
+            let db_handle = db(&ctx).unwrap();
+            let conn = db_handle.conn();
+            let p: String = conn
+                .query_row(
+                    "SELECT fi.path FROM calibration_set_frames csf
+                     JOIN frames f ON f.id = csf.frame_id
+                     JOIN files fi ON fi.id = f.file_id
+                     WHERE csf.set_id = ?1",
+                    [master_set_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            PathBuf::from(p)
+        };
+
+        // ── The pin: the master FILE's own header, re-read from disk. ──
+        let header = FitsHeader::from_path(&master_path).unwrap();
+        assert_eq!(header.get_str("BAYERPAT").as_deref(), Some("RGGB"));
+        assert_eq!(
+            header.get_i32("XBAYROFF"),
+            Some(1),
+            "the members' REAL phase must survive, not a fabricated 0"
+        );
+        assert_eq!(header.get_i32("YBAYROFF"), Some(0));
+        assert_eq!(header.get_str("ROWORDER").as_deref(), Some("BOTTOM-UP"));
+
+        // XBAYROFF must be an INTEGER card. The header reader strips quotes, so
+        // `get_i32` alone cannot tell `1` from `'1'` — and a quoted offset is
+        // exactly the spelling third-party debayerers refuse to read.
+        let raw = header.to_header_text();
+        let xcard = raw
+            .lines()
+            .find(|l| l.starts_with("XBAYROFF"))
+            .expect("XBAYROFF card in the written master");
+        assert!(
+            !xcard.contains('\''),
+            "XBAYROFF must be an integer card, got {xcard:?}"
+        );
+
+        // Per-channel constants, measured on the very plane that was written.
+        let near = |kw: &str, want: f64| {
+            let got = header
+                .get_f64(kw)
+                .unwrap_or_else(|| panic!("{kw} card in the written master"));
+            assert!((got - want).abs() < 1e-3, "{kw} = {got}, want {want}");
+        };
+        near("ATH_FNR", 2000.0);
+        near("ATH_FNG", 4000.0);
+        near("ATH_FNB", 1000.0);
+        // The global constant stays what it always was — the mosaic-mixed
+        // central-third mean — so a consumer that knows only ATH_FNRM is
+        // unaffected by the three above.
+        near("ATH_FNRM", 2750.0);
+    }
 }

@@ -84,3 +84,31 @@ CFA master flats at build; masters emit real offsets + ROWORDER with a
 deterministic member-consensus rule; XISF ColorFilterArray support; advisory
 (never blocking) CFA-compat warnings in matching and light-cal; CFA mosaic
 test fixtures.
+
+## Status: cycle complete (2026-08-03)
+
+Every finding above is closed or deferred with owner visibility — nothing is
+left silently open.
+
+**Closed in code:** CFA phase offsets and `ROWORDER` are parsed into the
+catalog (FITS + XISF) and reach both master files and calibrated lights, at
+their REAL values or not at all; master Bayer cards come from a deterministic
+member consensus instead of an unordered `LIMIT 1`; per-CFA-channel flat
+scaling ships (default ON for colour lights, `CentralThird`), with the
+constants stamped on CFA master flats and reused only when the flat's phase
+matches the light's; the XISF `<ColorFilterArray>` element is adopted; every
+silent Bayer-drop path now warns; the blob↔columns drift is gone (scanner
+re-parse and master rebuild both rewrite `fits_header`, and copy-through falls
+back to the columns when the blob is silent or blank); CFA compatibility is
+checked and surfaced as an advisory in readiness and at calibrate time; the
+3-channel rejection message no longer calls a LIGHT a "calibration frame"; and
+the "zero CFA math tests" gap is closed — mosaic fixtures now run from the
+channel-geometry unit level through three end-to-end tests that assert the
+cards on files actually written to disk.
+
+**Deferred, all recorded** in the companion audit's "Deferred follow-ups":
+`pixinsightTrimmed` per-channel variant; the Flat Analysis contour plot on CFA
+data (display-only); a matcher-level `bayerpat` parameter; whether a mono flat
+on OSC lights should ever hard block (currently advisory); a per-batch divisor
+memo (perf only); and phase-class canonicalization, so `GRBG` at (0, 0) and
+`RGGB` at (1, 0) stop reading as different mosaics.

@@ -1803,10 +1803,14 @@ fn run_light_cal(
             Ok(advisories) => {
                 for advisory in advisories {
                     if advisory.kind == "lights" {
+                        // `light_patterns`, plural: a set-level note carries the
+                        // JOINED list of the layouts its lights declared, where
+                        // the per-master notes below carry one label. Same field
+                        // name for both shapes would make the log unqueryable.
                         tracing::warn!(
                             set_id,
                             kind = advisory.kind,
-                            light_pattern = %advisory.light_pattern,
+                            light_patterns = %advisory.light_pattern,
                             "cfa layouts disagree among light frames"
                         );
                     } else {
@@ -2091,6 +2095,7 @@ mod orchestration_tests {
     use crate::cache::MemoryImageCache;
     use crate::db::schema::init_db;
     use crate::events::NullEmitter;
+    use crate::fits_writer::keywords::{FrameKind, HeaderBuilder};
     use crate::fits_writer::write_fits_f32;
     use crate::services::compute_queue::ComputeQueue;
     use crate::services::operation_queue::OperationQueue;
@@ -2644,6 +2649,401 @@ mod orchestration_tests {
             (fnm - 2750.0).abs() < 1e-6,
             "ATH_CFNM must be the mosaic-weighted blend (R+2G+B)/4, got {fnm}"
         );
+    }
+
+    // ── End-to-end CFA metadata (Task 10) ────────────────────────────────────
+    //
+    // Every layer of the Bayer chain is unit-pinned on its own (header/element
+    // -> `frames` columns, columns/blob -> cards, cards -> writer). What these
+    // two add is the chain ASSERTED AGAINST A FILE ON DISK: the calibrated
+    // output a user actually feeds to WBPP/Siril. A break in any seam ships a
+    // frame that debayers to the wrong colours — or to none at all — while the
+    // pixels themselves look perfectly healthy.
+
+    /// The mosaic colour index of pixel `(x, y)` for RGGB at CFA phase (1, 0) —
+    /// the phase the fixtures below declare. Spelled out rather than routed
+    /// through `cfa_channel_at` so the fixture states the layout
+    /// INDEPENDENTLY: a bug in the production mapping must not also rewrite
+    /// the data the test measures it against. `0` = R, `1` = G, `2` = B.
+    fn rggb_at_phase_1_0(x: usize, y: usize) -> usize {
+        // grid[y % 2][(x + 1) % 2] over [[R, G], [G, B]].
+        match (x % 2 == 1, y % 2 == 0) {
+            (true, true) => 0,
+            (false, false) => 2,
+            _ => 1,
+        }
+    }
+
+    /// A `w`x`h` RGGB mosaic at phase (1, 0) with the given `[R, G, B]` levels.
+    fn mosaic_phase_1_0(w: usize, h: usize, rgb: [f32; 3]) -> Vec<f32> {
+        let mut data = vec![0f32; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                data[y * w + x] = rgb[rggb_at_phase_1_0(x, y)];
+            }
+        }
+        data
+    }
+
+    /// The four CFA cards a real OSC capture writes, at the phase
+    /// [`rggb_at_phase_1_0`] describes. `XBAYROFF = 1` deliberately: a fixture
+    /// at phase 0 cannot tell a copied-through offset from a fabricated one.
+    fn osc_bayer_cards() -> Vec<Card> {
+        vec![
+            Card::new("BAYERPAT", CardValue::Str("RGGB".into())).unwrap(),
+            Card::new("XBAYROFF", CardValue::Integer(1)).unwrap(),
+            Card::new("YBAYROFF", CardValue::Integer(0)).unwrap(),
+            Card::new("ROWORDER", CardValue::Str("BOTTOM-UP".into())).unwrap(),
+        ]
+    }
+
+    /// Seed a LIGHT frame the way the scanner does: parse the real file on
+    /// disk, then write BOTH the `frames` row (Bayer columns included,
+    /// straight from that parse) and the `fits_header` blob. The blob is what
+    /// light-cal copy-through reads, so a fixture that skips it cannot
+    /// exercise copy-through at all.
+    fn seed_scanned_light(conn: &Connection, frame_id: i64, session_id: i64, path: &Path) {
+        let (parsed, header_text) = crate::fits_parser::parse_fits_with_header(path, 0).unwrap();
+        let file_id = frame_id + 2_000_000;
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 0, '2026-07-05T00:00:00Z', 'FITS')",
+            params![
+                file_id,
+                path.to_string_lossy(),
+                path.file_name().unwrap().to_string_lossy()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, instrume, object, date_obs,
+                                 bayerpat, xbayroff, ybayroff, roworder)
+             VALUES (?1, ?2, 'Light', 'TestCam', 'M31', '2026-07-05T20:30:00Z', ?3, ?4, ?5, ?6)",
+            params![
+                frame_id,
+                file_id,
+                parsed.bayerpat,
+                parsed.xbayroff,
+                parsed.ybayroff,
+                parsed.roworder
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+            params![session_id, frame_id],
+        )
+        .unwrap();
+        crate::db::insert_fits_header(conn, file_id, &header_text).unwrap();
+    }
+
+    /// End-to-end Bayer metadata: the CFA cards an OSC capture writes must
+    /// reach the calibrated OUTPUT FILE verbatim — the same pattern, the same
+    /// REAL phase offsets, and the row order that tells a debayer which way
+    /// the mosaic runs. The phase is (1, 0), not (0, 0), precisely so a
+    /// fabricated zero cannot pass.
+    #[test]
+    fn cfa_bayer_cards_survive_the_full_run_into_the_written_output() {
+        use crate::integration::banded::BandSource;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+
+        let (w, h) = (6usize, 6usize);
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            let session = seed_frame_set(&conn, 1);
+
+            // Masters: a constant dark plus a flat that is exactly 2x the light
+            // in every channel, so a correctly-phased run returns the
+            // dark-subtracted light verbatim and a phase error shows up as
+            // swapped colour levels rather than as a rounding difference.
+            let dark_path = src.join("master_dark.fits");
+            write_fits_f32(&dark_path, w, h, 1, &vec![100.0f32; w * h], &osc_bayer_cards())
+                .unwrap();
+            let flat_path = src.join("master_flat.fits");
+            write_fits_f32(
+                &flat_path,
+                w,
+                h,
+                1,
+                &mosaic_phase_1_0(w, h, [2000.0, 4000.0, 1000.0]),
+                &osc_bayer_cards(),
+            )
+            .unwrap();
+            let dark = seed_master_set_with_file(&conn, 100, "MasterDark", &dark_path);
+            let flat = seed_master_set_with_file(&conn, 101, "MasterFlat", &flat_path);
+            // The masters declare the same mosaic as the lights, so the
+            // advisory CFA check has nothing to report and the fixture reads as
+            // one coherent OSC rig rather than a mismatched one.
+            conn.execute(
+                "UPDATE frames SET bayerpat = 'RGGB', xbayroff = 1, ybayroff = 0,
+                                   roworder = 'BOTTOM-UP'
+                 WHERE id IN (?1, ?2)",
+                params![dark + 4_000_000, flat + 4_000_000],
+            )
+            .unwrap();
+
+            // The LIGHT is written carrying the four CFA cards and ingested
+            // through the real parser, so both its `frames` columns and its
+            // stored header blob are exactly what a scan of this file produces.
+            let light_path = src.join("light_1.fits");
+            let mut cards = HeaderBuilder::new(FrameKind::Light)
+                .instrume("TestCam")
+                .object("M31")
+                .exptime(120.0)
+                .build()
+                .unwrap();
+            cards.extend(osc_bayer_cards());
+            write_fits_f32(
+                &light_path,
+                w,
+                h,
+                1,
+                &mosaic_phase_1_0(w, h, [1100.0, 2100.0, 600.0]),
+                &cards,
+            )
+            .unwrap();
+            seed_scanned_light(&conn, 1, session, &light_path);
+            add_link(&conn, 1, dark, "Dark");
+            add_link(&conn, 1, flat, "Flat");
+        }
+        let ctx = test_ctx(database);
+
+        let emitter = run_thread_body(&ctx, 1, false);
+        assert_eq!(emitter.first("calibration-finished")["outcome"], "success");
+
+        let db_handle = db(&ctx).unwrap();
+        let row = {
+            let conn = db_handle.conn();
+            get_light_calibration_for_frame(&conn, 1).unwrap().unwrap()
+        };
+        assert_eq!(row.calstat, "BDF");
+        assert_eq!(row.cfa_scaling_applied, Some(true));
+
+        // ── The pin: the written FILE's own header, re-read from disk. ──
+        let out = PathBuf::from(&row.output_path);
+        let header = crate::fits_parser::FitsHeader::from_path(&out).unwrap();
+        assert_eq!(header.get_str("BAYERPAT").as_deref(), Some("RGGB"));
+        assert_eq!(
+            header.get_i32("XBAYROFF"),
+            Some(1),
+            "the source's REAL phase must survive, not a fabricated 0"
+        );
+        assert_eq!(header.get_i32("YBAYROFF"), Some(0));
+        assert_eq!(
+            header.get_str("ROWORDER").as_deref(),
+            Some("BOTTOM-UP"),
+            "without ROWORDER a debayer cannot know which way the mosaic runs"
+        );
+
+        // XBAYROFF must be an INTEGER card. The header reader strips quotes, so
+        // `get_i32` alone cannot tell `1` from `'1'` — and a quoted offset is
+        // exactly the spelling third-party debayerers refuse to read.
+        let raw = header.to_header_text();
+        let xcard = raw
+            .lines()
+            .find(|l| l.starts_with("XBAYROFF"))
+            .expect("XBAYROFF card in the written output");
+        assert!(
+            !xcard.contains('\''),
+            "XBAYROFF must be an integer card, got {xcard:?}"
+        );
+
+        // …and the phase actually drove the math: every colour divided by its
+        // own flat constant returns the dark-subtracted light verbatim (the
+        // source is 32-bit float, so no scale divisor either).
+        let mut band = BandSource::open(&[out.clone()], tmp.path()).unwrap();
+        let mut bufs = vec![Vec::new()];
+        band.read_band(0, h, &mut bufs).unwrap();
+        for y in 0..h {
+            for x in 0..w {
+                let want = [1000.0f32, 2000.0, 500.0][rggb_at_phase_1_0(x, y)];
+                assert_eq!(bufs[0][y * w + x], want, "pixel ({x},{y})");
+            }
+        }
+    }
+
+    /// Minimal valid monolithic XISF: the 16-byte prefix, an XML header, and an
+    /// attached UInt16 sample block. `image_body` lands verbatim inside
+    /// `<Image>`, so a caller can declare the CFA the native XISF way — a
+    /// `<ColorFilterArray>` child and no FITSKeyword in sight.
+    fn write_xisf_u16(path: &Path, w: usize, h: usize, samples: &[u16], image_body: &str) {
+        let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // `location` carries the attachment's byte offset, which depends on the
+        // XML's length, which depends on the offset. Broken by formatting the
+        // offset zero-padded to a FIXED width: substituting the real value
+        // cannot resize the header.
+        let xml_for = |pos: usize| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<xisf version=\"1.0\">\n\
+                 <Image geometry=\"{w}:{h}:1\" sampleFormat=\"UInt16\" colorSpace=\"Gray\" \
+                 location=\"attachment:{pos:08}:{}\">\n{image_body}</Image>\n</xisf>",
+                bytes.len()
+            )
+        };
+        let probe_len = xml_for(0).len();
+        let xml = xml_for(16 + probe_len);
+        assert_eq!(
+            xml.len(),
+            probe_len,
+            "the zero-padded offset must not resize the header"
+        );
+        let xml_bytes = xml.as_bytes();
+        let mut out = Vec::with_capacity(16 + xml_bytes.len() + bytes.len());
+        out.extend_from_slice(b"XISF0100");
+        out.extend_from_slice(&(xml_bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]); // reserved
+        out.extend_from_slice(xml_bytes);
+        out.extend_from_slice(&bytes);
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// An XISF whose ONLY CFA declaration is the native `<ColorFilterArray>`
+    /// element — no `BAYERPAT` keyword anywhere in the file, and therefore none
+    /// in the stored header blob copy-through reads. The pattern survives only
+    /// if the XISF parser adopts the element into `frames.bayerpat` AND the
+    /// card builder falls back to that column. Drop either half and the
+    /// calibrated output ships with no CFA geometry at all, which every
+    /// downstream tool reads as mono.
+    #[test]
+    fn xisf_color_filter_array_element_reaches_the_written_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let library_dir = tmp.path().join("library");
+        std::fs::create_dir_all(&library_dir).unwrap();
+
+        let (w, h) = (6usize, 6usize);
+        // RGGB at phase (0, 0): the element declares no offsets, so the engine
+        // assumes 0 — the mosaic is laid out to match that assumption.
+        let cell = |x: usize, y: usize| match (x % 2 == 0, y % 2 == 0) {
+            (true, true) => 0usize,  // R
+            (false, false) => 2,     // B
+            _ => 1,                  // G
+        };
+        let mut samples = vec![0u16; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                samples[y * w + x] = [1100u16, 2100, 600][cell(x, y)];
+            }
+        }
+        let light_path = src.join("light_1.xisf");
+        write_xisf_u16(
+            &light_path,
+            w,
+            h,
+            &samples,
+            // No BAYERPAT keyword anywhere — the CFA is declared ONLY by the
+            // native element, which is the entire point of this fixture.
+            "<FITSKeyword name=\"OBJECT\" value=\"'M31'\" comment=\"\"/>\n\
+             <FITSKeyword name=\"INSTRUME\" value=\"'TestCam'\" comment=\"\"/>\n\
+             <ColorFilterArray pattern=\"RGGB\" width=\"2\" height=\"2\" name=\"RGGB\"/>\n",
+        );
+
+        // The scanner's own two reads: the parser fills the catalog columns,
+        // `extract_xisf_header` fills the blob copy-through consults.
+        let parsed = crate::fits_parser::parse_xisf(&light_path, 0).unwrap();
+        assert_eq!(
+            parsed.bayerpat.as_deref(),
+            Some("RGGB"),
+            "fixture sanity: the element must be adopted into the catalog column"
+        );
+        assert_eq!(
+            parsed.xbayroff, None,
+            "the element carries no phase — none may be invented"
+        );
+        let header_text = crate::fits_parser::extract_xisf_header(&light_path).unwrap();
+        assert!(
+            !parse_stored_header_keys(FileFormat::XISF, &header_text).contains_key("BAYERPAT"),
+            "fixture sanity: the blob copy-through reads holds no BAYERPAT"
+        );
+
+        let database = crate::db::Database::new(tmp.path().join("catalog.db")).unwrap();
+        {
+            let conn = database.conn();
+            crate::db::set_setting(
+                &conn,
+                crate::settings::keys::CALIBRATION_LIBRARY_DIR,
+                &library_dir.to_string_lossy(),
+            )
+            .unwrap();
+            let session = seed_frame_set(&conn, 1);
+
+            let flat_path = src.join("master_flat.fits");
+            let mut flat_data = vec![0f32; w * h];
+            for y in 0..h {
+                for x in 0..w {
+                    flat_data[y * w + x] = [2000.0f32, 4000.0, 1000.0][cell(x, y)];
+                }
+            }
+            write_fits_f32(&flat_path, w, h, 1, &flat_data, &[]).unwrap();
+            let flat = seed_master_set_with_file(&conn, 101, "MasterFlat", &flat_path);
+
+            conn.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (1, ?1, 'light_1.xisf', 0, '2026-07-05T00:00:00Z', 'XISF')",
+                params![light_path.to_string_lossy()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO frames (id, file_id, imagetyp, instrume, object, date_obs,
+                                     bayerpat, xbayroff, ybayroff, roworder)
+                 VALUES (1, 1, 'Light', 'TestCam', 'M31', '2026-07-05T20:30:00Z', ?1, ?2, ?3, ?4)",
+                params![
+                    parsed.bayerpat,
+                    parsed.xbayroff,
+                    parsed.ybayroff,
+                    parsed.roworder
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_members (session_id, frame_id) VALUES (?1, 1)",
+                params![session],
+            )
+            .unwrap();
+            crate::db::insert_fits_header(&conn, 1, &header_text).unwrap();
+            add_link(&conn, 1, flat, "Flat");
+        }
+        let ctx = test_ctx(database);
+
+        let emitter = run_thread_body(&ctx, 1, false);
+        assert_eq!(emitter.first("calibration-finished")["outcome"], "success");
+
+        let db_handle = db(&ctx).unwrap();
+        let row = {
+            let conn = db_handle.conn();
+            get_light_calibration_for_frame(&conn, 1).unwrap().unwrap()
+        };
+        assert_eq!(row.calstat, "F");
+        assert_eq!(
+            row.cfa_scaling_applied,
+            Some(true),
+            "the adopted pattern must reach the ENGINE, not only the header"
+        );
+
+        let out = PathBuf::from(&row.output_path);
+        let header = crate::fits_parser::FitsHeader::from_path(&out).unwrap();
+        assert_eq!(
+            header.get_str("BAYERPAT").as_deref(),
+            Some("RGGB"),
+            "the element-declared pattern must reach the output header"
+        );
+        // No offsets were declared, and none may be invented: an XBAYROFF = 0
+        // card is a claim every future debayer acts on, not a harmless default.
+        assert_eq!(header.get_i32("XBAYROFF"), None);
+        assert_eq!(header.get_i32("YBAYROFF"), None);
     }
 
     #[test]

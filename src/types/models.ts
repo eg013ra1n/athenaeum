@@ -19,7 +19,7 @@ bayerpat: string | null,
  * fabricated phase silently swaps the color channels of every consumer
  * that debayers the frame.
  *
- * NOTE: index-based list readers currently leave this None regardless of
+ * NOTE: index-based readers currently leave this None regardless of
  * the stored value — consumers needing the real value must query
  * frames.xbayroff/ybayroff/roworder directly.
  */
@@ -28,7 +28,7 @@ xbayroff: number | null,
  * CFA phase offset along Y (YBAYROFF). Same "absent stays None" rule as
  * `xbayroff`.
  *
- * NOTE: index-based list readers currently leave this None regardless of
+ * NOTE: index-based readers currently leave this None regardless of
  * the stored value — consumers needing the real value must query
  * frames.xbayroff/ybayroff/roworder directly.
  */
@@ -39,7 +39,7 @@ ybayroff: number | null,
  * silent — the astronomical bottom-up default is a *rendering* decision
  * (see `orientation.rs`), not something to write back into the catalog.
  *
- * NOTE: index-based list readers currently leave this None regardless of
+ * NOTE: index-based readers currently leave this None regardless of
  * the stored value — consumers needing the real value must query
  * frames.xbayroff/ybayroff/roworder directly.
  */

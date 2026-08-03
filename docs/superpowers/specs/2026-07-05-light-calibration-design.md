@@ -178,6 +178,7 @@ New table `light_calibrations`:
 | `flat_norm_applied` | INTEGER NOT NULL | 1 = normalization divisor applied, 0 = plain flat division |
 | `flat_norm_mode` | TEXT NOT NULL DEFAULT 'centralThird' | statistic used when normalizing: 'centralThird' \| 'pixinsightTrimmed' |
 | `cal_params` | TEXT NOT NULL DEFAULT '{}' | JSON of the Advanced parameters actually applied (`trim_fraction`, `pedestal_dn`, `bias_fallback`); any difference vs the requested run's params → *stale* |
+| `cfa_scaling_applied` | INTEGER NULL | 1 = the flat was normalized per CFA channel, 0 = one global scalar. What HAPPENED, not what was requested: `cal_params.cfa_flat_scaling` is satisfied globally for a mono light, a `pixinsightTrimmed` run, or degenerate channel constants. NULL = a row written before the feature, read as 0 |
 | `output_hash` | TEXT NOT NULL | xxh3 of the written file |
 | `engine_version` | INTEGER NOT NULL | bump on math changes → everything becomes stale |
 | `created_at` | TEXT NOT NULL | |
@@ -187,7 +188,10 @@ Frame status is **derived**, not stored:
 - no row → *not calibrated*
 - row's `*_set_id`s differ from the frame's current matcher links, or a
   referenced master's `master_provenance.created_at` is newer than
-  `created_at`, or `engine_version` is older → *stale*
+  `created_at`, or `engine_version` is older, or `cfa_scaling_applied`
+  differs from the requested `cfa_flat_scaling` where per-channel scaling
+  could have acted (flat applied + normalization on + not `pixinsightTrimmed`
+  + the frame declares a pattern) → *stale*
 - `calstat` lacks a type the frame now has a link for → *partial* (a special
   case of stale; the readiness dialog offers re-calibration)
 - otherwise → *calibrated*
@@ -238,7 +242,11 @@ best-effort per policy.
 ## 7. Output headers
 
 Copied from the source light: WCS, optics, `DATE-OBS`, session cards,
-`BAYERPAT`/`XBAYROFF`/`YBAYROFF`. Added:
+`BAYERPAT`/`XBAYROFF`/`YBAYROFF`/`ROWORDER`. The Bayer four fall back to the
+`frames` columns when the stored header blob is silent or carries a blank
+value (an XISF declaring its mosaic only via `<ColorFilterArray>`, a
+pre-columns scan); an offset the source never declared is never invented.
+Added:
 
 | card | value |
 | ---- | ----- |
@@ -247,7 +255,9 @@ Copied from the source light: WCS, optics, `DATE-OBS`, session cards,
 | `ATH_CSRN` | source filename (adoption fallback key) |
 | `ATH_CDRK` / `ATH_CFLT` / `ATH_CBIA` | uuid + path of each master actually applied |
 | `ATH_CSCL` | numeric-scale divisor (e.g. 65535.0) |
-| `ATH_CFNM` | flat-normalization divisor actually applied (`ATH_FNRM` value, or 1.0 when normalization is off) |
+| `ATH_CFNM` | flat-normalization divisor actually applied (`ATH_FNRM` value, or 1.0 when normalization is off). Per-channel runs stamp the mosaic-weighted blend of the three constants below, `(R + 2G + B) / 4` — G is half the mosaic — so a reader that knows only this card still gets a number continuous with the global constant |
+| `ATH_CCFA` | logical `T`, stamped only when the flat was normalized per CFA channel |
+| `ATH_CFNR` / `ATH_CFNG` / `ATH_CFNB` | the per-channel flat-norm divisors actually applied. All four CFA cards are omitted entirely on a mono / global run, so such an output's header is byte-for-byte what it was before per-channel scaling existed |
 | `ATH_CVER` | engine version |
 
 All `ATH_*` names respect the 8-char FITS keyword limit and extend the

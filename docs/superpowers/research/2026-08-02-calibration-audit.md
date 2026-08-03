@@ -263,6 +263,20 @@ future enhancement, not part of this fix cycle.
    normalization ON compares the floor against `flat/ATH_FNRM`, OFF against the
    raw flat value — so `total` is always the emitting frame's own denominator,
    never a cross-frame or cross-mode rate.
+7. **OSC/CFA cycle log fields** added to the canonical field dictionary:
+   `pattern` (a CFA pattern string as a source declared it — the XISF
+   `<ColorFilterArray>` adopt/reject pair) and `bayerpat` (the same, where the
+   value is one the parser could not vouch for); `light_pattern` /
+   `master_pattern` / `flat_pattern` — ONE layout label each (`RGGB`,
+   `RGGB at (1, 0)`, `mono`, `unrecognized 'XTRANS'`), the same string the
+   readiness dialog shows, so a log line and the UI never disagree;
+   `light_patterns`, plural, for the JOINED list on the set-level
+   "lights declare more than one layout" note — a distinct name precisely
+   because the singular field is a single label and one name for two shapes
+   makes the field unqueryable; `field` (which keyword or column a note is
+   about) with `value` (the offending value) on the Bayer-consensus,
+   offset-range and channel-constant warns; and `cfa_warnings` (a count) on
+   the readiness debug event.
 
 ## Deferred follow-ups (not in the fix plan)
 
@@ -275,6 +289,34 @@ future enhancement, not part of this fix cycle.
 - Scan-root deletion leaves master/superseded shells with dangling supersede
   pointers when the deleted root held master files — un-supersede-on-root-delete
   semantics need an owner decision (re-added roots re-ingest masters as NEW sets).
+
+From the 2026-08-02 OSC/CFA hardening cycle:
+
+- **`pixinsightTrimmed` per-channel variant.** That statistic is a whole-frame
+  two-sided trimmed mean, so per-channel scaling is skipped in it and the run
+  falls back to the global scalar. A per-channel version needs three trimmed
+  means over three interleaved sample sets — a real design step, not a flag.
+- **Flat Analysis contour plot on CFA data** block-averages mixed mosaic
+  pixels, so its surface reads flatter than the sensor is. Display-only: no
+  calibration path consumes those numbers.
+- **Matcher-level `bayerpat` parameter.** The configurable matcher compares
+  set-level columns, and `calibration_set` carries no Bayer column — a real
+  matching rule would need the pattern denormalized onto the set first.
+- **Mono-flat-on-OSC is advisory, not blocked.** The readiness dialog says so
+  and the batch logs it, then calibrates anyway. Whether that should ever hard
+  block is an owner decision, not an engineering one.
+- **Per-batch `(flat_path, mode, geometry) → divisor` memo** (perf, no
+  behaviour change): the divisor is resolved per FRAME, so a flat with no
+  stamped `ATH_FNR/G/B` — every master built before this cycle — is read in
+  full once for the constants and again by the band stream, for every light in
+  the batch. The flat-vs-light phase-disagreement path likewise re-emits its
+  `warn!` once per frame instead of once per batch.
+- **Phase-class canonicalization.** `GRBG` at offset (0, 0) and `RGGB` at
+  (1, 0) are the same mosaic, but compare unequal everywhere — so a legitimate
+  pairing can raise a compatibility advisory and push a perfectly good flat
+  onto the recompute path. There is exactly one place to land the fix:
+  `CfaGeometry::same_phase`, which the flat-card check and the advisory
+  comparison already share.
 
 ## Post-cycle follow-ups (from the 2026-08-02 final whole-branch review)
 
@@ -326,6 +368,24 @@ Release-note lines owed (next `RELEASE_NOTES.md` rewrite):
   warning instead of failing or silently poisoning the master.
 - A failed disk delete of a master is reported honestly (the file would
   otherwise re-ingest as an imported master on the next scan).
+
+From the OSC/CFA hardening cycle:
+
+- New: **per-channel flat scaling for colour (OSC) cameras** — the master flat
+  is now normalized separately for red, green and blue instead of by one
+  mixed number, removing the colour cast a single scale factor leaves behind.
+  On by default for lights that declare a Bayer pattern; mono is unchanged.
+- **Bayer metadata you can trust** on master frames and calibrated lights:
+  the real `XBAYROFF`/`YBAYROFF` phase (never a fabricated `0`), `ROWORDER`,
+  and — on masters — the pattern agreed by the member frames rather than
+  whichever member happened to be read first.
+- **XISF files that declare their colour filter array the native way** (a
+  `<ColorFilterArray>` element instead of a `BAYERPAT` keyword) are now
+  recognized as colour throughout calibration.
+- Colour lights calibrated before this release show as *stale* once and can be
+  re-run to pick up per-channel scaling. Mono frames are untouched.
+- Existing master files are not rewritten: their Bayer cards stay as they were
+  built. Rebuilding a master that Athenaeum built itself refreshes them.
 
 Owner smoke list (consolidated): the 7 scenarios in the fix plan's final gates,
 plus: delete an auto-matched link → "Link not cleared" notice; delete_master
