@@ -650,8 +650,14 @@ pub async fn autofind_objects_from_coordinates(
     };
 
     let start = std::time::Instant::now();
-    let summary_result = {
-        let conn = db.conn();
+    // The whole batch is blocking work (per-frame DB reads + coordinate
+    // math). Running it inline starved a tokio worker thread for the
+    // batch's full duration while holding a pooled connection (audit C6);
+    // the Axum mirror already used spawn_blocking. A JoinError (panic) is
+    // surfaced, and the cancel handle is removed on every path.
+    let db_worker = db.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        let conn = db_worker.conn();
         object_fill::autofind_objects_from_coordinates(
             &conn,
             &dso,
@@ -660,14 +666,19 @@ pub async fn autofind_objects_from_coordinates(
             cancel_flag,
             &progress,
         )
-    };
+    })
+    .await;
 
     {
         let mut handles = state.ctx.active_plate_solves.lock().unwrap();
         handles.remove(&1);
     }
 
-    let summary = summary_result.map_err(|e| e.to_string())?;
+    let summary = match join {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(e.to_string()),
+        Err(join_err) => return Err(format!("autofind batch panicked: {join_err}")),
+    };
 
     let _ = app.emit(
         "autofind-objects-complete",
