@@ -702,6 +702,16 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_frames_is_master ON frames(is_master)",
         [],
     )?;
+    // frames.file_id is the child side of a FOREIGN KEY, which SQLite does
+    // NOT index automatically. Without this, every `... WHERE file_id = ?`
+    // and every `EXISTS(SELECT 1 FROM frames WHERE file_id = files.id)` is a
+    // full scan of `frames` — the scanner's has-frame classification does one
+    // per catalogued file, which measured 18.6s on a 50k-frame catalog
+    // (0.015s with this index: SEARCH ... USING COVERING INDEX).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_frames_file_id ON frames(file_id)",
+        [],
+    )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_calibration_set_instrume ON calibration_set(instrume)",
         [],
