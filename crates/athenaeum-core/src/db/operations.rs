@@ -1556,6 +1556,13 @@ pub fn bulk_update_frame_metadata(
         id_placeholders
     );
 
+    // One atomic unit: the frames UPDATE (override stamp included), the
+    // three cascade DELETEs, and the empty-set prune. A failure partway
+    // previously left edited frames with a partial subset of their stale
+    // links — silently violating the "ANY edit unlinks" invariant below
+    // (audit I1).
+    let sp = SavepointGuard::new(conn, "bulk_update_frame_metadata")?;
+
     let count = conn
         .execute(&sql, rusqlite::params_from_iter(values.iter()))
         .map_err(|e| {
@@ -1625,6 +1632,8 @@ pub fn bulk_update_frame_metadata(
             e
         })?;
     }
+
+    sp.commit()?;
 
     // After writing the edits the override flag is on for every touched
     // frame. If the user just reverted everything back to its original
@@ -4164,6 +4173,127 @@ mod bulk_metadata_tests {
             "SELECT COUNT(*) FROM session_members WHERE frame_id = ?1", [frame_id], |r| r.get(0),
         ).unwrap();
         assert_eq!(sm_count, 0, "OBJECT edit must unlink session membership");
+    }
+
+    #[test]
+    fn bulk_update_frame_metadata_nests_inside_an_outer_transaction() {
+        // The write section runs inside a SAVEPOINT, which nests. A raw
+        // `BEGIN` would fail here with "cannot start a transaction within a
+        // transaction", and an outer rollback must still take the edit with
+        // it — callers that wrap this in their own transaction keep
+        // all-or-nothing semantics.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let frame_id = insert_frame(&conn, "/x/nested.fits", Some("Light"));
+
+        let tx = conn.unchecked_transaction().unwrap();
+        let edits = FrameMetadataEdits {
+            object: Some(Some("M31".into())),
+            ..Default::default()
+        };
+        bulk_update_frame_metadata(&conn, &[frame_id], &edits).unwrap();
+        drop(tx); // rollback — the edit must vanish with it
+
+        let obj: Option<String> = conn
+            .query_row("SELECT object FROM frames WHERE id = ?1", [frame_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(obj, None, "outer rollback must undo the savepointed edit");
+    }
+
+    #[test]
+    fn bulk_update_frame_metadata_rolls_back_the_edit_when_a_cascade_fails() {
+        // audit I1: the frames UPDATE (override stamp included), the three
+        // cascade DELETEs and the empty-set prune are ONE unit. Before the
+        // savepoint each was its own autocommit, so a failure partway left
+        // the frame edited-and-flagged with only part of its now-stale links
+        // removed — silently violating the "ANY edit unlinks" invariant.
+        //
+        // The abort is injected with a trigger on the LAST cascade table
+        // (session_members): deterministic, and the same shape as the real
+        // constraint failures this path can hit.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let frame_id = insert_frame(&conn, "/x/atomic.fits", Some("Dark"));
+
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        let set_id: i64 = conn
+            .query_row(
+                "SELECT id FROM calibration_set ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
+            rusqlite::params![set_id, frame_id],
+        )
+        .unwrap();
+
+        let session_id = make_session(&conn);
+        conn.execute(
+            "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
+            rusqlite::params![session_id, frame_id],
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "CREATE TRIGGER injected_session_members_failure
+             BEFORE DELETE ON session_members
+             BEGIN SELECT RAISE(ABORT, 'injected cascade failure'); END",
+        )
+        .unwrap();
+
+        let edits = FrameMetadataEdits {
+            object: Some(Some("M31".into())),
+            ..Default::default()
+        };
+        let err = bulk_update_frame_metadata(&conn, &[frame_id], &edits);
+        assert!(
+            err.is_err(),
+            "injected cascade failure must surface as an error"
+        );
+
+        // Everything the call had already written is gone: the edit itself,
+        // the override stamp, and the earlier cascade DELETE.
+        let (obj, override_flag): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT object, override FROM frames WHERE id = ?1",
+                [frame_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(obj, None, "failed cascade must roll back the metadata edit");
+        assert_eq!(
+            override_flag, 0,
+            "failed cascade must roll back the override stamp"
+        );
+
+        let csf_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_frames WHERE frame_id = ?1",
+                [frame_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            csf_count, 1,
+            "the cascade DELETE that did run must be rolled back too"
+        );
+
+        let sm_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_members WHERE frame_id = ?1",
+                [frame_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sm_count, 1, "the aborted DELETE must have changed nothing");
     }
 
     #[test]

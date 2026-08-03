@@ -983,6 +983,13 @@ pub fn bulk_update_calibration_metadata(
     let now = Utc::now().to_rfc3339();
     let mut updated_count = 0;
 
+    // All-or-nothing across the whole selection: matches the existing
+    // failure semantics (any per-set error fails the command) — previously
+    // earlier sets stayed committed and the failing set stayed half-written
+    // (audit I1).
+    let sp = crate::db::SavepointGuard::new(&conn, "bulk_update_calibration_metadata")
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
     for set_id in &set_ids {
         // First, check if we already have originals saved for this set
         let has_originals: bool = conn
@@ -1101,6 +1108,8 @@ pub fn bulk_update_calibration_metadata(
 
         updated_count += 1;
     }
+
+    sp.commit().map_err(|e| ApiError::Internal(e.to_string()))?;
 
     tracing::info!(count = updated_count, "updated calibration set metadata");
 
@@ -1351,5 +1360,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(link, 1, "consumer link must survive refresh");
+    }
+
+    /// audit I1: the per-set loop is all-or-nothing. Any per-set error fails
+    /// the whole command, so a failure on set N must not leave sets 1..N-1
+    /// committed (and set N half-written, with an originals row saved for an
+    /// update that never landed). The abort is injected with a trigger
+    /// scoped to the second set — deterministic, and the same shape as a
+    /// real constraint failure on the calibration_set UPDATE.
+    #[test]
+    fn bulk_update_calibration_metadata_rolls_back_earlier_sets_when_a_later_one_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx = ServiceContext::new_for_tests(tmp.path().join("catalog.db"));
+        let (first_id, second_id) = {
+            let conn = db(&ctx).unwrap().conn();
+            let (first_id, _) = seed_raw_dark_set(&conn, "2026-06-01", &["20:00:00", "20:10:00"]);
+            let (second_id, _) = seed_raw_dark_set(&conn, "2026-06-02", &["20:00:00", "20:10:00"]);
+            // CREATE TRIGGER cannot take bound parameters — the id is
+            // interpolated into the stored trigger text.
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER injected_calibration_set_failure
+                 BEFORE UPDATE ON calibration_set WHEN NEW.id = {second_id}
+                 BEGIN SELECT RAISE(ABORT, 'injected per-set failure'); END"
+            ))
+            .unwrap();
+            (first_id, second_id)
+        };
+
+        let edits = CalibrationMetadataEdits {
+            ccd_temp: Some(-20.0),
+            gain: None,
+            offset: None,
+            binning: None,
+            exptime: None,
+        };
+        let res = bulk_update_calibration_metadata(&ctx, vec![first_id, second_id], edits);
+        assert!(
+            res.is_err(),
+            "injected per-set failure must fail the command"
+        );
+
+        let conn = db(&ctx).unwrap().conn();
+        let temp: f64 = conn
+            .query_row(
+                "SELECT ccd_temp FROM calibration_set WHERE id = ?1",
+                [first_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(temp, -10.0, "the earlier set's edit must be rolled back");
+        let frame_temps: Vec<f64> = conn
+            .prepare(
+                "SELECT ccd_temp FROM frames
+                 WHERE id IN (SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1)",
+            )
+            .unwrap()
+            .query_map([first_id], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            frame_temps.iter().all(|t| *t == -10.0),
+            "the earlier set's member-frame propagation must be rolled back, got {frame_temps:?}"
+        );
+        let originals: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calibration_set_originals", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            originals, 0,
+            "no originals row may survive a failed command"
+        );
     }
 }
