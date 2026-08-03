@@ -37,8 +37,12 @@ impl SqliteConnectionManager {
 
     /// Apply PRAGMAs and register custom functions on a connection.
     fn setup_connection(conn: &Connection) -> Result<()> {
+        // foreign_keys is already the bundled build's compile-time default;
+        // stating it makes enforcement survive a switch to a system SQLite or
+        // a build-flag change.
         conn.execute_batch(
-            "PRAGMA busy_timeout = 5000;
+            "PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = 5000;
              PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA cache_size = -64000;
@@ -144,5 +148,38 @@ impl Database {
     /// Get the database file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every pooled connection must enforce foreign keys — the whole catalog's
+    /// cascade discipline (calibration links, archive manifests, session
+    /// members) is built on it. Pinned on a real pooled checkout rather than
+    /// trusting the bundled build's compile-time default.
+    #[test]
+    fn pooled_connections_enforce_foreign_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(dir.path().join("fk.db")).unwrap();
+
+        // Take two checkouts so the pragma is verified on a freshly-made
+        // connection, not just the schema-init one.
+        for _ in 0..2 {
+            let conn = db.conn();
+            let on: i64 = conn
+                .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(on, 1, "foreign_keys must be ON on a pooled connection");
+        }
+
+        // And that it actually bites: an FK-violating insert is rejected.
+        let conn = db.conn();
+        let err = conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (999999, 999999)",
+            [],
+        );
+        assert!(err.is_err(), "FK violation must be rejected, got {err:?}");
     }
 }

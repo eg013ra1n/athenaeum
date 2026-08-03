@@ -1650,6 +1650,15 @@ pub fn init_db(conn: &Connection) -> Result<()> {
              ALTER TABLE light_calibrations_new RENAME TO light_calibrations;
              COMMIT;",
         );
+        // A failed statement inside the batch leaves its explicit BEGIN
+        // open; `PRAGMA foreign_keys` is a silent no-op while a transaction
+        // is pending, so roll back FIRST or the re-enable below would do
+        // nothing (audit M7).
+        if rebuild.is_err() && !conn.is_autocommit() {
+            if let Err(e) = conn.execute("ROLLBACK", []) {
+                tracing::error!(error = %e, "migration batch rollback failed");
+            }
+        }
         // Re-enable FK enforcement whether or not the rebuild succeeded, then
         // surface the rebuild error — never leave the connection unenforced.
         let re_enable = conn.pragma_update(None, "foreign_keys", true);
@@ -1761,6 +1770,15 @@ pub fn init_db(conn: &Connection) -> Result<()> {
              ALTER TABLE archive_operations_new RENAME TO archive_operations;
              COMMIT;",
         );
+        // A failed statement inside the batch leaves its explicit BEGIN
+        // open; `PRAGMA foreign_keys` is a silent no-op while a transaction
+        // is pending, so roll back FIRST or the re-enable below would do
+        // nothing (audit M7).
+        if rebuild.is_err() && !conn.is_autocommit() {
+            if let Err(e) = conn.execute("ROLLBACK", []) {
+                tracing::error!(error = %e, "migration batch rollback failed");
+            }
+        }
         // Re-enable FK enforcement whether or not the rebuild succeeded, then
         // surface the rebuild error (if any) — never leave the connection
         // running unenforced.

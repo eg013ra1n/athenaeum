@@ -2489,6 +2489,12 @@ pub fn deduplicate_session_members_in_set(
 ) -> Result<usize> {
     let mut total_removed = 0;
 
+    // All three phases plus the trailing count refresh are one unit: Phase 1
+    // deletes-then-reinserts session_members rows, so a failure part-way
+    // through used to leave members dropped and counts stale (audit M1).
+    // A savepoint nests, so an outer-transaction caller keeps working.
+    let sp = SavepointGuard::new(conn, "dedup_session_members")?;
+
     // --- Phase 1: Per-session frame_id dedup (original logic) ---
     let session_ids: Vec<i64> = conn
         .prepare(
@@ -2632,6 +2638,7 @@ pub fn deduplicate_session_members_in_set(
         )?;
     }
 
+    sp.commit()?;
     Ok(total_removed)
 }
 
@@ -3042,15 +3049,26 @@ pub fn clear_excluded_frames(conn: &Connection) -> Result<()> {
 }
 
 /// Insert excluded frames in batch
+///
+/// Tolerates outer-transaction callers: the local batch transaction is only
+/// opened when the connection is in autocommit, same pattern (and reason) as
+/// `insert_session_members` above — an unconditional `unchecked_transaction`
+/// here would commit the CALLER's transaction early (audit M2).
 pub fn insert_excluded_frames(conn: &Connection, entries: &[(i64, String)]) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = if conn.is_autocommit() {
+        Some(conn.unchecked_transaction()?)
+    } else {
+        None
+    };
     let mut stmt = conn.prepare_cached(
         "INSERT INTO excluded_frames (file_id, reason) VALUES (?1, ?2)",
     )?;
     for (file_id, reason) in entries {
         stmt.execute(params![file_id, reason])?;
     }
-    tx.commit()?;
+    if let Some(tx) = tx {
+        tx.commit()?;
+    }
     Ok(())
 }
 

@@ -503,6 +503,12 @@ pub fn commit_plan(
     }
     // Overwrite mode keeps paths as-is (existing zip is overwritten when build_zip runs).
 
+    // The operation row and its file manifest are one unit — a failure
+    // part-way through the loop used to leave an operation with a truncated
+    // manifest, which the executor would happily run as if complete (audit
+    // M5). A savepoint nests, so an outer-transaction caller keeps working.
+    let sp = crate::db::SavepointGuard::new(conn, "archive_commit_plan")?;
+
     let op_id = adb::insert_operation(
         conn,
         has_frame_set.then_some(plan.frames_set_id),
@@ -529,6 +535,8 @@ pub fn commit_plan(
             f.file_size_bytes,
         )?;
     }
+
+    sp.commit()?;
     Ok(op_id)
 }
 

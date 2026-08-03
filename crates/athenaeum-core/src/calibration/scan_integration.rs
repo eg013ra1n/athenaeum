@@ -923,6 +923,12 @@ pub fn create_master_sets_from_frames(
         let date_start = date_obs_str.clone().unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
         let date_end = date_start.clone();
 
+        // The set row and its single member link are one unit — a failure
+        // between them would leave a memberless master set behind (audit M4).
+        // A savepoint nests under `register_master`'s transaction and behaves
+        // like a plain transaction in the scanner's autocommit context.
+        let sp = crate::db::SavepointGuard::new(conn, "create_master_set")?;
+
         conn.execute(
             "INSERT INTO calibration_set
              (imagetyp, exptime, filter, ccd_temp, gain, offset, binning, instrume, date,
@@ -954,6 +960,7 @@ pub fn create_master_sets_from_frames(
             rusqlite::params![set_id, frame.id],
         )?;
 
+        sp.commit()?;
         sets_created += 1;
     }
 
