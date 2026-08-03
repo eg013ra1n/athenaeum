@@ -7,7 +7,7 @@
 use crate::models::{MergeLogEntry, MergeReport};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, Transaction};
 
 /// Insert one audit row using the caller's own connection (non-transactional
 /// use). Prefer `insert_log_entry_tx` when the caller already holds a tx.
@@ -135,18 +135,4 @@ pub fn get_log_entries(
         });
     }
     Ok(entries)
-}
-
-/// Count log entries for a frame set. Cheap — used by the UI to decide
-/// whether to show the History tab badge.
-#[allow(dead_code)]
-pub fn count_log_entries(conn: &Connection, frames_set_id: i64) -> Result<i64> {
-    let count: Option<i64> = conn
-        .query_row(
-            "SELECT COUNT(*) FROM frame_set_merge_log WHERE frames_set_id = ?1",
-            params![frames_set_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(count.unwrap_or(0))
 }

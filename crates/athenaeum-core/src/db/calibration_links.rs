@@ -1,15 +1,14 @@
-use rusqlite::{Connection, Result, params};
-use crate::models::{
-    CalibrationLink, CalibrationStats, FrameCalibrationStatus, CalibrationGroup,
-    FrameSetCalibrationGroups, CalibrationSetDetail, ImageType, CalibrationWarning,
-    CalibrationHierarchyView, CalibrationDateGroup, CalibrationCameraGroup,
-    CalibrationFilterGroup, LightFrameWithCalibration, CalibrationSetWithFrameCount,
-    SubCalibrationDetail, CalibrationSetConsumer,
-};
+use crate::calibration::config::{CalibrationMatchingConfig, MatchMode};
 use crate::calibration::configurable_matcher::load_config;
-use crate::calibration::config::{MatchMode, CalibrationMatchingConfig};
-use std::collections::HashMap;
+use crate::models::{
+    CalibrationCameraGroup, CalibrationDateGroup, CalibrationFilterGroup, CalibrationGroup,
+    CalibrationHierarchyView, CalibrationLink, CalibrationSetConsumer, CalibrationSetDetail,
+    CalibrationSetWithFrameCount, CalibrationWarning, FrameCalibrationStatus,
+    FrameSetCalibrationGroups, ImageType, LightFrameWithCalibration, SubCalibrationDetail,
+};
 use chrono::NaiveDate;
+use rusqlite::{params, Connection, Result};
+use std::collections::HashMap;
 
 /// Insert a new calibration link
 ///
@@ -40,7 +39,11 @@ pub fn insert_calibration_link(conn: &Connection, link: &CalibrationLink) -> Res
     // consumer that wants to distinguish (badge "Manual" vs "Auto") can do so
     // by score alone, while `is_manual_override` remains the authoritative flag.
     let match_score = link.match_score.map(|s| {
-        if !link.is_manual_override && s >= 1.0 { 0.999 } else { s }
+        if !link.is_manual_override && s >= 1.0 {
+            0.999
+        } else {
+            s
+        }
     });
 
     // If this is an automatic assignment, check if there's a manual override we should preserve
@@ -99,7 +102,7 @@ pub fn get_links_for_frame(conn: &Connection, frame_id: i64) -> Result<Vec<Calib
                 matched_at, match_score, date_warning, temp_warning, is_manual_override
          FROM calibration_set_to_frames
          WHERE source_id = ?1 AND source_type = 'frame'
-         ORDER BY calibration_type"
+         ORDER BY calibration_type",
     )?;
 
     let links = stmt.query_map([frame_id], |row| {
@@ -121,13 +124,16 @@ pub fn get_links_for_frame(conn: &Connection, frame_id: i64) -> Result<Vec<Calib
 }
 
 /// Get all calibration links for a specific calibration set
-pub fn get_links_for_calibration_set(conn: &Connection, set_id: i64) -> Result<Vec<CalibrationLink>> {
+pub fn get_links_for_calibration_set(
+    conn: &Connection,
+    set_id: i64,
+) -> Result<Vec<CalibrationLink>> {
     let mut stmt = conn.prepare(
         "SELECT id, source_id, source_type, calibration_set_id, calibration_type,
                 matched_at, match_score, date_warning, temp_warning, is_manual_override
          FROM calibration_set_to_frames
          WHERE source_id = ?1 AND source_type = 'calibration_set'
-         ORDER BY calibration_type"
+         ORDER BY calibration_type",
     )?;
 
     let links = stmt.query_map([set_id], |row| {
@@ -230,7 +236,10 @@ pub fn clear_manual_override(
 /// Get sub-calibration details for a calibration set
 /// Returns the linked sub-calibrations (e.g., Flat→Dark/Bias, Dark→Bias) with full set details
 /// Warnings are calculated dynamically based on date and temperature differences
-pub fn get_sub_calibration_details(conn: &Connection, set_id: i64) -> Result<Vec<SubCalibrationDetail>> {
+pub fn get_sub_calibration_details(
+    conn: &Connection,
+    set_id: i64,
+) -> Result<Vec<SubCalibrationDetail>> {
     let links = get_links_for_calibration_set(conn, set_id)?;
 
     // Get parent set details for warning calculation
@@ -284,7 +293,7 @@ fn calculate_sub_calibration_date_warning(
     let threshold_days = match calibration_type {
         "Dark" => config.warnings.dark_date_warning_days,
         "DarkFlat" => config.warnings.darkflat_date_warning_days,
-        "Bias" => config.warnings.dark_date_warning_days,  // Use dark threshold for bias
+        "Bias" => config.warnings.dark_date_warning_days, // Use dark threshold for bias
         _ => config.warnings.flat_date_warning_days,
     };
 
@@ -348,7 +357,7 @@ fn calculate_sub_calibration_temp_warning(
         // Use the configured threshold, default to 2.0°C
         temp_param.warning_threshold.unwrap_or(2.0)
     } else {
-        return false;  // No calibration type config
+        return false; // No calibration type config
     };
 
     // Calculate temperature difference (ccd_temp is f64, not Option)
@@ -358,7 +367,10 @@ fn calculate_sub_calibration_temp_warning(
 
 /// Get calibration status for a specific frame
 /// Warnings are calculated dynamically based on current config (not stored values)
-pub fn get_frame_calibration_status(conn: &Connection, frame_id: i64) -> Result<FrameCalibrationStatus> {
+pub fn get_frame_calibration_status(
+    conn: &Connection,
+    frame_id: i64,
+) -> Result<FrameCalibrationStatus> {
     let links = get_links_for_frame(conn, frame_id)?;
 
     let mut status = FrameCalibrationStatus {
@@ -407,67 +419,6 @@ pub fn get_frame_calibration_status(conn: &Connection, frame_id: i64) -> Result<
     Ok(status)
 }
 
-/// Get calibration statistics for a frame set
-pub fn get_calibration_statistics(conn: &Connection, frame_set_id: i64) -> Result<CalibrationStats> {
-    // Get all frame IDs in the frame set
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT f.id
-         FROM frames f
-         JOIN session_members sm ON f.id = sm.frame_id
-         JOIN sessions s ON sm.session_id = s.id
-         JOIN imaging_nights n ON s.imaging_night_id = n.id
-         WHERE n.frames_set_id = ?1 AND f.imagetyp = 'Light'"
-    )?;
-
-    let frame_ids: Vec<i64> = stmt.query_map([frame_set_id], |row| row.get(0))?
-        .collect::<Result<Vec<i64>>>()?;
-
-    let total_frames = frame_ids.len();
-
-    let mut frames_with_flats = 0;
-    let mut frames_with_darks = 0;
-    let mut frames_with_bias = 0;
-    let mut frames_complete = 0;
-    let mut frames_partial = 0;
-    let mut frames_none = 0;
-    let mut total_warnings = 0;
-
-    for frame_id in frame_ids {
-        let status = get_frame_calibration_status(conn, frame_id)?;
-
-        if status.has_flats { frames_with_flats += 1; }
-        if status.has_darks { frames_with_darks += 1; }
-        if status.has_bias { frames_with_bias += 1; }
-
-        if status.flats_warning || status.darks_warning || status.bias_warning {
-            total_warnings += 1;
-        }
-
-        // Check if frame has complete calibration
-        let has_any = status.has_flats || status.has_darks || status.has_bias;
-        let has_complete = status.has_flats && (status.has_darks || status.has_bias);
-
-        if has_complete {
-            frames_complete += 1;
-        } else if has_any {
-            frames_partial += 1;
-        } else {
-            frames_none += 1;
-        }
-    }
-
-    Ok(CalibrationStats {
-        total_frames,
-        frames_with_flats,
-        frames_with_darks,
-        frames_with_bias,
-        frames_complete,
-        frames_partial,
-        frames_none,
-        total_warnings,
-    })
-}
-
 /// Check if a calibration link exists
 #[allow(dead_code)]
 /// Frame sets that ultimately consume the given calibration set.
@@ -499,7 +450,7 @@ pub fn get_calibration_set_consumers(
            JOIN imaging_nights inight  ON inight.id = s.imaging_night_id
            JOIN frames_set fs          ON fs.id = inight.frames_set_id
           GROUP BY fs.id, fs.name
-          ORDER BY fs.date_obs_start DESC, fs.name ASC"
+          ORDER BY fs.date_obs_start DESC, fs.name ASC",
     )?;
 
     let rows = stmt.query_map(params![set_id], |row| {
@@ -517,7 +468,7 @@ pub fn link_exists(
     conn: &Connection,
     source_id: i64,
     source_type: &str,
-    calibration_type: &str
+    calibration_type: &str,
 ) -> Result<bool> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM calibration_set_to_frames
@@ -531,7 +482,7 @@ pub fn link_exists(
 /// Get frames grouped by their calibration set combinations for a frame set
 pub fn get_calibration_groups_for_frame_set(
     conn: &Connection,
-    frame_set_id: i64
+    frame_set_id: i64,
 ) -> Result<FrameSetCalibrationGroups> {
     // Step 1: Get all LIGHT frame IDs in the frame set
     // Navigate: frames_set → imaging_nights → sessions → session_members → frames
@@ -542,7 +493,7 @@ pub fn get_calibration_groups_for_frame_set(
          JOIN imaging_nights ino ON ino.id = s.imaging_night_id
          JOIN frames f ON f.id = sm.frame_id
          WHERE ino.frames_set_id = ?1 AND f.imagetyp = 'Light'
-         ORDER BY sm.frame_id"
+         ORDER BY sm.frame_id",
     )?;
 
     let frame_ids: Vec<i64> = stmt
@@ -565,7 +516,7 @@ pub fn get_calibration_groups_for_frame_set(
         let mut link_stmt = conn.prepare(
             "SELECT calibration_type, calibration_set_id
              FROM calibration_set_to_frames
-             WHERE source_id = ?1 AND source_type = 'frame'"
+             WHERE source_id = ?1 AND source_type = 'frame'",
         )?;
 
         let links = link_stmt.query_map([frame_id], |row| {
@@ -589,7 +540,10 @@ pub fn get_calibration_groups_for_frame_set(
         if flat_set_id.is_none() && dark_set_id.is_none() && bias_set_id.is_none() {
             uncalibrated_frames.push(*frame_id);
         } else {
-            groups_map.entry(key).or_insert_with(Vec::new).push(*frame_id);
+            groups_map
+                .entry(key)
+                .or_insert_with(Vec::new)
+                .push(*frame_id);
         }
     }
 
@@ -619,8 +573,13 @@ pub fn get_calibration_groups_for_frame_set(
         let has_warnings = check_group_warnings(conn, &frame_ids_in_group)?;
 
         // Collect detailed warnings for each calibration type
-        let (flat_warnings, dark_warnings, bias_warnings) =
-            get_calibration_warnings_for_group(conn, &frame_ids_in_group, flat_set_id, dark_set_id, bias_set_id)?;
+        let (flat_warnings, dark_warnings, bias_warnings) = get_calibration_warnings_for_group(
+            conn,
+            &frame_ids_in_group,
+            flat_set_id,
+            dark_set_id,
+            bias_set_id,
+        )?;
 
         groups.push(CalibrationGroup {
             flat_set_id,
@@ -712,26 +671,30 @@ fn get_calibration_set_detail(conn: &Connection, set_id: i64) -> Result<Calibrat
 /// Helper: Check if temperature warnings are enabled for a given calibration path
 fn is_temp_warning_enabled(config: &CalibrationMatchingConfig, cal_type: &str) -> bool {
     match cal_type {
-        "Flat" => {
-            config.lights.flat.as_ref()
-                .map(|c| c.ccd_temp.mode == MatchMode::Warning)
-                .unwrap_or(false)
-        }
-        "Dark" => {
-            config.lights.dark.as_ref()
-                .map(|c| c.ccd_temp.mode == MatchMode::Warning)
-                .unwrap_or(false)
-        }
-        "Bias" => {
-            config.lights.bias.as_ref()
-                .map(|c| c.ccd_temp.mode == MatchMode::Warning)
-                .unwrap_or(false)
-        }
-        "DarkFlat" => {
-            config.flats.darkflat.as_ref()
-                .map(|c| c.ccd_temp.mode == MatchMode::Warning)
-                .unwrap_or(false)
-        }
+        "Flat" => config
+            .lights
+            .flat
+            .as_ref()
+            .map(|c| c.ccd_temp.mode == MatchMode::Warning)
+            .unwrap_or(false),
+        "Dark" => config
+            .lights
+            .dark
+            .as_ref()
+            .map(|c| c.ccd_temp.mode == MatchMode::Warning)
+            .unwrap_or(false),
+        "Bias" => config
+            .lights
+            .bias
+            .as_ref()
+            .map(|c| c.ccd_temp.mode == MatchMode::Warning)
+            .unwrap_or(false),
+        "DarkFlat" => config
+            .flats
+            .darkflat
+            .as_ref()
+            .map(|c| c.ccd_temp.mode == MatchMode::Warning)
+            .unwrap_or(false),
         _ => false,
     }
 }
@@ -741,7 +704,7 @@ fn is_date_warning_enabled(config: &CalibrationMatchingConfig, cal_type: &str) -
     match cal_type {
         "Flat" => {
             let threshold = config.warnings.flat_date_warning_days;
-            threshold > 0 && threshold < 10000  // Reasonable threshold
+            threshold > 0 && threshold < 10000 // Reasonable threshold
         }
         "Dark" => {
             let threshold = config.warnings.dark_date_warning_days;
@@ -770,7 +733,8 @@ fn get_frame_temp(conn: &Connection, frame_id: i64) -> Option<f64> {
         "SELECT ccd_temp FROM frames WHERE id = ?1",
         [frame_id],
         |row| row.get(0),
-    ).ok()
+    )
+    .ok()
 }
 
 /// Get frame date from database
@@ -782,7 +746,9 @@ fn get_frame_date(conn: &Connection, frame_id: i64) -> Option<NaiveDate> {
             let date_str: Option<String> = row.get(0)?;
             Ok(date_str.and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()))
         },
-    ).ok().flatten()
+    )
+    .ok()
+    .flatten()
 }
 
 /// Get calibration set average temperature
@@ -795,7 +761,8 @@ fn get_calibration_set_temp(conn: &Connection, set_id: i64) -> Option<f64> {
          WHERE csf.set_id = ?1",
         [set_id],
         |row| row.get(0),
-    ).ok()
+    )
+    .ok()
 }
 
 /// Get calibration set date (average date of frames)
@@ -810,16 +777,34 @@ fn get_calibration_set_date(conn: &Connection, set_id: i64) -> Option<NaiveDate>
             let date_str: Option<String> = row.get(0)?;
             Ok(date_str.and_then(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()))
         },
-    ).ok().flatten()
+    )
+    .ok()
+    .flatten()
 }
 
 /// Get temperature warning threshold from config for a specific calibration path
 fn get_temp_warning_threshold(config: &CalibrationMatchingConfig, cal_type: &str) -> Option<f64> {
     match cal_type {
-        "Flat" => config.lights.flat.as_ref().and_then(|c| c.ccd_temp.warning_threshold),
-        "Dark" => config.lights.dark.as_ref().and_then(|c| c.ccd_temp.warning_threshold),
-        "Bias" => config.lights.bias.as_ref().and_then(|c| c.ccd_temp.warning_threshold),
-        "DarkFlat" => config.flats.darkflat.as_ref().and_then(|c| c.ccd_temp.warning_threshold),
+        "Flat" => config
+            .lights
+            .flat
+            .as_ref()
+            .and_then(|c| c.ccd_temp.warning_threshold),
+        "Dark" => config
+            .lights
+            .dark
+            .as_ref()
+            .and_then(|c| c.ccd_temp.warning_threshold),
+        "Bias" => config
+            .lights
+            .bias
+            .as_ref()
+            .and_then(|c| c.ccd_temp.warning_threshold),
+        "DarkFlat" => config
+            .flats
+            .darkflat
+            .as_ref()
+            .and_then(|c| c.ccd_temp.warning_threshold),
         _ => None,
     }
 }
@@ -829,7 +814,7 @@ fn get_date_warning_threshold(config: &CalibrationMatchingConfig, cal_type: &str
     match cal_type {
         "Flat" => config.warnings.flat_date_warning_days,
         "Dark" => config.warnings.dark_date_warning_days,
-        "Bias" => config.warnings.dark_date_warning_days,  // Use dark threshold for bias
+        "Bias" => config.warnings.dark_date_warning_days, // Use dark threshold for bias
         "DarkFlat" => config.warnings.darkflat_date_warning_days,
         _ => 0,
     }
@@ -953,7 +938,8 @@ pub fn calculate_calibration_warnings(
     let mut warnings = Vec::new();
 
     // Check temperature warning
-    let (has_temp_warning, temp_diff) = calculate_temp_warning(conn, frame_id, set_id, cal_type, &config);
+    let (has_temp_warning, temp_diff) =
+        calculate_temp_warning(conn, frame_id, set_id, cal_type, &config);
     if has_temp_warning {
         if let Some(diff) = temp_diff {
             warnings.push(CalibrationWarning {
@@ -966,13 +952,17 @@ pub fn calculate_calibration_warnings(
     }
 
     // Check date warning
-    let (has_date_warning, date_diff) = calculate_date_warning(conn, frame_id, set_id, cal_type, &config);
+    let (has_date_warning, date_diff) =
+        calculate_date_warning(conn, frame_id, set_id, cal_type, &config);
     if has_date_warning {
         if let Some(diff) = date_diff {
             let threshold = get_date_warning_threshold(&config, cal_type);
             warnings.push(CalibrationWarning {
                 warning_type: "date".to_string(),
-                message: format!("{} calibration is {} days old (>{} days recommended)", cal_type, diff, threshold),
+                message: format!(
+                    "{} calibration is {} days old (>{} days recommended)",
+                    cal_type, diff, threshold
+                ),
                 calibration_type: cal_type.to_string(),
                 set_id,
             });
@@ -1010,7 +1000,11 @@ fn get_calibration_warnings_for_group(
     flat_set_id: Option<i64>,
     dark_set_id: Option<i64>,
     bias_set_id: Option<i64>,
-) -> Result<(Vec<CalibrationWarning>, Vec<CalibrationWarning>, Vec<CalibrationWarning>)> {
+) -> Result<(
+    Vec<CalibrationWarning>,
+    Vec<CalibrationWarning>,
+    Vec<CalibrationWarning>,
+)> {
     let mut flat_warnings = Vec::new();
     let mut dark_warnings = Vec::new();
     let mut bias_warnings = Vec::new();
@@ -1025,7 +1019,10 @@ fn get_calibration_warnings_for_group(
         for &frame_id in frame_ids {
             let warnings = calculate_calibration_warnings(conn, frame_id, set_id, "Flat");
             for warning in warnings {
-                if !flat_warnings.iter().any(|w| w.warning_type == warning.warning_type) {
+                if !flat_warnings
+                    .iter()
+                    .any(|w| w.warning_type == warning.warning_type)
+                {
                     flat_warnings.push(warning);
                 }
             }
@@ -1040,7 +1037,10 @@ fn get_calibration_warnings_for_group(
         for &frame_id in frame_ids {
             let warnings = calculate_calibration_warnings(conn, frame_id, set_id, "Dark");
             for warning in warnings {
-                if !dark_warnings.iter().any(|w| w.warning_type == warning.warning_type) {
+                if !dark_warnings
+                    .iter()
+                    .any(|w| w.warning_type == warning.warning_type)
+                {
                     dark_warnings.push(warning);
                 }
             }
@@ -1055,7 +1055,10 @@ fn get_calibration_warnings_for_group(
         for &frame_id in frame_ids {
             let warnings = calculate_calibration_warnings(conn, frame_id, set_id, "Bias");
             for warning in warnings {
-                if !bias_warnings.iter().any(|w| w.warning_type == warning.warning_type) {
+                if !bias_warnings
+                    .iter()
+                    .any(|w| w.warning_type == warning.warning_type)
+                {
                     bias_warnings.push(warning);
                 }
             }
@@ -1085,10 +1088,14 @@ fn get_warnings_for_calibration_set(
     // Calculate warnings dynamically for each frame
     // We only need to find ONE frame that triggers a warning for this set
     for &frame_id in frame_ids {
-        let frame_warnings = calculate_calibration_warnings(conn, frame_id, set_id, calibration_type);
+        let frame_warnings =
+            calculate_calibration_warnings(conn, frame_id, set_id, calibration_type);
         for warning in frame_warnings {
             // Check if we already have this warning type
-            if !warnings.iter().any(|w| w.warning_type == warning.warning_type) {
+            if !warnings
+                .iter()
+                .any(|w| w.warning_type == warning.warning_type)
+            {
                 warnings.push(warning);
             }
         }
@@ -1122,7 +1129,7 @@ fn check_group_warnings(conn: &Connection, frame_ids: &[i64]) -> Result<bool> {
 /// Get calibration hierarchy organized by Date → Camera → Filter for a frame set
 pub fn get_calibration_hierarchy_for_frame_set(
     conn: &Connection,
-    frame_set_id: i64
+    frame_set_id: i64,
 ) -> Result<CalibrationHierarchyView> {
     // Step 1: Get all LIGHT frames in the frame set with metadata
     let mut stmt = conn.prepare(
@@ -1157,7 +1164,7 @@ pub fn get_calibration_hierarchy_for_frame_set(
          JOIN sessions s ON s.id = sm.session_id
          JOIN imaging_nights n ON n.id = s.imaging_night_id
          WHERE n.frames_set_id = ?1 AND f.imagetyp = 'Light'
-         ORDER BY DATE(f.date_obs) DESC, f.instrume, COALESCE(f.filter, ''), f.date_obs"
+         ORDER BY DATE(f.date_obs) DESC, f.instrume, COALESCE(f.filter, ''), f.date_obs",
     )?;
 
     // Collect raw frame data
@@ -1228,8 +1235,14 @@ pub fn get_calibration_hierarchy_for_frame_set(
     let mut date_map: DateMap = HashMap::new();
 
     for frame in frames {
-        let date_key = frame.session_date.clone().unwrap_or_else(|| "Unknown Date".to_string());
-        let camera_key = frame.instrume.clone().unwrap_or_else(|| "Unknown Camera".to_string());
+        let date_key = frame
+            .session_date
+            .clone()
+            .unwrap_or_else(|| "Unknown Date".to_string());
+        let camera_key = frame
+            .instrume
+            .clone()
+            .unwrap_or_else(|| "Unknown Camera".to_string());
         let filter_key = frame.filter.clone();
 
         date_map
@@ -1269,13 +1282,11 @@ pub fn get_calibration_hierarchy_for_frame_set(
 
             // Sort filters (None/"No Filter" first, then alphabetically)
             let mut filters: Vec<&Option<String>> = filter_map.keys().collect();
-            filters.sort_by(|a, b| {
-                match (a, b) {
-                    (None, None) => std::cmp::Ordering::Equal,
-                    (None, Some(_)) => std::cmp::Ordering::Less,
-                    (Some(_), None) => std::cmp::Ordering::Greater,
-                    (Some(a), Some(b)) => a.cmp(b),
-                }
+            filters.sort_by(|a, b| match (a, b) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(a), Some(b)) => a.cmp(b),
             });
 
             for filter in filters {
@@ -1309,13 +1320,11 @@ pub fn get_calibration_hierarchy_for_frame_set(
                         })
                         .collect();
                     // Sort by exptime
-                    result.sort_by(|a, b| {
-                        match (&a.0, &b.0) {
-                            (None, None) => std::cmp::Ordering::Equal,
-                            (None, Some(_)) => std::cmp::Ordering::Less,
-                            (Some(_), None) => std::cmp::Ordering::Greater,
-                            (Some(a), Some(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
-                        }
+                    result.sort_by(|a, b| match (&a.0, &b.0) {
+                        (None, None) => std::cmp::Ordering::Equal,
+                        (None, Some(_)) => std::cmp::Ordering::Less,
+                        (Some(_), None) => std::cmp::Ordering::Greater,
+                        (Some(a), Some(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
                     });
                     result
                 } else {
@@ -1343,7 +1352,8 @@ pub fn get_calibration_hierarchy_for_frame_set(
                         let status = get_frame_calibration_status(conn, raw_frame.id)?;
 
                         // Track if we have calibration
-                        let has_any_calibration = status.has_flats || status.has_darks || status.has_bias;
+                        let has_any_calibration =
+                            status.has_flats || status.has_darks || status.has_bias;
                         if has_any_calibration {
                             calibrated_frames += 1;
                         } else {
@@ -1357,13 +1367,22 @@ pub fn get_calibration_hierarchy_for_frame_set(
 
                         // Collect ALL unique calibration set IDs (not just the first one)
                         if let Some(set_id) = status.flat_set_id {
-                            flat_set_frames.entry(set_id).or_default().push(raw_frame.id);
+                            flat_set_frames
+                                .entry(set_id)
+                                .or_default()
+                                .push(raw_frame.id);
                         }
                         if let Some(set_id) = status.dark_set_id {
-                            dark_set_frames.entry(set_id).or_default().push(raw_frame.id);
+                            dark_set_frames
+                                .entry(set_id)
+                                .or_default()
+                                .push(raw_frame.id);
                         }
                         if let Some(set_id) = status.bias_set_id {
-                            bias_set_frames.entry(set_id).or_default().push(raw_frame.id);
+                            bias_set_frames
+                                .entry(set_id)
+                                .or_default()
+                                .push(raw_frame.id);
                         }
 
                         light_frames.push(LightFrameWithCalibration {
@@ -1396,8 +1415,10 @@ pub fn get_calibration_hierarchy_for_frame_set(
                         .into_iter()
                         .filter_map(|(set_id, frame_ids)| {
                             let set = get_calibration_set_detail(conn, set_id).ok()?;
-                            let warnings = get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Flat");
-                            let sub_calibration = get_sub_calibration_details(conn, set_id).unwrap_or_default();
+                            let warnings =
+                                get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Flat");
+                            let sub_calibration =
+                                get_sub_calibration_details(conn, set_id).unwrap_or_default();
                             Some(CalibrationSetWithFrameCount {
                                 set,
                                 frame_count: frame_ids.len() as i64,
@@ -1413,8 +1434,10 @@ pub fn get_calibration_hierarchy_for_frame_set(
                         .into_iter()
                         .filter_map(|(set_id, frame_ids)| {
                             let set = get_calibration_set_detail(conn, set_id).ok()?;
-                            let warnings = get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Dark");
-                            let sub_calibration = get_sub_calibration_details(conn, set_id).unwrap_or_default();
+                            let warnings =
+                                get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Dark");
+                            let sub_calibration =
+                                get_sub_calibration_details(conn, set_id).unwrap_or_default();
                             Some(CalibrationSetWithFrameCount {
                                 set,
                                 frame_count: frame_ids.len() as i64,
@@ -1431,13 +1454,14 @@ pub fn get_calibration_hierarchy_for_frame_set(
                         .into_iter()
                         .filter_map(|(set_id, frame_ids)| {
                             let set = get_calibration_set_detail(conn, set_id).ok()?;
-                            let warnings = get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Bias");
+                            let warnings =
+                                get_warnings_for_calibration_set(conn, set_id, &frame_ids, "Bias");
                             Some(CalibrationSetWithFrameCount {
                                 set,
                                 frame_count: frame_ids.len() as i64,
                                 frame_ids,
                                 warnings,
-                                sub_calibration: Vec::new(),  // Bias sets don't have sub-calibrations
+                                sub_calibration: Vec::new(), // Bias sets don't have sub-calibrations
                             })
                         })
                         .collect();
@@ -1447,7 +1471,8 @@ pub fn get_calibration_hierarchy_for_frame_set(
                     }
 
                     // Build filter display string - always include exptime when available
-                    let base_filter_display = filter.clone().unwrap_or_else(|| "No Filter".to_string());
+                    let base_filter_display =
+                        filter.clone().unwrap_or_else(|| "No Filter".to_string());
                     let filter_display = match group_exptime {
                         Some(exp) => format!("{} ({}s)", base_filter_display, exp),
                         None => base_filter_display,
@@ -1527,7 +1552,8 @@ mod tests {
         conn.execute(
             "INSERT INTO calibration_set (id, imagetyp, date) VALUES (?1, ?2, ?3)",
             rusqlite::params![id, "Dark", "2024-01-01"],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1586,8 +1612,8 @@ mod tests {
         insert_calibration_link(&conn, &link2).unwrap();
 
         let links = get_links_for_frame(&conn, 1).unwrap();
-        assert_eq!(links.len(), 1);  // Still only one link
-        assert_eq!(links[0].calibration_set_id, 20);  // Updated set ID
+        assert_eq!(links.len(), 1); // Still only one link
+        assert_eq!(links[0].calibration_set_id, 20); // Updated set ID
     }
 
     #[test]

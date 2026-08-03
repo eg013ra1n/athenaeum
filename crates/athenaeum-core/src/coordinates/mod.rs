@@ -144,31 +144,6 @@ pub fn angular_distance(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64
     cos_angle.acos().to_degrees()
 }
 
-/// Calculate great-circle angular distance using haversine formula
-/// More stable for very small angles
-/// Input: RA and Dec in decimal degrees
-/// Output: Angular separation in degrees
-#[allow(dead_code)]
-pub fn angular_distance_haversine(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) -> f64 {
-    // Convert to radians
-    let ra1 = ra1_deg.to_radians();
-    let dec1 = dec1_deg.to_radians();
-    let ra2 = ra2_deg.to_radians();
-    let dec2 = dec2_deg.to_radians();
-
-    let delta_ra = ra2 - ra1;
-    let delta_dec = dec2 - dec1;
-
-    // Haversine formula
-    let a = (delta_dec / 2.0).sin().powi(2)
-        + dec1.cos() * dec2.cos() * (delta_ra / 2.0).sin().powi(2);
-
-    let c = 2.0 * a.sqrt().asin();
-
-    // Return in degrees
-    c.to_degrees()
-}
-
 /// Convert 3D Cartesian unit vector to RA/Dec (degrees)
 pub fn cartesian_to_radec(x: f64, y: f64, z: f64) -> (f64, f64) {
     let dec_rad = z.asin();
@@ -178,11 +153,7 @@ pub fn cartesian_to_radec(x: f64, y: f64, z: f64) -> (f64, f64) {
     let dec_deg = dec_rad.to_degrees();
 
     // Normalize RA to [0, 360)
-    let ra_normalized = if ra_deg < 0.0 {
-        ra_deg + 360.0
-    } else {
-        ra_deg
-    };
+    let ra_normalized = if ra_deg < 0.0 { ra_deg + 360.0 } else { ra_deg };
 
     (ra_normalized, dec_deg)
 }
@@ -224,7 +195,9 @@ pub fn spherical_mean(coords: &[(f64, f64)]) -> Result<(f64, f64)> {
     let magnitude = (sum_x.powi(2) + sum_y.powi(2) + sum_z.powi(2)).sqrt();
 
     if magnitude < 1e-10 {
-        return Err(anyhow!("Coordinates are too dispersed to compute a meaningful mean"));
+        return Err(anyhow!(
+            "Coordinates are too dispersed to compute a meaningful mean"
+        ));
     }
 
     let mean_x = sum_x / magnitude;

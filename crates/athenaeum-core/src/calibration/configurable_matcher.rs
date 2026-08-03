@@ -2,18 +2,17 @@
 ///
 /// This module implements the configurable calibration matching system
 /// that uses user-defined rules from CalibrationMatchingConfig.
-
 use crate::calibration::config::{
-    CalibrationMatchingConfig, CalibrationTypeConfig, MatchMode, ParameterConfig,
-    MasterPreference, ScoringConfig,
+    CalibrationMatchingConfig, CalibrationTypeConfig, MasterPreference, MatchMode, ParameterConfig,
+    ScoringConfig,
 };
 use crate::calibration::finder::{
     CalibrationCandidate, CandidateMatchDetails, CandidateMode, ParameterMatch,
 };
 use crate::models::{Frame, ImageType};
-use rusqlite::Connection;
-use chrono::{DateTime, Utc};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use rusqlite::Connection;
 
 /// Result of checking a single parameter, with the per-parameter detail the
 /// manual modal needs to render "what was compared, against what threshold".
@@ -34,7 +33,10 @@ impl ParameterCheckResult {
             warning: false,
             warning_message: None,
             skip_matching: false,
-            detail: ParameterMatch { matched: true, ..detail },
+            detail: ParameterMatch {
+                matched: true,
+                ..detail
+            },
         }
     }
 
@@ -44,7 +46,10 @@ impl ParameterCheckResult {
             warning: false,
             warning_message: None,
             skip_matching: false,
-            detail: ParameterMatch { matched: false, ..detail },
+            detail: ParameterMatch {
+                matched: false,
+                ..detail
+            },
         }
     }
 
@@ -54,7 +59,11 @@ impl ParameterCheckResult {
             warning: true,
             warning_message: Some(msg),
             skip_matching: false,
-            detail: ParameterMatch { matched: true, warning: true, ..detail },
+            detail: ParameterMatch {
+                matched: true,
+                warning: true,
+                ..detail
+            },
         }
     }
 
@@ -111,12 +120,10 @@ fn check_string_param(
         MatchMode::Warning => {
             // Warning mode for string params just checks if they're different
             match (frame_value, set_value) {
-                (Some(f), Some(s)) if f != s => {
-                    ParameterCheckResult::warning(
-                        format!("{} mismatch: frame='{}' vs set='{}'", param_name, f, s),
-                        base_detail,
-                    )
-                }
+                (Some(f), Some(s)) if f != s => ParameterCheckResult::warning(
+                    format!("{} mismatch: frame='{}' vs set='{}'", param_name, f, s),
+                    base_detail,
+                ),
                 _ => ParameterCheckResult::matched(base_detail),
             }
         }
@@ -247,30 +254,81 @@ pub fn check_calibration_match(
             details.$field = r.detail.clone();
             if r.skip_matching {
                 return (
-                    ConfigMatchResult { matches: false, skip_matching: true, warnings: warnings.clone() },
+                    ConfigMatchResult {
+                        matches: false,
+                        skip_matching: true,
+                        warnings: warnings.clone(),
+                    },
                     details,
                 );
             }
-            if !r.matches { all_match = false; }
-            if let Some(msg) = r.warning_message { warnings.push(msg); }
+            if !r.matches {
+                all_match = false;
+            }
+            if let Some(msg) = r.warning_message {
+                warnings.push(msg);
+            }
         }};
     }
 
-    apply!(instrume, check_string_param(&frame.instrume, set_instrume, &config.instrume, "instrume"));
-    apply!(binning,  check_string_param(&frame.binning,  set_binning,  &config.binning,  "binning"));
-    apply!(gain,     check_float_param(frame.gain,       set_gain,     &config.gain,     "gain",     0.01));
-    apply!(offset,   check_float_param(frame.offset,     set_offset,   &config.offset,   "offset",   0.01));
-    apply!(telescop, check_string_param(&frame.telescop, set_telescop, &config.telescop, "telescop"));
-    apply!(exptime,  check_float_param(frame.exptime,    set_exptime,  &config.exptime,  "exptime",  0.1));
-    apply!(focallen, check_float_param(frame.focallen,   set_focallen, &config.focallen, "focallen", 1.0));
-    apply!(filter,   check_string_param(&frame.filter,   set_filter,   &config.filter,   "filter"));
+    apply!(
+        instrume,
+        check_string_param(&frame.instrume, set_instrume, &config.instrume, "instrume")
+    );
+    apply!(
+        binning,
+        check_string_param(&frame.binning, set_binning, &config.binning, "binning")
+    );
+    apply!(
+        gain,
+        check_float_param(frame.gain, set_gain, &config.gain, "gain", 0.01)
+    );
+    apply!(
+        offset,
+        check_float_param(frame.offset, set_offset, &config.offset, "offset", 0.01)
+    );
+    apply!(
+        telescop,
+        check_string_param(&frame.telescop, set_telescop, &config.telescop, "telescop")
+    );
+    apply!(
+        exptime,
+        check_float_param(frame.exptime, set_exptime, &config.exptime, "exptime", 0.1)
+    );
+    apply!(
+        focallen,
+        check_float_param(
+            frame.focallen,
+            set_focallen,
+            &config.focallen,
+            "focallen",
+            1.0
+        )
+    );
+    apply!(
+        filter,
+        check_string_param(&frame.filter, set_filter, &config.filter, "filter")
+    );
     // A4: fall back to set_temp when measured ccd_temp is missing so master
     // frames / uncooled emergency captures still get a temperature comparison.
     let frame_temp_effective = crate::models::effective_temp(frame.ccd_temp, frame.set_temp);
-    apply!(ccd_temp, check_float_param(frame_temp_effective, set_ccd_temp, &config.ccd_temp, "ccd_temp", 2.0));
+    apply!(
+        ccd_temp,
+        check_float_param(
+            frame_temp_effective,
+            set_ccd_temp,
+            &config.ccd_temp,
+            "ccd_temp",
+            2.0
+        )
+    );
 
     (
-        ConfigMatchResult { matches: all_match, skip_matching: false, warnings },
+        ConfigMatchResult {
+            matches: all_match,
+            skip_matching: false,
+            warnings,
+        },
         details,
     )
 }
@@ -373,27 +431,42 @@ pub fn find_calibration_candidates(
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, i64>(0)?,           // id
-            row.get::<_, Option<f64>>(1)?,   // gain
-            row.get::<_, Option<f64>>(2)?,   // offset
-            row.get::<_, Option<String>>(3)?, // binning
-            row.get::<_, Option<String>>(4)?, // instrume
-            row.get::<_, Option<f64>>(5)?,   // exptime
-            row.get::<_, Option<f64>>(6)?,   // focallen
-            row.get::<_, Option<String>>(7)?, // filter
-            row.get::<_, Option<f64>>(8)?,   // ccd_temp
-            row.get::<_, Option<f64>>(9)?,   // temp_min
-            row.get::<_, Option<f64>>(10)?,  // temp_max
-            row.get::<_, String>(11)?,       // date_start
-            row.get::<_, String>(12)?,       // date_end
-            row.get::<_, Option<String>>(13)?, // telescop
+            row.get::<_, i64>(0)?,              // id
+            row.get::<_, Option<f64>>(1)?,      // gain
+            row.get::<_, Option<f64>>(2)?,      // offset
+            row.get::<_, Option<String>>(3)?,   // binning
+            row.get::<_, Option<String>>(4)?,   // instrume
+            row.get::<_, Option<f64>>(5)?,      // exptime
+            row.get::<_, Option<f64>>(6)?,      // focallen
+            row.get::<_, Option<String>>(7)?,   // filter
+            row.get::<_, Option<f64>>(8)?,      // ccd_temp
+            row.get::<_, Option<f64>>(9)?,      // temp_min
+            row.get::<_, Option<f64>>(10)?,     // temp_max
+            row.get::<_, String>(11)?,          // date_start
+            row.get::<_, String>(12)?,          // date_end
+            row.get::<_, Option<String>>(13)?,  // telescop
             row.get::<_, i32>(14).unwrap_or(0), // is_master_library
         ))
     })?;
 
     for row_result in rows {
-        let (set_id, gain, offset, binning, instrume, exptime, focallen, filter,
-             ccd_temp, temp_min, temp_max, date_start, date_end, telescop, is_master_library) = row_result?;
+        let (
+            set_id,
+            gain,
+            offset,
+            binning,
+            instrume,
+            exptime,
+            focallen,
+            filter,
+            ccd_temp,
+            temp_min,
+            temp_max,
+            date_start,
+            date_end,
+            telescop,
+            is_master_library,
+        ) = row_result?;
 
         let set_temp = match (temp_min, temp_max) {
             (Some(min), Some(max)) => Some((min + max) / 2.0),
@@ -401,8 +474,17 @@ pub fn find_calibration_candidates(
         };
 
         let (match_result, mut details) = check_calibration_match(
-            frame, &instrume, &binning, gain, offset, &telescop, exptime,
-            focallen, &filter, set_temp, type_config,
+            frame,
+            &instrume,
+            &binning,
+            gain,
+            offset,
+            &telescop,
+            exptime,
+            focallen,
+            &filter,
+            set_temp,
+            type_config,
         );
 
         // Diffs for the engine score. These are also surfaced via details so
@@ -520,7 +602,11 @@ fn calculate_date_diff(
 }
 
 /// Check if date difference should trigger a warning using config thresholds
-fn check_date_warning_days(date_diff: Option<i64>, calibration_type: &str, config: &CalibrationMatchingConfig) -> bool {
+fn check_date_warning_days(
+    date_diff: Option<i64>,
+    calibration_type: &str,
+    config: &CalibrationMatchingConfig,
+) -> bool {
     match date_diff {
         Some(days) => {
             let threshold = match calibration_type {
@@ -557,7 +643,8 @@ pub fn score_match(
     if let Some(temp) = temp_diff {
         let temp_score = 1.0 / (1.0 + (temp.abs() / config.temperature_scale));
         // Apply weight: weighted average between 1.0 and temp_score
-        let weighted_temp = 1.0 * (1.0 - config.temperature_match_weight) + temp_score * config.temperature_match_weight;
+        let weighted_temp = 1.0 * (1.0 - config.temperature_match_weight)
+            + temp_score * config.temperature_match_weight;
         score *= weighted_temp;
     }
 
@@ -565,7 +652,8 @@ pub fn score_match(
     if let Some(exp) = exptime_diff {
         let exp_score = 1.0 / (1.0 + (exp.abs() / config.exposure_scale));
         // Apply weight: weighted average between 1.0 and exp_score
-        let weighted_exp = 1.0 * (1.0 - config.exposure_match_weight) + exp_score * config.exposure_match_weight;
+        let weighted_exp =
+            1.0 * (1.0 - config.exposure_match_weight) + exp_score * config.exposure_match_weight;
         score *= weighted_exp;
     }
 
@@ -613,7 +701,11 @@ fn get_default_fallback_chain(source_type: &str, include_bias: bool) -> Vec<Stri
     match source_type {
         "flats" => {
             if include_bias {
-                vec!["darkflat".to_string(), "dark".to_string(), "bias".to_string()]
+                vec![
+                    "darkflat".to_string(),
+                    "dark".to_string(),
+                    "bias".to_string(),
+                ]
             } else {
                 vec!["darkflat".to_string(), "dark".to_string()]
             }
@@ -659,7 +751,8 @@ pub fn find_calibration_with_fallback(
 
     // Try each calibration type in the fallback chain
     for calibration_type in fallback_chain {
-        let candidates = find_calibration_sets(conn, frame, source_type, &calibration_type, config)?;
+        let candidates =
+            find_calibration_sets(conn, frame, source_type, &calibration_type, config)?;
         if !candidates.is_empty() {
             return Ok(candidates);
         }
@@ -682,15 +775,13 @@ pub fn load_config(conn: &Connection) -> CalibrationMatchingConfig {
     );
 
     match result {
-        Ok(json) => {
-            match CalibrationMatchingConfig::from_json(&json) {
-                Ok(config) => config.migrate(),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to parse calibration matching config, using defaults");
-                    CalibrationMatchingConfig::default()
-                }
+        Ok(json) => match CalibrationMatchingConfig::from_json(&json) {
+            Ok(config) => config.migrate(),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to parse calibration matching config, using defaults");
+                CalibrationMatchingConfig::default()
             }
-        }
+        },
         Err(_) => {
             // No config in database, use defaults
             CalibrationMatchingConfig::default()
@@ -705,17 +796,6 @@ pub fn find_dark_for_light(
     config: &CalibrationMatchingConfig,
 ) -> Result<Vec<CalibrationCandidate>> {
     find_calibration_sets(conn, frame, "lights", "dark", config)
-}
-
-/// Find Bias calibration sets for a frame using configurable rules
-#[allow(dead_code)]
-pub fn find_bias_for_frame(
-    conn: &Connection,
-    frame: &Frame,
-    source_type: &str,
-    config: &CalibrationMatchingConfig,
-) -> Result<Vec<CalibrationCandidate>> {
-    find_calibration_sets(conn, frame, source_type, "bias", config)
 }
 
 /// Find calibration for Flat sets (DarkFlat → Dark → Bias fallback)
@@ -771,12 +851,7 @@ mod tests {
         assert!(!result.matches);
 
         // Missing required value
-        let result = check_string_param(
-            &None,
-            &Some("ASI294MC".to_string()),
-            &config,
-            "instrume",
-        );
+        let result = check_string_param(&None, &Some("ASI294MC".to_string()), &config, "instrume");
         assert!(result.skip_matching);
     }
 
@@ -800,15 +875,12 @@ mod tests {
         let config = ParameterConfig::warning(2.0, 5.0);
 
         // Within warning threshold - no warning
-        let result = check_float_param(
-            Some(-10.0),
-            Some(-11.0),
-            &config,
-            "ccd_temp",
-            2.0,
-        );
+        let result = check_float_param(Some(-10.0), Some(-11.0), &config, "ccd_temp", 2.0);
         assert!(result.matches, "Should match when within warning threshold");
-        assert!(!result.warning, "Should not warn when within warning threshold");
+        assert!(
+            !result.warning,
+            "Should not warn when within warning threshold"
+        );
 
         // Outside warning threshold but within matching threshold - warning but match
         let result = check_float_param(
@@ -818,7 +890,10 @@ mod tests {
             "ccd_temp",
             2.0,
         );
-        assert!(result.matches, "Should match when within matching threshold");
+        assert!(
+            result.matches,
+            "Should match when within matching threshold"
+        );
         assert!(result.warning, "Should warn when outside warning threshold");
         assert!(result.warning_message.is_some());
 
@@ -830,7 +905,10 @@ mod tests {
             "ccd_temp",
             2.0,
         );
-        assert!(!result.matches, "Should NOT match when outside matching threshold");
+        assert!(
+            !result.matches,
+            "Should NOT match when outside matching threshold"
+        );
     }
 
     #[test]
@@ -889,7 +967,12 @@ mod tests {
         let score_5s = score_match(Some(3), Some(0.1), Some(3.82), &config);
 
         // 1s dark should score higher (closer exposure match)
-        assert!(score_1s > score_5s, "Closer exposure should score higher: {} vs {}", score_1s, score_5s);
+        assert!(
+            score_1s > score_5s,
+            "Closer exposure should score higher: {} vs {}",
+            score_1s,
+            score_5s
+        );
     }
 
     // ── Engine-level tests ──────────────────────────────────────────────
@@ -927,10 +1010,11 @@ mod tests {
               binning, instrume, date, date_start, date_end, frame_count, is_master_library)
              VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5, ?6, ?7, ?8, ?9, ?9, ?9, 10, ?10)",
             params![
-                id, imagetyp, exptime, ccd_temp, gain, offset, binning, instrume,
-                date_start, is_master,
+                id, imagetyp, exptime, ccd_temp, gain, offset, binning, instrume, date_start,
+                is_master,
             ],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     fn light_frame_for_dark() -> Frame {
@@ -985,37 +1069,125 @@ mod tests {
     fn engine_only_compatible_drops_failing_candidates() {
         let conn = engine_test_db();
         // Match: same camera/binning/gain/offset/exptime, ~10°C
-        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(
+            &conn,
+            1,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
         // Mismatch: different binning
-        insert_dark_set(&conn, 2, "ASI2600MM", "2x2", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(
+            &conn,
+            2,
+            "ASI2600MM",
+            "2x2",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
         // Mismatch: different exptime (rejected by Exact in default config)
-        insert_dark_set(&conn, 3, "ASI2600MM", "1x1", 56.0, 50.0, 60.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(
+            &conn,
+            3,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            60.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
 
         let frame = light_frame_for_dark();
         let config = CalibrationMatchingConfig::default();
 
         let compatible = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
-        ).unwrap();
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::OnlyCompatible,
+        )
+        .unwrap();
 
         let ids: Vec<i64> = compatible.iter().map(|c| c.set_id).collect();
-        assert_eq!(ids, vec![1], "OnlyCompatible should keep just the matching set");
+        assert_eq!(
+            ids,
+            vec![1],
+            "OnlyCompatible should keep just the matching set"
+        );
         assert!(compatible[0].passed_hard_filter);
     }
 
     #[test]
     fn engine_include_incompatible_returns_all_with_flag() {
         let conn = engine_test_db();
-        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
-        insert_dark_set(&conn, 2, "ASI2600MM", "2x2", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
-        insert_dark_set(&conn, 3, "ASI2600MM", "1x1", 56.0, 50.0, 60.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(
+            &conn,
+            1,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
+        insert_dark_set(
+            &conn,
+            2,
+            "ASI2600MM",
+            "2x2",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
+        insert_dark_set(
+            &conn,
+            3,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            60.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
 
         let frame = light_frame_for_dark();
         let config = CalibrationMatchingConfig::default();
 
         let all = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
-        ).unwrap();
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::IncludeIncompatible,
+        )
+        .unwrap();
 
         // All three rows present.
         assert_eq!(all.len(), 3, "IncludeIncompatible should keep every row");
@@ -1033,18 +1205,54 @@ mod tests {
         // agree for any compatible candidate, otherwise the modal lies about
         // what auto-link will pick.
         let conn = engine_test_db();
-        insert_dark_set(&conn, 1, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -8.5, "2025-09-25T00:00:00+00:00", 0, "Dark");
-        insert_dark_set(&conn, 2, "ASI2600MM", "2x2", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(
+            &conn,
+            1,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            300.0,
+            -8.5,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
+        insert_dark_set(
+            &conn,
+            2,
+            "ASI2600MM",
+            "2x2",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
 
         let frame = light_frame_for_dark();
         let config = CalibrationMatchingConfig::default();
 
         let compatible = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
-        ).unwrap();
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::OnlyCompatible,
+        )
+        .unwrap();
         let all = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
-        ).unwrap();
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::IncludeIncompatible,
+        )
+        .unwrap();
 
         let auto_score = compatible
             .iter()
@@ -1073,29 +1281,55 @@ mod tests {
         // OnlyCompatible would drop them on the instrume Exact filter.
         let conn = engine_test_db();
         // Wrong-camera dark: same exptime/gain/binning, different instrume.
-        insert_dark_set(&conn, 5, "OtherCamera", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(
+            &conn,
+            5,
+            "OtherCamera",
+            "1x1",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
 
         let frame = light_frame_for_dark();
         let config = CalibrationMatchingConfig::default();
 
         // Auto-link path: must reject the cross-camera dark.
         let auto = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
-        ).unwrap();
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::OnlyCompatible,
+        )
+        .unwrap();
         assert!(auto.is_empty(), "auto-link must NOT pick wrong-camera dark");
 
         // Manual modal path: must surface it so the user can override.
         let manual = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
-        ).unwrap();
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::IncludeIncompatible,
+        )
+        .unwrap();
         assert_eq!(manual.len(), 1);
         assert_eq!(manual[0].set_id, 5);
         assert!(!manual[0].passed_hard_filter);
         assert!(!manual[0].details.instrume.matched);
         // Score must be zero for any hard-filter reject (camera mismatch here).
         // High date/temp/exptime closeness must not produce misleading scores.
-        assert_eq!(manual[0].match_score, 0.0,
-            "wrong-camera dark must score 0 even with perfect date/temp/exptime");
+        assert_eq!(
+            manual[0].match_score, 0.0,
+            "wrong-camera dark must score 0 even with perfect date/temp/exptime"
+        );
     }
 
     #[test]
@@ -1106,35 +1340,111 @@ mod tests {
         let conn = engine_test_db();
 
         // Wrong binning, otherwise perfect.
-        insert_dark_set(&conn, 1, "ASI2600MM", "2x2", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(
+            &conn,
+            1,
+            "ASI2600MM",
+            "2x2",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
         // Wrong gain.
-        insert_dark_set(&conn, 2, "ASI2600MM", "1x1", 999.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(
+            &conn,
+            2,
+            "ASI2600MM",
+            "1x1",
+            999.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
         // exptime way off (>5s matching_threshold).
-        insert_dark_set(&conn, 3, "ASI2600MM", "1x1", 56.0, 50.0, 60.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(
+            &conn,
+            3,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            60.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
         // temp way off (>5°C matching_threshold).
-        insert_dark_set(&conn, 4, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -25.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(
+            &conn,
+            4,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            300.0,
+            -25.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
         // Real match.
-        insert_dark_set(&conn, 5, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(
+            &conn,
+            5,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
 
         let frame = light_frame_for_dark();
         let config = CalibrationMatchingConfig::default();
 
         let manual = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
-        ).unwrap();
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::IncludeIncompatible,
+        )
+        .unwrap();
 
         let by_id: std::collections::HashMap<i64, &CalibrationCandidate> =
             manual.iter().map(|c| (c.set_id, c)).collect();
 
         for &id in &[1i64, 2, 3, 4] {
-            let c = by_id.get(&id).expect("incompatible candidate must still be returned");
+            let c = by_id
+                .get(&id)
+                .expect("incompatible candidate must still be returned");
             assert!(!c.passed_hard_filter, "set {} should fail hard filter", id);
-            assert_eq!(c.match_score, 0.0, "set {} score must be 0 (hard-filter reject)", id);
+            assert_eq!(
+                c.match_score, 0.0,
+                "set {} score must be 0 (hard-filter reject)",
+                id
+            );
         }
         // Compatible match keeps a real score.
         let good = by_id.get(&5).unwrap();
         assert!(good.passed_hard_filter);
-        assert!(good.match_score > 0.5, "compatible match should score well, got {}", good.match_score);
+        assert!(
+            good.match_score > 0.5,
+            "compatible match should score well, got {}",
+            good.match_score
+        );
     }
 
     #[test]
@@ -1157,20 +1467,40 @@ mod tests {
                      '2025-09-25T00:00:00+00:00', '2025-09-25T00:00:00+00:00',
                      '2025-09-25T00:00:00+00:00', 10, 0)",
             params![],
-        ).unwrap();
+        )
+        .unwrap();
         // Set 2: valid match
-        insert_dark_set(&conn, 2, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        insert_dark_set(
+            &conn,
+            2,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
 
         let frame = light_frame_for_dark();
         let config = CalibrationMatchingConfig::default();
 
         let compatible = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
-        ).unwrap();
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::OnlyCompatible,
+        )
+        .unwrap();
 
         let ids: Vec<i64> = compatible.iter().map(|c| c.set_id).collect();
         assert_eq!(
-            ids, vec![2],
+            ids,
+            vec![2],
             "skip_matching on one row must not hide other valid candidates"
         );
     }
@@ -1196,8 +1526,21 @@ mod tests {
                      '2025-09-25T00:00:00+00:00', '2025-09-25T00:00:00+00:00',
                      '2025-09-25T00:00:00+00:00', 10, 0)",
             params![NULL_GAIN_SET_ID],
-        ).unwrap();
-        insert_dark_set(&conn, VALID_SET_ID, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
+        )
+        .unwrap();
+        insert_dark_set(
+            &conn,
+            VALID_SET_ID,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
 
         let frame = light_frame_for_dark();
         let config = CalibrationMatchingConfig::default();
@@ -1205,23 +1548,43 @@ mod tests {
         // genuinely incomparable rather than merely mismatched.
         let gain_cfg = &config.get_type_config("lights", "dark").unwrap().gain;
         assert_eq!(gain_cfg.mode, MatchMode::Exact);
-        assert!(gain_cfg.required, "test premise: gain must be Exact + required");
+        assert!(
+            gain_cfg.required,
+            "test premise: gain must be Exact + required"
+        );
 
         // Auto-link: incomparable set must NOT be offered.
         let auto = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
-        ).unwrap();
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::OnlyCompatible,
+        )
+        .unwrap();
         let auto_ids: Vec<i64> = auto.iter().map(|c| c.set_id).collect();
         assert!(
             !auto_ids.contains(&NULL_GAIN_SET_ID),
-            "auto-link must not offer an incomparable set: got {:?}", auto_ids
+            "auto-link must not offer an incomparable set: got {:?}",
+            auto_ids
         );
-        assert!(auto_ids.contains(&VALID_SET_ID), "valid set still auto-links: got {:?}", auto_ids);
+        assert!(
+            auto_ids.contains(&VALID_SET_ID),
+            "valid set still auto-links: got {:?}",
+            auto_ids
+        );
 
         // Show All: incomparable set must be visible, flagged incompatible.
         let manual = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
-        ).unwrap();
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::IncludeIncompatible,
+        )
+        .unwrap();
         let incomparable = manual
             .iter()
             .find(|c| c.set_id == NULL_GAIN_SET_ID)
@@ -1251,13 +1614,39 @@ mod tests {
         const MASTER_SET_ID: i64 = 2;
 
         let conn = engine_test_db();
-        insert_dark_set(&conn, RAW_SET_ID, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
-        insert_dark_set(&conn, MASTER_SET_ID, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 1, "MasterDark");
+        insert_dark_set(
+            &conn,
+            RAW_SET_ID,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
+        insert_dark_set(
+            &conn,
+            MASTER_SET_ID,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            1,
+            "MasterDark",
+        );
 
         let frame = light_frame_for_dark();
         let mut config = CalibrationMatchingConfig::default();
         // Force NoPreference for darks
-        config.master_preferences.insert("dark".to_string(), MasterPreference::NoPreference);
+        config
+            .master_preferences
+            .insert("dark".to_string(), MasterPreference::NoPreference);
         // Make sure the darks→bias optional knob doesn't interfere with the test.
         config.behavioral_options.insert(
             "darks".to_string(),
@@ -1273,16 +1662,43 @@ mod tests {
         }
 
         let ids: Vec<i64> = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
-        ).unwrap().into_iter().map(|c| c.set_id).collect();
-        assert!(ids.contains(&MASTER_SET_ID), "master must be an auto-link candidate: got {:?}", ids);
-        assert!(ids.contains(&RAW_SET_ID), "raw set still competes on score: got {:?}", ids);
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::OnlyCompatible,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|c| c.set_id)
+        .collect();
+        assert!(
+            ids.contains(&MASTER_SET_ID),
+            "master must be an auto-link candidate: got {:?}",
+            ids
+        );
+        assert!(
+            ids.contains(&RAW_SET_ID),
+            "raw set still competes on score: got {:?}",
+            ids
+        );
 
         let all = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::IncludeIncompatible,
-        ).unwrap();
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::IncludeIncompatible,
+        )
+        .unwrap();
         let all_ids: Vec<i64> = all.iter().map(|c| c.set_id).collect();
-        assert!(all_ids.contains(&MASTER_SET_ID), "IncludeIncompatible should still surface masters: got {:?}", all_ids);
+        assert!(
+            all_ids.contains(&MASTER_SET_ID),
+            "IncludeIncompatible should still surface masters: got {:?}",
+            all_ids
+        );
     }
 
     #[test]
@@ -1296,8 +1712,32 @@ mod tests {
         const MASTER_SET_ID: i64 = 2;
 
         let conn = engine_test_db();
-        insert_dark_set(&conn, RAW_SET_ID, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 0, "Dark");
-        insert_dark_set(&conn, MASTER_SET_ID, "ASI2600MM", "1x1", 56.0, 50.0, 300.0, -10.0, "2025-09-25T00:00:00+00:00", 1, "MasterDark");
+        insert_dark_set(
+            &conn,
+            RAW_SET_ID,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            0,
+            "Dark",
+        );
+        insert_dark_set(
+            &conn,
+            MASTER_SET_ID,
+            "ASI2600MM",
+            "1x1",
+            56.0,
+            50.0,
+            300.0,
+            -10.0,
+            "2025-09-25T00:00:00+00:00",
+            1,
+            "MasterDark",
+        );
 
         let frame = light_frame_for_dark();
         // No master_preferences override — this pins the SHIPPED default.
@@ -1315,8 +1755,17 @@ mod tests {
         }
 
         let ids: Vec<i64> = find_calibration_candidates(
-            &conn, &frame, "lights", "dark", &config, CandidateMode::OnlyCompatible,
-        ).unwrap().into_iter().map(|c| c.set_id).collect();
+            &conn,
+            &frame,
+            "lights",
+            "dark",
+            &config,
+            CandidateMode::OnlyCompatible,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|c| c.set_id)
+        .collect();
         assert_eq!(
             ids,
             vec![MASTER_SET_ID, RAW_SET_ID],

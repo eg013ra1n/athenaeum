@@ -2,7 +2,6 @@
 ///
 /// This module provides a fully configurable calibration matching system.
 /// Users can define matching rules via UI settings instead of hardcoded logic.
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -173,15 +172,31 @@ impl Default for CalibrationTypeConfig {
 impl CalibrationTypeConfig {
     /// Validate all parameter configs in this type config
     pub fn validate(&self) -> Result<(), String> {
-        self.instrume.validate().map_err(|e| format!("instrume: {}", e))?;
-        self.binning.validate().map_err(|e| format!("binning: {}", e))?;
+        self.instrume
+            .validate()
+            .map_err(|e| format!("instrume: {}", e))?;
+        self.binning
+            .validate()
+            .map_err(|e| format!("binning: {}", e))?;
         self.gain.validate().map_err(|e| format!("gain: {}", e))?;
-        self.offset.validate().map_err(|e| format!("offset: {}", e))?;
-        self.telescop.validate().map_err(|e| format!("telescop: {}", e))?;
-        self.exptime.validate().map_err(|e| format!("exptime: {}", e))?;
-        self.focallen.validate().map_err(|e| format!("focallen: {}", e))?;
-        self.filter.validate().map_err(|e| format!("filter: {}", e))?;
-        self.ccd_temp.validate().map_err(|e| format!("ccd_temp: {}", e))?;
+        self.offset
+            .validate()
+            .map_err(|e| format!("offset: {}", e))?;
+        self.telescop
+            .validate()
+            .map_err(|e| format!("telescop: {}", e))?;
+        self.exptime
+            .validate()
+            .map_err(|e| format!("exptime: {}", e))?;
+        self.focallen
+            .validate()
+            .map_err(|e| format!("focallen: {}", e))?;
+        self.filter
+            .validate()
+            .map_err(|e| format!("filter: {}", e))?;
+        self.ccd_temp
+            .validate()
+            .map_err(|e| format!("ccd_temp: {}", e))?;
         Ok(())
     }
 }
@@ -457,44 +472,73 @@ impl Default for CalibrationMatchingConfig {
         // Behavioral options
         let mut lights_opts = BehavioralOptions::default();
         lights_opts.use_bias_for_dark_optimization = true;
-        config.behavioral_options.insert("lights".to_string(), lights_opts);
+        config
+            .behavioral_options
+            .insert("lights".to_string(), lights_opts);
 
         let mut flats_opts = BehavioralOptions::default();
         flats_opts.use_bias_for_dark_optimization = true;
         flats_opts.use_bias_if_no_darks = true; // Default to true for backwards compatibility
-        flats_opts.fallback_chain = vec!["darkflat".to_string(), "dark".to_string(), "bias".to_string()];
-        config.behavioral_options.insert("flats".to_string(), flats_opts);
+        flats_opts.fallback_chain = vec![
+            "darkflat".to_string(),
+            "dark".to_string(),
+            "bias".to_string(),
+        ];
+        config
+            .behavioral_options
+            .insert("flats".to_string(), flats_opts);
 
         let mut darks_opts = BehavioralOptions::default();
         darks_opts.use_bias_for_dark_optimization = true;
-        config.behavioral_options.insert("darks".to_string(), darks_opts);
+        config
+            .behavioral_options
+            .insert("darks".to_string(), darks_opts);
 
         // Master preferences (default to PreferMaster: masters are always
         // candidates, the preference only orders them ahead of raw sets)
-        config.master_preferences.insert("flat".to_string(), MasterPreference::PreferMaster);
-        config.master_preferences.insert("dark".to_string(), MasterPreference::PreferMaster);
-        config.master_preferences.insert("bias".to_string(), MasterPreference::PreferMaster);
-        config.master_preferences.insert("darkflat".to_string(), MasterPreference::PreferMaster);
+        config
+            .master_preferences
+            .insert("flat".to_string(), MasterPreference::PreferMaster);
+        config
+            .master_preferences
+            .insert("dark".to_string(), MasterPreference::PreferMaster);
+        config
+            .master_preferences
+            .insert("bias".to_string(), MasterPreference::PreferMaster);
+        config
+            .master_preferences
+            .insert("darkflat".to_string(), MasterPreference::PreferMaster);
 
         // Clustering defaults
         // Flat: 30 days max age, 30 minutes time cluster (session-based)
-        config.clustering.insert("flat".to_string(), ClusteringConfig::default());
+        config
+            .clustering
+            .insert("flat".to_string(), ClusteringConfig::default());
         // Dark/Bias/DarkFlat: 365 days max age, 30 days time cluster (1440 min/day * 30 = 43200)
-        config.clustering.insert("dark".to_string(), ClusteringConfig {
-            max_age_days: 365,
-            time_cluster_minutes: 43200, // 30 days
-            ..ClusteringConfig::default()
-        });
-        config.clustering.insert("bias".to_string(), ClusteringConfig {
-            max_age_days: 365,
-            time_cluster_minutes: 43200, // 30 days
-            ..ClusteringConfig::default()
-        });
-        config.clustering.insert("darkflat".to_string(), ClusteringConfig {
-            max_age_days: 365,
-            time_cluster_minutes: 43200, // 30 days
-            ..ClusteringConfig::default()
-        });
+        config.clustering.insert(
+            "dark".to_string(),
+            ClusteringConfig {
+                max_age_days: 365,
+                time_cluster_minutes: 43200, // 30 days
+                ..ClusteringConfig::default()
+            },
+        );
+        config.clustering.insert(
+            "bias".to_string(),
+            ClusteringConfig {
+                max_age_days: 365,
+                time_cluster_minutes: 43200, // 30 days
+                ..ClusteringConfig::default()
+            },
+        );
+        config.clustering.insert(
+            "darkflat".to_string(),
+            ClusteringConfig {
+                max_age_days: 365,
+                time_cluster_minutes: 43200, // 30 days
+                ..ClusteringConfig::default()
+            },
+        );
 
         config
     }
@@ -531,7 +575,11 @@ impl CalibrationMatchingConfig {
     }
 
     /// Get the matching config for a source→calibration pair
-    pub fn get_type_config(&self, source: &str, calibration: &str) -> Option<&CalibrationTypeConfig> {
+    pub fn get_type_config(
+        &self,
+        source: &str,
+        calibration: &str,
+    ) -> Option<&CalibrationTypeConfig> {
         let source_config = match source {
             "lights" | "light" => &self.lights,
             "flats" | "flat" => &self.flats,
@@ -556,15 +604,6 @@ impl CalibrationMatchingConfig {
     /// Get master preference for a calibration type
     pub fn get_master_preference(&self, calibration: &str) -> MasterPreference {
         self.master_preferences
-            .get(calibration)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Get clustering config for a calibration type
-    #[allow(dead_code)]
-    pub fn get_clustering(&self, calibration: &str) -> ClusteringConfig {
-        self.clustering
             .get(calibration)
             .cloned()
             .unwrap_or_default()
@@ -596,7 +635,9 @@ impl CalibrationMatchingConfig {
 
         // Validate flats configs
         if let Some(darkflat) = &self.flats.darkflat {
-            darkflat.validate().map_err(|e| format!("flats→darkflat: {}", e))?;
+            darkflat
+                .validate()
+                .map_err(|e| format!("flats→darkflat: {}", e))?;
         }
         if let Some(dark) = &self.flats.dark {
             dark.validate().map_err(|e| format!("flats→dark: {}", e))?;

@@ -53,21 +53,9 @@ pub struct QueuedJob {
     pub run: Box<dyn FnOnce() + Send + 'static>,
 }
 
-/// Serializable summary used by inspection/listing APIs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QueueEntry {
-    pub kind: OperationKind,
-    pub operation_id: i64,
-}
-
 struct Inner {
     pending: Mutex<VecDeque<QueuedJob>>,
     notify: Condvar,
-    /// Snapshot for inspection. Updated under the same mutex as `pending`.
-    inspector: Mutex<Vec<QueueEntry>>,
-    /// Currently running entry, if any. Updated by the worker.
-    running: Mutex<Option<QueueEntry>>,
 }
 
 #[derive(Clone)]
@@ -82,10 +70,10 @@ impl OperationQueue {
         let inner = Arc::new(Inner {
             pending: Mutex::new(VecDeque::new()),
             notify: Condvar::new(),
-            inspector: Mutex::new(Vec::new()),
-            running: Mutex::new(None),
         });
-        let queue = OperationQueue { inner: inner.clone() };
+        let queue = OperationQueue {
+            inner: inner.clone(),
+        };
         thread::Builder::new()
             .name("athenaeum-op-queue".into())
             .spawn(move || worker_loop(inner))
@@ -95,28 +83,11 @@ impl OperationQueue {
 
     /// Push a job onto the back of the queue. Returns immediately.
     pub fn enqueue(&self, job: QueuedJob) {
-        let entry = QueueEntry {
-            kind: job.kind,
-            operation_id: job.operation_id,
-        };
         {
             let mut pending = self.inner.pending.lock().unwrap();
-            let mut inspector = self.inner.inspector.lock().unwrap();
             pending.push_back(job);
-            inspector.push(entry);
         }
         self.inner.notify.notify_one();
-    }
-
-    /// Snapshot of queued jobs (front-to-back order). Does not include the
-    /// currently-running job.
-    pub fn pending_snapshot(&self) -> Vec<QueueEntry> {
-        self.inner.inspector.lock().unwrap().clone()
-    }
-
-    /// Currently-running job, if any.
-    pub fn running_snapshot(&self) -> Option<QueueEntry> {
-        self.inner.running.lock().unwrap().clone()
     }
 }
 
@@ -128,23 +99,8 @@ fn worker_loop(inner: Arc<Inner>) {
             while pending.is_empty() {
                 pending = inner.notify.wait(pending).unwrap();
             }
-            // Pop from both pending and the inspector snapshot.
-            let job = pending.pop_front().unwrap();
-            let mut inspector = inner.inspector.lock().unwrap();
-            if !inspector.is_empty() {
-                inspector.remove(0);
-            }
-            job
+            pending.pop_front().unwrap()
         };
-
-        // Mark running.
-        {
-            let mut running = inner.running.lock().unwrap();
-            *running = Some(QueueEntry {
-                kind: job.kind,
-                operation_id: job.operation_id,
-            });
-        }
 
         // Run. Catch panics so a misbehaving job doesn't kill the worker.
         let job_kind = job.kind;
@@ -157,12 +113,6 @@ fn worker_loop(inner: Arc<Inner>) {
                 operation_id = op_id,
                 "operation queue job panicked"
             );
-        }
-
-        // Clear running.
-        {
-            let mut running = inner.running.lock().unwrap();
-            *running = None;
         }
     }
 }

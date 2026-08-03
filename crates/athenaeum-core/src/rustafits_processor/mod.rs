@@ -37,12 +37,6 @@ impl Resolution {
         }
     }
 
-    /// Get default JPEG quality for this resolution
-    #[allow(dead_code)]
-    pub fn default_quality(&self) -> u8 {
-        self.jpeg_quality(None)
-    }
-
     /// Get setting key for this resolution's quality
     pub fn quality_setting_key(&self) -> &'static str {
         match self {
@@ -77,7 +71,6 @@ pub struct ProcessedImage {
     pub is_color: bool, // Whether this is a color/Bayer image
 }
 
-
 /// Process a FITS/XISF file to JPEG entirely in memory (no temp files).
 ///
 /// Uses `converter.process()` to get raw RGB pixels, then encodes JPEG
@@ -99,8 +92,7 @@ pub fn process_fits_to_jpeg<P: AsRef<Path>>(
     }
 
     // Build rustafits converter with resolution-specific settings
-    let mut converter = ImageConverter::new()
-        .with_thread_pool(pool.clone());
+    let mut converter = ImageConverter::new().with_thread_pool(pool.clone());
 
     // Apply downscale if needed (for thumbnails)
     if resolution.downscale_factor() > 1 {
@@ -194,80 +186,3 @@ impl Default for AnnotationSettings {
         }
     }
 }
-
-/// Process FITS/XISF to JPEG and cache it in the specified directory
-///
-/// This variant writes directly to the cache directory instead of a temp file,
-/// which is more efficient for the caching use case.
-///
-/// Note: rustafits 0.2+ handles Bayer/color detection internally for both FITS and XISF
-pub fn process_fits_to_jpeg_cached<P: AsRef<Path>>(
-    input_path: P,
-    output_path: P,
-    resolution: Resolution,
-    quality: Option<u8>,
-    pool: &Arc<rayon::ThreadPool>,
-) -> Result<ProcessedImage> {
-    let input_path = input_path.as_ref();
-    let output_path = output_path.as_ref();
-
-    // Validate input file exists
-    if !input_path.exists() {
-        anyhow::bail!("Input file does not exist: {}", input_path.display());
-    }
-
-    // Ensure output directory exists
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create output directory: {}", parent.display())
-        })?;
-    }
-
-    // Build rustafits converter with resolution-specific settings
-    let mut converter = ImageConverter::new()
-        .with_thread_pool(pool.clone());
-
-    // Apply downscale if needed (for thumbnails)
-    if resolution.downscale_factor() > 1 {
-        converter = converter.with_downscale(resolution.downscale_factor());
-    }
-
-    // Apply preview mode for faster processing
-    if resolution.use_preview_mode() {
-        converter = converter.with_preview_mode();
-    }
-
-    // Process FITS/XISF to raw RGB pixels
-    let processed = converter
-        .process(input_path)
-        .with_context(|| format!("Failed to process image: {}", input_path.display()))?;
-
-    let width = processed.width as u32;
-    let height = processed.height as u32;
-    let is_color = processed.is_color;
-
-    // Save processed image to disk as JPEG
-    let jpeg_quality = resolution.jpeg_quality(quality);
-    ImageConverter::save_processed(&processed, output_path, jpeg_quality)
-        .with_context(|| {
-            format!(
-                "Failed to save image: {} -> {}",
-                input_path.display(),
-                output_path.display()
-            )
-        })?;
-
-    // Read JPEG bytes from disk
-    let image_data = std::fs::read(&output_path).with_context(|| {
-        format!("Failed to read generated JPEG: {}", output_path.display())
-    })?;
-
-    Ok(ProcessedImage {
-        image_data,
-        width,
-        height,
-        format: "jpeg".to_string(),
-        is_color,
-    })
-}
-

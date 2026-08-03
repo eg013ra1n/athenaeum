@@ -1,10 +1,10 @@
 // Frame set processor - processes all light frames in a frame set
-use crate::models::{Frame, CalibrationTolerance, CalibrationHierarchy, ImageType};
 use crate::calibration::hierarchy::{build_complete_hierarchy, store_calibration_hierarchy};
-use rusqlite::Connection;
-use anyhow::{Result, Context};
+use crate::models::{CalibrationHierarchy, CalibrationTolerance, Frame, ImageType};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 
 /// Progress report for frame set processing
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
@@ -110,10 +110,7 @@ impl ProcessingStats {
 }
 
 /// Get all light frames from a frame set
-pub fn get_light_frames_from_frame_set(
-    conn: &Connection,
-    frame_set_id: i64,
-) -> Result<Vec<Frame>> {
+pub fn get_light_frames_from_frame_set(conn: &Connection, frame_set_id: i64) -> Result<Vec<Frame>> {
     let mut stmt = conn.prepare(
         "SELECT f.id, f.file_id, f.object, f.date_obs, f.telescop, f.instrume,
                 f.exptime, f.filter, f.imagetyp, f.is_master, f.ra, f.dec, f.objctra, f.objctdec,
@@ -129,71 +126,73 @@ pub fn get_light_frames_from_frame_set(
          ORDER BY f.date_obs"
     )?;
 
-    let frames = stmt.query_map([frame_set_id], |row| {
-        // Parse date_obs as string first, then convert to DateTime
-        let date_obs_str: Option<String> = row.get(3)?;
-        let date_obs = date_obs_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
+    let frames = stmt
+        .query_map([frame_set_id], |row| {
+            // Parse date_obs as string first, then convert to DateTime
+            let date_obs_str: Option<String> = row.get(3)?;
+            let date_obs = date_obs_str
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
 
-        // Parse imagetyp as string
-        let imagetyp_str: Option<String> = row.get(8)?;
-        let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s));
+            // Parse imagetyp as string
+            let imagetyp_str: Option<String> = row.get(8)?;
+            let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s));
 
-        // Calculate binning string
-        let xbinning: Option<i32> = row.get(16)?;
-        let ybinning: Option<i32> = row.get(17)?;
-        let binning = match (xbinning, ybinning) {
-            (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
-            _ => None,
-        };
+            // Calculate binning string
+            let xbinning: Option<i32> = row.get(16)?;
+            let ybinning: Option<i32> = row.get(17)?;
+            let binning = match (xbinning, ybinning) {
+                (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
+                _ => None,
+            };
 
-        Ok(Frame {
-            id: Some(row.get(0)?),
-            file_id: row.get(1)?,
-            object: row.get(2)?,
-            date_obs,
-            telescop: row.get(4)?,
-            instrume: row.get(5)?,
-            exptime: row.get(6)?,
-            filter: row.get(7)?,
-            imagetyp,
-            is_master: row.get(9)?,
-            ra: row.get(10)?,
-            dec: row.get(11)?,
-            objctra: row.get(12)?,
-            objctdec: row.get(13)?,
-            gain: row.get(14)?,
-            offset: row.get(15)?,
-            xbinning,
-            ybinning,
-            binning,
-            ccd_temp: row.get(18)?,
-            set_temp: row.get(19)?,
-            focallen: row.get(20)?,
-            xpixsz: row.get(21)?,
-            ypixsz: row.get(22)?,
-            naxis1: row.get(23)?,
-            naxis2: row.get(24)?,
-            sitelat: row.get(25)?,
-            lat_obs: row.get(26)?,
-            sitelong: row.get(27)?,
-            long_obs: row.get(28)?,
-            override_: false,
-            swcreate: None,
-            // CFA columns are load-bearing here: the flat matcher's
-            // `is_mono_with_ambiguous_filter` check reads `bayerpat`, so a
-            // light loaded without it is treated as a mono frame. Absent
-            // values stay None — never fabricated.
-            bayerpat: row.get(31)?,
-            xbayroff: row.get(32)?,
-            ybayroff: row.get(33)?,
-            roworder: row.get(34)?,
-            rotation: None,
-            uuid: row.get(29)?,
-            updated_at: row.get(30)?,
-        })
-    })?
-    .collect::<Result<Vec<Frame>, _>>()?;
+            Ok(Frame {
+                id: Some(row.get(0)?),
+                file_id: row.get(1)?,
+                object: row.get(2)?,
+                date_obs,
+                telescop: row.get(4)?,
+                instrume: row.get(5)?,
+                exptime: row.get(6)?,
+                filter: row.get(7)?,
+                imagetyp,
+                is_master: row.get(9)?,
+                ra: row.get(10)?,
+                dec: row.get(11)?,
+                objctra: row.get(12)?,
+                objctdec: row.get(13)?,
+                gain: row.get(14)?,
+                offset: row.get(15)?,
+                xbinning,
+                ybinning,
+                binning,
+                ccd_temp: row.get(18)?,
+                set_temp: row.get(19)?,
+                focallen: row.get(20)?,
+                xpixsz: row.get(21)?,
+                ypixsz: row.get(22)?,
+                naxis1: row.get(23)?,
+                naxis2: row.get(24)?,
+                sitelat: row.get(25)?,
+                lat_obs: row.get(26)?,
+                sitelong: row.get(27)?,
+                long_obs: row.get(28)?,
+                override_: false,
+                swcreate: None,
+                // CFA columns are load-bearing here: the flat matcher's
+                // `is_mono_with_ambiguous_filter` check reads `bayerpat`, so a
+                // light loaded without it is treated as a mono frame. Absent
+                // values stay None — never fabricated.
+                bayerpat: row.get(31)?,
+                xbayroff: row.get(32)?,
+                ybayroff: row.get(33)?,
+                roworder: row.get(34)?,
+                rotation: None,
+                uuid: row.get(29)?,
+                updated_at: row.get(30)?,
+            })
+        })?
+        .collect::<Result<Vec<Frame>, _>>()?;
 
     Ok(frames)
 }
@@ -242,11 +241,17 @@ pub fn process_frame_set(
             max_age_days,
             time_cluster_minutes,
             temp_weight,
-        ).context(format!("Failed to build hierarchy for frame {:?}", frame.id))?;
+        )
+        .context(format!(
+            "Failed to build hierarchy for frame {:?}",
+            frame.id
+        ))?;
 
         // Store hierarchy in database
-        store_calibration_hierarchy(conn, &hierarchy)
-            .context(format!("Failed to store hierarchy for frame {:?}", frame.id))?;
+        store_calibration_hierarchy(conn, &hierarchy).context(format!(
+            "Failed to store hierarchy for frame {:?}",
+            frame.id
+        ))?;
 
         // Update statistics
         stats.update_from_hierarchy(&hierarchy);
@@ -304,139 +309,17 @@ fn resolve_manual_overrides(
         None => return (frontend_flat, None),
     };
 
-    let manual_flat_set_id = frontend_flat
-        .or_else(|| get_manual_override_set_id(conn, frame_id, "Flat").ok().flatten());
+    let manual_flat_set_id = frontend_flat.or_else(|| {
+        get_manual_override_set_id(conn, frame_id, "Flat")
+            .ok()
+            .flatten()
+    });
 
     let manual_dark_set_id = get_manual_override_set_id(conn, frame_id, "Dark")
         .ok()
         .flatten();
 
     (manual_flat_set_id, manual_dark_set_id)
-}
-
-/// Process all light frames in a frame set with progress callback
-#[allow(dead_code)]
-pub fn process_frame_set_with_progress<F>(
-    conn: &Connection,
-    frame_set_id: i64,
-    tolerance: &CalibrationTolerance,
-    flat_pattern: Option<&str>,
-    manual_flat_selections: Option<&std::collections::HashMap<String, i64>>,
-    max_age_days: i64,
-    time_cluster_minutes: i64,
-    temp_weight: f64,
-    mut progress_callback: F,
-) -> Result<ProcessingStats>
-where
-    F: FnMut(ProcessingProgress),
-{
-    // Get all light frames from the frame set
-    let frames = get_light_frames_from_frame_set(conn, frame_set_id)
-        .context("Failed to get light frames from frame set")?;
-
-    let mut stats = ProcessingStats::new();
-    let total_frames = frames.len();
-
-    // Process each frame
-    for (index, frame) in frames.iter().enumerate() {
-        let (manual_flat_set_id, manual_dark_set_id) =
-            resolve_manual_overrides(conn, frame, manual_flat_selections);
-
-        // Build calibration hierarchy for this frame
-        let hierarchy = build_complete_hierarchy(
-            conn,
-            frame,
-            tolerance,
-            flat_pattern,
-            manual_flat_set_id,
-            manual_dark_set_id,
-            max_age_days,
-            time_cluster_minutes,
-            temp_weight,
-        ).context(format!("Failed to build hierarchy for frame {:?}", frame.id))?;
-
-        // Store hierarchy in database
-        store_calibration_hierarchy(conn, &hierarchy)
-            .context(format!("Failed to store hierarchy for frame {:?}", frame.id))?;
-
-        // Update statistics
-        stats.update_from_hierarchy(&hierarchy);
-
-        // Report progress
-        let progress = ProcessingProgress {
-            total_frames,
-            processed_frames: index + 1,
-            current_frame_id: frame.id,
-            percent_complete: ((index + 1) as f64 / total_frames as f64) * 100.0,
-        };
-
-        progress_callback(progress);
-    }
-
-    Ok(stats)
-}
-
-/// Clear all calibration links for a frame set
-///
-/// By default, this preserves manual overrides. Set `preserve_manual_overrides = false`
-/// to clear all links including manual ones.
-pub fn clear_calibration_links_for_frame_set(
-    conn: &Connection,
-    frame_set_id: i64,
-) -> Result<usize> {
-    clear_calibration_links_for_frame_set_with_options(conn, frame_set_id, true)
-}
-
-/// Clear calibration links for a frame set with options
-///
-/// # Arguments
-/// * `preserve_manual_overrides` - If true, manual overrides are kept
-pub fn clear_calibration_links_for_frame_set_with_options(
-    conn: &Connection,
-    frame_set_id: i64,
-    preserve_manual_overrides: bool,
-) -> Result<usize> {
-    // Get all frame IDs in the frame set
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT sm.frame_id
-         FROM session_members sm
-         JOIN sessions s ON sm.session_id = s.id
-         JOIN imaging_nights n ON s.imaging_night_id = n.id
-         WHERE n.frames_set_id = ?1"
-    )?;
-
-    let frame_ids: Vec<i64> = stmt
-        .query_map([frame_set_id], |row| row.get(0))?
-        .collect::<Result<Vec<i64>, _>>()?;
-
-    // Delete calibration links for each frame
-    let mut total_deleted = 0;
-    for frame_id in frame_ids {
-        let deleted = if preserve_manual_overrides {
-            // Only delete non-manual links
-            conn.execute(
-                "DELETE FROM calibration_set_to_frames
-                 WHERE source_id = ?1 AND source_type = 'frame' AND is_manual_override = 0",
-                [frame_id],
-            )?
-        } else {
-            // Delete all links
-            conn.execute(
-                "DELETE FROM calibration_set_to_frames
-                 WHERE source_id = ?1 AND source_type = 'frame'",
-                [frame_id],
-            )?
-        };
-        total_deleted += deleted;
-    }
-
-    if preserve_manual_overrides {
-        tracing::info!(frame_set_id, count = total_deleted, "cleared auto-find calibration links, manual overrides preserved");
-    } else {
-        tracing::info!(frame_set_id, count = total_deleted, "cleared all calibration links, including manual");
-    }
-
-    Ok(total_deleted)
 }
 
 #[cfg(test)]
@@ -569,19 +452,29 @@ mod tests {
              VALUES (1, 1, '2025-09-25T00:00:00+00:00', 'ASI2600MC', 300.0, 'Light', 0,
                      'RGGB', 1, 0, 'BOTTOM-UP')",
             [],
-        ).unwrap();
-        conn.execute("INSERT INTO frames_set (id, name) VALUES (1, 'TestSet')", []).unwrap();
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames_set (id, name) VALUES (1, 'TestSet')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO imaging_nights (id, frames_set_id, start_time, end_time)
              VALUES (1, 1, '2025-09-25', '2025-09-25')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO sessions (id, imaging_night_id, instrume) VALUES (1, 1, 'ASI2600MC')",
             [],
-        ).unwrap();
-        conn.execute("INSERT INTO session_members (session_id, frame_id) VALUES (1, 1)", [])
-            .unwrap();
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_members (session_id, frame_id) VALUES (1, 1)",
+            [],
+        )
+        .unwrap();
 
         let frames = get_light_frames_from_frame_set(&conn, 1).unwrap();
         assert_eq!(frames.len(), 1);

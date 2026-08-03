@@ -27,6 +27,8 @@ pub mod defaults {
     // Background scan monitoring
     pub const MONITORING_INTERVAL_MINUTES: &str = "1";
     pub const MONITORING_ENABLED_GLOBAL: &str = "true";
+    // Used by frontend via get_setting/set_setting as a UI flag (not directly in Rust)
+    #[allow(dead_code)]
     pub const AUTO_MERGE_ON_BUTTON_CLICK: &str = "false";
     pub const AUTO_MERGE_ON_MONITOR_DETECT: &str = "false";
 
@@ -108,6 +110,8 @@ pub mod keys {
     // Background scan monitoring (see docs spec 2026-04-23 auto-scanning)
     pub const MONITORING_INTERVAL_MINUTES: &str = "monitoring.interval_minutes";
     pub const MONITORING_ENABLED_GLOBAL: &str = "monitoring.enabled_global";
+    // Used by frontend via get_setting/set_setting as a UI flag (not directly in Rust)
+    #[allow(dead_code)]
     pub const AUTO_MERGE_ON_BUTTON_CLICK: &str = "auto_merge.on_button_click";
     pub const AUTO_MERGE_ON_MONITOR_DETECT: &str = "auto_merge.on_monitor_detect";
 
@@ -254,22 +258,6 @@ impl SettingsManager {
     pub fn set_runtime_override(&self, key: String, value: String) {
         if let Ok(mut overrides) = self.runtime_overrides.lock() {
             overrides.insert(key, value);
-        }
-    }
-
-    /// Clear a runtime override
-    #[allow(dead_code)]
-    pub fn clear_runtime_override(&self, key: &str) {
-        if let Ok(mut overrides) = self.runtime_overrides.lock() {
-            overrides.remove(key);
-        }
-    }
-
-    /// Clear all runtime overrides
-    #[allow(dead_code)]
-    pub fn clear_all_runtime_overrides(&self) {
-        if let Ok(mut overrides) = self.runtime_overrides.lock() {
-            overrides.clear();
         }
     }
 
@@ -443,7 +431,11 @@ mod tests {
 
         // Should return default when nothing is set
         let value = manager
-            .get_with_precedence(&conn, keys::GROUPING_THRESHOLD_VALUE, defaults::GROUPING_THRESHOLD_VALUE)
+            .get_with_precedence(
+                &conn,
+                keys::GROUPING_THRESHOLD_VALUE,
+                defaults::GROUPING_THRESHOLD_VALUE,
+            )
             .unwrap();
         assert_eq!(value, "3.0");
     }
@@ -459,7 +451,11 @@ mod tests {
 
         // Should return DB value
         let value = manager
-            .get_with_precedence(&conn, keys::GROUPING_THRESHOLD_VALUE, defaults::GROUPING_THRESHOLD_VALUE)
+            .get_with_precedence(
+                &conn,
+                keys::GROUPING_THRESHOLD_VALUE,
+                defaults::GROUPING_THRESHOLD_VALUE,
+            )
             .unwrap();
         assert_eq!(value, "10.0");
     }
@@ -481,7 +477,11 @@ mod tests {
 
         // Should return runtime value
         let value = manager
-            .get_with_precedence(&conn, keys::GROUPING_THRESHOLD_VALUE, defaults::GROUPING_THRESHOLD_VALUE)
+            .get_with_precedence(
+                &conn,
+                keys::GROUPING_THRESHOLD_VALUE,
+                defaults::GROUPING_THRESHOLD_VALUE,
+            )
             .unwrap();
         assert_eq!(value, "15.0");
     }
@@ -521,7 +521,9 @@ mod tests {
         init_db(&conn).unwrap();
         let manager = SettingsManager::new();
 
-        manager.persist_setting(&conn, keys::ARCHIVE_ROOT_PATH, "/tmp/archive").unwrap();
+        manager
+            .persist_setting(&conn, keys::ARCHIVE_ROOT_PATH, "/tmp/archive")
+            .unwrap();
         assert_eq!(
             manager.get_archive_root_path(&conn).unwrap(),
             Some("/tmp/archive".to_string())
@@ -553,7 +555,9 @@ mod tests {
         init_db(&conn).unwrap();
         let manager = SettingsManager::new();
 
-        manager.persist_setting(&conn, keys::COMPUTE_MAX_CONCURRENT, "4").unwrap();
+        manager
+            .persist_setting(&conn, keys::COMPUTE_MAX_CONCURRENT, "4")
+            .unwrap();
         assert_eq!(manager.get_compute_max_concurrent(&conn).unwrap(), 4);
     }
 
@@ -569,10 +573,14 @@ mod tests {
         // import/export, or a botched migration. The getter clamps
         // defensively so such a value can never permanently stall the
         // queue (0) or defeat the point of having one (huge).
-        manager.persist_setting(&conn, keys::COMPUTE_MAX_CONCURRENT, "0").unwrap();
+        manager
+            .persist_setting(&conn, keys::COMPUTE_MAX_CONCURRENT, "0")
+            .unwrap();
         assert_eq!(manager.get_compute_max_concurrent(&conn).unwrap(), 1);
 
-        manager.persist_setting(&conn, keys::COMPUTE_MAX_CONCURRENT, "999").unwrap();
+        manager
+            .persist_setting(&conn, keys::COMPUTE_MAX_CONCURRENT, "999")
+            .unwrap();
         assert_eq!(manager.get_compute_max_concurrent(&conn).unwrap(), 8);
     }
 

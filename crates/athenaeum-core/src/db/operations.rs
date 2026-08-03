@@ -1,7 +1,7 @@
 // Database CRUD operations
 
-use crate::models::*;
 use crate::fingerprint::compute_header_fingerprint;
+use crate::models::*;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result};
 
@@ -72,7 +72,11 @@ pub(crate) fn path_prefix_upper(prefix: &str) -> Option<String> {
 /// character decides, not the build OS, which keeps the predicate builders
 /// testable with Windows-shaped fixtures from any host.
 pub(crate) fn native_separator_of(path: &str) -> char {
-    if path.starts_with('/') { '/' } else { '\\' }
+    if path.starts_with('/') {
+        '/'
+    } else {
+        '\\'
+    }
 }
 
 /// Fold '/'-spelled separators in a user/tool-supplied Windows path to the
@@ -154,7 +158,11 @@ pub(crate) struct SavepointGuard<'c> {
 impl<'c> SavepointGuard<'c> {
     pub(crate) fn new(conn: &'c Connection, name: &'static str) -> rusqlite::Result<Self> {
         conn.execute_batch(&format!("SAVEPOINT {name}"))?;
-        Ok(Self { conn, name, done: false })
+        Ok(Self {
+            conn,
+            name,
+            done: false,
+        })
     }
 
     /// Persist the savepoint's changes (`RELEASE`). Consumes `self` so the
@@ -325,8 +333,8 @@ pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
             .map(|dt| dt.with_timezone(&Utc));
 
         let last_scan_errors_str: Option<String> = row.get(6)?;
-        let last_scan_errors = last_scan_errors_str
-            .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+        let last_scan_errors =
+            last_scan_errors_str.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
 
         Ok(ScanRoot {
             id: Some(row.get(0)?),
@@ -341,7 +349,8 @@ pub fn get_scan_roots(conn: &Connection) -> Result<Vec<ScanRoot>> {
         })
     })?;
 
-    roots.collect()}
+    roots.collect()
+}
 
 /// Set monitor_enabled flag for a scan root
 pub fn set_scan_root_monitor_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<()> {
@@ -411,11 +420,7 @@ pub struct ReconcileResult {
 }
 
 /// Set unique_camera flag for a scan root (flag-only, no cascade)
-pub fn set_unique_camera_flag(
-    conn: &Connection,
-    root_id: i64,
-    enabled: bool,
-) -> Result<()> {
+pub fn set_unique_camera_flag(conn: &Connection, root_id: i64, enabled: bool) -> Result<()> {
     conn.execute(
         "UPDATE scan_roots SET unique_camera = ?1 WHERE id = ?2",
         params![if enabled { 1 } else { 0 }, root_id],
@@ -424,10 +429,7 @@ pub fn set_unique_camera_flag(
 }
 
 /// Delete calibration sets for frames under a scan root
-pub fn delete_calibration_sets_for_root(
-    conn: &Connection,
-    root_id: i64,
-) -> Result<usize> {
+pub fn delete_calibration_sets_for_root(conn: &Connection, root_id: i64) -> Result<usize> {
     // Get root path
     let root_path: String = conn.query_row(
         "SELECT path FROM scan_roots WHERE id = ?1",
@@ -468,7 +470,7 @@ pub fn delete_calibration_sets_for_root(
                AND COALESCE(cs.is_master_library, 0) = 0
                AND cs.superseded_by_set_id IS NULL
                AND cs.id NOT IN (SELECT source_set_id FROM master_provenance
-                                  WHERE source_set_id IS NOT NULL)"
+                                  WHERE source_set_id IS NOT NULL)",
         )?;
         let rows = stmt.query_map(params![root_prefix, path_hi], |row| row.get(0))?;
         rows.filter_map(|r| r.ok()).collect()
@@ -478,18 +480,28 @@ pub fn delete_calibration_sets_for_root(
 
     // Explicit cascade delete for affected calibration sets
     if !affected_set_ids.is_empty() {
-        let placeholders: String = affected_set_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let placeholders: String = affected_set_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
         let set_values: Vec<rusqlite::types::Value> = affected_set_ids
             .iter()
             .map(|id| rusqlite::types::Value::Integer(*id))
             .collect();
 
         // calibration_set_frames
-        let sql = format!("DELETE FROM calibration_set_frames WHERE set_id IN ({})", placeholders);
+        let sql = format!(
+            "DELETE FROM calibration_set_frames WHERE set_id IN ({})",
+            placeholders
+        );
         conn.execute(&sql, rusqlite::params_from_iter(set_values.iter()))?;
 
         // calibration_set_to_frames — as target (calibration_set_id)
-        let sql = format!("DELETE FROM calibration_set_to_frames WHERE calibration_set_id IN ({})", placeholders);
+        let sql = format!(
+            "DELETE FROM calibration_set_to_frames WHERE calibration_set_id IN ({})",
+            placeholders
+        );
         conn.execute(&sql, rusqlite::params_from_iter(set_values.iter()))?;
 
         // calibration_set_to_frames — as source (source_type='calibration_set')
@@ -500,7 +512,10 @@ pub fn delete_calibration_sets_for_root(
         conn.execute(&sql, rusqlite::params_from_iter(set_values.iter()))?;
 
         // calibration_set_originals
-        let sql = format!("DELETE FROM calibration_set_originals WHERE set_id IN ({})", placeholders);
+        let sql = format!(
+            "DELETE FROM calibration_set_originals WHERE set_id IN ({})",
+            placeholders
+        );
         conn.execute(&sql, rusqlite::params_from_iter(set_values.iter()))?;
 
         // calibration_set
@@ -683,7 +698,11 @@ pub fn update_scan_root_timestamp(conn: &Connection, id: i64) -> Result<()> {
 }
 
 /// Persist scan errors for a scan root (stored as JSON, cleared if empty)
-pub fn update_scan_root_errors(conn: &Connection, id: i64, errors: &[String]) -> anyhow::Result<()> {
+pub fn update_scan_root_errors(
+    conn: &Connection,
+    id: i64,
+    errors: &[String],
+) -> anyhow::Result<()> {
     let json_val: Option<String> = if errors.is_empty() {
         None
     } else {
@@ -716,7 +735,8 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
         let sep = native_separator_of(&path);
         let prefix = format!("{}{}", path.trim_end_matches(sep), sep);
         let path_hi = path_prefix_upper(&prefix);
-        let mut stmt = conn.prepare("SELECT id FROM files WHERE path >= ?1 AND (?2 IS NULL OR path < ?2)")?;
+        let mut stmt =
+            conn.prepare("SELECT id FROM files WHERE path >= ?1 AND (?2 IS NULL OR path < ?2)")?;
         let rows = stmt.query_map(params![prefix, path_hi], |row| row.get(0))?;
         rows.filter_map(|r| r.ok()).collect()
     };
@@ -727,26 +747,44 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
             let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!("SELECT id FROM frames WHERE file_id IN ({})", placeholders);
             let mut stmt = conn.prepare(&sql)?;
-            let params_vec: Vec<rusqlite::types::Value> = file_ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect();
-            let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |row| row.get(0))?;
+            let params_vec: Vec<rusqlite::types::Value> = file_ids
+                .iter()
+                .map(|id| rusqlite::types::Value::Integer(*id))
+                .collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
+                row.get(0)
+            })?;
             rows.filter_map(|r| r.ok()).collect()
         };
 
         // Delete child tables explicitly (avoiding cascade overhead)
         if !frame_ids.is_empty() {
-            let frame_placeholders: String = frame_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let frame_values: Vec<rusqlite::types::Value> = frame_ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect();
+            let frame_placeholders: String =
+                frame_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let frame_values: Vec<rusqlite::types::Value> = frame_ids
+                .iter()
+                .map(|id| rusqlite::types::Value::Integer(*id))
+                .collect();
 
             // 1. session_members
-            let sql = format!("DELETE FROM session_members WHERE frame_id IN ({})", frame_placeholders);
+            let sql = format!(
+                "DELETE FROM session_members WHERE frame_id IN ({})",
+                frame_placeholders
+            );
             conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
 
             // 2. calibration_set_frames
-            let sql = format!("DELETE FROM calibration_set_frames WHERE frame_id IN ({})", frame_placeholders);
+            let sql = format!(
+                "DELETE FROM calibration_set_frames WHERE frame_id IN ({})",
+                frame_placeholders
+            );
             conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
 
             // 3. frame_tags
-            let sql = format!("DELETE FROM frame_tags WHERE frame_id IN ({})", frame_placeholders);
+            let sql = format!(
+                "DELETE FROM frame_tags WHERE frame_id IN ({})",
+                frame_placeholders
+            );
             conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
 
             // 4. calibration_set_to_frames (source_id refers to frame_id when source_type='frame')
@@ -756,18 +794,30 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
 
         // Delete by file_id
         let file_placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let file_values: Vec<rusqlite::types::Value> = file_ids.iter().map(|id| rusqlite::types::Value::Integer(*id)).collect();
+        let file_values: Vec<rusqlite::types::Value> = file_ids
+            .iter()
+            .map(|id| rusqlite::types::Value::Integer(*id))
+            .collect();
 
         // 5. fits_header
-        let sql = format!("DELETE FROM fits_header WHERE file_id IN ({})", file_placeholders);
+        let sql = format!(
+            "DELETE FROM fits_header WHERE file_id IN ({})",
+            file_placeholders
+        );
         conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
 
         // 6. black_hole
-        let sql = format!("DELETE FROM black_hole WHERE file_id IN ({})", file_placeholders);
+        let sql = format!(
+            "DELETE FROM black_hole WHERE file_id IN ({})",
+            file_placeholders
+        );
         conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
 
         // 7. frames
-        let sql = format!("DELETE FROM frames WHERE file_id IN ({})", file_placeholders);
+        let sql = format!(
+            "DELETE FROM frames WHERE file_id IN ({})",
+            file_placeholders
+        );
         conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
 
         // 8. files
@@ -898,14 +948,24 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
                 id: Some(fid),
                 file_id: file.id.unwrap(),
                 object: row.get(13).ok(),
-                date_obs: row.get::<_, Option<String>>(14).ok().flatten().and_then(|s| {
-                    DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
-                }),
+                date_obs: row
+                    .get::<_, Option<String>>(14)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| {
+                        DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&Utc))
+                    }),
                 telescop: row.get(15).ok(),
                 instrume: row.get(16).ok(),
                 exptime: row.get(17).ok(),
                 filter: row.get(18).ok(),
-                imagetyp: row.get::<_, Option<String>>(19).ok().flatten().and_then(|s| ImageType::from_str(&s)),
+                imagetyp: row
+                    .get::<_, Option<String>>(19)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| ImageType::from_str(&s)),
                 is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
                 gain: row.get(21).ok(),
                 offset: row.get(22).ok(),
@@ -951,7 +1011,7 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
 pub fn get_files_by_directory(
     conn: &Connection,
     directory_path: &str,
-    limit: Option<usize>
+    limit: Option<usize>,
 ) -> Result<Vec<(File, Option<Frame>)>> {
     let limit_clause = match limit {
         Some(n) => format!("LIMIT {}", n),
@@ -1014,14 +1074,24 @@ pub fn get_files_by_directory(
                 id: Some(fid),
                 file_id: file.id.unwrap(),
                 object: row.get(13).ok(),
-                date_obs: row.get::<_, Option<String>>(14).ok().flatten().and_then(|s| {
-                    DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
-                }),
+                date_obs: row
+                    .get::<_, Option<String>>(14)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| {
+                        DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&Utc))
+                    }),
                 telescop: row.get(15).ok(),
                 instrume: row.get(16).ok(),
                 exptime: row.get(17).ok(),
                 filter: row.get(18).ok(),
-                imagetyp: row.get::<_, Option<String>>(19).ok().flatten().and_then(|s| ImageType::from_str(&s)),
+                imagetyp: row
+                    .get::<_, Option<String>>(19)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| ImageType::from_str(&s)),
                 is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
                 gain: row.get(21).ok(),
                 offset: row.get(22).ok(),
@@ -1068,7 +1138,7 @@ pub fn get_files_by_directory_for_camera(
     conn: &Connection,
     directory_path: &str,
     instrume: &str,
-    limit: Option<usize>
+    limit: Option<usize>,
 ) -> Result<Vec<(File, Option<Frame>)>> {
     let limit_clause = match limit {
         Some(n) => format!("LIMIT {}", n),
@@ -1103,74 +1173,87 @@ pub fn get_files_by_directory_for_camera(
 
     let mut stmt = conn.prepare(&query)?;
 
-    let results = stmt.query_map(params![path_prefix, path_hi, sep, expected_depth, instrume], |row| {
-        let file = File {
-            id: Some(row.get(0)?),
-            path: row.get(1)?,
-            filename: row.get(2)?,
-            size: row.get(3)?,
-            modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
-            format: if row.get::<_, String>(5)? == "FITS" {
-                FileFormat::FITS
-            } else {
-                FileFormat::XISF
-            },
-            created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
-            metadata_hash: row.get(7)?,
-            content_hash: row.get(8)?,
-            archived_in_operation: row.get(9)?,
-            archive_zip_path: row.get(10)?,
-            archive_path_in_zip: row.get(11)?,
-            uuid: row.get(45)?,
-            updated_at: row.get(46)?,
-        };
+    let results = stmt.query_map(
+        params![path_prefix, path_hi, sep, expected_depth, instrume],
+        |row| {
+            let file = File {
+                id: Some(row.get(0)?),
+                path: row.get(1)?,
+                filename: row.get(2)?,
+                size: row.get(3)?,
+                modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
+                format: if row.get::<_, String>(5)? == "FITS" {
+                    FileFormat::FITS
+                } else {
+                    FileFormat::XISF
+                },
+                created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
+                metadata_hash: row.get(7)?,
+                content_hash: row.get(8)?,
+                archived_in_operation: row.get(9)?,
+                archive_zip_path: row.get(10)?,
+                archive_path_in_zip: row.get(11)?,
+                uuid: row.get(45)?,
+                updated_at: row.get(46)?,
+            };
 
-        let frame = Some(Frame {
-            id: Some(row.get(12)?),
-            file_id: file.id.unwrap(),
-            object: row.get(13).ok(),
-            date_obs: row.get::<_, Option<String>>(14).ok().flatten().and_then(|s| {
-                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
-            }),
-            telescop: row.get(15).ok(),
-            instrume: row.get(16).ok(),
-            exptime: row.get(17).ok(),
-            filter: row.get(18).ok(),
-            imagetyp: row.get::<_, Option<String>>(19).ok().flatten().and_then(|s| ImageType::from_str(&s)),
-            is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
-            gain: row.get(21).ok(),
-            offset: row.get(22).ok(),
-            binning: row.get(23).ok(),
-            xbinning: row.get(24).ok(),
-            ybinning: row.get(25).ok(),
-            ccd_temp: row.get(26).ok(),
-            set_temp: row.get(27).ok(),
-            focallen: row.get(28).ok(),
-            xpixsz: row.get(29).ok(),
-            ypixsz: row.get(30).ok(),
-            naxis1: row.get(31).ok(),
-            naxis2: row.get(32).ok(),
-            ra: row.get(33).ok(),
-            dec: row.get(34).ok(),
-            sitelat: row.get(35).ok(),
-            lat_obs: row.get(36).ok(),
-            sitelong: row.get(37).ok(),
-            long_obs: row.get(38).ok(),
-            objctra: row.get(39).ok(),
-            objctdec: row.get(40).ok(),
-            override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
-            swcreate: row.get(42).ok(),
-            bayerpat: row.get(43).ok(),
-            xbayroff: None,
-            ybayroff: None,
-            roworder: None,
-            rotation: row.get(44).ok(),
-            uuid: row.get(47).ok(),
-            updated_at: row.get(48).ok(),
-        });
+            let frame = Some(Frame {
+                id: Some(row.get(12)?),
+                file_id: file.id.unwrap(),
+                object: row.get(13).ok(),
+                date_obs: row
+                    .get::<_, Option<String>>(14)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| {
+                        DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&Utc))
+                    }),
+                telescop: row.get(15).ok(),
+                instrume: row.get(16).ok(),
+                exptime: row.get(17).ok(),
+                filter: row.get(18).ok(),
+                imagetyp: row
+                    .get::<_, Option<String>>(19)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| ImageType::from_str(&s)),
+                is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
+                gain: row.get(21).ok(),
+                offset: row.get(22).ok(),
+                binning: row.get(23).ok(),
+                xbinning: row.get(24).ok(),
+                ybinning: row.get(25).ok(),
+                ccd_temp: row.get(26).ok(),
+                set_temp: row.get(27).ok(),
+                focallen: row.get(28).ok(),
+                xpixsz: row.get(29).ok(),
+                ypixsz: row.get(30).ok(),
+                naxis1: row.get(31).ok(),
+                naxis2: row.get(32).ok(),
+                ra: row.get(33).ok(),
+                dec: row.get(34).ok(),
+                sitelat: row.get(35).ok(),
+                lat_obs: row.get(36).ok(),
+                sitelong: row.get(37).ok(),
+                long_obs: row.get(38).ok(),
+                objctra: row.get(39).ok(),
+                objctdec: row.get(40).ok(),
+                override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
+                swcreate: row.get(42).ok(),
+                bayerpat: row.get(43).ok(),
+                xbayroff: None,
+                ybayroff: None,
+                roworder: None,
+                rotation: row.get(44).ok(),
+                uuid: row.get(47).ok(),
+                updated_at: row.get(48).ok(),
+            });
 
-        Ok((file, frame))
-    })?;
+            Ok((file, frame))
+        },
+    )?;
 
     results.collect()
 }
@@ -1221,14 +1304,24 @@ fn map_missing_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Missing
         id: Some(row.get(12)?),
         file_id: file.id.unwrap(),
         object: row.get(13).ok(),
-        date_obs: row.get::<_, Option<String>>(14).ok().flatten().and_then(|s| {
-            DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
-        }),
+        date_obs: row
+            .get::<_, Option<String>>(14)
+            .ok()
+            .flatten()
+            .and_then(|s| {
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            }),
         telescop: row.get(15).ok(),
         instrume: row.get(16).ok(),
         exptime: row.get(17).ok(),
         filter: row.get(18).ok(),
-        imagetyp: row.get::<_, Option<String>>(19).ok().flatten().and_then(|s| ImageType::from_str(&s)),
+        imagetyp: row
+            .get::<_, Option<String>>(19)
+            .ok()
+            .flatten()
+            .and_then(|s| ImageType::from_str(&s)),
         is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
         gain: row.get(21).ok(),
         offset: row.get(22).ok(),
@@ -1479,17 +1572,23 @@ pub fn bulk_update_frame_metadata(
                 let parts: Vec<&str> = binning.split('x').collect();
                 if parts.len() != 2 {
                     return Err(rusqlite::Error::ToSqlConversionFailure(
-                        format!("binning must be in 'AxB' format (e.g. '1x1'), got '{}'", binning).into(),
+                        format!(
+                            "binning must be in 'AxB' format (e.g. '1x1'), got '{}'",
+                            binning
+                        )
+                        .into(),
                     ));
                 }
                 let xb: i64 = parts[0].parse().map_err(|_| {
                     rusqlite::Error::ToSqlConversionFailure(
-                        format!("binning x component must be an integer, got '{}'", parts[0]).into(),
+                        format!("binning x component must be an integer, got '{}'", parts[0])
+                            .into(),
                     )
                 })?;
                 let yb: i64 = parts[1].parse().map_err(|_| {
                     rusqlite::Error::ToSqlConversionFailure(
-                        format!("binning y component must be an integer, got '{}'", parts[1]).into(),
+                        format!("binning y component must be an integer, got '{}'", parts[1])
+                            .into(),
                     )
                 })?;
                 if xb < 1 || yb < 1 || xb > 16 || yb > 16 {
@@ -1716,8 +1815,15 @@ pub fn get_distinct_instrumes(conn: &Connection) -> Result<Vec<String>> {
 ///
 /// If use_content_hash is true, groups by content_hash (xxhash).
 /// If use_content_hash is false, groups by metadata_hash (size + modified + filename).
-pub fn find_duplicate_groups(conn: &Connection, use_content_hash: bool) -> Result<Vec<DuplicateGroup>> {
-    let hash_column = if use_content_hash { "content_hash" } else { "metadata_hash" };
+pub fn find_duplicate_groups(
+    conn: &Connection,
+    use_content_hash: bool,
+) -> Result<Vec<DuplicateGroup>> {
+    let hash_column = if use_content_hash {
+        "content_hash"
+    } else {
+        "metadata_hash"
+    };
 
     // Scan roots eligible for duplicate detection, fetched once in Rust so
     // the path predicate can be bound as byte-range params per root instead
@@ -1748,26 +1854,28 @@ pub fn find_duplicate_groups(conn: &Connection, use_content_hash: bool) -> Resul
 
     let mut stmt = conn.prepare(&query)?;
 
-    let mut groups: Vec<DuplicateGroup> = stmt.query_map(rusqlite::params_from_iter(root_values.iter()), |row| {
-        let paths_str: String = row.get(3)?;
-        let file_paths: Vec<String> = paths_str.split('|').map(|s| s.to_string()).collect();
+    let mut groups: Vec<DuplicateGroup> = stmt
+        .query_map(rusqlite::params_from_iter(root_values.iter()), |row| {
+            let paths_str: String = row.get(3)?;
+            let file_paths: Vec<String> = paths_str.split('|').map(|s| s.to_string()).collect();
 
-        let ids_str: String = row.get(4)?;
-        let file_ids: Vec<i64> = ids_str.split('|')
-            .filter_map(|s| s.parse::<i64>().ok())
-            .collect();
+            let ids_str: String = row.get(4)?;
+            let file_ids: Vec<i64> = ids_str
+                .split('|')
+                .filter_map(|s| s.parse::<i64>().ok())
+                .collect();
 
-        Ok(DuplicateGroup {
-            id: None,
-            size: row.get(1)?,
-            content_hash: row.get(0)?,
-            file_count: row.get(2)?,
-            file_paths,
-            file_ids,
-            files: Vec::new(),
-        })
-    })?
-    .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(DuplicateGroup {
+                id: None,
+                size: row.get(1)?,
+                content_hash: row.get(0)?,
+                file_count: row.get(2)?,
+                file_paths,
+                file_ids,
+                files: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
 
     enrich_duplicate_groups(conn, &mut groups)?;
     Ok(groups)
@@ -1786,20 +1894,28 @@ fn enrich_duplicate_groups(conn: &Connection, groups: &mut [DuplicateGroup]) -> 
     // than caching and getting stale.
     let mut sr_stmt = conn.prepare("SELECT id, path FROM scan_roots ORDER BY length(path) DESC")?;
     let scan_roots: Vec<(i64, String)> = sr_stmt
-        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
         .filter_map(|r| r.ok())
         .collect();
 
     // One SELECT covering every file id across every group. Pulls the frame
     // row (imagetyp, date_obs, filename) via LEFT JOIN so files without an
     // extracted frame still come through with None-y frame fields.
-    let mut all_ids: Vec<i64> = groups.iter().flat_map(|g| g.file_ids.iter().copied()).collect();
+    let mut all_ids: Vec<i64> = groups
+        .iter()
+        .flat_map(|g| g.file_ids.iter().copied())
+        .collect();
     all_ids.sort_unstable();
     all_ids.dedup();
     if all_ids.is_empty() {
         return Ok(());
     }
-    let placeholders: String = std::iter::repeat("?").take(all_ids.len()).collect::<Vec<_>>().join(",");
+    let placeholders: String = std::iter::repeat("?")
+        .take(all_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
     let query = format!(
         "SELECT f.id, f.path, f.filename, f.modified_at, fr.imagetyp, fr.date_obs
          FROM files f
@@ -1807,7 +1923,10 @@ fn enrich_duplicate_groups(conn: &Connection, groups: &mut [DuplicateGroup]) -> 
          WHERE f.id IN ({})",
         placeholders
     );
-    let params_vec: Vec<rusqlite::types::Value> = all_ids.iter().map(|i| rusqlite::types::Value::Integer(*i)).collect();
+    let params_vec: Vec<rusqlite::types::Value> = all_ids
+        .iter()
+        .map(|i| rusqlite::types::Value::Integer(*i))
+        .collect();
     let mut stmt = conn.prepare(&query)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
         let id: i64 = row.get(0)?;
@@ -1832,13 +1951,24 @@ fn enrich_duplicate_groups(conn: &Connection, groups: &mut [DuplicateGroup]) -> 
         let modified_at = chrono::DateTime::parse_from_rfc3339(&modified_at_str)
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .unwrap_or_else(|_| chrono::Utc::now());
-        by_id.insert(id, Row { path, filename, modified_at, imagetyp, date_obs });
+        by_id.insert(
+            id,
+            Row {
+                path,
+                filename,
+                modified_at,
+                imagetyp,
+                date_obs,
+            },
+        );
     }
 
     for group in groups.iter_mut() {
         let mut files: Vec<crate::models::DuplicateFile> = Vec::with_capacity(group.file_ids.len());
         for file_id in &group.file_ids {
-            let Some(r) = by_id.get(file_id) else { continue };
+            let Some(r) = by_id.get(file_id) else {
+                continue;
+            };
             let (scan_root_id, scan_root_path) = scan_roots
                 .iter()
                 // Separator-boundary-safe (scanner helper): with roots /data
@@ -1867,8 +1997,16 @@ fn enrich_duplicate_groups(conn: &Connection, groups: &mut [DuplicateGroup]) -> 
 /// Rebuild the duplicate groups cache tables
 /// This clears existing cache and recomputes all duplicate groups
 pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool) -> Result<usize> {
-    let hash_type = if use_content_hash { "content" } else { "metadata" };
-    let hash_column = if use_content_hash { "content_hash" } else { "metadata_hash" };
+    let hash_type = if use_content_hash {
+        "content"
+    } else {
+        "metadata"
+    };
+    let hash_column = if use_content_hash {
+        "content_hash"
+    } else {
+        "metadata_hash"
+    };
 
     // Start transaction
     let sp = SavepointGuard::new(conn, "rebuild_dup_groups_cache")?;
@@ -1926,7 +2064,8 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool)
     // SQLite's left-to-right auto-numbering continuing past the explicit
     // indices, which is correct but easy to get subtly wrong; one scheme
     // keeps every bind position unambiguous by construction).
-    let (files_root_predicate, files_root_values) = scan_root_prefix_predicate("files.path", &roots);
+    let (files_root_predicate, files_root_values) =
+        scan_root_prefix_predicate("files.path", &roots);
     let files_query = format!(
         "SELECT id FROM files WHERE {} = ? AND size = ?
          AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = files.id)
@@ -1951,7 +2090,9 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool)
         ];
         bind_values.extend(files_root_values.iter().cloned());
         let file_ids: Vec<i64> = files_stmt
-            .query_map(rusqlite::params_from_iter(bind_values.iter()), |row| row.get(0))?
+            .query_map(rusqlite::params_from_iter(bind_values.iter()), |row| {
+                row.get(0)
+            })?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -1971,14 +2112,21 @@ pub fn rebuild_duplicate_groups_cache(conn: &Connection, use_content_hash: bool)
 
 /// Get duplicate groups from cache
 /// Returns cached duplicate groups with file paths and IDs
-pub fn get_cached_duplicates(conn: &Connection, use_content_hash: bool) -> Result<Vec<DuplicateGroup>> {
-    let hash_type = if use_content_hash { "content" } else { "metadata" };
+pub fn get_cached_duplicates(
+    conn: &Connection,
+    use_content_hash: bool,
+) -> Result<Vec<DuplicateGroup>> {
+    let hash_type = if use_content_hash {
+        "content"
+    } else {
+        "metadata"
+    };
 
     let mut stmt = conn.prepare(
         "SELECT dg.id, dg.hash, dg.size, dg.file_count
          FROM duplicate_groups dg
          WHERE dg.hash_type = ?1
-         ORDER BY dg.file_count DESC, dg.size DESC"
+         ORDER BY dg.file_count DESC, dg.size DESC",
     )?;
 
     let groups: Vec<(i64, String, i64, i64)> = stmt
@@ -1998,13 +2146,11 @@ pub fn get_cached_duplicates(conn: &Connection, use_content_hash: bool) -> Resul
              JOIN files f ON f.id = dgf.file_id
              WHERE dgf.group_id = ?1
              AND NOT EXISTS (SELECT 1 FROM black_hole bh WHERE bh.file_id = f.id)
-             ORDER BY f.path"
+             ORDER BY f.path",
         )?;
 
         let files: Vec<(i64, String)> = files_stmt
-            .query_map(params![group_id], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
+            .query_map(params![group_id], |row| Ok((row.get(0)?, row.get(1)?)))?
             .filter_map(|r| r.ok())
             .collect();
 
@@ -2020,7 +2166,7 @@ pub fn get_cached_duplicates(conn: &Connection, use_content_hash: bool) -> Resul
             id: Some(group_id),
             size,
             content_hash: hash,
-            file_count: files.len() as i32,  // Use actual count after filtering
+            file_count: files.len() as i32, // Use actual count after filtering
             file_paths,
             file_ids,
             files: Vec::new(),
@@ -2033,7 +2179,11 @@ pub fn get_cached_duplicates(conn: &Connection, use_content_hash: bool) -> Resul
 
 /// Check if duplicate cache exists and has data
 pub fn has_duplicate_cache(conn: &Connection, use_content_hash: bool) -> Result<bool> {
-    let hash_type = if use_content_hash { "content" } else { "metadata" };
+    let hash_type = if use_content_hash {
+        "content"
+    } else {
+        "metadata"
+    };
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM duplicate_groups WHERE hash_type = ?1",
         params![hash_type],
@@ -2084,33 +2234,8 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
 
 /// Delete a setting by key
 pub fn delete_setting(conn: &Connection, key: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM settings WHERE key = ?1",
-        params![key],
-    )?;
+    conn.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
     Ok(())
-}
-
-/// Get all settings
-pub fn get_all_settings(conn: &Connection) -> Result<Vec<Setting>> {
-    let mut stmt = conn.prepare(
-        "SELECT key, value, updated_at FROM settings ORDER BY key"
-    )?;
-
-    let settings = stmt.query_map([], |row| {
-        let updated_at_str: Option<String> = row.get(2)?;
-        let updated_at = updated_at_str.and_then(|s| {
-            DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
-        });
-
-        Ok(Setting {
-            key: row.get(0)?,
-            value: row.get(1)?,
-            updated_at,
-        })
-    })?;
-
-    settings.collect()
 }
 
 // ============================================================================
@@ -2143,7 +2268,7 @@ pub fn create_frames_set(
 /// Get all frames sets with member counts
 pub fn get_frames_sets_by_project(
     conn: &Connection,
-    _project_id: i64,  // Kept for backwards compatibility, but ignored
+    _project_id: i64, // Kept for backwards compatibility, but ignored
 ) -> Result<Vec<(crate::models::FramesSet, usize)>> {
     let mut stmt = conn.prepare(
         "SELECT fs.id, fs.name, fs.is_custom, fs.date_obs_start, fs.date_obs_end, fs.objctra, fs.objctdec, fs.total_exp_time, fs.flat_pattern,
@@ -2191,7 +2316,7 @@ pub fn get_all_frames_set_member_ids(conn: &Connection) -> Result<Vec<i64>> {
          FROM session_members sm
          JOIN sessions s ON sm.session_id = s.id
          JOIN imaging_nights in_tbl ON s.imaging_night_id = in_tbl.id
-         ORDER BY sm.frame_id"
+         ORDER BY sm.frame_id",
     )?;
 
     let frame_ids = stmt.query_map(params![], |row| row.get(0))?;
@@ -2245,18 +2370,6 @@ pub fn update_frames_set_metadata(
     Ok(())
 }
 
-pub fn update_frames_set_flat_pattern(
-    conn: &Connection,
-    id: i64,
-    flat_pattern: Option<&str>,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE frames_set SET flat_pattern = ?1 WHERE id = ?2",
-        params![flat_pattern, id],
-    )?;
-    Ok(())
-}
-
 /// Set the archived status of a frames_set
 pub fn set_frame_set_archived(conn: &Connection, id: i64, archived: bool) -> Result<()> {
     let archived_int = if archived { 1 } else { 0 };
@@ -2291,7 +2404,9 @@ pub fn get_light_frames_for_project(
 
         let date_obs_str: Option<String> = row.get(4)?;
         let date_obs = date_obs_str.and_then(|s| {
-            DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+            DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
         });
 
         let imagetyp_str: Option<String> = row.get(9)?;
@@ -2387,11 +2502,7 @@ pub fn create_session(
 /// `&Connection`). Standalone callers get a local batch transaction for
 /// fsync amortization; in-transaction callers join the existing tx so we
 /// don't trigger SQLite's "cannot start a transaction within a transaction".
-pub fn insert_session_members(
-    conn: &Connection,
-    session_id: i64,
-    frame_ids: &[i64],
-) -> Result<()> {
+pub fn insert_session_members(conn: &Connection, session_id: i64, frame_ids: &[i64]) -> Result<()> {
     if conn.is_autocommit() {
         let tx = conn.unchecked_transaction()?;
         for frame_id in frame_ids {
@@ -2483,10 +2594,7 @@ pub fn update_imaging_night_time_range(
 /// 1. Per-session: remove identical frame_id duplicates within a single session
 /// 2. Cross-session: remove different frame_ids that reference the same physical file (same files.path)
 /// 3. Session consolidation: merge sessions with the same instrume within the same imaging night
-pub fn deduplicate_session_members_in_set(
-    conn: &Connection,
-    frames_set_id: i64,
-) -> Result<usize> {
+pub fn deduplicate_session_members_in_set(conn: &Connection, frames_set_id: i64) -> Result<usize> {
     let mut total_removed = 0;
 
     // All three phases plus the trailing count refresh are one unit: Phase 1
@@ -2501,7 +2609,7 @@ pub fn deduplicate_session_members_in_set(
             "SELECT s.id
              FROM sessions s
              JOIN imaging_nights in_tbl ON s.imaging_night_id = in_tbl.id
-             WHERE in_tbl.frames_set_id = ?1"
+             WHERE in_tbl.frames_set_id = ?1",
         )?
         .query_map(params![frames_set_id], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -2513,7 +2621,7 @@ pub fn deduplicate_session_members_in_set(
                  FROM session_members
                  WHERE session_id = ?1
                  GROUP BY frame_id
-                 HAVING count > 1"
+                 HAVING count > 1",
             )?
             .query_map(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -2543,7 +2651,7 @@ pub fn deduplicate_session_members_in_set(
              JOIN frames fr ON sm.frame_id = fr.id
              JOIN files f ON fr.file_id = f.id
              WHERE n.frames_set_id = ?1
-             ORDER BY f.path, sm.frame_id"
+             ORDER BY f.path, sm.frame_id",
         )?
         .query_map(params![frames_set_id], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -2568,9 +2676,7 @@ pub fn deduplicate_session_members_in_set(
     // --- Phase 3: Session consolidation ---
     // Merge sessions with the same instrume within the same imaging night.
     let night_ids: Vec<i64> = conn
-        .prepare(
-            "SELECT id FROM imaging_nights WHERE frames_set_id = ?1"
-        )?
+        .prepare("SELECT id FROM imaging_nights WHERE frames_set_id = ?1")?
         .query_map(params![frames_set_id], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -2583,14 +2689,15 @@ pub fn deduplicate_session_members_in_set(
                  LEFT JOIN session_members sm ON s.id = sm.session_id
                  WHERE s.imaging_night_id = ?1
                  GROUP BY s.id, s.instrume
-                 ORDER BY COALESCE(s.instrume, ''), cnt DESC"
+                 ORDER BY COALESCE(s.instrume, ''), cnt DESC",
             )?
             .query_map(params![night_id], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut instrume_primary: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut instrume_primary: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
         for (session_id, instrume, _count) in &sessions {
             if let Some(&primary_id) = instrume_primary.get(instrume) {
                 // Move members from duplicate session to primary (ignore conflicts from PK)
@@ -2604,10 +2711,7 @@ pub fn deduplicate_session_members_in_set(
                     params![session_id],
                 )?;
                 // Delete the now-empty session
-                conn.execute(
-                    "DELETE FROM sessions WHERE id = ?1",
-                    params![session_id],
-                )?;
+                conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
             } else {
                 instrume_primary.insert(instrume.clone(), *session_id);
             }
@@ -2620,7 +2724,7 @@ pub fn deduplicate_session_members_in_set(
             "SELECT s.id
              FROM sessions s
              JOIN imaging_nights n ON s.imaging_night_id = n.id
-             WHERE n.frames_set_id = ?1"
+             WHERE n.frames_set_id = ?1",
         )?
         .query_map(params![frames_set_id], |row| row.get(0))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -2651,7 +2755,7 @@ pub fn get_imaging_nights_for_set(
         "SELECT id, frames_set_id, start_time, end_time, created_at
          FROM imaging_nights
          WHERE frames_set_id = ?1
-         ORDER BY start_time ASC"
+         ORDER BY start_time ASC",
     )?;
 
     let nights = stmt.query_map(params![frames_set_id], |row| {
@@ -2769,13 +2873,17 @@ pub fn get_frames_with_files_by_ids(
             file_id: row.get(13)?,
             object: row.get(14)?,
             date_obs: date_obs_raw.and_then(|s| {
-                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
             }),
             telescop: row.get(16)?,
             instrume: row.get(17)?,
             exptime: row.get(18)?,
             filter: row.get(19)?,
-            imagetyp: row.get::<_, Option<String>>(20)?.and_then(|s| crate::models::ImageType::from_str(&s)),
+            imagetyp: row
+                .get::<_, Option<String>>(20)?
+                .and_then(|s| crate::models::ImageType::from_str(&s)),
             is_master: row.get::<_, i32>(21)? == 1,
             gain: row.get(22)?,
             offset: row.get(23)?,
@@ -2835,7 +2943,9 @@ pub fn get_imaging_nights_with_sessions(
             start_time: row.get(2)?,
             end_time: row.get(3)?,
             created_at: row.get::<_, Option<String>>(4)?.and_then(|s| {
-                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+                DateTime::parse_from_rfc3339(&s)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
             }),
         })
     })?;
@@ -2862,7 +2972,9 @@ pub fn get_imaging_nights_with_sessions(
                 frame_count: row.get(3)?,
                 total_exp_time: row.get(4)?,
                 created_at: row.get::<_, Option<String>>(5)?.and_then(|s| {
-                    DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc))
                 }),
                 uuid: row.get(6)?,
                 updated_at: row.get(7)?,
@@ -2919,13 +3031,17 @@ pub fn get_imaging_nights_with_sessions(
                     file_id: row.get(13)?,
                     object: row.get(14)?,
                     date_obs: row.get::<_, Option<String>>(15)?.and_then(|s| {
-                        DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+                        DateTime::parse_from_rfc3339(&s)
+                            .ok()
+                            .map(|dt| dt.with_timezone(&Utc))
                     }),
                     telescop: row.get(16)?,
                     instrume: row.get(17)?,
                     exptime: row.get(18)?,
                     filter: row.get(19)?,
-                    imagetyp: row.get::<_, Option<String>>(20)?.and_then(|s| crate::models::ImageType::from_str(&s)),
+                    imagetyp: row
+                        .get::<_, Option<String>>(20)?
+                        .and_then(|s| crate::models::ImageType::from_str(&s)),
                     is_master: row.get::<_, i32>(21)? == 1,
                     gain: row.get(22)?,
                     offset: row.get(23)?,
@@ -2986,56 +3102,10 @@ pub fn get_imaging_nights_with_sessions(
 
 /// Get frame IDs for a given session
 pub fn get_frame_ids_for_session(conn: &Connection, session_id: i64) -> Result<Vec<i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT frame_id FROM session_members WHERE session_id = ?1"
-    )?;
+    let mut stmt = conn.prepare("SELECT frame_id FROM session_members WHERE session_id = ?1")?;
 
     let frame_ids = stmt.query_map(params![session_id], |row| row.get(0))?;
     frame_ids.collect()
-}
-
-/// Clone a session (create a new session with the same data but different imaging_night_id)
-/// Returns the new session_id
-pub fn clone_session(
-    conn: &Connection,
-    original_session_id: i64,
-    new_imaging_night_id: i64,
-) -> Result<i64> {
-    // Get original session data
-    let session: crate::models::Session = conn.query_row(
-        "SELECT id, imaging_night_id, instrume, frame_count, total_exp_time, created_at, uuid, updated_at
-         FROM sessions WHERE id = ?1",
-        params![original_session_id],
-        |row| {
-            Ok(crate::models::Session {
-                id: row.get(0)?,
-                imaging_night_id: row.get(1)?,
-                instrume: row.get(2)?,
-                frame_count: row.get(3)?,
-                total_exp_time: row.get(4)?,
-                created_at: row.get::<_, Option<String>>(5)?.and_then(|s| {
-                    DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
-                }),
-                uuid: row.get(6)?,
-                updated_at: row.get(7)?,
-            })
-        },
-    )?;
-
-    // Create new session with new imaging_night_id
-    let new_session_id = create_session(
-        conn,
-        new_imaging_night_id,
-        &session.instrume,
-        session.frame_count,
-        session.total_exp_time,
-    )?;
-
-    // Copy session_members
-    let frame_ids = get_frame_ids_for_session(conn, original_session_id)?;
-    insert_session_members(conn, new_session_id, &frame_ids)?;
-
-    Ok(new_session_id)
 }
 
 // ============================================================================
@@ -3060,9 +3130,8 @@ pub fn insert_excluded_frames(conn: &Connection, entries: &[(i64, String)]) -> R
     } else {
         None
     };
-    let mut stmt = conn.prepare_cached(
-        "INSERT INTO excluded_frames (file_id, reason) VALUES (?1, ?2)",
-    )?;
+    let mut stmt =
+        conn.prepare_cached("INSERT INTO excluded_frames (file_id, reason) VALUES (?1, ?2)")?;
     for (file_id, reason) in entries {
         stmt.execute(params![file_id, reason])?;
     }
@@ -3075,72 +3144,6 @@ pub fn insert_excluded_frames(conn: &Connection, entries: &[(i64, String)]) -> R
 /// Get count of excluded frames
 pub fn get_excluded_frames_count(conn: &Connection) -> Result<i64> {
     conn.query_row("SELECT COUNT(*) FROM excluded_frames", [], |row| row.get(0))
-}
-
-/// Reclassify excluded frames: update imagetyp, remove from excluded_frames,
-/// return distinct instrume values for calibration refresh.
-pub fn reclassify_excluded_frames(
-    conn: &Connection,
-    file_ids: &[i64],
-    new_imagetyp: &str,
-) -> Result<(usize, Vec<String>)> {
-    if file_ids.is_empty() {
-        return Ok((0, Vec::new()));
-    }
-
-    let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let values: Vec<rusqlite::types::Value> = file_ids
-        .iter()
-        .map(|id| rusqlite::types::Value::Integer(*id))
-        .collect();
-
-    // Update imagetyp for frames matching these file_ids
-    let sql = format!(
-        "UPDATE frames SET imagetyp = ?1 WHERE file_id IN ({})",
-        placeholders
-    );
-    let mut update_params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::Text(new_imagetyp.to_string())];
-    update_params.extend(values.iter().cloned());
-    let frames_updated = conn.execute(&sql, rusqlite::params_from_iter(update_params.iter()))?;
-
-    // Remove from excluded_frames
-    let sql = format!(
-        "DELETE FROM excluded_frames WHERE file_id IN ({})",
-        placeholders
-    );
-    conn.execute(&sql, rusqlite::params_from_iter(values.iter()))?;
-
-    // Get distinct instrume values for affected frames
-    let sql = format!(
-        "SELECT DISTINCT instrume FROM frames WHERE file_id IN ({}) AND instrume IS NOT NULL",
-        placeholders
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let cameras: Vec<String> = stmt
-        .query_map(rusqlite::params_from_iter(values.iter()), |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-
-    Ok((frames_updated, cameras))
-}
-
-/// Get frame IDs (frames.id) for a list of file IDs (files.id)
-pub fn get_frame_ids_for_file_ids(conn: &Connection, file_ids: &[i64]) -> Result<Vec<i64>> {
-    if file_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let values: Vec<rusqlite::types::Value> = file_ids
-        .iter()
-        .map(|id| rusqlite::types::Value::Integer(*id))
-        .collect();
-    let sql = format!("SELECT id FROM frames WHERE file_id IN ({})", placeholders);
-    let mut stmt = conn.prepare(&sql)?;
-    let ids: Vec<i64> = stmt
-        .query_map(rusqlite::params_from_iter(values.iter()), |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(ids)
 }
 
 /// Map a set of selected paths (files and/or folders) to the catalog frame
@@ -3444,10 +3447,7 @@ pub fn get_frame_memberships_summary(
 ///
 /// Only frames currently flagged `override = 1` are inspected; clean rows
 /// are skipped so the cost is proportional to actual edits.
-pub fn recompute_override_flag_for_frames(
-    conn: &Connection,
-    frame_ids: &[i64],
-) -> Result<usize> {
+pub fn recompute_override_flag_for_frames(conn: &Connection, frame_ids: &[i64]) -> Result<usize> {
     use crate::fits_parser::stored_header::{parse_stored_header_keys, snapshot_from_keys};
     use crate::models::FileFormat;
 
@@ -3568,10 +3568,7 @@ pub fn recompute_override_flag_for_frames(
             && opt_f64_eq(&dec, &snap.dec);
 
         if all_match {
-            conn.execute(
-                "UPDATE frames SET override = 0 WHERE id = ?1",
-                [frame_id],
-            )?;
+            conn.execute("UPDATE frames SET override = 0 WHERE id = ?1", [frame_id])?;
             cleared += 1;
         }
     }
@@ -3591,9 +3588,7 @@ fn opt_str_eq(a: &Option<String>, b: &Option<String>) -> bool {
 fn opt_f64_eq(a: &Option<f64>, b: &Option<f64>) -> bool {
     match (a, b) {
         (None, None) => true,
-        (Some(av), Some(bv)) => {
-            (!av.is_finite() && !bv.is_finite()) || (av - bv).abs() <= 1e-6
-        }
+        (Some(av), Some(bv)) => (!av.is_finite() && !bv.is_finite()) || (av - bv).abs() <= 1e-6,
         _ => false,
     }
 }
@@ -3760,7 +3755,10 @@ pub fn count_frame_metadata_relations(
             p = placeholders
         ),
         rusqlite::params_from_iter(
-            id_params.iter().chain(id_params.iter()).chain(id_params.iter()),
+            id_params
+                .iter()
+                .chain(id_params.iter())
+                .chain(id_params.iter()),
         ),
         |r| r.get(0),
     )?;
@@ -3804,28 +3802,6 @@ pub fn rename_files_path_prefix(
     Ok(n)
 }
 
-/// Get all excluded frames joined with file paths
-pub fn get_excluded_frames(conn: &Connection) -> Result<Vec<crate::models::ExcludedFrameEntry>> {
-    let mut stmt = conn.prepare(
-        "SELECT ef.file_id, f.path, f.filename, ef.reason, ef.excluded_at
-         FROM excluded_frames ef
-         JOIN files f ON ef.file_id = f.id
-         ORDER BY f.path ASC"
-    )?;
-
-    let entries = stmt.query_map([], |row| {
-        Ok(crate::models::ExcludedFrameEntry {
-            file_id: row.get(0)?,
-            path: row.get(1)?,
-            filename: row.get(2)?,
-            reason: row.get(3)?,
-            excluded_at: row.get(4)?,
-        })
-    })?;
-
-    entries.collect()
-}
-
 /// Get all excluded frames with full file + frame metadata, the exclusion
 /// reason, and the duplicate-group flag — the shape the Excluded Frames page
 /// needs to drive its Missing-Metadata-style repair toolbar.
@@ -3867,20 +3843,6 @@ pub fn get_excluded_frames_with_metadata(
     rows.collect()
 }
 
-pub fn get_catalog_meta(conn: &Connection) -> rusqlite::Result<crate::models::CatalogMeta> {
-    conn.query_row(
-        "SELECT catalog_uuid, schema_version, created_at FROM catalog_meta WHERE id = 1",
-        [],
-        |r| {
-            Ok(crate::models::CatalogMeta {
-                catalog_uuid: r.get(0)?,
-                schema_version: r.get(1)?,
-                created_at: r.get(2)?,
-            })
-        },
-    )
-}
-
 #[cfg(test)]
 mod bulk_metadata_tests {
     use super::*;
@@ -3904,11 +3866,9 @@ mod bulk_metadata_tests {
             rusqlite::params![file_id, imagetyp],
         )
         .unwrap();
-        conn.query_row(
-            "SELECT id FROM frames WHERE file_id = ?1",
-            [file_id],
-            |r| r.get(0),
-        )
+        conn.query_row("SELECT id FROM frames WHERE file_id = ?1", [file_id], |r| {
+            r.get(0)
+        })
         .unwrap()
     }
 
@@ -3919,24 +3879,39 @@ mod bulk_metadata_tests {
             "INSERT INTO frames_set (name, date_obs_start, date_obs_end)
              VALUES ('test', '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let frames_set_id: i64 = conn
-            .query_row("SELECT id FROM frames_set ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM frames_set ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO imaging_nights (frames_set_id, start_time, end_time)
              VALUES (?1, '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z')",
             [frames_set_id],
-        ).unwrap();
+        )
+        .unwrap();
         let imaging_night_id: i64 = conn
-            .query_row("SELECT id FROM imaging_nights ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM imaging_nights ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO sessions (imaging_night_id, instrume) VALUES (?1, 'CamA')",
             [imaging_night_id],
-        ).unwrap();
-        conn.query_row("SELECT id FROM sessions ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
-            .unwrap()
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT id FROM sessions ORDER BY id DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -3996,11 +3971,21 @@ mod bulk_metadata_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(member_after, 0, "the frame must be unlinked from the raw set");
+        assert_eq!(
+            member_after, 0,
+            "the frame must be unlinked from the raw set"
+        );
         let raw_set: i64 = conn
-            .query_row("SELECT COUNT(*) FROM calibration_set WHERE id = 700", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 700",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(raw_set, 1, "the superseded raw set shell must survive the cascade prune");
+        assert_eq!(
+            raw_set, 1,
+            "the superseded raw set shell must survive the cascade prune"
+        );
         let prov: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM master_provenance WHERE source_set_id = 700",
@@ -4018,8 +4003,16 @@ mod bulk_metadata_tests {
 
         // Build a temp catalog with files+frames at known paths (reusing the
         // module's `insert_frame` helper, which returns the generated frame_id).
-        let l1 = insert_frame(&conn, "/data/astro/M31/2026-07-12/L_0001.fits", Some("Light"));
-        let l2 = insert_frame(&conn, "/data/astro/M31/2026-07-12/L_0002.fits", Some("Light"));
+        let l1 = insert_frame(
+            &conn,
+            "/data/astro/M31/2026-07-12/L_0001.fits",
+            Some("Light"),
+        );
+        let l2 = insert_frame(
+            &conn,
+            "/data/astro/M31/2026-07-12/L_0002.fits",
+            Some("Light"),
+        );
         let f1 = insert_frame(&conn, "/data/astro/M31/flats/F_0001.fits", Some("Flat"));
         // A real subfolder directly under M31 — a folder select must still
         // sweep descendants at any depth after the LIKE→range-compare fix.
@@ -4028,7 +4021,8 @@ mod bulk_metadata_tests {
 
         // exact file → its frame
         assert_eq!(
-            frame_ids_under_paths(&conn, &["/data/astro/M31/2026-07-12/L_0001.fits".into()]).unwrap(),
+            frame_ids_under_paths(&conn, &["/data/astro/M31/2026-07-12/L_0001.fits".into()])
+                .unwrap(),
             vec![l1]
         );
 
@@ -4056,7 +4050,10 @@ mod bulk_metadata_tests {
         let m31_extra = insert_frame(&conn, "/data/astro/M31extra/z.fits", Some("Light"));
         let mut only_m31 = frame_ids_under_paths(&conn, &["/data/astro/M31".into()]).unwrap();
         only_m31.sort();
-        assert_eq!(only_m31, expect, "M31extra sibling must not match /data/astro/M31");
+        assert_eq!(
+            only_m31, expect,
+            "M31extra sibling must not match /data/astro/M31"
+        );
         assert!(!only_m31.contains(&m31_extra));
 
         // OVER-MATCH GUARD 1 (wildcard chars): `_`/`%` in the selected folder's
@@ -4087,7 +4084,9 @@ mod bulk_metadata_tests {
         assert!(!got_case.contains(&case_sibling));
 
         // non-cataloged path → empty
-        assert!(frame_ids_under_paths(&conn, &["/nope".into()]).unwrap().is_empty());
+        assert!(frame_ids_under_paths(&conn, &["/nope".into()])
+            .unwrap()
+            .is_empty());
 
         // empty input → empty
         assert!(frame_ids_under_paths(&conn, &[]).unwrap().is_empty());
@@ -4136,14 +4135,20 @@ mod bulk_metadata_tests {
         conn.execute(
             "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-01-01')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let set_id: i64 = conn
-            .query_row("SELECT id FROM calibration_set ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM calibration_set ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
             rusqlite::params![set_id, dark_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Create a session (with parent imaging_night + frames_set) and put
         // the frame in it.
@@ -4151,7 +4156,8 @@ mod bulk_metadata_tests {
         conn.execute(
             "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
             rusqlite::params![session_id, dark_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Also link as a consumer to a calibration set.
         conn.execute(
@@ -4161,9 +4167,13 @@ mod bulk_metadata_tests {
         ).unwrap();
 
         // Sanity: links exist before edit.
-        let csf_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set_frames WHERE frame_id = ?1", [dark_id], |r| r.get(0),
-        ).unwrap();
+        let csf_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_frames WHERE frame_id = ?1",
+                [dark_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(csf_count, 1);
 
         // Reclassify the frame: Dark → Light.
@@ -4176,14 +4186,22 @@ mod bulk_metadata_tests {
 
         // imagetyp updated.
         let new_type: String = conn
-            .query_row("SELECT imagetyp FROM frames WHERE id = ?1", [dark_id], |r| r.get(0))
+            .query_row(
+                "SELECT imagetyp FROM frames WHERE id = ?1",
+                [dark_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(new_type, "Light");
 
         // All three junction tables should no longer reference this frame.
-        let csf_after: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set_frames WHERE frame_id = ?1", [dark_id], |r| r.get(0),
-        ).unwrap();
+        let csf_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_frames WHERE frame_id = ?1",
+                [dark_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(csf_after, 0, "calibration_set_frames should be cleared");
 
         let cstf_after: i64 = conn.query_row(
@@ -4192,23 +4210,38 @@ mod bulk_metadata_tests {
         ).unwrap();
         assert_eq!(cstf_after, 0, "calibration_set_to_frames should be cleared");
 
-        let sm_after: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM session_members WHERE frame_id = ?1", [dark_id], |r| r.get(0),
-        ).unwrap();
+        let sm_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_members WHERE frame_id = ?1",
+                [dark_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(sm_after, 0, "session_members should be cleared");
 
         // calibration_set with no surviving members IS pruned (master sets
         // and last-frame regular sets — see
         // `changing_imagetyp_prunes_now_empty_master_calibration_set`).
-        let set_still_there: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM calibration_set WHERE id = ?1", [set_id], |r| r.get(0),
-        ).unwrap();
-        assert_eq!(set_still_there, 0, "now-empty calibration_set should be pruned");
+        let set_still_there: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = ?1",
+                [set_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            set_still_there, 0,
+            "now-empty calibration_set should be pruned"
+        );
         // Sessions / imaging_nights / frames_set are still left intact —
         // their pruning policy is unchanged.
-        let session_still_there: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sessions WHERE id = ?1", [session_id], |r| r.get(0),
-        ).unwrap();
+        let session_still_there: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(session_still_there, 1);
     }
 
@@ -4224,7 +4257,8 @@ mod bulk_metadata_tests {
         conn.execute(
             "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
             rusqlite::params![session_id, frame_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         let edits = FrameMetadataEdits {
             object: Some(Some("M31".into())),
@@ -4232,9 +4266,13 @@ mod bulk_metadata_tests {
         };
         bulk_update_frame_metadata(&conn, &[frame_id], &edits).unwrap();
 
-        let sm_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM session_members WHERE frame_id = ?1", [frame_id], |r| r.get(0),
-        ).unwrap();
+        let sm_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_members WHERE frame_id = ?1",
+                [frame_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(sm_count, 0, "OBJECT edit must unlink session membership");
     }
 
@@ -4370,15 +4408,20 @@ mod bulk_metadata_tests {
         conn.execute(
             "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
             rusqlite::params![session_id, frame_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         let edits = FrameMetadataEdits::default();
         let n = bulk_update_frame_metadata(&conn, &[frame_id], &edits).unwrap();
         assert_eq!(n, 0);
 
-        let sm_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM session_members WHERE frame_id = ?1", [frame_id], |r| r.get(0),
-        ).unwrap();
+        let sm_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_members WHERE frame_id = ?1",
+                [frame_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(sm_count, 1, "empty-edit calls must not cascade");
     }
 
@@ -4447,16 +4490,17 @@ mod bulk_metadata_tests {
         let rows = [
             "/old/A/foo.fits",
             "/old/A/sub/bar.fits",
-            "/old/A/sub/old/A/baz.fits", // ← repeated segment inside
+            "/old/A/sub/old/A/baz.fits",     // ← repeated segment inside
             "/old/Acme/leave_me_alone.fits", // ← prefix-of-prefix, must not match
-            "/other/quux.fits",          // ← unrelated
+            "/other/quux.fits",              // ← unrelated
         ];
         for p in rows {
             conn.execute(
                 "INSERT INTO files (path, filename, size, modified_at, format, created_at)
                  VALUES (?1, 'x.fits', 0, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
                 [p],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         let n = rename_files_path_prefix(&conn, "/old/A/", "/new/A/").unwrap();
@@ -4464,18 +4508,24 @@ mod bulk_metadata_tests {
 
         let collect = |sql: &str| -> Vec<String> {
             let mut stmt = conn.prepare(sql).unwrap();
-            stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().filter_map(|r| r.ok()).collect()
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
         };
         let paths = collect("SELECT path FROM files ORDER BY path");
-        assert_eq!(paths, vec![
-            "/new/A/foo.fits".to_string(),
-            "/new/A/sub/bar.fits".to_string(),
-            // The inner '/old/A/' segment is preserved — only the leading
-            // prefix was swapped. (REPLACE would have produced /new/A/sub/new/A/baz.fits.)
-            "/new/A/sub/old/A/baz.fits".to_string(),
-            "/old/Acme/leave_me_alone.fits".to_string(),
-            "/other/quux.fits".to_string(),
-        ]);
+        assert_eq!(
+            paths,
+            vec![
+                "/new/A/foo.fits".to_string(),
+                "/new/A/sub/bar.fits".to_string(),
+                // The inner '/old/A/' segment is preserved — only the leading
+                // prefix was swapped. (REPLACE would have produced /new/A/sub/new/A/baz.fits.)
+                "/new/A/sub/old/A/baz.fits".to_string(),
+                "/old/Acme/leave_me_alone.fits".to_string(),
+                "/other/quux.fits".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -4487,7 +4537,10 @@ mod bulk_metadata_tests {
         insert_frame(&conn, r"C:\data\Oldextra\c.fits", Some("Light"));
 
         let n = rename_files_path_prefix(&conn, r"C:\data\Old\", r"C:\data\New\").unwrap();
-        assert_eq!(n, 2, "both descendants rewired, sibling-prefix folder untouched");
+        assert_eq!(
+            n, 2,
+            "both descendants rewired, sibling-prefix folder untouched"
+        );
 
         let moved: i64 = conn
             .query_row(
@@ -4524,11 +4577,8 @@ mod bulk_metadata_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        conn.execute(
-            "UPDATE frames SET object = 'M42' WHERE id = ?1",
-            [frame_id],
-        )
-        .unwrap();
+        conn.execute("UPDATE frames SET object = 'M42' WHERE id = ?1", [frame_id])
+            .unwrap();
 
         // Pretend the FITS header was scanned with OBJECT="M42" and
         // IMAGETYP="Light" — matching the frame's stored fields, so any
@@ -4644,14 +4694,20 @@ mod bulk_metadata_tests {
             "INSERT INTO calibration_set (imagetyp, instrume, gain, binning, date)
              VALUES ('MasterFlat', 'CamA', 100.0, '1x1', '2026-01-01')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let cal_set_id: i64 = conn
-            .query_row("SELECT id FROM calibration_set ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM calibration_set ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
             rusqlite::params![cal_set_id, masterflat_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         // A LIGHT in another frame consumes this MasterFlat — the FK cascade
         // on calibration_set_to_frames.calibration_set_id should clean this
@@ -4672,13 +4728,24 @@ mod bulk_metadata_tests {
 
         // Calibration set is gone.
         let set_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM calibration_set WHERE id = ?1", [cal_set_id], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = ?1",
+                [cal_set_id],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(set_count, 0, "the empty MasterFlat calibration_set should have been pruned");
+        assert_eq!(
+            set_count, 0,
+            "the empty MasterFlat calibration_set should have been pruned"
+        );
 
         // Membership row gone.
         let member_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1", [cal_set_id], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set_frames WHERE set_id = ?1",
+                [cal_set_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(member_count, 0);
 
@@ -4686,10 +4753,14 @@ mod bulk_metadata_tests {
         let consumer_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM calibration_set_to_frames WHERE calibration_set_id = ?1",
-                [cal_set_id], |r| r.get(0),
+                [cal_set_id],
+                |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(consumer_count, 0, "consumer references should cascade-delete with the set");
+        assert_eq!(
+            consumer_count, 0,
+            "consumer references should cascade-delete with the set"
+        );
     }
 
     #[test]
@@ -4709,13 +4780,18 @@ mod bulk_metadata_tests {
             [],
         ).unwrap();
         let cal_set_id: i64 = conn
-            .query_row("SELECT id FROM calibration_set ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM calibration_set ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         for fid in [dark_a, dark_b] {
             conn.execute(
                 "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
                 rusqlite::params![cal_set_id, fid],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Reclassify dark_a → LIGHT.
@@ -4727,15 +4803,23 @@ mod bulk_metadata_tests {
 
         // Set still exists.
         let set_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM calibration_set WHERE id = ?1", [cal_set_id], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = ?1",
+                [cal_set_id],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(set_count, 1, "set with surviving members must NOT be pruned");
+        assert_eq!(
+            set_count, 1,
+            "set with surviving members must NOT be pruned"
+        );
 
         // dark_b membership intact.
         let surviving_member: i64 = conn
             .query_row(
                 "SELECT frame_id FROM calibration_set_frames WHERE set_id = ?1",
-                [cal_set_id], |r| r.get(0),
+                [cal_set_id],
+                |r| r.get(0),
             )
             .unwrap();
         assert_eq!(surviving_member, dark_b);
@@ -4768,7 +4852,11 @@ mod bulk_metadata_tests {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .unwrap();
-            assert_eq!(typ, "MasterDark", "input '{}' should normalize to MasterDark", input);
+            assert_eq!(
+                typ, "MasterDark",
+                "input '{}' should normalize to MasterDark",
+                input
+            );
             assert_eq!(is_master, 1, "input '{}' should set is_master=1", input);
         }
     }
@@ -4840,11 +4928,13 @@ mod bulk_metadata_tests {
         conn.execute(
             "UPDATE frames_set SET name = 'M42' WHERE id = (SELECT MIN(id) FROM frames_set)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
             rusqlite::params![session_id, light],
-        ).unwrap();
+        )
+        .unwrap();
 
         // dark → calibration_set member
         conn.execute(
@@ -4853,12 +4943,17 @@ mod bulk_metadata_tests {
             [],
         ).unwrap();
         let cal_set_id: i64 = conn
-            .query_row("SELECT id FROM calibration_set ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM calibration_set ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
             rusqlite::params![cal_set_id, dark],
-        ).unwrap();
+        )
+        .unwrap();
 
         // light → consumer of cal_set_id (as Dark)
         conn.execute(
@@ -4883,7 +4978,9 @@ mod bulk_metadata_tests {
 
         assert_eq!(summary.calibration_set_consumer.len(), 1);
         assert_eq!(
-            summary.calibration_set_consumer[0].calibration_type.as_deref(),
+            summary.calibration_set_consumer[0]
+                .calibration_type
+                .as_deref(),
             Some("Dark")
         );
         assert_eq!(summary.calibration_set_consumer[0].selected_count, 1);
@@ -4910,20 +5007,27 @@ mod bulk_metadata_tests {
         conn.execute(
             "INSERT INTO session_members (session_id, frame_id) VALUES (?1, ?2)",
             rusqlite::params![session_id, f1],
-        ).unwrap();
+        )
+        .unwrap();
 
         // f2: member of a calibration set + consumer of one.
         conn.execute(
             "INSERT INTO calibration_set (imagetyp, date) VALUES ('Dark', '2026-01-01')",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let set_id: i64 = conn
-            .query_row("SELECT id FROM calibration_set ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM calibration_set ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
             rusqlite::params![set_id, f2],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO calibration_set_to_frames (source_id, source_type, calibration_set_id, calibration_type)
              VALUES (?1, 'frame', ?2, 'Dark')",
@@ -4934,7 +5038,10 @@ mod bulk_metadata_tests {
         assert_eq!(rel.calibration_set_member_count, 1);
         assert_eq!(rel.calibration_set_consumer_count, 1);
         assert_eq!(rel.session_member_count, 1);
-        assert_eq!(rel.affected_frame_count, 2, "f1 and f2 are both linked somewhere");
+        assert_eq!(
+            rel.affected_frame_count, 2,
+            "f1 and f2 are both linked somewhere"
+        );
     }
 
     /// The metadata pane's revert button must be able to clear a user-typed
@@ -4957,7 +5064,9 @@ mod bulk_metadata_tests {
         let n = bulk_update_frame_metadata(&conn, &[id], &set_edits).unwrap();
         assert_eq!(n, 1, "set xpixsz should update 1 row");
         let stored: Option<f64> = conn
-            .query_row("SELECT xpixsz FROM frames WHERE id = ?1", [id], |r| r.get(0))
+            .query_row("SELECT xpixsz FROM frames WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(stored, Some(3.76), "xpixsz must be set after the edit");
 
@@ -4969,7 +5078,9 @@ mod bulk_metadata_tests {
         let n = bulk_update_frame_metadata(&conn, &[id], &clear_edits).unwrap();
         assert_eq!(n, 1, "clear xpixsz should update 1 row");
         let stored: Option<f64> = conn
-            .query_row("SELECT xpixsz FROM frames WHERE id = ?1", [id], |r| r.get(0))
+            .query_row("SELECT xpixsz FROM frames WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(stored.is_none(), "xpixsz must be NULL after the revert");
 
@@ -4978,17 +5089,28 @@ mod bulk_metadata_tests {
         let conn2 = Connection::open_in_memory().unwrap();
         init_db(&conn2).unwrap();
         let id2 = insert_frame(&conn2, "/x/b.fits", Some("Light"));
-        bulk_update_frame_metadata(&conn2, &[id2], &FrameMetadataEdits {
-            xpixsz: Some(Some(2.5)),
-            ..Default::default()
-        }).unwrap();
+        bulk_update_frame_metadata(
+            &conn2,
+            &[id2],
+            &FrameMetadataEdits {
+                xpixsz: Some(Some(2.5)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let no_edit = FrameMetadataEdits::default(); // every field is the outer None
         let n = bulk_update_frame_metadata(&conn2, &[id2], &no_edit).unwrap();
         assert_eq!(n, 0, "default edits (all outer None) must be a no-op");
         let stored: Option<f64> = conn2
-            .query_row("SELECT xpixsz FROM frames WHERE id = ?1", [id2], |r| r.get(0))
+            .query_row("SELECT xpixsz FROM frames WHERE id = ?1", [id2], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(stored, Some(2.5), "no-edit must NOT clear the previously-set value");
+        assert_eq!(
+            stored,
+            Some(2.5),
+            "no-edit must NOT clear the previously-set value"
+        );
     }
 
     /// Wire-format check: confirm the custom serde deserializer distinguishes
@@ -5021,17 +5143,36 @@ mod bulk_metadata_tests {
         // as missing metadata for LIGHT frames.
         let frame_id = insert_frame(&conn, "/x/missing_obj.fits", Some("Light"));
         let file_id: i64 = conn
-            .query_row("SELECT file_id FROM frames WHERE id = ?1", [frame_id], |r| r.get(0))
+            .query_row(
+                "SELECT file_id FROM frames WHERE id = ?1",
+                [frame_id],
+                |r| r.get(0),
+            )
             .unwrap();
 
         let rows = get_frames_with_missing_metadata(&conn, "object").unwrap();
         assert_eq!(rows.len(), 1, "expected exactly one missing-object row");
         let row = &rows[0];
-        assert!(row.file.uuid.is_some(), "file.uuid must be populated by the identity trigger");
-        assert!(row.file.updated_at.is_some(), "file.updated_at must be populated by the identity trigger");
-        assert!(row.frame.uuid.is_some(), "frame.uuid must be populated by the identity trigger");
-        assert!(row.frame.updated_at.is_some(), "frame.updated_at must be populated by the identity trigger");
-        assert!(!row.has_duplicate, "no duplicate_group_files row exists for this file");
+        assert!(
+            row.file.uuid.is_some(),
+            "file.uuid must be populated by the identity trigger"
+        );
+        assert!(
+            row.file.updated_at.is_some(),
+            "file.updated_at must be populated by the identity trigger"
+        );
+        assert!(
+            row.frame.uuid.is_some(),
+            "frame.uuid must be populated by the identity trigger"
+        );
+        assert!(
+            row.frame.updated_at.is_some(),
+            "frame.updated_at must be populated by the identity trigger"
+        );
+        assert!(
+            !row.has_duplicate,
+            "no duplicate_group_files row exists for this file"
+        );
         assert_eq!(row.file.id, Some(file_id));
         assert_eq!(row.frame.id, Some(frame_id));
 
@@ -5042,8 +5183,14 @@ mod bulk_metadata_tests {
         let excluded = get_excluded_frames_with_metadata(&conn).unwrap();
         assert_eq!(excluded.len(), 1);
         let ex = &excluded[0];
-        assert_eq!(ex.reason, "test-reason", "reason must read from its shifted index");
-        assert!(!ex.excluded_at.is_empty(), "excluded_at must read from its shifted index");
+        assert_eq!(
+            ex.reason, "test-reason",
+            "reason must read from its shifted index"
+        );
+        assert!(
+            !ex.excluded_at.is_empty(),
+            "excluded_at must read from its shifted index"
+        );
         assert!(ex.file.uuid.is_some());
         assert!(ex.frame.uuid.is_some());
         assert!(!ex.has_duplicate);
@@ -5166,7 +5313,10 @@ mod path_prefix_range_tests {
         insert_file(&conn, "/data/x\u{450}/g.fits");
 
         let n = rename_files_path_prefix(&conn, "/data/x\u{ff}", "/data/RENAMED").unwrap();
-        assert_eq!(n, 1, "only the file under the /data/x\\u{{ff}} prefix should be renamed");
+        assert_eq!(
+            n, 1,
+            "only the file under the /data/x\\u{{ff}} prefix should be renamed"
+        );
 
         let mut paths = all_paths(&conn);
         paths.sort();
@@ -5192,7 +5342,9 @@ mod path_prefix_range_tests {
     }
 
     fn all_paths(conn: &Connection) -> Vec<String> {
-        let mut stmt = conn.prepare("SELECT path FROM files ORDER BY path").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT path FROM files ORDER BY path")
+            .unwrap();
         stmt.query_map([], |r| r.get::<_, String>(0))
             .unwrap()
             .filter_map(|r| r.ok())
@@ -5252,7 +5404,11 @@ mod path_prefix_range_tests {
         conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/M31_Ha')", [])
             .unwrap();
         let root_id: i64 = conn
-            .query_row("SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         insert_file(&conn, "/data/M31_Ha/a.fits");
         insert_file(&conn, "/data/M31XHa/b.fits");
@@ -5456,7 +5612,11 @@ mod path_prefix_range_tests {
         )
         .unwrap();
         let root_id: i64 = conn
-            .query_row("SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
 
         // Four files under the root (all get their instrume suffixed) plus the
@@ -5513,8 +5673,13 @@ mod path_prefix_range_tests {
             [],
         )
         .unwrap();
-        for (set_id, frame_id) in [(700i64, 901i64), (701, 911), (702, 921), (703, 941), (705, 951)]
-        {
+        for (set_id, frame_id) in [
+            (700i64, 901i64),
+            (701, 911),
+            (702, 921),
+            (703, 941),
+            (705, 951),
+        ] {
             conn.execute(
                 "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (?1, ?2)",
                 params![set_id, frame_id],
@@ -5563,14 +5728,22 @@ mod path_prefix_range_tests {
             .expect("reconcile must not trip over master provenance references");
 
         // The rename committed — the savepoint was not rolled back.
-        assert_eq!(result.frames_renamed, 4, "every frame under the root is renamed");
+        assert_eq!(
+            result.frames_renamed, 4,
+            "every frame under the root is renamed"
+        );
         let renamed: String = conn
-            .query_row("SELECT instrume FROM frames WHERE id = 901", [], |r| r.get(0))
+            .query_row("SELECT instrume FROM frames WHERE id = 901", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(renamed, format!("CAM N{root_id}"));
 
         // Lineage survives; the plain raw set is the only casualty.
-        assert_eq!(result.calibration_sets_deleted, 1, "only the lineage-free set is deleted");
+        assert_eq!(
+            result.calibration_sets_deleted, 1,
+            "only the lineage-free set is deleted"
+        );
         let surviving: Vec<i64> = {
             let mut stmt = conn
                 .prepare("SELECT id FROM calibration_set ORDER BY id")
@@ -5604,7 +5777,11 @@ mod path_prefix_range_tests {
             .unwrap();
         assert_eq!(prov, 1, "the provenance row must survive");
         let ops: i64 = conn
-            .query_row("SELECT COUNT(*) FROM archive_operations WHERE id = 800", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM archive_operations WHERE id = 800",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(ops, 1, "the archive audit row must not be CASCADE-dropped");
 
@@ -5619,7 +5796,10 @@ mod path_prefix_range_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(sub_link, 1, "the master's sub-calibration link must survive");
+        assert_eq!(
+            sub_link, 1,
+            "the master's sub-calibration link must survive"
+        );
 
         // BY DESIGN, unchanged by this fix: the trailing per-frame link cleanup
         // is unconditional on the target set, so a light under the root loses
@@ -5636,7 +5816,10 @@ mod path_prefix_range_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(light_link, 0, "per-frame links under the root are cleared wholesale");
+        assert_eq!(
+            light_link, 0,
+            "per-frame links under the root are cleared wholesale"
+        );
     }
 
     #[test]
@@ -5654,7 +5837,11 @@ mod path_prefix_range_tests {
         conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/darks')", [])
             .unwrap();
         let root_id: i64 = conn
-            .query_row("SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM scan_roots ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO files (id, path, filename, size, modified_at, format, created_at)
@@ -5706,21 +5893,33 @@ mod path_prefix_range_tests {
 
         // The root's file + frame are gone.
         let files_left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM files WHERE id = 900", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM files WHERE id = 900", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(files_left, 0, "the root's file must be deleted");
         let frames_left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM frames WHERE id = 901", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM frames WHERE id = 901", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(frames_left, 0, "the root's frame must be deleted");
 
         // Lineage survives as empty shells, provenance intact.
         let raw: i64 = conn
-            .query_row("SELECT COUNT(*) FROM calibration_set WHERE id = 600", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 600",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(raw, 1, "the superseded raw set shell must survive");
         let master: i64 = conn
-            .query_row("SELECT COUNT(*) FROM calibration_set WHERE id = 601", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 601",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(master, 1, "the master set must survive");
         let prov: i64 = conn
@@ -5745,10 +5944,16 @@ mod path_prefix_range_tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
-        conn.execute("INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/RootA', 1)", [])
-            .unwrap();
-        conn.execute("INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/RootB', 0)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/RootA', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/RootB', 0)",
+            [],
+        )
+        .unwrap();
 
         // Duplicate pair under the eligible root.
         for (p, fname) in [
@@ -5775,25 +5980,38 @@ mod path_prefix_range_tests {
 
         // Site 1427 (find_duplicate_groups).
         let groups = find_duplicate_groups(&conn, true).unwrap();
-        assert_eq!(groups.len(), 1, "only the RootA duplicate pair should be found");
+        assert_eq!(
+            groups.len(),
+            1,
+            "only the RootA duplicate pair should be found"
+        );
         assert_eq!(groups[0].content_hash, "HASH1");
         let mut found_paths = groups[0].file_paths.clone();
         found_paths.sort();
         assert_eq!(
             found_paths,
-            vec!["/data/RootA/dup1.fits".to_string(), "/data/RootA/dup2.fits".to_string()]
+            vec![
+                "/data/RootA/dup1.fits".to_string(),
+                "/data/RootA/dup2.fits".to_string()
+            ]
         );
 
         // Sites 1580 + 1614 (rebuild_duplicate_groups_cache, main query + per-group files query).
         let created = rebuild_duplicate_groups_cache(&conn, true).unwrap();
-        assert_eq!(created, 1, "cache rebuild should also find exactly the RootA group");
+        assert_eq!(
+            created, 1,
+            "cache rebuild should also find exactly the RootA group"
+        );
         let cached = get_cached_duplicates(&conn, true).unwrap();
         assert_eq!(cached.len(), 1);
         let mut cached_paths = cached[0].file_paths.clone();
         cached_paths.sort();
         assert_eq!(
             cached_paths,
-            vec!["/data/RootA/dup1.fits".to_string(), "/data/RootA/dup2.fits".to_string()]
+            vec![
+                "/data/RootA/dup1.fits".to_string(),
+                "/data/RootA/dup2.fits".to_string()
+            ]
         );
     }
 
@@ -5874,7 +6092,10 @@ mod path_prefix_range_tests {
         }
 
         let groups = find_duplicate_groups(&conn, true).unwrap();
-        assert!(groups.is_empty(), "no scan root is eligible, so nothing should match");
+        assert!(
+            groups.is_empty(),
+            "no scan root is eligible, so nothing should match"
+        );
 
         let created = rebuild_duplicate_groups_cache(&conn, true).unwrap();
         assert_eq!(created, 0, "cache rebuild should likewise find no groups");
@@ -5914,7 +6135,10 @@ mod path_prefix_range_tests {
 
         let astro = get_files_by_directory(&conn, "/data/Astro", None).unwrap();
         assert_eq!(
-            astro.iter().map(|(f, _)| f.path.clone()).collect::<Vec<_>>(),
+            astro
+                .iter()
+                .map(|(f, _)| f.path.clone())
+                .collect::<Vec<_>>(),
             vec!["/data/Astro/a.fits".to_string()],
             "case-differing sibling /data/astro must not be swept in"
         );
@@ -5938,7 +6162,10 @@ mod path_prefix_range_tests {
 
         let astro = get_files_by_directory_for_camera(&conn, "/data/Astro", "CamA", None).unwrap();
         assert_eq!(
-            astro.iter().map(|(f, _)| f.path.clone()).collect::<Vec<_>>(),
+            astro
+                .iter()
+                .map(|(f, _)| f.path.clone())
+                .collect::<Vec<_>>(),
             vec!["/data/Astro/a.fits".to_string()],
             "case-differing sibling /data/astro must not be swept in"
         );
@@ -6135,7 +6362,10 @@ mod fingerprint_backfill_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(nulls, 0, "init_db self-heal should leave no NULL fingerprints");
+        assert_eq!(
+            nulls, 0,
+            "init_db self-heal should leave no NULL fingerprints"
+        );
     }
 }
 
@@ -6190,7 +6420,11 @@ mod savepoint_migration_tests {
         outer.commit().unwrap();
 
         let instrume: String = conn
-            .query_row("SELECT instrume FROM frames WHERE file_id = ?1", [file_id], |r| r.get(0))
+            .query_row(
+                "SELECT instrume FROM frames WHERE file_id = ?1",
+                [file_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(
             instrume,
@@ -6223,10 +6457,17 @@ mod savepoint_migration_tests {
             .expect("SAVEPOINT must nest inside an already-open outer transaction, not error with 'cannot start a transaction within a transaction'");
         outer.commit().unwrap();
 
-        let root_count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0)).unwrap();
+        let root_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(root_count, 0, "the scan root row must have been deleted");
-        let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0)).unwrap();
-        assert_eq!(file_count, 0, "files under the deleted root must have cascaded away");
+        let file_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            file_count, 0,
+            "files under the deleted root must have cascaded away"
+        );
     }
 
     #[test]
@@ -6234,9 +6475,15 @@ mod savepoint_migration_tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
-        conn.execute("INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/Root', 1)", [])
-            .unwrap();
-        for (p, fname) in [("/data/Root/a.fits", "a.fits"), ("/data/Root/b.fits", "b.fits")] {
+        conn.execute(
+            "INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/Root', 1)",
+            [],
+        )
+        .unwrap();
+        for (p, fname) in [
+            ("/data/Root/a.fits", "a.fits"),
+            ("/data/Root/b.fits", "b.fits"),
+        ] {
             conn.execute(
                 "INSERT INTO files (path, filename, size, modified_at, format, created_at, content_hash)
                  VALUES (?1, ?2, 100, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z', 'HASH1')",
@@ -6252,7 +6499,11 @@ mod savepoint_migration_tests {
             .expect("SAVEPOINT must nest inside an already-open outer transaction, not error with 'cannot start a transaction within a transaction'");
         outer.commit().unwrap();
 
-        assert_eq!(result.unwrap(), 1, "the one duplicate pair should have produced one cached group");
+        assert_eq!(
+            result.unwrap(),
+            1,
+            "the one duplicate pair should have produced one cached group"
+        );
         let cached = get_cached_duplicates(&conn, true).unwrap();
         assert_eq!(cached.len(), 1);
     }
@@ -6264,8 +6515,11 @@ mod savepoint_migration_tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
 
-        conn.execute("INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/Root', 1)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data/Root', 1)",
+            [],
+        )
+        .unwrap();
 
         // Pre-existing cache row (same hash_type the call below will target)
         // so we can prove the guard's rollback restores it after the
@@ -6305,7 +6559,9 @@ mod savepoint_migration_tests {
         );
 
         let groups: Vec<(String, i64)> = {
-            let mut stmt = conn.prepare("SELECT hash, size FROM duplicate_groups").unwrap();
+            let mut stmt = conn
+                .prepare("SELECT hash, size FROM duplicate_groups")
+                .unwrap();
             stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
                 .unwrap()
                 .filter_map(|r| r.ok())
@@ -6318,9 +6574,14 @@ mod savepoint_migration_tests {
         );
 
         let link_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM duplicate_group_files", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM duplicate_group_files", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(link_count, 0, "no duplicate_group_files rows from the failed pass should remain");
+        assert_eq!(
+            link_count, 0,
+            "no duplicate_group_files rows from the failed pass should remain"
+        );
     }
 
     // -- category 3: guard unit test — drop-without-commit vs. commit ----------
@@ -6335,13 +6596,23 @@ mod savepoint_migration_tests {
         {
             let sp = SavepointGuard::new(&conn, "test_guard_drop").unwrap();
             conn.execute("DELETE FROM scan_roots", []).unwrap();
-            let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0)).unwrap();
-            assert_eq!(count, 0, "the delete should be visible inside the open savepoint");
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "the delete should be visible inside the open savepoint"
+            );
             drop(sp); // no commit() — Drop must ROLLBACK TO + RELEASE
         }
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 1, "dropping the guard without commit() must roll back the delete");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "dropping the guard without commit() must roll back the delete"
+        );
     }
 
     #[test]
@@ -6355,8 +6626,13 @@ mod savepoint_migration_tests {
         conn.execute("DELETE FROM scan_roots", []).unwrap();
         sp.commit().unwrap();
 
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 0, "commit() must persist the delete past the savepoint");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "commit() must persist the delete past the savepoint"
+        );
     }
 }
 
@@ -6384,9 +6660,8 @@ pub fn find_files_by_content_hashes(
             .take(chunk.len())
             .collect::<Vec<_>>()
             .join(",");
-        let sql = format!(
-            "SELECT content_hash, path FROM files WHERE content_hash IN ({placeholders})"
-        );
+        let sql =
+            format!("SELECT content_hash, path FROM files WHERE content_hash IN ({placeholders})");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
             rusqlite::params_from_iter(chunk.iter().map(|s| s.as_str())),
@@ -6413,15 +6688,22 @@ mod scan_root_kind_tests {
     fn upsert_scan_root_stores_kind() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        let id = crate::db::upsert_scan_root(&conn, "/data/library", "calibration_library").unwrap();
-        let kind: String = conn.query_row(
-            "SELECT kind FROM scan_roots WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        let id =
+            crate::db::upsert_scan_root(&conn, "/data/library", "calibration_library").unwrap();
+        let kind: String = conn
+            .query_row("SELECT kind FROM scan_roots WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(kind, "calibration_library");
         // Upserting an existing path must NOT silently flip its kind.
         let id2 = crate::db::upsert_scan_root(&conn, "/data/library", "normal").unwrap();
         assert_eq!(id, id2);
-        let kind: String = conn.query_row(
-            "SELECT kind FROM scan_roots WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        let kind: String = conn
+            .query_row("SELECT kind FROM scan_roots WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(kind, "calibration_library");
     }
 

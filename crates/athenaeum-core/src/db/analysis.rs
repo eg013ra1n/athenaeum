@@ -1,5 +1,5 @@
-use rusqlite::{params, Connection, Result};
 use crate::models::{FrameAnalysis, StarMetric};
+use rusqlite::{params, Connection, Result};
 
 /// Insert or replace frame analysis results (keyed by frame_id via UNIQUE constraint).
 pub fn upsert_frame_analysis(conn: &Connection, a: &FrameAnalysis) -> Result<i64> {
@@ -47,7 +47,7 @@ pub fn get_frame_analysis(conn: &Connection, frame_id: i64) -> Result<Option<Fra
                 background, noise, detection_threshold, width, height,
                 source_channels, trail_r_squared, possibly_trailed,
                 median_beta, quality_score, config_hash, analyzed_at
-         FROM frame_analysis WHERE frame_id = ?1"
+         FROM frame_analysis WHERE frame_id = ?1",
     )?;
 
     let mut rows = stmt.query_map(params![frame_id], row_to_analysis)?;
@@ -59,7 +59,10 @@ pub fn get_frame_analysis(conn: &Connection, frame_id: i64) -> Result<Option<Fra
 }
 
 /// Get analyses for multiple frame IDs.
-pub fn get_frame_analyses_by_ids(conn: &Connection, frame_ids: &[i64]) -> Result<Vec<FrameAnalysis>> {
+pub fn get_frame_analyses_by_ids(
+    conn: &Connection,
+    frame_ids: &[i64],
+) -> Result<Vec<FrameAnalysis>> {
     if frame_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -76,7 +79,10 @@ pub fn get_frame_analyses_by_ids(conn: &Connection, frame_ids: &[i64]) -> Result
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::types::ToSql> = frame_ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+    let params: Vec<&dyn rusqlite::types::ToSql> = frame_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::types::ToSql)
+        .collect();
     let rows = stmt.query_map(params.as_slice(), row_to_analysis)?;
 
     let mut results = Vec::new();
@@ -87,7 +93,10 @@ pub fn get_frame_analyses_by_ids(conn: &Connection, frame_ids: &[i64]) -> Result
 }
 
 /// Get all analyses for frames belonging to a frame set.
-pub fn get_frame_analyses_for_frame_set(conn: &Connection, frame_set_id: i64) -> Result<Vec<FrameAnalysis>> {
+pub fn get_frame_analyses_for_frame_set(
+    conn: &Connection,
+    frame_set_id: i64,
+) -> Result<Vec<FrameAnalysis>> {
     let mut stmt = conn.prepare(
         "SELECT fa.id, fa.frame_id, fa.file_id, fa.stars_detected, fa.median_fwhm, fa.median_eccentricity,
                 fa.median_snr, fa.median_hfr, fa.frame_snr, fa.snr_weight, fa.psf_signal,
@@ -109,35 +118,13 @@ pub fn get_frame_analyses_for_frame_set(conn: &Connection, frame_set_id: i64) ->
     Ok(results)
 }
 
-/// Delete analysis for a single frame.
-pub fn delete_frame_analysis(conn: &Connection, frame_id: i64) -> Result<usize> {
-    conn.execute("DELETE FROM frame_analysis WHERE frame_id = ?1", params![frame_id])
-}
-
-/// Delete all analyses for frames in a frame set.
-pub fn delete_analyses_for_frame_set(conn: &Connection, frame_set_id: i64) -> Result<usize> {
-    conn.execute(
-        "DELETE FROM frame_analysis WHERE frame_id IN (
-            SELECT sm.frame_id FROM session_members sm
-            INNER JOIN sessions s ON s.id = sm.session_id
-            INNER JOIN imaging_nights n ON n.id = s.imaging_night_id
-            WHERE n.frames_set_id = ?1
-        )",
-        params![frame_set_id],
-    )
-}
-
-/// Clean up orphaned analyses where the file no longer exists.
-pub fn delete_analyses_for_missing_files(conn: &Connection) -> Result<usize> {
-    conn.execute(
-        "DELETE FROM frame_analysis WHERE file_id NOT IN (SELECT id FROM files)",
-        [],
-    )
-}
-
 /// Bulk-insert star metrics for a frame analysis.
 /// Deletes any existing stars for this analysis_id first, then inserts all new ones.
-pub fn upsert_star_metrics(conn: &Connection, analysis_id: i64, stars: &[StarMetric]) -> Result<()> {
+pub fn upsert_star_metrics(
+    conn: &Connection,
+    analysis_id: i64,
+    stars: &[StarMetric],
+) -> Result<()> {
     conn.execute(
         "DELETE FROM star_metrics WHERE frame_analysis_id = ?1",
         params![analysis_id],
@@ -147,13 +134,26 @@ pub fn upsert_star_metrics(conn: &Connection, analysis_id: i64, stars: &[StarMet
         "INSERT INTO star_metrics (
             frame_analysis_id, x, y, peak, flux, fwhm, fwhm_x, fwhm_y,
             eccentricity, snr, hfr, theta, beta, fit_method, fit_residual
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
     )?;
 
     for s in stars {
         stmt.execute(params![
-            analysis_id, s.x, s.y, s.peak, s.flux, s.fwhm, s.fwhm_x, s.fwhm_y,
-            s.eccentricity, s.snr, s.hfr, s.theta, s.beta, s.fit_method, s.fit_residual,
+            analysis_id,
+            s.x,
+            s.y,
+            s.peak,
+            s.flux,
+            s.fwhm,
+            s.fwhm_x,
+            s.fwhm_y,
+            s.eccentricity,
+            s.snr,
+            s.hfr,
+            s.theta,
+            s.beta,
+            s.fit_method,
+            s.fit_residual,
         ])?;
     }
     Ok(())
@@ -164,7 +164,7 @@ pub fn get_star_metrics(conn: &Connection, analysis_id: i64) -> Result<Vec<StarM
     let mut stmt = conn.prepare(
         "SELECT id, frame_analysis_id, x, y, peak, flux, fwhm, fwhm_x, fwhm_y,
                 eccentricity, snr, hfr, theta, beta, fit_method, fit_residual
-         FROM star_metrics WHERE frame_analysis_id = ?1"
+         FROM star_metrics WHERE frame_analysis_id = ?1",
     )?;
 
     let rows = stmt.query_map(params![analysis_id], |row| {
@@ -203,7 +203,7 @@ pub fn get_star_metrics_by_frame_id(conn: &Connection, frame_id: i64) -> Result<
                 sm.hfr, sm.theta, sm.beta, sm.fit_method, sm.fit_residual
          FROM star_metrics sm
          INNER JOIN frame_analysis fa ON fa.id = sm.frame_analysis_id
-         WHERE fa.frame_id = ?1"
+         WHERE fa.frame_id = ?1",
     )?;
 
     let rows = stmt.query_map(params![frame_id], |row| {

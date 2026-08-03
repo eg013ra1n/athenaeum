@@ -17,7 +17,9 @@ pub fn calculate_fov(
     _binning: Option<i32>,
 ) -> Option<f64> {
     match (pixel_size_um, focal_length_mm, naxis) {
-        (Some(pixel_size), Some(focal_len), Some(sensor_pixels)) if focal_len > 0.0 && sensor_pixels > 0 => {
+        (Some(pixel_size), Some(focal_len), Some(sensor_pixels))
+            if focal_len > 0.0 && sensor_pixels > 0 =>
+        {
             // Convert pixel size from micrometers to millimeters
             let pixel_size_mm = pixel_size / 1000.0;
 
@@ -32,45 +34,6 @@ pub fn calculate_fov(
             Some(fov_degrees)
         }
         _ => None,
-    }
-}
-
-/// Calculate angular distance between two points on the celestial sphere
-///
-/// # Arguments
-/// * `ra1_deg` - Right Ascension of point 1 in degrees
-/// * `dec1_deg` - Declination of point 1 in degrees
-/// * `ra2_deg` - Right Ascension of point 2 in degrees
-/// * `dec2_deg` - Declination of point 2 in degrees
-///
-/// # Returns
-/// Angular distance in degrees
-#[allow(dead_code)]
-pub fn angular_distance(ra1_deg: f64, dec1_deg: f64, ra2_deg: f64, dec2_deg: f64) -> f64 {
-    crate::coordinates::angular_distance(ra1_deg, dec1_deg, ra2_deg, dec2_deg)
-}
-
-/// Format byte count into human-readable format
-///
-/// # Arguments
-/// * `bytes` - Number of bytes
-///
-/// # Returns
-/// Formatted string (e.g., "1.23 GB", "456.78 MB", "789 KB", "123 bytes")
-#[allow(dead_code)]
-pub fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} bytes", bytes)
     }
 }
 
@@ -92,26 +55,5 @@ mod tests {
         assert_eq!(calculate_fov(None, Some(200.0), Some(4144), Some(1)), None);
         assert_eq!(calculate_fov(Some(4.63), None, Some(4144), Some(1)), None);
         assert_eq!(calculate_fov(Some(4.63), Some(200.0), None, Some(1)), None);
-    }
-
-    #[test]
-    fn test_angular_distance() {
-        // Test with known values (0.5 degrees apart)
-        let dist = angular_distance(0.0, 0.0, 0.5, 0.0);
-        assert!((dist - 0.5).abs() < 0.0001);
-
-        // Test with same point
-        let dist = angular_distance(123.456, 45.678, 123.456, 45.678);
-        assert!(dist.abs() < 0.0001);
-    }
-
-    #[test]
-    fn test_format_bytes() {
-        assert_eq!(format_bytes(0), "0 bytes");
-        assert_eq!(format_bytes(512), "512 bytes");
-        assert_eq!(format_bytes(1024), "1.00 KB");
-        assert_eq!(format_bytes(1536), "1.50 KB");
-        assert_eq!(format_bytes(1048576), "1.00 MB");
-        assert_eq!(format_bytes(1073741824), "1.00 GB");
     }
 }
