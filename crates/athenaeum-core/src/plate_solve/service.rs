@@ -16,7 +16,6 @@ use astroimage::platesolving::{SolveHints, WcsSolution};
 use crate::models::Frame;
 use crate::plate_solve::config::PlateSolveConfig;
 use crate::plate_solve::dso_lookup::DsoCatalog;
-use crate::plate_solve::gate_audit::GateStage;
 use crate::plate_solve::hints::{extract_hints, observation_epoch};
 use crate::plate_solve::storage::{
     insert_plate_solve, update_frame_from_solve, update_frame_object_if_missing, PlateSolveRecord,
@@ -266,9 +265,9 @@ pub fn solve_frame_with_hints(
         }
     };
     let bright_mag_limit = 12.0_f32; // mirrors VERIFY_MAG_LIMIT in orchestrate.rs
-    // Representative catalog for the bright-star FOV count: the legacy deep
-    // cache, or — for an additive tier stack — the base layer (all bright stars
-    // brighter than `bright_mag_limit` live in the brightest/base tier).
+                                     // Representative catalog for the bright-star FOV count: the legacy deep
+                                     // cache, or — for an additive tier stack — the base layer (all bright stars
+                                     // brighter than `bright_mag_limit` live in the brightest/base tier).
     let count_bright_in_fov = |c: &StarCache| {
         c.cone(
             solution.wcs.crval.0,
@@ -486,12 +485,21 @@ pub fn store_result(
                     "labelled frame from solved position"
                 ),
                 Ok(false) => {}
-                Err(e) => tracing::warn!(frame_id, error = %e, "failed to update frame.object after solve"),
+                Err(e) => {
+                    tracing::warn!(frame_id, error = %e, "failed to update frame.object after solve")
+                }
             }
         }
     }
 
     Ok(StoreOutcome::Persisted)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GateStage {
+    Hinted,
+    ScaleCleared,
+    FullBlind,
 }
 
 #[derive(Clone, Debug)]
@@ -567,11 +575,6 @@ pub(crate) fn adaptive_tol_px(pixel_scale_arcsec: f64, base_arcsec: f64) -> f64 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn gate_audit_disabled_is_zero_behaviour_change() {
-        assert!(!crate::plate_solve::gate_audit::enabled());
-    }
 
     fn mk_result(matched: usize, expected: usize, ratio: f64, scale: f64, rms: f64) -> SolveResult {
         SolveResult {
@@ -710,16 +713,17 @@ mod tests {
         let defocused = mk_result(10, 800, 0.070, 0.48, 2.35);
 
         // Default gate (floor now 6): the correct-but-sparse solve PERSISTS.
-        let out =
-            store_result(&conn, 1, &defocused, None, &PlateSolveConfig::default()).unwrap();
+        let out = store_result(&conn, 1, &defocused, None, &PlateSolveConfig::default()).unwrap();
         assert!(
             matches!(out, StoreOutcome::Persisted),
             "defocused-but-correct solve (10 inliers, ratio 0.070) must persist"
         );
         let ps: i64 = conn
-            .query_row("SELECT COUNT(*) FROM plate_solves WHERE frame_id=1", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM plate_solves WHERE frame_id=1",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(ps, 1, "must write a plate_solves row");
 

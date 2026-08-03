@@ -1,7 +1,6 @@
 pub mod config;
 pub mod dso_lookup;
 pub mod failure;
-pub mod gate_audit;
 pub mod hints;
 pub mod layers;
 pub mod object_fill;
