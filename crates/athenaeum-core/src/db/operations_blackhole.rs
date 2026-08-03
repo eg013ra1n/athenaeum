@@ -263,11 +263,27 @@ pub fn remove_from_black_hole(conn: &Connection, file_id: i64) -> Result<()> {
 ///
 /// Catalog first, disk second — the same stance as `api::masters::delete_master`
 /// — and every catalog write (the master unregister of
-/// [`unregister_master_if_any`] included) is one savepoint. A crash between the
-/// two halves leaves an orphan file on disk, which a later scan simply
-/// re-ingests; it can never leave a catalog row pointing at a file that is gone
-/// forever, nor a half-rewired calibration lineage. The savepoint nests, so this
-/// composes inside a caller's transaction.
+/// [`unregister_master_if_any`] included) is one savepoint, so the lineage can
+/// never end up half-rewired.
+///
+/// **Autocommit callers** (every caller today) get the full guarantee: the
+/// catalog rows are durable before the unlink is attempted, so a crash between
+/// the two halves leaves an orphan file on disk — which a later scan simply
+/// re-ingests — never a catalog row pointing at a file that is gone forever.
+///
+/// **Callers holding an outer transaction** get atomicity but NOT that
+/// guarantee, and take on an obligation: the savepoint nests (a `RELEASE`, not
+/// a durable commit) while the unlink happens unconditionally right after, so
+/// rolling the outer transaction back once this has returned `Ok` restores a
+/// `files` row whose file is already gone — the one outcome this ordering
+/// exists to prevent. Do not roll back after an `Ok` from this function.
+///
+/// `Err` has two shapes. A failure *before* `sp.commit()` (path lookup,
+/// unregister, either DELETE) rolls the savepoint back: nothing changed, on
+/// disk or in the catalog. A failure of the **unlink** — the only step after
+/// the commit — arrives with the catalog rows ALREADY gone and not restorable;
+/// the file survives on disk, the mismatch is logged at `error!`, and callers
+/// (retention, the Void UI) can surface it but cannot undo it.
 pub fn send_to_void(conn: &Connection, file_id: i64) -> Result<()> {
     // Get file path before deletion
     let path: String = conn.query_row(
@@ -847,6 +863,61 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM black_hole", [], |r| r.get(0))
             .unwrap();
         assert_eq!(bh, 0);
+    }
+
+    /// The ordering itself, pinned: catalog rows are committed BEFORE the disk
+    /// delete is attempted, so a failing unlink leaves the catalog already
+    /// clean (audit I3). Without this, a refactor back to disk-first would keep
+    /// every other test in this module green.
+    ///
+    /// The forced failure is portable: `path` points at a real *directory*, so
+    /// `Path::exists()` is true (the unlink is attempted, not skipped) while
+    /// `remove_file` fails — EISDIR on unix, "Access is denied" on Windows — on
+    /// any platform and without root, a permissions fixture would not.
+    #[test]
+    fn send_to_void_commits_catalog_before_the_disk_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let as_dir = dir.path().join("not_a_file");
+        std::fs::create_dir(&as_dir).unwrap();
+
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO files (path, filename, size, modified_at, format)
+             VALUES (?1, 'not_a_file', 1, '2026-01-01T00:00:00Z', 'FITS')",
+            params![as_dir.to_str().unwrap()],
+        )
+        .unwrap();
+        let fid = conn.last_insert_rowid();
+        add_to_black_hole(&conn, fid, "duplicates", as_dir.to_str().unwrap()).unwrap();
+
+        let err = send_to_void(&conn, fid).unwrap_err();
+        assert!(
+            as_dir.exists(),
+            "the directory must survive — that is what made the unlink fail: {err}"
+        );
+
+        // Catalog-first: the rows went before the disk step was even attempted,
+        // so they are gone despite the Err.
+        let files: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files WHERE id = ?1", [fid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            files, 0,
+            "files row committed before the disk delete failed"
+        );
+        let bh: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM black_hole WHERE file_id = ?1",
+                [fid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            bh, 0,
+            "black_hole row committed before the disk delete failed"
+        );
     }
 
     // ── Source filter is data, not SQL (audit C1) ────────────────────────────
