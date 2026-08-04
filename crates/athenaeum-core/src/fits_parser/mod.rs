@@ -241,6 +241,160 @@ pub fn parse_fits(path: &Path, file_id: i64) -> Result<Frame> {
     build_frame_from_header(&header, file_id, path)
 }
 
+/// Already-resolved keyword values shared by the FITS and XISF `Frame`
+/// assembly tails. The FITS path reads these via `FitsHeader::get_*`, the
+/// XISF path via the `fits_keywords`/`xisf_properties` maps — only that
+/// lookup mechanism differs, so `finalize_frame` takes the resolved values,
+/// never a header object, and both paths share everything downstream.
+struct FrameFields {
+    file_id: i64,
+    object: Option<String>,
+    date_obs: Option<DateTime<Utc>>,
+    telescop: Option<String>,
+    instrume: Option<String>,
+    exptime: Option<f64>,
+    filter: Option<String>,
+    imagetyp_str: Option<String>,
+    frame_str: Option<String>,
+    gain: Option<f64>,
+    offset: Option<f64>,
+    xbinning: Option<i32>,
+    ybinning: Option<i32>,
+    ccd_temp: Option<f64>,
+    set_temp: Option<f64>,
+    focallen: Option<f64>,
+    swcreate: Option<String>,
+    bayerpat: Option<String>,
+    xbayroff: Option<i64>,
+    ybayroff: Option<i64>,
+    roworder: Option<String>,
+    xpixsz: Option<f64>,
+    ypixsz: Option<f64>,
+    naxis1: Option<i32>,
+    naxis2: Option<i32>,
+    ra: Option<f64>,
+    dec: Option<f64>,
+    sitelat: Option<f64>,
+    lat_obs: Option<f64>,
+    sitelong: Option<f64>,
+    long_obs: Option<f64>,
+    objctra: Option<String>,
+    objctdec: Option<String>,
+    rotation: Option<f64>,
+}
+
+/// Shared `Frame` assembly tail: IMAGETYP→FRAME fallback, the is_master
+/// heuristic (IMAGETYP prefix OR filename contains "master"/"_calibrated_"/
+/// "-calibrated-"), the binning string, and the final field assignment.
+/// Word-for-word identical between the FITS and XISF parse paths.
+fn finalize_frame(fields: FrameFields, path: &Path) -> Frame {
+    let FrameFields {
+        file_id,
+        object,
+        date_obs,
+        telescop,
+        instrume,
+        exptime,
+        filter,
+        imagetyp_str,
+        frame_str,
+        gain,
+        offset,
+        xbinning,
+        ybinning,
+        ccd_temp,
+        set_temp,
+        focallen,
+        swcreate,
+        bayerpat,
+        xbayroff,
+        ybayroff,
+        roworder,
+        xpixsz,
+        ypixsz,
+        naxis1,
+        naxis2,
+        ra,
+        dec,
+        sitelat,
+        lat_obs,
+        sitelong,
+        long_obs,
+        objctra,
+        objctdec,
+        rotation,
+    } = fields;
+
+    // Parse IMAGETYP
+    let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s))
+        .or_else(|| frame_str.and_then(|s| ImageType::from_str(&s)));
+
+    // Determine if this is a master file
+    // Priority 1: Check IMAGETYP keyword for "Master" prefix
+    let is_master = imagetyp.as_ref().map(|t| t.is_master()).unwrap_or(false);
+
+    // Priority 2: Check filename if IMAGETYP doesn't indicate master
+    let filename_is_master = if !is_master {
+        let filename = path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let filename_lower = filename.to_lowercase();
+        filename_lower.contains("master") ||
+        filename_lower.contains("_calibrated_") ||
+        filename_lower.contains("-calibrated-")
+    } else {
+        false
+    };
+
+    // Construct binning string if available
+    let binning = match (xbinning, ybinning) {
+        (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
+        _ => None,
+    };
+
+    Frame {
+        id: None,
+        file_id,
+        object,
+        date_obs,
+        telescop,
+        instrume,
+        exptime,
+        filter,
+        imagetyp,
+        is_master: is_master || filename_is_master,
+        gain,
+        offset,
+        binning,
+        xbinning,
+        ybinning,
+        ccd_temp,
+        set_temp,
+        focallen,
+        xpixsz,
+        ypixsz,
+        naxis1,
+        naxis2,
+        ra,
+        dec,
+        sitelat,
+        lat_obs,
+        sitelong,
+        long_obs,
+        objctra,
+        objctdec,
+        override_: false,
+        swcreate,
+        bayerpat,
+        xbayroff,
+        ybayroff,
+        roworder,
+        rotation,
+        uuid: None,
+        updated_at: None,
+    }
+}
+
 /// Build a Frame from an already-parsed FitsHeader.
 pub(crate) fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &Path) -> Result<Frame> {
     // Extract standard FITS keywords
@@ -382,35 +536,9 @@ pub(crate) fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &
         }
     };
 
-    // Parse IMAGETYP
-    let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s))
-        .or_else(|| header.get_str("FRAME").and_then(|s| ImageType::from_str(&s)));
+    let frame_str = header.get_str("FRAME");
 
-    // Determine if this is a master file
-    // Priority 1: Check IMAGETYP keyword for "Master" prefix
-    let is_master = imagetyp.as_ref().map(|t| t.is_master()).unwrap_or(false);
-
-    // Priority 2: Check filename if IMAGETYP doesn't indicate master
-    let filename_is_master = if !is_master {
-        let filename = path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        let filename_lower = filename.to_lowercase();
-        filename_lower.contains("master") ||
-        filename_lower.contains("_calibrated_") ||
-        filename_lower.contains("-calibrated-")
-    } else {
-        false
-    };
-
-    // Construct binning string if available
-    let binning = match (xbinning, ybinning) {
-        (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
-        _ => None,
-    };
-
-    Ok(Frame {
-        id: None,
+    Ok(finalize_frame(FrameFields {
         file_id,
         object,
         date_obs,
@@ -418,16 +546,20 @@ pub(crate) fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &
         instrume,
         exptime,
         filter,
-        imagetyp,
-        is_master: is_master || filename_is_master,
+        imagetyp_str,
+        frame_str,
         gain,
         offset,
-        binning,
         xbinning,
         ybinning,
         ccd_temp,
         set_temp,
         focallen,
+        swcreate,
+        bayerpat,
+        xbayroff,
+        ybayroff,
+        roworder,
         xpixsz,
         ypixsz,
         naxis1,
@@ -440,16 +572,8 @@ pub(crate) fn build_frame_from_header(header: &FitsHeader, file_id: i64, path: &
         long_obs,
         objctra,
         objctdec,
-        override_: false,
-        swcreate,
-        bayerpat,
-        xbayroff,
-        ybayroff,
-        roworder,
         rotation,
-        uuid: None,
-        updated_at: None,
-    })
+    }, path))
 }
 
 /// Parse XISF file metadata
@@ -779,34 +903,9 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
             }
         });
 
-    // Parse IMAGETYP
-    let imagetyp = imagetyp_str.as_ref().and_then(|s| ImageType::from_str(s))
-        .or_else(|| fits_keywords.get("FRAME").and_then(|s| ImageType::from_str(s)));
+    let frame_str = fits_keywords.get("FRAME").cloned();
 
-    // Determine if this is a master file
-    let is_master = imagetyp.as_ref().map(|t| t.is_master()).unwrap_or(false);
-
-    // Check filename if IMAGETYP doesn't indicate master
-    let filename_is_master = if !is_master {
-        let filename = path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        let filename_lower = filename.to_lowercase();
-        filename_lower.contains("master") ||
-        filename_lower.contains("_calibrated_") ||
-        filename_lower.contains("-calibrated-")
-    } else {
-        false
-    };
-
-    // Construct binning string if available
-    let binning = match (xbinning, ybinning) {
-        (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
-        _ => None,
-    };
-
-    Ok(Frame {
-        id: None,
+    Ok(finalize_frame(FrameFields {
         file_id,
         object,
         date_obs,
@@ -814,16 +913,20 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         instrume,
         exptime,
         filter,
-        imagetyp,
-        is_master: is_master || filename_is_master,
+        imagetyp_str,
+        frame_str,
         gain,
         offset,
-        binning,
         xbinning,
         ybinning,
         ccd_temp,
         set_temp,
         focallen,
+        swcreate,
+        bayerpat,
+        xbayroff,
+        ybayroff,
+        roworder,
         xpixsz,
         ypixsz,
         naxis1,
@@ -836,16 +939,8 @@ pub fn parse_xisf(path: &Path, file_id: i64) -> Result<Frame> {
         long_obs,
         objctra,
         objctdec,
-        override_: false,
-        swcreate,
-        bayerpat,
-        xbayroff,
-        ybayroff,
-        roworder,
         rotation,
-        uuid: None,
-        updated_at: None,
-    })
+    }, path))
 }
 
 /// Parse DATE-OBS and optional TIME-OBS into ISO 8601 timestamp
