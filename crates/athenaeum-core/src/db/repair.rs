@@ -166,4 +166,49 @@ mod tests {
             .unwrap();
         assert!(bp2.is_none());
     }
+
+    /// Pins the `init_db` tail call itself: startup alone must repair a
+    /// catalog that already holds sync-erased rows. Deleting the call in
+    /// `schema.rs` leaves the two tests above green (they invoke the repair
+    /// directly) — only this one goes red. File-backed on purpose, so the
+    /// run also proves the tail call sits *after* the guarded-`ALTER TABLE`
+    /// migrations that add the CFA columns it writes.
+    #[test]
+    fn init_db_repairs_a_catalog_that_already_holds_erased_rows() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("catalog.db");
+
+        // A catalog created before the fix: schema present, flag not yet
+        // stamped, and a frame whose CFA columns were erased in transit
+        // while its header blob kept the Bayer cards.
+        let conn = Connection::open(&db_path).unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params![CFA_BACKFILL_FLAG],
+        )
+        .unwrap();
+        insert_frame_with_header(&conn, 1, None, OSC_HEADER);
+
+        // Next app start — init_db and nothing else.
+        init_db(&conn).unwrap();
+
+        let bp: Option<String> = conn
+            .query_row("SELECT bayerpat FROM frames WHERE id = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            bp.as_deref(),
+            Some("RGGB"),
+            "init_db must run the CFA back-fill on an already-corrupted catalog"
+        );
+        let flag: Option<String> = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![CFA_BACKFILL_FLAG],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(flag.as_deref(), Some("done"), "flag must be stamped");
+    }
 }
