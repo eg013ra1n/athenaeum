@@ -906,9 +906,10 @@ pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<File> {
 /// The order is load-bearing: [`map_file_frame_row`] reads by index, and the
 /// callers that append columns start at [`FILE_FRAME_COLUMNS`]. Append new
 /// columns at the end (and read them at the new index) — never reorder, never
-/// insert in the middle. The four CFA columns sit at the end for exactly that
-/// reason: they were appended after `uuid`/`updated_at` had already claimed
-/// indices 45..48.
+/// insert in the middle. Three of the CFA columns (`xbayroff`/`ybayroff`/
+/// `roworder`) sit at the end for exactly that reason: they were appended
+/// after `uuid`/`updated_at` had already claimed indices 45..48 (`bayerpat`
+/// was always mid-list at index 43).
 ///
 /// Column list only, no `SELECT` keyword — callers prefix it themselves.
 const FILE_FRAME_SELECT: &str =
@@ -2970,6 +2971,8 @@ pub fn load_frame_with_path(
             instrume: row.get("instrume")?,
             exptime: row.get("exptime")?,
             filter: row.get("filter")?,
+            // Not in this loader's projection — plate-solve/registration never
+            // read it. Extend the SELECT before consuming `imagetyp` here.
             imagetyp: None,
             is_master: row.get::<_, i32>("is_master").unwrap_or(0) != 0,
             gain: row.get("gain")?,
