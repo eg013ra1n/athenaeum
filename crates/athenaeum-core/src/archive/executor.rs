@@ -702,6 +702,40 @@ mod tests {
         );
     }
 
+    /// The third outcome of the shared terminal tail. A cancel is NOT a
+    /// failure: `finish_forward_operation` must emit `outcome: "cancelled"`, so
+    /// the progress widget dismisses in the cancel colour rather than reporting
+    /// an error to the user, and must still roll the partial work back.
+    #[test]
+    fn run_operation_standalone_emits_cancelled_terminal_event() {
+        let (conn, _arch, _scan, op_id) = run_full_fixture();
+        let cancel = Arc::new(AtomicBool::new(true)); // pre-cancelled
+        let emitter = CapturingEmitter::default();
+
+        let result = run_operation_standalone(&conn, op_id, &cancel, &emitter);
+        assert!(result.is_err(), "standalone must still surface the cancel to its caller");
+
+        let events = emitter.0.lock().unwrap();
+        let finished: Vec<_> = events.iter().filter(|(n, _)| n == "archive-finished").collect();
+        assert_eq!(finished.len(), 1, "exactly one terminal event");
+        assert_eq!(finished[0].1["operation_id"], op_id);
+        assert_eq!(
+            finished[0].1["outcome"], "cancelled",
+            "a cancel must not be reported as a failure"
+        );
+
+        // The row lands on `rolled_back`, not `cancelled`: the cancel branch
+        // stamps `Cancelled` and then runs the same rollback the failure branch
+        // does (restore sources, delete partial zips), and rollback stamps
+        // `RolledBack` last. That ordering is the point — a cancelled operation
+        // must not leave partial work behind — so this pins the terminal state
+        // rather than the transient one.
+        let status: String = conn
+            .query_row("SELECT status FROM archive_operations WHERE id = ?1", [op_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "rolled_back", "cancel rolls the partial operation back");
+    }
+
     #[test]
     fn cancel_during_copy_aborts_with_cancel_signal() {
         let (conn, _arch, _scan, op_id) = run_full_fixture();

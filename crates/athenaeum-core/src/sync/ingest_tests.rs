@@ -20,7 +20,7 @@ use tokio::time::Instant;
 
 use crate::db::schema::init_db;
 use crate::events::NullEmitter;
-use crate::fits_writer::write_fits_f32;
+use crate::fits_writer::{write_fits_f32, Card, CardValue};
 use crate::models::{Frame, ImageType};
 use crate::package::{self, ManifestRecord, PayloadKind, MANIFEST_VERSION};
 use crate::sharing::loopback::{FaultPlan, LoopbackNetwork, LoopbackTransport};
@@ -63,7 +63,14 @@ fn fixture_frame(uuid: &str, object: &str, updated_at: &str) -> Frame {
 
 /// Write a minimal real FITS file at `path` (4x4 mono, no user cards).
 fn write_fits(path: &Path) {
-    write_fits_f32(path, 4, 4, 1, &[0.0f32; 16], &[]).unwrap();
+    write_fits_with_cards(path, &[]);
+}
+
+/// Write a minimal real FITS file at `path` carrying `cards` as extra header
+/// cards — lets a test prove the receiver reads the LANDED FILE's own header
+/// and not just the manifest snapshot.
+fn write_fits_with_cards(path: &Path, cards: &[Card]) {
+    write_fits_f32(path, 4, 4, 1, &[0.0f32; 16], cards).unwrap();
 }
 
 /// Write a minimal real FITS file at `path` with every pixel set to `val` — lets
@@ -84,10 +91,24 @@ fn build_fixture_package(
     object: &str,
     updated_at: &str,
 ) -> (PathBuf, PackageAnnounce) {
+    build_fixture_package_with_cards(root, frame_uuid, filename, object, updated_at, &[])
+}
+
+/// As [`build_fixture_package`], but the payload FITS carries `cards` as extra
+/// header cards. The manifest snapshot is unaffected — so a test can deliver a
+/// snapshot that is silent about a field the landed file does declare.
+fn build_fixture_package_with_cards(
+    root: &Path,
+    frame_uuid: &str,
+    filename: &str,
+    object: &str,
+    updated_at: &str,
+    cards: &[Card],
+) -> (PathBuf, PackageAnnounce) {
     let src_dir = root.join("src");
     std::fs::create_dir_all(&src_dir).unwrap();
     let src = src_dir.join(filename);
-    write_fits(&src);
+    write_fits_with_cards(&src, cards);
 
     let byte_size = std::fs::metadata(&src).unwrap().len();
     let xxh3 = package::xxh3_full_file(&src).unwrap();
@@ -708,6 +729,82 @@ fn duplicate_delivery_single_row_but_acked() {
         ),
         1,
         "duplicate history recorded"
+    );
+}
+
+/// Wiring pin for the defensive CFA back-fill in `insert_ingested_rows`.
+///
+/// A sender running a build with the CFA-blind frame projection ships a
+/// `frame_meta` snapshot whose Bayer fields are erased, while the payload file
+/// it sends still declares them in its own header. The receiver must fill the
+/// gap from the landed file — otherwise the frame lands mono-looking and every
+/// downstream OSC decision (per-channel flat scaling, debayer) is wrong.
+///
+/// Deleting the `backfill_frame_cfa` call in `insert_ingested_rows` must fail
+/// this test and only this test.
+#[test]
+fn ingest_backfills_cfa_from_the_landed_file_header() {
+    let tmp = TempDir::new().unwrap();
+    let incoming = tmp.path().join("incoming");
+    let (pkg_dir, announce) = build_fixture_package_with_cards(
+        tmp.path(),
+        "frame-uuid-cfa",
+        "OSC_0001.fits",
+        "M42",
+        "2026-01-16T10:00:00.000Z",
+        &[
+            Card::new("BAYERPAT", CardValue::Str("RGGB".to_string())).unwrap(),
+            Card::new("XBAYROFF", CardValue::Integer(1)).unwrap(),
+            Card::new("YBAYROFF", CardValue::Integer(0)).unwrap(),
+            Card::new("ROWORDER", CardValue::Str("BOTTOM-UP".to_string())).unwrap(),
+        ],
+    );
+
+    // Premise: the snapshot serialized into the manifest really is CFA-blind, so
+    // anything the frames row ends up carrying can only have come from the
+    // landed file's own header.
+    let shipped = fixture_frame("frame-uuid-cfa", "M42", "2026-01-16T10:00:00.000Z");
+    assert!(
+        shipped.bayerpat.is_none()
+            && shipped.xbayroff.is_none()
+            && shipped.ybayroff.is_none()
+            && shipped.roworder.is_none(),
+        "fixture premise: the manifest snapshot must carry no CFA fields"
+    );
+
+    let conn = catalog_conn();
+    ingest_package(
+        IngestConn::Borrowed(&conn),
+        &incoming,
+        &pkg_dir,
+        &announce,
+        PEER_HEX,
+        &announce.package_id.0,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let (bayerpat, xbayroff, ybayroff, roworder): (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<String>,
+    ) = conn
+        .query_row(
+            "SELECT bayerpat, xbayroff, ybayroff, roworder FROM frames WHERE uuid = 'frame-uuid-cfa'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+
+    assert_eq!(bayerpat.as_deref(), Some("RGGB"), "BAYERPAT back-filled from the landed file");
+    assert_eq!(xbayroff, Some(1), "XBAYROFF back-filled from the landed file");
+    assert_eq!(ybayroff, Some(0), "YBAYROFF back-filled from the landed file");
+    assert_eq!(
+        roworder.as_deref(),
+        Some("BOTTOM-UP"),
+        "ROWORDER back-filled from the landed file"
     );
 }
 
