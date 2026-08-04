@@ -243,33 +243,11 @@ pub async fn start_archive_operation(
             let emitter = SseProgressEmitter::new(event_tx);
             let db = ctx_for_worker.db.get().expect("db");
             let conn = db.conn();
-            match executor::run_operation(&conn, op_id, &cancel_flag, &emitter) {
-                Ok(()) => {
-                    tracing::info!(operation_id = op_id, "archive operation completed");
-                }
-                Err(e) => {
-                    if executor::was_cancelled(&e) {
-                        let _ = adb::update_operation_status(
-                            &conn,
-                            op_id,
-                            ArchiveStatus::Cancelled,
-                            None,
-                        );
-                    } else {
-                        tracing::error!(operation_id = op_id, error = ?e, "archive operation failed");
-                        let msg = format!("{:#}", e);
-                        let _ = adb::update_operation_status(
-                            &conn,
-                            op_id,
-                            ArchiveStatus::Failed,
-                            Some(&msg),
-                        );
-                    }
-                    if let Err(rb_err) = rollback::rollback_operation(&conn, op_id, &emitter) {
-                        tracing::error!(operation_id = op_id, error = ?rb_err, "rollback after failed archive operation also failed, operation may be left in an inconsistent state");
-                    }
-                }
-            }
+            // Outcome bookkeeping + terminal `archive-finished` live in core
+            // (`run_operation_standalone`) — this worker used to hand-roll the
+            // failure path and forgot the emit, so the web progress widget
+            // never auto-dismissed. Errors are logged (and rolled back) inside.
+            let _ = executor::run_operation_standalone(&conn, op_id, &cancel_flag, &emitter);
             ctx_for_worker
                 .active_archives
                 .lock()
@@ -391,12 +369,9 @@ pub async fn resume_archive_operation(
             let emitter = SseProgressEmitter::new(event_tx);
             let db = ctx_for_worker.db.get().expect("db");
             let conn = db.conn();
-            if let Err(e) = resume::resume_operation(&conn, op_id, &cancel_flag, &emitter) {
-                tracing::error!(operation_id = op_id, error = ?e, "archive resume failed");
-                let msg = format!("{:#}", e);
-                let _ = adb::update_operation_status(&conn, op_id, ArchiveStatus::Failed, Some(&msg));
-                let _ = rollback::rollback_operation(&conn, op_id, &emitter);
-            }
+            // Terminal event + failure bookkeeping in core — kept in lockstep
+            // with the desktop resume worker. Errors logged inside.
+            let _ = resume::resume_operation_standalone(&conn, op_id, &cancel_flag, &emitter);
             ctx_for_worker.active_archives.lock().unwrap().remove(&op_id);
         }),
     });

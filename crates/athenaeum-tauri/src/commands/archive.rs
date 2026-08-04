@@ -235,37 +235,11 @@ pub async fn start_archive_operation(
             let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
             let db = ctx_for_worker.db.get().expect("db");
             let conn = db.conn();
-            let result = executor::run_operation(&conn, op_id, &cancel_flag, &emitter);
-            let outcome = match result {
-                Ok(()) => {
-                    tracing::info!(operation_id = op_id, "archive operation completed");
-                    "completed"
-                }
-                Err(e) => {
-                    let outcome = if executor::was_cancelled(&e) {
-                        let _ = adb::update_operation_status(
-                            &conn, op_id, ArchiveStatus::Cancelled, None,
-                        );
-                        "cancelled"
-                    } else {
-                        tracing::error!(operation_id = op_id, error = ?e, "archive operation failed");
-                        let msg = format!("{:#}", e);
-                        let _ = adb::update_operation_status(
-                            &conn, op_id, ArchiveStatus::Failed, Some(&msg),
-                        );
-                        "failed"
-                    };
-                    if let Err(rb_err) = rollback::rollback_operation(&conn, op_id, &emitter) {
-                        tracing::error!(operation_id = op_id, error = ?rb_err, "rollback after failed archive operation also failed, operation may be left in an inconsistent state");
-                    }
-                    outcome
-                }
-            };
-            athenaeum_core::events::emit_event(
-                &emitter,
-                "archive-finished",
-                &serde_json::json!({ "operation_id": op_id, "outcome": outcome }),
-            );
+            // Outcome bookkeeping + terminal `archive-finished` live in core
+            // (`run_operation_standalone`) — shared with the web worker so the
+            // two backends can't drift again. Errors are logged (and rolled
+            // back) inside; nothing to add here.
+            let _ = executor::run_operation_standalone(&conn, op_id, &cancel_flag, &emitter);
             let mut map = ctx_for_worker.active_archives.lock().unwrap();
             map.remove(&op_id);
         }),
@@ -320,12 +294,10 @@ pub async fn resume_archive_operation(
             let emitter = crate::tauri_events::TauriProgressEmitter(app_for_emitter);
             let db = ctx_for_worker.db.get().expect("db");
             let conn = db.conn();
-            if let Err(e) = resume::resume_operation(&conn, operation_id, &cancel_flag, &emitter) {
-                tracing::error!(operation_id, error = ?e, "archive resume failed");
-                let msg = format!("{:#}", e);
-                let _ = adb::update_operation_status(&conn, operation_id, ArchiveStatus::Failed, Some(&msg));
-                let _ = rollback::rollback_operation(&conn, operation_id, &emitter);
-            }
+            // Terminal event + failure bookkeeping in core — this worker used
+            // to emit nothing, so the (future) resume widget could never
+            // dismiss. Errors logged inside.
+            let _ = resume::resume_operation_standalone(&conn, operation_id, &cancel_flag, &emitter);
             ctx_for_worker.active_archives.lock().unwrap().remove(&operation_id);
         }),
     });
