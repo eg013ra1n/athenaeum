@@ -1,5 +1,6 @@
-import { Layers, X } from 'lucide-react';
+import { Layers } from 'lucide-react';
 import { useRegistrationProgressContext } from '../contexts/RegistrationProgressContext';
+import { QueueIndicator } from './QueueIndicator';
 
 interface RegistrationQueueIndicatorProps {
   collapsed: boolean;
@@ -9,67 +10,23 @@ export function RegistrationQueueIndicator({ collapsed }: RegistrationQueueIndic
   const { currentRegistration, queueLength, hasActiveRegistrations, cancelAll } =
     useRegistrationProgressContext();
 
-  if (!hasActiveRegistrations) return null;
-
   const progress = currentRegistration?.progress;
   const percent =
-    progress && progress.total > 0
-      ? Math.round((progress.current / progress.total) * 100)
-      : 0;
-  const name = currentRegistration?.frameSetName || 'Registration';
-  const pendingCount = queueLength > 1 ? queueLength - 1 : 0;
-
-  if (collapsed) {
-    return (
-      <div
-        className="px-2 pb-2"
-        title={`${name}: ${percent}%${pendingCount > 0 ? ` (+${pendingCount} queued)` : ''}`}
-      >
-        <div className="relative flex items-center justify-center py-3">
-          <Layers size={20} className="text-accent" />
-          {pendingCount > 0 && (
-            <span className="absolute -top-0.5 -right-0.5 bg-accent text-surface text-[9px] font-bold rounded-full w-3.5 h-3.5 flex items-center justify-center">
-              {pendingCount}
-            </span>
-          )}
-        </div>
-        <div className="w-full bg-surface-hover rounded-full h-1">
-          <div
-            className="bg-accent h-1 rounded-full transition-all duration-300"
-            style={{ width: `${percent}%` }}
-          />
-        </div>
-      </div>
-    );
-  }
+    progress && progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+  const label = currentRegistration?.frameSetName || 'Registration';
 
   return (
-    <div className="px-4 pb-2">
-      <div className="bg-surface rounded-lg p-2.5 border border-border">
-        <div className="flex items-center justify-between mb-1.5">
-          <div className="flex items-center gap-1.5 min-w-0">
-            <Layers size={14} className="text-accent shrink-0" />
-            <span className="text-xs text-content-secondary truncate">{name}</span>
-          </div>
-          <button
-            onClick={cancelAll}
-            className="text-content-muted hover:text-content transition-colors shrink-0"
-            title="Cancel registration"
-          >
-            <X size={12} />
-          </button>
-        </div>
-        <div className="w-full bg-surface-hover rounded-full h-1.5 mb-1">
-          <div
-            className="bg-accent h-1.5 rounded-full transition-all duration-300"
-            style={{ width: `${percent}%` }}
-          />
-        </div>
-        <div className="flex items-center justify-between text-[10px] text-content-muted">
-          <span>{progress ? `${progress.current}/${progress.total}` : 'Starting...'}</span>
-          {pendingCount > 0 && <span>+{pendingCount} queued</span>}
-        </div>
-      </div>
-    </div>
+    <QueueIndicator
+      collapsed={collapsed}
+      icon={Layers}
+      active={hasActiveRegistrations}
+      label={label}
+      percent={percent}
+      current={progress?.current}
+      total={progress?.total}
+      queueLength={queueLength}
+      cancelTitle="Cancel registration"
+      onCancelAll={cancelAll}
+    />
   );
 }
