@@ -22,8 +22,6 @@ rayon = "1"
 # Required for rusqlite::params! in route handlers that run inline SQL queries
 rusqlite = { version = "0.40", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
-futures = "0.3"
-base64 = "0.23"
 solvemyastro = { path = "../../solvemyastro" }
 # Already in Cargo.lock transitively (axum depends on percent-encoding
 # "2.1", resolving to 2.3.2) — declared explicitly so routes/auth.rs can

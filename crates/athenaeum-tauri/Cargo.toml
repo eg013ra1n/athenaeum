@@ -28,7 +28,6 @@ tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 chrono = { version = "0.4", features = ["serde"] }
 rayon = "1.10"
-anyhow = "1"
 rustafits = { path = "../../rustafits" }
 base64 = "0.23"
 # Explicit TLS backend — see the reqwest comment in athenaeum-core/Cargo.toml.
