@@ -25,6 +25,7 @@ mod calibration;
 mod duplicates;
 mod export;
 mod spatial;
+mod calendar;
 mod images;
 mod missing_files;
 mod analysis;
@@ -184,7 +185,7 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/query_frames_in_bounds", post(spatial::query_frames_in_bounds))
         .route("/api/get_frame_preview", post(images::get_frame_preview))
         // Calendar
-        .route("/api/get_calendar_month_data", post(spatial::get_calendar_month_data))
+        .route("/api/get_calendar_month_data", post(calendar::get_calendar_month_data))
         // Analysis
         .route("/api/get_analysis_config", post(analysis::get_analysis_config))
         .route("/api/set_analysis_config", post(analysis::set_analysis_config))

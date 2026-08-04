@@ -55,7 +55,6 @@ pub mod analysis;
 pub mod compute;
 pub mod plate_solve;
 pub mod registration;
-pub mod utils;
 pub mod archive;
 pub mod masters;
 pub mod lights;

@@ -6,6 +6,11 @@ use std::path::{Path, PathBuf};
 pub mod scan_roots;
 pub mod files;
 pub mod calibration;
+// Sky-map spatial queries (imaging locations, rectangular selection). Ungated:
+// db/models only.
+pub mod spatial;
+// Calendar month aggregation. Ungated: db/models/coordinates only.
+pub mod calendar;
 // Personal-sync commands (Stage I, task A7). Ungated: uses only db/sharing/sync.
 pub mod sync;
 // Full-app capture-node retention (task M4). Ungated: db/settings/sync only.

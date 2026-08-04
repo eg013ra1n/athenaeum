@@ -50,18 +50,30 @@ impl SqliteConnectionManager {
              PRAGMA mmap_size = 268435456;",
         )?;
 
-        conn.create_scalar_function("SIN", 1, FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
-            let val: Option<f64> = ctx.get(0)?;
-            Ok(val.map(f64::sin))
-        })?;
-
-        conn.create_scalar_function("COS", 1, FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
-            let val: Option<f64> = ctx.get(0)?;
-            Ok(val.map(f64::cos))
-        })?;
+        register_math_functions(conn)?;
 
         Ok(())
     }
+}
+
+/// Register the trigonometric scalar functions the catalog SQL relies on
+/// (`api::spatial::get_imaging_locations` computes a circular mean of rotation
+/// angles). Bundled SQLite is built without `SQLITE_ENABLE_MATH_FUNCTIONS`, so
+/// `SIN`/`COS` only exist because we install them per connection. Pooled
+/// connections get this via `setup_connection`; tests that open a bare
+/// `Connection` must call it themselves.
+pub fn register_math_functions(conn: &Connection) -> Result<()> {
+    conn.create_scalar_function("SIN", 1, FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+        let val: Option<f64> = ctx.get(0)?;
+        Ok(val.map(f64::sin))
+    })?;
+
+    conn.create_scalar_function("COS", 1, FunctionFlags::SQLITE_DETERMINISTIC, |ctx| {
+        let val: Option<f64> = ctx.get(0)?;
+        Ok(val.map(f64::cos))
+    })?;
+
+    Ok(())
 }
 
 impl ManageConnection for SqliteConnectionManager {
