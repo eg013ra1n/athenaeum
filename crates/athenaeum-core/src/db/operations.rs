@@ -897,6 +897,142 @@ pub fn get_file_by_path(conn: &Connection, path: &str) -> Result<File> {
     )
 }
 
+/// Projection shared by every `files` × `frames` row this module hands back as
+/// a [`File`] + [`Frame`] pair — the three listing queries (`get_files`,
+/// `get_files_by_directory`, `get_files_by_directory_for_camera`) and the
+/// missing-metadata / excluded-frames views, which append their own columns
+/// after this block.
+///
+/// The order is load-bearing: [`map_file_frame_row`] reads by index, and the
+/// callers that append columns start at [`FILE_FRAME_COLUMNS`]. Append new
+/// columns at the end (and read them at the new index) — never reorder, never
+/// insert in the middle. The four CFA columns sit at the end for exactly that
+/// reason: they were appended after `uuid`/`updated_at` had already claimed
+/// indices 45..48.
+///
+/// Column list only, no `SELECT` keyword — callers prefix it themselves.
+const FILE_FRAME_SELECT: &str =
+    "f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
+     f.archived_in_operation, f.archive_zip_path, f.archive_path_in_zip,
+     fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
+     fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
+     fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
+     fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation,
+     f.uuid, f.updated_at, fr.uuid, fr.updated_at,
+     fr.xbayroff, fr.ybayroff, fr.roworder";
+
+/// Number of columns in [`FILE_FRAME_SELECT`], i.e. the index of the first
+/// column a caller appends after the shared block. Pinned against the real
+/// prepared statement by `shared_projection_column_count_matches_const`.
+const FILE_FRAME_COLUMNS: usize = 52;
+
+/// Index of `fr.id` inside [`FILE_FRAME_SELECT`] — `NULL` there means the
+/// LEFT JOIN found no `frames` row for the file.
+const FRAME_ID_COLUMN: usize = 12;
+
+/// Decode one row of [`FILE_FRAME_SELECT`] into its [`File`] and, when the
+/// join produced one, its [`Frame`].
+///
+/// The frame fields keep the `.ok()` decoding the four inlined copies of this
+/// mapper used before consolidation: a value that fails to decode degrades to
+/// `None` for that one field instead of failing the whole listing. Only the
+/// file columns — which the browser cannot render without — are strict.
+fn map_file_frame_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(File, Option<Frame>)> {
+    let file_id: i64 = row.get(0)?;
+    let file = File {
+        id: Some(file_id),
+        path: row.get(1)?,
+        filename: row.get(2)?,
+        size: row.get(3)?,
+        modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
+        format: if row.get::<_, String>(5)? == "FITS" {
+            FileFormat::FITS
+        } else {
+            FileFormat::XISF
+        },
+        created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
+        metadata_hash: row.get(7)?,
+        content_hash: row.get(8)?,
+        archived_in_operation: row.get(9)?,
+        archive_zip_path: row.get(10)?,
+        archive_path_in_zip: row.get(11)?,
+        uuid: row.get(45)?,
+        updated_at: row.get(46)?,
+    };
+
+    let frame = row
+        .get::<_, Option<i64>>(FRAME_ID_COLUMN)?
+        .map(|frame_id| Frame {
+            id: Some(frame_id),
+            file_id,
+            object: row.get(13).ok(),
+            date_obs: row
+                .get::<_, Option<String>>(14)
+                .ok()
+                .flatten()
+                .and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.with_timezone(&Utc))
+                }),
+            telescop: row.get(15).ok(),
+            instrume: row.get(16).ok(),
+            exptime: row.get(17).ok(),
+            filter: row.get(18).ok(),
+            imagetyp: row
+                .get::<_, Option<String>>(19)
+                .ok()
+                .flatten()
+                .and_then(|s| ImageType::from_str(&s)),
+            is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
+            gain: row.get(21).ok(),
+            offset: row.get(22).ok(),
+            binning: row.get(23).ok(),
+            xbinning: row.get(24).ok(),
+            ybinning: row.get(25).ok(),
+            ccd_temp: row.get(26).ok(),
+            set_temp: row.get(27).ok(),
+            focallen: row.get(28).ok(),
+            xpixsz: row.get(29).ok(),
+            ypixsz: row.get(30).ok(),
+            naxis1: row.get(31).ok(),
+            naxis2: row.get(32).ok(),
+            ra: row.get(33).ok(),
+            dec: row.get(34).ok(),
+            sitelat: row.get(35).ok(),
+            lat_obs: row.get(36).ok(),
+            sitelong: row.get(37).ok(),
+            long_obs: row.get(38).ok(),
+            objctra: row.get(39).ok(),
+            objctdec: row.get(40).ok(),
+            override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
+            swcreate: row.get(42).ok(),
+            bayerpat: row.get(43).ok(),
+            xbayroff: row.get(49).ok(),
+            ybayroff: row.get(50).ok(),
+            roworder: row.get(51).ok(),
+            rotation: row.get(44).ok(),
+            uuid: row.get(47).ok(),
+            updated_at: row.get(48).ok(),
+        });
+
+    Ok((file, frame))
+}
+
+/// The frame of a row an INNER JOIN produced. A `None` there means the query
+/// lost its join (or the projection drifted) — surfaced as the same decode
+/// error `row.get::<i64>` on a NULL `fr.id` used to raise, never as a
+/// fabricated empty frame.
+fn require_joined_frame(frame: Option<Frame>) -> rusqlite::Result<Frame> {
+    frame.ok_or_else(|| {
+        rusqlite::Error::InvalidColumnType(
+            FRAME_ID_COLUMN,
+            "fr.id".to_string(),
+            rusqlite::types::Type::Null,
+        )
+    })
+}
+
 /// Get all files with optional filters
 pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, Option<Frame>)>> {
     let limit_clause = match limit {
@@ -905,105 +1041,17 @@ pub fn get_files(conn: &Connection, limit: Option<usize>) -> Result<Vec<(File, O
     };
 
     let query = format!(
-        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
-                f.archived_in_operation, f.archive_zip_path, f.archive_path_in_zip,
-                fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
-                fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-                fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation,
-                f.uuid, f.updated_at, fr.uuid, fr.updated_at
+        "SELECT {select}
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          ORDER BY f.created_at DESC
-         {}",
-        limit_clause
+         {limit_clause}",
+        select = FILE_FRAME_SELECT,
+        limit_clause = limit_clause,
     );
 
     let mut stmt = conn.prepare(&query)?;
-
-    let results = stmt.query_map([], |row| {
-        let file = File {
-            id: Some(row.get(0)?),
-            path: row.get(1)?,
-            filename: row.get(2)?,
-            size: row.get(3)?,
-            modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
-            format: if row.get::<_, String>(5)? == "FITS" {
-                FileFormat::FITS
-            } else {
-                FileFormat::XISF
-            },
-            created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
-            metadata_hash: row.get(7)?,
-            content_hash: row.get(8)?,
-            archived_in_operation: row.get(9)?,
-            archive_zip_path: row.get(10)?,
-            archive_path_in_zip: row.get(11)?,
-            uuid: row.get(45)?,
-            updated_at: row.get(46)?,
-        };
-
-        let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(12) {
-            frame_id.map(|fid| Frame {
-                id: Some(fid),
-                file_id: file.id.unwrap(),
-                object: row.get(13).ok(),
-                date_obs: row
-                    .get::<_, Option<String>>(14)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| {
-                        DateTime::parse_from_rfc3339(&s)
-                            .ok()
-                            .map(|dt| dt.with_timezone(&Utc))
-                    }),
-                telescop: row.get(15).ok(),
-                instrume: row.get(16).ok(),
-                exptime: row.get(17).ok(),
-                filter: row.get(18).ok(),
-                imagetyp: row
-                    .get::<_, Option<String>>(19)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| ImageType::from_str(&s)),
-                is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
-                gain: row.get(21).ok(),
-                offset: row.get(22).ok(),
-                binning: row.get(23).ok(),
-                xbinning: row.get(24).ok(),
-                ybinning: row.get(25).ok(),
-                ccd_temp: row.get(26).ok(),
-                set_temp: row.get(27).ok(),
-                focallen: row.get(28).ok(),
-                xpixsz: row.get(29).ok(),
-                ypixsz: row.get(30).ok(),
-                naxis1: row.get(31).ok(),
-                naxis2: row.get(32).ok(),
-                ra: row.get(33).ok(),
-                dec: row.get(34).ok(),
-                sitelat: row.get(35).ok(),
-                lat_obs: row.get(36).ok(),
-                sitelong: row.get(37).ok(),
-                long_obs: row.get(38).ok(),
-                objctra: row.get(39).ok(),
-                objctdec: row.get(40).ok(),
-                override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
-                swcreate: row.get(42).ok(),
-                bayerpat: row.get(43).ok(),
-                xbayroff: None,
-                ybayroff: None,
-                roworder: None,
-                rotation: row.get(44).ok(),
-                uuid: row.get(47).ok(),
-                updated_at: row.get(48).ok(),
-            })
-        } else {
-            None
-        };
-
-        Ok((file, frame))
-    })?;
-
+    let results = stmt.query_map([], map_file_frame_row)?;
     results.collect()
 }
 
@@ -1029,107 +1077,22 @@ pub fn get_files_by_directory(
     let expected_depth = dir.matches(sep.as_str()).count() as i64 + 1;
 
     let query = format!(
-        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
-                f.archived_in_operation, f.archive_zip_path, f.archive_path_in_zip,
-                fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
-                fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-                fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation,
-                f.uuid, f.updated_at, fr.uuid, fr.updated_at
+        "SELECT {select}
          FROM files f
          LEFT JOIN frames fr ON f.id = fr.file_id
          WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)
            AND (LENGTH(f.path) - LENGTH(REPLACE(f.path, ?3, ''))) = ?4
          ORDER BY f.filename
-         {}",
-        limit_clause
+         {limit_clause}",
+        select = FILE_FRAME_SELECT,
+        limit_clause = limit_clause,
     );
 
     let mut stmt = conn.prepare(&query)?;
-
-    let results = stmt.query_map(params![path_prefix, path_hi, sep, expected_depth], |row| {
-        let file = File {
-            id: Some(row.get(0)?),
-            path: row.get(1)?,
-            filename: row.get(2)?,
-            size: row.get(3)?,
-            modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
-            format: if row.get::<_, String>(5)? == "FITS" {
-                FileFormat::FITS
-            } else {
-                FileFormat::XISF
-            },
-            created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
-            metadata_hash: row.get(7)?,
-            content_hash: row.get(8)?,
-            archived_in_operation: row.get(9)?,
-            archive_zip_path: row.get(10)?,
-            archive_path_in_zip: row.get(11)?,
-            uuid: row.get(45)?,
-            updated_at: row.get(46)?,
-        };
-
-        let frame = if let Ok(frame_id) = row.get::<_, Option<i64>>(12) {
-            frame_id.map(|fid| Frame {
-                id: Some(fid),
-                file_id: file.id.unwrap(),
-                object: row.get(13).ok(),
-                date_obs: row
-                    .get::<_, Option<String>>(14)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| {
-                        DateTime::parse_from_rfc3339(&s)
-                            .ok()
-                            .map(|dt| dt.with_timezone(&Utc))
-                    }),
-                telescop: row.get(15).ok(),
-                instrume: row.get(16).ok(),
-                exptime: row.get(17).ok(),
-                filter: row.get(18).ok(),
-                imagetyp: row
-                    .get::<_, Option<String>>(19)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| ImageType::from_str(&s)),
-                is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
-                gain: row.get(21).ok(),
-                offset: row.get(22).ok(),
-                binning: row.get(23).ok(),
-                xbinning: row.get(24).ok(),
-                ybinning: row.get(25).ok(),
-                ccd_temp: row.get(26).ok(),
-                set_temp: row.get(27).ok(),
-                focallen: row.get(28).ok(),
-                xpixsz: row.get(29).ok(),
-                ypixsz: row.get(30).ok(),
-                naxis1: row.get(31).ok(),
-                naxis2: row.get(32).ok(),
-                ra: row.get(33).ok(),
-                dec: row.get(34).ok(),
-                sitelat: row.get(35).ok(),
-                lat_obs: row.get(36).ok(),
-                sitelong: row.get(37).ok(),
-                long_obs: row.get(38).ok(),
-                objctra: row.get(39).ok(),
-                objctdec: row.get(40).ok(),
-                override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
-                swcreate: row.get(42).ok(),
-                bayerpat: row.get(43).ok(),
-                xbayroff: None,
-                ybayroff: None,
-                roworder: None,
-                rotation: row.get(44).ok(),
-                uuid: row.get(47).ok(),
-                updated_at: row.get(48).ok(),
-            })
-        } else {
-            None
-        };
-
-        Ok((file, frame))
-    })?;
-
+    let results = stmt.query_map(
+        params![path_prefix, path_hi, sep, expected_depth],
+        map_file_frame_row,
+    )?;
     results.collect()
 }
 
@@ -1154,108 +1117,217 @@ pub fn get_files_by_directory_for_camera(
     let expected_depth = dir.matches(sep.as_str()).count() as i64 + 1;
 
     let query = format!(
-        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
-                f.archived_in_operation, f.archive_zip_path, f.archive_path_in_zip,
-                fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
-                fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-                fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-                fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation,
-                f.uuid, f.updated_at, fr.uuid, fr.updated_at
+        "SELECT {select}
          FROM files f
          JOIN frames fr ON f.id = fr.file_id
          WHERE f.path >= ?1 AND (?2 IS NULL OR f.path < ?2)
            AND (LENGTH(f.path) - LENGTH(REPLACE(f.path, ?3, ''))) = ?4
            AND fr.instrume = ?5
          ORDER BY f.filename
-         {}",
-        limit_clause
+         {limit_clause}",
+        select = FILE_FRAME_SELECT,
+        limit_clause = limit_clause,
     );
 
     let mut stmt = conn.prepare(&query)?;
 
+    // INNER JOIN + `fr.instrume = ?`: every row has a frame, so the mapper's
+    // `Option` is unwrapped back into the `Some` this listing has always
+    // returned — a caller of the camera-filtered variant never sees `None`.
     let results = stmt.query_map(
         params![path_prefix, path_hi, sep, expected_depth, instrume],
         |row| {
-            let file = File {
-                id: Some(row.get(0)?),
-                path: row.get(1)?,
-                filename: row.get(2)?,
-                size: row.get(3)?,
-                modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
-                format: if row.get::<_, String>(5)? == "FITS" {
-                    FileFormat::FITS
-                } else {
-                    FileFormat::XISF
-                },
-                created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
-                metadata_hash: row.get(7)?,
-                content_hash: row.get(8)?,
-                archived_in_operation: row.get(9)?,
-                archive_zip_path: row.get(10)?,
-                archive_path_in_zip: row.get(11)?,
-                uuid: row.get(45)?,
-                updated_at: row.get(46)?,
-            };
-
-            let frame = Some(Frame {
-                id: Some(row.get(12)?),
-                file_id: file.id.unwrap(),
-                object: row.get(13).ok(),
-                date_obs: row
-                    .get::<_, Option<String>>(14)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| {
-                        DateTime::parse_from_rfc3339(&s)
-                            .ok()
-                            .map(|dt| dt.with_timezone(&Utc))
-                    }),
-                telescop: row.get(15).ok(),
-                instrume: row.get(16).ok(),
-                exptime: row.get(17).ok(),
-                filter: row.get(18).ok(),
-                imagetyp: row
-                    .get::<_, Option<String>>(19)
-                    .ok()
-                    .flatten()
-                    .and_then(|s| ImageType::from_str(&s)),
-                is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
-                gain: row.get(21).ok(),
-                offset: row.get(22).ok(),
-                binning: row.get(23).ok(),
-                xbinning: row.get(24).ok(),
-                ybinning: row.get(25).ok(),
-                ccd_temp: row.get(26).ok(),
-                set_temp: row.get(27).ok(),
-                focallen: row.get(28).ok(),
-                xpixsz: row.get(29).ok(),
-                ypixsz: row.get(30).ok(),
-                naxis1: row.get(31).ok(),
-                naxis2: row.get(32).ok(),
-                ra: row.get(33).ok(),
-                dec: row.get(34).ok(),
-                sitelat: row.get(35).ok(),
-                lat_obs: row.get(36).ok(),
-                sitelong: row.get(37).ok(),
-                long_obs: row.get(38).ok(),
-                objctra: row.get(39).ok(),
-                objctdec: row.get(40).ok(),
-                override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
-                swcreate: row.get(42).ok(),
-                bayerpat: row.get(43).ok(),
-                xbayroff: None,
-                ybayroff: None,
-                roworder: None,
-                rotation: row.get(44).ok(),
-                uuid: row.get(47).ok(),
-                updated_at: row.get(48).ok(),
-            });
-
-            Ok((file, frame))
+            let (file, frame) = map_file_frame_row(row)?;
+            Ok((file, Some(require_joined_frame(frame)?)))
         },
     )?;
 
     results.collect()
+}
+
+#[cfg(test)]
+mod file_frame_row_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// One directory holding three files: an OSC light with a full CFA
+    /// declaration, a mono light from a different camera, and a file with no
+    /// `frames` row at all (scanned but unparsed).
+    fn seed_directory(conn: &Connection) {
+        for (path, filename) in [
+            ("/data/OSC/light_osc.fits", "light_osc.fits"),
+            ("/data/OSC/mono.fits", "mono.fits"),
+            ("/data/OSC/orphan.fits", "orphan.fits"),
+        ] {
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+                 VALUES (?1, ?2, 1024, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z')",
+                rusqlite::params![path, filename],
+            )
+            .unwrap();
+        }
+
+        let osc_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE filename = 'light_osc.fits'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO frames
+             (file_id, object, date_obs, instrume, exptime, imagetyp, is_master,
+              bayerpat, xbayroff, ybayroff, roworder)
+             VALUES (?1, 'M42', '2026-01-01T22:00:00+00:00', 'ASI2600MC', 300.0, 'Light', 0,
+                     'RGGB', 1, 0, 'BOTTOM-UP')",
+            rusqlite::params![osc_id],
+        )
+        .unwrap();
+
+        let mono_id: i64 = conn
+            .query_row(
+                "SELECT id FROM files WHERE filename = 'mono.fits'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO frames (file_id, object, instrume, imagetyp, is_master)
+             VALUES (?1, 'M42', 'ASI1600MM', 'Light', 0)",
+            rusqlite::params![mono_id],
+        )
+        .unwrap();
+    }
+
+    /// The directory browse must return frame-less files too (frame `None`),
+    /// and the frames it does return must carry the CFA columns — the browser's
+    /// metadata pane shows the Bayer declaration, and a listing that reports
+    /// `None` for a frame the catalog knows is `RGGB` is lying about the file.
+    #[test]
+    fn directory_listing_carries_cfa_and_keeps_frameless_files() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_directory(&conn);
+
+        let rows = get_files_by_directory(&conn, "/data/OSC", None).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|(f, _)| f.filename.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                "light_osc.fits".to_string(),
+                "mono.fits".to_string(),
+                "orphan.fits".to_string()
+            ],
+            "LEFT JOIN listing is ordered by filename and keeps the frame-less file"
+        );
+
+        let (_, orphan_frame) = rows
+            .iter()
+            .find(|(f, _)| f.filename == "orphan.fits")
+            .unwrap();
+        assert!(
+            orphan_frame.is_none(),
+            "a file with no frames row must map to None, not an empty frame"
+        );
+
+        let (_, osc_frame) = rows
+            .iter()
+            .find(|(f, _)| f.filename == "light_osc.fits")
+            .unwrap();
+        let osc_frame = osc_frame.as_ref().expect("the OSC light has a frames row");
+        assert_eq!(osc_frame.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(osc_frame.xbayroff, Some(1));
+        assert_eq!(osc_frame.ybayroff, Some(0));
+        assert_eq!(osc_frame.roworder.as_deref(), Some("BOTTOM-UP"));
+        assert!(osc_frame.date_obs.is_some(), "date_obs must parse");
+        assert_eq!(osc_frame.object.as_deref(), Some("M42"));
+
+        let (_, mono_frame) = rows
+            .iter()
+            .find(|(f, _)| f.filename == "mono.fits")
+            .unwrap();
+        let mono_frame = mono_frame
+            .as_ref()
+            .expect("the mono light has a frames row");
+        assert!(
+            mono_frame.bayerpat.is_none()
+                && mono_frame.xbayroff.is_none()
+                && mono_frame.ybayroff.is_none()
+                && mono_frame.roworder.is_none(),
+            "absent CFA columns stay None — never fabricated"
+        );
+    }
+
+    /// The camera-filtered variant is INNER-JOIN + `fr.instrume = ?`: only the
+    /// matching camera's files come back, each with its frame present.
+    #[test]
+    fn directory_listing_for_camera_filters_by_instrume_and_carries_cfa() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_directory(&conn);
+
+        let rows =
+            get_files_by_directory_for_camera(&conn, "/data/OSC", "ASI2600MC", None).unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|(f, _)| f.filename.clone())
+                .collect::<Vec<_>>(),
+            vec!["light_osc.fits".to_string()],
+            "only the requested camera's file, and never the frame-less one"
+        );
+
+        let frame = rows[0]
+            .1
+            .as_ref()
+            .expect("INNER JOIN always yields a frame");
+        assert_eq!(frame.instrume.as_deref(), Some("ASI2600MC"));
+        assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(frame.xbayroff, Some(1));
+        assert_eq!(frame.ybayroff, Some(0));
+        assert_eq!(frame.roworder.as_deref(), Some("BOTTOM-UP"));
+    }
+
+    /// `FILE_FRAME_COLUMNS` is the index every appended column is measured
+    /// from (`has_duplicate`, then `reason`/`excluded_at`). Adding a column to
+    /// the shared projection without bumping the constant would silently shift
+    /// those reads — a runtime bug, not a compile error — so the constant is
+    /// pinned against the real prepared statement.
+    #[test]
+    fn shared_projection_column_count_matches_const() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let stmt = conn
+            .prepare(&format!(
+                "SELECT {} FROM files f LEFT JOIN frames fr ON f.id = fr.file_id",
+                FILE_FRAME_SELECT
+            ))
+            .unwrap();
+        assert_eq!(
+            stmt.column_count(),
+            FILE_FRAME_COLUMNS,
+            "FILE_FRAME_COLUMNS must equal the number of columns FILE_FRAME_SELECT projects"
+        );
+    }
+
+    /// `get_files` reads the same projection, so it carries the CFA columns too.
+    #[test]
+    fn get_files_carries_cfa() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_directory(&conn);
+
+        let rows = get_files(&conn, None).unwrap();
+        let (_, frame) = rows
+            .iter()
+            .find(|(f, _)| f.filename == "light_osc.fits")
+            .unwrap();
+        let frame = frame.as_ref().expect("the OSC light has a frames row");
+        assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(frame.xbayroff, Some(1));
+        assert_eq!(frame.ybayroff, Some(0));
+        assert_eq!(frame.roworder.as_deref(), Some("BOTTOM-UP"));
+    }
 }
 
 /// Get frames with missing metadata
@@ -1266,95 +1338,26 @@ pub fn get_files_by_directory_for_camera(
 /// `metadata_hash`. That covers both exact-byte duplicates (content hash) and
 /// "same header/size/filename" near-duplicates (metadata hash), matching how
 /// the rest of the app treats duplicates.
-/// SELECT clause for `MissingMetadataRow` rows.
-const MISSING_METADATA_SELECT: &str =
-    "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
-            f.archived_in_operation, f.archive_zip_path, f.archive_path_in_zip,
-            fr.id, fr.object, fr.date_obs, fr.telescop, fr.instrume, fr.exptime, fr.filter, fr.imagetyp, fr.is_master,
-            fr.gain, fr.offset, fr.binning, fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp,
-            fr.focallen, fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs, fr.sitelong,
-            fr.long_obs, fr.objctra, fr.objctdec, fr.override, fr.swcreate, fr.bayerpat, fr.rotation,
-            f.uuid, f.updated_at, fr.uuid, fr.updated_at,
-            CASE WHEN dgf.file_id IS NOT NULL THEN 1 ELSE 0 END AS has_duplicate";
+/// SELECT clause for `MissingMetadataRow` rows: the shared file+frame
+/// projection plus the duplicate flag. Both views that use it join `frames`
+/// with an INNER JOIN, so every row carries a frame.
+///
+/// `has_duplicate` therefore lands at [`FILE_FRAME_COLUMNS`], and anything a
+/// caller appends after this clause starts one column later — see
+/// `get_excluded_frames_with_metadata`.
+fn missing_metadata_select() -> String {
+    format!(
+        "SELECT {select},
+                CASE WHEN dgf.file_id IS NOT NULL THEN 1 ELSE 0 END AS has_duplicate",
+        select = FILE_FRAME_SELECT,
+    )
+}
 
-/// Map a row from a SELECT that uses `MISSING_METADATA_SELECT`.
+/// Map a row from a SELECT that uses `missing_metadata_select()`.
 fn map_missing_metadata_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MissingMetadataRow> {
-    let file = File {
-        id: Some(row.get(0)?),
-        path: row.get(1)?,
-        filename: row.get(2)?,
-        size: row.get(3)?,
-        modified_at: parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
-        format: if row.get::<_, String>(5)? == "FITS" {
-            FileFormat::FITS
-        } else {
-            FileFormat::XISF
-        },
-        created_at: parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
-        metadata_hash: row.get(7)?,
-        content_hash: row.get(8)?,
-        archived_in_operation: row.get(9)?,
-        archive_zip_path: row.get(10)?,
-        archive_path_in_zip: row.get(11)?,
-        uuid: row.get(45)?,
-        updated_at: row.get(46)?,
-    };
-
-    let frame = Frame {
-        id: Some(row.get(12)?),
-        file_id: file.id.unwrap(),
-        object: row.get(13).ok(),
-        date_obs: row
-            .get::<_, Option<String>>(14)
-            .ok()
-            .flatten()
-            .and_then(|s| {
-                DateTime::parse_from_rfc3339(&s)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            }),
-        telescop: row.get(15).ok(),
-        instrume: row.get(16).ok(),
-        exptime: row.get(17).ok(),
-        filter: row.get(18).ok(),
-        imagetyp: row
-            .get::<_, Option<String>>(19)
-            .ok()
-            .flatten()
-            .and_then(|s| ImageType::from_str(&s)),
-        is_master: row.get::<_, i32>(20).ok().map(|v| v == 1).unwrap_or(false),
-        gain: row.get(21).ok(),
-        offset: row.get(22).ok(),
-        binning: row.get(23).ok(),
-        xbinning: row.get(24).ok(),
-        ybinning: row.get(25).ok(),
-        ccd_temp: row.get(26).ok(),
-        set_temp: row.get(27).ok(),
-        focallen: row.get(28).ok(),
-        xpixsz: row.get(29).ok(),
-        ypixsz: row.get(30).ok(),
-        naxis1: row.get(31).ok(),
-        naxis2: row.get(32).ok(),
-        ra: row.get(33).ok(),
-        dec: row.get(34).ok(),
-        sitelat: row.get(35).ok(),
-        lat_obs: row.get(36).ok(),
-        sitelong: row.get(37).ok(),
-        long_obs: row.get(38).ok(),
-        objctra: row.get(39).ok(),
-        objctdec: row.get(40).ok(),
-        override_: row.get::<_, i32>(41).ok().map(|v| v == 1).unwrap_or(false),
-        swcreate: row.get(42).ok(),
-        bayerpat: row.get(43).ok(),
-        xbayroff: None,
-        ybayroff: None,
-        roworder: None,
-        rotation: row.get(44).ok(),
-        uuid: row.get(47).ok(),
-        updated_at: row.get(48).ok(),
-    };
-
-    let has_duplicate: i32 = row.get(49)?;
+    let (file, frame) = map_file_frame_row(row)?;
+    let frame = require_joined_frame(frame)?;
+    let has_duplicate: i32 = row.get(FILE_FRAME_COLUMNS)?;
 
     Ok(MissingMetadataRow {
         file,
@@ -1415,7 +1418,7 @@ pub fn get_frames_with_missing_metadata(
          WHERE {imagetyp_filter} ({missing_clause})
          GROUP BY f.id
          ORDER BY f.modified_at DESC",
-        select = MISSING_METADATA_SELECT,
+        select = missing_metadata_select(),
         imagetyp_filter = imagetyp_filter,
         missing_clause = missing_clause,
     );
@@ -3893,7 +3896,7 @@ pub fn rename_files_path_prefix(
 /// reason, and the duplicate-group flag — the shape the Excluded Frames page
 /// needs to drive its Missing-Metadata-style repair toolbar.
 ///
-/// Reuses `MISSING_METADATA_SELECT` and `map_missing_metadata_row` so the
+/// Reuses `missing_metadata_select()` and `map_missing_metadata_row` so the
 /// row shape stays in lock-step with the missing-metadata view; adds two
 /// trailing columns for `reason` and `excluded_at`. Sorted newest-first by
 /// `excluded_at`.
@@ -3908,16 +3911,16 @@ pub fn get_excluded_frames_with_metadata(
          LEFT JOIN duplicate_group_files dgf ON dgf.file_id = f.id
          GROUP BY f.id
          ORDER BY ef.excluded_at DESC",
-        select = MISSING_METADATA_SELECT,
+        select = missing_metadata_select(),
     );
 
     let mut stmt = conn.prepare(&query)?;
     let rows = stmt.query_map([], |row| {
         let base = map_missing_metadata_row(row)?;
-        // Trailing two columns appended after the MISSING_METADATA_SELECT
-        // 50-column block (indices 0..=49).
-        let reason: String = row.get(50)?;
-        let excluded_at: String = row.get(51)?;
+        // Trailing two columns, appended after the shared file+frame block
+        // (indices 0..FILE_FRAME_COLUMNS) and its `has_duplicate` flag.
+        let reason: String = row.get(FILE_FRAME_COLUMNS + 1)?;
+        let excluded_at: String = row.get(FILE_FRAME_COLUMNS + 2)?;
         Ok(crate::models::ExcludedFrameRow {
             file: base.file,
             frame: base.frame,
@@ -5215,12 +5218,14 @@ mod bulk_metadata_tests {
         assert_eq!(edits.xpixsz, Some(Some(3.76)), "value → Some(Some(v))");
     }
 
-    /// Regression test for the hand-maintained column indices in
-    /// `MISSING_METADATA_SELECT` / `map_missing_metadata_row` /
-    /// `get_excluded_frames_with_metadata`. Appending `uuid`/`updated_at` to
-    /// the shared SELECT constant shifted `has_duplicate` (45→49) and the
-    /// trailing `reason`/`excluded_at` columns (46,47→50,51) — a mismatch
-    /// here would be a silent runtime bug, not a compile error.
+    /// Regression test for the column indices in `missing_metadata_select()` /
+    /// `map_missing_metadata_row` / `get_excluded_frames_with_metadata`.
+    /// Appending `uuid`/`updated_at` to the shared projection once shifted
+    /// `has_duplicate` (45→49) and the trailing `reason`/`excluded_at` columns
+    /// (46,47→50,51); appending the three CFA columns shifted them again
+    /// (→52 and 53,54). They are now derived from `FILE_FRAME_COLUMNS` rather
+    /// than hand-typed, but a mismatch would still be a silent runtime bug,
+    /// not a compile error.
     #[test]
     fn missing_metadata_and_excluded_frames_carry_uuid_and_shifted_indices() {
         let conn = Connection::open_in_memory().unwrap();
