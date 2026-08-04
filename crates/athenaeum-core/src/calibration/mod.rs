@@ -4,6 +4,7 @@
 pub mod config;
 pub mod configurable_matcher;
 pub mod finder;
+pub mod frame_row;
 pub mod hierarchy;
 pub mod manual;
 pub mod processor;

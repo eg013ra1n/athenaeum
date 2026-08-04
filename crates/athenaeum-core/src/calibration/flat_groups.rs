@@ -93,13 +93,11 @@ pub fn detect_flat_groups(
     date_range: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<Vec<FlatGroup>> {
     // Build query with parameter matching
-    let mut query = String::from(
-        "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
-                is_master, ra, dec, objctra, objctdec, gain, offset, xbinning, ybinning,
-                ccd_temp, set_temp, focallen, xpixsz, ypixsz, naxis1, naxis2,
-                sitelat, lat_obs, sitelong, long_obs, uuid, updated_at
+    let mut query = format!(
+        "SELECT {}
          FROM frames
-         WHERE imagetyp = 'Flat' AND instrume = ?1 AND binning = ?2"
+         WHERE imagetyp = 'Flat' AND instrume = ?1 AND binning = ?2",
+        crate::calibration::frame_row::GROUP_FRAME_SELECT_COLUMNS
     );
 
     let mut param_count = 2;
@@ -197,72 +195,7 @@ pub fn detect_flat_groups(
     let mut rows = stmt.raw_query();
 
     while let Some(row) = rows.next()? {
-        use crate::models::ImageType;
-
-        // Parse date_obs
-        let date_obs_str: Option<String> = row.get(3)?;
-        let date_obs = date_obs_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
-
-        // Parse imagetyp
-        let imagetyp_str: Option<String> = row.get(8)?;
-        let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s));
-
-        // Calculate binning
-        let xbinning: Option<i32> = row.get(16)?;
-        let ybinning: Option<i32> = row.get(17)?;
-        let binning = match (xbinning, ybinning) {
-            (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
-            _ => None,
-        };
-
-        // Convert is_master from SQL INTEGER to bool
-        let is_master_int: i32 = row.get(9)?;
-        let is_master = is_master_int != 0;
-
-        let frame = Frame {
-            id: Some(row.get(0)?),
-            file_id: row.get(1)?,
-            object: row.get(2)?,
-            date_obs,
-            telescop: row.get(4)?,
-            instrume: row.get(5)?,
-            exptime: row.get(6)?,
-            filter: row.get(7)?,
-            imagetyp,
-            is_master,
-            gain: row.get(14)?,
-            offset: row.get(15)?,
-            binning,
-            xbinning,
-            ybinning,
-            ccd_temp: row.get(18)?,
-            set_temp: row.get(19)?,
-            focallen: row.get(20)?,
-            xpixsz: row.get(21)?,
-            ypixsz: row.get(22)?,
-            naxis1: row.get(23)?,
-            naxis2: row.get(24)?,
-            ra: row.get(10)?,
-            dec: row.get(11)?,
-            sitelat: row.get(25)?,
-            lat_obs: row.get(26)?,
-            sitelong: row.get(27)?,
-            long_obs: row.get(28)?,
-            objctra: row.get(12)?,
-            objctdec: row.get(13)?,
-            override_: false,
-            swcreate: None,
-            bayerpat: None,
-            xbayroff: None,
-            ybayroff: None,
-            roworder: None,
-            rotation: None,
-            uuid: row.get(29)?,
-            updated_at: row.get(30)?,
-        };
-
-        frames.push(frame);
+        frames.push(crate::calibration::frame_row::frame_from_group_row(row)?);
     }
 
     tracing::debug!(count = frames.len(), "flat search query found frames");
@@ -737,6 +670,39 @@ mod tests {
             None,
         );
         assert_eq!(groups.len(), 0);
+    }
+
+    /// The flat detector builds its SELECT from the shared column list and
+    /// decodes with the shared mapper. If the two ever drift apart, the
+    /// mapper's `row.get` for the CFA columns runs off the end of the row and
+    /// this call returns `Err` — so a plain grouping assertion is the wiring
+    /// guard for the flat query.
+    #[test]
+    fn detect_flat_groups_executes_with_the_shared_column_list() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (40, '/data/flat.fits', 'flat.fits', 1024, '2025-09-25T00:00:00+00:00', 'FITS')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO frames
+             (id, file_id, date_obs, instrume, exptime, filter, imagetyp, is_master,
+              gain, offset, binning, xbinning, ybinning, ccd_temp,
+              bayerpat, xbayroff, ybayroff, roworder)
+             VALUES (40, 40, '2025-09-25T00:00:00+00:00', 'ASI2600MC', 2.0, NULL, 'Flat', 0,
+                     56.0, 50.0, '1x1', 1, 1, -10.0,
+                     'RGGB', 1, 0, 'BOTTOM-UP')",
+            [],
+        ).unwrap();
+
+        let groups = detect_flat_groups(
+            &conn, "ASI2600MC", None, "1x1", Some(56.0), None, None, 30, None,
+        ).unwrap();
+
+        assert_eq!(groups.len(), 1, "seeded flat must form one group");
+        assert_eq!(groups[0].frame_ids, vec![40]);
     }
 
     #[test]

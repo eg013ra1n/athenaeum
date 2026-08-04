@@ -145,13 +145,11 @@ pub fn detect_dark_groups(
     // Build query with parameter matching
     // Dark matching requires: instrume, binning, gain, offset, exptime
     // Focal length is NOT used (Dark is sensor-only, not optical)
-    let mut query = String::from(
-        "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
-                is_master, ra, dec, objctra, objctdec, gain, offset, xbinning, ybinning,
-                ccd_temp, set_temp, focallen, xpixsz, ypixsz, naxis1, naxis2,
-                sitelat, lat_obs, sitelong, long_obs, uuid, updated_at
+    let mut query = format!(
+        "SELECT {}
          FROM frames
-         WHERE imagetyp = 'Dark' AND instrume = ?1 AND binning = ?2 AND gain = ?3 AND offset = ?4"
+         WHERE imagetyp = 'Dark' AND instrume = ?1 AND binning = ?2 AND gain = ?3 AND offset = ?4",
+        crate::calibration::frame_row::GROUP_FRAME_SELECT_COLUMNS
     );
 
     let mut param_count = 4;
@@ -254,13 +252,11 @@ pub fn detect_bias_groups(
     // Bias matching requires: instrume, binning, gain, offset
     // NO exptime (bias frames have ~0 exposure)
     // NO focal_length (Bias is sensor-only, not optical)
-    let mut query = String::from(
-        "SELECT id, file_id, object, date_obs, telescop, instrume, exptime, filter, imagetyp,
-                is_master, ra, dec, objctra, objctdec, gain, offset, xbinning, ybinning,
-                ccd_temp, set_temp, focallen, xpixsz, ypixsz, naxis1, naxis2,
-                sitelat, lat_obs, sitelong, long_obs, uuid, updated_at
+    let mut query = format!(
+        "SELECT {}
          FROM frames
-         WHERE imagetyp = 'Bias' AND instrume = ?1 AND binning = ?2 AND gain = ?3 AND offset = ?4"
+         WHERE imagetyp = 'Bias' AND instrume = ?1 AND binning = ?2 AND gain = ?3 AND offset = ?4",
+        crate::calibration::frame_row::GROUP_FRAME_SELECT_COLUMNS
     );
 
     let mut param_count = 4;
@@ -350,72 +346,7 @@ fn execute_dark_query(
     let mut rows = stmt.raw_query();
 
     while let Some(row) = rows.next()? {
-        use crate::models::ImageType;
-
-        // Parse date_obs
-        let date_obs_str: Option<String> = row.get(3)?;
-        let date_obs = date_obs_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
-
-        // Parse imagetyp
-        let imagetyp_str: Option<String> = row.get(8)?;
-        let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s));
-
-        // Calculate binning
-        let xbinning: Option<i32> = row.get(16)?;
-        let ybinning: Option<i32> = row.get(17)?;
-        let binning = match (xbinning, ybinning) {
-            (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
-            _ => None,
-        };
-
-        // Convert is_master from SQL INTEGER to bool
-        let is_master_int: i32 = row.get(9)?;
-        let is_master = is_master_int != 0;
-
-        let frame = Frame {
-            id: Some(row.get(0)?),
-            file_id: row.get(1)?,
-            object: row.get(2)?,
-            date_obs,
-            telescop: row.get(4)?,
-            instrume: row.get(5)?,
-            exptime: row.get(6)?,
-            filter: row.get(7)?,
-            imagetyp,
-            is_master,
-            gain: row.get(14)?,
-            offset: row.get(15)?,
-            binning,
-            xbinning,
-            ybinning,
-            ccd_temp: row.get(18)?,
-            set_temp: row.get(19)?,
-            focallen: row.get(20)?,
-            xpixsz: row.get(21)?,
-            ypixsz: row.get(22)?,
-            naxis1: row.get(23)?,
-            naxis2: row.get(24)?,
-            ra: row.get(10)?,
-            dec: row.get(11)?,
-            sitelat: row.get(25)?,
-            lat_obs: row.get(26)?,
-            sitelong: row.get(27)?,
-            long_obs: row.get(28)?,
-            objctra: row.get(12)?,
-            objctdec: row.get(13)?,
-            override_: false,
-            swcreate: None,
-            bayerpat: None,
-            xbayroff: None,
-            ybayroff: None,
-            roworder: None,
-            rotation: None,
-            uuid: row.get(29)?,
-            updated_at: row.get(30)?,
-        };
-
-        frames.push(frame);
+        frames.push(crate::calibration::frame_row::frame_from_group_row(row)?);
     }
 
     Ok(frames)
@@ -458,72 +389,7 @@ fn execute_bias_query(
     let mut rows = stmt.raw_query();
 
     while let Some(row) = rows.next()? {
-        use crate::models::ImageType;
-
-        // Parse date_obs
-        let date_obs_str: Option<String> = row.get(3)?;
-        let date_obs = date_obs_str.and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
-
-        // Parse imagetyp
-        let imagetyp_str: Option<String> = row.get(8)?;
-        let imagetyp = imagetyp_str.and_then(|s| ImageType::from_str(&s));
-
-        // Calculate binning
-        let xbinning: Option<i32> = row.get(16)?;
-        let ybinning: Option<i32> = row.get(17)?;
-        let binning = match (xbinning, ybinning) {
-            (Some(x), Some(y)) => Some(format!("{}x{}", x, y)),
-            _ => None,
-        };
-
-        // Convert is_master from SQL INTEGER to bool
-        let is_master_int: i32 = row.get(9)?;
-        let is_master = is_master_int != 0;
-
-        let frame = Frame {
-            id: Some(row.get(0)?),
-            file_id: row.get(1)?,
-            object: row.get(2)?,
-            date_obs,
-            telescop: row.get(4)?,
-            instrume: row.get(5)?,
-            exptime: row.get(6)?,
-            filter: row.get(7)?,
-            imagetyp,
-            is_master,
-            gain: row.get(14)?,
-            offset: row.get(15)?,
-            binning,
-            xbinning,
-            ybinning,
-            ccd_temp: row.get(18)?,
-            set_temp: row.get(19)?,
-            focallen: row.get(20)?,
-            xpixsz: row.get(21)?,
-            ypixsz: row.get(22)?,
-            naxis1: row.get(23)?,
-            naxis2: row.get(24)?,
-            ra: row.get(10)?,
-            dec: row.get(11)?,
-            sitelat: row.get(25)?,
-            lat_obs: row.get(26)?,
-            sitelong: row.get(27)?,
-            long_obs: row.get(28)?,
-            objctra: row.get(12)?,
-            objctdec: row.get(13)?,
-            override_: false,
-            swcreate: None,
-            bayerpat: None,
-            xbayroff: None,
-            ybayroff: None,
-            roworder: None,
-            rotation: None,
-            uuid: row.get(29)?,
-            updated_at: row.get(30)?,
-        };
-
-        frames.push(frame);
+        frames.push(crate::calibration::frame_row::frame_from_group_row(row)?);
     }
 
     Ok(frames)
@@ -1613,6 +1479,108 @@ mod tests {
             member_count(&conn, master_id), 0,
             "raw frames must not be linked into the master set"
         );
+    }
+
+    /// Seeds a real `files` + `frames` row pair for a calibration frame that
+    /// declares CFA (Bayer) metadata, so the loaders can be exercised against
+    /// the real schema instead of a hand-built `Frame`.
+    fn seed_cfa_calibration_frame(conn: &Connection, id: i64, imagetyp: &str, exptime: f64) {
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (?1, ?2, ?3, 1024, '2025-09-25T00:00:00+00:00', 'FITS')",
+            rusqlite::params![
+                id,
+                format!("/data/cfa_{}.fits", id),
+                format!("cfa_{}.fits", id),
+            ],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO frames
+             (id, file_id, date_obs, instrume, exptime, imagetyp, is_master,
+              gain, offset, binning, xbinning, ybinning, ccd_temp,
+              bayerpat, xbayroff, ybayroff, roworder)
+             VALUES (?1, ?1, '2025-09-25T00:00:00+00:00', 'ASI2600MC', ?2, ?3, 0,
+                     56.0, 50.0, '1x1', 1, 1, -10.0,
+                     'RGGB', 1, 0, 'BOTTOM-UP')",
+            rusqlite::params![id, exptime, imagetyp],
+        ).unwrap();
+    }
+
+    /// Same contract as the light/representative-frame loaders fixed in
+    /// `420bde27`: a dark shot on a colour sensor must arrive with its CFA
+    /// metadata, not with the four fields assumed away as `None`.
+    #[test]
+    fn dark_loader_carries_cfa_metadata() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_cfa_calibration_frame(&conn, 300, "Dark", 300.0);
+
+        let query = format!(
+            "SELECT {} FROM frames
+             WHERE imagetyp = 'Dark' AND instrume = ?1 AND binning = ?2 AND gain = ?3 AND offset = ?4",
+            crate::calibration::frame_row::GROUP_FRAME_SELECT_COLUMNS
+        );
+        // `exptime = None` keeps the bound parameters aligned with the four
+        // placeholders above — the exposure clause is appended by
+        // `detect_dark_groups`, not by this hand-built base query.
+        let frames = execute_dark_query(
+            &conn, &query, "ASI2600MC", "1x1", 56.0, 50.0, None, None,
+        ).unwrap();
+
+        assert_eq!(frames.len(), 1, "seeded dark must be found");
+        let f = &frames[0];
+        assert_eq!(f.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(f.xbayroff, Some(1));
+        assert_eq!(f.ybayroff, Some(0));
+        assert_eq!(f.roworder.as_deref(), Some("BOTTOM-UP"));
+    }
+
+    /// Bias path, same contract.
+    #[test]
+    fn bias_loader_carries_cfa_metadata() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_cfa_calibration_frame(&conn, 301, "Bias", 0.0);
+
+        let query = format!(
+            "SELECT {} FROM frames
+             WHERE imagetyp = 'Bias' AND instrume = ?1 AND binning = ?2 AND gain = ?3 AND offset = ?4",
+            crate::calibration::frame_row::GROUP_FRAME_SELECT_COLUMNS
+        );
+        let frames = execute_bias_query(
+            &conn, &query, "ASI2600MC", "1x1", 56.0, 50.0, None,
+        ).unwrap();
+
+        assert_eq!(frames.len(), 1, "seeded bias must be found");
+        let f = &frames[0];
+        assert_eq!(f.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(f.xbayroff, Some(1));
+        assert_eq!(f.ybayroff, Some(0));
+        assert_eq!(f.roworder.as_deref(), Some("BOTTOM-UP"));
+    }
+
+    /// The public entry points build their own SELECT from the shared column
+    /// list. If that list and the shared mapper ever drift apart, the mapper's
+    /// `row.get` runs off the end of the row and the call fails — so a plain
+    /// end-to-end grouping assertion is the wiring guard for both queries.
+    #[test]
+    fn detect_dark_and_bias_groups_execute_with_the_shared_column_list() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        seed_cfa_calibration_frame(&conn, 310, "Dark", 300.0);
+        seed_cfa_calibration_frame(&conn, 311, "Bias", 0.0);
+
+        let dark_groups = detect_dark_groups(
+            &conn, "ASI2600MC", "1x1", Some(56.0), Some(50.0), Some(300.0), None, 30, None, None,
+        ).unwrap();
+        assert_eq!(dark_groups.len(), 1, "seeded dark must form one group");
+        assert_eq!(dark_groups[0].frame_ids, vec![310]);
+
+        let bias_groups = detect_bias_groups(
+            &conn, "ASI2600MC", "1x1", Some(56.0), Some(50.0), None, 30, None, None,
+        ).unwrap();
+        assert_eq!(bias_groups.len(), 1, "seeded bias must form one group");
+        assert_eq!(bias_groups[0].frame_ids, vec![311]);
     }
 
     #[test]
