@@ -2,7 +2,7 @@
 
 use crate::models::{CameraStats, CalibrationSetDetail, FileWithFrame, ImageType};
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::DateTime;
 use rusqlite::{Connection, params};
 
 /// Get all cameras with statistics
@@ -260,88 +260,20 @@ pub fn get_frames_for_calibration_set(
     conn: &Connection,
     set_id: i64,
 ) -> Result<Vec<FileWithFrame>> {
-    let mut stmt = conn.prepare(
-        "SELECT f.id, f.path, f.filename, f.size, f.modified_at, f.format, f.created_at, f.metadata_hash, f.content_hash,
-                f.archived_in_operation, f.archive_zip_path, f.archive_path_in_zip,
-                fr.id, fr.file_id, fr.object, fr.date_obs, fr.telescop, fr.instrume,
-                fr.exptime, fr.filter, fr.imagetyp, fr.is_master, fr.gain, fr.offset, fr.binning,
-                fr.xbinning, fr.ybinning, fr.ccd_temp, fr.set_temp, fr.focallen,
-                fr.xpixsz, fr.ypixsz, fr.naxis1, fr.naxis2, fr.ra, fr.dec, fr.sitelat, fr.lat_obs,
-                fr.sitelong, fr.long_obs, fr.objctra, fr.objctdec, fr.override,
-                f.uuid, f.updated_at, fr.uuid, fr.updated_at
+    let query = format!(
+        "SELECT {select}
          FROM calibration_set_frames csf
          JOIN frames fr ON csf.frame_id = fr.id
          JOIN files f ON fr.file_id = f.id
          WHERE csf.set_id = ?1
          ORDER BY fr.date_obs ASC",
-    )?;
+        select = super::operations::FILE_FRAME_SELECT,
+    );
+    let mut stmt = conn.prepare(&query)?;
 
     let frames = stmt.query_map(params![set_id], |row| {
-        let file = crate::models::File {
-            id: row.get(0)?,
-            path: row.get(1)?,
-            filename: row.get(2)?,
-            size: row.get(3)?,
-            modified_at: crate::db::parse_stored_ts("files.modified_at", &row.get::<_, String>(4)?),
-            format: if row.get::<_, String>(5)? == "FITS" {
-                crate::models::FileFormat::FITS
-            } else {
-                crate::models::FileFormat::XISF
-            },
-            created_at: crate::db::parse_stored_ts("files.created_at", &row.get::<_, String>(6)?),
-            metadata_hash: row.get(7)?,
-            content_hash: row.get(8)?,
-            archived_in_operation: row.get(9)?,
-            archive_zip_path: row.get(10)?,
-            archive_path_in_zip: row.get(11)?,
-            uuid: row.get(43)?,
-            updated_at: row.get(44)?,
-        };
-
-        let frame = crate::models::Frame {
-            id: row.get(12)?,
-            file_id: row.get(13)?,
-            object: row.get(14)?,
-            date_obs: row.get::<_, Option<String>>(15)?.and_then(|s| {
-                DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
-            }),
-            telescop: row.get(16)?,
-            instrume: row.get(17)?,
-            exptime: row.get(18)?,
-            filter: row.get(19)?,
-            imagetyp: row.get::<_, Option<String>>(20)?.and_then(|s| crate::models::ImageType::from_str(&s)),
-            is_master: row.get::<_, i32>(21)? == 1,
-            gain: row.get(22)?,
-            offset: row.get(23)?,
-            binning: row.get(24)?,
-            xbinning: row.get(25)?,
-            ybinning: row.get(26)?,
-            ccd_temp: row.get(27)?,
-            set_temp: row.get(28)?,
-            focallen: row.get(29)?,
-            xpixsz: row.get(30)?,
-            ypixsz: row.get(31)?,
-            naxis1: row.get(32)?,
-            naxis2: row.get(33)?,
-            ra: row.get(34)?,
-            dec: row.get(35)?,
-            sitelat: row.get(36)?,
-            lat_obs: row.get(37)?,
-            sitelong: row.get(38)?,
-            long_obs: row.get(39)?,
-            objctra: row.get(40)?,
-            objctdec: row.get(41)?,
-            override_: row.get::<_, i32>(42)? == 1,
-            swcreate: None,
-            bayerpat: None,
-            xbayroff: None,
-            ybayroff: None,
-            roworder: None,
-            rotation: None,
-            uuid: row.get(45)?,
-            updated_at: row.get(46)?,
-        };
-
+        let (file, frame) = super::operations::map_file_frame_row(row)?;
+        let frame = super::operations::require_joined_frame(frame)?;
         Ok(FileWithFrame {
             file,
             frame: Some(frame),
@@ -398,6 +330,52 @@ mod stored_timestamp_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file.modified_at, DateTime::<Utc>::UNIX_EPOCH);
         assert_eq!(rows[0].file.created_at, DateTime::<Utc>::UNIX_EPOCH);
+    }
+}
+
+#[cfg(test)]
+mod cfa_projection_tests {
+    use crate::db::schema::init_db;
+    use rusqlite::Connection;
+
+    /// The calibration-set frame listing shares the 47-column SELECT that
+    /// erased the CFA columns — pinned here against the canonical projection.
+    #[test]
+    fn calibration_set_frames_carry_cfa_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO files (id, path, filename, size, modified_at, format)
+             VALUES (1, '/t/flat.fits', 'flat.fits', 1, '2026-01-01T00:00:00+00:00', 'FITS')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO frames (id, file_id, imagetyp, instrume, swcreate,
+                                 bayerpat, xbayroff, ybayroff, roworder, rotation)
+             VALUES (1, 1, 'FLAT', 'CamA', 'CaptureApp', 'RGGB', 1, 0, 'BOTTOM-UP', 0.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date) VALUES (1, 'FLAT', '2026-01-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (1, 1)",
+            [],
+        )
+        .unwrap();
+
+        let rows = super::get_frames_for_calibration_set(&conn, 1).unwrap();
+        assert_eq!(rows.len(), 1);
+        let frame = rows[0].frame.as_ref().expect("joined frame");
+        assert_eq!(frame.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(frame.xbayroff, Some(1));
+        assert_eq!(frame.ybayroff, Some(0));
+        assert_eq!(frame.roworder.as_deref(), Some("BOTTOM-UP"));
+        assert_eq!(frame.swcreate.as_deref(), Some("CaptureApp"));
     }
 }
 
