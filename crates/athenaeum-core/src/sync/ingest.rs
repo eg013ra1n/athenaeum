@@ -608,21 +608,24 @@ fn insert_ingested_rows(
 
     // Re-extract the raw header from the landed file for the metadata-pane revert
     // blob. The manifest carries only the parsed Frame snapshot, not header text.
+    let format_for_backfill = format.clone();
     let header = match format {
         FileFormat::FITS => crate::fits_parser::extract_fits_header(landed),
         FileFormat::XISF => crate::fits_parser::extract_xisf_header(landed),
     };
-    match header {
+    let header_text = match header {
         Ok(text) => {
             crate::db::insert_fits_header(tx, file_id, &text).context("insert fits_header row")?;
+            Some(text)
         }
         Err(e) => {
             // Non-fatal: a missing header only disables per-field revert for this
             // frame. Insert an empty blob so the row still exists.
             tracing::warn!(frame_uuid = %record.frame_uuid, error = %e, "sync ingest header extract failed");
             crate::db::insert_fits_header(tx, file_id, "").context("insert empty fits_header row")?;
+            None
         }
-    }
+    };
 
     // Insert the frame from the snapshot, then stamp the manifest identity. The
     // scanner primitive omits the uuid/updated_at columns, so the identity
@@ -632,6 +635,17 @@ fn insert_ingested_rows(
     let mut frame = snapshot.clone();
     frame.id = None;
     frame.file_id = file_id;
+    // Defensive CFA back-fill: a sender running a build with the CFA-blind
+    // `get_frames_with_files_by_ids` projection ships `frame_meta` with the
+    // Bayer fields erased. The landed file's own header is authoritative for
+    // what the snapshot left empty; a value the snapshot carried always wins.
+    if let Some(text) = &header_text {
+        crate::fits_parser::stored_header::backfill_frame_cfa(
+            &mut frame,
+            format_for_backfill,
+            text,
+        );
+    }
     let frame_id = crate::db::insert_frame(tx, &frame).context("insert frames row")?;
     let updated_at = snapshot.updated_at.clone().unwrap_or_else(now_iso);
     tx.execute(

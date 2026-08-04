@@ -227,6 +227,60 @@ pub fn snapshot_from_keys(frame_id: i64, keys: &HashMap<String, String>) -> Fram
     }
 }
 
+/// The four CFA identity fields as stored in a raw header, parsed with the
+/// same leniency as [`snapshot_from_keys`]. Consumers back-fill catalog
+/// columns from these when a frame snapshot arrived without them: sync
+/// ingest from a sender whose `frame_meta` was built by a CFA-blind
+/// projection, and the one-time catalog repair for rows already landed
+/// that way (`db::repair`).
+pub struct CfaHeaderFields {
+    pub bayerpat: Option<String>,
+    pub xbayroff: Option<i64>,
+    pub ybayroff: Option<i64>,
+    pub roworder: Option<String>,
+}
+
+pub fn cfa_fields_from_keys(keys: &HashMap<String, String>) -> CfaHeaderFields {
+    let get = |k: &str| keys.get(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    CfaHeaderFields {
+        bayerpat: get("BAYERPAT"),
+        xbayroff: get("XBAYROFF").and_then(|s| s.parse::<i64>().ok()),
+        ybayroff: get("YBAYROFF").and_then(|s| s.parse::<i64>().ok()),
+        roworder: get("ROWORDER"),
+    }
+}
+
+/// Fill a [`Frame`](crate::models::Frame)'s missing CFA fields from the file's
+/// own raw header. Only `None` fields are filled — a value the snapshot carried
+/// always wins.
+pub fn backfill_frame_cfa(
+    frame: &mut crate::models::Frame,
+    format: FileFormat,
+    header_text: &str,
+) {
+    if frame.bayerpat.is_some()
+        && frame.xbayroff.is_some()
+        && frame.ybayroff.is_some()
+        && frame.roworder.is_some()
+    {
+        return;
+    }
+    let keys = parse_stored_header_keys(format, header_text);
+    let cfa = cfa_fields_from_keys(&keys);
+    if frame.bayerpat.is_none() {
+        frame.bayerpat = cfa.bayerpat;
+    }
+    if frame.xbayroff.is_none() {
+        frame.xbayroff = cfa.xbayroff;
+    }
+    if frame.ybayroff.is_none() {
+        frame.ybayroff = cfa.ybayroff;
+    }
+    if frame.roworder.is_none() {
+        frame.roworder = cfa.roworder;
+    }
+}
+
 /// Parse FITS header text where each line is one 80-char card (the format
 /// `to_header_text` produces). Skips END/COMMENT/HISTORY/blank cards. Handles
 /// quoted-string and unquoted-numeric value forms; comments after `/` are
@@ -551,5 +605,51 @@ mod tests {
             "keywords after a dangling `&` must still parse"
         );
         assert_eq!(keys.get("EXPTIME"), Some(&"120.0".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod cfa_backfill_tests {
+    use super::*;
+    use crate::models::{FileFormat, Frame};
+
+    // "KEY = value" dump form — explicitly supported by the ASIAIR fallback
+    // parser, so the test doesn't depend on 80-col card layout.
+    const OSC_HEADER: &str = "BAYERPAT= 'RGGB'\nXBAYROFF= 1\nYBAYROFF= 0\nROWORDER= 'BOTTOM-UP'\nEND";
+
+    fn blank_frame() -> Frame {
+        // Frame derives Default — everything None/false except the required id.
+        Frame { file_id: 1, ..Default::default() }
+    }
+
+    #[test]
+    fn cfa_fields_parse_from_keys() {
+        let keys = parse_stored_header_keys(FileFormat::FITS, OSC_HEADER);
+        let cfa = cfa_fields_from_keys(&keys);
+        assert_eq!(cfa.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(cfa.xbayroff, Some(1));
+        assert_eq!(cfa.ybayroff, Some(0));
+        assert_eq!(cfa.roworder.as_deref(), Some("BOTTOM-UP"));
+    }
+
+    #[test]
+    fn backfill_fills_only_missing_fields() {
+        let mut frame = blank_frame();
+        frame.bayerpat = Some("GBRG".to_string()); // snapshot value must win
+        backfill_frame_cfa(&mut frame, FileFormat::FITS, OSC_HEADER);
+        assert_eq!(frame.bayerpat.as_deref(), Some("GBRG"), "existing value never overwritten");
+        assert_eq!(frame.xbayroff, Some(1));
+        assert_eq!(frame.ybayroff, Some(0));
+        assert_eq!(frame.roworder.as_deref(), Some("BOTTOM-UP"));
+    }
+
+    #[test]
+    fn backfill_is_inert_on_a_mono_header() {
+        let mut frame = blank_frame();
+        backfill_frame_cfa(&mut frame, FileFormat::FITS, "EXPTIME = 300.0\nEND");
+        assert!(frame.bayerpat.is_none());
+        assert!(frame.xbayroff.is_none());
+        assert!(frame.ybayroff.is_none());
+        assert!(frame.roworder.is_none());
     }
 }
