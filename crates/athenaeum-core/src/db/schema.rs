@@ -2087,6 +2087,13 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // One-time data repairs (settings-flag gated). Best-effort by design: a
+    // repair failure must not brick catalog init — the error is logged here
+    // and the flag stays unstamped so the next start retries.
+    if let Err(e) = super::repair::backfill_cfa_from_stored_headers(conn) {
+        tracing::error!(error = ?e, "cfa back-fill repair failed");
+    }
+
     Ok(())
 }
 

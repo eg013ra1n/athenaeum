@@ -2,6 +2,7 @@
 // Handles SQLite catalog operations
 
 pub mod schema;
+pub mod repair;
 mod operations;
 mod operations_blackhole;
 mod equipment;
