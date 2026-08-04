@@ -35,15 +35,42 @@ pub fn get_all_cameras(conn: &Connection) -> Result<Vec<CameraStats>> {
     Ok(cameras)
 }
 
-/// Get calibration sets for a specific camera
-pub fn get_camera_dark_library(
+/// Shared SELECT + row mapper behind the three camera calibration-library
+/// accessors (audit I7 → DB-hygiene Task 16). All three query `calibration_set`
+/// joined to its first member frame (lowest frame id — deterministic, see the
+/// comment on [`first_member_tests`] above) and differ only in the master
+/// flag, an optional `imagetyp` allow-list, and the sort order:
+///
+/// - `get_camera_dark_library`: `is_master = false`, no `imagetyp` filter (the
+///   raw calibration library, despite the "dark" name).
+/// - `get_camera_master_dark_library`: `is_master = true`,
+///   `imagetyp IN ('MasterDark','MasterBias','MasterDarkFlat')`.
+/// - `get_camera_master_flat_library`: `is_master = true`,
+///   `imagetyp = 'MasterFlat'`.
+///
+/// These divergences are real and pinned by
+/// `camera_library_accessor_tests::each_accessor_returns_only_its_own_set` —
+/// never unify them.
+fn query_camera_calibration_sets(
     conn: &Connection,
     instrume: &str,
+    is_master: bool,
+    imagetyp_filter: Option<&[&str]>,
+    order_by: &str,
 ) -> Result<Vec<CalibrationSetDetail>> {
-    // Query calibration sets with extended frame metadata from the first member =
-    // lowest frame id, deterministic (audit I7 — the old bare-column GROUP BY
-    // returned an arbitrary member).
-    let mut stmt = conn.prepare(
+    let imagetyp_clause = match imagetyp_filter {
+        Some(types) => {
+            let quoted = types
+                .iter()
+                .map(|t| format!("'{t}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("AND cs.imagetyp IN ({quoted})")
+        }
+        None => String::new(),
+    };
+
+    let query = format!(
         "SELECT
             cs.id,
             cs.imagetyp,
@@ -79,9 +106,13 @@ pub fn get_camera_dark_library(
         LEFT JOIN frames f ON f.id = first_member.frame_id
         LEFT JOIN files fi ON fi.id = f.file_id
         WHERE cs.instrume = ?1
-        AND cs.is_master_library = 0
-        ORDER BY cs.imagetyp, cs.exptime, cs.ccd_temp"
-    )?;
+        AND cs.is_master_library = {is_master_library}
+        {imagetyp_clause}
+        ORDER BY {order_by}",
+        is_master_library = is_master as i32,
+    );
+
+    let mut stmt = conn.prepare(&query)?;
 
     let sets = stmt
         .query_map([instrume], |row| {
@@ -116,7 +147,7 @@ pub fn get_camera_dark_library(
                 date_end,
                 date_display,
                 frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
-                is_master: false,  // Regular calibration sets only
+                is_master,
                 // Extended fields from frame metadata
                 naxis1: row.get(15)?,
                 naxis2: row.get(16)?,
@@ -135,6 +166,20 @@ pub fn get_camera_dark_library(
     Ok(sets)
 }
 
+/// Get calibration sets for a specific camera
+pub fn get_camera_dark_library(
+    conn: &Connection,
+    instrume: &str,
+) -> Result<Vec<CalibrationSetDetail>> {
+    query_camera_calibration_sets(
+        conn,
+        instrume,
+        false,
+        None,
+        "cs.imagetyp, cs.exptime, cs.ccd_temp",
+    )
+}
+
 /// Check if dark library exists for camera
 pub fn has_dark_library(conn: &Connection, instrume: &str) -> Result<bool> {
     let mut stmt = conn.prepare("SELECT COUNT(*) FROM calibration_set WHERE instrume = ?1 AND is_master_library = 0")?;
@@ -147,99 +192,13 @@ pub fn get_camera_master_dark_library(
     conn: &Connection,
     instrume: &str,
 ) -> Result<Vec<CalibrationSetDetail>> {
-    // Extended frame metadata comes from the first member = lowest frame id,
-    // deterministic (audit I7 — the old bare-column GROUP BY returned an
-    // arbitrary member).
-    let mut stmt = conn.prepare(
-        "SELECT
-            cs.id,
-            cs.imagetyp,
-            cs.exptime,
-            cs.ccd_temp,
-            cs.temp_min,
-            cs.temp_max,
-            cs.gain,
-            cs.offset,
-            cs.binning,
-            cs.instrume,
-            cs.filter,
-            cs.date_start,
-            cs.date_end,
-            cs.date,
-            cs.frame_count,
-            f.naxis1,
-            f.naxis2,
-            f.bayerpat,
-            f.swcreate,
-            f.xpixsz,
-            fi.format,
-            cs.focallen,
-            cs.uuid,
-            cs.updated_at,
-            cs.superseded_by_set_id
-        FROM calibration_set cs
-        LEFT JOIN (
-            SELECT set_id, MIN(frame_id) AS frame_id
-            FROM calibration_set_frames
-            GROUP BY set_id
-        ) first_member ON first_member.set_id = cs.id
-        LEFT JOIN frames f ON f.id = first_member.frame_id
-        LEFT JOIN files fi ON fi.id = f.file_id
-        WHERE cs.instrume = ?1
-        AND cs.is_master_library = 1
-        AND cs.imagetyp IN ('MasterDark', 'MasterBias', 'MasterDarkFlat')
-        ORDER BY cs.imagetyp, cs.exptime, cs.ccd_temp"
-    )?;
-
-    let sets = stmt
-        .query_map([instrume], |row| {
-            let imagetyp_str: String = row.get(1)?;
-            let imagetyp = ImageType::from_str(&imagetyp_str)
-                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
-
-            let date_start: String = row.get(11)?;
-            let date_end: String = row.get(12)?;
-
-            // Generate date_display from date_start (YYYY-MM format)
-            let date_display = if let Ok(dt) = DateTime::parse_from_rfc3339(&date_start) {
-                dt.format("%Y-%m").to_string()
-            } else {
-                // Fallback if parsing fails
-                date_start.chars().take(7).collect()
-            };
-
-            Ok(CalibrationSetDetail {
-                id: Some(row.get(0)?),
-                imagetyp,
-                exptime: row.get(2)?,
-                ccd_temp: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                temp_min: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-                temp_max: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-                gain: row.get(6)?,
-                offset: row.get(7)?,
-                binning: row.get(8)?,
-                instrume: row.get(9)?,
-                filter: row.get(10)?,
-                date_start,
-                date_end,
-                date_display,
-                frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
-                is_master: true,  // Master calibration sets
-                naxis1: row.get(15)?,
-                naxis2: row.get(16)?,
-                bayerpat: row.get(17)?,
-                swcreate: row.get(18)?,
-                xpixsz: row.get(19)?,
-                format: row.get(20)?,
-                focallen: row.get(21)?,
-                uuid: row.get(22)?,
-                updated_at: row.get(23)?,
-                superseded_by_set_id: row.get(24)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(sets)
+    query_camera_calibration_sets(
+        conn,
+        instrume,
+        true,
+        Some(&["MasterDark", "MasterBias", "MasterDarkFlat"]),
+        "cs.imagetyp, cs.exptime, cs.ccd_temp",
+    )
 }
 
 /// Check if master dark library exists for camera (MasterDark, MasterBias, MasterDarkFlat)
@@ -258,99 +217,13 @@ pub fn get_camera_master_flat_library(
     conn: &Connection,
     instrume: &str,
 ) -> Result<Vec<CalibrationSetDetail>> {
-    // Extended frame metadata comes from the first member = lowest frame id,
-    // deterministic (audit I7 — the old bare-column GROUP BY returned an
-    // arbitrary member).
-    let mut stmt = conn.prepare(
-        "SELECT
-            cs.id,
-            cs.imagetyp,
-            cs.exptime,
-            cs.ccd_temp,
-            cs.temp_min,
-            cs.temp_max,
-            cs.gain,
-            cs.offset,
-            cs.binning,
-            cs.instrume,
-            cs.filter,
-            cs.date_start,
-            cs.date_end,
-            cs.date,
-            cs.frame_count,
-            f.naxis1,
-            f.naxis2,
-            f.bayerpat,
-            f.swcreate,
-            f.xpixsz,
-            fi.format,
-            cs.focallen,
-            cs.uuid,
-            cs.updated_at,
-            cs.superseded_by_set_id
-        FROM calibration_set cs
-        LEFT JOIN (
-            SELECT set_id, MIN(frame_id) AS frame_id
-            FROM calibration_set_frames
-            GROUP BY set_id
-        ) first_member ON first_member.set_id = cs.id
-        LEFT JOIN frames f ON f.id = first_member.frame_id
-        LEFT JOIN files fi ON fi.id = f.file_id
-        WHERE cs.instrume = ?1
-        AND cs.is_master_library = 1
-        AND cs.imagetyp = 'MasterFlat'
-        ORDER BY cs.filter, cs.exptime, cs.ccd_temp"
-    )?;
-
-    let sets = stmt
-        .query_map([instrume], |row| {
-            let imagetyp_str: String = row.get(1)?;
-            let imagetyp = ImageType::from_str(&imagetyp_str)
-                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
-
-            let date_start: String = row.get(11)?;
-            let date_end: String = row.get(12)?;
-
-            // Generate date_display from date_start (YYYY-MM format)
-            let date_display = if let Ok(dt) = DateTime::parse_from_rfc3339(&date_start) {
-                dt.format("%Y-%m").to_string()
-            } else {
-                // Fallback if parsing fails
-                date_start.chars().take(7).collect()
-            };
-
-            Ok(CalibrationSetDetail {
-                id: Some(row.get(0)?),
-                imagetyp,
-                exptime: row.get(2)?,
-                ccd_temp: row.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
-                temp_min: row.get::<_, Option<f64>>(4)?.unwrap_or(0.0),
-                temp_max: row.get::<_, Option<f64>>(5)?.unwrap_or(0.0),
-                gain: row.get(6)?,
-                offset: row.get(7)?,
-                binning: row.get(8)?,
-                instrume: row.get(9)?,
-                filter: row.get(10)?,
-                date_start,
-                date_end,
-                date_display,
-                frame_count: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
-                is_master: true,  // Master calibration sets
-                naxis1: row.get(15)?,
-                naxis2: row.get(16)?,
-                bayerpat: row.get(17)?,
-                swcreate: row.get(18)?,
-                xpixsz: row.get(19)?,
-                format: row.get(20)?,
-                focallen: row.get(21)?,
-                uuid: row.get(22)?,
-                updated_at: row.get(23)?,
-                superseded_by_set_id: row.get(24)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(sets)
+    query_camera_calibration_sets(
+        conn,
+        instrume,
+        true,
+        Some(&["MasterFlat"]),
+        "cs.filter, cs.exptime, cs.ccd_temp",
+    )
 }
 
 /// Check if master flat library exists for camera
@@ -575,6 +448,80 @@ mod first_member_tests {
             sets[0].naxis1,
             Some(6000),
             "must be the FIRST member (lowest frame id), not an arbitrary one"
+        );
+    }
+}
+
+/// DB-hygiene Task 16 pin-behavior test — written and run against the
+/// pre-refactor three-copies-of-one-query code to pin the WHERE-clause
+/// divergences before `query_camera_calibration_sets` consolidates them:
+/// `get_camera_dark_library` filters only `is_master_library = 0` (no
+/// `imagetyp` filter — it is really "raw calibration library" despite the
+/// name); `get_camera_master_dark_library` adds
+/// `imagetyp IN ('MasterDark','MasterBias','MasterDarkFlat')`;
+/// `get_camera_master_flat_library` adds `imagetyp = 'MasterFlat'`. Each
+/// accessor must return exactly its own set and none of the other two.
+#[cfg(test)]
+mod camera_library_accessor_tests {
+    use super::{
+        get_camera_dark_library, get_camera_master_dark_library, get_camera_master_flat_library,
+    };
+    use rusqlite::Connection;
+
+    #[test]
+    fn each_accessor_returns_only_its_own_set() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, instrume, is_master_library, date_start, date_end)
+             VALUES ('Dark', '2026-01-01', 'CamPin', 0, '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let raw_dark_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, instrume, is_master_library, date_start, date_end)
+             VALUES ('MasterDark', '2026-01-01', 'CamPin', 1, '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let master_dark_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO calibration_set (imagetyp, date, instrume, is_master_library, date_start, date_end)
+             VALUES ('MasterFlat', '2026-01-01', 'CamPin', 1, '2026-01-01T00:00:00Z', '2026-01-01T01:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let master_flat_id = conn.last_insert_rowid();
+
+        let dark_library = get_camera_dark_library(&conn, "CamPin").unwrap();
+        assert_eq!(
+            dark_library.iter().filter_map(|s| s.id).collect::<Vec<_>>(),
+            vec![raw_dark_id],
+            "get_camera_dark_library must return only the raw (is_master_library = 0) set"
+        );
+
+        let master_dark_library = get_camera_master_dark_library(&conn, "CamPin").unwrap();
+        assert_eq!(
+            master_dark_library
+                .iter()
+                .filter_map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![master_dark_id],
+            "get_camera_master_dark_library must return only the MasterDark set"
+        );
+
+        let master_flat_library = get_camera_master_flat_library(&conn, "CamPin").unwrap();
+        assert_eq!(
+            master_flat_library
+                .iter()
+                .filter_map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec![master_flat_id],
+            "get_camera_master_flat_library must return only the MasterFlat set"
         );
     }
 }
