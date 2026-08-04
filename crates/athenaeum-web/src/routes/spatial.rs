@@ -11,31 +11,14 @@ use serde::Deserialize;
 
 use crate::WebAppState;
 
-/// camelCase wrapper for the core `SelectionBounds` type.
-/// Frontend sends `raMin`, `raMax`, etc. but the core struct uses snake_case.
+/// Wire shape of `query_frames_in_bounds`: the frontend sends the core
+/// `SelectionBounds` (snake_case, no `rename_all`) nested under a `bounds`
+/// key — the same envelope the Tauri command (named `bounds` argument +
+/// `rename_all = "snake_case"`) has always accepted. Mirrors the
+/// `CreateFrameSetFromSelectionArgs` precedent in `frame_sets.rs`.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SelectionBoundsArgs {
-    pub ra_min: f64,
-    pub ra_max: f64,
-    pub dec_min: f64,
-    pub dec_max: f64,
-    #[serde(default)]
-    pub crosses_meridian: Option<bool>,
-    #[serde(default)]
-    pub selected_object_ids: Option<Vec<i64>>,
-}
-
-impl From<SelectionBoundsArgs> for SelectionBounds {
-    fn from(a: SelectionBoundsArgs) -> Self {
-        SelectionBounds {
-            ra_min: a.ra_min,
-            ra_max: a.ra_max,
-            dec_min: a.dec_min,
-            dec_max: a.dec_max,
-            crosses_meridian: a.crosses_meridian,
-        }
-    }
+pub struct QueryFramesInBoundsArgs {
+    pub bounds: SelectionBounds,
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -63,11 +46,41 @@ pub async fn get_imaging_locations(
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn query_frames_in_bounds(
     State(state): State<WebAppState>,
-    Json(args): Json<SelectionBoundsArgs>,
+    Json(args): Json<QueryFramesInBoundsArgs>,
 ) -> Result<Json<SelectionCandidates>, (StatusCode, String)> {
     let db = state.ctx.db.get()
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Database not initialized".to_string()))?;
-    api::query_frames_in_bounds(&db.conn(), args.into())
+    api::query_frames_in_bounds(&db.conn(), args.bounds)
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QueryFramesInBoundsArgs;
+
+    /// Byte-for-byte the payload `useRectangleSelection.ts` builds (nested
+    /// `bounds`, snake_case — same envelope the Tauri command's named
+    /// `bounds` argument + `rename_all = "snake_case"` accepts). Pinned so
+    /// the web route can never again drift from the frontend's wire shape:
+    /// it used to expect flat camelCase and 422'd every selection.
+    #[test]
+    fn deserializes_the_frontend_selection_payload() {
+        let json = r#"{"bounds":{"ra_min":10.5,"ra_max":11.5,"dec_min":41.0,"dec_max":42.0,"crosses_meridian":false}}"#;
+        let args: QueryFramesInBoundsArgs = serde_json::from_str(json).unwrap();
+        assert_eq!(args.bounds.ra_min, 10.5);
+        assert_eq!(args.bounds.ra_max, 11.5);
+        assert_eq!(args.bounds.dec_min, 41.0);
+        assert_eq!(args.bounds.dec_max, 42.0);
+        assert_eq!(args.bounds.crosses_meridian, Some(false));
+    }
+
+    /// `crosses_meridian` is `#[serde(default)]` on the core type — an older
+    /// client omitting it must still deserialize.
+    #[test]
+    fn crosses_meridian_is_optional() {
+        let json = r#"{"bounds":{"ra_min":0.0,"ra_max":1.0,"dec_min":0.0,"dec_max":1.0}}"#;
+        let args: QueryFramesInBoundsArgs = serde_json::from_str(json).unwrap();
+        assert_eq!(args.bounds.crosses_meridian, None);
+    }
 }
