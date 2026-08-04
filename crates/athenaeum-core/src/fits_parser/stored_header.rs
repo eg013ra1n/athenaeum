@@ -242,10 +242,19 @@ pub struct CfaHeaderFields {
 
 pub fn cfa_fields_from_keys(keys: &HashMap<String, String>) -> CfaHeaderFields {
     let get = |k: &str| keys.get(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    // Kept in lock-step with the scanner's `parse_offset` in
+    // `build_frame_from_header`: some writers spell an integer-valued offset as
+    // a float ("1.0"). A strict integer parse would silently drop it to
+    // "unknown" here while the scanner lands it.
+    let offset = |k: &str| -> Option<i64> {
+        get(k).and_then(|s| {
+            s.parse::<i64>().ok().or_else(|| s.parse::<f64>().ok().map(|f| f as i64))
+        })
+    };
     CfaHeaderFields {
         bayerpat: get("BAYERPAT"),
-        xbayroff: get("XBAYROFF").and_then(|s| s.parse::<i64>().ok()),
-        ybayroff: get("YBAYROFF").and_then(|s| s.parse::<i64>().ok()),
+        xbayroff: offset("XBAYROFF"),
+        ybayroff: offset("YBAYROFF"),
         roworder: get("ROWORDER"),
     }
 }
@@ -630,6 +639,22 @@ mod cfa_backfill_tests {
         assert_eq!(cfa.xbayroff, Some(1));
         assert_eq!(cfa.ybayroff, Some(0));
         assert_eq!(cfa.roworder.as_deref(), Some("BOTTOM-UP"));
+    }
+
+    /// Scanner parity: `build_frame_from_header` accepts an integer-valued
+    /// offset spelled as a float ("1.0"), so the back-fill helper must too.
+    /// The one-time repair stamps its settings flag after running and sets
+    /// `bayerpat` non-NULL, so a row under-filled here is never revisited.
+    #[test]
+    fn float_spelled_cfa_offsets_parse_from_keys() {
+        let keys = parse_stored_header_keys(
+            FileFormat::FITS,
+            "BAYERPAT= 'RGGB'\nXBAYROFF= 1.0\nYBAYROFF= 0.0\nEND",
+        );
+        let cfa = cfa_fields_from_keys(&keys);
+        assert_eq!(cfa.bayerpat.as_deref(), Some("RGGB"));
+        assert_eq!(cfa.xbayroff, Some(1), "float-spelled offset must not drop to unknown");
+        assert_eq!(cfa.ybayroff, Some(0), "float-spelled offset must not drop to unknown");
     }
 
     #[test]
