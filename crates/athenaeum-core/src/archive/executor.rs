@@ -96,6 +96,63 @@ pub fn run_operation(
     Ok(())
 }
 
+/// [`run_operation`] plus the outcome bookkeeping + terminal
+/// `archive-finished` event every forward worker needs. Both hosts' start
+/// workers call this (and `resume::resume_operation_standalone` the resume
+/// workers) so the terminal block exists once — the web worker used to
+/// hand-roll it and forgot the emit, leaving the progress widget mounted
+/// forever. Same wire shape the desktop worker always emitted:
+/// `{operation_id, outcome}` — no `kind`, the frontend defaults to
+/// `'archive'`.
+pub fn run_operation_standalone(
+    conn: &Connection,
+    operation_id: i64,
+    cancel: &CancelFlag,
+    emitter: &dyn ProgressEmitter,
+) -> Result<()> {
+    let result = run_operation(conn, operation_id, cancel, emitter);
+    finish_forward_operation(conn, operation_id, emitter, result)
+}
+
+/// Shared tail of the two standalone entry points: status bookkeeping on
+/// error (cancelled/failed + inner rollback), then the terminal event, then
+/// the original result so callers can still see the error (already logged
+/// here — dropping it at the call site is fine).
+pub(crate) fn finish_forward_operation(
+    conn: &Connection,
+    operation_id: i64,
+    emitter: &dyn ProgressEmitter,
+    result: Result<()>,
+) -> Result<()> {
+    let outcome = match &result {
+        Ok(()) => {
+            tracing::info!(operation_id, "archive operation completed");
+            "completed"
+        }
+        Err(e) => {
+            let outcome = if was_cancelled(e) {
+                let _ = adb::update_operation_status(conn, operation_id, ArchiveStatus::Cancelled, None);
+                "cancelled"
+            } else {
+                tracing::error!(operation_id, error = ?e, "archive operation failed");
+                let msg = format!("{:#}", e);
+                let _ = adb::update_operation_status(conn, operation_id, ArchiveStatus::Failed, Some(&msg));
+                "failed"
+            };
+            if let Err(rb_err) = crate::archive::rollback::rollback_operation(conn, operation_id, emitter) {
+                tracing::error!(operation_id, error = ?rb_err, "rollback after failed archive operation also failed, operation may be left in an inconsistent state");
+            }
+            outcome
+        }
+    };
+    emit_event(
+        emitter,
+        "archive-finished",
+        &serde_json::json!({ "operation_id": operation_id, "outcome": outcome }),
+    );
+    result
+}
+
 /// Stage 2: copy each file into staging. Idempotent per row: if a step exists
 /// with status=Done, skip it (resume after crash).
 fn copy_phase(
@@ -515,7 +572,17 @@ mod tests {
     use crate::db::schema::init_db;
     use crate::events::NullEmitter;
     use rusqlite::params;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    #[derive(Default)]
+    struct CapturingEmitter(Mutex<Vec<(String, serde_json::Value)>>);
+
+    impl ProgressEmitter for CapturingEmitter {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            self.0.lock().unwrap().push((event_name.to_string(), payload));
+        }
+    }
 
     /// End-to-end fixture: real files on disk, planner runs, executor runs to Completion.
     fn run_full_fixture() -> (Connection, TempDir, TempDir, i64) {
@@ -598,6 +665,41 @@ mod tests {
             "SELECT archived_at FROM frames_set WHERE id = 1", [], |r| r.get(0),
         ).unwrap();
         assert!(archived_at.is_some());
+    }
+
+    /// The standalone wrapper owns the terminal event both hosts' workers
+    /// relied on hand-rolling (web forgot it; both resume workers forgot it).
+    #[test]
+    fn run_operation_standalone_emits_completed_terminal_event() {
+        let (conn, _arch, _scan, op_id) = run_full_fixture();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let emitter = CapturingEmitter::default();
+
+        run_operation_standalone(&conn, op_id, &cancel, &emitter).unwrap();
+
+        let events = emitter.0.lock().unwrap();
+        let finished: Vec<_> = events.iter().filter(|(n, _)| n == "archive-finished").collect();
+        assert_eq!(finished.len(), 1, "exactly one terminal event");
+        assert_eq!(finished[0].1["operation_id"], op_id);
+        assert_eq!(finished[0].1["outcome"], "completed");
+    }
+
+    /// Failure path still emits — and still runs the inner rollback.
+    #[test]
+    fn run_operation_standalone_emits_failed_for_unknown_operation() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let emitter = CapturingEmitter::default();
+
+        let result = run_operation_standalone(&conn, 999, &cancel, &emitter);
+        assert!(result.is_err(), "standalone must still surface the error to its caller");
+
+        let events = emitter.0.lock().unwrap();
+        assert!(
+            events.iter().any(|(n, p)| n == "archive-finished" && p["outcome"] == "failed"),
+            "terminal event must fire on failure too"
+        );
     }
 
     #[test]

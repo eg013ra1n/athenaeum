@@ -44,15 +44,13 @@ struct RollbackFinished<'a> {
 /// operation's terminal state — the outcome the UI must end on is the archive's
 /// (`failed` / `cancelled`), not the rollback's.
 ///
-/// For the record, those callers are inconsistent today, and this split is
-/// deliberately agnostic to that:
-/// - emit their own terminal event: the desktop archive worker
-///   (`athenaeum-tauri` `commands/archive.rs`) and the calibration-archive
-///   worker (`api::masters::archive_originals`).
-/// - emit none at all: the web archive worker (`athenaeum-web`
-///   `routes/archive.rs`) and both resume workers (desktop + web). That gap
-///   predates this function — those widgets never auto-dismissed — and is
-///   tracked separately; do not paper over it from in here.
+/// The forward-path callers get the same treatment from
+/// `executor::run_operation_standalone` / `resume::resume_operation_standalone`
+/// (one shared terminal block in core, both hosts' workers call it); the
+/// calibration-archive worker (`api::masters::archive_originals`) still emits
+/// its own richer terminal payload. Only the *inner* [`rollback_operation`]
+/// stays event-free — there a rollback is a sub-step of a failed operation,
+/// and the outcome the UI must end on is the archive's, not the rollback's.
 pub fn rollback_operation_standalone(
     conn: &Connection,
     operation_id: i64,

@@ -30,6 +30,19 @@ pub fn resume_operation(
     }
 }
 
+/// [`resume_operation`] plus the shared terminal bookkeeping — see
+/// `executor::run_operation_standalone`. Both hosts' resume workers call
+/// this; neither used to emit any terminal event at all.
+pub fn resume_operation_standalone(
+    conn: &Connection,
+    operation_id: i64,
+    cancel: &CancelFlag,
+    emitter: &dyn ProgressEmitter,
+) -> Result<()> {
+    let result = resume_operation(conn, operation_id, cancel, emitter);
+    crate::archive::executor::finish_forward_operation(conn, operation_id, emitter, result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +120,38 @@ mod tests {
         let op = adb::get_operation(&conn, op_id).unwrap();
         assert_eq!(op.status, "completed");
         let _ = arch;
+    }
+}
+
+#[cfg(test)]
+mod standalone_tests {
+    use super::*;
+    use crate::events::ProgressEmitter;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct CapturingEmitter(Mutex<Vec<(String, serde_json::Value)>>);
+
+    impl ProgressEmitter for CapturingEmitter {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            self.0.lock().unwrap().push((event_name.to_string(), payload));
+        }
+    }
+
+    #[test]
+    fn resume_operation_standalone_emits_terminal_event() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::schema::init_db(&conn).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let emitter = CapturingEmitter::default();
+
+        let result = resume_operation_standalone(&conn, 999, &cancel, &emitter);
+        assert!(result.is_err());
+
+        let events = emitter.0.lock().unwrap();
+        assert!(events
+            .iter()
+            .any(|(n, p)| n == "archive-finished" && p["outcome"] == "failed"));
     }
 }
