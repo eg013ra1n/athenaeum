@@ -7,13 +7,15 @@ export function ArchiveResumeBanner() {
   const [ops, setOps] = useState<ArchiveOperationSummary[]>([]);
   const [dismissed, setDismissed] = useState(false);
   const [busy, setBusy] = useState(false);
-  // Rollback runs on the operation queue and reports through the shared
-  // archive-progress / archive-finished events — keep the widget mounted
-  // until it says it is done, then retire the banner.
+  // Resume and rollback both run on the operation queue and report through
+  // the shared archive-progress / archive-finished events — keep the widget
+  // mounted until the terminal event, then retire the banner.
   const [rollingBack, setRollingBack] = useState(false);
+  const [resuming, setResuming] = useState(false);
 
-  const handleRollbackFinished = useCallback(() => {
+  const handleWorkerFinished = useCallback(() => {
     setRollingBack(false);
+    setResuming(false);
     setDismissed(true);
   }, []);
 
@@ -40,14 +42,15 @@ export function ArchiveResumeBanner() {
           {ops.length > 1 && ` (and ${ops.length - 1} more)`}
         </span>
         <button
-          disabled={busy || rollingBack}
+          disabled={busy || rollingBack || resuming}
           onClick={async () => {
             setBusy(true);
+            setResuming(true);
             try {
               await resumeArchiveOperation(op.id);
-              setDismissed(true);
             } catch (e) {
               console.error('resume archive failed', e);
+              setResuming(false);
               alert(`Resume failed: ${e}`);
             } finally {
               setBusy(false);
@@ -58,7 +61,7 @@ export function ArchiveResumeBanner() {
           Resume
         </button>
         <button
-          disabled={busy || rollingBack}
+          disabled={busy || rollingBack || resuming}
           onClick={async () => {
             setBusy(true);
             setRollingBack(true);
@@ -77,15 +80,16 @@ export function ArchiveResumeBanner() {
           Roll back
         </button>
         <button
+          disabled={busy || rollingBack || resuming}
           onClick={() => setDismissed(true)}
-          className="px-2 py-0.5 rounded border border-border text-xs text-content-muted ml-auto"
+          className="px-2 py-0.5 rounded border border-border text-xs text-content-muted ml-auto disabled:opacity-60"
         >
           Decide later
         </button>
       </div>
-      {rollingBack && (
+      {(rollingBack || resuming) && (
         <div className="fixed bottom-4 right-4 z-50 w-80">
-          <ArchiveProgress operationId={op.id} onClose={handleRollbackFinished} />
+          <ArchiveProgress operationId={op.id} onClose={handleWorkerFinished} />
         </div>
       )}
     </>

@@ -295,8 +295,8 @@ pub async fn resume_archive_operation(
             let db = ctx_for_worker.db.get().expect("db");
             let conn = db.conn();
             // Terminal event + failure bookkeeping in core — this worker used
-            // to emit nothing, so the (future) resume widget could never
-            // dismiss. Errors logged inside.
+            // to emit nothing, so the resume widget could never dismiss.
+            // Errors logged inside.
             let _ = resume::resume_operation_standalone(&conn, operation_id, &cancel_flag, &emitter);
             ctx_for_worker.active_archives.lock().unwrap().remove(&operation_id);
         }),
