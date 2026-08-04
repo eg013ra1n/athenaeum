@@ -11,6 +11,13 @@ pub mod calibration;
 pub mod spatial;
 // Calendar month aggregation. Ungated: db/models/coordinates only.
 pub mod calendar;
+// Frame-set workflows (auto-generate clustering + session detection + the
+// collab project-match suggestion). Render-gated ONLY because it calls
+// `api::collab::find_matching_projects` and `api::collab` is render-gated;
+// nothing here touches the image pipeline. Both transports build core with
+// default features, so the gate is invisible to them.
+#[cfg(feature = "render")]
+pub mod frame_sets;
 // Personal-sync commands (Stage I, task A7). Ungated: uses only db/sharing/sync.
 pub mod sync;
 // Full-app capture-node retention (task M4). Ungated: db/settings/sync only.

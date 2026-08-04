@@ -14,164 +14,16 @@ pub async fn auto_generate_frame_sets(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AutoGenerateResult, String> {
-    let db = state.ctx.db.get().ok_or("Database not initialized")?;
-    let conn = db.conn();
-
-    // Use provided threshold or get from settings
-    let threshold_deg = if let Some(custom_threshold) = threshold_deg {
-        custom_threshold
-    } else {
-        state.ctx.settings
-            .get_grouping_threshold_deg(&conn)
-            .map_err(|e| e.to_string())?
-    };
-
-    // Fetch all LIGHT frames
-    let all_frames = db::get_light_frames_for_project(&conn, project_id)
-        .map_err(|e| e.to_string())?;
-
-    // Get all frame IDs that are already in any set
-    let existing_member_ids = db::get_all_frames_set_member_ids(&conn)
-        .map_err(|e| e.to_string())?;
-    let existing_members_set: std::collections::HashSet<i64> = existing_member_ids.into_iter().collect();
-
-    // Filter out frames that are already in sets
-    let mut frames_already_in_sets = 0;
-    let frames: Vec<(i64, crate::models::Frame)> = all_frames
-        .into_iter()
-        .filter(|(_, frame)| {
-            if let Some(frame_id) = frame.id {
-                if existing_members_set.contains(&frame_id) {
-                    frames_already_in_sets += 1;
-                    return false;
-                }
-            }
-            true
-        })
-        .collect();
-
-    if frames.is_empty() {
-        return Ok(AutoGenerateResult {
-            sets_created: 0,
-            frames_clustered: 0,
-            frames_excluded: 0,
-            frames_already_in_sets,
-            exclusion_reasons: Vec::new(),
-        });
-    }
-
-    // Run clustering
-    let (clusters, excluded) = crate::clustering::auto_generate_frame_sets(frames, threshold_deg)
-        .map_err(|e| e.to_string())?;
-
-    // Persist excluded frames to DB (clear old, insert new)
-    db::clear_excluded_frames(&conn).map_err(|e| e.to_string())?;
-    if !excluded.is_empty() {
-        db::insert_excluded_frames(&conn, &excluded).map_err(|e| e.to_string())?;
-    }
-
-    // Create frame sets in a transaction
-    let mut sets_created = 0;
-    let mut frames_clustered = 0;
-
-    // Get session gap threshold from settings
-    let gap_threshold_hours: f64 = state.ctx.settings
-        .get_session_gap_threshold_hours(&conn)
-        .unwrap_or(6.0);
-
-    // Collaboration: emitter for the per-set project-match suggestions below.
+    // Collaboration: emitter for the per-set project-match suggestions.
     let emitter = crate::tauri_events::TauriProgressEmitter(app_handle.clone());
 
-    for cluster in clusters {
-        // Calculate metadata from cluster frames
-        let metadata = crate::frames_set_metadata::calculate_metadata_from_frame_ids(
-            &cluster.member_frame_ids,
-            &conn,
-        ).map_err(|e| e.to_string())?;
-
-        // Create frames_set
-        let set_id = db::create_frames_set(
-            &conn,
-            cluster.name.as_deref(),
-            false, // is_custom = false for auto-generated sets
-            metadata.date_obs_start.as_deref(),
-            metadata.date_obs_end.as_deref(),
-            metadata.objctra.as_deref(),
-            metadata.objctdec.as_deref(),
-            metadata.total_exp_time,
-            metadata.avg_rotation,
-            metadata.min_rotation,
-            metadata.max_rotation,
-        ).map_err(|e| e.to_string())?;
-
-        // Collaboration: suggest linking a new set whose center falls inside one
-        // of my projects' target radius (spec §7 join-first-shoot-later; never
-        // auto-link — the notification is a suggestion).
-        if let (Some(ra_str), Some(dec_str)) = (&metadata.objctra, &metadata.objctdec) {
-            if let (Ok(ra), Ok(dec)) = (
-                athenaeum_core::coordinates::parse_ra_sexagesimal(ra_str),
-                athenaeum_core::coordinates::parse_dec_sexagesimal(dec_str),
-            ) {
-                match athenaeum_core::api::collab::find_matching_projects(&conn, ra, dec, set_id) {
-                    Ok(matches) if !matches.is_empty() => {
-                        athenaeum_core::events::emit_event(
-                            &emitter,
-                            "project-set-match",
-                            &athenaeum_core::api::collab::ProjectSetMatchEvent {
-                                frames_set_id: set_id,
-                                set_name: cluster.name.clone(),
-                                matches,
-                            },
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(err) => tracing::warn!(set_id, error = %format!("{err:#}"), "project match check failed"),
-                }
-            }
-        }
-
-        // Get frames for session detection
-        let frames = db::get_frames_with_files_by_ids(&conn, &cluster.member_frame_ids)
-            .map_err(|e| e.to_string())?;
-
-        // Detect sessions
-        let detected_nights = crate::sessions::detect_sessions(frames, gap_threshold_hours)
-            .map_err(|e| e.to_string())?;
-
-        // Create imaging nights and sessions
-        for night in detected_nights {
-            let night_id = db::create_imaging_night(
-                &conn,
-                set_id,
-                &night.start_time,
-                &night.end_time,
-            ).map_err(|e| e.to_string())?;
-
-            for session in night.sessions {
-                let session_id = db::create_session(
-                    &conn,
-                    night_id,
-                    &session.instrume,
-                    session.frame_ids.len() as i32,
-                    session.total_exp_time,
-                ).map_err(|e| e.to_string())?;
-
-                db::insert_session_members(&conn, session_id, &session.frame_ids)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-
-        sets_created += 1;
-        frames_clustered += cluster.member_frame_ids.len();
-    }
-
-    Ok(AutoGenerateResult {
-        sets_created,
-        frames_clustered,
-        frames_excluded: excluded.len(),
-        frames_already_in_sets,
-        exclusion_reasons: excluded.into_iter().map(|(_, reason)| reason).collect(),
-    })
+    athenaeum_core::api::frame_sets::auto_generate_frame_sets(
+        &state.ctx,
+        Some(project_id),
+        threshold_deg,
+        &emitter,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Get all frame sets for a project
@@ -860,14 +712,9 @@ pub async fn remove_files_from_excluded(
 }
 
 // DTOs for frame sets
-#[derive(serde::Serialize)]
-pub struct AutoGenerateResult {
-    pub sets_created: usize,
-    pub frames_clustered: usize,
-    pub frames_excluded: usize,
-    pub frames_already_in_sets: usize,
-    pub exclusion_reasons: Vec<String>,
-}
+// `AutoGenerateResult` now lives in core beside the workflow that builds it;
+// re-exported so `commands::*` keeps exposing the same name.
+pub use athenaeum_core::api::frame_sets::AutoGenerateResult;
 
 #[derive(serde::Serialize)]
 pub struct FramesSetWithCount {
