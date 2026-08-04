@@ -641,6 +641,101 @@ function SetIdBadge({
   );
 }
 
+// ── Shared calibration-table helpers (Flats / Darks / Bias) ────────────────
+//
+// The three calibration tables share their sort state, their gain/binning/
+// offset match cells and their trailing "create master" cell. Only the
+// per-type columns, colors and sub-calibration links genuinely differ, so
+// those stay inline in each table. The lights table is structurally different
+// and does not use these.
+
+/** Sort state for a table: click a field to sort ascending, click again to flip. */
+function useTableSort<F extends string>(initial: F): {
+  sortField: F | null;
+  sortDir: SortDir;
+  handleSort: (f: F) => void;
+  thProps: { sortField: F | null; sortDir: SortDir; onSort: (f: F) => void };
+} {
+  const [sortField, setSortField] = useState<F | null>(initial);
+  const [sortDir, setSortDir] = useState<SortDir>('desc');
+
+  const handleSort = useCallback((field: F) => {
+    if (field === sortField) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    } else {
+      setSortField(field);
+      setSortDir('asc');
+    }
+  }, [sortField]);
+
+  return { sortField, sortDir, handleSort, thProps: { sortField, sortDir, onSort: handleSort } };
+}
+
+/** The row fields the match badges compare against the linked light frames. */
+interface MatchParams {
+  gain: number | null;
+  binning: string | null;
+  offset: number | null;
+  cameraGain: number | null;
+  cameraBinning: string | null;
+  cameraOffset: number | null;
+}
+
+/**
+ * The Gain / Binning / Offset match cells of a calibration-set row.
+ *
+ * `order` exists because the Bias table has always rendered these as B, G, O
+ * while Flats and Darks render G, B, O. That inconsistency is pre-existing and
+ * deliberately preserved here — don't "fix" it without a UI decision (the
+ * matching column headers stay inline in each table for the same reason).
+ */
+function MatchCells({ row, order = 'gbo' }: { row: MatchParams; order?: 'gbo' | 'bgo' }) {
+  const gMatch = row.cameraGain != null && row.gain != null && Math.abs(row.gain - row.cameraGain) < 0.01;
+  const bMatch = row.cameraBinning != null && row.binning === row.cameraBinning;
+  const oMatch = row.cameraOffset != null && row.offset != null && Math.abs(row.offset - row.cameraOffset) < 0.01;
+
+  const gainCell = <td className="px-1.5 py-1 text-sm"><MatchBadge label="Gain" value={row.gain} matches={row.cameraGain != null ? gMatch : null} /></td>;
+  const binningCell = <td className="px-1.5 py-1 text-sm"><MatchBadge label="Binning" value={row.binning} matches={row.cameraBinning != null ? bMatch : null} /></td>;
+  const offsetCell = <td className="px-1.5 py-1 text-sm"><MatchBadge label="Offset" value={row.offset} matches={row.cameraOffset != null ? oMatch : null} /></td>;
+
+  return order === 'bgo'
+    ? <>{binningCell}{gainCell}{offsetCell}</>
+    : <>{gainCell}{binningCell}{offsetCell}</>;
+}
+
+/** Trailing cell: the create-master hammer button, or the live "building…" pulse. */
+function CreateMasterCell({
+  setId,
+  isMaster,
+  onCreateMaster,
+  buildStatusBySet,
+}: {
+  setId: number;
+  isMaster: boolean;
+  onCreateMaster?: (setId: number) => void;
+  buildStatusBySet?: Record<number, 'starting' | 'building' | 'done'>;
+}) {
+  const phase = buildStatusBySet?.[setId];
+  const building = phase != null && phase !== 'done';
+  return (
+    <td className="px-2 py-1 text-center">
+      {!isMaster && onCreateMaster && (
+        building ? (
+          <span className="text-[10px] text-accent animate-pulse">building…</span>
+        ) : (
+          <button
+            onClick={(e) => { e.stopPropagation(); onCreateMaster(setId); }}
+            className="p-1 rounded hover:bg-surface-hover text-content-muted hover:text-content"
+            title="Create master from this set"
+          >
+            <Hammer size={13} />
+          </button>
+        )
+      )}
+    </td>
+  );
+}
+
 // ── Lights Table ───────────────────────────────────────────────────────────
 
 type LightSortField = 'frameCount' | 'filter' | 'exptime' | 'sortTemp' | 'sortDate' | 'camera' | 'focallen' | 'flatSetId' | 'darkSetId' | 'avgFwhm' | 'avgEcc' | 'avgSnr' | 'totalIntegration';
@@ -829,17 +924,7 @@ function FlatsTable({
   onCreateMaster?: (setId: number) => void;
   buildStatusBySet?: Record<number, 'starting' | 'building' | 'done'>;
 }) {
-  const [sortField, setSortField] = useState<FlatSortField | null>('sortDate');
-  const [sortDir, setSortDir] = useState<SortDir>('desc');
-
-  const handleSort = useCallback((field: FlatSortField) => {
-    if (field === sortField) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
-    } else {
-      setSortField(field);
-      setSortDir('asc');
-    }
-  }, [sortField]);
+  const { sortField, sortDir, thProps } = useTableSort<FlatSortField>('sortDate');
 
   const sorted = useMemo(
     () => sortRows(rows, sortField as keyof FlatRow | null, sortDir),
@@ -849,8 +934,6 @@ function FlatsTable({
   if (sorted.length === 0) {
     return <div className="px-4 py-3 text-xs text-content-muted italic">No flat sets found.</div>;
   }
-
-  const thProps = { sortField, sortDir, onSort: handleSort };
 
   return (
     <div>
@@ -876,9 +959,6 @@ function FlatsTable({
         <tbody>
           {sorted.map(row => {
             const highlighted = highlightedSetIds.has(row.setId);
-            const gMatch = row.cameraGain != null && row.gain != null && Math.abs(row.gain - row.cameraGain) < 0.01;
-            const bMatch = row.cameraBinning != null && row.binning === row.cameraBinning;
-            const oMatch = row.cameraOffset != null && row.offset != null && Math.abs(row.offset - row.cameraOffset) < 0.01;
             return (
               <tr
                 key={row.setId}
@@ -920,9 +1000,7 @@ function FlatsTable({
                     />
                   ) : <span className="text-content-muted">—</span>}
                 </td>
-                {!compact && <td className="px-1.5 py-1 text-sm"><MatchBadge label="Gain" value={row.gain} matches={row.cameraGain != null ? gMatch : null} /></td>}
-                {!compact && <td className="px-1.5 py-1 text-sm"><MatchBadge label="Binning" value={row.binning} matches={row.cameraBinning != null ? bMatch : null} /></td>}
-                {!compact && <td className="px-1.5 py-1 text-sm"><MatchBadge label="Offset" value={row.offset} matches={row.cameraOffset != null ? oMatch : null} /></td>}
+                {!compact && <MatchCells row={row} />}
                 {!compact && (
                   <td className="px-1.5 py-1 text-sm">
                     {row.usedByLightCount > 0 ? (
@@ -937,21 +1015,12 @@ function FlatsTable({
                     )}
                   </td>
                 )}
-                <td className="px-2 py-1 text-center">
-                  {!row.isMaster && onCreateMaster && (
-                    buildStatusBySet?.[row.setId] && buildStatusBySet[row.setId] !== 'done' ? (
-                      <span className="text-[10px] text-accent animate-pulse">building…</span>
-                    ) : (
-                      <button
-                        onClick={(e) => { e.stopPropagation(); onCreateMaster(row.setId); }}
-                        className="p-1 rounded hover:bg-surface-hover text-content-muted hover:text-content"
-                        title="Create master from this set"
-                      >
-                        <Hammer size={13} />
-                      </button>
-                    )
-                  )}
-                </td>
+                <CreateMasterCell
+                  setId={row.setId}
+                  isMaster={row.isMaster}
+                  onCreateMaster={onCreateMaster}
+                  buildStatusBySet={buildStatusBySet}
+                />
               </tr>
             );
           })}
@@ -986,17 +1055,7 @@ function DarksTable({
   onCreateMaster?: (setId: number) => void;
   buildStatusBySet?: Record<number, 'starting' | 'building' | 'done'>;
 }) {
-  const [sortField, setSortField] = useState<DarkSortField | null>('sortDate');
-  const [sortDir, setSortDir] = useState<SortDir>('desc');
-
-  const handleSort = useCallback((field: DarkSortField) => {
-    if (field === sortField) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
-    } else {
-      setSortField(field);
-      setSortDir('asc');
-    }
-  }, [sortField]);
+  const { sortField, sortDir, thProps } = useTableSort<DarkSortField>('sortDate');
 
   const sorted = useMemo(
     () => sortRows(rows, sortField as keyof DarkRow | null, sortDir),
@@ -1006,8 +1065,6 @@ function DarksTable({
   if (sorted.length === 0) {
     return <div className="px-4 py-3 text-xs text-content-muted italic">No dark sets found.</div>;
   }
-
-  const thProps = { sortField, sortDir, onSort: handleSort };
 
   return (
     <div>
@@ -1031,9 +1088,6 @@ function DarksTable({
         <tbody>
           {sorted.map(row => {
             const highlighted = highlightedSetIds.has(row.setId);
-            const gMatch = row.cameraGain != null && row.gain != null && Math.abs(row.gain - row.cameraGain) < 0.01;
-            const bMatch = row.cameraBinning != null && row.binning === row.cameraBinning;
-            const oMatch = row.cameraOffset != null && row.offset != null && Math.abs(row.offset - row.cameraOffset) < 0.01;
             return (
               <tr
                 key={row.setId}
@@ -1071,9 +1125,7 @@ function DarksTable({
                     />
                   ) : <span className="text-content-muted">—</span>}
                 </td>
-                {!compact && <td className="px-1.5 py-1 text-sm"><MatchBadge label="Gain" value={row.gain} matches={row.cameraGain != null ? gMatch : null} /></td>}
-                {!compact && <td className="px-1.5 py-1 text-sm"><MatchBadge label="Binning" value={row.binning} matches={row.cameraBinning != null ? bMatch : null} /></td>}
-                {!compact && <td className="px-1.5 py-1 text-sm"><MatchBadge label="Offset" value={row.offset} matches={row.cameraOffset != null ? oMatch : null} /></td>}
+                {!compact && <MatchCells row={row} />}
                 {!compact && (
                   <td className="px-1.5 py-1 text-sm">
                     {row.usedByLightCount > 0 ? (
@@ -1088,21 +1140,12 @@ function DarksTable({
                     )}
                   </td>
                 )}
-                <td className="px-2 py-1 text-center">
-                  {!row.isMaster && onCreateMaster && (
-                    buildStatusBySet?.[row.setId] && buildStatusBySet[row.setId] !== 'done' ? (
-                      <span className="text-[10px] text-accent animate-pulse">building…</span>
-                    ) : (
-                      <button
-                        onClick={(e) => { e.stopPropagation(); onCreateMaster(row.setId); }}
-                        className="p-1 rounded hover:bg-surface-hover text-content-muted hover:text-content"
-                        title="Create master from this set"
-                      >
-                        <Hammer size={13} />
-                      </button>
-                    )
-                  )}
-                </td>
+                <CreateMasterCell
+                  setId={row.setId}
+                  isMaster={row.isMaster}
+                  onCreateMaster={onCreateMaster}
+                  buildStatusBySet={buildStatusBySet}
+                />
               </tr>
             );
           })}
@@ -1135,17 +1178,7 @@ function BiasTable({
   onCreateMaster?: (setId: number) => void;
   buildStatusBySet?: Record<number, 'starting' | 'building' | 'done'>;
 }) {
-  const [sortField, setSortField] = useState<BiasSortField | null>('sortDate');
-  const [sortDir, setSortDir] = useState<SortDir>('desc');
-
-  const handleSort = useCallback((field: BiasSortField) => {
-    if (field === sortField) {
-      setSortDir(d => d === 'asc' ? 'desc' : 'asc');
-    } else {
-      setSortField(field);
-      setSortDir('asc');
-    }
-  }, [sortField]);
+  const { sortField, sortDir, thProps } = useTableSort<BiasSortField>('sortDate');
 
   const sorted = useMemo(
     () => sortRows(rows, sortField as keyof BiasRow | null, sortDir),
@@ -1155,8 +1188,6 @@ function BiasTable({
   if (sorted.length === 0) {
     return <div className="px-4 py-3 text-xs text-content-muted italic">No bias sets found.</div>;
   }
-
-  const thProps = { sortField, sortDir, onSort: handleSort };
 
   return (
     <div>
@@ -1177,9 +1208,6 @@ function BiasTable({
         <tbody>
           {sorted.map(row => {
             const highlighted = highlightedSetIds.has(row.setId);
-            const gMatch = row.cameraGain != null && row.gain != null && Math.abs(row.gain - row.cameraGain) < 0.01;
-            const bMatch = row.cameraBinning != null && row.binning === row.cameraBinning;
-            const oMatch = row.cameraOffset != null && row.offset != null && Math.abs(row.offset - row.cameraOffset) < 0.01;
             return (
               <tr
                 key={row.setId}
@@ -1204,9 +1232,9 @@ function BiasTable({
                 <td className="px-1.5 py-1 text-sm text-content-secondary tabular-nums">{row.frameCount}</td>
                 <td className="px-1.5 py-1 text-sm font-mono text-content-secondary whitespace-nowrap">{row.dateRange}</td>
                 <td className="px-1.5 py-1 text-sm text-content-secondary whitespace-nowrap">{row.camera ?? '—'}</td>
-                {!compact && <td className="px-1.5 py-1 text-sm"><MatchBadge label="Binning" value={row.binning} matches={row.cameraBinning != null ? bMatch : null} /></td>}
-                {!compact && <td className="px-1.5 py-1 text-sm"><MatchBadge label="Gain" value={row.gain} matches={row.cameraGain != null ? gMatch : null} /></td>}
-                {!compact && <td className="px-1.5 py-1 text-sm"><MatchBadge label="Offset" value={row.offset} matches={row.cameraOffset != null ? oMatch : null} /></td>}
+                {/* Bias renders B, G, O — the reverse of Flats/Darks. Pre-existing
+                    inconsistency, deliberately preserved (see MatchCells). */}
+                {!compact && <MatchCells row={row} order="bgo" />}
                 {!compact && (
                   <td className="px-1.5 py-1 text-sm">
                     {row.usedByLightCount > 0 ? (
@@ -1221,21 +1249,12 @@ function BiasTable({
                     )}
                   </td>
                 )}
-                <td className="px-2 py-1 text-center">
-                  {!row.isMaster && onCreateMaster && (
-                    buildStatusBySet?.[row.setId] && buildStatusBySet[row.setId] !== 'done' ? (
-                      <span className="text-[10px] text-accent animate-pulse">building…</span>
-                    ) : (
-                      <button
-                        onClick={(e) => { e.stopPropagation(); onCreateMaster(row.setId); }}
-                        className="p-1 rounded hover:bg-surface-hover text-content-muted hover:text-content"
-                        title="Create master from this set"
-                      >
-                        <Hammer size={13} />
-                      </button>
-                    )
-                  )}
-                </td>
+                <CreateMasterCell
+                  setId={row.setId}
+                  isMaster={row.isMaster}
+                  onCreateMaster={onCreateMaster}
+                  buildStatusBySet={buildStatusBySet}
+                />
               </tr>
             );
           })}
