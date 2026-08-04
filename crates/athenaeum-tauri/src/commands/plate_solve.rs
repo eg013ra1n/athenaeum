@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use tauri::{Emitter, State};
 
+use athenaeum_core::db::load_frame_with_path;
 use athenaeum_core::plate_solve::config::{self, PlateSolveConfig};
 use athenaeum_core::plate_solve::dso_lookup::DsoCatalog;
 use athenaeum_core::plate_solve::hints::extract_hints;
@@ -241,7 +242,7 @@ pub async fn plate_solve_batch(
         let mut work_items: Vec<WorkItem> = Vec::with_capacity(frame_ids.len());
         for frame_id in &frame_ids {
             match load_frame_with_path(&conn, *frame_id) {
-                Ok((frame, file_path)) => {
+                Ok(Some((frame, file_path))) => {
                     let hints = extract_hints(&frame, Some(&conn));
                     work_items.push(WorkItem::Ready {
                         frame_id: *frame_id,
@@ -250,7 +251,16 @@ pub async fn plate_solve_batch(
                         hints,
                     });
                 }
+                Ok(None) => {
+                    let e = format!("Frame {frame_id} not found");
+                    tracing::warn!(frame_id, error = %e, "failed to load frame for plate solve");
+                    work_items.push(WorkItem::LoadFailed {
+                        frame_id: *frame_id,
+                        error: e,
+                    });
+                }
                 Err(e) => {
+                    let e = e.to_string();
                     tracing::warn!(frame_id, error = %e, "failed to load frame for plate solve");
                     work_items.push(WorkItem::LoadFailed {
                         frame_id: *frame_id,
@@ -857,70 +867,4 @@ pub async fn download_catalog_layers(
     .map_err(|e| format!("download task panicked: {e}"))?;
 
     result.map(|p| p.display().to_string()).map_err(|e| e.to_string())
-}
-
-// ========== Helpers ==========
-
-fn load_frame_with_path(
-    conn: &rusqlite::Connection,
-    frame_id: i64,
-) -> Result<(athenaeum_core::models::Frame, String), String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT f.*, fl.path FROM frames f
-             JOIN files fl ON fl.id = f.file_id
-             WHERE f.id = ?1",
-        )
-        .map_err(|e| e.to_string())?;
-
-    stmt.query_row([frame_id], |row| {
-        let frame = athenaeum_core::models::Frame {
-            id: row.get("id")?,
-            file_id: row.get("file_id")?,
-            object: row.get("object")?,
-            date_obs: row.get::<_, Option<String>>("date_obs").ok().flatten()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok()
-                    .or_else(|| chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S").ok()
-                        .map(|ndt| ndt.and_utc().fixed_offset()))
-                    .map(|dt| dt.with_timezone(&chrono::Utc))),
-            telescop: row.get("telescop")?,
-            instrume: row.get("instrume")?,
-            exptime: row.get("exptime")?,
-            filter: row.get("filter")?,
-            imagetyp: None, // not needed for plate solving
-            is_master: row.get::<_, i32>("is_master").unwrap_or(0) != 0,
-            gain: row.get("gain")?,
-            offset: row.get("offset")?,
-            binning: row.get("binning")?,
-            xbinning: row.get("xbinning")?,
-            ybinning: row.get("ybinning")?,
-            ccd_temp: row.get("ccd_temp")?,
-            set_temp: row.get("set_temp")?,
-            focallen: row.get("focallen")?,
-            xpixsz: row.get("xpixsz")?,
-            ypixsz: row.get("ypixsz")?,
-            naxis1: row.get("naxis1")?,
-            naxis2: row.get("naxis2")?,
-            ra: row.get("ra")?,
-            dec: row.get("dec")?,
-            sitelat: row.get("sitelat")?,
-            lat_obs: row.get("lat_obs")?,
-            sitelong: row.get("sitelong")?,
-            long_obs: row.get("long_obs")?,
-            objctra: row.get("objctra")?,
-            objctdec: row.get("objctdec")?,
-            override_: row.get::<_, i32>("override").unwrap_or(0) != 0,
-            swcreate: row.get("swcreate")?,
-            bayerpat: row.get("bayerpat")?,
-            xbayroff: row.get("xbayroff")?,
-            ybayroff: row.get("ybayroff")?,
-            roworder: row.get("roworder")?,
-            rotation: row.get("rotation")?,
-            uuid: row.get("uuid")?,
-            updated_at: row.get("updated_at")?,
-        };
-        let path: String = row.get("path")?;
-        Ok((frame, path))
-    })
-    .map_err(|e| format!("Frame {frame_id} not found: {e}"))
 }

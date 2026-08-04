@@ -2923,6 +2923,93 @@ pub fn get_frames_with_files_by_ids(
     results.collect()
 }
 
+/// Load a `Frame` and its on-disk path from the DB for a given `frame_id`.
+///
+/// Shared by registration, and both Tauri/web plate-solve batch loaders
+/// (previously three near-identical copies).
+///
+/// Returns `Ok(None)` when no frame with that id exists — callers map the
+/// not-found case to their own shape (skip-and-log, `StatusCode::NOT_FOUND`,
+/// etc). A real query/parse failure is `Err` instead.
+pub fn load_frame_with_path(
+    conn: &Connection,
+    frame_id: i64,
+) -> anyhow::Result<Option<(Frame, String)>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.*, fl.path
+             FROM frames f
+             JOIN files fl ON fl.id = f.file_id
+             WHERE f.id = ?1",
+        )
+        .map_err(|e| anyhow::anyhow!("prepare: {e}"))?;
+
+    let result = stmt.query_row([frame_id], |row| {
+        let frame = Frame {
+            id: row.get("id")?,
+            file_id: row.get("file_id")?,
+            object: row.get("object")?,
+            date_obs: row
+                .get::<_, Option<String>>("date_obs")
+                .ok()
+                .flatten()
+                .and_then(|s| {
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .or_else(|| {
+                            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                                .ok()
+                                .map(|ndt| ndt.and_utc().fixed_offset())
+                        })
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                }),
+            telescop: row.get("telescop")?,
+            instrume: row.get("instrume")?,
+            exptime: row.get("exptime")?,
+            filter: row.get("filter")?,
+            imagetyp: None,
+            is_master: row.get::<_, i32>("is_master").unwrap_or(0) != 0,
+            gain: row.get("gain")?,
+            offset: row.get("offset")?,
+            binning: row.get("binning")?,
+            xbinning: row.get("xbinning")?,
+            ybinning: row.get("ybinning")?,
+            ccd_temp: row.get("ccd_temp")?,
+            set_temp: row.get("set_temp")?,
+            focallen: row.get("focallen")?,
+            xpixsz: row.get("xpixsz")?,
+            ypixsz: row.get("ypixsz")?,
+            naxis1: row.get("naxis1")?,
+            naxis2: row.get("naxis2")?,
+            ra: row.get("ra")?,
+            dec: row.get("dec")?,
+            sitelat: row.get("sitelat")?,
+            lat_obs: row.get("lat_obs")?,
+            sitelong: row.get("sitelong")?,
+            long_obs: row.get("long_obs")?,
+            objctra: row.get("objctra")?,
+            objctdec: row.get("objctdec")?,
+            override_: row.get::<_, i32>("override").unwrap_or(0) != 0,
+            swcreate: row.get("swcreate")?,
+            bayerpat: row.get("bayerpat")?,
+            xbayroff: row.get("xbayroff")?,
+            ybayroff: row.get("ybayroff")?,
+            roworder: row.get("roworder")?,
+            rotation: row.get("rotation")?,
+            uuid: row.get("uuid")?,
+            updated_at: row.get("updated_at")?,
+        };
+        let path: String = row.get("path")?;
+        Ok((frame, path))
+    });
+
+    match result {
+        Ok(pair) => Ok(Some(pair)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("failed to load frame {frame_id}: {e}")),
+    }
+}
+
 /// Get imaging nights with sessions for a frame set
 pub fn get_imaging_nights_with_sessions(
     conn: &Connection,

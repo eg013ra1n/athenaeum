@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use astroimage::ImageAnalyzer;
 use solvemyastro::{Caches, CentroidRefinement, SolveConfig, StarCache};
 
+use crate::db::load_frame_with_path;
 use crate::events::{emit_event, ProgressEmitter};
 use crate::models::Frame;
 use crate::plate_solve::config::PlateSolveConfig;
@@ -132,13 +133,16 @@ pub fn register_frame_set(
     let mut members: Vec<MemberInfo> = Vec::with_capacity(total);
     for &fid in &frame_ids {
         match load_frame_with_path(conn, fid) {
-            Ok((frame, path)) => members.push(MemberInfo {
+            Ok(Some((frame, path))) => members.push(MemberInfo {
                 frame_id: fid,
                 frame,
                 path,
                 detections: Vec::new(),
                 detection_count: 0,
             }),
+            Ok(None) => {
+                tracing::warn!(frame_id = fid, "frame not found, skipping");
+            }
             Err(e) => {
                 tracing::warn!(frame_id = fid, error = %e, "failed to load frame, skipping");
             }
@@ -662,80 +666,6 @@ fn aligned_status(flipped: bool) -> &'static str {
     } else {
         "aligned"
     }
-}
-
-/// Load a `Frame` and its on-disk path from the DB for a given `frame_id`.
-///
-/// Mirrors the helper used by `plate_solve::commands::plate_solve.rs`.
-fn load_frame_with_path(conn: &Connection, frame_id: i64) -> Result<(Frame, String)> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT f.*, fl.path
-             FROM frames f
-             JOIN files fl ON fl.id = f.file_id
-             WHERE f.id = ?1",
-        )
-        .map_err(|e| anyhow::anyhow!("prepare: {e}"))?;
-
-    stmt.query_row([frame_id], |row| {
-        let frame = Frame {
-            id: row.get("id")?,
-            file_id: row.get("file_id")?,
-            object: row.get("object")?,
-            date_obs: row
-                .get::<_, Option<String>>("date_obs")
-                .ok()
-                .flatten()
-                .and_then(|s| {
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .ok()
-                        .or_else(|| {
-                            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                                .ok()
-                                .map(|ndt| ndt.and_utc().fixed_offset())
-                        })
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                }),
-            telescop: row.get("telescop")?,
-            instrume: row.get("instrume")?,
-            exptime: row.get("exptime")?,
-            filter: row.get("filter")?,
-            imagetyp: None,
-            is_master: row.get::<_, i32>("is_master").unwrap_or(0) != 0,
-            gain: row.get("gain")?,
-            offset: row.get("offset")?,
-            binning: row.get("binning")?,
-            xbinning: row.get("xbinning")?,
-            ybinning: row.get("ybinning")?,
-            ccd_temp: row.get("ccd_temp")?,
-            set_temp: row.get("set_temp")?,
-            focallen: row.get("focallen")?,
-            xpixsz: row.get("xpixsz")?,
-            ypixsz: row.get("ypixsz")?,
-            naxis1: row.get("naxis1")?,
-            naxis2: row.get("naxis2")?,
-            ra: row.get("ra")?,
-            dec: row.get("dec")?,
-            sitelat: row.get("sitelat")?,
-            lat_obs: row.get("lat_obs")?,
-            sitelong: row.get("sitelong")?,
-            long_obs: row.get("long_obs")?,
-            objctra: row.get("objctra")?,
-            objctdec: row.get("objctdec")?,
-            override_: row.get::<_, i32>("override").unwrap_or(0) != 0,
-            swcreate: row.get("swcreate")?,
-            bayerpat: row.get("bayerpat")?,
-            xbayroff: row.get("xbayroff")?,
-            ybayroff: row.get("ybayroff")?,
-            roworder: row.get("roworder")?,
-            rotation: row.get("rotation")?,
-            uuid: row.get("uuid")?,
-            updated_at: row.get("updated_at")?,
-        };
-        let path: String = row.get("path")?;
-        Ok((frame, path))
-    })
-    .map_err(|e| anyhow::anyhow!("Frame {frame_id} not found: {e}"))
 }
 
 // ── pre-registration consistency gate (R2) ───────────────────────────────────
