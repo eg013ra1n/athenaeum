@@ -71,6 +71,12 @@ every Claude Code session automatically. Tools:
 - `list_operations(kind?, since?)` — completed operations with durations.
 - `get_operation(operation_id)` — every event of one operation, cross-module.
 
+By default the server scans BOTH flavor trees — production
+(`com.vsharifov.athenaeum`) and the debug `.dev` sibling — merging events
+chronologically, so a dev session sees the production app's logs alongside
+its own; `ATHENAEUM_LOG_DIR` / `ATHENAEUM_DB_PATH` / `ATHENAEUM_APP_DATA_DIR`
+narrow it to one tree.
+
 Manual use without MCP: it's a stdio JSON-RPC binary —
 `cargo run -q -p log-mcp -- <log-dir>` — or just grep the JSONL
 (`grep '"root_id":3' …/logs/*.jsonl`).

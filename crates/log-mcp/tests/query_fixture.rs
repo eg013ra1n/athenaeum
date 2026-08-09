@@ -203,9 +203,9 @@ fn scan_merges_files_across_multiple_dirs_and_skips_missing() {
     .expect("write dev fixture");
 
     let both = vec![prod.path().to_path_buf(), dev.path().to_path_buf()];
-    let results = log_mcp::query::tail(&both, 10).expect("tail");
+    let results = query::tail(&both, 10).expect("tail");
     assert_eq!(results.len(), 2, "events from both dirs: {results:?}");
-    // filename sort ⇒ the older file streams first regardless of which dir owns it
+    // chronological merge ⇒ the older event comes first regardless of which dir owns it
     assert_eq!(results[0]["fields"]["message"], "prod event");
     assert_eq!(results[1]["fields"]["message"], "dev event");
 
@@ -214,8 +214,49 @@ fn scan_merges_files_across_multiple_dirs_and_skips_missing() {
         prod.path().to_path_buf(),
         PathBuf::from("/nonexistent-athenaeum-dev-tree"),
     ];
+    assert_eq!(query::tail(&with_missing, 10).expect("tail").len(), 1);
+}
+
+#[test]
+fn tail_merges_same_named_files_from_both_trees_chronologically() {
+    // Both build flavors write the SAME filename — `Process::prefix()` is
+    // "athenaeum-desktop" regardless of build profile — so on a day both ran,
+    // the two trees hold a same-named daily file. Concatenating them (all of
+    // one tree's day, then all of the other's) and keeping the last `limit`
+    // in stream order biases the ring to whichever dir sorts last; the merge
+    // must be by timestamp so `tail` really returns the newest N events.
+    let a = tempfile::tempdir().expect("tempdir");
+    let b = tempfile::tempdir().expect("tempdir");
+    let name = "athenaeum-desktop.2026-08-08.jsonl";
+    let event = |ts: &str, msg: &str| {
+        format!(
+            r#"{{"timestamp":"{ts}","level":"INFO","target":"athenaeum_core::scanner","fields":{{"message":"{msg}"}}}}"#
+        )
+    };
+    std::fs::write(
+        a.path().join(name),
+        format!(
+            "{}\n{}\n",
+            event("2026-08-08T10:00:00.000000Z", "a-10:00"),
+            event("2026-08-08T12:00:00.000000Z", "a-12:00")
+        ),
+    )
+    .expect("write dir-a fixture");
+    std::fs::write(
+        b.path().join(name),
+        format!("{}\n", event("2026-08-08T11:00:00.000000Z", "b-11:00")),
+    )
+    .expect("write dir-b fixture");
+
+    let both = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+    let results = query::tail(&both, 2).expect("tail");
+    let messages: Vec<&str> = results
+        .iter()
+        .filter_map(|v| v.pointer("/fields/message").and_then(|m| m.as_str()))
+        .collect();
     assert_eq!(
-        log_mcp::query::tail(&with_missing, 10).expect("tail").len(),
-        1
+        messages,
+        vec!["b-11:00", "a-12:00"],
+        "expected the 2 newest events across both trees, in chronological order"
     );
 }

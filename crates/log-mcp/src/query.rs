@@ -31,7 +31,7 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `(span name, id-field name)` for every operation kind we track.
 pub const OPERATION_KINDS: &[(&str, &str)] = &[
@@ -76,26 +76,22 @@ fn severity(level: &str) -> Option<i32> {
     }
 }
 
-/// `*.jsonl` files across `dirs`, sorted by filename — chronological because
+/// One dir's `*.jsonl` files, sorted by filename — chronological because
 /// `tracing-appender`'s daily rolling prefix format sorts that way
-/// (`<prefix>.<date>.jsonl`) — with the full path as tie-break. A dir that
-/// cannot be read (typically the `.dev` sibling before the first dev run)
-/// is skipped: one missing tree must not hide the other's logs.
-fn log_files(dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = Vec::new();
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        files.extend(
-            entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl")),
-        );
-    }
-    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()).then_with(|| a.cmp(b)));
-    Ok(files)
+/// (`<prefix>.<date>.jsonl`). A dir that cannot be read (typically the
+/// `.dev` sibling before the first dev run) yields no files rather than an
+/// error: one missing tree must not hide the other's logs.
+fn log_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    files.sort();
+    files
 }
 
 /// Does this span object (an entry from `spans[]`, or the `span` object)
@@ -186,38 +182,75 @@ pub fn scan(dirs: &[PathBuf], f: &Filter) -> Result<Vec<Value>> {
     scan_with(dirs, f.limit, |v| event_matches(v, f))
 }
 
+/// The event's `timestamp`, or `""` when absent (a malformed event sorts
+/// first rather than last, so it can never displace a real newest event).
+/// The JSONL timestamp is fixed-width RFC3339 UTC, so lexicographic order
+/// *is* chronological order — no date parsing needed.
+fn event_timestamp(v: &Value) -> &str {
+    v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("")
+}
+
 /// Same file-scanning/ring-buffer machinery as `scan`, but with an
 /// arbitrary predicate — used by `list_operations`, whose "close event
 /// whose span name is an operation kind" match isn't expressible as a
 /// plain `Filter`.
+///
+/// Each dir is streamed into its **own** ring of `limit`, then the rings are
+/// merged by timestamp. Both build flavors write the same filename
+/// (`athenaeum-desktop.<date>.jsonl` regardless of build profile), so on a
+/// day both ran, concatenating the trees would stream one tree's whole day
+/// before the other's — a single shared ring would then keep only the
+/// last-streamed tree's events and report them out of order. A single dir
+/// keeps byte-identical behavior: its ring is returned untouched, never
+/// re-sorted.
 fn scan_with(
     dirs: &[PathBuf],
     limit: usize,
     mut predicate: impl FnMut(&Value) -> bool,
 ) -> Result<Vec<Value>> {
     let limit = limit.max(1);
-    let mut ring: VecDeque<Value> = VecDeque::with_capacity(limit.min(4096));
-    for path in log_files(dirs)? {
-        let content = std::fs::read_to_string(&path)?;
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+    let mut rings: Vec<VecDeque<Value>> = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let mut ring: VecDeque<Value> = VecDeque::with_capacity(limit.min(4096));
+        for path in log_files(dir) {
+            let content = std::fs::read_to_string(&path)?;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let value: Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(_) => continue, // malformed line: skip, don't crash
+                };
+                if !predicate(&value) {
+                    continue;
+                }
+                if ring.len() == limit {
+                    ring.pop_front();
+                }
+                ring.push_back(value);
             }
-            let value: Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue, // malformed line: skip, don't crash
-            };
-            if !predicate(&value) {
-                continue;
-            }
-            if ring.len() == limit {
-                ring.pop_front();
-            }
-            ring.push_back(value);
+        }
+        if !ring.is_empty() {
+            rings.push(ring);
         }
     }
-    Ok(ring.into_iter().collect())
+
+    // One tree contributing (the common case, and every single-dir caller):
+    // hand back its ring exactly as the old single-ring code did.
+    if rings.len() <= 1 {
+        return Ok(rings.pop().map(Vec::from).unwrap_or_default());
+    }
+
+    // Several trees: merge by timestamp. A stable sort keeps each tree's own
+    // stream order for equal timestamps.
+    let mut merged: Vec<Value> = rings.into_iter().flatten().collect();
+    merged.sort_by(|a, b| event_timestamp(a).cmp(event_timestamp(b)));
+    if merged.len() > limit {
+        merged.drain(..merged.len() - limit);
+    }
+    Ok(merged)
 }
 
 /// `tail_logs(n)`: unfiltered scan, last `n` lines.
@@ -350,7 +383,10 @@ fn resolve_app_data_dirs() -> Vec<PathBuf> {
 
 /// Default log dirs, mirroring `athenaeum_core::logging::resolve_log_dir`'s
 /// precedence: `ATHENAEUM_LOG_DIR` > `ATHENAEUM_DB_PATH`'s parent + `logs/`
-/// > BOTH platform app-data dirs (production and `.dev`) + `logs/`.
+/// > `ATHENAEUM_APP_DATA_DIR` + `logs/` > BOTH platform app-data dirs
+/// (production and `.dev`) + `logs/`. The first three each pin the app to
+/// ONE tree, so they resolve to a single dir — only the platform default
+/// fans out to both flavors.
 pub fn default_log_dirs() -> Vec<PathBuf> {
     if let Ok(dir) = std::env::var("ATHENAEUM_LOG_DIR") {
         return vec![PathBuf::from(dir)];
@@ -361,6 +397,10 @@ pub fn default_log_dirs() -> Vec<PathBuf> {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         return vec![parent.join("logs")];
+    }
+    // Mirrors core's `resolve_app_data_dir`: a set-but-empty value is treated as unset.
+    if let Some(dir) = std::env::var_os("ATHENAEUM_APP_DATA_DIR").filter(|d| !d.is_empty()) {
+        return vec![PathBuf::from(dir).join("logs")];
     }
     resolve_app_data_dirs()
         .into_iter()
