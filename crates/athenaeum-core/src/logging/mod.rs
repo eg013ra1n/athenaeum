@@ -36,26 +36,35 @@ pub struct LoggingHandle {
 
 static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Resolve the app data directory from environment variables (no Tauri needed).
-/// Mirrors Tauri's default app_data_dir resolution per platform.
-/// Moved verbatim from the old (pre-tracing) `logging.rs::resolve_app_data_dir`.
+/// Resolve the app data directory from environment variables (no Tauri
+/// needed). `ATHENAEUM_APP_DATA_DIR` wins verbatim; otherwise mirrors
+/// Tauri's default app_data_dir resolution per platform, using
+/// `crate::paths::app_data_dir_name()` for the leaf — so debug builds land
+/// in the `.dev` sibling, consistent with the desktop's own resolver
+/// (`athenaeum-tauri/src/paths.rs`).
 fn resolve_app_data_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("ATHENAEUM_APP_DATA_DIR") {
+        return Some(PathBuf::from(dir));
+    }
     #[cfg(target_os = "windows")]
     {
         return std::env::var_os("APPDATA")
-            .map(|d| PathBuf::from(d).join("com.vsharifov.athenaeum"));
+            .map(|d| PathBuf::from(d).join(crate::paths::app_data_dir_name()));
     }
     #[cfg(target_os = "macos")]
     {
-        return std::env::var_os("HOME")
-            .map(|d| PathBuf::from(d).join("Library/Application Support/com.vsharifov.athenaeum"));
+        return std::env::var_os("HOME").map(|d| {
+            PathBuf::from(d)
+                .join("Library/Application Support")
+                .join(crate::paths::app_data_dir_name())
+        });
     }
     #[cfg(target_os = "linux")]
     {
         return std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-            .map(|d| d.join("com.vsharifov.athenaeum"));
+            .map(|d| d.join(crate::paths::app_data_dir_name()));
     }
     #[allow(unreachable_code)]
     None

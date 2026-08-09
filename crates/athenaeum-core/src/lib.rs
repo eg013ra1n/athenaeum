@@ -3,6 +3,7 @@
 
 pub mod models;
 pub mod coordinates;
+pub mod paths;
 pub mod fingerprint;
 pub mod calibration;
 pub mod db;
