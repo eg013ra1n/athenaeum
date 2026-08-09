@@ -29,6 +29,7 @@ pub mod tauri_events;
 // Commands (Tauri API endpoints)
 mod commands;
 mod commands_rustafits;
+mod paths;
 
 use cache::MemoryImageCache;
 use commands::AppState;
@@ -152,7 +153,7 @@ pub fn run() {
             }
 
             // Clean up old file-based cache directory if it exists (one-time migration)
-            if let Ok(app_dir) = app_handle.path().app_data_dir() {
+            if let Ok(app_dir) = crate::paths::resolve_app_data_dir(&app_handle) {
                 let old_cache_dir = app_dir.join("cache");
                 if old_cache_dir.exists() {
                     match std::fs::remove_dir_all(&old_cache_dir) {

@@ -3,7 +3,7 @@
 use crate::db::Database;
 use crate::settings;
 use std::sync::Arc;
-use tauri::{Manager, State};
+use tauri::State;
 
 // ── Update check types ────────────────────────────────────────────────────────
 
@@ -51,10 +51,7 @@ pub async fn initialize_database(
     app_handle: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let app_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?;
+    let app_dir = crate::paths::resolve_app_data_dir(&app_handle)?;
 
     std::fs::create_dir_all(&app_dir).map_err(|e| e.to_string())?;
 

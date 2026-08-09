@@ -11,7 +11,7 @@
 // `get_database_path` (fully un-converted).
 
 use crate::models::*;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, State};
 
 use athenaeum_core::api::files as api;
 use athenaeum_core::api::PathPolicy;
@@ -182,15 +182,13 @@ pub async fn get_log_path() -> Result<String, String> {
 /// from the web route's version (which reads the *actual* configured path
 /// off the live `Database` handle via `ctx.db.get()`). See
 /// `athenaeum_core::api::files` module doc for why this stays here.
+/// Resolution goes through `crate::paths::resolve_app_data_dir` (build-flavor aware).
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn get_database_path(
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
-    let app_dir = app_handle
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?;
+    let app_dir = crate::paths::resolve_app_data_dir(&app_handle)?;
     Ok(app_dir.join("athenaeum.db").to_string_lossy().to_string())
 }
 

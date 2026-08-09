@@ -43,7 +43,9 @@ static LOG_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// in the `.dev` sibling, consistent with the desktop's own resolver
 /// (`athenaeum-tauri/src/paths.rs`).
 fn resolve_app_data_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("ATHENAEUM_APP_DATA_DIR") {
+    // A set-but-empty override is treated as unset — an empty value would
+    // otherwise resolve the data tree to the process CWD.
+    if let Some(dir) = std::env::var_os("ATHENAEUM_APP_DATA_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
     }
     #[cfg(target_os = "windows")]
