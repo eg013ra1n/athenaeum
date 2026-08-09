@@ -499,6 +499,13 @@ pub fn store_result(
 pub(crate) enum GateStage {
     Hinted,
     ScaleCleared,
+    // Reserved for stage-aware gate thresholds: a whole-sky solve must stay
+    // strict while a scale-recovered-near-hint solve can tolerate defocused
+    // inlier counts (the 2026-05 defocus fix lowered the floor globally —
+    // the per-stage split is the finer follow-up). Production currently
+    // labels every blind solve ScaleCleared (store_result), so this is
+    // constructed only by the blind_gate_ok tests until that work lands.
+    #[allow(dead_code)]
     FullBlind,
 }
 
