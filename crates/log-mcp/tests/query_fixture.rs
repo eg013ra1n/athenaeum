@@ -8,6 +8,7 @@
 
 use log_mcp::query::{self, Filter};
 use std::io::Write;
+use std::path::PathBuf;
 
 /// One scan operation (`root_id` 1): an info progress event, an error
 /// event (both inside the `scan` span), an unrelated out-of-span debug
@@ -21,6 +22,10 @@ const FIXTURE_LINES: &[&str] = &[
     // Malformed: truncated JSON — must be skipped, not crash the scan.
     r#"{"timestamp": "2026-07-03T10:00:04.000000Z", "level": "INFO", broken"#,
 ];
+
+fn dirs(dir: &tempfile::TempDir) -> Vec<PathBuf> {
+    vec![dir.path().to_path_buf()]
+}
 
 fn write_fixture() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().expect("tempdir");
@@ -40,7 +45,7 @@ fn query_logs_level_error_matches_one() {
         limit: query::clamp_limit(None),
         ..Default::default()
     };
-    let results = query::scan(dir.path(), &f).expect("scan");
+    let results = query::scan(&dirs(&dir), &f).expect("scan");
     assert_eq!(
         results.len(),
         1,
@@ -57,7 +62,7 @@ fn query_logs_level_error_matches_one() {
 #[test]
 fn get_operation_returns_every_event_in_the_scan_span() {
     let dir = write_fixture();
-    let results = query::get_operation(dir.path(), "1", query::MAX_LIMIT).expect("get_operation");
+    let results = query::get_operation(&dirs(&dir), "1", query::MAX_LIMIT).expect("get_operation");
     // info progress + error + close = 3; the unrelated debug event and the
     // malformed line must not appear.
     assert_eq!(
@@ -77,7 +82,7 @@ fn get_operation_returns_every_event_in_the_scan_span() {
 #[test]
 fn tail_logs_returns_all_valid_lines() {
     let dir = write_fixture();
-    let results = query::tail(dir.path(), 10).expect("tail");
+    let results = query::tail(&dirs(&dir), 10).expect("tail");
     // 4 valid lines parsed; the 5th (malformed) line is silently skipped.
     assert_eq!(results.len(), 4);
 }
@@ -85,7 +90,7 @@ fn tail_logs_returns_all_valid_lines() {
 #[test]
 fn list_operations_projects_the_close_event() {
     let dir = write_fixture();
-    let ops = query::list_operations(dir.path(), None, None, query::clamp_limit(None))
+    let ops = query::list_operations(&dirs(&dir), None, None, query::clamp_limit(None))
         .expect("list_operations");
     assert_eq!(ops.len(), 1, "expected exactly one completed operation");
     let op = &ops[0];
@@ -99,7 +104,7 @@ fn list_operations_projects_the_close_event() {
 fn list_operations_kind_filter_excludes_other_kinds() {
     let dir = write_fixture();
     let ops = query::list_operations(
-        dir.path(),
+        &dirs(&dir),
         Some("archive_op"),
         None,
         query::clamp_limit(None),
@@ -117,7 +122,7 @@ fn malformed_line_does_not_abort_the_scan() {
         limit: query::clamp_limit(None),
         ..Default::default()
     };
-    assert!(query::scan(dir.path(), &f).is_ok());
+    assert!(query::scan(&dirs(&dir), &f).is_ok());
 }
 
 #[test]
@@ -138,7 +143,7 @@ fn list_operations_includes_registration_span_close() {
     .expect("write fixture line");
 
     let ops = query::list_operations(
-        dir.path(),
+        &dirs(&dir),
         Some("registration"),
         None,
         query::clamp_limit(None),
@@ -172,7 +177,7 @@ fn tail_logs_truncates_to_last_n() {
     }
 
     // Scan with limit=2; should return the last 2 lines only.
-    let results = query::tail(dir.path(), 2).expect("tail");
+    let results = query::tail(&dirs(&dir), 2).expect("tail");
     assert_eq!(results.len(), 2, "expected exactly 2 lines");
 
     let messages: Vec<&str> = results
@@ -180,4 +185,37 @@ fn tail_logs_truncates_to_last_n() {
         .filter_map(|v| v.pointer("/fields/message").and_then(|m| m.as_str()))
         .collect();
     assert_eq!(messages, vec!["m4", "m5"], "expected [m4, m5] in order");
+}
+
+#[test]
+fn scan_merges_files_across_multiple_dirs_and_skips_missing() {
+    let prod = tempfile::tempdir().expect("tempdir");
+    let dev = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        prod.path().join("athenaeum-desktop.2026-08-08.jsonl"),
+        r#"{"timestamp":"2026-08-08T10:00:00.000000Z","level":"INFO","target":"athenaeum_core::scanner","fields":{"message":"prod event"}}"#,
+    )
+    .expect("write prod fixture");
+    std::fs::write(
+        dev.path().join("athenaeum-desktop.2026-08-09.jsonl"),
+        r#"{"timestamp":"2026-08-09T10:00:00.000000Z","level":"INFO","target":"athenaeum_core::scanner","fields":{"message":"dev event"}}"#,
+    )
+    .expect("write dev fixture");
+
+    let both = vec![prod.path().to_path_buf(), dev.path().to_path_buf()];
+    let results = log_mcp::query::tail(&both, 10).expect("tail");
+    assert_eq!(results.len(), 2, "events from both dirs: {results:?}");
+    // filename sort ⇒ the older file streams first regardless of which dir owns it
+    assert_eq!(results[0]["fields"]["message"], "prod event");
+    assert_eq!(results[1]["fields"]["message"], "dev event");
+
+    // a missing dir (the .dev tree before the first dev run) is skipped, never an error
+    let with_missing = vec![
+        prod.path().to_path_buf(),
+        PathBuf::from("/nonexistent-athenaeum-dev-tree"),
+    ];
+    assert_eq!(
+        log_mcp::query::tail(&with_missing, 10).expect("tail").len(),
+        1
+    );
 }

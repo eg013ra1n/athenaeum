@@ -31,7 +31,7 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// `(span name, id-field name)` for every operation kind we track.
 pub const OPERATION_KINDS: &[(&str, &str)] = &[
@@ -76,16 +76,25 @@ fn severity(level: &str) -> Option<i32> {
     }
 }
 
-/// `*.jsonl` files in `dir`, sorted by filename — chronological because
+/// `*.jsonl` files across `dirs`, sorted by filename — chronological because
 /// `tracing-appender`'s daily rolling prefix format sorts that way
-/// (`<prefix>.<date>.jsonl`).
-fn log_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
-        .collect();
-    files.sort();
+/// (`<prefix>.<date>.jsonl`) — with the full path as tie-break. A dir that
+/// cannot be read (typically the `.dev` sibling before the first dev run)
+/// is skipped: one missing tree must not hide the other's logs.
+fn log_files(dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        files.extend(
+            entries
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl")),
+        );
+    }
+    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()).then_with(|| a.cmp(b)));
     Ok(files)
 }
 
@@ -170,11 +179,11 @@ fn event_matches(value: &Value, f: &Filter) -> bool {
     true
 }
 
-/// Stream every `*.jsonl` file in `dir` in chronological order, parsing
+/// Stream every `*.jsonl` file across `dirs` in chronological order, parsing
 /// each line lazily (malformed lines are skipped, never fatal), and keep
 /// the last `f.limit` matches.
-pub fn scan(dir: &Path, f: &Filter) -> Result<Vec<Value>> {
-    scan_with(dir, f.limit, |v| event_matches(v, f))
+pub fn scan(dirs: &[PathBuf], f: &Filter) -> Result<Vec<Value>> {
+    scan_with(dirs, f.limit, |v| event_matches(v, f))
 }
 
 /// Same file-scanning/ring-buffer machinery as `scan`, but with an
@@ -182,13 +191,13 @@ pub fn scan(dir: &Path, f: &Filter) -> Result<Vec<Value>> {
 /// whose span name is an operation kind" match isn't expressible as a
 /// plain `Filter`.
 fn scan_with(
-    dir: &Path,
+    dirs: &[PathBuf],
     limit: usize,
     mut predicate: impl FnMut(&Value) -> bool,
 ) -> Result<Vec<Value>> {
     let limit = limit.max(1);
     let mut ring: VecDeque<Value> = VecDeque::with_capacity(limit.min(4096));
-    for path in log_files(dir)? {
+    for path in log_files(dirs)? {
         let content = std::fs::read_to_string(&path)?;
         for line in content.lines() {
             let line = line.trim();
@@ -212,9 +221,9 @@ fn scan_with(
 }
 
 /// `tail_logs(n)`: unfiltered scan, last `n` lines.
-pub fn tail(dir: &Path, n: usize) -> Result<Vec<Value>> {
+pub fn tail(dirs: &[PathBuf], n: usize) -> Result<Vec<Value>> {
     scan(
-        dir,
+        dirs,
         &Filter {
             limit: n.max(1),
             ..Default::default()
@@ -224,9 +233,9 @@ pub fn tail(dir: &Path, n: usize) -> Result<Vec<Value>> {
 
 /// `get_operation(id)`: every event whose current span stack carries `id`
 /// under any operation id-field.
-pub fn get_operation(dir: &Path, id: &str, limit: usize) -> Result<Vec<Value>> {
+pub fn get_operation(dirs: &[PathBuf], id: &str, limit: usize) -> Result<Vec<Value>> {
     scan(
-        dir,
+        dirs,
         &Filter {
             operation_id: Some(id.to_string()),
             limit: limit.max(1),
@@ -249,12 +258,12 @@ pub struct OperationSummary {
 /// duration}`. `duration` comes from `fields."time.busy"` (a single JSON
 /// key containing a literal dot, not a nested object).
 pub fn list_operations(
-    dir: &Path,
+    dirs: &[PathBuf],
     kind: Option<&str>,
     since: Option<&str>,
     limit: usize,
 ) -> Result<Vec<OperationSummary>> {
-    let raw = scan_with(dir, limit, |v| {
+    let raw = scan_with(dirs, limit, |v| {
         if v.pointer("/fields/message").and_then(|m| m.as_str()) != Some("close") {
             return false;
         }
@@ -306,46 +315,55 @@ fn project_operation(v: &Value) -> Option<OperationSummary> {
     })
 }
 
-/// Resolve the app-data directory from environment variables (no Tauri
-/// needed). Mirrors Tauri's default `app_data_dir` resolution per
-/// platform — duplicated (not imported) from
-/// `athenaeum_core::logging::resolve_app_data_dir` so this crate stays
-/// dependency-free of `athenaeum-core`.
-fn resolve_app_data_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        return std::env::var_os("APPDATA")
-            .map(|d| PathBuf::from(d).join("com.vsharifov.athenaeum"));
+/// Both build flavors' app-data dirs (production + the debug `.dev`
+/// sibling), existing or not — enumeration skips missing dirs. Duplicated
+/// (not imported) from `athenaeum_core` so this crate stays dependency-free
+/// of it; log-mcp is an observer and always watches BOTH trees regardless
+/// of its own build profile.
+fn resolve_app_data_dirs() -> Vec<PathBuf> {
+    const IDENTS: [&str; 2] = ["com.vsharifov.athenaeum", "com.vsharifov.athenaeum.dev"];
+    fn root_dir() -> Option<PathBuf> {
+        #[cfg(target_os = "windows")]
+        {
+            return std::env::var_os("APPDATA").map(PathBuf::from);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            return std::env::var_os("HOME")
+                .map(|d| PathBuf::from(d).join("Library/Application Support"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            return std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
+                });
+        }
+        #[allow(unreachable_code)]
+        None
     }
-    #[cfg(target_os = "macos")]
-    {
-        return std::env::var_os("HOME")
-            .map(|d| PathBuf::from(d).join("Library/Application Support/com.vsharifov.athenaeum"));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        return std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-            .map(|d| d.join("com.vsharifov.athenaeum"));
-    }
-    #[allow(unreachable_code)]
-    None
+    root_dir()
+        .map(|r| IDENTS.iter().map(|i| r.join(i)).collect())
+        .unwrap_or_default()
 }
 
-/// Default log dir, mirroring `athenaeum_core::logging::resolve_log_dir`'s
+/// Default log dirs, mirroring `athenaeum_core::logging::resolve_log_dir`'s
 /// precedence: `ATHENAEUM_LOG_DIR` > `ATHENAEUM_DB_PATH`'s parent + `logs/`
-/// > platform app-data dir + `logs/`.
-pub fn default_log_dir() -> Option<PathBuf> {
+/// > BOTH platform app-data dirs (production and `.dev`) + `logs/`.
+pub fn default_log_dirs() -> Vec<PathBuf> {
     if let Ok(dir) = std::env::var("ATHENAEUM_LOG_DIR") {
-        return Some(PathBuf::from(dir));
+        return vec![PathBuf::from(dir)];
     }
     if let Ok(db_path) = std::env::var("ATHENAEUM_DB_PATH") {
         let parent = PathBuf::from(&db_path)
             .parent()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        return Some(parent.join("logs"));
+        return vec![parent.join("logs")];
     }
-    resolve_app_data_dir().map(|d| d.join("logs"))
+    resolve_app_data_dirs()
+        .into_iter()
+        .map(|d| d.join("logs"))
+        .collect()
 }

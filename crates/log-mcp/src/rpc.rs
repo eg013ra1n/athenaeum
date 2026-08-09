@@ -8,7 +8,7 @@ use crate::query::{self, Filter};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -55,10 +55,10 @@ impl Response {
     }
 }
 
-/// Handle one request against the log dir. Returns `None` for
+/// Handle one request against the log dirs. Returns `None` for
 /// notifications (no `id`, or `id: null`), which must never get a
 /// response.
-pub fn handle(req: &Request, log_dir: &Path) -> Option<Response> {
+pub fn handle(req: &Request, log_dirs: &[PathBuf]) -> Option<Response> {
     let is_notification = matches!(req.id, None | Some(Value::Null));
     let id = req.id.clone().unwrap_or(Value::Null);
 
@@ -72,7 +72,7 @@ pub fn handle(req: &Request, log_dir: &Path) -> Option<Response> {
     match req.method.as_str() {
         "initialize" => Some(Response::ok(id, initialize_result())),
         "tools/list" => Some(Response::ok(id, tools_list_result())),
-        "tools/call" => match dispatch_tool_call(&req.params, log_dir) {
+        "tools/call" => match dispatch_tool_call(&req.params, log_dirs) {
             Ok(v) => Some(Response::ok(id, v)),
             Err(e) => Some(Response::err(id, -32603, e.to_string())),
         },
@@ -220,7 +220,7 @@ fn value_to_id_string(v: &Value) -> String {
     }
 }
 
-fn dispatch_tool_call(params: &Value, log_dir: &Path) -> Result<Value> {
+fn dispatch_tool_call(params: &Value, log_dirs: &[PathBuf]) -> Result<Value> {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
@@ -230,16 +230,16 @@ fn dispatch_tool_call(params: &Value, log_dir: &Path) -> Result<Value> {
     let result: Value = match name {
         "query_logs" => {
             let f = filter_from_args(&args);
-            serde_json::to_value(query::scan(log_dir, &f)?)?
+            serde_json::to_value(query::scan(log_dirs, &f)?)?
         }
         "tail_logs" => {
             let n = query::clamp_limit(
                 args.get("n")
                     .and_then(|v| v.as_u64())
                     .map(|v| v as usize)
-                    .or(Some(50))
+                    .or(Some(50)),
             );
-            serde_json::to_value(query::tail(log_dir, n)?)?
+            serde_json::to_value(query::tail(log_dirs, n)?)?
         }
         "list_operations" => {
             let kind = args.get("kind").and_then(|v| v.as_str());
@@ -249,7 +249,7 @@ fn dispatch_tool_call(params: &Value, log_dir: &Path) -> Result<Value> {
                     .and_then(|v| v.as_u64())
                     .map(|v| v as usize),
             );
-            serde_json::to_value(query::list_operations(log_dir, kind, since, limit)?)?
+            serde_json::to_value(query::list_operations(log_dirs, kind, since, limit)?)?
         }
         "get_operation" => {
             let id = args
@@ -262,7 +262,7 @@ fn dispatch_tool_call(params: &Value, log_dir: &Path) -> Result<Value> {
                     .map(|v| v as usize)
                     .or(Some(query::MAX_LIMIT)),
             );
-            serde_json::to_value(query::get_operation(log_dir, &id, limit)?)?
+            serde_json::to_value(query::get_operation(log_dirs, &id, limit)?)?
         }
         other => bail!("unknown tool: {other}"),
     };
