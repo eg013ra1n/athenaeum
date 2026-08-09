@@ -75,7 +75,10 @@ By default the server scans BOTH flavor trees — production
 (`com.vsharifov.athenaeum`) and the debug `.dev` sibling — merging events
 chronologically, so a dev session sees the production app's logs alongside
 its own; `ATHENAEUM_LOG_DIR` / `ATHENAEUM_DB_PATH` / `ATHENAEUM_APP_DATA_DIR`
-narrow it to one tree.
+narrow it to one tree. Operation ids can collide across the two trees — the dev
+DB is a snapshot of the production one, so both apps mint ids from the same
+sequence — so disambiguate a merged `get_operation` result with `since`, or pin
+one tree via `ATHENAEUM_LOG_DIR`.
 
 Manual use without MCP: it's a stdio JSON-RPC binary —
 `cargo run -q -p log-mcp -- <log-dir>` — or just grep the JSONL

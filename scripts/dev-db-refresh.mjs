@@ -6,7 +6,9 @@
 // `sqlite3 .backup` (WAL-safe even while the production app runs), wipes the
 // identity-bound transfer tables in the copy (the dev tree has its own sync
 // identity — inherited outbound rows would be resurrected at startup pointing
-// at payload dirs that don't exist there), and symlinks the multi-GB
+// at payload dirs that don't exist there), wipes the identity-bound settings
+// rows (mirroring api/account.rs::clear_local_session plus the peer/relay
+// caches a fresh device must re-fetch from the hub), and symlinks the multi-GB
 // catalogs/ dir instead of duplicating it. Never touches sync/, account/,
 // or logs/. Requires the sqlite3 CLI (ships with macOS; `apt install sqlite3`
 // on Debian).
@@ -33,10 +35,30 @@ const TRANSFER_TABLES = [
   'sync_inbound',
 ];
 
-// Settings precedence is runtime > DB > default, so a copied `account.hub_url`
-// row outranks the debug build's test-hub default and would silently point dev
-// at the PRODUCTION hub. Deleted in the same transaction as the table wipe.
-const HUB_URL_KEY = 'account.hub_url';
+// Identity-bound settings rows, deleted in the same transaction as the table
+// wipe. Settings precedence is runtime > DB > default, so every copied row here
+// outranks the debug build's own default:
+//   - `account.hub_url` would silently point dev at the PRODUCTION hub instead
+//     of its debug test-hub default.
+//   - the rest mirror api/account.rs::clear_local_session (email + device id,
+//     and the pairing caches it drops via clear_sync_caches) plus the remaining
+//     account-derived peer caches. `api::sync::account_signed_in` is
+//     settings-only — it reads `account.device_id` and nothing else — and gates
+//     autostart_if_enabled, so an inherited device id boots the dev app's sync
+//     receiver + iroh transport as a "signed-in" device that holds no token
+//     (the token lives in the OS keychain, which is never copied) while serving
+//     prod-derived peer/relay caches.
+// Key literals verified against crates/athenaeum-core/src/settings/mod.rs::keys.
+const IDENTITY_SETTINGS_KEYS = [
+  'account.hub_url',
+  'account.email',
+  'account.device_id',
+  'sync.cached_peer_node_id',
+  'sync.cached_relay_map',
+  'sync.authorized_peer_ids',
+  'sync.device_names',
+  'sync.peer_capabilities',
+];
 
 function appDataRoot() {
   if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support');
@@ -98,14 +120,16 @@ const present = new Set(
 );
 const toWipe = TRANSFER_TABLES.filter((t) => present.has(t));
 
+const keyList = IDENTITY_SETTINGS_KEYS.map((k) => `'${k}'`).join(', ');
 const wipe = [
   'BEGIN;',
   ...toWipe.map((t) => `DELETE FROM ${t};`),
-  `DELETE FROM settings WHERE key = '${HUB_URL_KEY}';`,
+  `DELETE FROM settings WHERE key IN (${keyList});`,
   'COMMIT;',
 ].join(' ');
 sqlite3(devDb, wipe);
-console.log(`wiped transfer state: ${[...toWipe, `settings:${HUB_URL_KEY}`].join(', ')}`);
+console.log(`wiped transfer state: ${toWipe.join(', ')}`);
+console.log(`wiped identity settings: ${IDENTITY_SETTINGS_KEYS.join(', ')}`);
 
 const prodCatalogs = path.join(prodDir, 'catalogs');
 const devCatalogs = path.join(devDir, 'catalogs');

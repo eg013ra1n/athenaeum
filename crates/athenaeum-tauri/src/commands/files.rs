@@ -177,8 +177,9 @@ pub async fn get_log_path() -> Result<String, String> {
 
 /// Get the path to the database file
 ///
-/// NOT single-sourced: needs `tauri::AppHandle::path().app_data_dir()`, which
-/// has no `ServiceContext` equivalent and is fundamentally different in kind
+/// NOT single-sourced: needs a `tauri::AppHandle` to resolve the app-data dir,
+/// which has no `ServiceContext` equivalent and is fundamentally different in
+/// kind
 /// from the web route's version (which reads the *actual* configured path
 /// off the live `Database` handle via `ctx.db.get()`). See
 /// `athenaeum_core::api::files` module doc for why this stays here.

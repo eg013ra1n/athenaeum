@@ -4,7 +4,8 @@
 //!
 //! Framing: line-delimited JSON-RPC on stdin/stdout — one JSON object per
 //! line, no `Content-Length` header (MCP stdio transport). The log
-//! directory is `argv[1]` if given, else BOTH build flavors' dirs
+//! directory is `argv[1]` if given — it must exist, an explicit dir that
+//! doesn't aborts at startup — else BOTH build flavors' dirs
 //! (production + `.dev`) are scanned (see `query::default_log_dirs`).
 //!
 //! Zero-print rule: this process's stdout is the JSON-RPC transport
@@ -18,7 +19,16 @@ use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
     let log_dirs: Vec<PathBuf> = match std::env::args().nth(1) {
-        Some(dir) => vec![PathBuf::from(dir)],
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            // An explicit dir is a claim, not a hint: a typo'd path must fail
+            // loudly here instead of answering every query with zero events,
+            // which reads exactly like "nothing was logged". The no-argv
+            // default trees stay silently skippable — a machine that has only
+            // ever run one build flavor legitimately lacks the other's dir.
+            assert!(dir.is_dir(), "log dir does not exist: {}", dir.display());
+            vec![dir]
+        }
         None => query::default_log_dirs(),
     };
     assert!(

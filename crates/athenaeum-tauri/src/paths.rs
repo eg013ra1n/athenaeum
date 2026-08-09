@@ -37,6 +37,30 @@ fn rename_leaf(platform_dir: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
 
+    /// The release identifier is the coupling point between this host and
+    /// `athenaeum_core::paths`: the dev tree is DEFINED as that identifier plus
+    /// a `.dev` suffix, and `scripts/dev-db-refresh.mjs` hardcodes the same
+    /// string as `IDENT`. Changing `tauri.conf.json`'s identifier without
+    /// mirroring it in core would make the debug build resolve a `.dev` sibling
+    /// of a directory nobody writes — or, worse, land back on the production
+    /// tree. Pinned here because nothing else fails when they drift.
+    #[test]
+    fn app_data_dir_name_tracks_the_release_identifier() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json"))
+            .expect("tauri.conf.json parses");
+        // Top-level identifier — NOT the nested capability `identifier`.
+        let identifier = conf["identifier"].as_str().expect("top-level identifier");
+        assert_eq!(identifier, "com.vsharifov.athenaeum");
+        // Tests normally build with `debug_assertions` (dev profile), where core
+        // resolves the `.dev` sibling; `cargo test --release` pins the other arm.
+        let expected = if cfg!(debug_assertions) {
+            format!("{identifier}.dev")
+        } else {
+            identifier.to_string()
+        };
+        assert_eq!(athenaeum_core::paths::app_data_dir_name(), expected);
+    }
+
     #[test]
     fn rename_leaf_swaps_only_the_final_component() {
         let out = rename_leaf(PathBuf::from(

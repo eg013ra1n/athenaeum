@@ -49,7 +49,7 @@ The dev tree starts with no `sync/` and no `account/` → the dev app is a **fre
 
 1. Resolve the platform prod dir and the `.dev` sibling; create the `.dev` dir if missing.
 2. Copy `athenaeum.db` via `sqlite3 <prod> ".backup <dev>"` (WAL-safe). The sqlite3 CLI is required — the transfer-table wipe (next step) needs it regardless, so there is no CLI-less fallback; the script exits with an instructive error when it is missing.
-3. **Wipe identity-bound transfer state** in the dev copy — the same 8 tables the batch-model upgrade reset wipes (`sync_outbound`, `sync_inbound`, `sync_outbound_files`, `sync_inbound_files`, `sync_events`, `sync_receipts`, `sync_sources`, `sync_history`). The dev copy has a fresh device identity; inherited outbound rows would otherwise be resurrected at startup pointing at payload dirs that don't exist in the dev tree. Catalog tables are untouched. The wipe also deletes the `account.hub_url` settings row — settings precedence is DB-over-default, so a copied row would re-point the dev build at the production hub instead of its debug test-hub default.
+3. **Wipe identity-bound transfer state** in the dev copy — the same 8 tables the batch-model upgrade reset wipes (`sync_outbound`, `sync_inbound`, `sync_outbound_files`, `sync_inbound_files`, `sync_events`, `sync_receipts`, `sync_sources`, `sync_history`). The dev copy has a fresh device identity; inherited outbound rows would otherwise be resurrected at startup pointing at payload dirs that don't exist in the dev tree. Catalog tables are untouched. The wipe also deletes the identity-bound settings rows (`account.hub_url`, `account.email`, `account.device_id`, and the `sync.*` peer/relay caches) — settings precedence is DB-over-default and `account_signed_in` is settings-only, so copied rows would re-point the dev build at the production hub and boot the sync stack as a signed-in device.
 4. Symlink `catalogs/` → the prod `catalogs/` if not already present (Gaia tiers are multi-GB and read-mostly; a dev-triggered tier download writes into the shared dir — acceptable, additive).
 5. Never copy `sync/`, `account/`, or `logs/`.
 
@@ -59,6 +59,7 @@ Run on demand; without it the dev app starts with an empty catalog (normal `init
 
 - **DB separation ≠ file separation.** A snapshot of the prod catalog points at the same FITS files on disk. Move / Archive / Black-Hole / calibration outputs in a dev session operate on the real files. Unchanged from today; the catalog is protected, the files are not.
 - **WebView storage stays shared.** The Tauri `identifier` is not changed, so localStorage (notification history, UI state) is keyed identically for the dev run and the installed app. Cosmetic.
+- **Unfinished operations ride the snapshot.** `file_operations` / `archive_operations` rows left mid-flight in the production catalog are copied along with it, so the dev app's startup reconcile may act on the real files once. Idempotent and rare, but it is the same class of exposure as "DB separation ≠ file separation" above.
 - Uninstall scripts are not updated: the `.dev` tree only ever exists on development machines, never on end-user installs (release builds never create it).
 
 ## What was verified to not break
