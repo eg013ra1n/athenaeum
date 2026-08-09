@@ -19,9 +19,9 @@ import path from 'node:path';
 
 const IDENT = 'com.vsharifov.athenaeum';
 
-// The same 8 tables the batch-model upgrade reset wipes (see schema.rs test
-// `batch_upgrade_wipes_transfer_tables_once_and_spares_catalog`), children
-// before parents for FK safety.
+// The same 8 tables as sync::store::TRANSFER_TABLES (see schema.rs test
+// batch_upgrade_wipes_transfer_tables_once_and_spares_catalog). Order is not
+// FK-significant (that store declares no FKs between them); kept stable for diffability.
 const TRANSFER_TABLES = [
   'sync_outbound_files',
   'sync_inbound_files',
@@ -32,6 +32,11 @@ const TRANSFER_TABLES = [
   'sync_outbound',
   'sync_inbound',
 ];
+
+// Settings precedence is runtime > DB > default, so a copied `account.hub_url`
+// row outranks the debug build's test-hub default and would silently point dev
+// at the PRODUCTION hub. Deleted in the same transaction as the table wipe.
+const HUB_URL_KEY = 'account.hub_url';
 
 function appDataRoot() {
   if (process.platform === 'darwin') return path.join(os.homedir(), 'Library', 'Application Support');
@@ -45,14 +50,29 @@ function sqlite3(...args) {
     console.error('sqlite3 CLI not found — install it (ships with macOS; `apt install sqlite3` on Debian) and re-run.');
     process.exit(1);
   }
-  if (r.status !== 0) {
-    console.error(`sqlite3 failed (args: ${args.join(' ')}):\n${r.stderr}`);
+  if (r.status !== 0 || r.error) {
+    console.error(`sqlite3 failed (args: ${args.join(' ')}):\n${r.error?.message ?? r.stderr}`);
     process.exit(1);
   }
   return r.stdout;
 }
 
+// sqlite3 dot-commands resolve C-style backslash escapes inside double quotes,
+// which mangles Windows paths (`\U` dropped, `\a` → BEL). Forward slashes are
+// accepted by SQLite on Windows; POSIX paths are passed through untouched.
+const q = (p) => (process.platform === 'win32' ? p.replace(/\\/g, '/') : p);
+
+if (process.env.ATHENAEUM_APP_DATA_DIR) {
+  console.warn(
+    'note: ATHENAEUM_APP_DATA_DIR is set — this script ignores it and always refreshes the platform .dev tree; an app started with that override reads a different directory.',
+  );
+}
+
 const root = appDataRoot();
+if (!root) {
+  console.error('could not resolve the app-data root (APPDATA unset?) — set it and re-run.');
+  process.exit(1);
+}
 const prodDir = path.join(root, IDENT);
 const devDir = path.join(root, `${IDENT}.dev`);
 const prodDb = path.join(prodDir, 'athenaeum.db');
@@ -67,12 +87,25 @@ fs.mkdirSync(devDir, { recursive: true });
 // A stale WAL/SHM pair from a previous dev run must not shadow the fresh copy.
 for (const suffix of ['', '-wal', '-shm']) fs.rmSync(devDb + suffix, { force: true });
 
-sqlite3(prodDb, `.backup "${devDb}"`);
+sqlite3(prodDb, `.backup "${q(devDb)}"`);
 console.log(`snapshot: ${prodDb} -> ${devDb}`);
 
-const wipe = ['BEGIN;', ...TRANSFER_TABLES.map((t) => `DELETE FROM ${t};`), 'COMMIT;'].join(' ');
+// A catalog predating the batch model lacks some of these tables; wiping only
+// what exists keeps the transaction from aborting and leaving an unwiped copy
+// (mirrors the table_present guard in sync::store::wipe_transfer_bookkeeping_on_upgrade).
+const present = new Set(
+  sqlite3(devDb, "SELECT name FROM sqlite_master WHERE type='table';").split('\n').map((s) => s.trim()),
+);
+const toWipe = TRANSFER_TABLES.filter((t) => present.has(t));
+
+const wipe = [
+  'BEGIN;',
+  ...toWipe.map((t) => `DELETE FROM ${t};`),
+  `DELETE FROM settings WHERE key = '${HUB_URL_KEY}';`,
+  'COMMIT;',
+].join(' ');
 sqlite3(devDb, wipe);
-console.log(`wiped transfer state: ${TRANSFER_TABLES.join(', ')}`);
+console.log(`wiped transfer state: ${[...toWipe, `settings:${HUB_URL_KEY}`].join(', ')}`);
 
 const prodCatalogs = path.join(prodDir, 'catalogs');
 const devCatalogs = path.join(devDir, 'catalogs');
@@ -86,4 +119,4 @@ if (!fs.existsSync(prodCatalogs)) {
   fs.symlinkSync(prodCatalogs, devCatalogs);
   console.log(`linked catalogs: ${devCatalogs} -> ${prodCatalogs}`);
 }
-console.log('done — dev catalog refreshed (fresh sync identity, signed-out account)');
+console.log('done — dev catalog refreshed (fresh sync identity, signed-out account) — close the dev app before re-running');
