@@ -48,7 +48,7 @@ The dev tree starts with no `sync/` and no `account/` → the dev app is a **fre
 `scripts/dev-db-refresh.mjs` (Node, no new deps; macOS/Linux — Windows may run it but the symlink step is skipped):
 
 1. Resolve the platform prod dir and the `.dev` sibling; create the `.dev` dir if missing.
-2. Copy `athenaeum.db` — prefer `sqlite3 <prod> ".backup <dev>"` (WAL-safe); if the `sqlite3` CLI is unavailable, fall back to copying `athenaeum.db` + `-wal` + `-shm` and print a warning to close the production app first.
+2. Copy `athenaeum.db` via `sqlite3 <prod> ".backup <dev>"` (WAL-safe). The sqlite3 CLI is required — the transfer-table wipe (next step) needs it regardless, so there is no CLI-less fallback; the script exits with an instructive error when it is missing.
 3. **Wipe identity-bound transfer state** in the dev copy — the same 8 tables the batch-model upgrade reset wipes (`sync_outbound`, `sync_inbound`, `sync_outbound_files`, `sync_inbound_files`, `sync_events`, `sync_receipts`, `sync_sources`, `sync_history`). The dev copy has a fresh device identity; inherited outbound rows would otherwise be resurrected at startup pointing at payload dirs that don't exist in the dev tree. Catalog tables are untouched.
 4. Symlink `catalogs/` → the prod `catalogs/` if not already present (Gaia tiers are multi-GB and read-mostly; a dev-triggered tier download writes into the shared dir — acceptable, additive).
 5. Never copy `sync/`, `account/`, or `logs/`.

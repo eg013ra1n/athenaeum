@@ -10,6 +10,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "dev:web": "VITE_TARGET=web vite",
+    "dev:db-refresh": "node scripts/dev-db-refresh.mjs",
     "build:web": "VITE_TARGET=web tsc && VITE_TARGET=web vite build"
   },
   "dependencies": {
