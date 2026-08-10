@@ -1,32 +1,32 @@
-//! One-shot background backfill of `files.content_hash` for the whole catalog
-//! (Task E, item 5).
+//! Background content-index pass: populates `files.content_hash` for the whole
+//! catalog.
 //!
 //! The device-to-device transfer dedup handshake matches a sender's sampling
-//! hashes against `files.content_hash` over the receiver's whole catalog. Before
-//! Task E that column was written only by sync-ingest and by the scanner when
-//! `duplicates.use_content_hash` was on (default off), so a scanned-but-never-
-//! synced library was effectively invisible to dedup — the owner's field DB had
-//! `content_hash` on 2 of 13,566 rows. The scanner now hashes every new/changed
-//! file unconditionally; this backfill closes the gap for rows written *before*
-//! that change.
+//! hashes against `files.content_hash` over the receiver's whole catalog. The
+//! scanner only writes this column when `duplicates.use_content_hash` is on
+//! (default off — hashing every scanned file is a measurable performance
+//! regression), so for most libraries this pass is the ordinary populator of
+//! the column, not a one-off migration: list every `files` row still missing a
+//! hash, re-hash the ones present on disk with the same
+//! [`compute_xxhash`](crate::duplicates::compute_xxhash) the scanner / ingest /
+//! sender-offer all use, and UPDATE the row.
 //!
-//! It runs once per process launch (single-flight guard) on a background thread:
-//! list every `files` row still missing a hash, re-hash the ones present on disk
-//! with the same [`compute_xxhash`](crate::duplicates::compute_xxhash) the
-//! scanner / ingest / sender-offer all use, and UPDATE the row. Missing or
-//! unreadable files are skipped at `debug` and retried on the next launch, so
-//! the pass is idempotent and self-healing. A gentle per-chunk nap keeps a
-//! multi-thousand-file catalog converging in the background without starving the
-//! app's own IO.
+//! Missing or unreadable files are skipped at `debug` and retried on the next
+//! run, so the pass is idempotent and self-healing. A gentle per-chunk nap
+//! keeps a multi-thousand-file catalog converging in the background without
+//! starving the app's own IO.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 
 use crate::db::Database;
+use crate::events::{emit_event, ProgressEmitter};
 
 /// Rows hashed per chunk between throttle naps.
 const CHUNK: usize = 64;
@@ -43,7 +43,7 @@ const CHUNK_SLEEP: Duration = Duration::from_millis(50);
 /// a NEW db whose NULL-hash rows would then never backfill until a full restart).
 /// A repeat spawn for the SAME path (StrictMode double-mount, a repeat
 /// `initialize_database`) is still a no-op. Kept out of
-/// [`backfill_content_hashes`] itself so tests can drive the pass repeatedly.
+/// [`run_content_index`] itself so tests can drive the pass repeatedly.
 static BACKFILL_RAN_FOR: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 /// Outcome of one backfill pass. Returned for tests/logging; hosts ignore it.
@@ -56,6 +56,51 @@ pub struct BackfillSummary {
     /// Rows skipped (missing on disk, unreadable, or UPDATE failed) — still NULL,
     /// retried on the next launch.
     pub skipped: usize,
+    /// True if the pass stopped early because its cancel flag was set.
+    pub cancelled: bool,
+}
+
+/// Per-chunk progress for the content-index job. UI data, not a log line — the
+/// pass also logs its own `debug!` per chunk (ProgressEmitter events and
+/// tracing stay separate concerns).
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentIndexProgress {
+    pub done: usize,
+    pub total: usize,
+    pub updated: usize,
+    pub skipped: usize,
+}
+
+/// Terminal event. Emitted on EVERY exit path — normal completion, cancel,
+/// the nothing-to-do early return, AND the row-listing failure — so the
+/// sidebar card and the notification handler have exactly one place to close
+/// on; none of them can hang open waiting for an event that never comes.
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentIndexFinished {
+    pub updated: usize,
+    pub skipped: usize,
+    pub cancelled: bool,
+    /// The pass could not enumerate its work (locked DB, schema mismatch,
+    /// corrupt catalog). Without this the failure exit is indistinguishable
+    /// from a clean nothing-to-do run, and the UI would cheerfully report
+    /// "finished — 0 indexed" over a broken catalog.
+    pub failed: bool,
+}
+
+/// Rows still missing a hash. Pure SQL — never touches the disk, so the status
+/// command is safe to call from the UI on every Settings mount.
+pub fn count_pending(db: &Database) -> usize {
+    let conn = db.conn();
+    conn.query_row("SELECT COUNT(*) FROM files WHERE content_hash IS NULL", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|n| n as usize)
+    .unwrap_or_else(|e| {
+        tracing::error!(error = %e, "content index: failed to count pending rows");
+        0
+    })
 }
 
 /// Host entry point: run the whole-library content-hash backfill at most once
@@ -70,13 +115,17 @@ pub fn backfill_content_hashes_once(db: &Database) {
             return;
         }
     }
-    let _ = backfill_content_hashes(db);
+    let _ = run_content_index(db, &crate::events::NullEmitter, Arc::new(AtomicBool::new(false)));
 }
 
-/// Run one backfill pass (no single-flight guard — that lives in
+/// Run one content-index pass (no single-flight guard — that lives in
 /// [`backfill_content_hashes_once`]). Idempotent at the DB level: only NULL-hash
 /// rows are visited, so a re-run converges and never re-hashes a done row.
-pub fn backfill_content_hashes(db: &Database) -> BackfillSummary {
+pub fn run_content_index(
+    db: &Database,
+    emitter: &dyn ProgressEmitter,
+    cancel: Arc<AtomicBool>,
+) -> BackfillSummary {
     // Snapshot the NULL-hash rows (with their recorded size/modified_at for the
     // stale-row check below) into a Vec up front, then DROP the connection: the
     // pool is small (max 8) and this pass runs for minutes — holding a checked-out
@@ -101,6 +150,11 @@ pub fn backfill_content_hashes(db: &Database) -> BackfillSummary {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::error!(error = %e, "content-hash backfill: failed to list pending rows");
+                emit_event(
+                    emitter,
+                    "content-index-finished",
+                    &ContentIndexFinished { updated: 0, skipped: 0, cancelled: false, failed: true },
+                );
                 return BackfillSummary::default();
             }
         }
@@ -108,15 +162,27 @@ pub fn backfill_content_hashes(db: &Database) -> BackfillSummary {
 
     let pending_count = pending.len();
     if pending_count == 0 {
-        tracing::info!(pending = 0, "content-hash backfill: nothing to do");
+        tracing::info!(pending = 0, "content index: nothing to do");
+        emit_event(
+            emitter,
+            "content-index-finished",
+            &ContentIndexFinished { updated: 0, skipped: 0, cancelled: false, failed: false },
+        );
         return BackfillSummary::default();
     }
-    tracing::info!(pending = pending_count, "content-hash backfill started");
+    tracing::info!(pending = pending_count, "content index started");
 
     let mut updated = 0usize;
     let mut skipped = 0usize;
+    let mut cancelled = false;
     let chunk_total = pending_count.div_ceil(CHUNK);
     for (chunk_idx, chunk) in pending.chunks(CHUNK).enumerate() {
+        if cancel.load(Ordering::SeqCst) {
+            cancelled = true;
+            tracing::info!(updated, skipped, "content index cancelled");
+            break;
+        }
+
         // Hash the chunk's files FIRST (no connection held), then check a pooled
         // connection out only for the chunk's UPDATEs.
         let mut hashed: Vec<(i64, String)> = Vec::with_capacity(chunk.len());
@@ -170,15 +236,30 @@ pub fn backfill_content_hashes(db: &Database) -> BackfillSummary {
                 }
             }
         }
-        tracing::debug!(chunk = chunk_idx + 1, of = chunk_total, updated, skipped, "content-hash backfill chunk done");
+        tracing::debug!(chunk = chunk_idx + 1, of = chunk_total, updated, skipped, "content index chunk done");
+        emit_event(
+            emitter,
+            "content-index-progress",
+            &ContentIndexProgress {
+                done: ((chunk_idx + 1) * CHUNK).min(pending_count),
+                total: pending_count,
+                updated,
+                skipped,
+            },
+        );
         // Gentle throttle between chunks (skip the nap after the last chunk).
         if chunk_idx + 1 < chunk_total {
             std::thread::sleep(CHUNK_SLEEP);
         }
     }
 
-    tracing::info!(pending = pending_count, updated, skipped, "content-hash backfill finished");
-    BackfillSummary { pending: pending_count, updated, skipped }
+    emit_event(
+        emitter,
+        "content-index-finished",
+        &ContentIndexFinished { updated, skipped, cancelled, failed: false },
+    );
+    tracing::info!(pending = pending_count, updated, skipped, cancelled, "content index finished");
+    BackfillSummary { pending: pending_count, updated, skipped, cancelled }
 }
 
 #[cfg(test)]
@@ -241,7 +322,7 @@ mod tests {
             .unwrap();
         }
 
-        let s1 = backfill_content_hashes(&db);
+        let s1 = run_content_index(&db, &crate::events::NullEmitter, Arc::new(AtomicBool::new(false)));
         assert_eq!(s1.pending, 4);
         assert_eq!(s1.updated, 2, "both matching on-disk files hashed");
         assert_eq!(s1.skipped, 2, "missing-path AND drifted rows skipped");
@@ -269,7 +350,7 @@ mod tests {
 
         // Idempotent: a second pass sees only the still-NULL missing row and
         // hashes nothing new.
-        let s2 = backfill_content_hashes(&db);
+        let s2 = run_content_index(&db, &crate::events::NullEmitter, Arc::new(AtomicBool::new(false)));
         assert_eq!(s2.pending, 2, "the missing-path and drifted rows remain NULL");
         assert_eq!(s2.updated, 0);
         assert_eq!(s2.skipped, 2);
@@ -279,7 +360,126 @@ mod tests {
     fn backfill_empty_catalog_is_noop() {
         let tmp = tempfile::TempDir::new().unwrap();
         let db = Database::new(tmp.path().join("catalog.db")).unwrap();
-        let s = backfill_content_hashes(&db);
+        let s = run_content_index(&db, &crate::events::NullEmitter, Arc::new(AtomicBool::new(false)));
         assert_eq!(s, BackfillSummary::default());
+    }
+
+    struct CapturingEmitter(std::sync::Mutex<Vec<(String, serde_json::Value)>>);
+
+    impl crate::events::ProgressEmitter for CapturingEmitter {
+        fn emit_json(&self, event_name: &str, payload: serde_json::Value) {
+            self.0.lock().unwrap().push((event_name.to_string(), payload));
+        }
+    }
+
+    /// N real files on disk with matching `files` rows and NULL content_hash.
+    /// Real bytes because the pass's stale-row guard compares the row's
+    /// (size, modified_at) against the file's — a fake row would be skipped.
+    fn test_db_with_pending_rows(n: usize) -> (Database, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("t.db")).unwrap();
+        let conn = db.conn();
+        crate::db::schema::init_db(&conn).unwrap();
+        for i in 0..n {
+            let p = tmp.path().join(format!("f{i}.fits"));
+            crate::archive::restore::tests::write_minimal_fits(&p);
+            let meta = std::fs::metadata(&p).unwrap();
+            let modified: chrono::DateTime<Utc> = meta.modified().unwrap().into();
+            conn.execute(
+                "INSERT INTO files (path, filename, size, modified_at, format, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'FITS', ?5)",
+                rusqlite::params![
+                    p.to_str().unwrap(),
+                    format!("f{i}.fits"),
+                    meta.len() as i64,
+                    modified.to_rfc3339(),
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        (db, tmp)
+    }
+
+    /// The pass reports progress and a terminal event, so the sidebar card and
+    /// the completion notification have something to render.
+    #[test]
+    fn content_index_emits_progress_and_finish() {
+        let (db, _tmp) = test_db_with_pending_rows(3);
+        let emitter = CapturingEmitter(std::sync::Mutex::new(Vec::new()));
+
+        let summary = run_content_index(&db, &emitter, Arc::new(AtomicBool::new(false)));
+
+        assert_eq!(summary.updated, 3);
+        assert!(!summary.cancelled);
+
+        let events = emitter.0.lock().unwrap();
+        assert!(
+            events.iter().any(|(name, _)| name == "content-index-progress"),
+            "expected at least one progress event"
+        );
+        let (_, finished) = events
+            .iter()
+            .find(|(name, _)| name == "content-index-finished")
+            .expect("expected a terminal event");
+        assert_eq!(finished["updated"], 3);
+        assert_eq!(finished["cancelled"], false);
+    }
+
+    /// A pre-set cancel flag stops the pass before it hashes anything, and the
+    /// terminal event says so — the sidebar's X must not look like a no-op.
+    #[test]
+    fn content_index_honours_cancel_flag() {
+        let (db, _tmp) = test_db_with_pending_rows(3);
+        let emitter = CapturingEmitter(std::sync::Mutex::new(Vec::new()));
+
+        let summary = run_content_index(&db, &emitter, Arc::new(AtomicBool::new(true)));
+
+        assert!(summary.cancelled, "pre-set flag must report cancelled");
+        assert_eq!(summary.updated, 0, "cancelled before any chunk ran");
+
+        let events = emitter.0.lock().unwrap();
+        let (_, finished) = events
+            .iter()
+            .find(|(name, _)| name == "content-index-finished")
+            .expect("a cancelled run still emits a terminal event");
+        assert_eq!(finished["cancelled"], true);
+    }
+
+    /// Status needs a cheap count that does not walk the disk.
+    #[test]
+    fn count_pending_counts_null_hash_rows_only() {
+        let (db, _tmp) = test_db_with_pending_rows(3);
+        assert_eq!(count_pending(&db), 3);
+        run_content_index(&db, &crate::events::NullEmitter, Arc::new(AtomicBool::new(false)));
+        assert_eq!(count_pending(&db), 0);
+    }
+
+    /// A row-listing failure (locked DB, schema mismatch, corrupt catalog) is
+    /// logged, not swallowed — but it must ALSO still emit exactly one
+    /// terminal event with `failed: true`, or the sidebar card hangs open
+    /// forever and the UI can't tell a broken catalog from a clean
+    /// nothing-to-do run. Forces a real `prepare` failure (dropped table)
+    /// rather than an injected one.
+    #[test]
+    fn content_index_emits_failed_when_listing_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let db = Database::new(tmp.path().join("catalog.db")).unwrap();
+        db.conn().execute("DROP TABLE files", []).unwrap();
+        let emitter = CapturingEmitter(std::sync::Mutex::new(Vec::new()));
+
+        let summary = run_content_index(&db, &emitter, Arc::new(AtomicBool::new(false)));
+
+        assert_eq!(summary, BackfillSummary::default());
+
+        let events = emitter.0.lock().unwrap();
+        let finished_events: Vec<_> = events
+            .iter()
+            .filter(|(name, _)| name == "content-index-finished")
+            .collect();
+        assert_eq!(finished_events.len(), 1, "exactly one terminal event, no progress events");
+        assert_eq!(finished_events[0].1["failed"], true);
+        assert_eq!(finished_events[0].1["cancelled"], false);
     }
 }

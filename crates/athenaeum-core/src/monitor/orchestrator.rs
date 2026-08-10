@@ -404,7 +404,11 @@ mod tests {
         );
         drop(conn);
 
-        crate::duplicates::backfill::backfill_content_hashes(db);
+        crate::duplicates::backfill::run_content_index(
+            db,
+            &NullEmitter,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
 
         let conn = db.conn();
         let hash_after_backfill: Option<String> = conn
