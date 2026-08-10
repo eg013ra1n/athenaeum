@@ -45,6 +45,11 @@ pub enum ComputeJobKind {
     Analysis,
     MasterBuild,
     LightCalibration,
+    /// Whole-library `files.content_hash` pass that feeds transfer dedup.
+    /// IO-bound rather than CPU-bound, but it rides the same admission queue so
+    /// it can't fight a master build for the disk, and so the sidebar card and
+    /// its cancel button come for free.
+    ContentIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ts_rs::TS)]
@@ -395,5 +400,13 @@ mod tests {
             snaps.last().expect("at least one snapshot").is_empty(),
             "final snapshot after permit drop must be empty"
         );
+    }
+
+    /// The sidebar indicator keys off the serialised kind; pin the wire string
+    /// so a rename can't silently orphan the card.
+    #[test]
+    fn content_index_kind_serialises_snake_case() {
+        let json = serde_json::to_string(&ComputeJobKind::ContentIndex).unwrap();
+        assert_eq!(json, "\"content_index\"");
     }
 }

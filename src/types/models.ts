@@ -474,11 +474,22 @@ export type LoggingConfig = { level: string, modules: { [key in string]: string 
 
 export type LoggingConfigResponse = { config: LoggingConfig, envOverrideActive: boolean, };
 
-export type ComputeJobKind = "analysis" | "master_build" | "light_calibration";
+export type ComputeJobKind = "analysis" | "master_build" | "light_calibration" | "content_index";
 
 export type ComputeJobState = "queued" | "running";
 
 export type ComputeQueueEntry = { jobId: number, kind: ComputeJobKind, label: string, state: ComputeJobState, queuedAt: string, };
+
+export type ContentIndexProgress = { done: number, total: number, updated: number, skipped: number, };
+
+export type ContentIndexFinished = { updated: number, skipped: number, cancelled: boolean, 
+/**
+ * The pass could not enumerate its work (locked DB, schema mismatch,
+ * corrupt catalog). Without this the failure exit is indistinguishable
+ * from a clean nothing-to-do run, and the UI would cheerfully report
+ * "finished — 0 indexed" over a broken catalog.
+ */
+failed: boolean, };
 
 export type Combination = "average" | "median";
 
