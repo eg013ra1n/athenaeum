@@ -2420,6 +2420,30 @@ pub struct RegisteredScanOutcome {
     pub reconcile: crate::db::ReconcileResult,
 }
 
+/// Scan-time content hashing is opt-in via `duplicates.use_content_hash`
+/// (default false).
+///
+/// `5aa58fed` briefly hard-coded this on so the transfer dedup handshake would
+/// see the whole scanned library. That put a 3 x 512 KB sampling read on every
+/// new/changed file — 27.86 GiB instead of 0.30 GiB on an 18 946-file library,
+/// measured x5.9 cold. The dedup index is now filled by the explicit,
+/// cancellable content-index job (`api::content_index`) instead, so the scan
+/// hot path stays header-only.
+pub(crate) fn scan_hashing_enabled(
+    settings: &crate::settings::SettingsManager,
+    conn: &rusqlite::Connection,
+) -> bool {
+    // A read failure must not pass silently just because the fallback happens
+    // to equal the default: the visible symptom would be a user turning the
+    // setting ON and scans quietly continuing not to hash.
+    settings
+        .get_duplicates_use_content_hash(conn)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "duplicates.use_content_hash read failed; scan hashing disabled");
+            false
+        })
+}
+
 /// Run a scan against a scan root with full lifecycle management:
 /// - Fails fast if a scan is already active for this root.
 /// - Registers a `ScanHandle` in `ctx.active_scans` (with cancel flag).
@@ -2485,16 +2509,13 @@ pub fn run_registered_scan<E: ProgressEmitter>(
         .find(|r| r.id == Some(root_id))
         .ok_or("Scan root not found")?;
 
-    // Task E: always hash. The scanner populates content_hash for the whole
-    // library so device-to-device transfer dedup isn't blind to scanned
-    // (never-synced) files. `duplicates.use_content_hash` is now purely the
-    // Duplicates-view grouping toggle, decoupled from scan-time hashing.
+    let use_content_hash = scan_hashing_enabled(&ctx.settings, &conn);
     let result = scan_directory_parallel(
         Path::new(&root.path),
         root_id,
         &conn,
         emitter,
-        true,
+        use_content_hash,
         cancel_flag,
         root.unique_camera,
     );
@@ -3094,6 +3115,73 @@ mod inplace_tests {
             )
             .unwrap();
         assert_eq!(frames, 1, "frameless files row must be re-parsed");
+    }
+
+    /// Scan-time content hashing is OPT-IN. `5aa58fed` hard-coded it on at both
+    /// entry points, which added a 3 x 512 KB read per file — measured x5.9 on a
+    /// cold 2010-file real library. The hash column is now populated by the
+    /// content-index job instead (see `api::content_index`).
+    #[test]
+    fn scan_hashing_defaults_off_and_follows_the_setting() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let settings = crate::settings::SettingsManager::new();
+
+        assert!(
+            !scan_hashing_enabled(&settings, &conn),
+            "no setting row: scan must not hash"
+        );
+
+        crate::db::set_setting(&conn, "duplicates.use_content_hash", "true").unwrap();
+        assert!(
+            scan_hashing_enabled(&settings, &conn),
+            "setting on: scan hashes"
+        );
+
+        crate::db::set_setting(&conn, "duplicates.use_content_hash", "false").unwrap();
+        assert!(
+            !scan_hashing_enabled(&settings, &conn),
+            "setting off: scan must not hash"
+        );
+    }
+
+    /// The behavioural half: with hashing off the scanner writes NULL, so the
+    /// content-index job has rows to find.
+    #[test]
+    fn scan_leaves_content_hash_null_when_hashing_is_off() {
+        let scan = TempDir::new().unwrap();
+        let f = scan.path().join("M33/L_001.fits");
+        std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+        crate::archive::restore::tests::write_minimal_fits(&f);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, ?1)",
+            [scan.path().to_str().unwrap()],
+        )
+        .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = scan_directory_parallel(
+            scan.path(),
+            1,
+            &conn,
+            &NullEmitter,
+            false, // hashing off
+            cancel,
+            false,
+        );
+        assert_eq!(result.files_processed, 1);
+
+        let hashed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE content_hash IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hashed, 0, "hashing off must leave content_hash NULL");
     }
 }
 

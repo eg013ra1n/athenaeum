@@ -370,13 +370,19 @@ mod tests {
         assert_eq!(outbound_count(&ctx), 0, "nothing to enqueue with no hook");
     }
 
-    /// Task E: the production scan path (`run_registered_scan`, driven here by
-    /// the monitor cycle) ALWAYS populates `files.content_hash`, even though
-    /// `duplicates.use_content_hash` is unset (default false). That setting now
-    /// governs only the Duplicates-view grouping, never scan-time hashing — so
-    /// the whole scanned library feeds the transfer dedup index.
+    /// Task E briefly made the production scan path (`run_registered_scan`,
+    /// driven here by the monitor cycle) ALWAYS populate `files.content_hash`,
+    /// even with `duplicates.use_content_hash` unset (default false) — a 3 x
+    /// 512 KB sampling read on every new/changed file, measured x5.9 slower
+    /// cold on a real library (see `scanner::scan_hashing_enabled`). The
+    /// content-index-job plan's Task 1 reverted that: scan-time hashing is
+    /// opt-in again, so the transfer dedup index is filled by an explicit
+    /// backfill pass instead of riding every scan. This test now pins BOTH
+    /// halves of that contract: the scan itself leaves the column NULL, and
+    /// `duplicates::backfill` (driven explicitly, as the content-index job
+    /// will) is what populates it.
     #[test]
-    fn registered_scan_always_populates_content_hash() {
+    fn registered_scan_leaves_content_hash_null_backfill_populates_it() {
         let (_tmp, ctx) = test_ctx_with_scan_root(1);
         let offline_roots = Arc::new(Mutex::new(HashSet::new()));
 
@@ -385,17 +391,28 @@ mod tests {
         let db = ctx.db.get().unwrap();
         let conn = db.conn();
 
-        // Precondition: the grouping setting is at its default (false), proving
-        // hashing does not depend on it.
+        // Precondition: the grouping setting is at its default (false).
         let use_content_hash = ctx.settings.get_duplicates_use_content_hash(&conn).unwrap();
         assert!(!use_content_hash, "precondition: duplicates.use_content_hash defaults to false");
 
-        let hash: Option<String> = conn
+        let hash_after_scan: Option<String> = conn
             .query_row("SELECT content_hash FROM files LIMIT 1", [], |r| r.get(0))
             .unwrap();
         assert!(
-            hash.is_some(),
-            "a newly scanned file must carry a content_hash regardless of the duplicates setting"
+            hash_after_scan.is_none(),
+            "scan-time hashing is opt-in: a scan with the setting off must leave content_hash NULL"
+        );
+        drop(conn);
+
+        crate::duplicates::backfill::backfill_content_hashes(db);
+
+        let conn = db.conn();
+        let hash_after_backfill: Option<String> = conn
+            .query_row("SELECT content_hash FROM files LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            hash_after_backfill.is_some(),
+            "an explicit backfill pass must populate content_hash for a scanned-but-unhashed file"
         );
     }
 }
