@@ -491,6 +491,26 @@ export type ContentIndexFinished = { updated: number, skipped: number, cancelled
  */
 failed: boolean, };
 
+export type ContentIndexStatus = { 
+/**
+ * Catalogued files still missing a hash.
+ */
+pending: number, 
+/**
+ * Catalogued files in total.
+ */
+total: number, 
+/**
+ * A pass holds this catalog's single-flight slot: either waiting for a
+ * compute-queue ticket or hashing. Queued counts as running on purpose —
+ * this is what refuses a second start.
+ */
+running: boolean, 
+/**
+ * Whether the job runs automatically on this node.
+ */
+syncConfigured: boolean, };
+
 export type Combination = "average" | "median";
 
 export type Rejection = { "method": "none" } | { "method": "percentile_clip", low: number, high: number, } | { "method": "sigma_clip", sigma_low: number, sigma_high: number, } | { "method": "winsorized_sigma", sigma_low: number, sigma_high: number, } | { "method": "linear_fit_clip", sigma_low: number, sigma_high: number, };

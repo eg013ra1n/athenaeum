@@ -20,6 +20,9 @@ pub mod calendar;
 pub mod frame_sets;
 // Personal-sync commands (Stage I, task A7). Ungated: uses only db/sharing/sync.
 pub mod sync;
+// Trigger policy for the whole-library content-hash index. Ungated: db +
+// duplicates::backfill + the compute queue, plus `api::sync`'s own gate.
+pub mod content_index;
 // Full-app capture-node retention (task M4). Ungated: db/settings/sync only.
 pub mod retention;
 // Account commands (Stage II, task B4). Ungated: db/settings/account only.

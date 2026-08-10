@@ -1183,6 +1183,20 @@ fn autostart_gate(dev: bool, signed_in: bool) -> bool {
     dev || signed_in
 }
 
+/// "Is device-to-device sync configured on this node" — the SAME predicate the
+/// receiver's autostart uses, deliberately shared rather than re-derived.
+///
+/// `files.content_hash` exists for exactly one consumer: the transfer dedup
+/// handshake. A node that never transfers must not pay 3 x 512 KB of disk reads
+/// per catalogued file for an index nobody reads, so the content-index job is
+/// gated on this. Local state only — no hub call, no keychain.
+pub fn sync_configured(ctx: &ServiceContext) -> Result<bool, ApiError> {
+    Ok(autostart_gate(
+        dev_pairing_enabled(ctx)?,
+        account_signed_in(ctx)?,
+    ))
+}
+
 /// The DISTINCT destination peers of a set of non-terminal outbound rows,
 /// first-seen order preserved (tv2 follow-up — sender resurrection). One engine
 /// per peer re-drives every one of that peer's non-terminal rows, so the startup
