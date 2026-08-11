@@ -30,6 +30,9 @@ mod images;
 mod missing_files;
 mod analysis;
 mod compute;
+// `pub(crate)` so `main.rs` can install this module's `ScanCompletionHook`
+// at startup (same reason as `sync` below).
+pub(crate) mod content_index;
 mod plate_solve;
 mod registration;
 mod archive;
@@ -199,6 +202,9 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/get_compute_queue", post(compute::get_compute_queue))
         .route("/api/cancel_compute_job", post(compute::cancel_compute_job))
         .route("/api/set_compute_max_concurrent", post(compute::set_compute_max_concurrent))
+        // Content index
+        .route("/api/get_content_index_status", post(content_index::get_content_index_status))
+        .route("/api/start_content_index", post(content_index::start_content_index))
         // Plate solving
         .route("/api/get_plate_solve_config", post(plate_solve::get_plate_solve_config))
         .route("/api/set_plate_solve_config", post(plate_solve::set_plate_solve_config))

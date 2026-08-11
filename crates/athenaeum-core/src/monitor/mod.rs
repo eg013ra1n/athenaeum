@@ -23,16 +23,21 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 
-/// Host-installed hook invoked after a *registered* scan (interactive OR
-/// monitor-triggered) completes with newly-ingested files.
+/// Host-installed hook invoked after a MONITOR-triggered registered scan
+/// completes with newly-ingested files.
+///
+/// **Monitor-triggered only.** `orchestrator::run_cycle` is the sole call site
+/// (it passes the scan's `new_file_ids`), and it is reached only from
+/// [`MonitorService::tick`] — an interactive scan does NOT fire this hook. A
+/// host that also wants to react to human-triggered scans must wire that at its
+/// own command/route boundary; assuming otherwise is how a double-fire gets
+/// written.
 ///
 /// Kept as a trait — rather than a concrete host type — so core never depends on
 /// `AppState`/Tauri/Axum: a host can implement it once at startup, closing over
 /// its own state, and install it via [`MonitorService::set_scan_completion_hook`].
-/// The monitor orchestrator (this module's `orchestrator::run_cycle`) calls it
-/// with the scan's `new_file_ids`. In the mesh model (Sync 2C) no host installs
-/// a hook — the app no longer auto-sends on scan — so this is a dormant seam; a
-/// `None` hook is the common case and must never block or panic a cycle.
+/// A `None` hook (unit tests, a host that never wires one up) must never block or
+/// panic a cycle.
 ///
 /// Fire-and-forget by contract: `on_scan_completed` runs synchronously on the
 /// monitor's blocking-pool thread ([`MonitorService::tick`]) and must not

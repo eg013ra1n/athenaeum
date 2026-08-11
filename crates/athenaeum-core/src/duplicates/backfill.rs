@@ -16,10 +16,9 @@
 //! keeps a multi-thousand-file catalog converging in the background without
 //! starving the app's own IO.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -36,15 +35,6 @@ const CHUNK: usize = 64;
 /// then a short pause. On a ~13.5k-file catalog this is ~210 chunks — a few
 /// minutes of mostly-idle wall time, never a startup stall (it runs off-thread).
 const CHUNK_SLEEP: Duration = Duration::from_millis(50);
-
-/// Per-DB single-flight guard (review fix): at most one backfill per DATABASE
-/// PATH per process launch. Keyed by path — a process-global bool would starve a
-/// rebound catalog (dev-reset / DB-path change re-runs `initialize_database` with
-/// a NEW db whose NULL-hash rows would then never backfill until a full restart).
-/// A repeat spawn for the SAME path (StrictMode double-mount, a repeat
-/// `initialize_database`) is still a no-op. Kept out of
-/// [`run_content_index`] itself so tests can drive the pass repeatedly.
-static BACKFILL_RAN_FOR: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 /// Outcome of one backfill pass. Returned for tests/logging; hosts ignore it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -103,24 +93,11 @@ pub fn count_pending(db: &Database) -> usize {
     })
 }
 
-/// Host entry point: run the whole-library content-hash backfill at most once
-/// per process. Spawn it on a background thread post-init (blocking file IO).
-/// Errors are logged, never fatal.
-pub fn backfill_content_hashes_once(db: &Database) {
-    let ran = BACKFILL_RAN_FOR.get_or_init(|| Mutex::new(HashSet::new()));
-    {
-        let mut set = ran.lock().expect("backfill guard mutex poisoned");
-        if !set.insert(db.path().to_path_buf()) {
-            tracing::debug!(path = %db.path().display(), "content-hash backfill already ran for this catalog this launch; skipping");
-            return;
-        }
-    }
-    let _ = run_content_index(db, &crate::events::NullEmitter, Arc::new(AtomicBool::new(false)));
-}
-
-/// Run one content-index pass (no single-flight guard — that lives in
-/// [`backfill_content_hashes_once`]). Idempotent at the DB level: only NULL-hash
-/// rows are visited, so a re-run converges and never re-hashes a done row.
+/// Run one content-index pass. No single-flight guard of its own — that (and
+/// the trigger policy: the sync gate, compute-queue admission, the boot and
+/// post-scan re-arms) lives in [`crate::api::content_index`]. Idempotent at the
+/// DB level: only NULL-hash rows are visited, so a re-run converges and never
+/// re-hashes a done row.
 pub fn run_content_index(
     db: &Database,
     emitter: &dyn ProgressEmitter,

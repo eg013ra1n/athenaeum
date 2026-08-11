@@ -18,6 +18,7 @@ use athenaeum_core::api::PathPolicy;
 use athenaeum_core::models::{RelinkResult, ScanRoot};
 use axum::{extract::State, http::StatusCode, Json};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
@@ -287,6 +288,16 @@ pub async fn start_scan_with_progress(
 ) -> Result<Json<ScanResultDto>, (StatusCode, String)> {
     let emitter = SseProgressEmitter::new(state.event_tx.clone());
     let dto = api::start_scan_with_progress(&state.ctx, args.root_id, &emitter).map_err(api_err)?;
+    // New rows may need hashing. Gated + single-flight inside, so this is a
+    // no-op on an ungated node or while a pass is already running.
+    {
+        let ctx = Arc::clone(&state.ctx);
+        let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
+            Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
+        std::thread::spawn(move || {
+            athenaeum_core::api::content_index::autostart_content_index(&ctx, emitter);
+        });
+    }
     Ok(Json(dto))
 }
 

@@ -2,6 +2,7 @@
 
 use crate::db::{self};
 use crate::models::*;
+use std::sync::Arc;
 use tauri::State;
 
 use super::AppState;
@@ -808,6 +809,19 @@ pub async fn find_new_frames_for_set(
                         tracing::warn!(root_id, error = %e, "find_new_frames: scan of root failed");
                     }
                 }
+            }
+            // Third path that ingests files on desktop, so it re-arms the
+            // content index like the other two. Once, after the loop — the job
+            // re-derives its own work from the catalog and is single-flight, so
+            // a per-root call would just be a redundant no-op. (The web mirror
+            // never starts a scan here, so it has nothing to re-arm.)
+            {
+                let ctx = Arc::clone(&state.ctx);
+                let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
+                    Arc::new(crate::tauri_events::TauriProgressEmitter(app_handle.clone()));
+                std::thread::spawn(move || {
+                    athenaeum_core::api::content_index::autostart_content_index(&ctx, emitter);
+                });
             }
         }
     }

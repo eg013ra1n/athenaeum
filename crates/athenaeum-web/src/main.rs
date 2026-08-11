@@ -263,18 +263,31 @@ async fn main() {
         });
     }
 
-    // Task E: one-shot whole-library content-hash backfill (see
-    // core::duplicates::backfill). Populates `files.content_hash` for rows
-    // written before the scanner started hashing unconditionally so the
-    // transfer dedup handshake isn't blind to scanned (never-synced) files.
-    // Single-flight + gentle throttle inside; blocking file IO → a std thread,
-    // never fatal. Mirrors the desktop wiring in `commands/core.rs`.
-    if let Some(db) = state.ctx.db.get() {
-        let db = db.clone();
+    // Content index (transfer dedup's `files.content_hash`). Gated on sync being
+    // configured and admitted through the compute queue, so it is visible in the
+    // sidebar and cancellable — the predecessor ran silently on every launch and
+    // read ~1.5 MB per catalogued file with nothing in the UI to explain it.
+    // Mirrors the desktop wiring in `commands/core.rs`.
+    {
+        let ctx = Arc::clone(&state.ctx);
+        let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
+            Arc::new(events::SseProgressEmitter::new(state.event_tx.clone()));
         std::thread::spawn(move || {
-            athenaeum_core::duplicates::backfill::backfill_content_hashes_once(&db);
+            athenaeum_core::api::content_index::autostart_content_index(&ctx, emitter);
         });
     }
+
+    // Second re-arm trigger: the background monitor scans on its own timer and
+    // calls the scanner directly, never crossing the route boundary where the
+    // interactive re-arm sits. `ScanCompletionHook` is the seam core exposes for
+    // exactly this, and it fires only when a cycle actually ingested new files.
+    // Mirrors the desktop wiring in `commands/core.rs`.
+    state.monitor.set_scan_completion_hook(Arc::new(
+        routes::content_index::ContentIndexRearmHook::new(
+            Arc::clone(&state.ctx),
+            state.event_tx.clone(),
+        ),
+    ));
 
     // Full-app capture-node retention loop (task M4). Hourly; gated inside the
     // tick (no-op unless this is a signed-in `capture` node with a policy set)

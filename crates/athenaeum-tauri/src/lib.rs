@@ -394,6 +394,9 @@ pub fn run() {
             commands::get_compute_queue,
             commands::cancel_compute_job,
             commands::set_compute_max_concurrent,
+            // Content index commands
+            commands::get_content_index_status,
+            commands::start_content_index,
             // Master build commands
             commands::preview_master_build,
             commands::start_master_build,

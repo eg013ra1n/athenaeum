@@ -153,19 +153,34 @@ pub async fn initialize_database(
         });
     }
 
-    // Task E: one-shot whole-library content-hash backfill. Populates
-    // `files.content_hash` for rows written before the scanner started hashing
-    // unconditionally, so the device-to-device transfer dedup handshake sees the
-    // scanned (never-synced) library, not just sync-ingested files. Single-flight
-    // + gentle IO throttle inside; blocking file IO → a std thread, never fatal.
+    // Content index (transfer dedup's `files.content_hash`). Gated on sync being
+    // configured and admitted through the compute queue, so it is visible in the
+    // sidebar and cancellable — the predecessor ran silently on every launch and
+    // read ~1.5 MB per catalogued file with nothing in the UI to explain it.
     // Placed here (DB guaranteed ready) beside the sync autostart spawn; mirrors
     // the web host wiring in `main.rs`.
-    if let Some(db) = state.ctx.db.get() {
-        let db = db.clone();
+    {
+        let ctx = Arc::clone(&state.ctx);
+        let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
+            Arc::new(crate::tauri_events::TauriProgressEmitter(app_handle.clone()));
         std::thread::spawn(move || {
-            athenaeum_core::duplicates::backfill::backfill_content_hashes_once(&db);
+            athenaeum_core::api::content_index::autostart_content_index(&ctx, emitter);
         });
     }
+
+    // Second re-arm trigger: the background monitor scans on its own timer and
+    // calls the scanner directly, never crossing the command boundary where the
+    // interactive re-arm sits. `ScanCompletionHook` is the seam core exposes for
+    // exactly this, and it fires only when a cycle actually ingested new files.
+    // Installed here rather than beside `run_loop` in `lib.rs` because the hook
+    // is read fresh at the start of every tick, and the DB it needs is only
+    // ready at this point.
+    state.monitor.set_scan_completion_hook(Arc::new(
+        super::content_index::ContentIndexRearmHook::new(
+            Arc::clone(&state.ctx),
+            app_handle.clone(),
+        ),
+    ));
 
     tracing::info!(path = %db_path.display(), "database initialized");
     Ok(db_path.to_string_lossy().to_string())

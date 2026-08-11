@@ -6,6 +6,7 @@
 
 use crate::models::*;
 use crate::tauri_events::TauriProgressEmitter;
+use std::sync::Arc;
 use tauri::State;
 
 use athenaeum_core::api::scan_roots as api;
@@ -146,10 +147,29 @@ pub async fn delete_scan_root(id: i64, state: State<'_, AppState>) -> Result<(),
     api::delete_scan_root(&state.ctx, id).map_err(|e| e.to_string())
 }
 
+/// Progress-less scan variant. Kept for parity with the web surface (whose
+/// `start_scan` route delegates to `start_scan_with_progress`); no frontend
+/// caller invokes it. `app_handle` is injected by Tauri, not supplied by the
+/// caller — the JS-facing signature is still `start_scan({ rootId })`.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
-pub async fn start_scan(root_id: i64, state: State<'_, AppState>) -> Result<ScanResultDto, String> {
-    api::start_scan(&state.ctx, root_id).map_err(|e| e.to_string())
+pub async fn start_scan(
+    root_id: i64,
+    app_handle: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ScanResultDto, String> {
+    let dto = api::start_scan(&state.ctx, root_id).map_err(|e| e.to_string())?;
+    // New rows may need hashing. Gated + single-flight inside, so this is a
+    // no-op on an ungated node or while a pass is already running.
+    {
+        let ctx = Arc::clone(&state.ctx);
+        let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
+            Arc::new(TauriProgressEmitter(app_handle));
+        std::thread::spawn(move || {
+            athenaeum_core::api::content_index::autostart_content_index(&ctx, emitter);
+        });
+    }
+    Ok(dto)
 }
 
 #[tauri::command]
@@ -228,6 +248,16 @@ pub async fn start_scan_with_progress(
     let scan_emitter = TauriProgressEmitter(app_handle.clone());
     let dto = api::start_scan_with_progress(&state.ctx, root_id, &scan_emitter)
         .map_err(|e| e.to_string())?;
+    // New rows may need hashing. Gated + single-flight inside, so this is a
+    // no-op on an ungated node or while a pass is already running.
+    {
+        let ctx = Arc::clone(&state.ctx);
+        let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
+            Arc::new(TauriProgressEmitter(app_handle.clone()));
+        std::thread::spawn(move || {
+            athenaeum_core::api::content_index::autostart_content_index(&ctx, emitter);
+        });
+    }
     Ok(dto)
 }
 
