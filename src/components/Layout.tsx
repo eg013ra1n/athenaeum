@@ -25,6 +25,7 @@ import { TransferIndicator } from './transfers/TransferIndicator';
 import { TransfersPanel } from './transfers/TransfersPanel';
 import { AutoUpdateCheck } from './AutoUpdateCheck';
 import { useProjectMatches } from '../hooks/useProjectMatches';
+import { useContentIndexNotifications } from '../hooks/useContentIndex';
 import Logo from '../assets/athenaeum.png';
 
 /** Mounts the global `project-set-match` listener. Rendered inside
@@ -32,6 +33,14 @@ import Logo from '../assets/athenaeum.png';
  * has its context; the Layout body itself runs above the provider. */
 function ProjectMatchesListener() {
   useProjectMatches();
+  return null;
+}
+
+/** Mounts the global `content-index-finished` listener, for the same reason
+ * `ProjectMatchesListener` exists: the hook needs `useNotifications`, which is
+ * only available below `NotificationProvider`. */
+function ContentIndexListener() {
+  useContentIndexNotifications();
   return null;
 }
 
@@ -139,6 +148,7 @@ export default function Layout() {
           <TransfersPanel />
           <AutoUpdateCheck />
           <ProjectMatchesListener />
+          <ContentIndexListener />
         </div>
         </LightCalibrationProvider>
         </MasterBuildProvider>

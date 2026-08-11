@@ -10,6 +10,7 @@ import SyncSection from '../components/settings/SyncSection';
 import { AnalysisSettingsPanel } from '../components/analysis/AnalysisSettingsPanel';
 import { PlateSolveSettingsPanel } from '../components/plate-solve';
 import { isTauri } from '../utils/platform';
+import { useContentIndex } from '../hooks/useContentIndex';
 import { getArchiveSettings, setArchiveCompression as apiSetArchiveCompression } from '../api/archive';
 import type { ArchiveCompression } from '../types/archive';
 import type { AnnotationSettings } from '../types/analysis-config';
@@ -31,7 +32,6 @@ export default function Settings() {
   const [blinkCacheSize, setBlinkCacheSize] = useState('200');
   const [blinkRetentionMinutes, setBlinkRetentionMinutes] = useState('30');
   const [useContentHash, setUseContentHash] = useState(false);
-  const [contentHashRescanned, setContentHashRescanned] = useState(false);
   const [checkBeta, setCheckBeta] = useState(false);
   const [autoCheck, setAutoCheck] = useState(true);
   const [annotationSettings, setAnnotationSettings] = useState<AnnotationSettings>(DEFAULT_ANNOTATION_SETTINGS);
@@ -60,9 +60,8 @@ export default function Settings() {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
 
-  // Content hash rescan state
-  const [rescanningContentHash, setRescanningContentHash] = useState(false);
-  const [rescanSuccess, setRescanSuccess] = useState<{updated: number, total: number} | null>(null);
+  // Content index — status + manual start for the Content Index card below.
+  const contentIndex = useContentIndex();
 
   // Tab state — initial value comes from `?tab=…` so deep-links (e.g. the
   // "Open Plate-Solve Settings" CTA on the index-missing modal) land on the
@@ -129,7 +128,7 @@ export default function Settings() {
       setError(null);
 
       const [
-        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, blinkThreadsVal, cacheSizeVal, retentionMin, contentHash, contentHashRescanned, checkBetaVal, autoCheckVal
+        value, unit, sessionGap, qThumbnail, qPreview, qFull, resolution, blinkThreadsVal, cacheSizeVal, retentionMin, contentHash, checkBetaVal, autoCheckVal
       ] = await Promise.all([
         api.invoke<string>('get_setting', {
           key: 'grouping.threshold.value',
@@ -176,10 +175,6 @@ export default function Settings() {
           defaultValue: 'false',
         }),
         api.invoke<string>('get_setting', {
-          key: 'duplicates.content_hash_rescanned',
-          defaultValue: 'false',
-        }),
-        api.invoke<string>('get_setting', {
           key: 'updates.check_beta',
           defaultValue: 'false',
         }),
@@ -222,7 +217,6 @@ export default function Settings() {
       setBlinkCacheSize(cacheSizeVal);
       setBlinkRetentionMinutes(retentionMin);
       setUseContentHash(contentHash.toLowerCase() === 'true');
-      setContentHashRescanned(contentHashRescanned.toLowerCase() === 'true');
       setCheckBeta(checkBetaVal.toLowerCase() === 'true');
       setAutoCheck(autoCheckVal.toLowerCase() === 'true');
 
@@ -376,11 +370,6 @@ export default function Settings() {
           key: 'duplicates.use_content_hash',
           value: useContentHash ? 'true' : 'false',
         }),
-        // Reset rescan flag when toggling content hash
-        api.invoke('set_setting', {
-          key: 'duplicates.content_hash_rescanned',
-          value: useContentHash ? 'false' : 'false',
-        }),
         api.invoke('set_setting', {
           key: 'updates.check_beta',
           value: checkBeta ? 'true' : 'false',
@@ -450,35 +439,6 @@ export default function Settings() {
         return value.toFixed(4);
       default:
         return 'N/A';
-    }
-  };
-
-  const handleRescanContentHash = async () => {
-    try {
-      setRescanningContentHash(true);
-      setError(null);
-      setRescanSuccess(null);
-
-      const result = await api.invoke<{files_total: number, files_updated: number, files_skipped: number, files_missing: number, errors: string[]}>('rescan_all_for_content_hash');
-
-      if (result.errors.length > 0) {
-        setError(`Rescan completed with ${result.errors.length} errors. Check console for details.`);
-        console.error('Rescan errors:', result.errors);
-      }
-
-      setRescanSuccess({ updated: result.files_updated, total: result.files_total });
-
-      // Update the rescanned flag in state to hide warning immediately
-      if (result.files_updated > 0 || result.files_skipped > 0) {
-        setContentHashRescanned(true);
-      }
-
-      setTimeout(() => setRescanSuccess(null), 5000);
-    } catch (err) {
-      setError(err as string);
-      console.error('Failed to rescan content hashes:', err);
-    } finally {
-      setRescanningContentHash(false);
     }
   };
 
@@ -1204,39 +1164,88 @@ export default function Settings() {
                 />
                 <div>
                   <span className="block text-sm font-medium text-content-secondary">
-                    Use File Content Hash (XXHash)
+                    Group duplicates by file content (XXHash)
                   </span>
                   <span className="block text-xs text-content-muted mt-1">
-                    When enabled, duplicate detection will use XXHash sampling (1.5MB per file) instead of metadata-based hashing. More accurate for finding true duplicates.
-                    <br />
-                    <span className="text-warning font-medium">⚠️ Not recommended for NAS or slow network storage</span> - hash computation requires reading file data which may be slow over network.
+                    Groups the Duplicates view by a content hash instead of by size, date and
+                    filename. More accurate, and it needs the content index below.
+                  </span>
+                  <span className="block text-xs text-content-muted mt-1">
+                    With this on, scans also hash new and changed files as they go — slower on
+                    NAS or other network storage. Left off, scans stay header-only — the content
+                    index below is what fills the hashes in.
                   </span>
                 </div>
               </label>
             </div>
+          </div>
+        </div>
 
-            {/* Rescan Warning */}
-            {useContentHash && !contentHashRescanned && (
-              <div className="p-4 bg-warning-muted border border-warning/50 rounded-lg">
-                <p className="text-sm text-warning/80">
-                  ⚠️ After enabling content hash, you must rescan all files to compute their hashes. New files scanned after enabling this will automatically have their content hashes computed.
-                </p>
-                <button
-                  onClick={handleRescanContentHash}
-                  disabled={rescanningContentHash}
-                  className="mt-3 flex items-center gap-2 px-4 py-2 bg-warning hover:brightness-90 disabled:bg-surface-hover disabled:cursor-not-allowed text-white rounded-lg transition-colors"
-                >
-                  <RefreshCw size={18} className={rescanningContentHash ? 'animate-spin' : ''} />
-                  {rescanningContentHash ? 'Computing Hashes...' : 'Rescan All Files for Content Hash'}
-                </button>
-                {rescanSuccess !== null && (
-                  <div className="mt-2 flex items-center gap-2 text-success">
-                    <CheckCircle size={18} />
-                    <span>Updated {rescanSuccess.updated} of {rescanSuccess.total} files</span>
-                  </div>
-                )}
-              </div>
+        <div>
+          <h3 className="text-lg font-semibold mb-4">Content Index</h3>
+          <div className="p-4 bg-surface rounded-lg border border-border space-y-3">
+            <p className="text-xs text-content-muted">
+              A content hash of every catalogued file, used to skip files a device already has
+              when transferring, and to group duplicates by content. Building it reads about
+              1.5 MB per file, so it runs in the background as a job of its own — not as part of
+              a scan — and you can stop it any time from the job card in the sidebar.
+            </p>
+
+            {contentIndex.status && (
+              <p className="text-sm text-content-secondary">
+                {contentIndex.status.total === 0
+                  ? 'No files catalogued yet.'
+                  : contentIndex.status.pending === 0
+                    ? `All ${contentIndex.status.total} files indexed.`
+                    : `${contentIndex.status.pending} of ${contentIndex.status.total} files not indexed yet.`}
+              </p>
             )}
+
+            {contentIndex.status && contentIndex.status.pending > 0 && (
+              <p className="text-xs text-content-muted">
+                The count only reaches zero for files the app can read. Files on storage that is
+                offline, and files that changed since the last scan, are skipped and stay
+                counted — running the job again will not clear them. Bring the storage back
+                online, or rescan the files that changed, and the next run picks them up.
+              </p>
+            )}
+
+            {/* Hidden while a pass runs: the previous run's counts beside a
+                spinning "Indexing…" button would read as this run's result. */}
+            {!contentIndex.running && contentIndex.lastFinished && (
+              <p className={`text-xs ${contentIndex.lastFinished.failed ? 'text-warning' : 'text-content-muted'}`}>
+                {contentIndex.lastFinished.failed
+                  ? 'The last run could not read the catalog and indexed nothing. See the log for details.'
+                  : `Last run${contentIndex.lastFinished.cancelled ? ' (cancelled)' : ''}: ${contentIndex.lastFinished.updated} indexed${
+                      contentIndex.lastFinished.skipped > 0
+                        ? `, ${contentIndex.lastFinished.skipped} skipped`
+                        : ''
+                    }.`}
+              </p>
+            )}
+
+            {/* Also gated on pending: with nothing to index the button is
+                disabled, and inviting a build it refuses would read as broken. */}
+            {contentIndex.status && !contentIndex.status.syncConfigured && contentIndex.status.pending > 0 && (
+              <p className="text-xs text-content-muted">
+                Sync is not set up on this device, so the index is not built automatically.
+                You can still build it now if you want content-based duplicate grouping.
+              </p>
+            )}
+
+            <button
+              onClick={contentIndex.start}
+              disabled={
+                contentIndex.starting ||
+                !contentIndex.status ||
+                contentIndex.running ||
+                contentIndex.status.pending === 0
+              }
+              className="flex items-center gap-2 px-4 py-2 bg-accent hover:bg-accent-hover disabled:bg-surface-hover disabled:text-content-muted disabled:cursor-not-allowed text-surface rounded-lg transition-colors"
+            >
+              <RefreshCw size={18} className={contentIndex.running ? 'animate-spin' : ''} />
+              {contentIndex.running ? 'Indexing…' : 'Build index now'}
+            </button>
           </div>
         </div>
 
