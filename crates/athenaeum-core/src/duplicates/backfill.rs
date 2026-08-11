@@ -1,13 +1,15 @@
 //! Background content-index pass: populates `files.content_hash` for the whole
 //! catalog.
 //!
-//! The device-to-device transfer dedup handshake matches a sender's sampling
-//! hashes against `files.content_hash` over the receiver's whole catalog. The
-//! scanner only writes this column when `duplicates.use_content_hash` is on
-//! (default off — hashing every scanned file is a measurable performance
-//! regression), so for most libraries this pass is the ordinary populator of
-//! the column, not a one-off migration: list every `files` row still missing a
-//! hash, re-hash the ones present on disk with the same
+//! The column has two consumers: the device-to-device transfer dedup handshake,
+//! which matches a sender's sampling hashes against `files.content_hash` over
+//! the receiver's whole catalog, and the Duplicates view, which groups by
+//! content instead of by (size, date, filename) when
+//! `duplicates.use_content_hash` is on. The scanner only writes the column when
+//! that same setting is on (default off — hashing every scanned file is a
+//! measurable performance regression), so for most libraries this pass is the
+//! ordinary populator of the column, not a one-off migration: list every `files`
+//! row still missing a hash, re-hash the ones present on disk with the same
 //! [`compute_xxhash`](crate::duplicates::compute_xxhash) the scanner / ingest /
 //! sender-offer all use, and UPDATE the row.
 //!
@@ -126,7 +128,7 @@ pub fn run_content_index(
             }) {
             Ok(rows) => rows,
             Err(e) => {
-                tracing::error!(error = %e, "content-hash backfill: failed to list pending rows");
+                tracing::error!(error = %e, "content index: failed to list pending rows");
                 emit_event(
                     emitter,
                     "content-index-finished",
@@ -164,6 +166,17 @@ pub fn run_content_index(
         // connection out only for the chunk's UPDATEs.
         let mut hashed: Vec<(i64, String)> = Vec::with_capacity(chunk.len());
         for (id, path, db_size, db_modified) in chunk {
+            // Poll per file as well as per chunk: a chunk is 64 files x ~1.5 MB
+            // of sampled reads, so on the network storage this job exists to
+            // protect, chunk granularity alone leaves seconds of dead time after
+            // the user presses X. The partial chunk's `hashed` vec is DISCARDED
+            // rather than flushed — those rows stay NULL and the next pass
+            // retries them, which is both correct and simpler than a half-chunk
+            // write.
+            if cancel.load(Ordering::SeqCst) {
+                cancelled = true;
+                break;
+            }
             let p = Path::new(path);
             // Stale-row guard (review fix): only hash a file whose on-disk
             // (size, modified_at) still MATCH the row — the same comparison the
@@ -187,16 +200,20 @@ pub fn run_content_index(
             );
             if !matches_row {
                 skipped += 1;
-                tracing::debug!(file_id = id, path = %path, "content-hash backfill: missing or drifted on disk; left for the next scan");
+                tracing::debug!(file_id = id, path = %path, "content index: missing or drifted on disk; left for the next scan");
                 continue;
             }
             match crate::duplicates::compute_xxhash(p) {
                 Ok(hash) => hashed.push((*id, hash)),
                 Err(e) => {
                     skipped += 1;
-                    tracing::debug!(file_id = id, path = %path, error = %e, "content-hash backfill: unreadable; skipping");
+                    tracing::debug!(file_id = id, path = %path, error = %e, "content index: unreadable; skipping");
                 }
             }
+        }
+        if cancelled {
+            tracing::info!(updated, skipped, "content index cancelled");
+            break;
         }
         if !hashed.is_empty() {
             let conn = db.conn();
@@ -208,7 +225,7 @@ pub fn run_content_index(
                     Ok(_) => updated += 1,
                     Err(e) => {
                         skipped += 1;
-                        tracing::warn!(file_id = id, error = %e, "content-hash backfill: UPDATE failed");
+                        tracing::warn!(file_id = id, error = %e, "content index: UPDATE failed");
                     }
                 }
             }

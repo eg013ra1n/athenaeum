@@ -34,6 +34,12 @@ pub async fn get_content_index_status(
 /// POST /api/start_content_index
 ///
 /// Manual "Index now". Returns false when a pass is already in flight.
+///
+/// This is the ONLY seam (with its Tauri mirror) that clears a cancel: pressing
+/// the button is the user changing their mind, so the automatic trigger is
+/// armed again too. Core deliberately does not clear inside
+/// `start_content_index` — the autostart calls that as well, and clearing there
+/// would let an autostart racing a cancelling worker erase the suppression.
 #[tracing::instrument(skip_all, err(Debug))]
 pub async fn start_content_index(
     State(state): State<WebAppState>,
@@ -43,6 +49,7 @@ pub async fn start_content_index(
         StatusCode::INTERNAL_SERVER_ERROR,
         "database not initialized".to_string(),
     ))?;
+    api::content_index::clear_cancelled_by_user(db.path());
     let emitter: Arc<dyn ProgressEmitter> =
         Arc::new(SseProgressEmitter::new(state.event_tx.clone()));
     Ok(Json(api::content_index::start_content_index(

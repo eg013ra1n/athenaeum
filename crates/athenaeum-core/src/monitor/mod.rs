@@ -128,9 +128,13 @@ impl MonitorService {
     }
 
     /// Install the post-scan hook (task M2). Both hosts call this once at
-    /// startup — alongside where they spawn `run_loop` — closing over their own
-    /// `ServiceContext` + personal-sync sender runtime. There is only ever one
-    /// hook per process; a second call overwrites the first.
+    /// startup, from the point where the database is guaranteed ready rather
+    /// than from where they spawn `run_loop` — desktop inside
+    /// `commands::core::initialize_database`, web in `main.rs` after the same
+    /// initialisation — closing over their own `ServiceContext` plus whatever
+    /// their transport needs to build an emitter per fire (an `AppHandle` on
+    /// desktop, an SSE `broadcast::Sender` on web). There is only ever one hook
+    /// per process; a second call overwrites the first.
     pub fn set_scan_completion_hook(&self, hook: Arc<dyn ScanCompletionHook>) {
         *self.scan_completion_hook.lock().unwrap() = Some(hook);
     }

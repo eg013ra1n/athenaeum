@@ -1,12 +1,15 @@
 //! Trigger policy for the whole-library content-hash index.
 //!
-//! `files.content_hash` has exactly one consumer — the device-to-device
-//! transfer dedup handshake. So the index is not part of scanning (which used
-//! to hash unconditionally, at 3 x 512 KB of disk reads per file) and it does
-//! not run at all on a node that has never configured sync. When it does run it
-//! is a first-class visible job: it takes a `ComputeQueue` ticket, so it shows
-//! up in the sidebar with a cancel button and can't fight a master build for
-//! the disk.
+//! `files.content_hash` has two consumers — the device-to-device transfer dedup
+//! handshake, and content-based grouping in the Duplicates view when
+//! `duplicates.use_content_hash` is on. Neither is worth paying for on every
+//! scan, so the index is not part of scanning (which used to hash
+//! unconditionally, at 3 x 512 KB of disk reads per file), and the AUTOMATIC
+//! trigger does not fire at all on a node that has never configured sync — a
+//! node that wants the column only for duplicate grouping starts the job by
+//! hand from Settings, which is deliberately ungated. When it does run it is a
+//! first-class visible job: it takes a `ComputeQueue` ticket, so it shows up in
+//! the sidebar with a cancel button and can't fight a master build for the disk.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -104,6 +107,66 @@ fn is_running(path: &Path) -> bool {
     lock_running().contains(path)
 }
 
+/// Catalogs whose pass the USER cancelled in this process. While a DB path is
+/// in here, [`autostart_content_index`] does nothing for it.
+///
+/// A cancel is the one exit that must not feed [`LAST_UNHASHABLE`]: a pass
+/// stopped after one chunk reports `skipped ~ 0`, and as a baseline that reads
+/// as "this catalog has almost nothing unhashable", so the very next trigger —
+/// boot, ANY scan, or a monitor cycle that ingests files (roughly every ten
+/// minutes on a monitored capture library) — would see `pending > 0` and
+/// restart the whole pass. The user pressed X on a job that reads ~1.5 MB per
+/// catalogued file and it would come straight back, with no off switch short of
+/// un-configuring sync. It would also destroy a GOOD baseline left by an earlier
+/// complete pass, turning convergence off for the rest of the process.
+///
+/// Cancelling a `ContentIndex` job is always deliberate user intent: nothing in
+/// core cancels one, and `ComputeQueue::cancel` reaches it only through
+/// `cancel_compute_job` (the sidebar card's X).
+///
+/// Per process, deliberately NOT persisted — same reasoning as
+/// [`LAST_UNHASHABLE`]: a cancel means "not now", not "never again", so a
+/// relaunch earns one fresh attempt. Within the session the user is in charge:
+/// the manual "Build index now" seam in each host clears the entry through
+/// [`clear_cancelled_by_user`], so the button always works.
+static CANCELLED_BY_USER: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn cancelled_set() -> &'static Mutex<HashSet<PathBuf>> {
+    CANCELLED_BY_USER.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn lock_cancelled() -> MutexGuard<'static, HashSet<PathBuf>> {
+    cancelled_set().lock().unwrap_or_else(|poisoned| {
+        tracing::warn!("content index cancelled-set mutex was poisoned; recovering");
+        poisoned.into_inner()
+    })
+}
+
+/// Remember that the user cancelled this catalog's pass.
+fn record_cancelled_by_user(path: &Path) {
+    lock_cancelled().insert(path.to_path_buf());
+}
+
+/// Forget a cancel — the user changed their mind and asked for a pass by hand.
+///
+/// Called from the two MANUAL seams (the Tauri command and its Axum mirror),
+/// never from inside [`start_content_index`], because that function serves both
+/// the button AND [`autostart_content_index`]. Clearing in there would tie the
+/// clear to whoever wins the single-flight claim rather than to user intent, and
+/// that is a real window: a cancelling worker records the marker after an
+/// in-flight autostart has already read it as absent, the autostart then claims
+/// the slot, and — clearing there — it would erase the suppression the user just
+/// earned and run the full pass anyway. Autostart never touches this function,
+/// so pressing the button is the only thing that clears.
+pub fn clear_cancelled_by_user(path: &Path) {
+    lock_cancelled().remove(path);
+}
+
+/// Whether the user cancelled this catalog's pass earlier in this process.
+fn was_cancelled_by_user(path: &Path) -> bool {
+    lock_cancelled().contains(path)
+}
+
 /// What the Settings card renders.
 #[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
@@ -150,7 +213,11 @@ pub fn get_content_index_status(ctx: &ServiceContext) -> Result<ContentIndexStat
 /// the behaviour this whole change exists to remove.
 ///
 /// NOT gated: a manual "Index now" from Settings must work on a node that has
-/// no sync configured. The gate lives in [`autostart_content_index`].
+/// no sync configured, AND after the user cancelled an earlier pass. The gate
+/// and the cancel suppression both live in [`autostart_content_index`]; the
+/// matching clear lives at the two manual seams (see
+/// [`clear_cancelled_by_user`]) rather than here, because this function serves
+/// the automatic trigger too.
 pub fn start_content_index(
     database: Database,
     queue: ComputeQueue,
@@ -182,7 +249,11 @@ pub fn start_content_index(
             // `QueueCancelled` is a user decision, not a failure, and carries no
             // detail to log beyond the fact itself.
             Err(_) => {
-                tracing::info!("content index cancelled while queued");
+                // A cancel before admission is still a cancel: suppress the
+                // automatic re-arm, exactly as the running path below does, or
+                // the next trigger would re-queue what the user just dropped.
+                record_cancelled_by_user(database.path());
+                tracing::info!("content index cancelled while queued; autostart suppressed");
                 // Task 2's invariant: `content-index-finished` fires on EVERY
                 // exit path, so consumers have exactly one place to close on.
                 // This branch is an exit the pass itself never sees — and
@@ -205,10 +276,28 @@ pub fn start_content_index(
 
         let summary =
             crate::duplicates::backfill::run_content_index(&database, emitter.as_ref(), cancel);
-        // Written BEFORE the guard drops (it is bound first, so it drops last),
-        // which is what makes the re-arm check race-free: any autostart that
-        // observes the slot free also observes this pass's baseline.
-        record_unhashable(&database, summary.skipped);
+        if summary.cancelled {
+            // A partial pass's `skipped` is not a baseline (see
+            // CANCELLED_BY_USER): record nothing, and leave whatever an earlier
+            // complete pass established in place.
+            record_cancelled_by_user(database.path());
+            tracing::info!(
+                updated = summary.updated,
+                skipped = summary.skipped,
+                "content index cancelled by user; autostart suppressed"
+            );
+        } else {
+            // Written BEFORE the guard drops (it is bound first, so it drops
+            // last). That ordering proves one thing and only one: an autostart
+            // that observes the slot free also observes THIS pass's baseline.
+            // It says nothing about the other operand — `autostart_content_index`
+            // reads `pending` before it reads the baseline, so a pass completing
+            // inside that window can still let one redundant re-arm through.
+            // Bounded (that pass finds nothing to do, records the same baseline,
+            // and the next trigger is quiet again) and it errs towards indexing
+            // rather than towards leaving hashes unfilled.
+            record_unhashable(&database, summary.skipped);
+        }
         drop(permit);
     });
 
@@ -233,6 +322,12 @@ pub fn autostart_content_index(ctx: &ServiceContext, emitter: Arc<dyn ProgressEm
         tracing::debug!("content index autostart skipped: database not initialised");
         return;
     };
+    // Checked BEFORE `count_pending`, so a cancelled catalog costs nothing per
+    // trigger — and this fires on every scan and every monitor cycle.
+    if was_cancelled_by_user(database.path()) {
+        tracing::debug!("content index autostart skipped: the user cancelled a pass this session");
+        return;
+    }
     // Re-arm on WORK A PASS CAN ACTUALLY DO, not on NULL-hash rows.
     //
     // `count_pending` counts every `files` row with a NULL hash, but the pass
@@ -527,5 +622,138 @@ mod tests {
         wait_until("the re-armed pass hashes the newly scanned file", || {
             get_content_index_status(&ctx).unwrap().pending == 2
         });
+    }
+
+    /// Emitter that cancels the running content-index job the first time the
+    /// pass reports progress — from inside the pass's OWN thread, at a point
+    /// where work provably remains (chunk 1 of 2 has just been written).
+    ///
+    /// Deterministic where a cancel timed from the test thread would be a race:
+    /// the flag is set before the pass can reach its next cancel check, so the
+    /// pass always ends `cancelled` with rows still NULL. It goes through the
+    /// real `ComputeQueue::cancel`, the same call the sidebar's X makes.
+    struct CancelOnFirstProgress {
+        queue: ComputeQueue,
+        fired: AtomicBool,
+    }
+
+    impl ProgressEmitter for CancelOnFirstProgress {
+        fn emit_json(&self, event_name: &str, _payload: serde_json::Value) {
+            use std::sync::atomic::Ordering;
+            if event_name != "content-index-progress"
+                || self.fired.swap(true, Ordering::SeqCst)
+            {
+                return;
+            }
+            let job = self
+                .queue
+                .snapshot()
+                .into_iter()
+                .find(|e| e.kind == ComputeJobKind::ContentIndex)
+                .expect("the running pass must be visible in the compute queue");
+            assert!(self.queue.cancel(job.job_id), "cancel must find the job");
+        }
+    }
+
+    /// A user's cancel STAYS cancelled. The pass is the loudest disk consumer
+    /// in the app (~1.5 MB read per catalogued file), and its automatic
+    /// triggers — boot, every scan, every monitor cycle that ingests files —
+    /// fire often enough that a re-arm within the minute is the normal case, so
+    /// pressing X has to switch it off, not pause it. Recording the partial
+    /// pass's `skipped` as the convergence baseline is what used to undo the
+    /// cancel: ~0 unhashable against a large `pending` reads as "lots of new
+    /// work".
+    ///
+    /// The second half is the other half of the contract: the manual "Build
+    /// index now" button is the user changing their mind and must always work.
+    #[test]
+    fn a_user_cancel_suppresses_autostart_until_a_manual_start() {
+        // 70 rows = two chunks (CHUNK = 64), so the first progress event lands
+        // with rows still unhashed and the cancel has something to interrupt.
+        let (ctx, _tmp) = test_ctx_with_files(70);
+        sign_in(&ctx);
+        let database = ctx.db.get().unwrap().clone();
+
+        assert!(start_content_index(
+            database.clone(),
+            ctx.compute_queue.clone(),
+            Arc::new(CancelOnFirstProgress {
+                queue: ctx.compute_queue.clone(),
+                fired: AtomicBool::new(false),
+            }),
+        ));
+        wait_until("the cancelled pass releases the single-flight slot", || {
+            !get_content_index_status(&ctx).unwrap().running
+        });
+        let left_behind = get_content_index_status(&ctx).unwrap().pending;
+        assert!(
+            left_behind > 0,
+            "the cancel must have stopped the pass with work left (pending = {left_behind})"
+        );
+
+        // The trigger that used to undo the cancel. Deterministic: a start
+        // claims the single-flight slot synchronously, before it spawns.
+        autostart_content_index(&ctx, Arc::new(NullEmitter));
+        assert!(
+            !get_content_index_status(&ctx).unwrap().running,
+            "a cancelled pass must not be re-armed automatically"
+        );
+        // Belt and braces: a bounded window in which a resurrected pass (6 tiny
+        // files) would have finished and shown up in `pending`. This asserts
+        // that something did NOT happen, so there is no state to poll for.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(
+            get_content_index_status(&ctx).unwrap().pending,
+            left_behind,
+            "nothing may have been hashed after the cancel"
+        );
+
+        // ...and the manual button overrides it, for this pass AND for the
+        // automatic triggers that follow. Driven through `manual_start`, the
+        // clear-then-start pair both hosts spell out at their own boundary.
+        assert!(manual_start(
+            &database,
+            ctx.compute_queue.clone(),
+            Arc::new(NullEmitter)
+        ));
+        wait_until("the manual pass indexes what the cancel left", || {
+            get_content_index_status(&ctx).unwrap().pending == 0
+        });
+        wait_until("the manual pass releases the single-flight slot", || {
+            !get_content_index_status(&ctx).unwrap().running
+        });
+        assert!(
+            !was_cancelled_by_user(database.path()),
+            "a manual start must clear the suppression, not merely bypass it"
+        );
+
+        // The suppression really is gone, not just stepped over: the automatic
+        // trigger works again. (Nothing is pending now, so what this asserts is
+        // that the gate ran to the end — a still-suppressed catalog returns at
+        // the marker check, above `count_pending`.)
+        autostart_content_index(&ctx, Arc::new(NullEmitter));
+        assert_eq!(
+            get_content_index_status(&ctx).unwrap().pending,
+            0,
+            "the catalog stays fully indexed"
+        );
+    }
+
+    /// What both host wrappers do for a manual "Index now": clear the cancel
+    /// marker, then start. The clear lives at the host seam BECAUSE
+    /// `start_content_index` also serves the autostart (see
+    /// [`clear_cancelled_by_user`]), so a test that called only
+    /// `start_content_index` would pin the wrong contract.
+    ///
+    /// Mirrors `athenaeum-tauri/src/commands/content_index.rs` and
+    /// `athenaeum-web/src/routes/content_index.rs`, kept in step by hand like
+    /// every other two-backend seam here.
+    fn manual_start(
+        database: &Database,
+        queue: ComputeQueue,
+        emitter: Arc<dyn ProgressEmitter>,
+    ) -> bool {
+        clear_cancelled_by_user(database.path());
+        start_content_index(database.clone(), queue, emitter)
     }
 }

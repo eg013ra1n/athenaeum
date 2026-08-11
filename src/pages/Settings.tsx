@@ -1204,9 +1204,10 @@ export default function Settings() {
             {contentIndex.status && contentIndex.status.pending > 0 && (
               <p className="text-xs text-content-muted">
                 The count only reaches zero for files the app can read. Files on storage that is
-                offline, and files that changed since the last scan, are skipped and stay
-                counted — running the job again will not clear them. Bring the storage back
-                online, or rescan the files that changed, and the next run picks them up.
+                offline, files that changed since the last scan, and files archived into a ZIP
+                are skipped and stay counted — running the job again will not clear them. Bring
+                the storage back online, restore an archive, or rescan the files that changed,
+                and the next run picks them up.
               </p>
             )}
 

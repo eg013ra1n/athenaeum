@@ -47,11 +47,12 @@ pub struct AutoMergeCompleteEvent {
 /// - Otherwise, run `scanner::run_registered_scan` and emit a
 ///   `monitor-detected` event if it processed any files.
 /// - If that scan ingested any new files AND a [`ScanCompletionHook`] is
-///   installed, invoke it with those file ids (task M2) — this is what lets
-///   personal-sync auto mode fire on unattended monitor scans, not just
-///   human-clicked ones. `hook` is `None` for hosts/tests that never call
-///   `MonitorService::set_scan_completion_hook`; a monitor cycle runs exactly
-///   the same either way, just silently skipping that one call.
+///   installed, invoke it with those file ids (task M2) — this is what lets a
+///   host react to UNATTENDED monitor scans and not just to human-clicked ones
+///   (both hosts install a hook that re-arms the content index). `hook` is
+///   `None` for hosts/tests that never call
+///   `MonitorService::set_scan_completion_hook`; a monitor cycle runs exactly the
+///   same either way, just silently skipping that one call.
 ///
 /// This function is synchronous and intended to be called from inside
 /// `tokio::task::spawn_blocking`. `offline_roots` persists across ticks to
@@ -138,11 +139,11 @@ pub fn run_cycle<E: ProgressEmitter>(
                     emit_event(emitter, "monitor-detected", &payload);
                 }
 
-                // Personal-sync auto mode (task M2): let the installed hook
-                // react to newly-ingested files from this UNATTENDED scan.
-                // Guards (auto-mode toggle, role, signed-in) live inside the
-                // hook's implementation, read fresh on every fire — never
-                // decided here.
+                // Task M2: let the installed hook react to newly-ingested files
+                // from this UNATTENDED scan. Whatever gating it needs (both
+                // hosts install a content-index re-arm, which gates on sync
+                // being configured) lives inside the hook's own implementation,
+                // read fresh on every fire — never decided here.
                 if !result.new_file_ids.is_empty() {
                     if let Some(h) = hook {
                         h.on_scan_completed(result.new_file_ids);

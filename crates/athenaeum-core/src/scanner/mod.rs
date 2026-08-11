@@ -1130,7 +1130,7 @@ fn reparse_and_update_in_place(
     // KNOWN TRADE-OFF (smoke №8 review, deferred): this ~1.5MB sampling read runs
     // inside the caller's phase-2 batch WRITE transaction, so a re-scan with many
     // changed files extends the exclusive-lock hold and can SQLITE_BUSY concurrent
-    // writers (the content-hash backfill skips-and-retries next launch; UI writes
+    // writers (the content index skips-and-retries next launch; UI writes
     // ride the 5s busy_timeout). Hoisting the hash out of the tx needs a scanner
     // phase restructure — deliberately deferred; changed-file batches are small in
     // normal use (mtime/size drift only).
@@ -1275,8 +1275,8 @@ fn reparse_and_update_in_place(
 /// freshly built master:
 /// - `use_content_hash = false` — registration never stores one, and the
 ///   rewrite invalidates any value a hashing scan had filled in. The re-parse
-///   writes NULL, which is honest and recoverable (the content-hash backfill
-///   fills NULLs); a retained stale hash would not be.
+///   writes NULL, which is honest and recoverable (the content index fills
+///   NULLs); a retained stale hash would not be.
 /// - `unique_camera = false` / `root_id = 0` — `register_master` stores
 ///   INSTRUME exactly as parsed, with no " N<root_id>" suffix, and later
 ///   library scans classify the file as unchanged so they never add one.

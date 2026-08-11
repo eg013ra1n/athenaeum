@@ -23,6 +23,12 @@ pub async fn get_content_index_status(
 }
 
 /// Manual "Index now". Returns false when a pass is already in flight.
+///
+/// This is the ONLY seam (with its Axum mirror) that clears a cancel: pressing
+/// the button is the user changing their mind, so the automatic trigger is
+/// armed again too. Core deliberately does not clear inside
+/// `start_content_index` — the autostart calls that as well, and clearing there
+/// would let an autostart racing a cancelling worker erase the suppression.
 #[tauri::command]
 #[tracing::instrument(skip_all, err)]
 pub async fn start_content_index(
@@ -35,6 +41,7 @@ pub async fn start_content_index(
         .get()
         .cloned()
         .ok_or_else(|| "database not initialized".to_string())?;
+    api::content_index::clear_cancelled_by_user(db.path());
     let emitter: Arc<dyn athenaeum_core::events::ProgressEmitter> =
         Arc::new(crate::tauri_events::TauriProgressEmitter(app_handle));
     Ok(api::content_index::start_content_index(

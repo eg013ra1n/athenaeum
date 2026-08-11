@@ -30,9 +30,10 @@ export function useContentIndex() {
    * source for "the run left work behind, and repeating it will not help". */
   const [lastFinished, setLastFinished] = useState<ContentIndexFinished | null>(null);
   /** A pass that started elsewhere (boot autostart, post-scan re-arm) while the
-   * card was already open. Progress is used ONLY to flip this flag — the
-   * sidebar compute-queue card owns the progress display, and a second one
-   * here would read as two jobs. */
+   * card was already open. The progress events are used ONLY to flip this flag:
+   * nothing renders their numbers today — the sidebar compute-queue card shows
+   * a label, running/queued and a cancel button, and this card shows a running
+   * state. A percentage or a bar is a deliberate follow-up, not an oversight. */
   const [runningLive, setRunningLive] = useState(false);
 
   const refresh = useCallback(() => {
@@ -121,9 +122,12 @@ export function useContentIndexNotifications() {
         title: payload.cancelled
           ? `Content index cancelled — ${payload.updated} indexed`
           : `Content index finished — ${payload.updated} files indexed`,
+        // Same explanation as the Settings card's skipped-count note, in the
+        // same order — one number explained two different ways is worse than
+        // either explanation on its own.
         detail:
           payload.skipped > 0
-            ? `${payload.skipped} skipped — offline storage, or changed since the last scan`
+            ? `${payload.skipped} skipped — offline storage, changed since the last scan, or archived into a ZIP`
             : '',
         kind: 'sync',
         tone: payload.cancelled ? 'warning' : 'success',
