@@ -41,15 +41,6 @@ pub struct ScanResultDto {
     pub new_file_ids: Vec<i64>,
 }
 
-#[derive(serde::Serialize)]
-pub struct RescanResultDto {
-    pub files_total: usize,
-    pub files_updated: usize,
-    pub files_skipped: usize,
-    pub files_missing: usize,
-    pub errors: Vec<String>,
-}
-
 // ── Path helper ──────────────────────────────────────────────────────────────
 
 /// Strip Windows extended-length path prefix that `canonicalize()` adds.
@@ -975,94 +966,6 @@ pub fn start_scan(ctx: &ServiceContext, root_id: i64) -> Result<ScanResultDto, A
         calibration_sets_deleted: reconcile.calibration_sets_deleted,
         sessions_updated: reconcile.sessions_updated,
         new_file_ids: result.new_file_ids,
-    })
-}
-
-pub fn rescan_all_for_content_hash(ctx: &ServiceContext) -> Result<RescanResultDto, ApiError> {
-    let db = db(ctx)?;
-    let conn = db.conn();
-
-    tracing::info!("starting content hash rescan for all files");
-
-    // Get all files from database
-    let all_files = crate::db::get_files(&conn, None)?;
-    let total = all_files.len();
-
-    let mut updated = 0;
-    let mut skipped = 0;
-    let mut missing = 0;
-    let mut errors = Vec::new();
-
-    for (file, _frame) in all_files {
-        let path_buf = std::path::PathBuf::from(&file.path);
-
-        // Skip if file doesn't exist on disk
-        if !path_buf.exists() {
-            missing += 1;
-            continue;
-        }
-
-        // Skip if already has content hash
-        if file.content_hash.is_some() {
-            skipped += 1;
-            continue;
-        }
-
-        // Compute content hash
-        match crate::duplicates::compute_xxhash(&path_buf) {
-            Ok(hash) => {
-                // Update database
-                match conn.execute(
-                    "UPDATE files SET content_hash = ?1 WHERE id = ?2",
-                    rusqlite::params![hash, file.id],
-                ) {
-                    Ok(_) => {
-                        updated += 1;
-                        if updated % 100 == 0 {
-                            tracing::debug!(
-                                current = updated + skipped + missing,
-                                total,
-                                "content hash rescan progress"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg = format!("{}: Failed to update database: {}", file.path, e);
-                        errors.push(error_msg);
-                    }
-                }
-            }
-            Err(e) => {
-                let error_msg = format!("{}: Failed to compute hash: {}", file.path, e);
-                errors.push(error_msg);
-            }
-        }
-    }
-
-    tracing::info!(
-        total,
-        updated,
-        skipped,
-        missing,
-        errors = errors.len(),
-        "content hash rescan complete"
-    );
-
-    // Mark content hash rescan as completed
-    if updated > 0 || skipped > 0 {
-        // Only set flag if we actually processed files successfully
-        ctx.settings
-            .persist_setting(&conn, "duplicates.content_hash_rescanned", "true")
-            .map_err(|e| ApiError::Internal(format!("Failed to set rescan flag: {}", e)))?;
-        tracing::debug!("content hash rescan flag set to true");
-    }
-
-    Ok(RescanResultDto {
-        files_total: total,
-        files_updated: updated,
-        files_skipped: skipped,
-        files_missing: missing,
-        errors,
     })
 }
 

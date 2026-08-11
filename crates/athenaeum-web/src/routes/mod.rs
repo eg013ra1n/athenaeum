@@ -69,7 +69,6 @@ pub fn build_router(state: WebAppState, static_dir: Option<PathBuf>) -> Router {
         .route("/api/cancel_scan", post(scan_roots::cancel_scan))
         .route("/api/check_all_scan_roots_availability", post(scan_roots::check_all_scan_roots_availability))
         .route("/api/get_missing_files_counts", post(scan_roots::get_missing_files_counts))
-        .route("/api/rescan_all_for_content_hash", post(scan_roots::rescan_all_for_content_hash))
         .route("/api/relink_scan_root", post(scan_roots::relink_scan_root))
         .route("/api/set_scan_root_monitor_enabled", post(scan_roots::set_scan_root_monitor_enabled))
         // Missing files

@@ -15,7 +15,7 @@ use athenaeum_core::api::PathPolicy;
 use super::AppState;
 
 pub use athenaeum_core::api::scan_roots::{
-    FolderCandidateVerdict, FolderOverview, RescanResultDto, ScanResultDto,
+    FolderCandidateVerdict, FolderOverview, ScanResultDto,
 };
 
 #[tauri::command]
@@ -170,12 +170,6 @@ pub async fn start_scan(
         });
     }
     Ok(dto)
-}
-
-#[tauri::command]
-#[tracing::instrument(skip_all, err)]
-pub async fn rescan_all_for_content_hash(state: State<'_, AppState>) -> Result<RescanResultDto, String> {
-    api::rescan_all_for_content_hash(&state.ctx).map_err(|e| e.to_string())
 }
 
 /// Relink files from old scan root to new location

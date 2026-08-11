@@ -272,7 +272,6 @@ pub fn run() {
             commands::start_scan,
             commands::start_scan_with_progress,
             commands::cancel_scan,
-            commands::rescan_all_for_content_hash,
             commands::get_files,
             commands::get_files_by_directory,
             commands::get_frames_with_missing_metadata,

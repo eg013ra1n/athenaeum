@@ -24,7 +24,7 @@ use crate::events::SseProgressEmitter;
 use crate::routes::api_err;
 use crate::WebAppState;
 
-pub use athenaeum_core::api::scan_roots::{RescanResultDto, ScanResultDto};
+pub use athenaeum_core::api::scan_roots::ScanResultDto;
 
 // ── Request structs ──────────────────────────────────────────────────────────
 
@@ -344,15 +344,6 @@ pub async fn start_scan(
     Json(args): Json<StartScanArgs>,
 ) -> Result<Json<ScanResultDto>, (StatusCode, String)> {
     start_scan_with_progress(State(state), Json(args)).await
-}
-
-/// POST /api/rescan_all_for_content_hash
-#[tracing::instrument(skip_all, err(Debug))]
-pub async fn rescan_all_for_content_hash(
-    State(state): State<WebAppState>,
-    Json(_): Json<serde_json::Value>,
-) -> Result<Json<RescanResultDto>, (StatusCode, String)> {
-    api::rescan_all_for_content_hash(&state.ctx).map(Json).map_err(api_err)
 }
 
 /// POST /api/relink_scan_root
