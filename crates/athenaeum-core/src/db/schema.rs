@@ -2087,6 +2087,47 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // ── Foreign-key child columns ────────────────────────────────────────────
+    //
+    // SQLite indexes the PARENT side of a foreign key automatically and the
+    // child side never. With `PRAGMA foreign_keys = ON`, deleting one parent row
+    // then costs a FULL SCAN of every child table whose FK column is unindexed —
+    // per parent row. Removing a 26_150-file scan root measured **45.8 minutes**
+    // pegged at 100% CPU because `fits_header.file_id` (114_054 rows) had no
+    // index; with it the same delete takes 1.3 seconds. Same reasoning as
+    // `idx_frames_file_id` above, applied to the rest of the schema.
+    //
+    // Most of these tables are small or empty today. That is exactly why they
+    // are cheap to add now and expensive to discover later — the cost is
+    // O(rows_deleted × child_rows), so it stays invisible until the table fills.
+    // `every_foreign_key_child_column_is_indexed` pins the invariant.
+    for stmt in [
+        "CREATE INDEX IF NOT EXISTS idx_fits_header_file_id ON fits_header(file_id)",
+        "CREATE INDEX IF NOT EXISTS idx_excluded_frames_file_id ON excluded_frames(file_id)",
+        "CREATE INDEX IF NOT EXISTS idx_frame_set_reference_frame ON frame_set_reference(reference_frame_id)",
+        "CREATE INDEX IF NOT EXISTS idx_frame_set_reference_set ON frame_set_reference(frames_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_frame_tags_tag ON frame_tags(tag_id)",
+        "CREATE INDEX IF NOT EXISTS idx_registration_results_frame ON registration_results(frame_id)",
+        "CREATE INDEX IF NOT EXISTS idx_imaging_nights_frames_set ON imaging_nights(frames_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_imaging_night ON sessions(imaging_night_id)",
+        "CREATE INDEX IF NOT EXISTS idx_calibration_set_originals_set ON calibration_set_originals(set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_light_cal_dark_set ON light_calibrations(dark_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_light_cal_flat_set ON light_calibrations(flat_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_light_cal_bias_set ON light_calibrations(bias_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_master_provenance_source_set ON master_provenance(source_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_master_provenance_master_set ON master_provenance(master_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_archive_op_steps_op_file ON archive_operation_steps(operation_file_id)",
+        // NOT `idx_file_op_steps_op_file` — that name is already taken above by
+        // an index on (operation_id, operation_file_id), whose leftmost column
+        // cannot serve this FK, and `IF NOT EXISTS` would silently do nothing.
+        "CREATE INDEX IF NOT EXISTS idx_file_op_steps_op_file_id ON file_operation_steps(operation_file_id)",
+        "CREATE INDEX IF NOT EXISTS idx_project_contributions_package ON project_contributions(package_id)",
+        "CREATE INDEX IF NOT EXISTS idx_project_link_intents_frames_set ON project_link_intents(frames_set_id)",
+        "CREATE INDEX IF NOT EXISTS idx_project_links_frames_set ON project_links(frames_set_id)",
+    ] {
+        conn.execute(stmt, [])?;
+    }
+
     // One-time data repairs (settings-flag gated). Best-effort by design: a
     // repair failure must not brick catalog init — the error is logged here
     // and the flag stays unstamped so the next start retries.
@@ -2106,6 +2147,83 @@ mod identity_schema_tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         conn
+    }
+
+    /// Every foreign-key CHILD column must have an index whose leftmost column
+    /// it is.
+    ///
+    /// SQLite indexes the parent side automatically and the child side never.
+    /// With `PRAGMA foreign_keys = ON` an unindexed child column turns every
+    /// delete of a parent row into a full scan of that child table, so a bulk
+    /// delete costs O(rows_deleted × child_rows) and stays invisible until the
+    /// child table fills up. `fits_header.file_id` reached 114_054 rows before
+    /// anyone noticed: removing a 26_150-file scan root took 45.8 minutes at
+    /// 100% CPU, versus 1.3 seconds once indexed.
+    ///
+    /// A new FK therefore ships with its index, or this test fails and names it.
+    /// Watch the index NAME too — `CREATE INDEX IF NOT EXISTS` on a name that
+    /// already belongs to a different column list is a silent no-op, which is
+    /// how `file_operation_steps.operation_file_id` slipped through the first
+    /// pass of this very fix.
+    #[test]
+    fn every_foreign_key_child_column_is_indexed() {
+        let conn = mem_db();
+
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        let mut unindexed: Vec<String> = Vec::new();
+        for table in &tables {
+            // Leftmost column of each index — the only position a foreign-key
+            // check can probe.
+            let index_names: Vec<String> = conn
+                .prepare(&format!("PRAGMA index_list('{table}')"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let mut leftmost: Vec<String> = Vec::new();
+            for index in &index_names {
+                let cols: Vec<String> = conn
+                    .prepare(&format!("PRAGMA index_info('{index}')"))
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, Option<String>>(2))
+                    .unwrap()
+                    .filter_map(|c| c.ok().flatten())
+                    .collect();
+                if let Some(first) = cols.first() {
+                    leftmost.push(first.clone());
+                }
+            }
+
+            let child_cols: Vec<String> = conn
+                .prepare(&format!("PRAGMA foreign_key_list('{table}')"))
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+
+            for col in child_cols {
+                if !leftmost.contains(&col) {
+                    unindexed.push(format!("{table}.{col}"));
+                }
+            }
+        }
+
+        assert!(
+            unindexed.is_empty(),
+            "foreign-key child columns without an index (every parent-row delete \
+             full-scans these tables): {unindexed:?}"
+        );
     }
 
     #[test]
