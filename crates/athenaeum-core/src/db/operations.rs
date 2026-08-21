@@ -197,26 +197,59 @@ fn exec_in_chunks(
 /// Drop without calling `commit()` ⇒ `ROLLBACK TO` + `RELEASE`, so the
 /// savepoint's changes are undone on any early return (`?`) or panic-unwind,
 /// not just the explicit error paths.
+///
+/// When no transaction is open yet the guard opens its own with `BEGIN
+/// IMMEDIATE` — it takes the write lock BEFORE the body's first read. Every
+/// write path here reads before it writes (`delete_scan_root` resolves 26_150
+/// file ids before its first DELETE), and in WAL a deferred transaction that
+/// reads first and writes later gets SQLITE_BUSY the instant another connection
+/// commits in between. `busy_timeout` does not help there and is not even
+/// consulted — the read snapshot is stale, and only a rollback-and-retry can
+/// resolve it. A "Remove folder" click died exactly this way: "database is
+/// locked" after 35 ms with a 5 s busy_timeout configured. Holding the write
+/// lock from the start makes the OTHER writer the one that waits.
 pub(crate) struct SavepointGuard<'c> {
     conn: &'c Connection,
     name: &'static str,
+    /// True when this guard opened the enclosing transaction itself, and so
+    /// owns the `COMMIT`/`ROLLBACK` as well as the savepoint. False when it
+    /// nested inside a caller's transaction — releasing the savepoint is then
+    /// the whole job, and ending the transaction is the caller's business.
+    owns_transaction: bool,
     done: bool,
 }
 
 impl<'c> SavepointGuard<'c> {
     pub(crate) fn new(conn: &'c Connection, name: &'static str) -> rusqlite::Result<Self> {
-        conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+        let owns_transaction = conn.is_autocommit();
+        if owns_transaction {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+        }
+        if let Err(e) = conn.execute_batch(&format!("SAVEPOINT {name}")) {
+            // Don't strand the transaction we just opened on a pooled connection.
+            if owns_transaction {
+                if let Err(e2) = conn.execute_batch("ROLLBACK") {
+                    tracing::error!(savepoint = name, error = %e2, "rollback after SAVEPOINT failure failed");
+                }
+            }
+            return Err(e);
+        }
         Ok(Self {
             conn,
             name,
+            owns_transaction,
             done: false,
         })
     }
 
-    /// Persist the savepoint's changes (`RELEASE`). Consumes `self` so the
-    /// subsequent `Drop` sees `done == true` and is a no-op.
+    /// Persist the savepoint's changes (`RELEASE`, plus `COMMIT` when this
+    /// guard owns the transaction). Consumes `self` so the subsequent `Drop`
+    /// sees `done == true` and is a no-op.
     pub(crate) fn commit(mut self) -> rusqlite::Result<()> {
         self.conn.execute_batch(&format!("RELEASE {}", self.name))?;
+        if self.owns_transaction {
+            self.conn.execute_batch("COMMIT")?;
+        }
         self.done = true;
         Ok(())
     }
@@ -232,6 +265,13 @@ impl Drop for SavepointGuard<'_> {
                 .execute_batch(&format!("ROLLBACK TO {0}; RELEASE {0}", self.name))
             {
                 tracing::error!(savepoint = self.name, error = %e, "SavepointGuard rollback failed");
+            }
+            // Runs even if the savepoint rollback above failed: a pooled
+            // connection must never go back to the pool inside a transaction.
+            if self.owns_transaction {
+                if let Err(e) = self.conn.execute_batch("ROLLBACK") {
+                    tracing::error!(savepoint = self.name, error = %e, "SavepointGuard transaction rollback failed");
+                }
             }
         }
     }
@@ -6752,6 +6792,131 @@ mod savepoint_migration_tests {
             count, 0,
             "commit() must persist the delete past the savepoint"
         );
+    }
+
+    /// Open a file-backed connection with the same PRAGMAs the app's pool sets.
+    /// WAL needs a real file, and the whole point of this test is WAL's
+    /// snapshot rules. `busy_timeout` is the caller's choice so the intruder
+    /// can fail fast instead of parking the test for five seconds.
+    fn open_wal(path: &std::path::Path, busy_ms: u32) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA busy_timeout = {busy_ms};
+             PRAGMA journal_mode = WAL;"
+        ))
+        .unwrap();
+        conn
+    }
+
+    /// A guard that opens its own transaction must take the WRITE lock up
+    /// front, not on the first write.
+    ///
+    /// Every big write path here reads before it writes (`delete_scan_root`
+    /// resolves 26_150 file ids before its first DELETE). In WAL, a deferred
+    /// transaction that reads first and writes later gets SQLITE_BUSY the
+    /// instant any other connection commits in between — and `busy_timeout` is
+    /// deliberately NOT consulted, because the read snapshot is already stale
+    /// and waiting can never fix it. That is how a real "Remove folder" click
+    /// died with "database is locked" after 35 ms with a 5 s busy_timeout
+    /// configured: the loser of the race must be the OTHER writer, never the
+    /// transaction that is already in flight.
+    #[test]
+    fn guard_takes_the_write_lock_before_the_first_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("guard.db");
+
+        let ours = open_wal(&db_path, 5_000);
+        init_db(&ours).unwrap();
+        ours.execute("INSERT INTO scan_roots (path) VALUES ('/data/Root')", [])
+            .unwrap();
+        let intruder = open_wal(&db_path, 100);
+
+        let sp = SavepointGuard::new(&ours, "concurrent_writer").unwrap();
+        // Read first — exactly the shape of every delete_* path in this module.
+        let _: i64 = ours
+            .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
+            .unwrap();
+
+        let stolen = intruder.execute("INSERT INTO scan_roots (path) VALUES ('/data/Other')", []);
+        assert!(
+            stolen.is_err(),
+            "the second writer must be the one that backs off; if it commits here \
+             our own transaction is left holding a stale snapshot"
+        );
+
+        // The write half of our own transaction must go through.
+        ours.execute("DELETE FROM scan_roots", []).unwrap();
+        sp.commit().unwrap();
+
+        let count: i64 = ours
+            .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "our committed delete must be the one that landed");
+    }
+
+    /// A nested guard must stay a plain SAVEPOINT: opening a second transaction
+    /// on the same connection is an error, and the inner guard's rollback must
+    /// not take the outer guard's writes with it. The connection also has to
+    /// come back to autocommit, or a pooled connection is returned to the pool
+    /// still inside a transaction.
+    #[test]
+    fn nested_guard_does_not_open_a_second_transaction() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let outer = SavepointGuard::new(&conn, "outer_guard").unwrap();
+        conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/Outer')", [])
+            .unwrap();
+        {
+            let inner = SavepointGuard::new(&conn, "inner_guard").unwrap();
+            conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/Inner')", [])
+                .unwrap();
+            drop(inner);
+        }
+        let after_inner: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after_inner, 1,
+            "the inner rollback must drop only its own row"
+        );
+
+        outer.commit().unwrap();
+        assert!(
+            conn.is_autocommit(),
+            "committing the outermost guard must end the transaction"
+        );
+
+        let final_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(final_count, 1);
+    }
+
+    /// The rollback path has the same obligation: a guard that is dropped
+    /// without `commit()` must leave the connection in autocommit, since it
+    /// goes straight back into the pool.
+    #[test]
+    fn dropped_guard_returns_the_connection_to_autocommit() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        {
+            let sp = SavepointGuard::new(&conn, "dropped_guard").unwrap();
+            conn.execute("INSERT INTO scan_roots (path) VALUES ('/data/Gone')", [])
+                .unwrap();
+            drop(sp);
+        }
+
+        assert!(
+            conn.is_autocommit(),
+            "a rolled-back guard must not strand an open transaction"
+        );
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM scan_roots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "the insert must have been rolled back");
     }
 }
 
