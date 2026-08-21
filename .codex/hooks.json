@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CODEX_PROJECT_DIR:-.}\"/.codex/hooks/mark-rust-dirty.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CODEX_PROJECT_DIR:-.}\"/.codex/hooks/check-rust.sh",
+            "timeout": 180,
+            "statusMessage": "Running cargo check..."
+          }
+        ]
+      }
+    ]
+  }
+}

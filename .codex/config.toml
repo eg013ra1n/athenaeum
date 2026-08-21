@@ -1,0 +1,8 @@
+[mcp_servers.athenaeum-logs]
+command = "cargo"
+args = [
+    "run",
+    "-q",
+    "-p",
+    "log-mcp",
+]
