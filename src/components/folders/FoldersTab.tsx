@@ -74,6 +74,12 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
   const [addDialog, setAddDialog] = useState<{ open: boolean; preselect?: AddableKind }>({ open: false });
   const [scanResultMap, setScanResultMap] = useState<Record<number, ScanResult>>({});
   const [relinkingRootId, setRelinkingRootId] = useState<number | null>(null);
+  /** Root whose removal is in flight. Removing a big root walks every file,
+   *  frame and calibration link it owns, so the click needs to look like it
+   *  did something — without this the UI just blinks and a failure (the whole
+   *  delete is one transaction, so it either lands or doesn't) is the only
+   *  visible outcome. */
+  const [removingRootId, setRemovingRootId] = useState<number | null>(null);
   /** Relink outcome tagged with the root that produced it — never shown on another row. */
   const [relinkResult, setRelinkResult] = useState<{ rootId: number; result: RelinkResult } | null>(null);
   const [relinkBrowserRootId, setRelinkBrowserRootId] = useState<number | null>(null);
@@ -287,6 +293,7 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
     message: 'Remove this folder from the catalog? Its catalog entries are forgotten; files on disk are never touched.',
     danger: true,
     onConfirm: async () => {
+      setRemovingRootId(id);
       try {
         await deleteScanRoot(id);
         setSelection(null);
@@ -295,6 +302,8 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
         console.error('[FoldersTab] remove failed:', e);
         clearRootsError();
         showAlert('Remove failed', typeof e === 'string' ? e : String(e));
+      } finally {
+        setRemovingRootId(null);
       }
     },
   });
@@ -433,6 +442,7 @@ export default function FoldersTab({ selectSyncIncomingToken, onRootsChanged, on
             onToggleUniqueCamera={(v) => { if (root.id) void toggleUniqueCameraFlag(root.id, v).catch((e) => reportToggleFailure('unique-camera', e)); }}
             onToggleMonitor={(v) => { if (root.id) void toggleMonitorEnabled(root.id, v).catch((e) => reportToggleFailure('monitor', e)); }}
             onRemove={() => root.id && handleRemoveScanRoot(root.id)}
+            removing={removingRootId === root.id}
             onMissingChanged={() => void refreshAux()}
           />
         );

@@ -25,11 +25,15 @@ interface MonitoredInspectorProps {
   onToggleUniqueCamera: (v: boolean) => void;
   onToggleMonitor: (v: boolean) => void;
   onRemove: () => void;
+  /** Removal of this root is in flight — the delete walks every file and frame
+   *  it owns, so the button has to say so instead of silently doing nothing. */
+  removing: boolean;
   onMissingChanged: () => void;
 }
 
 export function MonitoredInspector(props: MonitoredInspectorProps) {
-  const { root, overview, missingCount, scanResult, isScanning, relinking, relinkResult } = props;
+  const { root, overview, missingCount, scanResult, isScanning, relinking, relinkResult, removing } =
+    props;
   const offline = !root.is_available;
   const [missingOpen, setMissingOpen] = useState(false);
   const [missingFiles, setMissingFiles] = useState<MissingFileRecord[] | null>(null);
@@ -196,9 +200,10 @@ export function MonitoredInspector(props: MonitoredInspectorProps) {
             Forgets the folder and its catalog entries (frames, the sets they belong to).{' '}
             <span className="font-semibold text-content">Files on disk are never touched.</span>
           </p>
-          <button onClick={props.onRemove}
-            className="shrink-0 px-3 py-1.5 rounded-lg border border-error/50 text-error text-sm hover:bg-error-muted transition">
-            Remove folder…
+          <button onClick={props.onRemove} disabled={removing}
+            className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-error/50 text-error text-sm hover:bg-error-muted transition disabled:opacity-60 disabled:cursor-not-allowed">
+            {removing && <Loader2 size={14} className="animate-spin" />}
+            {removing ? 'Removing…' : 'Remove folder…'}
           </button>
         </div>
       </Section>
