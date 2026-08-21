@@ -137,6 +137,54 @@ pub fn scan_root_prefix_predicate(
     (clauses.join(" OR "), values)
 }
 
+/// Max bind parameters per statement for the `IN (…)` lists in this crate whose
+/// length comes from DATA rather than from a constant.
+///
+/// SQLite's `SQLITE_MAX_VARIABLE_NUMBER` is 32766 in the bundled amalgamation
+/// (999 in older builds); 900 stays under both. Over the limit a statement does
+/// not merely run slowly — it fails to PREPARE with "too many SQL variables",
+/// which is how the Duplicates screen and "Remove folder" both died on a
+/// catalog that mirrors one library across several drives.
+pub(crate) const MAX_BIND_PARAMS: usize = 900;
+
+/// Render `?,?,…` for a chunk.
+fn bind_placeholders(n: usize) -> String {
+    std::iter::repeat("?").take(n).collect::<Vec<_>>().join(",")
+}
+
+/// Collect the i64 first column of `build_sql` run once per chunk of `ids`.
+/// `build_sql` receives that chunk's placeholder list.
+fn select_ids_in_chunks(
+    conn: &Connection,
+    ids: &[i64],
+    build_sql: impl Fn(&str) -> String,
+) -> rusqlite::Result<Vec<i64>> {
+    let mut out = Vec::new();
+    for chunk in ids.chunks(MAX_BIND_PARAMS) {
+        let sql = build_sql(&bind_placeholders(chunk.len()));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| row.get(0))?;
+        for r in rows {
+            out.push(r?);
+        }
+    }
+    Ok(out)
+}
+
+/// Run `build_sql` once per chunk of `ids`, returning the total rows affected.
+fn exec_in_chunks(
+    conn: &Connection,
+    ids: &[i64],
+    build_sql: impl Fn(&str) -> String,
+) -> rusqlite::Result<usize> {
+    let mut affected = 0;
+    for chunk in ids.chunks(MAX_BIND_PARAMS) {
+        let sql = build_sql(&bind_placeholders(chunk.len()));
+        affected += conn.execute(&sql, rusqlite::params_from_iter(chunk.iter()))?;
+    }
+    Ok(affected)
+}
+
 /// RAII savepoint: nest-safe transaction scope over a shared `&Connection`.
 /// `rusqlite::Connection::savepoint()` needs `&mut Connection`, which the
 /// pool only ever lends out as `&Connection` — so nest-safety here is done
@@ -741,88 +789,61 @@ pub fn delete_scan_root(conn: &Connection, id: i64) -> Result<()> {
         rows.filter_map(|r| r.ok()).collect()
     };
 
+    // Both id lists are sized by the catalog, not by a constant — a real
+    // library root holds 26_150 files — so every `IN (…)` below is chunked at
+    // MAX_BIND_PARAMS. Unchunked, a root larger than SQLITE_MAX_VARIABLE_NUMBER
+    // could not be deleted at all: the statements fail to prepare.
     if !file_ids.is_empty() {
         // Pre-compute frame IDs for these files
-        let frame_ids: Vec<i64> = {
-            let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!("SELECT id FROM frames WHERE file_id IN ({})", placeholders);
-            let mut stmt = conn.prepare(&sql)?;
-            let params_vec: Vec<rusqlite::types::Value> = file_ids
-                .iter()
-                .map(|id| rusqlite::types::Value::Integer(*id))
-                .collect();
-            let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
-                row.get(0)
-            })?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
+        let frame_ids = select_ids_in_chunks(conn, &file_ids, |p| {
+            format!("SELECT id FROM frames WHERE file_id IN ({p})")
+        })?;
 
         // Delete child tables explicitly (avoiding cascade overhead)
         if !frame_ids.is_empty() {
-            let frame_placeholders: String =
-                frame_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let frame_values: Vec<rusqlite::types::Value> = frame_ids
-                .iter()
-                .map(|id| rusqlite::types::Value::Integer(*id))
-                .collect();
-
             // 1. session_members
-            let sql = format!(
-                "DELETE FROM session_members WHERE frame_id IN ({})",
-                frame_placeholders
-            );
-            conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
+            exec_in_chunks(conn, &frame_ids, |p| {
+                format!("DELETE FROM session_members WHERE frame_id IN ({p})")
+            })?;
 
             // 2. calibration_set_frames
-            let sql = format!(
-                "DELETE FROM calibration_set_frames WHERE frame_id IN ({})",
-                frame_placeholders
-            );
-            conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
+            exec_in_chunks(conn, &frame_ids, |p| {
+                format!("DELETE FROM calibration_set_frames WHERE frame_id IN ({p})")
+            })?;
 
             // 3. frame_tags
-            let sql = format!(
-                "DELETE FROM frame_tags WHERE frame_id IN ({})",
-                frame_placeholders
-            );
-            conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
+            exec_in_chunks(conn, &frame_ids, |p| {
+                format!("DELETE FROM frame_tags WHERE frame_id IN ({p})")
+            })?;
 
             // 4. calibration_set_to_frames (source_id refers to frame_id when source_type='frame')
-            let sql = format!("DELETE FROM calibration_set_to_frames WHERE source_id IN ({}) AND source_type = 'frame'", frame_placeholders);
-            conn.execute(&sql, rusqlite::params_from_iter(frame_values.iter()))?;
+            exec_in_chunks(conn, &frame_ids, |p| {
+                format!(
+                    "DELETE FROM calibration_set_to_frames
+                     WHERE source_id IN ({p}) AND source_type = 'frame'"
+                )
+            })?;
         }
 
-        // Delete by file_id
-        let file_placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let file_values: Vec<rusqlite::types::Value> = file_ids
-            .iter()
-            .map(|id| rusqlite::types::Value::Integer(*id))
-            .collect();
-
         // 5. fits_header
-        let sql = format!(
-            "DELETE FROM fits_header WHERE file_id IN ({})",
-            file_placeholders
-        );
-        conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
+        exec_in_chunks(conn, &file_ids, |p| {
+            format!("DELETE FROM fits_header WHERE file_id IN ({p})")
+        })?;
 
         // 6. black_hole
-        let sql = format!(
-            "DELETE FROM black_hole WHERE file_id IN ({})",
-            file_placeholders
-        );
-        conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
+        exec_in_chunks(conn, &file_ids, |p| {
+            format!("DELETE FROM black_hole WHERE file_id IN ({p})")
+        })?;
 
         // 7. frames
-        let sql = format!(
-            "DELETE FROM frames WHERE file_id IN ({})",
-            file_placeholders
-        );
-        conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
+        exec_in_chunks(conn, &file_ids, |p| {
+            format!("DELETE FROM frames WHERE file_id IN ({p})")
+        })?;
 
         // 8. files
-        let sql = format!("DELETE FROM files WHERE id IN ({})", file_placeholders);
-        conn.execute(&sql, rusqlite::params_from_iter(file_values.iter()))?;
+        exec_in_chunks(conn, &file_ids, |p| {
+            format!("DELETE FROM files WHERE id IN ({p})")
+        })?;
     }
 
     // 9. Delete orphaned calibration sets. Guarded prune: a raw set that fed a
@@ -1906,9 +1927,10 @@ fn enrich_duplicate_groups(conn: &Connection, groups: &mut [DuplicateGroup]) -> 
         .filter_map(|r| r.ok())
         .collect();
 
-    // One SELECT covering every file id across every group. Pulls the frame
-    // row (imagetyp, date_obs, filename) via LEFT JOIN so files without an
-    // extracted frame still come through with None-y frame fields.
+    // Every file id across every group, deduped, then read back in chunks
+    // (see below). Pulls the frame row (imagetyp, date_obs, filename) via
+    // LEFT JOIN so files without an extracted frame still come through with
+    // None-y frame fields.
     let mut all_ids: Vec<i64> = groups
         .iter()
         .flat_map(|g| g.file_ids.iter().copied())
@@ -1918,32 +1940,6 @@ fn enrich_duplicate_groups(conn: &Connection, groups: &mut [DuplicateGroup]) -> 
     if all_ids.is_empty() {
         return Ok(());
     }
-    let placeholders: String = std::iter::repeat("?")
-        .take(all_ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let query = format!(
-        "SELECT f.id, f.path, f.filename, f.modified_at, fr.imagetyp, fr.date_obs
-         FROM files f
-         LEFT JOIN frames fr ON fr.file_id = f.id
-         WHERE f.id IN ({})",
-        placeholders
-    );
-    let params_vec: Vec<rusqlite::types::Value> = all_ids
-        .iter()
-        .map(|i| rusqlite::types::Value::Integer(*i))
-        .collect();
-    let mut stmt = conn.prepare(&query)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
-        let id: i64 = row.get(0)?;
-        let path: String = row.get(1)?;
-        let filename: String = row.get(2)?;
-        let modified_at_str: String = row.get(3)?;
-        let imagetyp: Option<String> = row.get(4)?;
-        let date_obs: Option<String> = row.get(5)?;
-        Ok((id, path, filename, modified_at_str, imagetyp, date_obs))
-    })?;
-
     struct Row {
         path: String,
         filename: String,
@@ -1951,22 +1947,51 @@ fn enrich_duplicate_groups(conn: &Connection, groups: &mut [DuplicateGroup]) -> 
         imagetyp: Option<String>,
         date_obs: Option<String>,
     }
-    let mut by_id: std::collections::HashMap<i64, Row> = std::collections::HashMap::new();
-    for row in rows {
-        let (id, path, filename, modified_at_str, imagetyp, date_obs) = row?;
-        let modified_at = chrono::DateTime::parse_from_rfc3339(&modified_at_str)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .unwrap_or_else(|_| chrono::Utc::now());
-        by_id.insert(
-            id,
-            Row {
-                path,
-                filename,
-                modified_at,
-                imagetyp,
-                date_obs,
-            },
+    let mut by_id: std::collections::HashMap<i64, Row> =
+        std::collections::HashMap::with_capacity(all_ids.len());
+
+    // The id list is unbounded — a catalog mirroring one library across
+    // several drives puts six figures of ids in here — so the `IN (…)` is
+    // chunked at MAX_BIND_PARAMS. Unchunked it exceeds
+    // SQLITE_MAX_VARIABLE_NUMBER and the SELECT fails to prepare at all
+    // ("too many SQL variables"), taking the whole Duplicates screen with it.
+    // `files.id` is the rowid, so each chunk is a primary-key lookup.
+    for chunk in all_ids.chunks(MAX_BIND_PARAMS) {
+        let placeholders: String = bind_placeholders(chunk.len());
+        let query = format!(
+            "SELECT f.id, f.path, f.filename, f.modified_at, fr.imagetyp, fr.date_obs
+             FROM files f
+             LEFT JOIN frames fr ON fr.file_id = f.id
+             WHERE f.id IN ({})",
+            placeholders
         );
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            let id: i64 = row.get(0)?;
+            let path: String = row.get(1)?;
+            let filename: String = row.get(2)?;
+            let modified_at_str: String = row.get(3)?;
+            let imagetyp: Option<String> = row.get(4)?;
+            let date_obs: Option<String> = row.get(5)?;
+            Ok((id, path, filename, modified_at_str, imagetyp, date_obs))
+        })?;
+
+        for row in rows {
+            let (id, path, filename, modified_at_str, imagetyp, date_obs) = row?;
+            let modified_at = chrono::DateTime::parse_from_rfc3339(&modified_at_str)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+            by_id.insert(
+                id,
+                Row {
+                    path,
+                    filename,
+                    modified_at,
+                    imagetyp,
+                    date_obs,
+                },
+            );
+        }
     }
 
     for group in groups.iter_mut() {
@@ -6267,6 +6292,113 @@ mod path_prefix_range_tests {
             "longest-prefix attribution must still win for a true descendant"
         );
     }
+
+    /// A scan root holding more files than SQLITE_MAX_VARIABLE_NUMBER must
+    /// still be removable. The delete resolves every file id and every frame id
+    /// up front and feeds them to eight `IN (…)` statements; unchunked, such a
+    /// root could not be deleted at all ("too many SQL variables"). A real
+    /// library root measured 26_150 files — 80% of the 32_766 ceiling.
+    #[test]
+    fn delete_scan_root_handles_more_files_than_the_sqlite_variable_limit() {
+        const FILES: i64 = 33_000;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (id, path) VALUES (1, '/data/Big')",
+            [],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        {
+            let mut file_stmt = tx
+                .prepare(
+                    "INSERT INTO files (id, path, filename, size, modified_at, format)
+                     VALUES (?1, ?2, 'x.fits', 1, '2026-01-01T00:00:00Z', 'FITS')",
+                )
+                .unwrap();
+            let mut frame_stmt = tx
+                .prepare("INSERT INTO frames (file_id) VALUES (?1)")
+                .unwrap();
+            for i in 1..=FILES {
+                file_stmt
+                    .execute(rusqlite::params![i, format!("/data/Big/f{i}.fits")])
+                    .unwrap();
+                frame_stmt.execute(rusqlite::params![i]).unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        delete_scan_root(&conn, 1).unwrap();
+
+        for (table, label) in [
+            ("files", "files"),
+            ("frames", "frames"),
+            ("scan_roots", "the root row"),
+        ] {
+            let left: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(left, 0, "{label} must be gone after the root is deleted");
+        }
+    }
+
+    /// A catalog that mirrors the same library across several drives puts far
+    /// more than SQLITE_MAX_VARIABLE_NUMBER file ids into one duplicate scan
+    /// (a real 114k-file catalog produced 39_366 groups / 111_514 ids). The
+    /// enrichment SELECT binds one parameter per id, so an unchunked
+    /// `IN (?,?,…)` fails to even prepare with "too many SQL variables" and
+    /// the whole Duplicates screen errors out. 34_000 files clears the
+    /// bundled 32_766 limit (and the historic 999 one).
+    #[test]
+    fn enrich_duplicate_groups_chunks_past_the_sqlite_variable_limit() {
+        const PAIRS: usize = 17_000;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO scan_roots (path, find_duplicates) VALUES ('/data', 1)",
+            [],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO files (path, filename, size, modified_at, format, created_at, content_hash)
+                     VALUES (?1, ?2, 100, '2026-01-01T00:00:00Z', 'FITS', '2026-01-01T00:00:00Z', ?3)",
+                )
+                .unwrap();
+            for i in 0..PAIRS {
+                for copy in ["a", "b"] {
+                    let filename = format!("dup_{i}.fits");
+                    stmt.execute(rusqlite::params![
+                        format!("/data/{copy}/{filename}"),
+                        filename,
+                        format!("HASH{i}"),
+                    ])
+                    .unwrap();
+                }
+            }
+        }
+        tx.commit().unwrap();
+
+        let groups = find_duplicate_groups(&conn, true).unwrap();
+        assert_eq!(groups.len(), PAIRS, "every hash must form its own group");
+        assert!(
+            groups.iter().all(|g| g.files.len() == 2),
+            "no group may lose a member at a chunk boundary"
+        );
+        assert!(
+            groups.iter().all(|g| g
+                .files
+                .iter()
+                .all(|f| f.scan_root_path.as_deref() == Some("/data"))),
+            "every enriched file keeps its scan-root attribution across chunks"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6628,21 +6760,19 @@ mod savepoint_migration_tests {
 /// responder's membership probe: an offered sampling hash present here is a
 /// *candidate* duplicate that still needs full-hash confirmation.
 ///
-/// The `IN (…)` list is chunked at 900 bind params (SQLite's default limit is
-/// 999) and the per-chunk results are unioned. An empty `hashes` slice runs no
+/// The `IN (…)` list is chunked at [`MAX_BIND_PARAMS`] and the per-chunk
+/// results are unioned. An empty `hashes` slice runs no
 /// query and returns an empty vec. `content_hash` and `path` are both indexed
 /// (`idx_files_content_hash`, `idx_files_path`), so each chunk is an index scan.
 pub fn find_files_by_content_hashes(
     conn: &Connection,
     hashes: &[String],
 ) -> Result<Vec<(String, String)>> {
-    // SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999; stay well under it.
-    const CHUNK: usize = 900;
     let mut out = Vec::new();
     if hashes.is_empty() {
         return Ok(out);
     }
-    for chunk in hashes.chunks(CHUNK) {
+    for chunk in hashes.chunks(MAX_BIND_PARAMS) {
         let placeholders = std::iter::repeat("?")
             .take(chunk.len())
             .collect::<Vec<_>>()

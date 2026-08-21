@@ -99,35 +99,10 @@ pub async fn get_blackholed_file_ids(
     file_ids: Vec<i64>,
     state: State<'_, AppState>,
 ) -> Result<Vec<i64>, String> {
-    if file_ids.is_empty() {
-        return Ok(vec![]);
-    }
-
     let db = state.ctx.db.get().ok_or("Database not initialized")?;
     let conn = db.conn();
 
-    // Build IN clause with placeholders
-    let placeholders: Vec<String> = file_ids.iter().map(|_| "?".to_string()).collect();
-    let sql = format!(
-        "SELECT file_id FROM black_hole WHERE file_id IN ({})",
-        placeholders.join(", ")
-    );
-
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-
-    // Convert file_ids to rusqlite params
-    let params: Vec<&dyn rusqlite::ToSql> = file_ids
-        .iter()
-        .map(|id| id as &dyn rusqlite::ToSql)
-        .collect();
-
-    let blackholed: Vec<i64> = stmt
-        .query_map(params.as_slice(), |row| row.get(0))
-        .map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-
-    Ok(blackholed)
+    db::get_blackholed_file_ids(&conn, &file_ids).map_err(|e| e.to_string())
 }
 
 /// Restore a file from the black hole

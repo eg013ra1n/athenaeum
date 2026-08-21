@@ -176,32 +176,11 @@ pub async fn get_blackholed_file_ids(
     State(state): State<WebAppState>,
     Json(args): Json<GetBlackholedFileIdsArgs>,
 ) -> Result<Json<Vec<i64>>, (StatusCode, String)> {
-    if args.file_ids.is_empty() {
-        return Ok(Json(vec![]));
-    }
-
     let db = state.ctx.db.get().ok_or_else(no_db)?;
     let conn = db.conn();
 
-    let placeholders: Vec<String> = args.file_ids.iter().map(|_| "?".to_string()).collect();
-    let sql = format!(
-        "SELECT file_id FROM black_hole WHERE file_id IN ({})",
-        placeholders.join(", ")
-    );
-
-    let mut stmt = conn.prepare(&sql).map_err(db_err)?;
-
-    let params: Vec<&dyn rusqlite::ToSql> = args
-        .file_ids
-        .iter()
-        .map(|id| id as &dyn rusqlite::ToSql)
-        .collect();
-
-    let blackholed: Vec<i64> = stmt
-        .query_map(params.as_slice(), |row| row.get(0))
-        .map_err(db_err)?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(db_err)?;
+    let blackholed =
+        athenaeum_core::db::get_blackholed_file_ids(&conn, &args.file_ids).map_err(db_err)?;
 
     Ok(Json(blackholed))
 }

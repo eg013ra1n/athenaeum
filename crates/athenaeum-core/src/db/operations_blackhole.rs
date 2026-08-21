@@ -278,6 +278,46 @@ pub fn get_black_hole_files(
     entries.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// Of `file_ids`, the subset currently sitting in the black hole.
+///
+/// The caller's list is data-shaped, not bounded by a constant — it is every
+/// light of a frame set, or every file a user selected before hitting Blink —
+/// so the `IN (…)` is chunked at [`crate::db::MAX_BIND_PARAMS`]. Unchunked, a
+/// list past SQLITE_MAX_VARIABLE_NUMBER (32766) fails to even prepare with
+/// "too many SQL variables" and takes the whole view with it.
+/// `black_hole.file_id` carries a UNIQUE index, so each chunk is an index probe
+/// returning at most one row per id. Order is not meaningful — callers turn the
+/// result into a Set.
+///
+/// The input is deduped first, and that is load-bearing, not tidiness: a single
+/// `IN (5,5)` is a set-membership test and yields one row, but the same id in
+/// two different chunks would yield one row per chunk. Deduping keeps the
+/// chunked result identical to what one unchunked query would have returned.
+pub fn get_blackholed_file_ids(conn: &Connection, file_ids: &[i64]) -> Result<Vec<i64>> {
+    let mut out = Vec::new();
+    if file_ids.is_empty() {
+        return Ok(out);
+    }
+    let mut ids = file_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    for chunk in ids.chunks(crate::db::MAX_BIND_PARAMS) {
+        let placeholders: String = std::iter::repeat("?")
+            .take(chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT file_id FROM black_hole WHERE file_id IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+            row.get::<_, i64>(0)
+        })?;
+        for r in rows {
+            out.push(r?);
+        }
+    }
+    Ok(out)
+}
+
 /// Remove a file from the black hole (restore)
 pub fn remove_from_black_hole(conn: &Connection, file_id: i64) -> Result<()> {
     conn.execute(
@@ -542,6 +582,107 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 1, "must not create a duplicate black_hole row");
+    }
+
+    /// The blackhole probe is fed a data-shaped id list (every light of a frame
+    /// set, or a whole Blink selection), so it must survive a list longer than
+    /// SQLITE_MAX_VARIABLE_NUMBER (32766) — unchunked, the SELECT fails to
+    /// prepare with "too many SQL variables". 40_000 ids clears the limit; only
+    /// every third one is actually blackholed, so a chunk boundary that dropped
+    /// or duplicated rows would show up in the count and the spot checks.
+    #[test]
+    fn blackholed_probe_chunks_past_the_sqlite_variable_limit() {
+        const TOTAL: i64 = 40_000;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let tx = conn.transaction().unwrap();
+        {
+            let mut file_stmt = tx
+                .prepare(
+                    "INSERT INTO files (id, path, filename, size, modified_at, format)
+                     VALUES (?1, ?2, 'x.fits', 10, '2024-01-01T00:00:00Z', 'FITS')",
+                )
+                .unwrap();
+            let mut bh_stmt = tx
+                .prepare(
+                    "INSERT INTO black_hole (file_id, from_where, moved_at, original_path)
+                     VALUES (?1, 'light', '2024-01-01T00:00:00Z', ?2)",
+                )
+                .unwrap();
+            for id in 1..=TOTAL {
+                let path = format!("/tmp/f{id}.fits");
+                file_stmt.execute(rusqlite::params![id, path]).unwrap();
+                if id % 3 == 0 {
+                    bh_stmt.execute(rusqlite::params![id, path]).unwrap();
+                }
+            }
+        }
+        tx.commit().unwrap();
+
+        let all_ids: Vec<i64> = (1..=TOTAL).collect();
+        let blackholed = get_blackholed_file_ids(&conn, &all_ids).unwrap();
+
+        assert_eq!(
+            blackholed.len() as i64,
+            TOTAL / 3,
+            "every blackholed id must come back exactly once across all chunks"
+        );
+        let found: std::collections::HashSet<i64> = blackholed.into_iter().collect();
+        assert!(found.contains(&900), "id on the first chunk boundary");
+        assert!(found.contains(&39_999), "id in the last, short chunk");
+        assert!(!found.contains(&901), "a non-blackholed id must not appear");
+    }
+
+    /// Chunking must not change what a repeated id yields. One unchunked
+    /// `IN (5,5)` is a set-membership test and returns a single row; two chunks
+    /// each holding a copy of id 5 would return it twice. The input is deduped
+    /// for exactly this reason — callers build a Set today, but the function's
+    /// result must not silently depend on how the caller's list was assembled.
+    #[test]
+    fn blackholed_probe_returns_a_repeated_id_once() {
+        const TOTAL: i64 = 1_000;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let tx = conn.transaction().unwrap();
+        for id in 1..=TOTAL {
+            let path = format!("/tmp/f{id}.fits");
+            tx.execute(
+                "INSERT INTO files (id, path, filename, size, modified_at, format)
+                 VALUES (?1, ?2, 'x.fits', 10, '2024-01-01T00:00:00Z', 'FITS')",
+                rusqlite::params![id, path],
+            )
+            .unwrap();
+            if id % 2 == 0 {
+                tx.execute(
+                    "INSERT INTO black_hole (file_id, from_where, moved_at, original_path)
+                     VALUES (?1, 'light', '2024-01-01T00:00:00Z', ?2)",
+                    rusqlite::params![id, path],
+                )
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+
+        // Every id listed twice — 2000 entries, so without the dedup the copies
+        // land in different chunks and come back twice.
+        let mut doubled: Vec<i64> = (1..=TOTAL).collect();
+        doubled.extend(1..=TOTAL);
+
+        let blackholed = get_blackholed_file_ids(&conn, &doubled).unwrap();
+
+        assert_eq!(
+            blackholed.len() as i64,
+            TOTAL / 2,
+            "a repeated id must be reported once, as an unchunked query would"
+        );
+        let mut sorted = blackholed.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), blackholed.len(), "no duplicates in the result");
     }
 
     /// A bulk move over a mix of fresh and already-blackholed files counts only
