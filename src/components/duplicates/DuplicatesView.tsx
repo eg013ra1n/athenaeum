@@ -22,6 +22,14 @@ import { RuleChainPanel } from './RuleChainPanel';
 const MASTER_ROOT_SETTING_KEY = 'duplicates.master_scan_root_id';
 const RULE_CHAIN_SETTING_KEY = 'duplicates.rule_chain';
 
+/** How many group cards are added to the DOM at a time.
+ *
+ *  A catalog that mirrors one library across several drives produces tens of
+ *  thousands of groups (39_366 measured on a 114k-file catalog). Rendering them
+ *  all cost 6.3 GB of WebView memory — the payload itself is only ~70 MB, so
+ *  the cost is DOM and React fibers, roughly 165 KB per card. */
+const GROUPS_PAGE_SIZE = 500;
+
 interface DuplicatesViewProps {
   /** Already-loaded duplicate groups (from useDuplicates in the parent). */
   duplicates: DuplicateGroup[];
@@ -50,6 +58,12 @@ export const DuplicatesView: React.FC<DuplicatesViewProps> = ({
   const [firedRuleByGroup, setFiredRuleByGroup] = useState<Map<string, RuleKind>>(new Map());
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [sortMode, setSortMode] = useState<SortMode>('wasted-desc');
+  /** How many groups are currently rendered. Caps the DOM only: the rule chain,
+   *  the per-group delete marks and the move plan are all computed over the FULL
+   *  group list (see `deletesByGroup` and `plan` below), so a capped view never
+   *  narrows what the Black Hole button actually does — it only limits what the
+   *  user can review by eye. */
+  const [visibleCount, setVisibleCount] = useState(GROUPS_PAGE_SIZE);
 
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [alert, setAlert] = useState<{ title: string; message: string; kind: 'error' | 'info' | 'warning' } | null>(null);
@@ -290,6 +304,20 @@ export const DuplicatesView: React.FC<DuplicatesViewProps> = ({
     }
     return filtered;
   }, [sortedGroups, verifyResults]);
+
+  /** The slice actually handed to React. Everything else in this component
+   *  keeps working off `verifiedGroups` / `duplicates`. */
+  const renderedGroups = useMemo(
+    () => verifiedGroups.slice(0, visibleCount),
+    [verifiedGroups, visibleCount],
+  );
+  const hiddenGroupsCount = verifiedGroups.length - renderedGroups.length;
+
+  // A fresh list (refresh, rescan) or a new sort order puts different groups on
+  // top, so the window starts over rather than staying wherever it was grown to.
+  useEffect(() => {
+    setVisibleCount(GROUPS_PAGE_SIZE);
+  }, [duplicates, sortMode]);
 
   // Counts for the summary banner.
   const mismatchFileCount = useMemo(() => {
@@ -629,7 +657,7 @@ export const DuplicatesView: React.FC<DuplicatesViewProps> = ({
         </div>
       ) : (
         <div className="bg-surface rounded-lg border border-border divide-y divide-border/40 overflow-hidden">
-          {verifiedGroups.map((group) => {
+          {renderedGroups.map((group) => {
             const key = groupKey(group);
             const deletes = deletesByGroup.get(key) ?? new Set<number>();
             const firedRule = firedRuleByGroup.get(key);
@@ -651,6 +679,23 @@ export const DuplicatesView: React.FC<DuplicatesViewProps> = ({
               />
             );
           })}
+
+          {hiddenGroupsCount > 0 && (
+            <div className="p-4 flex flex-col items-center gap-2">
+              <p className="text-xs text-content-muted text-center">
+                Showing {renderedGroups.length.toLocaleString()} of{' '}
+                {verifiedGroups.length.toLocaleString()} groups. Rules, the selection count and
+                the Black Hole plan still cover every group, shown or not.
+              </p>
+              <button
+                type="button"
+                onClick={() => setVisibleCount((n) => n + GROUPS_PAGE_SIZE)}
+                className="px-3 py-1.5 rounded text-sm border border-border bg-surface-hover text-content hover:text-accent hover:border-accent/50 transition-colors cursor-pointer"
+              >
+                Show {Math.min(GROUPS_PAGE_SIZE, hiddenGroupsCount).toLocaleString()} more
+              </button>
+            </div>
+          )}
         </div>
       )}
 
