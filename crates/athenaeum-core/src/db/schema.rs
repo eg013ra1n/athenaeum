@@ -13,7 +13,11 @@ pub const UUID_TABLES: [&str; 7] = [
 /// Exemptions in the WHEN clause:
 /// - master library sets (`is_master_library = 1`): intrinsically
 ///   single-frame; the sole member may legitimately be removed via re-import
-///   without the parent row being garbage.
+///   without the parent row being garbage. This trigger fires *inside* that
+///   window, so it never touches masters. The whole-table
+///   [`prune_orphaned_calibration_sets`] does collect the ones nothing refers
+///   to any more — it only runs at quiescent points, where a member-less
+///   unreferenced master is a ghost rather than a re-import in progress.
 /// - superseded raw sets / `master_provenance.source_set_id` targets: frozen
 ///   provenance history. `source_set_id` is an FK with no ON DELETE action,
 ///   so pruning such a set would abort the caller's own DELETE with a
@@ -69,8 +73,34 @@ pub(crate) fn create_calibration_set_empty_prune_trigger(conn: &Connection) -> r
 /// The single source of truth for every whole-table prune site (`init_db`
 /// startup sweep, `delete_scan_root`, the `bulk_update_frame_metadata`
 /// cascade). Returns the number of rows pruned.
+///
+/// # Ghost masters — where this DIVERGES from the trigger
+///
+/// The `is_master_library = 1` exemption above is about lineage, not about
+/// masters being sacred. A master set that lost its member *and* is referenced
+/// by nothing at all is a ghost: its file is gone (the member frame was the only
+/// link to it), yet the Master Dark/Flat library still lists it (that query LEFT
+/// JOINs members) and the matcher still offers it as a candidate
+/// (`configurable_matcher` filters on `superseded_by_set_id IS NULL`, never on
+/// having a frame) — so an auto-link can pick a master whose file does not
+/// exist. Deleting one 26_150-file scan root left 39 of these behind.
+///
+/// Such rows are pruned here, and deliberately NOT by the per-row trigger: a
+/// master legitimately loses and regains its sole member during a re-import, and
+/// the trigger fires *inside* that window. This helper only runs at quiescent
+/// points, where a member-less unreferenced master really is garbage. That is
+/// why the two are no longer byte-for-byte identical.
+///
+/// "Referenced by nothing" is checked against every FK that points at
+/// `calibration_set`, because each one loses data a different way: NO ACTION
+/// (`superseded_by_set_id`, `master_provenance.source_set_id`) aborts the
+/// caller's own transaction, CASCADE (`master_provenance.master_set_id`,
+/// `calibration_set_to_frames`, `calibration_set_originals`,
+/// `archive_operations`) silently takes the referring row with it, and SET NULL
+/// (`light_calibrations.{dark,flat,bias}_set_id`) silently blanks what a
+/// calibrated artifact recorded about the master it used.
 pub(crate) fn prune_orphaned_calibration_sets(conn: &Connection) -> rusqlite::Result<usize> {
-    conn.execute(
+    let plain_orphans = conn.execute(
         "DELETE FROM calibration_set
          WHERE COALESCE(is_master_library, 0) = 0
            AND superseded_by_set_id IS NULL
@@ -81,7 +111,59 @@ pub(crate) fn prune_orphaned_calibration_sets(conn: &Connection) -> rusqlite::Re
                  WHERE set_id = calibration_set.id
            )",
         [],
-    )
+    )?;
+
+    // `init_db` calls this sweep BEFORE the 12-step `archive_operations`
+    // rebuild that adds `calibration_set_id`, so on a database that predates
+    // archive-of-originals the clause below would reference a column that does
+    // not exist yet and fail to prepare — taking startup down with it. Skip the
+    // ghost branch until the schema has caught up; the rebuild runs a few lines
+    // later, so the next call (next start, or the next scan-root delete) does
+    // the collecting. Never widen this to skip the guard itself: a ghost master
+    // that an archive operation still references must survive.
+    if !column_exists(conn, "archive_operations", "calibration_set_id")? {
+        return Ok(plain_orphans);
+    }
+
+    let ghost_masters = conn.execute(
+        "DELETE FROM calibration_set
+         WHERE COALESCE(is_master_library, 0) = 1
+           AND superseded_by_set_id IS NULL
+           AND NOT EXISTS (
+                SELECT 1 FROM calibration_set_frames
+                 WHERE set_id = calibration_set.id
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM calibration_set other
+                 WHERE other.superseded_by_set_id = calibration_set.id
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM master_provenance
+                 WHERE master_set_id = calibration_set.id
+                    OR source_set_id = calibration_set.id
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM calibration_set_to_frames
+                 WHERE calibration_set_id = calibration_set.id
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM calibration_set_originals
+                 WHERE set_id = calibration_set.id
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM archive_operations
+                 WHERE calibration_set_id = calibration_set.id
+           )
+           AND NOT EXISTS (
+                SELECT 1 FROM light_calibrations
+                 WHERE dark_set_id = calibration_set.id
+                    OR flat_set_id = calibration_set.id
+                    OR bias_set_id = calibration_set.id
+           )",
+        [],
+    )?;
+
+    Ok(plain_orphans + ghost_masters)
 }
 
 fn column_exists(conn: &Connection, table: &str, col: &str) -> rusqlite::Result<bool> {
@@ -3103,6 +3185,152 @@ mod archive_schema_tests {
             "SELECT COUNT(*) FROM calibration_set WHERE id = 512",
             [], |r| r.get(0)).unwrap();
         assert_eq!(still_there, 1, "startup sweep must spare superseded sets");
+    }
+
+    /// Member-less master-library set, i.e. one whose master file is gone.
+    fn insert_ghost_master(conn: &Connection, id: i64) {
+        conn.execute(
+            "INSERT INTO calibration_set (id, imagetyp, date, is_master_library)
+             VALUES (?1, 'MasterDark', '2025-01-01', 1)",
+            [id],
+        )
+        .unwrap();
+    }
+
+    /// A master-library set whose file left with its scan root is a ghost: no
+    /// member frame, and nothing anywhere referring to it. It is not harmless —
+    /// the Master Dark/Flat library lists it (that query LEFT JOINs members) and
+    /// the matcher still offers it as a candidate (`configurable_matcher`
+    /// filters only on `superseded_by_set_id IS NULL`, never on having a frame),
+    /// so an auto-link can pick a master whose file does not exist. Removing one
+    /// 26_150-file scan root left 39 of these behind.
+    ///
+    /// The per-row trigger deliberately does NOT do this — see its doc: a master
+    /// legitimately loses and regains its sole member during a re-import, and
+    /// the trigger fires inside that window. The whole-table prune only runs at
+    /// quiescent points (startup sweep, after a scan-root delete, after the
+    /// bulk-metadata cascade), where a member-less unreferenced master is
+    /// genuinely garbage.
+    #[test]
+    fn shared_prune_removes_ghost_master_sets() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        insert_ghost_master(&conn, 530);
+
+        // A master that still has its frame must not be touched.
+        insert_ghost_master(&conn, 531);
+        insert_dummy_frame(&conn, 7030);
+        conn.execute(
+            "INSERT INTO calibration_set_frames (set_id, frame_id) VALUES (531, 7030)",
+            [],
+        )
+        .unwrap();
+
+        let pruned = super::prune_orphaned_calibration_sets(&conn).unwrap();
+        assert_eq!(pruned, 1, "only the ghost master should be pruned");
+
+        let ghost: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 530",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ghost, 0, "member-less unreferenced master must be pruned");
+        let live: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM calibration_set WHERE id = 531",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(live, 1, "a master that still has its frame must survive");
+    }
+
+    /// …but only when NOTHING points at it. Each reference below is a different
+    /// FK action and a different way to lose data silently: NO ACTION aborts the
+    /// caller's own transaction, CASCADE takes the provenance / originals /
+    /// archive-operation row with it, SET NULL blanks what a calibrated artifact
+    /// recorded about the master it used.
+    #[test]
+    fn shared_prune_spares_referenced_master_sets() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // 540 — a raw set points at it via superseded_by_set_id (NO ACTION).
+        insert_ghost_master(&conn, 540);
+        insert_dummy_calibration_set(&conn, 541, "Dark");
+        conn.execute(
+            "UPDATE calibration_set SET superseded_by_set_id = 540 WHERE id = 541",
+            [],
+        )
+        .unwrap();
+
+        // 542 — anchors a master_provenance row (CASCADE would eat the lineage).
+        insert_ghost_master(&conn, 542);
+        conn.execute(
+            "INSERT INTO master_provenance
+             (master_set_id, recipe_json, member_frame_uuids, member_hash, created_at)
+             VALUES (542, '{}', '[]', 'hash', '2025-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // 543 — a light still links to it (CASCADE would silently unlink).
+        insert_ghost_master(&conn, 543);
+        conn.execute(
+            "INSERT INTO calibration_set_to_frames
+             (source_id, source_type, calibration_set_id, calibration_type)
+             VALUES (1, 'frame', 543, 'Dark')",
+            [],
+        )
+        .unwrap();
+
+        // 544 — carries archived-originals metadata (CASCADE).
+        insert_ghost_master(&conn, 544);
+        conn.execute(
+            "INSERT INTO calibration_set_originals (set_id, saved_at)
+             VALUES (544, '2025-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // 545 — an archive operation records it (CASCADE would delete the
+        // operation row, losing the zip's catalog side entirely).
+        insert_ghost_master(&conn, 545);
+        conn.execute(
+            "INSERT INTO archive_operations
+             (calibration_set_id, archive_root_path, compression, status, started_at)
+             VALUES (545, '/archive', 'deflate', 'completed', '2025-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        // 546 — a calibrated light records it as the dark it used (SET NULL).
+        insert_ghost_master(&conn, 546);
+        conn.execute(
+            "INSERT INTO light_calibrations
+             (dark_set_id, output_path, calstat, flat_norm_applied, output_hash,
+              engine_version, created_at)
+             VALUES (546, '/out/c_a.fits', 'BD', 1, 'hash', 1, '2025-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        let pruned = super::prune_orphaned_calibration_sets(&conn).unwrap();
+        assert_eq!(pruned, 0, "every referenced master must be spared");
+
+        for id in [540, 541, 542, 543, 544, 545, 546] {
+            let alive: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM calibration_set WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(alive, 1, "set {id} must survive the prune");
+        }
     }
 
     #[test]
