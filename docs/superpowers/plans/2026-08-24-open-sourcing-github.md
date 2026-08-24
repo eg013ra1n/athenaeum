@@ -36,6 +36,32 @@ Executed in one session. Deviations from the plan as written, and why:
 | 7 | Task 8's `git gc` moved from before the push to after it. | A push transfers only reachable objects, so the repack bought nothing beforehand while locking a 4 GB repository for minutes. |
 | 8 | Task 7 additionally removed the README's claim of a metadata token-template engine (`{OBJECT}`, `{DATE-OBS:%Y-%m-%d}`). | No such engine exists — `CLAUDE.md` records the tokens and the `export_templates` table as doc and schema leftovers. Publishing it would have advertised a feature the app does not have. |
 
+### Task 9 found a real defect — nine tests that could never pass off this machine
+
+The clean-clone acceptance test earned its place. `cargo test -p athenaeum-core`
+was green in the working copy and failed nine tests in a fresh clone:
+`file_op::reconcile::tests` (7) and `scanner::moved_file_guard_tests` (2).
+
+Cause: all nine keyed on `rustafits/tests/mono.fits` through
+`concat!(env!("CARGO_MANIFEST_DIR"), "/../../rustafits/tests/mono.fits")`, and
+`rustafits/.gitignore` carries `*.fits` — the 52 MB frames are deliberately
+never committed. The tests passed only on a machine that already had them. A
+contributor, and the GitHub runner, saw nine failures. A tenth reference lived
+in `athenaeum-web/src/routes/scan_roots.rs`, outside the `-p athenaeum-core`
+gate but inside `cargo test --workspace`.
+
+Fix (owner's call, taken mid-execution): commit a real fixture instead of
+rewriting the tests to use synthetic data, which would have contradicted the
+documented real-data-first rationale in their own doc comments.
+`crates/athenaeum-core/tests/fixtures/mono_header.fits` is the same QHY268M
+frame cut to a 16x16 crop — 8.6 KB carrying the complete original header over
+genuine centre pixels. `SITELAT`, `SITELONG`, `SITEELEV` and `CAMERAID` are
+scrubbed: the original header pins the owner's observing site to centimetres
+and carries the camera serial, and the file is public now.
+
+Verified: 1598 passed / 0 failed both in the working copy and in a fresh clone
+taken from GitHub.
+
 Gate evidence at publication time: `cargo build --workspace` finished clean;
 `cargo test -p athenaeum-core` — 1600 passed, 0 failed, 13 ignored across 11 test
 binaries; `npx tsc --noEmit` clean; gitleaks clean on both repositories.
