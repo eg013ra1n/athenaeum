@@ -21,6 +21,27 @@
 - Markdown tables use spaced separators (`| ---- |`) for MD060/Obsidian.
 - The three project gates are `cargo build --workspace`, `cargo test -p athenaeum-core`, `npx tsc --noEmit`. Clippy is not a gate.
 
+## Execution log — 2026-08-24
+
+Executed in one session. Deviations from the plan as written, and why:
+
+| # | Deviation | Reason |
+| ---- | ---- | ---- |
+| 1 | Task 8 does not create the repository — `eg013ra1n/athenaeum` already existed, public since 2025-10-27, carrying an unrelated line of history (tip `b6f52d4f`, 6 stars, 1 fork, 5 divergent tags). Force-pushed over it by decision. | Discovered while retiring the auto-memory rule that said the github remote was unmaintained. `gh repo create` would have failed. |
+| 2 | Task 1 grew a step retiring the rule in auto-memory, and a second memory (`feedback_gitlab_only.md`, "never push to GitHub") had to be rewritten too. | Both would have reinstated the superseded model in later sessions. |
+| 3 | Task 2 skipped the `gitleaks dir` working-tree scan and relies on `gitleaks git`, which covers `HEAD`. | `gitleaks dir .` descends into `target/` (hundreds of GB here), `node_modules/` and `builds/` — none of it tracked or published. It ran for over 10 minutes without finishing and was killed. |
+| 4 | Task 5 dropped `dtolnay/rust-toolchain@stable` in favour of `rustup show active-toolchain`. | The action installs stable and would have shadowed the `1.96.1` pin, or forced the version to be written a second time — against this plan's own global constraint. |
+| 5 | Task 4 acquired an extra step restoring solvemyastro's GitLab remote. | `git submodule sync` rewrites the submodule's own `origin`. It silently repointed it from GitLab to GitHub, which would have orphaned the private copy. It is now `origin` = GitHub, `gitlab` = GitLab, `all` = both. |
+| 6 | Task 4's rebuild step was not re-run. | The successful `cargo build --workspace` already ran after the `solvemyastro/Cargo.toml` edit; the only later change was `.gitmodules`, which cargo never reads. |
+| 7 | Task 8's `git gc` moved from before the push to after it. | A push transfers only reachable objects, so the repack bought nothing beforehand while locking a 4 GB repository for minutes. |
+| 8 | Task 7 additionally removed the README's claim of a metadata token-template engine (`{OBJECT}`, `{DATE-OBS:%Y-%m-%d}`). | No such engine exists — `CLAUDE.md` records the tokens and the `export_templates` table as doc and schema leftovers. Publishing it would have advertised a feature the app does not have. |
+
+Gate evidence at publication time: `cargo build --workspace` finished clean;
+`cargo test -p athenaeum-core` — 1600 passed, 0 failed, 13 ignored across 11 test
+binaries; `npx tsc --noEmit` clean; gitleaks clean on both repositories.
+
+---
+
 ## File Structure
 
 | Path | Status | Responsibility |
