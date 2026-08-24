@@ -57,11 +57,22 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Build workspace
-        run: cargo build --workspace
+      # One compilation pass, not two. `cargo build --workspace` followed by
+      # `cargo test` compiled the workspace twice: once as plain libs and bins,
+      # then again with cfg(test) plus every integration-test binary. `--no-run`
+      # covers both in a single pass, and the run step below reuses its
+      # artifacts.
+      - name: Compile workspace and tests
+        run: cargo test --workspace --no-run
 
-      - name: Test core
-        run: cargo test -p athenaeum-core
+      # perseus is excluded from the run, not the compile. Its e2e_loopback
+      # suite drives real iroh transfers over loopback and is load-sensitive:
+      # `unclean_shutdown_mid_transfer_resumes_on_restart` finishes in ~10-17s
+      # alone but times out at 30s when a full-workspace run saturates the
+      # cores. It stays compiled here and is meant to be run on a developer
+      # machine, where it is not competing for CPU.
+      - name: Test workspace
+        run: cargo test --workspace --exclude perseus
 
       - name: Typecheck frontend
         run: npx tsc --noEmit
