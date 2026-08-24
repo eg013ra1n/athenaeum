@@ -3185,10 +3185,15 @@ mod inplace_tests {
     }
 }
 
-/// Volume-aware move-detection guard + its two-site wiring. Uses the real
-/// `mono.fits` fixture from the rustafits submodule (not a synthetic
-/// minimal FITS) so `compute_header_fingerprint` runs against genuine
-/// header content, per the project's real-data-first rule.
+/// Volume-aware move-detection guard + its two-site wiring. Uses the committed
+/// `tests/fixtures/mono_header.fits` (not a synthetic minimal FITS) so
+/// `compute_header_fingerprint` runs against genuine header content, per the
+/// project's real-data-first rule. That fixture is a real QHY268M frame cut
+/// down to a 16x16 crop: the full original header, with the observing site
+/// and the camera serial scrubbed, over genuine centre pixels. It lives in
+/// this crate rather than the rustafits submodule, which gitignores `*.fits`
+/// — the 52 MB originals are never committed, so tests keyed on them could
+/// not pass for a contributor or on CI.
 #[cfg(test)]
 mod moved_file_guard_tests {
     use super::*;
@@ -3197,7 +3202,7 @@ mod moved_file_guard_tests {
     use tempfile::TempDir;
 
     const MONO_FIXTURE: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../rustafits/tests/mono.fits");
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mono_header.fits");
 
     /// Insert a fake `files` + `fits_header` row carrying the real
     /// fingerprint of the fixture, standing in for a "previously scanned"

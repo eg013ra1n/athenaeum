@@ -254,7 +254,8 @@ mod tests {
     /// Path to the real FITS fixture used by the plate-solve/rustafits
     /// submodule tests — real bytes so `compute_xxhash` exercises the actual
     /// sampling hash path instead of trivially hashing an empty/tiny file.
-    const MONO_FITS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../rustafits/tests/mono.fits");
+    const MONO_FITS: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mono_header.fits");
 
     fn open_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

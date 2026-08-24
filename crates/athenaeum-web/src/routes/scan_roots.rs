@@ -413,12 +413,15 @@ mod relink_tests {
     use std::sync::{Arc, Mutex, OnceLock, RwLock};
     use tempfile::TempDir;
 
-    /// Real `mono.fits` fixture from the rustafits submodule (not a
-    /// synthetic minimal FITS) so `relink_files`'s header-fingerprint
-    /// matching runs against genuine header content — same fixture and
-    /// rationale as `scanner::moved_file_guard_tests`.
+    /// Committed `mono_header.fits` fixture (not a synthetic minimal FITS) so
+    /// `relink_files`'s header-fingerprint matching runs against genuine
+    /// header content — same fixture and rationale as
+    /// `scanner::moved_file_guard_tests`.
     const MONO_FIXTURE: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../rustafits/tests/mono.fits");
+        concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../athenaeum-core/tests/fixtures/mono_header.fits"
+    );
 
     /// Builds a `WebAppState` backed by a real (file-based, temp) database —
     /// unlike `routes::tests::test_state` in `routes/mod.rs` (which
