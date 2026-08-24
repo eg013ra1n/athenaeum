@@ -1116,14 +1116,29 @@ du -sh .git
 
 Expected: substantially smaller than 4.0 GB.
 
-- [ ] **Step 3: Create the public repository**
+- [ ] **Step 3: Reuse the existing public repository**
+
+`eg013ra1n/athenaeum` **already exists** and is public — created 2025-10-27,
+last pushed 2026-05-20, carrying an independent line of history whose tip
+(`b6f52d4f`) is unknown to this repository. It has 6 stars, 1 fork, no issues,
+and 6 merged pull requests that are all the owner's own. It was abandoned when
+GitLab became canonical.
+
+Decision (2026-08-24): **keep the repository and force-push over it.** That
+preserves the URL, the stars and the fork link. There were never any outside
+contributions to lose. Do NOT run `gh repo create` — it would fail.
 
 ```bash
-gh repo create eg013ra1n/athenaeum \
-  --public \
+gh repo view eg013ra1n/athenaeum --json name,visibility,pushedAt,stargazerCount
+```
+
+Expected: the repository exists and is `PUBLIC`. Refresh its metadata to match
+the current project:
+
+```bash
+gh repo edit eg013ra1n/athenaeum \
   --description "Catalog manager for astrophotographers — FITS/XISF metadata, frame-set clustering, calibration matching, master creation and export" \
-  --homepage "https://artfrom.space" \
-  --disable-wiki
+  --homepage "https://artfrom.space"
 ```
 
 - [ ] **Step 4: Add the remotes**
@@ -1142,23 +1157,33 @@ git remote -v
 
 Expected: `all` shows two push URLs and one fetch URL.
 
-- [ ] **Step 5: Push `main` and the tags**
+- [ ] **Step 5: Force-push `main` and the tags**
 
-All 23 tags are ancestors of `main`, so this pushes no commit that `main` does not already carry.
+The remote's `main` is an unrelated line, so a plain push is rejected. All 23
+local tags are ancestors of `main`, so this pushes no commit that `main` does
+not already carry — but 5 remote tags (`v0.2.0-beta.1` … `v0.2.0-beta.5`) point
+at different commits and must be overwritten, which a plain `--tags` will not do.
 
 ```bash
-git push github main
-git push github --tags
+git push --force github main
+git push --force --tags github
 ```
+
+This discards the abandoned public line. It is the decision recorded in Step 3;
+do not soften it into a merge — the two histories share no commit, so a merge
+would graft an unrelated tree onto the project.
 
 - [ ] **Step 6: Verify what actually landed**
 
 ```bash
+git rev-parse main
 git ls-remote --heads https://github.com/eg013ra1n/athenaeum.git
-git ls-remote --tags  https://github.com/eg013ra1n/athenaeum.git | wc -l
+git ls-remote --tags  https://github.com/eg013ra1n/athenaeum.git | grep -c 'refs/tags'
 ```
 
-Expected: exactly one head, `refs/heads/main`, at the same SHA as local `main`; 23 tags. If any other branch appears, delete it — only `main` is published.
+Expected: exactly one head, `refs/heads/main`, at the same SHA as local `main`;
+23 tags, up from the 5 that were there. The old tip `b6f52d4f` must no longer be
+advertised. If any other branch appears, delete it — only `main` is published.
 
 - [ ] **Step 7: Configure the repository surface**
 
