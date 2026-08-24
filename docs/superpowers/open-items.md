@@ -163,14 +163,6 @@ cycle, so anything from them that matters later belongs here or in a plan.
 
 ## Release notes owed at the next tag
 
-Each cycle's own doc holds the phrasing; this is the index, since a line lost here is
-a shipped change no user hears about.
-
-- Removing a folder from the catalog is near-instant on large libraries; the Duplicates screen opens on very large catalogs; masters whose files are gone no longer linger or get auto-linked.
-- Scanning is substantially faster again, with content hashing moved to an explicit background job.
-- Web archive progress completes; web sky-map selection fixed; OSC Bayer metadata survives device transfers, with automatic repair of frames received earlier.
-- Void is catalog-first, so a failed unlink leaves an orphan file on disk that a rescan re-ingests; recurring scan errors for permanently unparseable orphans; a one-time silent sweep of leaked consumer-link rows on first launch.
-- Every previously calibrated light now derives as stale, because the light-calibration engine version changed.
-- Notification dedupe keys now include the kind, so one duplicate notification is possible immediately after the upgrade.
-- The cross-platform cycle's own list, in the Status section of `research/2026-07-30-cross-platform-path-audit.md`.
-- The OSC/CFA cycle's own list, in the post-cycle sections of its audit.
+Paid in full on 2026-08-24: every line below the fold went into `RELEASE_NOTES.md`
+for v0.5.1 (the seed comment block included). Nothing is owed until the next cycle
+lands and adds its lines here.
