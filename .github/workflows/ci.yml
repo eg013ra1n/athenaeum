@@ -17,6 +17,8 @@ jobs:
   build-and-test:
     name: Build, test and typecheck
     runs-on: ubuntu-latest
+    # A hung test must not sit on a runner for the default six hours.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,14 +67,18 @@ jobs:
       - name: Compile workspace and tests
         run: cargo test --workspace --no-run
 
-      # perseus is excluded from the run, not the compile. Its e2e_loopback
-      # suite drives real iroh transfers over loopback and is load-sensitive:
-      # `unclean_shutdown_mid_transfer_resumes_on_restart` finishes in ~10-17s
-      # alone but times out at 30s when a full-workspace run saturates the
-      # cores. It stays compiled here and is meant to be run on a developer
-      # machine, where it is not competing for CPU.
+      # Both cargo invocations MUST name the identical set of crates. Passing
+      # `--exclude perseus` here changed the feature unification of the shared
+      # dependencies, so cargo rebuilt 77 crates in this step — roughly 680 of
+      # its 744 seconds went to recompiling rather than testing. Skipping the
+      # one bad test by name keeps the unit graph identical and reuses the
+      # artifacts from the step above.
+      #
+      # perseus's `unclean_shutdown_mid_transfer_resumes_on_restart` drives a
+      # real iroh transfer over loopback and is load-sensitive: ~10-17s alone,
+      # but past its 30s deadline when a full-workspace run saturates the cores.
       - name: Test workspace
-        run: cargo test --workspace --exclude perseus
+        run: cargo test --workspace -- --skip unclean_shutdown_mid_transfer_resumes_on_restart
 
       - name: Typecheck frontend
         run: npx tsc --noEmit
