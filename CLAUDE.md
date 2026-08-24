@@ -332,5 +332,11 @@ Device-to-device transfers over iroh (specs: `docs/superpowers/specs/2026-07-20-
 
 1. Rewrite `RELEASE_NOTES.md` (file is fully REPLACED each release): italic tagline line, then `## What's New` / `## Changes` / `## Bug Fixes` — user-facing EN prose.
 2. Version bump ×5: `package.json`, `crates/{athenaeum-core,athenaeum-tauri,athenaeum-web}/Cargo.toml`, `crates/athenaeum-tauri/tauri.conf.json`; refresh `Cargo.lock` via `cargo check`.
-3. One commit `chore(release): vX.Y.Z — …` on the version branch; gates (`cargo build --workspace`, core tests, `npx tsc --noEmit`); ff-merge to `main`; tag `vX.Y.Z`; push `main` + the version branch + the tag. The tag pipeline then: builds ×3 platforms → uploads to `artfrom.space/builds/<tag>/` (+ `latest` symlink + stable-named aliases) → GitLab Release from RELEASE_NOTES.md → publishes `version.json` → Discord/Telegram notifications.
+3. One commit `chore(release): vX.Y.Z — …` on `main`; gates (`cargo build --workspace`, core tests, `npx tsc --noEmit`); tag `vX.Y.Z`; push `main` and the tag to both remotes (`git push all main && git push all vX.Y.Z`). The tag pipeline then: builds ×3 platforms → uploads to `artfrom.space/builds/<tag>/` (+ `latest` symlink + stable-named aliases) → GitLab Release from RELEASE_NOTES.md → publishes `version.json` → Discord/Telegram notifications.
 4. **Docs site (easy to forget — separate repo `../artfrom-space`):** add blog post `src/content/docs/blog/vX.Y.Z.md` (frontmatter: title/date/authors: vilen/tags: release/excerpt; Starlight de-dots the slug → `/blog/vXYZ/`) + a Version History row in `src/content/docs/releases/download.md`. Commit `docs: vX.Y.Z release post + download-page row`, push `main` — its CI builds and rsync-deploys the site. Refresh guides/manuals only when UI flows actually changed.
+
+**Branching.** `main` is the development trunk and releases are tags on it. This
+replaces the older "develop on a branch named after the version, ff-merge at
+release" rule, which left `main` hundreds of commits stale — unworkable once
+`main` is the default branch outside contributors base their pull requests on.
+A release branch is cut only if a backport is ever actually needed.
