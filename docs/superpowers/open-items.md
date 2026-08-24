@@ -1,9 +1,9 @@
 # Open items
 
 What is finished in code but not yet confirmed by hand, and what has already been
-decided and should not be reopened. Everything here concerns branch `0.5.1`, which
-carries ten completed cycles on top of the last tag (`v0.5.0-beta.1`) and has not
-been released.
+decided and should not be reopened. Everything here sits on `main` — the development
+trunk since 2026-08-24, when the project went open source and version branches were
+retired — and covers the ten completed cycles on top of the last tag.
 
 Plans, specs and audits live in `plans/`, `specs/` and `research/` beside this file
 and hold the detail. This file holds only the residue: the checks nobody has run and

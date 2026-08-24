@@ -52,7 +52,7 @@ DB lives in OS app-data dir for desktop; `/data` (or `$ATHENAEUM_DB_PATH`) in Do
 
 **`athenaeum-core` (`crates/athenaeum-core/src/`)** — see `lib.rs` for the canonical list. Top-level domains: `models`, `coordinates`, `db`, `fits_parser`, `clustering`, `settings`, `scanner`, `monitor`, `duplicates`, `calibration`, `archive`, `file_op`, `export`, `analysis`, `plate_solve`, `cache`, `catalog`, `auto_merge`, `relinking`, `sessions`, `services` (`ServiceContext` + `ProgressEmitter` trait), `events`, `logging`, `rustafits_processor`.
 
-**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — ~157 functions across 16 modules (measured 2026-08-04, post dead-code-cleanup cycle; `utils` was deleted — its last helper moved into core with the spatial migration. `cache` is an empty placeholder module post-T6 — still declared in `mod.rs` so it counts as a module, contributes 0 commands). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
+**Tauri commands (`crates/athenaeum-tauri/src/commands/`)** — 232 functions across 23 modules (measured 2026-08-24; `cache` is an empty placeholder module post-T6 — still declared in `mod.rs` so it counts as a module, contributes 0 commands). Each has a sibling in `crates/athenaeum-web/src/routes/` with the same name and surface:
 
 `core` `scan_roots` `files` `settings` `frame_sets` `calibration` `duplicates` `cache` `spatial` `archive` `analysis` `plate_solve` `registration` `export` `missing_files` `calendar`
 
@@ -331,7 +331,7 @@ Device-to-device transfers over iroh (specs: `docs/superpowers/specs/2026-07-20-
 ## Release workflow
 
 1. Rewrite `RELEASE_NOTES.md` (file is fully REPLACED each release): italic tagline line, then `## What's New` / `## Changes` / `## Bug Fixes` — user-facing EN prose.
-2. Version bump ×5: `package.json`, `crates/{athenaeum-core,athenaeum-tauri,athenaeum-web}/Cargo.toml`, `crates/athenaeum-tauri/tauri.conf.json`; refresh `Cargo.lock` via `cargo check`.
+2. Version bump ×6: `package.json`, `crates/{athenaeum-core,athenaeum-tauri,athenaeum-web,perseus}/Cargo.toml`, `crates/athenaeum-tauri/tauri.conf.json` (Tauri uses `X.Y.Z-N`, not `-beta.N` — bundle naming rejects the dotted form); refresh `Cargo.lock` via `cargo check`.
 3. One commit `chore(release): vX.Y.Z — …` on `main`; gates (`cargo build --workspace`, core tests, `npx tsc --noEmit`); tag `vX.Y.Z`; push `main` and the tag to both remotes (`git push all main && git push all vX.Y.Z`). The tag pipeline then: builds ×3 platforms → uploads to `artfrom.space/builds/<tag>/` (+ `latest` symlink + stable-named aliases) → GitLab Release from RELEASE_NOTES.md → publishes `version.json` → Discord/Telegram notifications.
 4. **Docs site (easy to forget — separate repo `../artfrom-space`):** add blog post `src/content/docs/blog/vX.Y.Z.md` (frontmatter: title/date/authors: vilen/tags: release/excerpt; Starlight de-dots the slug → `/blog/vXYZ/`) + a Version History row in `src/content/docs/releases/download.md`. Commit `docs: vX.Y.Z release post + download-page row`, push `main` — its CI builds and rsync-deploys the site. Refresh guides/manuals only when UI flows actually changed.
 

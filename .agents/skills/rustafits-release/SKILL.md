@@ -77,7 +77,7 @@ Run from **inside the athenaeum submodule** at `athenaeum/rustafits/` (or the st
     cd ..                      # back to athenaeum root
     git add rustafits
     git commit -m "chore: bump rustafits submodule to vX.Y.Z"
-    git push origin <athenaeum-branch>
+    git push all main          # main is the trunk; `all` pushes GitLab + GitHub
     ```
     Because athenaeum uses `rustafits = { path = "../../rustafits" }` (not a crates.io version pin), no `Cargo.toml` edits are needed in athenaeum-core/athenaeum-tauri.
 
