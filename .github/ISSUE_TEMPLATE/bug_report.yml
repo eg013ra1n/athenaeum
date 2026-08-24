@@ -1,0 +1,59 @@
+name: Bug report
+description: Something behaves incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Attaching the JSONL log makes triage far faster. Settings → Logging
+        shows the log directory; the newest `athenaeum-desktop.*` or
+        `athenaeum-web.*` file covers the session where it happened.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what happened, and what you expected instead.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Athenaeum version
+      placeholder: "0.5.1"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Windows
+        - Linux (AppImage)
+        - Linux (DEB)
+        - Docker / web
+    validations:
+      required: true
+
+  - type: dropdown
+    id: file-format
+    attributes:
+      label: Which file format is involved
+      options:
+        - "Not file-specific"
+        - FITS
+        - XISF
+        - Both
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log
+      description: Paste the relevant JSONL lines, or attach the file.
+      render: text

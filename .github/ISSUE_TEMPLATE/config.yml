@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://artfrom.space
+    about: Guides, manuals and release downloads.
+  - name: Questions and ideas
+    url: https://github.com/eg013ra1n/athenaeum/discussions
+    about: For anything that is not a bug report or a concrete feature request.
