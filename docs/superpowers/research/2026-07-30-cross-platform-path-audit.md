@@ -155,7 +155,7 @@ Fix: byte-range form (`native_separator_of` + `trim_end_matches(sep)` + `path_pr
 
 ## Status (2026-07-30 fix cycle)
 
-Plan: `docs/superpowers/plans/2026-07-30-cross-platform-path-fixes.md` (19 tasks). All 4 Critical and all 24 Important findings are fixed on branch `0.5.1`, commits `a1040617..b3634a78`. The Minor group was swept selectively. *Deferred* below is the true residual ledger: it carries both the items deliberately queued out of this cycle **and** the remainder of the Minor group, which was left untouched — it is not a claim that everything else in Minor was fixed.
+Plan: `docs/superpowers/plans/2026-07-30-cross-platform-path-fixes.md` (19 tasks). All 4 Critical and all 24 Important findings are fixed on branch `0.5.1`, commits `a1040617..b3634a78`. The Minor group was swept selectively. **The Windows compile gate cleared on 2026-08-24**: the v0.5.1 tag pipeline (#299) built Windows green in 19.9 min — the first CI compile of this cycle's `cfg(windows)` code (the manifest, `rename_replace`, the test), which no local MSVC check could cover (dies in `ring`). *Deferred* below is the true residual ledger: it carries both the items deliberately queued out of this cycle **and** the remainder of the Minor group, which was left untouched — it is not a claim that everything else in Minor was fixed.
 
 ### Critical
 

@@ -136,9 +136,8 @@ owed for it.
 
 ### Cross-platform path fixes — 2026-07-30
 
-**The first tag build is a blocking gate:** Windows CI compile has never run against
-the `cfg(windows)` code this cycle added (the manifest, `rename_replace`, one test).
-A local MSVC check dies in ring.
+The compile gate cleared with the v0.5.1 tag (2026-08-24) — see the audit doc's
+Status section. What remains is the manual smoke list:
 
 - Restore-to-original, Windows, end to end.
 - A move across a Docker bind mount (EXDEV), killed mid-copy, then resumed.
