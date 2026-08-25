@@ -166,7 +166,7 @@ pub fn update_step(
     } else {
         None
     };
-    let completed_at_clause = if matches!(status, StepStatus::Done | StepStatus::Failed | StepStatus::RolledBack) {
+    let completed_at_clause = if matches!(status, StepStatus::Done | StepStatus::Failed) {
         Some(now)
     } else {
         None

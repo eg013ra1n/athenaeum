@@ -148,7 +148,6 @@ pub enum StepStatus {
     InProgress,
     Done,
     Failed,
-    RolledBack,
 }
 
 impl StepStatus {
@@ -158,7 +157,6 @@ impl StepStatus {
             StepStatus::InProgress => "in_progress",
             StepStatus::Done => "done",
             StepStatus::Failed => "failed",
-            StepStatus::RolledBack => "rolled_back",
         }
     }
 }

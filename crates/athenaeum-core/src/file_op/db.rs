@@ -253,7 +253,7 @@ pub fn update_step(
     };
     let completed_at_clause = if matches!(
         status,
-        StepStatus::Done | StepStatus::Failed | StepStatus::RolledBack
+        StepStatus::Done | StepStatus::Failed
     ) {
         Some(now)
     } else {

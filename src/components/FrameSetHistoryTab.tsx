@@ -159,10 +159,6 @@ function readableReason(reason: string): string {
   switch (reason) {
     case 'no_coords':
       return 'missing coordinates or date_obs';
-    case 'outside_threshold':
-      return 'outside coordinate threshold';
-    case 'already_in_set':
-      return 'already in another set';
     default:
       return reason;
   }

@@ -5,7 +5,6 @@ import {
   Thermometer,
   Calendar,
   FileX,
-  Settings,
   ExternalLink,
 } from 'lucide-react';
 import type { DetailedWarning, WarningType, WarningSeverity } from '../../types/export';
@@ -247,10 +246,6 @@ function getTypeIcon(type: WarningType) {
       return Calendar;
     case 'missing_calibration':
       return FileX;
-    case 'gain_offset_mismatch':
-    case 'binning_mismatch':
-    case 'exposure_mismatch':
-      return Settings;
     default:
       return AlertTriangle;
   }

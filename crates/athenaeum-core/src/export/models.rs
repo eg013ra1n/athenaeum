@@ -668,12 +668,6 @@ pub enum WarningType {
     CalibrationAge,
     /// Missing calibration (using fallback)
     MissingCalibration,
-    /// Gain/offset mismatch
-    GainOffsetMismatch,
-    /// Binning mismatch
-    BinningMismatch,
-    /// Exposure time mismatch
-    ExposureMismatch,
     /// General warning
     General,
 }

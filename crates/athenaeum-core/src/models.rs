@@ -1056,8 +1056,6 @@ pub struct CalibrationSetOriginals {
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
     NoCoords,
-    OutsideThreshold,
-    AlreadyInSet,
 }
 
 /// A candidate light frame eligible for merging into a frame set.

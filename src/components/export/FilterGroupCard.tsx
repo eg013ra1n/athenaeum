@@ -38,8 +38,7 @@ export function FilterGroupCard({ group, warnings = [] }: FilterGroupCardProps) 
     return warnings.filter(
       (w) =>
         w.warningType === 'temperature_mismatch' ||
-        w.warningType === 'calibration_age' ||
-        w.warningType === 'exposure_mismatch'
+        w.warningType === 'calibration_age'
     ).filter((w) => w.title.toLowerCase().includes(calibType.toLowerCase()));
   };
 

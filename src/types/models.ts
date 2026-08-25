@@ -411,7 +411,7 @@ dec?: number | null,
  */
 rotation?: number | null, };
 
-export type SkipReason = "no_coords" | "outside_threshold" | "already_in_set";
+export type SkipReason = "no_coords";
 
 export type CandidateFrame = { frame_id: number, file_id: number, filename: string, ra: number | null, dec: number | null, date_obs: string | null, filter: string | null, instrume: string | null, };
 

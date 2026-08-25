@@ -744,7 +744,7 @@ delta: string | null,
  */
 recommendation: string | null, };
 
-export type WarningType = "temperature_mismatch" | "calibration_age" | "missing_calibration" | "gain_offset_mismatch" | "binning_mismatch" | "exposure_mismatch" | "general";
+export type WarningType = "temperature_mismatch" | "calibration_age" | "missing_calibration" | "general";
 
 export type WarningSeverity = "info" | "warning" | "error";
 
